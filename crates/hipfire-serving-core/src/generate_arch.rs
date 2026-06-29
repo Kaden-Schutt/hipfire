@@ -369,7 +369,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     //
     // Compare the freshly-tokenized prompt against the tokens we know
     // are already resident in the V4F KV / SWA / compressed-KV rings
-    // from the prior request (`m.cursor.conversation_tokens`). If the new
+    // from the prior request (`m.active.cursor.conversation_tokens`). If the new
     // prompt FULLY EXTENDS the prior conversation — i.e., starts with
     // the entire `conversation_tokens` — we can skip prefill for those
     // tokens and only prefill the suffix.
@@ -405,12 +405,12 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     // prior.len()` (full match, nothing to do) with a noop check
     // downstream (suffix_tokens is empty).
     //
-    // After the daemon's `reset` handler clears `m.cursor.conversation_tokens`
+    // After the daemon's `reset` handler clears `m.active.cursor.conversation_tokens`
     // (legacy stateless path), `prior` is empty and `lcp = 0` → full
     // prefill. For prefix-cache mode the serve stops calling reset for
     // V4F and lets this LCP detection drive cache-hit accounting.
     let lcp: usize = {
-        let prior = &m.cursor.conversation_tokens;
+        let prior = &m.active.cursor.conversation_tokens;
         if prior.is_empty() || prompt_ids.len() < prior.len() {
             0
         } else {
@@ -436,7 +436,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
-        m.cursor.conversation_tokens.clear();
+        m.active.cursor.conversation_tokens.clear();
         // Tear down the captured V4F decode hipGraph alongside the
         // state, same rationale as the daemon's `"reset"` handler:
         // a fresh-context turn invalidates every device-buffer pointer
@@ -500,7 +500,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if !spec_mode {
         state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
     }
-    // Keep `m.cursor.conversation_tokens` in lockstep with what's actually
+    // Keep `m.active.cursor.conversation_tokens` in lockstep with what's actually
     // resident in the KV/SWA/compressed-KV rings:
     //   - On a CACHE MISS (lcp==0): replace with prompt_ids (we just
     //     full-prefilled the whole prompt).
@@ -513,11 +513,15 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     //     comparison run off the end of what's actually cached and
     //     make divergent assumptions about ring contents.
     if lcp == 0 {
-        m.cursor.conversation_tokens.clear();
-        m.cursor.conversation_tokens.extend_from_slice(&prompt_ids);
+        m.active.cursor.conversation_tokens.clear();
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(&prompt_ids);
     } else {
-        m.cursor.conversation_tokens.truncate(lcp);
-        m.cursor
+        m.active.cursor.conversation_tokens.truncate(lcp);
+        m.active
+            .cursor
             .conversation_tokens
             .extend_from_slice(suffix_tokens);
     }
@@ -709,7 +713,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     decode_t0.elapsed().as_millis() as u64,
                 );
                 let _ = stdout.flush();
-                m.cursor.conversation_tokens.push(t);
+                m.active.cursor.conversation_tokens.push(t);
                 generated_count += 1;
             }
             if let Some(&t) = r.accepted_tokens.last() {
@@ -859,7 +863,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // assembled from `<｜DSML｜tool_calls>` blocks). Replaying that
         // here once captures all the logical structure without a
         // second tokenizer pass.
-        let decode_start_tokens_idx = m.cursor.conversation_tokens.len();
+        let decode_start_tokens_idx = m.active.cursor.conversation_tokens.len();
         let mut emit_text_buf = String::new();
         let mut emit_tool_calls_buf: Vec<prompt_frame::ToolCall> = Vec::new();
         use hipfire_arch_deepseek4::dsml::StreamEvent;
@@ -904,7 +908,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 decode_t0.elapsed().as_millis() as u64,
             );
             let _ = stdout.flush();
-            m.cursor.conversation_tokens.push(next_tok);
+            m.active.cursor.conversation_tokens.push(next_tok);
             if grammar_active {
                 matcher.advance(&frag);
             }
@@ -965,10 +969,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
         if have_replayable_payload
             && generated_count > 0
-            && m.cursor.conversation_tokens.len() > decode_start_tokens_idx
+            && m.active.cursor.conversation_tokens.len() > decode_start_tokens_idx
         {
             let cached_seq: Vec<u32> =
-                m.cursor.conversation_tokens[decode_start_tokens_idx..].to_vec();
+                m.active.cursor.conversation_tokens[decode_start_tokens_idx..].to_vec();
             let fp = prompt_frame::assistant_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
@@ -987,7 +991,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         }
     }
 
-    m.cursor.seq_pos = state.n_tokens as usize;
+    m.active.cursor.seq_pos = state.n_tokens as usize;
 
     let _ = gpu.hip.device_synchronize();
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
@@ -1838,15 +1842,15 @@ pub fn generate_minimax(
         };
         eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
         m.minimax_state.as_mut().unwrap().reset();
-        m.cursor.seq_pos = 0;
-        m.cursor.conversation_tokens.clear();
+        m.active.cursor.seq_pos = 0;
+        m.active.cursor.conversation_tokens.clear();
     }
 
     let t0 = Instant::now();
 
     // ── Prefill: decode_step per prompt token. Disjoint field borrows of
     // `m` (config / weights / state) let us also push to
-    // `m.cursor.conversation_tokens` in the same scope (same pattern as
+    // `m.active.cursor.conversation_tokens` in the same scope (same pattern as
     // generate_qwen2). The LAST decode_step's logits are the predictions
     // for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
@@ -1867,7 +1871,7 @@ pub fn generate_minimax(
         }
     }
     for &tok in &prompt_ids {
-        m.cursor.conversation_tokens.push(tok);
+        m.active.cursor.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
 
@@ -1925,7 +1929,7 @@ pub fn generate_minimax(
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
-        m.cursor.conversation_tokens.push(next_tok);
+        m.active.cursor.conversation_tokens.push(next_tok);
         generated_count += 1;
 
         // Advance one step on the freshly sampled token.
@@ -1945,7 +1949,7 @@ pub fn generate_minimax(
         }
     }
 
-    m.cursor.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
+    m.active.cursor.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -2111,7 +2115,7 @@ pub fn generate_lfm2moe(
     // With CASK/TriAttention active, `n_tokens` is the physical cursor and
     // `compact_offset` carries the logical prefix already compacted away.
     let overflow = {
-        let state = m.lfm2moe_state.as_ref().unwrap();
+        let state = m.active.lfm2moe_state.as_ref().unwrap();
         let current = if m.eviction.is_some() {
             state.n_tokens + state.kv.compact_offset
         } else {
@@ -2126,7 +2130,7 @@ pub fn generate_lfm2moe(
     };
     if overflow {
         let (n, logical, cap) = {
-            let state = m.lfm2moe_state.as_ref().unwrap();
+            let state = m.active.lfm2moe_state.as_ref().unwrap();
             (
                 state.n_tokens,
                 state.n_tokens + state.kv.compact_offset,
@@ -2147,9 +2151,9 @@ pub fn generate_lfm2moe(
         eprintln!(
             "[daemon] arch_id=11 context full (physical={n} logical={logical}/{cap}) — resetting Lfm2MoeState",
         );
-        let _ = m.lfm2moe_state.as_mut().unwrap().reset(gpu);
-        m.cursor.seq_pos = 0;
-        m.cursor.conversation_tokens.clear();
+        let _ = m.active.lfm2moe_state.as_mut().unwrap().reset(gpu);
+        m.active.cursor.seq_pos = 0;
+        m.active.cursor.conversation_tokens.clear();
     }
 
     let t0 = Instant::now();
@@ -2161,6 +2165,7 @@ pub fn generate_lfm2moe(
     if prefill_already_done {
         let current_position = {
             let state = m
+                .active
                 .lfm2moe_state
                 .as_ref()
                 .expect("lfm2moe_state missing on arch_id=11 generate");
@@ -2187,6 +2192,7 @@ pub fn generate_lfm2moe(
             return;
         }
         let state = m
+            .active
             .lfm2moe_state
             .as_ref()
             .expect("lfm2moe_state missing on arch_id=11 generate");
@@ -2209,7 +2215,7 @@ pub fn generate_lfm2moe(
     } else {
         let cfg = m.lfm2moe_config.as_ref().unwrap();
         let weights = m.lfm2moe_weights.as_ref().unwrap();
-        let state = m.lfm2moe_state.as_mut().unwrap();
+        let state = m.active.lfm2moe_state.as_mut().unwrap();
         if let Some(ref ev) = m.eviction {
             let mut logits = Vec::new();
             for &tok in &prompt_ids {
@@ -2251,7 +2257,7 @@ pub fn generate_lfm2moe(
             }
         }
         for &tok in &prompt_ids {
-            m.cursor.conversation_tokens.push(tok);
+            m.active.cursor.conversation_tokens.push(tok);
         }
         prefill_ms = t0.elapsed().as_millis();
     }
@@ -2285,13 +2291,13 @@ pub fn generate_lfm2moe(
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
-        m.cursor.conversation_tokens.push(next_tok);
+        m.active.cursor.conversation_tokens.push(next_tok);
         generated_count += 1;
 
         let step = {
             let cfg = m.lfm2moe_config.as_ref().unwrap();
             let weights = m.lfm2moe_weights.as_ref().unwrap();
-            let state = m.lfm2moe_state.as_mut().unwrap();
+            let state = m.active.lfm2moe_state.as_mut().unwrap();
             let position = state.n_tokens as u32;
             let step = lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position);
             if step.is_ok() {
@@ -2325,8 +2331,8 @@ pub fn generate_lfm2moe(
         }
     }
 
-    m.cursor.seq_pos = {
-        let state = m.lfm2moe_state.as_ref().unwrap();
+    m.active.cursor.seq_pos = {
+        let state = m.active.lfm2moe_state.as_ref().unwrap();
         state.n_tokens + state.kv.compact_offset
     };
 
@@ -2471,6 +2477,7 @@ fn generate_lfm2moe_dflash(
         (df.ctx_capacity, df.block_size)
     };
     let target_capacity = m
+        .active
         .lfm2moe_state
         .as_ref()
         .map(|s| s.max_seq)
@@ -2493,7 +2500,7 @@ fn generate_lfm2moe_dflash(
     let t0 = Instant::now();
     let first_token = if let Some(expected_position) = expected_prefilled_position {
         let current_position = {
-            let state = m.lfm2moe_state.as_ref().unwrap();
+            let state = m.active.lfm2moe_state.as_ref().unwrap();
             state.n_tokens + state.kv.compact_offset
         };
         if current_position != expected_position {
@@ -2537,7 +2544,7 @@ fn generate_lfm2moe_dflash(
             df.draft_scratch.reset_upload_tracking();
         }
         let logits = {
-            let state = m.lfm2moe_state.as_ref().unwrap();
+            let state = m.active.lfm2moe_state.as_ref().unwrap();
             match gpu.download_f32(&state.logits) {
                 Ok(logits) => logits,
                 Err(e) => {
@@ -2558,7 +2565,7 @@ fn generate_lfm2moe_dflash(
     } else {
         let cfg = m.lfm2moe_config.as_ref().unwrap();
         let weights = m.lfm2moe_weights.as_ref().unwrap();
-        let state = m.lfm2moe_state.as_mut().unwrap();
+        let state = m.active.lfm2moe_state.as_mut().unwrap();
         let df = m.lfm2_dflash.as_mut().unwrap();
         if let Err(e) = state.reset(gpu) {
             emit_error_with_id(stdout, id, format!("lfm2moe dflash reset failed: {e}"));
@@ -2619,8 +2626,11 @@ fn generate_lfm2moe_dflash(
         t0.elapsed().as_millis()
     };
     if !prefill_already_done {
-        m.cursor.conversation_tokens.clear();
-        m.cursor.conversation_tokens.extend_from_slice(&prompt_ids);
+        m.active.cursor.conversation_tokens.clear();
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(&prompt_ids);
     }
 
     if first_token == eos_tok
@@ -2667,7 +2677,7 @@ fn generate_lfm2moe_dflash(
             tokenizer,
         );
     }
-    m.cursor.conversation_tokens.push(first_token);
+    m.active.cursor.conversation_tokens.push(first_token);
 
     let decode_t0 = Instant::now();
     let mut generated_count = 1usize;
@@ -2684,7 +2694,7 @@ fn generate_lfm2moe_dflash(
         let step = {
             let cfg = m.lfm2moe_config.as_ref().unwrap();
             let weights = m.lfm2moe_weights.as_ref().unwrap();
-            let state = m.lfm2moe_state.as_mut().unwrap();
+            let state = m.active.lfm2moe_state.as_mut().unwrap();
             let df = m.lfm2_dflash.as_mut().unwrap();
             lfm2moe::spec_step_dflash(
                 gpu,
@@ -2737,7 +2747,7 @@ fn generate_lfm2moe_dflash(
                     tokenizer,
                 );
             }
-            m.cursor.conversation_tokens.push(tok);
+            m.active.cursor.conversation_tokens.push(tok);
             generated_count += 1;
         }
         position += step.advance;
@@ -2747,7 +2757,8 @@ fn generate_lfm2moe_dflash(
         }
     }
 
-    m.cursor.seq_pos = m
+    m.active.cursor.seq_pos = m
+        .active
         .lfm2moe_state
         .as_ref()
         .map(|s| s.n_tokens)

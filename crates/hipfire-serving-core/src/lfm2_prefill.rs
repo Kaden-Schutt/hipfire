@@ -388,6 +388,7 @@ fn lfm2_prefill_active_session_tokens(
     }
     let (current_position, capacity, capacity_label) = {
         let state = m
+            .active
             .lfm2moe_state
             .as_ref()
             .ok_or_else(|| "lfm2 active session missing state".to_string())?;
@@ -431,6 +432,7 @@ fn lfm2_prefill_active_session_tokens(
         .ok_or_else(|| "lfm2 weights missing".to_string())?;
     let eviction = m.eviction.as_ref();
     let state = m
+        .active
         .lfm2moe_state
         .as_mut()
         .ok_or_else(|| "lfm2 active session missing state".to_string())?;
@@ -452,7 +454,7 @@ fn lfm2_prefill_active_session_tokens(
                 }
             }
         }
-        m.cursor.seq_pos = state.n_tokens + state.kv.compact_offset;
+        m.active.cursor.seq_pos = state.n_tokens + state.kv.compact_offset;
     } else if let Some(df) = m.lfm2_dflash.as_mut() {
         let mut capture = lfm2moe::forward::Lfm2HiddenCapture::new(
             cfg.num_hidden_layers,
@@ -470,13 +472,16 @@ fn lfm2_prefill_active_session_tokens(
         .map_err(|e| format!("lfm2 generate_batch_prefill DFlash prefill failed: {e:?}"))?;
         df.target_hidden_host
             .extend_from_slice(&capture.take_rows());
-        m.cursor.seq_pos = state.n_tokens;
+        m.active.cursor.seq_pos = state.n_tokens;
     } else {
         lfm2moe::forward::prefill_batch(cfg, weights, state, gpu, tokens)
             .map_err(|e| format!("lfm2 generate_batch_prefill failed: {e:?}"))?;
-        m.cursor.seq_pos = state.n_tokens;
+        m.active.cursor.seq_pos = state.n_tokens;
     }
-    m.cursor.conversation_tokens.extend_from_slice(tokens);
+    m.active
+        .cursor
+        .conversation_tokens
+        .extend_from_slice(tokens);
     Ok(tokens.len())
 }
 
@@ -625,7 +630,8 @@ pub fn run_generate_batch_prefill_serial_lfm2(
             &mut boundary_checkpoints,
         )?;
         let logical_position = lfm2_active_logical_position(m)?;
-        let prefix_hash = compute_lfm2_prefix_hash(m, session, &m.cursor.conversation_tokens);
+        let prefix_hash =
+            compute_lfm2_prefix_hash(m, session, &m.active.cursor.conversation_tokens);
         let result = Lfm2PrefillSessionResult {
             id: session.id.clone(),
             prefill_tokens: tokens.len(),

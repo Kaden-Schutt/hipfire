@@ -120,6 +120,72 @@ the `SequenceState` ownership question — we are building it now, not deferring
 - **C2 — concurrent residency, serial step.** N sessions resident (arena reserve),
   decode them round-robin (no shared slot). Validate two concurrent sessions
   produce identical output to two serial runs.
+
+  **C2 design — `m.active` shape + borrow implications (2026-06-29).** The active
+  session is today DECOMPOSED across four `LoadedModel` fields — `cursor:
+  SessionCursor` (163 access sites), `sequence_state: Option<SequenceState>`
+  (qwen35 KV+DeltaNet, 15), `q35_active_prefilled_generated_suffix_len: usize`
+  (3), and `lfm2moe_state: Option<Lfm2MoeState>` (cfg, 18). Activate spreads a
+  saved session into these (`restore_into_loaded`); save recomposes
+  (`take_from_loaded`) — that field-by-field copy IS the cursor *working copy*.
+
+  **Shape decision: group the four into one cohesive `pub active: ResidentSession`
+  field (NOT an enum, NOT accessor methods).** Rationale follows the C1a finding:
+  - *Not accessor methods* — `m.set_seq_pos(x)` borrows all of `*m`, breaking the
+    pervasive disjoint field borrows the generation loop holds (`let tok =
+    m.tokenizer…` alive across a cursor write; `let ss = m.sequence_state…`). C1a
+    hit 29 borrow conflicts this way and reverted.
+  - *Not an enum* (`enum ActiveSession { Qwen35(..), Lfm2(..) }`) — an enum
+    reintroduces the borrow problem *inside* the rich tier: the qwen35 hot path
+    needs `cursor` AND `sequence_state` borrowed disjointly, which an enum variant
+    can't yield without a single `match` binding threaded through ~100 sites.
+  - *Field grouping wins* — `m.active.cursor.seq_pos` and
+    `m.active.sequence_state.kv` are plain field paths; Rust grants disjoint
+    borrows at any nesting depth, so `m.active.cursor` ⟂ `m.active.sequence_state`
+    ⟂ `m.tokenizer` all coexist exactly as the four flat fields do today. The
+    change is a pure field-path regroup — the same mechanical class as C1a
+    (`{seq_pos,conversation_tokens}` → `cursor`) and C1b-1, both GPU-validated.
+
+  ```rust
+  #[derive(Default)]
+  pub struct ResidentSession {
+      pub cursor: SessionCursor,
+      pub sequence_state: Option<SequenceState>,        // qwen35 KV + DeltaNet
+      pub q35_active_prefilled_generated_suffix_len: usize,
+      #[cfg(feature = "arch-lfm2moe")]
+      pub lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
+  }
+  ```
+
+  `Option<T>: Default` regardless of `T`, so `derive(Default)` holds even though
+  `SequenceState`/`Lfm2MoeState` aren't `Default`; the cfg-gated field is fine in
+  a derived `Default`. Field names are kept identical (even the redundant
+  `active.q35_active_prefilled_…`) so every access is a pure `m.X → m.active.X`
+  prefix-insert (compiler-backstopped: a non-`LoadedModel` `m` — `m` is overloaded
+  for messages/iterators — would fail to find `.active`).
+
+  **Sub-steps (mirrors C1a/C1b discipline):**
+  - **C2a — group into `ResidentSession` (DONE 2026-06-29).** Pure regroup:
+    defined the struct (model.rs), replaced the 4 `LoadedModel` fields
+    (`cursor`/`sequence_state`/`q35_active_prefilled_generated_suffix_len`/
+    `lfm2moe_state`) with `pub active: ResidentSession`, prefix-inserted the access
+    sites (163 `m.cursor` + 15 `m.sequence_state` + 18 `m.lfm2moe_state` + 3
+    suffix-len + the `impl LoadedModel` `self.sequence_state`) across
+    generate/generate_arch/generate_vl/qwen35_prefill/lfm2_prefill/session/load +
+    daemon main.rs, fixed the 15 construction literals (11 all-default →
+    `ResidentSession::default()`, 3 qwen35 carry `sequence_state` shorthand, 1 lfm2
+    carries `Some(state)`). GOTCHA repeated from C1b-1: single-line perl misses
+    multi-line `m\n  .field` chains (18 of them) — caught with a `-0777` slurp
+    pass. Compiles clean w/ & w/o `arch-lfm2moe` + workspace. **GPU-validated
+    (gfx1151):** coherence-gate.sh exit 0 16/16 OK; baseline-vs-changes Output
+    diff is byte-IDENTICAL across qwen3.5 dense 0.8b–27b (mq3/mq4/mq6/lloyd) +
+    lfm2.5-8b-a1b → behavior-preserving confirmed (lfm2 greedy repetition is
+    pre-existing).
+  - **C2b — eliminate the working copy** (folds in C1b-2): the registry session
+    structs hold/produce a `ResidentSession`; activate = move it into `m.active`,
+    save = move it back — no field-by-field `take_/restore_into_loaded` copy.
+  - **C2c — N concurrent residents**: `m.active` → a resident set keyed by session
+    id (arena `reserve`), serial round-robin decode (no microbatch yet).
 - **C3 — microbatched prefill** for one arch (lfm2 or a dense arch) via the
   scheduler selection. Validate vs serial parity + measure throughput.
 - **C4 — microbatched decode** + wire the scheduler's `PrefillBatchSelection` to

@@ -4558,12 +4558,12 @@ fn main() {
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
                     generic_state_arena.release_worker(&target_worker_id);
-                    m.cursor.seq_pos = 0;
-                    m.cursor.conversation_tokens.clear();
+                    m.active.cursor.seq_pos = 0;
+                    m.active.cursor.conversation_tokens.clear();
                     m.q35_registry.sessions.clear();
                     m.q35_registry.active_session_id = if is_qwen35_family_arch_id(m.arch_id)
                         && m.pp == 1
-                        && m.sequence_state.is_some()
+                        && m.active.sequence_state.is_some()
                     {
                         m.q35_registry.allocation_epoch = next_qwen35_state_allocation_epoch();
                         Some(QWEN35_LEGACY_SESSION_ID.to_string())
@@ -4578,7 +4578,8 @@ fn main() {
                     // tensors when pp > 1.
                     if m.pp > 1 {
                         if let (Some(dn), Some(ref mut gpus), Some(ref la)) = (
-                            m.sequence_state
+                            m.active
+                                .sequence_state
                                 .as_ref()
                                 .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>()),
                             m.pp_gpus.as_mut(),
@@ -4601,6 +4602,7 @@ fn main() {
                             }
                         }
                     } else if let Some(dn) = m
+                        .active
                         .sequence_state
                         .as_ref()
                         .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
@@ -4616,7 +4618,7 @@ fn main() {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
-                    if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
+                    if let Some(kv) = m.active.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
                         kv.compact_offset = 0;
                     }
                     if let Some(kv) = m.llama_kv.as_mut() {
@@ -4666,11 +4668,14 @@ fn main() {
                     // states on-GPU, so it takes `gpu` and returns Result.
                     #[cfg(feature = "arch-lfm2moe")]
                     {
-                        if let Some(ref mut s) = m.lfm2moe_state {
+                        if let Some(ref mut s) = m.active.lfm2moe_state {
                             let _ = s.reset(&mut gpu);
                         }
                         m.lfm2_registry.sessions.clear();
-                        if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 && m.lfm2moe_state.is_some() {
+                        if m.arch_id == ARCH_ID_LFM2_MOE
+                            && m.pp == 1
+                            && m.active.lfm2moe_state.is_some()
+                        {
                             m.lfm2_registry.active_session_id =
                                 Some(LFM2_LEGACY_SESSION_ID.to_string());
                             m.lfm2_registry.allocation_epoch = next_qwen35_state_allocation_epoch();
@@ -5821,9 +5826,10 @@ fn main() {
 
                 // Reset state BEFORE timing so we're measuring cold prefill, not
                 // prefill-on-top-of-prior-state.
-                m.cursor.seq_pos = 0;
-                m.cursor.conversation_tokens.clear();
+                m.active.cursor.seq_pos = 0;
+                m.active.cursor.conversation_tokens.clear();
                 if let Some(dn) = m
+                    .active
                     .sequence_state
                     .as_ref()
                     .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
@@ -5852,7 +5858,7 @@ fn main() {
                 // LFM2.5-MoE (arch_id=11): same — KV + conv-state cache share
                 // Lfm2MoeState; reset cursors (takes gpu) for a cold bench.
                 #[cfg(feature = "arch-lfm2moe")]
-                if let Some(ref mut s) = m.lfm2moe_state {
+                if let Some(ref mut s) = m.active.lfm2moe_state {
                     let _ = s.reset(&mut gpu);
                 }
 
@@ -5867,6 +5873,7 @@ fn main() {
                     let weights = m.q35_weights.as_ref().unwrap();
                     let scratch = m.q35_scratch.as_ref().unwrap();
                     let ss = m
+                        .active
                         .sequence_state
                         .as_mut()
                         .expect("qwen35 active state present");
@@ -5950,7 +5957,7 @@ fn main() {
                     {
                         let config = m.lfm2moe_config.as_ref().unwrap();
                         let weights = m.lfm2moe_weights.as_ref().unwrap();
-                        let state = m.lfm2moe_state.as_mut().unwrap();
+                        let state = m.active.lfm2moe_state.as_mut().unwrap();
                         let mut ok = true;
                         for (i, &tok) in synthetic.iter().enumerate() {
                             if lfm2moe::forward::decode_step(
@@ -5994,9 +6001,10 @@ fn main() {
 
                 // Reset state AFTER measurement — we've written N KV slots and a
                 // DeltaNet state that the next real request must not inherit.
-                m.cursor.seq_pos = 0;
-                m.cursor.conversation_tokens.clear();
+                m.active.cursor.seq_pos = 0;
+                m.active.cursor.conversation_tokens.clear();
                 if let Some(dn) = m
+                    .active
                     .sequence_state
                     .as_ref()
                     .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())

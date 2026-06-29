@@ -92,10 +92,10 @@ pub fn qwen35_prefill_active_session(
     if tokens.is_empty() {
         return Ok(0);
     }
-    if m.cursor.seq_pos + tokens.len() > m.physical_cap {
+    if m.active.cursor.seq_pos + tokens.len() > m.physical_cap {
         return Err(format!(
             "generate_batch_prefill exceeds loaded KV budget: seq_pos={} + prefill={} > physical_cap={}",
-            m.cursor.seq_pos,
+            m.active.cursor.seq_pos,
             tokens.len(),
             m.physical_cap
         ));
@@ -113,6 +113,7 @@ pub fn qwen35_prefill_active_session(
         .as_ref()
         .ok_or_else(|| "qwen35 scratch missing; PP batch-prefill is not supported".to_string())?;
     let ss = m
+        .active
         .sequence_state
         .as_mut()
         .ok_or_else(|| "qwen35 active session missing decode state".to_string())?;
@@ -133,7 +134,7 @@ pub fn qwen35_prefill_active_session(
     // gap between turns, off the decode critical path. The next turn's prompt then
     // prefills into a near-empty hot ring with full (compressed) history in cold.
     // Flag-gated (hier.enabled); no-op for fresh sessions (seq_pos == 0 → reset path).
-    if hier_enabled && m.cursor.seq_pos > 0 {
+    if hier_enabled && m.active.cursor.seq_pos > 0 {
         if let Some(h) = kv.hier.as_mut() {
             let keep = std::env::var("HIPFIRE_KV_IDLE_KEEP")
                 .ok()
@@ -148,33 +149,36 @@ pub fn qwen35_prefill_active_session(
     // it. Force the per-token forward_scratch prefill so the hot ring is populated.
     if replay_as_generated_suffix || hier_enabled {
         for &token in tokens {
-            m.cursor.conversation_tokens.push(token);
+            m.active.cursor.conversation_tokens.push(token);
             qwen35::forward_scratch(
                 gpu,
                 weights,
                 config,
                 token,
-                m.cursor.seq_pos,
+                m.active.cursor.seq_pos,
                 kv,
                 dn,
                 scratch,
             )
             .map_err(|e| format!("qwen35 forward_scratch suffix replay failed: {e:?}"))?;
-            m.cursor.seq_pos += 1;
+            m.active.cursor.seq_pos += 1;
         }
     } else {
-        let pos = m.cursor.seq_pos;
+        let pos = m.active.cursor.seq_pos;
         qwen35::forward_prefill_batch(
             gpu, weights, config, tokens, pos, kv, dn, scratch, None, None, None, None,
         )
         .map_err(|e| format!("qwen35 forward_prefill_batch failed: {e:?}"))?;
-        m.cursor.seq_pos += tokens.len();
-        m.cursor.conversation_tokens.extend_from_slice(tokens);
+        m.active.cursor.seq_pos += tokens.len();
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(tokens);
     }
     gpu.hip
         .device_synchronize()
         .map_err(|e| format!("qwen35 batch-prefill session sync failed: {e:?}"))?;
-    m.q35_active_prefilled_generated_suffix_len = if replay_as_generated_suffix {
+    m.active.q35_active_prefilled_generated_suffix_len = if replay_as_generated_suffix {
         tokens.len()
     } else {
         0
@@ -234,7 +238,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
     let raw_q_tokens = tokenizer.encode(prompt);
     // Prompt-hash/preload sessions that declare a zero logical position need
     // to materialize the full prompt from position zero even if another active
-    // resident session has advanced m.cursor.seq_pos. Attached prompt sessions also
+    // resident session has advanced m.active.cursor.seq_pos. Attached prompt sessions also
     // render from zero so the daemon can slice off the cached prefix that was
     // fingerprinted by prefix_hash_preflight.
     let seq_pos_for_prompt = if session.state_handle.runtime_state_handle.is_some()
@@ -243,7 +247,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
     {
         0
     } else {
-        m.cursor.seq_pos
+        m.active.cursor.seq_pos
     };
     let assistant_prefix =
         prompt_frame::AssistantPrefix::from_label(Some(&session.assistant_prefix));

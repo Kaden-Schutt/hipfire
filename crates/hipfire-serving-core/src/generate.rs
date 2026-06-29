@@ -156,8 +156,8 @@ pub fn generate_mtp(
     };
 
     // Fresh target state — MTP runs its own prefill from position 0.
-    m.cursor.seq_pos = 0;
-    m.cursor.conversation_tokens.clear();
+    m.active.cursor.seq_pos = 0;
+    m.active.cursor.conversation_tokens.clear();
     {
         let dn = m.dn_state().unwrap();
         for s in &dn.s_matrices {
@@ -174,7 +174,7 @@ pub fn generate_mtp(
     // Assemble a transient ModelSlot, mirroring generate_dflash's take/putback.
     let target_config = m.q35_config.as_ref().unwrap().clone();
     let weights = m.q35_weights.take().expect("q35 weights");
-    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.sequence_state);
+    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.active.sequence_state);
     let scratch = m.q35_scratch.take().expect("q35 scratch");
     macro_rules! putback {
         ($t:expr) => {{
@@ -586,8 +586,8 @@ pub fn generate_dflash(
 
     // Fresh target state — DFlash seed_target_hidden_from_prompt does its own
     // full prefill, so we reset first to avoid double-accounting.
-    m.cursor.seq_pos = 0;
-    m.cursor.conversation_tokens.clear();
+    m.active.cursor.seq_pos = 0;
+    m.active.cursor.conversation_tokens.clear();
     {
         let dn = m.dn_state().unwrap();
         for s in &dn.s_matrices {
@@ -613,7 +613,7 @@ pub fn generate_dflash(
     // actually touch it. Reopening via mmap is essentially free (few µs).
     let target_config = m.q35_config.as_ref().unwrap().clone();
     let weights = m.q35_weights.take().expect("q35 weights");
-    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.sequence_state);
+    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.active.sequence_state);
     let scratch = m.q35_scratch.take().expect("q35 scratch");
     let hfq = match HfqFile::open(Path::new(&m.model_path)) {
         Ok(h) => h,
@@ -1077,8 +1077,8 @@ pub fn generate_dflash(
     m.q35_weights = Some(target.weights);
     put_qwen35_state_into_model(m, target.kv_cache, target.dn_state);
     m.q35_scratch = Some(target.scratch);
-    m.cursor.seq_pos = position;
-    m.cursor.conversation_tokens = emitted.clone();
+    m.active.cursor.seq_pos = position;
+    m.active.cursor.conversation_tokens = emitted.clone();
 
     let t_end = Instant::now();
     let total_s = t_end.duration_since(t0).as_secs_f64();
@@ -1174,15 +1174,16 @@ pub fn generate_multi(
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.cursor.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.active.cursor.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
-            m.cursor.seq_pos, m.max_seq
+            m.active.cursor.seq_pos, m.max_seq
         );
-        m.cursor.seq_pos = 0;
-        m.cursor.conversation_tokens.clear();
+        m.active.cursor.seq_pos = 0;
+        m.active.cursor.conversation_tokens.clear();
         if let (Some(dn), Some(ref mut gpus), Some(ref la)) = (
-            m.sequence_state
+            m.active
+                .sequence_state
                 .as_ref()
                 .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>()),
             m.pp_gpus.as_mut(),
@@ -1204,7 +1205,7 @@ pub fn generate_multi(
                 let _ = g.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
+        if let Some(kv) = m.active.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
             kv.compact_offset = 0;
         }
     }
@@ -1235,7 +1236,7 @@ pub fn generate_multi(
         None => hipfire_arch_qwen35::pflash::RequestKind::Text,
     };
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        if m.cursor.seq_pos == 0 {
+        if m.active.cursor.seq_pos == 0 {
             match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
                 gpu,
                 state,
@@ -1303,7 +1304,7 @@ pub fn generate_multi(
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.cursor.seq_pos == 0 && m.chat_template.is_some();
+    let try_jinja = jinja_enabled && m.active.cursor.seq_pos == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = prompt_frame::JinjaChatFrame {
@@ -1348,7 +1349,7 @@ pub fn generate_multi(
                 eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
                 prompt_frame::ChatFrame {
                     tokenizer,
-                    system: if m.cursor.seq_pos == 0 {
+                    system: if m.active.cursor.seq_pos == 0 {
                         system_prompt
                     } else {
                         None
@@ -1363,7 +1364,7 @@ pub fn generate_multi(
     } else {
         prompt_frame::ChatFrame {
             tokenizer,
-            system: if m.cursor.seq_pos == 0 {
+            system: if m.active.cursor.seq_pos == 0 {
                 system_prompt
             } else {
                 None
@@ -1376,12 +1377,12 @@ pub fn generate_multi(
     };
 
     let trailer = nl.len();
-    if m.cursor.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+    if m.active.cursor.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
             id,
-            m.cursor.seq_pos,
+            m.active.cursor.seq_pos,
             new_tokens.len(),
             max_tokens,
             trailer,
@@ -1419,6 +1420,7 @@ pub fn generate_multi(
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch_set = m.pp_scratch_set.as_ref().unwrap();
     let ss = m
+        .active
         .sequence_state
         .as_mut()
         .expect("qwen35 active state present");
@@ -1442,7 +1444,7 @@ pub fn generate_multi(
         weights,
         config,
         &new_tokens,
-        m.cursor.seq_pos,
+        m.active.cursor.seq_pos,
         kv,
         dn,
         scratch_set,
@@ -1455,11 +1457,14 @@ pub fn generate_multi(
         let _ = stdout.flush();
         return;
     }
-    m.cursor.seq_pos += new_tokens.len();
-    m.cursor.conversation_tokens.extend_from_slice(&new_tokens);
+    m.active.cursor.seq_pos += new_tokens.len();
+    m.active
+        .cursor
+        .conversation_tokens
+        .extend_from_slice(&new_tokens);
 
     // ngram scope: generated tokens only (matches pp=1).
-    let ngram_scope_start = m.cursor.conversation_tokens.len();
+    let ngram_scope_start = m.active.cursor.conversation_tokens.len();
 
     let mut rng_state: u32 = 0x13579BDFu32;
 
@@ -1469,7 +1474,7 @@ pub fn generate_multi(
         .collect();
 
     // First sample on the output device.
-    let ngram_scope = &m.cursor.conversation_tokens[ngram_scope_start..];
+    let ngram_scope = &m.active.cursor.conversation_tokens[ngram_scope_start..];
     let mut blocked0: Vec<u32> = Vec::new();
     collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked0);
     let cfg0 = SamplerConfig {
@@ -1510,7 +1515,7 @@ pub fn generate_multi(
 
     while generated < max_tokens {
         generated += 1;
-        m.cursor.conversation_tokens.push(next_token);
+        m.active.cursor.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
         emit_committed_event(
             stdout,
@@ -1529,7 +1534,7 @@ pub fn generate_multi(
             weights,
             config,
             next_token,
-            m.cursor.seq_pos,
+            m.active.cursor.seq_pos,
             kv,
             dn,
             scratch_set,
@@ -1542,7 +1547,7 @@ pub fn generate_multi(
             let _ = stdout.flush();
             return;
         }
-        m.cursor.seq_pos += 1;
+        m.active.cursor.seq_pos += 1;
 
         if next_token == config.eos_token {
             break;
@@ -1589,7 +1594,7 @@ pub fn generate_multi(
                         weights,
                         config,
                         t,
-                        m.cursor.seq_pos,
+                        m.active.cursor.seq_pos,
                         kv,
                         dn,
                         scratch_set,
@@ -1597,8 +1602,8 @@ pub fn generate_multi(
                         eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
                         break;
                     }
-                    m.cursor.seq_pos += 1;
-                    m.cursor.conversation_tokens.push(t);
+                    m.active.cursor.seq_pos += 1;
+                    m.active.cursor.conversation_tokens.push(t);
                     streamed_tokens.push(t);
                     emit_committed_event(
                         stdout,
@@ -1654,7 +1659,7 @@ pub fn generate_multi(
                     id
                 );
                 let _ = stdout.flush();
-                let ngram_scope = &m.cursor.conversation_tokens[ngram_scope_start..];
+                let ngram_scope = &m.active.cursor.conversation_tokens[ngram_scope_start..];
                 let mut blocked: Vec<u32> = Vec::new();
                 collect_unclosed_attractor_blocks(
                     ngram_scope,
@@ -1691,11 +1696,13 @@ pub fn generate_multi(
             let nudge_tokens = tokenizer.encode(budget_alert_text);
             let budget_left = max_tokens.saturating_sub(generated);
             let nudge_len = nudge_tokens.len().min(budget_left);
-            let need_kv =
-                m.cursor.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+            let need_kv = m.active.cursor.seq_pos
+                + nudge_len
+                + (max_tokens - generated - nudge_len)
+                + nl.len();
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
-                    m.cursor.conversation_tokens.push(tok);
+                    m.active.cursor.conversation_tokens.push(tok);
                     streamed_tokens.push(tok);
                     emit_committed_event(
                         stdout,
@@ -1713,7 +1720,7 @@ pub fn generate_multi(
                         weights,
                         config,
                         tok,
-                        m.cursor.seq_pos,
+                        m.active.cursor.seq_pos,
                         kv,
                         dn,
                         scratch_set,
@@ -1721,7 +1728,7 @@ pub fn generate_multi(
                         eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
                         break;
                     }
-                    m.cursor.seq_pos += 1;
+                    m.active.cursor.seq_pos += 1;
                     generated += 1;
                 }
             } else if nudge_len < nudge_tokens.len() {
@@ -1745,7 +1752,7 @@ pub fn generate_multi(
         }
 
         // Steady-state sample.
-        let ngram_scope = &m.cursor.conversation_tokens[ngram_scope_start..];
+        let ngram_scope = &m.active.cursor.conversation_tokens[ngram_scope_start..];
         let mut blocked: Vec<u32> = Vec::new();
         collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
         let cfg = SamplerConfig {
@@ -1774,14 +1781,16 @@ pub fn generate_multi(
     }
 
     // ChatML \n trailer so the next turn opens cleanly.
-    if im_end_token == Some(*m.cursor.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+    if im_end_token == Some(*m.active.cursor.conversation_tokens.last().unwrap_or(&0))
+        && !nl.is_empty()
+    {
         for &t in &nl {
             if let Err(e) = qwen35::forward_scratch_multi(
                 gpus,
                 weights,
                 config,
                 t,
-                m.cursor.seq_pos,
+                m.active.cursor.seq_pos,
                 kv,
                 dn,
                 scratch_set,
@@ -1789,8 +1798,8 @@ pub fn generate_multi(
                 eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
                 break;
             }
-            m.cursor.seq_pos += 1;
-            m.cursor.conversation_tokens.push(t);
+            m.active.cursor.seq_pos += 1;
+            m.active.cursor.conversation_tokens.push(t);
         }
     }
 
@@ -2346,7 +2355,7 @@ pub fn generate(
     let current_seq_pos = q35_session
         .as_ref()
         .map(|s| s.cursor.seq_pos)
-        .unwrap_or(m.cursor.seq_pos);
+        .unwrap_or(m.active.cursor.seq_pos);
     if !prefill_already_done
         && m.eviction.is_none()
         && current_seq_pos + prompt_est + max_tokens > m.max_seq
@@ -2358,8 +2367,8 @@ pub fn generate(
         if let Some(session) = q35_session.as_mut() {
             session.reset(gpu);
         } else {
-            m.cursor.seq_pos = 0;
-            m.cursor.conversation_tokens.clear();
+            m.active.cursor.seq_pos = 0;
+            m.active.cursor.conversation_tokens.clear();
             if let Some(kv) = m.llama_kv.as_mut() {
                 kv.compact_offset = 0;
             }
@@ -2469,7 +2478,7 @@ pub fn generate(
             q35_session
                 .as_ref()
                 .map(|s| s.cursor.seq_pos)
-                .unwrap_or(m.cursor.seq_pos),
+                .unwrap_or(m.active.cursor.seq_pos),
             raw_q_tokens.len(),
             drafter_gpu.is_some()
         );
@@ -2478,7 +2487,7 @@ pub fn generate(
         let seq_pos = q35_session
             .as_ref()
             .map(|s| s.cursor.seq_pos)
-            .unwrap_or(m.cursor.seq_pos);
+            .unwrap_or(m.active.cursor.seq_pos);
         if seq_pos == 0 {
             let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
             // Sibling-device drafter: bind its device before compress, then
@@ -2594,7 +2603,7 @@ pub fn generate(
         q35_session
             .as_ref()
             .map(|s| s.cursor.seq_pos)
-            .unwrap_or(m.cursor.seq_pos)
+            .unwrap_or(m.active.cursor.seq_pos)
     };
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
@@ -2685,7 +2694,7 @@ pub fn generate(
     let current_seq_pos = q35_session
         .as_ref()
         .map(|s| s.cursor.seq_pos)
-        .unwrap_or(m.cursor.seq_pos);
+        .unwrap_or(m.active.cursor.seq_pos);
     let budget_prefill_tokens = if prefill_already_done {
         0
     } else {
@@ -2694,7 +2703,7 @@ pub fn generate(
     let absolute_pos = if let Some(session) = q35_session.as_ref() {
         session.cursor.seq_pos + session.kv_cache().compact_offset
     } else {
-        m.cursor.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
+        m.active.cursor.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
     };
     if m.eviction.is_none() {
         if current_seq_pos + budget_prefill_tokens + max_tokens + trailer > m.physical_cap {
@@ -3488,7 +3497,7 @@ pub fn generate(
 
         let mut rng_state = 42u32;
         for (i, &tok) in new_tokens.iter().enumerate() {
-            let pos = m.cursor.seq_pos + i;
+            let pos = m.active.cursor.seq_pos + i;
             let (_, rng) = llama::forward_scratch(
                 gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
             )
@@ -3496,10 +3505,13 @@ pub fn generate(
             rng_state = rng;
         }
         let this_turn_prompt_len_llama = new_tokens.len();
-        m.cursor.seq_pos += new_tokens.len();
-        m.cursor.conversation_tokens.extend_from_slice(&new_tokens);
+        m.active.cursor.seq_pos += new_tokens.len();
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(&new_tokens);
         let ngram_scope_start_llama =
-            m.cursor.conversation_tokens.len() - this_turn_prompt_len_llama;
+            m.active.cursor.conversation_tokens.len() - this_turn_prompt_len_llama;
 
         let mut out_bytes = [0u8; 8];
         gpu.hip
@@ -3526,7 +3538,7 @@ pub fn generate(
 
         for _ in 0..max_tokens {
             generated += 1;
-            m.cursor.conversation_tokens.push(next_token);
+            m.active.cursor.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
             emit_committed_event(
                 stdout,
@@ -3543,9 +3555,9 @@ pub fn generate(
             // Scope repeat_buf to this turn's prompt + generated tokens
             // (same logic as the Qwen3.5 path: prompt anchor + current turn).
             let rw = repeat_window.min(64);
-            let scope_start =
-                ngram_scope_start_llama.max(m.cursor.conversation_tokens.len().saturating_sub(rw));
-            let hist_slice = &m.cursor.conversation_tokens[scope_start..];
+            let scope_start = ngram_scope_start_llama
+                .max(m.active.cursor.conversation_tokens.len().saturating_sub(rw));
+            let hist_slice = &m.active.cursor.conversation_tokens[scope_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
             gpu.hip
                 .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
@@ -3555,7 +3567,7 @@ pub fn generate(
             // always fully populated. The sampled next_token from this call
             // is discarded when we break on im_end/eos — wasteful by one
             // launch but avoids a KV cache gap at the terminator.
-            let pos = m.cursor.seq_pos + generated - 1;
+            let pos = m.active.cursor.seq_pos + generated - 1;
             let (tok, rng) = llama::forward_scratch(
                 gpu,
                 weights,
@@ -3588,10 +3600,10 @@ pub fn generate(
             next_token = tok;
             rng_state = rng;
         }
-        m.cursor.seq_pos += generated;
+        m.active.cursor.seq_pos += generated;
 
         // ChatML \n boundary — run through forward to keep KV cache in sync
-        if im_end_token == Some(*m.cursor.conversation_tokens.last().unwrap_or(&0))
+        if im_end_token == Some(*m.active.cursor.conversation_tokens.last().unwrap_or(&0))
             && !nl.is_empty()
         {
             for &t in &nl {
@@ -3600,7 +3612,7 @@ pub fn generate(
                     weights,
                     config,
                     t,
-                    m.cursor.seq_pos,
+                    m.active.cursor.seq_pos,
                     kv,
                     scratch,
                     temp,
@@ -3611,8 +3623,8 @@ pub fn generate(
                 )
                 .unwrap();
                 rng_state = rng2;
-                m.cursor.seq_pos += 1;
-                m.cursor.conversation_tokens.push(t);
+                m.active.cursor.seq_pos += 1;
+                m.active.cursor.conversation_tokens.push(t);
             }
         }
 
