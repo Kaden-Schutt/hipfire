@@ -181,9 +181,21 @@ the `SequenceState` ownership question — we are building it now, not deferring
     diff is byte-IDENTICAL across qwen3.5 dense 0.8b–27b (mq3/mq4/mq6/lloyd) +
     lfm2.5-8b-a1b → behavior-preserving confirmed (lfm2 greedy repetition is
     pre-existing).
-  - **C2b — eliminate the working copy** (folds in C1b-2): the registry session
-    structs hold/produce a `ResidentSession`; activate = move it into `m.active`,
-    save = move it back — no field-by-field `take_/restore_into_loaded` copy.
+  - **C2b — collapse the swap spread (DONE 2026-06-29).** Scope finding: C2a
+    already made the active slot cohesive (`m.active`), so the C1b-2 "decomposed
+    active session" is *already* gone — what remained was the field-by-field
+    *spread* in `restore_into_loaded` (`m.active.cursor.seq_pos = self.cursor…;
+    restore_sequence_state_into_model(m, …); m.active.q35_…suffix = …`). Replaced
+    both arches' restore with a single wholesale move
+    `m.active = ResidentSession { … }` (activate = move the resident in); deleted
+    the now-dead `restore_sequence_state_into_model` helper (converge-and-delete).
+    `take_from_loaded` left as-is — it is extraction, not a spread, and lfm2's
+    take intentionally derives `seq_pos` from `state.n_tokens`. Did NOT nest a
+    `ResidentSession` inside the session structs (would be ~130 hot-path edits +
+    borrow surgery for the disjoint `state.sequence_state.kv`/`.recurrent` sites,
+    and C2c dissolves the swap anyway) — the session structs keep flat fields as
+    the parked snapshot. Behavior-preserving: coherence-gate.sh exit 0 16/16,
+    output BYTE-IDENTICAL to the C2a commit across the full qwen3.5+lfm2 matrix.
   - **C2c — N concurrent residents**: `m.active` → a resident set keyed by session
     id (arena `reserve`), serial round-robin decode (no microbatch yet).
 - **C3 — microbatched prefill** for one arch (lfm2 or a dense arch) via the

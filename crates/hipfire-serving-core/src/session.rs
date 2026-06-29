@@ -45,7 +45,7 @@ use crate::events::write_error;
 use crate::memory::{
     kv_cache_bytes, loaded_model_memory_view, minimax_state_bytes, tensor_bytes, tensor_vec_bytes,
 };
-use crate::model::LoadedModel;
+use crate::model::{LoadedModel, ResidentSession};
 
 /// Synthetic session id used by the legacy single-session `generate` path (the
 /// pre-multi-session code that didn't supply its own session id).
@@ -321,14 +321,20 @@ impl Qwen35RequestSessionState {
             )
             .map_err(|e| format!("restore qwen35 session logits snapshot: {e:?}"))?;
         }
-        m.active.cursor.seq_pos = self.cursor.seq_pos;
-        m.active.cursor.conversation_tokens = self.cursor.conversation_tokens;
-        // Prefix hash metadata is kept with saved Qwen35 request sessions.
-        // The loaded singleton path computes it when checkpointable prefill
-        // sessions are saved back into the session map.
-        restore_sequence_state_into_model(m, self.sequence_state);
+        // Install the saved session as the active resident slot in one move (C2b)
+        // — replaces the former field-by-field spread of cursor / sequence_state /
+        // suffix-len into `m.active`.
+        m.active = ResidentSession {
+            cursor: self.cursor,
+            sequence_state: Some(self.sequence_state),
+            q35_active_prefilled_generated_suffix_len: self.prefilled_generated_suffix_len,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_state: None,
+        };
+        // Prefix hash metadata is kept with saved Qwen35 request sessions; the
+        // loaded singleton path computes it when checkpointable prefill sessions
+        // are saved back into the session map.
         m.q35_registry.allocation_epoch = allocation_epoch;
-        m.active.q35_active_prefilled_generated_suffix_len = self.prefilled_generated_suffix_len;
         Ok(())
     }
 
@@ -406,9 +412,14 @@ impl Lfm2RequestSessionState {
     }
 
     pub fn restore_into_loaded(self, m: &mut LoadedModel) {
-        m.active.cursor.seq_pos = self.cursor.seq_pos;
-        m.active.cursor.conversation_tokens = self.cursor.conversation_tokens;
-        m.active.lfm2moe_state = Some(self.state);
+        // Install the saved lfm2 session as the active resident slot in one move
+        // (C2b) — replaces the former cursor/state field spread into `m.active`.
+        m.active = ResidentSession {
+            cursor: self.cursor,
+            sequence_state: None,
+            q35_active_prefilled_generated_suffix_len: 0,
+            lfm2moe_state: Some(self.state),
+        };
         if let Some(df) = m.lfm2_dflash.as_mut() {
             df.target_hidden_host = self.dflash_target_hidden_host.unwrap_or_default();
         }
@@ -556,11 +567,6 @@ impl Lfm2RequestSessionState {
             allocation_epoch: next_qwen35_state_allocation_epoch(),
         })
     }
-}
-
-/// Install a session's unified `SequenceState` as the model's active state.
-pub(crate) fn restore_sequence_state_into_model(m: &mut LoadedModel, ss: SequenceState) {
-    m.active.sequence_state = Some(ss);
 }
 
 /// Build the model's active `SequenceState` from raw KV + DeltaNet parts (e.g.

@@ -381,7 +381,7 @@ pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling daemon resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1431",
+    source: "crates/hipfire-serving-core/src/session.rs:1437",
 };
 
 /// `HIPFIRE_DDTREE_BUDGET` — Runtime variable controlling DDTree budget in hipfire
@@ -3331,7 +3331,7 @@ pub const ENV_HIPFIRE_SCORE_TAIL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling server resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1432",
+    source: "crates/hipfire-serving-core/src/session.rs:1438",
 };
 
 /// `HIPFIRE_SMOKE_KV` — Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the
