@@ -199,6 +199,115 @@ fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Opti
 }
 
 /// Load a quantized 2D weight → WeightTensor, tagging gpu_dtype from quant_type.
+// ── Opus Quant (OQ4G256 / OQ8G256) on-disk → kernel-layout repack ──────────
+// Mirrors lfm2moe.rs (which mirrors qwen35); the on-disk HFQM block layout is
+// shared across arches, so the repack is identical. OQ4 is the W4A8 int4 format
+// (`DType::Oq4G256`), OQ8 the W8A8 int8 format (`DType::Oq8G256`) — both run on
+// the Opus iu8 grouped-WMMA kernel family `weight_gemv` already dispatches.
+const OQ4_QT: u8 = 34;
+const OQ8_QT: u8 = 35;
+const OQ_GROUP: usize = 256;
+
+fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
+    let ng = k / OQ_GROUP;
+    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+}
+
+/// On-disk OQ4 block [f16 scale | 128 nibbles] → arch-combined layout
+/// [packed nibbles | f32 scales | interleaved f32-scale+nibble blocks].
+fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const BLOCK: usize = 130;
+    const INTERLEAVED_BLOCK: usize = 132;
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ4G256 requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let expect = m * ng * BLOCK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQ4G256 byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let packed_bytes = m * (k / 2);
+    let scales_bytes = m * ng * 4;
+    let il_base = packed_bytes + scales_bytes;
+    let mut out = vec![0u8; oq4_arch_combined_len(m, k)];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let split_dst = r * (k / 2) + g * (OQ_GROUP / 2);
+            out[split_dst..split_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale_dst = packed_bytes + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            let il_dst = il_base + (r * ng + g) * INTERLEAVED_BLOCK;
+            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
+            out[il_dst + 4..il_dst + INTERLEAVED_BLOCK]
+                .copy_from_slice(&data[src + 2..src + BLOCK]);
+        }
+    }
+    Ok(out)
+}
+
+/// On-disk OQ8 block [f16 scale | 256 i8] → [i8 weights | f32 scales].
+fn pack_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const BLOCK: usize = 258;
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ8G256 requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let expect = m * ng * BLOCK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQ8G256 byte length {} != M*ng*258 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let weight_bytes = m * k;
+    let mut out = vec![0u8; weight_bytes + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * k + g * OQ_GROUP;
+            out[dst..dst + OQ_GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
+            let scale_dst = weight_bytes + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn upload_wt_oq(
+    gpu: &mut Gpu,
+    data: &[u8],
+    dtype: DType,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let mut buf = gpu
+        .upload_raw(data, &[data.len()])
+        .map_err(|e| format!("upload_raw: {e:?}"))?;
+    buf.dtype = dtype;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
+fn awq_scale_name(weight_name: &str) -> String {
+    match weight_name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{weight_name}.awq_scale.weight"),
+    }
+}
+
 fn load_wt(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -210,6 +319,21 @@ fn load_wt(
     wt_from_raw(gpu, qt, &data, m, k).map_err(|e| format!("minimax: load_wt {name}: {e}"))
 }
 
+/// Like [`load_wt`] but also attaches the OQ4 AWQ smoothing sidecar
+/// (`<name>.awq_scale.weight`) when present — needed for OQ4+/OQ4++ dense
+/// projections. Harmless (no-op) for formats with no sidecar.
+fn load_wt_with_awq(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
+    let mut w = load_wt(hfq, gpu, name, m, k)?;
+    w.awq_scale = load_mm_awq_scale(hfq, gpu, &awq_scale_name(name), k);
+    Ok(w)
+}
+
 /// quant_type → DType mapping (subset used by MiniMax HFQ files; mirrors
 /// qwen35::load_weight_tensor_raw). Uploads raw bytes and tags the dtype.
 fn wt_from_raw(
@@ -219,6 +343,19 @@ fn wt_from_raw(
     m: usize,
     k: usize,
 ) -> Result<WeightTensor, String> {
+    match qt {
+        OQ4_QT => {
+            return upload_wt_oq(
+                gpu,
+                &pack_oq4_arch_combined(data, m, k)?,
+                DType::Oq4G256,
+                m,
+                k,
+            )
+        }
+        OQ8_QT => return upload_wt_oq(gpu, &pack_oq8(data, m, k)?, DType::Oq8G256, m, k),
+        _ => {}
+    }
     let dtype = match qt {
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
@@ -307,7 +444,7 @@ impl MiniMaxWeights {
             .upload_raw(&embed_bytes, &[embed_bytes.len()])
             .map_err(|e| format!("minimax: upload embed: {e:?}"))?;
         let final_norm = load_norm(hfq, gpu, "model.norm.weight", &[hidden])?;
-        let lm_head = load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, hidden)?;
+        let lm_head = load_wt_with_awq(hfq, gpu, "lm_head.weight", cfg.vocab_size, hidden)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
@@ -321,28 +458,28 @@ impl MiniMaxWeights {
             )?;
             let q_norm = load_norm(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[q_dim])?;
             let k_norm = load_norm(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[kv_dim])?;
-            let wq = load_wt(
+            let wq = load_wt_with_awq(
                 hfq,
                 gpu,
                 &format!("{p}.self_attn.q_proj.weight"),
                 q_dim,
                 hidden,
             )?;
-            let wk = load_wt(
+            let wk = load_wt_with_awq(
                 hfq,
                 gpu,
                 &format!("{p}.self_attn.k_proj.weight"),
                 kv_dim,
                 hidden,
             )?;
-            let wv = load_wt(
+            let wv = load_wt_with_awq(
                 hfq,
                 gpu,
                 &format!("{p}.self_attn.v_proj.weight"),
                 kv_dim,
                 hidden,
             )?;
-            let wo = load_wt(
+            let wo = load_wt_with_awq(
                 hfq,
                 gpu,
                 &format!("{p}.self_attn.o_proj.weight"),
@@ -350,7 +487,7 @@ impl MiniMaxWeights {
                 q_dim,
             )?;
 
-            let router = load_wt(
+            let router = load_wt_with_awq(
                 hfq,
                 gpu,
                 &format!("{p}.block_sparse_moe.gate.weight"),

@@ -7197,12 +7197,95 @@ fn main() {
             // Fall through to standard path for non-MQ2 formats.
         }
 
+        // ── MiniMax-M2 OQ dense path ───────────────────────────────────────────
+        // When an OQ format is requested, route the dense attention projections
+        // (q/k/v/o_proj) and lm_head through the requested OQ4 format (OQ4++ runs
+        // LDLQ+AWQ from the calib `.hfq` Hessians), and PROMOTE the precision-
+        // sensitive MoE router to OQ8++ rather than dropping it to Q8. Oq4G256 and
+        // Oq8G256 are one Opus kernel family (iu8 grouped-WMMA), so the router
+        // keeps 8-bit precision (its top-k is fragile) while staying on the same
+        // runtime path — the design rule for OQ mixed precision (cf. Qwen3.5).
+        // Routed experts are handled by the per-expert branch below.
+        if is_minimax
+            && lfm2_oq_format.is_some()
+            && meta.shape.len() == 2
+            && meta.shape[1] % 256 == 0
+            && (name.ends_with(".self_attn.q_proj.weight")
+                || name.ends_with(".self_attn.k_proj.weight")
+                || name.ends_with(".self_attn.v_proj.weight")
+                || name.ends_with(".self_attn.o_proj.weight")
+                || name.ends_with("lm_head.weight")
+                || name.ends_with(".block_sparse_moe.gate.weight"))
+        {
+            // Promote the router (top-k routing) to OQ8++; everything else dense
+            // takes the requested OQ4 width.
+            let oq_format = if name.ends_with(".block_sparse_moe.gate.weight") {
+                HfqInputFormat::Oq8Plus
+            } else {
+                lfm2_oq_format.unwrap()
+            };
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let (q, qt, gs, label) =
+                quantize_hfq_source_tensor(name, &f32_bytes, 2, &shape, oq_format)
+                    .unwrap_or_else(|e| panic!("minimax oq quantize {name}: {e}"));
+            eprintln!(
+                "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [MiniMax dense OQ]",
+                name,
+                meta.shape,
+                raw_data.len() as f64 / 1024.0,
+                q.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: qt,
+                shape: shape.clone(),
+                group_size: gs,
+                data: q,
+                spilled_len: 0,
+            });
+            if let Some(scales) = OQ4_AWQ_SIDECAR.with(|c| c.borrow_mut().take()) {
+                let sidecar_name = match name.strip_suffix(".weight") {
+                    Some(stem) => format!("{stem}.awq_scale.weight"),
+                    None => format!("{name}.awq_scale.weight"),
+                };
+                let bytes = awq_scales_to_f16_bytes(&scales);
+                eprintln!(
+                    "    AWQ:    {sidecar_name} [{}] (1D F16, {} B)",
+                    scales.len(),
+                    bytes.len()
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::F16,
+                    shape: vec![scales.len() as u32],
+                    group_size: 0,
+                    data: bytes,
+                    spilled_len: 0,
+                });
+            }
+            quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
+
         // ── MiniMax-M2 router: keep Q8 ─────────────────────────────────────────
         // The MoE router (`block_sparse_moe.gate.weight`) is precision-sensitive
         // (4-bit noise flips top-k on borderline tokens) but must NOT be F16:
         // weight_gemv's F16 arm dispatches gemm_f16_batched_lmhead, which is a
         // WMMA lm-head kernel that produces garbage for the router's tiny m
         // (=n_exp). Q8 (gemv_q8_0) is well-behaved at any m and ~0.4% noise.
+        // (Non-OQ formats only — the OQ path above promotes the router to OQ8++.)
         if is_minimax && name.ends_with("block_sparse_moe.gate.weight") {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
