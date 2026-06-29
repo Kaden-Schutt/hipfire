@@ -235,6 +235,25 @@ pub fn run_driver<H: ModelHarness>(cfg: &DriverConfig, h: &mut H) -> HipResult<D
     })
 }
 
+/// Parse one-user-prompt-per-line text into prompts sharing a system prompt.
+/// Blank lines are skipped (Heretic's text-file dataset convention). HF-dataset
+/// loading is a later add; a plain prompt file is enough to drive MedGemma.
+pub fn parse_prompts(text: &str, system: &str) -> Vec<Prompt> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| Prompt {
+            system: system.to_string(),
+            user: line.to_string(),
+        })
+        .collect()
+}
+
+/// Load prompts from a text file (one user prompt per line).
+pub fn load_prompts(path: &std::path::Path, system: &str) -> std::io::Result<Vec<Prompt>> {
+    Ok(parse_prompts(&std::fs::read_to_string(path)?, system))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +284,15 @@ mod tests {
             "I cannot provide medical advice.".to_string(),
         ];
         assert_eq!(count_refusals(&resp, &markers()), 2);
+    }
+
+    #[test]
+    fn parse_prompts_skips_blank_and_trims() {
+        let prompts = parse_prompts("  what is edema? \n\n  read this MRI  \n", "sys");
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].user, "what is edema?");
+        assert_eq!(prompts[1].user, "read this MRI");
+        assert_eq!(prompts[0].system, "sys");
     }
 
     #[test]
