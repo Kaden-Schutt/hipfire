@@ -381,7 +381,7 @@ pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling daemon resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1410",
+    source: "crates/hipfire-serving-core/src/session.rs:1411",
 };
 
 /// `HIPFIRE_DDTREE_BUDGET` — Runtime variable controlling DDTree budget in hipfire
@@ -1306,7 +1306,7 @@ pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CTX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EXPERIMENTAL_BUDGET_ALERT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EXPERIMENTAL_BUDGET_ALERT",
     description: "cache so the model \"sees\" them as part of its own trajectory,",
-    source: "crates/hipfire-daemon/src/main.rs:3692",
+    source: "crates/hipfire-daemon/src/main.rs:3693",
 };
 
 /// `HIPFIRE_FILES_STATE_MAX` — Parses "HIPFIRE_FILES_STATE_MAX" with fallback defaults
@@ -2577,7 +2577,7 @@ pub const ENV_HIPFIRE_PFLASH_SCORE_LAYER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_DFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3023",
+    source: "crates/hipfire-daemon/src/main.rs:3026",
 };
 
 /// `HIPFIRE_PP_LAYERS` — Runtime variable controlling pp layers in hipfire
@@ -2598,7 +2598,7 @@ pub const ENV_HIPFIRE_PP_PARITY_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_PFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_PFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3041",
+    source: "crates/hipfire-daemon/src/main.rs:3044",
 };
 
 /// `HIPFIRE_PREFILL_ALPHA` — Runtime variable controlling prefill alpha in hipfire
@@ -3331,7 +3331,7 @@ pub const ENV_HIPFIRE_SCORE_TAIL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling server resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1411",
+    source: "crates/hipfire-serving-core/src/session.rs:1412",
 };
 
 /// `HIPFIRE_SMOKE_KV` — Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the

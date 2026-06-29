@@ -28,6 +28,7 @@ use hipfire_model::{
     is_qwen35_family_arch_id, is_qwen35_moe_arch_id, parse_model_worker_id, AcceleratorDeviceInfo,
     AcceleratorInventory, ModelWorkerId, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
 };
+use hipfire_runtime::arch::SessionServingBackend;
 use hipfire_runtime::kv;
 use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_state::{
@@ -2255,5 +2256,153 @@ pub fn qwen35_restore_or_error(
             id,
             &format!("failed to restore qwen35 request session: {e}"),
         );
+    }
+}
+
+fn session_op_unsupported(arch_id: u32, op: &str) -> String {
+    format!("{op}: rich session protocol unsupported for arch_id={arch_id} (qwen35/lfm2 only)")
+}
+
+/// The arch's default ("legacy") session id used when a generate request omits an
+/// explicit `session_id`. qwen35 and lfm2 use different legacy ids; returns the
+/// qwen35 legacy id as a harmless default for other arches (callers gate on
+/// session support before using it). Lets the daemon resolve the default without
+/// an `if is_qwen35 {} else if is_lfm2 {}` branch at the call site.
+pub fn loaded_model_default_session_id(m: &LoadedModel) -> &'static str {
+    #[cfg(feature = "arch-lfm2moe")]
+    if m.arch_id == ARCH_ID_LFM2_MOE {
+        return LFM2_LEGACY_SESSION_ID;
+    }
+    let _ = m;
+    QWEN35_LEGACY_SESSION_ID
+}
+
+/// C0 of the SessionServingBackend hoist
+/// (docs/plans/2026-06-29-session-serving-backend.md): the rich session protocol
+/// implemented on `LoadedModel`, dispatching by `arch_id` to the existing per-arch
+/// `qwen35_*` / `lfm2_*` functions. This gives the daemon ONE
+/// `&mut dyn SessionServingBackend` session-op surface — collapsing the
+/// `if is_qwen35 {} else if is_lfm2 {}` ladder at the call sites (S4) — without
+/// relocating session state off the single resident slot. The per-arch backend
+/// impls + state relocation land with the per-session-slot restructure
+/// (docs/plans/2026-06-29-concurrent-session-execution.md, C1+).
+impl SessionServingBackend for LoadedModel {
+    fn state_arena_backend(&self) -> SequenceStateArenaBackend {
+        loaded_model_state_arena_backend(self)
+    }
+
+    fn state_page_descriptors(&self) -> Vec<SequenceStatePageDescriptor> {
+        sequence_state_arena_page_descriptors(loaded_model_state_arena_backend(self), self)
+    }
+
+    fn request_session_count(&self) -> usize {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_request_session_count(self);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_request_session_count(self);
+        }
+        0
+    }
+
+    fn active_logical_position(&self) -> Result<usize, String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_active_logical_position(self);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_active_logical_position(self);
+        }
+        Err(session_op_unsupported(
+            self.arch_id,
+            "active_logical_position",
+        ))
+    }
+
+    fn activate_session(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_activate_session(self, gpu, session_id);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_activate_session(self, gpu, session_id);
+        }
+        Err(session_op_unsupported(self.arch_id, "activate_session"))
+    }
+
+    fn save_active_session(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_save_active_session(self, gpu);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            // lfm2 save is GPU-free (host-side cursor snapshot).
+            return lfm2_save_active_session(self);
+        }
+        Err(session_op_unsupported(self.arch_id, "save_active_session"))
+    }
+
+    fn reset_active_session(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_reset_active_session(self, gpu);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_reset_active_session(self, gpu);
+        }
+        Err(session_op_unsupported(self.arch_id, "reset_active_session"))
+    }
+
+    fn release_sessions(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        session_ids: &[String],
+    ) -> Result<usize, String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_release_sessions(self, gpu, session_ids);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_release_sessions(self, gpu, session_ids);
+        }
+        Err(session_op_unsupported(self.arch_id, "release_sessions"))
+    }
+
+    fn fork_session_state(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        request: SequenceStateForkRequest<'_>,
+    ) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_fork_session_state(self, gpu, request);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_fork_session_state(self, gpu, request);
+        }
+        Err(session_op_unsupported(self.arch_id, "fork_session_state"))
+    }
+
+    fn checkpoint_session_state(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        request: SequenceStateCheckpointRequest<'_>,
+    ) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_checkpoint_session_state(self, gpu, request);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_checkpoint_session_state(self, gpu, request);
+        }
+        Err(session_op_unsupported(
+            self.arch_id,
+            "checkpoint_session_state",
+        ))
     }
 }

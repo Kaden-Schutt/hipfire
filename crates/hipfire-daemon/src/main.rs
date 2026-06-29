@@ -81,6 +81,9 @@ use qwen35_decode::*;
 use qwen35_prefill::*;
 use request::ThinkMode;
 use session::*;
+// Rich session protocol (qwen35/lfm2) is dispatched through this trait
+// (impl'd on `LoadedModel`) instead of a per-arch `if is_qwen35 {} else …` ladder.
+use hipfire_runtime::arch::SessionServingBackend;
 
 fn invalid_kld_ref(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
@@ -3443,20 +3446,18 @@ fn main() {
                 let is_lfm2_generate_session = m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1;
                 #[cfg(not(feature = "arch-lfm2moe"))]
                 let is_lfm2_generate_session = false;
-                if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 {
-                    let target_session_id = session_id.unwrap_or(QWEN35_LEGACY_SESSION_ID);
-                    if let Err(e) = qwen35_activate_session(m, &mut gpu, target_session_id) {
+                // S4: one `SessionServingBackend::activate_session` dispatch for the
+                // rich-session arches (qwen35 5/6, lfm2 11) instead of the per-arch
+                // `qwen35_*`/`lfm2_*` activate ladder. The arch-specific default
+                // ("legacy") session id is resolved by `loaded_model_default_session_id`.
+                let supports_generate_session =
+                    (is_qwen35_family_arch_id(m.arch_id) && m.pp == 1) || is_lfm2_generate_session;
+                if supports_generate_session {
+                    let target_session_id =
+                        session_id.unwrap_or_else(|| loaded_model_default_session_id(m));
+                    if let Err(e) = m.activate_session(&mut gpu, target_session_id) {
                         emit_error_with_id(&mut stdout, id, e);
                         continue;
-                    }
-                } else if is_lfm2_generate_session {
-                    #[cfg(feature = "arch-lfm2moe")]
-                    {
-                        let target_session_id = session_id.unwrap_or(LFM2_LEGACY_SESSION_ID);
-                        if let Err(e) = lfm2_activate_session(m, &mut gpu, target_session_id) {
-                            emit_error_with_id(&mut stdout, id, e);
-                            continue;
-                        }
                     }
                 } else if session_id.is_some() || prefill_already_done {
                     emit_error_with_id(

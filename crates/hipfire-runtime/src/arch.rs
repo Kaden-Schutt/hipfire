@@ -477,7 +477,19 @@ pub trait ServingBackend: Send {
 /// Prefill/materialize orchestration (`run_generate_batch_prefill_serial`) and
 /// the DFlash spec-decode fast path are NOT on this trait yet — they are the
 /// driver surface, refined in S2/S3 as the per-arch bodies move onto the backend.
-pub trait SessionServingBackend: ServingBackend {
+///
+/// # Not bound to [`ServingBackend`]
+///
+/// Intentionally a standalone trait, not `: ServingBackend`. On today's
+/// single-resident-slot daemon the session state (incl. the shared `seq_pos` /
+/// `conversation_tokens` cursor) lives in `LoadedModel`, so the C0 hoist
+/// implements this trait on `LoadedModel` (dispatching by `arch_id`) — and
+/// `LoadedModel` is not itself a `ServingBackend`. Once the per-session-slot
+/// restructure (docs/plans/2026-06-29-concurrent-session-execution.md, C1) moves
+/// session state into per-arch backends, those backends implement both traits;
+/// keeping them unbound avoids forcing a `ServingBackend` impl onto `LoadedModel`
+/// now.
+pub trait SessionServingBackend {
     /// How this backend's sequence-state pages are owned, for the scheduler's
     /// cross-session accounting (`Qwen35Wrapped` = arena-managed, `BackendOwned`
     /// = the backend owns its pages).
