@@ -249,7 +249,7 @@ pub fn validate_qwen35_decode_resident_sessions(
                     session.session_id
                 )
             })?;
-        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         if logical_position != session.logical_position {
             return Err(format!(
                 "decode session {} logical_position mismatch: expected={} resident={}",
@@ -282,7 +282,7 @@ pub fn validate_qwen35_fused_dense_decode_resident_sessions(
                     session.session_id
                 )
             })?;
-        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         if logical_position != session.logical_position {
             return Err(format!(
                 "decode session {} logical_position mismatch: expected={} resident={}",
@@ -584,7 +584,7 @@ pub fn qwen35_decode_step_serial_reference(
     for session in &envelope.sessions {
         qwen35_activate_session(m, gpu, &session.session_id)?;
         let mut state = Qwen35RequestSessionState::take_from_loaded(m, gpu)?;
-        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         if logical_position != session.logical_position {
             qwen35_restore_or_error(stdout, &session.id, m, gpu, state);
             return Err(format!(
@@ -603,7 +603,7 @@ pub fn qwen35_decode_step_serial_reference(
             session.max_tokens_remaining,
             im_end_token,
         )?;
-        state.conversation_tokens.push(outcome.token);
+        state.cursor.conversation_tokens.push(outcome.token);
         {
             let config = m
                 .q35_config
@@ -622,7 +622,7 @@ pub fn qwen35_decode_step_serial_reference(
                 weights,
                 config,
                 outcome.token,
-                state.seq_pos,
+                state.cursor.seq_pos,
                 state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                 state
                     .sequence_state
@@ -642,8 +642,8 @@ pub fn qwen35_decode_step_serial_reference(
             )
             .map_err(|e| format!("save qwen35 decode logits snapshot: {e:?}"))?;
         }
-        state.seq_pos += 1;
-        let new_logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        state.cursor.seq_pos += 1;
+        let new_logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         qwen35_restore_or_error(stdout, &session.id, m, gpu, state);
         session_lines.push(serde_json::json!({
             "type": "generate_batch_decode_step_session_done",
@@ -788,7 +788,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
     let result = (|| -> Result<Vec<serde_json::Value>, String> {
         let mut outcomes = Vec::with_capacity(states.len());
         for (session, state) in &states {
-            let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+            let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             if logical_position != session.logical_position {
                 return Err(format!(
                     "decode session {} logical_position mismatch: expected={} resident={}",
@@ -817,7 +817,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
         };
 
         for ((_, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
-            state.conversation_tokens.push(outcome.token);
+            state.cursor.conversation_tokens.push(outcome.token);
         }
 
         let token_rows: Vec<[u32; 1]> = outcomes.iter().map(|outcome| [outcome.token]).collect();
@@ -842,7 +842,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
             .zip(token_rows.iter())
             .map(|((_, state), tokens)| qwen35::DensePrefillSessionBatchRow {
                 tokens,
-                start_pos: state.seq_pos,
+                start_pos: state.cursor.seq_pos,
                 kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                 dn_state: state
                     .sequence_state
@@ -863,8 +863,8 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
 
         let mut lines = Vec::with_capacity(states.len());
         for ((session, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
-            state.seq_pos += 1;
-            let new_logical_position = state.seq_pos + state.kv_cache().compact_offset;
+            state.cursor.seq_pos += 1;
+            let new_logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             lines.push(serde_json::json!({
                 "type": "generate_batch_decode_step_session_done",
                 "id": envelope.id,
@@ -908,13 +908,16 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                         session.session_id, outcome.token, oracle_outcome.token
                     ));
                 }
-                oracle_state.conversation_tokens.push(oracle_outcome.token);
+                oracle_state
+                    .cursor
+                    .conversation_tokens
+                    .push(oracle_outcome.token);
                 qwen35::forward_scratch(
                     gpu,
                     weights,
                     config,
                     oracle_outcome.token,
-                    oracle_state.seq_pos,
+                    oracle_state.cursor.seq_pos,
                     oracle_state
                         .sequence_state
                         .kv
@@ -941,7 +944,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                 .map_err(|e| {
                     format!("save qwen35 grouped-MoE decode internal parity logits: {e:?}")
                 })?;
-                oracle_state.seq_pos += 1;
+                oracle_state.cursor.seq_pos += 1;
                 let fused_next = gpu
                     .argmax_f32(&fused_state.logits, config.vocab_size)
                     .map_err(|e| format!("qwen35 grouped-MoE fused parity fused argmax: {e:?}"))?;
@@ -1068,7 +1071,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
     let result = (|| -> Result<Vec<serde_json::Value>, String> {
         let mut outcomes = Vec::with_capacity(states.len());
         for (session, state) in &states {
-            let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+            let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             if logical_position != session.logical_position {
                 return Err(format!(
                     "decode session {} logical_position mismatch: expected={} resident={}",
@@ -1097,7 +1100,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
         };
 
         for ((_, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
-            state.conversation_tokens.push(outcome.token);
+            state.cursor.conversation_tokens.push(outcome.token);
         }
 
         let token_rows: Vec<[u32; 1]> = outcomes.iter().map(|outcome| [outcome.token]).collect();
@@ -1122,7 +1125,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
             .zip(token_rows.iter())
             .map(|((_, state), tokens)| qwen35::DensePrefillSessionBatchRow {
                 tokens,
-                start_pos: state.seq_pos,
+                start_pos: state.cursor.seq_pos,
                 kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                 dn_state: state
                     .sequence_state
@@ -1141,8 +1144,8 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
 
         let mut lines = Vec::with_capacity(states.len());
         for ((session, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
-            state.seq_pos += 1;
-            let new_logical_position = state.seq_pos + state.kv_cache().compact_offset;
+            state.cursor.seq_pos += 1;
+            let new_logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             lines.push(serde_json::json!({
                 "type": "generate_batch_decode_step_session_done",
                 "id": envelope.id,
@@ -1186,13 +1189,16 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                         session.session_id, outcome.token, oracle_outcome.token
                     ));
                 }
-                oracle_state.conversation_tokens.push(oracle_outcome.token);
+                oracle_state
+                    .cursor
+                    .conversation_tokens
+                    .push(oracle_outcome.token);
                 qwen35::forward_scratch(
                     gpu,
                     weights,
                     config,
                     oracle_outcome.token,
-                    oracle_state.seq_pos,
+                    oracle_state.cursor.seq_pos,
                     oracle_state
                         .sequence_state
                         .kv
@@ -1215,7 +1221,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                     scratch.logits.buf.size(),
                 )
                 .map_err(|e| format!("save qwen35 decode internal parity logits: {e:?}"))?;
-                oracle_state.seq_pos += 1;
+                oracle_state.cursor.seq_pos += 1;
                 let fused_next = gpu
                     .argmax_f32(&fused_state.logits, config.vocab_size)
                     .map_err(|e| format!("qwen35 fused parity fused argmax: {e:?}"))?;
@@ -1263,7 +1269,7 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
     let mut state = Qwen35RequestSessionState::take_from_loaded(m, gpu)?;
 
     let result = (|| -> Result<Vec<serde_json::Value>, String> {
-        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         if logical_position != session.logical_position {
             return Err(format!(
                 "decode session {} logical_position mismatch: expected={} resident={}",
@@ -1277,7 +1283,7 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
             session.max_tokens_remaining,
             im_end_token,
         )?;
-        state.conversation_tokens.push(outcome.token);
+        state.cursor.conversation_tokens.push(outcome.token);
         {
             let config = m
                 .q35_config
@@ -1296,7 +1302,7 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
                 weights,
                 config,
                 outcome.token,
-                state.seq_pos,
+                state.cursor.seq_pos,
                 state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                 state
                     .sequence_state
@@ -1316,8 +1322,8 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
             )
             .map_err(|e| format!("save qwen35 native singleton logits snapshot: {e:?}"))?;
         }
-        state.seq_pos += 1;
-        let new_logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        state.cursor.seq_pos += 1;
+        let new_logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         Ok(vec![serde_json::json!({
             "type": "generate_batch_decode_step_session_done",
             "id": envelope.id,

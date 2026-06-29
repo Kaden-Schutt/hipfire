@@ -106,8 +106,10 @@ pub fn next_qwen35_state_allocation_epoch() -> u64 {
 /// session out of and back into the single resident model slot. `allocation_epoch`
 /// stamps the generation so stale handles are rejected.
 pub struct Qwen35RequestSessionState {
-    pub seq_pos: usize,
-    pub conversation_tokens: Vec<u32>,
+    /// This session's generation cursor (C1b: same `SessionCursor` type the
+    /// active slot carries, so the swap moves one value and C1b's elimination of
+    /// the working copy is a straight reuse of the resident session's cursor).
+    pub cursor: SessionCursor,
     pub prefix_hash: Option<SequenceStatePrefixHash>,
     /// Unified per-sequence decode state (KV cache + DeltaNet recurrent state),
     /// keyed by the qwen35 hybrid MixerProfile. P2c: replaces the former separate
@@ -254,8 +256,7 @@ impl Qwen35RequestSessionState {
         let kv = Self::clone_kv_cache(gpu, source.kv_cache())?;
         let dn = Self::clone_dn_state(gpu, source.dn_state())?;
         Ok(Self {
-            seq_pos: source.seq_pos,
-            conversation_tokens: source.conversation_tokens.clone(),
+            cursor: source.cursor.clone(),
             prefix_hash: source.prefix_hash.clone(),
             sequence_state: SequenceState::new(
                 source.sequence_state.profile.clone(),
@@ -288,8 +289,9 @@ impl Qwen35RequestSessionState {
         gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
             .map_err(|e| format!("save qwen35 session logits snapshot: {e:?}"))?;
         Ok(Self {
-            seq_pos: m.cursor.seq_pos,
-            conversation_tokens: std::mem::take(&mut m.cursor.conversation_tokens),
+            // Move the whole active cursor into the parked snapshot (the slot's
+            // `m.cursor` is overwritten by the next restore).
+            cursor: std::mem::take(&mut m.cursor),
             prefix_hash: None,
             sequence_state: m.sequence_state.take().expect("checked is_none above"),
             logits,
@@ -315,8 +317,8 @@ impl Qwen35RequestSessionState {
             )
             .map_err(|e| format!("restore qwen35 session logits snapshot: {e:?}"))?;
         }
-        m.cursor.seq_pos = self.seq_pos;
-        m.cursor.conversation_tokens = self.conversation_tokens;
+        m.cursor.seq_pos = self.cursor.seq_pos;
+        m.cursor.conversation_tokens = self.cursor.conversation_tokens;
         // Prefix hash metadata is kept with saved Qwen35 request sessions.
         // The loaded singleton path computes it when checkpointable prefill
         // sessions are saved back into the session map.
@@ -327,8 +329,8 @@ impl Qwen35RequestSessionState {
     }
 
     pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
+        self.cursor.seq_pos = 0;
+        self.cursor.conversation_tokens.clear();
         self.prefix_hash = None;
         self.prefilled_generated_suffix_len = 0;
         for s in &self.dn_state().s_matrices {
@@ -346,8 +348,8 @@ impl Qwen35RequestSessionState {
 
 #[cfg(feature = "arch-lfm2moe")]
 pub struct Lfm2RequestSessionState {
-    pub seq_pos: usize,
-    pub conversation_tokens: Vec<u32>,
+    /// This session's generation cursor (C1b — see `Qwen35RequestSessionState`).
+    pub cursor: SessionCursor,
     pub prefix_hash: Option<SequenceStatePrefixHash>,
     pub state: lfm2moe::lfm2moe::Lfm2MoeState,
     pub dflash_target_hidden_host: Option<Vec<f32>>,
@@ -370,8 +372,7 @@ impl Lfm2RequestSessionState {
         )
         .map_err(|e| format!("lfm2 session state allocation failed: {e}"))?;
         Ok(Self {
-            seq_pos: 0,
-            conversation_tokens: Vec::new(),
+            cursor: SessionCursor::default(),
             prefix_hash: None,
             state,
             dflash_target_hidden_host: None,
@@ -385,8 +386,10 @@ impl Lfm2RequestSessionState {
             .take()
             .ok_or_else(|| "lfm2 active session missing state".to_string())?;
         Ok(Self {
-            seq_pos: state.n_tokens,
-            conversation_tokens: std::mem::take(&mut m.cursor.conversation_tokens),
+            cursor: SessionCursor {
+                seq_pos: state.n_tokens,
+                conversation_tokens: std::mem::take(&mut m.cursor.conversation_tokens),
+            },
             prefix_hash: None,
             state,
             dflash_target_hidden_host: m
@@ -398,8 +401,8 @@ impl Lfm2RequestSessionState {
     }
 
     pub fn restore_into_loaded(self, m: &mut LoadedModel) {
-        m.cursor.seq_pos = self.seq_pos;
-        m.cursor.conversation_tokens = self.conversation_tokens;
+        m.cursor.seq_pos = self.cursor.seq_pos;
+        m.cursor.conversation_tokens = self.cursor.conversation_tokens;
         m.lfm2moe_state = Some(self.state);
         if let Some(df) = m.lfm2_dflash.as_mut() {
             df.target_hidden_host = self.dflash_target_hidden_host.unwrap_or_default();
@@ -409,8 +412,8 @@ impl Lfm2RequestSessionState {
 
     pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
         self.state.reset(gpu)?;
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
+        self.cursor.seq_pos = 0;
+        self.cursor.conversation_tokens.clear();
         self.prefix_hash = None;
         if let Some(hidden) = self.dflash_target_hidden_host.as_mut() {
             hidden.clear();
@@ -541,8 +544,7 @@ impl Lfm2RequestSessionState {
         source: &Lfm2RequestSessionState,
     ) -> Result<Self, String> {
         Ok(Self {
-            seq_pos: source.seq_pos,
-            conversation_tokens: source.conversation_tokens.clone(),
+            cursor: source.cursor.clone(),
             prefix_hash: source.prefix_hash.clone(),
             state: Self::clone_state(gpu, &source.state)?,
             dflash_target_hidden_host: source.dflash_target_hidden_host.clone(),
@@ -614,7 +616,7 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
         if session_id == QWEN35_LEGACY_SESSION_ID {
             return;
         }
-        let logical_position = session.seq_pos + session.kv_cache().compact_offset;
+        let logical_position = session.cursor.seq_pos + session.kv_cache().compact_offset;
         let handle = qwen35_sequence_state_handle(session_id, session.allocation_epoch);
         let owns_pages = session.allocation_epoch != 0;
         let kv_bytes = session
@@ -1711,8 +1713,7 @@ pub fn qwen35_allocate_session_state(
         Some(Box::new(dn_state)),
     );
     Ok(Qwen35RequestSessionState {
-        seq_pos: 0,
-        conversation_tokens: Vec::new(),
+        cursor: SessionCursor::default(),
         prefix_hash: None,
         sequence_state,
         logits: gpu
@@ -1764,7 +1765,7 @@ pub fn lfm2_save_active_session(m: &mut LoadedModel) -> Result<(), String> {
     if let Some(active_id) = m.lfm2_registry.active_session_id.take() {
         let mut session = Lfm2RequestSessionState::take_from_loaded(m)
             .map_err(|e| format!("failed to save active lfm2 session: {e}"))?;
-        session.seq_pos = session.state.n_tokens;
+        session.cursor.seq_pos = session.state.n_tokens;
         m.lfm2_registry.sessions.insert(active_id, session);
         m.lfm2_registry.allocation_epoch = 0;
     }
@@ -2021,7 +2022,7 @@ pub fn qwen35_checkpoint_session_state(
             .sessions
             .get(request.source_session_id)
             .expect("source residency was validated");
-        let logical_position = source.seq_pos + source.kv_cache().compact_offset;
+        let logical_position = source.cursor.seq_pos + source.kv_cache().compact_offset;
         validate_checkpoint_logical_position(
             request.source_session_id,
             request.expected_logical_position,

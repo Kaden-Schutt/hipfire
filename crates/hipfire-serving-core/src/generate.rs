@@ -2345,7 +2345,7 @@ pub fn generate(
     let prompt_est = tokenizer.encode(prompt).len() + 20;
     let current_seq_pos = q35_session
         .as_ref()
-        .map(|s| s.seq_pos)
+        .map(|s| s.cursor.seq_pos)
         .unwrap_or(m.cursor.seq_pos);
     if !prefill_already_done
         && m.eviction.is_none()
@@ -2468,7 +2468,7 @@ pub fn generate(
             pflash_state.is_some(),
             q35_session
                 .as_ref()
-                .map(|s| s.seq_pos)
+                .map(|s| s.cursor.seq_pos)
                 .unwrap_or(m.cursor.seq_pos),
             raw_q_tokens.len(),
             drafter_gpu.is_some()
@@ -2477,7 +2477,7 @@ pub fn generate(
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         let seq_pos = q35_session
             .as_ref()
-            .map(|s| s.seq_pos)
+            .map(|s| s.cursor.seq_pos)
             .unwrap_or(m.cursor.seq_pos);
         if seq_pos == 0 {
             let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
@@ -2593,7 +2593,7 @@ pub fn generate(
     } else {
         q35_session
             .as_ref()
-            .map(|s| s.seq_pos)
+            .map(|s| s.cursor.seq_pos)
             .unwrap_or(m.cursor.seq_pos)
     };
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
@@ -2684,7 +2684,7 @@ pub fn generate(
     let trailer = nl.len();
     let current_seq_pos = q35_session
         .as_ref()
-        .map(|s| s.seq_pos)
+        .map(|s| s.cursor.seq_pos)
         .unwrap_or(m.cursor.seq_pos);
     let budget_prefill_tokens = if prefill_already_done {
         0
@@ -2692,7 +2692,7 @@ pub fn generate(
         new_tokens.len()
     };
     let absolute_pos = if let Some(session) = q35_session.as_ref() {
-        session.seq_pos + session.kv_cache().compact_offset
+        session.cursor.seq_pos + session.kv_cache().compact_offset
     } else {
         m.cursor.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
     };
@@ -2751,10 +2751,10 @@ pub fn generate(
 
     if is_qwen35_family_arch_id(m.arch_id) {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
-        // continuing from session.seq_pos (KV cache + DeltaNet state are cumulative)
+        // continuing from session.cursor.seq_pos (KV cache + DeltaNet state are cumulative)
         let mut session = q35_session.take().expect("qwen35 request session state");
         if prefill_already_done {
-            let current_position = session.seq_pos + session.kv_cache().compact_offset;
+            let current_position = session.cursor.seq_pos + session.kv_cache().compact_offset;
             let expected_position = prefilled_prompt_tokens.unwrap_or(new_tokens.len());
             if current_position != expected_position {
                 write_error(
@@ -2815,7 +2815,7 @@ pub fn generate(
             // gap, off the decode critical path — before the new prompt tokens append.
             // (The batch-protocol path does this in qwen35_prefill_active_session;
             // single `generate` prefills inline, so mirror it here.)
-            if session.seq_pos > 0 {
+            if session.cursor.seq_pos > 0 {
                 if let Some(h) = kv.hier.as_mut() {
                     if h.enabled {
                         let keep = std::env::var("HIPFIRE_KV_IDLE_KEEP")
@@ -2841,19 +2841,19 @@ pub fn generate(
                         weights,
                         config,
                         tok,
-                        session.seq_pos,
+                        session.cursor.seq_pos,
                         kv,
                         dn,
                         scratch,
                     )
                     .unwrap();
-                    session.seq_pos += 1;
+                    session.cursor.seq_pos += 1;
                 }
             } else if let Some(ref ev) = m.eviction {
                 let window = ev.budget() + ev.beta();
                 let mut remaining: &[u32] = &new_tokens;
                 while !remaining.is_empty() {
-                    let space = window.saturating_sub(session.seq_pos).max(1);
+                    let space = window.saturating_sub(session.cursor.seq_pos).max(1);
                     let chunk_len = remaining.len().min(space);
                     let (chunk, rest) = remaining.split_at(chunk_len);
                     qwen35::forward_prefill_batch(
@@ -2861,7 +2861,7 @@ pub fn generate(
                         weights,
                         config,
                         chunk,
-                        session.seq_pos,
+                        session.cursor.seq_pos,
                         kv,
                         dn,
                         scratch,
@@ -2871,13 +2871,13 @@ pub fn generate(
                         None,
                     )
                     .unwrap();
-                    session.seq_pos += chunk_len;
+                    session.cursor.seq_pos += chunk_len;
                     if let Some(hipfire_runtime::triattn::EvictionResult {
                         new_physical: new_phys,
                         ..
-                    }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                    }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                     {
-                        session.seq_pos = new_phys;
+                        session.cursor.seq_pos = new_phys;
                     }
                     remaining = rest;
                 }
@@ -2887,7 +2887,7 @@ pub fn generate(
                     weights,
                     config,
                     &new_tokens,
-                    session.seq_pos,
+                    session.cursor.seq_pos,
                     kv,
                     dn,
                     scratch,
@@ -2897,9 +2897,12 @@ pub fn generate(
                     None,
                 )
                 .unwrap();
-                session.seq_pos += new_tokens.len();
+                session.cursor.seq_pos += new_tokens.len();
             }
-            session.conversation_tokens.extend_from_slice(&new_tokens);
+            session
+                .cursor
+                .conversation_tokens
+                .extend_from_slice(&new_tokens);
         }
 
         // ngram scope for the repeat penalty: ONLY generated tokens (never the
@@ -2910,11 +2913,12 @@ pub fn generate(
         // generated tokens yet); subsequent samples: generated-so-far only.
         let ngram_scope_start = if prefill_already_done {
             session
+                .cursor
                 .conversation_tokens
                 .len()
                 .saturating_sub(session.prefilled_generated_suffix_len)
         } else {
-            session.conversation_tokens.len()
+            session.cursor.conversation_tokens.len()
         };
         session.prefilled_generated_suffix_len = 0;
 
@@ -2940,7 +2944,7 @@ pub fn generate(
             .collect();
 
         // First sample: use conversation so far as scope.
-        let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
+        let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
         // #111 attractor block: empty `ngram_scope` on first sample (no
         // generated tokens yet), so the unclosed-depth is always 0 and
         // `blocked` is empty. Still call collect_* for symmetry with
@@ -3014,7 +3018,7 @@ pub fn generate(
         // push generated past max_tokens: each loop start rechecks the cap.
         while generated < max_tokens {
             generated += 1;
-            session.conversation_tokens.push(next_token);
+            session.cursor.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
             emit_committed_event(
                 stdout,
@@ -3037,7 +3041,7 @@ pub fn generate(
             // position — the next turn then attended over zero-init K/V
             // at that slot.
             //
-            // Under eviction, session.seq_pos is the *physical* write slot; we
+            // Under eviction, session.cursor.seq_pos is the *physical* write slot; we
             // advance and call maybe_evict immediately so the next write
             // never overruns physical_cap. compact_offset bookkeeping on
             // the cache itself keeps RoPE phase correct across evictions.
@@ -3046,7 +3050,7 @@ pub fn generate(
                 weights,
                 config,
                 next_token,
-                session.seq_pos,
+                session.cursor.seq_pos,
                 kv,
                 dn,
                 scratch,
@@ -3059,14 +3063,14 @@ pub fn generate(
                 qwen35_restore_or_error(stdout, id, m, gpu, session);
                 return;
             }
-            session.seq_pos += 1;
+            session.cursor.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
-                }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                 {
-                    session.seq_pos = new_phys;
+                    session.cursor.seq_pos = new_phys;
                 }
             }
             if filter_stop {
@@ -3128,23 +3132,23 @@ pub fn generate(
                             weights,
                             config,
                             t,
-                            session.seq_pos,
+                            session.cursor.seq_pos,
                             kv,
                             dn,
                             scratch,
                         )
                         .unwrap();
-                        session.seq_pos += 1;
+                        session.cursor.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
                                 new_physical: new_phys,
                                 ..
-                            }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                            }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                             {
-                                session.seq_pos = new_phys;
+                                session.cursor.seq_pos = new_phys;
                             }
                         }
-                        session.conversation_tokens.push(t);
+                        session.cursor.conversation_tokens.push(t);
                         streamed_tokens.push(t);
                         emit_committed_event(
                             stdout,
@@ -3220,7 +3224,7 @@ pub fn generate(
                     );
                     let _ = stdout.flush();
                     // Fall through — resample next token as normal
-                    let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
+                    let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
                     let mut blocked: Vec<u32> = Vec::new();
                     collect_unclosed_attractor_blocks(
                         ngram_scope,
@@ -3259,11 +3263,13 @@ pub fn generate(
                 // eviction the physical check is trivially satisfied (budget
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
-                let need_kv =
-                    session.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                let need_kv = session.cursor.seq_pos
+                    + nudge_len
+                    + (max_tokens - generated - nudge_len)
+                    + nl.len();
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
-                        session.conversation_tokens.push(tok);
+                        session.cursor.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
                         emit_committed_event(
                             stdout,
@@ -3285,7 +3291,7 @@ pub fn generate(
                             weights,
                             config,
                             tok,
-                            session.seq_pos,
+                            session.cursor.seq_pos,
                             kv,
                             dn,
                             scratch,
@@ -3298,14 +3304,14 @@ pub fn generate(
                             qwen35_restore_or_error(stdout, id, m, gpu, session);
                             return;
                         }
-                        session.seq_pos += 1;
+                        session.cursor.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
                                 new_physical: new_phys,
                                 ..
-                            }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                            }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                             {
-                                session.seq_pos = new_phys;
+                                session.cursor.seq_pos = new_phys;
                             }
                         }
                         generated += 1;
@@ -3337,7 +3343,7 @@ pub fn generate(
             // cheap when not tripped, ~5 µs per blocked token when
             // tripped (single 4-byte H2D into the logits buffer
             // performed inside sampler::sample).
-            let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
+            let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
             let mut blocked: Vec<u32> = Vec::new();
             collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
             let cfg = SamplerConfig {
@@ -3363,13 +3369,14 @@ pub fn generate(
                 &mut rng_state,
             );
         }
-        // session.seq_pos is already the "next physical write slot" — advanced
+        // session.cursor.seq_pos is already the "next physical write slot" — advanced
         // per-token in the decode loop above, and evicted back down to
         // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
 
         // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
         // and DeltaNet state stay in sync with seq_pos.
-        if im_end_token == Some(*session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty()
+        if im_end_token == Some(*session.cursor.conversation_tokens.last().unwrap_or(&0))
+            && !nl.is_empty()
         {
             for &t in &nl {
                 if let Err(e) = qwen35::forward_scratch(
@@ -3377,7 +3384,7 @@ pub fn generate(
                     weights,
                     config,
                     t,
-                    session.seq_pos,
+                    session.cursor.seq_pos,
                     kv,
                     dn,
                     scratch,
@@ -3390,17 +3397,17 @@ pub fn generate(
                     qwen35_restore_or_error(stdout, id, m, gpu, session);
                     return;
                 }
-                session.seq_pos += 1;
+                session.cursor.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
                     if let Some(hipfire_runtime::triattn::EvictionResult {
                         new_physical: new_phys,
                         ..
-                    }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                    }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                     {
-                        session.seq_pos = new_phys;
+                        session.cursor.seq_pos = new_phys;
                     }
                 }
-                session.conversation_tokens.push(t);
+                session.cursor.conversation_tokens.push(t);
             }
         }
 

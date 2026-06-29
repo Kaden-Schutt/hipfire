@@ -198,7 +198,7 @@ pub fn qwen35_prefill_owned_session_serial_segment(
             weights,
             config,
             token,
-            state.seq_pos,
+            state.cursor.seq_pos,
             state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
             state
                 .sequence_state
@@ -211,8 +211,8 @@ pub fn qwen35_prefill_owned_session_serial_segment(
             scratch,
         )
         .map_err(|e| format!("qwen35 serial boundary prefill segment failed: {e:?}"))?;
-        state.seq_pos += 1;
-        state.conversation_tokens.push(token);
+        state.cursor.seq_pos += 1;
+        state.cursor.conversation_tokens.push(token);
     }
     Ok(tokens.len())
 }
@@ -585,14 +585,14 @@ pub fn qwen35_prefill_suffix_batch(
                     session.id
                 )
             })?;
-            let logical_position = saved.seq_pos + saved.kv_cache().compact_offset;
+            let logical_position = saved.cursor.seq_pos + saved.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
                 m.arch_id,
                 m.q35_kv_mode.as_deref(),
                 &session.state_kinds,
                 &session.assistant_prefix,
                 session.max_think_tokens,
-                &saved.conversation_tokens,
+                &saved.cursor.conversation_tokens,
             );
             if let Some(saved) = m.q35_registry.sessions.get_mut(&session.id) {
                 saved.prefix_hash = Some(prefix_hash.clone());
@@ -670,7 +670,7 @@ pub fn emit_qwen35_owned_prefill_checkpoint(
     if qwen35_prefill_checkpoint_boundary_kind(hook).is_empty() {
         return Err("qwen35 prefill checkpoint boundary kind is empty".to_string());
     }
-    let logical_position = source.seq_pos + source.kv_cache().compact_offset;
+    let logical_position = source.cursor.seq_pos + source.kv_cache().compact_offset;
     if logical_position != hook.logical_position {
         return Err(format!(
             "qwen35 owned prefill checkpoint source {} logical_position mismatch: expected={} resident={}",
@@ -733,9 +733,9 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 }
             },
         };
-        if state.seq_pos + spec.tokens.len() > m.physical_cap {
+        if state.cursor.seq_pos + spec.tokens.len() > m.physical_cap {
             let id = spec.id.to_string();
-            let seq_pos = state.seq_pos;
+            let seq_pos = state.cursor.seq_pos;
             m.q35_registry.sessions.insert(id.clone(), state);
             for (restore_id, restore_state) in owned_sessions {
                 m.q35_registry.sessions.insert(restore_id, restore_state);
@@ -869,7 +869,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                         let end = prepared[idx].tokens.len().min(cut);
                         (progress[idx] < end).then(|| qwen35::DensePrefillSessionBatchRow {
                             tokens: &prepared[idx].tokens[progress[idx]..end],
-                            start_pos: state.seq_pos,
+                            start_pos: state.cursor.seq_pos,
                             kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                             dn_state: state
                                 .sequence_state
@@ -904,8 +904,9 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 let start = progress[idx];
                 let end = prepared[idx].tokens.len().min(cut);
                 let state = &mut owned_sessions[idx].1;
-                state.seq_pos += end - start;
+                state.cursor.seq_pos += end - start;
                 state
+                    .cursor
                     .conversation_tokens
                     .extend_from_slice(&prepared[idx].tokens[start..end]);
                 progress[idx] = end;
@@ -942,14 +943,14 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         let mut sessions = Vec::with_capacity(owned_sessions.len());
         for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
             state.prefilled_generated_suffix_len = 0;
-            let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+            let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
                 m.arch_id,
                 m.q35_kv_mode.as_deref(),
                 &prepared[idx].state_kinds,
                 &prepared[idx].assistant_prefix,
                 prepared[idx].max_think_tokens,
-                &state.conversation_tokens,
+                &state.cursor.conversation_tokens,
             );
             state.prefix_hash = Some(prefix_hash.clone());
             sessions.push(Qwen35PrefillSessionResult {
@@ -1011,7 +1012,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             .zip(prepared.iter())
             .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
                 tokens: &spec.tokens,
-                start_pos: state.seq_pos,
+                start_pos: state.cursor.seq_pos,
                 kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                 dn_state: state
                     .sequence_state
@@ -1044,14 +1045,17 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
 
     let mut sessions = Vec::with_capacity(owned_sessions.len());
     for ((id, mut state), spec) in owned_sessions.into_iter().zip(prepared.iter()) {
-        state.seq_pos += spec.tokens.len();
-        state.conversation_tokens.extend_from_slice(&spec.tokens);
+        state.cursor.seq_pos += spec.tokens.len();
+        state
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(&spec.tokens);
         state.prefilled_generated_suffix_len = if spec.replay_as_generated_suffix {
             spec.tokens.len()
         } else {
             0
         };
-        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         let debug_sample_token = if spec.replay_as_generated_suffix
             && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
         {
@@ -1087,7 +1091,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             &spec.state_kinds,
             &spec.assistant_prefix,
             spec.max_think_tokens,
-            &state.conversation_tokens,
+            &state.cursor.conversation_tokens,
         );
         state.prefix_hash = Some(prefix_hash.clone());
         sessions.push(Qwen35PrefillSessionResult {
@@ -1168,9 +1172,9 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                 }
             },
         };
-        if state.seq_pos + spec.tokens.len() > m.physical_cap {
+        if state.cursor.seq_pos + spec.tokens.len() > m.physical_cap {
             let id = spec.id.to_string();
-            let seq_pos = state.seq_pos;
+            let seq_pos = state.cursor.seq_pos;
             m.q35_registry.sessions.insert(id.clone(), state);
             for (restore_id, restore_state) in owned_sessions {
                 m.q35_registry.sessions.insert(restore_id, restore_state);
@@ -1303,7 +1307,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                         let end = contract.sessions[idx].tokens.len().min(cut);
                         (progress[idx] < end).then(|| qwen35::DensePrefillSessionBatchRow {
                             tokens: &contract.sessions[idx].tokens[progress[idx]..end],
-                            start_pos: state.seq_pos,
+                            start_pos: state.cursor.seq_pos,
                             kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                             dn_state: state
                                 .sequence_state
@@ -1338,8 +1342,9 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                 let start = progress[idx];
                 let end = contract.sessions[idx].tokens.len().min(cut);
                 let state = &mut owned_sessions[idx].1;
-                state.seq_pos += end - start;
+                state.cursor.seq_pos += end - start;
                 state
+                    .cursor
                     .conversation_tokens
                     .extend_from_slice(&contract.sessions[idx].tokens[start..end]);
                 progress[idx] = end;
@@ -1376,14 +1381,14 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
         let mut sessions = Vec::with_capacity(owned_sessions.len());
         for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
             state.prefilled_generated_suffix_len = 0;
-            let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+            let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
                 m.arch_id,
                 m.q35_kv_mode.as_deref(),
                 contract.sessions[idx].state_kinds,
                 contract.sessions[idx].assistant_prefix,
                 contract.sessions[idx].max_think_tokens,
-                &state.conversation_tokens,
+                &state.cursor.conversation_tokens,
             );
             state.prefix_hash = Some(prefix_hash.clone());
             sessions.push(Qwen35PrefillSessionResult {
@@ -1443,7 +1448,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             .zip(contract.sessions.iter())
             .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
                 tokens: spec.tokens,
-                start_pos: state.seq_pos,
+                start_pos: state.cursor.seq_pos,
                 kv_cache: state.sequence_state.kv.as_mut().expect("qwen35 session KV"),
                 dn_state: state
                     .sequence_state
@@ -1474,14 +1479,17 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
 
     let mut sessions = Vec::with_capacity(owned_sessions.len());
     for ((id, mut state), spec) in owned_sessions.into_iter().zip(contract.sessions.iter()) {
-        state.seq_pos += spec.tokens.len();
-        state.conversation_tokens.extend_from_slice(spec.tokens);
+        state.cursor.seq_pos += spec.tokens.len();
+        state
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(spec.tokens);
         state.prefilled_generated_suffix_len = if spec.replay_as_generated_suffix {
             spec.tokens.len()
         } else {
             0
         };
-        let logical_position = state.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
         let debug_sample_token = if spec.replay_as_generated_suffix
             && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
         {
@@ -1517,7 +1525,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             spec.state_kinds,
             spec.assistant_prefix,
             spec.max_think_tokens,
-            &state.conversation_tokens,
+            &state.cursor.conversation_tokens,
         );
         state.prefix_hash = Some(prefix_hash.clone());
         sessions.push(Qwen35PrefillSessionResult {
@@ -1673,7 +1681,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
                 &session.state_kinds,
                 &session.assistant_prefix,
                 session.max_think_tokens,
-                &saved.conversation_tokens,
+                &saved.cursor.conversation_tokens,
             )
         };
         if let Some(saved) = m.q35_registry.sessions.get_mut(&session.id) {
