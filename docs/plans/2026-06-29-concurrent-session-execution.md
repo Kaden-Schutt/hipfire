@@ -91,6 +91,24 @@ the `SequenceState` ownership question — we are building it now, not deferring
   session state; thread the active session's cursor through the generation loop.
   No concurrency yet — behavior-identical, single active session. Validate
   coherence + sessions unchanged.
+
+  **Scope finding (2026-06-29):** `m.seq_pos` is the **universal generation
+  cursor**, not a rich-tier-only field. It is written by *every* arch's
+  generate/prefill path — `generate_vl.rs` (VL decode, `m.seq_pos += 1`),
+  `lfm2_prefill.rs`, `qwen35_prefill.rs`, `generate_arch.rs` (minimax etc.) and
+  the generic `generate.rs` — ~91 `m.seq_pos` sites plus `conversation_tokens`.
+  So C1 touches every arch's live hot path and needs multi-arch GPU validation
+  (not just qwen35/lfm2). Sub-steps:
+  - **C1a — accessor indirection (safe, behavior-preserving).** Add
+    `seq_pos()` / `set_seq_pos()` / `bump_seq_pos()` (+ `conversation_tokens*`)
+    to `LoadedModel`; migrate the ~91 `m.seq_pos` sites (S0-style mechanical
+    rename). The field stays; call sites are decoupled from it. Gate: workspace
+    build + coherence on ≥2 arches.
+  - **C1b — relocate behind the accessor.** Change the accessor internals to
+    read/write the *active session's* cursor (the saved session structs already
+    carry `seq_pos`/`conversation_tokens`), eliminating the working-copy field +
+    the take/restore swap of it. Validate coherence + multi-turn across
+    qwen35 / lfm2 / minimax / VL.
 - **C2 — concurrent residency, serial step.** N sessions resident (arena reserve),
   decode them round-robin (no shared slot). Validate two concurrent sessions
   produce identical output to two serial runs.
