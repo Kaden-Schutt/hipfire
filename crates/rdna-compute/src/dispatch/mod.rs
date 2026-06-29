@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // Op-family submodules split out of this file (dispatch-refactor Phase 1). Each
 // is a child `impl Gpu` block; as a descendant of `dispatch` it reaches Gpu's
@@ -230,6 +230,81 @@ impl GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, len_elems * self.dtype.size()) },
             shape: vec![len_elems],
             dtype: self.dtype,
+        }
+    }
+}
+
+/// Cheap, `Clone`-able, `Send + Sync` handle to a single `Gpu`'s deferred-free
+/// mailbox. A dropped [`OwnedTensor`] pushes its raw pooled `DeviceBuffer` here;
+/// the owning `Gpu` empties it (returning buffers to the pool) only at explicit,
+/// capture-gated reclaim boundaries (`Gpu::reclaim_pending`). The handle belongs
+/// to the `Gpu` that allocated — it is single-GPU-correct and must not be shared
+/// across devices. `Arc<Mutex<Vec<DeviceBuffer>>>` is `Send + Sync` because
+/// `DeviceBuffer: Send`.
+type FreeMailbox = Arc<Mutex<Vec<DeviceBuffer>>>;
+
+/// RAII owner of one *uniquely-owned* pooled GPU scratch buffer.
+///
+/// `GpuTensor` deliberately has a no-op drop: it doubles as a non-owning view /
+/// kernel-arg type, and `sub_offset`/`alias` mint interior views that must never
+/// be freed. `OwnedTensor` is the complement — it owns a fresh, unique pooled
+/// buffer and, on `Drop`, enqueues that raw `DeviceBuffer` into its `Gpu`'s
+/// deferred-free mailbox on EVERY exit path, including `?`-propagated errors and
+/// panics. That is what lets a converted forward use plain `?` and delete its
+/// manual error-path frees.
+///
+/// `Drop` does the *minimum*: steal the buffer, lock the mailbox, push. No
+/// `&mut Gpu`, no pool access, no `hipFree`, no other fallible work — so it is
+/// infallible and safe to run while a hipGraph/stream capture is live (it never
+/// touches device memory). The buffer is returned to the pool later, at an
+/// explicit `Gpu::reclaim_pending` boundary.
+///
+/// Kernels keep taking `&GpuTensor`: `Deref` (and `view()`) expose the inner
+/// tensor, so existing `gpu.kernel(&tmp, …)` call sites compile unchanged via
+/// deref coercion.
+///
+/// There is intentionally NO way to wrap an existing `GpuTensor`/view as owned
+/// (no `into_owned`): every `OwnedTensor` is minted by `alloc_owned` /
+/// `zeros_owned` / `upload_owned_f32` against a freshly-popped pooled buffer, so
+/// an interior `sub_offset`/`alias` pointer can never reach `pool.free`.
+pub struct OwnedTensor {
+    /// The live pooled tensor. On `Drop`, `inner.buf` is swapped out into the
+    /// mailbox and replaced by a null, non-owning stub (whose own drop is a true
+    /// no-op, matching `GpuTensor`'s contract).
+    inner: GpuTensor,
+    mailbox: FreeMailbox,
+}
+
+impl OwnedTensor {
+    /// Borrow the underlying tensor as a plain `&GpuTensor` for kernel dispatch.
+    /// Deref coercion makes this implicit at most call sites; `view()` is for the
+    /// rare spot where coercion does not fire (e.g. a generic/turbofish context).
+    #[inline]
+    pub fn view(&self) -> &GpuTensor {
+        &self.inner
+    }
+}
+
+impl std::ops::Deref for OwnedTensor {
+    type Target = GpuTensor;
+    #[inline]
+    fn deref(&self) -> &GpuTensor {
+        &self.inner
+    }
+}
+
+impl Drop for OwnedTensor {
+    fn drop(&mut self) {
+        // Steal the real buffer, leaving an empty non-owning stub behind so the
+        // subsequent drop of `inner` (a `GpuTensor`, no-op drop) frees nothing.
+        // The ONLY work here is lock + push: no GPU call, no pool, no `&mut Gpu`.
+        let buf = std::mem::replace(&mut self.inner.buf, unsafe {
+            DeviceBuffer::from_raw(std::ptr::null_mut::<c_void>(), 0)
+        });
+        // A poisoned mailbox (a thread panicked mid-reclaim) degrades to a single
+        // leaked pooled buffer rather than a double-panic during unwind.
+        if let Ok(mut q) = self.mailbox.lock() {
+            q.push(buf);
         }
     }
 }
@@ -467,6 +542,11 @@ pub struct Gpu {
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
     pool: crate::pool::GpuPool,
+    /// Deferred-free mailbox for `OwnedTensor` scratch (see `OwnedTensor`).
+    /// Dropped owned tensors enqueue their raw pooled buffer here (capture-safe,
+    /// infallible); `reclaim_pending()` returns them to `pool` at explicit,
+    /// capture-gated forward boundaries. Belongs to this `Gpu` only.
+    free_mailbox: FreeMailbox,
     /// Calibration activation capture (Tier-1 collector). When `Some`, the
     /// instrumented linear dispatch arms (`gemv_f16_xf32`, `fused_qkvza_f16_xf32`,
     /// `fused_gate_up_f16_xf32`) resolve their weight buffer pointer to a tensor
@@ -911,6 +991,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            free_mailbox: Arc::new(Mutex::new(Vec::new())),
             active_capture: None,
             capture_names: HashMap::new(),
             active_stream: None,
@@ -2148,10 +2229,83 @@ impl Gpu {
         Ok(())
     }
 
+    // ── RAII scratch (`OwnedTensor`) ─────────────────────────────────────────
+
+    /// Allocate an (uninitialised) `OwnedTensor` backed by a UNIQUE freshly
+    /// popped pooled buffer. Identical to `alloc_tensor`, except the result frees
+    /// itself back to the deferred-free mailbox on drop instead of needing an
+    /// explicit `free_tensor`. See `OwnedTensor`.
+    pub fn alloc_owned(&mut self, shape: &[usize], dtype: DType) -> HipResult<OwnedTensor> {
+        let inner = self.alloc_tensor(shape, dtype)?;
+        Ok(OwnedTensor {
+            inner,
+            mailbox: Arc::clone(&self.free_mailbox),
+        })
+    }
+
+    /// Zero-initialised counterpart of `alloc_owned`.
+    pub fn zeros_owned(&mut self, shape: &[usize], dtype: DType) -> HipResult<OwnedTensor> {
+        let inner = self.zeros(shape, dtype)?;
+        Ok(OwnedTensor {
+            inner,
+            mailbox: Arc::clone(&self.free_mailbox),
+        })
+    }
+
+    /// Host-upload counterpart of `alloc_owned` (F32).
+    pub fn upload_owned_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<OwnedTensor> {
+        let inner = self.upload_f32(data, shape)?;
+        Ok(OwnedTensor {
+            inner,
+            mailbox: Arc::clone(&self.free_mailbox),
+        })
+    }
+
+    /// Return every buffer enqueued by dropped `OwnedTensor`s to the pool.
+    ///
+    /// EXPLICIT and graph-gated. While any graph state is live
+    /// (`graph_state_live()` — actively capturing, OR a captured/replayable graph
+    /// is cached) this is a no-op: a buffer enqueued in this window may have its
+    /// pointer baked into a live or replayable graph, so returning it to the pool
+    /// (where a later alloc could hand it out) would alias graph-referenced
+    /// memory. Buffers stay queued until graph state clears (graphs invalidated /
+    /// destroyed), mirroring the established `*_staging_scratch_keepalive` rule.
+    /// (The gate guards against view/graph aliasing, not `hipFree`: `pool.free`
+    /// issues no device free and is itself capture-safe.) Nothing else drains the
+    /// mailbox — in particular `alloc_tensor` does not — so a view borrowed
+    /// mid-forward stays valid until the next boundary reclaim. Call at forward /
+    /// decode-turn boundaries; safe to call unconditionally (it self-gates).
+    pub fn reclaim_pending(&mut self) {
+        // Pure pool/host work: pool.free pushes to a free-list and needs no
+        // device binding, so this method stays infallible.
+        if self.graph_state_live() {
+            return;
+        }
+        // Take the queue under the lock, then `pool.free` outside it.
+        let pending: Vec<DeviceBuffer> = match self.free_mailbox.lock() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => return,
+        };
+        for buf in pending {
+            self.pool.free(buf);
+        }
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
         self.bind_thread_or_warn();
+        // Empty the `OwnedTensor` deferred-free mailbox first (ungated: capture is
+        // already torn down at unload) so any still-queued scratch is freed too
+        // rather than leaked.
+        let pending: Vec<DeviceBuffer> = self
+            .free_mailbox
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default();
+        for buf in pending {
+            self.pool.free(buf);
+        }
         self.pool.drain(&self.hip);
     }
 

@@ -17,7 +17,7 @@ pub mod profiler;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
-    gen_fwht_signs, ActivationCapture, DType, Gpu, GpuTensor, LLOYD_MQ4_GROUP_BYTES,
+    gen_fwht_signs, ActivationCapture, DType, Gpu, GpuTensor, OwnedTensor, LLOYD_MQ4_GROUP_BYTES,
     MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;
