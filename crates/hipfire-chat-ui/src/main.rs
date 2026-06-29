@@ -151,6 +151,8 @@ fn App() -> impl IntoView {
     // Responses API server-side conversation state: the last response id, sent
     // as previous_response_id so the server reconstructs prior context.
     let (last_response_id, set_last_response_id) = signal(None::<String>);
+    // Running server build identity (from /health), shown in the settings footer.
+    let (server_version, set_server_version) = signal(None::<String>);
     // In-flight abort handle, so the Stop button can cancel a stream.
     let abort = StoredValue::new(None::<AbortController>);
     let messages_ref = NodeRef::<leptos::html::Main>::new();
@@ -161,6 +163,14 @@ fn App() -> impl IntoView {
                 set_settings.update(|s| s.model = items[0].id.clone());
             }
             set_models.set(items);
+        }
+    });
+
+    leptos::task::spawn_local(async move {
+        if let Ok(health) = get_json::<Value>("/health").await {
+            if let Some(version) = health["version"].as_str() {
+                set_server_version.set(Some(version.to_string()));
+            }
         }
     });
 
@@ -339,7 +349,7 @@ fn App() -> impl IntoView {
             </header>
 
             <SettingsDrawer settings=settings set_settings=set_settings models=models
-                open=settings_open set_open=set_settings_open/>
+                open=settings_open set_open=set_settings_open version=server_version/>
 
             <main class="messages" node_ref=messages_ref aria-live="polite">
                 {move || messages.get().into_iter().map(message_view).collect_view()}
@@ -455,6 +465,7 @@ fn SettingsDrawer(
     models: ReadSignal<Vec<ModelItem>>,
     open: ReadSignal<bool>,
     set_open: WriteSignal<bool>,
+    version: ReadSignal<Option<String>>,
 ) -> impl IntoView {
     // Helper to build a labeled numeric override input bound to one field.
     macro_rules! num_field {
@@ -521,6 +532,12 @@ fn SettingsDrawer(
                     prop:value=move || settings.get().system
                     on:input=move |ev| { let v = event_target_value(&ev); set_settings.update(|s| s.system = v); }></textarea>
             </label>
+            <div class="drawer-foot">
+                {move || match version.get() {
+                    Some(v) => format!("hipfire {v}"),
+                    None => "hipfire".to_string(),
+                }}
+            </div>
         </aside>
     }
 }

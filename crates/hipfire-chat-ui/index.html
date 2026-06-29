@@ -38,7 +38,7 @@
     /* Settings drawer — slides in from the right, overlaying the transcript. */
     .drawer { position: absolute; top: 0; right: 0; height: 100%; width: min(360px, 86vw); z-index: 20;
       transform: translateX(102%); transition: transform 160ms ease; background: var(--panel); border-left: 1px solid var(--line);
-      box-shadow: -8px 0 24px rgba(0,0,0,0.12); padding: 14px 16px 24px; overflow-y: auto; display: grid; gap: 12px; align-content: start; }
+      box-shadow: -8px 0 24px rgba(0,0,0,0.12); padding: 14px 16px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
     .drawer.open { transform: none; }
     .drawer-head { display: flex; align-items: center; justify-content: space-between; }
     .drawer-head strong { font-size: 15px; }
@@ -47,6 +47,8 @@
     input, select { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; background: var(--panel); color: var(--text); }
     .system { width: 100%; min-height: 70px; resize: vertical; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; background: var(--panel); color: var(--text); }
     .hint { margin: -4px 0 0; color: var(--muted); font-size: 12px; }
+    .drawer-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--line); color: var(--muted);
+                   font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
     .toggle { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; }
     .toggle input { width: 18px; height: 18px; margin: 0; }
 
