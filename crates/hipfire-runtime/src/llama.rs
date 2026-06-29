@@ -5,11 +5,11 @@
 //! LLaMA model implementation using RDNA GPU compute.
 //! Supports loading from GGUF files and running inference.
 
-use crate::dispatch::is_batchable_la;
 use crate::kv::KvCache;
 use crate::quant::{
     dequantize_q4_0, dequantize_q4_k, dequantize_q6_k, dequantize_q8_0, f16_to_f32,
 };
+use crate::transformer::MIN_BATCH;
 use crate::weights::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_for_mq, rotate_x_mq_batched_for, weight_gemm,
     weight_gemv, weight_gemv_prerotated, EmbeddingFormat, LayerWeights, WeightTensor,
@@ -612,21 +612,13 @@ pub fn forward_prefill_batch(
         return Ok(());
     }
 
-    let force_fallback = !crate::config::get().prefill_batched;
-    const MIN_BATCH: usize = 4;
+    // Eligibility goes through the shared transformer seam so the
+    // per-(dtype × arch) coverage decision lives in one place (mirrored by the
+    // capture-mode assertion in `forward_prefill_batch_chunk_captured`).
     let arch = gpu.arch.as_str();
-    let kv_ok =
-        kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
-    let weights_ok = weights.layers.iter().all(|l| {
-        is_batchable_la(l.wq.gpu_dtype, arch)
-            && is_batchable_la(l.wk.gpu_dtype, arch)
-            && is_batchable_la(l.wv.gpu_dtype, arch)
-            && is_batchable_la(l.wo.gpu_dtype, arch)
-            && is_batchable_la(l.w_gate.gpu_dtype, arch)
-            && is_batchable_la(l.w_up.gpu_dtype, arch)
-            && is_batchable_la(l.w_down.gpu_dtype, arch)
-    });
-    let eligible = !force_fallback && n >= MIN_BATCH && kv_ok && weights_ok;
+    let batched_enabled = crate::config::get().prefill_batched;
+    let eligible =
+        crate::transformer::llama_prefill_batchable(weights, kv_cache, arch, n, batched_enabled);
 
     if !eligible {
         for (i, &tok) in tokens.iter().enumerate() {
@@ -725,19 +717,9 @@ pub fn forward_prefill_batch_chunk_captured(
     );
 
     let arch = gpu.arch.as_str();
-    let kv_ok =
-        kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
-    let weights_ok = weights.layers.iter().all(|l| {
-        is_batchable_la(l.wq.gpu_dtype, arch)
-            && is_batchable_la(l.wk.gpu_dtype, arch)
-            && is_batchable_la(l.wv.gpu_dtype, arch)
-            && is_batchable_la(l.wo.gpu_dtype, arch)
-            && is_batchable_la(l.w_gate.gpu_dtype, arch)
-            && is_batchable_la(l.w_up.gpu_dtype, arch)
-            && is_batchable_la(l.w_down.gpu_dtype, arch)
-    });
     assert!(
-        kv_ok && weights_ok,
+        crate::transformer::kv_quant_batchable(kv_cache)
+            && crate::transformer::llama_weights_batchable(weights, arch),
         "forward_prefill_batch_chunk_captured requires batched-eligible weights + KV"
     );
 
@@ -3049,6 +3031,7 @@ fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transformer::is_batchable_la;
 
     #[test]
     fn is_batchable_la_always_ok_dtypes() {

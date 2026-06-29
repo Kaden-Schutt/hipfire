@@ -167,6 +167,7 @@ fn validate(spec: &Spec) -> anyhow::Result<()> {
         }
     }
     validate_arch_id_coverage(spec)?;
+    gfx_class_agreement(spec)?;
     Ok(())
 }
 
@@ -241,6 +242,204 @@ fn support_glyph(m: &str) -> &'static str {
     }
 }
 
+// ── gfx capability classes ──────────────────────────────────────────────────
+// Support clusters by GPU capability, not by individual gfx id, so the matrix's
+// gfx axis is these classes. Each carries a representative gfx id used to
+// evaluate the pure runtime predicates (e.g. `is_batchable_la`). `members` lists
+// the ids that must all agree under those predicates — `gfx_class_agreement`
+// asserts that, so a class never silently hides an intra-class split.
+struct GfxClass {
+    label: &'static str,
+    repr: &'static str,
+    members: &'static [&'static str],
+}
+
+const GFX_CLASSES: &[GfxClass] = &[
+    GfxClass {
+        label: "cdna",
+        repr: "gfx906",
+        members: &["gfx900", "gfx906", "gfx908", "gfx942"],
+    },
+    GfxClass {
+        label: "rdna12",
+        repr: "gfx1030",
+        members: &[
+            "gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032",
+        ],
+    },
+    GfxClass {
+        label: "rdna3",
+        repr: "gfx1100",
+        members: &["gfx1100", "gfx1101", "gfx1102"],
+    },
+    GfxClass {
+        label: "rdna3.5",
+        repr: "gfx1151",
+        members: &["gfx1150", "gfx1151"],
+    },
+    GfxClass {
+        label: "rdna4",
+        repr: "gfx1201",
+        members: &["gfx1200", "gfx1201"],
+    },
+];
+
+/// `✓`/`·` for a derived boolean, `🔒` for a quant whose prefill is governed by a
+/// quality `[[gate]]` rather than a kernel predicate (the runtime predicate
+/// returns `None`).
+fn bool_glyph(b: Option<bool>) -> &'static str {
+    match b {
+        Some(true) => "✅",
+        Some(false) => "❌",
+        None => "🔒",
+    }
+}
+
+/// Assert every member gfx id of a class agrees with the class representative
+/// under the prefill predicate, for every quant — otherwise the class is hiding
+/// an intra-class split and the gfx axis granularity is wrong.
+fn gfx_class_agreement(spec: &Spec) -> anyhow::Result<()> {
+    use hipfire_runtime::transformer::quant_prefill_batchable;
+    for class in GFX_CLASSES {
+        for q in &spec.quant {
+            let repr = quant_prefill_batchable(&q.name, class.repr);
+            for &m in class.members {
+                let got = quant_prefill_batchable(&q.name, m);
+                if got != repr {
+                    anyhow::bail!(
+                        "gfx class {:?} is not uniform for quant {:?}: repr {} => {:?}, \
+                         but member {} => {:?}. Split the class or fix the predicate.",
+                        class.label,
+                        q.name,
+                        class.repr,
+                        repr,
+                        m,
+                        got,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derived 2-D projections of the N-D capability space, rendered from the pure
+/// runtime predicates (no GPU). The classic per-arch chart in [`render_chart`]
+/// is the `family × feature` projection (collapsed at the reference gfx + best
+/// stable quant); these add the gfx/quant cross-sections that the per-arch chart
+/// flattens away.
+fn render_projections(spec: &Spec) -> String {
+    use hipfire_runtime::transformer::quant_prefill_batchable;
+
+    let mut s = String::new();
+    s.push_str("\n### Batched prefill: quant × gfx-class (derived)\n\n");
+    s.push_str(
+        "Projection of the prefill axis over **weight-quant × gfx-class**, computed from the \
+         runtime predicate `is_batchable_la` (GPU-free). ✅ = batched-prefill GEMM exists; \
+         ❌ = falls back to per-token decode; 🔒 = governed by a quality `[[gate]]` (OQ \
+         activation-quant formats), see the gates table. This is the kernel-availability truth \
+         the per-arch chart collapses to the reference gfx.\n\n",
+    );
+    s.push('|');
+    s.push_str(" Quant |");
+    for c in GFX_CLASSES {
+        s.push_str(&format!(" {} |", c.label));
+    }
+    s.push('\n');
+    s.push_str("|---|");
+    for _ in GFX_CLASSES {
+        s.push_str("---|");
+    }
+    s.push('\n');
+    for q in &spec.quant {
+        s.push_str(&format!("| {} |", q.name));
+        for c in GFX_CLASSES {
+            s.push_str(&format!(
+                " {} |",
+                bool_glyph(quant_prefill_batchable(&q.name, c.repr))
+            ));
+        }
+        s.push('\n');
+    }
+
+    // Prefill × kv-mode projection: the other purely-derived axis, from
+    // `kv_mode_prefill_batchable`. gfx-independent (the batched flash-masked
+    // prefill kernels exist on every arch that has the quant GEMM).
+    use hipfire_runtime::transformer::{kv_mode_prefill_batchable, KvPrefillMode};
+    s.push_str("\n### Batched prefill: kv-mode (derived)\n\n");
+    s.push_str(
+        "Projection of the prefill axis over **kv-mode**, from `kv_mode_prefill_batchable`. \
+         Only Q8 and the rotated asym K modes have a batched flash-masked prefill kernel; \
+         fp32 and no-kv (SSM) fall back to per-token decode.\n\n",
+    );
+    s.push_str("| KV mode | Batched prefill |\n|---|---|\n");
+    for (label, mode) in [
+        ("fp32", KvPrefillMode::Fp32),
+        ("q8", KvPrefillMode::Q8),
+        ("asym{2,3,4}", KvPrefillMode::Asym),
+        ("no-kv (SSM)", KvPrefillMode::NoKv),
+    ] {
+        s.push_str(&format!(
+            "| {} | {} |\n",
+            label,
+            bool_glyph(Some(kv_mode_prefill_batchable(mode)))
+        ));
+    }
+
+    s.push_str(&render_dflash_projection(spec));
+    s
+}
+
+/// `dflash: family × gfx-class` projection. The cell combines the per-family
+/// `[[arch]].dflash` *intent* (does the family have a draft/spec path at all)
+/// with the mechanical gfx gate `dflash_gfx_supported` (dflash needs WMMA): a
+/// family that targets dflash still shows ❌ on non-WMMA gfx (cdna / rdna12),
+/// because the spec path falls back to plain autoregressive decode there.
+fn render_dflash_projection(spec: &Spec) -> String {
+    use hipfire_runtime::transformer::dflash_gfx_supported;
+
+    let mut s = String::new();
+    s.push_str("\n### DFlash spec-decode: family × gfx-class (derived)\n\n");
+    s.push_str(
+        "Projection of the dflash axis over **family × gfx-class**: the per-family `[[arch]]` \
+         intent capped by the gfx WMMA gate `dflash_gfx_supported` (GPU-free, shares \
+         `arch_caps.has_wmma`). ✅/🟡 = family intent on a WMMA gfx; ❌ = no spec path for the \
+         family, or a non-WMMA gfx where dflash falls back to plain decode.\n\n",
+    );
+    s.push('|');
+    s.push_str(" Family (arch_id) |");
+    for c in GFX_CLASSES {
+        s.push_str(&format!(" {} |", c.label));
+    }
+    s.push('\n');
+    s.push_str("|---|");
+    for _ in GFX_CLASSES {
+        s.push_str("---|");
+    }
+    s.push('\n');
+    for a in &spec.arch {
+        let ids = a
+            .ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!("| {} ({}) |", a.label, ids));
+        for c in GFX_CLASSES {
+            // Cap intent by the mechanical gfx gate: full/partial intent on a
+            // non-WMMA class collapses to none.
+            let cell = if a.dflash == "none" || !dflash_gfx_supported(c.repr) {
+                "none"
+            } else {
+                a.dflash.as_str()
+            };
+            s.push_str(&format!(" {} |", support_glyph(cell)));
+        }
+        s.push('\n');
+    }
+    s
+}
+
 fn render_rust(spec: &Spec) -> String {
     let mut s = String::new();
     s.push_str("// SPDX-License-Identifier: Apache-2.0\n");
@@ -309,6 +508,12 @@ fn render_chart(spec: &Spec) -> String {
     s.push_str("### Capability matrix (generated)\n\n");
     s.push_str("Machine-readable subset consumed by `arch_features` / admission. Edit `docs/model-support.toml`.\n\n");
     s.push_str(
+        "This per-arch chart is the **`family × feature` projection** of the 5-axis capability \
+         space (`family × gfx-class × quant × kv × feature`), collapsed at the reference gfx \
+         (`rdna3.5`/gfx1151), the family's best stable quant, and its best KV mode. The gfx/quant \
+         cross-sections it flattens are rendered as separate derived projections below.\n\n",
+    );
+    s.push_str(
         "| Arch (arch_id) | Batched prefill | DFlash spec | MTP spec | KV quant | Vision |\n",
     );
     s.push_str("|---|---|---|---|---|---|\n");
@@ -355,6 +560,8 @@ fn render_chart(spec: &Spec) -> String {
             g.note,
         ));
     }
+
+    s.push_str(&render_projections(spec));
     s
 }
 

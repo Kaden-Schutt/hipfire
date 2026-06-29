@@ -50,6 +50,7 @@ pub mod speed_bench;
 pub mod tokenizer;
 pub mod tool_call;
 pub mod tp_shard;
+pub mod transformer;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 #[cfg(feature = "deltanet")]
