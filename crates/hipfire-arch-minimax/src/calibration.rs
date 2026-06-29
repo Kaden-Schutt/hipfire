@@ -126,14 +126,18 @@ pub fn collect_calibration_artifacts(
     ));
     static_meta.push((
         "routed_expert_capture",
-        serde_json::json!("not-captured:indexed-moe-kernels-need-explicit-taps"),
+        serde_json::json!("imatrix-only-per-selected-expert"),
     ));
 
+    // Routed experts are captured by NAME via taps in forward.rs (the fused
+    // indexed-MoE GEMV has no per-tensor weight pointer); imatrix-only because
+    // per-expert [K,K] Hessians do not fit. Dense/attn/router/lm_head keep full
+    // Hessians (pointer-captured via build_capture_names).
     collect(
         gpu,
         crate::ARCH_ID,
         build_capture_names(weights),
-        Vec::new(),
+        vec![".block_sparse_moe.experts.".to_string()],
         output,
         &static_meta,
         |gpu| {

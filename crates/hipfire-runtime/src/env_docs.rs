@@ -1208,7 +1208,7 @@ pub const ENV_HIPFIRE_EMIT_TOKEN_IDS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EP_DECODE_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_DECODE_TIMING",
     description: "2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd)",
-    source: "crates/hipfire-arch-minimax/src/forward.rs:1480",
+    source: "crates/hipfire-arch-minimax/src/forward.rs:1574",
 };
 
 /// `HIPFIRE_EP_DUMP_IDX` — top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable
@@ -1982,7 +1982,7 @@ pub const ENV_HIPFIRE_MEMSET_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MINIMAX_CAPTURE_POSTATTN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MINIMAX_CAPTURE_POSTATTN",
     description: "Runtime variable controlling minimax capture postattn in hipfire",
-    source: "crates/hipfire-arch-minimax/src/forward.rs:131",
+    source: "crates/hipfire-arch-minimax/src/forward.rs:206",
 };
 
 /// `HIPFIRE_MINIMAX_DOWN_FORMAT` — Runtime variable controlling minimax down format in hipfire
