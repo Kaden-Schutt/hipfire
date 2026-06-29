@@ -16,3 +16,6 @@
 [submodule "third_party/moshi"]
 	path = third_party/moshi
 	url = https://github.com/kyutai-labs/moshi.git
+[submodule "third_party/transformers"]
+	path = third_party/transformers
+	url = https://github.com/Zyphra/transformers
