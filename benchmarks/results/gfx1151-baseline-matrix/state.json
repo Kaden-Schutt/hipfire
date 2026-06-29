@@ -1,0 +1,5338 @@
+{
+  "done": [
+    [
+      "llama-3.2-1b-inst",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "nemotron-4b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "supra-50m",
+      "mq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4",
+      "f16"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "nemotron-4b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "nemotron-4b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "supra-50m",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "mq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "supra-50m",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4",
+      "q8"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4",
+      "q8"
+    ],
+    [
+      "nemotron-4b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "supra-50m",
+      "oq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "supra-50m",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "nemotron-4b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "supra-50m",
+      "mq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4",
+      "q8"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "nemotron-4b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4",
+      "q8"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "mq4",
+      "q8"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "supra-50m",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "supra-50m",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "nemotron-4b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "supra-50m",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "supra-50m",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "nemotron-4b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "supra-50m",
+      "oq4",
+      "q8"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "nemotron-4b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "supra-50m",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4",
+      "f16"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4",
+      "f16"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4",
+      "f16"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "supra-50m",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4+",
+      "f16"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "supra-50m",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4",
+      "f16"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "nemotron-4b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4++",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "nemotron-4b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "mq4",
+      "f16"
+    ],
+    [
+      "nemotron-4b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4",
+      "f16"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4",
+      "f16"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4",
+      "q8"
+    ],
+    [
+      "llama-3.2-1b",
+      "mq4+",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "oq4",
+      "kvarn"
+    ],
+    [
+      "nemotron-4b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4",
+      "kvarn"
+    ],
+    [
+      "llama-3.1-8b-inst",
+      "oq4+",
+      "f16"
+    ],
+    [
+      "lfm2.5-350m",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "qwen3.5-4b",
+      "oq4++",
+      "f16"
+    ],
+    [
+      "llama-3.2-1b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "oq4+",
+      "kvarn"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "qwen3.5-4b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "nemotron-4b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "qwen3.5-2b",
+      "oq4",
+      "asym4"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "lfm2.5-8b-a1b",
+      "mq4",
+      "f16"
+    ],
+    [
+      "llama-3.2-1b-inst",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "qwen3.5-9b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "qwen3.5-0.8b",
+      "mq4",
+      "q8"
+    ],
+    [
+      "lfm2.5-1.2b-inst",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "qwen3.5-9b",
+      "oq4",
+      "q8"
+    ],
+    [
+      "llama-3.2-3b-inst",
+      "oq4++",
+      "kvarn"
+    ]
+  ],
+  "failed": [
+    [
+      "qwen3-0.6b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "supra-50m",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "supra-50m",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "nemotron-4b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "supra-50m",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "supra-50m",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "nemotron-4b",
+      "mq4+",
+      "asym4"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "supra-50m",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "nemotron-4b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "qwen3-0.6b",
+      "oq4+",
+      "q8"
+    ],
+    [
+      "qwen3-0.6b",
+      "mq4+",
+      "q8"
+    ],
+    [
+      "supra-50m",
+      "oq4++",
+      "asym4"
+    ],
+    [
+      "nemotron-4b",
+      "oq4++",
+      "q8"
+    ],
+    [
+      "nemotron-4b",
+      "oq4+",
+      "asym4"
+    ],
+    [
+      "nemotron-4b",
+      "oq4++",
+      "asym4"
+    ]
+  ],
+  "rows": [
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 549.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5209.3,
+      "decode_tok_s": 185.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 549.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5114.4,
+      "decode_tok_s": 179.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 549.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5327.8,
+      "decode_tok_s": 193.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 549.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 216.3,
+      "decode_tok_s": 195.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5146.2,
+      "decode_tok_s": 183.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5063.4,
+      "decode_tok_s": 177.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5079.1,
+      "decode_tok_s": 191.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 213.5,
+      "decode_tok_s": 193.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 549.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5363.4,
+      "decode_tok_s": 186.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 549.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5297.9,
+      "decode_tok_s": 179.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 549.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5204.8,
+      "decode_tok_s": 193.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 549.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 215.8,
+      "decode_tok_s": 195.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 39.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 723.9982598717228,
+      "decode_tok_s": 575.0307373895479,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 39.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 720.3333881931067,
+      "decode_tok_s": 567.8466757190891,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 39.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 721.9951677139934,
+      "decode_tok_s": 576.2798691659007,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 39.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 722.8925865794878,
+      "decode_tok_s": 568.8394490157892,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 495.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 6185.651241633671,
+      "decode_tok_s": 219.76871362016536,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 495.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 6099.103052646158,
+      "decode_tok_s": 219.4979387977464,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 495.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 6144.307886459602,
+      "decode_tok_s": 219.4093870240308,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 495.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 6130.4075758830495,
+      "decode_tok_s": 219.78221683978623,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 538.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5135.2,
+      "decode_tok_s": 183.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 538.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5052.6,
+      "decode_tok_s": 176.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 538.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5060.6,
+      "decode_tok_s": 191.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 538.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 212.5,
+      "decode_tok_s": 191.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5093.8,
+      "decode_tok_s": 185.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5126.6,
+      "decode_tok_s": 177.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5217.9,
+      "decode_tok_s": 193.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-0.8b",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 538.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 214.4,
+      "decode_tok_s": 194.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 806.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4010.581286425382,
+      "decode_tok_s": 106.85069008958898,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 806.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3989.3368261235146,
+      "decode_tok_s": 106.86951301758752,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 806.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3960.8250141586113,
+      "decode_tok_s": 106.77544539737876,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 806.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4002.703664053298,
+      "decode_tok_s": 106.85127272011792,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 806.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4164.223797012684,
+      "decode_tok_s": 106.36750398428988,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 806.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4148.641665292535,
+      "decode_tok_s": 106.23911637314784,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 806.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4140.669599342387,
+      "decode_tok_s": 106.37529745795068,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 806.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4119.83590340468,
+      "decode_tok_s": 106.3721072323584,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 1285.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3874.5,
+      "decode_tok_s": 112.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 1285.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3690.7,
+      "decode_tok_s": 110.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 1285.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3889.7,
+      "decode_tok_s": 115.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 1285.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 123.3,
+      "decode_tok_s": 116.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1919.1,
+      "decode_tok_s": 107.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1924.8,
+      "decode_tok_s": 105.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1928.4,
+      "decode_tok_s": 110.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 117.1,
+      "decode_tok_s": 109.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 1285.3,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3773.3,
+      "decode_tok_s": 112.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 1285.3,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3791.1,
+      "decode_tok_s": 110.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 1285.3,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3857.6,
+      "decode_tok_s": 115.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 1285.3,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 123.5,
+      "decode_tok_s": 116.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 1253.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1938.6,
+      "decode_tok_s": 107.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 1253.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1947.5,
+      "decode_tok_s": 105.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 1253.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1919.1,
+      "decode_tok_s": 110.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 1253.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 117.1,
+      "decode_tok_s": 110.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1941.7,
+      "decode_tok_s": 107.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1931.8,
+      "decode_tok_s": 105.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1889.3,
+      "decode_tok_s": 110.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-2b",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 1252.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 117.3,
+      "decode_tok_s": 110.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 1926.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1458.1083246528774,
+      "decode_tok_s": 55.88131602689092,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 1926.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1444.4309434368506,
+      "decode_tok_s": 55.89316975675534,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 1926.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1448.1700329418488,
+      "decode_tok_s": 55.937597889703774,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 1926.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1450.8353299887058,
+      "decode_tok_s": 55.86582537819764,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 2587.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 963.5,
+      "decode_tok_s": 53.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 2587.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1279.2,
+      "decode_tok_s": 59.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 2587.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1290.1,
+      "decode_tok_s": 61.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 2587.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 62.8,
+      "decode_tok_s": 60.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1129.0,
+      "decode_tok_s": 60.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1124.2,
+      "decode_tok_s": 59.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1133.1,
+      "decode_tok_s": 61.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 62.0,
+      "decode_tok_s": 59.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 2588.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1288.4,
+      "decode_tok_s": 60.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 2588.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1282.4,
+      "decode_tok_s": 59.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 2588.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1286.0,
+      "decode_tok_s": 61.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 2588.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 62.8,
+      "decode_tok_s": 60.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 2504.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1132.8,
+      "decode_tok_s": 60.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 2504.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1114.8,
+      "decode_tok_s": 59.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 2504.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1130.6,
+      "decode_tok_s": 60.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 2504.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 62.1,
+      "decode_tok_s": 59.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1114.1,
+      "decode_tok_s": 60.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1110.0,
+      "decode_tok_s": 59.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1119.6,
+      "decode_tok_s": 61.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-4b",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 2504.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 62.2,
+      "decode_tok_s": 60.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 4242.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 50.33716353702893,
+      "decode_tok_s": 37.71865297390868,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 4242.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 50.244738367366025,
+      "decode_tok_s": 37.75242606270583,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 4242.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 50.06597455861552,
+      "decode_tok_s": 37.629578222304424,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 4242.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 50.16493254728078,
+      "decode_tok_s": 37.67304814995709,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 4555.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 756.3153979557671,
+      "decode_tok_s": 44.26597969186133,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 4555.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 757.5661556472727,
+      "decode_tok_s": 44.259871559235854,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 4555.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 756.6034262523664,
+      "decode_tok_s": 44.24312060987007,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 4555.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 755.5605835799453,
+      "decode_tok_s": 44.238604154751314,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 5313.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 740.9,
+      "decode_tok_s": 40.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 5313.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 735.8,
+      "decode_tok_s": 39.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 5313.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 744.4,
+      "decode_tok_s": 40.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 5313.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 41.4,
+      "decode_tok_s": 40.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 241.4,
+      "decode_tok_s": 37.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 235.9,
+      "decode_tok_s": 37.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 241.9,
+      "decode_tok_s": 38.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 39.2,
+      "decode_tok_s": 38.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 5315.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 748.5,
+      "decode_tok_s": 41.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 5315.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 746.5,
+      "decode_tok_s": 40.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 5315.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 747.7,
+      "decode_tok_s": 41.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 5315.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 42.4,
+      "decode_tok_s": 41.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 5129.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 240.5,
+      "decode_tok_s": 37.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 5129.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 241.4,
+      "decode_tok_s": 37.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 5129.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 245.2,
+      "decode_tok_s": 38.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 5129.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 39.4,
+      "decode_tok_s": 38.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 252.1,
+      "decode_tok_s": 37.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 237.5,
+      "decode_tok_s": 37.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 248.8,
+      "decode_tok_s": 38.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3.5-9b",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 5127.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 39.1,
+      "decode_tok_s": 38.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 42.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 679.3856271252465,
+      "decode_tok_s": 546.3140091369652,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 42.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 684.3305485448076,
+      "decode_tok_s": 546.8663243716412,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 42.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 680.814001905836,
+      "decode_tok_s": 544.8266420364163,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 42.8,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 681.7367544945323,
+      "decode_tok_s": 543.6407067696146,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "supra-50m",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 481.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 218.03420044463635,
+      "decode_tok_s": 185.9739401633555,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 481.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 217.99742186581187,
+      "decode_tok_s": 186.08006878821905,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 481.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 218.16764835689872,
+      "decode_tok_s": 185.7446204643021,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 481.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 218.04731928681855,
+      "decode_tok_s": 186.11062836243565,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.37822684352645,
+      "decode_tok_s": 79.5851732275129,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.58058434199933,
+      "decode_tok_s": 79.61050599745995,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.57757848474957,
+      "decode_tok_s": 79.59237709231648,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.60557678587159,
+      "decode_tok_s": 79.57377461447489,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.44033230555766,
+      "decode_tok_s": 79.39432905314095,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.26741508069621,
+      "decode_tok_s": 79.4822585410756,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.4847358834557,
+      "decode_tok_s": 79.38521147762069,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.46285579064403,
+      "decode_tok_s": 79.48423020227568,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.76390641380586,
+      "decode_tok_s": 43.89665007001773,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.70488417217435,
+      "decode_tok_s": 43.86422582811289,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.7046877021523,
+      "decode_tok_s": 43.835492407932094,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.71503467529416,
+      "decode_tok_s": 43.788731064206395,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": null,
+      "status": "fail",
+      "note": "calib generation failed",
+      "prefill_tok_s": null,
+      "decode_tok_s": null,
+      "kld": null,
+      "ppl": null,
+      "quality_status": null,
+      "speed_status": null,
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.6671359360142,
+      "decode_tok_s": 28.79661204835607,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.660804939033365,
+      "decode_tok_s": 28.73420660756667,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.684036121361263,
+      "decode_tok_s": 28.782503441400262,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.677340675773586,
+      "decode_tok_s": 28.808516372169517,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3909.1,
+      "decode_tok_s": 473.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3850.7,
+      "decode_tok_s": 467.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3850.7,
+      "decode_tok_s": 473.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3739.1,
+      "decode_tok_s": 473.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 421.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 421.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 423.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 14333.3,
+      "decode_tok_s": 423.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3794.1,
+      "decode_tok_s": 467.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3794.1,
+      "decode_tok_s": 473.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3685.7,
+      "decode_tok_s": 473.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 229.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3850.7,
+      "decode_tok_s": 473.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 223.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 412.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 223.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 14333.3,
+      "decode_tok_s": 415.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 223.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 415.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 223.0,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 14333.3,
+      "decode_tok_s": 412.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 14333.3,
+      "decode_tok_s": 426.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 421.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 423.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-350m",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 222.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 13578.9,
+      "decode_tok_s": 423.8,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1121.7,
+      "decode_tok_s": 227.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1141.6,
+      "decode_tok_s": 227.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1131.6,
+      "decode_tok_s": 226.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1157.0,
+      "decode_tok_s": 227.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 135.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 135.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 135.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 135.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1141.6,
+      "decode_tok_s": 226.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1157.0,
+      "decode_tok_s": 226.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1136.6,
+      "decode_tok_s": 227.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 698.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1151.8,
+      "decode_tok_s": 227.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 674.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 133.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 674.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4161.3,
+      "decode_tok_s": 134.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 674.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4161.3,
+      "decode_tok_s": 134.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 674.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 134.5,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 135.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4161.3,
+      "decode_tok_s": 135.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4161.3,
+      "decode_tok_s": 135.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-1.2b-inst",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 674.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4229.5,
+      "decode_tok_s": 135.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4",
+      "kv": "q8",
+      "hfq_mb": 4659.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 542.7,
+      "decode_tok_s": 152.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4",
+      "kv": "asym4",
+      "hfq_mb": 4659.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 541.5,
+      "decode_tok_s": 151.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4",
+      "kv": "f16",
+      "hfq_mb": 4659.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 544.0,
+      "decode_tok_s": 151.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4",
+      "kv": "kvarn",
+      "hfq_mb": 4659.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 542.7,
+      "decode_tok_s": 151.3,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 628.3,
+      "decode_tok_s": 132.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 628.3,
+      "decode_tok_s": 132.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 628.3,
+      "decode_tok_s": 131.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 628.3,
+      "decode_tok_s": 132.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 4659.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 542.7,
+      "decode_tok_s": 150.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 4659.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 542.7,
+      "decode_tok_s": 150.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 4659.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 544.0,
+      "decode_tok_s": 150.6,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 4659.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 541.5,
+      "decode_tok_s": 150.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 4649.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 626.7,
+      "decode_tok_s": 131.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 4649.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 630.0,
+      "decode_tok_s": 130.9,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 4649.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 630.0,
+      "decode_tok_s": 131.1,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 4649.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 628.3,
+      "decode_tok_s": 131.4,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 630.0,
+      "decode_tok_s": 132.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 628.3,
+      "decode_tok_s": 132.0,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 630.0,
+      "decode_tok_s": 131.7,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "lfm2.5-8b-a1b",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 4648.9,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 628.3,
+      "decode_tok_s": 132.2,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3985.102037101587,
+      "decode_tok_s": 106.58629598075768,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3979.056611920404,
+      "decode_tok_s": 106.64562406309736,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3994.049873197013,
+      "decode_tok_s": 106.50007445769658,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 3979.3603128107025,
+      "decode_tok_s": 106.59842768318526,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.17748719750101,
+      "decode_tok_s": 79.27267823086505,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.22611669492144,
+      "decode_tok_s": 79.13751954539076,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.09796667124945,
+      "decode_tok_s": 79.19676257593018,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.23451833797188,
+      "decode_tok_s": 79.16636080413309,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.56884615211223,
+      "decode_tok_s": 79.51277967784746,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.48375501494438,
+      "decode_tok_s": 79.53583720533258,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.69227445017708,
+      "decode_tok_s": 79.59261277282053,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 83.51649921768458,
+      "decode_tok_s": 79.66007909095762,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 5001.700418343501,
+      "decode_tok_s": 103.75427281575833,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4920.838873797006,
+      "decode_tok_s": 104.7424027863993,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4897.800737248888,
+      "decode_tok_s": 104.70471101325526,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 807.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 4930.9221134700965,
+      "decode_tok_s": 104.74908213371276,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.24167317260925,
+      "decode_tok_s": 78.05881837587961,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.23993303876462,
+      "decode_tok_s": 78.09949248838655,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.29868521839667,
+      "decode_tok_s": 78.1481783948398,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 784.4,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.18799413841107,
+      "decode_tok_s": 78.03406402463777,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.51572008169605,
+      "decode_tok_s": 78.52411183462901,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.45631080033307,
+      "decode_tok_s": 78.43913331302454,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.5949069814416,
+      "decode_tok_s": 78.40347570840181,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-1b-inst",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 783.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 82.49980359643402,
+      "decode_tok_s": 78.41822817402578,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 1928.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1815.5144093608433,
+      "decode_tok_s": 55.039841746144624,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 1928.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1780.491497112111,
+      "decode_tok_s": 54.95096269248377,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 1928.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1799.105354914083,
+      "decode_tok_s": 54.97256170847424,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 1928.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 1782.1659169138306,
+      "decode_tok_s": 54.99463221884709,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 1862.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.22967544293969,
+      "decode_tok_s": 43.10287976374104,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 1862.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.26102079278107,
+      "decode_tok_s": 43.19169156630568,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 1862.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.2343297729639,
+      "decode_tok_s": 43.05891066513308,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 1862.2,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.243713350904585,
+      "decode_tok_s": 43.06176841087456,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.469165514675815,
+      "decode_tok_s": 43.30580764097373,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.44119458609067,
+      "decode_tok_s": 43.2579239011672,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.483677241215034,
+      "decode_tok_s": 43.32979444910155,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.2-3b-inst",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 1860.7,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 45.43964652296306,
+      "decode_tok_s": 43.27240214676307,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4+",
+      "kv": "q8",
+      "hfq_mb": 4558.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 723.7485849934764,
+      "decode_tok_s": 41.18313773447825,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4+",
+      "kv": "asym4",
+      "hfq_mb": 4558.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 773.744081781694,
+      "decode_tok_s": 43.71069661649776,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4+",
+      "kv": "f16",
+      "hfq_mb": 4558.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 780.0678692940609,
+      "decode_tok_s": 43.65993603273622,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "mq4+",
+      "kv": "kvarn",
+      "hfq_mb": 4558.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 775.5185781855469,
+      "decode_tok_s": 43.63626509774318,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4+",
+      "kv": "q8",
+      "hfq_mb": 4382.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.326973931636463,
+      "decode_tok_s": 28.334046975743423,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4+",
+      "kv": "asym4",
+      "hfq_mb": 4382.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.427149339566316,
+      "decode_tok_s": 28.41782212347345,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4+",
+      "kv": "f16",
+      "hfq_mb": 4382.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.353503019680335,
+      "decode_tok_s": 28.362667097528668,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4+",
+      "kv": "kvarn",
+      "hfq_mb": 4382.6,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.340016361890385,
+      "decode_tok_s": 28.329326614124035,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4++",
+      "kv": "q8",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.522647308317584,
+      "decode_tok_s": 28.525656227038656,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4++",
+      "kv": "asym4",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.51977497447128,
+      "decode_tok_s": 28.50778247806869,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4++",
+      "kv": "f16",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.504818539660143,
+      "decode_tok_s": 28.493269231568465,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "llama-3.1-8b-inst",
+      "format": "oq4++",
+      "kv": "kvarn",
+      "hfq_mb": 4380.1,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 29.51146580992363,
+      "decode_tok_s": 28.52184132574235,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "fail",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4",
+      "kv": "q8",
+      "hfq_mb": 3591.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 75.90755690064533,
+      "decode_tok_s": 42.240008218216,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4",
+      "kv": "asym4",
+      "hfq_mb": 3591.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 76.06584111841099,
+      "decode_tok_s": 42.24904348549631,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4",
+      "kv": "f16",
+      "hfq_mb": 3591.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 75.70912935486677,
+      "decode_tok_s": 42.32009469975286,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    },
+    {
+      "model": "nemotron-4b",
+      "format": "oq4",
+      "kv": "kvarn",
+      "hfq_mb": 3591.5,
+      "status": "ok",
+      "note": "",
+      "prefill_tok_s": 75.5493232481407,
+      "decode_tok_s": 42.19567043037854,
+      "kld": null,
+      "ppl": null,
+      "quality_status": "skip",
+      "speed_status": "pass",
+      "speed_reason": null
+    }
+  ]
+}
