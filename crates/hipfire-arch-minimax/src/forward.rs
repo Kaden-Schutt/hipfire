@@ -314,6 +314,17 @@ fn decode_step_body(
                     k_top,
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up mq3l: {e:?}"))?,
+            DType::Oq4G256 => gpu
+                .gemv_oq4g256_moe_gate_up_k8_indexed(
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                )
+                .map_err(|e| format!("minimax L{l}: gate_up oq4: {e:?}"))?,
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }
 
@@ -403,6 +414,28 @@ fn decode_step_body(
                     k_top,
                 )
                 .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
+            }
+            DType::Oq4G256 => {
+                gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.rot_batch,
+                    &state.down_expanded,
+                    hidden,
+                    inter,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: down oq4: {e:?}"))?;
+                gpu.moe_down_combine_k8_batched(
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    &state.h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
             }
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }
@@ -599,6 +632,17 @@ fn minimax_moe_block(
                 k_top,
             )
             .map_err(|e| format!("minimax L{l}: gate_up mq3l: {e:?}"))?,
+        DType::Oq4G256 => gpu
+            .gemv_oq4g256_moe_gate_up_k8_indexed(
+                &layer.expert_gate_up_ptrs,
+                &state.topk_indices,
+                &state.ffn_x_rot,
+                &state.gate_batch,
+                &state.up_batch,
+                2 * inter,
+                hidden,
+            )
+            .map_err(|e| format!("minimax L{l}: gate_up oq4: {e:?}"))?,
         other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
     }
     fused_silu_mul_rotate_mq_batched_for(
@@ -682,6 +726,28 @@ fn minimax_moe_block(
                 k_top,
             )
             .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
+        }
+        DType::Oq4G256 => {
+            gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                &layer.expert_down_ptrs,
+                &state.topk_indices,
+                &state.rot_batch,
+                &state.down_expanded,
+                hidden,
+                inter,
+                k_top,
+                1,
+            )
+            .map_err(|e| format!("minimax L{l}: down oq4: {e:?}"))?;
+            gpu.moe_down_combine_k8_batched(
+                &state.down_expanded,
+                &state.topk_weights,
+                out_target,
+                hidden,
+                k_top,
+                1,
+            )
+            .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
         }
         other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
     }
@@ -1115,6 +1181,19 @@ pub fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("minimax L{l} batch gate_up mq2l: {e:?}"))?,
+            DType::Oq4G256 => gpu
+                .gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                    &layer.expert_gate_up_ptrs,
+                    &topk_idx,
+                    &ffn_x_rot,
+                    &gate,
+                    &up,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch gate_up oq4: {e:?}"))?,
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: gate_up dtype {other:?} has no batched kernel yet"
@@ -1179,6 +1258,21 @@ pub fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("minimax L{l} batch down mq2l: {e:?}"))?,
+            DType::Oq4G256 => {
+                gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &rot,
+                    &down_exp,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch down oq4: {e:?}"))?;
+                gpu.moe_down_combine_k8_batched(&down_exp, &topk_w, &x, hidden, k_top, b)
+                    .map_err(|e| format!("minimax L{l} batch combine: {e:?}"))?;
+            }
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: down dtype {other:?} has no batched kernel yet"

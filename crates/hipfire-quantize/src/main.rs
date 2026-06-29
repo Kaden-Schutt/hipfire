@@ -7439,7 +7439,19 @@ fn main() {
                 } else {
                     None
                 };
-                let (q, qt, label) = if let Some(df) = down_fmt.as_deref() {
+                // OQ format requested (oq4/oq4++): emit ALL experts as OQ4G256 so
+                // the per-layer fused gate_up/down blobs stay uniform-stride for the
+                // indexed gemv_oq4g256_moe_* kernels. Takes precedence over the MQ
+                // env knobs (which target MQ-base models). Per-expert LDLQ does not
+                // apply (no per-expert Hessian); AWQ pre-scaling above still holds.
+                let mm_oq4 = lfm2_oq_format.is_some();
+                let (q, qt, label) = if mm_oq4 {
+                    (
+                        quantize_oq4g256(&f32_data, &signs1, &signs2),
+                        QuantType::Oq4G256,
+                        "OQ4-MM",
+                    )
+                } else if let Some(df) = down_fmt.as_deref() {
                     match df {
                         "mq6" => (
                             quantize_mq6g256(&f32_data, &signs1, &signs2),

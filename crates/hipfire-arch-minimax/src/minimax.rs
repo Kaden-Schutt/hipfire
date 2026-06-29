@@ -301,6 +301,36 @@ fn upload_wt_oq(
     })
 }
 
+/// Repack one expert's on-disk OQ4G256 tensor (130 B blocks `[f16 scale | 128
+/// nibbles]`) into the indexed-MoE kernel block layout (132 B `[f32 scale | 128
+/// nibbles]`) that `gemv_oq4g256_moe_*` reads. The 128 signed-nibble payload is
+/// byte-identical; only the scale widens f16 → f32. Called per expert before
+/// fusing w1/w3/w2 into the per-layer gate_up/down blobs.
+fn oq4_ondisk_to_moe_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const SRC_BLK: usize = 130;
+    const DST_BLK: usize = 132;
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ4 expert requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let expect = m * ng * SRC_BLK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQ4 expert byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let mut out = vec![0u8; m * ng * DST_BLK];
+    for blk in 0..(m * ng) {
+        let src = blk * SRC_BLK;
+        let dst = blk * DST_BLK;
+        let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+        out[dst..dst + 4].copy_from_slice(&scale.to_le_bytes());
+        out[dst + 4..dst + DST_BLK].copy_from_slice(&data[src + 2..src + SRC_BLK]);
+    }
+    Ok(out)
+}
+
 fn awq_scale_name(weight_name: &str) -> String {
     match weight_name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
@@ -534,6 +564,18 @@ impl MiniMaxWeights {
                 let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
                 let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
                 let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
+                // OQ4 experts ship as on-disk OQ4G256 (130 B blocks); repack each
+                // into the 132 B indexed-MoE kernel layout before fusing. w1/w3 are
+                // [inter, hidden]; w2 is [hidden, inter].
+                let (w1, w3, w2) = if qt1 == OQ4_QT {
+                    (
+                        oq4_ondisk_to_moe_blocks(&w1, inter, hidden)?,
+                        oq4_ondisk_to_moe_blocks(&w3, inter, hidden)?,
+                        oq4_ondisk_to_moe_blocks(&w2, hidden, inter)?,
+                    )
+                } else {
+                    (w1, w3, w2)
+                };
                 let gu_len = w1.len() + w3.len();
                 if e == 0 {
                     gu_stride = gu_len;
@@ -569,10 +611,22 @@ impl MiniMaxWeights {
             // (the forward's rotate_x_mq / silu_mul_rotate / dtype dispatch read
             // those + the AWQ scale, never the buffer's full extent — per-expert
             // data is reached through the pointer table below).
-            let mut gate_up = wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter, hidden)
-                .map_err(|e2| format!("minimax: pack gate_up L{l}: {e2}"))?;
-            let mut down = wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter)
-                .map_err(|e2| format!("minimax: pack down L{l}: {e2}"))?;
+            // OQ4 expert blobs are already in 132 B kernel layout (repacked per
+            // expert above), so upload them raw as Oq4G256 — NOT through
+            // wt_from_raw, whose OQ4 arm would re-run the dense arch-combined
+            // repack. Other dtypes (MQ*) are byte-identical on disk → kernel.
+            let mut gate_up = if qt_gu == OQ4_QT {
+                upload_wt_oq(gpu, &gu_combined, DType::Oq4G256, 2 * inter, hidden)
+            } else {
+                wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter, hidden)
+            }
+            .map_err(|e2| format!("minimax: pack gate_up L{l}: {e2}"))?;
+            let mut down = if qt_dn == OQ4_QT {
+                upload_wt_oq(gpu, &dn_combined, DType::Oq4G256, hidden, inter)
+            } else {
+                wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter)
+            }
+            .map_err(|e2| format!("minimax: pack down L{l}: {e2}"))?;
             drop(gu_combined);
             drop(dn_combined);
             gate_up.awq_scale = load_mm_awq_scale(
