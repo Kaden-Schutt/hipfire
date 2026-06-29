@@ -2913,14 +2913,14 @@ pub const ENV_HIPFIRE_QUANT_THREADS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH",
     description: "Defaults to auto when unset",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:356",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:360",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_BATCH_MAX` — Runtime variable controlling qwen35 decode batch max in hipfire
 pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_BATCH_MAX",
     description: "Runtime variable controlling qwen35 decode batch max in hipfire",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:480",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:484",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` — Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior
@@ -2928,7 +2928,7 @@ pub const ENV_HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY",
     description:
         "Interprets \"HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY\" from environment to select behavior",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:502",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:506",
 };
 
 /// `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW` — Interprets "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW" from environment to select behavior
@@ -2936,7 +2936,7 @@ pub const ENV_HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW",
     description:
         "Interprets \"HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW\" from environment to select behavior",
-    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:491",
+    source: "crates/hipfire-serving-core/src/qwen35_decode.rs:495",
 };
 
 /// `HIPFIRE_QWEN35_EXPERT_CACHE_MB` — Parses "HIPFIRE_QWEN35_EXPERT_CACHE_MB" with fallback defaults

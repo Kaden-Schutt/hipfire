@@ -161,9 +161,13 @@ pub fn validate_qwen35_fused_dense_decode_model_capability(
         .q35_kv_mode
         .as_deref()
         .ok_or_else(|| "qwen35 fused dense decode requires known KV mode".to_string())?;
-    if !matches!(kv_mode, "fp32" | "f32") {
+    // FP32 or plain Q8 KV. The decode chunk reuses `forward_prefill_dense_session_batch`,
+    // which now branches its per-layer KV write/attention on Q8 (the quant-dense
+    // prefill port). Asym/KVarN/turbo KV modes have no fused kernel yet, so those
+    // fall back to serial_reference here.
+    if !matches!(kv_mode, "fp32" | "f32" | "q8" | "int8") {
         return Err(format!(
-            "qwen35 fused dense decode requires FP32 KV state; loaded kv_mode={kv_mode}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+            "qwen35 fused dense decode requires FP32 or plain Q8 KV state; loaded kv_mode={kv_mode}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
         ));
     }
     let state_quant = m.q35_state_quant.ok_or_else(|| {

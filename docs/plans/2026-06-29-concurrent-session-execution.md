@@ -266,8 +266,23 @@ wire live traffic.
   at the dense gate). Fix candidate: branch the grouped-MoE DeltaNet FP32/Q8 like the
   dense KV branch (needs FP32 DeltaNet layer in the grouped-MoE loop). Separate from
   the dense port; needed for MoE live concurrency.
-- **REMAINING:** dense fused DECODE quant port (qwen35_decode_step_fused_dense_layer_chunked
-  + capability gate requires kv_mode=fp32 today), then live-traffic wiring.
+- **Dense fused DECODE quant port — DONE (kernel-ready).** The dense decode chunk
+  (`qwen35_decode_step_fused_dense_native_chunk`) calls the SAME now-quant-aware
+  `forward_prefill_dense_session_batch`, and the singleton path uses `forward_scratch`
+  (the proven per-token forward, already quant-correct); the decode session-signature
+  validator reuses the SAME (relaxed) contract. So decode needed only the capability
+  gate relaxed: `validate_qwen35_fused_dense_decode_model_capability` now accepts
+  kv_mode `q8`/`int8` (plain Q8 KV) in addition to fp32 (asym/KVarN still fall back).
+  Weights gate was already relaxed via the shared predicate. **Validation note:** the
+  decode COMPUTE reuses the prefill-validated kernel (fused==serial parity proven for
+  Q8); end-to-end *decode-batch* parity (`smoke-server-decode-batch.sh`) is currently
+  blocked by the unwired server path (`generate_batch_prefill_capability: unknown`,
+  `prefill_queue_not_enabled`) — i.e. the live-wiring gap below — so it will be
+  exercised once wiring lands.
+- **REMAINING:** (a) the separate grouped-MoE FP32-DeltaNet fallback (for MoE
+  concurrency); (b) live-traffic wiring (hipfire-server scheduler → generate_batch_*
+  envelopes → daemon fused backends) — this is what `smoke-server-decode-batch.sh`
+  needs, and it will validate the dense decode-quant path end-to-end.
 
 ## Verification
 
