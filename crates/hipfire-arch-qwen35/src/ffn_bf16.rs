@@ -21,7 +21,7 @@ pub(crate) use hipfire_cpu::{
     ProjectionModuleContract, ProjectionModuleInvocation, ProjectionModuleOutput,
     ProjectionStateContract, ProjectionTensorContract,
 };
-pub(crate) use hipfire_npu::{xdna1_swiglu_admission, Xdna1ModuleArtifacts};
+pub(crate) use hipfire_npu::{xdna_swiglu_admission, XdnaModuleArtifacts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnBf16Mode {
@@ -42,7 +42,7 @@ pub struct FfnBf16Config {
     /// Path to the NPU instruction binary for the SwiGLU operation.
     /// Set via `HIPFIRE_QWEN35_XDNA1_INSTR`. Required when mode=xdna1.
     pub xdna1_instr: Option<String>,
-    pub xdna1_artifacts: Xdna1ModuleArtifacts,
+    pub xdna1_artifacts: XdnaModuleArtifacts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +89,7 @@ pub fn config() -> &'static FfnBf16Config {
             mode,
             layer,
             trace,
-            xdna1_artifacts: Xdna1ModuleArtifacts::new(xdna1_xclbin.clone(), xdna1_instr.clone()),
+            xdna1_artifacts: XdnaModuleArtifacts::new(xdna1_xclbin.clone(), xdna1_instr.clone()),
             xdna1_xclbin,
             xdna1_instr,
         }
@@ -111,7 +111,7 @@ pub(crate) fn xdna1_dense_ffn_module_invocation_from_shape(
     layer_idx: usize,
     residual_len: usize,
     hidden_size: usize,
-    artifacts: &Xdna1ModuleArtifacts,
+    artifacts: &XdnaModuleArtifacts,
 ) -> DenseFfnModuleInvocation {
     let base = dense_ffn_module_invocation_from_shape(
         layer_idx,
@@ -120,7 +120,7 @@ pub(crate) fn xdna1_dense_ffn_module_invocation_from_shape(
         DenseFfnBackendPreference::NpuOptIn,
         false,
     );
-    let admission = xdna1_swiglu_admission(&ModuleInvocation::from(base.clone()), artifacts);
+    let admission = xdna_swiglu_admission(&ModuleInvocation::from(base.clone()), artifacts);
     DenseFfnModuleInvocation {
         selected_backend: admission.selection.selected_backend,
         fallback_reason: admission.selection.fallback_reason,
@@ -210,7 +210,7 @@ mod tests {
         );
         assert_eq!(
             dense_ffn_backend_decision(DenseFfnBackendPreference::NpuOptIn, true),
-            (DenseFfnBackend::NpuXdna1, None)
+            (DenseFfnBackend::NpuXdna, None)
         );
         assert_eq!(
             dense_ffn_backend_decision(DenseFfnBackendPreference::NpuOptIn, false),
@@ -336,7 +336,7 @@ mod tests {
             2,
             4096,
             11008,
-            &Xdna1ModuleArtifacts::new(None, None),
+            &XdnaModuleArtifacts::new(None, None),
         );
         assert_eq!(missing.selected_backend, DenseFfnBackend::GpuProduction);
         assert_eq!(missing.fallback_reason, Some("npu_artifacts_missing"));
@@ -345,9 +345,9 @@ mod tests {
             2,
             4096,
             11008,
-            &Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+            &XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
         );
-        assert_eq!(admitted.selected_backend, DenseFfnBackend::NpuXdna1);
+        assert_eq!(admitted.selected_backend, DenseFfnBackend::NpuXdna);
         assert_eq!(admitted.fallback_reason, None);
     }
 

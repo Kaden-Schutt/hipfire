@@ -37,7 +37,7 @@ impl DenseFfnBackendPreference {
 pub enum DenseFfnBackend {
     CpuOracle,
     GpuProduction,
-    NpuXdna1,
+    NpuXdna,
 }
 
 impl DenseFfnBackend {
@@ -45,7 +45,7 @@ impl DenseFfnBackend {
         match self {
             Self::CpuOracle => "cpu_oracle",
             Self::GpuProduction => "gpu_production",
-            Self::NpuXdna1 => "npu_xdna1",
+            Self::NpuXdna => "npu_xdna",
         }
     }
 }
@@ -327,7 +327,7 @@ pub fn dense_ffn_backend_decision(
     match preferred_backend {
         DenseFfnBackendPreference::CpuOracle => (DenseFfnBackend::CpuOracle, None),
         DenseFfnBackendPreference::GpuProduction => (DenseFfnBackend::GpuProduction, None),
-        DenseFfnBackendPreference::NpuOptIn if npu_available => (DenseFfnBackend::NpuXdna1, None),
+        DenseFfnBackendPreference::NpuOptIn if npu_available => (DenseFfnBackend::NpuXdna, None),
         DenseFfnBackendPreference::NpuOptIn => (
             DenseFfnBackend::GpuProduction,
             Some("npu_backend_unavailable"),
@@ -715,7 +715,7 @@ mod tests {
         );
         assert_eq!(
             dense_ffn_backend_decision(DenseFfnBackendPreference::NpuOptIn, true),
-            (DenseFfnBackend::NpuXdna1, None)
+            (DenseFfnBackend::NpuXdna, None)
         );
         assert_eq!(
             dense_ffn_backend_decision(DenseFfnBackendPreference::NpuOptIn, false),

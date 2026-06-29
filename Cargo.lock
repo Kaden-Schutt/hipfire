@@ -1673,6 +1673,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-cpu",
  "hipfire-model",
+ "hipfire-xdna",
  "serde_json",
 ]
 
@@ -1882,6 +1883,13 @@ version = "0.3.0"
 dependencies = [
  "tempfile",
  "twox-hash",
+]
+
+[[package]]
+name = "hipfire-xdna"
+version = "0.3.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

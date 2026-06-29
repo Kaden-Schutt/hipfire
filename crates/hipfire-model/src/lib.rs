@@ -341,7 +341,7 @@ impl AcceleratorDeviceInfo {
         }
     }
 
-    pub fn npu_xdna1(
+    pub fn npu_xdna(
         device_id: impl Into<String>,
         ordinal: Option<usize>,
         runtime: Option<String>,
@@ -352,8 +352,8 @@ impl AcceleratorDeviceInfo {
             kind: "npu".to_string(),
             device_id: device_id.into(),
             ordinal,
-            arch: Some("xdna1".to_string()),
-            name: Some("XDNA1 NPU".to_string()),
+            arch: Some("xdna".to_string()),
+            name: Some("XDNA NPU".to_string()),
             runtime,
             available,
             reason,

@@ -22,6 +22,7 @@ members = [
     "crates/hipfire-operator",
     "crates/hipfire-vision-cache",
     "crates/hipfire-npu",
+    "crates/hipfire-xdna",
     "crates/hipfire-prompt",
     "crates/hipfire-rocm",
     "crates/hipfire-runtime",

@@ -3021,14 +3021,14 @@ pub const ENV_HIPFIRE_QWEN35_STAGE_TRACE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN35_XDNA1_INSTR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_XDNA1_INSTR",
     description: "Runtime variable controlling qwen35 xdna1 instr in hipfire",
-    source: "crates/hipfire-npu/src/lib.rs:72",
+    source: "crates/hipfire-npu/src/lib.rs:76",
 };
 
 /// `HIPFIRE_QWEN35_XDNA1_XCLBIN` — Runtime variable controlling qwen35 xdna1 xclbin in hipfire
 pub const ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_XDNA1_XCLBIN",
     description: "Runtime variable controlling qwen35 xdna1 xclbin in hipfire",
-    source: "crates/hipfire-npu/src/lib.rs:69",
+    source: "crates/hipfire-npu/src/lib.rs:73",
 };
 
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
@@ -3548,7 +3548,7 @@ pub const ENV_HIPFIRE_WO_WMMA_VARIANT: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_XDNA1_LIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_XDNA1_LIB",
     description: "Runtime variable controlling xdna1 lib in hipfire",
-    source: "crates/hipfire-npu/src/lib.rs:65",
+    source: "crates/hipfire-npu/src/lib.rs:69",
 };
 
 /// `HIP_PATH` — fails with "file not found". Add well-known candidates as -I flags;

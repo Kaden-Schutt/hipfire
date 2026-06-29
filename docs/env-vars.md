@@ -430,8 +430,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD` | Runtime variable controlling qwen35 routed only moe forward in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:7871` |
 | `HIPFIRE_QWEN35_STAGE_SYNC` | Runtime variable controlling qwen35 stage sync in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:14374` |
 | `HIPFIRE_QWEN35_STAGE_TRACE` | Runtime variable controlling qwen35 stage trace in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:14368` |
-| `HIPFIRE_QWEN35_XDNA1_INSTR` | Runtime variable controlling qwen35 xdna1 instr in hipfire | `crates/hipfire-npu/src/lib.rs:72` |
-| `HIPFIRE_QWEN35_XDNA1_XCLBIN` | Runtime variable controlling qwen35 xdna1 xclbin in hipfire | `crates/hipfire-npu/src/lib.rs:69` |
+| `HIPFIRE_QWEN35_XDNA1_INSTR` | Runtime variable controlling qwen35 xdna1 instr in hipfire | `crates/hipfire-npu/src/lib.rs:76` |
+| `HIPFIRE_QWEN35_XDNA1_XCLBIN` | Runtime variable controlling qwen35 xdna1 xclbin in hipfire | `crates/hipfire-npu/src/lib.rs:73` |
 | `HIPFIRE_RDNA2_VARIANT` | Runtime variable controlling rdna2 variant in hipfire | `crates/rdna-compute/src/feature_flags.rs:313` |
 | `HIPFIRE_RECOVER_MODE` | HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity) | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:138` |
 | `HIPFIRE_RECOVER_NOISE` | KVarN+CASK: tail queries read merged cold keys strictly in their past). 0 = | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:137` |
@@ -505,7 +505,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_WARN_GENERIC` | Enabled by default; set to 0 to disable | `crates/rdna-compute/src/generic_warn.rs:53` |
 | `HIPFIRE_WO_MMQ` | Enabled when set to 1 | `crates/rdna-compute/src/feature_flags.rs:219` |
 | `HIPFIRE_WO_WMMA_VARIANT` | Runtime variable controlling wo wmma variant in hipfire | `crates/rdna-compute/src/feature_flags.rs:300` |
-| `HIPFIRE_XDNA1_LIB` | Runtime variable controlling xdna1 lib in hipfire | `crates/hipfire-npu/src/lib.rs:65` |
+| `HIPFIRE_XDNA1_LIB` | Runtime variable controlling xdna1 lib in hipfire | `crates/hipfire-npu/src/lib.rs:69` |
 | `HIP_PATH` | fails with "file not found". Add well-known candidates as -I flags; | `crates/rdna-compute/src/compiler.rs:509` |
 | `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1209` |
 | `HOME` | Runtime variable controlling home in hipfire | `crates/rdna-compute/src/compiler.rs:227` |

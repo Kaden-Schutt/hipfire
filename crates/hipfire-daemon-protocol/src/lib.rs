@@ -336,10 +336,10 @@ mod tests {
                 "reason": null
             }, {
                 "kind": "npu",
-                "device_id": "xdna1:0",
+                "device_id": "xdna:0",
                 "ordinal": 0,
-                "arch": "xdna1",
-                "name": "XDNA1 NPU",
+                "arch": "xdna",
+                "name": "XDNA NPU",
                 "total_memory_bytes": null,
                 "integrated": null,
                 "runtime": "xdna1_ffi",
@@ -358,8 +358,8 @@ mod tests {
         assert_eq!(inventory.devices[0].device_id, "0");
         assert_eq!(inventory.devices[0].arch.as_deref(), Some("gfx1201"));
         assert_eq!(inventory.devices[1].kind, "npu");
-        assert_eq!(inventory.devices[1].device_id, "xdna1:0");
-        assert_eq!(inventory.devices[1].arch.as_deref(), Some("xdna1"));
+        assert_eq!(inventory.devices[1].device_id, "xdna:0");
+        assert_eq!(inventory.devices[1].arch.as_deref(), Some("xdna"));
     }
 
     #[test]

@@ -4,38 +4,42 @@
 
 //! NPU module opt-in contracts.
 //!
-//! This crate intentionally does not own XDNA runtime dispatch yet. It owns the
+//! This crate intentionally does not own XDNA runtime dispatch. It owns the
 //! typed policy boundary for deciding whether an NPU module has the artifacts
-//! needed to be admitted by an architecture-specific caller.
+//! needed to be admitted by an architecture-specific caller. For live device
+//! presence it consumes the `hipfire-xdna` device layer via
+//! [`XdnaHardwareProbe`]; all admission/inventory policy stays pure by taking a
+//! probe value rather than touching hardware directly.
 
 use hipfire_cpu::{BackendSelection, DenseFfnBackend, DenseFfnBackendPreference, ModuleInvocation};
 use hipfire_model::AcceleratorDeviceInfo;
 use serde_json::{json, Value};
 
-pub const XDNA1_SWIGLU_BACKEND: &str = "npu_xdna1";
+pub const XDNA_SWIGLU_BACKEND: &str = "npu_xdna";
 pub const NPU_ARTIFACTS_MISSING_FALLBACK: &str = "npu_artifacts_missing";
-pub const XDNA1_RUNTIME_MISSING_FALLBACK: &str = "xdna1_runtime_missing";
+pub const XDNA_RUNTIME_MISSING_FALLBACK: &str = "xdna_runtime_missing";
+pub const NPU_HARDWARE_ABSENT_FALLBACK: &str = "npu_hardware_absent";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpuModuleTarget {
-    Xdna1Swiglu,
+    XdnaSwiglu,
 }
 
 impl NpuModuleTarget {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Xdna1Swiglu => "xdna1_swiglu",
+            Self::XdnaSwiglu => "xdna_swiglu",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Xdna1ModuleArtifacts {
+pub struct XdnaModuleArtifacts {
     pub xclbin: Option<String>,
     pub instr: Option<String>,
 }
 
-impl Xdna1ModuleArtifacts {
+impl XdnaModuleArtifacts {
     pub fn new(xclbin: Option<String>, instr: Option<String>) -> Self {
         Self { xclbin, instr }
     }
@@ -47,13 +51,13 @@ impl Xdna1ModuleArtifacts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Xdna1InventoryConfig {
+pub struct XdnaInventoryConfig {
     pub runtime_lib: Option<String>,
-    pub swiglu_artifacts: Xdna1ModuleArtifacts,
+    pub swiglu_artifacts: XdnaModuleArtifacts,
 }
 
-impl Xdna1InventoryConfig {
-    pub fn new(runtime_lib: Option<String>, swiglu_artifacts: Xdna1ModuleArtifacts) -> Self {
+impl XdnaInventoryConfig {
+    pub fn new(runtime_lib: Option<String>, swiglu_artifacts: XdnaModuleArtifacts) -> Self {
         Self {
             runtime_lib,
             swiglu_artifacts,
@@ -65,7 +69,7 @@ impl Xdna1InventoryConfig {
             runtime_lib: std::env::var("HIPFIRE_XDNA1_LIB")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            swiglu_artifacts: Xdna1ModuleArtifacts::new(
+            swiglu_artifacts: XdnaModuleArtifacts::new(
                 std::env::var("HIPFIRE_QWEN35_XDNA1_XCLBIN")
                     .ok()
                     .filter(|value| !value.trim().is_empty()),
@@ -93,8 +97,78 @@ impl Xdna1InventoryConfig {
     }
 }
 
-pub fn xdna1_inventory_devices(config: &Xdna1InventoryConfig) -> Vec<AcceleratorDeviceInfo> {
-    if !config.explicitly_configured() {
+/// Result of probing for live XDNA NPU hardware through `hipfire-xdna`.
+///
+/// This is plain data so inventory policy stays unit-testable without a device.
+/// The real hardware access lives in [`XdnaHardwareProbe::detect`]; everything
+/// downstream takes a probe value and remains pure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XdnaHardwareProbe {
+    /// Whether an XDNA NPU device responded.
+    pub present: bool,
+    /// Device ordinal when present.
+    pub ordinal: Option<usize>,
+    /// Device node path (when present) or the probe error (when absent).
+    pub detail: Option<String>,
+}
+
+impl XdnaHardwareProbe {
+    /// No NPU detected.
+    pub fn absent() -> Self {
+        Self::default()
+    }
+
+    /// NPU detected at `ordinal` (used in tests and synthetic inventories).
+    pub fn present(ordinal: Option<usize>) -> Self {
+        Self {
+            present: true,
+            ordinal,
+            detail: None,
+        }
+    }
+
+    /// Probe the live NPU via `hipfire-xdna`.
+    ///
+    /// Uses `resource_info` (which responds even when the NPU is idle, unlike
+    /// the power/utilization sensors) to confirm the device is reachable. Never
+    /// panics; absent or unsupported hardware yields `present == false` with the
+    /// reason captured in [`XdnaHardwareProbe::detail`].
+    pub fn detect() -> Self {
+        match hipfire_xdna::XdnaDevice::open_default() {
+            Ok(dev) => match dev.resource_info() {
+                Ok(_) => Self {
+                    present: true,
+                    ordinal: Some(0),
+                    detail: Some(dev.path().to_string()),
+                },
+                Err(err) => Self {
+                    present: false,
+                    ordinal: None,
+                    detail: Some(err.to_string()),
+                },
+            },
+            Err(err) => Self {
+                present: false,
+                ordinal: None,
+                detail: Some(err.to_string()),
+            },
+        }
+    }
+}
+
+/// Build the NPU accelerator inventory by merging operator config with a live
+/// hardware [`XdnaHardwareProbe`].
+///
+/// A device entry is emitted when the hardware is detected **or** a runtime /
+/// artifacts path was explicitly configured, so "configured but no NPU" stays
+/// visible (with a hardware-absent reason) and "NPU present but unconfigured"
+/// surfaces the missing-runtime reason. `available` requires all three:
+/// hardware present, runtime configured, and artifacts complete.
+pub fn xdna_inventory_devices(
+    config: &XdnaInventoryConfig,
+    probe: &XdnaHardwareProbe,
+) -> Vec<AcceleratorDeviceInfo> {
+    if !probe.present && !config.explicitly_configured() {
         return Vec::new();
     }
 
@@ -103,9 +177,11 @@ pub fn xdna1_inventory_devices(config: &Xdna1InventoryConfig) -> Vec<Accelerator
         .as_deref()
         .is_some_and(|path| !path.trim().is_empty());
     let artifacts_available = config.swiglu_artifacts.complete();
-    let available = runtime_available && artifacts_available;
-    let reason = if !runtime_available {
-        Some(XDNA1_RUNTIME_MISSING_FALLBACK.to_string())
+    let available = probe.present && runtime_available && artifacts_available;
+    let reason = if !probe.present {
+        Some(NPU_HARDWARE_ABSENT_FALLBACK.to_string())
+    } else if !runtime_available {
+        Some(XDNA_RUNTIME_MISSING_FALLBACK.to_string())
     } else if !artifacts_available {
         Some(NPU_ARTIFACTS_MISSING_FALLBACK.to_string())
     } else {
@@ -113,17 +189,21 @@ pub fn xdna1_inventory_devices(config: &Xdna1InventoryConfig) -> Vec<Accelerator
     };
     let runtime = runtime_available.then(|| "xdna1_ffi".to_string());
 
-    vec![AcceleratorDeviceInfo::npu_xdna1(
-        "xdna1:0",
-        Some(0),
+    vec![AcceleratorDeviceInfo::npu_xdna(
+        "xdna:0",
+        probe.ordinal.or(Some(0)),
         runtime,
         available,
         reason,
     )]
 }
 
-pub fn xdna1_inventory_devices_from_env() -> Vec<AcceleratorDeviceInfo> {
-    xdna1_inventory_devices(&Xdna1InventoryConfig::from_env())
+/// Convenience wrapper: read config from the environment and probe live hardware.
+pub fn xdna_inventory_devices_from_env() -> Vec<AcceleratorDeviceInfo> {
+    xdna_inventory_devices(
+        &XdnaInventoryConfig::from_env(),
+        &XdnaHardwareProbe::detect(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +220,7 @@ impl NpuModuleAdmission {
     pub fn admitted(&self) -> bool {
         self.opt_in
             && self.artifacts_available
-            && self.selection.selected_backend == DenseFfnBackend::NpuXdna1
+            && self.selection.selected_backend == DenseFfnBackend::NpuXdna
     }
 
     pub fn fallback_reason(&self) -> Option<&'static str> {
@@ -148,15 +228,15 @@ impl NpuModuleAdmission {
     }
 }
 
-pub fn xdna1_swiglu_admission(
+pub fn xdna_swiglu_admission(
     invocation: &ModuleInvocation,
-    artifacts: &Xdna1ModuleArtifacts,
+    artifacts: &XdnaModuleArtifacts,
 ) -> NpuModuleAdmission {
     let opt_in =
         invocation.backend_selection().preferred_backend == DenseFfnBackendPreference::NpuOptIn;
     let artifacts_available = artifacts.complete();
     let (selected_backend, fallback_reason) = if opt_in && artifacts_available {
-        (DenseFfnBackend::NpuXdna1, None)
+        (DenseFfnBackend::NpuXdna, None)
     } else if opt_in {
         (
             DenseFfnBackend::GpuProduction,
@@ -167,7 +247,7 @@ pub fn xdna1_swiglu_admission(
     };
 
     NpuModuleAdmission {
-        target: NpuModuleTarget::Xdna1Swiglu,
+        target: NpuModuleTarget::XdnaSwiglu,
         module_kind: invocation.module_kind(),
         module_id: invocation.module_id().to_string(),
         opt_in,
@@ -200,10 +280,10 @@ mod tests {
     use hipfire_cpu::{dense_ffn_module_invocation_from_shape, DenseFfnBackendPreference};
 
     #[test]
-    fn xdna1_artifacts_require_both_paths() {
-        assert!(!Xdna1ModuleArtifacts::new(None, None).complete());
-        assert!(!Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), None).complete());
-        assert!(Xdna1ModuleArtifacts::new(
+    fn xdna_artifacts_require_both_paths() {
+        assert!(!XdnaModuleArtifacts::new(None, None).complete());
+        assert!(!XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), None).complete());
+        assert!(XdnaModuleArtifacts::new(
             Some("a.xclbin".to_string()),
             Some("a.instr".to_string())
         )
@@ -211,37 +291,43 @@ mod tests {
     }
 
     #[test]
-    fn xdna1_inventory_stays_empty_without_explicit_runtime_or_artifacts() {
-        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
-            None,
-            Xdna1ModuleArtifacts::new(None, None),
-        ));
+    fn xdna_inventory_stays_empty_without_hardware_or_config() {
+        let devices = xdna_inventory_devices(
+            &XdnaInventoryConfig::new(None, XdnaModuleArtifacts::new(None, None)),
+            &XdnaHardwareProbe::absent(),
+        );
 
         assert!(devices.is_empty());
     }
 
     #[test]
-    fn xdna1_inventory_reports_configured_runtime_and_artifacts() {
-        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
-            Some("libxdna1.so".to_string()),
-            Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
-        ));
+    fn xdna_inventory_reports_configured_runtime_and_artifacts() {
+        let devices = xdna_inventory_devices(
+            &XdnaInventoryConfig::new(
+                Some("libxdna1.so".to_string()),
+                XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+            ),
+            &XdnaHardwareProbe::present(Some(0)),
+        );
 
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].kind, "npu");
-        assert_eq!(devices[0].device_id, "xdna1:0");
-        assert_eq!(devices[0].arch.as_deref(), Some("xdna1"));
+        assert_eq!(devices[0].device_id, "xdna:0");
+        assert_eq!(devices[0].arch.as_deref(), Some("xdna"));
         assert_eq!(devices[0].runtime.as_deref(), Some("xdna1_ffi"));
         assert!(devices[0].available);
         assert_eq!(devices[0].reason, None);
     }
 
     #[test]
-    fn xdna1_inventory_marks_partial_configuration_unavailable() {
-        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
-            Some("libxdna1.so".to_string()),
-            Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), None),
-        ));
+    fn xdna_inventory_marks_partial_configuration_unavailable() {
+        let devices = xdna_inventory_devices(
+            &XdnaInventoryConfig::new(
+                Some("libxdna1.so".to_string()),
+                XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), None),
+            ),
+            &XdnaHardwareProbe::present(Some(0)),
+        );
 
         assert_eq!(devices.len(), 1);
         assert!(!devices[0].available);
@@ -252,22 +338,63 @@ mod tests {
     }
 
     #[test]
-    fn xdna1_inventory_marks_artifacts_without_runtime_unavailable() {
-        let devices = xdna1_inventory_devices(&Xdna1InventoryConfig::new(
-            None,
-            Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
-        ));
+    fn xdna_inventory_marks_artifacts_without_runtime_unavailable() {
+        let devices = xdna_inventory_devices(
+            &XdnaInventoryConfig::new(
+                None,
+                XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+            ),
+            &XdnaHardwareProbe::present(Some(0)),
+        );
 
         assert_eq!(devices.len(), 1);
         assert!(!devices[0].available);
         assert_eq!(
             devices[0].reason.as_deref(),
-            Some(XDNA1_RUNTIME_MISSING_FALLBACK)
+            Some(XDNA_RUNTIME_MISSING_FALLBACK)
         );
     }
 
     #[test]
-    fn xdna1_swiglu_admission_keeps_npu_opt_in_explicit() {
+    fn xdna_inventory_surfaces_detected_hardware_when_unconfigured() {
+        // NPU present but operator configured nothing: the device is now visible
+        // (not hidden as before) and flagged unavailable with the runtime reason.
+        let devices = xdna_inventory_devices(
+            &XdnaInventoryConfig::new(None, XdnaModuleArtifacts::new(None, None)),
+            &XdnaHardwareProbe::present(Some(0)),
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].kind, "npu");
+        assert!(!devices[0].available);
+        assert_eq!(
+            devices[0].reason.as_deref(),
+            Some(XDNA_RUNTIME_MISSING_FALLBACK)
+        );
+    }
+
+    #[test]
+    fn xdna_inventory_marks_configured_hardware_absent() {
+        // Fully configured but no NPU detected: stay visible with a hardware
+        // reason instead of falsely reporting available.
+        let devices = xdna_inventory_devices(
+            &XdnaInventoryConfig::new(
+                Some("libxdna1.so".to_string()),
+                XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+            ),
+            &XdnaHardwareProbe::absent(),
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert!(!devices[0].available);
+        assert_eq!(
+            devices[0].reason.as_deref(),
+            Some(NPU_HARDWARE_ABSENT_FALLBACK)
+        );
+    }
+
+    #[test]
+    fn xdna_swiglu_admission_keeps_npu_opt_in_explicit() {
         let invocation = ModuleInvocation::from(dense_ffn_module_invocation_from_shape(
             3,
             4096,
@@ -276,7 +403,7 @@ mod tests {
             false,
         ));
 
-        let missing = xdna1_swiglu_admission(&invocation, &Xdna1ModuleArtifacts::new(None, None));
+        let missing = xdna_swiglu_admission(&invocation, &XdnaModuleArtifacts::new(None, None));
         assert!(!missing.admitted());
         assert_eq!(
             missing.selection.preferred_backend,
@@ -291,23 +418,23 @@ mod tests {
             Some(NPU_ARTIFACTS_MISSING_FALLBACK)
         );
 
-        let admitted = xdna1_swiglu_admission(
+        let admitted = xdna_swiglu_admission(
             &invocation,
-            &Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+            &XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
         );
         assert!(admitted.admitted());
         assert_eq!(
             admitted.selection.selected_backend,
-            DenseFfnBackend::NpuXdna1
+            DenseFfnBackend::NpuXdna
         );
         assert_eq!(
             npu_module_admission_json(&admitted)["target"],
-            "xdna1_swiglu"
+            "xdna_swiglu"
         );
     }
 
     #[test]
-    fn xdna1_swiglu_admission_leaves_gpu_path_as_production() {
+    fn xdna_swiglu_admission_leaves_gpu_path_as_production() {
         let invocation = ModuleInvocation::from(dense_ffn_module_invocation_from_shape(
             3,
             4096,
@@ -316,9 +443,9 @@ mod tests {
             false,
         ));
 
-        let admission = xdna1_swiglu_admission(
+        let admission = xdna_swiglu_admission(
             &invocation,
-            &Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+            &XdnaModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
         );
         assert!(!admission.opt_in);
         assert!(!admission.admitted());
