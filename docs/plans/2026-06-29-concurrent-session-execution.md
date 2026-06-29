@@ -205,6 +205,70 @@ the `SequenceState` ownership question — we are building it now, not deferring
 - **C5 — extend** to the remaining rich arch + simple-tier opt-in; delete the
   single-slot remnants.
 
+## Ground-truth finding (2026-06-29, after C2a/C2b) — plan premise partly stale
+
+Investigating the C2c entry surfaced that the "single resident slot / execution is
+serial / build concurrency now" premise is **only partly true**. The actual state:
+
+- **qwen35 already has concurrent multi-session kernels.** Decode:
+  `run_generate_batch_decode_step_qwen35` (qwen35_decode.rs:343) selects
+  `Qwen35DecodeBatchBackend::{SerialReference, FusedDenseLayerChunked,
+  FusedGroupedMoeLayerChunked}` — the two *Fused* backends run a true microbatched
+  forward over several **registry-resident** sessions (they call
+  `qwen35_save_active_session` first to park `m.active`, then operate on the
+  resident set via `validate_qwen35_decode_resident_sessions`). Prefill:
+  `qwen35_prefill_suffix_batch` likewise has a fused-grouped-MoE batched backend
+  plus a serial-reference fallback. So C3/C4-level **kernels** largely **exist**
+  for qwen35, and each resident session carries its own cursor — the
+  "shared-cursor blocks concurrency" framing is moot on the batch path.
+- **These batch paths are NOT wired to live traffic.** `hipfire-server` never
+  emits `generate_batch_decode` / `generate_batch_prefill` envelopes for organic
+  HTTP requests (only the daemon's test harness + the explicit batch protocol do;
+  cf. the health.rs `generate_batch_prefill_not_used_for_file_batches` note). The
+  scheduler *plans* batches (`PrefillBatchSelection`/`next_prefill_batch`) but the
+  server still drives the daemon one session at a time through `generate()` /
+  `m.active`. **The real gap is the executor wiring** (server scheduler selection
+  → batch envelopes → the daemon's existing fused backends), not a hot-path
+  kernel rewrite.
+- **lfm2 is serial-only** — no fused batch decode (only per-token
+  `lfm2moe::forward::decode_step` + `run_generate_batch_prefill_serial_lfm2`).
+- **Known bug:** the fused-dense batch-prefill KV-quant path is buggy (worked
+  around by `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=serial` in
+  smoke-generate-batch-prefill).
+
+**Re-scope implication.** C2c-as-written (single-slot → resident-set hot-path
+rewrite) is largely unnecessary: residency already works on the batch path; C2a/C2b
+cleaned up the single-session `generate()` slot. The genuine remaining work is one
+of: (A) wire the server scheduler → `generate_batch_*` → daemon fused backends so
+**organic** concurrent traffic uses them; (B) fix the fused-dense KV-quant bug; (C)
+add fused batch decode to lfm2; (D) build the two-session parity smoke + a grounded
+"current concurrency state" doc first.
+
+**USER DIRECTION + PROGRESS (2026-06-29):** chose (A) full quant-dense port + then
+wire live traffic.
+- **Dense fused PREFILL quant port — DONE + VALIDATED.** Made the dense fused
+  prefill quant-complete: (1) KV contract relaxed to accept plain Q8 + Q8 KV
+  write/attention branch (shared `prefill_session_batch_{write_q8_kv,attention_q8}_layer`
+  helpers, renamed from `grouped_moe_*`); (2) `dense_session_prefill_gemm_full_precision`
+  + `_residual` now dispatch Q8_0 + MQ4G256 (FWHT pre-rotation via internally-alloced
+  scratch; MQ6G256 + other quant fall back to serial via the contract); (3) dense
+  lm_head final-logits dispatch Q8_0 + MQ4G256; (4) weights contract predicate allows
+  Q8_0 + MQ4G256. **Validation:** `smoke-generate-batch-prefill.sh` dense path now
+  `backend=fused_dense ... ok` for size 2/4/8 + boundary + explicit (fused == serial
+  parity) on qwen3.5-0.8b-mq4 (mq4 weights + Q8 KV + Q8_0 lm_head); coherence-gate
+  16/16 OK + normal-path output BYTE-IDENTICAL to baseline (fused path is batch-only,
+  doesn't touch single generation). No HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=serial
+  workaround needed for prefill.
+- **Separate PRE-EXISTING finding (NOT from this change):** the grouped-MoE fused
+  prefill requires Q8 DeltaNet state, but the daemon auto-upgrades DeltaNet to FP32
+  for the MoE test model → `grouped MoE session fused prefix row 0 has FP32 DeltaNet
+  state; first MoE target is Q8 DeltaNet`. This was masked before (smoke failed earlier
+  at the dense gate). Fix candidate: branch the grouped-MoE DeltaNet FP32/Q8 like the
+  dense KV branch (needs FP32 DeltaNet layer in the grouped-MoE loop). Separate from
+  the dense port; needed for MoE live concurrency.
+- **REMAINING:** dense fused DECODE quant port (qwen35_decode_step_fused_dense_layer_chunked
+  + capability gate requires kv_mode=fp32 today), then live-traffic wiring.
+
 ## Verification
 
 Per phase on gfx1151 under `hipfire lock`: `coherence-gate-dflash.sh`; a

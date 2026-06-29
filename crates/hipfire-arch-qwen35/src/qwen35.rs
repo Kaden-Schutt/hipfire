@@ -9933,7 +9933,7 @@ pub fn dense_prefill_session_batch_write_f32_kv_layer(
     )
 }
 
-pub fn grouped_moe_prefill_session_batch_write_q8_kv_layer(
+pub fn prefill_session_batch_write_q8_kv_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -10020,7 +10020,7 @@ pub fn dense_prefill_session_batch_attention_f32_layer(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_moe_prefill_session_batch_attention_q8_layer(
+pub fn prefill_session_batch_attention_q8_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -10175,6 +10175,31 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
             weights.output.k,
             row_count,
         ),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::MQ4G256 => {
+            let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
+            let rotated = gpu
+                .rotate_x_mq_batched(&normed_rows, &rot, weights.output.k, row_count)
+                .and_then(|()| {
+                    gpu.gemm_hfq4g256(
+                        &weights.output.buf,
+                        &rot,
+                        &batch_logits,
+                        weights.output.m,
+                        weights.output.k,
+                        row_count,
+                    )
+                });
+            let _ = gpu.free_tensor(rot);
+            rotated
+        }
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
@@ -10368,15 +10393,20 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
                 signature.kv_compact_offset,
             ));
         }
-        if signature.kv_quantized
-            || signature.kv_quant_q8
-            || signature.kv_quant_asym2
+        // KV may be plain Q8 (Q8_0, inline per-block scale) or full precision —
+        // the per-layer KV write + attention branch on `kv_q8` in
+        // `forward_prefill_dense_session_batch_prefix_full_precision`. Asym/FWHT
+        // KV and any other quantized-but-not-plain-Q8 state stay on
+        // serial_reference (not fused). (Row uniformity is already enforced by
+        // `validate_dense_prefill_session_batch_state_signatures`.)
+        if signature.kv_quant_asym2
             || signature.kv_quant_asym3
             || signature.kv_quant_asym4
             || signature.kv_quant_fwht
+            || (signature.kv_quantized && !signature.kv_quant_q8)
         {
             return Err(format!(
-                "dense session fused prefix row {idx} has quantized KV state; first fused target is FP32 KV"
+                "dense session fused prefix row {idx} has unsupported KV quantization; only plain Q8 or FP32 KV is fused"
             ));
         }
         if signature.dn_quant != StateQuant::FP32 {
@@ -10452,10 +10482,14 @@ pub fn validate_grouped_moe_prefill_session_batch_q8_state_contract(
     Ok(())
 }
 
+// Weight dtypes the dense fused prefill GEMM helpers can dispatch. Full precision
+// (F32/F16/BF16/Raw) plus plain Q8_0 and MQ4G256 (quantized dense models). MQ6G256
+// and other quant formats have no batched non-residual kernel yet, so models using
+// them fall back to serial_reference via the contract. (Name kept to avoid churn.)
 fn dense_prefill_weight_full_precision_supported(weight: &WeightTensor) -> bool {
     matches!(
         weight.gpu_dtype,
-        DType::F32 | DType::F16 | DType::BF16 | DType::Raw
+        DType::F32 | DType::F16 | DType::BF16 | DType::Raw | DType::Q8_0 | DType::MQ4G256
     )
 }
 
@@ -11243,6 +11277,10 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
+    // Per-batch KV quant (uniform across rows — see the state-signature contract).
+    // true = the sessions' KV caches are plain Q8 (Q8_0); the KV write +
+    // attention use the Q8 path. false = full-precision F32 KV.
+    kv_q8: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -11513,30 +11551,62 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     row_count,
                     0,
                 )?;
-                dense_prefill_session_batch_write_f32_kv_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    layer_idx,
-                    &pbs.fa_k_batch,
-                    &pbs.fa_v_batch,
-                    kv_dim,
-                    row_count,
-                )?;
-                dense_prefill_session_batch_attention_f32_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    layer_idx,
-                    &pbs.fa_q_batch,
-                    &pbs.fa_attn_out_batch,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    max_ctx_len,
-                    max_ctx_len,
-                    row_count,
-                )?;
+                if kv_q8 {
+                    // Plain-Q8 KV: the routed write/attention helpers are shared
+                    // with the grouped-MoE fused path — they are FFN-agnostic and
+                    // operate on Q8_0 (inline-scale) KV buffers via the same
+                    // device pointer tables.
+                    prefill_session_batch_write_q8_kv_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        row_count,
+                    )?;
+                    prefill_session_batch_attention_q8_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                } else {
+                    dense_prefill_session_batch_write_f32_kv_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        kv_dim,
+                        row_count,
+                    )?;
+                    dense_prefill_session_batch_attention_f32_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                }
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 dense_session_prefill_gemm_full_precision_residual(
                     gpu,
@@ -11702,6 +11772,9 @@ pub fn forward_prefill_dense_session_batch(
             ));
         }
     }
+    // Row signatures are uniform (state-signature contract), so row 0's KV quant
+    // decides the per-layer KV write/attention path for the whole batch.
+    let kv_q8 = signatures.first().map(|s| s.kv_quant_q8).unwrap_or(false);
     let result = forward_prefill_dense_session_batch_prefix_full_precision(
         gpu,
         weights,
@@ -11712,6 +11785,7 @@ pub fn forward_prefill_dense_session_batch(
         execution_plan.multi_state_prefix_rows,
         rows.len(),
         max_ctx_len,
+        kv_q8,
     );
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
@@ -12205,7 +12279,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     row_count,
                     0,
                 )?;
-                grouped_moe_prefill_session_batch_write_q8_kv_layer(
+                prefill_session_batch_write_q8_kv_layer(
                     gpu,
                     device_tables,
                     route_shape,
@@ -12216,7 +12290,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     config.head_dim,
                     row_count,
                 )?;
-                grouped_moe_prefill_session_batch_attention_q8_layer(
+                prefill_session_batch_attention_q8_layer(
                     gpu,
                     device_tables,
                     route_shape,
@@ -13055,6 +13129,13 @@ fn gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
     }
 }
 
+// Batched single-projection GEMM for the dense fused prefill. Despite the
+// `_full_precision` name (kept to avoid churning ~10 call sites), this now
+// dispatches plain Q8_0 and MQ4G256 weights too — quantized dense models route
+// here. MQ4 needs the shared FWHT pre-rotation (rotate_x_mq_batched) into a
+// scratch first; the rotation is allocated internally (prefill is one-shot, so
+// the small per-GEMM alloc is acceptable). MQ6G256 non-residual has no batched
+// kernel yet, so those weights fall back to serial_reference via the contract.
 fn dense_session_prefill_gemm_full_precision(
     gpu: &mut Gpu,
     weight: &WeightTensor,
@@ -13067,15 +13148,27 @@ fn dense_session_prefill_gemm_full_precision(
         DType::F16 | DType::BF16 | DType::Raw => {
             gemm_fp16_or_bf16_x_f32_wmma(gpu, &weight.buf, x, y, weight.m, weight.k, n)
         }
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&weight.buf, x, y, weight.m, weight.k, n),
+        DType::MQ4G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            let result = gpu.gemm_hfq4g256(&weight.buf, &rot, y, weight.m, weight.k, n);
+            let _ = gpu.free_tensor(rot);
+            result
+        }
         other => Err(hip_bridge::HipError::new(
             0,
-            &format!(
-                "dense session fused prefix full-precision GEMM does not support dtype {other:?}"
-            ),
+            &format!("dense session fused prefix GEMM does not support dtype {other:?}"),
         )),
     }
 }
 
+// Residual variant of [`dense_session_prefill_gemm_full_precision`] (adds the
+// GEMM result into `y_residual`). Also dispatches plain Q8_0 + MQ4G256 now: Q8
+// runs the chunked GEMM into `scratch` then adds it into the residual; MQ4 runs
+// the FWHT-rotated `gemm_hfq4g256_residual` which accumulates directly. MQ6G256
+// residual has a kernel (`gemm_hfq6g256_residual`) but is left for a follow-up so
+// the contract gates MQ6 to serial uniformly with the non-residual path.
 fn dense_session_prefill_gemm_full_precision_residual(
     gpu: &mut Gpu,
     weight: &WeightTensor,
@@ -13095,23 +13188,33 @@ fn dense_session_prefill_gemm_full_precision_residual(
             weight.k,
             n,
         ),
-        DType::F16 | DType::BF16 | DType::Raw => {
-            gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
-                gpu,
-                &weight.buf,
-                x,
-                y_residual,
-                scratch,
-                weight.m,
-                weight.k,
-                n,
-            )
+        DType::F16 | DType::BF16 | DType::Raw => gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+            gpu,
+            &weight.buf,
+            x,
+            y_residual,
+            scratch,
+            weight.m,
+            weight.k,
+            n,
+        ),
+        DType::Q8_0 => {
+            let out = scratch.sub_offset(0, n * weight.m);
+            gpu.gemm_q8_0_batched_chunked(&weight.buf, x, &out, weight.m, weight.k, n)?;
+            let accum = y_residual.sub_offset(0, n * weight.m);
+            gpu.add_inplace_f32(&accum, &out)
+        }
+        DType::MQ4G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            let result =
+                gpu.gemm_hfq4g256_residual(&weight.buf, &rot, y_residual, weight.m, weight.k, n);
+            let _ = gpu.free_tensor(rot);
+            result
         }
         other => Err(hip_bridge::HipError::new(
             0,
-            &format!(
-                "dense session fused prefix full-precision residual GEMM does not support dtype {other:?}"
-            ),
+            &format!("dense session fused prefix residual GEMM does not support dtype {other:?}"),
         )),
     }
 }
