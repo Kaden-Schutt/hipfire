@@ -165,6 +165,17 @@ pub struct DdtreeState {
     pub path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+impl DdtreeState {
+    /// Return every GPU-resident snapshot + scratch buffer to the pool.
+    /// Consumes self; called from `unload_model`'s DFlash teardown.
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        self.post_seed_snap.free_gpu(gpu);
+        self.scratch.free_gpu(gpu);
+        self.path_c_parent_pre_snap.free_gpu(gpu);
+        self.path_c_main_end_snap.free_gpu(gpu);
+    }
+}
+
 thread_local! {
     /// Per-request raw-prompt override, parsed from the generate message's
     /// optional `"raw"` field. `None` = use the auto default (raw iff the model

@@ -3011,14 +3011,20 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         let _ = gpu;
         return;
     }
-    // DFlash state: draft weights have free_gpu; ring / snapshot / tape /
-    // verify_scratch don't expose one — their GpuTensors / DeviceBuffers will
-    // leak until daemon exit if the caller cycles load/unload mid-session.
-    // Acceptable for the daemon since unload is rare and the weights are the
-    // bulk of the VRAM anyway.
+    // DFlash state: free every GPU-resident component explicitly. No `Drop` on
+    // GpuTensor/DeviceBuffer, so the ring buffer, verify scratch, snapshot, tape,
+    // and (optional) DDTree state must each be returned to the pool — otherwise a
+    // mid-session load/unload cycle strands them until daemon exit.
     if let Some(df) = m.dflash {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
+        df.hidden_rb.free_gpu(gpu);
+        df.verify_scratch.free_gpu(gpu);
+        df.target_snap.free_gpu(gpu);
+        df.gdn_tape.free_gpu(gpu);
+        if let Some(ddtree) = df.ddtree {
+            ddtree.free_gpu(gpu);
+        }
     }
     #[cfg(feature = "arch-lfm2moe")]
     if let Some(df) = m.lfm2_dflash {

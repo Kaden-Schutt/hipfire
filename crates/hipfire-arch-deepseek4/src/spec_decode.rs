@@ -297,128 +297,139 @@ fn speculative_decode_impl(
         Some(_) => None,
         None => Some(forward::PrefillBatchScratch::new(gpu, cfg, k)?),
     };
-    let pbs: &forward::PrefillBatchScratch =
-        cached_pbs.unwrap_or_else(|| owned_pbs.as_ref().unwrap());
-    if pbs.max_batch < k {
-        return Err(format!(
-            "spec_decode: cached PBS max_batch ({}) < k ({})",
-            pbs.max_batch, k
-        ));
-    }
-    forward::forward_prefill_batch_chunk(
-        cfg,
-        weights,
-        state,
-        gpu,
-        pbs,
-        &verify_tokens,
-        last_position + 1,
-    )?;
-
-    // ── 4. Per-position top-1 from the verifier ───────────────────────
-    let all_logits = forward::final_norm_and_head_all_batched(cfg, weights, state, pbs, gpu, k)?;
-    let mut verify_matcher = grammar.as_ref().map(|g| (*g.matcher).clone());
-
-    // ── 5. Longest matching prefix → acceptance ────────────────────────
-    //
-    // In tool-call mode the verifier's preferred token is chosen after the
-    // same DSML grammar mask as the non-spec decode path. The verifier matcher
-    // advances only along the actually accepted prefix; at divergence, the
-    // appended verifier token is legal for the grammar state reached by that
-    // prefix.
-    let mut accepted_tokens: Vec<u32> = Vec::with_capacity(k);
-    let mut n_accept = 0usize;
-    for (idx, &draft) in draft_tokens.iter().enumerate() {
-        let main = match (grammar.as_mut(), verify_matcher.as_ref()) {
-            (Some(g), Some(matcher)) => {
-                let mut logits = all_logits[idx].clone();
-                apply_grammar_mask(matcher, g.decoded_vocab, g.mask, &mut logits);
-                logits_argmax(&logits) as u32
-            }
-            _ => logits_argmax(&all_logits[idx]) as u32,
-        };
-        if draft == main {
-            accepted_tokens.push(draft);
-            n_accept += 1;
-            if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
-                advance_matcher_token(matcher, g.decoded_vocab, draft);
-            }
-        } else {
-            accepted_tokens.push(main);
-            if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
-                advance_matcher_token(matcher, g.decoded_vocab, main);
-            }
-            break;
+    // Run the verify body in a closure so a locally-allocated `owned_pbs` is
+    // returned to the pool on EVERY exit path — `PrefillBatchScratch` has no
+    // Drop and the body has several `?` early returns. Cached-PBS callers pass
+    // `Some`, so `owned_pbs` is `None` for them and the free below is a no-op.
+    let result = (|| -> Result<SpecStepResult, String> {
+        let pbs: &forward::PrefillBatchScratch =
+            cached_pbs.unwrap_or_else(|| owned_pbs.as_ref().unwrap());
+        if pbs.max_batch < k {
+            return Err(format!(
+                "spec_decode: cached PBS max_batch ({}) < k ({})",
+                pbs.max_batch, k
+            ));
         }
-    }
+        forward::forward_prefill_batch_chunk(
+            cfg,
+            weights,
+            state,
+            gpu,
+            pbs,
+            &verify_tokens,
+            last_position + 1,
+        )?;
 
-    if let Some(g) = grammar.as_mut() {
-        for &tok in &accepted_tokens {
-            advance_matcher_token(g.matcher, g.decoded_vocab, tok);
+        // ── 4. Per-position top-1 from the verifier ───────────────────────
+        let all_logits =
+            forward::final_norm_and_head_all_batched(cfg, weights, state, pbs, gpu, k)?;
+        let mut verify_matcher = grammar.as_ref().map(|g| (*g.matcher).clone());
+
+        // ── 5. Longest matching prefix → acceptance ────────────────────────
+        //
+        // In tool-call mode the verifier's preferred token is chosen after the
+        // same DSML grammar mask as the non-spec decode path. The verifier matcher
+        // advances only along the actually accepted prefix; at divergence, the
+        // appended verifier token is legal for the grammar state reached by that
+        // prefix.
+        let mut accepted_tokens: Vec<u32> = Vec::with_capacity(k);
+        let mut n_accept = 0usize;
+        for (idx, &draft) in draft_tokens.iter().enumerate() {
+            let main = match (grammar.as_mut(), verify_matcher.as_ref()) {
+                (Some(g), Some(matcher)) => {
+                    let mut logits = all_logits[idx].clone();
+                    apply_grammar_mask(matcher, g.decoded_vocab, g.mask, &mut logits);
+                    logits_argmax(&logits) as u32
+                }
+                _ => logits_argmax(&all_logits[idx]) as u32,
+            };
+            if draft == main {
+                accepted_tokens.push(draft);
+                n_accept += 1;
+                if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
+                    advance_matcher_token(matcher, g.decoded_vocab, draft);
+                }
+            } else {
+                accepted_tokens.push(main);
+                if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
+                    advance_matcher_token(matcher, g.decoded_vocab, main);
+                }
+                break;
+            }
         }
-    }
 
-    // ── 6. Refresh state.mtp_last_hidden from the verify pass ──────────
-    // Capture the FULL [hc_mult, hidden] residual stream of
-    // pbs.streams_batch[accepted_tokens.len() - 1, :, :]. Matches the
-    // antirez/ds4 reference MTP HC plumbing (see project memory entry
-    // `project_deepseek4_mtp_hc_plumbing_gap`). Stream-0-only capture was what
-    // discarded 75% of HC signal and pinned K=2 accept at ~50%.
-    {
-        let last_idx = accepted_tokens.len() - 1;
-        let stream_len = cfg.hc_mult * cfg.hidden_size;
-        let off = last_idx * stream_len;
-        let last_full = pbs.streams_batch.sub_offset(off, stream_len);
-        let need_realloc = state
-            .mtp_last_hidden
-            .as_ref()
-            .map(|t| t.numel() != stream_len)
-            .unwrap_or(true);
-        if need_realloc {
-            state.mtp_last_hidden = Some(
-                gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
-                    .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?,
-            );
+        if let Some(g) = grammar.as_mut() {
+            for &tok in &accepted_tokens {
+                advance_matcher_token(g.matcher, g.decoded_vocab, tok);
+            }
         }
-        let dst = state.mtp_last_hidden.as_ref().unwrap();
-        gpu.memcpy_dtod_auto(&dst.buf, &last_full.buf, stream_len * 4)
-            .map_err(|e| format!("capture verify-pass full HC streams: {e:?}"))?;
+
+        // ── 6. Refresh state.mtp_last_hidden from the verify pass ──────────
+        // Capture the FULL [hc_mult, hidden] residual stream of
+        // pbs.streams_batch[accepted_tokens.len() - 1, :, :]. Matches the
+        // antirez/ds4 reference MTP HC plumbing (see project memory entry
+        // `project_deepseek4_mtp_hc_plumbing_gap`). Stream-0-only capture was what
+        // discarded 75% of HC signal and pinned K=2 accept at ~50%.
+        {
+            let last_idx = accepted_tokens.len() - 1;
+            let stream_len = cfg.hc_mult * cfg.hidden_size;
+            let off = last_idx * stream_len;
+            let last_full = pbs.streams_batch.sub_offset(off, stream_len);
+            let need_realloc = state
+                .mtp_last_hidden
+                .as_ref()
+                .map(|t| t.numel() != stream_len)
+                .unwrap_or(true);
+            if need_realloc {
+                state.mtp_last_hidden = Some(
+                    gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
+                        .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?,
+                );
+            }
+            let dst = state.mtp_last_hidden.as_ref().unwrap();
+            gpu.memcpy_dtod_auto(&dst.buf, &last_full.buf, stream_len * 4)
+                .map_err(|e| format!("capture verify-pass full HC streams: {e:?}"))?;
+        }
+
+        // ── 7. Restore state.n_tokens to the post-accept position ─────────
+        // Caller's next forward expects `state.n_tokens` == (next position
+        // to be processed). We emitted `accepted_tokens.len()` tokens
+        // starting at position last_position+1, so the next free position
+        // is last_position + 1 + accepted_tokens.len().
+        //
+        // Why this isn't simply `initial_n_tokens + accepted_tokens.len()`:
+        // initial_n_tokens (== last_position + 1) is the position of the
+        // FIRST emitted token. After emitting all accepted_tokens, next
+        // position is initial_n_tokens + accepted_tokens.len(). Same thing.
+        //
+        // Stale-cache caveat: MTP layer's SWA cache has writes at positions
+        // [N+1 .. N+K] from the draft loop; the main layers' SWA caches
+        // have writes at the same positions from the verify pass. Positions
+        // BEYOND n_accept were computed using rejected draft tokens (input
+        // mismatch with what the caller will treat as committed). Those
+        // entries get naturally invalidated when the caller's next forward
+        // overwrites them via ring buffer. Bug only manifests when a
+        // forward READS those stale slots before overwriting — happens
+        // only in narrow windows and is documented as a production-hardening
+        // follow-up.
+        //
+        // Correct fix shape: speculative verify must either write into scratch
+        // cache state and commit only the accepted prefix, or explicitly
+        // invalidate/rewind every per-layer cache slot beyond n_accept before
+        // returning. Moving n_tokens alone is not sufficient, because SWA ring
+        // indices can still alias rejected-token cache entries on a later read.
+        state.n_tokens = initial_n_tokens + accepted_tokens.len() as u64;
+
+        Ok(SpecStepResult {
+            accepted_tokens,
+            n_accepted: n_accept,
+            n_proposed: k,
+        })
+    })();
+    if let Some(p) = owned_pbs {
+        p.free_gpu(gpu);
     }
-
-    // ── 7. Restore state.n_tokens to the post-accept position ─────────
-    // Caller's next forward expects `state.n_tokens` == (next position
-    // to be processed). We emitted `accepted_tokens.len()` tokens
-    // starting at position last_position+1, so the next free position
-    // is last_position + 1 + accepted_tokens.len().
-    //
-    // Why this isn't simply `initial_n_tokens + accepted_tokens.len()`:
-    // initial_n_tokens (== last_position + 1) is the position of the
-    // FIRST emitted token. After emitting all accepted_tokens, next
-    // position is initial_n_tokens + accepted_tokens.len(). Same thing.
-    //
-    // Stale-cache caveat: MTP layer's SWA cache has writes at positions
-    // [N+1 .. N+K] from the draft loop; the main layers' SWA caches
-    // have writes at the same positions from the verify pass. Positions
-    // BEYOND n_accept were computed using rejected draft tokens (input
-    // mismatch with what the caller will treat as committed). Those
-    // entries get naturally invalidated when the caller's next forward
-    // overwrites them via ring buffer. Bug only manifests when a
-    // forward READS those stale slots before overwriting — happens
-    // only in narrow windows and is documented as a production-hardening
-    // follow-up.
-    //
-    // Correct fix shape: speculative verify must either write into scratch
-    // cache state and commit only the accepted prefix, or explicitly
-    // invalidate/rewind every per-layer cache slot beyond n_accept before
-    // returning. Moving n_tokens alone is not sufficient, because SWA ring
-    // indices can still alias rejected-token cache entries on a later read.
-    state.n_tokens = initial_n_tokens + accepted_tokens.len() as u64;
-
-    Ok(SpecStepResult {
-        accepted_tokens,
-        n_accepted: n_accept,
-        n_proposed: k,
-    })
+    result
 }
 
 /// Standalone helper: compute argmax of a [vocab] logits vector.
