@@ -125,3 +125,31 @@ pub fn collect_calibration_artifacts(
         },
     )
 }
+
+/// Daemon calibration seam: collect from the already-resident [`ZayaModel`] by
+/// delegating to [`collect_calibration_artifacts`] over its GPU-resident weights.
+impl hipfire_runtime::calibration::CalibratableBackend for crate::arch::ZayaModel {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        _tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let opts = CalibOpts {
+            kldref,
+            kldref_topk: 64,
+        };
+        collect_calibration_artifacts(
+            gpu,
+            self.weights(),
+            self.config(),
+            tokens,
+            &opts,
+            output,
+            provenance,
+        )
+    }
+}

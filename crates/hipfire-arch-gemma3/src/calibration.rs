@@ -224,6 +224,39 @@ pub fn collect_calibration_artifacts_text_only(
     .map_err(|e| HipError::new(0, &e))
 }
 
+/// Daemon calibration seam: collect from the already-resident [`Gemma3Backend`]
+/// (arch_id 12, dense text). Delegates to the text-only collector with an empty
+/// prefix; the resident backend already holds bf16 weights + config. Gemma3-VL
+/// (arch_id 13, `Gemma3VlBackend`, `language_model.` prefix) is not yet wired.
+impl hipfire_runtime::calibration::CalibratableBackend for crate::arch::Gemma3Backend {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        tokenizer: &Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let opts = CalibOpts {
+            kldref,
+            kldref_topk: 64,
+        };
+        collect_calibration_artifacts_text_only(
+            gpu,
+            &self.weights,
+            &self.config,
+            tokenizer,
+            tokens,
+            &opts,
+            output,
+            "",
+            provenance,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

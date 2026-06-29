@@ -1740,6 +1740,7 @@ dependencies = [
  "hipfire-eval",
  "hipfire-evidence",
  "hipfire-generate",
+ "hipfire-kld",
  "hipfire-kvquant",
  "hipfire-mixer",
  "hipfire-model",

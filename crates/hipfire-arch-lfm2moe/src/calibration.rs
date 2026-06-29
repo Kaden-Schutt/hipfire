@@ -181,6 +181,41 @@ pub fn collect_calibration_artifacts(
     .map_err(|e| HipError::new(0, &e))
 }
 
+/// Thin `&weights`/`&config` adapter so the daemon's loose LFM2 resident slots
+/// (`lfm2moe_weights`/`lfm2moe_config`) satisfy the calibration seam without a
+/// bundled backend type — mirrors `qwen35::Qwen35CalibBackend`.
+pub struct Lfm2MoeCalibBackend<'a> {
+    pub weights: &'a Lfm2MoeWeights,
+    pub config: &'a Lfm2MoeConfig,
+}
+
+impl hipfire_runtime::calibration::CalibratableBackend for Lfm2MoeCalibBackend<'_> {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        _tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let opts = CalibOpts {
+            kldref,
+            kldref_topk: 64,
+        };
+        collect_calibration_artifacts(
+            gpu,
+            self.weights,
+            self.config,
+            tokens,
+            &opts,
+            output,
+            provenance,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

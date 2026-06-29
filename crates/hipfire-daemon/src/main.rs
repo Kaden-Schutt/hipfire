@@ -4808,16 +4808,15 @@ fn main() {
                     );
                     continue;
                 }
-                let (Some(weights), Some(config), Some(tokenizer)) = (
-                    m.q35_weights.as_ref(),
-                    m.q35_config.as_ref(),
-                    m.tokenizer.as_ref(),
-                ) else {
+                // Only the tokenizer is needed up front (to encode the corpus);
+                // the per-arch calibration backend is resolved below. Every arch
+                // with a collector reaches it through the one CalibratableBackend
+                // seam — no qwen3.5-only gate.
+                let Some(tokenizer) = m.tokenizer.as_ref() else {
                     emit_error_with_id(
                         &mut stdout,
                         "",
-                        "collect: resident model is not a qwen3.5-family model with a tokenizer"
-                            .to_string(),
+                        "collect: resident model has no tokenizer".to_string(),
                     );
                     continue;
                 };
@@ -4832,29 +4831,85 @@ fn main() {
                         continue;
                     }
                 };
-                let all = tokenizer.encode(&text);
+                // Bound tokenization to `max_tokens`: the tokenizer is superlinear
+                // in input length, so encoding a whole multi-MB corpus would grind
+                // for hours (the same stall fixed for kld_eval in 8571b79b). Only
+                // the first `max_tokens` are ever calibrated on; tokenize just that
+                // prefix (+ headroom).
+                let take_chars = max_tokens.saturating_mul(8);
+                let bounded: String = text.chars().take(take_chars).collect();
+                let all = tokenizer.encode(&bounded);
                 let n_tok = all.len().min(max_tokens);
-                let tokens = &all[..n_tok];
-                let opts = qwen35::CalibOpts {
-                    kldref,
-                    kldref_topk: 64,
-                };
+                let tokens = all[..n_tok].to_vec();
                 let provenance = [
                     ("source_model", serde_json::json!(m.model_path)),
                     ("corpus", serde_json::json!(corpus)),
                     ("n_calib_tokens", serde_json::json!(n_tok)),
                 ];
-                // Streams the .calib.hfq directly to `output` one tensor at a
-                // time (no full-RAM materialization), returning a summary.
-                match qwen35::collect_calibration_artifacts(
-                    &mut gpu,
-                    weights,
-                    config,
-                    tokens,
-                    &opts,
-                    std::path::Path::new(&output),
-                    &provenance,
-                ) {
+                let out_path = std::path::Path::new(&output);
+                // Arch-agnostic calibration seam: resolve the resident backend's
+                // collector and delegate. Each impl streams the .calib.hfq directly
+                // to `output` one tensor at a time (no full-RAM materialization),
+                // returning a summary. Probe order matches the resident slot layout.
+                use hipfire_runtime::calibration::CalibratableBackend;
+                let result: Result<hipfire_runtime::calibration::CalibSummary, String> = 'pick: {
+                    if let Some(b) = m.zaya_backend.as_ref() {
+                        break 'pick b.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    if let Some(b) = m.gemma3_text.as_ref() {
+                        break 'pick b.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    #[cfg(feature = "arch-lfm2moe")]
+                    if let (Some(w), Some(c)) =
+                        (m.lfm2moe_weights.as_ref(), m.lfm2moe_config.as_ref())
+                    {
+                        let be = lfm2moe::calibration::Lfm2MoeCalibBackend {
+                            weights: w,
+                            config: c,
+                        };
+                        break 'pick be.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
+                        let be = qwen35::Qwen35CalibBackend {
+                            weights: w,
+                            config: c,
+                        };
+                        break 'pick be.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    Err(format!(
+                        "collect: arch_id {} has no calibration-capable backend",
+                        m.arch_id
+                    ))
+                };
+                match result {
                     Ok(summary) => {
                         let resp = serde_json::json!({
                             "type": "collected",
@@ -4898,7 +4953,7 @@ fn main() {
                     .map(|v| v as usize)
                     .unwrap_or(256);
                 let output = msg.get("output").and_then(|v| v.as_str()).map(String::from);
-                let Some(m) = model.as_ref() else {
+                let Some(m) = model.as_mut() else {
                     emit_error_with_id(&mut stdout, "", "kld_eval: no model loaded".to_string());
                     continue;
                 };
@@ -4910,42 +4965,131 @@ fn main() {
                     );
                     continue;
                 }
-                // Dispatch by resident arch. qwen3.5-family (q35 weights+config) and
-                // nemotron_h (nemotron_backend) both score through the shared
-                // `hipfire_kld::eval` orchestration via their per-arch forward seam;
-                // the tokenizer is arch-agnostic. `m`'s borrow ends after the reads
-                // below so the nemotron branches can take `&mut` on the resident model.
-                let is_qwen = m.q35_weights.is_some() && m.q35_config.is_some();
-                let is_nemotron = m.nemotron_backend.is_some();
-                if m.tokenizer.is_none() {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "kld_eval: resident model has no tokenizer".to_string(),
-                    );
-                    continue;
-                }
-                if !is_qwen && !is_nemotron {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "kld_eval: resident model is not a supported arch (qwen3.5-family or nemotron_h)"
-                            .to_string(),
-                    );
-                    continue;
-                }
                 let arch_id = m.arch_id;
                 let base_model = m.model_path.clone();
-                let n_vocab = if is_qwen {
-                    m.q35_config.as_ref().unwrap().vocab_size
-                } else {
-                    m.nemotron_backend.as_ref().unwrap().config().vocab_size
-                };
                 let cfg: hipfire_kld::KldConfig = msg
                     .get("config")
                     .and_then(|c| serde_json::from_value(c.clone()).ok())
                     .unwrap_or_default();
                 let version = hipfire_build_info::VERSION.to_string();
+                // Encode the corpus up front — needs the tokenizer, which must be
+                // borrowed BEFORE the mutable backend borrow below. `score` mode
+                // reads its tokens from the reference archive, so it needs none.
+                let tokens: Vec<u32> = if mode == "self_score" || mode == "build_ref" {
+                    let Some(corpus_path) = corpus.clone() else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("kld_eval: mode={mode} requires 'corpus'"),
+                        );
+                        continue;
+                    };
+                    let text = match std::fs::read_to_string(&corpus_path) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("kld_eval: read {corpus_path}: {e}"),
+                            );
+                            continue;
+                        }
+                    };
+                    let Some(tk) = m.tokenizer.as_ref() else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "kld_eval: resident model has no tokenizer".to_string(),
+                        );
+                        continue;
+                    };
+                    // Only the first `n_ctx × max_chunks` tokens are ever scored, so
+                    // tokenize just that prefix (+ a chunk of headroom). The tokenizer
+                    // is superlinear in input length, so encoding a whole multi-MB
+                    // corpus slice would grind for hours — this is the reference-load
+                    // stall. With no chunk cap we still encode the full slice.
+                    match max_chunks {
+                        Some(mc) => {
+                            let want = n_ctx.saturating_mul(mc.saturating_add(1)).max(n_ctx);
+                            let take_chars = want.saturating_mul(8);
+                            let bounded: String = text.chars().take(take_chars).collect();
+                            tk.encode(&bounded)
+                        }
+                        None => tk.encode(&text),
+                    }
+                } else {
+                    Vec::new()
+                };
+                // Arch-agnostic forward seam: owned AR backends ride the blanket
+                // SimpleAr impl; loose-slot arches (qwen3.5, lfm2moe, deepseek4,
+                // minimax) go through their `*KldForward` adapter. All arches
+                // equal. Probe order matches the resident slot layout; the
+                // labeled block keeps the lfm2moe `#[cfg]` arm clean.
+                use hipfire_runtime::kld_eval::ChunkScoredForward;
+                let fwd_opt: Option<Box<dyn ChunkScoredForward + '_>> = 'pick: {
+                    if let Some(b) = m.zaya_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.gemma3_text.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.gemma3_vl.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.qwen2_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.nemotron_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.llama_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let (Some(w), Some(c)) =
+                        (m.deepseek4_weights.as_ref(), m.deepseek4_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(deepseek4::kld::DeepseekV4KldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    if let (Some(w), Some(c)) =
+                        (m.minimax_weights.as_ref(), m.minimax_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(minimax::kld::MiniMaxKldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    #[cfg(feature = "arch-lfm2moe")]
+                    if let (Some(w), Some(c)) =
+                        (m.lfm2moe_weights.as_ref(), m.lfm2moe_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(lfm2moe::kld::Lfm2MoeKldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
+                        break 'pick Some(Box::new(qwen35::Qwen35KldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    None
+                };
+                let mut fwd = match fwd_opt {
+                    Some(f) => f,
+                    None => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("kld_eval: arch_id {arch_id} has no KLD-scorable backend"),
+                        );
+                        continue;
+                    }
+                };
+                let n_vocab = fwd.kld_vocab_size();
 
                 macro_rules! kld_chunk_cb {
                     () => {
@@ -4975,58 +5119,16 @@ fn main() {
 
                 match mode {
                     "self_score" | "build_ref" => {
-                        let Some(corpus) = corpus.clone() else {
-                            emit_error_with_id(
-                                &mut stdout,
-                                "",
-                                format!("kld_eval: mode={mode} requires 'corpus'"),
-                            );
-                            continue;
-                        };
-                        let text = match std::fs::read_to_string(&corpus) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                emit_error_with_id(
-                                    &mut stdout,
-                                    "",
-                                    format!("kld_eval: read {corpus}: {e}"),
-                                );
-                                continue;
-                            }
-                        };
-                        let tokens = model
-                            .as_ref()
-                            .unwrap()
-                            .tokenizer
-                            .as_ref()
-                            .unwrap()
-                            .encode(&text);
                         if mode == "self_score" {
-                            let result = if is_qwen {
-                                let m = model.as_ref().unwrap();
-                                qwen35::kld_eval_self_score(
-                                    &mut gpu,
-                                    m.q35_weights.as_ref().unwrap(),
-                                    m.q35_config.as_ref().unwrap(),
-                                    &tokens,
-                                    n_ctx,
-                                    top_k,
-                                    max_chunks,
-                                    kld_chunk_cb!(),
-                                )
-                            } else {
-                                let nm = model.as_mut().unwrap().nemotron_backend.as_mut().unwrap();
-                                hipfire_arch_nemotron::kld::kld_eval_self_score(
-                                    &mut gpu,
-                                    nm,
-                                    &tokens,
-                                    n_ctx,
-                                    top_k,
-                                    max_chunks,
-                                    kld_chunk_cb!(),
-                                )
-                            };
-                            match result {
+                            match hipfire_runtime::kld_eval::kld_self_score(
+                                &mut *fwd,
+                                &mut gpu,
+                                &tokens,
+                                n_ctx,
+                                top_k,
+                                max_chunks,
+                                kld_chunk_cb!(),
+                            ) {
                                 Ok(out) => {
                                     let mut seq = serde_json::Value::Null;
                                     if let Some(p) = output.as_deref() {
@@ -5057,45 +5159,22 @@ fn main() {
                                 );
                                 continue;
                             };
-                            let result = if is_qwen {
-                                let m = model.as_ref().unwrap();
-                                qwen35::kld_build_ref(
-                                    &mut gpu,
-                                    m.q35_weights.as_ref().unwrap(),
-                                    m.q35_config.as_ref().unwrap(),
-                                    &tokens,
-                                    n_ctx,
-                                    top_k,
-                                    max_chunks,
-                                    |c, n, s| {
-                                        let _ = writeln!(
-                                            stdout,
-                                            "{}",
-                                            serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":0.0})
-                                        );
-                                        let _ = stdout.flush();
-                                    },
-                                )
-                            } else {
-                                let nm = model.as_mut().unwrap().nemotron_backend.as_mut().unwrap();
-                                hipfire_arch_nemotron::kld::kld_build_ref(
-                                    &mut gpu,
-                                    nm,
-                                    &tokens,
-                                    n_ctx,
-                                    top_k,
-                                    max_chunks,
-                                    |c, n, s| {
-                                        let _ = writeln!(
-                                            stdout,
-                                            "{}",
-                                            serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":0.0})
-                                        );
-                                        let _ = stdout.flush();
-                                    },
-                                )
-                            };
-                            match result {
+                            match hipfire_runtime::kld_eval::kld_build_ref(
+                                &mut *fwd,
+                                &mut gpu,
+                                &tokens,
+                                n_ctx,
+                                top_k,
+                                max_chunks,
+                                |c, n, s| {
+                                    let _ = writeln!(
+                                        stdout,
+                                        "{}",
+                                        serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":0.0})
+                                    );
+                                    let _ = stdout.flush();
+                                },
+                            ) {
                                 Ok(p) => {
                                     let meta = hipfire_kld::RefMeta {
                                         schema: 2,
@@ -5110,7 +5189,7 @@ fn main() {
                                         scoring_start: p.n_ctx / 2,
                                         top_k: p.top_k,
                                         total_scored: p.n_chunk * p.scored_per_chunk,
-                                        slice_path: corpus.clone(),
+                                        slice_path: corpus.clone().unwrap_or_default(),
                                         slice_md5: String::new(),
                                         config: cfg.clone(),
                                         producer: hipfire_kld::ProducerInfo {
@@ -5204,27 +5283,13 @@ fn main() {
                             .iter()
                             .map(|m| format!("{:?} {}: {}", m.severity, m.field, m.detail))
                             .collect();
-                        let result = if is_qwen {
-                            let m = model.as_ref().unwrap();
-                            qwen35::kld_score(
-                                &mut gpu,
-                                m.q35_weights.as_ref().unwrap(),
-                                m.q35_config.as_ref().unwrap(),
-                                &archive,
-                                max_chunks,
-                                kld_chunk_cb!(),
-                            )
-                        } else {
-                            let nm = model.as_mut().unwrap().nemotron_backend.as_mut().unwrap();
-                            hipfire_arch_nemotron::kld::kld_score(
-                                &mut gpu,
-                                nm,
-                                &archive,
-                                max_chunks,
-                                kld_chunk_cb!(),
-                            )
-                        };
-                        match result {
+                        match hipfire_runtime::kld_eval::kld_score(
+                            &mut *fwd,
+                            &mut gpu,
+                            &archive,
+                            max_chunks,
+                            kld_chunk_cb!(),
+                        ) {
                             Ok(out) => {
                                 let mut seq = serde_json::Value::Null;
                                 if let Some(p) = output.as_deref() {

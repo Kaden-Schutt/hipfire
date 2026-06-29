@@ -541,6 +541,33 @@ pub struct CalibSummary {
     pub max_consistency: f32,
 }
 
+/// Daemon-side calibration seam: collect a `.calib.hfq` from an ALREADY-RESIDENT
+/// model — no second load. Parallels [`crate::kld_eval::ChunkScoredForward`] (the
+/// `kld_eval` op's seam), but unlike KLD — which rides the blanket `SimpleAr`
+/// impl — calibration needs each arch's RAW weights + capturing forward
+/// (`gpu_forward_calib`-style), which `SimpleAr` does not expose. So there is no
+/// blanket impl: each arch implements this by delegating to its existing
+/// `collect_calibration_artifacts`. Bundled backends (`ZayaModel`,
+/// `Gemma3Backend`) impl it directly; loose-slot arches (qwen35, lfm2moe) impl it
+/// on a thin `&weights`/`&config` adapter, mirroring `qwen35::Qwen35KldForward`.
+///
+/// `tokenizer` is supplied because some collectors (gemma3 text-only) need it
+/// inside the forward; arches that don't simply ignore it. `kldref` bakes the
+/// per-position top-k lm-head reference into the sidecar (top-k fixed at 64, the
+/// `collect_artifacts` example's value). The data plane stays in-process — only
+/// the resulting [`CalibSummary`] crosses back to the daemon's JSONL.
+pub trait CalibratableBackend {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String>;
+}
+
 /// Outputs of an arch's capturing forward that the driver folds into the
 /// streamed package. `extra_tensors` are small, already-in-RAM tensors (KLDREF
 /// reference, MoE router histogram) appended to the `.calib.hfq`; `extra_meta`

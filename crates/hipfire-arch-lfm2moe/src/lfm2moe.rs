@@ -468,6 +468,97 @@ pub struct Lfm2MoeWeights {
     pub layers: Vec<Lfm2MoeLayerWeights>,
 }
 
+impl ConvWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.in_proj.free_all(gpu);
+        let _ = gpu.free_tensor(self.conv_weight);
+        self.out_proj.free_all(gpu);
+    }
+}
+
+impl AttnWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.wq.free_all(gpu);
+        self.wk.free_all(gpu);
+        self.wv.free_all(gpu);
+        self.wo.free_all(gpu);
+        let _ = gpu.free_tensor(self.q_norm);
+        let _ = gpu.free_tensor(self.k_norm);
+    }
+}
+
+impl Mixer {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Mixer::Conv(c) => c.free_gpu(gpu),
+            Mixer::Attention(a) => a.free_gpu(gpu),
+        }
+    }
+}
+
+impl DenseFfn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.w1.free_all(gpu);
+        self.w3.free_all(gpu);
+        self.w2.free_all(gpu);
+    }
+}
+
+impl ExpertWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.gate_up.free_all(gpu);
+        self.down.free_all(gpu);
+    }
+}
+
+impl MoeFfn {
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        self.router.free_all(gpu);
+        let _ = gpu.free_tensor(self.expert_bias);
+        // Experts own their own buffers (one allocation per expert), so each is
+        // freed exactly once; any shared ParoQuant rotation is skipped via the
+        // `is_alias` check in `WeightTensor::free_all`.
+        for e in self.experts.drain(..) {
+            e.free_gpu(gpu);
+        }
+        // Pointer tables (device addresses), not the expert blobs themselves.
+        let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(self.expert_down_ptrs);
+    }
+}
+
+impl Ffn {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            Ffn::Dense(d) => d.free_gpu(gpu),
+            Ffn::Moe(m) => m.free_gpu(gpu),
+        }
+    }
+}
+
+impl Lfm2MoeLayerWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.operator_norm);
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.mixer.free_gpu(gpu);
+        self.ffn.free_gpu(gpu);
+    }
+}
+
+impl Lfm2MoeWeights {
+    /// Return every GPU buffer this model owns to the pool. Required because the
+    /// LFM2 weights have no Drop, so `unload_model` must free explicitly or the
+    /// weights (the bulk of VRAM) leak across a load/unload cycle.
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embed);
+        let _ = gpu.free_tensor(self.embedding_norm);
+        self.lm_head.free_all(gpu);
+        for l in self.layers.drain(..) {
+            l.free_gpu(gpu);
+        }
+    }
+}
+
 impl Lfm2MoeWeights {
     pub fn load(hfq: &mut HfqFile, cfg: &Lfm2MoeConfig, gpu: &mut Gpu) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
@@ -767,6 +858,41 @@ pub struct Lfm2MoeState {
     // head
     pub final_norm_buf: GpuTensor, // [hidden]
     pub logits: GpuTensor,         // [vocab]
+}
+
+impl Lfm2MoeState {
+    /// Free the KV cache + per-conv-layer ring buffers + all per-step scratch +
+    /// the device position scalar. Paired with `Lfm2MoeWeights::free_gpu` in
+    /// `unload_model`.
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        self.kv.free_gpu(gpu);
+        for cs in self.conv_states.drain(..) {
+            let _ = gpu.free_tensor(cs);
+        }
+        let _ = gpu.hip.free(self.pos_buf);
+        let _ = gpu.free_tensor(self.h);
+        let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.free_tensor(self.fa_q);
+        let _ = gpu.free_tensor(self.fa_k);
+        let _ = gpu.free_tensor(self.fa_v);
+        let _ = gpu.free_tensor(self.fa_attn_out);
+        let _ = gpu.free_tensor(self.conv_bcx);
+        let _ = gpu.free_tensor(self.conv_y);
+        let _ = gpu.free_tensor(self.ffn_tmp);
+        let _ = gpu.free_tensor(self.ffn_x_rot);
+        let _ = gpu.free_tensor(self.dense_gate);
+        let _ = gpu.free_tensor(self.dense_up);
+        let _ = gpu.free_tensor(self.dense_act);
+        let _ = gpu.free_tensor(self.router_logits);
+        let _ = gpu.free_tensor(self.topk_indices);
+        let _ = gpu.free_tensor(self.topk_weights);
+        let _ = gpu.free_tensor(self.gate_batch);
+        let _ = gpu.free_tensor(self.up_batch);
+        let _ = gpu.free_tensor(self.rot_batch);
+        let _ = gpu.free_tensor(self.down_expanded);
+        let _ = gpu.free_tensor(self.final_norm_buf);
+        let _ = gpu.free_tensor(self.logits);
+    }
 }
 
 impl Lfm2MoeState {

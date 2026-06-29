@@ -585,6 +585,80 @@ pub struct MiniMaxState {
     pub logits: GpuTensor,         // [vocab]
 }
 
+impl MiniMaxExpertWeights {
+    /// Free this expert's packed gate_up + down buffers. `WeightTensor::free_all`
+    /// also drops any AWQ sidecar and non-aliased ParoQuant rotation.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.gate_up.free_all(gpu);
+        self.down.free_all(gpu);
+    }
+}
+
+impl MiniMaxLayerWeights {
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.attn_norm);
+        let _ = gpu.free_tensor(self.ffn_norm);
+        let _ = gpu.free_tensor(self.q_norm);
+        let _ = gpu.free_tensor(self.k_norm);
+        self.wq.free_all(gpu);
+        self.wk.free_all(gpu);
+        self.wv.free_all(gpu);
+        self.wo.free_all(gpu);
+        self.router.free_all(gpu);
+        let _ = gpu.free_tensor(self.routing_bias);
+        for e in self.experts.drain(..) {
+            e.free_gpu(gpu);
+        }
+        // Pointer tables (device addresses into the packed expert blobs), not the
+        // blobs themselves — freed once here, no double-free with `experts`.
+        let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
+        let _ = gpu.free_tensor(self.expert_down_ptrs);
+    }
+}
+
+impl MiniMaxWeights {
+    /// Return every GPU buffer this model owns to the pool. Required because the
+    /// MiniMaxWeights backend has no Drop, so `unload_model` must free explicitly
+    /// or the weights (the bulk of VRAM) leak across a load/unload cycle.
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embed);
+        let _ = gpu.free_tensor(self.final_norm);
+        self.lm_head.free_all(gpu);
+        for l in self.layers.drain(..) {
+            l.free_gpu(gpu);
+        }
+    }
+}
+
+impl MiniMaxState {
+    /// Free the KV cache + all per-step scratch buffers + the device position
+    /// scalar. Paired with `MiniMaxWeights::free_gpu` in `unload_model`.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.kv.free_gpu(gpu);
+        let _ = gpu.hip.free(self.pos_buf);
+        let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.free_tensor(self.x_rot);
+        let _ = gpu.free_tensor(self.fa_q);
+        let _ = gpu.free_tensor(self.fa_k);
+        let _ = gpu.free_tensor(self.fa_v);
+        let _ = gpu.free_tensor(self.fa_attn_out);
+        let _ = gpu.free_tensor(self.flash_partials);
+        let _ = gpu.free_tensor(self.h);
+        let _ = gpu.free_tensor(self.ffn_tmp);
+        let _ = gpu.free_tensor(self.ffn_x_rot);
+        let _ = gpu.free_tensor(self.router_logits);
+        let _ = gpu.free_tensor(self.topk_indices);
+        let _ = gpu.free_tensor(self.topk_weights);
+        let _ = gpu.free_tensor(self.gate_batch);
+        let _ = gpu.free_tensor(self.up_batch);
+        let _ = gpu.free_tensor(self.rot_batch);
+        let _ = gpu.free_tensor(self.down_expanded);
+        let _ = gpu.free_tensor(self.final_norm_buf);
+        let _ = gpu.free_tensor(self.final_rot);
+        let _ = gpu.free_tensor(self.logits);
+    }
+}
+
 impl MiniMaxState {
     pub fn new(gpu: &mut Gpu, cfg: &MiniMaxConfig) -> Result<Self, String> {
         // Cap the KV cache so the real 204800-ctx config doesn't OOM; callers

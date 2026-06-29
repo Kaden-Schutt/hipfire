@@ -5044,13 +5044,6 @@ pub fn dump_embed_fp32(
     Ok((vocab, dim))
 }
 
-/// Outcome of a daemon-resident KLD evaluation pass.
-// KLD-eval orchestration (chunk loop, top-k reference, scoring, aggregation) now
-// lives once in `hipfire_kld::eval`; this arch supplies only `forward_chunk_scored`
-// (below) and thin wrappers binding it. Re-export the shared result/ref types so
-// existing callers keep using `qwen35::Kld{EvalOutcome,RefPayloads}`.
-pub use hipfire_kld::{KldEvalOutcome, KldRefPayloads};
-
 /// Run the resident model over `chunk` (per-token decode, fresh KV + DeltaNet
 /// state) and invoke `at_scored(j, full_logits, actual_next)` for each scored
 /// position `j` in `[scoring_start, n_ctx-1)`. The single forward path that both
@@ -5085,88 +5078,73 @@ fn forward_chunk_scored(
     Ok(())
 }
 
-/// Self-consistency KLD against the resident model, no reload.
-///
-/// Pass 1 builds a reference (top-K log-softmax per scored position) from the
-/// loaded model over each `n_ctx` chunk; pass 2 scores the SAME model against
-/// that in-memory reference via a second forward through the identical code.
-/// Because reference build and scoring share one forward path on one loaded
-/// model + config, a healthy run returns ≈0 on ANY arch — this is the guard that
-/// would have caught the historical two-binary 2.85-nat drift in seconds. A
-/// non-zero result is a real forward non-determinism or plumbing bug.
-#[allow(clippy::too_many_arguments)]
-pub fn kld_eval_self_score(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    tokens: &[u32],
-    n_ctx: usize,
-    top_k: usize,
-    max_chunks: Option<usize>,
-    on_chunk: impl FnMut(usize, usize, usize, f32),
-) -> HipResult<KldEvalOutcome> {
-    hipfire_kld::eval::self_score(
-        tokens,
-        n_ctx,
-        top_k,
-        max_chunks,
-        |chunk, scoring_start, emit| {
-            forward_chunk_scored(gpu, weights, config, chunk, scoring_start, |j, lg, nx| {
-                emit(j, lg, nx)
-            })
-        },
-        on_chunk,
-    )
+/// Adapter making a resident Qwen3.5 (the loose `weights`+`config` slots, which
+/// don't implement [`hipfire_runtime::arch::SimpleAr`]) KLD-scorable through the
+/// generic [`hipfire_runtime::kld_eval`] driver — reusing the per-token
+/// `forward_chunk_scored` path above. Every other arch gets the blanket impl.
+pub struct Qwen35KldForward<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
 }
 
-/// Build a KLD reference from the resident model. Thin wrapper binding
-/// `forward_chunk_scored` to the shared `hipfire_kld::eval::build_ref`.
-#[allow(clippy::too_many_arguments)]
-pub fn kld_build_ref(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    tokens: &[u32],
-    n_ctx: usize,
-    top_k: usize,
-    max_chunks: Option<usize>,
-    on_chunk: impl FnMut(usize, usize, usize),
-) -> HipResult<KldRefPayloads> {
-    hipfire_kld::eval::build_ref(
-        tokens,
-        n_ctx,
-        top_k,
-        config.vocab_size,
-        max_chunks,
-        |chunk, scoring_start, emit| {
-            forward_chunk_scored(gpu, weights, config, chunk, scoring_start, |j, lg, nx| {
-                emit(j, lg, nx)
-            })
-        },
-        on_chunk,
-    )
+impl hipfire_runtime::kld_eval::ChunkScoredForward for Qwen35KldForward<'_> {
+    fn forward_chunk_scored(
+        &mut self,
+        gpu: &mut Gpu,
+        chunk: &[u32],
+        scoring_start: usize,
+        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+    ) -> Result<(), String> {
+        forward_chunk_scored(
+            gpu,
+            self.weights,
+            self.config,
+            chunk,
+            scoring_start,
+            |j, lg, next| at_scored(j, lg, next),
+        )
+        .map_err(|e| format!("qwen35 kld forward: {e:?}"))
+    }
+
+    fn kld_vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
 }
 
-/// Score the resident model against a persisted reference. Thin wrapper binding
-/// `forward_chunk_scored` to the shared `hipfire_kld::eval::score`.
-pub fn kld_score(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    archive: &hipfire_kld::RefArchive,
-    max_chunks: Option<usize>,
-    on_chunk: impl FnMut(usize, usize, usize, f32),
-) -> HipResult<KldEvalOutcome> {
-    hipfire_kld::eval::score(
-        archive,
-        max_chunks,
-        |chunk, scoring_start, emit| {
-            forward_chunk_scored(gpu, weights, config, chunk, scoring_start, |j, lg, nx| {
-                emit(j, lg, nx)
-            })
-        },
-        on_chunk,
-    )
+/// Thin `&weights`/`&config` adapter so the daemon's loose Qwen3.5 resident slots
+/// satisfy the calibration seam ([`hipfire_runtime::calibration::CalibratableBackend`])
+/// without a bundled backend type — the calibration analogue of
+/// [`Qwen35KldForward`].
+pub struct Qwen35CalibBackend<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+}
+
+impl hipfire_runtime::calibration::CalibratableBackend for Qwen35CalibBackend<'_> {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        _tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let opts = CalibOpts {
+            kldref,
+            kldref_topk: 64,
+        };
+        collect_calibration_artifacts(
+            gpu,
+            self.weights,
+            self.config,
+            tokens,
+            &opts,
+            output,
+            provenance,
+        )
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident

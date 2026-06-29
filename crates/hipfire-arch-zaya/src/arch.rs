@@ -53,6 +53,13 @@ impl ZayaModel {
     pub fn config(&self) -> &ZayaConfig {
         &self.cfg
     }
+
+    /// GPU-resident weights — exposed for the daemon calibration seam
+    /// ([`hipfire_runtime::calibration::CalibratableBackend`]), which runs the
+    /// capturing forward over the already-loaded weights (no second load).
+    pub fn weights(&self) -> &ZayaGpuWeights {
+        &self.weights
+    }
 }
 
 impl SimpleAr for ZayaModel {

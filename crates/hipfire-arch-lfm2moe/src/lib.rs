@@ -21,6 +21,7 @@ pub mod calibration;
 pub mod config;
 pub mod dflash;
 pub mod forward;
+pub mod kld;
 pub mod lfm2moe;
 
 pub use config::{Lfm2MoeConfig, MixerKind};

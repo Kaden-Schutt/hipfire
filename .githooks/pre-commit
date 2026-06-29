@@ -106,6 +106,22 @@ if [ -n "$STAGED_RS" ]; then
         fi
         echo "  clippy: OK"
     fi
+
+    # Env-var docs: regenerate from the full tracked source tree and re-stage,
+    # so committed docs/env-vars.md + env_docs.rs never drift from the env vars
+    # actually read in code. `gen-env-docs` scans the whole tree (not just staged
+    # files), so it also absorbs drift left by earlier commits. The freshness
+    # CHECK in no-gpu-ci.sh (`gen-env-docs --check`) is the CI-side guard; this
+    # is the commit-time fix. `git add` of an unchanged file is a no-op, so this
+    # never spuriously pulls the docs into an unrelated commit. A build failure
+    # warns but does not block (CI's --check still catches staleness).
+    echo "=== Env-var docs: regenerate + re-stage ==="
+    if cargo run -q -p hipfire-cli -- gen-env-docs 2>/dev/null; then
+        git add docs/env-vars.md crates/hipfire-runtime/src/env_docs.rs
+        echo "  env-docs: regenerated + staged (no-op if unchanged)"
+    else
+        echo "  env-docs: WARN gen-env-docs failed to run; skipping (CI --check still guards)"
+    fi
     echo
 fi
 

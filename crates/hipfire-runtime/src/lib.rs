@@ -33,6 +33,7 @@ pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
 pub mod host_profile;
+pub mod kld_eval;
 pub mod kv;
 pub mod kv_hier;
 pub mod llama;

@@ -22,6 +22,7 @@
 
 pub mod arch;
 pub mod forward;
+pub mod kld;
 pub mod minimax;
 
 pub use arch::MiniMaxM2;
