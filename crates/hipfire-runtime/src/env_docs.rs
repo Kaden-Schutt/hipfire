@@ -1379,11 +1379,32 @@ pub const ENV_HIPFIRE_GDN_Q8_REG_GFX1151: EnvVarDoc = EnvVarDoc {
     source: "crates/rdna-compute/src/dispatch/mod.rs:3732",
 };
 
+/// `HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY` — AWQ-style calibration mode: with no K×K outer-product or multi-GB Hessian
+pub const ENV_HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY",
+    description: "AWQ-style calibration mode: with no K×K outer-product or multi-GB Hessian",
+    source: "crates/hipfire-arch-gemma3/src/calibration.rs:256",
+};
+
 /// `HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS` — Runtime variable controlling gemma3 calib layers per pass in hipfire
 pub const ENV_HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS",
     description: "Runtime variable controlling gemma3 calib layers per pass in hipfire",
     source: "crates/hipfire-arch-gemma3/src/calibration.rs:88",
+};
+
+/// `HIPFIRE_GEMMA3_CALIB_MICROBATCH` — Runtime variable controlling gemma3 calib microbatch in hipfire
+pub const ENV_HIPFIRE_GEMMA3_CALIB_MICROBATCH: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_GEMMA3_CALIB_MICROBATCH",
+    description: "Runtime variable controlling gemma3 calib microbatch in hipfire",
+    source: "crates/hipfire-arch-gemma3/src/calibration.rs:118",
+};
+
+/// `HIPFIRE_GEMMA3_CALIB_NO_BATCH` — Enabled when set to 1
+pub const ENV_HIPFIRE_GEMMA3_CALIB_NO_BATCH: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_GEMMA3_CALIB_NO_BATCH",
+    description: "Enabled when set to 1",
+    source: "crates/hipfire-arch-gemma3/src/calibration.rs:112",
 };
 
 /// `HIPFIRE_GEMMA3_NO_BATCHED_PREFILL` — Runtime variable controlling gemma3 no batched prefill in hipfire
@@ -2360,7 +2381,7 @@ pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_PREFILL_ACT_BITS",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-runtime/src/weights.rs:1398",
+    source: "crates/hipfire-runtime/src/weights.rs:1408",
 };
 
 /// `HIPFIRE_OQ4_TRACE` — Runtime variable controlling oQ4 trace in hipfire
@@ -3874,7 +3895,10 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_FUSED_HFQ4_2ROW_GFX1151,
     ENV_HIPFIRE_GATE_UP_VARIANT,
     ENV_HIPFIRE_GDN_Q8_REG_GFX1151,
+    ENV_HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY,
     ENV_HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS,
+    ENV_HIPFIRE_GEMMA3_CALIB_MICROBATCH,
+    ENV_HIPFIRE_GEMMA3_CALIB_NO_BATCH,
     ENV_HIPFIRE_GEMMA3_NO_BATCHED_PREFILL,
     ENV_HIPFIRE_GEMMA3_PREFILL_MICROBATCH,
     ENV_HIPFIRE_GEMMA3_VISION_NOWMMA,

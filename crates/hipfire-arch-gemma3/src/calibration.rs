@@ -11,7 +11,7 @@ use rdna_compute::Gpu;
 pub use hipfire_runtime::calibration::CalibSummary;
 
 use crate::config::Gemma3Config;
-use crate::forward::{forward_step, Gemma3State};
+use crate::forward::{embed_token, forward_prefill_batch, forward_step, Gemma3State};
 use crate::weights::Gemma3Weights;
 
 /// Options for [`collect_calibration_artifacts_text_only`].
@@ -101,6 +101,77 @@ fn run_text_forward_for_capture(
     collect_kldref: bool,
     kldref: &mut Vec<(f32, Vec<(u32, f32)>)>,
 ) -> HipResult<()> {
+    // Per-position KLDREF needs lm-head logits at EVERY position, but batched
+    // prefill only emits last-position logits — so that path stays per-token.
+    // The common case (no KLDREF) runs WIDE batched prefill: each `weight_gemm`
+    // linear captures the whole microbatch in a single launch (the `weight_gemm`
+    // calibration tap), instead of one N=1 GEMV per token. `HIPFIRE_GEMMA3_CALIB_NO_BATCH=1`
+    // forces the legacy per-token path (for bit-for-bit comparison / debugging).
+    let want_kldref = collect_kldref && opts.kldref;
+    let force_per_token =
+        std::env::var("HIPFIRE_GEMMA3_CALIB_NO_BATCH").ok().as_deref() == Some("1");
+    if want_kldref || force_per_token {
+        return run_text_forward_per_token(gpu, weights, config, tokens, opts, want_kldref, kldref);
+    }
+
+    let dim = config.hidden_size;
+    let microbatch = std::env::var("HIPFIRE_GEMMA3_CALIB_MICROBATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(128);
+    let mut state = Gemma3State::new(gpu, config)
+        .map_err(|e| HipError::new(0, &format!("gemma3 calib state: {e}")))?;
+    let mut start_pos = 0usize;
+    let mut result = Ok(());
+    for chunk in tokens.chunks(microbatch) {
+        let x_batch = match gpu.alloc_tensor(&[chunk.len() * dim], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
+        // Embed each token of the chunk into a contiguous [m, dim] activation,
+        // then run the batched prefill forward (taps fire inside `weight_gemm`).
+        let r = (|| {
+            for (i, &t) in chunk.iter().enumerate() {
+                embed_token(gpu, weights, config, &state.x, t)?;
+                gpu.memcpy_dtod_at_auto(&x_batch.buf, i * dim * 4, &state.x.buf, 0, dim * 4)?;
+            }
+            forward_prefill_batch(
+                gpu,
+                weights,
+                config,
+                &mut state,
+                &x_batch,
+                chunk.len(),
+                start_pos,
+            )
+        })();
+        let _ = gpu.free_tensor(x_batch);
+        if let Err(e) = r {
+            result = Err(e);
+            break;
+        }
+        start_pos += chunk.len();
+    }
+    state.free_gpu(gpu);
+    result
+}
+
+/// Legacy single-token calibration forward. Retained for the KLDREF path (needs
+/// per-position logits) and as a `HIPFIRE_GEMMA3_CALIB_NO_BATCH=1` reference for
+/// validating the batched path produces equivalent Hessians/imatrices.
+fn run_text_forward_per_token(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    config: &Gemma3Config,
+    tokens: &[u32],
+    opts: &CalibOpts,
+    want_kldref: bool,
+    kldref: &mut Vec<(f32, Vec<(u32, f32)>)>,
+) -> HipResult<()> {
     let mut state = Gemma3State::new(gpu, config)
         .map_err(|e| HipError::new(0, &format!("gemma3 calib state: {e}")))?;
     let mut result = Ok(());
@@ -109,7 +180,7 @@ fn run_text_forward_for_capture(
             result = Err(e);
             break;
         }
-        if collect_kldref && opts.kldref {
+        if want_kldref {
             match gpu.download_f32(&state.logits) {
                 Ok(lg) => kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk))),
                 Err(e) => {
@@ -176,12 +247,25 @@ pub fn collect_calibration_artifacts_text_only(
     // Gemma3 is dense (no MoE) so every captured tensor wants a full Hessian, but
     // all layers at once do not fit — the grouped driver re-runs the forward per
     // layer-group and concatenates the parts. KLDREF is captured once (group 0).
+    //
+    // `HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY=1` skips the [K,K] Hessians (every name
+    // contains "", so all tensors fall to imatrix-only). This is the fast
+    // AWQ-style calibration mode: with no K×K outer-product or multi-GB Hessian
+    // write, the forward becomes the bottleneck — which is where the batched
+    // prefill tap pays off.
+    let imatrix_only = if std::env::var("HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY").ok().as_deref()
+        == Some("1")
+    {
+        vec![String::new()]
+    } else {
+        Vec::new()
+    };
     collect_grouped(
         gpu,
         0,
         config.num_hidden_layers,
         layers_per_pass(),
-        Vec::new(),
+        imatrix_only,
         output,
         &static_meta,
         |start, end| build_capture_names_for_layers(weights, prefix, start, end),
