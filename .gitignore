@@ -37,15 +37,9 @@ kernels/compiled/
 # Agent / tool state
 .serena/
 .remember/
-# graphify knowledge graph — mostly regenerable (rebuild with `graphify update .`).
-# Ignore the whole tree (graph.json, cache/, dated snapshot dirs, …); keep only
-# the durable, commit-worthy state via the un-ignore (!) cherry-picks below.
-graphify-out/*
-!graphify-out/.graphify_python
-!graphify-out/.graphify_root
-!graphify-out/.graphify_labels.json
-!graphify-out/GRAPH_REPORT.md
-!graphify-out/manifest.json
+# graphify knowledge graph — fully regenerable (rebuild with `graphify update .`).
+# Ignore the whole tree; force-add a specific file only for a deliberate snapshot.
+graphify-out/
 # Machine-specific generated hooks (embed a local interpreter path).
 # Each user/agent runs `graphify hook install` on their end.
 .githooks/post-commit
