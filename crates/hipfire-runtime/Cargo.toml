@@ -61,6 +61,7 @@ hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
+hipfire-state = { path = "../hipfire-state" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-mixer = { path = "../hipfire-mixer" }

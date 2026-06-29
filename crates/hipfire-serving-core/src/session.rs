@@ -55,6 +55,31 @@ pub const LFM2_LEGACY_SESSION_ID: &str = "__legacy_generate__";
 pub const DEFAULT_MODEL_WORKER_ID: &str = "__default__";
 static QWEN35_STATE_ALLOCATION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// Generic per-arch session bookkeeping: resident sessions keyed by id, the
+/// active session id, and the allocation epoch. The qwen35 and lfm2 rich serving
+/// paths carry an identical-shaped registry over their own per-session state `S`
+/// (`Qwen35RequestSessionState` / `Lfm2RequestSessionState`); unifying the three
+/// common fields here is S0 of the `SessionServingBackend` hoist (the future trait
+/// operates on one shape). Arch-specific extras (e.g. qwen35's
+/// `q35_active_prefilled_generated_suffix_len`) intentionally stay separate.
+pub struct SessionRegistry<S> {
+    pub sessions: std::collections::HashMap<String, S>,
+    pub active_session_id: Option<String>,
+    pub allocation_epoch: u64,
+}
+
+// Manual `Default` (not derived) so it does not impose `S: Default` — the
+// per-session state types are not `Default`-constructible.
+impl<S> Default for SessionRegistry<S> {
+    fn default() -> Self {
+        Self {
+            sessions: std::collections::HashMap::new(),
+            active_session_id: None,
+            allocation_epoch: 0,
+        }
+    }
+}
+
 /// Monotonic epoch stamped onto each allocated session state, so a stale handle
 /// referencing freed/reallocated state can be detected and rejected.
 pub fn next_qwen35_state_allocation_epoch() -> u64 {
@@ -282,7 +307,7 @@ impl Qwen35RequestSessionState {
         // The loaded singleton path computes it when checkpointable prefill
         // sessions are saved back into the session map.
         restore_sequence_state_into_model(m, self.sequence_state);
-        m.q35_active_state_allocation_epoch = allocation_epoch;
+        m.q35_registry.allocation_epoch = allocation_epoch;
         m.q35_active_prefilled_generated_suffix_len = self.prefilled_generated_suffix_len;
         Ok(())
     }
@@ -354,7 +379,7 @@ impl Lfm2RequestSessionState {
                 .lfm2_dflash
                 .as_mut()
                 .map(|df| std::mem::take(&mut df.target_hidden_host)),
-            allocation_epoch: m.lfm2_active_state_allocation_epoch,
+            allocation_epoch: m.lfm2_registry.allocation_epoch,
         })
     }
 
@@ -365,7 +390,7 @@ impl Lfm2RequestSessionState {
         if let Some(df) = m.lfm2_dflash.as_mut() {
             df.target_hidden_host = self.dflash_target_hidden_host.unwrap_or_default();
         }
-        m.lfm2_active_state_allocation_epoch = self.allocation_epoch;
+        m.lfm2_registry.allocation_epoch = self.allocation_epoch;
     }
 
     pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
@@ -548,18 +573,20 @@ pub(crate) fn take_qwen35_state_from_model(
 }
 
 pub fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
-    m.q35_active_session_id.as_deref() == Some(session_id)
-        || m.q35_sessions.contains_key(session_id)
+    m.q35_registry.active_session_id.as_deref() == Some(session_id)
+        || m.q35_registry.sessions.contains_key(session_id)
 }
 
 pub fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     let saved = m
-        .q35_sessions
+        .q35_registry
+        .sessions
         .keys()
         .filter(|id| id.as_str() != QWEN35_LEGACY_SESSION_ID)
         .count();
     let active = usize::from(
-        m.q35_active_session_id
+        m.q35_registry
+            .active_session_id
             .as_deref()
             .is_some_and(|id| id != QWEN35_LEGACY_SESSION_ID),
     );
@@ -659,14 +686,14 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
             role: role.to_string(),
         });
     };
-    for (session_id, session) in &m.q35_sessions {
+    for (session_id, session) in &m.q35_registry.sessions {
         push_session(session_id, session, "resident");
     }
-    if let Some(active_id) = m.q35_active_session_id.as_deref() {
+    if let Some(active_id) = m.q35_registry.active_session_id.as_deref() {
         if active_id != QWEN35_LEGACY_SESSION_ID {
             let compact_offset = m.kv_cache().map(|kv| kv.compact_offset).unwrap_or(0);
             let logical_position = m.seq_pos + compact_offset;
-            let allocation_epoch = m.q35_active_state_allocation_epoch;
+            let allocation_epoch = m.q35_registry.allocation_epoch;
             let owns_pages = allocation_epoch != 0;
             let handle = qwen35_sequence_state_handle(active_id, allocation_epoch);
             descriptors.push(SequenceStatePageDescriptor {
@@ -763,19 +790,21 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_session_resident(m: &LoadedModel, session_id: &str) -> bool {
-    m.lfm2_active_session_id.as_deref() == Some(session_id)
-        || m.lfm2_sessions.contains_key(session_id)
+    m.lfm2_registry.active_session_id.as_deref() == Some(session_id)
+        || m.lfm2_registry.sessions.contains_key(session_id)
 }
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_request_session_count(m: &LoadedModel) -> usize {
     let saved = m
-        .lfm2_sessions
+        .lfm2_registry
+        .sessions
         .keys()
         .filter(|id| id.as_str() != LFM2_LEGACY_SESSION_ID)
         .count();
     let active = usize::from(
-        m.lfm2_active_session_id
+        m.lfm2_registry
+            .active_session_id
             .as_deref()
             .is_some_and(|id| id != LFM2_LEGACY_SESSION_ID),
     );
@@ -861,7 +890,7 @@ fn lfm2_push_state_descriptors(
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_session_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
     let mut descriptors = Vec::new();
-    for (session_id, session) in &m.lfm2_sessions {
+    for (session_id, session) in &m.lfm2_registry.sessions {
         lfm2_push_state_descriptors(
             m,
             &mut descriptors,
@@ -873,7 +902,7 @@ pub fn lfm2_session_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
         );
     }
     if let (Some(active_id), Some(state)) = (
-        m.lfm2_active_session_id.as_deref(),
+        m.lfm2_registry.active_session_id.as_deref(),
         m.lfm2moe_state.as_ref(),
     ) {
         lfm2_push_state_descriptors(
@@ -882,7 +911,7 @@ pub fn lfm2_session_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
             active_id,
             state,
             state.n_tokens + state.kv.compact_offset,
-            m.lfm2_active_state_allocation_epoch,
+            m.lfm2_registry.allocation_epoch,
             "active",
         );
     }
@@ -1509,15 +1538,15 @@ pub fn qwen35_release_sessions(
         if session_id == QWEN35_LEGACY_SESSION_ID {
             continue;
         }
-        if m.q35_active_session_id.as_deref() == Some(session_id.as_str()) {
+        if m.q35_registry.active_session_id.as_deref() == Some(session_id.as_str()) {
             qwen35_save_active_session(m, gpu)?;
         }
-        if m.q35_sessions.remove(session_id).is_some() {
+        if m.q35_registry.sessions.remove(session_id).is_some() {
             released += 1;
         }
     }
 
-    if m.q35_active_session_id.is_none() {
+    if m.q35_registry.active_session_id.is_none() {
         let created = qwen35_activate_session(m, gpu, QWEN35_LEGACY_SESSION_ID)?;
         if created {
             qwen35_reset_active_session(m, gpu)?;
@@ -1686,11 +1715,11 @@ pub fn qwen35_save_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<(), String> {
-    if let Some(active_id) = m.q35_active_session_id.take() {
+    if let Some(active_id) = m.q35_registry.active_session_id.take() {
         let session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
             .map_err(|e| format!("failed to save active qwen35 session: {e}"))?;
-        m.q35_sessions.insert(active_id, session);
-        m.q35_active_state_allocation_epoch = 0;
+        m.q35_registry.sessions.insert(active_id, session);
+        m.q35_registry.allocation_epoch = 0;
     }
     Ok(())
 }
@@ -1702,28 +1731,28 @@ pub fn qwen35_activate_session(
     gpu: &mut rdna_compute::Gpu,
     session_id: &str,
 ) -> Result<bool, String> {
-    if m.q35_active_session_id.as_deref() == Some(session_id) {
+    if m.q35_registry.active_session_id.as_deref() == Some(session_id) {
         return Ok(false);
     }
-    let existed = m.q35_sessions.contains_key(session_id);
+    let existed = m.q35_registry.sessions.contains_key(session_id);
     qwen35_save_active_session(m, gpu)?;
-    let session = match m.q35_sessions.remove(session_id) {
+    let session = match m.q35_registry.sessions.remove(session_id) {
         Some(session) => session,
         None => qwen35_allocate_session_state(m, gpu)?,
     };
     session.restore_into_loaded(m, gpu)?;
-    m.q35_active_session_id = Some(session_id.to_string());
+    m.q35_registry.active_session_id = Some(session_id.to_string());
     Ok(!existed)
 }
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_save_active_session(m: &mut LoadedModel) -> Result<(), String> {
-    if let Some(active_id) = m.lfm2_active_session_id.take() {
+    if let Some(active_id) = m.lfm2_registry.active_session_id.take() {
         let mut session = Lfm2RequestSessionState::take_from_loaded(m)
             .map_err(|e| format!("failed to save active lfm2 session: {e}"))?;
         session.seq_pos = session.state.n_tokens;
-        m.lfm2_sessions.insert(active_id, session);
-        m.lfm2_active_state_allocation_epoch = 0;
+        m.lfm2_registry.sessions.insert(active_id, session);
+        m.lfm2_registry.allocation_epoch = 0;
     }
     Ok(())
 }
@@ -1746,17 +1775,17 @@ pub fn lfm2_activate_session(
     gpu: &mut rdna_compute::Gpu,
     session_id: &str,
 ) -> Result<bool, String> {
-    if m.lfm2_active_session_id.as_deref() == Some(session_id) {
+    if m.lfm2_registry.active_session_id.as_deref() == Some(session_id) {
         return Ok(false);
     }
-    let existed = m.lfm2_sessions.contains_key(session_id);
+    let existed = m.lfm2_registry.sessions.contains_key(session_id);
     lfm2_save_active_session(m)?;
-    let session = match m.lfm2_sessions.remove(session_id) {
+    let session = match m.lfm2_registry.sessions.remove(session_id) {
         Some(session) => session,
         None => lfm2_allocate_session_state(m, gpu)?,
     };
     session.restore_into_loaded(m);
-    m.lfm2_active_session_id = Some(session_id.to_string());
+    m.lfm2_registry.active_session_id = Some(session_id.to_string());
     Ok(!existed)
 }
 
@@ -1804,14 +1833,14 @@ pub fn lfm2_release_sessions(
         if session_id == LFM2_LEGACY_SESSION_ID {
             continue;
         }
-        if m.lfm2_active_session_id.as_deref() == Some(session_id.as_str()) {
+        if m.lfm2_registry.active_session_id.as_deref() == Some(session_id.as_str()) {
             lfm2_save_active_session(m)?;
         }
-        if m.lfm2_sessions.remove(session_id).is_some() {
+        if m.lfm2_registry.sessions.remove(session_id).is_some() {
             released += 1;
         }
     }
-    if m.lfm2_active_session_id.is_none() {
+    if m.lfm2_registry.active_session_id.is_none() {
         let created = lfm2_activate_session(m, gpu, LFM2_LEGACY_SESSION_ID)?;
         if created {
             lfm2_reset_active_session(m, gpu)?;
@@ -1828,10 +1857,11 @@ pub fn lfm2_validate_prefix_hash(
 ) -> Result<(), String> {
     validate_checkpoint_source_resident(
         source_session_id,
-        m.lfm2_sessions.contains_key(source_session_id),
+        m.lfm2_registry.sessions.contains_key(source_session_id),
     )?;
     let source = m
-        .lfm2_sessions
+        .lfm2_registry
+        .sessions
         .get(source_session_id)
         .expect("source residency was validated");
     validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)
@@ -1850,14 +1880,18 @@ pub fn lfm2_fork_session_state(
     }
     validate_checkpoint_source_resident(
         request.source_session_id,
-        m.lfm2_sessions.contains_key(request.source_session_id),
+        m.lfm2_registry
+            .sessions
+            .contains_key(request.source_session_id),
     )?;
     let source = m
-        .lfm2_sessions
+        .lfm2_registry
+        .sessions
         .get(request.source_session_id)
         .expect("source residency was validated");
     let forked = Lfm2RequestSessionState::fork_from(gpu, source)?;
-    m.lfm2_sessions
+    m.lfm2_registry
+        .sessions
         .insert(request.dest_session_id.to_string(), forked);
     Ok(())
 }
@@ -1875,10 +1909,13 @@ pub fn lfm2_checkpoint_session_state(
     {
         validate_checkpoint_source_resident(
             request.source_session_id,
-            m.lfm2_sessions.contains_key(request.source_session_id),
+            m.lfm2_registry
+                .sessions
+                .contains_key(request.source_session_id),
         )?;
         let source = m
-            .lfm2_sessions
+            .lfm2_registry
+            .sessions
             .get(request.source_session_id)
             .expect("source residency was validated");
         let logical_position = source.state.n_tokens + source.state.kv.compact_offset;
@@ -1889,7 +1926,7 @@ pub fn lfm2_checkpoint_session_state(
         )?;
     }
     if let Some(prefix_hash) = request.checkpoint_prefix_hash {
-        if let Some(source) = m.lfm2_sessions.get_mut(request.source_session_id) {
+        if let Some(source) = m.lfm2_registry.sessions.get_mut(request.source_session_id) {
             source.prefix_hash = Some(prefix_hash.clone());
         }
     }
@@ -1914,7 +1951,8 @@ pub fn qwen35_fork_session_state(
     if request.source_session_id == request.dest_session_id {
         return Ok(());
     }
-    let source_is_active = m.q35_active_session_id.as_deref() == Some(request.source_session_id);
+    let source_is_active =
+        m.q35_registry.active_session_id.as_deref() == Some(request.source_session_id);
     if !source_is_active {
         qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)?;
     }
@@ -1929,14 +1967,18 @@ pub fn qwen35_fork_session_state(
     }
     validate_checkpoint_source_resident(
         request.source_session_id,
-        m.q35_sessions.contains_key(request.source_session_id),
+        m.q35_registry
+            .sessions
+            .contains_key(request.source_session_id),
     )?;
     let source = m
-        .q35_sessions
+        .q35_registry
+        .sessions
         .get(request.source_session_id)
         .expect("source residency was validated");
     let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
-    m.q35_sessions
+    m.q35_registry
+        .sessions
         .insert(request.dest_session_id.to_string(), forked);
     Ok(())
 }
@@ -1956,10 +1998,13 @@ pub fn qwen35_checkpoint_session_state(
     {
         validate_checkpoint_source_resident(
             request.source_session_id,
-            m.q35_sessions.contains_key(request.source_session_id),
+            m.q35_registry
+                .sessions
+                .contains_key(request.source_session_id),
         )?;
         let source = m
-            .q35_sessions
+            .q35_registry
+            .sessions
             .get(request.source_session_id)
             .expect("source residency was validated");
         let logical_position = source.seq_pos + source.kv_cache().compact_offset;
@@ -1970,7 +2015,7 @@ pub fn qwen35_checkpoint_session_state(
         )?;
     }
     if let Some(prefix_hash) = request.checkpoint_prefix_hash {
-        if let Some(source) = m.q35_sessions.get_mut(request.source_session_id) {
+        if let Some(source) = m.q35_registry.sessions.get_mut(request.source_session_id) {
             source.prefix_hash = Some(prefix_hash.clone());
         }
     }
@@ -1994,10 +2039,11 @@ pub fn qwen35_validate_prefix_hash(
 ) -> Result<(), String> {
     validate_checkpoint_source_resident(
         source_session_id,
-        m.q35_sessions.contains_key(source_session_id),
+        m.q35_registry.sessions.contains_key(source_session_id),
     )?;
     let source = m
-        .q35_sessions
+        .q35_registry
+        .sessions
         .get(source_session_id)
         .expect("source residency was validated");
     validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)

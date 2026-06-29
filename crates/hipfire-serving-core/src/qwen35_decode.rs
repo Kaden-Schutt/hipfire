@@ -239,12 +239,16 @@ pub fn validate_qwen35_decode_resident_sessions(
     backend_label: &str,
 ) -> Result<(), String> {
     for session in &envelope.sessions {
-        let state = m.q35_sessions.get(&session.session_id).ok_or_else(|| {
-            format!(
-                "decode session {} is not resident for {backend_label} decode",
-                session.session_id
-            )
-        })?;
+        let state = m
+            .q35_registry
+            .sessions
+            .get(&session.session_id)
+            .ok_or_else(|| {
+                format!(
+                    "decode session {} is not resident for {backend_label} decode",
+                    session.session_id
+                )
+            })?;
         let logical_position = state.seq_pos + state.kv_cache().compact_offset;
         if logical_position != session.logical_position {
             return Err(format!(
@@ -268,12 +272,16 @@ pub fn validate_qwen35_fused_dense_decode_resident_sessions(
         .ok_or_else(|| "qwen35 fused dense decode requires qwen35 config".to_string())?;
     let mut signatures = Vec::with_capacity(envelope.sessions.len());
     for session in &envelope.sessions {
-        let state = m.q35_sessions.get(&session.session_id).ok_or_else(|| {
-            format!(
-                "decode session {} is not resident for fused dense decode",
-                session.session_id
-            )
-        })?;
+        let state = m
+            .q35_registry
+            .sessions
+            .get(&session.session_id)
+            .ok_or_else(|| {
+                format!(
+                    "decode session {} is not resident for fused dense decode",
+                    session.session_id
+                )
+            })?;
         let logical_position = state.seq_pos + state.kv_cache().compact_offset;
         if logical_position != session.logical_position {
             return Err(format!(
@@ -764,12 +772,16 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
     let mut states: Vec<(GenerateBatchDecodeSession, Qwen35RequestSessionState)> =
         Vec::with_capacity(chunk.len());
     for session in chunk {
-        let state = m.q35_sessions.remove(&session.session_id).ok_or_else(|| {
-            format!(
-                "decode session {} is not resident for fused grouped-MoE native decode",
-                session.session_id
-            )
-        })?;
+        let state = m
+            .q35_registry
+            .sessions
+            .remove(&session.session_id)
+            .ok_or_else(|| {
+                format!(
+                    "decode session {} is not resident for fused grouped-MoE native decode",
+                    session.session_id
+                )
+            })?;
         states.push((session.clone(), state));
     }
 
@@ -960,7 +972,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
     })();
 
     for (session, state) in states {
-        m.q35_sessions.insert(session.session_id, state);
+        m.q35_registry.sessions.insert(session.session_id, state);
     }
 
     result
@@ -1040,12 +1052,16 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
     let mut states: Vec<(GenerateBatchDecodeSession, Qwen35RequestSessionState)> =
         Vec::with_capacity(chunk.len());
     for session in chunk {
-        let state = m.q35_sessions.remove(&session.session_id).ok_or_else(|| {
-            format!(
-                "decode session {} is not resident for fused dense native decode",
-                session.session_id
-            )
-        })?;
+        let state = m
+            .q35_registry
+            .sessions
+            .remove(&session.session_id)
+            .ok_or_else(|| {
+                format!(
+                    "decode session {} is not resident for fused dense native decode",
+                    session.session_id
+                )
+            })?;
         states.push((session.clone(), state));
     }
 
@@ -1230,7 +1246,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
     })();
 
     for (session, state) in states {
-        m.q35_sessions.insert(session.session_id, state);
+        m.q35_registry.sessions.insert(session.session_id, state);
     }
 
     result

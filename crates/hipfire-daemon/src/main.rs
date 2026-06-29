@@ -4559,15 +4559,15 @@ fn main() {
                     generic_state_arena.release_worker(&target_worker_id);
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
-                    m.q35_sessions.clear();
-                    m.q35_active_session_id = if is_qwen35_family_arch_id(m.arch_id)
+                    m.q35_registry.sessions.clear();
+                    m.q35_registry.active_session_id = if is_qwen35_family_arch_id(m.arch_id)
                         && m.pp == 1
                         && m.sequence_state.is_some()
                     {
-                        m.q35_active_state_allocation_epoch = next_qwen35_state_allocation_epoch();
+                        m.q35_registry.allocation_epoch = next_qwen35_state_allocation_epoch();
                         Some(QWEN35_LEGACY_SESSION_ID.to_string())
                     } else {
-                        m.q35_active_state_allocation_epoch = 0;
+                        m.q35_registry.allocation_epoch = 0;
                         None
                     };
                     // Multi-GPU branch: route per-LA-layer memsets through
@@ -4668,14 +4668,14 @@ fn main() {
                         if let Some(ref mut s) = m.lfm2moe_state {
                             let _ = s.reset(&mut gpu);
                         }
-                        m.lfm2_sessions.clear();
+                        m.lfm2_registry.sessions.clear();
                         if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 && m.lfm2moe_state.is_some() {
-                            m.lfm2_active_session_id = Some(LFM2_LEGACY_SESSION_ID.to_string());
-                            m.lfm2_active_state_allocation_epoch =
-                                next_qwen35_state_allocation_epoch();
+                            m.lfm2_registry.active_session_id =
+                                Some(LFM2_LEGACY_SESSION_ID.to_string());
+                            m.lfm2_registry.allocation_epoch = next_qwen35_state_allocation_epoch();
                         } else {
-                            m.lfm2_active_session_id = None;
-                            m.lfm2_active_state_allocation_epoch = 0;
+                            m.lfm2_registry.active_session_id = None;
+                            m.lfm2_registry.allocation_epoch = 0;
                         }
                     }
                     // arch_id=12/13 (Gemma3 text / Gemma3-VL text): rewind the

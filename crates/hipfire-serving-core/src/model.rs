@@ -39,6 +39,7 @@ use hipfire_state::ModelArtifactMemory;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::session::Lfm2RequestSessionState;
 use crate::session::Qwen35RequestSessionState;
+use crate::session::SessionRegistry;
 
 /// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
 /// CaskConfig{sidecar: None, ..} means no eviction — matches 0.1.7-alpha behavior.
@@ -218,9 +219,7 @@ pub struct LoadedModel {
     pub sequence_state: Option<SequenceState>,
     pub q35_kv_mode: Option<String>,
     pub q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
-    pub q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
-    pub q35_active_session_id: Option<String>,
-    pub q35_active_state_allocation_epoch: u64,
+    pub q35_registry: SessionRegistry<Qwen35RequestSessionState>,
     pub q35_active_prefilled_generated_suffix_len: usize,
     // Qwen3 state
     pub llama_config: Option<llama::LlamaConfig>,
@@ -304,11 +303,7 @@ pub struct LoadedModel {
     #[cfg(feature = "arch-lfm2moe")]
     pub lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
     #[cfg(feature = "arch-lfm2moe")]
-    pub lfm2_sessions: std::collections::HashMap<String, Lfm2RequestSessionState>,
-    #[cfg(feature = "arch-lfm2moe")]
-    pub lfm2_active_session_id: Option<String>,
-    #[cfg(feature = "arch-lfm2moe")]
-    pub lfm2_active_state_allocation_epoch: u64,
+    pub lfm2_registry: SessionRegistry<Lfm2RequestSessionState>,
     /// Cached EOS token id resolved at load time. Falls back to 1 if the
     /// tokenizer lacks the special-token entry.
     #[cfg(feature = "arch-lfm2moe")]

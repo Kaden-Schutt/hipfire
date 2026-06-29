@@ -637,11 +637,11 @@ pub fn run_generate_batch_prefill_serial_lfm2(
                 .map(|hash| hash.prefix_len)
                 .unwrap_or(session.state_handle.cached_prefix_tokens),
             prefix_hash: prefix_hash.clone(),
-            allocation_epoch: m.lfm2_active_state_allocation_epoch,
+            allocation_epoch: m.lfm2_registry.allocation_epoch,
             boundary_checkpoints,
         };
         lfm2_save_active_session(m)?;
-        if let Some(saved) = m.lfm2_sessions.get_mut(&session.id) {
+        if let Some(saved) = m.lfm2_registry.sessions.get_mut(&session.id) {
             saved.prefix_hash = Some(prefix_hash);
         } else if existed {
             return Err(format!(

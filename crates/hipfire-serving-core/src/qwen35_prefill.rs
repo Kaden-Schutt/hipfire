@@ -570,7 +570,7 @@ pub fn qwen35_prefill_suffix_batch(
         for session in attach_only {
             qwen35_activate_session(m, gpu, &session.id)?;
             qwen35_save_active_session(m, gpu)?;
-            let saved = m.q35_sessions.get(&session.id).ok_or_else(|| {
+            let saved = m.q35_registry.sessions.get(&session.id).ok_or_else(|| {
                 format!(
                     "qwen35 attach-only session {} missing after activation",
                     session.id
@@ -585,7 +585,7 @@ pub fn qwen35_prefill_suffix_batch(
                 session.max_think_tokens,
                 &saved.conversation_tokens,
             );
-            if let Some(saved) = m.q35_sessions.get_mut(&session.id) {
+            if let Some(saved) = m.q35_registry.sessions.get_mut(&session.id) {
                 saved.prefix_hash = Some(prefix_hash.clone());
             }
             sessions_by_id.insert(
@@ -712,13 +712,13 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
         Vec::with_capacity(prepared.len());
     for spec in prepared {
-        let state = match m.q35_sessions.remove(&spec.id) {
+        let state = match m.q35_registry.sessions.remove(&spec.id) {
             Some(state) => state,
             None => match qwen35_allocate_session_state(m, gpu) {
                 Ok(state) => state,
                 Err(e) => {
                     for (restore_id, restore_state) in owned_sessions {
-                        m.q35_sessions.insert(restore_id, restore_state);
+                        m.q35_registry.sessions.insert(restore_id, restore_state);
                     }
                     return Err(e);
                 }
@@ -727,9 +727,9 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         if state.seq_pos + spec.tokens.len() > m.physical_cap {
             let id = spec.id.to_string();
             let seq_pos = state.seq_pos;
-            m.q35_sessions.insert(id.clone(), state);
+            m.q35_registry.sessions.insert(id.clone(), state);
             for (restore_id, restore_state) in owned_sessions {
-                m.q35_sessions.insert(restore_id, restore_state);
+                m.q35_registry.sessions.insert(restore_id, restore_state);
             }
             return Err(format!(
                 "generate_batch_prefill exceeds loaded KV budget for session {}: seq_pos={} + prefill={} > physical_cap={}",
@@ -776,7 +776,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                         Ok(tokens) => tokens,
                         Err(err) => {
                             for (id, state) in owned_sessions {
-                                m.q35_sessions.insert(id, state);
+                                m.q35_registry.sessions.insert(id, state);
                             }
                             return Err(err);
                         }
@@ -802,7 +802,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                         };
                         let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
                         let checkpoint_id = emit_qwen35_owned_prefill_checkpoint(
-                            &mut m.q35_sessions,
+                            &mut m.q35_registry.sessions,
                             gpu,
                             hook,
                             state,
@@ -882,7 +882,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 Ok(shape) => shape,
                 Err(e) => {
                     for (id, state) in owned_sessions {
-                        m.q35_sessions.insert(id, state);
+                        m.q35_registry.sessions.insert(id, state);
                     }
                     return Err(format!(
                         "qwen35 grouped-MoE fused boundary prefill-session batch backend failed: {e:?}; \
@@ -919,7 +919,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                     };
                     let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
                     let checkpoint_id =
-                        emit_qwen35_owned_prefill_checkpoint(&mut m.q35_sessions, gpu, hook, state).map_err(|e| {
+                        emit_qwen35_owned_prefill_checkpoint(&mut m.q35_registry.sessions, gpu, hook, state).map_err(|e| {
                             format!(
                                 "qwen35 session {} failed to create fused semantic boundary checkpoint {}: {}",
                                 prepared[idx].id, checkpoint_id_for_error, e
@@ -952,7 +952,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 debug_sample_token: None,
                 boundary_checkpoints: std::mem::take(&mut boundary_checkpoints_by_session[idx]),
             });
-            m.q35_sessions.insert(id, state);
+            m.q35_registry.sessions.insert(id, state);
         }
         return Ok(Qwen35PrefillBatchResult {
             mode: "qwen35_fused_grouped_moe_prefill_boundary_chunked",
@@ -1024,7 +1024,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         Ok(shape) => shape,
         Err(e) => {
             for (id, state) in owned_sessions {
-                m.q35_sessions.insert(id, state);
+                m.q35_registry.sessions.insert(id, state);
             }
             return Err(format!(
                 "qwen35 grouped-MoE fused prefill-session batch backend failed: {e:?}; \
@@ -1090,7 +1090,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             debug_sample_token,
             boundary_checkpoints: Vec::new(),
         });
-        m.q35_sessions.insert(id, state);
+        m.q35_registry.sessions.insert(id, state);
     }
 
     Ok(Qwen35PrefillBatchResult {
@@ -1147,13 +1147,13 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
     let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
         Vec::with_capacity(contract.sessions.len());
     for spec in &contract.sessions {
-        let state = match m.q35_sessions.remove(spec.id) {
+        let state = match m.q35_registry.sessions.remove(spec.id) {
             Some(state) => state,
             None => match qwen35_allocate_session_state(m, gpu) {
                 Ok(state) => state,
                 Err(e) => {
                     for (restore_id, restore_state) in owned_sessions {
-                        m.q35_sessions.insert(restore_id, restore_state);
+                        m.q35_registry.sessions.insert(restore_id, restore_state);
                     }
                     return Err(e);
                 }
@@ -1162,9 +1162,9 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
         if state.seq_pos + spec.tokens.len() > m.physical_cap {
             let id = spec.id.to_string();
             let seq_pos = state.seq_pos;
-            m.q35_sessions.insert(id.clone(), state);
+            m.q35_registry.sessions.insert(id.clone(), state);
             for (restore_id, restore_state) in owned_sessions {
-                m.q35_sessions.insert(restore_id, restore_state);
+                m.q35_registry.sessions.insert(restore_id, restore_state);
             }
             return Err(format!(
                 "generate_batch_prefill exceeds loaded KV budget for session {}: seq_pos={} + prefill={} > physical_cap={}",
@@ -1211,7 +1211,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                         Ok(tokens) => tokens,
                         Err(err) => {
                             for (id, state) in owned_sessions {
-                                m.q35_sessions.insert(id, state);
+                                m.q35_registry.sessions.insert(id, state);
                             }
                             return Err(err);
                         }
@@ -1237,7 +1237,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                         };
                         let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
                         let checkpoint_id = emit_qwen35_owned_prefill_checkpoint(
-                            &mut m.q35_sessions,
+                            &mut m.q35_registry.sessions,
                             gpu,
                             hook,
                             state,
@@ -1316,7 +1316,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                 Ok(shape) => shape,
                 Err(e) => {
                     for (id, state) in owned_sessions {
-                        m.q35_sessions.insert(id, state);
+                        m.q35_registry.sessions.insert(id, state);
                     }
                     return Err(format!(
                         "qwen35 fused dense boundary prefill-session batch backend failed: {e:?}; \
@@ -1353,7 +1353,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                     };
                     let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
                     let checkpoint_id =
-                        emit_qwen35_owned_prefill_checkpoint(&mut m.q35_sessions, gpu, hook, state).map_err(|e| {
+                        emit_qwen35_owned_prefill_checkpoint(&mut m.q35_registry.sessions, gpu, hook, state).map_err(|e| {
                             format!(
                                 "qwen35 session {} failed to create fused semantic boundary checkpoint {}: {}",
                                 contract.sessions[idx].id, checkpoint_id_for_error, e
@@ -1386,7 +1386,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                 debug_sample_token: None,
                 boundary_checkpoints: std::mem::take(&mut boundary_checkpoints_by_session[idx]),
             });
-            m.q35_sessions.insert(id, state);
+            m.q35_registry.sessions.insert(id, state);
         }
         return Ok(Qwen35PrefillBatchResult {
             mode: "qwen35_fused_dense_prefill_boundary_chunked",
@@ -1454,7 +1454,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
         Ok(shape) => shape,
         Err(e) => {
             for (id, state) in owned_sessions {
-                m.q35_sessions.insert(id, state);
+                m.q35_registry.sessions.insert(id, state);
             }
             return Err(format!(
                 "qwen35 fused dense prefill-session batch backend failed: {e:?}; \
@@ -1520,7 +1520,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             debug_sample_token,
             boundary_checkpoints: Vec::new(),
         });
-        m.q35_sessions.insert(id, state);
+        m.q35_registry.sessions.insert(id, state);
     }
 
     Ok(Qwen35PrefillBatchResult {
@@ -1655,7 +1655,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
         };
         qwen35_save_active_session(m, gpu)?;
         let prefix_hash = {
-            let saved = m.q35_sessions.get(&session.id).ok_or_else(|| {
+            let saved = m.q35_registry.sessions.get(&session.id).ok_or_else(|| {
                 format!("qwen35 session {} missing after prefill save", session.id)
             })?;
             compute_qwen35_prefix_hash(
@@ -1667,7 +1667,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
                 &saved.conversation_tokens,
             )
         };
-        if let Some(saved) = m.q35_sessions.get_mut(&session.id) {
+        if let Some(saved) = m.q35_registry.sessions.get_mut(&session.id) {
             saved.prefix_hash = Some(prefix_hash.clone());
         }
         total_prefill_tokens += prefilled;

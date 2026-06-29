@@ -1745,6 +1745,7 @@ dependencies = [
  "hipfire-mixer",
  "hipfire-model",
  "hipfire-prompt",
+ "hipfire-state",
  "libc",
  "memmap2",
  "minijinja",

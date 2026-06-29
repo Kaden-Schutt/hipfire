@@ -46,7 +46,9 @@ use crate::model::CaskConfig;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::model::Lfm2DflashState;
 use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel};
-use crate::session::{next_qwen35_state_allocation_epoch, QWEN35_LEGACY_SESSION_ID};
+use crate::session::{
+    next_qwen35_state_allocation_epoch, SessionRegistry, QWEN35_LEGACY_SESSION_ID,
+};
 use hipfire_runtime::sequence_state::SequenceState;
 
 /// Matrix-backed admission gate: refuse a request for `feature` on a model whose
@@ -598,9 +600,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -632,11 +632,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -699,9 +695,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -733,11 +727,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -835,9 +825,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -869,11 +857,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -943,9 +927,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -977,11 +959,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1055,9 +1033,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -1089,11 +1065,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1163,9 +1135,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -1197,11 +1167,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: Some(config),
@@ -1292,9 +1258,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -1326,11 +1290,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1427,9 +1387,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -1461,11 +1419,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1667,9 +1621,7 @@ pub fn load_model(
                 sequence_state: None,
                 q35_kv_mode: None,
                 q35_state_quant: None,
-                q35_sessions: std::collections::HashMap::new(),
-                q35_active_session_id: None,
-                q35_active_state_allocation_epoch: 0,
+                q35_registry: SessionRegistry::default(),
                 q35_active_prefilled_generated_suffix_len: 0,
                 llama_config: None,
                 llama_weights: None,
@@ -1697,9 +1649,11 @@ pub fn load_model(
                 lfm2moe_config: Some(config),
                 lfm2moe_weights: Some(weights),
                 lfm2moe_state: Some(state),
-                lfm2_sessions: std::collections::HashMap::new(),
-                lfm2_active_session_id: Some(crate::session::LFM2_LEGACY_SESSION_ID.to_string()),
-                lfm2_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
+                lfm2_registry: SessionRegistry {
+                    sessions: std::collections::HashMap::new(),
+                    active_session_id: Some(crate::session::LFM2_LEGACY_SESSION_ID.to_string()),
+                    allocation_epoch: next_qwen35_state_allocation_epoch(),
+                },
                 lfm2moe_eos_tok: eos_tok,
                 dots_ocr_config: None,
                 dots_ocr_weights: None,
@@ -2016,9 +1970,11 @@ pub fn load_model(
             sequence_state,
             q35_kv_mode: Some(kv_mode.clone()),
             q35_state_quant: Some(dn_quant),
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
-            q35_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
+            q35_registry: SessionRegistry {
+                sessions: std::collections::HashMap::new(),
+                active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+                allocation_epoch: next_qwen35_state_allocation_epoch(),
+            },
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -2050,11 +2006,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -2146,9 +2098,7 @@ pub fn load_model(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -2180,11 +2130,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -2351,9 +2297,7 @@ pub fn load_model_safetensors(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -2381,11 +2325,7 @@ pub fn load_model_safetensors(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             vision_config: None,
@@ -2476,9 +2416,7 @@ pub fn load_model_safetensors(
             sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
+            q35_registry: SessionRegistry::default(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -2506,11 +2444,7 @@ pub fn load_model_safetensors(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_state: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             vision_config: None,
@@ -2619,9 +2553,11 @@ pub fn load_model_safetensors(
         sequence_state,
         q35_kv_mode: Some(kv_mode.to_string()),
         q35_state_quant: Some(hipfire_arch_qwen35::qwen35::StateQuant::Q8),
-        q35_sessions: std::collections::HashMap::new(),
-        q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
-        q35_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
+        q35_registry: SessionRegistry {
+            sessions: std::collections::HashMap::new(),
+            active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+            allocation_epoch: next_qwen35_state_allocation_epoch(),
+        },
         q35_active_prefilled_generated_suffix_len: 0,
         llama_config: None,
         llama_weights: None,
@@ -2649,11 +2585,7 @@ pub fn load_model_safetensors(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_state: None,
         #[cfg(feature = "arch-lfm2moe")]
-        lfm2_sessions: std::collections::HashMap::new(),
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_session_id: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_state_allocation_epoch: 0,
+        lfm2_registry: SessionRegistry::default(),
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_eos_tok: 0,
         vision_config: None,
@@ -2914,9 +2846,7 @@ pub fn load_model_pp(
         sequence_state,
         q35_kv_mode: None,
         q35_state_quant: None,
-        q35_sessions: std::collections::HashMap::new(),
-        q35_active_session_id: None,
-        q35_active_state_allocation_epoch: 0,
+        q35_registry: SessionRegistry::default(),
         q35_active_prefilled_generated_suffix_len: 0,
         llama_config: None,
         llama_weights: None,
@@ -2948,11 +2878,7 @@ pub fn load_model_pp(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_state: None,
         #[cfg(feature = "arch-lfm2moe")]
-        lfm2_sessions: std::collections::HashMap::new(),
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_session_id: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_state_allocation_epoch: 0,
+        lfm2_registry: SessionRegistry::default(),
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_eos_tok: 0,
         dots_ocr_config: None,
