@@ -1190,6 +1190,18 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// OQ4G256 (Opus Quant W4 experts) indexed MoE GEMV family. Same indexed
+/// dispatch + expert-pointer contract as the HFQ4G256 siblings; the only
+/// difference is the per-group expert block (132 B `[f32 scale | 128 signed
+/// nibbles]`, symmetric `w = sc * sext4(nib)`, no zero-point — vs HFQ4's 136 B
+/// affine). See docs/plans/2026-06-30-minimax-moe-oq4-kernels.md.
+pub const GEMV_OQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4g256_moe_gate_up_indexed.hip");
+pub const GEMV_OQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4g256_moe_gate_up_indexed_batched.hip");
+pub const GEMV_OQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4g256_moe_down_k8_indexed_batched_expanded.hip");
+
 /// gfx1151 two-row probe for the atomic-free batched indexed MoE down path.
 /// Same math/output contract as
 /// `GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`, but packs two
