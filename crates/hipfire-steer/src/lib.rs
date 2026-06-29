@@ -38,6 +38,8 @@ use std::sync::{OnceLock, RwLock};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+pub mod driver;
+
 /// How a direction is applied to the residual stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SteerMode {
