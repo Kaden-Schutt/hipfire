@@ -162,6 +162,41 @@ pub struct SteerMeansResponse {
     pub means: Vec<Vec<f32>>,
 }
 
+/// Load a `.lora` adapter container (path on the daemon host) onto the APPLY
+/// stack. `scale` overrides the adapter's baked-in default intensity if present.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoraLoadRequest {
+    pub path: String,
+    #[serde(default)]
+    pub scale: Option<f32>,
+}
+
+/// Adjust a loaded adapter's live `scale` (intensity).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoraSetScaleRequest {
+    pub id: String,
+    pub scale: f32,
+}
+
+/// Remove a loaded adapter by id.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoraUnloadRequest {
+    pub id: String,
+}
+
+/// One loaded adapter in a [`LoraListResponse`].
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoraAdapterInfo {
+    pub id: String,
+    pub scale: f32,
+}
+
+/// Result of a `LoraList` op: the currently loaded adapter stack.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoraListResponse {
+    pub adapters: Vec<LoraAdapterInfo>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -181,6 +216,11 @@ pub enum DaemonRequest {
     SteerFinishCapture,
     SteerBeginApply(SteerApplyRequest),
     SteerClear,
+    LoraLoad(LoraLoadRequest),
+    LoraSetScale(LoraSetScaleRequest),
+    LoraUnload(LoraUnloadRequest),
+    LoraClear,
+    LoraList,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +243,8 @@ pub enum DaemonResponse {
     KldEvaled(KldEvalResponse),
     SteerCaptured(SteerMeansResponse),
     SteerOk,
+    LoraListed(LoraListResponse),
+    LoraOk,
     #[serde(other)]
     Unknown,
 }

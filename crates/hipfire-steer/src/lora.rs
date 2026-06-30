@@ -15,10 +15,60 @@
 //! See `docs/plans/2026-06-30-abliteration-lora.md`.
 
 use std::ops::Range;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::SteerMode;
+
+/// Magic + version for the on-disk LoRA container. A self-describing JSON file
+/// (`*.lora.json`) for now — small (directions are `num_layers × hidden` f32, ~1 MB
+/// for gemma-4B) and portable; folding into the binary `.hfq` container is a later
+/// packaging step (see the plan).
+const LORA_MAGIC: &str = "hipfire-lora";
+const LORA_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct LoraContainer {
+    magic: String,
+    version: u32,
+    adapter: LoraAdapter,
+}
+
+/// Write `adapter` to `path` as a versioned LoRA container.
+pub fn write_adapter(path: &Path, adapter: &LoraAdapter) -> Result<(), String> {
+    let container = LoraContainer {
+        magic: LORA_MAGIC.to_string(),
+        version: LORA_VERSION,
+        adapter: adapter.clone(),
+    };
+    let json = serde_json::to_string_pretty(&container)
+        .map_err(|e| format!("lora: serialize adapter: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("lora: write {}: {e}", path.display()))
+}
+
+/// Read a LoRA container written by [`write_adapter`], checking magic + version.
+pub fn read_adapter(path: &Path) -> Result<LoraAdapter, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("lora: read {}: {e}", path.display()))?;
+    let container: LoraContainer =
+        serde_json::from_str(&text).map_err(|e| format!("lora: parse {}: {e}", path.display()))?;
+    if container.magic != LORA_MAGIC {
+        return Err(format!(
+            "lora: {} is not a LoRA container (magic {:?})",
+            path.display(),
+            container.magic
+        ));
+    }
+    if container.version != LORA_VERSION {
+        return Err(format!(
+            "lora: {} version {} unsupported (expected {LORA_VERSION})",
+            path.display(),
+            container.version
+        ));
+    }
+    Ok(container.adapter)
+}
 
 /// Where a low-rank delta is applied. This increment supports residual-stream
 /// targets only (exact to the steer hook); projection targets (`o_proj`/
@@ -281,5 +331,29 @@ mod tests {
         assert_eq!(ad, back);
         assert_eq!(back.deltas[0].rank(), 1);
         assert_eq!(back.deltas[0].target, LoraTarget::Residual { layer: 0 });
+    }
+
+    #[test]
+    fn container_round_trips_through_disk() {
+        let v = unit(&[0.4, -0.2, 0.1, 0.85]);
+        let ad = abliteration_adapter("disk", &[v], SteerMode::Ablate, 0.5, 0..1).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-lora-test-{}.lora.json",
+            std::process::id()
+        ));
+        write_adapter(&path, &ad).unwrap();
+        let back = read_adapter(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ad, back);
+    }
+
+    #[test]
+    fn read_adapter_rejects_non_container() {
+        let path =
+            std::env::temp_dir().join(format!("hipfire-lora-bad-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"not":"a lora"}"#).unwrap();
+        let err = read_adapter(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("parse") || err.contains("magic"));
     }
 }

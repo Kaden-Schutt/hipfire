@@ -134,6 +134,38 @@ impl DaemonHarness {
     fn ref_path(&self) -> PathBuf {
         self.tmp.join("base.kldref")
     }
+
+    // ── LoRA adapter stack control (proxies to the daemon `lora_*` ops) ──────
+
+    /// Load a `.lora` adapter container onto the live model; `scale` overrides the
+    /// adapter's default intensity if given.
+    pub fn lora_load(&mut self, path: &Path, scale: Option<f32>) -> HipResult<()> {
+        let p = path.display().to_string();
+        self.rt
+            .block_on(self.engine.lora_load(p, scale))
+            .map_err(|e| herr("lora_load", e))
+    }
+
+    /// Dial a loaded adapter's live intensity.
+    pub fn lora_set_scale(&mut self, id: &str, scale: f32) -> HipResult<()> {
+        self.rt
+            .block_on(self.engine.lora_set_scale(id.to_string(), scale))
+            .map_err(|e| herr("lora_set_scale", e))
+    }
+
+    /// Drop the whole adapter stack.
+    pub fn lora_clear(&mut self) -> HipResult<()> {
+        self.rt
+            .block_on(self.engine.lora_clear())
+            .map_err(|e| herr("lora_clear", e))
+    }
+
+    /// `(id, scale)` for each loaded adapter.
+    pub fn lora_list(&mut self) -> HipResult<Vec<(String, f32)>> {
+        self.rt
+            .block_on(self.engine.lora_list())
+            .map_err(|e| herr("lora_list", e))
+    }
 }
 
 impl ModelHarness for DaemonHarness {
