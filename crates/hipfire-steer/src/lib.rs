@@ -121,10 +121,36 @@ impl CaptureAcc {
 #[derive(Clone, Debug)]
 pub struct CaptureMeans(pub Vec<Vec<f32>>);
 
+/// One loaded adapter resident in an APPLY session. `directions` are per-block
+/// unit vectors; `scale` is the live intensity (the steer `strength`, adjustable
+/// via [`set_adapter_scale`]). A `SteerSpec` is the single-adapter case.
+#[derive(Clone, Debug)]
+struct ResidentAdapter {
+    id: String,
+    directions: Vec<Vec<f32>>,
+    mode: SteerMode,
+    scale: f32,
+    layer_range: Range<usize>,
+}
+
+impl ResidentAdapter {
+    /// Whether this adapter mutates block `layer_idx` (in range and not disabled).
+    fn touches(&self, layer_idx: usize) -> bool {
+        self.scale != 0.0 && self.layer_range.contains(&layer_idx)
+    }
+}
+
+/// An ordered set of adapters applied at each in-range block boundary. Their
+/// deltas SUM (each read from the same pre-apply residual), so the stack is
+/// order-independent — see [`apply_stack_host`] / [`apply_on_gpu`].
+struct LoraStack {
+    adapters: Vec<ResidentAdapter>,
+}
+
 enum Session {
     Inactive,
     Capturing(CaptureAcc),
-    Applying(SteerSpec),
+    Applying(LoraStack),
 }
 
 static SESSION: OnceLock<RwLock<Session>> = OnceLock::new();
@@ -140,9 +166,22 @@ fn session() -> &'static RwLock<Session> {
     SESSION.get_or_init(|| RwLock::new(Session::Inactive))
 }
 
+/// Serializes tests that mutate the process-global session (the apply control API
+/// + the driver orchestration test), which would otherwise race under the default
+/// parallel test runner.
+#[cfg(test)]
+pub(crate) static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn set_session(s: Session) {
     let active = !matches!(s, Session::Inactive);
     *session().write().unwrap() = s;
+    mark_session_changed(active);
+}
+
+/// Bump the epoch (so the per-thread GPU apply cache refreshes) and update the
+/// fast-path `ACTIVE` gate. For in-place mutations of the resident stack that
+/// don't replace the whole `Session` (load/scale/unload).
+fn mark_session_changed(active: bool) {
     EPOCH.fetch_add(1, Ordering::Release);
     ACTIVE.store(active, Ordering::Release);
 }
@@ -176,10 +215,158 @@ pub fn finish_capture() -> Option<CaptureMeans> {
     means
 }
 
-/// Begin an APPLY session: subsequent forwards steer/ablate at each in-range
-/// block boundary.
+/// Begin an APPLY session from a single spec: replaces any current stack with one
+/// adapter (`id = "default"`, `scale = spec.strength`). The back-compat entry the
+/// search loop uses; [`load_adapter`] composes a multi-adapter stack instead.
 pub fn begin_apply(spec: SteerSpec) {
-    set_session(Session::Applying(spec));
+    let adapter = ResidentAdapter {
+        id: "default".to_string(),
+        directions: spec.directions,
+        mode: spec.mode,
+        scale: spec.strength,
+        layer_range: spec.layer_range,
+    };
+    set_session(Session::Applying(LoraStack {
+        adapters: vec![adapter],
+    }));
+}
+
+/// Push (or replace, by `id`) an adapter onto the APPLY stack, starting a session
+/// if none is active. `directions` are per-block unit vectors; `scale` is the live
+/// intensity. Stacked adapters' deltas sum at each block boundary.
+pub fn load_adapter(
+    id: impl Into<String>,
+    directions: Vec<Vec<f32>>,
+    mode: SteerMode,
+    scale: f32,
+    layer_range: Range<usize>,
+) {
+    let adapter = ResidentAdapter {
+        id: id.into(),
+        directions,
+        mode,
+        scale,
+        layer_range,
+    };
+    {
+        let mut guard = session().write().unwrap();
+        match &mut *guard {
+            Session::Applying(stack) => {
+                stack.adapters.retain(|a| a.id != adapter.id);
+                stack.adapters.push(adapter);
+            }
+            _ => {
+                *guard = Session::Applying(LoraStack {
+                    adapters: vec![adapter],
+                });
+            }
+        }
+    }
+    mark_session_changed(true);
+}
+
+/// Materialize and load a rank-1 residual [`lora::LoraAdapter`] (ablate-only) onto
+/// the APPLY stack — the bridge from the serialized artifact to the runtime.
+pub fn load_lora_adapter(adapter: &lora::LoraAdapter) -> Result<(), String> {
+    use lora::LoraTarget;
+    if adapter.deltas.is_empty() {
+        return Err("load_lora_adapter: adapter has no deltas".to_string());
+    }
+    let layer = |t: &LoraTarget| match t {
+        LoraTarget::Residual { layer } => *layer,
+    };
+    let max_layer = adapter
+        .deltas
+        .iter()
+        .map(|d| layer(&d.target))
+        .max()
+        .unwrap();
+    let min_layer = adapter
+        .deltas
+        .iter()
+        .map(|d| layer(&d.target))
+        .min()
+        .unwrap();
+    let hidden = adapter.meta.hidden;
+    let mut directions = vec![vec![0.0f32; hidden]; max_layer + 1];
+    for d in &adapter.deltas {
+        if d.rank() != 1 {
+            return Err(format!(
+                "load_lora_adapter: layer {} delta is rank {}, only rank-1 supported",
+                layer(&d.target),
+                d.rank()
+            ));
+        }
+        // Residual form: A row = vᵀ = the unit direction.
+        directions[layer(&d.target)] = d.a[0].clone();
+    }
+    load_adapter(
+        adapter.id.clone(),
+        directions,
+        SteerMode::Ablate,
+        adapter.scale,
+        min_layer..max_layer + 1,
+    );
+    Ok(())
+}
+
+/// Set a loaded adapter's live `scale` (intensity). Returns `false` if no adapter
+/// with `id` is loaded. Cheap — bumps the epoch so the GPU cache refreshes.
+pub fn set_adapter_scale(id: &str, scale: f32) -> bool {
+    let found = {
+        let mut guard = session().write().unwrap();
+        match &mut *guard {
+            Session::Applying(stack) => stack
+                .adapters
+                .iter_mut()
+                .find(|a| a.id == id)
+                .map(|a| a.scale = scale)
+                .is_some(),
+            _ => false,
+        }
+    };
+    if found {
+        mark_session_changed(true);
+    }
+    found
+}
+
+/// Remove an adapter by `id`. Returns `false` if absent. The session goes
+/// `Inactive` when the last adapter is unloaded.
+pub fn unload_adapter(id: &str) -> bool {
+    let (found, empty) = {
+        let mut guard = session().write().unwrap();
+        match &mut *guard {
+            Session::Applying(stack) => {
+                let before = stack.adapters.len();
+                stack.adapters.retain(|a| a.id != id);
+                let found = stack.adapters.len() < before;
+                let empty = stack.adapters.is_empty();
+                if empty {
+                    *guard = Session::Inactive;
+                }
+                (found, empty)
+            }
+            _ => (false, false),
+        }
+    };
+    if found {
+        mark_session_changed(!empty);
+    }
+    found
+}
+
+/// `(id, scale)` for each loaded adapter (apply session only). Drives a
+/// `lora_list`-style introspection.
+pub fn loaded_adapters() -> Vec<(String, f32)> {
+    match &*session().read().unwrap() {
+        Session::Applying(stack) => stack
+            .adapters
+            .iter()
+            .map(|a| (a.id.clone(), a.scale))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Tear down any active session.
@@ -238,9 +425,9 @@ pub fn maybe_steer_block(gpu: &mut Gpu, x: &GpuTensor, layer_idx: usize) -> HipR
             let host = gpu.download_f32(x)?;
             acc.observe(layer_idx, &host);
         }
-        Session::Applying(spec) => {
-            if spec.layer_range.contains(&layer_idx) {
-                apply_on_gpu(gpu, x, layer_idx, spec, epoch)?;
+        Session::Applying(stack) => {
+            if stack.adapters.iter().any(|a| a.touches(layer_idx)) {
+                apply_on_gpu(gpu, x, layer_idx, stack, epoch)?;
             }
         }
     }
@@ -269,18 +456,16 @@ pub fn maybe_steer_block_batched(
             let last = (num_positions - 1) * hidden;
             acc.observe(layer_idx, &host[last..last + hidden]);
         }
-        Session::Applying(spec) => {
-            if spec.layer_range.contains(&layer_idx) {
+        Session::Applying(stack) => {
+            if stack.adapters.iter().any(|a| a.touches(layer_idx)) {
                 // Prefill is one-shot per request, and the search loop scores via
                 // single-token decode forwards, so this host round-trip is amortized
-                // — the per-token decode path is the one moved on-GPU. A batched
-                // on-GPU apply would need a broadcast axpy (steer) and a no-sigmoid
-                // per-row scaled-add (ablate), neither of which exists yet. See plan.
+                // — the per-token decode path is the one moved on-GPU. The whole
+                // stack is summed per position (read from the pre-apply residual).
                 let mut host = gpu.download_f32(x_batch)?;
-                let dir = &spec.directions[layer_idx];
                 for p in 0..num_positions {
                     let off = p * hidden;
-                    apply_direction(&mut host[off..off + hidden], dir, spec.mode, spec.strength);
+                    apply_stack_host(&stack.adapters, layer_idx, &mut host[off..off + hidden]);
                 }
                 write_back(gpu, x_batch, &host)?;
             }
@@ -300,94 +485,163 @@ thread_local! {
 
 struct ApplyCache {
     epoch: u64,
-    num_layers: usize,
     hidden: usize,
-    /// One `[1, hidden]` unit direction per block (2-D so `gemv_f32` reads m=1, k=hidden).
-    dirs: Vec<GpuTensor>,
-    /// `[1]` device scalar holding `strength` (the additive steer coefficient).
-    strength_buf: GpuTensor,
+    /// GPU-resident mirror of the stack (per-adapter uploaded directions + scale).
+    adapters: Vec<CachedAdapter>,
     /// `[1]` scratch for the ablate dot product `v·x`.
     proj_buf: GpuTensor,
-    /// `[1]` scratch for the data-dependent ablate coefficient `-strength·(v·x)`.
+    /// `[1]` scratch for the data-dependent per-adapter coefficient.
     coef_buf: GpuTensor,
 }
 
-/// Steer/ablate one `[hidden]` residual fully on-GPU — no full-vector host bounce.
-/// Reuses register-tiled `gemv_f32` (dot) + `scaled_add_inplace_gpu_scalar_f32`
-/// (axpy); for ablate only a 4-byte scalar round-trips for the coefficient.
+struct CachedAdapter {
+    mode: SteerMode,
+    scale: f32,
+    layer_range: Range<usize>,
+    /// One `[1, hidden]` unit direction per block (2-D so `gemv_f32` reads m=1, k=hidden).
+    dirs: Vec<GpuTensor>,
+}
+
+/// Apply the whole stack to one `[hidden]` residual fully on-GPU — no full-vector
+/// host bounce. Reuses register-tiled `gemv_f32` (dot) +
+/// `scaled_add_inplace_gpu_scalar_f32` (axpy). Stacking is the additive sum: every
+/// adapter's coefficient is read from the PRE-apply residual (all `gemv` reads run
+/// before any `scaled_add` write), so the result is order-independent. For ablate
+/// only a 4-byte scalar round-trips per adapter.
 fn apply_on_gpu(
     gpu: &mut Gpu,
     x: &GpuTensor,
     layer_idx: usize,
-    spec: &SteerSpec,
+    stack: &LoraStack,
     epoch: u64,
 ) -> HipResult<()> {
     APPLY_CACHE.with(|cell| -> HipResult<()> {
         let mut slot = cell.borrow_mut();
-        ensure_apply_cache(&mut slot, gpu, spec, epoch)?;
+        ensure_apply_cache(&mut slot, gpu, stack, epoch)?;
         let cache = slot.as_ref().unwrap();
-        let dir = &cache.dirs[layer_idx];
-        match spec.mode {
-            SteerMode::Steer => {
-                // x += strength * v
-                gpu.scaled_add_inplace_gpu_scalar_f32(x, dir, &cache.strength_buf)?;
+
+        // Phase 1 (reads): per-adapter coefficient from the pre-apply residual.
+        // `gemv_f32` reads `x` without writing, so collecting all coefficients
+        // before any write makes the stack a sum from the original `x`.
+        let mut writes: Vec<(usize, f32)> = Vec::new();
+        for (ai, a) in cache.adapters.iter().enumerate() {
+            if a.scale == 0.0 || !a.layer_range.contains(&layer_idx) {
+                continue;
             }
-            SteerMode::Ablate => {
-                // proj = v·x  (dir is [1, hidden] → gemv yields a [1] scalar)
-                gpu.gemv_f32(dir, x, &cache.proj_buf)?;
-                let proj = gpu.download_f32(&cache.proj_buf)?[0];
-                let coef = -spec.strength * proj;
-                gpu.memcpy_htod_auto(&cache.coef_buf.buf, &coef.to_le_bytes())?;
-                // x += (-strength · proj) * v
-                gpu.scaled_add_inplace_gpu_scalar_f32(x, dir, &cache.coef_buf)?;
-            }
+            let coef = match a.mode {
+                SteerMode::Steer => a.scale,
+                SteerMode::Ablate => {
+                    gpu.gemv_f32(&a.dirs[layer_idx], x, &cache.proj_buf)?;
+                    let proj = gpu.download_f32(&cache.proj_buf)?[0];
+                    -a.scale * proj
+                }
+            };
+            writes.push((ai, coef));
+        }
+
+        // Phase 2 (writes): x += Σ coef · v.
+        for (ai, coef) in writes {
+            let dir = &cache.adapters[ai].dirs[layer_idx];
+            gpu.memcpy_htod_auto(&cache.coef_buf.buf, &coef.to_le_bytes())?;
+            gpu.scaled_add_inplace_gpu_scalar_f32(x, dir, &cache.coef_buf)?;
         }
         Ok(())
     })
 }
 
-/// Build (first use / dim change) or refresh (epoch change) the per-thread GPU
-/// apply cache. Buffers are reused across epochs when dims match, so a search
-/// loop calling `begin_apply` repeatedly neither reallocates nor leaks.
+/// Build (first use / shape change) or refresh (epoch change) the per-thread GPU
+/// apply cache to mirror the resident stack. Direction buffers are reused across
+/// epochs when the stack shape is unchanged, so the search loop neither
+/// reallocates nor leaks; scales/modes/ranges are cheap host fields refreshed
+/// every epoch (a `set_adapter_scale` re-uploads dirs too — fine, small, and
+/// avoids tracking a separate scale epoch).
 fn ensure_apply_cache(
     slot: &mut Option<ApplyCache>,
     gpu: &mut Gpu,
-    spec: &SteerSpec,
+    stack: &LoraStack,
     epoch: u64,
 ) -> HipResult<()> {
-    let num_layers = spec.directions.len();
-    let hidden = spec.directions.first().map_or(0, |d| d.len());
+    let hidden = stack
+        .adapters
+        .first()
+        .and_then(|a| a.directions.first())
+        .map_or(0, |d| d.len());
 
-    let dims_match = slot
-        .as_ref()
-        .is_some_and(|c| c.num_layers == num_layers && c.hidden == hidden);
+    let shape_matches = slot.as_ref().is_some_and(|c| {
+        c.hidden == hidden
+            && c.adapters.len() == stack.adapters.len()
+            && c.adapters
+                .iter()
+                .zip(stack.adapters.iter())
+                .all(|(ca, a)| ca.dirs.len() == a.directions.len())
+    });
 
-    if !dims_match {
-        let mut dirs = Vec::with_capacity(num_layers);
-        for d in &spec.directions {
-            dirs.push(gpu.upload_f32(d, &[1, hidden])?);
+    if !shape_matches {
+        let mut adapters = Vec::with_capacity(stack.adapters.len());
+        for a in &stack.adapters {
+            let mut dirs = Vec::with_capacity(a.directions.len());
+            for d in &a.directions {
+                dirs.push(gpu.upload_f32(d, &[1, hidden])?);
+            }
+            adapters.push(CachedAdapter {
+                mode: a.mode,
+                scale: a.scale,
+                layer_range: a.layer_range.clone(),
+                dirs,
+            });
         }
         *slot = Some(ApplyCache {
             epoch,
-            num_layers,
             hidden,
-            strength_buf: gpu.full_f32(&[1], spec.strength)?,
+            adapters,
             proj_buf: gpu.alloc_tensor(&[1], DType::F32)?,
             coef_buf: gpu.alloc_tensor(&[1], DType::F32)?,
-            dirs,
         });
         return Ok(());
     }
 
     let cache = slot.as_mut().unwrap();
     if cache.epoch != epoch {
-        for (buf, d) in cache.dirs.iter().zip(spec.directions.iter()) {
-            gpu.memcpy_htod_auto(&buf.buf, &f32_bytes(d))?;
+        for (ca, a) in cache.adapters.iter_mut().zip(stack.adapters.iter()) {
+            for (buf, d) in ca.dirs.iter().zip(a.directions.iter()) {
+                gpu.memcpy_htod_auto(&buf.buf, &f32_bytes(d))?;
+            }
+            ca.mode = a.mode;
+            ca.scale = a.scale;
+            ca.layer_range = a.layer_range.clone();
         }
-        gpu.memcpy_htod_auto(&cache.strength_buf.buf, &spec.strength.to_le_bytes())?;
         cache.epoch = epoch;
     }
     Ok(())
+}
+
+/// Host reference for [`apply_on_gpu`]: sum every in-range adapter's delta into
+/// `x`, each read from the pre-apply residual (so the stack is order-independent).
+/// Drives the batched prefill apply and is the unit-tested correctness anchor.
+fn apply_stack_host(adapters: &[ResidentAdapter], layer_idx: usize, x: &mut [f32]) {
+    let mut acc = vec![0.0f32; x.len()];
+    for a in adapters {
+        if !a.touches(layer_idx) {
+            continue;
+        }
+        let v = &a.directions[layer_idx];
+        match a.mode {
+            SteerMode::Steer => {
+                for (ai, &vi) in acc.iter_mut().zip(v.iter()) {
+                    *ai += a.scale * vi;
+                }
+            }
+            SteerMode::Ablate => {
+                let proj = dot(x, v) * a.scale;
+                for (ai, &vi) in acc.iter_mut().zip(v.iter()) {
+                    *ai -= proj * vi;
+                }
+            }
+        }
+    }
+    for (xi, &ai) in x.iter_mut().zip(acc.iter()) {
+        *xi += ai;
+    }
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -431,6 +685,142 @@ fn normalize(v: &mut [f32]) {
 fn write_back(gpu: &mut Gpu, x: &GpuTensor, host: &[f32]) -> HipResult<()> {
     let bytes: Vec<u8> = host.iter().flat_map(|f| f.to_le_bytes()).collect();
     gpu.memcpy_htod_auto(&x.buf, &bytes)
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    use crate::lora;
+
+    fn unit(v: &[f32]) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / n).collect()
+    }
+
+    fn adapter(id: &str, dir: Vec<f32>, mode: SteerMode, scale: f32) -> ResidentAdapter {
+        ResidentAdapter {
+            id: id.to_string(),
+            directions: vec![dir],
+            mode,
+            scale,
+            layer_range: 0..1,
+        }
+    }
+
+    #[test]
+    fn stack_host_single_ablate_equals_apply_direction() {
+        let v = unit(&[0.3, -0.4, 0.5, 0.2]);
+        let stack = vec![adapter("a", v.clone(), SteerMode::Ablate, 0.8)];
+        let x0 = vec![1.0, 2.0, -1.5, 0.7];
+        let mut xs = x0.clone();
+        apply_stack_host(&stack, 0, &mut xs);
+        let mut xr = x0.clone();
+        apply_direction(&mut xr, &v, SteerMode::Ablate, 0.8);
+        for (a, b) in xs.iter().zip(&xr) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn stack_host_orthogonal_sum_equals_sequential() {
+        let v1 = unit(&[1.0, 0.0, 0.0, 0.0]);
+        let v2 = unit(&[0.0, 1.0, 0.0, 0.0]);
+        let stack = vec![
+            adapter("a", v1.clone(), SteerMode::Ablate, 0.6),
+            adapter("b", v2.clone(), SteerMode::Ablate, 0.9),
+        ];
+        let x0 = vec![2.0, -3.0, 1.0, 0.5];
+        let mut xs = x0.clone();
+        apply_stack_host(&stack, 0, &mut xs);
+        let mut xseq = x0.clone();
+        apply_direction(&mut xseq, &v1, SteerMode::Ablate, 0.6);
+        apply_direction(&mut xseq, &v2, SteerMode::Ablate, 0.9);
+        for (a, b) in xs.iter().zip(&xseq) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn stack_host_skips_zero_scale_and_out_of_range() {
+        let v = unit(&[1.0, 1.0, 0.0, 0.0]);
+        let mut a = adapter("z", v, SteerMode::Ablate, 0.0);
+        let x0 = vec![1.0, 2.0, 3.0, 4.0];
+        let mut x = x0.clone();
+        apply_stack_host(std::slice::from_ref(&a), 0, &mut x);
+        assert_eq!(x, x0); // scale 0 → no-op
+        a.scale = 1.0;
+        a.layer_range = 1..2;
+        apply_stack_host(std::slice::from_ref(&a), 0, &mut x);
+        assert_eq!(x, x0); // out of range at layer 0 → no-op
+    }
+
+    #[test]
+    fn stack_host_matches_lora_module_reference() {
+        // The resident-stack apply == the increment-1 LoraAdapter host apply.
+        let v = unit(&[0.2, 0.9, -0.1, 0.3]);
+        let lad =
+            lora::abliteration_adapter("x", &[v.clone()], SteerMode::Ablate, 0.7, 0..1).unwrap();
+        let resident = vec![adapter("x", v, SteerMode::Ablate, 0.7)];
+        let x0 = vec![1.0, -1.0, 2.0, 0.5];
+        let mut xa = x0.clone();
+        apply_stack_host(&resident, 0, &mut xa);
+        let mut xb = x0.clone();
+        lora::apply_residual_stack(std::slice::from_ref(&lad), 0, &mut xb);
+        for (a, b) in xa.iter().zip(&xb) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn control_api_load_scale_unload() {
+        let _g = crate::SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear();
+        assert!(!is_active());
+        let v = unit(&[1.0, 0.0, 0.0, 0.0]);
+        // begin_apply seeds a single "default" adapter.
+        begin_apply(SteerSpec {
+            directions: vec![v.clone()],
+            mode: SteerMode::Ablate,
+            strength: 0.5,
+            layer_range: 0..1,
+        });
+        assert!(is_active());
+        assert_eq!(loaded_adapters(), vec![("default".to_string(), 0.5)]);
+        // load_adapter stacks a second.
+        load_adapter("ablit", vec![v], SteerMode::Ablate, 1.0, 0..1);
+        assert_eq!(loaded_adapters().len(), 2);
+        // set_adapter_scale dials intensity; unknown id is a no-op.
+        assert!(set_adapter_scale("ablit", 0.25));
+        assert!(!set_adapter_scale("missing", 1.0));
+        let ablit_scale = loaded_adapters()
+            .into_iter()
+            .find(|(id, _)| id == "ablit")
+            .unwrap()
+            .1;
+        assert_eq!(ablit_scale, 0.25);
+        // Unloading one keeps the session active; the last unload clears it.
+        assert!(unload_adapter("default"));
+        assert!(is_active());
+        assert!(unload_adapter("ablit"));
+        assert!(!is_active());
+        assert!(loaded_adapters().is_empty());
+        clear();
+    }
+
+    #[test]
+    fn load_lora_adapter_populates_stack() {
+        let _g = crate::SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear();
+        let v = unit(&[0.1, 0.2, 0.3, 0.9]);
+        let lad = lora::abliteration_adapter("med", &[v], SteerMode::Ablate, 0.6, 0..1).unwrap();
+        load_lora_adapter(&lad).unwrap();
+        assert_eq!(loaded_adapters(), vec![("med".to_string(), 0.6)]);
+        clear();
+    }
 }
 
 #[cfg(test)]

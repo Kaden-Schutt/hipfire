@@ -447,6 +447,10 @@ mod tests {
 
     #[test]
     fn run_driver_produces_a_report_with_pareto_front() {
+        // Shares the process-global steer session with the apply-control tests.
+        let _g = crate::SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let p = |u: &str| Prompt {
             system: "sys".into(),
             user: u.into(),
