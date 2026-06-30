@@ -1213,6 +1213,20 @@ pub const GEMV_OQ8G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_OQ8G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq8g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// QTIP3 (trellis-coded 3-bit) indexed MoE GEMV family. Same indexed dispatch +
+/// expert-pointer contract as the OQ4/HFQ4 siblings; the per-group expert block
+/// is the QTIP 100 B layout `[f32 scale | 96 B of 3-bit trellis symbols]` with
+/// the codebook COMPUTED on-device (1MAD), so there is no codebook in the weight
+/// stream. See kernels/src/gemv_qtip3g256.hip (the dense kernel) + the low-bit
+/// sweep (project_lowbit_quant_findings): qtip3+LDLQ+low-rank is the competitive
+/// 3-bit expert point.
+pub const GEMV_QTIP3G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_qtip3g256_moe_gate_up_indexed.hip");
+pub const GEMV_QTIP3G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_qtip3g256_moe_gate_up_indexed_batched.hip");
+pub const GEMV_QTIP3G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_qtip3g256_moe_down_k8_indexed_batched_expanded.hip");
+
 /// gfx1151 two-row probe for the atomic-free batched indexed MoE down path.
 /// Same math/output contract as
 /// `GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`, but packs two
