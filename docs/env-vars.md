@@ -485,7 +485,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_SMOKE_STEPS` | Runtime variable controlling smoke steps in hipfire | `crates/hipfire-runtime/examples/a3b_smoke_forward.rs:39` |
 | `HIPFIRE_SPEC_PHASES` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:7090` |
 | `HIPFIRE_STATE` | Interprets "HIPFIRE_STATE" from environment to select behavior | `crates/hipfire-runtime/examples/greedy_dump_top5.rs:246` |
-| `HIPFIRE_STEER_DUMP` | Runtime variable controlling steer dump in hipfire | `crates/hipfire-steer/src/driver.rs:215` |
+| `HIPFIRE_STEER_DUMP` | Runtime variable controlling steer dump in hipfire | `crates/hipfire-steer/src/driver.rs:227` |
 | `HIPFIRE_TARGET_ARCH` | Runtime variable controlling target arch in hipfire | `crates/rdna-compute/src/dispatch/mod.rs:917` |
 | `HIPFIRE_TIER_RATIO` | Runtime variable controlling tier ratio in hipfire | `crates/hipfire-quantize/src/main.rs:5886` |
 | `HIPFIRE_TINYQUANT_FAMILIES` | Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES") | `crates/hipfire-eval/src/executor_tinyquant.rs:370` |

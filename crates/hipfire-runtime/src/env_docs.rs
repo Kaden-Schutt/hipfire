@@ -3408,7 +3408,7 @@ pub const ENV_HIPFIRE_STATE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_STEER_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_STEER_DUMP",
     description: "Runtime variable controlling steer dump in hipfire",
-    source: "crates/hipfire-steer/src/driver.rs:215",
+    source: "crates/hipfire-steer/src/driver.rs:227",
 };
 
 /// `HIPFIRE_TARGET_ARCH` — Runtime variable controlling target arch in hipfire

@@ -43,6 +43,14 @@ fn strip_thinking(text: &str) -> &str {
     }
 }
 
+/// Upper bound on the KLD context window for the capability-damage guard. The
+/// daemon clamps this down to the corpus length (`n_ctx.min(tokens.len())`), so a
+/// short good-eval set forms one chunk covering the whole corpus instead of
+/// flooring to zero chunks — the corpus does NOT need to reach `KLD_N_CTX`. This
+/// only caps chunk size for a long good-eval; the `total_scored == 0` guard in
+/// `kld_score` then catches only a genuinely empty corpus.
+const KLD_N_CTX: usize = 512;
+
 /// A [`ModelHarness`] backed by a `hipfire-daemon` subprocess. Holds the tokio
 /// runtime the async [`DaemonEngine`] needs and blocks on each op so the sync
 /// driver can drive it. `num_layers`/`hidden` come from the load response and
@@ -54,7 +62,6 @@ pub struct DaemonHarness {
     hidden: usize,
     system: String,
     max_new_tokens: usize,
-    n_ctx: usize,
     tmp: PathBuf,
 }
 
@@ -107,7 +114,6 @@ impl DaemonHarness {
             hidden,
             system,
             max_new_tokens,
-            n_ctx: max_seq.min(2048),
             tmp,
         })
     }
@@ -220,14 +226,24 @@ impl ModelHarness for DaemonHarness {
             ref_path: Some(self.ref_path().display().to_string()),
             output: None,
             max_chunks: None,
-            n_ctx: Some(self.n_ctx),
+            n_ctx: Some(KLD_N_CTX),
             config: None,
             capture_hidden_layers: false,
             dump_logits: false,
         };
-        self.rt
+        let resp = self
+            .rt
             .block_on(self.engine.kld_eval(req, |_| {}))
             .map_err(|e| herr("kld_build_ref", e))?;
+        // The daemon clamps the window to the corpus, so a short good-eval still
+        // forms one chunk; zero chunks now means the corpus tokenized to nothing
+        // (empty good-eval). Fail loudly rather than silently disabling the guard.
+        if resp.n_chunk == 0 {
+            return Err(HipError::new(
+                0,
+                "kld_build_ref: good-eval corpus is empty (0 chunks) — provide good-eval prompts",
+            ));
+        }
         Ok(())
     }
 
@@ -240,7 +256,7 @@ impl ModelHarness for DaemonHarness {
             ref_path: Some(self.ref_path().display().to_string()),
             output: None,
             max_chunks: None,
-            n_ctx: Some(self.n_ctx),
+            n_ctx: Some(KLD_N_CTX),
             config: None,
             capture_hidden_layers: false,
             dump_logits: false,
@@ -249,6 +265,15 @@ impl ModelHarness for DaemonHarness {
             .rt
             .block_on(self.engine.kld_eval(req, |_| {}))
             .map_err(|e| herr("kld_score", e))?;
+        // `mean_kld` defaults to 0.0 when nothing was scored — that is the silent
+        // failure that made over-ablation look damage-free. Treat 0 scored as an
+        // error so a real 0.0 can only mean "measured, no divergence".
+        if resp.total_scored == 0 {
+            return Err(HipError::new(
+                0,
+                "kld_score: scored 0 positions (empty/too-short reference) — KLD guard is blind",
+            ));
+        }
         Ok(resp.mean_kld.unwrap_or(0.0))
     }
 }

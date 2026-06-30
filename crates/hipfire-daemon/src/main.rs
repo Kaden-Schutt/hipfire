@@ -5033,6 +5033,20 @@ fn main() {
                 } else {
                     Vec::new()
                 };
+                // Clamp the KLD window to the corpus: chunks are non-overlapping
+                // `n_ctx` windows counted by floor (`tokens.len() / n_ctx`) with the
+                // partial tail discarded, so a corpus shorter than n_ctx would yield
+                // ZERO chunks and silently score nothing. Clamping makes any corpus
+                // with ≥2 tokens form exactly one chunk; no effect once the corpus is
+                // ≥ n_ctx. `score` reads its window from the archive, and `tokens` is
+                // empty there, so this only adjusts build_ref / self_score. The
+                // clamped value flows into KldRefPayloads.n_ctx → RefMeta, keeping
+                // scoring_start (= n_ctx/2) consistent for the later score pass.
+                let n_ctx = if tokens.is_empty() {
+                    n_ctx
+                } else {
+                    n_ctx.min(tokens.len())
+                };
                 // Arch-agnostic forward seam: owned AR backends ride the blanket
                 // SimpleAr impl; loose-slot arches (qwen3.5, lfm2moe, deepseek4,
                 // minimax) go through their `*KldForward` adapter. All arches

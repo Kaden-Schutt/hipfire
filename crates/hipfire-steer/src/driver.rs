@@ -206,22 +206,33 @@ pub fn pareto_front(trials: &[Trial]) -> Vec<usize> {
 /// daemon harness that is a different process, so the local statics would not
 /// reach it. KLD is a sequence-KL against a base reference the harness builds
 /// once up front (steer cleared) and scores each steered candidate against.
+/// Print one labeled batch of bad-eval generations with a REFUSE/answer tag per
+/// prompt (stderr, behind `HIPFIRE_STEER_DUMP`). `label` is "base" or the trial's
+/// `mode strength`, so base vs steered output sits side by side in the log.
+fn dump_generations(label: &str, cfg: &DriverConfig, responses: &[String]) {
+    eprintln!("\n=== {label} bad-eval generations (the scorer sees) ===");
+    for (p, r) in cfg.bad_eval.iter().zip(responses.iter()) {
+        let tag = if is_refusal(r, &cfg.markers) {
+            "REFUSE"
+        } else {
+            "answer"
+        };
+        eprintln!("[{tag}] {}\n  -> {}\n", p.user, r.replace('\n', " ").trim());
+    }
+}
+
 pub fn run_driver(cfg: &DriverConfig, h: &mut dyn ModelHarness) -> HipResult<DriverReport> {
+    // `HIPFIRE_STEER_DUMP=1` prints the base and per-trial bad-eval generations the
+    // refusal scorer actually sees — the qualitative companion to the numeric report.
+    let dump = std::env::var_os("HIPFIRE_STEER_DUMP").is_some();
+
     // Base reference: build the KLD reference (steer cleared) on the good-eval
     // set, and measure the unmodified refusal rate on the bad-eval set.
     h.clear()?;
     h.kld_build_ref(&cfg.good_eval)?;
     let base_responses = h.generate(&cfg.bad_eval)?;
-    if std::env::var_os("HIPFIRE_STEER_DUMP").is_some() {
-        eprintln!("\n=== base bad-eval generations (the scorer sees) ===");
-        for (p, r) in cfg.bad_eval.iter().zip(base_responses.iter()) {
-            let tag = if is_refusal(r, &cfg.markers) {
-                "REFUSE"
-            } else {
-                "answer"
-            };
-            eprintln!("[{tag}] {}\n  -> {}\n", p.user, r.replace('\n', " ").trim());
-        }
+    if dump {
+        dump_generations("base", cfg, &base_responses);
     }
     let base_refusals = count_refusals(&base_responses, &cfg.markers);
 
@@ -249,8 +260,12 @@ pub fn run_driver(cfg: &DriverConfig, h: &mut dyn ModelHarness) -> HipResult<Dri
                 layer_range: cfg.layer_range.clone(),
             })?;
             let kl_divergence = h.kld_score(&cfg.good_eval)?;
-            let refusals = count_refusals(&h.generate(&cfg.bad_eval)?, &cfg.markers);
+            let responses = h.generate(&cfg.bad_eval)?;
             h.clear()?;
+            if dump {
+                dump_generations(&format!("{mode:?} strength={strength:.2}"), cfg, &responses);
+            }
+            let refusals = count_refusals(&responses, &cfg.markers);
             trials.push(Trial {
                 mode,
                 strength,
