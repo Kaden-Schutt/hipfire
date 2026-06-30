@@ -3478,6 +3478,101 @@ impl Gpu {
         )
     }
 
+    /// `w[n] += (1/k)·Σ_c d[n,c]²` — per-row (per-token) mean-square of an
+    /// output-grad block `d[n,k]`. Used by GuidedQuant calibration to turn a
+    /// linear's output adjoint `∂ℓ/∂z` into a per-token Fisher weight. `w` is
+    /// caller-zeroed `[n]`.
+    pub fn calib_row_meansq_f32(
+        &mut self,
+        d: &GpuTensor,
+        w: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_row_meansq_f32",
+        )?;
+        let d_ptr = d.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &d_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let block = 64u32;
+        let grid = ((n as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "calib_row_meansq_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(d_ptr);
+                bb.push_ptr(w_ptr);
+                bb.push_i32(n_i);
+                bb.push_i32(k_i);
+                bb
+            },
+        )
+    }
+
+    /// `H[i,j] += Σ_n w[n]·x[n,i]·x[n,j]` — the per-row-weighted (GuidedQuant /
+    /// empirical-Fisher) Hessian. `w≡1` reduces to [`Self::calib_hessian_outer_f32`].
+    pub fn calib_hessian_outer_weighted_f32(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        h: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_hessian_outer_weighted_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let h_ptr = h.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &h_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let tile = 16u32;
+        let grid_x = ((k as u32) + tile - 1) / tile;
+        let grid_y = ((k as u32) + tile - 1) / tile;
+        self.launch_maybe_blob(
+            "calib_hessian_outer_weighted_f32",
+            [grid_x, grid_y, 1],
+            [tile, tile, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(x_ptr);
+                bb.push_ptr(w_ptr);
+                bb.push_ptr(h_ptr);
+                bb.push_i32(n_i);
+                bb.push_i32(k_i);
+                bb
+            },
+        )
+    }
+
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
     fn ensure_givens4_kernel(
         &mut self,
