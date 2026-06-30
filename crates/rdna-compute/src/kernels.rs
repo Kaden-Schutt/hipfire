@@ -1227,6 +1227,12 @@ pub const GEMV_QTIP3G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_QTIP3G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_qtip3g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Indexed-MoE low-rank weight-error correction (LQER/CALDERA): the two-stage
+/// `out += U_e·(V_e·x)` term that composes with any expert format (run after the
+/// main GEMV). One source file, two kernels: `gemv_lowrank_moe_proj` (V·x→t) and
+/// `gemv_lowrank_moe_expand` (U·t→ +=out).
+pub const GEMV_LOWRANK_MOE_SRC: &str = include_str!("../../../kernels/src/gemv_lowrank_moe.hip");
+
 /// gfx1151 two-row probe for the atomic-free batched indexed MoE down path.
 /// Same math/output contract as
 /// `GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`, but packs two

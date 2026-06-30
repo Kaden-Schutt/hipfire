@@ -4862,6 +4862,108 @@ impl Gpu {
         )
     }
 
+    // ── Low-rank residual (LQER) correction — composes with any expert fmt ──
+
+    /// Stage 1: `t[krank,:] = V_e·x` for each routed expert. `t` is [k_top × r].
+    pub fn gemv_lowrank_moe_proj(
+        &mut self,
+        expert_v_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        t: &GpuTensor,
+        r: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_lowrank_moe_proj",
+            kernels::GEMV_LOWRANK_MOE_SRC,
+            "gemv_lowrank_moe_proj",
+        )?;
+        let vp = expert_v_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let tp = t.buf.as_ptr();
+        let r_val = r as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &r_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_lowrank_moe_proj",
+            [k_top as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(tp);
+                b.push_i32(r_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// Stage 2: `out[krank,row] += U_e[row,:]·t[krank,:]`. `out` is [k_top × m].
+    pub fn gemv_lowrank_moe_expand(
+        &mut self,
+        expert_u_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        t: &GpuTensor,
+        out: &GpuTensor,
+        m: usize,
+        r: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_lowrank_moe_expand",
+            kernels::GEMV_LOWRANK_MOE_SRC,
+            "gemv_lowrank_moe_expand",
+        )?;
+        let up = expert_u_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let tp = t.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let m_val = m as i32;
+        let r_val = r as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &up as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &r_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_lowrank_moe_expand",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(up);
+                b.push_ptr(ip);
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_i32(m_val);
+                b.push_i32(r_val);
+                b
+            },
+        )
+    }
+
     /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed
     /// MoE down. Same expanded-output contract as the HFQ4G256 sibling;
     /// caller must follow with `moe_down_combine_k8_batched` to fold the
