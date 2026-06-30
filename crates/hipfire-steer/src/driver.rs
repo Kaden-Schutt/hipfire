@@ -185,7 +185,7 @@ pub fn pareto_front(trials: &[Trial]) -> Vec<usize> {
 }
 
 /// Run the full driver: measure base → capture +/- → derive → sweep apply → score.
-pub fn run_driver<H: ModelHarness>(cfg: &DriverConfig, h: &mut H) -> HipResult<DriverReport> {
+pub fn run_driver(cfg: &DriverConfig, h: &mut dyn ModelHarness) -> HipResult<DriverReport> {
     // Base reference: first-token logprobs on the good-eval set (KLD reference)
     // and the unmodified refusal rate on the bad-eval set.
     let base_logprobs = h.first_token_logprobs(&cfg.good_eval)?;
@@ -352,9 +352,11 @@ mod tests {
             self.hidden
         }
         fn run_forwards(&mut self, prompts: &[Prompt]) -> HipResult<()> {
-            // No GPU here; capture would normally accumulate. We just ensure the
-            // call shape is exercised. finish_capture still returns zeroed means.
-            let _ = prompts;
+            // No GPU here; commit one (zeroed) capture per prompt to exercise the
+            // real call shape. finish_capture then returns zeroed means.
+            for _ in prompts {
+                crate::commit_capture();
+            }
             Ok(())
         }
         fn first_token_logprobs(&mut self, prompts: &[Prompt]) -> HipResult<Vec<Vec<f32>>> {

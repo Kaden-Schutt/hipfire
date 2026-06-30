@@ -69,6 +69,9 @@ struct CaptureAcc {
     sums: Vec<Vec<f64>>,
     /// Number of prompts folded in (shared across layers).
     count: u64,
+    /// Last residual seen this prompt, per block — overwritten each forward,
+    /// folded into `sums` by `commit`.
+    current: Vec<Vec<f32>>,
     hidden: usize,
 }
 
@@ -77,25 +80,28 @@ impl CaptureAcc {
         Self {
             sums: vec![vec![0.0; hidden]; num_layers],
             count: 0,
+            current: vec![vec![0.0; hidden]; num_layers],
             hidden,
         }
     }
 
-    /// Fold one residual vector (`hidden` elements) at `layer_idx`.
-    fn add(&mut self, layer_idx: usize, x: &[f32]) {
+    /// Record the latest residual at `layer_idx`, overwriting any prior value
+    /// this prompt. After a prompt's full prefill, `current[layer]` holds the
+    /// LAST prompt-token residual — Heretic's capture position.
+    fn observe(&mut self, layer_idx: usize, x: &[f32]) {
         debug_assert_eq!(x.len(), self.hidden);
-        let row = &mut self.sums[layer_idx];
-        for (s, &v) in row.iter_mut().zip(x.iter()) {
-            *s += v as f64;
-        }
+        self.current[layer_idx].copy_from_slice(x);
     }
 
-    /// `count` is bumped once per prompt, i.e. once after the LAST block. We key
-    /// it off layer 0 so a single prompt's pass over all blocks counts once.
-    fn note_prompt(&mut self, layer_idx: usize) {
-        if layer_idx == 0 {
-            self.count += 1;
+    /// Fold the current (last-token) residuals into the running means and count
+    /// one prompt. Called by the harness after each prompt's forward.
+    fn commit(&mut self) {
+        for (sum, cur) in self.sums.iter_mut().zip(self.current.iter()) {
+            for (s, &v) in sum.iter_mut().zip(cur.iter()) {
+                *s += v as f64;
+            }
         }
+        self.count += 1;
     }
 
     /// Per-block means as f32. Panics-free: empty capture yields zeros.
@@ -146,6 +152,14 @@ fn set_session(s: Session) {
 /// means. Run the +set, call [`finish_capture`], then the -set similarly.
 pub fn begin_capture(num_layers: usize, hidden: usize) {
     set_session(Session::Capturing(CaptureAcc::new(num_layers, hidden)));
+}
+
+/// Fold the current prompt's last-token residuals into the capture means and
+/// count it. Call once after each prompt's forward during a CAPTURE session.
+pub fn commit_capture() {
+    if let Session::Capturing(acc) = &mut *session().write().unwrap() {
+        acc.commit();
+    }
 }
 
 /// End a CAPTURE session and return the accumulated per-block means (`None` if
@@ -221,8 +235,7 @@ pub fn maybe_steer_block(gpu: &mut Gpu, x: &GpuTensor, layer_idx: usize) -> HipR
         Session::Inactive => {}
         Session::Capturing(acc) => {
             let host = gpu.download_f32(x)?;
-            acc.add(layer_idx, &host);
-            acc.note_prompt(layer_idx);
+            acc.observe(layer_idx, &host);
         }
         Session::Applying(spec) => {
             if spec.layer_range.contains(&layer_idx) {
@@ -253,8 +266,7 @@ pub fn maybe_steer_block_batched(
         Session::Capturing(acc) => {
             let host = gpu.download_f32(x_batch)?;
             let last = (num_positions - 1) * hidden;
-            acc.add(layer_idx, &host[last..last + hidden]);
-            acc.note_prompt(layer_idx);
+            acc.observe(layer_idx, &host[last..last + hidden]);
         }
         Session::Applying(spec) => {
             if spec.layer_range.contains(&layer_idx) {
@@ -465,10 +477,10 @@ mod tests {
     #[test]
     fn capture_means_average_over_prompts() {
         let mut acc = CaptureAcc::new(1, 2);
-        acc.add(0, &[2.0, 4.0]);
-        acc.note_prompt(0);
-        acc.add(0, &[4.0, 8.0]);
-        acc.note_prompt(0);
+        acc.observe(0, &[2.0, 4.0]);
+        acc.commit();
+        acc.observe(0, &[4.0, 8.0]);
+        acc.commit();
         let m = acc.means();
         assert_eq!(m.0[0], vec![3.0, 6.0]);
     }

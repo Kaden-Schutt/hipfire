@@ -61,6 +61,7 @@ members = [
     "crates/hipfire-dispatch-tests",
     "crates/hipfire-train",
     "crates/hipfire-steer",
+    "crates/hipfire-steer-harness",
 ]
 # The Leptos browser UIs target wasm32 (leptos CSR + web-sys) and are built
 # standalone via `trunk`, so they must NOT be workspace members — otherwise

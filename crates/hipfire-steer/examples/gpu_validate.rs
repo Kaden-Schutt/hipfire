@@ -15,8 +15,8 @@
 //! Exits non-zero if any case exceeds tolerance, so it can gate a GPU smoke run.
 
 use hipfire_steer::{
-    apply_direction, begin_apply, begin_capture, clear, derive_directions, finish_capture,
-    maybe_steer_block, CaptureMeans, SteerMode, SteerSpec,
+    apply_direction, begin_apply, begin_capture, clear, commit_capture, derive_directions,
+    finish_capture, maybe_steer_block, CaptureMeans, SteerMode, SteerSpec,
 };
 use rdna_compute::Gpu;
 
@@ -186,6 +186,7 @@ fn run_capture(gpu: &mut Gpu, rng: &mut Lcg, offsets: &[f32]) -> CaptureMeans {
             let x_gpu = gpu.upload_f32(&x, &[HIDDEN]).unwrap();
             maybe_steer_block(gpu, &x_gpu, layer_idx).unwrap();
         }
+        commit_capture();
     }
     finish_capture().expect("capture session was active")
 }

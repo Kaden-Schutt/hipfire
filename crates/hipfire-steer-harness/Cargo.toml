@@ -1,0 +1,17 @@
+[package]
+name = "hipfire-steer-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-family model adapters + CLI for the hipfire-steer driver. The generic driver/scoring and the ModelHarness trait live in hipfire-steer; this crate provides family adapters (gemma3 first) behind that trait + an arch_id dispatcher. Adding a family = one module here + a dispatch arm + the block hook in that arch's forward."
+
+[[bin]]
+name = "hipfire-steer"
+path = "src/main.rs"
+
+[dependencies]
+hipfire-steer = { path = "../hipfire-steer" }
+hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }

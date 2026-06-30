@@ -1875,6 +1875,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-steer-harness"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-gemma3",
+ "hipfire-runtime",
+ "hipfire-steer",
+ "rdna-compute",
+]
+
+[[package]]
 name = "hipfire-sysinfo"
 version = "0.3.0"
 dependencies = [
