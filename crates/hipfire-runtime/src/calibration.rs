@@ -194,6 +194,55 @@ impl CalibCollector {
         }
     }
 
+    /// GuidedQuant capture: accumulate the per-token **Fisher-weighted** Hessian
+    /// `H̄ = Σ_n w[n]·xₙxₙᵀ` (and its diagonal) for `tensor_name`. `x` is the
+    /// linear's input activation `[n,k]` (a real contiguous block, not the shared
+    /// scratch the `ActivationCapture::capture` tap takes); `w` `[n]` is the
+    /// per-token weight the caller forms from that linear's output-grad `∂ℓ/∂z`
+    /// (see `calib_row_meansq_f32`). Unbuffered — one weighted outer-product +
+    /// weighted sumsq per call, fine offline. `w≡1` makes this identical to the
+    /// plain unweighted capture.
+    pub fn capture_weighted(
+        &self,
+        gpu: &mut Gpu,
+        tensor_name: &str,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) {
+        let mut accs = self.accs.lock().unwrap();
+        if !accs.contains_key(tensor_name) {
+            let diag = gpu.zeros(&[k], DType::F32).unwrap();
+            let h = if self.wants_hessian(tensor_name) {
+                Some(gpu.zeros(&[k, k], DType::F32).unwrap())
+            } else {
+                None
+            };
+            // No row buffering on this path; a minimal placeholder keeps `Acc`
+            // uniform (`flush` is a no-op while `buf_rows == 0`).
+            let buf = gpu.zeros(&[1, k], DType::F32).unwrap();
+            accs.insert(
+                tensor_name.to_string(),
+                Acc {
+                    diag,
+                    h,
+                    h_f64: None,
+                    buf,
+                    buf_rows: 0,
+                    k,
+                    n_tokens: 0,
+                },
+            );
+        }
+        let acc = accs.get_mut(tensor_name).unwrap();
+        gpu.calib_sumsq_weighted_f32(x, w, &acc.diag, n, k).unwrap();
+        if let Some(h) = &acc.h {
+            gpu.calib_hessian_outer_weighted_f32(x, w, h, n, k).unwrap();
+        }
+        acc.n_tokens += n as u64;
+    }
+
     /// Stream the accumulated tensors into an HFQM `.calib.hfq` at `path`,
     /// **one tensor at a time** (download → normalize `/ n_tokens` → write →
     /// drop), so peak host memory is a single Hessian rather than all of them

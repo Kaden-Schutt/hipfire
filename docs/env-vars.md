@@ -197,7 +197,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_FP8_WMMA` | Interprets "HIPFIRE_FP8_WMMA" from environment to select behavior | `crates/rdna-compute/src/feature_flags.rs:191` |
 | `HIPFIRE_FUSED_HFQ4_2ROW_GFX1151` | Selects behavior from recognized values | `crates/rdna-compute/src/dispatch/mod.rs:3317` |
 | `HIPFIRE_GATE_UP_VARIANT` | Runtime variable controlling gate up variant in hipfire | `crates/rdna-compute/src/feature_flags.rs:246` |
-| `HIPFIRE_GDN_Q8_REG_GFX1151` | HIPFIRE_GDN_Q8_REG_GFX1151=1 enables the gfx1151 register-state | `crates/rdna-compute/src/dispatch/mod.rs:3967` |
+| `HIPFIRE_GDN_Q8_REG_GFX1151` | HIPFIRE_GDN_Q8_REG_GFX1151=1 enables the gfx1151 register-state | `crates/rdna-compute/src/dispatch/mod.rs:4016` |
 | `HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY` | AWQ-style calibration mode: with no K×K outer-product or multi-GB Hessian | `crates/hipfire-arch-gemma3/src/calibration.rs:256` |
 | `HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS` | Runtime variable controlling gemma3 calib layers per pass in hipfire | `crates/hipfire-arch-gemma3/src/calibration.rs:88` |
 | `HIPFIRE_GEMMA3_CALIB_MICROBATCH` | Runtime variable controlling gemma3 calib microbatch in hipfire | `crates/hipfire-arch-gemma3/src/calibration.rs:118` |

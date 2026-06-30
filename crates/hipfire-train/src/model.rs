@@ -16,6 +16,7 @@ use crate::ops::cross_entropy::cross_entropy;
 use crate::ops::distill::distill_kl;
 use crate::ops::linear::{linear_backward_x, linear_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
+use hipfire_runtime::calibration::CalibCollector;
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
 
 /// Owned frozen weights for one layer.
@@ -494,6 +495,114 @@ pub fn model_loss_backward(
     }
     grads.reverse(); // align with layer order
     Ok((loss_sum, grads))
+}
+
+/// GuidedQuant down_proj capture: form the per-token Fisher weight
+/// `w[n] = mean_c (∂ℓ/∂z)²` from the down output-grad `d_out [seq,h]`, normalize
+/// so `mean(w)=1` (scale-invariant for LDLQ, keeps H̄ ~ plain-H magnitude), and
+/// accumulate the weighted Hessian `H̄ = Σ wₙ·actₙactₙᵀ` for this layer's
+/// `down_proj` into the collector (`act_in [seq,inter]` is down's input).
+fn down_guided_capture(
+    gpu: &mut Gpu,
+    collector: &CalibCollector,
+    layer: usize,
+    d_out: &GpuTensor,
+    act_in: &GpuTensor,
+    seq: usize,
+    h: usize,
+    inter: usize,
+) -> HipResult<()> {
+    let w = gpu.zeros(&[seq], DType::F32)?;
+    gpu.calib_row_meansq_f32(d_out, &w, seq, h)?;
+    let mean: f32 = gpu.download_f32(&w)?.iter().sum::<f32>() / seq.max(1) as f32;
+    if mean > 0.0 {
+        gpu.scale_f32(&w, 1.0 / mean)?;
+    }
+    let name = format!("model.layers.{layer}.mlp.down_proj");
+    collector.capture_weighted(gpu, &name, act_in, &w, seq, inter);
+    gpu.free_tensor(w)?;
+    Ok(())
+}
+
+/// Like [`model_loss_backward`], but during the reverse block walk it captures
+/// the **GuidedQuant Fisher-weighted Hessian** for each layer's `down_proj` into
+/// `collector` (down's output adjoint is the loop's `d_x`, its input is
+/// `acts.layer_acts[i].act`). The LoRA grads are discarded — this path exists
+/// only to drive the weighted-Hessian accumulation, not an optimizer step.
+/// First move of the calibration-backward path (down_proj only).
+pub fn model_calib_down_backward(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    acts: &ModelActivations,
+    targets: &[f32],
+    ignore_index: i32,
+    collector: &CalibCollector,
+) -> HipResult<f32> {
+    let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
+    let inter = model.dims.inter;
+    debug_assert!(
+        model.lm_head.is_none(),
+        "backward supports tied embeddings only"
+    );
+
+    let tgt = gpu.upload_f32(targets, &[seq])?;
+    let loss = gpu.zeros(&[seq], DType::F32)?;
+    let d_logits = gpu.zeros(&[seq * vocab], DType::F32)?;
+    cross_entropy(
+        gpu,
+        &acts.logits,
+        &tgt,
+        &loss,
+        &d_logits,
+        seq,
+        vocab,
+        ignore_index,
+    )?;
+    let loss_sum: f32 = gpu.download_f32(&loss)?.iter().sum();
+
+    let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
+    linear_backward_x(gpu, &d_logits, &model.embed, &d_xf, seq, h, vocab, false)?;
+    let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
+    let dw_dummy = gpu.zeros(&[h], DType::F32)?;
+    rmsnorm_backward(
+        gpu,
+        &d_xf,
+        &acts.x_last,
+        &model.final_norm,
+        &acts.rinv_final,
+        &d_x_last,
+        &dw_dummy,
+        seq,
+        h,
+    )?;
+
+    let mut d_x = d_x_last;
+    for i in (0..model.layers.len()).rev() {
+        // Capture down_proj BEFORE block_backward consumes d_x: here d_x is the
+        // grad w.r.t. this block's output = down_proj's output adjoint.
+        down_guided_capture(
+            gpu,
+            collector,
+            i,
+            &d_x,
+            &acts.layer_acts[i].act,
+            seq,
+            h,
+            inter,
+        )?;
+        let (lw, ll) = &model.layers[i];
+        let (d_in, _g) = block_backward(
+            gpu,
+            &d_x,
+            &acts.layer_inputs[i],
+            &lw.as_block(),
+            &ll.as_block(),
+            &acts.layer_acts[i],
+            &model.dims,
+        )?;
+        d_x = d_in;
+    }
+    Ok(loss_sum)
 }
 
 /// Flatten per-layer LoRA grads into the same order as `LlamaModel::lora_params`.

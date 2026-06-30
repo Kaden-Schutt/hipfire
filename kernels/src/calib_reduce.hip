@@ -70,6 +70,24 @@ extern "C" __global__ void calib_hessian_outer_f32(
     }
 }
 
+// acc[c] += Σ_n w[n]·x[n,c]².  Per-row-weighted column sum-of-squares = the
+// diagonal of the weighted Hessian (diag(H̄)). One thread per column.
+extern "C" __global__ void calib_sumsq_weighted_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ acc,
+    int N, int K
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= K) return;
+    float s = 0.0f;
+    for (int n = 0; n < N; n++) {
+        float v = x[(long long)n * K + c];
+        s += w[n] * v * v;
+    }
+    acc[c] += s;
+}
+
 // w[n] += (1/K) Σ_c d[n,c]².  One thread per ROW (token); the inner loop walks
 // the K columns. Used by GuidedQuant calibration to turn a linear's output-grad
 // block d[N,K] (∂ℓ/∂z) into the per-token Fisher weight w[n] that reweights the

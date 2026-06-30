@@ -3524,6 +3524,55 @@ impl Gpu {
         )
     }
 
+    /// `acc[c] += Σ_n w[n]·x[n,c]²` — the per-row-weighted column sum-of-squares,
+    /// i.e. the diagonal of the weighted Hessian. `w≡1` reduces to
+    /// [`Self::calib_sumsq_reduce_f32`].
+    pub fn calib_sumsq_weighted_f32(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_sumsq_weighted_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let a_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let block = 64u32;
+        let grid = ((k as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "calib_sumsq_weighted_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(x_ptr);
+                bb.push_ptr(w_ptr);
+                bb.push_ptr(a_ptr);
+                bb.push_i32(n_i);
+                bb.push_i32(k_i);
+                bb
+            },
+        )
+    }
+
     /// `H[i,j] += Σ_n w[n]·x[n,i]·x[n,j]` — the per-row-weighted (GuidedQuant /
     /// empirical-Fisher) Hessian. `w≡1` reduces to [`Self::calib_hessian_outer_f32`].
     pub fn calib_hessian_outer_weighted_f32(
