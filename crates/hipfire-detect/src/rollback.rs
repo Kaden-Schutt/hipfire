@@ -169,7 +169,10 @@ mod tests {
         let line = "rollback_parity: foo replay_gdn_tape=2 replay_full_prefill=3";
         let v = serde_json::to_value(replay_parity(line)).unwrap();
         assert_eq!(v["ok"], json!(false));
-        assert_eq!(v["reason"], json!("fast_gdn_tape_replay_is_diagnostic_only"));
+        assert_eq!(
+            v["reason"],
+            json!("fast_gdn_tape_replay_is_diagnostic_only")
+        );
         assert_eq!(v["replay_gdn_tape"], json!(2));
         assert_eq!(v["replay_full_prefill"], json!(3));
         assert_eq!(v["replay_batched_prefill"], json!(0)); // optional, absent

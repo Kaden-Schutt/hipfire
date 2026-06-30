@@ -5,20 +5,11 @@
 //! f32, Q4F16, Q8F16, Q4_K, HFQ4, HFQ6) into f32, plus f16<->f32 bit helpers.
 
 use super::*;
-
-pub(crate) fn decode_f16_slice(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|chunk| f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
-        .collect()
-}
-
-pub(crate) fn decode_bf16_slice(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|chunk| f32::from_bits((u16::from_le_bytes([chunk[0], chunk[1]]) as u32) << 16))
-        .collect()
-}
+#[cfg(test)]
+pub(crate) use hipfire_primitives::conv::f32_to_f16_bits;
+pub(crate) use hipfire_primitives::conv::{
+    decode_bf16_slice, decode_f16_slice, decode_f32_slice, f16_bits_to_f32,
+};
 
 pub(crate) fn decode_q4f16_g64_slice(
     name: &str,
@@ -55,7 +46,11 @@ pub(crate) fn decode_q4f16_g64_slice(
     Ok(out)
 }
 
-pub(crate) fn decode_q8f16_slice(name: &str, bytes: &[u8], elem_count: usize) -> DiffusionResult<Vec<f32>> {
+pub(crate) fn decode_q8f16_slice(
+    name: &str,
+    bytes: &[u8],
+    elem_count: usize,
+) -> DiffusionResult<Vec<f32>> {
     let expected_blocks = elem_count.div_ceil(32);
     let expected_bytes = expected_blocks * 34;
     if bytes.len() < expected_bytes {
@@ -67,7 +62,11 @@ pub(crate) fn decode_q8f16_slice(name: &str, bytes: &[u8], elem_count: usize) ->
     Ok(hipfire_runtime::quant::dequantize_q8_0(bytes, elem_count))
 }
 
-pub(crate) fn decode_q4_k_slice(name: &str, bytes: &[u8], elem_count: usize) -> DiffusionResult<Vec<f32>> {
+pub(crate) fn decode_q4_k_slice(
+    name: &str,
+    bytes: &[u8],
+    elem_count: usize,
+) -> DiffusionResult<Vec<f32>> {
     let expected_blocks = elem_count.div_ceil(256);
     let expected_bytes = expected_blocks * 144;
     if bytes.len() < expected_bytes {
@@ -173,62 +172,4 @@ pub(crate) fn decode_hfq6_g256_slice(
         }
     }
     Ok(out)
-}
-
-pub(crate) fn decode_f32_slice(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
-
-pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exp = ((bits >> 10) & 0x1f) as i32;
-    let frac = (bits & 0x03ff) as u32;
-    let f32_bits = if exp == 0 {
-        if frac == 0 {
-            sign
-        } else {
-            let mut frac_norm = frac;
-            let mut exp_norm = -14i32;
-            while (frac_norm & 0x0400) == 0 {
-                frac_norm <<= 1;
-                exp_norm -= 1;
-            }
-            frac_norm &= 0x03ff;
-            sign | (((exp_norm + 127) as u32) << 23) | (frac_norm << 13)
-        }
-    } else if exp == 0x1f {
-        sign | 0x7f80_0000 | (frac << 13)
-    } else {
-        sign | (((exp - 15 + 127) as u32) << 23) | (frac << 13)
-    };
-    f32::from_bits(f32_bits)
-}
-
-#[cfg(test)]
-pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = bits & 0x7f_ffff;
-    if exp == 255 {
-        return sign | if mant == 0 { 0x7c00 } else { 0x7e00 };
-    }
-    let half_exp = exp - 127 + 15;
-    if half_exp >= 31 {
-        return sign | 0x7c00;
-    }
-    if half_exp <= 0 {
-        if half_exp < -10 {
-            return sign;
-        }
-        let mant = mant | 0x80_0000;
-        let shift = (14 - half_exp) as u32;
-        let rounded = (mant + (1 << (shift - 1))) >> shift;
-        return sign | rounded as u16;
-    }
-    let rounded = mant + 0x1000;
-    sign | ((half_exp as u16) << 10) | ((rounded >> 13) as u16 & 0x03ff)
 }

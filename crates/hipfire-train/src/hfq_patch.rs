@@ -116,16 +116,11 @@ pub fn is_norm(name: &str) -> bool {
 }
 
 pub fn f32_to_bf16_bits(f: f32) -> u16 {
-    let bits = f.to_bits();
-    if (bits >> 23) & 0xFF == 0xFF {
-        return (bits >> 16) as u16; // inf/nan: truncate high half
-    }
-    let round_bias = 0x7FFF + ((bits >> 16) & 1);
-    ((bits + round_bias) >> 16) as u16
+    hipfire_primitives::conv::f32_to_bf16_bits(f)
 }
 
 pub fn bf16_bits_to_f32(b: u16) -> f32 {
-    f32::from_bits((b as u32) << 16)
+    hipfire_primitives::conv::bf16_bits_to_f32(b)
 }
 
 /// Patch a parsed HFQM byte buffer in place: overwrite each BF16 norm tensor

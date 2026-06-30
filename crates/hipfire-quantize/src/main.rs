@@ -59,10 +59,12 @@ pub use hipfire_kvquant::{kv_compact, kvarn};
 #[allow(dead_code)]
 // KVarN codec + deferred KV-compaction now live in the leaf `hipfire-kvquant`
 // crate (so the engine read path can share them). Re-export at the crate root so
-// the existing `crate::kvarn` / `crate::{cpu_fwht_256,gen_fwht_signs,f16_to_f32,
-// f32_to_f16}` references across this bin (codecs.rs, qtip.rs, ldlq.rs, main.rs)
-// keep resolving unchanged.
-pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
+// the existing `crate::kvarn` / conversion / FWHT references across this bin
+// (codecs.rs, qtip.rs, ldlq.rs, main.rs) keep resolving unchanged.
+pub use hipfire_primitives::conv::{
+    bf16_bits_to_f32 as bf16_to_f32, f16_to_f32, f32_slice_to_bf16_bytes, f32_slice_to_f16_bytes,
+    f32_to_bf16_bits, f32_to_f16, plain_dtype_to_f32 as to_f32,
+};
 pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 // Tiny random-init model fixtures for fast kernel/plumbing gating.
 mod fixture;
@@ -355,36 +357,6 @@ fn parse_arch_id_override() -> Option<u32> {
             eprintln!("error: --arch-id value '{raw}' is not a valid u32: {e}");
             std::process::exit(1);
         }
-    }
-}
-
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
-
-fn f32_slice_to_f16_bytes(f32_data: &[f32]) -> Vec<u8> {
-    f32_data
-        .iter()
-        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-        .collect()
-}
-
-/// Convert raw tensor bytes to F32 based on dtype string
-fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
-    match dtype {
-        "F16" => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        "BF16" => data
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        "F32" => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        other => panic!("unsupported dtype: {other}"),
     }
 }
 
@@ -711,25 +683,6 @@ fn dequantize_e4m3_f32scale_to_f32(
 /// 18 VGPRs, 100% occupancy on RDNA1. Beats Q4_K at all matrix sizes.
 /// CPU-side FWHT (Walsh-Hadamard Transform) on a 256-element group.
 /// Matches the GPU-side fwht_forward_256 in turbo_common: signs1 → butterfly → scale → signs2.
-/// f32 → bf16 bits, round-to-nearest-even (truncate the low 16 mantissa bits).
-fn f32_to_bf16_bits(f: f32) -> u16 {
-    let bits = f.to_bits();
-    if (bits >> 23) & 0xFF == 0xFF {
-        // inf / nan: truncate the high half (keeps inf; nan stays nan).
-        return (bits >> 16) as u16;
-    }
-    let bias = 0x7FFF + ((bits >> 16) & 1);
-    (bits.wrapping_add(bias) >> 16) as u16
-}
-
-fn f32_slice_to_bf16_bytes(d: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(d.len() * 2);
-    for &f in d {
-        out.extend_from_slice(&f32_to_bf16_bits(f).to_le_bytes());
-    }
-    out
-}
-
 /// Simulated QTIP quantization of a 2D weight (row-major `m × k`), in place,
 /// bit-rate-parametric (Phase C: 2-bit primary, 3-bit fallback). Per row, per
 /// 256-group: FWHT-rotate (incoherence) → beam-encode trellis → optimal scale →

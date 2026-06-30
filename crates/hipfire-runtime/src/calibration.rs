@@ -46,15 +46,6 @@ fn hessian_storage_from_env() -> HessianStorage {
     }
 }
 
-fn f32_to_bf16_bits(f: f32) -> u16 {
-    let bits = f.to_bits();
-    if (bits >> 23) & 0xff == 0xff {
-        return (bits >> 16) as u16;
-    }
-    let bias = 0x7fff + ((bits >> 16) & 1);
-    (bits.wrapping_add(bias) >> 16) as u16
-}
-
 fn compact_hessian_bytes(k: usize) -> u64 {
     (k * 4 + k * (k - 1)) as u64
 }
@@ -707,7 +698,7 @@ fn write_hessian_bf16_tril_diag_f32(
     }
     for i in 1..k {
         for j in 0..i {
-            let bits = f32_to_bf16_bits(h[i * k + j] * scale);
+            let bits = hipfire_primitives::conv::f32_to_bf16_bits(h[i * k + j] * scale);
             buf.extend_from_slice(&bits.to_le_bytes());
             if buf.len() >= 16384 {
                 w.write_all(&buf)?;
@@ -795,10 +786,6 @@ pub fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
 mod tests {
     use super::*;
 
-    fn bf16_to_f32(bits: u16) -> f32 {
-        f32::from_bits((bits as u32) << 16)
-    }
-
     #[test]
     fn compact_hessian_size_matches_diag_plus_lower_triangle() {
         assert_eq!(compact_hessian_bytes(1), 4);
@@ -816,8 +803,11 @@ mod tests {
         assert_eq!(out.len(), compact_hessian_bytes(3) as usize);
 
         let read_f32 = |off: usize| f32::from_le_bytes(out[off..off + 4].try_into().unwrap());
-        let read_bf16 =
-            |off: usize| bf16_to_f32(u16::from_le_bytes(out[off..off + 2].try_into().unwrap()));
+        let read_bf16 = |off: usize| {
+            hipfire_primitives::conv::bf16_bits_to_f32(u16::from_le_bytes(
+                out[off..off + 2].try_into().unwrap(),
+            ))
+        };
         assert_eq!(read_f32(0), 1.0);
         assert_eq!(read_f32(4), 2.0);
         assert_eq!(read_f32(8), 4.0);

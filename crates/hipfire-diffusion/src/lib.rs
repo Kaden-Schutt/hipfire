@@ -726,7 +726,10 @@ impl VaeLatentNorm {
                 latents_std.len()
             )));
         }
-        if latents_std.iter().any(|value| value.abs() <= f32::MIN_POSITIVE) {
+        if latents_std
+            .iter()
+            .any(|value| value.abs() <= f32::MIN_POSITIVE)
+        {
             return Err(DiffusionError::InvalidMetadata(
                 "VAE latents_std entries must be non-zero".to_string(),
             ));
@@ -1610,7 +1613,6 @@ fn classifier_free_guidance_is_identity(cfg_scale: f32) -> bool {
     (cfg_scale - 1.0).abs() <= f32::EPSILON
 }
 
-
 fn scale_model_input_with_runtime_context(
     schedule: &DiffusionSchedule,
     sample: &CpuTensor,
@@ -1628,21 +1630,19 @@ fn scale_model_input_with_runtime_context(
             Ok((sample.clone(), DiffusionRuntimeKind::CpuSourceReference))
         }
         SchedulerInputScaling::Sigma => {
-            {
-                let sigma = *schedule.sigmas.get(step).ok_or_else(|| {
-                    DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
-                })?;
-                let scale = (sigma * sigma + 1.0).sqrt().recip();
-                let data = runtime_context
-                    .with_rocm_gpu(|gpu| scale_model_input_hip_on_gpu(gpu, &sample.data, scale))?;
-                Ok((
-                    CpuTensor {
-                        shape: sample.shape.clone(),
-                        data,
-                    },
-                    DiffusionRuntimeKind::RocmHybridReference,
-                ))
-            }
+            let sigma = *schedule.sigmas.get(step).ok_or_else(|| {
+                DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
+            })?;
+            let scale = (sigma * sigma + 1.0).sqrt().recip();
+            let data = runtime_context
+                .with_rocm_gpu(|gpu| scale_model_input_hip_on_gpu(gpu, &sample.data, scale))?;
+            Ok((
+                CpuTensor {
+                    shape: sample.shape.clone(),
+                    data,
+                },
+                DiffusionRuntimeKind::RocmHybridReference,
+            ))
         }
     }
 }

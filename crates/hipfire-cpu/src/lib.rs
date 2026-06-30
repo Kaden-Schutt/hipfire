@@ -551,18 +551,15 @@ pub fn projection_module_output_json(output: &ProjectionModuleOutput) -> Value {
 }
 
 pub fn f32_to_bf16_bits_rne(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let lsb = (bits >> 16) & 1;
-    let rounding_bias = 0x7fff + lsb;
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+    hipfire_primitives::conv::f32_to_bf16_bits(x)
 }
 
 pub fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
+    hipfire_primitives::conv::bf16_bits_to_f32(bits)
 }
 
 pub fn round_f32_to_bf16(x: f32) -> f32 {
-    bf16_bits_to_f32(f32_to_bf16_bits_rne(x))
+    hipfire_primitives::conv::round_f32_to_bf16(x)
 }
 
 pub fn decode_w_down_shadow(

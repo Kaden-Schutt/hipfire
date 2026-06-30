@@ -15,47 +15,11 @@ use crate::model::{HostBlock, NemotronWeights};
 use crate::moe::{MoeExpertWeights, MoeWeights};
 use crate::{BlockKind, NemotronHConfig};
 use hipfire_model::ModelSource;
+use hipfire_primitives::conv::{decode_plain_dtype_to_f32, f16_to_f32};
 
 /// Decode a safetensors tensor's raw bytes to `Vec<f32>` per its dtype string.
 fn dequant(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>, String> {
-    match dtype {
-        "BF16" => Ok(bytes
-            .chunks_exact(2)
-            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-            .collect()),
-        "F16" => Ok(bytes
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()),
-        "F32" => Ok(bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()),
-        other => Err(format!("nemotron loader: unsupported dtype {other:?}")),
-    }
-}
-
-/// IEEE half → f32 (handles subnormals/inf/nan).
-fn f16_to_f32(h: u16) -> f32 {
-    let sign = (h >> 15) & 1;
-    let exp = (h >> 10) & 0x1f;
-    let mant = h & 0x3ff;
-    let val = match exp {
-        0 => (mant as f32) * 2f32.powi(-24),
-        0x1f => {
-            if mant == 0 {
-                f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
-        _ => (1.0 + (mant as f32) / 1024.0) * 2f32.powi(exp as i32 - 15),
-    };
-    if sign == 1 {
-        -val
-    } else {
-        val
-    }
+    decode_plain_dtype_to_f32(dtype, bytes).map_err(|e| format!("nemotron loader: {e}"))
 }
 
 /// Read tensor `name` from the source and dequantize to `Vec<f32>`.

@@ -1322,6 +1322,7 @@ dependencies = [
  "hipfire-kld",
  "hipfire-mixer",
  "hipfire-model",
+ "hipfire-primitives",
  "hipfire-runtime",
  "rdna-compute",
  "serde",
@@ -1388,6 +1389,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-mixer",
  "hipfire-model",
+ "hipfire-primitives",
  "hipfire-runtime",
  "rdna-compute",
  "serde",
@@ -1467,6 +1469,7 @@ dependencies = [
 name = "hipfire-cpu"
 version = "0.3.0"
 dependencies = [
+ "hipfire-primitives",
  "serde_json",
 ]
 
@@ -1551,6 +1554,7 @@ dependencies = [
  "anyhow",
  "base64",
  "hip-bridge",
+ "hipfire-primitives",
  "hipfire-runtime",
  "image",
  "rayon",

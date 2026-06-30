@@ -108,8 +108,10 @@ fn run_text_forward_for_capture(
     // calibration tap), instead of one N=1 GEMV per token. `HIPFIRE_GEMMA3_CALIB_NO_BATCH=1`
     // forces the legacy per-token path (for bit-for-bit comparison / debugging).
     let want_kldref = collect_kldref && opts.kldref;
-    let force_per_token =
-        std::env::var("HIPFIRE_GEMMA3_CALIB_NO_BATCH").ok().as_deref() == Some("1");
+    let force_per_token = std::env::var("HIPFIRE_GEMMA3_CALIB_NO_BATCH")
+        .ok()
+        .as_deref()
+        == Some("1");
     if want_kldref || force_per_token {
         return run_text_forward_per_token(gpu, weights, config, tokens, opts, want_kldref, kldref);
     }
@@ -253,7 +255,9 @@ pub fn collect_calibration_artifacts_text_only(
     // AWQ-style calibration mode: with no K×K outer-product or multi-GB Hessian
     // write, the forward becomes the bottleneck — which is where the batched
     // prefill tap pays off.
-    let imatrix_only = if std::env::var("HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY").ok().as_deref()
+    let imatrix_only = if std::env::var("HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY")
+        .ok()
+        .as_deref()
         == Some("1")
     {
         vec![String::new()]

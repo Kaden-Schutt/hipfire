@@ -23,6 +23,8 @@
 // (the post-rotation weight distribution). Full-model wiring + `astrea`
 // KLD/PPL gating vs MQ4/MQ3 is the next increment, BEFORE the decode kernel.
 
+use hipfire_primitives::conv::f16_bits_to_f32;
+
 /// Bits per weight (2-bit target).
 pub const BITS_PER_WEIGHT: u32 = 2;
 
@@ -72,27 +74,6 @@ pub fn build_codebook() -> Vec<f32> {
     let var = cb.iter().map(|v| v * v).sum::<f64>() / cb.len() as f64;
     let inv_std = if var > 0.0 { 1.0 / var.sqrt() } else { 1.0 };
     cb.iter().map(|v| (v * inv_std) as f32).collect()
-}
-
-/// Reinterpret an IEEE-754 half (binary16) bit pattern as f32 — the
-/// `view(np.float16)` step in QTIP's `decode_3inst`.
-#[inline]
-fn f16_bits_to_f32(h: u16) -> f32 {
-    let sign = if (h >> 15) & 1 == 1 { -1.0f32 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let mant = (h & 0x3ff) as f32;
-    let mag = if exp == 0 {
-        mant * 2.0f32.powi(-24) // subnormal
-    } else if exp == 0x1f {
-        if mant == 0.0 {
-            f32::INFINITY
-        } else {
-            f32::NAN
-        }
-    } else {
-        (1.0 + mant / 1024.0) * 2.0f32.powi(exp - 15)
-    };
-    sign * mag
 }
 
 /// QTIP "3INST" computed-codebook hash (QTIP §3 / Algorithm 3INST; constants

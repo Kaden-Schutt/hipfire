@@ -23,7 +23,10 @@ use crate::model::find_model;
 /// stderr (step index, per-step delta, cumulative elapsed, throughput, and ETA)
 /// so batch generation speed is observable in real time. `images` is the batch
 /// size, reported so the per-step rate can be read as images/step-second.
-fn step_timing_progress(label: &str, images: usize) -> impl FnMut(DiffusionProgress) -> DiffusionResult<()> {
+fn step_timing_progress(
+    label: &str,
+    images: usize,
+) -> impl FnMut(DiffusionProgress) -> DiffusionResult<()> {
     let label = label.to_string();
     // Start the clock now (before generation) so the first reported step includes
     // model setup and text-encode latency rather than reading as zero.
@@ -39,7 +42,11 @@ fn step_timing_progress(label: &str, images: usize) -> impl FnMut(DiffusionProgr
         let elapsed = now.duration_since(start).as_secs_f64();
         let done = progress.completed_steps;
         let total = progress.total_steps.max(1);
-        let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+        let rate = if elapsed > 0.0 {
+            done as f64 / elapsed
+        } else {
+            0.0
+        };
         let eta = if rate > 0.0 {
             (total.saturating_sub(done)) as f64 / rate
         } else {
@@ -788,8 +795,8 @@ fn resolve_runtime_options(
     if DiffusionGenerationRuntimeOptions::cpu_reference_requested() {
         return Ok(DiffusionGenerationRuntimeOptions::cpu_reference());
     }
-    let device = hipfire_runtime::multi_gpu::resolve_primary_device(explicit_device)
-        .map_err(|error| {
+    let device =
+        hipfire_runtime::multi_gpu::resolve_primary_device(explicit_device).map_err(|error| {
             anyhow::anyhow!(
                 "failed to resolve a ROCm device: {error}; pass --rocm-device-id, or set \
                  HIPFIRE_DIFFUSION_CPU_REFERENCE=1 to use the slow CPU reference oracle"

@@ -118,7 +118,14 @@ pub fn self_score<E>(
         });
     }
 
-    Ok(finish(n_chunk, total_scored, global_kld_sum, global_nll_sum, global_nll_n, per_chunk))
+    Ok(finish(
+        n_chunk,
+        total_scored,
+        global_kld_sum,
+        global_nll_sum,
+        global_nll_n,
+        per_chunk,
+    ))
 }
 
 /// Build a KLD reference from the resident model: per `n_ctx` chunk, capture the
@@ -213,7 +220,14 @@ pub fn score<E>(
         });
     }
 
-    Ok(finish(n_chunk, total_scored, global_kld_sum, global_nll_sum, global_nll_n, per_chunk))
+    Ok(finish(
+        n_chunk,
+        total_scored,
+        global_kld_sum,
+        global_nll_sum,
+        global_nll_n,
+        per_chunk,
+    ))
 }
 
 fn finish(

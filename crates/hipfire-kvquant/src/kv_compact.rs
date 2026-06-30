@@ -20,7 +20,7 @@
 #![allow(dead_code)]
 
 use crate::kvarn::{self, QuantTile};
-use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+use hipfire_primitives::fwht::{gen_fwht_signs, signed_fwht};
 
 /// One compacted cold buffer for a contiguous range of (old) cold tokens. Slot
 /// structure is SHARED across kv-heads (CASK ranks tokens with a head-aggregated
@@ -34,11 +34,6 @@ pub struct ColdTier {
     pub n_slots: usize, // padded (even) tile width
     pub n_valid: usize, // real slot count (slots >= n_valid are zero padding — mask in reads)
     pub rotate: bool,
-}
-
-#[inline]
-fn fwht(v: &mut [f32], s1: &[f32], s2: &[f32]) {
-    cpu_fwht_256(v, s1, s2);
 }
 
 /// Deferred cold-tier compaction. `k`,`v` are `[n_tok, n_kv_heads*head_dim]` f32,
@@ -151,8 +146,8 @@ pub fn compact_cold_kv(
                 }
             }
             if rotate {
-                fwht(&mut kvec, &s1, &s2);
-                fwht(&mut vvec, &s1, &s2);
+                signed_fwht(&mut kvec, &s1, &s2);
+                signed_fwht(&mut vvec, &s1, &s2);
             }
             for d in 0..head_dim {
                 ktile[d * n_slots + s] = kvec[d];
@@ -194,8 +189,8 @@ impl ColdTier {
                 vv[dd] = vt[dd * ns + s];
             }
             if self.rotate {
-                fwht(&mut kv, &s2, &s1); // inverse FWHT: swap sign tables
-                fwht(&mut vv, &s2, &s1);
+                signed_fwht(&mut kv, &s2, &s1); // inverse FWHT: swap sign tables
+                signed_fwht(&mut vv, &s2, &s1);
             }
             for dd in 0..d {
                 k[s * d + dd] = kv[dd];

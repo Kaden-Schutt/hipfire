@@ -9,6 +9,7 @@
     clippy::too_many_arguments
 )]
 
+use hipfire_primitives::conv::f16_to_f32;
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use memmap2::Mmap;
 use std::fs::File;
@@ -17,31 +18,6 @@ use std::path::Path;
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-    if exp == 0 {
-        if frac == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 {
-            f <<= 1;
-            e -= 1;
-        }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { frac << 13 | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
-}
 
 fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let group_size = 256;

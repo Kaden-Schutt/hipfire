@@ -8,6 +8,7 @@ description = "Zyphra ZAYA1 architecture (CCA attention + EDA/MoD-routed MoE, ar
 [dependencies]
 hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 rdna-compute = { path = "../rdna-compute" }
