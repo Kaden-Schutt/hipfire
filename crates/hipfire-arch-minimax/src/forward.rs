@@ -224,7 +224,19 @@ fn decode_step_body(
     // the per-expert calibration taps below — so when activation capture is armed
     // (Collect / collect_artifacts), force the eager hand path. Mirrors the
     // `capture.is_none()` carve-out for the oracle dumper.
-    if minimax_forward_lowered_enabled() && capture.is_none() && gpu.active_capture.is_none() {
+    // The lowered super-op builder does not yet carry the QTIP3 trellis expert
+    // ops nor the LQER low-rank down correction — both are only in the eager
+    // hand path below. Route those models to eager regardless of the toggle.
+    let lowered_supports = weights
+        .layers
+        .first()
+        .map(|l0| l0.experts[0].down.gpu_dtype != DType::Qtip3G256 && l0.down_lr.is_none())
+        .unwrap_or(true);
+    if minimax_forward_lowered_enabled()
+        && lowered_supports
+        && capture.is_none()
+        && gpu.active_capture.is_none()
+    {
         return decode_step_body_lowered(cfg, weights, state, gpu, position);
     }
 
@@ -591,6 +603,37 @@ fn decode_step_body(
                     1,
                 )
                 .map_err(|e| format!("minimax L{l}: down qtip3: {e:?}"))?;
+                // LQER low-rank correction: down_expanded += U_e·(V_e·rot_batch_e).
+                // V_e·x uses the PER-EXPERT input (x_stride = inter); the result is
+                // accumulated into the contiguous [k_top×hidden] down output before
+                // the weighted combine, so it picks up the same topk weighting.
+                if let Some(lr) = &layer.down_lr {
+                    let t = gpu
+                        .alloc_tensor(&[k_top, lr.rank], DType::F32)
+                        .map_err(|e| format!("minimax L{l}: alloc lr t: {e:?}"))?;
+                    gpu.gemv_lowrank_moe_proj(
+                        &lr.v_ptrs,
+                        &state.topk_indices,
+                        &state.rot_batch,
+                        &t,
+                        lr.rank,
+                        inter,
+                        k_top,
+                        inter,
+                    )
+                    .map_err(|e| format!("minimax L{l}: down lr proj: {e:?}"))?;
+                    gpu.gemv_lowrank_moe_expand(
+                        &lr.u_ptrs,
+                        &state.topk_indices,
+                        &t,
+                        &state.down_expanded,
+                        hidden,
+                        lr.rank,
+                        k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l}: down lr expand: {e:?}"))?;
+                    let _ = gpu.free_tensor(t);
+                }
                 gpu.moe_down_combine_k8_batched(
                     &state.down_expanded,
                     &state.topk_weights,

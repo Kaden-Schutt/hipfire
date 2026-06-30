@@ -482,6 +482,9 @@ pub struct MiniMaxLayerWeights {
     pub experts: Vec<MiniMaxExpertWeights>,
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// Optional LQER low-rank correction for the down projection (`None` unless
+    /// the .hfq carries `.w2.lr_u/.lr_v` sidecars).
+    pub down_lr: Option<MiniMaxDownLowRank>,
 }
 
 pub struct MiniMaxExpertWeights {
@@ -489,6 +492,19 @@ pub struct MiniMaxExpertWeights {
     pub gate_up: WeightTensor,
     /// Down (w2): [hidden, intermediate] MQ4G256.
     pub down: WeightTensor,
+}
+
+/// Packed per-expert low-rank down-projection error correction (LQER). `u_data`
+/// holds all experts' U_e[hidden×r] f32 contiguously, `v_data` all V_e[r×inter];
+/// `u_ptrs`/`v_ptrs` are the [2*n_exp] device-pointer tables the indexed kernels
+/// index by routed expert id. The forward adds U_e·(V_e·rot_batch_e) to the down
+/// output before the weighted combine.
+pub struct MiniMaxDownLowRank {
+    pub u_data: GpuTensor,
+    pub v_data: GpuTensor,
+    pub u_ptrs: GpuTensor,
+    pub v_ptrs: GpuTensor,
+    pub rank: usize,
 }
 
 pub struct MiniMaxWeights {
@@ -600,6 +616,16 @@ impl MiniMaxWeights {
             let mut dn_stride = 0usize;
             let mut qt_gu = 0u8;
             let mut qt_dn = 0u8;
+            // Optional LQER low-rank correction for the DOWN projection: per-expert
+            // U_e[hidden,r] / V_e[r,inter] f32 sidecars (`.w2.lr_u/.lr_v`). Packed
+            // into per-projection blobs like the weights; the forward adds
+            // U_e·(V_e·rot_batch_e) into the down output. `dn_lr_rank == 0` ⇒ the
+            // .hfq carries no lr sidecars (correction disabled).
+            let mut dn_u_combined: Vec<u8> = Vec::new();
+            let mut dn_v_combined: Vec<u8> = Vec::new();
+            let mut dn_u_stride = 0usize;
+            let mut dn_v_stride = 0usize;
+            let mut dn_lr_rank = 0usize;
             // EP shard: only upload rank-owned experts into the compact blob.
             // `local_of_global[e]` maps a global expert id to its slot in the
             // compact (owned-only) blob, or usize::MAX if not owned by this rank.
@@ -658,6 +684,43 @@ impl MiniMaxWeights {
                     gu_combined.extend_from_slice(&w1);
                     gu_combined.extend_from_slice(&w3);
                     dn_combined.extend_from_slice(&w2);
+                    // Down low-rank sidecars (f32, raw LE). Present only when the
+                    // .hfq was quantized with HIPFIRE_LOWRANK_R>0. U_e is
+                    // [hidden×r], V_e is [r×inter]; r is uniform across experts.
+                    if let (Ok((qtu, ulr)), Ok((qtv, vlr))) = (
+                        read_tensor(hfq, &format!("{ep}.w2.lr_u.weight")),
+                        read_tensor(hfq, &format!("{ep}.w2.lr_v.weight")),
+                    ) {
+                        // F32 sidecars only; derive r from U's length (hidden·r).
+                        if qtu == hipfire_runtime::quant::QuantType::F32.code()
+                            && qtv == hipfire_runtime::quant::QuantType::F32.code()
+                        {
+                            let r = ulr.len() / 4 / hidden;
+                            if dn_lr_rank == 0 {
+                                dn_lr_rank = r;
+                                dn_u_stride = ulr.len();
+                                dn_v_stride = vlr.len();
+                                let cap = shard
+                                    .map(|(s, _)| s.experts_per_rank(n_exp))
+                                    .unwrap_or(n_exp);
+                                dn_u_combined.reserve(ulr.len() * cap);
+                                dn_v_combined.reserve(vlr.len() * cap);
+                            }
+                            if r == dn_lr_rank
+                                && ulr.len() == dn_u_stride
+                                && vlr.len() == dn_v_stride
+                            {
+                                dn_u_combined.extend_from_slice(&ulr);
+                                dn_v_combined.extend_from_slice(&vlr);
+                            } else {
+                                return Err(format!(
+                                    "minimax L{l}E{e}: non-uniform down lr stride (u {}/{dn_u_stride}, v {}/{dn_v_stride})",
+                                    ulr.len(),
+                                    vlr.len()
+                                ));
+                            }
+                        }
+                    }
                 }
                 // Non-owned: w1/w3/w2 read from the file (for stride validation)
                 // then dropped — never uploaded. That is the EP memory win.
@@ -750,6 +813,57 @@ impl MiniMaxWeights {
                     ptr.to_ne_bytes()
                 })
                 .collect();
+            // Down low-rank U/V: upload the packed blobs and build per-expert
+            // pointer tables mirroring `dn_bytes` (non-owned reuse the base — their
+            // rotated input is 0 so the correction is 0). `None` when no sidecars.
+            let down_lr = if dn_lr_rank > 0 {
+                let u_data = gpu
+                    .upload_raw(&dn_u_combined, &[dn_u_combined.len()])
+                    .map_err(|e| format!("minimax L{l}: upload down lr_u: {e:?}"))?;
+                let v_data = gpu
+                    .upload_raw(&dn_v_combined, &[dn_v_combined.len()])
+                    .map_err(|e| format!("minimax L{l}: upload down lr_v: {e:?}"))?;
+                let u_base = u_data.buf.as_ptr() as u64;
+                let v_base = v_data.buf.as_ptr() as u64;
+                let mk = |base: u64, stride: usize| -> Vec<u8> {
+                    (0..n_exp)
+                        .flat_map(|e| {
+                            let ptr = if owns(e) {
+                                base + (local_of_global[e] * stride) as u64
+                            } else {
+                                base
+                            };
+                            ptr.to_ne_bytes()
+                        })
+                        .collect()
+                };
+                let u_bytes = mk(u_base, dn_u_stride);
+                let v_bytes = mk(v_base, dn_v_stride);
+                let u_ptrs = gpu
+                    .alloc_tensor(&[2 * n_exp], DType::F32)
+                    .map_err(|e| format!("minimax: alloc down lr_u ptrs: {e:?}"))?;
+                let v_ptrs = gpu
+                    .alloc_tensor(&[2 * n_exp], DType::F32)
+                    .map_err(|e| format!("minimax: alloc down lr_v ptrs: {e:?}"))?;
+                gpu.hip
+                    .memcpy_htod(&u_ptrs.buf, &u_bytes)
+                    .map_err(|e| format!("minimax: htod down lr_u ptrs: {e:?}"))?;
+                gpu.hip
+                    .memcpy_htod(&v_ptrs.buf, &v_bytes)
+                    .map_err(|e| format!("minimax: htod down lr_v ptrs: {e:?}"))?;
+                if l == 0 {
+                    eprintln!("minimax: down low-rank correction active (rank {dn_lr_rank})");
+                }
+                Some(MiniMaxDownLowRank {
+                    u_data,
+                    v_data,
+                    u_ptrs,
+                    v_ptrs,
+                    rank: dn_lr_rank,
+                })
+            } else {
+                None
+            };
             let expert_gate_up_ptrs = gpu
                 .alloc_tensor(&[2 * n_exp], DType::F32)
                 .map_err(|e| format!("minimax: alloc gu_ptrs: {e:?}"))?;
@@ -777,6 +891,7 @@ impl MiniMaxWeights {
                 experts,
                 expert_gate_up_ptrs,
                 expert_down_ptrs,
+                down_lr,
             });
         }
 
@@ -867,6 +982,12 @@ impl MiniMaxLayerWeights {
         // blobs themselves — freed once here, no double-free with `experts`.
         let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
         let _ = gpu.free_tensor(self.expert_down_ptrs);
+        if let Some(lr) = self.down_lr {
+            let _ = gpu.free_tensor(lr.u_data);
+            let _ = gpu.free_tensor(lr.v_data);
+            let _ = gpu.free_tensor(lr.u_ptrs);
+            let _ = gpu.free_tensor(lr.v_ptrs);
+        }
     }
 }
 
