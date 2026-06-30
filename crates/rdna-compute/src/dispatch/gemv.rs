@@ -4865,6 +4865,10 @@ impl Gpu {
     // ── Low-rank residual (LQER) correction — composes with any expert fmt ──
 
     /// Stage 1: `t[krank,:] = V_e·x` for each routed expert. `t` is [k_top × r].
+    /// `x_stride`: 0 → all routed slots share the single `[k]` input `x`
+    /// (gate_up); `k` → each slot reads its own `[k]` row at `x + krank*k`
+    /// (down, where the per-expert intermediate differs).
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_lowrank_moe_proj(
         &mut self,
         expert_v_ptrs: &GpuTensor,
@@ -4874,6 +4878,7 @@ impl Gpu {
         r: usize,
         k: usize,
         k_top: usize,
+        x_stride: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -4887,6 +4892,7 @@ impl Gpu {
         let tp = t.buf.as_ptr();
         let r_val = r as i32;
         let k_val = k as i32;
+        let xs_val = x_stride as i32;
         let mut params: Vec<*mut c_void> = vec![
             &vp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -4894,6 +4900,7 @@ impl Gpu {
             &tp as *const _ as *mut c_void,
             &r_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &xs_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "gemv_lowrank_moe_proj",
@@ -4909,6 +4916,7 @@ impl Gpu {
                 b.push_ptr(tp);
                 b.push_i32(r_val);
                 b.push_i32(k_val);
+                b.push_i32(xs_val);
                 b
             },
         )

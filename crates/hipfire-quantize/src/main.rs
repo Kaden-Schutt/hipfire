@@ -863,14 +863,17 @@ fn bbt_scales(spec_diag: &[f32], k: usize, alpha: f32) -> Vec<f32> {
 /// singular values). This is the LQER/CALDERA low-rank residual: emit
 /// dequant(W4)+E_r so a W4·A8 GEMM + a 2-WMMA UᵥVᵥ correction recovers most of
 /// the W4→high-bit gap. Returns zeros for r=0, the full matrix for r≥min(m,k).
-fn randomized_lowrank(e: &[f32], m: usize, k: usize, r: usize) -> Vec<f32> {
+/// Randomized rank-`r` range-finder factorization of the error matrix `e`
+/// [m×k]: returns `(U, V)` with `U` [m×r] (orthonormal columns) and `V` [r×k]
+/// such that `U·V ≈ e`. This is the factored form the runtime low-rank
+/// correction consumes directly (`out += U·(V·x)`); [`randomized_lowrank`] is
+/// the same computation followed by the `U·V` reconstruction.
+fn randomized_lowrank_factors(e: &[f32], m: usize, k: usize, r: usize) -> (Vec<f32>, Vec<f32>) {
     use rayon::prelude::*;
     if r == 0 {
-        return vec![0.0f32; m * k];
+        return (vec![0.0f32; m * r.max(1)], vec![0.0f32; r * k]);
     }
-    if r >= m.min(k) {
-        return e.to_vec();
-    }
+    let r = r.min(m).min(k);
     // Ω [k×r] — xorshift Gaussian-ish (uniform is fine for a range finder).
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
     let mut omega = vec![0.0f32; k * r];
@@ -923,13 +926,26 @@ fn randomized_lowrank(e: &[f32], m: usize, k: usize, r: usize) -> Vec<f32> {
             *bj = acc;
         }
     });
-    // E_r = Q·B  [m×k] (parallel over rows).
+    (y, b)
+}
+
+fn randomized_lowrank(e: &[f32], m: usize, k: usize, r: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    if r == 0 {
+        return vec![0.0f32; m * k];
+    }
+    if r >= m.min(k) {
+        return e.to_vec();
+    }
+    // Same range-finder as the runtime path, then reconstruct E_r = U·V [m×k].
+    let (u, v) = randomized_lowrank_factors(e, m, k, r);
+    let r = r.min(m).min(k);
     let mut er = vec![0.0f32; m * k];
     er.par_chunks_mut(k).enumerate().for_each(|(i, erow)| {
         for (j, ej) in erow.iter_mut().enumerate() {
             let mut acc = 0.0f32;
             for c in 0..r {
-                acc += y[i * r + c] * b[c * k + j];
+                acc += u[i * r + c] * v[c * k + j];
             }
             *ej = acc;
         }
@@ -3710,10 +3726,11 @@ fn quantize_hfq_source_tensor(
 ///     3-bit trellis symbols + scale, 100 B/group, decoded by `gemv_qtip3g256`).
 /// All other tensors (norms, 1D scalars, ragged dims) are left untouched.
 fn pack_qtip3_real_tensors(
-    tensors: &mut [HfqTensor],
+    tensors: &mut Vec<HfqTensor>,
     qtip_cb: &[f32],
     qtip_s1: &[f32],
     qtip_s2: &[f32],
+    lowrank_r: usize,
 ) {
     use rayon::prelude::*;
     // The tied embed/lm_head ([vocab × dim]) is gather-accessed (embedding
@@ -3746,6 +3763,15 @@ fn pack_qtip3_real_tensors(
         eprintln!("  qtip3 (real): embed/lm_head → Q8F16 ({n_q8} tensors, gather-friendly)");
     }
     let (mut n_packed, mut max_err) = (0usize, 0.0f32);
+    // Optional LQER low-rank correction: when `lowrank_r > 0`, each packed tensor
+    // also emits a rank-r factorization (U,V) of its ROTATED-frame quant error
+    // E_rot = W_rot − dequant(Q(W_rot)) as `<base>.lr_u/.lr_v` sidecars. The
+    // runtime adds U·(V·x_rot) after the trellis GEMV; since x_rot = FWHT(x), this
+    // recovers W_rot·x_rot = W·x. Sidecars are staged here and appended after the
+    // packing loop (can't push while iterating).
+    let want_lr = lowrank_r > 0;
+    let mut new_sidecars: Vec<HfqTensor> = Vec::new();
+    let mut n_lr = 0usize;
     for t in tensors.iter_mut() {
         if !(matches!(t.quant_type, QuantType::BF16)
             && t.shape.len() == 2
@@ -3755,19 +3781,27 @@ fn pack_qtip3_real_tensors(
         {
             continue;
         }
+        let m = t.shape[0] as usize;
         let k = t.shape[1] as usize;
         let groups = k / 256;
+        let stem = t
+            .name
+            .strip_suffix(".weight")
+            .unwrap_or(&t.name)
+            .to_string();
         let wf: Vec<f32> = t
             .data
             .chunks_exact(2)
             .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
-        // Per row → packed records; collect per-row max-error in parallel.
-        let row_out: Vec<(Vec<u8>, f32)> = wf
+        // Per row → packed records; collect per-row max-error (and, when low-rank
+        // is enabled, the per-row rotated-frame error E_rot) in parallel.
+        let row_out: Vec<(Vec<u8>, f32, Vec<f32>)> = wf
             .par_chunks(k)
             .map(|row| {
                 let mut packed = Vec::with_capacity(groups * qtip::QTIP3_BLOCK_BYTES);
                 let mut rerr = 0.0f32;
+                let mut erow = if want_lr { vec![0.0f32; k] } else { Vec::new() };
                 for g in 0..groups {
                     let mut grp = [0.0f32; 256];
                     grp.copy_from_slice(&row[g * 256..g * 256 + 256]);
@@ -3777,27 +3811,70 @@ fn pack_qtip3_real_tensors(
                     let scale = qtip::optimal_scale_bits(&grp, &sym, qtip_cb, 3);
                     // Self-check: decode in the rotated frame vs the encode target.
                     let deq = qtip::decode_group_bits(&sym, scale, qtip_cb, 3);
-                    for (a, b) in grp.iter().zip(&deq) {
-                        rerr = rerr.max((a - b).abs());
+                    for (idx, (a, b)) in grp.iter().zip(&deq).enumerate() {
+                        let d = a - b;
+                        rerr = rerr.max(d.abs());
+                        if want_lr {
+                            erow[g * 256 + idx] = d;
+                        }
                     }
                     packed.extend_from_slice(&qtip::pack_qtip3_group(&sym, scale));
                 }
-                (packed, rerr)
+                (packed, rerr, erow)
             })
             .collect();
         let mut data = Vec::with_capacity(row_out.len() * groups * qtip::QTIP3_BLOCK_BYTES);
-        for (packed, rerr) in &row_out {
+        let mut e_rot = if want_lr {
+            Vec::with_capacity(m * k)
+        } else {
+            Vec::new()
+        };
+        for (packed, rerr, erow) in &row_out {
             data.extend_from_slice(packed);
             max_err = max_err.max(*rerr);
+            if want_lr {
+                e_rot.extend_from_slice(erow);
+            }
         }
         t.data = data;
         t.quant_type = QuantType::Qtip3G256;
         t.group_size = 256;
         n_packed += 1;
+
+        if want_lr {
+            let (u, v) = randomized_lowrank_factors(&e_rot, m, k, lowrank_r);
+            let rr = lowrank_r.min(m).min(k);
+            let to_le = |f: &[f32]| -> Vec<u8> { f.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            new_sidecars.push(HfqTensor {
+                name: format!("{stem}.lr_u.weight"),
+                quant_type: QuantType::F32,
+                shape: vec![m as u32, rr as u32],
+                group_size: 0,
+                data: to_le(&u),
+                spilled_len: 0,
+            });
+            new_sidecars.push(HfqTensor {
+                name: format!("{stem}.lr_v.weight"),
+                quant_type: QuantType::F32,
+                shape: vec![rr as u32, k as u32],
+                group_size: 0,
+                data: to_le(&v),
+                spilled_len: 0,
+            });
+            n_lr += 1;
+        }
+    }
+    if want_lr {
+        tensors.extend(new_sidecars);
     }
     eprintln!(
         "  qtip3 (real): packed {n_packed} tensors as Qtip3G256 (100 B/group, 0.391 B/w); \
-         rotated-frame decode max-abs-err {max_err:.5}"
+         rotated-frame decode max-abs-err {max_err:.5}{}",
+        if want_lr {
+            format!("; emitted rank-{lowrank_r} lr_u/lr_v for {n_lr} tensors")
+        } else {
+            String::new()
+        }
     );
 }
 
@@ -3887,7 +3964,16 @@ fn run_hfq_source_pipeline(
         let qtip_cb = qtip::build_codebook();
         let qtip_s1 = gen_fwht_signs(42, 256);
         let qtip_s2 = gen_fwht_signs(1042, 256);
-        pack_qtip3_real_tensors(&mut hfq_tensors, &qtip_cb, &qtip_s1, &qtip_s2);
+        pack_qtip3_real_tensors(
+            &mut hfq_tensors,
+            &qtip_cb,
+            &qtip_s1,
+            &qtip_s2,
+            std::env::var("HIPFIRE_LOWRANK_R")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        );
         // Recount rewritten params: the post-pass changes quant types after the
         // per-tensor loop above bumped the counter for the BF16 staging.
         quantized_params = hfq_tensors
@@ -10513,7 +10599,16 @@ fn main() {
     // runtime FWHT-rotates x. A self-check re-decodes and reports max abs error
     // vs the effective sim weight so the producer is verified offline.
     if use_qtip3_real {
-        pack_qtip3_real_tensors(&mut hfq_tensors, &qtip_cb, &qtip_s1, &qtip_s2);
+        pack_qtip3_real_tensors(
+            &mut hfq_tensors,
+            &qtip_cb,
+            &qtip_s1,
+            &qtip_s2,
+            std::env::var("HIPFIRE_LOWRANK_R")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        );
     }
 
     insert_parameter_counts_metadata(

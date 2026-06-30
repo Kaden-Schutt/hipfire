@@ -15,22 +15,28 @@
 // U,V are per-expert f32 row-major, indexed by a device pointer table (like the
 // weight blobs). r is small (16–32); ~1% extra compute over the main GEMV.
 
-// Stage 1: t[krank, i] = Σ_j V_e[i,j]·x[j].  Grid (k_top), block 32 (lane i<R).
+// Stage 1: t[krank, i] = Σ_j V_e[i,j]·x_in[j].  Grid (k_top), block 32 (lane i<R).
+// `x_stride` selects the input layout:
+//   0 → all routed experts share one [K] input vector `x` (gate_up: the routed
+//       token's rotated hidden state is the same for every expert).
+//   K → each routed slot has its own [K] input row at `x + krank*K` (down: the
+//       per-expert silu(gate)·up intermediate differs per expert).
 __launch_bounds__(32)
 extern "C" __global__ void gemv_lowrank_moe_proj(
     const unsigned long long* __restrict__ expert_v_ptrs, // [n_exp] → V_e[r,K] f32
     const int* __restrict__ topk_indices,                  // [k_top]
-    const float* __restrict__ x,                           // [K]
+    const float* __restrict__ x,                           // [K] or [k_top × K]
     float* __restrict__ t,                                 // [k_top × R]
-    int R, int K
+    int R, int K, int x_stride
 ) {
     const int krank = blockIdx.x;
     const int i = threadIdx.x;
     if (i >= R) return;
     const int e = topk_indices[krank];
     const float* __restrict__ vrow = reinterpret_cast<const float*>(expert_v_ptrs[e]) + (long long)i * K;
+    const float* __restrict__ xin = x + (long long)krank * x_stride;
     float acc = 0.0f;
-    for (int j = 0; j < K; j++) acc += vrow[j] * x[j];
+    for (int j = 0; j < K; j++) acc += vrow[j] * xin[j];
     t[krank * R + i] = acc;
 }
 

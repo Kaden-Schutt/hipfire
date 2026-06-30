@@ -87,7 +87,7 @@ fn main() {
         .upload_raw(&vec![0u8; k_top * m * 4], &[k_top, m])
         .unwrap();
 
-    gpu.gemv_lowrank_moe_proj(&vpt, &topk_t, &xd, &t, r, k, k_top)
+    gpu.gemv_lowrank_moe_proj(&vpt, &topk_t, &xd, &t, r, k, k_top, 0)
         .unwrap();
     gpu.gemv_lowrank_moe_expand(&upt, &topk_t, &t, &out, m, r, k_top)
         .unwrap();
