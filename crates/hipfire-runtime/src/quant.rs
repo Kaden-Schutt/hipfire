@@ -380,3 +380,46 @@ pub fn dequantize_q6_k(data: &[u8], n: usize) -> Vec<f32> {
     }
     out
 }
+
+/// Canonical map from an on-disk HFQ `quant_type` byte to the GPU dispatch
+/// [`DType`], for the **pure** formats: ones the loader handles as a plain
+/// `upload_raw` + dtype tag with no host-side repack.
+///
+/// This is the single source of truth that replaces the per-arch
+/// `slab_dtype_for_quant` / `dtype_for_quant` copies that drifted across
+/// qwen35, minimax, lfm2, gemma3, and qwen2 (each carried a divergent subset —
+/// e.g. only qwen35 mapped `31 => Qtip3G256`). Routing every loader through
+/// here means a new pure format lands in all arches with one edit.
+///
+/// Returns `None` for:
+/// - unknown codes, and
+/// - formats that require a host-side transform before upload (bf16 buffer
+///   retag `16`; Opus-Quant arch-repack `33/34/35/37`). Callers keep those
+///   transform branches and fall through to this map for the pure cases.
+///
+/// `k` (the input/column dim) gates the FP4 group-32 formats, which require
+/// `k % 256 == 0`.
+pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<rdna_compute::DType> {
+    use rdna_compute::DType;
+    Some(match qt {
+        1 => DType::F16,
+        3 => DType::Q8_0,
+        6 => DType::HFQ4G256,
+        7 => DType::HFQ4G128,
+        8 => DType::HFQ6G256,
+        11 => DType::HFQ3G256,
+        12 => DType::HFQ3G128,
+        13 => DType::MQ4G256,
+        14 => DType::MQ8G256,
+        15 => DType::MQ6G256,
+        17 => DType::MQ3G256,
+        18 => DType::MQ2G256,
+        19 => DType::MQ2G256Lloyd,
+        20 => DType::MQ3G256Lloyd,
+        21 if k % 256 == 0 => DType::HFP4G32,
+        24 if k % 256 == 0 => DType::MFP4G32,
+        30 => DType::MQ4G256Lloyd,
+        31 => DType::Qtip3G256,
+        _ => return None,
+    })
+}

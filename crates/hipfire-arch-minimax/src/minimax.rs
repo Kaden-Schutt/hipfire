@@ -447,20 +447,10 @@ fn wt_from_raw(
         OQ8_QT => return upload_wt_oq(gpu, &pack_oq8(data, m, k)?, DType::Oq8G256, m, k),
         _ => {}
     }
-    let dtype = match qt {
-        3 => DType::Q8_0,
-        6 => DType::HFQ4G256,
-        8 => DType::HFQ6G256,
-        13 => DType::MQ4G256,
-        15 => DType::MQ6G256,
-        17 => DType::MQ3G256,
-        18 => DType::MQ2G256,
-        19 => DType::MQ2G256Lloyd,
-        20 => DType::MQ3G256Lloyd,
-        30 => DType::MQ4G256Lloyd,
-        1 => DType::F16,
-        other => return Err(format!("unsupported quant_type {other}")),
-    };
+    // Pure (upload-and-tag) formats route through the shared canonical map in
+    // hipfire_runtime::quant; the OQ arch-repack formats were handled above.
+    let dtype = hipfire_runtime::quant::dtype_for_quant_type(qt, k)
+        .ok_or_else(|| format!("unsupported quant_type {qt}"))?;
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("upload_raw: {e:?}"))?;

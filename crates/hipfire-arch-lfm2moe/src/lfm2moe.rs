@@ -378,19 +378,11 @@ fn wt_from_raw(
         _ => {}
     }
     let dtype = match qt {
-        3 => DType::Q8_0,
-        6 => DType::HFQ4G256,
-        8 => DType::HFQ6G256,
-        13 => DType::MQ4G256,
-        15 => DType::MQ6G256,
-        17 => DType::MQ3G256,
-        18 => DType::MQ2G256,
-        19 => DType::MQ2G256Lloyd,
-        20 => DType::MQ3G256Lloyd,
-        30 => DType::MQ4G256Lloyd,
-        1 => DType::F16,
+        // bf16 is tagged in-place here (arch-local convention); all pure
+        // upload-and-tag formats route through the shared canonical map.
         16 => DType::BF16,
-        other => return Err(format!("unsupported quant_type {other}")),
+        _ => hipfire_runtime::quant::dtype_for_quant_type(qt, k)
+            .ok_or_else(|| format!("unsupported quant_type {qt}"))?,
     };
     upload_wt_raw(gpu, data, dtype, m, k)
 }

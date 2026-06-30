@@ -474,10 +474,6 @@ fn load_weight_tensor(
         .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("gemma3: tensor not found: {name}"));
     let mut wt = match info.quant_type {
-        6 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G256, m, k),
-        7 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::HFQ4G128, m, k),
-        3 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Q8_0, m, k),
-        1 => weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::F16, m, k),
         33 => {
             let combined = oq4_to_oq8_combined(&data, m, k);
             weight_tensor(
@@ -523,11 +519,19 @@ fn load_weight_tensor(
             buf.dtype = DType::BF16;
             weight_tensor(buf, DType::BF16, m, k)
         }
-        qt => panic!(
-            "gemma3: unsupported linear quant_type {qt} for {name}; \
-             handled 1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128), \
-             16 (BF16), 33/34/35/37 (OP4/OP8). Extend for MQ4/MQ6."
-        ),
+        // All pure upload-and-tag formats (F16/Q8/HFQ*/MQ*/Qtip3G256/FP4…)
+        // route through the shared canonical map in hipfire_runtime::quant;
+        // the transform arms above (bf16 retag, OP4/OP8 arch-repack) stay local.
+        qt => {
+            let dtype = hipfire_runtime::quant::dtype_for_quant_type(qt, k).unwrap_or_else(|| {
+                panic!(
+                    "gemma3: unsupported linear quant_type {qt} for {name}; \
+                     transform arms handle 16 (BF16), 33/34/35/37 (OP4/OP8); \
+                     all pure formats come from hipfire_runtime::quant::dtype_for_quant_type."
+                )
+            });
+            weight_tensor(gpu.upload_raw(&data, &[data.len()])?, dtype, m, k)
+        }
     };
     if wt.gpu_dtype.supports_awq_sidecar() {
         wt.awq_scale = load_awq_scale(hfq, gpu, name, k);

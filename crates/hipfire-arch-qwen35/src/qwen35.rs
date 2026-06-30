@@ -4295,25 +4295,9 @@ fn gpu_slab_bank_size() -> usize {
 }
 
 fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
-    match qt {
-        3 => Some(DType::Q8_0),
-        6 => Some(DType::HFQ4G256),
-        7 => Some(DType::HFQ4G128),
-        8 => Some(DType::HFQ6G256),
-        11 => Some(DType::HFQ3G256),
-        12 => Some(DType::HFQ3G128),
-        13 => Some(DType::MQ4G256),
-        14 => Some(DType::MQ8G256),
-        15 => Some(DType::MQ6G256),
-        17 => Some(DType::MQ3G256),
-        31 => Some(DType::Qtip3G256),
-        18 => Some(DType::MQ2G256),
-        19 => Some(DType::MQ2G256Lloyd),
-        20 => Some(DType::MQ3G256Lloyd),
-        21 if k % 256 == 0 => Some(DType::HFP4G32),
-        24 if k % 256 == 0 => Some(DType::MFP4G32),
-        _ => None,
-    }
+    // Canonical map lives in hipfire_runtime::quant (shared across all arch
+    // loaders). Thin alias retained for the slab-planning call sites.
+    hipfire_runtime::quant::dtype_for_quant_type(qt, k)
 }
 
 fn build_slab_banks(hfq: &HfqFile, bank_size: usize) -> Vec<SlabPlanBank> {
