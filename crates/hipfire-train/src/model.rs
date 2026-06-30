@@ -502,6 +502,7 @@ pub fn model_loss_backward(
 /// so `mean(w)=1` (scale-invariant for LDLQ, keeps H̄ ~ plain-H magnitude), and
 /// accumulate the weighted Hessian `H̄ = Σ wₙ·actₙactₙᵀ` for this layer's
 /// `down_proj` into the collector (`act_in [seq,inter]` is down's input).
+#[allow(clippy::too_many_arguments)]
 fn down_guided_capture(
     gpu: &mut Gpu,
     collector: &CalibCollector,
@@ -511,13 +512,21 @@ fn down_guided_capture(
     seq: usize,
     h: usize,
     inter: usize,
+    fisher: bool,
 ) -> HipResult<()> {
-    let w = gpu.zeros(&[seq], DType::F32)?;
-    gpu.calib_row_meansq_f32(d_out, &w, seq, h)?;
-    let mean: f32 = gpu.download_f32(&w)?.iter().sum::<f32>() / seq.max(1) as f32;
-    if mean > 0.0 {
-        gpu.scale_f32(&w, 1.0 / mean)?;
-    }
+    let w = if fisher {
+        let w = gpu.zeros(&[seq], DType::F32)?;
+        gpu.calib_row_meansq_f32(d_out, &w, seq, h)?;
+        let mean: f32 = gpu.download_f32(&w)?.iter().sum::<f32>() / seq.max(1) as f32;
+        if mean > 0.0 {
+            gpu.scale_f32(&w, 1.0 / mean)?;
+        }
+        w
+    } else {
+        // Control: w≡1 ⇒ capture_weighted produces the plain XᵀX over the same
+        // tokens — the apples-to-apples baseline for the guided-vs-plain compare.
+        gpu.upload_f32(&vec![1.0f32; seq], &[seq])?
+    };
     let name = format!("model.layers.{layer}.mlp.down_proj");
     collector.capture_weighted(gpu, &name, act_in, &w, seq, inter);
     gpu.free_tensor(w)?;
@@ -537,6 +546,7 @@ pub fn model_calib_down_backward(
     targets: &[f32],
     ignore_index: i32,
     collector: &CalibCollector,
+    fisher: bool,
 ) -> HipResult<f32> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
     let inter = model.dims.inter;
@@ -589,6 +599,7 @@ pub fn model_calib_down_backward(
             seq,
             h,
             inter,
+            fisher,
         )?;
         let (lw, ll) = &model.layers[i];
         let (d_in, _g) = block_backward(
