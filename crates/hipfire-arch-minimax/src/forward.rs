@@ -426,6 +426,21 @@ fn decode_step_body(
                     hidden,
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up oq8: {e:?}"))?,
+            // QTIP3 trellis experts: same FWHT-pre-rotated `ffn_x_rot` input as
+            // the MQ/HFQ family; the kernel decodes the 100 B/group trellis on
+            // the fly. Low-rank error correction (U,V) is applied separately
+            // after this GEMV when the expert carries lr sidecars.
+            DType::Qtip3G256 => gpu
+                .gemv_qtip3g256_moe_gate_up_k8_indexed(
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                )
+                .map_err(|e| format!("minimax L{l}: gate_up qtip3: {e:?}"))?,
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }
 
@@ -554,6 +569,28 @@ fn decode_step_body(
                     1,
                 )
                 .map_err(|e| format!("minimax L{l}: down oq8: {e:?}"))?;
+                gpu.moe_down_combine_k8_batched(
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    &state.h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
+            }
+            DType::Qtip3G256 => {
+                gpu.gemv_qtip3g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.rot_batch,
+                    &state.down_expanded,
+                    hidden,
+                    inter,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: down qtip3: {e:?}"))?;
                 gpu.moe_down_combine_k8_batched(
                     &state.down_expanded,
                     &state.topk_weights,

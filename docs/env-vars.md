@@ -173,7 +173,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DUMP_HIDDEN_POS` | Runtime variable controlling dump hidden pos in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:16905` |
 | `HIPFIRE_DUMP_REQUEST` | a strace. Off by default — gigantic for typical agent prompts | `crates/hipfire-server/src/routes/chat.rs:85` |
 | `HIPFIRE_EMIT_TOKEN_IDS` | or "\" in it would corrupt the line, breaking the client's JSONL | `crates/hipfire-serving-core/src/events.rs:111` |
-| `HIPFIRE_EP_DECODE_TIMING` | 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd) | `crates/hipfire-arch-minimax/src/forward.rs:1574` |
+| `HIPFIRE_EP_DECODE_TIMING` | 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd) | `crates/hipfire-arch-minimax/src/forward.rs:1611` |
 | `HIPFIRE_EP_DUMP_IDX` | top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable | `crates/hipfire-arch-deepseek4/src/forward.rs:2428` |
 | `HIPFIRE_EP_DUMP_POS` | Divergence-localization dump: HIPFIRE_EP_DUMP_POS="0,64,...,302" prints a | `crates/hipfire-arch-deepseek4/src/forward.rs:2363` |
 | `HIPFIRE_EP_KV_SEQ` | Runtime variable controlling ep KV seq in hipfire | `crates/hipfire-runtime/examples/ep_decode_parity.rs:72` |

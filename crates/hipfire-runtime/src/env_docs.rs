@@ -1208,7 +1208,7 @@ pub const ENV_HIPFIRE_EMIT_TOKEN_IDS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EP_DECODE_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EP_DECODE_TIMING",
     description: "2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd)",
-    source: "crates/hipfire-arch-minimax/src/forward.rs:1574",
+    source: "crates/hipfire-arch-minimax/src/forward.rs:1611",
 };
 
 /// `HIPFIRE_EP_DUMP_IDX` — top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable
