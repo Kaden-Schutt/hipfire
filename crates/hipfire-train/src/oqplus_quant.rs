@@ -15,7 +15,7 @@
 //! the production seeds (42 / 1042); any fixed orthonormal basis yields the same
 //! error statistics, so this is faithful for a mechanism probe.
 
-use hipfire_kvquant::fwht::{cpu_fwht_256, gen_fwht_signs};
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 
 const GROUP: usize = 256;
 

@@ -45,6 +45,7 @@ members = [
     "crates/hipfire-quantize",
     "crates/hipfire-kvquant",
     "crates/hipfire-quant-format",
+    "crates/hipfire-primitives",
     "crates/hipfire-detect",
     "crates/hipfire-diffusion",
     "crates/hipfire-atlas",

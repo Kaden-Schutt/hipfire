@@ -1,0 +1,8 @@
+[package]
+name = "hipfire-primitives"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Dependency-free numeric primitives shared across hipfire crates: half/bf16 ↔ f32 conversions and the per-256 signed FWHT."
+
+[dependencies]

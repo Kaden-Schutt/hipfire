@@ -3,8 +3,13 @@ name = "hipfire-kvquant"
 version.workspace = true
 edition.workspace = true
 
-# Leaf crate (no hipfire deps): the KVarN codec + deferred cold-tier compaction,
-# shared by the hipfire-quantize bin (offline) and the engine (runtime read path).
+# The KVarN codec + deferred cold-tier compaction, shared by the
+# hipfire-quantize bin (offline) and the engine (runtime read path). The generic
+# numeric primitives (f16 conv, FWHT) it used to also host now live in the
+# shared hipfire-primitives leaf.
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+hipfire-primitives = { path = "../hipfire-primitives" }

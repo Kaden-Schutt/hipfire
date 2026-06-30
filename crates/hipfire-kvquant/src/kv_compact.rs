@@ -19,8 +19,8 @@
 // engine wiring (two-tier flash) and the tests below; not yet called from the bin.
 #![allow(dead_code)]
 
-use crate::fwht::{cpu_fwht_256, gen_fwht_signs};
 use crate::kvarn::{self, QuantTile};
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 
 /// One compacted cold buffer for a contiguous range of (old) cold tokens. Slot
 /// structure is SHARED across kv-heads (CASK ranks tokens with a head-aggregated

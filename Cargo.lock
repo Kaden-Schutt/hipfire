@@ -1631,6 +1631,9 @@ dependencies = [
 [[package]]
 name = "hipfire-kvquant"
 version = "0.3.0"
+dependencies = [
+ "hipfire-primitives",
+]
 
 [[package]]
 name = "hipfire-lock"
@@ -1686,6 +1689,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-primitives"
+version = "0.3.0"
+
+[[package]]
 name = "hipfire-prompt"
 version = "0.3.0"
 dependencies = [
@@ -1707,6 +1714,7 @@ dependencies = [
  "byteorder",
  "faer",
  "hipfire-kvquant",
+ "hipfire-primitives",
  "hipfire-quant-format",
  "memmap2",
  "rayon",
@@ -1751,6 +1759,7 @@ dependencies = [
  "hipfire-kvquant",
  "hipfire-mixer",
  "hipfire-model",
+ "hipfire-primitives",
  "hipfire-prompt",
  "hipfire-quant-format",
  "hipfire-state",
@@ -1872,6 +1881,7 @@ dependencies = [
  "half",
  "hipfire-kvquant",
  "hipfire-model",
+ "hipfire-primitives",
  "hipfire-runtime",
  "ratatui",
  "rayon",

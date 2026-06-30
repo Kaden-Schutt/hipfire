@@ -55,15 +55,15 @@ mod codecs;
 #[allow(unused_imports)]
 use codecs::*;
 // KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
+pub use hipfire_kvquant::{kv_compact, kvarn};
 #[allow(dead_code)]
 // KVarN codec + deferred KV-compaction now live in the leaf `hipfire-kvquant`
 // crate (so the engine read path can share them). Re-export at the crate root so
 // the existing `crate::kvarn` / `crate::{cpu_fwht_256,gen_fwht_signs,f16_to_f32,
 // f32_to_f16}` references across this bin (codecs.rs, qtip.rs, ldlq.rs, main.rs)
 // keep resolving unchanged.
-pub use hipfire_kvquant::conv::{f16_to_f32, f32_to_f16};
-pub use hipfire_kvquant::fwht::{cpu_fwht_256, gen_fwht_signs};
-pub use hipfire_kvquant::{kv_compact, kvarn};
+pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
+pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 // Tiny random-init model fixtures for fast kernel/plumbing gating.
 mod fixture;
 // RoughQuant Phase 2 — PCA rotation into the activation-Hessian eigenbasis.

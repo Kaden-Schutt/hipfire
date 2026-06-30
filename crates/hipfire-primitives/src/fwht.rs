@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 hipfire contributors
 // hipfire — per-256 signed FWHT (Walsh-Hadamard) + the engine-matching sign table.
 
 /// In-place per-256 signed FWHT: signs1 pre, Hadamard butterfly, 1/16·signs2 post
@@ -28,7 +29,7 @@ pub fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
-/// Generate FWHT sign table (matches engine's gen_fwht_signs).
+/// Generate FWHT sign table (matches the engine's `gen_fwht_signs`).
 pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
     (0..n)
@@ -41,4 +42,24 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fwht_is_orthonormal_involution() {
+        // With identity signs, applying the transform twice returns the input
+        // (orthonormal Hadamard is its own inverse up to the sign pre/post).
+        let s1 = vec![1.0f32; 256];
+        let s2 = vec![1.0f32; 256];
+        let mut x: Vec<f32> = (0..256).map(|i| (i as f32) * 0.01 - 1.0).collect();
+        let orig = x.clone();
+        cpu_fwht_256(&mut x, &s1, &s2);
+        cpu_fwht_256(&mut x, &s1, &s2);
+        for (a, b) in x.iter().zip(orig.iter()) {
+            assert!((a - b).abs() < 1e-4, "involution drift: {a} vs {b}");
+        }
+    }
 }
