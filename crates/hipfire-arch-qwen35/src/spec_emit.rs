@@ -40,9 +40,27 @@ pub struct Qwen35Emit<'a> {
     open_think_prefix: bool,
     think_count: usize,
     prev_in_think: bool,
+    /// Generation-intervention queue (see `SpecEmit::take_forced`). The
+    /// think-budget force-close injects the `</think>` continuation token IDs
+    /// here so the decode loop advances the target over them and CONTINUES into
+    /// the visible answer (spec-decode parity with the AR `</think>` splice),
+    /// instead of halting at the cap with an empty/partial answer. Drained by
+    /// [`Self::take_forced`].
+    forced: Vec<u32>,
+    /// One-shot latch: set once the think budget has force-closed a span. A
+    /// re-opened `<think>` that exhausts the budget AGAIN hard-stops (ThinkCap)
+    /// rather than force-closing forever (mirrors the AR re-open guard).
+    think_force_closed: bool,
     /// `generated` counter at the point of the most recent `observe` — only used
     /// for the attractor-detect log message (byte-for-byte stderr parity).
     generated_hint: usize,
+}
+
+/// The text spliced to force-close a `<think>` span. Mirrors the daemon's
+/// `think_continuation()` (same `HIPFIRE_THINK_CONTINUATION` override) so the AR
+/// and spec-decode paths close `<think>` identically. Default `</think>\n\n`.
+fn think_continuation_text() -> String {
+    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
 }
 
 impl<'a> Qwen35Emit<'a> {
@@ -97,6 +115,8 @@ impl<'a> Qwen35Emit<'a> {
             open_think_prefix: matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink),
             think_count: 0,
             prev_in_think: false,
+            forced: Vec::new(),
+            think_force_closed: false,
             generated_hint: 0,
         })
     }
@@ -216,9 +236,22 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             self.prev_in_think = in_think;
 
             if in_think && self.think_count >= self.max_think_tokens {
-                // Force-close: stream `</think>\n` and stop. The inline path
-                // wrote this literal token frame directly (not through the
-                // filter, not into streamed_tokens) — preserve that exactly.
+                if !self.think_force_closed {
+                    // Force-close by INJECTING the think-continuation token IDs
+                    // into the forced queue (see `take_forced`). The decode loop
+                    // advances the target over them, re-feeds them through
+                    // `observe` (so they stream as committed answer tokens), and
+                    // CONTINUES generating — spec-decode parity with the AR
+                    // `</think>` splice. (Previously this streamed `</think>\n`
+                    // as a display string + returned ThinkCap, which HALTED
+                    // spec-decode mid-turn → the empty/partial-answer bug.)
+                    self.forced = self.tokenizer.encode(&think_continuation_text());
+                    self.think_force_closed = true;
+                    return EmitOutcome { events, stop: None };
+                }
+                // Already force-closed once: a re-opened `<think>` exhausted the
+                // budget AGAIN. Hard-stop (ThinkCap) so a pathological re-open
+                // can't run to the token wall — mirrors the AR re-open guard.
                 events.push(ClientEvent::Token("</think>\n".to_string()));
                 return EmitOutcome {
                     events,
@@ -270,5 +303,13 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     /// attractor-detect log message reports the same number it did inline.
     fn set_generated_hint(&mut self, generated: usize) {
         self.generated_hint = generated;
+    }
+
+    /// Drain the think-budget force-close continuation (the `</think>` token
+    /// IDs). Non-empty exactly once per turn, right after the budget cap is
+    /// first hit; the decode loop then advances the target over these tokens
+    /// and continues into the visible answer (spec-decode parity with AR).
+    fn take_forced(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.forced)
     }
 }

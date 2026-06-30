@@ -91,10 +91,17 @@ impl RuntimeConfig {
                 .ok()
                 .as_deref()
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
+            // Default OFF (0 = disabled). The 4-gram×8 loop guard false-positives
+            // on legitimate enumeration-heavy reasoning at temp>0 — a repeating
+            // markdown bullet scaffold (`\n - **`) trips it INSIDE `<think>`,
+            // force-EOSing mid-think and emptying the answer channel (surfaced by
+            // the qwen3.6 temp=1.0 registry default). Runaway thinking is handled
+            // by the think-budget force-close instead. Opt back in with
+            // `HIPFIRE_NGRAM_LOOP_THRESHOLD=N` (was: default 8).
             ngram_loop_threshold: std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+                .unwrap_or(0),
             ngram_window: std::env::var("HIPFIRE_NGRAM_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())

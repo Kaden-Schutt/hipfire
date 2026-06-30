@@ -3627,22 +3627,23 @@ async function serve(port: number, host: string) {
           if (typeof sendView.min_p === "number") genParams.min_p = sendView.min_p;
         }
         void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
-        // Serve API is UNCAPPED by default (OpenAI/o1 convention — the client
-        // bounds length via max_tokens). The CLI-chat think-budget preset is a
-        // chat convenience, NOT an API default: forwarding the bare "med" preset
-        // here made the daemon route EVERY thinking request to AR (its
-        // `budgeted_thinking_needs_ar` gate), which DISABLED DFlash/MTP through
-        // the serve — they can't continue past a *forced* </think> so a budget
-        // sends them to AR. So forward a budget only when the operator set one
-        // EXPLICITLY (raw max_think_tokens or a non-default thinking_budget);
-        // `reasoning_effort` still caps per-request below and thinking=off
-        // hard-suppresses. (#74 trade-off accepted per design: an uncapped
-        // thinking model on a SMALL max_tokens can return empty content, so
-        // clients should size max_tokens for the reasoning they ask for, or pass
-        // reasoning_effort. The `hipfire run`/chat paths keep the preset budget.)
+        // Serve API forwards the resolved think budget by DEFAULT (preset "med"
+        // = 2048). An uncapped thinking model at temp>0 reasons straight to the
+        // max_tokens wall on some turns without ever closing </think> → empty
+        // content (observed across AR, DFlash, and MTP). The medium cap
+        // force-closes </think> and the model commits an answer.
+        //
+        // This used to be uncapped-by-default because a budget routed thinking
+        // requests to AR (the daemon's `budgeted_thinking_needs_ar` gate) and so
+        // DISABLED DFlash/MTP — they couldn't continue past a *forced* </think>.
+        // That gate is removed and DFlash/MTP now CONTINUE after the force-close
+        // (parity with AR, the same way they reached parity on sampling), so the
+        // cap no longer disables spec-decode. Opt out per-request with
+        // `reasoning_effort: xhigh` (0 = uncapped) or config `thinking_budget:
+        // uncapped`; `thinking=off` still hard-suppresses.
         if (effective.thinking === "off") {
           genParams.max_think_tokens = 1;
-        } else if (effective.max_think_tokens > 0 && effective.max_think_explicit) {
+        } else if (effective.max_think_tokens > 0) {
           genParams.max_think_tokens = effective.max_think_tokens;
         }
         // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1

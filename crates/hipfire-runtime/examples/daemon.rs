@@ -33,11 +33,11 @@ use hipfire_arch_qwen35::speculative;
 // Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
 // it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
 use hipfire_arch_qwen35::Qwen35Bundle;
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{currently_in_think, extract_tool_calls_from_text};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -2130,6 +2130,12 @@ fn main() {
                     m.conversation_tokens.clear();
                     free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
                     free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                    // Free the persistent MTP prefix-cache state (head KV +
+                    // prev_hidden) so the next MTP turn cold-prefills a fresh
+                    // conversation (no recurrent-state bleed across a reset).
+                    if let Some((mtp_state, _)) = m.qwen35_mtp_state.take() {
+                        mtp_state.free_gpu(&mut gpu);
+                    }
                     // Free the speculator's (relocated) checkpoint ring on reset.
                     if let Some(s) = m.speculator.as_mut() {
                         s.reset(&mut gpu);
@@ -4872,6 +4878,14 @@ fn generate_qwen35_mtp(
     // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && m.chat_template.is_some();
+    // Prefix-cache (HIPFIRE_MTP_PREFIX_CACHE, default OFF): when on, render the
+    // prompt through `build_cached_history_jinja` so each historical assistant
+    // turn replays its VERBATIM generated tokens (+ the live `<think>` primer
+    // this turn's cold render emitted), making the LCP byte-exact across turns —
+    // mirrors the AR `generate()` jinja-cache path. Without this the naive render
+    // re-tokenizes the client's (think-stripped) echo and the LCP breaks at the
+    // assistant-turn `<think>` primer.
+    let prefix_cache_on = std::env::var("HIPFIRE_MTP_PREFIX_CACHE").ok().as_deref() == Some("1");
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -4882,37 +4896,34 @@ fn generate_qwen35_mtp(
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
         };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(h) => h,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                    }
+        // Messages slice (synthesize a [system?, user] history for turn 1).
+        let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+        let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            Some(h) => h,
+            None => {
+                let mut v = Vec::new();
+                if let Some(sys) = system_prompt {
                     v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
+                        role: hipfire_runtime::prompt_frame::Role::System,
+                        content: sys.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
                     });
-                    synthesized = v;
-                    &synthesized
                 }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
+                v.push(hipfire_runtime::prompt_frame::Message {
+                    role: hipfire_runtime::prompt_frame::Role::User,
+                    content: prompt.to_string(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    tool_plan: String::new(),
+                });
+                synthesized = v;
+                &synthesized
+            }
         };
-        match render_result {
+        // Cold render: the canonical prompt + the source of the `<think>` primer.
+        let new_tokens: Vec<u32> = match frame.render_messages(messages_slice, tools, None) {
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
                 eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
@@ -4925,6 +4936,60 @@ fn generate_qwen35_mtp(
                 }
                 .build()
             }
+        };
+        // Cache-aware render (LCP-byte-exact) when prefix-cache is on + we have a
+        // prior conversation to forward-extend.
+        let render_cache_eligible = prefix_cache_on
+            && messages_history.is_some()
+            && m.eviction.is_none()
+            && !m.conversation_tokens.is_empty();
+        if render_cache_eligible {
+            // Primer = the assistant-opener tokens after the last
+            // `<|im_start|>assistant\n` in the cold render (e.g. `<think>\n`).
+            let primer: Vec<u32> = {
+                let im_start = tokenizer.special_token_id("<|im_start|>");
+                let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
+                match im_start.and_then(|id| new_tokens.iter().rposition(|&t| t == id)) {
+                    Some(q) if q + opener_len <= new_tokens.len() => {
+                        new_tokens[q + opener_len..].to_vec()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            let trace_cache =
+                std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+            let cache_ref = &mut m.asst_turn_cache;
+            match hipfire_runtime::prompt_frame::build_cached_history_jinja(
+                &frame,
+                messages_slice,
+                tools,
+                |msg| {
+                    let stripped = strip_think_for_fingerprint(&msg.content);
+                    let normalized =
+                        hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let hit = cache_ref.get(&fp).map(|cached| {
+                        let mut v = primer.clone();
+                        v.extend_from_slice(cached);
+                        v
+                    });
+                    if trace_cache {
+                        eprintln!(
+                            "[mtp-cache jinja lookup] fp={:#018x} content.len={}/strip={} primer={} hit={}",
+                            fp, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
+                        );
+                    }
+                    hit
+                },
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[mtp-cache] jinja cached-history build failed ({e}) — cold render");
+                    new_tokens
+                }
+            }
+        } else {
+            new_tokens
         }
     } else {
         hipfire_runtime::prompt_frame::ChatFrame {
@@ -4949,26 +5014,74 @@ fn generate_qwen35_mtp(
         None
     };
 
-    // ── Cold-reset the trunk recurrent state (v1 = single-turn) ─────────
-    // Like generate_dflash's !cache_hit branch: zero the bundle's DeltaNet
-    // recurrent state + reset the KV write head so a fresh prompt prefills
-    // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+    // ── LCP prefix-cache decision (HIPFIRE_MTP_PREFIX_CACHE, default OFF) ──
+    // On a pure forward extension of the prior conversation, reuse the trunk
+    // KV + DeltaNet + the persisted MTP head KV and prefill ONLY the new
+    // suffix; default OFF keeps the cold-reset path below byte-identical. The
+    // persisted state's `valid_len` must equal the current conversation length
+    // (only this fn sets it), so any AR/DFlash/reset turn in between
+    // auto-invalidates the cache → cold reset (no recurrent-state bleed).
+    // `prefix_cache_on` is resolved once at the prompt-render block above.
+    let prior_conv_len = m.conversation_tokens.len();
+    let mtp_state_valid = m
+        .qwen35_mtp_state
+        .as_ref()
+        .map(|(_, vlen)| *vlen == prior_conv_len)
+        .unwrap_or(false);
+    let lcp = {
+        let maxm = prior_conv_len.min(prompt_tokens.len());
+        let mut l = 0usize;
+        while l < maxm && m.conversation_tokens[l] == prompt_tokens[l] {
+            l += 1;
         }
-        for s in &dn.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        l
+    };
+    let cache_hit = prefix_cache_on
+        && mtp_state_valid
+        && lcp == prior_conv_len // pure forward extension (no divergence)
+        && lcp < prompt_tokens.len() // non-empty suffix to prefill
+        && lcp > 0
+        && m.eviction.is_none(); // eviction window not validated with MTP
+    let prefill_start = if cache_hit { lcp } else { 0 };
+    if prefix_cache_on && std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[mtp-prefix-cache] hit={cache_hit} lcp={lcp} prior_conv_len={prior_conv_len} prompt_len={} valid={mtp_state_valid} suffix={}",
+            prompt_tokens.len(),
+            prompt_tokens.len().saturating_sub(prefill_start),
+        );
+        if mtp_state_valid && lcp < prior_conv_len && lcp < prompt_tokens.len() {
+            let a = lcp.saturating_sub(4);
+            let bc = (lcp + 8).min(m.conversation_tokens.len());
+            let bp = (lcp + 8).min(prompt_tokens.len());
+            eprintln!(
+                "[mtp-prefix-cache DIVERGE@{lcp}] conv[{a}..{bc}]={:?} prompt[{a}..{bp}]={:?}",
+                tokenizer.decode(&m.conversation_tokens[a..bc]),
+                tokenizer.decode(&prompt_tokens[a..bp]),
+            );
         }
     }
-    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-        b.kv_cache.compact_offset = 0;
+
+    if !cache_hit {
+        // ── Cold-reset the trunk recurrent state ──────────────────────────
+        // Zero the bundle's DeltaNet recurrent state + reset the KV write head
+        // so a fresh prompt prefills from position 0 over clean buffers.
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+            let dn = &b.dn_state;
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+        }
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            b.kv_cache.compact_offset = 0;
+        }
     }
 
     // ── Take the bundle → build a transient ModelSlot ───────────────────
@@ -5062,7 +5175,18 @@ fn generate_qwen35_mtp(
     // alloc below needs &mut state + &mut gpu.
     let cvs_opt = head.weights.compressed_vocab_size;
     let kv_mode = MtpKvMode::Q8;
-    let mut state =
+    let mut state = if cache_hit {
+        // Prefix-cache HIT: reuse the persisted MtpSpecState (its head KV +
+        // prev_hidden are valid at position `lcp`); only the suffix is prefilled.
+        match m.qwen35_mtp_state.take() {
+            Some((s, _)) => s,
+            None => unreachable!("cache_hit ⇒ qwen35_mtp_state is Some"),
+        }
+    } else {
+        // Cold: free any stale persisted state, then allocate a fresh one.
+        if let Some((old, _)) = m.qwen35_mtp_state.take() {
+            old.free_gpu(gpu);
+        }
         match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
             Ok(s) => s,
             Err(e) => {
@@ -5076,7 +5200,8 @@ fn generate_qwen35_mtp(
                 }));
                 return;
             }
-        };
+        }
+    };
     // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
     // up front (mtp_only_demo does this; the daemon previously only set up the
     // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
@@ -5120,18 +5245,25 @@ fn generate_qwen35_mtp(
     let t0 = Instant::now();
 
     // ── Prefill: trunk batched + MTP private-KV fill (trunk-spine) ──────
+    // On a prefix-cache HIT, prefill ONLY the new suffix `[prefill_start..]`
+    // (the trunk KV + DeltaNet + head KV up to `prefill_start` are carried from
+    // the prior turn); on a cold start `prefill_start == 0` (the whole prompt).
     let head = m.qwen35_mtp_head.as_ref().unwrap();
     let prefill_res = mtp_spec::prefill_trunk_and_mtp_cache(
         gpu,
         &mut target,
         head,
         &mut state,
-        &prompt_tokens,
-        0,
+        &prompt_tokens[prefill_start..],
+        prefill_start,
     );
     if let Err(e) = prefill_res {
         emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
         state.free_gpu(gpu);
+        // Clear the conversation tracker so a partial/aborted prefill can't be
+        // LCP-reused next turn (the trunk state is now inconsistent).
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
         m.state = Some(ModelState::Qwen35(Qwen35Bundle {
             config: orig_config,
             weights: target.weights,
@@ -5151,6 +5283,8 @@ fn generate_qwen35_mtp(
         Err(e) => {
             emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
             state.free_gpu(gpu);
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
             m.state = Some(ModelState::Qwen35(Qwen35Bundle {
                 config: orig_config,
                 weights: target.weights,
@@ -5186,6 +5320,10 @@ fn generate_qwen35_mtp(
     let mut accepted_total = 0usize;
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
+    // Latched once the think-budget force-close has spliced `</think>` and the
+    // loop has resumed generating the answer (see the block-boundary force-close
+    // below). Prevents re-closing + stops further budget tracking.
+    let mut think_closed = false;
 
     // Emit the seed token first (TTFT = prefill).
     streamed_tokens.push(seed_token);
@@ -5246,7 +5384,6 @@ fn generate_qwen35_mtp(
         accepted_total += result.accept_count;
 
         let mut hit_eos = false;
-        let mut think_cap_hit = false;
         for &tok in &result.committed {
             if generated >= max_tokens {
                 break;
@@ -5286,7 +5423,7 @@ fn generate_qwen35_mtp(
                     break;
                 }
             }
-            if max_think_tokens > 0 {
+            if max_think_tokens > 0 && !think_closed {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
@@ -5303,16 +5440,11 @@ fn generate_qwen35_mtp(
                     think_count += 1;
                 }
                 prev_in_think = in_think;
-                if in_think && think_count >= max_think_tokens {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":"</think>\n"}}"#,
-                        id
-                    );
-                    let _ = stdout.flush();
-                    think_cap_hit = true;
-                    break;
-                }
+                // The force-close itself is applied at BLOCK granularity after
+                // this inner emit loop (see below) — NOT mid-block — so the
+                // emitted stream stays consistent with the trunk KV that
+                // spec_step already advanced over the whole committed block.
+                // Here we only TRACK the budget.
             }
         }
         last_committed = match result.committed.last() {
@@ -5320,30 +5452,162 @@ fn generate_qwen35_mtp(
             None => break, // defensive: spec_step always commits ≥ 1
         };
         cur_pos += result.advance;
-        if result.hit_eos || hit_eos || think_cap_hit {
+        if result.hit_eos || hit_eos {
             break;
+        }
+
+        // ── Block-boundary think-budget force-close (spec-decode parity) ────
+        // Budget exhausted AND still inside <think>: splice the `</think>`
+        // continuation through the trunk + MTP head cache and CONTINUE
+        // generating the answer in MTP spec-decode — parity with the AR
+        // `</think>` splice, NOT a fall-back to AR (so the user's reported
+        // tok/s stays MTP, not AR). Applied at the block boundary so emitted ==
+        // trunk state; cap overshoot is bounded by one accepted block (≤ max_n).
+        if max_think_tokens > 0 && !think_closed && prev_in_think && think_count >= max_think_tokens
+        {
+            let close_ids = tokenizer.encode(&think_continuation());
+            if !close_ids.is_empty() {
+                // Stream every continuation token to the client, exactly like a
+                // normal committed token (committed-event + byte filter).
+                for &ct in &close_ids {
+                    if generated >= max_tokens {
+                        break;
+                    }
+                    emitted.push(ct);
+                    streamed_tokens.push(ct);
+                    emit_committed_event(
+                        stdout,
+                        id,
+                        ct,
+                        streamed_tokens.len() - 1,
+                        t0.elapsed().as_millis() as u64,
+                    );
+                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
+                    bytes_fed_to_filter = all_bytes.len();
+                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                        if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                                id,
+                                serde_json::to_string(&text).unwrap_or_default()
+                            );
+                            let _ = stdout.flush();
+                        }
+                    }
+                    generated += 1;
+                }
+                // Advance trunk KV/DN + MTP head cache + refresh prev_hidden over
+                // [last_committed] ++ close_ids[..n-1]; the FINAL close token
+                // stays "deferred" as the next cycle's last_committed, mirroring
+                // the prefill→spec-loop handoff invariant exactly (cur_pos =
+                // #KV-written, last_committed = deferred token, prev_hidden =
+                // trunk hidden at cur_pos-1).
+                let mut advance_toks: Vec<u32> = Vec::with_capacity(close_ids.len());
+                advance_toks.push(last_committed);
+                advance_toks.extend_from_slice(&close_ids[..close_ids.len() - 1]);
+                if let Err(e) = mtp_spec::prefill_trunk_and_mtp_cache(
+                    gpu,
+                    &mut target,
+                    head,
+                    &mut state,
+                    &advance_toks,
+                    cur_pos,
+                ) {
+                    step_error = Some(format!("think force-close: {e:?}"));
+                    break;
+                }
+                cur_pos += advance_toks.len();
+                last_committed = *close_ids.last().unwrap();
+                think_closed = true;
+                prev_in_think = false;
+            }
         }
     }
 
     let t_end = Instant::now();
 
-    // ── Free the per-request MtpSpecState + put the bundle back ─────────
-    // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
-    // + the trunk DN snapshot, so the NEXT request starts with no residue.
-    state.free_gpu(gpu);
-    // The trunk's mid-decode DN/KV is advanced past the (un-baked) prompt; the
-    // next request cold-resets at the top of this fn (and the DFlash/AR paths
-    // reset on their own !cache_hit branch), so we leave it as-is here. Bake an
-    // empty conversation tracker (v1 is single-turn / no LCP reuse).
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-        config: orig_config,
-        weights: target.weights,
-        scratch: target.scratch,
-        kv_cache: target.kv_cache,
-        dn_state: target.dn_state,
-    }));
+    // ── Persist (prefix-cache) OR free (cold/error) the MTP state + bundle ──
+    if prefix_cache_on && step_error.is_none() {
+        // Flush the deferred last-committed token's KV so the trunk + MTP head
+        // KV are gap-free through the FULL conversation, then persist for the
+        // next turn's LCP reuse. `prefill_trunk_and_mtp_cache` over the single
+        // deferred token advances trunk KV/DN + head KV by one + refreshes
+        // prev_hidden — leaving every cache consistent at `prompt+emitted`.
+        if let Some(&last) = emitted.last() {
+            let head = m.qwen35_mtp_head.as_ref().unwrap();
+            let _ = mtp_spec::prefill_trunk_and_mtp_cache(
+                gpu,
+                &mut target,
+                head,
+                &mut state,
+                &[last],
+                cur_pos,
+            );
+        }
+        let mut conv = prompt_tokens.clone();
+        conv.extend_from_slice(&emitted);
+        let new_len = conv.len();
+        m.conversation_tokens = conv;
+        m.seq_pos = new_len;
+        m.qwen35_mtp_state = Some((state, new_len));
+        // Store this turn's assistant BODY (post-primer, trailing `\n`/im_end
+        // trimmed) in the asst_turn_cache keyed by the think-stripped content
+        // fingerprint, so the NEXT turn's cache-aware render (above) replays it
+        // verbatim with the `<think>` primer re-prepended → the LCP stays
+        // byte-exact. Mirrors the DFlash store (the render adds the im_end+nl
+        // trailer back on replay, so it's trimmed here).
+        {
+            let decoded_full = tokenizer.decode(&streamed_tokens);
+            let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+            let nl_set: std::collections::HashSet<u32> =
+                tokenizer.encode("\n").into_iter().collect();
+            let mut cached_seq: Vec<u32> = streamed_tokens.clone();
+            while let Some(&last) = cached_seq.last() {
+                if nl_set.contains(&last) {
+                    cached_seq.pop();
+                } else {
+                    break;
+                }
+            }
+            if let Some(&last) = cached_seq.last() {
+                if im_end_token == Some(last) {
+                    cached_seq.pop();
+                }
+            }
+            if !cached_seq.is_empty() {
+                let stripped = strip_think_for_fingerprint(&decoded_full);
+                let emit_text =
+                    hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+                let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+                m.asst_turn_cache.insert(fp, cached_seq);
+            }
+        }
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+            config: orig_config,
+            weights: target.weights,
+            scratch: target.scratch,
+            kv_cache: target.kv_cache,
+            dn_state: target.dn_state,
+        }));
+    } else {
+        // ── Default (cold / error): free the MTP state + put the bundle back ─
+        // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV
+        // cache + the trunk DN snapshot, so the NEXT request starts with no
+        // residue. The trunk's mid-decode DN/KV is advanced past the un-baked
+        // prompt; the next request cold-resets at the top of this fn.
+        state.free_gpu(gpu);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+            config: orig_config,
+            weights: target.weights,
+            scratch: target.scratch,
+            kv_cache: target.kv_cache,
+            dn_state: target.dn_state,
+        }));
+    }
 
     if let Some(e) = step_error {
         emit_error_with_id(stdout, id, format!("mtp spec_step: {e}"));
@@ -6600,7 +6864,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -6717,7 +6981,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -6782,7 +7046,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -6845,7 +7109,7 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
             0.0_f32, // cactus_delta: lossless serve path
@@ -6929,16 +7193,12 @@ fn generate(
     // rejection invariant) — a temp>0 request carrying a non-default top_p gets
     // temp-only sampling and a one-time warn below.
     //
-    // Exception: thinking-on + max_think_tokens currently needs the AR path.
-    // DFlash's budget cap can close/strip the think span but does not yet
-    // continue into visible answer text after the forced close. AR already
-    // splices </think> through KV and continues generation, so route budgeted
-    // thinking requests there until DFlash continuation is implemented.
-    let budgeted_thinking_needs_ar = max_think_tokens > 0
-        && !matches!(
-            assistant_prefix,
-            hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
-        );
+    // Budgeted thinking (max_think_tokens > 0) now stays on the spec-decode
+    // path: DFlash (via the `spec_emit` forced-token continuation) and MTP (via
+    // the block-boundary `prefill_trunk_and_mtp_cache` splice) both force-close
+    // `</think>` and CONTINUE generating the answer in spec-decode, mirroring
+    // the AR `</think>` splice. So a think cap no longer routes to AR — the
+    // user's reported tok/s reflects the spec-decode path they selected.
 
     // ── Qwen3.5/3.6 native-MTP serve path (config-driven) ──────────────────
     //
@@ -6975,7 +7235,6 @@ fn generate(
         && m.qwen35_mtp_head.is_some()
         && (temp <= 1e-6 || mtp_sampled_on)
         && (m.arch_id == 5 || m.arch_id == 6)
-        && !budgeted_thinking_needs_ar
     {
         generate_qwen35_mtp(
             m,
@@ -7047,7 +7306,11 @@ fn generate(
     // sampled request from being routed into a greedy-only drafter and silently
     // decoded greedy (the set_sampling call there would be a no-op). A greedy-only
     // drafter at temp>0 falls through to AR (faithful) instead.
-    let spec_can_sample = m.speculator.as_ref().map(|s| !s.requires_greedy()).unwrap_or(false);
+    let spec_can_sample = m
+        .speculator
+        .as_ref()
+        .map(|s| !s.requires_greedy())
+        .unwrap_or(false);
     // qwen35/36: spec-graph sampled routing — greedy always; temp>0 only when the
     // drafter samples (DflashSpeculator) AND fast-sample is on AND no min_p.
     let qwen_dflash_route = (m.arch_id == 5 || m.arch_id == 6)
@@ -7055,11 +7318,7 @@ fn generate(
     // llama: #477 greedy-only DFlash (temp>0 falls through to AR — spec-graph
     // never ran llama-DFlash, so no unvalidated sampled-llama path here).
     let llama_dflash_route = (m.arch_id == 0 || m.arch_id == 1) && temp <= 1e-6;
-    if m.speculator.is_some()
-        && !budgeted_thinking_needs_ar
-        && !force_ar_chat
-        && (qwen_dflash_route || llama_dflash_route)
-    {
+    if m.speculator.is_some() && !force_ar_chat && (qwen_dflash_route || llama_dflash_route) {
         // One-time visibility: temp + top_p + top_k ARE now honored on the
         // DFlash spec sampled path (identical (top_k,top_p) nucleus truncation on
         // draft + target → lossless == AR-at-(top_k,top_p)). Only min_p remains
@@ -7116,9 +7375,9 @@ fn generate(
             dflash_alpha,
             tools,
             messages_history,
-            stop,    // hunt3 M-F: thread user stop sequences into the default DFlash path
-            temp,    // request-resolved temp (0.0 greedy / >0 lossless rejection-sampling)
-            top_p,   // nucleus cutoff: honored on the sampled DFlash path
+            stop,  // hunt3 M-F: thread user stop sequences into the default DFlash path
+            temp,  // request-resolved temp (0.0 greedy / >0 lossless rejection-sampling)
+            top_p, // nucleus cutoff: honored on the sampled DFlash path
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (recipe → folded into tau)
             0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
         );
