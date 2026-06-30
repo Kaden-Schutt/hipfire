@@ -18,9 +18,7 @@ use std::ops::Range;
 
 use hip_bridge::HipResult;
 
-use crate::{
-    begin_apply, begin_capture, clear, derive_directions, finish_capture, SteerMode, SteerSpec,
-};
+use crate::{derive_directions, CaptureMeans, SteerMode, SteerSpec};
 
 /// One chat prompt (system + user). Mirrors what the harness will template.
 #[derive(Clone, Debug)]
@@ -29,21 +27,36 @@ pub struct Prompt {
     pub user: String,
 }
 
-/// What the driver needs from a loaded model. The implementor runs the actual
-/// forward passes; the steer hooks fire inside them, so `run_forwards` is what
-/// drives a CAPTURE session.
+/// What the driver needs from a loaded model. The steer hooks fire inside the
+/// implementor's forward, and the steer *session* lives wherever the forward runs
+/// (the daemon process for [`DaemonHarness`]) — so session control is routed
+/// through the harness too, never the `hipfire_steer::*` statics directly.
 pub trait ModelHarness {
     /// Number of transformer blocks (sets the per-block direction count).
     fn num_layers(&self) -> usize;
     /// Residual width.
     fn hidden(&self) -> usize;
-    /// Run a forward over each prompt (single-token is enough for capture). The
-    /// block hook fires per block, so a CAPTURE session accumulates residuals.
-    fn run_forwards(&mut self, prompts: &[Prompt]) -> HipResult<()>;
-    /// First-token log-softmax row per prompt — the KLD scoring signal.
-    fn first_token_logprobs(&mut self, prompts: &[Prompt]) -> HipResult<Vec<Vec<f32>>>;
+
+    /// Open a CAPTURE session sized for this model.
+    fn begin_capture(&mut self) -> HipResult<()>;
+    /// Prefill each prompt (no decode) through the hooked forward and commit its
+    /// last-prompt-token residuals into the capture means.
+    fn capture(&mut self, prompts: &[Prompt]) -> HipResult<()>;
+    /// Close the CAPTURE session and return the accumulated per-block means.
+    fn finish_capture(&mut self) -> HipResult<CaptureMeans>;
+    /// Open an APPLY session steering/ablating along `spec`'s directions.
+    fn begin_apply(&mut self, spec: &SteerSpec) -> HipResult<()>;
+    /// Tear down any active steer session (back to the unmodified base model).
+    fn clear(&mut self) -> HipResult<()>;
+
     /// Greedy responses per prompt — the refusal-classifier signal.
     fn generate(&mut self, prompts: &[Prompt]) -> HipResult<Vec<String>>;
+    /// Build the base KLD reference over `prompts` (steer must be cleared first).
+    /// Held in the harness/daemon for a later [`ModelHarness::kld_score`].
+    fn kld_build_ref(&mut self, prompts: &[Prompt]) -> HipResult<()>;
+    /// Score the current (steered) model against the reference built by
+    /// [`ModelHarness::kld_build_ref`] → mean sequence-KL(base ‖ candidate).
+    fn kld_score(&mut self, prompts: &[Prompt]) -> HipResult<f32>;
 }
 
 /// Disclaimer/refusal markers tuned for MedGemma's over-refusal mode, plus the
@@ -97,8 +110,10 @@ pub fn count_refusals(responses: &[String], markers: &[String]) -> usize {
 /// Mean KL(base ‖ candidate) over first-token distributions. Rows are per-prompt
 /// log-softmax vectors. Matches Heretic's `batchmean` KL with `log_target`.
 ///
-/// TODO(phase-3): route through `hipfire-kld` so reference and candidate scoring
-/// share one implementation and cannot drift.
+/// Host helper kept for unit coverage and any in-process logprob comparison; the
+/// daemon scoring path measures capability damage with sequence-KLD through
+/// `hipfire-kld` (see [`ModelHarness::kld_score`]) so reference and candidate
+/// scoring share one implementation and cannot drift.
 pub fn mean_kld(base: &[Vec<f32>], candidate: &[Vec<f32>]) -> f32 {
     let n = base.len().min(candidate.len());
     if n == 0 {
@@ -185,22 +200,41 @@ pub fn pareto_front(trials: &[Trial]) -> Vec<usize> {
 }
 
 /// Run the full driver: measure base → capture +/- → derive → sweep apply → score.
+///
+/// Session control (`begin_capture`/`begin_apply`/`clear`) routes through the
+/// harness because the steer session lives where the forward runs — for the
+/// daemon harness that is a different process, so the local statics would not
+/// reach it. KLD is a sequence-KL against a base reference the harness builds
+/// once up front (steer cleared) and scores each steered candidate against.
 pub fn run_driver(cfg: &DriverConfig, h: &mut dyn ModelHarness) -> HipResult<DriverReport> {
-    // Base reference: first-token logprobs on the good-eval set (KLD reference)
-    // and the unmodified refusal rate on the bad-eval set.
-    let base_logprobs = h.first_token_logprobs(&cfg.good_eval)?;
-    let base_refusals = count_refusals(&h.generate(&cfg.bad_eval)?, &cfg.markers);
+    // Base reference: build the KLD reference (steer cleared) on the good-eval
+    // set, and measure the unmodified refusal rate on the bad-eval set.
+    h.clear()?;
+    h.kld_build_ref(&cfg.good_eval)?;
+    let base_responses = h.generate(&cfg.bad_eval)?;
+    if std::env::var_os("HIPFIRE_STEER_DUMP").is_some() {
+        eprintln!("\n=== base bad-eval generations (the scorer sees) ===");
+        for (p, r) in cfg.bad_eval.iter().zip(base_responses.iter()) {
+            let tag = if is_refusal(r, &cfg.markers) {
+                "REFUSE"
+            } else {
+                "answer"
+            };
+            eprintln!("[{tag}] {}\n  -> {}\n", p.user, r.replace('\n', " ").trim());
+        }
+    }
+    let base_refusals = count_refusals(&base_responses, &cfg.markers);
 
     // Per-block contrastive direction from the +/- residual means.
     let good_means = {
-        begin_capture(h.num_layers(), h.hidden());
-        h.run_forwards(&cfg.good_prompts)?;
-        finish_capture().expect("good capture session active")
+        h.begin_capture()?;
+        h.capture(&cfg.good_prompts)?;
+        h.finish_capture()?
     };
     let bad_means = {
-        begin_capture(h.num_layers(), h.hidden());
-        h.run_forwards(&cfg.bad_prompts)?;
-        finish_capture().expect("bad capture session active")
+        h.begin_capture()?;
+        h.capture(&cfg.bad_prompts)?;
+        h.finish_capture()?
     };
     let directions = derive_directions(&good_means, &bad_means, cfg.orthogonalize);
 
@@ -208,15 +242,15 @@ pub fn run_driver(cfg: &DriverConfig, h: &mut dyn ModelHarness) -> HipResult<Dri
     let mut trials = Vec::new();
     for &mode in &cfg.modes {
         for &strength in &cfg.strengths {
-            begin_apply(SteerSpec {
+            h.begin_apply(&SteerSpec {
                 directions: directions.clone(),
                 mode,
                 strength,
                 layer_range: cfg.layer_range.clone(),
-            });
-            let kl_divergence = mean_kld(&base_logprobs, &h.first_token_logprobs(&cfg.good_eval)?);
+            })?;
+            let kl_divergence = h.kld_score(&cfg.good_eval)?;
             let refusals = count_refusals(&h.generate(&cfg.bad_eval)?, &cfg.markers);
-            clear();
+            h.clear()?;
             trials.push(Trial {
                 mode,
                 strength,
@@ -351,19 +385,34 @@ mod tests {
         fn hidden(&self) -> usize {
             self.hidden
         }
-        fn run_forwards(&mut self, prompts: &[Prompt]) -> HipResult<()> {
-            // No GPU here; commit one (zeroed) capture per prompt to exercise the
-            // real call shape. finish_capture then returns zeroed means.
+        // Session control routes to the in-process statics — exercising the real
+        // capture/apply call shape with no GPU (zeroed residuals → zeroed means).
+        fn begin_capture(&mut self) -> HipResult<()> {
+            crate::begin_capture(self.layers, self.hidden);
+            Ok(())
+        }
+        fn capture(&mut self, prompts: &[Prompt]) -> HipResult<()> {
             for _ in prompts {
                 crate::commit_capture();
             }
             Ok(())
         }
-        fn first_token_logprobs(&mut self, prompts: &[Prompt]) -> HipResult<Vec<Vec<f32>>> {
-            Ok(prompts
-                .iter()
-                .map(|_| vec![(0.5f32).ln(), (0.5f32).ln()])
-                .collect())
+        fn finish_capture(&mut self) -> HipResult<CaptureMeans> {
+            Ok(crate::finish_capture().expect("capture session active"))
+        }
+        fn begin_apply(&mut self, spec: &SteerSpec) -> HipResult<()> {
+            crate::begin_apply(spec.clone());
+            Ok(())
+        }
+        fn clear(&mut self) -> HipResult<()> {
+            crate::clear();
+            Ok(())
+        }
+        fn kld_build_ref(&mut self, _prompts: &[Prompt]) -> HipResult<()> {
+            Ok(())
+        }
+        fn kld_score(&mut self, _prompts: &[Prompt]) -> HipResult<f32> {
+            Ok(0.1)
         }
         fn generate(&mut self, prompts: &[Prompt]) -> HipResult<Vec<String>> {
             // Every other prompt "refuses" so base_refusals is nonzero.
@@ -408,6 +457,6 @@ mod tests {
         assert_eq!(report.n_bad_eval, 4);
         assert!(!report.pareto.is_empty());
         // Clean up the global session the driver toggled.
-        clear();
+        crate::clear();
     }
 }

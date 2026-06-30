@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-//! CLI for the hipfire-steer driver: load a model + the +/- prompt sets, run
-//! capture → derive → apply-sweep → score, and print the Pareto front.
+//! CLI for the hipfire-steer driver, driven through a `hipfire-daemon`
+//! subprocess: load a model + the +/- prompt sets, run capture → derive →
+//! apply-sweep → score (all through the daemon's correct inference, templating,
+//! and KLD), and print the Pareto front.
 //!
 //! ```text
 //! cargo run --release -p hipfire-steer-harness -- \
-//!     --hfq ~/.hipfire/models/medgemma-1.5-4b-it.q8f16.hfq \
-//!     --data-dir crates/hipfire-steer/data/heretic \
+//!     --hfq ~/.hipfire/models/medgemma-4b-it.q8f16.hfq \
+//!     --data-dir crates/hipfire-steer/data/medical \
 //!     --limit 16 --eval-limit 16 --mode ablate --strengths 0.5,1.0,1.5
 //! ```
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use hipfire_steer::driver::{load_prompts, run_driver, DriverConfig, Prompt};
+use hipfire_steer::driver::{load_prompts, run_driver, DriverConfig, ModelHarness, Prompt};
 use hipfire_steer::SteerMode;
-use rdna_compute::Gpu;
+use hipfire_steer_harness::DaemonHarness;
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
@@ -32,7 +34,7 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut hfq = None;
-    let mut data_dir = PathBuf::from("crates/hipfire-steer/data/heretic");
+    let mut data_dir = PathBuf::from("crates/hipfire-steer/data/medical");
     let mut limit = 16usize;
     let mut eval_limit = 16usize;
     let mut strengths = vec![1.0f32];
@@ -97,12 +99,8 @@ fn parse_args() -> Result<Args, String> {
 
 fn load_set(dir: &Path, name: &str, limit: usize) -> Result<Vec<Prompt>, Box<dyn Error>> {
     let path = dir.join(name);
-    let mut prompts = load_prompts(&path, SYSTEM_PROMPT).map_err(|e| {
-        format!(
-            "loading {}: {e} (run scripts/fetch_heretic_prompts.sh)",
-            path.display()
-        )
-    })?;
+    let mut prompts = load_prompts(&path, SYSTEM_PROMPT)
+        .map_err(|e| format!("loading {}: {e}", path.display()))?;
     prompts.truncate(limit);
     Ok(prompts)
 }
@@ -122,13 +120,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         bad_eval.len()
     );
 
-    eprintln!("loading {} ...", args.hfq);
-    let gpu = Gpu::init()?;
-    let mut harness = hipfire_steer_harness::build_harness(
-        gpu,
+    let daemon_bin = hipfire_daemon_adapter::find_daemon_bin_or_error()?;
+    eprintln!(
+        "loading {} via daemon {} ...",
+        args.hfq,
+        daemon_bin.display()
+    );
+    let tmp = std::env::temp_dir().join(format!("hipfire-steer-{}", std::process::id()));
+    let mut harness = DaemonHarness::connect(
+        &daemon_bin,
         Path::new(&args.hfq),
         args.max_seq,
         args.max_new_tokens,
+        SYSTEM_PROMPT.to_string(),
+        tmp,
     )?;
 
     let cfg = DriverConfig {
@@ -144,7 +149,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     eprintln!("running driver ({} layers) ...", harness.num_layers());
-    let report = run_driver(&cfg, harness.as_mut())?;
+    let report = run_driver(&cfg, &mut harness)?;
 
     println!("\n=== steer driver report ===");
     println!(

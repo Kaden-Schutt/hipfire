@@ -3,7 +3,7 @@ name = "hipfire-steer-harness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Per-family model adapters + CLI for the hipfire-steer driver. The generic driver/scoring and the ModelHarness trait live in hipfire-steer; this crate provides family adapters (gemma3 first) behind that trait + an arch_id dispatcher. Adding a family = one module here + a dispatch arm + the block hook in that arch's forward."
+description = "Daemon-backed CLI for the hipfire-steer driver. Drives capture→derive→apply→score through a hipfire-daemon (reusing its inference + chat templating + KLD) via the steer-session protocol ops, behind the hipfire-steer ModelHarness trait. The generic driver/scoring and the trait live in hipfire-steer; this crate is the DaemonHarness adapter + CLI."
 
 [[bin]]
 name = "hipfire-steer"
@@ -11,7 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 hipfire-steer = { path = "../hipfire-steer" }
-hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
-hipfire-runtime = { path = "../hipfire-runtime" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
+hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
+hipfire-generate = { path = "../hipfire-generate" }
+hipfire-model = { path = "../hipfire-model" }
 hip-bridge = { path = "../hip-bridge" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros", "process", "time"] }

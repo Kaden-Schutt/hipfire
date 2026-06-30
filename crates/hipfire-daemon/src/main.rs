@@ -2660,6 +2660,10 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
+                // A steer session is process-global and outlives the model it was
+                // captured/applied against; drop it before swapping models so a
+                // stale apply can't perturb the freshly-loaded one.
+                hipfire_steer::clear();
                 let requested_worker_id = message_worker_id(&msg);
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -4730,6 +4734,9 @@ fn main() {
                 generic_state_arena.clear();
                 dummy_model = None;
                 active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
+                // Drop any steer session so a stale capture/apply can't leak its
+                // process-global state across model loads.
+                hipfire_steer::clear();
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
             }
@@ -5322,6 +5329,201 @@ fn main() {
                         format!("kld_eval: unknown mode {other:?}"),
                     ),
                 }
+            }
+
+            // Refusal-direction steering / abliteration session control. The
+            // in-forward `maybe_steer_block` hook (compiled into the gemma3
+            // forward) keeps a process-global capture/apply session; these arms
+            // expose control over it so a client (hipfire-steer-harness) can drive
+            // capture→derive→apply→score through the daemon's correct inference +
+            // templating instead of a reimplemented harness. See
+            // docs/plans/2026-06-30-steer-daemon-pivot.md.
+            "steer_begin_capture" => {
+                let num_layers = msg
+                    .get("num_layers")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let hidden = msg
+                    .get("hidden")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let (Some(num_layers), Some(hidden)) = (num_layers, hidden) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_begin_capture: missing 'num_layers'/'hidden'".to_string(),
+                    );
+                    continue;
+                };
+                hipfire_steer::begin_capture(num_layers, hidden);
+                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = stdout.flush();
+            }
+
+            // Prefill ONE chat turn through the hooked forward (no decode) and fold
+            // its last-prompt-token residuals into the capture means. Prefill-only:
+            // a decoded token's forward would overwrite the residual the hook just
+            // recorded (the `collect` arm is prefill-only for the same reason).
+            "steer_capture" => {
+                let system = msg
+                    .get("system")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let Some(user) = msg.get("user").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: missing 'user'".to_string(),
+                    );
+                    continue;
+                };
+                let Some(m) = model.as_mut() else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: no model loaded".to_string(),
+                    );
+                    continue;
+                };
+                if m.pp != 1 {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: requires a single-GPU resident model (pp == 1)".to_string(),
+                    );
+                    continue;
+                }
+                let Some(tokenizer) = m.tokenizer.as_ref() else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: resident model has no tokenizer".to_string(),
+                    );
+                    continue;
+                };
+                // Frame the turn byte-identically to the `generate` path so capture
+                // sees the exact residuals serving would (BOS + gemma3 turn frame).
+                let system_opt = (!system.is_empty()).then_some(system.as_str());
+                let framed =
+                    hipfire_serving_core::generate_arch::framed_gemma3_prompt(&user, system_opt);
+                let tokens = tokenizer.encode(&framed);
+                if tokens.is_empty() {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: empty prompt after framing".to_string(),
+                    );
+                    continue;
+                }
+                // Prefill-only through whichever gemma3 backend is resident; both
+                // fire the block-boundary hook (batched last-position for arch 12,
+                // per-token last-wins for arch 13), so the hook observes the
+                // last-prompt-token residual per block. No decode loop.
+                use hipfire_runtime::arch::SimpleAr;
+                let result: Result<(), String> = if let Some(b) = m.gemma3_text.as_mut() {
+                    b.state.reset();
+                    SimpleAr::prefill(b, &mut gpu, &tokens)
+                } else if let Some(b) = m.gemma3_vl.as_mut() {
+                    b.state.reset();
+                    SimpleAr::prefill(b, &mut gpu, &tokens)
+                } else {
+                    Err(format!(
+                        "steer_capture: arch_id {} is not gemma3 (12|13)",
+                        m.arch_id
+                    ))
+                };
+                match result {
+                    Ok(()) => {
+                        hipfire_steer::commit_capture();
+                        let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, "", format!("steer_capture: {e}")),
+                }
+            }
+
+            // End the capture session and return the per-block means as a
+            // num_layers × hidden f32 matrix (the client derives directions from
+            // the +/- means it collected).
+            "steer_finish_capture" => match hipfire_steer::finish_capture() {
+                Some(means) => {
+                    let resp = serde_json::json!({
+                        "type": "steer_captured",
+                        "means": means.0,
+                    });
+                    let _ = writeln!(stdout, "{resp}");
+                    let _ = stdout.flush();
+                }
+                None => emit_error_with_id(
+                    &mut stdout,
+                    "",
+                    "steer_finish_capture: no capture session active".to_string(),
+                ),
+            },
+
+            // Begin an apply session: steer (additive) or ablate (projective) each
+            // block in [layer_start, layer_end) along the per-block `directions`.
+            "steer_begin_apply" => {
+                let directions: Option<Vec<Vec<f32>>> = msg
+                    .get("directions")
+                    .and_then(|v| v.as_array())
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| {
+                                row.as_array()
+                                    .map(|cols| {
+                                        cols.iter()
+                                            .filter_map(|x| x.as_f64().map(|f| f as f32))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    });
+                let Some(directions) = directions else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_begin_apply: missing 'directions'".to_string(),
+                    );
+                    continue;
+                };
+                let mode = match msg.get("mode").and_then(|v| v.as_str()).unwrap_or("ablate") {
+                    "steer" => hipfire_steer::SteerMode::Steer,
+                    "ablate" => hipfire_steer::SteerMode::Ablate,
+                    other => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("steer_begin_apply: unknown mode {other:?} (steer|ablate)"),
+                        );
+                        continue;
+                    }
+                };
+                let strength = msg.get("strength").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let layer_start =
+                    msg.get("layer_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let layer_end = msg
+                    .get("layer_end")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(directions.len());
+                hipfire_steer::begin_apply(hipfire_steer::SteerSpec {
+                    directions,
+                    mode,
+                    strength,
+                    layer_range: layer_start..layer_end,
+                });
+                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = stdout.flush();
+            }
+
+            // Tear down any active steer session (back to the base model).
+            "steer_clear" => {
+                hipfire_steer::clear();
+                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = stdout.flush();
             }
 
             // PFlash drafter TEACHER: forward the resident qwen3.5 target over a

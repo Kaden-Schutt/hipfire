@@ -214,12 +214,64 @@ impl Gemma3VlBackend {
 }
 
 impl SimpleAr for Gemma3VlBackend {
-    /// Text-only prefill (no image): one token at a time, like the gemma3 text
-    /// path. The image splice lives in [`ServingBackend::serve`], not here.
+    /// Text-only prefill (no image): batched, mirroring [`Gemma3Backend`]'s text
+    /// prefill — one `forward_prefill_batch` per microbatch reads each weight once
+    /// for the whole chunk instead of per token (fewer/larger launches: faster and
+    /// less exposure to the async LDS wedge). Numerically equivalent (both
+    /// full-causal); the batched block-boundary hook observes the last position,
+    /// so steer capture's last-prompt-token semantics are unchanged. Same env
+    /// toggles as the text backend. The image splice lives in
+    /// [`ServingBackend::serve`], not here.
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
-        for &t in tokens {
-            forward_step(gpu, &self.weights.text, &self.text_cfg, &mut self.state, t)
-                .map_err(|e| format!("gemma3-vl prefill forward_step: {e:?}"))?;
+        if tokens.len() > 1
+            && std::env::var("HIPFIRE_GEMMA3_NO_BATCHED_PREFILL")
+                .ok()
+                .as_deref()
+                != Some("1")
+        {
+            let dim = self.text_cfg.hidden_size;
+            let microbatch = std::env::var("HIPFIRE_GEMMA3_PREFILL_MICROBATCH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(128);
+            for chunk in tokens.chunks(microbatch) {
+                let x_batch = gpu
+                    .alloc_tensor(&[chunk.len() * dim], DType::F32)
+                    .map_err(|e| format!("gemma3-vl prefill x_batch alloc: {e:?}"))?;
+                let result = (|| {
+                    for (i, &t) in chunk.iter().enumerate() {
+                        embed_token(gpu, &self.weights.text, &self.text_cfg, &self.state.x, t)
+                            .map_err(|e| format!("gemma3-vl prefill embed: {e:?}"))?;
+                        gpu.memcpy_dtod_at_auto(
+                            &x_batch.buf,
+                            i * dim * 4,
+                            &self.state.x.buf,
+                            0,
+                            dim * 4,
+                        )
+                        .map_err(|e| format!("gemma3-vl prefill embed copy: {e:?}"))?;
+                    }
+                    let start_pos = self.state.next_pos;
+                    forward_prefill_batch(
+                        gpu,
+                        &self.weights.text,
+                        &self.text_cfg,
+                        &mut self.state,
+                        &x_batch,
+                        chunk.len(),
+                        start_pos,
+                    )
+                    .map_err(|e| format!("gemma3-vl batched prefill: {e:?}"))
+                })();
+                let _ = gpu.free_tensor(x_batch);
+                result?;
+            }
+        } else {
+            for &t in tokens {
+                forward_step(gpu, &self.weights.text, &self.text_cfg, &mut self.state, t)
+                    .map_err(|e| format!("gemma3-vl prefill forward_step: {e:?}"))?;
+            }
         }
         Ok(())
     }

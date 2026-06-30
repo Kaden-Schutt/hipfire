@@ -123,6 +123,45 @@ pub struct KldChunkEvent {
     pub mean_kld: f32,
 }
 
+/// Begin a steering CAPTURE session: the in-forward `maybe_steer_block` hook
+/// accumulates per-block residuals until `SteerFinishCapture`. `num_layers` /
+/// `hidden` size the per-block means.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SteerBeginCaptureRequest {
+    pub num_layers: usize,
+    pub hidden: usize,
+}
+
+/// Prefill one chat turn (system+user) through the hooked forward — recording the
+/// last-prompt-token residual per block — and commit it into the capture means.
+/// Prefill-only: no decode (a decoded token's forward would overwrite the
+/// captured residual).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SteerCaptureRequest {
+    #[serde(default)]
+    pub system: String,
+    pub user: String,
+}
+
+/// Begin a steering APPLY session: the in-forward hook steers/ablates each block
+/// in `[layer_start, layer_end)` using the per-block `directions`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SteerApplyRequest {
+    /// Per-block unit direction (`num_layers × hidden`, row-major).
+    pub directions: Vec<Vec<f32>>,
+    /// `"steer"` (additive `x += s·v`) or `"ablate"` (projective `x -= s·(v·x)v`).
+    pub mode: String,
+    pub strength: f32,
+    pub layer_start: usize,
+    pub layer_end: usize,
+}
+
+/// Per-block capture means returned by `SteerFinishCapture`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SteerMeansResponse {
+    pub means: Vec<Vec<f32>>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -137,6 +176,11 @@ pub enum DaemonRequest {
     ForceAnswer(RequestControl),
     Collect(CollectRequest),
     KldEval(KldEvalRequest),
+    SteerBeginCapture(SteerBeginCaptureRequest),
+    SteerCapture(SteerCaptureRequest),
+    SteerFinishCapture,
+    SteerBeginApply(SteerApplyRequest),
+    SteerClear,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +201,8 @@ pub enum DaemonResponse {
     Collected(CollectResponse),
     KldChunk(KldChunkEvent),
     KldEvaled(KldEvalResponse),
+    SteerCaptured(SteerMeansResponse),
+    SteerOk,
     #[serde(other)]
     Unknown,
 }

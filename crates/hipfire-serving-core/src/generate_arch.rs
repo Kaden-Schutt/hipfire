@@ -2792,7 +2792,10 @@ fn lfm2_argmax(row: &[f32]) -> u32 {
     best_idx as u32
 }
 
-fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
+/// Frame a `{system, user}` turn into the gemma3 chat template the generate path
+/// uses (literal `<bos>` + `<start_of_turn>` framing). Public so the daemon's
+/// steer-capture op templates a turn byte-identically to `generate`.
+pub fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
     let mut framed = String::from("<bos><start_of_turn>user\n");
     if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
         // gemma3 has no system role — HF folds system content into the user turn.

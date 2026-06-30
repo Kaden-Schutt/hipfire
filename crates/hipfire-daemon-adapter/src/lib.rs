@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
     CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, KldChunkEvent, KldEvalRequest,
-    KldEvalResponse, RequestControl,
+    KldEvalResponse, RequestControl, SteerApplyRequest, SteerBeginCaptureRequest,
+    SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
@@ -303,6 +304,77 @@ impl DaemonEngine {
                 DaemonResponse::Error(e) => anyhow::bail!("daemon kld_eval error: {}", e.message),
                 DaemonResponse::Unknown => {}
                 other => tracing::warn!("unexpected response during kld_eval: {other:?}"),
+            }
+        }
+    }
+
+    /// Begin a steering CAPTURE session in the daemon (`maybe_steer_block` starts
+    /// accumulating per-block residual means). Waits for `steer_ok`.
+    pub async fn steer_begin_capture(
+        &mut self,
+        num_layers: usize,
+        hidden: usize,
+    ) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerBeginCapture(
+            SteerBeginCaptureRequest { num_layers, hidden },
+        ))
+        .await?;
+        self.expect_steer_ok("steer_begin_capture").await
+    }
+
+    /// Prefill one chat turn through the hooked forward (no decode) and commit its
+    /// last-prompt-token residuals into the capture means. Waits for `steer_ok`.
+    pub async fn steer_capture(
+        &mut self,
+        system: impl Into<String>,
+        user: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerCapture(SteerCaptureRequest {
+            system: system.into(),
+            user: user.into(),
+        }))
+        .await?;
+        self.expect_steer_ok("steer_capture").await
+    }
+
+    /// End the CAPTURE session and return the accumulated per-block means.
+    pub async fn steer_finish_capture(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.send(&DaemonRequest::SteerFinishCapture).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::SteerCaptured(resp) => return Ok(resp.means),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon steer_finish_capture error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during steer_finish_capture: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Begin an APPLY session in the daemon: each in-range block boundary steers
+    /// or ablates along `directions`. Waits for `steer_ok`.
+    pub async fn steer_begin_apply(&mut self, req: SteerApplyRequest) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerBeginApply(req)).await?;
+        self.expect_steer_ok("steer_begin_apply").await
+    }
+
+    /// Tear down any active steer session in the daemon. Waits for `steer_ok`.
+    pub async fn steer_clear(&mut self) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerClear).await?;
+        self.expect_steer_ok("steer_clear").await
+    }
+
+    /// Drain to the `steer_ok` ack shared by the fire-and-forget steer ops.
+    async fn expect_steer_ok(&mut self, op: &str) -> anyhow::Result<()> {
+        loop {
+            match self.recv().await? {
+                DaemonResponse::SteerOk => return Ok(()),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon {op} error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during {op}: {other:?}"),
             }
         }
     }

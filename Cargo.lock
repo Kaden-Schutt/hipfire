@@ -1497,6 +1497,7 @@ dependencies = [
  "hipfire-runtime",
  "hipfire-serving-core",
  "hipfire-state",
+ "hipfire-steer",
  "hipfire-train",
  "rdna-compute",
  "serde_json",
@@ -1878,11 +1879,14 @@ dependencies = [
 name = "hipfire-steer-harness"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "hip-bridge",
- "hipfire-arch-gemma3",
- "hipfire-runtime",
+ "hipfire-daemon-adapter",
+ "hipfire-daemon-protocol",
+ "hipfire-generate",
+ "hipfire-model",
  "hipfire-steer",
- "rdna-compute",
+ "tokio",
 ]
 
 [[package]]
