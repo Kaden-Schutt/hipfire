@@ -483,8 +483,11 @@ pub struct MiniMaxLayerWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
     /// Optional LQER low-rank correction for the down projection (`None` unless
-    /// the .hfq carries `.w2.lr_u/.lr_v` sidecars).
-    pub down_lr: Option<MiniMaxDownLowRank>,
+    /// the .hfq carries `.w{1,3,2}.lr_u/.lr_v` sidecars). gate=w1→gate_batch,
+    /// up=w3→up_batch (shared input), down=w2→down output (per-expert input).
+    pub gate_lr: Option<MiniMaxLowRank>,
+    pub up_lr: Option<MiniMaxLowRank>,
+    pub down_lr: Option<MiniMaxLowRank>,
 }
 
 pub struct MiniMaxExpertWeights {
@@ -494,17 +497,135 @@ pub struct MiniMaxExpertWeights {
     pub down: WeightTensor,
 }
 
-/// Packed per-expert low-rank down-projection error correction (LQER). `u_data`
-/// holds all experts' U_e[hidden×r] f32 contiguously, `v_data` all V_e[r×inter];
-/// `u_ptrs`/`v_ptrs` are the [2*n_exp] device-pointer tables the indexed kernels
-/// index by routed expert id. The forward adds U_e·(V_e·rot_batch_e) to the down
-/// output before the weighted combine.
-pub struct MiniMaxDownLowRank {
+/// Packed per-expert low-rank error correction (LQER) for one projection.
+/// `u_data` holds all experts' U_e[m_out×r] f32 contiguously, `v_data` all
+/// V_e[r×k_in]; `u_ptrs`/`v_ptrs` are the [2*n_exp] device-pointer tables the
+/// indexed kernels index by routed expert id. The forward adds U_e·(V_e·x_e) to
+/// the projection output. Used independently for gate (w1), up (w3), and down
+/// (w2) — each on-disk tensor carries its own `.lr_u/.lr_v` sidecars.
+pub struct MiniMaxLowRank {
     pub u_data: GpuTensor,
     pub v_data: GpuTensor,
     pub u_ptrs: GpuTensor,
     pub v_ptrs: GpuTensor,
     pub rank: usize,
+}
+
+impl MiniMaxLowRank {
+    fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.u_data);
+        let _ = gpu.free_tensor(self.v_data);
+        let _ = gpu.free_tensor(self.u_ptrs);
+        let _ = gpu.free_tensor(self.v_ptrs);
+    }
+}
+
+/// Per-projection low-rank sidecar accumulator: appends each owned expert's
+/// `<base>.lr_u/.lr_v` (raw f32) into packed blobs, validating a uniform rank.
+/// `rank == 0` ⇒ the .hfq carried no sidecars (correction disabled). Built once
+/// per projection in the expert loop, then `finish`ed into a [`MiniMaxLowRank`].
+#[derive(Default)]
+struct LrAccum {
+    u: Vec<u8>,
+    v: Vec<u8>,
+    u_stride: usize,
+    v_stride: usize,
+    rank: usize,
+}
+
+impl LrAccum {
+    /// Read `<base>.lr_u/.lr_v` for one owned expert and append. `m_out` is the
+    /// projection's output-row count (U is [m_out×r]); `cap` reserves for all
+    /// owned experts. No-op if the sidecars are absent or not F32.
+    fn push(&mut self, hfq: &HfqFile, base: &str, m_out: usize, cap: usize) -> Result<(), String> {
+        let f32_qt = hipfire_runtime::quant::QuantType::F32.code();
+        let (Ok((qtu, u)), Ok((qtv, v))) = (
+            read_tensor(hfq, &format!("{base}.lr_u.weight")),
+            read_tensor(hfq, &format!("{base}.lr_v.weight")),
+        ) else {
+            return Ok(());
+        };
+        if qtu != f32_qt || qtv != f32_qt {
+            return Ok(());
+        }
+        let r = u.len() / 4 / m_out.max(1);
+        if self.rank == 0 {
+            self.rank = r;
+            self.u_stride = u.len();
+            self.v_stride = v.len();
+            self.u.reserve(u.len() * cap);
+            self.v.reserve(v.len() * cap);
+        }
+        if r != self.rank || u.len() != self.u_stride || v.len() != self.v_stride {
+            return Err(format!(
+                "minimax: non-uniform lr stride for {base} (u {}/{}, v {}/{})",
+                u.len(),
+                self.u_stride,
+                v.len(),
+                self.v_stride
+            ));
+        }
+        self.u.extend_from_slice(&u);
+        self.v.extend_from_slice(&v);
+        Ok(())
+    }
+
+    /// Upload the packed blobs and build per-expert pointer tables (mirroring the
+    /// weight tables: owned → base + local*stride, non-owned → base since their
+    /// input is 0). `None` when no sidecars were collected.
+    fn finish(
+        self,
+        gpu: &mut Gpu,
+        n_exp: usize,
+        local_of_global: &[usize],
+        owns: &dyn Fn(usize) -> bool,
+        what: &str,
+    ) -> Result<Option<MiniMaxLowRank>, String> {
+        if self.rank == 0 {
+            return Ok(None);
+        }
+        let u_data = gpu
+            .upload_raw(&self.u, &[self.u.len()])
+            .map_err(|e| format!("minimax: upload {what} lr_u: {e:?}"))?;
+        let v_data = gpu
+            .upload_raw(&self.v, &[self.v.len()])
+            .map_err(|e| format!("minimax: upload {what} lr_v: {e:?}"))?;
+        let u_base = u_data.buf.as_ptr() as u64;
+        let v_base = v_data.buf.as_ptr() as u64;
+        let mk = |base: u64, stride: usize| -> Vec<u8> {
+            (0..n_exp)
+                .flat_map(|e| {
+                    let ptr = if owns(e) {
+                        base + (local_of_global[e] * stride) as u64
+                    } else {
+                        base
+                    };
+                    ptr.to_ne_bytes()
+                })
+                .collect()
+        };
+        let u_bytes = mk(u_base, self.u_stride);
+        let v_bytes = mk(v_base, self.v_stride);
+        let u_ptrs = gpu
+            .alloc_tensor(&[2 * n_exp], DType::F32)
+            .map_err(|e| format!("minimax: alloc {what} lr_u ptrs: {e:?}"))?;
+        let v_ptrs = gpu
+            .alloc_tensor(&[2 * n_exp], DType::F32)
+            .map_err(|e| format!("minimax: alloc {what} lr_v ptrs: {e:?}"))?;
+        gpu.hip
+            .memcpy_htod(&u_ptrs.buf, &u_bytes)
+            .map_err(|e| format!("minimax: htod {what} lr_u ptrs: {e:?}"))?;
+        gpu.hip
+            .memcpy_htod(&v_ptrs.buf, &v_bytes)
+            .map_err(|e| format!("minimax: htod {what} lr_v ptrs: {e:?}"))?;
+        Ok(Some(MiniMaxLowRank {
+            u_data,
+            v_data,
+            u_ptrs,
+            v_ptrs,
+            rank: self.rank,
+        }))
+    }
 }
 
 pub struct MiniMaxWeights {
@@ -616,16 +737,13 @@ impl MiniMaxWeights {
             let mut dn_stride = 0usize;
             let mut qt_gu = 0u8;
             let mut qt_dn = 0u8;
-            // Optional LQER low-rank correction for the DOWN projection: per-expert
-            // U_e[hidden,r] / V_e[r,inter] f32 sidecars (`.w2.lr_u/.lr_v`). Packed
-            // into per-projection blobs like the weights; the forward adds
-            // U_e·(V_e·rot_batch_e) into the down output. `dn_lr_rank == 0` ⇒ the
-            // .hfq carries no lr sidecars (correction disabled).
-            let mut dn_u_combined: Vec<u8> = Vec::new();
-            let mut dn_v_combined: Vec<u8> = Vec::new();
-            let mut dn_u_stride = 0usize;
-            let mut dn_v_stride = 0usize;
-            let mut dn_lr_rank = 0usize;
+            // Optional LQER low-rank correction, accumulated per projection from
+            // the per-expert `.w{1,3,2}.lr_u/.lr_v` f32 sidecars (present only when
+            // the .hfq was quantized with HIPFIRE_LOWRANK_R>0). gate=w1, up=w3,
+            // down=w2; empty (rank 0) ⇒ correction disabled.
+            let mut gate_acc = LrAccum::default();
+            let mut up_acc = LrAccum::default();
+            let mut down_acc = LrAccum::default();
             // EP shard: only upload rank-owned experts into the compact blob.
             // `local_of_global[e]` maps a global expert id to its slot in the
             // compact (owned-only) blob, or usize::MAX if not owned by this rank.
@@ -684,43 +802,15 @@ impl MiniMaxWeights {
                     gu_combined.extend_from_slice(&w1);
                     gu_combined.extend_from_slice(&w3);
                     dn_combined.extend_from_slice(&w2);
-                    // Down low-rank sidecars (f32, raw LE). Present only when the
-                    // .hfq was quantized with HIPFIRE_LOWRANK_R>0. U_e is
-                    // [hidden×r], V_e is [r×inter]; r is uniform across experts.
-                    if let (Ok((qtu, ulr)), Ok((qtv, vlr))) = (
-                        read_tensor(hfq, &format!("{ep}.w2.lr_u.weight")),
-                        read_tensor(hfq, &format!("{ep}.w2.lr_v.weight")),
-                    ) {
-                        // F32 sidecars only; derive r from U's length (hidden·r).
-                        if qtu == hipfire_runtime::quant::QuantType::F32.code()
-                            && qtv == hipfire_runtime::quant::QuantType::F32.code()
-                        {
-                            let r = ulr.len() / 4 / hidden;
-                            if dn_lr_rank == 0 {
-                                dn_lr_rank = r;
-                                dn_u_stride = ulr.len();
-                                dn_v_stride = vlr.len();
-                                let cap = shard
-                                    .map(|(s, _)| s.experts_per_rank(n_exp))
-                                    .unwrap_or(n_exp);
-                                dn_u_combined.reserve(ulr.len() * cap);
-                                dn_v_combined.reserve(vlr.len() * cap);
-                            }
-                            if r == dn_lr_rank
-                                && ulr.len() == dn_u_stride
-                                && vlr.len() == dn_v_stride
-                            {
-                                dn_u_combined.extend_from_slice(&ulr);
-                                dn_v_combined.extend_from_slice(&vlr);
-                            } else {
-                                return Err(format!(
-                                    "minimax L{l}E{e}: non-uniform down lr stride (u {}/{dn_u_stride}, v {}/{dn_v_stride})",
-                                    ulr.len(),
-                                    vlr.len()
-                                ));
-                            }
-                        }
-                    }
+                    // LQER low-rank sidecars per projection (gate=w1, up=w3 carry
+                    // [inter×r] output rows; down=w2 carries [hidden×r]). Absent
+                    // sidecars are a no-op.
+                    let cap = shard
+                        .map(|(s, _)| s.experts_per_rank(n_exp))
+                        .unwrap_or(n_exp);
+                    gate_acc.push(hfq, &format!("{ep}.w1"), inter, cap)?;
+                    up_acc.push(hfq, &format!("{ep}.w3"), inter, cap)?;
+                    down_acc.push(hfq, &format!("{ep}.w2"), hidden, cap)?;
                 }
                 // Non-owned: w1/w3/w2 read from the file (for stride validation)
                 // then dropped — never uploaded. That is the EP memory win.
@@ -816,54 +906,19 @@ impl MiniMaxWeights {
             // Down low-rank U/V: upload the packed blobs and build per-expert
             // pointer tables mirroring `dn_bytes` (non-owned reuse the base — their
             // rotated input is 0 so the correction is 0). `None` when no sidecars.
-            let down_lr = if dn_lr_rank > 0 {
-                let u_data = gpu
-                    .upload_raw(&dn_u_combined, &[dn_u_combined.len()])
-                    .map_err(|e| format!("minimax L{l}: upload down lr_u: {e:?}"))?;
-                let v_data = gpu
-                    .upload_raw(&dn_v_combined, &[dn_v_combined.len()])
-                    .map_err(|e| format!("minimax L{l}: upload down lr_v: {e:?}"))?;
-                let u_base = u_data.buf.as_ptr() as u64;
-                let v_base = v_data.buf.as_ptr() as u64;
-                let mk = |base: u64, stride: usize| -> Vec<u8> {
-                    (0..n_exp)
-                        .flat_map(|e| {
-                            let ptr = if owns(e) {
-                                base + (local_of_global[e] * stride) as u64
-                            } else {
-                                base
-                            };
-                            ptr.to_ne_bytes()
-                        })
-                        .collect()
-                };
-                let u_bytes = mk(u_base, dn_u_stride);
-                let v_bytes = mk(v_base, dn_v_stride);
-                let u_ptrs = gpu
-                    .alloc_tensor(&[2 * n_exp], DType::F32)
-                    .map_err(|e| format!("minimax: alloc down lr_u ptrs: {e:?}"))?;
-                let v_ptrs = gpu
-                    .alloc_tensor(&[2 * n_exp], DType::F32)
-                    .map_err(|e| format!("minimax: alloc down lr_v ptrs: {e:?}"))?;
-                gpu.hip
-                    .memcpy_htod(&u_ptrs.buf, &u_bytes)
-                    .map_err(|e| format!("minimax: htod down lr_u ptrs: {e:?}"))?;
-                gpu.hip
-                    .memcpy_htod(&v_ptrs.buf, &v_bytes)
-                    .map_err(|e| format!("minimax: htod down lr_v ptrs: {e:?}"))?;
-                if l == 0 {
-                    eprintln!("minimax: down low-rank correction active (rank {dn_lr_rank})");
+            let gate_lr = gate_acc.finish(gpu, n_exp, &local_of_global, &owns, "gate")?;
+            let up_lr = up_acc.finish(gpu, n_exp, &local_of_global, &owns, "up")?;
+            let down_lr = down_acc.finish(gpu, n_exp, &local_of_global, &owns, "down")?;
+            if l == 0 {
+                if let Some(r) = gate_lr.as_ref().or(down_lr.as_ref()).map(|x| x.rank) {
+                    eprintln!(
+                        "minimax: low-rank correction active (rank {r}; gate={} up={} down={})",
+                        gate_lr.is_some(),
+                        up_lr.is_some(),
+                        down_lr.is_some()
+                    );
                 }
-                Some(MiniMaxDownLowRank {
-                    u_data,
-                    v_data,
-                    u_ptrs,
-                    v_ptrs,
-                    rank: dn_lr_rank,
-                })
-            } else {
-                None
-            };
+            }
             let expert_gate_up_ptrs = gpu
                 .alloc_tensor(&[2 * n_exp], DType::F32)
                 .map_err(|e| format!("minimax: alloc gu_ptrs: {e:?}"))?;
@@ -891,6 +946,8 @@ impl MiniMaxWeights {
                 experts,
                 expert_gate_up_ptrs,
                 expert_down_ptrs,
+                gate_lr,
+                up_lr,
                 down_lr,
             });
         }
@@ -982,11 +1039,11 @@ impl MiniMaxLayerWeights {
         // blobs themselves — freed once here, no double-free with `experts`.
         let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
         let _ = gpu.free_tensor(self.expert_down_ptrs);
-        if let Some(lr) = self.down_lr {
-            let _ = gpu.free_tensor(lr.u_data);
-            let _ = gpu.free_tensor(lr.v_data);
-            let _ = gpu.free_tensor(lr.u_ptrs);
-            let _ = gpu.free_tensor(lr.v_ptrs);
+        for lr in [self.gate_lr, self.up_lr, self.down_lr]
+            .into_iter()
+            .flatten()
+        {
+            lr.free(gpu);
         }
     }
 }

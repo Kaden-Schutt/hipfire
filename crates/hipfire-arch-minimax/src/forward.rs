@@ -230,7 +230,12 @@ fn decode_step_body(
     let lowered_supports = weights
         .layers
         .first()
-        .map(|l0| l0.experts[0].down.gpu_dtype != DType::Qtip3G256 && l0.down_lr.is_none())
+        .map(|l0| {
+            l0.experts[0].down.gpu_dtype != DType::Qtip3G256
+                && l0.gate_lr.is_none()
+                && l0.up_lr.is_none()
+                && l0.down_lr.is_none()
+        })
         .unwrap_or(true);
     if minimax_forward_lowered_enabled()
         && lowered_supports
@@ -454,6 +459,44 @@ fn decode_step_body(
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up qtip3: {e:?}"))?,
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
+        }
+
+        // LQER low-rank correction for gate (w1 → gate_batch) and up (w3 →
+        // up_batch). Both share the rotated token input ffn_x_rot (x_stride=0)
+        // and write the contiguous [k_top×inter] gate/up buffers directly, before
+        // silu fuses them — w1/w3 are independent tensors with their own U/V, so
+        // no fused split-output kernel is needed.
+        for (lr, out) in [
+            (layer.gate_lr.as_ref(), &state.gate_batch),
+            (layer.up_lr.as_ref(), &state.up_batch),
+        ] {
+            if let Some(lr) = lr {
+                let t = gpu
+                    .alloc_tensor(&[k_top, lr.rank], DType::F32)
+                    .map_err(|e| format!("minimax L{l}: alloc gate/up lr t: {e:?}"))?;
+                gpu.gemv_lowrank_moe_proj(
+                    &lr.v_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &t,
+                    lr.rank,
+                    hidden,
+                    k_top,
+                    0,
+                )
+                .map_err(|e| format!("minimax L{l}: gate/up lr proj: {e:?}"))?;
+                gpu.gemv_lowrank_moe_expand(
+                    &lr.u_ptrs,
+                    &state.topk_indices,
+                    &t,
+                    out,
+                    inter,
+                    lr.rank,
+                    k_top,
+                )
+                .map_err(|e| format!("minimax L{l}: gate/up lr expand: {e:?}"))?;
+                let _ = gpu.free_tensor(t);
+            }
         }
 
         fused_silu_mul_rotate_mq_batched_for(
