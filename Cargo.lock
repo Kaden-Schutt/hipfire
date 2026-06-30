@@ -1873,6 +1873,8 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "rdna-compute",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
