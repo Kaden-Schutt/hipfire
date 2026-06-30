@@ -19,7 +19,12 @@ impl Gpu {
         self.ensure_kernel("zaya_cca", kernels::ZAYA_CCA_SRC, func)
     }
 
-    fn zaya_launch(&self, func: &str, threads: usize, params: &mut Vec<*mut c_void>) -> HipResult<()> {
+    fn zaya_launch(
+        &self,
+        func: &str,
+        threads: usize,
+        params: &mut Vec<*mut c_void>,
+    ) -> HipResult<()> {
         let grid = (threads as u32).div_ceil(BLOCK);
         let f = &self.functions[func];
         unsafe {
@@ -52,7 +57,13 @@ impl Gpu {
     }
 
     /// Broadcast bias add: `x[i] += bias[i % d]`, `n = s*d`.
-    pub fn zaya_bias_add_f32(&mut self, x: &GpuTensor, bias: &GpuTensor, d: usize, n: usize) -> HipResult<()> {
+    pub fn zaya_bias_add_f32(
+        &mut self,
+        x: &GpuTensor,
+        bias: &GpuTensor,
+        d: usize,
+        n: usize,
+    ) -> HipResult<()> {
         self.zaya_ensure("zaya_bias_add_f32")?;
         let (xp, bp) = (x.buf.as_ptr(), bias.buf.as_ptr());
         let (di, ni) = (d as i32, n as i32);
@@ -77,7 +88,12 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_affine_input_f32")?;
-        let (op, xp, sp, bp) = (out.buf.as_ptr(), x.buf.as_ptr(), scale.buf.as_ptr(), bias.buf.as_ptr());
+        let (op, xp, sp, bp) = (
+            out.buf.as_ptr(),
+            x.buf.as_ptr(),
+            scale.buf.as_ptr(),
+            bias.buf.as_ptr(),
+        );
         let (di, ni) = (d as i32, n as i32);
         let mut p: Vec<*mut c_void> = vec![
             &op as *const _ as *mut c_void,
@@ -107,7 +123,12 @@ impl Gpu {
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_affine_residual_f32")?;
         let (op, hp, rp) = (out.buf.as_ptr(), h.buf.as_ptr(), res.buf.as_ptr());
-        let (hsp, hbp, rsp, rbp) = (hs.buf.as_ptr(), hb.buf.as_ptr(), rs.buf.as_ptr(), rb.buf.as_ptr());
+        let (hsp, hbp, rsp, rbp) = (
+            hs.buf.as_ptr(),
+            hb.buf.as_ptr(),
+            rs.buf.as_ptr(),
+            rb.buf.as_ptr(),
+        );
         let (di, ni) = (d as i32, n as i32);
         let mut p: Vec<*mut c_void> = vec![
             &op as *const _ as *mut c_void,
@@ -167,8 +188,19 @@ impl Gpu {
         out_len: usize,
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_conv1d_valid_f32")?;
-        let (op, ip, wp, bp) = (out.buf.as_ptr(), input.buf.as_ptr(), weight.buf.as_ptr(), bias.buf.as_ptr());
-        let (ch, gr, kn, il, ol) = (channels as i32, groups as i32, kernel as i32, in_len as i32, out_len as i32);
+        let (op, ip, wp, bp) = (
+            out.buf.as_ptr(),
+            input.buf.as_ptr(),
+            weight.buf.as_ptr(),
+            bias.buf.as_ptr(),
+        );
+        let (ch, gr, kn, il, ol) = (
+            channels as i32,
+            groups as i32,
+            kernel as i32,
+            in_len as i32,
+            out_len as i32,
+        );
         let mut p: Vec<*mut c_void> = vec![
             &op as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -199,7 +231,12 @@ impl Gpu {
         mode: i32,
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_qk_residual_f32")?;
-        let (qrp, krp, qp, kp) = (query_res.buf.as_ptr(), key_res.buf.as_ptr(), q.buf.as_ptr(), k.buf.as_ptr());
+        let (qrp, krp, qp, kp) = (
+            query_res.buf.as_ptr(),
+            key_res.buf.as_ptr(),
+            q.buf.as_ptr(),
+            k.buf.as_ptr(),
+        );
         let (si, nqi, nkvi, hdi) = (s as i32, nq as i32, nkv as i32, hd as i32);
         let mut p: Vec<*mut c_void> = vec![
             &qrp as *const _ as *mut c_void,
@@ -329,7 +366,13 @@ impl Gpu {
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_rope_partial_f32")?;
         let xp = x.buf.as_ptr();
-        let (si, hi, hdi, nr, pb) = (s as i32, heads as i32, hd as i32, n_rot as i32, pos_base as i32);
+        let (si, hi, hdi, nr, pb) = (
+            s as i32,
+            heads as i32,
+            hd as i32,
+            n_rot as i32,
+            pos_base as i32,
+        );
         let mut p: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &si as *const _ as *mut c_void,
@@ -356,7 +399,13 @@ impl Gpu {
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_strided_copy_f32")?;
         let (dp, sp) = (dst.buf.as_ptr(), src.buf.as_ptr());
-        let (r, ds, ss, so, l) = (rows as i32, dst_stride as i32, src_stride as i32, src_off as i32, len as i32);
+        let (r, ds, ss, so, l) = (
+            rows as i32,
+            dst_stride as i32,
+            src_stride as i32,
+            src_off as i32,
+            len as i32,
+        );
         let mut p: Vec<*mut c_void> = vec![
             &dp as *const _ as *mut c_void,
             &sp as *const _ as *mut c_void,
@@ -392,7 +441,13 @@ impl Gpu {
     }
 
     /// Copy `src[0..n]` into `dst[offset..offset+n]` (KV-cache append).
-    pub fn zaya_write_at_f32(&mut self, dst: &GpuTensor, src: &GpuTensor, offset: usize, n: usize) -> HipResult<()> {
+    pub fn zaya_write_at_f32(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        offset: usize,
+        n: usize,
+    ) -> HipResult<()> {
         self.zaya_ensure("zaya_write_at_f32")?;
         let (dp, sp) = (dst.buf.as_ptr(), src.buf.as_ptr());
         let (off, ni) = (offset as i32, n as i32);
@@ -420,7 +475,12 @@ impl Gpu {
         scaling: f32,
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_gqa_decode_f32")?;
-        let (op, qp, kp, vp) = (out.buf.as_ptr(), q.buf.as_ptr(), k_cache.buf.as_ptr(), v_cache.buf.as_ptr());
+        let (op, qp, kp, vp) = (
+            out.buf.as_ptr(),
+            q.buf.as_ptr(),
+            k_cache.buf.as_ptr(),
+            v_cache.buf.as_ptr(),
+        );
         let (posi, nqi, nkvi, hdi) = (pos as i32, nq as i32, nkv as i32, hd as i32);
         let mut p: Vec<*mut c_void> = vec![
             &op as *const _ as *mut c_void,
@@ -452,7 +512,12 @@ impl Gpu {
         scaling: f32,
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_gqa_attn_f32")?;
-        let (op, qp, kp, vp) = (out.buf.as_ptr(), q.buf.as_ptr(), k.buf.as_ptr(), v.buf.as_ptr());
+        let (op, qp, kp, vp) = (
+            out.buf.as_ptr(),
+            q.buf.as_ptr(),
+            k.buf.as_ptr(),
+            v.buf.as_ptr(),
+        );
         let (si, nqi, nkvi, hdi) = (s as i32, nq as i32, nkv as i32, hd as i32);
         let mut p: Vec<*mut c_void> = vec![
             &op as *const _ as *mut c_void,
@@ -478,7 +543,11 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.zaya_ensure("zaya_eda_add_f32")?;
-        let (rp, pp, sp) = (router_hidden.buf.as_ptr(), prev.buf.as_ptr(), scale.buf.as_ptr());
+        let (rp, pp, sp) = (
+            router_hidden.buf.as_ptr(),
+            prev.buf.as_ptr(),
+            scale.buf.as_ptr(),
+        );
         let (rhi, ni) = (rh as i32, n as i32);
         let mut p: Vec<*mut c_void> = vec![
             &rp as *const _ as *mut c_void,

@@ -2071,28 +2071,7 @@ fn quantize_mq2g256_lloyd_gptq(
 
 /// Inverse FWHT for MQ-family dequantization (sibling of cpu_fwht_256).
 fn cpu_inv_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert!(x.len() == 256);
-    for i in 0..256 {
-        x[i] *= signs2[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 {
-        x[i] *= scale * signs1[i];
-    }
+    cpu_fwht_256(x, signs2, signs1);
 }
 
 /// MQ2-Lloyd dequantize for round-trip / re-quant pipelines. Mirrors

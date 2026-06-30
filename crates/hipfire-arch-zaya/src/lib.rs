@@ -13,7 +13,7 @@
 //! `num_hidden_layers / 2` (e.g. 40) hybrid decoder blocks. See the upstream
 //! `convert_zaya_weights_to_hf.py` (`new_layer_idx = old // 2`) — this is the
 //! ground truth this crate mirrors, vendored at
-//! `third_party/transformers` (origin Zyphra/transformers @ `zaya1`).
+//! `third_party/zyphra-transformers` (origin Zyphra/transformers @ `zaya1`).
 //!
 //! Z0 (this module): the config + block taxonomy only — pure, GPU-free, parsed
 //! from the HF `config.json`. The CCA mixer (two causal conv1d over q/k, L2 qk-norm

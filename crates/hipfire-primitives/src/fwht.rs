@@ -6,13 +6,26 @@
 /// (orthonormal, 1/√256 = 1/16 normalization). Inverse = call with signs swapped.
 pub fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
-    for i in 0..256 {
+    signed_fwht(x, signs1, signs2);
+}
+
+/// In-place signed FWHT over a power-of-two slice.
+///
+/// Applies `signs1` before the Hadamard butterfly and `signs2` after the
+/// orthonormal `1/sqrt(n)` scale. For `n == 256`, this is the same transform as
+/// [`cpu_fwht_256`].
+pub fn signed_fwht(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    let n = x.len();
+    assert!(n.is_power_of_two(), "FWHT length must be a power of two");
+    assert_eq!(signs1.len(), n);
+    assert_eq!(signs2.len(), n);
+    for i in 0..n {
         x[i] *= signs1[i];
     }
     let mut stride = 1;
-    while stride < 256 {
+    while stride < n {
         let mut i = 0;
-        while i < 256 {
+        while i < n {
             for j in 0..stride {
                 let a = x[i + j];
                 let b = x[i + j + stride];
@@ -23,8 +36,8 @@ pub fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         }
         stride <<= 1;
     }
-    let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 {
+    let scale = 1.0 / (n as f32).sqrt();
+    for i in 0..n {
         x[i] *= scale * signs2[i];
     }
 }

@@ -3,10 +3,11 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! ZAYA1 CPU reference forward (f32), a faithful port of the upstream
-//! `modeling_zaya.py` (vendored `third_party/transformers` @ `zaya1`). This is the
-//! correctness oracle the GPU path is validated against; it captures per-block
-//! hidden states so they can be compared to `golden/zaya_golden.npz` (≥0.999
-//! cosine). Batch is implicitly 1; activations are `[seq, dim]` row-major.
+//! `modeling_zaya.py` (vendored `third_party/zyphra-transformers` @ `zaya1`).
+//! This is the correctness oracle the GPU path is validated against; it captures
+//! per-block hidden states so they can be compared to `golden/zaya_golden.npz`
+//! (≥0.999 cosine). Batch is implicitly 1; activations are `[seq, dim]`
+//! row-major.
 //!
 //! Pipeline per hybrid block (`ZayaDecoderLayer`):
 //!   residual = h

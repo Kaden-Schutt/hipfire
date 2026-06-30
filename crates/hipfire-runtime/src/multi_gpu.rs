@@ -757,9 +757,12 @@ pub fn resolve_primary_device_id(
     if let Some(id) = explicit {
         return Ok((validate(id)?, None));
     }
-    if let Some(first) = hipfire_devices
-        .and_then(|s| s.split(',').map(str::trim).find(|p| !p.is_empty()).map(str::to_string))
-    {
+    if let Some(first) = hipfire_devices.and_then(|s| {
+        s.split(',')
+            .map(str::trim)
+            .find(|p| !p.is_empty())
+            .map(str::to_string)
+    }) {
         let id = first
             .parse::<i32>()
             .map_err(|e| HipError::new(0, &format!("HIPFIRE_DEVICES parse: {e}")))?;
@@ -875,7 +878,10 @@ mod tests {
 
     #[test]
     fn resolve_primary_device_explicit_override_is_silent() {
-        assert_eq!(resolve_primary_device_id(4, None, Some(2)).unwrap(), (2, None));
+        assert_eq!(
+            resolve_primary_device_id(4, None, Some(2)).unwrap(),
+            (2, None)
+        );
     }
 
     #[test]

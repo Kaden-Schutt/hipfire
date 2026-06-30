@@ -10,7 +10,10 @@
 use rdna_compute::{DType, Gpu};
 
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn main() {
@@ -21,8 +24,12 @@ fn main() {
     let (channels, groups, kernel, in_len) = (4usize, 2usize, 2usize, 5usize);
     let out_len = in_len - kernel + 1;
     let per = channels / groups;
-    let input: Vec<f32> = (0..channels * in_len).map(|i| (i as f32) * 0.1 - 1.0).collect();
-    let weight: Vec<f32> = (0..channels * per * kernel).map(|i| 0.05 * (i as f32) + 0.2).collect();
+    let input: Vec<f32> = (0..channels * in_len)
+        .map(|i| (i as f32) * 0.1 - 1.0)
+        .collect();
+    let weight: Vec<f32> = (0..channels * per * kernel)
+        .map(|i| 0.05 * (i as f32) + 0.2)
+        .collect();
     let bias: Vec<f32> = (0..channels).map(|c| 0.01 * c as f32).collect();
     // CPU ref
     let mut cpu = vec![0f32; channels * out_len];
@@ -42,8 +49,10 @@ fn main() {
     let g_w = gpu.upload_f32(&weight, &[weight.len()]).unwrap();
     let g_b = gpu.upload_f32(&bias, &[channels]).unwrap();
     let g_out = gpu.zeros(&[channels * out_len], DType::F32).unwrap();
-    gpu.zaya_conv1d_valid_f32(&g_out, &g_in, &g_w, &g_b, channels, groups, kernel, in_len, out_len)
-        .unwrap();
+    gpu.zaya_conv1d_valid_f32(
+        &g_out, &g_in, &g_w, &g_b, channels, groups, kernel, in_len, out_len,
+    )
+    .unwrap();
     let got = gpu.download_f32(&g_out).unwrap();
     println!("conv1d_valid : maxdiff={:.3e}", maxdiff(&cpu, &got));
 
@@ -56,7 +65,12 @@ fn main() {
     for t in 0..s {
         for h in 0..heads {
             let row = &mut cpu2[(t * heads + h) * hd..(t * heads + h + 1) * hd];
-            let nrm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(f32::EPSILON);
+            let nrm: f32 = row
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt()
+                .max(f32::EPSILON);
             let inv = scale / nrm;
             for v in row.iter_mut() {
                 *v = *v * inv * temp[h];
@@ -84,11 +98,21 @@ fn main() {
         let c = i % d;
         cpu3[i] = (hh[i] + hb[c]) * hs[c] + (rr[i] + rb[c]) * rs[c];
     }
-    let (gh, gr) = (gpu.upload_f32(&hh, &[n]).unwrap(), gpu.upload_f32(&rr, &[n]).unwrap());
-    let (ghs, ghb) = (gpu.upload_f32(&hs, &[d]).unwrap(), gpu.upload_f32(&hb, &[d]).unwrap());
-    let (grs, grb) = (gpu.upload_f32(&rs, &[d]).unwrap(), gpu.upload_f32(&rb, &[d]).unwrap());
+    let (gh, gr) = (
+        gpu.upload_f32(&hh, &[n]).unwrap(),
+        gpu.upload_f32(&rr, &[n]).unwrap(),
+    );
+    let (ghs, ghb) = (
+        gpu.upload_f32(&hs, &[d]).unwrap(),
+        gpu.upload_f32(&hb, &[d]).unwrap(),
+    );
+    let (grs, grb) = (
+        gpu.upload_f32(&rs, &[d]).unwrap(),
+        gpu.upload_f32(&rb, &[d]).unwrap(),
+    );
     let go = gpu.zeros(&[n], DType::F32).unwrap();
-    gpu.zaya_affine_residual_f32(&go, &gh, &gr, &ghs, &ghb, &grs, &grb, d, n).unwrap();
+    gpu.zaya_affine_residual_f32(&go, &gh, &gr, &ghs, &ghb, &grs, &grb, d, n)
+        .unwrap();
     let got3 = gpu.download_f32(&go).unwrap();
     println!("affine_resid : maxdiff={:.3e}", maxdiff(&cpu3, &got3));
 
@@ -98,10 +122,17 @@ fn main() {
         let s = if x < 0.0 { -1.0 } else { 1.0 };
         let x = x.abs();
         let t = 1.0 / (1.0 + 0.3275911 * x);
-        let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t) * (-x * x).exp();
+        let y = 1.0
+            - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+                + 0.254829592)
+                * t)
+                * (-x * x).exp();
         s * y
     };
-    let cpu4: Vec<f32> = gx.iter().map(|&v| 0.5 * v * (1.0 + erf(v * std::f32::consts::FRAC_1_SQRT_2))).collect();
+    let cpu4: Vec<f32> = gx
+        .iter()
+        .map(|&v| 0.5 * v * (1.0 + erf(v * std::f32::consts::FRAC_1_SQRT_2)))
+        .collect();
     let g4 = gpu.upload_f32(&gx, &[gx.len()]).unwrap();
     gpu.zaya_gelu_exact_f32(&g4, gx.len()).unwrap();
     let got4 = gpu.download_f32(&g4).unwrap();
@@ -129,8 +160,12 @@ fn main() {
         let id_bytes: Vec<u8> = ids.iter().flat_map(|x| x.to_le_bytes()).collect();
         let g_ids = gpu.upload_raw(&id_bytes, &[sq]).unwrap();
         let out = gpu.zeros(&[sq * hidden], DType::F32).unwrap();
-        gpu.zaya_embed_gather_f32(&out, &g_e, &g_ids, hidden, sq * hidden).unwrap();
-        diffs.push(("embed_gather", maxdiff(&cpu, &gpu.download_f32(&out).unwrap())));
+        gpu.zaya_embed_gather_f32(&out, &g_e, &g_ids, hidden, sq * hidden)
+            .unwrap();
+        diffs.push((
+            "embed_gather",
+            maxdiff(&cpu, &gpu.download_f32(&out).unwrap()),
+        ));
     }
 
     // ── 6. value compose + qk_residual + add_conv_residual + rope + gqa_attn ───
@@ -150,8 +185,12 @@ fn main() {
         let gvc = gpu.upload_f32(&vcur, &[vcur.len()]).unwrap();
         let gvd = gpu.upload_f32(&vdel, &[vdel.len()]).unwrap();
         let gval = gpu.zeros(&[sq * nkv * hd], DType::F32).unwrap();
-        gpu.zaya_value_compose_f32(&gval, &gvc, &gvd, sq, nkv, hd).unwrap();
-        diffs.push(("value_compose", maxdiff(&cval, &gpu.download_f32(&gval).unwrap())));
+        gpu.zaya_value_compose_f32(&gval, &gvc, &gvd, sq, nkv, hd)
+            .unwrap();
+        diffs.push((
+            "value_compose",
+            maxdiff(&cval, &gpu.download_f32(&gval).unwrap()),
+        ));
 
         // qk_residual
         let q: Vec<f32> = (0..sq * nq * hd).map(|i| 0.1 * i as f32).collect();
@@ -182,10 +221,18 @@ fn main() {
         let gk = gpu.upload_f32(&k, &[k.len()]).unwrap();
         let gqr = gpu.zeros(&[sq * nq * hd], DType::F32).unwrap();
         let gkr = gpu.zeros(&[sq * nkv * hd], DType::F32).unwrap();
-        gpu.zaya_qk_residual_f32(&gqr, &gkr, &gq, &gk, sq, nq, nkv, hd, 0).unwrap();
-        gpu.zaya_qk_residual_f32(&gqr, &gkr, &gq, &gk, sq, nq, nkv, hd, 1).unwrap();
-        diffs.push(("qk_residual_q", maxdiff(&qres, &gpu.download_f32(&gqr).unwrap())));
-        diffs.push(("qk_residual_k", maxdiff(&kres, &gpu.download_f32(&gkr).unwrap())));
+        gpu.zaya_qk_residual_f32(&gqr, &gkr, &gq, &gk, sq, nq, nkv, hd, 0)
+            .unwrap();
+        gpu.zaya_qk_residual_f32(&gqr, &gkr, &gq, &gk, sq, nq, nkv, hd, 1)
+            .unwrap();
+        diffs.push((
+            "qk_residual_q",
+            maxdiff(&qres, &gpu.download_f32(&gqr).unwrap()),
+        ));
+        diffs.push((
+            "qk_residual_k",
+            maxdiff(&kres, &gpu.download_f32(&gkr).unwrap()),
+        ));
 
         // gqa_attn (no rope/norm for the math check; just causal softmax)
         let scaling = 1.0 / (hd as f32).sqrt();
@@ -223,7 +270,8 @@ fn main() {
         let gkk = gpu.upload_f32(&kk, &[kk.len()]).unwrap();
         let gvv = gpu.upload_f32(&vv, &[vv.len()]).unwrap();
         let gca = gpu.zeros(&[sq * nq * hd], DType::F32).unwrap();
-        gpu.zaya_gqa_attn_f32(&gca, &gqq, &gkk, &gvv, sq, nq, nkv, hd, scaling).unwrap();
+        gpu.zaya_gqa_attn_f32(&gca, &gqq, &gkk, &gvv, sq, nq, nkv, hd, scaling)
+            .unwrap();
         diffs.push(("gqa_attn", maxdiff(&catt, &gpu.download_f32(&gca).unwrap())));
     }
 
@@ -233,5 +281,8 @@ fn main() {
         println!("{name:<16} maxdiff={d:.3e}");
         worst = worst.max(*d);
     }
-    println!("\nworst maxdiff = {worst:.3e}  {}", if worst < 1e-4 { "PASS" } else { "FAIL" });
+    println!(
+        "\nworst maxdiff = {worst:.3e}  {}",
+        if worst < 1e-4 { "PASS" } else { "FAIL" }
+    );
 }

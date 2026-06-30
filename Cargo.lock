@@ -1348,6 +1348,7 @@ dependencies = [
  "hipfire-kld",
  "hipfire-model",
  "hipfire-npu",
+ "hipfire-primitives",
  "hipfire-rocm",
  "hipfire-runtime",
  "libc",
@@ -3086,6 +3087,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-kvquant",
+ "hipfire-primitives",
 ]
 
 [[package]]

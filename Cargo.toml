@@ -23,6 +23,7 @@ members = [
     "crates/hipfire-vision-cache",
     "crates/hipfire-npu",
     "crates/hipfire-xdna",
+    "crates/hipfire-primitives",
     "crates/hipfire-prompt",
     "crates/hipfire-rocm",
     "crates/hipfire-runtime",
@@ -67,6 +68,7 @@ exclude = [
     "crates/hipfire-admin-ui",
     "crates/hipfire-chat-ui",
     "crates/hipfire-web-ui",
+    "third_party/ares",
 ]
 
 [workspace.package]

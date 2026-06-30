@@ -10,6 +10,7 @@ deltanet = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-primitives = { path = "../hipfire-primitives" }
 
 [dev-dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }

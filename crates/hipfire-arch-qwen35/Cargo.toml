@@ -23,6 +23,7 @@ hipfire-kld = { path = "../hipfire-kld" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-npu = { path = "../hipfire-npu" }
 hipfire-rocm = { path = "../hipfire-rocm" }
 hip-bridge = { path = "../hip-bridge" }

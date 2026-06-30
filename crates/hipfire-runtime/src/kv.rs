@@ -12,6 +12,7 @@
 
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
+use hipfire_primitives::fwht;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// GPU-resident KV cache for autoregressive generation.
@@ -1622,17 +1623,7 @@ impl KvCache {
 
     /// Generate deterministic ±1 sign array for FWHT.
     pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-        let mut state = seed;
-        (0..n)
-            .map(|_| {
-                state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                if (state >> 16) & 1 == 1 {
-                    1.0f32
-                } else {
-                    -1.0f32
-                }
-            })
-            .collect()
+        fwht::gen_fwht_signs(seed, n)
     }
 
     /// Free all GPU tensors in this cache. Call before drop to return VRAM.

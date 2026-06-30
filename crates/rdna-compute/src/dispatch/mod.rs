@@ -768,22 +768,8 @@ pub struct Gpu {
     pub capture_handler: Option<Arc<dyn ActivationCapture>>,
 }
 
-/// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
-/// Deterministic and portable; used by both host-side codec (weight encoding) and
-/// device-side init (`ensure_mq_signs` / `ensure_mq_signs_128`).
-pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
+/// Generate `n` FWHT sign values (+1.0 / -1.0) from the shared Hipfire LCG.
+pub use hipfire_primitives::fwht::gen_fwht_signs;
 
 impl Gpu {
     /// Returns the active stream ref for kernel launches (None = null stream).

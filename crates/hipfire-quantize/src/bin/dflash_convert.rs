@@ -47,6 +47,7 @@
 //! dflash drafts from Qwen3/Qwen3.5 by both arch_id and the presence of
 //! the top-level `dflash` key in metadata.
 
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -201,49 +202,6 @@ fn f32_slice_to_f32_bytes(f32_data: &[f32]) -> Vec<u8> {
 }
 
 // ─── FWHT + MQ quantization ───────────────────────────────────────────────
-
-/// CPU-side FWHT on a 256-element group. Matches the GPU-side
-/// fwht_forward_256 in rdna_compute: signs1 → butterfly → scale → signs2.
-fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert!(x.len() == 256);
-    for i in 0..256 {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 {
-        x[i] *= scale * signs2[i];
-    }
-}
-
-/// Generate FWHT sign table matching the engine's gen_fwht_signs.
-/// Standard MQ4 seeds are 42 (signs1) and 1042 (signs2).
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// 104 bytes per 256 weights (0.406 B/w). Same binary layout as HFQ3-G256.
