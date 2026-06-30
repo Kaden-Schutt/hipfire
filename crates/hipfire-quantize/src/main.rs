@@ -772,6 +772,171 @@ fn qtip_simquant_nbit(
 /// QTIP-trellis the bulk after RoughQuant PCA rotation, protecting the leading
 /// `n_prot` columns (PCA-sorted by eigenvalue descending → highest-energy first)
 /// at full precision with PER-COLUMN granularity. The protected columns are
+// ── BBT-spectral (SpectralLLM) influence scaling ───────────────────────────
+// Reference: "Influence-Inspired Spectral Rotations for Extreme Low-Bit LLM
+// Quantization" (Pavlov). A math-invariant per-input-channel scale derived from
+// per-coordinate spectral (Walsh-Hadamard) activation energy:
+//   h = H x,  Inf_l = E[h_l^2]/Σ_k E[h_k^2],  s_l = (d·Inf_l + 1)^alpha.
+// E[h_l^2] = (H C H^T)_ll where C = E[x x^T] is the calib Hessian. Applied as
+// W' = W·diag(s), x' = x/s (exactly invariant), biasing the quant budget toward
+// high-spectral-energy channels. We probe it on the QTIP sim (the W2/W3 regime
+// where BBT pays off). This is the input-channel-basis variant of the paper's
+// scaling (scale folds into the activation), composed with QTIP's own per-group
+// FWHT — documented as a probe, not the paper's full WHT-rotated recipe.
+
+/// In-place plain normalized FWHT (length = power of two), 1/sqrt(n) scaled.
+fn fwht_norm_pow2(v: &mut [f32]) {
+    let n = v.len();
+    debug_assert!(n.is_power_of_two());
+    let mut h = 1;
+    while h < n {
+        let mut i = 0;
+        while i < n {
+            for j in i..i + h {
+                let a = v[j];
+                let b = v[j + h];
+                v[j] = a + b;
+                v[j + h] = a - b;
+            }
+            i += 2 * h;
+        }
+        h *= 2;
+    }
+    let inv = 1.0 / (n as f32).sqrt();
+    for x in v.iter_mut() {
+        *x *= inv;
+    }
+}
+
+/// Per-coordinate spectral activation energy diag(H C H^T) from a k×k Hessian
+/// `c` (row-major), full-dim Hadamard on k padded to the next power of two.
+/// Returns the first `k` diagonal entries (the active channels).
+fn bbt_spectral_diag(c: &[f32], k: usize) -> Vec<f32> {
+    let kp = k.next_power_of_two();
+    // Y = C H^T : FWHT each row (zero-padded to kp).
+    let mut y = vec![0.0f32; kp * kp];
+    let mut row = vec![0.0f32; kp];
+    for i in 0..k {
+        row[..k].copy_from_slice(&c[i * k..i * k + k]);
+        for r in row.iter_mut().take(kp).skip(k) {
+            *r = 0.0;
+        }
+        fwht_norm_pow2(&mut row);
+        y[i * kp..i * kp + kp].copy_from_slice(&row);
+    }
+    // Z = H Y : FWHT each column; keep only diag(Z)[0..k].
+    let mut col = vec![0.0f32; kp];
+    let mut diag = vec![0.0f32; k];
+    for l in 0..k {
+        for i in 0..kp {
+            col[i] = if i < k { y[i * kp + l] } else { 0.0 };
+        }
+        fwht_norm_pow2(&mut col);
+        diag[l] = col[l]; // (H Y)_{l,l}
+    }
+    diag
+}
+
+/// BBT per-channel scales s_l = (k·Inf_l + 1)^alpha from the spectral diag.
+fn bbt_scales(spec_diag: &[f32], k: usize, alpha: f32) -> Vec<f32> {
+    let total: f64 = spec_diag
+        .iter()
+        .map(|&v| v.max(0.0) as f64)
+        .sum::<f64>()
+        .max(1e-12);
+    spec_diag
+        .iter()
+        .map(|&v| {
+            let inf = (v.max(0.0) as f64) / total; // in [0,1], sums to 1
+            ((k as f64 * inf + 1.0).powf(alpha as f64) as f32).max(1e-2)
+        })
+        .collect::<Vec<f32>>()
+        .into_iter()
+        .take(k)
+        .collect()
+}
+
+/// Rank-`r` approximation of the m×k matrix `e` (row-major) via a randomized
+/// range finder: Ω∼N(0,1) [k×r], Y=EΩ, orthonormalize Y→Q (modified
+/// Gram-Schmidt), B=QᵀE, return E_r = QB. One pass (no power iteration) — enough
+/// for a quant-error CORRECTION term (we want the dominant directions, not exact
+/// singular values). This is the LQER/CALDERA low-rank residual: emit
+/// dequant(W4)+E_r so a W4·A8 GEMM + a 2-WMMA UᵥVᵥ correction recovers most of
+/// the W4→high-bit gap. Returns zeros for r=0, the full matrix for r≥min(m,k).
+fn randomized_lowrank(e: &[f32], m: usize, k: usize, r: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    if r == 0 {
+        return vec![0.0f32; m * k];
+    }
+    if r >= m.min(k) {
+        return e.to_vec();
+    }
+    // Ω [k×r] — xorshift Gaussian-ish (uniform is fine for a range finder).
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let mut omega = vec![0.0f32; k * r];
+    for v in omega.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *v = ((s >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0;
+    }
+    // Y = E·Ω  [m×r] (parallel over rows).
+    let mut y = vec![0.0f32; m * r];
+    y.par_chunks_mut(r).enumerate().for_each(|(i, yr)| {
+        let erow = &e[i * k..i * k + k];
+        for (c, yc) in yr.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for j in 0..k {
+                acc += erow[j] * omega[j * r + c];
+            }
+            *yc = acc;
+        }
+    });
+    // Orthonormalize columns of Y → Q (modified Gram-Schmidt; r small).
+    for c in 0..r {
+        for p in 0..c {
+            let mut dot = 0.0f32;
+            for i in 0..m {
+                dot += y[i * r + c] * y[i * r + p];
+            }
+            for i in 0..m {
+                y[i * r + c] -= dot * y[i * r + p];
+            }
+        }
+        let mut nrm = 0.0f32;
+        for i in 0..m {
+            nrm += y[i * r + c] * y[i * r + c];
+        }
+        nrm = nrm.sqrt().max(1e-12);
+        for i in 0..m {
+            y[i * r + c] /= nrm;
+        }
+    }
+    // B = Qᵀ·E  [r×k] (parallel over the r rows of B).
+    let mut b = vec![0.0f32; r * k];
+    b.par_chunks_mut(k).enumerate().for_each(|(c, brow)| {
+        for (j, bj) in brow.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for l in 0..m {
+                acc += y[l * r + c] * e[l * k + j];
+            }
+            *bj = acc;
+        }
+    });
+    // E_r = Q·B  [m×k] (parallel over rows).
+    let mut er = vec![0.0f32; m * k];
+    er.par_chunks_mut(k).enumerate().for_each(|(i, erow)| {
+        for (j, ej) in erow.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for c in 0..r {
+                acc += y[i * r + c] * b[c * k + j];
+            }
+            *ej = acc;
+        }
+    });
+    er
+}
+
 /// overwritten exactly after the per-256-group FWHT+trellis pass. Parallel over
 /// rows.
 ///
@@ -5338,9 +5503,17 @@ fn main() {
     // qtip3-sim: the 3-bit fallback (Phase C). 2-bit QTIP is unusable on the
     // 0.8B dense model (PPL 53.6 with LDLQ vs MQ4 14.0); 3-bit is still a
     // bandwidth win vs MQ4 and the documented fallback. Same trellis, bits=3.
-    let use_qtip2_sim = format == "qtip2-sim";
-    let use_qtip3_sim = format == "qtip3-sim";
-    let use_qtip_sim = use_qtip2_sim || use_qtip3_sim;
+    // `qtip<N>-sim` for N ∈ {2,3,4,6,8}: bit-parametric trellis sim (the codec
+    // is bit-general — `qtip::*_bits`/`qtip_ldlq_dequant_bits` take `bits`), for
+    // a bandwidth-vs-quality sweep across QTIP widths. Quality only (emits bf16);
+    // a real packed qtip<N> kernel is separate. LDLQ on/off = HIPFIRE_QTIP_HESSIAN
+    // present/absent.
+    let qtip_sim_bits: Option<u32> = format
+        .strip_prefix("qtip")
+        .and_then(|s| s.strip_suffix("-sim"))
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|b| matches!(b, 2 | 3 | 4 | 6 | 8));
+    let use_qtip_sim = qtip_sim_bits.is_some();
     // roughquant-sim (Phase 1, no rotation): emit a bf16 .hfq where each 2D
     // weight's most-salient input columns (ranked by diag(H)) are kept exact
     // and the rest are crushed to a low-bit uniform grid, baked back into bf16
@@ -5402,7 +5575,9 @@ fn main() {
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
     let use_qtip3_real = format == "qtip3";
-    let qtip_bits: u32 = if use_qtip3_sim || use_qtip3_real {
+    let qtip_bits: u32 = if let Some(b) = qtip_sim_bits {
+        b
+    } else if use_qtip3_real {
         3
     } else {
         2
@@ -5439,11 +5614,18 @@ fn main() {
                  (FWHT + bitshift trellis beam=128) → bf16"
             );
         }
-        (
-            qtip::build_codebook(),
-            gen_fwht_signs(42, 256),
-            gen_fwht_signs(1042, 256),
-        )
+        // HIPFIRE_QTIP_CODEBOOK=3inst selects the QTIP 3INST computed codebook
+        // (closer-to-Gaussian than 1MAD) for the SIM paths only — the real qtip3
+        // kernel computes 1MAD on-device, so its codebook must stay 1MAD.
+        let cb = if !use_qtip3_real
+            && std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst")
+        {
+            eprintln!("qtip: using 3INST computed codebook (sim)");
+            qtip::build_codebook_3inst()
+        } else {
+            qtip::build_codebook()
+        };
+        (cb, gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256))
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
@@ -9192,6 +9374,22 @@ fn main() {
     // Skips embeddings/lm_head and any k not divisible by 256.
     if use_qtip_sim {
         let (mut n_ldlq, mut n_plain) = (0usize, 0usize);
+        // BBT-spectral influence scaling (SpectralLLM): HIPFIRE_QTIP_BBT_ALPHA=α
+        // enables per-channel scaling by spectral activation energy (from the
+        // calib Hessian) before the trellis, math-invariant. α=0.5 is the paper
+        // default; unset = no BBT.
+        let bbt_alpha: Option<f32> = std::env::var("HIPFIRE_QTIP_BBT_ALPHA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&a: &f32| a > 0.0);
+        // HIPFIRE_LOWRANK_R=r adds a rank-r correction of the quant error back
+        // into the emitted weight (LQER/CALDERA low-rank residual probe). This
+        // sims the quality of W4 + a 2-WMMA UᵥVᵥ correction; rank=0 = off.
+        let lowrank_r: usize = std::env::var("HIPFIRE_LOWRANK_R")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let (mut n_bbt, mut n_lowrank) = (0usize, 0usize);
         for t in hfq_tensors.iter_mut() {
             if !(matches!(t.quant_type, QuantType::BF16)
                 && t.shape.len() == 2
@@ -9208,43 +9406,101 @@ fn main() {
                 .chunks_exact(2)
                 .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
+            // The true (pre-quant) weight, kept for the low-rank error residual.
+            let wf_orig: Option<Vec<f32>> = (lowrank_r > 0).then(|| wf.clone());
 
             // Prefer LDLQ (output-aware) when this tensor has a Hessian; else
             // plain QTIP. The block-trellis OBS encode is now bit-parametric,
             // so 3-bit gets the same Hessian-aware feedback as 2-bit.
             let key = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+
+            // BBT-spectral: derive per-channel scales from the Hessian's spectral
+            // diagonal, scale weight columns (W' = W·diag(s)); the trellis sees the
+            // scaled weight, and we divide the dequantized result back by s so the
+            // emitted bf16 reproduces W·x with an s-shaped quant-error budget.
+            let bbt_s: Option<Vec<f32>> = bbt_alpha.and_then(|a| {
+                qtip_hessian.as_ref().and_then(|sc| {
+                    let href = sc.get(key, 0)?;
+                    if href.k != k {
+                        return None;
+                    }
+                    let mut c = vec![0.0f32; k * k];
+                    for i in 0..k {
+                        for j in 0..k {
+                            c[i * k + j] = href.at(i, j) as f32;
+                        }
+                    }
+                    let spec = bbt_spectral_diag(&c, k);
+                    Some(bbt_scales(&spec, k, a))
+                })
+            });
+            if let Some(s) = &bbt_s {
+                for i in 0..m {
+                    for l in 0..k {
+                        wf[i * k + l] *= s[l];
+                    }
+                }
+                n_bbt += 1;
+            }
+
             let ldlq_out = qtip_hessian.as_ref().and_then(|sc| {
                 let href = sc.get(key, 0)?;
                 if href.k != k {
                     return None;
                 }
-                // Materialize k×k Hessian (f32) + 1% diagonal-mean ridge.
+                // Materialize k×k Hessian (f32) + 1% diagonal-mean ridge. Under
+                // BBT the input is x'=x/s, so Cov(x')_{ij}=C_{ij}/(s_i s_j).
                 let mut h = vec![0.0f32; k * k];
                 let mut diag_sum = 0.0f64;
                 for i in 0..k {
                     for j in 0..k {
-                        h[i * k + j] = href.at(i, j) as f32;
+                        let mut v = href.at(i, j) as f32;
+                        if let Some(s) = &bbt_s {
+                            v /= s[i] * s[j];
+                        }
+                        h[i * k + j] = v;
                     }
-                    diag_sum += href.at(i, i);
+                    diag_sum += h[i * k + i] as f64;
                 }
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 ldlq::qtip_ldlq_dequant_bits(
-                    &wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp, qtip_bits,
+                    &wf, m, k, &h, &qtip_s1, &qtip_s2, 128, damp, qtip_bits, &qtip_cb,
                 )
             });
-            match ldlq_out {
-                Some(deq) => {
-                    t.data = f32_slice_to_bf16_bytes(&deq);
+            let mut deq = match ldlq_out {
+                Some(d) => {
                     n_ldlq += 1;
+                    d
                 }
                 None => {
                     qtip_simquant_nbit(&mut wf, k, &qtip_cb, &qtip_s1, &qtip_s2, qtip_bits);
-                    t.data = f32_slice_to_bf16_bytes(&wf);
                     n_plain += 1;
+                    wf
+                }
+            };
+            // Undo the BBT column scaling: emit ≈ dequant(Q(W·s))·diag(1/s) ≈ W.
+            if let Some(s) = &bbt_s {
+                for i in 0..m {
+                    for l in 0..k {
+                        deq[i * k + l] /= s[l];
+                    }
                 }
             }
+            // Low-rank residual: E = W − dequant(W4); add E_r (rank-r) back. Sims
+            // emit(W4) + UᵥVᵥ — the 2-WMMA weight correction.
+            if let Some(orig) = &wf_orig {
+                let e: Vec<f32> = orig.iter().zip(&deq).map(|(a, b)| a - b).collect();
+                let er = randomized_lowrank(&e, m, k, lowrank_r);
+                for (d, c) in deq.iter_mut().zip(&er) {
+                    *d += *c;
+                }
+                n_lowrank += 1;
+            }
+            t.data = f32_slice_to_bf16_bytes(&deq);
         }
-        eprintln!("  qtip{qtip_bits}-sim: LDLQ on {n_ldlq} tensors, plain-QTIP on {n_plain}");
+        eprintln!(
+            "  qtip{qtip_bits}-sim: LDLQ on {n_ldlq}, plain {n_plain}, BBT-scaled {n_bbt}, lowrank-r{lowrank_r} on {n_lowrank}"
+        );
     }
 
     // roughquant-sim post-pass (Phase 1, no rotation): for every eligible 2D
@@ -12389,6 +12645,71 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn randomized_lowrank_recovers_lowrank() {
+        // E = u1 v1ᵀ + u2 v2ᵀ (exactly rank 2). rank-2 approx ≈ exact; rank-0 = 0.
+        let (m, k) = (24usize, 40usize);
+        let u1: Vec<f32> = (0..m).map(|i| (i as f32 * 0.1).sin()).collect();
+        let v1: Vec<f32> = (0..k).map(|j| (j as f32 * 0.2).cos()).collect();
+        let u2: Vec<f32> = (0..m).map(|i| (i as f32 * 0.05 + 1.0).cos()).collect();
+        let v2: Vec<f32> = (0..k).map(|j| (j as f32 * 0.07).sin()).collect();
+        let mut e = vec![0.0f32; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                e[i * k + j] = u1[i] * v1[j] + u2[i] * v2[j];
+            }
+        }
+        let fro = |a: &[f32]| a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let e_norm = fro(&e);
+        let resid = |r: usize| {
+            let er = randomized_lowrank(&e, m, k, r);
+            let d: Vec<f32> = e.iter().zip(&er).map(|(a, b)| a - b).collect();
+            fro(&d) / e_norm
+        };
+        assert!((resid(0) - 1.0).abs() < 1e-6, "rank0 residual not full");
+        assert!(
+            resid(2) < 1e-3,
+            "rank2 didn't recover rank-2 matrix: {}",
+            resid(2)
+        );
+        assert!(resid(1) < resid(0), "rank1 should beat rank0");
+    }
+
+    #[test]
+    fn bbt_spectral_diag_identity_and_rank1() {
+        // H orthonormal ⇒ H·I·Hᵀ = I ⇒ diag = 1 for every coordinate.
+        let k = 8;
+        let mut c = vec![0.0f32; k * k];
+        for i in 0..k {
+            c[i * k + i] = 1.0;
+        }
+        let d = bbt_spectral_diag(&c, k);
+        assert!(
+            d.iter().all(|&v| (v - 1.0).abs() < 1e-4),
+            "C=I diag {d:?} not all 1"
+        );
+        // Rank-1 C = v vᵀ ⇒ diag(H C Hᵀ)_l = (H v)_l². Total energy ‖v‖² preserved.
+        let v: Vec<f32> = (0..k).map(|i| i as f32 + 1.0).collect();
+        for i in 0..k {
+            for j in 0..k {
+                c[i * k + j] = v[i] * v[j];
+            }
+        }
+        let d = bbt_spectral_diag(&c, k);
+        let trace: f32 = d.iter().sum();
+        let vnorm2: f32 = v.iter().map(|x| x * x).sum();
+        assert!(
+            (trace - vnorm2).abs() / vnorm2 < 1e-3,
+            "spectral energy {trace} != ‖v‖² {vnorm2}"
+        );
+        // Scales positive; uniform influence (C=I) ⇒ all s ≈ (1+1)^α = √2 at α=0.5.
+        let s = bbt_scales(&vec![1.0f32; k], k, 0.5);
+        assert!(
+            s.iter().all(|&x| (x - 2.0f32.sqrt()).abs() < 1e-3),
+            "uniform scales {s:?} not √2"
+        );
+    }
 
     #[test]
     fn chat_template_override_replaces_existing_template() {

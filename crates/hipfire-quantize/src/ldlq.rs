@@ -111,6 +111,7 @@ pub fn qtip2_ldlq_dequant(
         beam_width,
         damp,
         2,
+        &crate::qtip::build_codebook(),
     )
 }
 
@@ -129,6 +130,7 @@ pub fn qtip_ldlq_dequant_bits(
     beam_width: usize,
     damp: f64,
     bits: u32,
+    cb: &[f32],
 ) -> Option<Vec<f32>> {
     use rayon::prelude::*;
     assert_eq!(weights_f32.len(), m * k);
@@ -160,7 +162,8 @@ pub fn qtip_ldlq_dequant_bits(
             }
         });
 
-    let cb = crate::qtip::build_codebook();
+    // Codebook threaded from the caller (1MAD or 3INST) — must match the
+    // beam_encode / decode the on-device kernel computes.
     let mut dequant = vec![0.0f64; m * k];
 
     for blk in 0..nb {

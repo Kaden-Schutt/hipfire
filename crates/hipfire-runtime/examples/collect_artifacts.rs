@@ -52,7 +52,12 @@ fn main() {
     let seed: u64 = arg("--seed", Some("0".into())).unwrap().parse().unwrap();
 
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(Path::new(&model)).expect("open model");
-    let source_arch_id = hfq.arch_id;
+    // `--arch <id>` overrides the hfq's stored arch_id. Needed for hfqs that
+    // predate proper arch tagging (e.g. some qwen3 MoE bf16 hfqs are stamped
+    // arch_id=0/llama but load fine through the qwen35 backend at 5/6).
+    let source_arch_id = arg("--arch", None)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(hfq.arch_id);
 
     // Loaded lazily — synthetic mode has no usable tokenizer; only the gemma3
     // text-only arm actually consumes it (asserts Some below).
