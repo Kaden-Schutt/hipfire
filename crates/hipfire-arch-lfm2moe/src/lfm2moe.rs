@@ -143,11 +143,11 @@ fn load_wt_with_awq(
     Ok(w)
 }
 
-const OQ_PLUS_QT: u8 = 33;
-const OQ4_QT: u8 = 34;
-const OQ8_QT: u8 = 35;
-const OQ_PLUS_COMPACT_QT: u8 = 36;
-const OQ4_ARCH_PACKED_QT: u8 = 37;
+const OQ_PLUS_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusG256.code();
+const OQ4_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256.code();
+const OQ8_QT: u8 = hipfire_runtime::quant::QuantType::Oq8G256.code();
+const OQ_PLUS_COMPACT_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusCompact.code();
+const OQ4_ARCH_PACKED_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256ArchPacked.code();
 const OQ_GROUP: usize = 256;
 
 fn oq4_arch_combined_len(m: usize, k: usize) -> usize {

@@ -1697,12 +1697,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-quant-format"
+version = "0.3.0"
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.3.0"
 dependencies = [
  "byteorder",
  "faer",
  "hipfire-kvquant",
+ "hipfire-quant-format",
  "memmap2",
  "rayon",
  "serde",
@@ -1729,6 +1734,7 @@ dependencies = [
  "hipfire-arch-gemma3",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
+ "hipfire-arch-minimax",
  "hipfire-arch-nemotron",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
@@ -1746,6 +1752,7 @@ dependencies = [
  "hipfire-mixer",
  "hipfire-model",
  "hipfire-prompt",
+ "hipfire-quant-format",
  "hipfire-state",
  "libc",
  "memmap2",

@@ -2441,7 +2441,7 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 /// via the loader's catch-all (honest capability gap) instead of reading as
 /// garbage. The decoded `WeightTensor` is identical to the qt=34 path
 /// (`DType::Oq4G256`) — only the on-disk parse differs.
-pub const OQ4_ARCH_PACKED_QT: u8 = 37;
+pub const OQ4_ARCH_PACKED_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256ArchPacked.code();
 
 /// Byte length of the OQ4 arch combined device layout for an `[m, k]` matrix:
 /// `[split nibbles m*(k/2)] [split f32 scales m*ng] [interleaved m*ng*132]`.

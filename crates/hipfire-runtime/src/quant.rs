@@ -381,6 +381,11 @@ pub fn dequantize_q6_k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Re-export the canonical on-disk byte-contract so arch loaders can reach it
+/// as `hipfire_runtime::quant::QuantType` without each depending on the leaf
+/// `hipfire-quant-format` crate directly.
+pub use hipfire_quant_format::QuantType;
+
 /// Canonical map from an on-disk HFQ `quant_type` byte to the GPU dispatch
 /// [`DType`], for the **pure** formats: ones the loader handles as a plain
 /// `upload_raw` + dtype tag with no host-side repack.
@@ -399,27 +404,31 @@ pub fn dequantize_q6_k(data: &[u8], n: usize) -> Vec<f32> {
 ///
 /// `k` (the input/column dim) gates the FP4 group-32 formats, which require
 /// `k % 256 == 0`.
+///
+/// Matches on the canonical [`QuantType`] (the shared byte-contract) rather
+/// than raw integers, so the on-disk ids stay authoritative in one crate.
 pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<rdna_compute::DType> {
+    use hipfire_quant_format::QuantType as Q;
     use rdna_compute::DType;
-    Some(match qt {
-        1 => DType::F16,
-        3 => DType::Q8_0,
-        6 => DType::HFQ4G256,
-        7 => DType::HFQ4G128,
-        8 => DType::HFQ6G256,
-        11 => DType::HFQ3G256,
-        12 => DType::HFQ3G128,
-        13 => DType::MQ4G256,
-        14 => DType::MQ8G256,
-        15 => DType::MQ6G256,
-        17 => DType::MQ3G256,
-        18 => DType::MQ2G256,
-        19 => DType::MQ2G256Lloyd,
-        20 => DType::MQ3G256Lloyd,
-        21 if k % 256 == 0 => DType::HFP4G32,
-        24 if k % 256 == 0 => DType::MFP4G32,
-        30 => DType::MQ4G256Lloyd,
-        31 => DType::Qtip3G256,
+    Some(match Q::from_code(qt)? {
+        Q::F16 => DType::F16,
+        Q::Q8F16 => DType::Q8_0,
+        Q::HFQ4G256 => DType::HFQ4G256,
+        Q::HFQ4G128 => DType::HFQ4G128,
+        Q::HFQ6G256 => DType::HFQ6G256,
+        Q::HFQ3G256 => DType::HFQ3G256,
+        Q::HFQ3G128 => DType::HFQ3G128,
+        Q::MQ4G256 => DType::MQ4G256,
+        Q::MQ8G256 => DType::MQ8G256,
+        Q::MQ6G256 => DType::MQ6G256,
+        Q::MQ3G256 => DType::MQ3G256,
+        Q::MQ2G256 => DType::MQ2G256,
+        Q::MQ2G256Lloyd => DType::MQ2G256Lloyd,
+        Q::MQ3G256Lloyd => DType::MQ3G256Lloyd,
+        Q::HFP4G32 if k % 256 == 0 => DType::HFP4G32,
+        Q::MFP4G32 if k % 256 == 0 => DType::MFP4G32,
+        Q::MQ4G256Lloyd => DType::MQ4G256Lloyd,
+        Q::Qtip3G256 => DType::Qtip3G256,
         _ => return None,
     })
 }

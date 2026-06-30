@@ -1,0 +1,8 @@
+[package]
+name = "hipfire-quant-format"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Canonical on-disk HFQ quant_type byte-contract, shared by the offline quantizer (writer) and the engine loaders (readers)."
+
+[dependencies]

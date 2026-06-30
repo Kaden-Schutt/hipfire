@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 hipfire contributors
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Canonical on-disk HFQ `quant_type` byte-contract.
+//!
+//! The single byte stored per tensor in an `.hfq` index identifies the weight
+//! encoding. It is the contract between the **writer** (the offline
+//! `hipfire-quantize` binary, which emits `QuantType as u8`) and every
+//! **reader** (the engine loaders in `hipfire-runtime` and the per-arch
+//! crates, which map the byte back to a GPU dispatch dtype).
+//!
+//! This enum used to live privately inside the `hipfire-quantize` binary, so
+//! every reader re-hardcoded the integers (`6`, `13`, `31`, …) — they drifted
+//! (e.g. only qwen35 knew `31 == Qtip3G256`). Homing it in this leaf crate,
+//! depended on by both sides, makes the numbering authoritative in one place.
+//!
+//! This crate is intentionally GPU-agnostic: it owns the *byte identity* only.
+//! The byte → GPU `DType` mapping (which needs `rdna-compute`) lives in
+//! `hipfire_runtime::quant::dtype_for_quant_type`, which matches on the
+//! variants here.
+
+/// On-disk HFQ weight encoding id (`#[repr(u8)]`; the stored byte is the
+/// discriminant). Reserved/retired ids are documented inline — DO NOT REUSE.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantType {
+    Q4F16G64 = 0,
+    F16 = 1,
+    F32 = 2,
+    Q8F16 = 3,
+    Q4K = 4,
+    Q8HFQ = 5,
+    HFQ4G256 = 6,
+    HFQ4G128 = 7,
+    HFQ6G256 = 8,
+    HFQ2G256 = 9,
+    HFQ2G128 = 10,
+    HFQ3G256 = 11,
+    HFQ3G128 = 12,
+    MQ4G256 = 13,      // MagnumQuant: FWHT-rotated HFQ4-G256
+    MQ8G256 = 14,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
+    MQ6G256 = 15,      // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
+    BF16 = 16,         // Original BF16 weights (zero precision loss for vision)
+    MQ3G256 = 17,      // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
+    MQ2G256 = 18,      // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
+    MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
+    MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
+    // HFP4 family — RDNA-optimal FP4 (E2M1 elements + UE8M0 block scale + FP16 row scale).
+    // See docs/quant-formats/hfp4.md for byte layout, dequant, rotation modes.
+    // Per-row header is 16 B; per-block payload is (1 + g/2) bytes (UE8M0 + nibbles).
+    HFP4G32 = 21, // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
+    /// I64→U32 downcast of DeepSeek V4 hash-routing `tid2eid` lookup tables.
+    /// Shape `[vocab, num_experts_per_tok]`. Stored as raw u32 LE; the
+    /// loader reads `bytes.chunks_exact(4)`. ID 22 was reserved for the
+    /// HFP4G16 NV-aligned ablation (never built) — we re-use the slot
+    /// for tid2eid storage to stay byte-compatible with antirezQ8.hfq.
+    TidI32 = 22,
+    // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
+    // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation (re-used by TidI32)
+    // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
+    // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
+    // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
+    // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
+    // MFP4G32 = HFP4G32 + offline FWHT rotation (256-element FWHT applied to weights at quant time;
+    // runtime applies the same FWHT to x via mq_rotate_x). format_flags bit 0 + bits 2-3 = 0b0101
+    // signals "rotation present, offline FWHT" for future interop/detection.
+    MFP4G32 = 24,    // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
+    PARO4G128 = 28,  // ParoQuant native AWQ W4 + pairwise activation rotation metadata
+    PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
+    // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
+    // HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
+    MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
+    // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+    // Models quantized pre-renumber MUST be re-quantized.
+    /// QTIP-3: trellis-coded 3-bit, FWHT-rotated. Block = [f32 scale][96 B
+    /// packed 3-bit trellis symbols] = 100 B/group (0.391 B/weight). Decoded by
+    /// the fused `gemv_qtip3g256` kernel (computed 1MAD codebook, zero LDS); the
+    /// runtime FWHT-rotates x (shared mq_rotate_x path). See qtip.rs / Phase C2.
+    Qtip3G256 = 31,
+    /// OQ+ / Opus Plus (W4A8) — the symmetric-int4 analog of MQ4+: the SAME
+    /// on-disk bytes as [`QuantType::Oq4G256`] (symmetric signed-INT4, FWHT,
+    /// per-group f32 scale, codec `quantize_oq4g256`, including its LDLQ/AWQ
+    /// calibration), but the loader (qt=33) nibble-EXPANDS the int4 weights to
+    /// int8 and dispatches the iu8 W8A8 grouped-WMMA path with int8
+    /// ACTIVATIONS. Weight values stay 4-bit (16 levels); activations gain int8
+    /// precision. Id 33 = the eval-plan's reserved Opus-A8 slot.
+    OqPlusG256 = 33,
+    /// Opus Quant W4A4 — symmetric signed-INT4, FWHT-rotated, per-group f32
+    /// scale. On-disk block = [f16 scale][128 nibbles] = 130 B/256-group
+    /// (codec `quantize_oq4g256`). Loader (qt=34) repacks to the kernel layout;
+    /// forward int4-quantizes activations and runs the iu4·iu4 GEMM. Id 34 =
+    /// the eval-plan's reserved "Opus Quant (W4A4)" slot.
+    Oq4G256 = 34,
+    /// Opus Quant W8A8 — symmetric signed-INT8, FWHT-rotated, per-group f32
+    /// scale. On-disk block = [f16 scale][256 int8] = 258 B/256-group (codec
+    /// `quantize_oq8g256`). Loader (qt=35) repacks to the kernel layout;
+    /// forward int8-quantizes activations and runs the iu8 GEMM. Near-lossless,
+    /// matrix-core-fast.
+    Oq8G256 = 35,
+    /// OQ+ compact magnitude-tiered (Opus Plus W4A8, ~4 b/w). On-disk block =
+    /// `[f16 scale][128 int4 nibbles][N_out × (u8 idx, i8 val)]` = 130 + 2·N_out
+    /// B/256-group (codec `quantize_oqplus_compact`; N_out = round(w8_frac·256)).
+    /// Loader (qt=36) derives N_out from the byte length, expands the int4
+    /// bulk to int8 and overlays the sparse int8 outliers → the iu8 W8A8 buffer.
+    OqPlusCompact = 36,
+    /// Opus Quant W4A4, already in the arch-combined **kernel** layout on disk
+    /// (the [`QuantType::Oq4G256`] payload after the per-arch repack the loader
+    /// would otherwise do at load time). The loader uploads it raw and tags
+    /// `Oq4G256` — no repack. Distinct id so the byte length is validated
+    /// against `oq4_arch_combined_len`, not the 130 B/group on-disk form.
+    Oq4G256ArchPacked = 37,
+}
+
+impl QuantType {
+    /// The stored on-disk byte (the `#[repr(u8)]` discriminant).
+    #[inline]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Map a stored byte back to its [`QuantType`], or `None` for an
+    /// unknown/reserved id. The inverse of [`QuantType::code`].
+    pub fn from_code(code: u8) -> Option<Self> {
+        use QuantType::*;
+        Some(match code {
+            0 => Q4F16G64,
+            1 => F16,
+            2 => F32,
+            3 => Q8F16,
+            4 => Q4K,
+            5 => Q8HFQ,
+            6 => HFQ4G256,
+            7 => HFQ4G128,
+            8 => HFQ6G256,
+            9 => HFQ2G256,
+            10 => HFQ2G128,
+            11 => HFQ3G256,
+            12 => HFQ3G128,
+            13 => MQ4G256,
+            14 => MQ8G256,
+            15 => MQ6G256,
+            16 => BF16,
+            17 => MQ3G256,
+            18 => MQ2G256,
+            19 => MQ2G256Lloyd,
+            20 => MQ3G256Lloyd,
+            21 => HFP4G32,
+            22 => TidI32,
+            24 => MFP4G32,
+            28 => PARO4G128,
+            29 => PARO4G128T,
+            30 => MQ4G256Lloyd,
+            31 => Qtip3G256,
+            33 => OqPlusG256,
+            34 => Oq4G256,
+            35 => Oq8G256,
+            36 => OqPlusCompact,
+            37 => Oq4G256ArchPacked,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QuantType;
+
+    #[test]
+    fn code_roundtrips_through_from_code() {
+        // Every variant must survive code() → from_code().
+        for c in 0u8..=255 {
+            if let Some(qt) = QuantType::from_code(c) {
+                assert_eq!(
+                    qt.code(),
+                    c,
+                    "from_code({c}) gave {qt:?} whose code() != {c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_discriminants_are_stable() {
+        // On-disk contract: these bytes must never move.
+        assert_eq!(QuantType::F16.code(), 1);
+        assert_eq!(QuantType::Qtip3G256.code(), 31);
+        assert_eq!(QuantType::OqPlusG256.code(), 33);
+        assert_eq!(QuantType::Oq4G256.code(), 34);
+        assert_eq!(QuantType::Oq8G256.code(), 35);
+        assert_eq!(QuantType::OqPlusCompact.code(), 36);
+    }
+}

@@ -44,6 +44,7 @@ members = [
     "crates/hipfire-arch-zaya",
     "crates/hipfire-quantize",
     "crates/hipfire-kvquant",
+    "crates/hipfire-quant-format",
     "crates/hipfire-detect",
     "crates/hipfire-diffusion",
     "crates/hipfire-atlas",

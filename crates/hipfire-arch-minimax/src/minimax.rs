@@ -204,9 +204,9 @@ fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Opti
 // shared across arches, so the repack is identical. OQ4 is the W4A8 int4 format
 // (`DType::Oq4G256`), OQ8 the W8A8 int8 format (`DType::Oq8G256`) — both run on
 // the Opus iu8 grouped-WMMA kernel family `weight_gemv` already dispatches.
-const OQ4_QT: u8 = 34;
-const OQ8_QT: u8 = 35;
-const OQPLUS_COMPACT_QT: u8 = 36;
+const OQ4_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256.code();
+const OQ8_QT: u8 = hipfire_runtime::quant::QuantType::Oq8G256.code();
+const OQPLUS_COMPACT_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusCompact.code();
 const OQ_GROUP: usize = 256;
 
 /// Sign-extend a 4-bit nibble (0..15 → -8..7).

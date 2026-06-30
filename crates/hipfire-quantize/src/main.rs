@@ -2124,96 +2124,13 @@ fn dequantize_mq2g256_lloyd_to_f32(
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
 
-#[repr(u8)]
-#[derive(Clone, Copy)]
-enum QuantType {
-    Q4F16G64 = 0,
-    F16 = 1,
-    #[allow(dead_code)]
-    F32 = 2,
-    Q8F16 = 3,
-    Q4K = 4,
-    Q8HFQ = 5,
-    HFQ4G256 = 6,
-    HFQ4G128 = 7,
-    HFQ6G256 = 8,
-    HFQ2G256 = 9,
-    HFQ2G128 = 10,
-    HFQ3G256 = 11,
-    HFQ3G128 = 12,
-    MQ4G256 = 13,      // MagnumQuant: FWHT-rotated HFQ4-G256
-    MQ8G256 = 14,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
-    MQ6G256 = 15,      // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
-    BF16 = 16,         // Original BF16 weights (zero precision loss for vision)
-    MQ3G256 = 17,      // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
-    MQ2G256 = 18,      // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
-    MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
-    MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
-    // HFP4 family — RDNA-optimal FP4 (E2M1 elements + UE8M0 block scale + FP16 row scale).
-    // See docs/quant-formats/hfp4.md for byte layout, dequant, rotation modes.
-    // Per-row header is 16 B; per-block payload is (1 + g/2) bytes (UE8M0 + nibbles).
-    HFP4G32 = 21, // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
-    // MFP4G32 = HFP4G32 + offline FWHT rotation (256-element FWHT applied to weights at quant time;
-    // runtime applies the same FWHT to x via mq_rotate_x). format_flags bit 0 + bits 2-3 = 0b0101
-    // signals "rotation present, offline FWHT" for future interop/detection.
-    MFP4G32 = 24, // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
-    /// I64→U32 downcast of DeepSeek V4 hash-routing `tid2eid` lookup tables.
-    /// Shape `[vocab, num_experts_per_tok]`. Stored as raw u32 LE; the
-    /// loader reads `bytes.chunks_exact(4)`. ID 22 was reserved for the
-    /// HFP4G16 NV-aligned ablation (never built) — we re-use the slot
-    /// for tid2eid storage to stay byte-compatible with antirezQ8.hfq.
-    TidI32 = 22,
-    // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
-    // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation (re-used by TidI32)
-    // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
-    // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
-    // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
-    // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
-    #[allow(dead_code)]
-    PARO4G128 = 28, // ParoQuant native AWQ W4 + pairwise activation rotation metadata
-    #[allow(dead_code)]
-    PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
-    // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
-    // HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
-    MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
-    // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-    // Models quantized pre-renumber MUST be re-quantized.
-    /// QTIP-3: trellis-coded 3-bit, FWHT-rotated. Block = [f32 scale][96 B
-    /// packed 3-bit trellis symbols] = 100 B/group (0.391 B/weight). Decoded by
-    /// the fused `gemv_qtip3g256` kernel (computed 1MAD codebook, zero LDS); the
-    /// runtime FWHT-rotates x (shared mq_rotate_x path). See qtip.rs / Phase C2.
-    Qtip3G256 = 31,
-    /// Opus Quant W4A4 — symmetric signed-INT4, FWHT-rotated, per-group f32
-    /// scale. On-disk block = [f16 scale][128 nibbles] = 130 B/256-group
-    /// (codec `quantize_oq4g256`). Loader (qwen35 qt=34) repacks to the kernel
-    /// layout; forward int4-quantizes activations and runs the iu4·iu4 GEMM.
-    /// Id 34 = the eval-plan's reserved "Opus Quant (W4A4)" slot (32=MQ+;
-    /// 33=OQ+/Opus Plus, see [`QuantType::OqPlusG256`]).
-    Oq4G256 = 34,
-    /// OQ+ / Opus Plus (W4A8) — the symmetric-int4 analog of MQ4+: the SAME
-    /// on-disk bytes as [`QuantType::Oq4G256`] (symmetric signed-INT4, FWHT,
-    /// per-group f32 scale, codec `quantize_oq4g256`, including its LDLQ/AWQ
-    /// calibration), but the loader (qwen35 qt=33) nibble-EXPANDS the int4
-    /// weights to int8 and dispatches the iu8 W8A8 grouped-WMMA path with int8
-    /// ACTIVATIONS. Weight values stay 4-bit (16 levels); activations gain int8
-    /// precision. The int8-activation variant the `quantize_oq4g256` doc calls
-    /// out — Opus Quant : OQ+ :: A4 : A8, mirroring MQ4 : MQ4+. Id 33 = the
-    /// eval-plan's reserved Opus-A8 slot (renamed OQ+ to match mq4+).
-    OqPlusG256 = 33,
-    /// Opus Quant W8A8 — symmetric signed-INT8, FWHT-rotated, per-group f32
-    /// scale. On-disk block = [f16 scale][256 int8] = 258 B/256-group (codec
-    /// `quantize_oq8g256`). Loader (qwen35 qt=35) repacks to the kernel layout;
-    /// forward int8-quantizes activations and runs the iu8 GEMM. Near-lossless,
-    /// matrix-core-fast.
-    Oq8G256 = 35,
-    /// OQ+ compact magnitude-tiered (Opus Plus W4A8, ~4 b/w). On-disk block =
-    /// `[f16 scale][128 int4 nibbles][N_out × (u8 idx, i8 val)]` = 130 + 2·N_out
-    /// B/256-group (codec `quantize_oqplus_compact`; N_out = round(w8_frac·256)).
-    /// Loader (qwen35 qt=36) derives N_out from the byte length, expands the int4
-    /// bulk to int8 and overlays the sparse int8 outliers → the iu8 W8A8 buffer.
-    /// Same compute/values as the int8 OQ+ tiered probe, ~half the storage.
-    OqPlusCompact = 36,
-}
+// QuantType — the on-disk HFQ `quant_type` byte-contract — now lives in the
+// shared `hipfire-quant-format` leaf crate, depended on by BOTH this writer and
+// the engine readers (hipfire-runtime + per-arch loaders). It previously lived
+// here privately, which forced every reader to re-hardcode the integers and let
+// them drift. Re-exported so existing `QuantType::Foo` references and the
+// `t.quant_type as u8` byte emission keep working unchanged.
+pub use hipfire_quant_format::QuantType;
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
 /// Determines whether a tensor gets the base format, a 6-bit promotion,

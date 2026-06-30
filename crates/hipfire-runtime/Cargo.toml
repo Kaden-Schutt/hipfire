@@ -54,6 +54,7 @@ arch-dots-ocr = []
 experimental-examples = []
 [dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-kld = { path = "../hipfire-kld" }
 hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-eval = { path = "../hipfire-eval" }
