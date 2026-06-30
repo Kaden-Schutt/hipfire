@@ -1,6 +1,9 @@
 # tiny-quant KLD baselines — gpu_arch family format mean_kld rel_tol
 # regenerate per GPU: HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh --record
 gfx1103 gemma3 hfq4 0.15877441 0.25
+gfx1103 gemma3 op4 0.22143150 0.25
+gfx1103 gemma3 op4+-calib 0.16938838 0.25
+gfx1103 gemma3 op8 0.00175243 0.25
 gfx1103 gemma3 q8f16 0.00158926 0.25
 gfx1103 llama hfq4 0.00388530 0.25
 gfx1103 llama mq3 0.04974133 0.25
@@ -8,15 +11,15 @@ gfx1103 llama mq4 0.00765633 0.25
 gfx1103 minimax mq4 0.00104174 0.25
 gfx1103 qwen2 hfq4 0.00266174 0.25
 gfx1103 qwen2 q8f16 0.00000870 0.25
-gfx1103 qwen3_5 mq3 0.52648510 0.25
-gfx1103 qwen3_5 mq4 0.23503346 0.25
-gfx1103 qwen3_5 mq6 0.02604116 0.25
-gfx1103 qwen3_5 q8f16 0.00113526 0.25
-gfx1103 qwen3_5 qtip3-sim-calib 0.35869091 0.25
-gfx1103 qwen3_5_moe mq3 0.24711707 0.25
-gfx1103 qwen3_5_moe mq4 0.14892133 0.25
-gfx1103 qwen3_5_moe mq6 0.14892133 0.25
-gfx1103 qwen3_5_moe q8f16 0.14122965 0.25
+gfx1103 qwen3_5 mq3 0.52711255 0.25
+gfx1103 qwen3_5 mq4 0.23497985 0.25
+gfx1103 qwen3_5 mq6 0.02616532 0.25
+gfx1103 qwen3_5 q8f16 0.00084598 0.25
+gfx1103 qwen3_5 qtip3-sim-calib 0.35641043 0.25
+gfx1103 qwen3_5_moe mq3 0.24754107 0.25
+gfx1103 qwen3_5_moe mq4 0.15463374 0.25
+gfx1103 qwen3_5_moe mq6 0.15463374 0.25
+gfx1103 qwen3_5_moe q8f16 0.14131456 0.25
 gfx1151 gemma3 hfq4 0.15877194 0.25
 gfx1151 gemma3 op4 0.22142470 0.25
 gfx1151 gemma3 op4+-calib 0.16927864 0.25
