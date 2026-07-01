@@ -833,11 +833,10 @@ pub fn model_card(path: &Path) -> ModelCard {
     let arch_id = inventory.as_ref().map(|(m, _)| m.arch_id);
     let quant = inventory
         .as_ref()
-        .and_then(|(m, tensors)| {
+        .and_then(|(m, _)| {
             serde_json::from_str::<Value>(&m.metadata_json)
                 .ok()
                 .and_then(|v| metadata_quant_token(&v))
-                .or_else(|| index_quant_token(tensors))
         })
         .unwrap_or_else(|| "unknown".to_string());
     ModelCard {
@@ -1507,51 +1506,6 @@ fn metadata_quant_token(metadata: &Value) -> Option<String> {
     .map(|s| s.to_ascii_lowercase())
 }
 
-fn index_quant_token(tensors: &[HfqIndexTensor]) -> Option<String> {
-    let mut params_by_token = std::collections::BTreeMap::<&'static str, u64>::new();
-    for tensor in tensors {
-        let token = match tensor.quant_type {
-            0 => "q4f16",
-            1 => "f16",
-            2 => "f32",
-            3 => "q8",
-            4 => "q4k",
-            5 => "q8hfq",
-            6 | 7 => "hfq4",
-            8 => "hfq6",
-            9 | 10 => "hfq2",
-            11 | 12 => "hfq3",
-            13 => "mq4",
-            14 => "mq8",
-            15 => "mq6",
-            16 => "bf16",
-            17 => "mq3",
-            18 => "mq2",
-            19 => "lloyd-mq2",
-            20 => "lloyd-mq3",
-            21 => "hfp4",
-            24 => "mfp4",
-            28 => "paro4",
-            29 => "paro4t",
-            30 => "lloyd-mq4",
-            31 => "qtip3",
-            33 => "oq4+",
-            34 => "oq4",
-            35 => "oq8",
-            36 => "oq4+c",
-            _ => continue,
-        };
-        let entry = params_by_token.entry(token).or_insert(0);
-        *entry = entry.saturating_add(index_tensor_param_count(tensor));
-    }
-    params_by_token
-        .into_iter()
-        .max_by(|(a_token, a_params), (b_token, b_params)| {
-            a_params.cmp(b_params).then_with(|| b_token.cmp(a_token))
-        })
-        .map(|(token, _)| token.to_string())
-}
-
 fn metadata_artifact_arch(metadata: &Value) -> Option<String> {
     [
         metadata.get("artifact_arch"),
@@ -1601,9 +1555,8 @@ pub fn build_llm_registry_in(
             let model_name = metadata_model_name(&metadata_value, &model);
             let tags = metadata_string_array(metadata_value.get("tags"));
             let features = metadata_string_array(metadata_value.get("features"));
-            let quant = metadata_quant_token(&metadata_value)
-                .or_else(|| index_quant_token(&tensors))
-                .unwrap_or_else(|| "unknown".to_string());
+            let quant =
+                metadata_quant_token(&metadata_value).unwrap_or_else(|| "unknown".to_string());
             let arch = metadata_artifact_arch(&metadata_value);
             let mut model_triattn =
                 matching_assets(&triattn, |asset| triattn_matches_model(&asset.file, &file));
@@ -2669,7 +2622,48 @@ mod tests {
     }
 
     #[test]
-    fn llm_registry_derives_legacy_hfq_size_and_quant_from_index() {
+    fn llm_registry_reads_identity_from_hfq_metadata_not_filename() {
+        let root = temp_dir("hipfire-model-registry-metadata");
+        let models = root.join("models");
+        let triattn = root.join("triattn");
+        let drafts = root.join("drafts");
+        let templates = root.join("templates");
+        fs::create_dir_all(&models).unwrap();
+        fs::create_dir_all(&triattn).unwrap();
+        fs::create_dir_all(&drafts).unwrap();
+        fs::create_dir_all(&templates).unwrap();
+        let metadata = json!({
+            "model_name": "Deepseek-v4-Flash",
+            "quant_format": "oq4++",
+            "artifact_arch": "gfx1201",
+            "parameter_counts": {
+                "schema": "hipfire.parameter_counts.v1",
+                "total_params": 671_000_000_000u64,
+                "active_params": 37_000_000_000u64,
+                "effective_params": 37_000_000_000u64,
+            },
+            "features": ["dflash", "triattn"],
+            "tags": ["flash"],
+        });
+        write_minimal_hfq(&models.join("misleading-qwen3.5-9B.mq4.hfq"), &metadata);
+
+        let registry = build_llm_registry_in(&models, &triattn, &drafts, &templates);
+
+        assert_eq!(registry.model_count(), 1);
+        let model = &registry.models[0];
+        assert_eq!(model.id, "misleading-qwen3.5-9B.mq4");
+        assert_eq!(model.model, "Deepseek-v4-Flash");
+        assert_eq!(model.size.as_deref(), Some("671B-E37B"));
+        assert_eq!(model.quant, "oq4++");
+        assert_eq!(model.arch.as_deref(), Some("gfx1201"));
+        assert_eq!(model.tags, vec!["flash"]);
+        assert_eq!(model.features, vec!["dflash", "triattn"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn llm_registry_marks_missing_quant_metadata_unknown() {
         let root = temp_dir("hipfire-model-registry-index");
         let models = root.join("models");
         let triattn = root.join("triattn");
@@ -2710,7 +2704,7 @@ mod tests {
         assert_eq!(model.id, "Deepseek-v4-Flash");
         assert_eq!(model.model, "Deepseek-v4-Flash");
         assert_eq!(model.size.as_deref(), Some("671M-E71M"));
-        assert_eq!(model.quant, "mq4");
+        assert_eq!(model.quant, "unknown");
         assert_eq!(
             model
                 .parameter_counts
