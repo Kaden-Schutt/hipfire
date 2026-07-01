@@ -191,6 +191,113 @@ fn w4a16(a: &[f32], w: &[f32], out: usize, h: usize, mode: &Rot) -> f32 {
     sqnr(&y, &yr)
 }
 
+/// Run the α-sweep for one linear (contraction/rotation dim `dim`, output rows `out`)
+/// over its per-layer reader activations `acts[nl][SEQ,dim]` and weights `wts[nl][out,dim]`.
+#[allow(clippy::too_many_arguments)]
+fn sweep_tensor(
+    gpu: &mut Gpu,
+    name: &str,
+    acts: &[Vec<f32>],
+    wts: &[Vec<f32>],
+    dim: usize,
+    out: usize,
+    s1: &[f32],
+    s2: &[f32],
+) -> HipResult<()> {
+    let nl = acts.len();
+    if dim % GROUP != 0 || !dim.is_power_of_two() {
+        println!("\n== {name} (dim={dim}) SKIP: rotation dim must be pow2 & %256");
+        return Ok(());
+    }
+    // Learning activation set + Hessian H = XᵀX [dim,dim].
+    let rows = nl * SEQ;
+    let mut xstack = Vec::with_capacity(rows * dim);
+    for m in acts.iter() {
+        xstack.extend_from_slice(m);
+    }
+    let mut hess = vec![0.0f32; dim * dim];
+    for r in 0..rows {
+        let xr = &xstack[r * dim..r * dim + dim];
+        for i in 0..dim {
+            let xi = xr[i];
+            if xi == 0.0 {
+                continue;
+            }
+            let hrow = &mut hess[i * dim..i * dim + dim];
+            for (o, &xj) in hrow.iter_mut().zip(xr.iter()) {
+                *o += xi * xj;
+            }
+        }
+    }
+    // Weight set for the weight-quant term, row-subsampled cheap (~384 rows).
+    let stride = ((nl * out) / 384).max(1);
+    let mut wstack = Vec::new();
+    let mut rows_wt = 0usize;
+    for m in wts.iter() {
+        let mut r = 0;
+        while r < out {
+            wstack.extend_from_slice(&m[r * dim..r * dim + dim]);
+            rows_wt += 1;
+            r += stride;
+        }
+    }
+
+    let fwht = Rot::Fwht(s1, s2);
+    let mut pre_fwht = 0.0f32;
+    let mut dec_fwht = 0.0f32;
+    for i in 0..nl {
+        pre_fwht += w4a4(gpu, &acts[i], &wts[i], out, dim, &fwht)?;
+        dec_fwht += w4a16(&acts[i], &wts[i], out, dim, &fwht);
+    }
+    pre_fwht /= nl as f32;
+    dec_fwht /= nl as f32;
+    println!(
+        "\n== {name}  dim={dim} out={out} rows_act={rows} rows_wt={rows_wt}\n  baseline per-group FWHT:   prefill W4A4 {pre_fwht:6.2} dB   decode W4A16 {dec_fwht:6.2} dB"
+    );
+    println!("   alpha | prefill W4A4 | decode W4A16 | note");
+    println!("  -------+--------------+--------------+-----------------------------");
+    for &alpha in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
+        let m = learn_rotation_phase_joint(
+            &xstack,
+            rows,
+            &wstack,
+            rows_wt,
+            &hess,
+            dim,
+            GROUP,
+            4,
+            Rotation::hadamard(dim, 1),
+            80,
+            0.05,
+            6,
+            alpha,
+        );
+        let mode = Rot::Full(&m);
+        let mut pre = 0.0f32;
+        let mut dec = 0.0f32;
+        for i in 0..nl {
+            pre += w4a4(gpu, &acts[i], &wts[i], out, dim, &mode)?;
+            dec += w4a16(&acts[i], &wts[i], out, dim, &mode);
+        }
+        pre /= nl as f32;
+        dec /= nl as f32;
+        let note = if alpha == 0.0 {
+            "act-only (= --rotate)"
+        } else if alpha == 1.0 {
+            "weight-only (decode-opt)"
+        } else if dec >= dec_fwht && pre > pre_fwht {
+            "<- single-buffer WIN"
+        } else {
+            ""
+        };
+        println!("   {alpha:4.2}  |   {pre:7.2}    |   {dec:7.2}    | {note}");
+    }
+    println!(
+        "  target: decode >= {dec_fwht:.2} dB (FWHT) AND prefill > {pre_fwht:.2} dB => one buffer"
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args()
         .nth(1)
@@ -214,112 +321,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = LlamaModel::from_f32_weights(&mut gpu, &cfg, w, SEQ, 2, 1.0)?;
     apply_r1(&mut gpu, &mut model, &Rotation::identity(h))?; // fold only
     let qd = model.dims.q_dim();
+    let inter = model.dims.inter;
     let tokens: Vec<u32> = (0..SEQ)
         .map(|t| (13 + t * 97) as u32 % cfg.vocab_size as u32)
         .collect();
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
     let acts = model_forward(&mut gpu, &model, &tokens, &pos)?;
 
-    let mut xn1 = Vec::new();
-    let mut wq = Vec::new();
+    // All Oq4G256 readers on Supra rotate on dim = h (=512, %256 ✓). down_proj reads
+    // on inter (=1408 here — NOT pow2/%256, so not an Oq4G256 target; the codec FWHT
+    // can't apply, and sweep_tensor skips it). We sample the residual-stream readers
+    // that span the interesting activation distributions: q_proj (post-norm residual),
+    // o_proj (attention context P·V — the outlier-prone one), up_proj (post-attn norm).
+    let (mut xn1, mut wq) = (vec![], vec![]);
+    let (mut ctx, mut wo) = (vec![], vec![]);
+    let (mut xn2, mut wup) = (vec![], vec![]);
+    let (mut hact, mut wdown) = (vec![], vec![]);
     for (i, (lw, _)) in model.layers.iter().enumerate() {
-        xn1.push(gpu.download_f32(&acts.layer_acts[i].xn1)?);
+        let a = &acts.layer_acts[i];
+        xn1.push(gpu.download_f32(&a.xn1)?);
         wq.push(gpu.download_f32(&lw.wq)?);
+        ctx.push(gpu.download_f32(&a.ctx)?); // attention context [SEQ,h]
+        wo.push(gpu.download_f32(&lw.wo)?); // [h,h]
+        xn2.push(gpu.download_f32(&a.xn2)?); // post-attn norm [SEQ,h]
+        wup.push(gpu.download_f32(&lw.wup)?); // [inter,h]
+        hact.push(gpu.download_f32(&a.act)?); // SwiGLU out [SEQ,inter]
+        wdown.push(gpu.download_f32(&lw.wdown)?); // [h,inter]
     }
     let nl = model.layers.len();
-
-    // Learning activation set: stacked q_proj reader activations (xn1).
-    let rows = nl * SEQ;
-    let mut xstack = Vec::with_capacity(rows * h);
-    for m in xn1.iter() {
-        xstack.extend_from_slice(m);
-    }
-    // Hessian H = XᵀX [h,h] over the reader activations (the calib collector's H).
-    let mut hess = vec![0.0f32; h * h];
-    for r in 0..rows {
-        let xr = &xstack[r * h..r * h + h];
-        for i in 0..h {
-            let xi = xr[i];
-            if xi == 0.0 {
-                continue;
-            }
-            let hrow = &mut hess[i * h..i * h + h];
-            for (o, &xj) in hrow.iter_mut().zip(xr.iter()) {
-                *o += xi * xj;
-            }
-        }
-    }
-    // Weight set for the weight-quant term: q_proj readers, row-subsampled cheap.
-    let stride = ((nl * qd) / 384).max(1);
-    let mut wstack = Vec::new();
-    let mut rows_wt = 0usize;
-    for m in wq.iter() {
-        let mut r = 0;
-        while r < qd {
-            wstack.extend_from_slice(&m[r * h..r * h + h]);
-            rows_wt += 1;
-            r += stride;
-        }
-    }
-    println!("  hidden={h} q_dim={qd} layers={nl}  learn rows_act={rows} rows_wt={rows_wt}");
+    println!("  hidden={h} q_dim={qd} inter={inter} layers={nl}");
 
     let s1 = gen_fwht_signs(42, GROUP);
     let s2 = gen_fwht_signs(1042, GROUP);
-    let fwht = Rot::Fwht(&s1, &s2);
 
-    // Deployed per-group FWHT baseline for BOTH phases.
-    let mut pre_fwht = 0.0f32;
-    let mut dec_fwht = 0.0f32;
-    for i in 0..nl {
-        pre_fwht += w4a4(&mut gpu, &xn1[i], &wq[i], qd, h, &fwht)?;
-        dec_fwht += w4a16(&xn1[i], &wq[i], qd, h, &fwht);
-    }
-    pre_fwht /= nl as f32;
-    dec_fwht /= nl as f32;
-    println!(
-        "\n  baseline per-group FWHT:   prefill W4A4 {pre_fwht:6.2} dB   decode W4A16 {dec_fwht:6.2} dB"
-    );
-
-    println!("\n   alpha | prefill W4A4 | decode W4A16 | note");
-    println!("  -------+--------------+--------------+-----------------------------");
-    for &alpha in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
-        let m = learn_rotation_phase_joint(
-            &xstack,
-            rows,
-            &wstack,
-            rows_wt,
-            &hess,
-            h,
-            GROUP,
-            4,
-            Rotation::hadamard(h, 1),
-            80,
-            0.05,
-            6,
-            alpha,
-        );
-        let mode = Rot::Full(&m);
-        let mut pre = 0.0f32;
-        let mut dec = 0.0f32;
-        for i in 0..nl {
-            pre += w4a4(&mut gpu, &xn1[i], &wq[i], qd, h, &mode)?;
-            dec += w4a16(&xn1[i], &wq[i], qd, h, &mode);
-        }
-        pre /= nl as f32;
-        dec /= nl as f32;
-        let note = if alpha == 0.0 {
-            "act-only (= today's --rotate)"
-        } else if alpha == 1.0 {
-            "weight-only (decode-optimal)"
-        } else if dec >= dec_fwht && pre > pre_fwht {
-            "<- single-buffer WIN"
-        } else {
-            ""
-        };
-        println!("   {alpha:4.2}  |   {pre:7.2}    |   {dec:7.2}    | {note}");
-    }
-    println!(
-        "\n  target: an alpha with decode >= {dec_fwht:.2} dB (FWHT) AND prefill > {pre_fwht:.2} dB\n  => one int4 buffer serves both phases; else two buffers."
-    );
+    sweep_tensor(&mut gpu, "q_proj", &xn1, &wq, h, qd, &s1, &s2)?;
+    sweep_tensor(&mut gpu, "o_proj", &ctx, &wo, h, h, &s1, &s2)?;
+    sweep_tensor(&mut gpu, "up_proj", &xn2, &wup, h, inter, &s1, &s2)?;
+    sweep_tensor(&mut gpu, "down_proj", &hact, &wdown, inter, h, &s1, &s2)?;
     Ok(())
 }

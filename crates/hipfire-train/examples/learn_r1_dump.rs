@@ -33,13 +33,19 @@ const SEQ: usize = 16;
 const MAGIC: [u8; 4] = *b"HFR1";
 
 /// Capture the residual-read activations (xn1 + xn2 per layer) that R1 flattens,
-/// mirroring `learned_r1_w4a4_probe`, and learn the kurtosis-minimizing rotation.
+/// mirroring `learned_r1_w4a4_probe`, and learn the rotation. `alpha == 0` learns the
+/// pure activation-kurtosis rotation (today's `--rotate`); `alpha > 0` learns the
+/// **phase-joint** rotation (one buffer for prefill W4A4 + decode W-int/A-f16),
+/// blending in the Hessian-weighted weight-quant term over the on-h readers so the
+/// stored int4 grid stays good for the f16-activation decode path. See
+/// [`hipfire_train::learn_rotation::learn_rotation_phase_joint`].
 fn learn_r1(
     gpu: &mut Gpu,
     model: &LlamaModel,
     tokens: &[u32],
     pos: &[f32],
     h: usize,
+    alpha: f32,
 ) -> Result<Rotation, Box<dyn std::error::Error>> {
     let acts = model_forward(gpu, model, tokens, pos)?;
     let nl = model.layers.len();
@@ -51,14 +57,72 @@ fn learn_r1(
         xres.extend_from_slice(&gpu.download_f32(&acts.layer_acts[i].xn2)?);
     }
     let rows = nl * 2 * SEQ;
-    Ok(hipfire_train::learn_rotation::learn_rotation_kurtosis(
+    if alpha <= 0.0 {
+        return Ok(hipfire_train::learn_rotation::learn_rotation_kurtosis(
+            &xres,
+            rows,
+            h,
+            Rotation::hadamard(h, 1),
+            120,
+            0.05,
+            6,
+        ));
+    }
+    // Hessian H = XᵀX [h,h] over the residual activations.
+    let mut hess = vec![0.0f32; h * h];
+    for r in 0..rows {
+        let xr = &xres[r * h..r * h + h];
+        for i in 0..h {
+            let xi = xr[i];
+            if xi == 0.0 {
+                continue;
+            }
+            let hrow = &mut hess[i * h..i * h + h];
+            for (o, &xj) in hrow.iter_mut().zip(xr.iter()) {
+                *o += xi * xj;
+            }
+        }
+    }
+    // Weight set: the on-h readers (q,k,v,o read on the residual; gate,up on the
+    // post-attn norm) — the tensors the deployed int4 grid quantizes in the M basis.
+    // Row-subsampled to ~512 rows total; kurtosis/quant stats converge on a sample.
+    let mut wstack = Vec::new();
+    let mut rows_wt = 0usize;
+    let mut add = |gpu: &mut Gpu,
+                   t: &rdna_compute::GpuTensor,
+                   stride: usize|
+     -> rdna_compute::HipResult<()> {
+        let m = gpu.download_f32(t)?;
+        let mrows = m.len() / h;
+        let mut r = 0;
+        while r < mrows {
+            wstack.extend_from_slice(&m[r * h..r * h + h]);
+            rows_wt += 1;
+            r += stride;
+        }
+        Ok(())
+    };
+    for (lw, _) in model.layers.iter() {
+        add(gpu, &lw.wq, 24)?;
+        add(gpu, &lw.wo, 24)?;
+        add(gpu, &lw.wgate, 64)?;
+        add(gpu, &lw.wup, 64)?;
+    }
+    println!("  phase-joint alpha={alpha}  rows_act={rows} rows_wt={rows_wt}");
+    Ok(hipfire_train::learn_rotation::learn_rotation_phase_joint(
         &xres,
         rows,
+        &wstack,
+        rows_wt,
+        &hess,
         h,
+        256,
+        4,
         Rotation::hadamard(h, 1),
-        120,
+        100,
         0.05,
         6,
+        alpha,
     ))
 }
 
@@ -66,6 +130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut argv = std::env::args().skip(1);
     let dir = argv.next().unwrap_or_else(|| DEFAULT_DIR.to_string());
     let out = argv.next().unwrap_or_else(|| "supra50m.r1".to_string());
+    // Optional argv[3] = alpha (0 = act-only kurtosis = default; >0 = phase-joint).
+    let alpha: f32 = argv.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let dir = Path::new(&dir);
     if !dir.exists() {
         return Err(format!("model dir not found: {} (argv[1])", dir.display()).into());
@@ -88,8 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
 
-    println!("learning R1 (kurtosis on residual xn1+xn2, hidden dim {h}) …");
-    let r1 = learn_r1(&mut gpu, &model, &tokens, &pos, h)?;
+    println!("learning R1 (residual xn1+xn2, hidden dim {h}, alpha={alpha}) …");
+    let r1 = learn_r1(&mut gpu, &model, &tokens, &pos, h, alpha)?;
     println!("  orthonormality {:.1e}", r1.orthonormality_error());
 
     // Sanity: the baked FᵀM stays orthonormal and apply_r1(FᵀM) leaves the fp
