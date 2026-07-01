@@ -2607,6 +2607,9 @@ fn main() {
     // params override individual fields; the rest fall back to these
     // load-time defaults. Cleared alongside `pflash_state`.
     let mut pflash_cfg: Option<hipfire_arch_qwen35::pflash::PflashConfig> = None;
+    // H-Neurons CETT capture: per-layer down_proj column norms (`[n_layers][intermediate]`),
+    // loaded once via `cett_load_colnorms` and reused for every `cett_capture` prefill.
+    let mut cett_colnorms: Option<Vec<Vec<f32>>> = None;
     // Hetero PFlash: when prefill_drafter_device differs from the target,
     // the drafter weights/KV/scratch live on a sibling device. The compress
     // output is a host-side Vec<u32>, so no peer-copy is needed — generate
@@ -5566,6 +5569,226 @@ fn main() {
                 hipfire_steer::clear();
                 let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
                 let _ = stdout.flush();
+            }
+
+            // ── H-Neurons CETT capture (arXiv 2512.01797) ───────────────────
+            // Load the per-layer down_proj column norms (`‖W_down[:,j]‖`) once
+            // from a compact little-endian binary produced host-side from the
+            // source fp16 weights:
+            //   [u32 n_layers][u32 intermediate][f32 × n_layers*intermediate].
+            // Cached in `cett_colnorms` and reused for every `cett_capture`.
+            "cett_load_colnorms" => {
+                let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "cett_load_colnorms: missing 'path'".to_string(),
+                    );
+                    continue;
+                };
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("cett_load_colnorms: {e}"));
+                        continue;
+                    }
+                };
+                if bytes.len() < 8 {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "cett_load_colnorms: file too short".to_string(),
+                    );
+                    continue;
+                }
+                let n_layers =
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+                let inter = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+                let want = 8 + n_layers * inter * 4;
+                if bytes.len() != want {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!(
+                            "cett_load_colnorms: size mismatch (got {} want {want})",
+                            bytes.len()
+                        ),
+                    );
+                    continue;
+                }
+                let mut cn = Vec::with_capacity(n_layers);
+                let mut off = 8usize;
+                for _ in 0..n_layers {
+                    let mut row = Vec::with_capacity(inter);
+                    for _ in 0..inter {
+                        row.push(f32::from_le_bytes([
+                            bytes[off],
+                            bytes[off + 1],
+                            bytes[off + 2],
+                            bytes[off + 3],
+                        ]));
+                        off += 4;
+                    }
+                    cn.push(row);
+                }
+                cett_colnorms = Some(cn);
+                let resp = serde_json::json!({
+                    "type": "cett_ok",
+                    "n_layers": n_layers,
+                    "intermediate": inter,
+                });
+                let _ = writeln!(stdout, "{resp}");
+                let _ = stdout.flush();
+            }
+
+            // Prefill (jinja-framed prompt + response) through the CETT-tapped
+            // llama forward and return the per-layer mean-over-response-tokens
+            // CETT feature (`[n_layers][intermediate]`). Requires a resident
+            // llama backend (arch 10) and a prior `cett_load_colnorms`.
+            "cett_capture" => {
+                let system = msg
+                    .get("system")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let Some(user) = msg.get("user").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(&mut stdout, "", "cett_capture: missing 'user'".to_string());
+                    continue;
+                };
+                let response = msg
+                    .get("response")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let Some(colnorms) = cett_colnorms.clone() else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "cett_capture: no colnorms (call cett_load_colnorms first)".to_string(),
+                    );
+                    continue;
+                };
+                let Some(m) = model.as_mut() else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "cett_capture: no model loaded".to_string(),
+                    );
+                    continue;
+                };
+                let arch_id = m.arch_id;
+                // Frame the prompt via the model's jinja chat_template, then build
+                // the full [prompt ++ response] token sequence. These are all
+                // immutable borrows of `m`, released before the mutable backend
+                // borrow below (mirrors the steer_capture ordering).
+                let framed = {
+                    let Some(tokenizer) = m.tokenizer.as_ref() else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "cett_capture: resident model has no tokenizer".to_string(),
+                        );
+                        continue;
+                    };
+                    let Some(tmpl) = m.chat_template.as_ref() else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "cett_capture: model has no chat_template".to_string(),
+                        );
+                        continue;
+                    };
+                    let frame = prompt_frame::JinjaChatFrame {
+                        tokenizer,
+                        template: tmpl,
+                        system: (!system.is_empty()).then_some(system.as_str()),
+                        user: &user,
+                        enable_thinking: false,
+                        bos_token: None,
+                    };
+                    match frame.render() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("cett_capture: jinja render: {e}"),
+                            );
+                            continue;
+                        }
+                    }
+                };
+                let (full, response_start) = {
+                    let tokenizer = m.tokenizer.as_ref().unwrap();
+                    let prompt_ids = tokenizer.encode(&framed);
+                    let response_ids = tokenizer.encode(&response);
+                    let rs = prompt_ids.len();
+                    let mut full = prompt_ids;
+                    full.extend(response_ids);
+                    (full, rs)
+                };
+                if full.len() <= response_start {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "cett_capture: empty response after tokenization".to_string(),
+                    );
+                    continue;
+                }
+                let Some(b) = m.llama_backend.as_mut() else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("cett_capture: arch_id {arch_id} has no resident llama backend"),
+                    );
+                    continue;
+                };
+                if colnorms.len() != b.config.n_layers {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!(
+                            "cett_capture: colnorms n_layers {} != model n_layers {}",
+                            colnorms.len(),
+                            b.config.n_layers
+                        ),
+                    );
+                    continue;
+                }
+                let hidden = b.config.dim;
+                hipfire_hneurons::capture::begin_capture(colnorms, response_start, hidden);
+                let res = hipfire_runtime::llama::prefill_forward(
+                    &mut gpu,
+                    &b.weights,
+                    &b.config,
+                    &full,
+                    &mut b.kv_cache,
+                );
+                match res {
+                    Ok(_) => match hipfire_hneurons::capture::finish_capture() {
+                        Some(feature) => {
+                            let resp = serde_json::json!({
+                                "type": "cett_feature",
+                                "feature": feature,
+                            });
+                            let _ = writeln!(stdout, "{resp}");
+                            let _ = stdout.flush();
+                        }
+                        None => emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "cett_capture: capture produced no feature".to_string(),
+                        ),
+                    },
+                    Err(e) => {
+                        hipfire_hneurons::capture::clear();
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("cett_capture: prefill: {e:?}"),
+                        );
+                    }
+                }
             }
 
             // LoRA adapter stack (shares the steer APPLY session). Load a `.lora`

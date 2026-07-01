@@ -54,7 +54,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_COLLECT_ARTIFACTS_BIN` | Runtime variable controlling collect artifacts bin in hipfire | `crates/hipfire-eval/src/lib.rs:1211` |
 | `HIPFIRE_COMP_DUMP` | Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each | `crates/hipfire-arch-deepseek4/src/forward.rs:643` |
 | `HIPFIRE_CONV1D_TREE_GFX1151` | Environment toggle value controls runtime behavior | `crates/rdna-compute/examples/bench_conv1d_tree_gfx1151.rs:22` |
-| `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:1073` |
+| `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:1125` |
 | `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1437` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `crates/hipfire-serving-core/src/load.rs:3207` |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:11360` |
@@ -187,7 +187,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_EVAL_KLDREF` | Runtime variable controlling eval kldref in hipfire | `crates/hipfire-eval/src/executor_examples.rs:678` |
 | `HIPFIRE_EVAL_PERPLEXITY_CORPUS` | Runtime variable controlling eval perplexity corpus in hipfire | `crates/hipfire-eval/src/run.rs:175` |
 | `HIPFIRE_EVAL_PERPLEXITY_CTX` | Parses "HIPFIRE_EVAL_PERPLEXITY_CTX" with fallback defaults | `crates/hipfire-eval/src/executor_examples.rs:764` |
-| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | cache so the model "sees" them as part of its own trajectory, | `crates/hipfire-daemon/src/main.rs:3725` |
+| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | cache so the model "sees" them as part of its own trajectory, | `crates/hipfire-daemon/src/main.rs:3728` |
 | `HIPFIRE_FILES_STATE_MAX` | Parses "HIPFIRE_FILES_STATE_MAX" with fallback defaults | `crates/hipfire-server/src/routes/files.rs:174` |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | Parses "HIPFIRE_FLASH_PARTIALS_BATCH" with fallback defaults | `crates/hipfire-runtime/src/config.rs:87` |
 | `HIPFIRE_FORCE_GENERIC` | Runtime variable controlling force generic in hipfire | `crates/rdna-compute/src/feature_flags.rs:325` |
@@ -369,10 +369,10 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_PFLASH_NIAH_BENCH_BIN` | Runtime variable controlling pflash niah bench bin in hipfire | `crates/hipfire-eval/src/lib.rs:1181` |
 | `HIPFIRE_PFLASH_REPORT_TRAIN` | Runtime variable controlling pflash report train in hipfire | `crates/hipfire-train/examples/ssm_drafter_train.rs:95` |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | Parses "HIPFIRE_PFLASH_SCORE_LAYER" with fallback defaults | `crates/hipfire-arch-qwen35/src/pflash.rs:1082` |
-| `HIPFIRE_PP_DFLASH` | Environment toggle value controls runtime behavior | `crates/hipfire-daemon/src/main.rs:3030` |
+| `HIPFIRE_PP_DFLASH` | Environment toggle value controls runtime behavior | `crates/hipfire-daemon/src/main.rs:3033` |
 | `HIPFIRE_PP_LAYERS` | Runtime variable controlling pp layers in hipfire | `crates/hipfire-serving-core/src/load.rs:2622` |
 | `HIPFIRE_PP_PARITY_MODEL` | Runtime variable controlling pp parity model in hipfire | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:197` |
-| `HIPFIRE_PP_PFLASH` | Environment toggle value controls runtime behavior | `crates/hipfire-daemon/src/main.rs:3048` |
+| `HIPFIRE_PP_PFLASH` | Environment toggle value controls runtime behavior | `crates/hipfire-daemon/src/main.rs:3051` |
 | `HIPFIRE_PREFILL_ALPHA` | Runtime variable controlling prefill alpha in hipfire | `crates/hipfire-arch-qwen35/src/pflash.rs:125` |
 | `HIPFIRE_PREFILL_BATCHED` | Enabled by default; set to 0 to disable | `crates/hipfire-runtime/src/config.rs:86` |
 | `HIPFIRE_PREFILL_BLOCK` | Runtime variable controlling prefill block in hipfire | `crates/hipfire-arch-qwen35/src/pflash.rs:145` |
@@ -439,11 +439,11 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_RECOVER_MODE` | HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity) | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:138` |
 | `HIPFIRE_RECOVER_NOISE` | KVarN+CASK: tail queries read merged cold keys strictly in their past). 0 = | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:137` |
 | `HIPFIRE_REPLAY_GRAPH` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:5089` |
-| `HIPFIRE_RESOURCE_LOCK` | HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases | `crates/hipfire-daemon-adapter/src/lib.rs:926` |
-| `HIPFIRE_RESOURCE_LOCK_CPU_CORES` | HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores | `crates/hipfire-daemon-adapter/src/lib.rs:811` |
+| `HIPFIRE_RESOURCE_LOCK` | HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases | `crates/hipfire-daemon-adapter/src/lib.rs:978` |
+| `HIPFIRE_RESOURCE_LOCK_CPU_CORES` | HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores | `crates/hipfire-daemon-adapter/src/lib.rs:863` |
 | `HIPFIRE_RESOURCE_LOCK_DIR` | HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory | `crates/hipfire-lock/src/lib.rs:213` |
-| `HIPFIRE_RESOURCE_LOCK_NPUS` | HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs | `crates/hipfire-daemon-adapter/src/lib.rs:776` |
-| `HIPFIRE_RESOURCE_LOCK_WAIT_MS` | HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup | `crates/hipfire-daemon-adapter/src/lib.rs:944` |
+| `HIPFIRE_RESOURCE_LOCK_NPUS` | HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs | `crates/hipfire-daemon-adapter/src/lib.rs:828` |
+| `HIPFIRE_RESOURCE_LOCK_WAIT_MS` | HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup | `crates/hipfire-daemon-adapter/src/lib.rs:996` |
 | `HIPFIRE_RESPONSES_STATE_MAX` | Runtime variable controlling responses state max in hipfire | `crates/hipfire-server/src/routes/responses.rs:714` |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | Runtime variable controlling rocblas all archs in hipfire | `crates/rdna-compute/src/feature_flags.rs:303` |
 | `HIPFIRE_ROCBLAS_OFF` | Enabled when set to 1 | `crates/rdna-compute/src/feature_flags.rs:305` |
@@ -511,7 +511,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_WO_WMMA_VARIANT` | Runtime variable controlling wo wmma variant in hipfire | `crates/rdna-compute/src/feature_flags.rs:300` |
 | `HIPFIRE_XDNA1_LIB` | Runtime variable controlling xdna1 lib in hipfire | `crates/hipfire-npu/src/lib.rs:69` |
 | `HIP_PATH` | fails with "file not found". Add well-known candidates as -I flags; | `crates/rdna-compute/src/compiler.rs:509` |
-| `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1355` |
+| `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1407` |
 | `HOME` | Runtime variable controlling home in hipfire | `crates/rdna-compute/src/compiler.rs:227` |
 | `HOSTNAME` | Runtime variable controlling hostname in hipfire | `crates/hipfire-tui/src/hipfire/status.rs:130` |
 | `HUGGINGFACE_HUB_CACHE` | Runtime variable controlling huggingface hub cache in hipfire | `crates/hipfire-server/src/routes/sdapi.rs:4127` |
@@ -526,7 +526,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `QWEN35_TEST_MODEL` | Runtime variable controlling qwen35 test model in hipfire | `crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:22` |
 | `ROCM_DEVICE_LIB_PATH` | Runtime variable controlling rocm device lib path in hipfire | `crates/rdna-compute/src/compiler.rs:497` |
 | `ROCM_PATH` | Runtime variable controlling rocm path in hipfire | `crates/rdna-compute/src/compiler.rs:494` |
-| `ROCR_VISIBLE_DEVICES` | Runtime variable controlling rocr visible devices in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:735` |
+| `ROCR_VISIBLE_DEVICES` | Runtime variable controlling rocr visible devices in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:787` |
 | `TINYLLAMA_GGUF` | Runtime variable controlling tinyllama gguf in hipfire | `crates/hipfire-runtime/examples/test_q4f16QA.rs:38` |
 | `TRIALS` | Runtime variable controlling trials in hipfire | `crates/rdna-compute/examples/bench_gfx1151_hfq4_s4_mmq.rs:151` |
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/rdna-compute/src/compiler.rs:228` |

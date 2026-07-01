@@ -19,6 +19,7 @@ hipfire-runtime    = { path = "../hipfire-runtime" }
 hipfire-kld        = { path = "../hipfire-kld" }
 hipfire-steer      = { path = "../hipfire-steer" }
 hipfire-lora-hfq   = { path = "../hipfire-lora-hfq" }
+hipfire-hneurons   = { path = "../hipfire-hneurons" }
 hipfire-arch-qwen35    = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-nemotron  = { path = "../hipfire-arch-nemotron" }

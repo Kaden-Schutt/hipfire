@@ -407,6 +407,17 @@ pub fn prefill_forward(
             // Batched down projection
             weight_gemm(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
 
+            // H-Neurons CETT tap (no-op unless a capture session is active).
+            // Full-sequence prefill starts at global position 0, so batch_start=0.
+            hipfire_hneurons::capture::maybe_capture_ffn(
+                gpu,
+                &ffn_hidden_batch,
+                &ffn_out_batch,
+                layer_idx,
+                0,
+                batch,
+            )?;
+
             // Batched residual
             gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
         }

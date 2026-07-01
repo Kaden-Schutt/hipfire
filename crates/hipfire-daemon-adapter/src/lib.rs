@@ -15,9 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
-    CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, KldChunkEvent, KldEvalRequest,
-    KldEvalResponse, LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest, RequestControl,
-    SteerApplyRequest, SteerBeginCaptureRequest, SteerCaptureRequest,
+    CettCaptureRequest, CettLoadColnormsRequest, CollectRequest, CollectResponse, DaemonRequest,
+    DaemonResponse, KldChunkEvent, KldEvalRequest, KldEvalResponse, LoraLoadRequest,
+    LoraSetScaleRequest, LoraUnloadRequest, RequestControl, SteerApplyRequest,
+    SteerBeginCaptureRequest, SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
@@ -365,6 +366,57 @@ impl DaemonEngine {
     pub async fn steer_clear(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::SteerClear).await?;
         self.expect_steer_ok("steer_clear").await
+    }
+
+    /// Load per-layer `down_proj` column norms (H-Neurons CETT) from a host-side
+    /// binary at `path`. Returns `(n_layers, intermediate)`.
+    pub async fn cett_load_colnorms(
+        &mut self,
+        path: impl Into<String>,
+    ) -> anyhow::Result<(usize, usize)> {
+        self.send(&DaemonRequest::CettLoadColnorms(CettLoadColnormsRequest {
+            path: path.into(),
+        }))
+        .await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::CettOk {
+                    n_layers,
+                    intermediate,
+                } => return Ok((n_layers, intermediate)),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon cett_load_colnorms error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during cett_load_colnorms: {other:?}"),
+            }
+        }
+    }
+
+    /// Prefill `(system, user)` + `response` through the CETT-tapped forward and
+    /// return the per-layer mean-over-response-tokens CETT feature.
+    pub async fn cett_capture(
+        &mut self,
+        system: impl Into<String>,
+        user: impl Into<String>,
+        response: impl Into<String>,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.send(&DaemonRequest::CettCapture(CettCaptureRequest {
+            system: system.into(),
+            user: user.into(),
+            response: response.into(),
+        }))
+        .await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::CettFeature { feature } => return Ok(feature),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon cett_capture error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during cett_capture: {other:?}"),
+            }
+        }
     }
 
     /// Drain to the `steer_ok` ack shared by the fire-and-forget steer ops.

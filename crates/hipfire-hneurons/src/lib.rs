@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod capture;
+
 /// Per-neuron CETT for one layer at one token.
 ///
 /// `act` is the down_proj INPUT (the `[intermediate]` FFN activations), `col_norm`

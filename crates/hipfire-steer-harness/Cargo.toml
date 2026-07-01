@@ -9,12 +9,20 @@ description = "Daemon-backed CLI for the hipfire-steer driver. Drives capture→
 name = "hipfire-steer"
 path = "src/main.rs"
 
+# H-Neurons (arXiv 2512.01797) reproduction driver: capture per-sample CETT
+# features via the daemon `cett_*` ops, then fit the hipfire-hneurons L1 probe.
+[[bin]]
+name = "hipfire-hneurons-probe"
+path = "src/bin/hneurons_probe.rs"
+
 [dependencies]
 hipfire-steer = { path = "../hipfire-steer" }
+hipfire-hneurons = { path = "../hipfire-hneurons" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hip-bridge = { path = "../hip-bridge" }
 anyhow = "1"
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros", "process", "time"] }

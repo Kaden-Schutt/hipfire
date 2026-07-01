@@ -7,6 +7,8 @@ description = "Hallucination-associated neuron (H-Neuron) identification, à la 
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
 
 [dev-dependencies]
 serde_json = "1"

@@ -66,6 +66,7 @@ hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-hneurons = { path = "../hipfire-hneurons" }
 hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"

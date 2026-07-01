@@ -162,6 +162,26 @@ pub struct SteerMeansResponse {
     pub means: Vec<Vec<f32>>,
 }
 
+/// Load per-layer `down_proj` column norms (`‖W_down[:,j]‖`) for H-Neurons CETT
+/// capture from a host-side binary at `path`
+/// (`[u32 n_layers][u32 intermediate][f32 × n_layers*intermediate]`, LE).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CettLoadColnormsRequest {
+    pub path: String,
+}
+
+/// Prefill one framed `(system, user)` turn plus its `response`, and return the
+/// per-layer mean-over-response-tokens CETT feature. Requires prior
+/// `CettLoadColnorms` and a resident llama backend.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CettCaptureRequest {
+    #[serde(default)]
+    pub system: String,
+    pub user: String,
+    #[serde(default)]
+    pub response: String,
+}
+
 /// Load a `.lora` adapter container (path on the daemon host) onto the APPLY
 /// stack. `scale` overrides the adapter's baked-in default intensity if present;
 /// `id` renames the adapter on load (so the same container can be stacked under
@@ -225,6 +245,8 @@ pub enum DaemonRequest {
     LoraUnload(LoraUnloadRequest),
     LoraClear,
     LoraList,
+    CettLoadColnorms(CettLoadColnormsRequest),
+    CettCapture(CettCaptureRequest),
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +271,13 @@ pub enum DaemonResponse {
     SteerOk,
     LoraListed(LoraListResponse),
     LoraOk,
+    CettOk {
+        n_layers: usize,
+        intermediate: usize,
+    },
+    CettFeature {
+        feature: Vec<Vec<f32>>,
+    },
     #[serde(other)]
     Unknown,
 }
