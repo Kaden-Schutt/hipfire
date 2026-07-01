@@ -1639,6 +1639,14 @@ name = "hipfire-hash"
 version = "0.3.0"
 
 [[package]]
+name = "hipfire-hneurons"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-kld"
 version = "0.3.0"
 dependencies = [
