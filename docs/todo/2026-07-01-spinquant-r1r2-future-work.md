@@ -101,7 +101,43 @@ lib mechanism needed beyond the value-activation capture.
 
 ---
 
-## 2. `.hfq` emission — deploy the learned rotation as a real artifact
+## 2. `.hfq` emission — R1 deploy tooling **DONE** (path (a)); serving blocked on a runtime gap
+
+**Landed (path (a), R1-only).**
+- `hipfire-train` `examples/learn_r1_dump.rs` — learns R1 (kurtosis on residual
+  xn1+xn2) on a real model and writes the raw learned `M` as a `.r1` file
+  (`b"HFR1"` + `h:u32` + `h*h` f32 LE). Validates before writing: bakes `FᵀM`,
+  reloads a fresh model, `apply_r1(FᵀM)`, asserts fp-invariance vs fold-only
+  (Supra-50M max|Δlogit| 5.6e-5).
+- `hipfire-quantize` `src/rotate.rs` + `--rotate <M.r1>` — the in-quantizer
+  re-implementation of `apply_r1`'s host math with `R1 = FᵀM`. A pre-pass folds
+  each RMSNorm into its readers and rotates all residual readers/writers/embedding;
+  the rotated f32 is installed as a global override that the universal extractor
+  (`tensor_to_f32_with_optional_fp8_scale`) returns, so **every** codec branch
+  quantizes rotated weights with no per-branch edits. Tied models are untied: a
+  rotated `lm_head` (final_norm folded) is synthesized and emitted F16 — the
+  runtime loader auto-prefers an explicit `lm_head.weight` (`hfq.rs:1823`), so **no
+  runtime change**. Unit test `bake_cancels_codec_fwht_leaving_m` proves
+  rotate-by-`FᵀM` then codec FWHT `==` rotate-by-`M`. Dense llama (arch 0/1).
+- Real Supra-50M → 73 MB oq4 `.hfq` (R1 orthonormality 1.1e-6, 110 tensors
+  rotated). Tiny-quant gate unchanged (`--rotate` inert when unused).
+
+**BLOCKED — end-to-end serving/KLD.** The arch-0/1 **llama runtime loader supports
+qt≤31 but not qt=34 (Oq4G256)** (`hfq.rs:1712` panic; a *baseline* oq4 llama fails
+identically at the first weight — this is pre-existing and orthogonal to the
+rotation). So the doc's "W4A4 KLD of learned-R1 vs baseline Oq4" can't run on
+llama yet. **Remaining work = a runtime task: wire Oq4G256 (and its activation
+FWHT) GEMV into the dense-llama forward** (oq4 currently serves only
+qwen35/nemotron). Once that lands, validate KLD + the `iu4·iu4` vs `iu4·iu8`
+throughput on gfx1151. The rotation weights are correct by construction (identical
+to the fp-invariance-proven `apply_r1`) + unit-tested; only the serving path is
+missing.
+
+**R2 deploy** stays out of this item: the codec's 256-wide FWHT crosses head
+boundaries, so a per-head `apply_r2` can't be un-baked (net would be
+`F₂₅₆ ∘ blockdiag(R2)`, not `R2`) — needs a per-head codec variant, separate work.
+
+<details><summary>Original two-path plan (path (a) was chosen)</summary>
 
 **Why.** The bake *math* is proven (`bake_for_oq4_recipe`, unit-tested exact), but
 nothing writes a servable `.hfq` yet. This is the tangible payoff.
@@ -137,6 +173,8 @@ bandwidth-bound — frame the benchmark accordingly).
 `…oq4…hfq` — R1/R2 are merged and invisible to the loader. If a tag is wanted to
 mark the learned-rotation provenance, encode it as a dot-group before the quant
 token (do **not** invent a new quant token).
+
+</details>
 
 ---
 
