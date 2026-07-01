@@ -35,6 +35,7 @@
 //! grad wired anyway).
 
 use crate::model::LlamaModel;
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use rdna_compute::{Gpu, GpuTensor, HipResult};
 
 /// An orthonormal `[h,h]` rotation, row-major (`r[i*h + j]`). Invariant: `R Rᵀ = I`.
@@ -103,6 +104,67 @@ impl Rotation {
             if (state >> 63) & 1 == 1 {
                 for i in 0..h {
                     r[i * h + j] = -r[i * h + j];
+                }
+            }
+        }
+        Self { h, r }
+    }
+
+    /// The Oq4G256 codec's per-256-group FWHT as a dense block-diagonal `[h,h]`
+    /// rotation `F` (signs 42/1042 — the production seeds). `rotate_rows(x, F)`
+    /// reproduces the codec's `fwht_rows`, so `F` is the rotation the deployed
+    /// int4 pipeline already applies. `h % 256 == 0` required.
+    pub fn block_fwht(h: usize) -> Self {
+        assert_eq!(h % 256, 0, "block_fwht size {h} not a multiple of 256");
+        let (s1, s2) = (gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256));
+        // Column i of the 256-block = cpu_fwht_256(e_i) (so rotate_rows == fwht).
+        let mut block = vec![0.0f32; 256 * 256];
+        for i in 0..256 {
+            let mut e = [0.0f32; 256];
+            e[i] = 1.0;
+            cpu_fwht_256(&mut e, &s1, &s2);
+            for (j, &v) in e.iter().enumerate() {
+                block[j * 256 + i] = v;
+            }
+        }
+        let mut r = vec![0.0f32; h * h];
+        for b in 0..(h / 256) {
+            let off = b * 256;
+            for j in 0..256 {
+                for i in 0..256 {
+                    r[(off + j) * h + (off + i)] = block[j * 256 + i];
+                }
+            }
+        }
+        Self { h, r }
+    }
+
+    /// Transpose (= inverse, since orthonormal).
+    pub fn transpose(&self) -> Self {
+        let h = self.h;
+        let mut r = vec![0.0f32; h * h];
+        for i in 0..h {
+            for j in 0..h {
+                r[j * h + i] = self.r[i * h + j];
+            }
+        }
+        Self { h, r }
+    }
+
+    /// Matrix product `self · rhs` (both `[h,h]`); orthonormal × orthonormal ⇒
+    /// orthonormal.
+    pub fn compose(&self, rhs: &Rotation) -> Self {
+        assert_eq!(self.h, rhs.h);
+        let h = self.h;
+        let mut r = vec![0.0f32; h * h];
+        for i in 0..h {
+            for k in 0..h {
+                let a = self.r[i * h + k];
+                if a == 0.0 {
+                    continue;
+                }
+                for j in 0..h {
+                    r[i * h + j] += a * rhs.r[k * h + j];
                 }
             }
         }
@@ -310,6 +372,17 @@ pub fn apply_r1(gpu: &mut Gpu, model: &mut LlamaModel, rot: &Rotation) -> HipRes
     Ok(())
 }
 
+/// Bake a learned rotation `M` for deployment through the Oq4G256 codec: returns
+/// `R1 = Fᵀ M` where `F` is the codec's per-256-group FWHT. Passing this to
+/// [`apply_r1`] merges it into the weights; the codec then applies `F`, and
+/// `F·(Fᵀ M) = M`, so the int4 grid sees the learned rotation. The result is a
+/// **standard** `Oq4G256` `.hfq` — R1 is fully merged (zero runtime cost, no
+/// loader changes); export is just "`apply_r1(bake_for_oq4_recipe(M))` then run
+/// the normal Oq4 quantizer on the rotated weights".
+pub fn bake_for_oq4_recipe(m: &Rotation) -> Rotation {
+    Rotation::block_fwht(m.h).transpose().compose(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +407,61 @@ mod tests {
             let err = Rotation::hadamard(h, 3).orthonormality_error();
             assert!(err < 1e-5, "h={h} hadamard orthonormality err {err:e}");
         }
+    }
+
+    #[test]
+    fn block_fwht_matches_cpu_fwht_and_is_orthonormal() {
+        use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+        let f = Rotation::block_fwht(512);
+        assert!(
+            f.orthonormality_error() < 1e-4,
+            "block_fwht not orthonormal"
+        );
+        // rotate_rows(x, F) must reproduce the codec's per-256-group fwht.
+        let x: Vec<f32> = (0..2 * 512).map(|i| (i as f32 * 0.013).sin()).collect();
+        let via_rot = rotate_rows(&x, &f, 2);
+        let (s1, s2) = (gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256));
+        let mut manual = x.clone();
+        for r in 0..2 {
+            for seg in 0..2 {
+                let base = r * 512 + seg * 256;
+                let mut buf = [0.0f32; 256];
+                buf.copy_from_slice(&manual[base..base + 256]);
+                cpu_fwht_256(&mut buf, &s1, &s2);
+                manual[base..base + 256].copy_from_slice(&buf);
+            }
+        }
+        let worst = via_rot
+            .iter()
+            .zip(&manual)
+            .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        assert!(worst < 1e-4, "block_fwht != codec fwht: {worst:e}");
+    }
+
+    /// The export bake identity: applying `R1 = Fᵀ M` and then the codec's FWHT
+    /// `F` reproduces the direct learned rotation `M` — so a standard Oq4G256
+    /// quantize of the `apply_r1(bake_for_oq4_recipe(M))` weights carries the
+    /// learned rotation, no loader changes.
+    #[test]
+    fn bake_composes_to_learned_through_codec_fwht() {
+        let h = 512usize;
+        let m = Rotation::random(h, 5);
+        let f = Rotation::block_fwht(h);
+        let r1_bake = bake_for_oq4_recipe(&m);
+        assert!(
+            r1_bake.orthonormality_error() < 1e-3,
+            "baked R1 not orthonormal"
+        );
+        let x: Vec<f32> = (0..3 * h).map(|i| (i as f32 * 0.007).cos()).collect();
+        // Deployed: apply R1_bake (merged into weights) then the codec FWHT.
+        let deployed = rotate_rows(&rotate_rows(&x, &r1_bake, 3), &f, 3);
+        // Direct: the learned rotation M.
+        let direct = rotate_rows(&x, &m, 3);
+        let worst = deployed
+            .iter()
+            .zip(&direct)
+            .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        assert!(worst < 1e-3, "bake identity broken: {worst:e}");
     }
 
     /// A reader followed by the residual rotation reproduces the pre-rotation

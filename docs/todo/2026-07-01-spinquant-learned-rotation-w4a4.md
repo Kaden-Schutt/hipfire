@@ -182,10 +182,25 @@ on V + o_proj input; merged. This is the "W4A8-gap-closing" pair even before R3/
 **Phase 4 — R3/R4 online Hadamard.** R4 = the existing down FWHT (verify it's
 positioned as SpinQuant's R4). R3 for KV4 (when we do 4-bit KV). Both fixed.
 
-**Phase 5 — export + validate.** Merge learned R1/R2 into the weights at
-quantize time, emit an `Oq4G256` `.hfq` with a rotation sidecar for R3/R4 seeds.
-Validate end-to-end: **W4A4 KLD / zero-shot vs fixed-rotation OQ4**, and
-**measure the prefill/batched throughput** of `iu4·iu4` vs `iu4·iu8`.
+**Phase 5 — export + validate. Bake math DONE; `.hfq` CLI wiring remains.**
+- **Key result: R1 needs NO rotation sidecar and NO loader changes.** It is fully
+  merged into the weights, and the deployed Oq4G256 codec already applies a
+  per-group FWHT `F`, so baking `R1 = Fᵀ M` (where `M` is the learned rotation)
+  makes the codec's `F` cancel to leave `M`. The emitted artifact is a *standard*
+  `Oq4G256` `.hfq`. Landed in `rotation.rs`: `Rotation::block_fwht`/`transpose`/
+  `compose` + `bake_for_oq4_recipe(M) = Fᵀ M`. Unit-tested:
+  `block_fwht_matches_cpu_fwht_and_is_orthonormal` (F reproduces the codec FWHT)
+  and `bake_composes_to_learned_through_codec_fwht` (`apply_r1(Fᵀ M)` then `F` = `M`,
+  exact) — so a normal Oq4 quantize of the rotated weights provably carries the
+  learned-rotation W4A4 quality (the 21.9 dB `learned_r1_w4a4_probe` measures IS
+  `M`).
+- **Remaining:** the literal `.hfq` byte emission — export lives in
+  `hipfire-quantize` per the AGENTS invariant, so the clean path is either (a) a
+  `--rotate` option there that applies `apply_r1(bake_for_oq4_recipe(M))` per
+  reader/writer weight before quantizing, or (b) write the `apply_r1`'d fp32
+  weights to safetensors and run the existing Oq4 quantizer. Then validate: W4A4
+  KLD / zero-shot vs fixed-rotation OQ4, and prefill/batched `iu4·iu4` vs `iu4·iu8`
+  throughput.
 
 ## New pieces (net)
 
