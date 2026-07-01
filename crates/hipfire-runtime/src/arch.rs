@@ -46,7 +46,8 @@
 //!      time.
 
 use crate::hfq::HfqFile;
-use rdna_compute::Gpu;
+use crate::llama::WeightTensor;
+use rdna_compute::{DType, Gpu};
 
 /// Bring-up contract for a hipfire architecture.
 ///
@@ -273,4 +274,43 @@ pub struct EosFilterOverrides {
     /// If `Some`, override whether to strip `<think>...</think>` blocks
     /// from the visible stream. Default is on for thinking-mode arches.
     pub strip_think: Option<bool>,
+}
+
+/// Load-time MMQ safety pre-screen (#87).
+///
+/// The Q8_1 MMQ integer dot-product path produces unacceptable error on some
+/// outlier-heavy weight rows. Screening probes each MMQ-eligible weight tensor
+/// at load time against the WMMA/FP16 reference and records a per-device-pointer
+/// verdict in `Gpu::mmq_screen.cache`, so the first serve-time GEMM doesn't pay
+/// the probe cost. Each arch iterates its own weights and returns
+/// `(n_safe, n_unsafe)`.
+///
+/// MoE routed experts and the shared expert are intentionally NOT screened:
+/// their `WeightTensor` Vecs are empty at load time under paged / EP-shard modes
+/// (buffers owned by the weight pager / packed EP blobs), so a naive `experts[i]`
+/// loop would screen nothing anyway. That coverage is a follow-up.
+pub trait MmqScreenable {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize);
+}
+
+/// Screen one `WeightTensor`; bumps `n_safe`/`n_unsafe` only for MMQ-eligible
+/// formats.
+///
+/// The dtype guard is load-bearing: non-HFQ4/MQ4 formats (e.g. the `*Lloyd`
+/// variants) have different buffer layouts and must NOT be fed to the HFQ4
+/// reference kernel — doing so reads past the buffer end (see PR #106).
+pub fn screen_weight_tensor(
+    wt: &WeightTensor,
+    gpu: &mut Gpu,
+    n_safe: &mut usize,
+    n_unsafe: &mut usize,
+) {
+    if !matches!(wt.gpu_dtype, DType::HFQ4G256 | DType::MQ4G256) {
+        return;
+    }
+    if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
+        *n_safe += 1;
+    } else {
+        *n_unsafe += 1;
+    }
 }

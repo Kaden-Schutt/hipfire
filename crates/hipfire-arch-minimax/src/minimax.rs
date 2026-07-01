@@ -12,6 +12,7 @@
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -681,5 +682,20 @@ impl MiniMaxState {
 
     pub fn reset(&mut self) {
         self.n_tokens = 0;
+    }
+}
+
+impl MmqScreenable for MiniMaxWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut n_safe, mut n_unsafe) = (0usize, 0usize);
+        screen_weight_tensor(&self.lm_head, gpu, &mut n_safe, &mut n_unsafe);
+        // Attention projections + the (dense) router only. Routed experts are
+        // out of scope — see the `MmqScreenable` doc comment.
+        for layer in &self.layers {
+            for wt in [&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.router] {
+                screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+            }
+        }
+        (n_safe, n_unsafe)
     }
 }

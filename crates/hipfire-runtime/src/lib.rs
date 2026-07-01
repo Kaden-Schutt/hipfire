@@ -44,3 +44,5 @@ pub mod tokenizer;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod tool_call;
+
+pub use crate::arch::{screen_weight_tensor, MmqScreenable};

@@ -36,6 +36,7 @@ use hipfire_dispatch::pipeline::superop::{
     self, EscapeKind, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -247,6 +248,27 @@ impl Qwen2Weights {
             let _ = gpu.free_tensor(l.w_up.buf);
             let _ = gpu.free_tensor(l.w_down.buf);
         }
+    }
+}
+
+impl MmqScreenable for Qwen2Weights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut n_safe, mut n_unsafe) = (0usize, 0usize);
+        screen_weight_tensor(&self.output, gpu, &mut n_safe, &mut n_unsafe);
+        for layer in &self.layers {
+            for wt in [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ] {
+                screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+            }
+        }
+        (n_safe, n_unsafe)
     }
 }
 

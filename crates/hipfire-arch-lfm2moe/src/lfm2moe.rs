@@ -17,6 +17,7 @@
 use crate::config::{Lfm2MoeConfig, MixerKind};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
@@ -218,6 +219,38 @@ pub struct Lfm2MoeWeights {
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
     pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
+}
+
+impl MmqScreenable for Lfm2MoeWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut n_safe, mut n_unsafe) = (0usize, 0usize);
+        screen_weight_tensor(&self.lm_head, gpu, &mut n_safe, &mut n_unsafe);
+        for layer in &self.layers {
+            match &layer.mixer {
+                Mixer::Conv(c) => {
+                    screen_weight_tensor(&c.in_proj, gpu, &mut n_safe, &mut n_unsafe);
+                    screen_weight_tensor(&c.out_proj, gpu, &mut n_safe, &mut n_unsafe);
+                }
+                Mixer::Attention(a) => {
+                    for wt in [&a.wq, &a.wk, &a.wv, &a.wo] {
+                        screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+                    }
+                }
+            }
+            match &layer.ffn {
+                Ffn::Dense(d) => {
+                    for wt in [&d.w1, &d.w3, &d.w2] {
+                        screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+                    }
+                }
+                // MoE router only; routed experts are out of scope.
+                Ffn::Moe(m) => {
+                    screen_weight_tensor(&m.router, gpu, &mut n_safe, &mut n_unsafe);
+                }
+            }
+        }
+        (n_safe, n_unsafe)
+    }
 }
 
 impl Lfm2MoeWeights {

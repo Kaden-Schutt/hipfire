@@ -17,6 +17,7 @@ use hipfire_runtime::llama::{
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
@@ -878,6 +879,44 @@ pub struct DeltaNetState {
     pub s_ef_residual: Vec<GpuTensor>,
     /// Current quantization mode
     pub quant: StateQuant,
+}
+
+impl MmqScreenable for Qwen35Weights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut n_safe, mut n_unsafe) = (0usize, 0usize);
+        screen_weight_tensor(&self.output, gpu, &mut n_safe, &mut n_unsafe);
+        for layer in &self.layers {
+            match layer {
+                LayerWeights::DeltaNet(w) => {
+                    for wt in [
+                        &w.wqkv, &w.wz, &w.w_alpha, &w.w_beta, &w.wo, &w.w_gate, &w.w_up,
+                        &w.w_down,
+                    ] {
+                        screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+                    }
+                }
+                LayerWeights::FullAttn(w) => {
+                    for wt in [&w.wq, &w.wk, &w.wv, &w.wo, &w.w_gate, &w.w_up, &w.w_down] {
+                        screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+                    }
+                }
+                // MoE layers: attention + the (single, dense) router only. Routed
+                // experts / shared expert are intentionally out of scope — see the
+                // `MmqScreenable` doc comment.
+                LayerWeights::DeltaNetMoe(w) => {
+                    for wt in [&w.wqkv, &w.wz, &w.w_alpha, &w.w_beta, &w.wo, &w.ffn.router] {
+                        screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+                    }
+                }
+                LayerWeights::FullAttnMoe(w) => {
+                    for wt in [&w.wq, &w.wk, &w.wv, &w.wo, &w.ffn.router] {
+                        screen_weight_tensor(wt, gpu, &mut n_safe, &mut n_unsafe);
+                    }
+                }
+            }
+        }
+        (n_safe, n_unsafe)
+    }
 }
 
 impl DeltaNetState {

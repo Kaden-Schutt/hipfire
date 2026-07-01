@@ -42,6 +42,7 @@ use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, attention_family, DispatchCtx, FullAttnParams, KernelKey, ShapeInfo};
+use hipfire_runtime::MmqScreenable;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -332,6 +333,13 @@ impl DotsVisionWeights {
 pub struct DotsOcrWeights {
     pub text: Qwen2Weights,
     pub vision: DotsVisionWeights,
+}
+
+impl MmqScreenable for DotsOcrWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        // Vision tower is F16-only (no MMQ-eligible weights); delegate to text.
+        self.text.screen_mmq_weights(gpu)
+    }
 }
 
 impl DotsOcrWeights {

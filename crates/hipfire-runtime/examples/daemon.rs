@@ -36,6 +36,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_runtime::arch::MmqScreenable;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
@@ -3505,6 +3506,7 @@ fn load_model(
         use hipfire_runtime::arch::Architecture;
         let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;
         let weights = <Qwen2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        maybe_screen_mmq(&weights, gpu);
         let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
@@ -3588,6 +3590,7 @@ fn load_model(
         use hipfire_runtime::arch::Architecture;
         let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
         let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        maybe_screen_mmq(&weights, gpu);
         // Size the decode KV cache to the requested window (the trait's
         // new_state uses a default max_seq; OCR prompts are long).
         let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
@@ -3778,6 +3781,7 @@ fn load_model(
         let _ = state_quant_override;
         let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
         let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, gpu)?;
+        maybe_screen_mmq(&weights, gpu);
         // Size the KV + conv-state cache to the requested window.
         let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
@@ -3885,6 +3889,7 @@ fn load_model(
         use hipfire_runtime::arch::Architecture;
         let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
         let weights = <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        maybe_screen_mmq(&weights, gpu);
         // Size the KV cache to the requested window (the trait's new_state
         // caps at 8192; honour the caller's max_seq when it's larger/smaller).
         let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
@@ -4005,36 +4010,7 @@ fn load_model(
         };
 
         let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
-
-        // MMQ per-weight screening (#87): pre-screen all weight matrices at
-        // load time so the first prefill doesn't pay the screening overhead.
-        // Results are cached by device pointer in gpu.mmq_screen.cache.
-        // Disabled by default on all arches; opt-in via mmq_screen=true or
-        // HIPFIRE_MMQ_SCREEN=1. gfx906 is included for the opt-in case so
-        // its ~700 µs/weight screening-reference dispatch doesn't surprise
-        // first prefill if a user enables it.
-        if gpu.mmq_screen.enabled
-            && matches!(
-                gpu.arch.as_str(),
-                "gfx906"
-                    | "gfx1100"
-                    | "gfx1101"
-                    | "gfx1102"
-                    | "gfx1103"
-                    | "gfx1150"
-                    | "gfx1151"
-                    | "gfx1152"
-            )
-        {
-            let t0 = std::time::Instant::now();
-            let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
-            let elapsed = t0.elapsed();
-            eprintln!(
-                "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
-                gpu.mmq_screen.threshold,
-                elapsed.as_secs_f64() * 1000.0,
-            );
-        }
+        maybe_screen_mmq(&weights, gpu);
 
         // KV cache modes (RotorQuant-style asymmetric: K rotated + V Q8):
         //   asym3 (default) — K at 3-bit rotated, V at Q8_0. 5.5× vs fp32.
@@ -4436,6 +4412,7 @@ fn load_model(
         use hipfire_runtime::arch::Architecture;
         let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
         let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        maybe_screen_mmq(&weights, gpu);
         eprintln!("  KV cache: Q8");
         let kv = llama::KvCache::new_gpu_q8(
             gpu,
@@ -5049,71 +5026,38 @@ fn load_model_pp(
     })
 }
 
-/// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
-/// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen.cache.
-fn screen_weights_qwen35(
-    weights: &qwen35::Qwen35Weights,
-    gpu: &mut rdna_compute::Gpu,
-) -> (usize, usize) {
-    use hipfire_arch_qwen35::qwen35::LayerWeights;
-    let mut n_safe = 0usize;
-    let mut n_unsafe = 0usize;
-
-    for layer in &weights.layers {
-        // Collect all weight tensors for this layer that could use MMQ
-        let wts: Vec<(&hipfire_runtime::llama::WeightTensor, &str)> = match layer {
-            LayerWeights::DeltaNet(l) => vec![
-                (&l.wqkv, "qkvza.qkv"),
-                (&l.wz, "qkvza.z"),
-                (&l.w_beta, "qkvza.beta"),
-                (&l.w_alpha, "qkvza.alpha"),
-                (&l.w_gate, "gate_up.gate"),
-                (&l.w_up, "gate_up.up"),
-                (&l.wo, "residual"),
-            ],
-            LayerWeights::FullAttn(l) => vec![
-                (&l.wq, "qkv.q"),
-                (&l.wk, "qkv.k"),
-                (&l.wv, "qkv.v"),
-                (&l.w_gate, "gate_up.gate"),
-                (&l.w_up, "gate_up.up"),
-                (&l.wo, "residual"),
-            ],
-            LayerWeights::DeltaNetMoe(l) => vec![
-                (&l.wqkv, "qkvza.qkv"),
-                (&l.wz, "qkvza.z"),
-                (&l.w_beta, "qkvza.beta"),
-                (&l.w_alpha, "qkvza.alpha"),
-                (&l.wo, "residual"),
-            ],
-            LayerWeights::FullAttnMoe(l) => vec![
-                (&l.wq, "qkv.q"),
-                (&l.wk, "qkv.k"),
-                (&l.wv, "qkv.v"),
-                (&l.wo, "residual"),
-            ],
-        };
-
-        for (wt, _name) in wts {
-            // MMQ kernels only operate on HFQ4G256 weights. Other formats
-            // (MQ3, MQ2, HFQ6, etc.) use different dispatch paths and must
-            // not be fed to the HFQ4-specific screening kernels — buffer
-            // layout mismatch would read past the end. See PR #106.
-            if !matches!(
-                wt.gpu_dtype,
-                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
-            ) {
-                continue;
-            }
-            if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
-                n_safe += 1;
-            } else {
-                n_unsafe += 1;
-            }
-        }
+/// Load-time MMQ per-weight screening (#87): pre-screen an arch's weight
+/// matrices so the first prefill doesn't pay the screening overhead. Results
+/// are cached by device pointer in `gpu.mmq_screen.cache`. Disabled by default
+/// on all arches; opt-in via `mmq_screen=true` or `HIPFIRE_MMQ_SCREEN=1`.
+/// gfx906 is included for the opt-in case so its ~700 µs/weight
+/// screening-reference dispatch doesn't surprise first prefill if enabled.
+///
+/// Each arch owns iteration over its own weights via `MmqScreenable`; this
+/// helper just applies the enable + arch guard uniformly across call sites.
+fn maybe_screen_mmq(weights: &impl MmqScreenable, gpu: &mut rdna_compute::Gpu) {
+    if !gpu.mmq_screen.enabled
+        || !matches!(
+            gpu.arch.as_str(),
+            "gfx906"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+        )
+    {
+        return;
     }
-
-    (n_safe, n_unsafe)
+    let t0 = std::time::Instant::now();
+    let (n_safe, n_unsafe) = weights.screen_mmq_weights(gpu);
+    eprintln!(
+        "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
+        gpu.mmq_screen.threshold,
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
 }
 
 /// Expert-parallel (EP) model load — shards the routed experts across `tp`
