@@ -1,20 +1,25 @@
-//! SpinQuant W4A4 payoff: is `iu4·iu4` (W4A4) actually ~2× `iu4·iu8` (W4A8) in the
-//! compute-bound prefill/batch regime on gfx1151? This is the throughput half of
-//! the SpinQuant premise ("W4A4 almost halves our compute") — the quality half is
-//! the learned rotation (`learned_r1_w4a4_probe`, +1.73 dB SQNR). Decode (B=1) is
-//! weight-bandwidth-bound, so it is shown only as a reference point where the ratio
-//! is expected to be ~1 (compute isn't the bottleneck there).
+//! W4A4 vs W4A8 GEMM *kernel* throughput on gfx1151. Times the two production
+//! kernels head-to-head at the SAME logical GEMM `[M,K]·[B,K]ᵀ → [B,M]`.
 //!
-//! W4A8's `iu4·iu8` GEMM unpacks the int4 weight to int8 and runs the int8 matrix
-//! core, so its compute cost == `gemm_iu8_i32_wmma`. W4A4 runs `gemm_iu4_i32_wmma`
-//! (int4 matrix core). We time the two production kernels head-to-head at the SAME
-//! logical GEMM `[M,K]·[B,K]ᵀ → [B,M]` and report GOP/s + the iu4/iu8 ratio.
+//! ⚠️ READ THIS FIRST — what this bench does and does NOT show:
+//!   • It compares `gemm_iu4_i32_wmma` (W4A4) against `gemm_iu8_i32_wmma`. The
+//!     latter is **W8A8** (int8 weight [M,K] + int8 act), NOT true W4A8 (`iu4·iu8`,
+//!     which keeps the weight int4 = half the bytes). So its bandwidth-bound rows
+//!     are the wrong comparison for the deployment W4A4-vs-W4A8 question.
+//!   • Its earlier "≈1.0× at balanced shapes ⇒ gfx1151 doesn't double-rate int4"
+//!     conclusion was WRONG. The hardware DOES: direct ISA measurement
+//!     (`scratchpad/isa_bench.hip`; AMD matrix calculator + rocprofv3) shows
+//!     `v_wmma_i32_16x16x16_iu4` = **2.0×** `..._iu8` (16 vs 32 cycles; measured
+//!     1.995× once WMMA latency is hidden with ≥8 independent accumulators), and
+//!     `v_dot8_i32_iu4` = 2.0× `v_dot4_i32_iu8`. See memory
+//!     `reference_gfx1151_int4_isa_rate`.
+//!   • So a ~1.0× here is a KERNEL artifact, not a hardware limit: these GEMM
+//!     kernels leave the matrix core idle (single dependent WMMA accumulator chain
+//!     per wave ⇒ latency-bound, ~5% of peak), so the int4 core's 2× never shows.
+//!     A real W4A4 payoff needs a latency-hidden, multi-accumulator iu4 GEMM.
 //!
-//! NOTE: this measures the matrix-core INSTRUCTION throughput only (random bytes,
-//! no rotation/dequant/rescale) — the fair "does the 4-bit core actually run 2×"
-//! question. RDNA3 (gfx1103/1151) does NOT always double-rate narrow types (see
-//! memory rdna3_wmma_accumulate / fsr4_rdna3_perf_notes), so the answer is the
-//! point of the bench.
+//! Kept as a KERNEL-level regression bench; the authoritative ISA rate lives in the
+//! microbench above. Decode (B=1) is weight-bandwidth-bound (ratio ~1 expected).
 //!
 //! Run (production kernels, precompiled — no JIT toolchain needed):
 //!   source ./scripts/rocm-env.sh
