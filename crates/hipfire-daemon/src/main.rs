@@ -5552,14 +5552,14 @@ fn main() {
                 };
                 let scale_override = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
                 let id_override = msg.get("id").and_then(|v| v.as_str()).map(String::from);
-                let mut adapter =
-                    match hipfire_steer::lora::read_adapter(std::path::Path::new(&path)) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            emit_error_with_id(&mut stdout, "", format!("lora_load: {e}"));
-                            continue;
-                        }
-                    };
+                let mut adapter = match hipfire_lora_hfq::read_lora_any(std::path::Path::new(&path))
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("lora_load: {e}"));
+                        continue;
+                    }
+                };
                 if let Some(new_id) = id_override {
                     adapter.id = new_id;
                 }

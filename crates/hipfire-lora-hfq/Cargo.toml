@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-lora-hfq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Binary .lora.hfq container for hipfire-steer LoRA adapters: (de)serialize a LoraAdapter as a canonical HFQM package (A/B tensors + JSON provenance). Kept separate from hipfire-steer because the hfq writer lives in hipfire-runtime, which depends on the arch crates that depend on hipfire-steer (a cycle if steer pulled runtime)."
+
+[dependencies]
+hipfire-steer = { path = "../hipfire-steer" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

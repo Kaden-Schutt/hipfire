@@ -255,7 +255,12 @@ fn export_lora(
         strength,
         0..layers,
     )?;
-    lora::write_adapter(out, &adapter)?;
+    // Binary hfq container for `*.hfq` paths, JSON otherwise.
+    if out.extension().and_then(|e| e.to_str()) == Some("hfq") {
+        hipfire_lora_hfq::write_lora_hfq(out, &adapter)?;
+    } else {
+        lora::write_adapter(out, &adapter)?;
+    }
     eprintln!(
         "wrote LoRA adapter: {} rank-1 deltas, default scale {strength:.2} → {}",
         adapter.deltas.len(),
