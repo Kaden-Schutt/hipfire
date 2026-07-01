@@ -138,11 +138,16 @@ impl DaemonHarness {
     // ── LoRA adapter stack control (proxies to the daemon `lora_*` ops) ──────
 
     /// Load a `.lora` adapter container onto the live model; `scale` overrides the
-    /// adapter's default intensity if given.
-    pub fn lora_load(&mut self, path: &Path, scale: Option<f32>) -> HipResult<()> {
+    /// adapter's default intensity and `id` renames it on load (both optional).
+    pub fn lora_load(
+        &mut self,
+        path: &Path,
+        scale: Option<f32>,
+        id: Option<&str>,
+    ) -> HipResult<()> {
         let p = path.display().to_string();
         self.rt
-            .block_on(self.engine.lora_load(p, scale))
+            .block_on(self.engine.lora_load(p, scale, id.map(String::from)))
             .map_err(|e| herr("lora_load", e))
     }
 

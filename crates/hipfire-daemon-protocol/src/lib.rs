@@ -163,12 +163,16 @@ pub struct SteerMeansResponse {
 }
 
 /// Load a `.lora` adapter container (path on the daemon host) onto the APPLY
-/// stack. `scale` overrides the adapter's baked-in default intensity if present.
+/// stack. `scale` overrides the adapter's baked-in default intensity if present;
+/// `id` renames the adapter on load (so the same container can be stacked under
+/// distinct names, e.g. two intensities of one abliteration).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LoraLoadRequest {
     pub path: String,
     #[serde(default)]
     pub scale: Option<f32>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Adjust a loaded adapter's live `scale` (intensity).

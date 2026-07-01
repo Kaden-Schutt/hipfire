@@ -34,6 +34,8 @@ struct Args {
     export_lora: Option<PathBuf>,
     /// When set, load this `.lora` and show base vs applied vs scale-0 refusals.
     apply_lora: Option<PathBuf>,
+    /// When set, stack two copies of this `.lora` at +/- scale to show they sum.
+    stack_demo: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
     let mut orthogonalize = true;
     let mut export_lora = None;
     let mut apply_lora = None;
+    let mut stack_demo = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-orthogonalize" => orthogonalize = false,
             "--export-lora" => export_lora = Some(PathBuf::from(next()?)),
             "--apply-lora" => apply_lora = Some(PathBuf::from(next()?)),
+            "--stack-demo" => stack_demo = Some(PathBuf::from(next()?)),
             "--strengths" => {
                 strengths = next()?
                     .split(',')
@@ -106,6 +110,7 @@ fn parse_args() -> Result<Args, String> {
         orthogonalize,
         export_lora,
         apply_lora,
+        stack_demo,
     })
 }
 
@@ -164,6 +169,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Apply mode: load a `.lora` and compare base / applied / scale-0 refusals.
     if let Some(path) = args.apply_lora.as_ref() {
         return apply_lora(&mut harness, &bad_eval, path);
+    }
+
+    // Stack demo: load two copies of one adapter at +s / -s to show they sum.
+    if let Some(path) = args.stack_demo.as_ref() {
+        let s = args.strengths.first().copied().unwrap_or(0.2);
+        return stack_demo(&mut harness, &bad_eval, path, s);
     }
 
     let cfg = DriverConfig {
@@ -272,7 +283,7 @@ fn apply_lora(
     let base_ref = count_refusals(&base, &markers);
 
     harness
-        .lora_load(path, None)
+        .lora_load(path, None, None)
         .map_err(|e| format!("lora_load: {e}"))?;
     let loaded = harness.lora_list().map_err(|e| format!("lora_list: {e}"))?;
     eprintln!("loaded adapters: {loaded:?}");
@@ -298,5 +309,53 @@ fn apply_lora(
     println!("base (no adapter):          refusals {base_ref}/{n}");
     println!("adapter applied (default):  refusals {applied_ref}/{n}");
     println!("adapter scale=0 (≡ base):   refusals {off_ref}/{n}");
+    Ok(())
+}
+
+/// Stack two copies of one adapter to show the GPU apply sums them: load "a" at
+/// `+s` (refusals drop), then load "b" (same directions) at `-s` — the deltas
+/// cancel (`+s·δ − s·δ = 0`), so refusals return to base. Exercises the
+/// multi-adapter stack path on hardware.
+fn stack_demo(
+    harness: &mut DaemonHarness,
+    bad_eval: &[Prompt],
+    path: &Path,
+    s: f32,
+) -> Result<(), Box<dyn Error>> {
+    use hipfire_steer::driver::count_refusals;
+    let markers = DriverConfig::default_markers();
+    let n = bad_eval.len();
+
+    harness
+        .lora_load(path, Some(s), Some("a"))
+        .map_err(|e| format!("lora_load a: {e}"))?;
+    let one = harness
+        .generate(bad_eval)
+        .map_err(|e| format!("generate a: {e}"))?;
+    let one_ref = count_refusals(&one, &markers);
+    eprintln!(
+        "after load a@{s:.2}: {:?}",
+        harness.lora_list().unwrap_or_default()
+    );
+
+    harness
+        .lora_load(path, Some(-s), Some("b"))
+        .map_err(|e| format!("lora_load b: {e}"))?;
+    let both = harness
+        .generate(bad_eval)
+        .map_err(|e| format!("generate a+b: {e}"))?;
+    let both_ref = count_refusals(&both, &markers);
+    eprintln!(
+        "after load b@{:.2}: {:?}",
+        -s,
+        harness.lora_list().unwrap_or_default()
+    );
+
+    println!("\n=== lora stack demo ===");
+    println!("a @ {s:+.2} (single):        refusals {one_ref}/{n}");
+    println!(
+        "a @ {s:+.2} + b @ {:+.2} (sum≈0): refusals {both_ref}/{n}",
+        -s
+    );
     Ok(())
 }

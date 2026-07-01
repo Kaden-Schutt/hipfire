@@ -380,15 +380,18 @@ impl DaemonEngine {
     }
 
     /// Load a `.lora` adapter container (path on the daemon host) onto the live
-    /// APPLY stack; `scale` overrides the adapter's default intensity if given.
+    /// APPLY stack; `scale` overrides the adapter's default intensity and `id`
+    /// renames it on load (both optional).
     pub async fn lora_load(
         &mut self,
         path: impl Into<String>,
         scale: Option<f32>,
+        id: Option<String>,
     ) -> anyhow::Result<()> {
         self.send(&DaemonRequest::LoraLoad(LoraLoadRequest {
             path: path.into(),
             scale,
+            id,
         }))
         .await?;
         self.expect_lora_ok("lora_load").await
