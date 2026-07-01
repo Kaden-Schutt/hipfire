@@ -141,12 +141,40 @@ oq4 llama ("The capital of France is Paris"; "The sky is blue and white") on
 real Supra-50M. Weights are correct by construction (== fp-invariance-proven
 `apply_r1`) + unit-tested (`bake_cancels_codec_fwht_leaving_m`).
 
-**Still to measure:** the quantitative "learned-R1 vs baseline-Oq4 KLD" (does the
-+1.7 dB SQNR translate to lower KLD?) and the `iu4·iu4` vs `iu4·iu8` throughput on
-gfx1151. The `hipfire eval --battery quality` KLD path currently **VMFaults on
-tiny Supra-50M oq4 (baseline AND rotated — an orthogonal eval/runtime fault**, not
-the rotation), so run the KLD on a larger dense-llama oq4 where that path is
-stable, or after the eval fault is fixed.
+**Measured — KLD (decode).** `hipfire eval --battery quality`, Supra-50M oq4 vs
+bf16: baseline 0.082, learned-R1 **0.100 (+22%, regressed)**. The eval KLD scores
+the **decode** path = W4A16 (weight int4, activation f16), but the learned M was
+optimized on **activation** kurtosis for W4A4 (both-int4). At decode only weight
+int4 matters, so the act-optimized rotation doesn't help — and the tiny model's
+baseline is already clean. The +1.7 dB is a W4A4 prefill/batch metric, not W4A16
+decode. (The eval path itself had a bug — it VMFaulted on Supra because `kld_eval`
+chunked at `n_ctx=2048` past the model's `max_position_embeddings=1024`; fixed to
+clamp to `m.max_seq`.)
+
+**Measured — ISA compute rate (gfx1151):** int4 gives a genuine **2× compute
+advantage over int8** at the instruction level, on both paths:
+- **WMMA** `v_wmma_i32_16x16x16_iu4` = **2.0×** `..._iu8` (AMD matrix calculator:
+  16 vs 32 exec cycles / 2048 vs 1024 ops-per-WGP-per-cycle; **measured 1.995×** at
+  the latency-hidden sweet spot INDEP=8, cross-validated hipEvent + rocprofv3). At
+  INDEP=4 it reads 1.87× — insufficient latency hiding, not a hardware limit.
+- **DOT** `v_dot8_i32_iu4` (8 int4 MACs/instr) = **2.0×** the MAC throughput of
+  `v_dot4_i32_iu8` (4 int8 MACs; same issue rate). Note `v_dot8_i32_iu8` does not
+  exist — the int8 dot is 4-wide.
+
+So the SpinQuant **W4A4 compute premise holds on gfx1151** (contrary to my first
+`w4a4_throughput_bench.rs`, which read ~1.0× — that was a *kernel-level* artifact:
+it compared W4A4 against **W8A8** weight bytes and was bandwidth/tiling-bound, not
+the matrix core). **Caveat:** the *hardware* does 2×; realizing it in the Oq4 path
+still needs a compute-bound shape + a well-tiled `iu4` GEMM (the production
+`gemm_iu4_i32_wmma` did not hit it at balanced shapes — a kernel-optimization gap).
+Tool: `scratchpad/isa_bench.hip` (matrix calc → disasm-verified microbench →
+rocprofv3). See memory `reference_gfx1151_int4_isa_rate`.
+
+**Still to measure:** (a) a real `iu4·iu8` (int4 weight + int8 act) **GEMM**
+throughput vs `iu4·iu4` (the deployment-level W4A4-vs-W4A8, once a kernel that hits
+the 2× exists); (b) a **W4A4-prefill** KLD (score via the batched both-int4 path,
+not decode); (c) a **joint act+weight** learned M (item ii) for the W4A16 decode
+path; (d) a larger dense-llama oq4 with real outliers (Supra-50M is too clean).
 
 **R2 deploy** stays out of this item: the codec's 256-wide FWHT crosses head
 boundaries, so a per-head `apply_r2` can't be un-baked (net would be
