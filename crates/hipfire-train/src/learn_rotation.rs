@@ -234,6 +234,134 @@ pub fn learn_rotation_joint(
     rot
 }
 
+/// Per-256-group (or `group`-wide) symmetric `bits`-bit fake-quant **residual**
+/// `Q(v) − v` of a row-major `[rows,h]` matrix, matching the Oq codec's symmetric
+/// per-group grid (scale = max|·|/qmax, round-to-nearest, clamp `[-qmax,qmax]`).
+/// This is the differentiable stand-in for the deployed weight quantizer.
+fn fake_quant_residual(v: &[f32], rows: usize, h: usize, group: usize, bits: u32) -> Vec<f32> {
+    let qmax = ((1i32 << (bits - 1)) - 1) as f32; // 4-bit → 7
+    let mut d = vec![0.0f32; rows * h];
+    for r in 0..rows {
+        let mut g0 = 0;
+        while g0 < h {
+            let g1 = (g0 + group).min(h);
+            let seg = &v[r * h + g0..r * h + g1];
+            let amax = seg.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            if amax > 0.0 {
+                let scale = amax / qmax;
+                for (j, &x) in seg.iter().enumerate() {
+                    let q = (x / scale).round().clamp(-qmax, qmax) * scale;
+                    d[r * h + g0 + j] = q - x;
+                }
+            }
+            g0 = g1;
+        }
+    }
+    d
+}
+
+/// Hessian-weighted weight-quant-error objective (the **decode-path** term of the
+/// phase-joint rotation): with the reader weight `W [out,h]` stored as `Q_b(W Rᵀ)`
+/// and the activation exact (`X Rᵀ`, f16), the decode output error is
+/// `‖ΔW·(X Rᵀ)ᵀ‖²` = `tr(ΔW R H Rᵀ ΔWᵀ)`, `ΔW = Q_b(W Rᵀ) − W Rᵀ`, `H = XᵀX`.
+/// Lower ⇒ the (one, shared) int-weight buffer degrades the f16-activation decode
+/// path less. This is the term that *protects* decode while the activation kurtosis
+/// term buys the A4 prefill win.
+pub fn hess_wquant_objective(
+    w: &[f32],
+    out: usize,
+    h: usize,
+    hess: &[f32],
+    rot: &Rotation,
+    group: usize,
+    bits: u32,
+) -> f64 {
+    let wr = crate::rotation::rotate_rows(w, rot, out); // W Rᵀ  [out,h]
+    let dw = fake_quant_residual(&wr, out, h, group, bits); // ΔW  [out,h]
+    let a = matmul(&dw, &rot.r, out, h, h); // ΔW·R  [out,h]
+    let ah = matmul(&a, hess, out, h, h); // (ΔW R)·H  [out,h]
+    a.iter()
+        .zip(ah.iter())
+        .map(|(&p, &q)| p as f64 * q as f64)
+        .sum()
+}
+
+/// Euclidean gradient of [`hess_wquant_objective`] w.r.t. `R`, **QAT convention**:
+/// stop-gradient on the quantizer (`Q(U)` frozen, so `ΔW = sg(Q(U)) − U` flows the
+/// `−U` path, `dΔW/dU = −I`). This is the direction that matters — rotating changes
+/// the residual *magnitude* via incoherence, which the STE-detached `2·C·R·H` misses
+/// (it steers a frozen residual and walks off the good Hadamard). With `U = W Rᵀ`,
+/// `M = R H Rᵀ`, `dL/dU = −2·ΔW·M`, and `dL/dR = (dL/dU)ᵀ W = −2·R H Rᵀ·ΔWᵀ·W`.
+fn hess_wquant_grad(
+    w: &[f32],
+    out: usize,
+    h: usize,
+    hess: &[f32],
+    rot: &Rotation,
+    group: usize,
+    bits: u32,
+) -> Vec<f32> {
+    let wr = crate::rotation::rotate_rows(w, rot, out); // U = W Rᵀ  [out,h]
+    let dw = fake_quant_residual(&wr, out, h, group, bits); // ΔW  [out,h]
+    let rh = matmul(&rot.r, hess, h, h, h); // R H
+    let rhrt = matmul_bt(&rh, &rot.r, h, h, h); // R H Rᵀ  [h,h]
+    let dwtw = matmul_at(&dw, w, out, h, h); // ΔWᵀ W  [h,h]
+    let mut g = matmul(&rhrt, &dwtw, h, h, h); // R H Rᵀ ΔWᵀ W
+    for v in g.iter_mut() {
+        *v *= -2.0;
+    }
+    g
+}
+
+/// **Phase-joint** rotation: one orthonormal `R` (one stored int-weight buffer) that
+/// serves *both* the compute-bound prefill (W4A4 — needs the rotated activation
+/// `X Rᵀ` to quantize to int4, driven by the kurtosis term) and the bandwidth-bound
+/// decode (W-int/A-f16 — needs `Q_b(W Rᵀ)` to stay a good grid, driven by the
+/// Hessian-weighted weight-quant term). The two per-step gradients are each
+/// Frobenius-normalized, then blended by `alpha ∈ [0,1]` (`0` = activation-only =
+/// today's `--rotate`; `1` = weight-quant-only ≈ decode-optimal; between = the
+/// single-buffer compromise). `hess` is `H = XᵀX` `[h,h]` from the calib collector.
+#[allow(clippy::too_many_arguments)]
+pub fn learn_rotation_phase_joint(
+    x_act: &[f32],
+    rows_act: usize,
+    w: &[f32],
+    out: usize,
+    hess: &[f32],
+    h: usize,
+    group: usize,
+    bits: u32,
+    init: Rotation,
+    iters: usize,
+    lr: f32,
+    fp_iters: usize,
+    alpha: f32,
+) -> Rotation {
+    assert_eq!(init.h, h);
+    assert_eq!(hess.len(), h * h, "H must be [h,h]");
+    let mut rot = init;
+    for it in 0..iters {
+        // Geometric lr decay: the frob-normalized Cayley step is a fixed rotation
+        // angle, so without decay it orbits a good optimum (e.g. the Hadamard start,
+        // near-optimal for weight quant) instead of settling into it.
+        let lr_t = lr * 0.99f32.powi(it as i32);
+        let mut ga = kurtosis_grad(x_act, &rot, rows_act, h);
+        let mut gw = hess_wquant_grad(w, out, h, hess, &rot, group, bits);
+        frob_normalize(&mut ga);
+        frob_normalize(&mut gw);
+        let mut g = vec![0.0f32; h * h];
+        for i in 0..h * h {
+            g[i] = (1.0 - alpha) * ga[i] + alpha * gw[i];
+        }
+        cayley_step(&mut rot.r, &g, h, lr_t, fp_iters);
+        if it % 16 == 15 {
+            rot.reorthonormalize();
+        }
+    }
+    rot.reorthonormalize();
+    rot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +507,96 @@ mod tests {
         assert!(learned.orthonormality_error() < 1e-3, "lost orthonormality");
         assert!(a_l < a_id, "act kurtosis not reduced: {a_id:.3e}→{a_l:.3e}");
         assert!(w_l < w_id, "wt kurtosis not reduced: {w_id:.3e}→{w_l:.3e}");
+    }
+
+    /// Phase-joint rotation: the two phase objectives genuinely trade off, and each
+    /// end of `alpha` optimizes its own. Activation outliers and weight outliers sit
+    /// in different channels, so no single rotation is best for both. Asserts:
+    /// (a) orthonormality held; (b) `alpha=1` drives the Hessian-weighted
+    /// weight-quant error below the identity/Hadamard start (decode protected);
+    /// (c) a real frontier — the activation-only end has lower activation kurtosis
+    /// but higher weight-quant error than the weight-only end.
+    #[test]
+    fn phase_joint_trades_activation_for_weight() {
+        let h = 32usize;
+        let mut s = 4242u64;
+        let mut nxt = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((s >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+        };
+        let heavy = |nxt: &mut dyn FnMut() -> f32, rows: usize, outliers: &[usize]| {
+            let mut x = vec![0.0f32; rows * h];
+            for r in 0..rows {
+                for c in 0..h {
+                    let base = nxt();
+                    x[r * h + c] = if outliers.contains(&c) {
+                        base + nxt().signum() * 8.0
+                    } else {
+                        base
+                    };
+                }
+            }
+            x
+        };
+        let rows_act = 48usize;
+        let act = heavy(&mut nxt, rows_act, &[3, 11, 20]);
+        let out = 64usize;
+        let w = heavy(&mut nxt, out, &[6, 17, 25]); // reader weight [out,h], different channels
+                                                    // H = XᵀX from the activations (the calib collector's Hessian).
+        let hess = matmul_at(&act, &act, rows_act, h, h);
+        let (group, bits) = (h, 4u32); // one group (h<256), int4
+
+        let start = Rotation::hadamard(h, 1);
+        let w_id = hess_wquant_objective(&w, out, h, &hess, &start, group, bits);
+
+        let learn = |alpha: f32| {
+            learn_rotation_phase_joint(
+                &act,
+                rows_act,
+                &w,
+                out,
+                &hess,
+                h,
+                group,
+                bits,
+                Rotation::hadamard(h, 1),
+                240,
+                0.4,
+                4,
+                alpha,
+            )
+        };
+        let act_only = learn(0.0);
+        let wt_only = learn(1.0);
+
+        let ka = |r: &Rotation| kurtosis_objective(&act, r, rows_act);
+        let qw = |r: &Rotation| hess_wquant_objective(&w, out, h, &hess, r, group, bits);
+        println!(
+            "phase-joint  act-kurt: α0={:.3e} α1={:.3e} | wquant: id={:.3e} α0={:.3e} α1={:.3e}",
+            ka(&act_only),
+            ka(&wt_only),
+            w_id,
+            qw(&act_only),
+            qw(&wt_only)
+        );
+        assert!(
+            act_only.orthonormality_error() < 1e-3,
+            "α0 lost orthonormality"
+        );
+        assert!(
+            wt_only.orthonormality_error() < 1e-3,
+            "α1 lost orthonormality"
+        );
+        // (b) weight-only end protects decode: weight-quant error below the start.
+        assert!(
+            qw(&wt_only) < w_id,
+            "α1 didn't reduce wquant: {:.3e}→{:.3e}",
+            w_id,
+            qw(&wt_only)
+        );
+        // (c) a real frontier: act-only has lower activation kurtosis...
+        assert!(ka(&act_only) < ka(&wt_only), "no act-kurt frontier");
+        // ...but pays with higher weight-quant error than the weight-only end.
+        assert!(qw(&act_only) > qw(&wt_only), "no wquant frontier");
     }
 }
