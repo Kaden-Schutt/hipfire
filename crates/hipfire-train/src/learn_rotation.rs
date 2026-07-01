@@ -142,6 +142,29 @@ pub fn kurtosis_objective(x: &[f32], rot: &Rotation, rows: usize) -> f64 {
     xr.iter().map(|&v| (v as f64).powi(4)).sum()
 }
 
+/// Euclidean gradient of the kurtosis surrogate `Σ(M Rᵀ)⁴` w.r.t. `R`:
+/// `G = 4·(M̃∘³)ᵀ M`, `M̃ = M Rᵀ`. `m` is `[rows,h]` row-major.
+fn kurtosis_grad(m: &[f32], rot: &Rotation, rows: usize, h: usize) -> Vec<f32> {
+    let mt = crate::rotation::rotate_rows(m, rot, rows); // M Rᵀ
+    let mut cube = vec![0.0f32; rows * h];
+    for (c, &v) in cube.iter_mut().zip(mt.iter()) {
+        *c = 4.0 * v * v * v;
+    }
+    matmul_at(&cube, m, rows, h, h) // (M̃³)ᵀ M → [h,h]
+}
+
+/// Scale a `[h,h]` gradient to unit Frobenius norm (so two objective terms can be
+/// mixed by a clean directional weight independent of their raw magnitudes).
+fn frob_normalize(g: &mut [f32]) {
+    let n: f32 = g.iter().map(|&v| v * v).sum::<f32>().sqrt();
+    if n > 1e-20 {
+        let inv = 1.0 / n;
+        for v in g.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
 /// Learn an orthonormal `R [h,h]` minimizing the 4th-moment (kurtosis) surrogate
 /// of the rows of `X [rows,h]` via Cayley SGD, starting from `init` (e.g. a
 /// Hadamard warm start, or identity). Returns the learned [`Rotation`]. `lr` is a
@@ -159,16 +182,50 @@ pub fn learn_rotation_kurtosis(
     assert_eq!(init.h, h);
     let mut rot = init;
     for it in 0..iters {
-        let xr = crate::rotation::rotate_rows(x, &rot, rows); // X Rᵀ
-                                                              // G = 4 (X̃∘³)ᵀ X.
-        let mut cube = vec![0.0f32; rows * h];
-        for (c, &v) in cube.iter_mut().zip(xr.iter()) {
-            *c = 4.0 * v * v * v;
-        }
-        let g = matmul_at(&cube, x, rows, h, h); // (X̃³)ᵀ X  → [h,h]
+        let g = kurtosis_grad(x, &rot, rows, h);
         cayley_step(&mut rot.r, &g, h, lr, fp_iters);
         // The approximate Cayley inverse drifts slightly off the manifold;
         // re-project periodically so error doesn't accumulate over many steps.
+        if it % 16 == 15 {
+            rot.reorthonormalize();
+        }
+    }
+    rot.reorthonormalize();
+    rot
+}
+
+/// Like [`learn_rotation_kurtosis`] but minimizes a **joint** activation+weight
+/// kurtosis: the deployed W4A4 quantizes *both* the rotated activation `X Rᵀ` and
+/// the rotated reader weight `W Rᵀ`, so a rotation that only flattens activations
+/// leaves the weight int4 error on the table. Each per-step gradient term is
+/// Frobenius-normalized before mixing, so `lambda ∈ [0,1]` is a clean directional
+/// blend (`0` = activations only, `1` = weights only, `0.5` = balanced). `x_act`
+/// is `[rows_act,h]`, `x_wt` is the stacked reader weights `[rows_wt,h]`.
+#[allow(clippy::too_many_arguments)]
+pub fn learn_rotation_joint(
+    x_act: &[f32],
+    rows_act: usize,
+    x_wt: &[f32],
+    rows_wt: usize,
+    h: usize,
+    init: Rotation,
+    iters: usize,
+    lr: f32,
+    fp_iters: usize,
+    lambda: f32,
+) -> Rotation {
+    assert_eq!(init.h, h);
+    let mut rot = init;
+    for it in 0..iters {
+        let mut ga = kurtosis_grad(x_act, &rot, rows_act, h);
+        let mut gw = kurtosis_grad(x_wt, &rot, rows_wt, h);
+        frob_normalize(&mut ga);
+        frob_normalize(&mut gw);
+        let mut g = vec![0.0f32; h * h];
+        for i in 0..h * h {
+            g[i] = (1.0 - lambda) * ga[i] + lambda * gw[i];
+        }
+        cayley_step(&mut rot.r, &g, h, lr, fp_iters);
         if it % 16 == 15 {
             rot.reorthonormalize();
         }
@@ -271,5 +328,56 @@ mod tests {
             l_learned < l_id,
             "learned kurtosis {l_learned:.3e} not below identity {l_id:.3e}"
         );
+    }
+
+    /// The joint objective must reduce *both* the activation and the (distinct)
+    /// weight kurtosis below their identity starts — a balanced blend, not just
+    /// one term. Uses two independent heavy-tailed sets with outliers in
+    /// different channels so a rotation good for one isn't automatically good for
+    /// the other.
+    #[test]
+    fn joint_reduces_both_kurtoses() {
+        let h = 16usize;
+        let mut s = 999u64;
+        let mut nxt = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((s >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+        };
+        let heavy = |nxt: &mut dyn FnMut() -> f32, rows: usize, outliers: &[usize]| {
+            let mut x = vec![0.0f32; rows * h];
+            for r in 0..rows {
+                for c in 0..h {
+                    let base = nxt();
+                    x[r * h + c] = if outliers.contains(&c) {
+                        base + nxt().signum() * 8.0
+                    } else {
+                        base
+                    };
+                }
+            }
+            x
+        };
+        let act = heavy(&mut nxt, 24, &[1, 5, 9]);
+        let wt = heavy(&mut nxt, 40, &[3, 12, 14]);
+        let a_id = kurtosis_objective(&act, &Rotation::identity(h), 24);
+        let w_id = kurtosis_objective(&wt, &Rotation::identity(h), 40);
+        let learned = learn_rotation_joint(
+            &act,
+            24,
+            &wt,
+            40,
+            h,
+            Rotation::hadamard(h, 1),
+            200,
+            0.4,
+            4,
+            0.5,
+        );
+        let a_l = kurtosis_objective(&act, &learned, 24);
+        let w_l = kurtosis_objective(&wt, &learned, 40);
+        println!("joint  act {a_id:.3e}→{a_l:.3e}  wt {w_id:.3e}→{w_l:.3e}");
+        assert!(learned.orthonormality_error() < 1e-3, "lost orthonormality");
+        assert!(a_l < a_id, "act kurtosis not reduced: {a_id:.3e}→{a_l:.3e}");
+        assert!(w_l < w_id, "wt kurtosis not reduced: {w_id:.3e}→{w_l:.3e}");
     }
 }

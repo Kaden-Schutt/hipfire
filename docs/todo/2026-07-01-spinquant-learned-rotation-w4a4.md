@@ -152,12 +152,20 @@ Stiefel-manifold optimizer landed in `crates/hipfire-train/src/learn_rotation.rs
   act+weight objective is the obvious refinement). But it confirms the thesis in
   the deployed setting: a *fixed* rotation plateaus at the FWHT tier; a *learned*
   one moves past it.
-- **OPEN follow-ups:** (ii) learn `M` on a joint activation+weight kurtosis (or
-  the real quantized-CE) — the current `M` is activation-only, leaving the weight
-  int4 error on the table; (iii) tied-head backward (deferred from Phase 0) for a
-  true quantized-CE objective; (iv) bake the learned R1 into an `Oq4G256` export
-  (Phase 5). Note deploying the learned R1 through the FWHT recipe means baking
-  `R1 = Fᵀ M` so the recipe's FWHT cancels to leave `M`.
+- **(ii) DONE — joint activation+weight objective.** `learn_rotation_joint`
+  (`learn_rotation.rs`) mixes Frobenius-normalized activation and weight kurtosis
+  gradients by a directional `lambda` (0.5 = balanced); unit-tested
+  (`joint_reduces_both_kurtoses`). In `learned_r1_w4a4_probe` (weight set = wq+wgate,
+  row-subsampled): full-W4A4 q_proj vs FWHT baseline **act-only +1.73 dB → joint
+  +1.81 dB** — a *marginal* +0.08 dB. On this small model / q_proj (out=h=512) the
+  activation rotation already dominates the W4A4 error, so the weight term barely
+  moves it; it should matter more where weight outliers bind (larger models, or the
+  down_proj which reads the wide MLP dim). The objective is the more-complete one
+  and it does help; the size of the win is model-dependent.
+- **OPEN follow-ups:** (iii) tied-head backward (deferred from Phase 0) for a true
+  quantized-CE objective; (iv) bake the learned R1 into an `Oq4G256` export
+  (Phase 5) — deploying through the FWHT recipe means baking `R1 = Fᵀ M` so the
+  recipe's FWHT cancels to leave `M`; (v) Phase 3 R2 (head-wise).
 
 **Phase 3 — add R2 (head-wise), learn {R1,R2} jointly.** `R2 [D_head,D_head]`
 on V + o_proj input; merged. This is the "W4A8-gap-closing" pair even before R3/R4.

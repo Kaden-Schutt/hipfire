@@ -21,7 +21,7 @@
 //!   hipfire lock release
 
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
-use hipfire_train::learn_rotation::learn_rotation_kurtosis;
+use hipfire_train::learn_rotation::{learn_rotation_joint, learn_rotation_kurtosis};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
 use hipfire_train::rotation::{apply_r1, rotate_rows, Rotation};
@@ -201,22 +201,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut xn1 = Vec::new();
     let mut wq = Vec::new();
     let mut xn2 = Vec::new();
+    let mut wgate = Vec::new();
     for (i, (lw, _)) in model.layers.iter().enumerate() {
         xn1.push(gpu.download_f32(&acts.layer_acts[i].xn1)?);
         wq.push(gpu.download_f32(&lw.wq)?);
         xn2.push(gpu.download_f32(&acts.layer_acts[i].xn2)?);
+        wgate.push(gpu.download_f32(&lw.wgate)?);
     }
     let nl = model.layers.len();
+    let inter = model.dims.inter;
 
-    // Learn M on the stacked residual-read activations (kurtosis surrogate).
+    // Activation set for learning: stacked residual-read activations (xn1+xn2).
     let rows = nl * 2 * SEQ;
     let mut xstack = Vec::with_capacity(rows * h);
     for m in xn1.iter().chain(xn2.iter()) {
         xstack.extend_from_slice(m);
     }
-    println!("\n  learning rotation on {rows} rows × {h} …");
+    // Weight set: reader weights (wq + wgate), the tensors the deployed W4A4
+    // quantizes in the rotated basis alongside the activations. Row-subsampled
+    // (stride) to ~a few thousand rows — the kurtosis statistics converge fine on
+    // a representative sample, and it keeps the offline learn cheap.
+    let all_wt: Vec<&Vec<f32>> = wq.iter().chain(wgate.iter()).collect();
+    let total_wt_rows = nl * (qd + inter);
+    let stride = (total_wt_rows / 4096).max(1);
+    let mut wstack = Vec::new();
+    let mut rows_wt = 0usize;
+    for m in &all_wt {
+        let mrows = m.len() / h;
+        let mut r = 0;
+        while r < mrows {
+            wstack.extend_from_slice(&m[r * h..r * h + h]);
+            rows_wt += 1;
+            r += stride;
+        }
+    }
+
+    println!("\n  learning rotations (act-only, then joint act+weight) …");
     let learned = learn_rotation_kurtosis(&xstack, rows, h, Rotation::hadamard(h, 1), 120, 0.05, 6);
-    println!("  (orthonormality {:.1e})", learned.orthonormality_error());
+    let learned_joint = learn_rotation_joint(
+        &xstack,
+        rows,
+        &wstack,
+        rows_wt,
+        h,
+        Rotation::hadamard(h, 1),
+        120,
+        0.05,
+        6,
+        0.5,
+    );
+    println!(
+        "  (orthonormality  act-only {:.1e}  joint {:.1e})",
+        learned.orthonormality_error(),
+        learned_joint.orthonormality_error()
+    );
 
     let s1 = gen_fwht_signs(42, GROUP);
     let s2 = gen_fwht_signs(1042, GROUP);
@@ -236,17 +274,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fwht = mean_snr(&mut gpu, &Rot::Fwht(&s1, &s2))?;
     let hada = mean_snr(&mut gpu, &Rot::Full(&had))?;
     let lrn = mean_snr(&mut gpu, &Rot::Full(&learned))?;
-    println!("  naive (no rotation)         {naive:8.2} dB");
-    println!("  per-group FWHT (deployed)   {fwht:8.2} dB   <- baseline");
-    println!("  global Hadamard             {hada:8.2} dB");
-    println!("  learned rotation            {lrn:8.2} dB");
+    let lrn_j = mean_snr(&mut gpu, &Rot::Full(&learned_joint))?;
+    println!("  naive (no rotation)          {naive:8.2} dB");
+    println!("  per-group FWHT (deployed)    {fwht:8.2} dB   <- baseline");
+    println!("  global Hadamard              {hada:8.2} dB");
+    println!("  learned (act only)           {lrn:8.2} dB");
+    println!("  learned (joint act+weight)   {lrn_j:8.2} dB");
     println!(
-        "\n  learned − per-group-FWHT baseline: {:+.2} dB",
-        lrn - fwht
+        "\n  vs per-group-FWHT baseline:  act-only {:+.2} dB   joint {:+.2} dB",
+        lrn - fwht,
+        lrn_j - fwht
     );
-    if lrn > fwht + 0.5 {
+    let best = lrn.max(lrn_j);
+    if best > fwht + 0.5 {
         println!("PHASE 2: the LEARNED rotation beats the deployed per-group FWHT in full W4A4.");
-    } else if lrn >= fwht - 0.5 {
+    } else if best >= fwht - 0.5 {
         println!("RESULT: learned ≈ per-group FWHT here (small model; the FWHT is already near-optimal).");
     } else {
         println!("RESULT: learned below FWHT — the kurtosis surrogate underperforms the block Hadamard here.");
