@@ -3805,6 +3805,14 @@ pub const NIBBLE_EXPAND_INT4_TO_INT8_SRC: &str =
 /// `docs/kernels/generic-kernel-library.md`.
 pub const GEMM_IU4_I32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_iu4_i32_wmma.hip");
 
+/// SpinQuant R1 W4A4 working copy of [`GEMM_IU4_I32_WMMA_SRC`] (Phase 1b sandbox,
+/// symbol `gemm_iu4_i32_wmma_r1`). Byte-identical math today; owned by the
+/// learned-rotation experiments so they can fuse the R4 FWHT / dequant epilogue
+/// without disturbing the production kernel. `parity_gemm_iu4_i32_wmma_r1`
+/// asserts they still agree. See `kernels/src/gemm_iu4_i32_wmma_r1.hip`.
+pub const GEMM_IU4_I32_WMMA_R1_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iu4_i32_wmma_r1.hip");
+
 /// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
 /// rescale in the f32 epilogue (productionizes the host-tiled E5 recipe).
 /// gfx1103 wave32, zero LDS. See `kernels/src/gemm_oq4_grouped_wmma.hip`.

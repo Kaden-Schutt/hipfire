@@ -97,9 +97,26 @@ QuaRot/+0.9 dB tier and validates the plumbing before learning.
   gate_proj 9.95→18.6 (+8.6). Rotation moves the int4-activation grid from
   marginal to usable, as SpinQuant predicts. Hadamard ≈ random (Hadamard the
   canonical fixed choice).
-- **(b) OPEN:** route `apply_r1`'d weights through the production `Oq4G256`
-  quantizer and run the real `iu4·iu4` GEMM end-to-end (kernel/plumbing, was
-  deprioritized vs the A4-quality mechanism).
+- **(b) DONE** (real `iu4·iu4` end-to-end). Working kernel copy
+  `kernels/src/gemm_iu4_i32_wmma_r1.hip` (symbol `gemm_iu4_i32_wmma_r1`, own
+  `Gpu::gemm_iu4_i32_wmma_r1` wrapper) — byte-identical to production, so the
+  learned-rotation work can evolve it (fuse R4 FWHT / dequant epilogue) without
+  touching the Oq4 forward. `parity_gemm_iu4_i32_wmma_r1`: EXACT vs int ref +
+  bit-identical to production. Probe `examples/w4a4_r1_probe.rs` runs the real
+  Oq4 W4A4 recipe (FWHT-256 signs 42/1042 → clip-search int4 weight / absmax int4
+  act → grouped iu4 GEMM → f32 rescale) on real Supra-50M, GPU == CPU-sim exactly
+  (int GEMM is exact). Result (mean q_proj SQNR): **naive W4A4 13.1 dB → +per-group
+  FWHT recipe 20.1 dB → +fixed Hadamard R1 19.95 dB (−0.17)**.
+- **KEY FINDING:** hipfire's Oq4G256 recipe *already* applies a per-256-group
+  FWHT, which already captures the fixed-rotation (QuaRot) tier — so a second
+  *fixed* data-agnostic R1 adds ~nothing on top. The +6.8 dB SpinQuant payoff
+  requires a **learned** R1 (Phase 2); `w4a4_r1_probe` is the baseline it must
+  beat. (Note the earlier A4-SNR probe's +8.3 dB was vs *no* rotation at all,
+  i.e. it re-derives the per-group-FWHT benefit; the marginal value of a fixed R1
+  over the deployed FWHT recipe is what's ~0 here.)
+- Toolchain note: the `_r1` kernel isn't in the precompiled cache, so it JITs —
+  set `ROCM_PATH=$HOME/.venv/.../_rocm_sdk_core` (has `lib/llvm/bin/clang++`); the
+  runtime-only `/opt/rocm` lacks the compiler.
 
 **Phase 2 — Cayley-SGD learn R1.** Add a small Stiefel-manifold optimizer
 (`crates/hipfire-train/src/ops/` + `optim.rs`): Cayley update with fixed-point

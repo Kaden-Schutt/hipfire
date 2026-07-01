@@ -1266,6 +1266,58 @@ impl Gpu {
             )
         }
     }
+    /// SpinQuant R1 working copy of [`Self::gemm_iu4_i32_wmma`] (Phase 1b
+    /// sandbox, symbol `gemm_iu4_i32_wmma_r1`). Identical contract; kept separate
+    /// so the learned-rotation W4A4 path can evolve the kernel without touching
+    /// production. Same args: `a_i4` [M,K/2], `x_i4` [B,K/2], `y_i32` [B,M].
+    pub fn gemm_iu4_i32_wmma_r1(
+        &mut self,
+        a_i4: &GpuTensor,
+        x_i4: &GpuTensor,
+        y_i32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % 16,
+            0,
+            "gemm_iu4_i32_wmma_r1: K must be a multiple of 16"
+        );
+        self.ensure_kernel(
+            "gemm_iu4_i32_wmma_r1",
+            kernels::GEMM_IU4_I32_WMMA_R1_SRC,
+            "gemm_iu4_i32_wmma_r1",
+        )?;
+        let ap = a_i4.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let yp = y_i32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let func = &self.functions["gemm_iu4_i32_wmma_r1"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     /// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
     /// rescale in the f32 epilogue. `w_i4` [M,K/2] + `w_scales` [M,K/group] (f32),
     /// `x_i4` [B,K/2] + `x_scales` [B,K/group] (f32), `y_f32` [B,M]. Requires
