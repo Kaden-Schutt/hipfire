@@ -162,8 +162,17 @@ Stiefel-manifold optimizer landed in `crates/hipfire-train/src/learn_rotation.rs
   moves it; it should matter more where weight outliers bind (larger models, or the
   down_proj which reads the wide MLP dim). The objective is the more-complete one
   and it does help; the size of the win is model-dependent.
-- **OPEN follow-ups:** (iii) tied-head backward (deferred from Phase 0) for a true
-  quantized-CE objective; (iv) bake the learned R1 into an `Oq4G256` export
+- **(iii) untied-head backward DONE.** The four `model_*_backward` fns no longer
+  assert tied-only; they use `out_proj = lm_head ?? embed` for `d_xf` (base
+  weights frozen, so that's the only use of the output matrix in backward), which
+  handles the untied head `apply_r1` produces. Verified: new
+  `gradcheck_model_untied` (distinct `lm_head`) matches finite differences
+  (worst ~7e-4), and the tied `gradcheck_model` still passes. This unblocks
+  gradient-based work on rotated models; the *full quantized-CE* forward (STE
+  quant threaded through every linear + R1) is the remaining larger piece, and
+  its value over the kurtosis surrogate is uncertain (plain STE's ~zero gradient,
+  above) — deferred until there's evidence it beats the surrogate.
+- **OPEN follow-ups:** (iv) bake the learned R1 into an `Oq4G256` export
   (Phase 5) — deploying through the FWHT recipe means baking `R1 = Fᵀ M` so the
   recipe's FWHT cancels to leave `M`; (v) Phase 3 R2 (head-wise).
 

@@ -437,10 +437,6 @@ pub fn model_loss_backward(
     ignore_index: i32,
 ) -> HipResult<(f32, Vec<BlockLoraGrad>)> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
-    debug_assert!(
-        model.lm_head.is_none(),
-        "backward supports tied embeddings only"
-    );
 
     // Loss + d_logits (sum-reduction).
     let tgt = gpu.upload_f32(targets, &[seq])?;
@@ -458,9 +454,13 @@ pub fn model_loss_backward(
     )?;
     let loss_sum: f32 = gpu.download_f32(&loss)?.iter().sum();
 
-    // d_xf = d_logits · embed  (tied lm_head frozen)
+    // d_xf = d_logits · out_proj. Base weights are frozen, so the only use of the
+    // output matrix in backward is this term — `out_proj = lm_head ?? embed`
+    // (mirrors model_forward), which handles both tied and untied heads (the
+    // latter produced by rotation::apply_r1).
+    let out_proj = model.lm_head.as_ref().unwrap_or(&model.embed);
     let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
-    linear_backward_x(gpu, &d_logits, &model.embed, &d_xf, seq, h, vocab, false)?;
+    linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false)?;
     // final norm backward → d_x_last
     let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
     let dw_dummy = gpu.zeros(&[h], DType::F32)?;
@@ -550,10 +550,6 @@ pub fn model_calib_down_backward(
 ) -> HipResult<f32> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
     let inter = model.dims.inter;
-    debug_assert!(
-        model.lm_head.is_none(),
-        "backward supports tied embeddings only"
-    );
 
     let tgt = gpu.upload_f32(targets, &[seq])?;
     let loss = gpu.zeros(&[seq], DType::F32)?;
@@ -570,8 +566,10 @@ pub fn model_calib_down_backward(
     )?;
     let loss_sum: f32 = gpu.download_f32(&loss)?.iter().sum();
 
+    // out_proj = lm_head ?? embed (frozen); handles tied + untied heads.
+    let out_proj = model.lm_head.as_ref().unwrap_or(&model.embed);
     let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
-    linear_backward_x(gpu, &d_logits, &model.embed, &d_xf, seq, h, vocab, false)?;
+    linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false)?;
     let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
     let dw_dummy = gpu.zeros(&[h], DType::F32)?;
     rmsnorm_backward(
@@ -639,18 +637,16 @@ pub fn model_distill_backward(
     teacher_p: &GpuTensor,
 ) -> HipResult<(f32, Vec<BlockLoraGrad>, GpuTensor)> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
-    debug_assert!(
-        model.lm_head.is_none(),
-        "backward supports tied embeddings only"
-    );
 
     let loss = gpu.zeros(&[seq], DType::F32)?;
     let d_logits = gpu.zeros(&[seq * vocab], DType::F32)?;
     distill_kl(gpu, &acts.logits, teacher_p, &loss, &d_logits, seq, vocab)?;
     let loss_sum: f32 = gpu.download_f32(&loss)?.iter().sum();
 
+    // out_proj = lm_head ?? embed (frozen); handles tied + untied heads.
+    let out_proj = model.lm_head.as_ref().unwrap_or(&model.embed);
     let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
-    linear_backward_x(gpu, &d_logits, &model.embed, &d_xf, seq, h, vocab, false)?;
+    linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false)?;
     let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
     let d_final_norm = gpu.zeros(&[h], DType::F32)?;
     rmsnorm_backward(
@@ -706,10 +702,6 @@ pub fn model_distill_backward_tail(
     n_score: usize,
 ) -> HipResult<(f32, Vec<BlockLoraGrad>, GpuTensor)> {
     let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
-    debug_assert!(
-        model.lm_head.is_none(),
-        "backward supports tied embeddings only"
-    );
     let n_score = n_score.min(seq).max(1);
     let first_scored = seq - n_score;
 
@@ -725,8 +717,10 @@ pub fn model_distill_backward_tail(
     let d_logits = gpu.upload_f32(&dl, &[seq * vocab])?;
     let loss_sum: f32 = gpu.download_f32(&loss)?[first_scored..].iter().sum();
 
+    // out_proj = lm_head ?? embed (frozen); handles tied + untied heads.
+    let out_proj = model.lm_head.as_ref().unwrap_or(&model.embed);
     let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
-    linear_backward_x(gpu, &d_logits, &model.embed, &d_xf, seq, h, vocab, false)?;
+    linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false)?;
     let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
     let d_final_norm = gpu.zeros(&[h], DType::F32)?;
     rmsnorm_backward(
