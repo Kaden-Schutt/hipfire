@@ -5348,6 +5348,44 @@ fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
     let hgt = load_h(hg_train)?;
     let hpt = load_h(hp_train)?;
 
+    // Diagnostic: how much did the Fisher weighting actually perturb the Hessian?
+    // Both train Hessians are over the SAME tokens, so diag(Hg)/diag(Hp) per input
+    // channel c = (Σ_n w_n x_n[c]²)/(Σ_n x_n[c]²) is the effective per-channel
+    // weight. A tight ratio (CV≈0) means w is near-uniform ⇒ g=1 is a no-op, not
+    // a "hurt". `‖Hg-Hp‖/‖Hp‖` is the overall relative perturbation.
+    {
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for idx in 0..k * k {
+            let d = (hgt[idx] - hpt[idx]) as f64;
+            num += d * d;
+            den += (hpt[idx] as f64).powi(2);
+        }
+        let (mut rmin, mut rmax, mut rsum, mut rsum2, mut nr) =
+            (f64::MAX, 0.0f64, 0.0f64, 0.0f64, 0usize);
+        for c in 0..k {
+            let dp = hpt[c * k + c] as f64;
+            if dp > 0.0 {
+                let r = hgt[c * k + c] as f64 / dp;
+                rmin = rmin.min(r);
+                rmax = rmax.max(r);
+                rsum += r;
+                rsum2 += r * r;
+                nr += 1;
+            }
+        }
+        let rmean = rsum / nr.max(1) as f64;
+        let rstd = (rsum2 / nr.max(1) as f64 - rmean * rmean).max(0.0).sqrt();
+        eprintln!(
+            "diag: ‖Hg-Hp‖/‖Hp‖ = {:.4}  |  diag(Hg)/diag(Hp): mean {:.3} std {:.3} CV {:.3} range [{:.3}, {:.3}]",
+            (num / den).sqrt(),
+            rmean,
+            rstd,
+            rstd / rmean.max(1e-9),
+            rmin,
+            rmax
+        );
+    }
+
     // LDLQ-quantize with each training Hessian (damp = 1% of mean diagonal).
     let cb = qtip::build_codebook();
     let s1 = gen_fwht_signs(42, 256);
