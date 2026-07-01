@@ -56,6 +56,10 @@ pub use hipfire_primitives::conv::{
     f32_to_bf16_bits, f32_to_f16, plain_dtype_to_f32 as to_f32,
 };
 pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+// SpinQuant R1 deploy-time merge (--rotate): fold+rotate readers/writers by FᵀM
+// before the Oq4 quantize so the codec FWHT leaves the int4 grid in learned M.
+// (fixture/roughquant/codecs/qtip/ldlq are owned by the library, re-exported above.)
+mod rotate;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -232,6 +236,12 @@ thread_local! {
 // `MQ_CLIPSEARCH` + `mq_clipsearch_enabled`/`set_mq_clipsearch` now live in the
 // library (re-exported above) so the codecs and this binary share one toggle.
 
+// SpinQuant R1 deploy merge (`--rotate`): pre-computed fold+rotate f32 overrides
+// keyed by tensor name. When set, `tensor_to_f32_with_optional_fp8_scale` returns
+// the rotated tensor instead of the raw source, so every codec branch quantizes
+// the R1-rotated weights transparently. See `rotate.rs`.
+static ROTATION_OVERRIDE: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
+
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -407,6 +417,13 @@ fn tensor_to_f32_with_optional_fp8_scale(
     fp8_scale_for: &HashMap<String, (usize, String)>,
     st_files: &[SafetensorsFile],
 ) -> Vec<f32> {
+    // SpinQuant R1 deploy merge: if `--rotate` pre-computed a fold+rotated version
+    // of this tensor, return it so the codec quantizes the rotated weight. The
+    // override is built (from the raw source) before it is installed, so the
+    // pre-pass itself reads through this function and sees the raw tensor.
+    if let Some(rot) = ROTATION_OVERRIDE.get().and_then(|m| m.get(name)) {
+        return rot.clone();
+    }
     // FP8 E4M3 + UE8M0 paired storage (DeepSeek V4). The dtype tag is either
     // `I8` (older safetensors writer) or `F8_E4M3` (newer); both
     // store identical E4M3 bytes, so the dequant math is the same.
@@ -434,6 +451,163 @@ fn tensor_to_f32_with_optional_fp8_scale(
         );
     }
     to_f32(raw_data, &meta.dtype)
+}
+
+/// Read a learned-R1 `.r1` file (`b"HFR1"` + `h: u32 LE` + `h*h` f32 LE), the
+/// output of `hipfire-train`'s `learn_r1_dump`. Validates the magic, header size,
+/// and that `h` matches the model's hidden size.
+fn read_r1_file(path: &str, expect_h: usize) -> Result<Vec<f32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read --rotate {path}: {e}"))?;
+    if bytes.len() < 8 || &bytes[0..4] != b"HFR1" {
+        return Err(format!("--rotate {path}: bad magic (expected HFR1)"));
+    }
+    let h = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    if h != expect_h {
+        return Err(format!(
+            "--rotate {path}: rotation h={h} != model hidden_size {expect_h}"
+        ));
+    }
+    let want = 8 + h * h * 4;
+    if bytes.len() != want {
+        return Err(format!(
+            "--rotate {path}: size {} != {want} (HFR1 + h + {h}*{h} f32)",
+            bytes.len()
+        ));
+    }
+    let mut m = vec![0.0f32; h * h];
+    for (i, v) in m.iter_mut().enumerate() {
+        let o = 8 + i * 4;
+        *v = f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    }
+    Ok(m)
+}
+
+/// SpinQuant R1 deploy pre-pass (`--rotate`): fold each RMSNorm scale into its
+/// readers and rotate all residual readers/writers/embedding by `R1 = FᵀM`, so the
+/// codec's per-256-group FWHT cancels `Fᵀ` and the int4 grid sees the learned `M`.
+/// Returns the name→rotated-f32 override map (installed into `ROTATION_OVERRIDE`
+/// so every codec branch quantizes the rotated weights) and the synthesized untied
+/// `lm_head` f32 (`final_norm` folded, then rotated) that the caller emits — the
+/// runtime auto-prefers an explicit `lm_head.weight` over the tied embedding.
+///
+/// Dense-llama only (arch_id 0/1); the tensor names follow the HF llama layout.
+fn build_rotation_overrides(
+    rotate_path: &str,
+    config: &serde_json::Value,
+    n_layers: usize,
+    st_files: &[SafetensorsFile],
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+) -> Result<(HashMap<String, Vec<f32>>, Vec<f32>), String> {
+    let h = config
+        .get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .ok_or("config missing hidden_size")? as usize;
+    let vocab = config
+        .get("vocab_size")
+        .and_then(|v| v.as_u64())
+        .ok_or("config missing vocab_size")? as usize;
+    if h % 256 != 0 {
+        return Err(format!(
+            "--rotate needs hidden_size {h} %256==0 (codec FWHT)"
+        ));
+    }
+    let m = read_r1_file(rotate_path, h)?;
+    let plan = rotate::R1Plan::from_learned_m(&m, h);
+    eprintln!(
+        "  --rotate: R1=FᵀM built (h={h}); orthonormality {:.1e}",
+        plan.orthonormality_error()
+    );
+
+    // f32 fetch through the universal extractor. ROTATION_OVERRIDE is not yet set,
+    // so this returns the raw source tensor (dequantized as needed).
+    let get_f32 = |name: &str| -> Option<Vec<f32>> {
+        for st in st_files {
+            if let Some((meta, raw)) = st.tensor_data(name) {
+                return Some(tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw,
+                    meta,
+                    fp8_scale_for,
+                    st_files,
+                ));
+            }
+        }
+        None
+    };
+
+    // RMSNorm scales folded into their readers.
+    let mut norm1 = Vec::with_capacity(n_layers);
+    let mut norm2 = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        norm1.push(
+            get_f32(&format!("model.layers.{l}.input_layernorm.weight"))
+                .ok_or_else(|| format!("missing input_layernorm for layer {l}"))?,
+        );
+        norm2.push(
+            get_f32(&format!("model.layers.{l}.post_attention_layernorm.weight"))
+                .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
+        );
+    }
+    let final_norm = get_f32("model.norm.weight").ok_or("missing model.norm.weight")?;
+
+    let mut ov: HashMap<String, Vec<f32>> = HashMap::new();
+    for l in 0..n_layers {
+        // Attention readers: fold input_layernorm, then reader-rotate on h.
+        for suf in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] {
+            let name = format!("model.layers.{l}.{suf}.weight");
+            if let Some(mut w) = get_f32(&name) {
+                let out = w.len() / h;
+                rotate::fold_cols(&mut w, &norm1[l], out, h);
+                plan.rotate_reader(&mut w, out);
+                ov.insert(name, w);
+            }
+        }
+        // MLP readers: fold post_attention_layernorm, then reader-rotate on h.
+        for suf in ["mlp.gate_proj", "mlp.up_proj"] {
+            let name = format!("model.layers.{l}.{suf}.weight");
+            if let Some(mut w) = get_f32(&name) {
+                let out = w.len() / h;
+                rotate::fold_cols(&mut w, &norm2[l], out, h);
+                plan.rotate_reader(&mut w, out);
+                ov.insert(name, w);
+            }
+        }
+        // Writers (o_proj, down_proj): writer-rotate on the output h dim.
+        for suf in ["self_attn.o_proj", "mlp.down_proj"] {
+            let name = format!("model.layers.{l}.{suf}.weight");
+            if let Some(mut w) = get_f32(&name) {
+                let cols = w.len() / h;
+                plan.rotate_writer(&mut w, cols);
+                ov.insert(name, w);
+            }
+        }
+        // Folded norms → identity (ones).
+        ov.insert(
+            format!("model.layers.{l}.input_layernorm.weight"),
+            vec![1.0f32; h],
+        );
+        ov.insert(
+            format!("model.layers.{l}.post_attention_layernorm.weight"),
+            vec![1.0f32; h],
+        );
+    }
+
+    // Head: synthesize the untied lm_head (fold final_norm into the ORIGINAL embed,
+    // then reader-rotate) BEFORE rotating the input embedding.
+    let mut embed = get_f32("model.embed_tokens.weight").ok_or("missing embed_tokens")?;
+    let mut lm_head = embed.clone();
+    rotate::fold_cols(&mut lm_head, &final_norm, vocab, h);
+    plan.rotate_reader(&mut lm_head, vocab);
+    // Input embedding: reader-rotate on h (no fold).
+    plan.rotate_reader(&mut embed, vocab);
+    ov.insert("model.embed_tokens.weight".to_string(), embed);
+    ov.insert("model.norm.weight".to_string(), vec![1.0f32; h]);
+
+    eprintln!(
+        "  --rotate: {} tensors folded+rotated; synthesized untied lm_head [{vocab}×{h}]",
+        ov.len()
+    );
+    Ok((ov, lm_head))
 }
 
 /// Convert one E2M1 nibble (4-bit FP: 1 sign + 2 exp + 1 mantissa, bias=1) to f32.
@@ -6817,6 +6991,32 @@ fn main() {
         fp8_scale_for.len()
     );
 
+    // ── SpinQuant R1 deploy pre-pass (`--rotate <M.r1>`) ─────────────────────
+    // Fold RMSNorm scales into readers and rotate residual readers/writers by
+    // FᵀM so the codec FWHT leaves the int4 grid in the learned M. Dense-llama
+    // only. Installs the rotated overrides globally (consumed transparently by
+    // every codec branch) and holds the synthesized untied lm_head for emission
+    // after the main tensor loop.
+    let mut rotate_lm_head: Option<Vec<f32>> = None;
+    if let Some(rotate_path) = arg_value(&args, "--rotate") {
+        if arch_id != 0 && arch_id != 1 {
+            eprintln!("error: --rotate is dense-llama only (arch_id 0/1); got arch_id {arch_id}");
+            std::process::exit(2);
+        }
+        match build_rotation_overrides(rotate_path, &config, n_layers, &st_files, &fp8_scale_for) {
+            Ok((overrides, lm_head)) => {
+                ROTATION_OVERRIDE
+                    .set(overrides)
+                    .expect("ROTATION_OVERRIDE set once");
+                rotate_lm_head = Some(lm_head);
+            }
+            Err(e) => {
+                eprintln!("error: --rotate: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // ── K-map pre-pass ──────────────────────────────────────────────────────
     // Build per-tensor quant level map. Gated to MoE models by default
     // (maintainer directive 2026-05-08): K-map's dense PPL effect is mixed
@@ -9432,6 +9632,34 @@ fn main() {
         // Release source file page cache after each tensor to prevent
         // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
+    }
+
+    // Emit the synthesized untied lm_head (`--rotate`). Stored F16 [vocab, h]: the
+    // output head is not on the int4 GEMM hot path, and F16 avoids replicating a
+    // per-format weight-codec branch. The runtime prefers an explicit lm_head.weight
+    // over the tied embedding (see hfq.rs loader), so this deploys the rotated head.
+    if let Some(lm) = rotate_lm_head.take() {
+        let h = config
+            .get("hidden_size")
+            .and_then(|v| v.as_u64())
+            .expect("hidden_size (validated in --rotate pre-pass)") as usize;
+        let vocab = lm.len() / h;
+        let bytes = f32_slice_to_f16_bytes(&lm);
+        eprintln!(
+            "  {:>8}: lm_head.weight [{vocab}, {h}] (untied R1 head, F16, {:.1} KB) [--rotate]",
+            "F16-R1",
+            bytes.len() as f64 / 1024.0
+        );
+        total_params += lm.len() as u64;
+        quantized_params += lm.len() as u64;
+        hfq_tensors.push(HfqTensor {
+            name: "lm_head.weight".to_string(),
+            quant_type: QuantType::F16,
+            shape: vec![vocab as u32, h as u32],
+            group_size: 0,
+            data: bytes,
+            spilled_len: 0,
+        });
     }
 
     // Summary
