@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
+use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
 use hipfire_hneurons::{FitConfig, L1Logreg};
 use hipfire_model::ModelLoadParams;
 
@@ -32,8 +33,15 @@ struct Args {
     daemon: Option<PathBuf>,
     model: PathBuf,
     colnorms: PathBuf,
+    // Shipped-response mode (cross-model demo): reference qids + answer_tokens.
     data_dir: PathBuf,
     data_prefix: String,
+    // Self-generate mode (on-paper): the resident model answers each question,
+    // labeled by TriviaQA `normalized_aliases`. Enabled when both are set.
+    gen_train: Option<PathBuf>,
+    gen_test: Option<PathBuf>,
+    gen_limit: usize,
+    gen_max_tokens: u32,
     limit: Option<usize>,
     l1: f32,
     max_seq: usize,
@@ -45,6 +53,10 @@ fn parse_args() -> Result<Args, String> {
     let mut colnorms = None;
     let mut data_dir = None;
     let mut data_prefix = "Llama33_TriviaQA".to_string();
+    let mut gen_train = None;
+    let mut gen_test = None;
+    let mut gen_limit = 400usize;
+    let mut gen_max_tokens = 48u32;
     let mut limit = Some(200usize);
     let mut l1 = 1e-3f32;
     let mut max_seq = 2048usize;
@@ -57,6 +69,14 @@ fn parse_args() -> Result<Args, String> {
             "--colnorms" => colnorms = Some(PathBuf::from(val()?)),
             "--data-dir" => data_dir = Some(PathBuf::from(val()?)),
             "--data-prefix" => data_prefix = val()?,
+            "--gen-train" => gen_train = Some(PathBuf::from(val()?)),
+            "--gen-test" => gen_test = Some(PathBuf::from(val()?)),
+            "--gen-limit" => gen_limit = val()?.parse().map_err(|e| format!("--gen-limit: {e}"))?,
+            "--gen-max-tokens" => {
+                gen_max_tokens = val()?
+                    .parse()
+                    .map_err(|e| format!("--gen-max-tokens: {e}"))?
+            }
             "--limit" => {
                 let v = val()?;
                 limit = if v == "0" || v == "all" {
@@ -70,12 +90,22 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown arg {other}")),
         }
     }
+    // data_dir is only required in shipped-response mode.
+    let self_gen = gen_train.is_some() && gen_test.is_some();
     Ok(Args {
         daemon,
         model: model.ok_or("--model required")?,
         colnorms: colnorms.ok_or("--colnorms required")?,
-        data_dir: data_dir.ok_or("--data-dir required")?,
-        data_prefix,
+        data_dir: data_dir.unwrap_or_else(|| PathBuf::from(".")),
+        data_prefix: if self_gen {
+            "TriviaQA-selfgen".to_string()
+        } else {
+            data_prefix
+        },
+        gen_train,
+        gen_test,
+        gen_limit,
+        gen_max_tokens,
         limit,
         l1,
         max_seq,
@@ -178,6 +208,132 @@ fn load_split(
     Ok(out)
 }
 
+/// A daemon connection that survives transient GPU wedges (nix2 sticky-719 LDS
+/// hazard). Every `generate`/`cett_capture` is retried; on failure the daemon is
+/// dropped (which kills the child and frees the GPU lock, letting amdgpu reset
+/// recover), then re-spawned + re-primed (load model + colnorms) before the
+/// retry. Accumulated features live in the probe process, which outlives the
+/// daemon, so a wedge costs one sample's re-work, not the whole run.
+struct Session {
+    engine: Option<DaemonEngine>,
+    daemon_bin: PathBuf,
+    model: String,
+    max_seq: u32,
+    colnorms: String,
+    respawns: usize,
+}
+
+impl Session {
+    async fn connect(
+        daemon_bin: PathBuf,
+        model: String,
+        max_seq: u32,
+        colnorms: String,
+    ) -> Result<Self, String> {
+        let mut s = Self {
+            engine: None,
+            daemon_bin,
+            model,
+            max_seq,
+            colnorms,
+            respawns: 0,
+        };
+        s.reprime(false).await?;
+        Ok(s)
+    }
+
+    /// (Re)spawn the daemon and reload model + colnorms. `after_wedge` adds a
+    /// longer settle delay for the GPU reset to complete.
+    async fn reprime(&mut self, after_wedge: bool) -> Result<(), String> {
+        // Drop any existing engine first — kills the daemon, frees the GPU lock.
+        self.engine = None;
+        if after_wedge {
+            self.respawns += 1;
+            let secs = 20 + 10 * self.respawns.min(4) as u64;
+            eprintln!("[session] GPU wedge — dropping daemon, waiting {secs}s for reset…");
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        }
+        let mut engine = DaemonEngine::spawn(&self.daemon_bin)
+            .await
+            .map_err(|e| format!("respawn daemon: {e}"))?;
+        let params = ModelLoadParams {
+            max_seq: self.max_seq,
+            ..Default::default()
+        };
+        engine
+            .load(&self.model, params)
+            .await
+            .map_err(|e| format!("reload model: {e}"))?;
+        engine
+            .cett_load_colnorms(&self.colnorms)
+            .await
+            .map_err(|e| format!("reload colnorms: {e}"))?;
+        self.engine = Some(engine);
+        Ok(())
+    }
+
+    async fn generate_retry(
+        &mut self,
+        id: &str,
+        prompt: &str,
+        sampling: &GenerationSamplingPolicy,
+        max_attempts: usize,
+    ) -> Result<String, String> {
+        let mut last = String::new();
+        for attempt in 0..max_attempts {
+            if self.engine.is_none() {
+                self.reprime(true).await?;
+            }
+            let req = GenerateTextRequest::from_prompt(id.to_string(), prompt, sampling.clone());
+            match self.engine.as_mut().unwrap().generate(req).await {
+                Ok((text, _done)) => return Ok(text),
+                Err(e) => {
+                    last = e.to_string();
+                    eprintln!(
+                        "[session] generate failed (attempt {}): {last}",
+                        attempt + 1
+                    );
+                    self.engine = None; // force reprime on next attempt
+                }
+            }
+        }
+        Err(format!(
+            "generate failed after {max_attempts} attempts: {last}"
+        ))
+    }
+
+    async fn capture_retry(
+        &mut self,
+        user: &str,
+        response: &str,
+        max_attempts: usize,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let mut last = String::new();
+        for attempt in 0..max_attempts {
+            if self.engine.is_none() {
+                self.reprime(true).await?;
+            }
+            match self
+                .engine
+                .as_mut()
+                .unwrap()
+                .cett_capture("", user, response)
+                .await
+            {
+                Ok(f) => return Ok(f),
+                Err(e) => {
+                    last = e.to_string();
+                    eprintln!("[session] capture failed (attempt {}): {last}", attempt + 1);
+                    self.engine = None;
+                }
+            }
+        }
+        Err(format!(
+            "capture failed after {max_attempts} attempts: {last}"
+        ))
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("hneurons-probe: {e}");
@@ -192,19 +348,7 @@ fn run() -> Result<(), String> {
         None => find_daemon_bin_or_error().map_err(|e| e.to_string())?,
     };
 
-    let train = load_split(&args.data_dir, &args.data_prefix, "train", args.limit)?;
-    let test = load_split(&args.data_dir, &args.data_prefix, "test", args.limit)?;
-    let (ntr_pos, ntr_neg) = class_counts(&train);
-    let (nte_pos, nte_neg) = class_counts(&test);
-    eprintln!(
-        "[data] train={} (hallucinated={ntr_pos}, correct={ntr_neg})  test={} (hallucinated={nte_pos}, correct={nte_neg})",
-        train.len(),
-        test.len()
-    );
-    if train.is_empty() || test.is_empty() {
-        return Err("empty train or test split".to_string());
-    }
-
+    let self_gen = args.gen_train.is_some() && args.gen_test.is_some();
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     let model = args
         .model
@@ -221,33 +365,63 @@ fn run() -> Result<(), String> {
         .ok_or("non-UTF8 colnorms path")?
         .to_string();
 
-    let (feat_train, feat_test) = rt.block_on(async {
-        let mut engine = DaemonEngine::spawn(&daemon_bin)
-            .await
-            .map_err(|e| format!("spawn daemon: {e}"))?;
-        let loaded = engine
-            .load(&model, params)
-            .await
-            .map_err(|e| format!("load model: {e}"))?;
-        eprintln!(
-            "[model] loaded {} layers={:?} dim={:?}",
-            model, loaded.layers, loaded.dim
-        );
-        let (nl, inter) = engine
-            .cett_load_colnorms(&colnorms)
-            .await
-            .map_err(|e| format!("cett_load_colnorms: {e}"))?;
-        eprintln!("[colnorms] n_layers={nl} intermediate={inter}");
+    let max_seq_u32 = params.max_seq;
+    let (feat_train, ytr, feat_test, yte) = rt.block_on(async {
+        let mut session = Session::connect(
+            daemon_bin.clone(),
+            model.clone(),
+            max_seq_u32,
+            colnorms.clone(),
+        )
+        .await?;
+        eprintln!("[model] loaded {model} + colnorms (resilient session)");
 
-        let ftr = capture_all(&mut engine, &train, "train").await?;
-        let fte = capture_all(&mut engine, &test, "test").await?;
-        Ok::<_, String>((ftr, fte))
+        if self_gen {
+            // On-paper protocol: the resident model answers, labeled by gold match.
+            let (ftr, ytr) = selfgen_split(
+                &mut session,
+                args.gen_train.as_ref().unwrap(),
+                args.gen_limit,
+                args.limit,
+                args.gen_max_tokens,
+                "train",
+            )
+            .await?;
+            let (fte, yte) = selfgen_split(
+                &mut session,
+                args.gen_test.as_ref().unwrap(),
+                args.gen_limit,
+                args.limit,
+                args.gen_max_tokens,
+                "test",
+            )
+            .await?;
+            Ok::<_, String>((ftr, ytr, fte, yte))
+        } else {
+            // Cross-model demo: shipped reference responses + qids labels.
+            let train = load_split(&args.data_dir, &args.data_prefix, "train", args.limit)?;
+            let test = load_split(&args.data_dir, &args.data_prefix, "test", args.limit)?;
+            let (ntr_pos, ntr_neg) = class_counts(&train);
+            let (nte_pos, nte_neg) = class_counts(&test);
+            eprintln!(
+                "[data] train={} (hallucinated={ntr_pos}, correct={ntr_neg})  test={} (hallucinated={nte_pos}, correct={nte_neg})",
+                train.len(),
+                test.len()
+            );
+            if train.is_empty() || test.is_empty() {
+                return Err("empty train or test split".to_string());
+            }
+            let ftr = capture_all(&mut session, &train, "train").await?;
+            let fte = capture_all(&mut session, &test, "test").await?;
+            let ytr: Vec<u8> = train.iter().map(|s| s.label).collect();
+            let yte: Vec<u8> = test.iter().map(|s| s.label).collect();
+            Ok::<_, String>((ftr, ytr, fte, yte))
+        }
     })?;
 
-    // Labels aligned with capture order.
-    let ytr: Vec<u8> = train.iter().map(|s| s.label).collect();
-    let yte: Vec<u8> = test.iter().map(|s| s.label).collect();
-
+    if feat_train.is_empty() || feat_test.is_empty() {
+        return Err("empty train or test features".to_string());
+    }
     let d = feat_train.first().map_or(0, |r| r.len());
     eprintln!(
         "[fit] samples={} features={} l1={}",
@@ -265,15 +439,12 @@ fn run() -> Result<(), String> {
     let hn = model.h_neurons();
     let nz = model.nonzero();
 
-    let inter = if d > 0 {
-        d / n_layers_of(&feat_train, d)
-    } else {
-        0
-    };
-    let _ = inter;
+    let te_pos = yte.iter().filter(|&&y| y == 1).count();
+    let te_neg = yte.len() - te_pos;
+    let bal_acc = balanced_accuracy(&model, &feat_test, &yte);
     println!("=== H-Neurons probe ===");
     println!(
-        "dataset:        {} ({} train / {} test)",
+        "dataset:        {} ({} train / {} test; test hallucinated={te_pos} correct={te_neg})",
         args.data_prefix,
         feat_train.len(),
         feat_test.len()
@@ -281,6 +452,7 @@ fn run() -> Result<(), String> {
     println!("features:       {d} (n_layers x intermediate)");
     println!("train accuracy: {:.4}", train_acc);
     println!("test accuracy:  {:.4}", test_acc);
+    println!("test balanced:  {:.4}", bal_acc);
     println!("nonzero weights:{nz}");
     println!(
         "H-Neurons (positive-weight, hallucination-associated): {}",
@@ -292,8 +464,30 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn n_layers_of(_feat: &[Vec<f32>], _d: usize) -> usize {
-    32 // informational only; not load-bearing
+/// Mean of per-class accuracy — robust to residual class imbalance.
+fn balanced_accuracy(model: &L1Logreg, x: &[Vec<f32>], y: &[u8]) -> f32 {
+    let mut correct = [0usize; 2];
+    let mut total = [0usize; 2];
+    for (xi, &yi) in x.iter().zip(y) {
+        let pred = u8::from(model.predict_proba(xi) >= 0.5);
+        total[yi as usize] += 1;
+        if pred == yi {
+            correct[yi as usize] += 1;
+        }
+    }
+    let mut acc = 0.0f32;
+    let mut classes = 0;
+    for c in 0..2 {
+        if total[c] > 0 {
+            acc += correct[c] as f32 / total[c] as f32;
+            classes += 1;
+        }
+    }
+    if classes > 0 {
+        acc / classes as f32
+    } else {
+        0.0
+    }
 }
 
 fn class_counts(s: &[Sample]) -> (usize, usize) {
@@ -301,17 +495,181 @@ fn class_counts(s: &[Sample]) -> (usize, usize) {
     (pos, s.len() - pos)
 }
 
+/// A question + its accepted (already-normalized) gold aliases.
+struct GenQuestion {
+    question: String,
+    aliases: Vec<String>,
+}
+
+/// Load `{question, aliases}` JSONL produced by `hneurons_triviaqa_prep.py`,
+/// capped at `limit` lines.
+fn load_gen_questions(path: &Path, limit: usize) -> Result<Vec<GenQuestion>, String> {
+    let body =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if out.len() >= limit {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("parse gen jsonl: {e}"))?;
+        let question = v
+            .get("question")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let aliases: Vec<String> = v
+            .get("aliases")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if question.is_empty() || aliases.is_empty() {
+            continue;
+        }
+        out.push(GenQuestion { question, aliases });
+    }
+    Ok(out)
+}
+
+/// TriviaQA-style normalization: lowercase, punctuation → space, drop articles,
+/// collapse whitespace. The dataset aliases are already normalized this way.
+fn normalize_answer(s: &str) -> String {
+    let lowered = s.to_lowercase();
+    let spaced: String = lowered
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    spaced
+        .split_whitespace()
+        .filter(|t| !matches!(*t, "a" | "an" | "the"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Label = 1 (hallucinated) unless a gold alias is a word-boundary substring of
+/// the normalized prediction (the lenient TriviaQA open-generation match).
+fn is_hallucinated(prediction: &str, aliases: &[String]) -> bool {
+    let norm = normalize_answer(prediction);
+    if norm.is_empty() {
+        return true;
+    }
+    let padded = format!(" {norm} ");
+    for a in aliases {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        if padded.contains(&format!(" {a} ")) {
+            return false;
+        }
+    }
+    true
+}
+
+/// On-paper split: the resident model answers each question (greedy), each answer
+/// is gold-labeled, the classes are balanced (down to `per_class` or the minority
+/// count), and only the kept samples are CETT-captured. Returns `(features,
+/// labels)`.
+async fn selfgen_split(
+    session: &mut Session,
+    path: &Path,
+    gen_limit: usize,
+    per_class: Option<usize>,
+    max_tokens: u32,
+    tag: &str,
+) -> Result<(Vec<Vec<f32>>, Vec<u8>), String> {
+    let questions = load_gen_questions(path, gen_limit)?;
+    eprintln!("[gen:{tag}] {} questions", questions.len());
+
+    // Generate every answer, then label.
+    let sampling = GenerationSamplingPolicy {
+        temperature: 0.0,
+        top_p: None,
+        repeat_penalty: None,
+        max_tokens,
+    };
+    let mut labeled: Vec<(String, String, u8)> = Vec::with_capacity(questions.len());
+    for (i, q) in questions.iter().enumerate() {
+        let text = session
+            .generate_retry(&format!("gen-{tag}-{i}"), &q.question, &sampling, 4)
+            .await
+            .map_err(|e| format!("generate[{tag} #{i}]: {e}"))?;
+        let label = u8::from(is_hallucinated(&text, &q.aliases));
+        labeled.push((q.question.clone(), text, label));
+        if (i + 1) % 50 == 0 || i + 1 == questions.len() {
+            let pos = labeled.iter().filter(|x| x.2 == 1).count();
+            eprintln!(
+                "[gen:{tag}] {}/{} (hallucinated={pos} correct={})",
+                i + 1,
+                questions.len(),
+                labeled.len() - pos
+            );
+        }
+    }
+
+    // Balance: take the first K of each class, K = min(minority, per_class cap).
+    let pos: Vec<&(String, String, u8)> = labeled.iter().filter(|x| x.2 == 1).collect();
+    let neg: Vec<&(String, String, u8)> = labeled.iter().filter(|x| x.2 == 0).collect();
+    let cap = per_class.unwrap_or(usize::MAX);
+    let k = pos.len().min(neg.len()).min(cap);
+    if k == 0 {
+        return Err(format!(
+            "[{tag}] cannot balance: hallucinated={} correct={}",
+            pos.len(),
+            neg.len()
+        ));
+    }
+    eprintln!(
+        "[gen:{tag}] balanced to {k}/class (from hallucinated={} correct={})",
+        pos.len(),
+        neg.len()
+    );
+    let kept: Vec<&(String, String, u8)> = pos
+        .into_iter()
+        .take(k)
+        .chain(neg.into_iter().take(k))
+        .collect();
+
+    // Capture only the kept, balanced set.
+    let mut feats = Vec::with_capacity(kept.len());
+    let mut labels = Vec::with_capacity(kept.len());
+    for (i, (question, response, label)) in kept.iter().enumerate() {
+        let feat = session
+            .capture_retry(question, response, 4)
+            .await
+            .map_err(|e| format!("cett_capture[{tag} #{i}]: {e}"))?;
+        let mut row = Vec::with_capacity(feat.iter().map(|l| l.len()).sum());
+        for layer in &feat {
+            row.extend_from_slice(layer);
+        }
+        feats.push(row);
+        labels.push(*label);
+        if (i + 1) % 25 == 0 || i + 1 == kept.len() {
+            eprintln!("[capture:{tag}] {}/{}", i + 1, kept.len());
+        }
+    }
+    Ok((feats, labels))
+}
+
 /// Capture the flattened CETT feature (`n_layers*intermediate`) for every sample,
 /// sequentially through the daemon. Prints progress every 25 samples.
 async fn capture_all(
-    engine: &mut DaemonEngine,
+    session: &mut Session,
     samples: &[Sample],
     tag: &str,
 ) -> Result<Vec<Vec<f32>>, String> {
     let mut out = Vec::with_capacity(samples.len());
     for (i, s) in samples.iter().enumerate() {
-        let feat = engine
-            .cett_capture("", &s.question, &s.response)
+        let feat = session
+            .capture_retry(&s.question, &s.response, 4)
             .await
             .map_err(|e| format!("cett_capture[{tag} #{i}]: {e}"))?;
         // Flatten [n_layers][intermediate] → row-major feature vector.
