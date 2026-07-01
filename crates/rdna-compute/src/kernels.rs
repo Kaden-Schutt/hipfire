@@ -3813,6 +3813,15 @@ pub const GEMM_IU4_I32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_
 pub const GEMM_IU4_I32_WMMA_R1_SRC: &str =
     include_str!("../../../kernels/src/gemm_iu4_i32_wmma_r1.hip");
 
+/// Tuned wave64 LDS-staged W4A4 GEMM (`gemm_iu4_i32_wmma_lds`, gfx1151 prefill
+/// path). Same contract/packing as [`GEMM_IU4_I32_WMMA_SRC`] but ~14× faster on
+/// large GEMMs (double-buffered LDS, N-heavy 2×8 tiling, BK64, b128 reads,
+/// `-mwavefrontsize64`). `parity_gemm_iu4_i32_wmma_lds` asserts it matches the
+/// single-chain kernel. See `kernels/src/gemm_iu4_i32_wmma_lds.hip` and memory
+/// `reference_gfx1151_iu4_gemm_tuning`.
+pub const GEMM_IU4_I32_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iu4_i32_wmma_lds.hip");
+
 /// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
 /// rescale in the f32 epilogue (productionizes the host-tiled E5 recipe).
 /// gfx1103 wave32, zero LDS. See `kernels/src/gemm_oq4_grouped_wmma.hip`.
