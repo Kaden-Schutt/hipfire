@@ -24,7 +24,7 @@ R1 21.85** (+1.73). Act-only A4 output SNR: learned 27.2 vs fixed-Hadamard 22.7.
 
 ---
 
-## 1. Learn R2 (head-wise) — **DONE** (act-only + joint); joint {R1,R2} still open
+## 1. Learn R2 (head-wise) + joint {R1,R2} — **DONE**
 
 **Landed.** `examples/learned_r2_w4a4_probe.rs` — mirror of the R1 probe on the
 head_dim axis. Captures per-layer value `v` (n_kv heads) and o_proj input `ctx`
@@ -49,9 +49,19 @@ learning on v by ~0.9 dB here — v is one GEMM upstream of the grid. Keep the
 value-learned R2 for the future KV4/R3 path; use the **ctx-learned** R2 for the
 o_proj weight/activation W4A4.
 
-**Still open:** truly *joint* {R1,R2} (independent-axis composition is expected to
-just add; measure the whole attention block under both, `learned_r1_w4a4_probe` ∘
-this). GQA is handled (value set uses n_kv, o_proj/ctx use n_heads, shared R2).
+**Joint {R1,R2} — DONE.** `examples/learned_joint_r1r2_probe.rs`. Part 1 re-runs
+the two int4 W4A4 measurements side by side (q_proj@R1 21.85 dB, o_proj@R2 17.24
+dB — both reproduced exactly). Part 2 is the composition proof *through the
+model*: bake `apply_r1(R1) ∘ apply_r2(R2)` into a fresh model, re-forward, and
+check the joint activations against the analytic single-rotation predictions —
+logits vs fold-only 5.8e-5, xn1 vs `R1·xn1_fold` 1.3e-5 (R2 leaves the q_proj
+input untouched), ctx vs `blockdiag(R2)·ctx_fold` 1.6e-5 (R1 leaves the o_proj
+input untouched). **R1 and R2 commute and compose with zero interference** — the
+joint attention block keeps both gains simultaneously. This settles the doc's
+open question: a *truly joint objective is unnecessary* (it was only warranted "if
+independent learning underperforms"; it doesn't — the axes are orthogonal and the
+gains simply add). GQA handled throughout (value set n_kv, o_proj/ctx n_heads,
+shared R2).
 
 <details><summary>Original plan (for the joint-{R1,R2} follow-up)</summary>
 
