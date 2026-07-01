@@ -284,6 +284,17 @@ impl Session {
             if self.engine.is_none() {
                 self.reprime(true).await?;
             }
+            // Reset the daemon's decode KV before EACH generation. The daemon
+            // generate path is stateful and accumulates KV across requests; without
+            // this, every prompt is appended after the prior ones (polluted context
+            // + eventual `pos >= max_seq`). Fresh reset ⇒ each answer is generated
+            // from the question alone.
+            if let Err(e) = self.engine.as_mut().unwrap().reset().await {
+                last = e.to_string();
+                eprintln!("[session] reset failed (attempt {}): {last}", attempt + 1);
+                self.engine = None;
+                continue;
+            }
             let req = GenerateTextRequest::from_prompt(id.to_string(), prompt, sampling.clone());
             match self.engine.as_mut().unwrap().generate(req).await {
                 Ok((text, _done)) => return Ok(text),
@@ -293,7 +304,10 @@ impl Session {
                         "[session] generate failed (attempt {}): {last}",
                         attempt + 1
                     );
-                    self.engine = None; // force reprime on next attempt
+                    if !looks_like_wedge(&last) {
+                        return Err(last); // data error — don't respawn/retry
+                    }
+                    self.engine = None; // GPU wedge — force reprime on next attempt
                 }
             }
         }
@@ -324,6 +338,9 @@ impl Session {
                 Err(e) => {
                     last = e.to_string();
                     eprintln!("[session] capture failed (attempt {}): {last}", attempt + 1);
+                    if !looks_like_wedge(&last) {
+                        return Err(last); // data error — don't respawn/retry
+                    }
                     self.engine = None;
                 }
             }
@@ -332,6 +349,19 @@ impl Session {
             "capture failed after {max_attempts} attempts: {last}"
         ))
     }
+}
+
+/// Heuristic: is this daemon error a GPU wedge (worth a daemon respawn) versus a
+/// deterministic data error (retrying is pointless)? Respawning costs a model
+/// reload + settle delay, so only do it for real GPU faults.
+fn looks_like_wedge(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("hiperror")
+        || e.contains("launch failure")
+        || e.contains("illegal memory")
+        || e.contains("hipmalloc")
+        || e.contains("stdout closed")
+        || e.contains("stream")
 }
 
 fn main() {
@@ -602,6 +632,11 @@ async fn selfgen_split(
             .generate_retry(&format!("gen-{tag}-{i}"), &q.question, &sampling, 4)
             .await
             .map_err(|e| format!("generate[{tag} #{i}]: {e}"))?;
+        // Drop empty generations: they tokenize to nothing (no response tokens to
+        // capture CETT over) and carry no correctness signal.
+        if text.trim().is_empty() {
+            continue;
+        }
         let label = u8::from(is_hallucinated(&text, &q.aliases));
         labeled.push((q.question.clone(), text, label));
         if (i + 1) % 50 == 0 || i + 1 == questions.len() {
