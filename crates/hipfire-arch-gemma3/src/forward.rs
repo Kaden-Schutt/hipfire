@@ -534,6 +534,11 @@ pub fn forward_prefill_batch(
         weight_gemm(gpu, &layer.w_up, &tmp, &up, m)?;
         gpu.gelu_mul_f32(&gate, &up, &ffn)?;
         weight_gemm(gpu, &layer.w_down, &ffn, &o, m)?;
+        // H-Neurons CETT tap (no-op unless a capture session is active). `o` holds
+        // the raw down_proj output here — the residual add below folds
+        // post_ffn_norm(o), so both down_proj input (`ffn`) and output (`o`) stay
+        // materialized. `start_pos` is the global position of this chunk's row 0.
+        hipfire_hneurons::capture::maybe_capture_ffn(gpu, &ffn, &o, layer_idx, start_pos, m)?;
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(x_batch, &tmp, x_batch)?;
         // Block-boundary steering/abliteration hook (no-op unless active).

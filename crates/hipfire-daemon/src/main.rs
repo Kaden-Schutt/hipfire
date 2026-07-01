@@ -5735,59 +5735,103 @@ fn main() {
                     );
                     continue;
                 }
-                let Some(b) = m.llama_backend.as_mut() else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!("cett_capture: arch_id {arch_id} has no resident llama backend"),
-                    );
-                    continue;
-                };
-                if colnorms.len() != b.config.n_layers {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!(
-                            "cett_capture: colnorms n_layers {} != model n_layers {}",
-                            colnorms.len(),
-                            b.config.n_layers
-                        ),
-                    );
-                    continue;
+                // Run the tapped prefill on whichever dense backend is resident.
+                // llama uses the generic prefill_forward (materializes down_proj
+                // in+out); gemma3 (text + vl) route through SimpleAr::prefill →
+                // the shared, tapped forward_prefill_batch. Both feed the same
+                // capture session. Helper to finalize identically per backend.
+                use hipfire_runtime::arch::SimpleAr;
+                fn finish() -> Result<Vec<Vec<f32>>, String> {
+                    hipfire_hneurons::capture::finish_capture()
+                        .ok_or_else(|| "capture produced no feature".to_string())
                 }
-                let hidden = b.config.dim;
-                hipfire_hneurons::capture::begin_capture(colnorms, response_start, hidden);
-                let res = hipfire_runtime::llama::prefill_forward(
-                    &mut gpu,
-                    &b.weights,
-                    &b.config,
-                    &full,
-                    &mut b.kv_cache,
-                );
-                match res {
-                    Ok(_) => match hipfire_hneurons::capture::finish_capture() {
-                        Some(feature) => {
-                            let resp = serde_json::json!({
-                                "type": "cett_feature",
-                                "feature": feature,
-                            });
-                            let _ = writeln!(stdout, "{resp}");
-                            let _ = stdout.flush();
+                let outcome: Result<Vec<Vec<f32>>, String> =
+                    if let Some(b) = m.llama_backend.as_mut() {
+                        if colnorms.len() != b.config.n_layers {
+                            Err(format!(
+                                "colnorms n_layers {} != model n_layers {}",
+                                colnorms.len(),
+                                b.config.n_layers
+                            ))
+                        } else {
+                            hipfire_hneurons::capture::begin_capture(
+                                colnorms,
+                                response_start,
+                                b.config.dim,
+                            );
+                            match hipfire_runtime::llama::prefill_forward(
+                                &mut gpu,
+                                &b.weights,
+                                &b.config,
+                                &full,
+                                &mut b.kv_cache,
+                            ) {
+                                Ok(_) => finish(),
+                                Err(e) => {
+                                    hipfire_hneurons::capture::clear();
+                                    Err(format!("prefill: {e:?}"))
+                                }
+                            }
                         }
-                        None => emit_error_with_id(
-                            &mut stdout,
-                            "",
-                            "cett_capture: capture produced no feature".to_string(),
-                        ),
-                    },
-                    Err(e) => {
-                        hipfire_hneurons::capture::clear();
-                        emit_error_with_id(
-                            &mut stdout,
-                            "",
-                            format!("cett_capture: prefill: {e:?}"),
-                        );
+                    } else if let Some(b) = m.gemma3_text.as_mut() {
+                        if colnorms.len() != b.config.num_hidden_layers {
+                            Err(format!(
+                                "colnorms n_layers {} != model n_layers {}",
+                                colnorms.len(),
+                                b.config.num_hidden_layers
+                            ))
+                        } else {
+                            hipfire_hneurons::capture::begin_capture(
+                                colnorms,
+                                response_start,
+                                b.config.hidden_size,
+                            );
+                            b.state.reset();
+                            match SimpleAr::prefill(b, &mut gpu, &full) {
+                                Ok(()) => finish(),
+                                Err(e) => {
+                                    hipfire_hneurons::capture::clear();
+                                    Err(format!("prefill: {e}"))
+                                }
+                            }
+                        }
+                    } else if let Some(b) = m.gemma3_vl.as_mut() {
+                        if colnorms.len() != b.text_cfg.num_hidden_layers {
+                            Err(format!(
+                                "colnorms n_layers {} != model n_layers {}",
+                                colnorms.len(),
+                                b.text_cfg.num_hidden_layers
+                            ))
+                        } else {
+                            hipfire_hneurons::capture::begin_capture(
+                                colnorms,
+                                response_start,
+                                b.text_cfg.hidden_size,
+                            );
+                            b.state.reset();
+                            match SimpleAr::prefill(b, &mut gpu, &full) {
+                                Ok(()) => finish(),
+                                Err(e) => {
+                                    hipfire_hneurons::capture::clear();
+                                    Err(format!("prefill: {e}"))
+                                }
+                            }
+                        }
+                    } else {
+                        Err(format!(
+                            "arch_id {arch_id} has no supported backend (llama|gemma3)"
+                        ))
+                    };
+                match outcome {
+                    Ok(feature) => {
+                        let resp = serde_json::json!({
+                            "type": "cett_feature",
+                            "feature": feature,
+                        });
+                        let _ = writeln!(stdout, "{resp}");
+                        let _ = stdout.flush();
                     }
+                    Err(e) => emit_error_with_id(&mut stdout, "", format!("cett_capture: {e}")),
                 }
             }
 
