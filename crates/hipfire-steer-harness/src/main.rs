@@ -30,15 +30,10 @@ struct Args {
     max_new_tokens: usize,
     max_seq: usize,
     orthogonalize: bool,
-    /// When set, capture+derive only and write a `.lora` adapter here (no sweep).
-    export_lora: Option<PathBuf>,
     /// When set, load this `.lora` and show base vs applied vs scale-0 refusals.
     apply_lora: Option<PathBuf>,
     /// When set, stack two copies of this `.lora` at +/- scale to show they sum.
     stack_demo: Option<PathBuf>,
-    /// `--merge-lora <adapter>`: bundle this adapter into `--hfq` → `--merge-out`.
-    merge_lora: Option<PathBuf>,
-    merge_out: Option<PathBuf>,
     /// Just load `--hfq` and report bad-eval refusals + any auto-loaded adapters.
     eval_refusals: bool,
 }
@@ -53,11 +48,8 @@ fn parse_args() -> Result<Args, String> {
     let mut max_new_tokens = 64usize;
     let mut max_seq = 2048usize;
     let mut orthogonalize = true;
-    let mut export_lora = None;
     let mut apply_lora = None;
     let mut stack_demo = None;
-    let mut merge_lora = None;
-    let mut merge_out = None;
     let mut eval_refusals = false;
 
     let mut it = std::env::args().skip(1);
@@ -73,11 +65,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--max-seq" => max_seq = next()?.parse().map_err(|_| "bad --max-seq")?,
             "--no-orthogonalize" => orthogonalize = false,
-            "--export-lora" => export_lora = Some(PathBuf::from(next()?)),
             "--apply-lora" => apply_lora = Some(PathBuf::from(next()?)),
             "--stack-demo" => stack_demo = Some(PathBuf::from(next()?)),
-            "--merge-lora" => merge_lora = Some(PathBuf::from(next()?)),
-            "--merge-out" => merge_out = Some(PathBuf::from(next()?)),
             "--eval-refusals" => eval_refusals = true,
             "--strengths" => {
                 strengths = next()?
@@ -99,9 +88,9 @@ fn parse_args() -> Result<Args, String> {
                 eprintln!(
                     "usage: hipfire-steer --hfq <model.hfq> [--data-dir DIR] [--limit N] \
                      [--eval-limit N] [--strengths a,b,c] [--mode steer|ablate|both] \
-                     [--max-new-tokens N] [--max-seq N] [--no-orthogonalize] \
-                     [--export-lora PATH]\n  --export-lora: capture+derive only, write a \
-                     rank-1 ablate adapter (scale = first --strengths) to PATH"
+                     [--max-new-tokens N] [--max-seq N] [--no-orthogonalize]\n\
+                     runtime demos: [--apply-lora PATH] [--stack-demo PATH] [--eval-refusals]\n\
+                     (adapter export / merge / convert live in `hipfire-coexistence lora ...`)"
                 );
                 std::process::exit(0);
             }
@@ -119,11 +108,8 @@ fn parse_args() -> Result<Args, String> {
         max_new_tokens,
         max_seq,
         orthogonalize,
-        export_lora,
         apply_lora,
         stack_demo,
-        merge_lora,
-        merge_out,
         eval_refusals,
     })
 }
@@ -138,26 +124,6 @@ fn load_set(dir: &Path, name: &str, limit: usize) -> Result<Vec<Prompt>, Box<dyn
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
-
-    // Merge mode: a pure offline file op (bundle adapter into --hfq → --merge-out).
-    // No daemon, no model load, no prompt sets.
-    if let Some(adapter_path) = args.merge_lora.as_ref() {
-        let out = args
-            .merge_out
-            .as_ref()
-            .ok_or("--merge-lora requires --merge-out <merged.hfq>")?;
-        let adapter = hipfire_lora_hfq::read_lora_any(adapter_path)?;
-        hipfire_lora_hfq::merge_lora_into_model(Path::new(&args.hfq), &adapter, out)?;
-        eprintln!(
-            "merged {} + {} ({} deltas, scale {:.2}) → {}",
-            args.hfq,
-            adapter_path.display(),
-            adapter.deltas.len(),
-            adapter.scale,
-            out.display()
-        );
-        return Ok(());
-    }
 
     let good_prompts = load_set(&args.data_dir, "good_prompts.txt", args.limit)?;
     let bad_prompts = load_set(&args.data_dir, "bad_prompts.txt", args.limit)?;
@@ -186,19 +152,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         SYSTEM_PROMPT.to_string(),
         tmp,
     )?;
-
-    // Export mode: capture + derive only, then write a rank-1 ablate adapter.
-    if let Some(out) = args.export_lora.as_ref() {
-        let strength = args.strengths.first().copied().unwrap_or(1.0);
-        return export_lora(
-            &mut harness,
-            &good_prompts,
-            &bad_prompts,
-            args.orthogonalize,
-            strength,
-            out,
-        );
-    }
 
     // Apply mode: load a `.lora` and compare base / applied / scale-0 refusals.
     if let Some(path) = args.apply_lora.as_ref() {
@@ -245,67 +198,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             t.mode, t.strength, t.refusals, report.n_bad_eval, t.kl_divergence
         );
     }
-    Ok(())
-}
-
-/// Capture +/- residual means through the daemon, derive per-block directions, and
-/// write a rank-1 ablate adapter (residual form) sized to the model. `strength`
-/// seeds the adapter's default `scale` (the live intensity dial at load time).
-fn export_lora(
-    harness: &mut DaemonHarness,
-    good_prompts: &[Prompt],
-    bad_prompts: &[Prompt],
-    orthogonalize: bool,
-    strength: f32,
-    out: &Path,
-) -> Result<(), Box<dyn Error>> {
-    use hipfire_steer::lora;
-
-    eprintln!(
-        "capturing directions ({} good / {} bad, {} layers) ...",
-        good_prompts.len(),
-        bad_prompts.len(),
-        harness.num_layers()
-    );
-    harness
-        .begin_capture()
-        .map_err(|e| format!("begin_capture: {e}"))?;
-    harness
-        .capture(good_prompts)
-        .map_err(|e| format!("capture good: {e}"))?;
-    let good_means = harness
-        .finish_capture()
-        .map_err(|e| format!("finish good: {e}"))?;
-    harness
-        .begin_capture()
-        .map_err(|e| format!("begin_capture: {e}"))?;
-    harness
-        .capture(bad_prompts)
-        .map_err(|e| format!("capture bad: {e}"))?;
-    let bad_means = harness
-        .finish_capture()
-        .map_err(|e| format!("finish bad: {e}"))?;
-
-    let directions = hipfire_steer::derive_directions(&good_means, &bad_means, orthogonalize);
-    let layers = harness.num_layers();
-    let adapter = lora::abliteration_adapter(
-        "abliterate",
-        &directions,
-        SteerMode::Ablate,
-        strength,
-        0..layers,
-    )?;
-    // Binary hfq container for `*.hfq` paths, JSON otherwise.
-    if out.extension().and_then(|e| e.to_str()) == Some("hfq") {
-        hipfire_lora_hfq::write_lora_hfq(out, &adapter)?;
-    } else {
-        lora::write_adapter(out, &adapter)?;
-    }
-    eprintln!(
-        "wrote LoRA adapter: {} rank-1 deltas, default scale {strength:.2} → {}",
-        adapter.deltas.len(),
-        out.display()
-    );
     Ok(())
 }
 

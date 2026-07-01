@@ -27,9 +27,10 @@ the relevant docs under `docs/`.
 - Keep coexistence and compatibility tooling out of the inference binaries. Any
   import/export, format conversion, or interop tool (e.g. safetensors/GGUF
   import, model or LoRA conversion, adapter merge/bundle, external-format export)
-  belongs in a separate binary/crate, not folded into the daemon, server, or
-  runtime hot path. The inference path stays lean and HIP-direct; conversion and
-  compatibility concerns are offline tooling.
+  belongs in the `hipfire-coexistence` binary (or another dedicated tooling
+  crate), not folded into the daemon, server, or runtime hot path. The inference
+  path stays lean and HIP-direct; conversion and compatibility concerns are
+  offline tooling.
 
 ## Branch And Git
 

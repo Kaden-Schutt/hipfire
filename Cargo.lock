@@ -1446,6 +1446,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-coexistence"
+version = "0.3.0"
+dependencies = [
+ "hipfire-daemon-adapter",
+ "hipfire-lora-hfq",
+ "hipfire-steer",
+ "hipfire-steer-harness",
+]
+
+[[package]]
 name = "hipfire-coherence"
 version = "0.3.0"
 dependencies = [
@@ -1901,7 +1911,6 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-generate",
- "hipfire-lora-hfq",
  "hipfire-model",
  "hipfire-steer",
  "tokio",

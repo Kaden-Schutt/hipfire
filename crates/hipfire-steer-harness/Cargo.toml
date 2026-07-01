@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 hipfire-steer = { path = "../hipfire-steer" }
-hipfire-lora-hfq = { path = "../hipfire-lora-hfq" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-generate = { path = "../hipfire-generate" }
