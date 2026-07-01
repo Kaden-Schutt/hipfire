@@ -170,11 +170,26 @@ still needs a compute-bound shape + a well-tiled `iu4` GEMM (the production
 Tool: `scratchpad/isa_bench.hip` (matrix calc → disasm-verified microbench →
 rocprofv3). See memory `reference_gfx1151_int4_isa_rate`.
 
-**Still to measure:** (a) a real `iu4·iu8` (int4 weight + int8 act) **GEMM**
-throughput vs `iu4·iu4` (the deployment-level W4A4-vs-W4A8, once a kernel that hits
-the 2× exists); (b) a **W4A4-prefill** KLD (score via the batched both-int4 path,
-not decode); (c) a **joint act+weight** learned M (item ii) for the W4A16 decode
-path; (d) a larger dense-llama oq4 with real outliers (Supra-50M is too clean).
+**Measured — tuned iu4 GEMM + the deployment W4A4/W4A8/W8A8 comparison**
+(scratchpad prototypes; memory `reference_gfx1151_iu4_gemm_tuning`). A tuned iu4
+GEMM (wave64 + double-buffered LDS + N-heavy 2×8 tiling + BK64 + `ds_load_b128`)
+reaches **~50k GOP/s (~14× the production single-chain, ~50% of peak)** — the
+"kernel-optimization gap" above is closable. Levers: LDS staging > wave64 (4 vs 8
+acc GPR) > larger BK. Dead ends (ISA+measurement): `__shfl` = `ds_bpermute` (the LDS
+unit, 6–8× slower), LDS bank-padding (read at bandwidth floor), register-blocking
+alone. **Strategic result:** with equally-tuned kernels, **W4A4 ≈ true W4A8
+(~1.04–1.06×)** on gfx1151 — W4A8 already captures the int4-*weight* bandwidth, and
+the kernels aren't pure-compute-bound so W4A4's 2× *core* edge is masked (W4A4 vs
+W8A8 = 1.2–1.9×, but that gap is weight bandwidth W4A8 also gets). ⇒ **on this APU,
+W4A8 (int8 activations, no rotation) is ~as fast as W4A4 with far less risk than the
+SpinQuant learned-rotation path** — the W4A4 throughput payoff over W4A8 is marginal
+here. Revisit on CDNA/gfx12 (core-bound) and productionize the tuned kernel.
+
+**Still to measure:** (a) **DONE above** — W4A4/W4A8/W8A8 tuned-kernel comparison
+(W4A4≈W4A8); remaining sub-item: `#2`/`#4` kernel tweaks on small-K/decode shapes;
+(b) a **W4A4-prefill** KLD (score via the batched both-int4 path, not decode); (c) a
+**joint act+weight** learned M (item ii) for the W4A16 decode path; (d) a larger
+dense-llama oq4 with real outliers (Supra-50M is too clean).
 
 **R2 deploy** stays out of this item: the codec's 256-wide FWHT crosses head
 boundaries, so a per-head `apply_r2` can't be un-baked (net would be
