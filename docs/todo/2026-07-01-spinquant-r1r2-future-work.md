@@ -24,7 +24,36 @@ R1 21.85** (+1.73). Act-only A4 output SNR: learned 27.2 vs fixed-Hadamard 22.7.
 
 ---
 
-## 1. Learn R2 (head-wise) + joint {R1, R2}
+## 1. Learn R2 (head-wise) — **DONE** (act-only + joint); joint {R1,R2} still open
+
+**Landed.** `examples/learned_r2_w4a4_probe.rs` — mirror of the R1 probe on the
+head_dim axis. Captures per-layer value `v` (n_kv heads) and o_proj input `ctx`
+(n_heads), learns `R2 [head_dim,head_dim]` three ways (value-only, ctx-only,
+joint ctx+o_proj-weight) via the *unchanged* `learn_rotation_kurtosis`/`_joint`,
+expands each to a block-diagonal `[q_dim,q_dim]` rotation (R2 per head), and
+scores full-W4A4 `ctx·Woᵀ` SQNR through the real `iu4·iu4` kernel. No new lib
+mechanism — reuses `rotate_rows`, the kurtosis learners, and the r1 kernel copy.
+
+**Result (real Supra-50M, GQA n_heads=8/n_kv=4/head_dim=64, mean over layers):**
+naive 15.24 dB → fixed per-head Hadamard 15.90 → **learned R2**: value +0.44,
+**ctx +1.35 (17.24)**, joint +1.09. The learned per-head R2 beats the fixed
+per-head Hadamard, and learned-on-ctx (17.24) even beats the codec's cross-head
+per-256-group FWHT (16.93) — a *head-local, `apply_r2`-mergeable* rotation wins.
+Orthonormality ≤4.8e-7.
+
+**Insight — learn on `ctx`, not `v`.** The doc originally nominated the value
+activations (the SpinQuant target / KV4 relevance). But on the **o_proj int4
+path** the tensor actually quantized is `ctx = P·V` (R2 flows through attention:
+rotating V by R2 rotates ctx by R2 per head). Learning directly on ctx beats
+learning on v by ~0.9 dB here — v is one GEMM upstream of the grid. Keep the
+value-learned R2 for the future KV4/R3 path; use the **ctx-learned** R2 for the
+o_proj weight/activation W4A4.
+
+**Still open:** truly *joint* {R1,R2} (independent-axis composition is expected to
+just add; measure the whole attention block under both, `learned_r1_w4a4_probe` ∘
+this). GQA is handled (value set uses n_kv, o_proj/ctx use n_heads, shared R2).
+
+<details><summary>Original plan (for the joint-{R1,R2} follow-up)</summary>
 
 **Why.** `apply_r2` (the merge) is done and fp-invariant, but R2 is still only
 ever the identity/random in tests — nothing *learns* it. R2 is the pair that
@@ -57,6 +86,8 @@ already handles the query-head o_proj columns.
 
 **Files.** `learn_rotation.rs` (reuse as-is), new `examples/learned_r2_*`. No new
 lib mechanism needed beyond the value-activation capture.
+
+</details>
 
 ---
 
