@@ -264,6 +264,54 @@ fn rotate_input(w: &[f32], rot: &Rotation, out: usize) -> Vec<f32> {
     o_out
 }
 
+/// R2 writer: rotate each head's `head_dim` **output rows** by `R2` — for
+/// `v_proj [n_heads·hd, cols]`, `new[head,a,:] = Σ_b R2[a,b]·W[head,b,:]`.
+fn rotate_head_rows(w: &[f32], r2: &Rotation, n_heads: usize, cols: usize) -> Vec<f32> {
+    let hd = r2.h;
+    let mut out = vec![0.0f32; w.len()];
+    for head in 0..n_heads {
+        let base = head * hd;
+        for a in 0..hd {
+            let dst = &mut out[(base + a) * cols..(base + a) * cols + cols];
+            for b in 0..hd {
+                let rab = r2.r[a * hd + b];
+                if rab == 0.0 {
+                    continue;
+                }
+                let src = &w[(base + b) * cols..(base + b) * cols + cols];
+                for (o, s) in dst.iter_mut().zip(src.iter()) {
+                    *o += rab * s;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// R2 reader: rotate each head's `head_dim` **input columns** by `R2ᵀ` — for
+/// `o_proj [rows, n_heads·hd]`, `new[d,head,a] = Σ_b W[d,head,b]·R2[a,b]`.
+fn rotate_head_cols(w: &[f32], r2: &Rotation, n_heads: usize, rows: usize) -> Vec<f32> {
+    let hd = r2.h;
+    let qd = n_heads * hd;
+    let mut out = vec![0.0f32; w.len()];
+    for d in 0..rows {
+        let row = &w[d * qd..d * qd + qd];
+        let orow = &mut out[d * qd..d * qd + qd];
+        for head in 0..n_heads {
+            let base = head * hd;
+            for a in 0..hd {
+                let rr = &r2.r[a * hd..a * hd + hd];
+                let mut acc = 0.0f32;
+                for (b, &rab) in rr.iter().enumerate() {
+                    acc += row[base + b] * rab;
+                }
+                orow[base + a] = acc;
+            }
+        }
+    }
+    out
+}
+
 /// Writer rotate: `W → R W` on the output (`h`) dimension of a `[h, cols]`
 /// weight. `new[e,c] = Σ_d R[e,d]·W[d,c]`.
 fn rotate_output(w: &[f32], rot: &Rotation, cols: usize) -> Vec<f32> {
@@ -369,6 +417,28 @@ pub fn apply_r1(gpu: &mut Gpu, model: &mut LlamaModel, rot: &Rotation) -> HipRes
         replace_tensor(gpu, lmh, |m| rotate_input(&m, rot, vocab))?;
     }
 
+    Ok(())
+}
+
+/// Bake SpinQuant `R2` (head-wise `[head_dim, head_dim]`) into `model` in place.
+/// `R2` rotates the value subspace of each attention head: it's merged into
+/// `v_proj` (writer, per-KV-head output rows `Wv → R2·Wv`) and `o_proj` (reader,
+/// per-query-head input columns `Wo → Wo·R2ᵀ`). Attention is linear in `V`, so
+/// the rotated value flows into the context unchanged after `o_proj` un-rotates
+/// it — the fp output is invariant, but the quantizer sees a better-conditioned
+/// per-head value/o_proj basis. Composes with [`apply_r1`] (different axes: R1 on
+/// the hidden dim, R2 on the head dim); apply either order. Shares one `R2` across
+/// heads (SpinQuant's construction).
+pub fn apply_r2(gpu: &mut Gpu, model: &mut LlamaModel, r2: &Rotation) -> HipResult<()> {
+    let hd = model.dims.head_dim;
+    assert_eq!(r2.h, hd, "R2 size {} != head_dim {}", r2.h, hd);
+    let (n_kv, n_heads, h) = (model.dims.n_kv, model.dims.n_heads, model.dims.h);
+    for (w, _lora) in model.layers.iter_mut() {
+        // v_proj [kv_dim, h]: rotate each KV head's head_dim output rows by R2.
+        replace_tensor(gpu, &mut w.wv, |m| rotate_head_rows(&m, r2, n_kv, h))?;
+        // o_proj [h, q_dim]: rotate each query head's head_dim input cols by R2ᵀ.
+        replace_tensor(gpu, &mut w.wo, |m| rotate_head_cols(&m, r2, n_heads, h))?;
+    }
     Ok(())
 }
 
@@ -492,6 +562,34 @@ mod tests {
             .zip(&yr)
             .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
         assert!(worst < 1e-4, "reader-rotation mismatch {worst:e}");
+    }
+
+    /// R2 merge correctness: rotating `v_proj`'s per-head output rows by `R2` and
+    /// `o_proj`'s per-head input columns by `R2ᵀ` composes to identity through the
+    /// value→(identity attention)→o_proj pipeline — so the fp output is preserved.
+    /// `attn = Wo·(Wv·x)` must equal `Wo_new·(Wv_new·x)`.
+    #[test]
+    fn r2_headwise_merge_is_identity() {
+        let (hd, n_heads, h) = (4usize, 3usize, 8usize);
+        let qd = n_heads * hd; // n_kv == n_heads here (ctx = v, identity attention)
+        let r2 = Rotation::random(hd, 3);
+        let x: Vec<f32> = (0..h).map(|i| (i as f32 * 0.31).sin()).collect();
+        let wv: Vec<f32> = (0..qd * h).map(|i| (i as f32 * 0.07).cos()).collect(); // [qd,h]
+        let wo: Vec<f32> = (0..h * qd).map(|i| (i as f32 * 0.05).sin()).collect(); // [h,qd]
+        let mul = |w: &[f32], v: &[f32], rows: usize, inner: usize| -> Vec<f32> {
+            (0..rows)
+                .map(|o| (0..inner).map(|k| w[o * inner + k] * v[k]).sum())
+                .collect()
+        };
+        let attn = mul(&wo, &mul(&wv, &x, qd, h), h, qd);
+        let wv_new = rotate_head_rows(&wv, &r2, n_heads, h);
+        let wo_new = rotate_head_cols(&wo, &r2, n_heads, h);
+        let attn_new = mul(&wo_new, &mul(&wv_new, &x, qd, h), h, qd);
+        let worst = attn
+            .iter()
+            .zip(&attn_new)
+            .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        assert!(worst < 1e-4, "R2 merge not identity: {worst:e}");
     }
 
     /// The residual rotation applied to a writer output reproduces the rotated

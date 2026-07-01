@@ -15,7 +15,7 @@
 
 use hipfire_train::block::BlockDims;
 use hipfire_train::model::{model_forward, LayerLora, LayerWeights, LlamaModel};
-use hipfire_train::rotation::{apply_r1, Rotation};
+use hipfire_train::rotation::{apply_r1, apply_r2, Rotation};
 use rdna_compute::{Gpu, HipResult};
 
 const NL: usize = 2;
@@ -120,16 +120,30 @@ fn compare(a: &[f32], b: &[f32]) -> (f32, f32) {
 }
 
 fn run_case(gpu: &mut Gpu, name: &str, rot: &Rotation, base: &[f32]) -> HipResult<f32> {
+    run_r1r2(gpu, name, Some(rot), None, base)
+}
+
+/// Build a fresh model, optionally bake `R1` (hidden-dim) and/or `R2` (head-dim),
+/// and compare logits to the untransformed baseline.
+fn run_r1r2(
+    gpu: &mut Gpu,
+    name: &str,
+    r1: Option<&Rotation>,
+    r2: Option<&Rotation>,
+    base: &[f32],
+) -> HipResult<f32> {
     let tokens: Vec<u32> = vec![2, 5, 1, 8];
     let pos: Vec<f32> = (0..SEQ).map(|t| t as f32).collect();
     let mut model = build_model(gpu)?;
-    apply_r1(gpu, &mut model, rot)?;
+    if let Some(r) = r1 {
+        apply_r1(gpu, &mut model, r)?;
+    }
+    if let Some(r) = r2 {
+        apply_r2(gpu, &mut model, r)?;
+    }
     let rotated = logits(gpu, &model, &tokens, &pos)?;
     let (maxabs, rell2) = compare(base, &rotated);
-    println!(
-        "  [{name}] orthonormality={:.1e}  max|Δlogit|={maxabs:.3e}  relL2={rell2:.3e}",
-        rot.orthonormality_error()
-    );
+    println!("  [{name}] max|Δlogit|={maxabs:.3e}  relL2={rell2:.3e}");
     Ok(maxabs)
 }
 
@@ -156,13 +170,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rnd1 = run_case(&mut gpu, "random R1 #1", &Rotation::random(H, 1), &base)?;
     let rnd2 = run_case(&mut gpu, "random R1 #2", &Rotation::random(H, 99), &base)?;
 
+    // R2 head-wise (head_dim rotation on V/o_proj), and R1+R2 together.
+    let r2a = Rotation::random(HD, 7);
+    let r2only = run_r1r2(&mut gpu, "random R2 (head-wise)", None, Some(&r2a), &base)?;
+    let r1r2 = run_r1r2(
+        &mut gpu,
+        "R1 + R2 jointly",
+        Some(&Rotation::random(H, 1)),
+        Some(&r2a),
+        &base,
+    )?;
+
     // Fold-only should be tiny (just reassociation of the scale into the GEMM);
-    // rotation adds a dense h×h GEMM of reassociation, so allow a looser bound.
-    let ok = ident < 1e-4 && rnd1 < 5e-3 && rnd2 < 5e-3;
+    // rotation adds a dense GEMM of reassociation, so allow a looser bound.
+    let ok = ident < 1e-4 && rnd1 < 5e-3 && rnd2 < 5e-3 && r2only < 5e-3 && r1r2 < 5e-3;
     if ok {
-        println!("\nPHASE 0 PASS — R1 transform leaves the fp32 forward invariant.");
+        println!(
+            "\nPHASE 0/3 PASS — R1 (hidden), R2 (head-wise), and R1+R2 all leave the fp32 \
+             forward invariant."
+        );
         Ok(())
     } else {
-        Err(format!("PHASE 0 FAIL — ident {ident:.2e}, rnd1 {rnd1:.2e}, rnd2 {rnd2:.2e}").into())
+        Err(format!(
+            "FAIL — ident {ident:.2e}, rnd1 {rnd1:.2e}, rnd2 {rnd2:.2e}, r2 {r2only:.2e}, \
+             r1r2 {r1r2:.2e}"
+        )
+        .into())
     }
 }

@@ -176,8 +176,19 @@ Stiefel-manifold optimizer landed in `crates/hipfire-train/src/learn_rotation.rs
   (Phase 5) — deploying through the FWHT recipe means baking `R1 = Fᵀ M` so the
   recipe's FWHT cancels to leave `M`; (v) Phase 3 R2 (head-wise).
 
-**Phase 3 — add R2 (head-wise), learn {R1,R2} jointly.** `R2 [D_head,D_head]`
-on V + o_proj input; merged. This is the "W4A8-gap-closing" pair even before R3/R4.
+**Phase 3 — add R2 (head-wise). Merge DONE; joint learning remains.**
+`R2 [head_dim, head_dim]` on the value subspace, merged by `rotation::apply_r2`:
+writer per-KV-head output rows of `v_proj` (`Wv → R2·Wv`) + reader per-query-head
+input columns of `o_proj` (`Wo → Wo·R2ᵀ`). Attention is linear in V, so the
+rotated value flows through the context and `o_proj` un-rotates it — fp output
+invariant, but the quantizer sees a better-conditioned per-head V/o_proj basis.
+Composes with R1 (orthogonal axes: R1 on hidden, R2 on head_dim), one shared R2
+across heads. Verified: CPU `r2_headwise_merge_is_identity` (the two per-head
+rotations compose to identity through value→o_proj) + GPU `rotation_invariance_probe`
+extended — random R2 `max|Δlogit|=4.8e-7`, R1+R2 jointly `2.4e-6`.
+- **OPEN:** *learn* R2 (kurtosis on per-head value activations) and learn {R1,R2}
+  jointly; measure the W4A8-gap close. R2's payoff shows most on the value/o_proj
+  int4 path — a per-head analog of the `learned_r1_w4a4_probe` measurement.
 
 **Phase 4 — R3/R4 online Hadamard.** R4 = the existing down FWHT (verify it's
 positioned as SpinQuant's R4). R3 for KV4 (when we do 4-bit KV). Both fixed.
