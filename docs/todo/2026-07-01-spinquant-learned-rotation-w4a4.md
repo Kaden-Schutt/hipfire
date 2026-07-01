@@ -64,10 +64,20 @@ present** — learning R is purely aligning the quant grid to the data.
 
 ## What to build (phased)
 
-**Phase 0 — rotation-invariant model transform.** Fold each RMSNorm scale `α`
-into the following weight so the block is rotation-invariant, then verify a
-random `R1` leaves the **FP** output bit-identical (the invariance is the
-correctness contract). Do this in `hipfire-train`'s llama model (dense, tied).
+**Phase 0 — rotation-invariant model transform. ✅ DONE.** Fold each RMSNorm
+scale `α` into the following weight so the block is rotation-invariant, then
+verify a random `R1` leaves the **FP** output bit-identical (the invariance is
+the correctness contract). Do this in `hipfire-train`'s llama model (dense, tied).
+- Landed as `crates/hipfire-train/src/rotation.rs`: `Rotation` (orthonormal
+  `[h,h]`; `identity`/`random`(Gram–Schmidt Gaussian)/`hadamard`(random-sign
+  Sylvester, the Phase-1 fixed rotation)) + `apply_r1(gpu, model, R)` which folds
+  norm1→{q,k,v}, norm2→{gate,up}, final_norm→lm_head, then reader-rotates
+  (`W Rᵀ`) q/k/v/gate/up/embed/head and writer-rotates (`R W`) o_proj/down_proj.
+  Unties the head first (input-embed vs α_f-folded head diverge under tie); the
+  tied backward stays a Phase-2 item.
+- Verified: CPU unit tests (orthonormality, reader/writer invariance identities)
+  + GPU probe `examples/rotation_invariance_probe.rs` on gfx1151: random-R1
+  `max|Δlogit|=2.6e-6`, fold-only `2.4e-7` — invariant to fp reassociation.
 
 **Phase 1 — R1 with a FIXED Hadamard, mergeable.** Insert `R1` (residual,
 `[hidden,hidden]`) as a fixed random Hadamard, merged into embed/attn/FFN input

@@ -187,7 +187,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_EVAL_KLDREF` | Runtime variable controlling eval kldref in hipfire | `crates/hipfire-eval/src/executor_examples.rs:678` |
 | `HIPFIRE_EVAL_PERPLEXITY_CORPUS` | Runtime variable controlling eval perplexity corpus in hipfire | `crates/hipfire-eval/src/run.rs:175` |
 | `HIPFIRE_EVAL_PERPLEXITY_CTX` | Parses "HIPFIRE_EVAL_PERPLEXITY_CTX" with fallback defaults | `crates/hipfire-eval/src/executor_examples.rs:764` |
-| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | cache so the model "sees" them as part of its own trajectory, | `crates/hipfire-daemon/src/main.rs:3697` |
+| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | cache so the model "sees" them as part of its own trajectory, | `crates/hipfire-daemon/src/main.rs:3725` |
 | `HIPFIRE_FILES_STATE_MAX` | Parses "HIPFIRE_FILES_STATE_MAX" with fallback defaults | `crates/hipfire-server/src/routes/files.rs:174` |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | Parses "HIPFIRE_FLASH_PARTIALS_BATCH" with fallback defaults | `crates/hipfire-runtime/src/config.rs:87` |
 | `HIPFIRE_FORCE_GENERIC` | Runtime variable controlling force generic in hipfire | `crates/rdna-compute/src/feature_flags.rs:325` |

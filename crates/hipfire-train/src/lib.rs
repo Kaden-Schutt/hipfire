@@ -23,6 +23,7 @@ pub mod ops;
 pub mod optim;
 pub mod oqplus_quant;
 pub mod qtip_quant;
+pub mod rotation;
 pub mod ssm_block;
 pub mod ssm_drafter;
 pub mod tensor;
