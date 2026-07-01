@@ -26,12 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Positional: <model_dir> <out.calib.hfq> [seq] [n_seq]; flag: --text <file>.
     let mut text_path: Option<String> = None;
     let mut plain = false; // --plain ⇒ w≡1 baseline (plain XᵀX over the same tokens)
+    let mut skip_seq = 0usize; // --skip N ⇒ drop the first N sequences (held-out split)
     let mut pos_args: Vec<String> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--text" => text_path = it.next(),
             "--plain" => plain = true,
+            "--skip" => skip_seq = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             _ => pos_args.push(a),
         }
     }
@@ -61,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("tokenized {} chars -> {} tokens", text.len(), ids.len());
         ids.chunks(seq)
             .filter(|c| c.len() == seq)
+            .skip(skip_seq)
             .take(n_seq)
             .map(|c| c.to_vec())
             .collect()

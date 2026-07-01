@@ -5290,6 +5290,137 @@ ENVIRONMENT:
     );
 }
 
+/// GuidedQuant validation (`--ldlq-probe`). LDLQ-quantize ONE weight `<key>`
+/// (the safetensors `<key>.weight`) with a guided vs a plain **training**
+/// Hessian, then score reconstruction on held-out guided/plain **eval**
+/// Hessians. The crossover — guided lower on the Fisher-eval, plain lower on the
+/// plain-eval — shows the Fisher weighting generalizes on its own objective.
+///
+/// Flags: --model <dir> --tensor <key> --hg-train <f> --hp-train <f>
+///        --hg-eval <f> --hp-eval <f> [--bits N]
+fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
+    use rayon::prelude::*;
+    let val = |k: &str| arg_value(args, k);
+    let model = val("--model").ok_or("need --model <dir>")?;
+    let key = val("--tensor").ok_or("need --tensor <key>")?.to_string();
+    let hg_train = val("--hg-train").ok_or("need --hg-train")?;
+    let hp_train = val("--hp-train").ok_or("need --hp-train")?;
+    let hg_eval = val("--hg-eval").ok_or("need --hg-eval")?;
+    let hp_eval = val("--hp-eval").ok_or("need --hp-eval")?;
+    let bits: u32 = val("--bits").and_then(|s| s.parse().ok()).unwrap_or(3);
+
+    // Weight W [m,k] f32 from safetensors.
+    let wname = format!("{key}.weight");
+    let st_paths = find_safetensors(Path::new(model));
+    let (w, m, k) = {
+        let mut found = None;
+        for p in &st_paths {
+            let sf = SafetensorsFile::open(p).map_err(|e| e.to_string())?;
+            if let Some((meta, bytes)) = sf.tensor_data(&wname) {
+                if meta.shape.len() != 2 {
+                    return Err(format!("{wname} is not 2D"));
+                }
+                found = Some((to_f32(bytes, &meta.dtype), meta.shape[0], meta.shape[1]));
+                break;
+            }
+        }
+        found.ok_or(format!("tensor {wname} not found under {model}"))?
+    };
+    eprintln!("W {key} [{m}×{k}], {bits}-bit LDLQ");
+
+    // Materialize a [k,k] Hessian from a .calib.hfq by key.
+    let load_h = |path: &str| -> Result<Vec<f32>, String> {
+        let sc = hessian_io::HessianSidecar::open(Path::new(path)).map_err(|e| e.to_string())?;
+        let h = sc
+            .get(&key, 0)
+            .ok_or_else(|| format!("no hessian for {key} in {path}"))?;
+        if h.k != k {
+            return Err(format!("hessian k={} != weight k={k} ({path})", h.k));
+        }
+        let mut out = vec![0.0f32; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                out[i * k + j] = h.at(i, j) as f32;
+            }
+        }
+        Ok(out)
+    };
+    let hgt = load_h(hg_train)?;
+    let hpt = load_h(hp_train)?;
+
+    // LDLQ-quantize with each training Hessian (damp = 1% of mean diagonal).
+    let cb = qtip::build_codebook();
+    let s1 = gen_fwht_signs(42, 256);
+    let s2 = gen_fwht_signs(1042, 256);
+    let damp = |h: &[f32]| -> f64 {
+        let s: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+        0.01 * (s / k as f64).max(1e-12)
+    };
+    let wq_g = ldlq::qtip_ldlq_dequant_bits(&w, m, k, &hgt, &s1, &s2, 128, damp(&hgt), bits, &cb)
+        .ok_or("LDLQ(guided) failed")?;
+    let wq_p = ldlq::qtip_ldlq_dequant_bits(&w, m, k, &hpt, &s1, &s2, 128, damp(&hpt), bits, &cb)
+        .ok_or("LDLQ(plain) failed")?;
+    drop((hgt, hpt));
+    eprintln!("LDLQ done (guided + plain); scoring held-out …");
+
+    // Held-out error under an eval Hessian: E = Σ_j (w_j−ŵ_j)ᵀ H (w_j−ŵ_j),
+    // plus the weight energy En = Σ_j w_jᵀ H w_j for a relative figure.
+    let err = |wq: &[f32], h: &[f32]| -> (f64, f64) {
+        (0..m)
+            .into_par_iter()
+            .map(|j| {
+                let wr = &w[j * k..(j + 1) * k];
+                let qr = &wq[j * k..(j + 1) * k];
+                let (mut e, mut en) = (0.0f64, 0.0f64);
+                for a in 0..k {
+                    let hrow = &h[a * k..(a + 1) * k];
+                    let (mut hd, mut hw) = (0.0f64, 0.0f64);
+                    for b in 0..k {
+                        let hab = hrow[b] as f64;
+                        hd += hab * (wr[b] - qr[b]) as f64;
+                        hw += hab * wr[b] as f64;
+                    }
+                    e += (wr[a] - qr[a]) as f64 * hd;
+                    en += wr[a] as f64 * hw;
+                }
+                (e, en)
+            })
+            .reduce(|| (0.0, 0.0), |x, y| (x.0 + y.0, x.1 + y.1))
+    };
+
+    let hge = load_h(hg_eval)?;
+    let (eg_f, en_f) = err(&wq_g, &hge);
+    let (ep_f, _) = err(&wq_p, &hge);
+    drop(hge);
+    let hpe = load_h(hp_eval)?;
+    let (eg_p, en_p) = err(&wq_g, &hpe);
+    let (ep_p, _) = err(&wq_p, &hpe);
+    drop(hpe);
+
+    println!("=== GuidedQuant LDLQ recon crossover — {key} ({bits}-bit) ===");
+    println!(
+        "held-out FISHER eval:  guided rel {:.5}  plain rel {:.5}  -> {}",
+        eg_f / en_f,
+        ep_f / en_f,
+        if eg_f < ep_f {
+            "GUIDED wins ✓"
+        } else {
+            "plain"
+        }
+    );
+    println!(
+        "held-out PLAIN  eval:  guided rel {:.5}  plain rel {:.5}  -> {}",
+        eg_p / en_p,
+        ep_p / en_p,
+        if ep_p < eg_p {
+            "PLAIN wins ✓"
+        } else {
+            "guided"
+        }
+    );
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -5312,6 +5443,22 @@ fn main() {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("emit-fixture: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // `--ldlq-probe`: GuidedQuant validation. LDLQ-quantize ONE weight with a
+    // guided vs a plain calibration Hessian, then score the reconstruction on
+    // held-out guided/plain eval Hessians — the crossover (guided wins the
+    // Fisher-eval, plain wins the plain-eval) shows the Fisher weighting does
+    // what it should. No full quant, no model load. See crates/hipfire-train
+    // examples/calib_guided.rs for producing the .calib.hfq inputs.
+    if args.iter().any(|a| a == "--ldlq-probe") {
+        match ldlq_recon_probe(&args) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("ldlq-probe: {e}");
                 std::process::exit(2);
             }
         }
