@@ -5061,6 +5061,25 @@ fn main() {
                 } else {
                     Vec::new()
                 };
+                // Respect the model's trained context. The load already clamped
+                // `max_seq` to `max_position_embeddings` (see
+                // `clamp_max_seq_to_model_context`, gated by
+                // `HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE`), so `m.max_seq` is the true
+                // usable window. A KLD chunk longer than that decodes past the
+                // model's positions and overruns position-indexed GPU buffers
+                // (RoPE cos/sin table, KV) → a hard VMFault, not a graceful error.
+                // Small-context models (e.g. Supra-50M, max_position_embeddings
+                // =1024) hit this with the default n_ctx=2048. The override gate
+                // flows through naturally: forcing a larger max_seq at load raises
+                // `m.max_seq`, which raises this ceiling.
+                let model_ctx = m.max_seq.max(2);
+                if n_ctx > model_ctx {
+                    eprintln!(
+                        "kld_eval: clamping n_ctx {n_ctx} → {model_ctx} (model trained context; \
+                         load with HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 + a larger --max-seq to raise it)"
+                    );
+                }
+                let n_ctx = n_ctx.min(model_ctx);
                 // Clamp the KLD window to the corpus: chunks are non-overlapping
                 // `n_ctx` windows counted by floor (`tokens.len() / n_ctx`) with the
                 // partial tail discarded, so a corpus shorter than n_ctx would yield
