@@ -497,7 +497,7 @@ fn build_rotation_overrides(
     n_layers: usize,
     st_files: &[SafetensorsFile],
     fp8_scale_for: &HashMap<String, (usize, String)>,
-) -> Result<(HashMap<String, Vec<f32>>, Vec<f32>), String> {
+) -> Result<(HashMap<String, Vec<f32>>, Option<Vec<f32>>), String> {
     let h = config
         .get("hidden_size")
         .and_then(|v| v.as_u64())
@@ -607,7 +607,7 @@ fn build_rotation_overrides(
         "  --rotate: {} tensors folded+rotated; synthesized untied lm_head [{vocab}×{h}]",
         ov.len()
     );
-    Ok((ov, lm_head))
+    Ok((ov, Some(lm_head)))
 }
 
 /// Convert one E2M1 nibble (4-bit FP: 1 sign + 2 exp + 1 mantissa, bias=1) to f32.
@@ -7008,7 +7008,7 @@ fn main() {
                 ROTATION_OVERRIDE
                     .set(overrides)
                     .expect("ROTATION_OVERRIDE set once");
-                rotate_lm_head = Some(lm_head);
+                rotate_lm_head = lm_head;
             }
             Err(e) => {
                 eprintln!("error: --rotate: {e}");
@@ -9600,6 +9600,36 @@ fn main() {
                 data,
                 spilled_len: 0,
             });
+        } else if let Some(rot) = ROTATION_OVERRIDE.get().and_then(|m| m.get(*name)) {
+            // --rotate: a non-quantized tensor with a fold+rotate override — most
+            // importantly an RMSNorm folded to ones. The raw source bytes are the
+            // PRE-fold gamma, which the folded readers already absorbed; storing raw
+            // here (as the sibling arm does) would re-apply gamma at runtime (gamma²
+            // → garbage). Encode the OVERRIDE at the source container width instead.
+            let (data, qt, label): (Vec<u8>, QuantType, &str) = match meta.dtype.as_str() {
+                "F32" => (
+                    rot.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+                    QuantType::F32,
+                    "F32",
+                ),
+                "F16" => (f32_slice_to_f16_bytes(rot), QuantType::F16, "F16"),
+                _ => (f32_slice_to_bf16_bytes(rot), QuantType::BF16, "BF16"),
+            };
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!(
+                "  {label:<10} {} {:?} ({} elements) [--rotate override]",
+                name, meta.shape, n_elements
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: qt,
+                shape,
+                group_size: 0,
+                data,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
         } else {
             // Preserve source precision for non-quantized tensors (norms,
             // biases, DeltaNet scalars, etc.). BF16 and F16 have the same byte
