@@ -101,7 +101,7 @@ lib mechanism needed beyond the value-activation capture.
 
 ---
 
-## 2. `.hfq` emission — R1 deploy tooling **DONE** (path (a)); serving blocked on a runtime gap
+## 2. `.hfq` emission — R1 deploy **DONE** (path (a), serves coherently); KLD number pending
 
 **Landed (path (a), R1-only).**
 - `hipfire-train` `examples/learn_r1_dump.rs` — learns R1 (kurtosis on residual
@@ -122,16 +122,31 @@ lib mechanism needed beyond the value-activation capture.
 - Real Supra-50M → 73 MB oq4 `.hfq` (R1 orthonormality 1.1e-6, 110 tensors
   rotated). Tiny-quant gate unchanged (`--rotate` inert when unused).
 
-**BLOCKED — end-to-end serving/KLD.** The arch-0/1 **llama runtime loader supports
-qt≤31 but not qt=34 (Oq4G256)** (`hfq.rs:1712` panic; a *baseline* oq4 llama fails
-identically at the first weight — this is pre-existing and orthogonal to the
-rotation). So the doc's "W4A4 KLD of learned-R1 vs baseline Oq4" can't run on
-llama yet. **Remaining work = a runtime task: wire Oq4G256 (and its activation
-FWHT) GEMV into the dense-llama forward** (oq4 currently serves only
-qwen35/nemotron). Once that lands, validate KLD + the `iu4·iu4` vs `iu4·iu8`
-throughput on gfx1151. The rotation weights are correct by construction (identical
-to the fp-invariance-proven `apply_r1`) + unit-tested; only the serving path is
-missing.
+**SERVING — DONE (coherent end-to-end).** Two blockers found and fixed:
+1. *Oq4 not served on llama.* The arch-0/1 llama loader supported qt≤31 but not
+   qt=34 (Oq4G256) — a *baseline* oq4 llama panicked at the first weight, pre-
+   existing/orthogonal. Fixed by wiring the qt=34/37 loader arm (repack →
+   `DType::Oq4G256`; the shared `weight_gemv`/`weight_gemm` Oq4 arms already exist).
+   The repack `oq4_pack_arch_combined` was converged into `hipfire_runtime::hfq`
+   (qwen35 re-exports, nemotron drops its private copy).
+2. *`--rotate` norm double-apply.* The quantizer's non-quantized fallback (norms,
+   which `should_quantize` skips) stored RAW source bytes, bypassing the rotation
+   override — so a folded RMSNorm kept its real γ while the readers also absorbed
+   it (γ² → garbage). Fixed: the fallback honors the override. **This was the whole
+   "fold breaks serving" mystery** — found by isolating with M=block_fwht (net=I)
+   and lossless q8, which stayed garbage until the norm fix.
+
+Result: `learn_r1_dump → hipfire-quantize --rotate → serve` produces a coherent
+oq4 llama ("The capital of France is Paris"; "The sky is blue and white") on
+real Supra-50M. Weights are correct by construction (== fp-invariance-proven
+`apply_r1`) + unit-tested (`bake_cancels_codec_fwht_leaving_m`).
+
+**Still to measure:** the quantitative "learned-R1 vs baseline-Oq4 KLD" (does the
++1.7 dB SQNR translate to lower KLD?) and the `iu4·iu4` vs `iu4·iu8` throughput on
+gfx1151. The `hipfire eval --battery quality` KLD path currently **VMFaults on
+tiny Supra-50M oq4 (baseline AND rotated — an orthogonal eval/runtime fault**, not
+the rotation), so run the KLD on a larger dense-llama oq4 where that path is
+stable, or after the eval fault is fixed.
 
 **R2 deploy** stays out of this item: the codec's 256-wide FWHT crosses head
 boundaries, so a per-head `apply_r2` can't be un-baked (net would be
