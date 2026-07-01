@@ -140,11 +140,24 @@ Stiefel-manifold optimizer landed in `crates/hipfire-train/src/learn_rotation.rs
   A4 output SNR q_proj **identity 14.4 → fixed-Hadamard 22.7 → learned 27.2 dB**
   (**+4.5 dB over fixed**), gate_proj 9.95 → 18.6 → 23.1 (+4.5). The learned-over-
   fixed delta matches SpinQuant's ~+5.9 dB learned-over-random claim.
-- **OPEN follow-ups:** (i) compose the learned R1 with the deployed per-group
-  FWHT recipe and re-measure through `w4a4_r1_probe` (does learned beat the ~20 dB
-  FWHT baseline where fixed R1 didn't?); (ii) the tied-head backward deferred from
-  Phase 0 if we move to a true quantized-CE objective; (iii) bake the learned R1
-  into an `Oq4G256` export (Phase 5).
+- **(i) DONE — learned beats the deployed FWHT in *full* W4A4.**
+  `examples/learned_r1_w4a4_probe.rs` runs the full recipe (both operands int4,
+  per-256-group, real iu4 kernel copy) rotation-for-rotation. Insight: the
+  recipe's per-group FWHT is itself a rotation `F`, so with a *free* learned R1 the
+  "R1 then FWHT" pipeline collapses to one rotation — compare rotations head to
+  head. Real Supra-50M mean q_proj SQNR: **naive 13.1 → per-group FWHT 20.1 →
+  global Hadamard 20.1 → learned 21.85 dB (+1.73 over the FWHT baseline)**. The
+  gain is smaller than the act-only A4 setting (+4.5 dB) — expected, since the
+  weight is now also int4 and `M` was learned on *activation* kurtosis (a joint
+  act+weight objective is the obvious refinement). But it confirms the thesis in
+  the deployed setting: a *fixed* rotation plateaus at the FWHT tier; a *learned*
+  one moves past it.
+- **OPEN follow-ups:** (ii) learn `M` on a joint activation+weight kurtosis (or
+  the real quantized-CE) — the current `M` is activation-only, leaving the weight
+  int4 error on the table; (iii) tied-head backward (deferred from Phase 0) for a
+  true quantized-CE objective; (iv) bake the learned R1 into an `Oq4G256` export
+  (Phase 5). Note deploying the learned R1 through the FWHT recipe means baking
+  `R1 = Fᵀ M` so the recipe's FWHT cancels to leave `M`.
 
 **Phase 3 — add R2 (head-wise), learn {R1,R2} jointly.** `R2 [D_head,D_head]`
 on V + o_proj input; merged. This is the "W4A8-gap-closing" pair even before R3/R4.
