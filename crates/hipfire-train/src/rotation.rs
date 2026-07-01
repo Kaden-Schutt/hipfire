@@ -109,6 +109,14 @@ impl Rotation {
         Self { h, r }
     }
 
+    /// Re-orthonormalize the rows in place (modified Gram–Schmidt). Cheap guard
+    /// against drift when an iterative process (e.g. the approximate Cayley
+    /// inverse in [`crate::learn_rotation`]) accumulates small departures from
+    /// `R Rᵀ = I` over many steps.
+    pub fn reorthonormalize(&mut self) {
+        gram_schmidt_rows(&mut self.r, self.h);
+    }
+
     /// `max |R Rᵀ − I|` — the orthonormality residual (a correctness probe).
     pub fn orthonormality_error(&self) -> f32 {
         let h = self.h;

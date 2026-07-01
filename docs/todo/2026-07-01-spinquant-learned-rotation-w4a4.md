@@ -118,12 +118,33 @@ QuaRot/+0.9 dB tier and validates the plumbing before learning.
   set `ROCM_PATH=$HOME/.venv/.../_rocm_sdk_core` (has `lib/llvm/bin/clang++`); the
   runtime-only `/opt/rocm` lacks the compiler.
 
-**Phase 2 — Cayley-SGD learn R1.** Add a small Stiefel-manifold optimizer
-(`crates/hipfire-train/src/ops/` + `optim.rs`): Cayley update with fixed-point
-inverse, orthonormality asserted each step. Objective = quantized-CE over calib
-sequences with `Q(W R1⁻¹) Q(R1 X)` in the forward (weight side via
-`oqplus_quant` sim, activation side via an A4 sim-quant to be added). Weights
-frozen; ~100–200 iters. Expect the +6.8 dB tier.
+**Phase 2 — Cayley-SGD learn R1. ✅ DONE (learned > fixed demonstrated).**
+Stiefel-manifold optimizer landed in `crates/hipfire-train/src/learn_rotation.rs`.
+- **Optimizer** `cayley_step`: `A = Ĝ − Ĝᵀ` (`Ĝ = G Rᵀ`), Cayley update
+  `R' = (I + α/2 A)⁻¹(I − α/2 A) R` via fixed-point inverse (no explicit solve).
+  `A` is Frobenius-normalized so `lr` is a bounded per-step rotation *angle*
+  (raw-gradient magnitude otherwise breaks the fixed-point contraction → NaN);
+  periodic `reorthonormalize` (new on `Rotation`) guards drift from the
+  approximate inverse. Unit-tested: `cayley_solves_procrustes` (L↓ >100×, stays
+  orthonormal) + `learns_to_reduce_kurtosis`.
+- **Objective — the key design call.** A plain STE on the quantized recon loss
+  has a ~zero gradient w.r.t. `R` (the clean `X Rᵀ·R Wᵀ = X Wᵀ` term is
+  R-invariant; STE zeroes the noise term — the loss looks flat exactly where it
+  isn't). So we minimize the **differentiable incoherence proxy**: per-element
+  4th moment `L(R)=Σ(X Rᵀ)⁴`. Orthonormal `R` fixes the 2nd moment, so this
+  minimizes kurtosis → flattens the outlier tails that crush the int4 grid, with
+  a clean dense gradient `G = 4(X̃∘³)ᵀX`. (This is a surrogate for SpinQuant's
+  quantized-CE; the CE-through-the-net path is a later option if needed.)
+- **Result** (`examples/learned_r1_probe.rs`, real Supra-50M, learn on stacked
+  xn1+xn2, kurtosis Σx⁴ 1.06e7→had 5.4e5→**learned 2.8e5**, orthonormality 6e-7):
+  A4 output SNR q_proj **identity 14.4 → fixed-Hadamard 22.7 → learned 27.2 dB**
+  (**+4.5 dB over fixed**), gate_proj 9.95 → 18.6 → 23.1 (+4.5). The learned-over-
+  fixed delta matches SpinQuant's ~+5.9 dB learned-over-random claim.
+- **OPEN follow-ups:** (i) compose the learned R1 with the deployed per-group
+  FWHT recipe and re-measure through `w4a4_r1_probe` (does learned beat the ~20 dB
+  FWHT baseline where fixed R1 didn't?); (ii) the tied-head backward deferred from
+  Phase 0 if we move to a true quantized-CE objective; (iii) bake the learned R1
+  into an `Oq4G256` export (Phase 5).
 
 **Phase 3 — add R2 (head-wise), learn {R1,R2} jointly.** `R2 [D_head,D_head]`
 on V + o_proj input; merged. This is the "W4A8-gap-closing" pair even before R3/R4.
