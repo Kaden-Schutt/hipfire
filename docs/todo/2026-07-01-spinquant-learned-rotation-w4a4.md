@@ -84,6 +84,22 @@ the correctness contract). Do this in `hipfire-train`'s llama model (dense, tied
 weights. Quantize OQ4 (real W4A4) and confirm: (a) FP invariance holds, (b) the
 `iu4·iu4` path runs, (c) A4 SNR/KLD improves vs no-R1. This reproduces the
 QuaRot/+0.9 dB tier and validates the plumbing before learning.
+- **(a) DONE** via Phase 0 (`apply_r1` with `Rotation::hadamard`).
+- **(c) A4 SNR — DONE.** New `crates/hipfire-train/src/a4_quant.rs`: `a4_simquant`
+  (per-256-group symmetric int4 absmax round-trip = the runtime A4 grid) + `snr_db`
+  + `rotation::rotate_rows`. Key metric lesson: raw-activation reconstruction SNR
+  is a *bad* proxy (its Frobenius norm is dominated by the outliers, which
+  quantize well — it rewards keeping them and ignores the crushed bulk); the
+  faithful metric is **end-to-end output SNR through the weight**, where the
+  crushed bulk propagates. CPU test (`hadamard_beats_identity_end_to_end`):
+  identity 9.35 dB → Hadamard 20.97 (+11.6). GPU probe
+  `examples/rotation_a4_snr_probe.rs` on real Supra-50M: q_proj 14.4→22.7 (+8.3),
+  gate_proj 9.95→18.6 (+8.6). Rotation moves the int4-activation grid from
+  marginal to usable, as SpinQuant predicts. Hadamard ≈ random (Hadamard the
+  canonical fixed choice).
+- **(b) OPEN:** route `apply_r1`'d weights through the production `Oq4G256`
+  quantizer and run the real `iu4·iu4` GEMM end-to-end (kernel/plumbing, was
+  deprioritized vs the A4-quality mechanism).
 
 **Phase 2 — Cayley-SGD learn R1.** Add a small Stiefel-manifold optimizer
 (`crates/hipfire-train/src/ops/` + `optim.rs`): Cayley update with fixed-point

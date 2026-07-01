@@ -10,6 +10,7 @@
 // one clean op per node, each with a matching backward — built on the dedicated
 // `gemm_f32_train` primitive (general transpose flags) in `rdna-compute`.
 
+pub mod a4_quant;
 pub mod block;
 pub mod checkpoint;
 pub mod config;

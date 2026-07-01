@@ -164,6 +164,16 @@ fn fold_cols(w: &mut [f32], alpha: &[f32], out: usize, cols: usize) {
     }
 }
 
+/// Rotate the `rows` of a row-major `[rows, h]` activation buffer by `Rᵀ` (each
+/// row `x → x Rᵀ`) — the residual stream as the R1-transformed model carries it.
+/// Orthonormal `R` preserves per-row norm, so this is a pure basis change: the
+/// SNR of a later A4 round-trip in this basis equals the end-to-end activation
+/// SNR in the original basis (the SpinQuant measurement). Same op as the reader
+/// weight rotate, exposed for the A4-SNR probe.
+pub fn rotate_rows(x: &[f32], rot: &Rotation, rows: usize) -> Vec<f32> {
+    rotate_input(x, rot, rows)
+}
+
 /// Reader rotate: `W → W Rᵀ` on the input (`h`) dimension of a `[out, h]` weight.
 /// `new[o,j] = Σ_i W[o,i]·R[j,i]`.
 fn rotate_input(w: &[f32], rot: &Rotation, out: usize) -> Vec<f32> {
