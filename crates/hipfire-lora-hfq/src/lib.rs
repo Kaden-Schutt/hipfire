@@ -105,29 +105,32 @@ pub fn write_lora_hfq(path: &Path, adapter: &LoraAdapter) -> Result<(), String> 
 /// Read a `.lora.hfq` container written by [`write_lora_hfq`].
 pub fn read_lora_hfq(path: &Path) -> Result<LoraAdapter, String> {
     let f = HfqFile::open(path).map_err(|e| format!("lora-hfq: open {}: {e}", path.display()))?;
+    adapter_from_hfq(&f, &path.display().to_string())
+}
+
+/// Reconstruct a [`LoraAdapter`] from an already-open HFQM container (top-level or
+/// an embedded section via [`HfqFile::open_at_offset`]). `src` labels errors.
+fn adapter_from_hfq(f: &HfqFile, src: &str) -> Result<LoraAdapter, String> {
     let meta: LoraHfqMeta = serde_json::from_str(&f.metadata_json)
-        .map_err(|e| format!("lora-hfq: parse metadata of {}: {e}", path.display()))?;
+        .map_err(|e| format!("lora-hfq: parse metadata of {src}: {e}"))?;
     if meta.container != CONTAINER {
         return Err(format!(
-            "lora-hfq: {} is not a lora container (container {:?})",
-            path.display(),
+            "lora-hfq: {src} is not a lora container (container {:?})",
             meta.container
         ));
     }
     if meta.version != CONTAINER_VERSION {
         return Err(format!(
-            "lora-hfq: {} version {} unsupported (expected {CONTAINER_VERSION})",
-            path.display(),
+            "lora-hfq: {src} version {} unsupported (expected {CONTAINER_VERSION})",
             meta.version
         ));
     }
     let hidden = meta.meta.hidden;
-    let a = rows(&f, "a", hidden)?;
-    let b = rows(&f, "b", hidden)?;
+    let a = rows(f, "a", hidden)?;
+    let b = rows(f, "b", hidden)?;
     if a.len() != meta.layers.len() || b.len() != meta.layers.len() {
         return Err(format!(
-            "lora-hfq: {} row count ({}/{}) != {} layers",
-            path.display(),
+            "lora-hfq: {src} row count ({}/{}) != {} layers",
             a.len(),
             b.len(),
             meta.layers.len()
@@ -163,6 +166,95 @@ pub fn read_lora_any(path: &Path) -> Result<LoraAdapter, String> {
     } else {
         lora::read_adapter(path)
     }
+}
+
+// ── Bundle-into-one-hfq (the `--merge-lora` artifact) ────────────────────────
+
+/// Trailer magic for a LoRA adapter bundled onto the end of a model `.hfq`.
+/// Mirrors the MTP bundle (`HFBNDMTP`): the last 16 bytes are this 8-byte magic
+/// followed by a little-endian `u64` byte offset of the embedded adapter HFQM
+/// section within the file.
+pub const LORA_BUNDLE_MAGIC: &[u8; 8] = b"HFBNDLRA";
+const LORA_BUNDLE_TRAILER_LEN: u64 = 16;
+
+/// Produce a self-contained model at `out`: the base model `.hfq` with `adapter`
+/// appended as a second HFQM section + a bundle trailer. The daemon auto-applies
+/// the adapter when such a model loads (see [`read_bundled_lora`]). The base is
+/// copied byte-for-byte, so the trunk's own load path is unchanged.
+pub fn merge_lora_into_model(base: &Path, adapter: &LoraAdapter, out: &Path) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    // Serialize the adapter as a standalone HFQM into a temp file, then read bytes.
+    let tmp = std::env::temp_dir().join(format!(
+        "hipfire-lora-merge-{}-{}.lora.hfq",
+        std::process::id(),
+        adapter.deltas.len()
+    ));
+    write_lora_hfq(&tmp, adapter)?;
+    let adapter_bytes =
+        std::fs::read(&tmp).map_err(|e| format!("lora-hfq: read temp section: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+
+    std::fs::copy(base, out).map_err(|e| {
+        format!(
+            "lora-hfq: copy base {} -> {}: {e}",
+            base.display(),
+            out.display()
+        )
+    })?;
+    let base_len = std::fs::metadata(out)
+        .map_err(|e| format!("lora-hfq: stat {}: {e}", out.display()))?
+        .len();
+
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(out)
+        .map_err(|e| format!("lora-hfq: open {} for append: {e}", out.display()))?;
+    f.seek(SeekFrom::End(0))
+        .map_err(|e| format!("lora-hfq: seek {}: {e}", out.display()))?;
+    f.write_all(&adapter_bytes)
+        .map_err(|e| format!("lora-hfq: append adapter section: {e}"))?;
+    let mut trailer = [0u8; LORA_BUNDLE_TRAILER_LEN as usize];
+    trailer[..8].copy_from_slice(LORA_BUNDLE_MAGIC);
+    trailer[8..].copy_from_slice(&base_len.to_le_bytes());
+    f.write_all(&trailer)
+        .map_err(|e| format!("lora-hfq: write bundle trailer: {e}"))?;
+    Ok(())
+}
+
+/// If `path` ends in a LoRA bundle trailer, return the embedded adapter section's
+/// byte offset. `Ok(None)` for a plain model with no bundled adapter.
+pub fn detect_bundled_lora_offset(path: &Path) -> std::io::Result<Option<u64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let size = f.seek(SeekFrom::End(0))?;
+    if size < LORA_BUNDLE_TRAILER_LEN {
+        return Ok(None);
+    }
+    f.seek(SeekFrom::End(-(LORA_BUNDLE_TRAILER_LEN as i64)))?;
+    let mut trailer = [0u8; LORA_BUNDLE_TRAILER_LEN as usize];
+    f.read_exact(&mut trailer)?;
+    if &trailer[..8] != LORA_BUNDLE_MAGIC {
+        return Ok(None);
+    }
+    let off = u64::from_le_bytes(trailer[8..].try_into().unwrap());
+    if off >= size - LORA_BUNDLE_TRAILER_LEN {
+        return Ok(None);
+    }
+    Ok(Some(off))
+}
+
+/// Read the adapter bundled into a merged model `.hfq`, or `Ok(None)` if `path`
+/// carries no bundle trailer.
+pub fn read_bundled_lora(path: &Path) -> Result<Option<LoraAdapter>, String> {
+    let off = detect_bundled_lora_offset(path)
+        .map_err(|e| format!("lora-hfq: probe bundle trailer of {}: {e}", path.display()))?;
+    let Some(off) = off else {
+        return Ok(None);
+    };
+    let f = HfqFile::open_at_offset(path, off)
+        .map_err(|e| format!("lora-hfq: open embedded section of {}: {e}", path.display()))?;
+    adapter_from_hfq(&f, &format!("{}@{off}", path.display())).map(Some)
 }
 
 fn rows(f: &HfqFile, name: &str, hidden: usize) -> Result<Vec<Vec<f32>>, String> {
@@ -210,6 +302,37 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(ad, back);
         assert_eq!(back.deltas.len(), 2);
+    }
+
+    #[test]
+    fn bundle_round_trips_and_leaves_base_openable() {
+        // A stand-in "base model" hfq (one small f32 tensor).
+        let pid = std::process::id();
+        let base = std::env::temp_dir().join(format!("hipfire-base-{pid}.hfq"));
+        let dummy = hipfire_runtime::hfq::HfqMemTensor {
+            name: "x".to_string(),
+            quant_type: 2,
+            shape: vec![2],
+            group_size: 0,
+            data: vec![0u8; 8],
+        };
+        hipfire_runtime::hfq::write_hfqm_package_mem(&base, 0, "{}", std::slice::from_ref(&dummy))
+            .unwrap();
+        assert!(detect_bundled_lora_offset(&base).unwrap().is_none());
+
+        let dirs = vec![unit(&[1.0, 2.0, 3.0, 4.0])];
+        let ad = abliteration_adapter("b", &dirs, SteerMode::Ablate, 0.3, 0..1).unwrap();
+        let out = std::env::temp_dir().join(format!("hipfire-merged-{pid}.hfq"));
+        merge_lora_into_model(&base, &ad, &out).unwrap();
+
+        // The trunk still opens (adapter section is past the base's payload)...
+        let trunk = hipfire_runtime::hfq::HfqFile::open(&out).unwrap();
+        assert!(trunk.find_tensor_info("x").is_some());
+        // ...and the bundled adapter round-trips.
+        let back = read_bundled_lora(&out).unwrap().unwrap();
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(ad, back);
     }
 
     #[test]

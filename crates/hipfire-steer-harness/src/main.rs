@@ -36,6 +36,11 @@ struct Args {
     apply_lora: Option<PathBuf>,
     /// When set, stack two copies of this `.lora` at +/- scale to show they sum.
     stack_demo: Option<PathBuf>,
+    /// `--merge-lora <adapter>`: bundle this adapter into `--hfq` → `--merge-out`.
+    merge_lora: Option<PathBuf>,
+    merge_out: Option<PathBuf>,
+    /// Just load `--hfq` and report bad-eval refusals + any auto-loaded adapters.
+    eval_refusals: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -51,6 +56,9 @@ fn parse_args() -> Result<Args, String> {
     let mut export_lora = None;
     let mut apply_lora = None;
     let mut stack_demo = None;
+    let mut merge_lora = None;
+    let mut merge_out = None;
+    let mut eval_refusals = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -68,6 +76,9 @@ fn parse_args() -> Result<Args, String> {
             "--export-lora" => export_lora = Some(PathBuf::from(next()?)),
             "--apply-lora" => apply_lora = Some(PathBuf::from(next()?)),
             "--stack-demo" => stack_demo = Some(PathBuf::from(next()?)),
+            "--merge-lora" => merge_lora = Some(PathBuf::from(next()?)),
+            "--merge-out" => merge_out = Some(PathBuf::from(next()?)),
+            "--eval-refusals" => eval_refusals = true,
             "--strengths" => {
                 strengths = next()?
                     .split(',')
@@ -111,6 +122,9 @@ fn parse_args() -> Result<Args, String> {
         export_lora,
         apply_lora,
         stack_demo,
+        merge_lora,
+        merge_out,
+        eval_refusals,
     })
 }
 
@@ -124,6 +138,26 @@ fn load_set(dir: &Path, name: &str, limit: usize) -> Result<Vec<Prompt>, Box<dyn
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
+
+    // Merge mode: a pure offline file op (bundle adapter into --hfq → --merge-out).
+    // No daemon, no model load, no prompt sets.
+    if let Some(adapter_path) = args.merge_lora.as_ref() {
+        let out = args
+            .merge_out
+            .as_ref()
+            .ok_or("--merge-lora requires --merge-out <merged.hfq>")?;
+        let adapter = hipfire_lora_hfq::read_lora_any(adapter_path)?;
+        hipfire_lora_hfq::merge_lora_into_model(Path::new(&args.hfq), &adapter, out)?;
+        eprintln!(
+            "merged {} + {} ({} deltas, scale {:.2}) → {}",
+            args.hfq,
+            adapter_path.display(),
+            adapter.deltas.len(),
+            adapter.scale,
+            out.display()
+        );
+        return Ok(());
+    }
 
     let good_prompts = load_set(&args.data_dir, "good_prompts.txt", args.limit)?;
     let bad_prompts = load_set(&args.data_dir, "bad_prompts.txt", args.limit)?;
@@ -175,6 +209,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(path) = args.stack_demo.as_ref() {
         let s = args.strengths.first().copied().unwrap_or(0.2);
         return stack_demo(&mut harness, &bad_eval, path, s);
+    }
+
+    // Eval-refusals: just report bad-eval refusals + any auto-loaded adapters
+    // (e.g. a `--merge-lora` model auto-applies its adapter at load).
+    if args.eval_refusals {
+        return eval_refusals(&mut harness, &bad_eval);
     }
 
     let cfg = DriverConfig {
@@ -314,6 +354,22 @@ fn apply_lora(
     println!("base (no adapter):          refusals {base_ref}/{n}");
     println!("adapter applied (default):  refusals {applied_ref}/{n}");
     println!("adapter scale=0 (≡ base):   refusals {off_ref}/{n}");
+    Ok(())
+}
+
+/// Load `--hfq` and report bad-eval refusals + any adapters the daemon auto-loaded
+/// at model load (a merged model applies its bundled adapter automatically).
+fn eval_refusals(harness: &mut DaemonHarness, bad_eval: &[Prompt]) -> Result<(), Box<dyn Error>> {
+    use hipfire_steer::driver::count_refusals;
+    let markers = DriverConfig::default_markers();
+    let loaded = harness.lora_list().unwrap_or_default();
+    let resp = harness
+        .generate(bad_eval)
+        .map_err(|e| format!("generate: {e}"))?;
+    let refusals = count_refusals(&resp, &markers);
+    println!("\n=== eval refusals ===");
+    println!("auto-loaded adapters: {loaded:?}");
+    println!("refusals: {refusals}/{}", bad_eval.len());
     Ok(())
 }
 

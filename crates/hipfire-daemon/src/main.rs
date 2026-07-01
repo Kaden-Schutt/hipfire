@@ -3165,6 +3165,34 @@ fn main() {
                                 .and_then(|w| w.mtp_layer.as_ref())
                                 .is_some();
 
+                        // Auto-apply a bundled abliteration/LoRA adapter if this
+                        // model carries one (a `--merge-lora` artifact: the adapter
+                        // HFQM section + a trailer appended to the `.hfq`). Additive
+                        // and best-effort — a plain model has no trailer, so this is
+                        // a 16-byte read + magic miss. The load arm already cleared
+                        // the steer session up top, so this seeds a fresh apply
+                        // stack that lives for the model's lifetime.
+                        match hipfire_lora_hfq::read_bundled_lora(std::path::Path::new(
+                            &m.model_path,
+                        )) {
+                            Ok(Some(adapter)) => {
+                                let (id, n) = (adapter.id.clone(), adapter.deltas.len());
+                                match hipfire_steer::load_lora_adapter(&adapter) {
+                                    Ok(()) => eprintln!(
+                                        "[hipfire-daemon] auto-applied bundled LoRA '{id}' ({n} deltas, scale {:.2})",
+                                        adapter.scale
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[hipfire-daemon] bundled LoRA '{id}' load failed: {e}"
+                                    ),
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                eprintln!("[hipfire-daemon] bundled LoRA probe failed: {e}")
+                            }
+                        }
+
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
                         // Pins the GPU at high sclk/mclk so the first `generate`
