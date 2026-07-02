@@ -17,12 +17,19 @@
 //! `mem_latency_ns` MUST be MEASURED here, never estimated — see
 //! `chip_profile.rs`'s honesty guards and the plan's Global Constraints.
 //!
+//! Issue #490: the DRAM buffer is sized PER-ARCH to >= 4x(L2+IC) via
+//! `chip_profile::pointer_chase_buffer_bytes` (the old fixed 128 MiB buffer fit
+//! inside the Infinity Cache on every IC-bearing part, so its "DRAM" latency
+//! was cache-deflated). A deliberately cache-resident reference chase plus
+//! `chip_profile::check_residency` proves the DRAM-sized chase actually left
+//! cache before any latency is shipped.
+//!
 //! GPU-required (no meaningful no-GPU mode — the whole point is a live
 //! device-side measurement). Usage:
 //!   HIP_VISIBLE_DEVICES=0 cargo run -p rdna-compute --example pointer_chase_latency
 
 use rdna_compute::profiler::GpuCapability;
-use rdna_compute::{profile, Gpu, KernelCompiler};
+use rdna_compute::{chip_profile, profile, Gpu, KernelCompiler};
 use std::ffi::c_void;
 
 /// Bytes per pointer-chase entry. One index per cache line so consecutive
@@ -31,18 +38,14 @@ use std::ffi::c_void;
 const STRIDE_BYTES: usize = 64;
 const STRIDE_WORDS: u32 = (STRIDE_BYTES / 4) as u32;
 
-/// Total buffer size. Must exceed L2 + Infinity Cache combined (gfx1201:
-/// 4 MiB + 64 MiB = 68 MiB per `profiler.rs::arch_spec`) with margin, so
-/// every hop is a genuine DRAM round trip rather than an on-chip cache hit.
-/// 128 MiB clears that with ~2x headroom and comfortably satisfies the
-/// plan's "≥ 64 MiB" floor.
-const BUFFER_BYTES: usize = 128 * 1024 * 1024;
-const NUM_ENTRIES: usize = BUFFER_BYTES / STRIDE_BYTES;
+/// Cache-resident reference buffer for the residency guard (issue #490).
+/// 512 KiB fits inside the smallest L2 on any supported RDNA arch, so its
+/// pointer-chase latency is an unambiguous CACHE-hit reference.
+const CACHE_RESIDENT_BYTES: usize = 512 * 1024;
 
-/// Total dependent-load hops for the timed run. `NUM_ENTRIES` is a single
-/// Sattolo cycle, so `2 * NUM_ENTRIES` walks it twice — comfortably above
-/// the plan's "≥ 2^20 hops" floor and averages out launch/timer overhead.
-const HOPS: u32 = (NUM_ENTRIES * 2) as u32;
+/// Minimum ratio by which the DRAM-sized chase must exceed the cache-resident
+/// chase to count as genuinely DRAM-resident.
+const RESIDENCY_MIN_RATIO: f64 = 1.5;
 
 /// Small throwaway pass before the timed one — warms DPM/clocks and page
 /// mappings so the timed run isn't paying first-touch tax (same rationale
@@ -119,21 +122,22 @@ fn main() {
     });
     println!("arch: {}", gpu.arch);
 
-    // Build the single-cycle permutation (host side, deterministic seed).
-    let mut perm: Vec<u32> = (0..NUM_ENTRIES as u32).collect();
-    sattolo_shuffle(&mut perm, PERMUTATION_SEED);
+    let vram_bytes = gpu
+        .hip
+        .get_vram_info()
+        .map(|(_, total)| total as u64)
+        .unwrap_or(0);
+    let cap = GpuCapability::detect(&gpu.arch, vram_bytes);
 
-    // Pack one index per cache-line-sized slot.
-    let mut host_buf = vec![0u32; NUM_ENTRIES * STRIDE_WORDS as usize];
-    for (i, &next) in perm.iter().enumerate() {
-        host_buf[i * STRIDE_WORDS as usize] = next;
-    }
-    let host_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(host_buf.as_ptr() as *const u8, BUFFER_BYTES) };
+    // Per-arch DRAM-resident buffer size (issue #490): >= 4x(L2+IC).
+    let dram_bytes = chip_profile::pointer_chase_buffer_bytes(&gpu.arch);
+    let onchip_mib = cap.l2_cache_mb + cap.infinity_cache_mb;
+    println!(
+        "onchip_cache_mib (L2+IC): {onchip_mib:.1}  dram_buffer_mib: {}  cache_ref_kib: {}",
+        dram_bytes / (1024 * 1024),
+        CACHE_RESIDENT_BYTES / 1024
+    );
 
-    // Compile + load the kernel. A private KernelCompiler (rather than
-    // reaching into `Gpu`'s internal one, which is pub(crate)) — this
-    // example never dispatches through the Gpu kernel tables.
     let mut compiler = KernelCompiler::new(&gpu.arch, String::new()).unwrap_or_else(|e| {
         eprintln!("KernelCompiler::new failed: {e}");
         std::process::exit(1);
@@ -154,91 +158,97 @@ fn main() {
         .module_get_function(&module, "pointer_chase")
         .expect("module_get_function(pointer_chase) failed");
 
-    // Upload the permutation buffer.
-    let d_buf = gpu.hip.malloc(BUFFER_BYTES).expect("malloc(buf) failed");
-    gpu.hip
-        .memcpy_htod(&d_buf, host_bytes)
-        .expect("memcpy_htod(buf) failed");
-    let d_out = gpu
-        .hip
-        .malloc(std::mem::size_of::<u64>())
-        .expect("malloc(out) failed");
+    let measure = |buffer_bytes: usize| -> f64 {
+        let num_entries = buffer_bytes / STRIDE_BYTES;
+        let hops: u32 = (num_entries * 2) as u32;
 
-    let launch = |hops: u32| {
-        let mut d_buf_ptr = d_buf.as_ptr();
-        let mut start_val: u32 = 0;
-        let mut hops_val: u32 = hops;
-        let mut stride_val: u32 = STRIDE_WORDS;
-        let mut d_out_ptr = d_out.as_ptr();
-        let mut params: Vec<*mut c_void> = vec![
-            &mut d_buf_ptr as *mut _ as *mut c_void,
-            &mut start_val as *mut _ as *mut c_void,
-            &mut hops_val as *mut _ as *mut c_void,
-            &mut stride_val as *mut _ as *mut c_void,
-            &mut d_out_ptr as *mut _ as *mut c_void,
-        ];
-        unsafe {
-            gpu.hip
-                .launch_kernel(&func, [1, 1, 1], [1, 1, 1], 0, None, &mut params)
-                .expect("kernel launch failed");
+        let mut perm: Vec<u32> = (0..num_entries as u32).collect();
+        sattolo_shuffle(&mut perm, PERMUTATION_SEED);
+        let mut host_buf = vec![0u32; num_entries * STRIDE_WORDS as usize];
+        for (i, &next) in perm.iter().enumerate() {
+            host_buf[i * STRIDE_WORDS as usize] = next;
         }
+        let host_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(host_buf.as_ptr() as *const u8, buffer_bytes) };
+
+        let d_buf = gpu.hip.malloc(buffer_bytes).expect("malloc(buf) failed");
+        gpu.hip
+            .memcpy_htod(&d_buf, host_bytes)
+            .expect("memcpy_htod(buf) failed");
+        let d_out = gpu
+            .hip
+            .malloc(std::mem::size_of::<u64>())
+            .expect("malloc(out) failed");
+
+        let launch = |hops: u32| {
+            let mut d_buf_ptr = d_buf.as_ptr();
+            let mut start_val: u32 = 0;
+            let mut hops_val: u32 = hops;
+            let mut stride_val: u32 = STRIDE_WORDS;
+            let mut d_out_ptr = d_out.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut d_buf_ptr as *mut _ as *mut c_void,
+                &mut start_val as *mut _ as *mut c_void,
+                &mut hops_val as *mut _ as *mut c_void,
+                &mut stride_val as *mut _ as *mut c_void,
+                &mut d_out_ptr as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                gpu.hip
+                    .launch_kernel(&func, [1, 1, 1], [1, 1, 1], 0, None, &mut params)
+                    .expect("kernel launch failed");
+            }
+        };
+
+        launch(WARMUP_HOPS);
+        gpu.hip
+            .device_synchronize()
+            .expect("device_synchronize (warmup) failed");
+
+        profile::start();
+        let timer = profile::begin_timer(&gpu.hip, "pointer_chase", "pointer_chase", buffer_bytes);
+        launch(hops);
+        profile::end_timer(&gpu.hip, timer).expect("end_timer failed");
+        let entries = profile::stop().unwrap_or_default();
+        let elapsed_us = entries
+            .last()
+            .map(|e| e.time_us)
+            .expect("no profile entry recorded — begin_timer/end_timer mismatch");
+
+        let mut out_bytes = [0u8; 8];
+        gpu.hip
+            .memcpy_dtoh(&mut out_bytes, &d_out)
+            .expect("memcpy_dtoh(out) failed");
+        std::hint::black_box(u64::from_ne_bytes(out_bytes));
+
+        gpu.hip.free(d_buf).expect("free(buf) failed");
+        gpu.hip.free(d_out).expect("free(out) failed");
+
+        elapsed_us * 1000.0 / hops as f64
     };
 
-    // Warm-up pass (untimed): primes DPM/clocks + page mappings.
-    launch(WARMUP_HOPS);
-    gpu.hip
-        .device_synchronize()
-        .expect("device_synchronize (warmup) failed");
+    let cache_ns = measure(CACHE_RESIDENT_BYTES);
+    let dram_ns = measure(dram_bytes);
 
-    // Timed pass — reuses the hipEvent timer pattern from profile.rs.
-    profile::start();
-    let timer = profile::begin_timer(&gpu.hip, "pointer_chase", "pointer_chase", BUFFER_BYTES);
-    launch(HOPS);
-    profile::end_timer(&gpu.hip, timer).expect("end_timer failed");
-    let entries = profile::stop().unwrap_or_default();
-    let elapsed_us = entries
-        .last()
-        .map(|e| e.time_us)
-        .expect("no profile entry recorded — begin_timer/end_timer mismatch");
+    println!("cache_resident_latency_ns: {cache_ns:.3}");
+    println!("mem_latency_ns: {dram_ns:.3}");
+    println!(
+        "dram_over_cache_ratio: {:.3} (guard requires >= {RESIDENCY_MIN_RATIO})",
+        dram_ns / cache_ns
+    );
 
-    let mut out_bytes = [0u8; 8];
-    gpu.hip
-        .memcpy_dtoh(&mut out_bytes, &d_out)
-        .expect("memcpy_dtoh(out) failed");
-    let final_idx = u64::from_ne_bytes(out_bytes);
+    chip_profile::check_residency(cache_ns, dram_ns, RESIDENCY_MIN_RATIO).unwrap_or_else(|e| {
+        eprintln!("RESIDENCY GUARD FAILED (mem_latency WITHHELD, not shipped): {e}");
+        std::process::exit(1);
+    });
 
-    gpu.hip.free(d_buf).expect("free(buf) failed");
-    gpu.hip.free(d_out).expect("free(out) failed");
-
-    let elapsed_ns = elapsed_us * 1000.0;
-    let hops = HOPS as f64;
-    let mem_latency_ns = elapsed_ns / hops;
-
-    let vram_bytes = gpu
-        .hip
-        .get_vram_info()
-        .map(|(_, total)| total as u64)
-        .unwrap_or(0);
-    let cap = GpuCapability::detect(&gpu.arch, vram_bytes);
     let sclk_mhz = cap.boost_clock_mhz;
-    // MHz == cycles/us, so ns * (cycles/us) / 1000 == cycles.
-    let mem_latency_cycles = mem_latency_ns * sclk_mhz as f64 / 1000.0;
-
-    println!("buffer_bytes: {BUFFER_BYTES}");
-    println!("num_entries: {NUM_ENTRIES}");
-    println!("hops: {HOPS}");
-    println!("elapsed_us: {elapsed_us:.3}");
+    let mem_latency_cycles = dram_ns * sclk_mhz as f64 / 1000.0;
     println!("sclk_mhz: {sclk_mhz}");
-    println!("final_idx (sink, ignore value): {final_idx}");
-    println!("mem_latency_ns: {mem_latency_ns:.3}");
     println!("mem_latency_cycles: {mem_latency_cycles:.2}");
 
-    // Step 3 sanity assert: fails loud on a broken measurement (e.g. the
-    // buffer actually fitting in cache, or a stuck/near-zero timer).
     assert!(
-        (50.0..2000.0).contains(&mem_latency_ns),
-        "mem_latency_ns={mem_latency_ns:.3} outside plausible DRAM-latency bound \
-         [50, 2000) ns — buffer may be fitting in cache, or the timer/permutation \
-         is broken"
+        (50.0..2000.0).contains(&dram_ns),
+        "mem_latency_ns={dram_ns:.3} outside plausible DRAM-latency bound [50, 2000) ns"
     );
 }
