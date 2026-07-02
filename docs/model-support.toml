@@ -193,6 +193,24 @@ weight_bits = 3
 act_bits = 16
 status = "experimental"
 
+# ── QTIP + Opus family (first-class registration) ─────────────────────────────
+# The catalog is ROUTE-ENFORCED: quant_catalog_matches_derived_gemv_routes (in
+# hipfire-runtime, run by no-gpu-ci) panics if a catalogued quant has no DType and
+# asserts a working GEMV route for stable/opt-in. So a format is registered here
+# only once it has a real DType + decode route.
+#   - qtip3: served (qwen3.5 decode, gemv_qtip3g256) — registered below.
+#   - oq3 / oq6 / qtip4: bytes reserved in QuantType (38/40/42); they register here
+#     when their DType + loader + kernel land (P2 serving) — the route test gates it.
+#   - op2 / qtip2 (2-bit): NOT registered — quality-marginal, mixed-precision-tail
+#     only, worth building only if >10% of that tail suits 2-bit. Bytes 39/41.
+
+[[quant]]
+name = "qtip3"
+label = "QTIP-3 (W3A16 trellis decode)"
+weight_bits = 3
+act_bits = 16
+status = "opt-in"
+
 # ── Intentional (arch × quant × feature) gates ─────────────────────────────────
 # Overrides an arch-level capability for a specific quant. The per-quant axis the
 # arch matrix can't express: e.g. qwen3.5 prefill is `full`, but W4A4 prefill is

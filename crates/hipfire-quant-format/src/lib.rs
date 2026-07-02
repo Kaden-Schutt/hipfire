@@ -119,6 +119,19 @@ pub enum QuantType {
     /// free Opus-family slot. 3-bit is only viable atop the SpinQuant learned
     /// rotation (see the W3A4 / SpinQuant memory notes).
     Oq3G256 = 38,
+    /// Opus Quant W2 — symmetric signed-INT2, FWHT-rotated, per-group f32 scale.
+    /// Family completion; codec/loader/kernel pending. 2-bit is quality-marginal
+    /// (see project_lowbit_quant_findings) — mixed-precision / heavy-treatment only.
+    Oq2G256 = 39,
+    /// Opus Quant W6 — symmetric signed-INT6, FWHT-rotated. Family completion; the
+    /// near-lossless mid-tier between Oq4 and Oq8. Codec/loader/kernel pending.
+    Oq6G256 = 40,
+    /// QTIP W2 — trellis-coded 2-bit, FWHT-rotated (bit-parametric sibling of
+    /// [`QuantType::Qtip3G256`]). Codec/kernel pending.
+    Qtip2G256 = 41,
+    /// QTIP W4 — trellis-coded 4-bit, FWHT-rotated (bit-parametric sibling of
+    /// [`QuantType::Qtip3G256`]). Codec/kernel pending.
+    Qtip4G256 = 42,
 }
 
 impl QuantType {
@@ -167,6 +180,10 @@ impl QuantType {
             36 => OqPlusCompact,
             37 => Oq4G256ArchPacked,
             38 => Oq3G256,
+            39 => Oq2G256,
+            40 => Oq6G256,
+            41 => Qtip2G256,
+            42 => Qtip4G256,
             _ => return None,
         })
     }
@@ -201,5 +218,9 @@ mod tests {
         assert_eq!(QuantType::OqPlusCompact.code(), 36);
         assert_eq!(QuantType::Oq4G256ArchPacked.code(), 37);
         assert_eq!(QuantType::Oq3G256.code(), 38);
+        assert_eq!(QuantType::Oq2G256.code(), 39);
+        assert_eq!(QuantType::Oq6G256.code(), 40);
+        assert_eq!(QuantType::Qtip2G256.code(), 41);
+        assert_eq!(QuantType::Qtip4G256.code(), 42);
     }
 }
