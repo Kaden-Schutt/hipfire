@@ -26,7 +26,7 @@
 //! pre-scale baked into `q_norm` (see `load_weights`).
 
 use hip_bridge::{DeviceBuffer, HipResult};
-use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat};
+use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;
@@ -404,6 +404,31 @@ pub fn embed_token(
     Ok(())
 }
 
+/// Prefill linear for the batched gemma3 path. Routes Q8_0 weights through the
+/// no-LDS WMMA kernel (`gemm_q8_0_wmma`, ~11–30× over the scalar
+/// `gemm_q8_0_batched` that `weight_gemm`'s chunked driver otherwise selects on
+/// non-RDNA4 arches) whenever the GPU has w32 WMMA (RDNA3/3.5/4) and `K % 32 ==
+/// 0`; anything else falls back to the generic `weight_gemm` dispatch. Preserves
+/// the imatrix/Hessian activation tap `weight_gemm` performs so batched
+/// calibration still works on gemma3. Portability: RDNA2 (no WMMA) stays on the
+/// scalar path via the fallback, and the kernel is register-tiled (no LDS), so
+/// it is safe on the gfx1103 LDS-fault class.
+fn prefill_linear(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+) -> HipResult<()> {
+    if w.gpu_dtype == DType::Q8_0 && gpu.arch_caps.has_wmma_w32() && w.k % 32 == 0 {
+        // Mirror `weight_gemm`'s batched calibration tap before dispatch.
+        gpu.maybe_capture_activation(&w.buf, x, m, w.k);
+        gpu.gemm_q8_0_wmma(&w.buf, x, y, w.m, w.k, m)
+    } else {
+        weight_gemm(gpu, w, x, y, m)
+    }
+}
+
 /// Batched prefill of `m` already-embedded tokens. `x_batch` is `[m, dim]`
 /// row-major — the caller embeds text tokens (×`embed_scale`) and splices image
 /// rows (unscaled) just like the per-token path. Writes KV for absolute
@@ -457,9 +482,9 @@ pub fn forward_prefill_batch(
 
         // ── Attention block ──
         gpu.rmsnorm_batched(x_batch, &layer.input_norm, &tmp, m, dim, eps)?;
-        weight_gemm(gpu, &layer.wq, &tmp, &q, m)?;
-        weight_gemm(gpu, &layer.wk, &tmp, &k, m)?;
-        weight_gemm(gpu, &layer.wv, &tmp, &v, m)?;
+        prefill_linear(gpu, &layer.wq, &tmp, &q, m)?;
+        prefill_linear(gpu, &layer.wk, &tmp, &k, m)?;
+        prefill_linear(gpu, &layer.wv, &tmp, &v, m)?;
 
         // Per-head QK-norm (q_norm carries the baked Q pre-scale): m*heads groups.
         gpu.rmsnorm_batched(&q, &layer.q_norm, &q, m * n_heads, head_dim, eps)?;
@@ -524,16 +549,16 @@ pub fn forward_prefill_batch(
             )?;
         }
 
-        weight_gemm(gpu, &layer.wo, &attn_out, &o, m)?;
+        prefill_linear(gpu, &layer.wo, &attn_out, &o, m)?;
         gpu.rmsnorm_batched(&o, &layer.post_attn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(x_batch, &tmp, x_batch)?;
 
         // ── FFN block (GeGLU) ──
         gpu.rmsnorm_batched(x_batch, &layer.pre_ffn_norm, &tmp, m, dim, eps)?;
-        weight_gemm(gpu, &layer.w_gate, &tmp, &gate, m)?;
-        weight_gemm(gpu, &layer.w_up, &tmp, &up, m)?;
+        prefill_linear(gpu, &layer.w_gate, &tmp, &gate, m)?;
+        prefill_linear(gpu, &layer.w_up, &tmp, &up, m)?;
         gpu.gelu_mul_f32(&gate, &up, &ffn)?;
-        weight_gemm(gpu, &layer.w_down, &ffn, &o, m)?;
+        prefill_linear(gpu, &layer.w_down, &ffn, &o, m)?;
         // H-Neurons CETT tap (no-op unless a capture session is active). `o` holds
         // the raw down_proj output here — the residual add below folds
         // post_ffn_norm(o), so both down_proj input (`ffn`) and output (`o`) stay
