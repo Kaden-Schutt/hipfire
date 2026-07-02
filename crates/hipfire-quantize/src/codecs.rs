@@ -709,6 +709,89 @@ pub fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) ->
     out
 }
 
+/// Opus-Quant W3A4 weight codec (Oq3G256) — the symmetric-INT3 analog of
+/// [`quantize_oq4g256`], the memory-ceiling lever (25% less weight traffic than
+/// int4). Per 256-group block = `[f16 scale][8 × (3 u32 bit-planes)]` = 98 B/group
+/// (3.0625 b/w). FWHT-256 rotated (3-bit NEEDS the rotation to be usable), symmetric
+/// clip-searched scale, `q in [-3, 3]` (symmetric signed 3-bit — avoids the
+/// asymmetric −4 endpoint, matching Oq4's `[-7,7]` convention). Storage is **bit-
+/// plane**: each 32-weight sub-block → 3 u32 (plane b = OR of bit-b of each signed
+/// two's-complement value at position i), the EXACT layout the tuned W3A4 iu4 GEMM /
+/// W3 decode GEMV consume (bit-plane + cheap Morton spread-to-int4 unpack; see
+/// memory `reference_gfx1151_w3a4_gemm`). Dequant: reconstruct 3-bit two's-complement
+/// per position, `scale · sext3`, inverse FWHT. NB: 3-bit is only viable with the
+/// SpinQuant learned rotation on top of the FWHT (`project_spinquant_w4a4`); the
+/// FWHT here is the fixed-rotation floor.
+pub(crate) fn quantize_oq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 98usize); // 2 (f16 scale) + 8×3 u32 bit-planes
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 3.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for s in 0..8 {
+            let (mut p0, mut p1, mut p2) = (0u32, 0u32, 0u32);
+            for i in 0..32 {
+                let q = (group[s * 32 + i] * inv).round().clamp(-3.0, 3.0) as i8;
+                let u = (q as u8) & 7; // 3-bit two's-complement
+                p0 |= ((u & 1) as u32) << i;
+                p1 |= (((u >> 1) & 1) as u32) << i;
+                p2 |= (((u >> 2) & 1) as u32) << i;
+            }
+            let bo = out_off + 2 + s * 12;
+            output[bo..bo + 4].copy_from_slice(&p0.to_le_bytes());
+            output[bo + 4..bo + 8].copy_from_slice(&p1.to_le_bytes());
+            output[bo + 8..bo + 12].copy_from_slice(&p2.to_le_bytes());
+        }
+    }
+    output
+}
+
+/// Dequantize OQ3G256 (round-trip oracle for the Opus W3 codec / tests).
+/// `[f16 scale][8 × (3 u32 bit-planes)]` per 256-group → reconstruct signed 3-bit
+/// two's-complement `scale·sext3`, inverse FWHT. Test-only oracle (gated on
+/// `cfg(test)` so non-test builds don't compile it as dead code).
+#[cfg(test)]
+pub(crate) fn dequant_oq3g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let (group_size, block_bytes) = (256usize, 98usize);
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; 256];
+        for s in 0..8 {
+            let bo = off + 2 + s * 12;
+            let p0 = u32::from_le_bytes([data[bo], data[bo + 1], data[bo + 2], data[bo + 3]]);
+            let p1 = u32::from_le_bytes([data[bo + 4], data[bo + 5], data[bo + 6], data[bo + 7]]);
+            let p2 = u32::from_le_bytes([data[bo + 8], data[bo + 9], data[bo + 10], data[bo + 11]]);
+            for i in 0..32 {
+                let wv = ((p0 >> i) & 1) | (((p1 >> i) & 1) << 1) | (((p2 >> i) & 1) << 2);
+                let signed = if wv > 3 { wv as i32 - 8 } else { wv as i32 };
+                grp[s * 32 + i] = scale * signed as f32;
+            }
+        }
+        // inverse FWHT (forward with signs swapped)
+        cpu_fwht_256(&mut grp, signs2, signs1);
+        out.extend_from_slice(&grp);
+    }
+    out.truncate(n);
+    out
+}
+
 /// Opus-Quant W8A8 weight codec (Oq8G256). Per 256-group block =
 /// `[f16 scale][256 signed int8]` = 258 B/group (8.0625 b/w). FWHT-256 rotated,
 /// symmetric clip-searched scale, `q in [-127, 127]` (signed 8-bit, avoid -128 to

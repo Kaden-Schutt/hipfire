@@ -3388,6 +3388,7 @@ enum HfqInputFormat {
     Mq6,
     Mq3,
     Qtip3,
+    Oq3,
     Oq4,
     OqPlus,
     OqPlusTiered,
@@ -3408,6 +3409,7 @@ impl HfqInputFormat {
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
+            "op3" | "op3g256" | "oq3" | "oq3g256" => Some(Self::Oq3),
             "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4+"
             | "oq4++" | "oq4g256" => Some(Self::Oq4),
             "opplus" | "op4-plus" => Some(Self::OqPlus),
@@ -3585,6 +3587,64 @@ fn quantize_hfq_source_tensor(
                 256,
                 "MQ3G256",
             )
+        }
+        HfqInputFormat::Oq3 => {
+            // Opus Quant W3A4 — symmetric signed-int3, FWHT-256, bit-plane packed
+            // (Oq3G256, 98 B/group). Requires 256-aligned K; ragged dims fall back to
+            // Q8. Shares the Oq4 calibration machinery: `--ldlq` (full-Hessian OBS
+            // error-feedback, `oq3++`) takes precedence, else `--awq` SmoothQuant
+            // (`oq3+`), else plain RTN+FWHT (`oq3`). At 3 bits the ±3 grid is coarse,
+            // so error feedback matters MORE than at int4. 3-bit is meant to ride the
+            // SpinQuant learned rotation — see the W3A4 memory note.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            let m_dim = shape[0] as usize;
+            let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
+                let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
+                // Optional AWQ composition (same as oq4): fold W·diag(s) and rebase
+                // H' = diag(1/s) H diag(1/s) so OBS minimizes the SMOOTHED output error.
+                let awq_scales = awq_scales_for(name);
+                let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
+                    let mut scaled = f32_data.clone();
+                    awq_pre_scale_weights(&mut scaled, m_dim, k, s);
+                    for i in 0..k {
+                        let si = s[i] as f64;
+                        for j in 0..k {
+                            h[i * k + j] = (h[i * k + j] as f64 / (si * s[j] as f64)) as f32;
+                        }
+                    }
+                    std::borrow::Cow::Owned(scaled)
+                } else {
+                    std::borrow::Cow::Borrowed(&f32_data[..])
+                };
+                let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                let out = ldlq::oq3_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
+                if out.is_some() {
+                    ldlq_record_success();
+                    if let Some(s) = awq_scales {
+                        OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
+                        eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int3 + smooth");
+                    } else {
+                        eprintln!("  ldlq: {name} [{m_dim}x{k}] OBS error-feedback int3");
+                    }
+                } else {
+                    ldlq_record_pack_failed(name);
+                }
+                out
+            });
+            let q = if let Some(q) = ldlq_q {
+                q
+            } else if let Some(scales) = awq_scales_for(name) {
+                let mut scaled = f32_data.clone();
+                awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                quantize_oq3g256(&scaled, &signs1, &signs2)
+            } else {
+                quantize_oq3g256(&f32_data, &signs1, &signs2)
+            };
+            (q, QuantType::Oq3G256, 256, "OQ3G256")
         }
         HfqInputFormat::Oq4 | HfqInputFormat::OqPlus => {
             // Opus Quant W4A4 (Oq4) / OQ+ Opus Plus W4A8 (OqPlus). IDENTICAL weight
@@ -13935,6 +13995,7 @@ mod codec_golden {
             &quantize_mq8g256_clipsearch(&x, &s1, &s2),
         );
         h("oq4g256", &quantize_oq4g256(&x, &s1, &s2));
+        h("oq3g256", &quantize_oq3g256(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
         h("mq3g256", &quantize_mq3g256(&x, &s1, &s2));
@@ -13980,6 +14041,7 @@ mod codec_golden {
         ("mq2g256_clipsearch", "a95cdd8e7672e915"),
         ("mq8g256_clipsearch", "8987f0aa7fdfb487"),
         ("oq4g256", "fceec61d1cb735b3"),
+        ("oq3g256", "2e40f019fba65028"),
         ("mq6g256", "c43cbf518aae87fe"),
         ("mq8g256", "8987f0aa7fdfb487"),
         ("mq3g256", "0c2f928a4236cf57"),
@@ -14079,6 +14141,48 @@ mod codec_golden {
         eprintln!("mq4 SQNR={m:.2} dB  oq4 SQNR={o:.2} dB");
         assert!(o > 8.0, "oq4 SQNR {o:.2} dB too low (broken codec?)");
         assert!(o > m - 3.0, "oq4 {o:.2} dB >3 dB worse than mq4 {m:.2} dB");
+    }
+
+    /// Opus OQ3 (symmetric signed-int3, bit-plane) must round-trip coherently on
+    /// FWHT-rotated weights: well below Oq4 (one fewer bit ≈ −6 dB) but far above
+    /// noise, proving the bit-plane pack + 3-bit two's-complement sext are correct.
+    #[test]
+    fn oq3_roundtrip_below_oq4_above_noise() {
+        let x = det_input(1024, 5);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq3 = dequant_oq3g256(&quantize_oq3g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let sqnr = |rec: &[f32]| -> f64 {
+            let (mut sig, mut noise) = (0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(rec) {
+                sig += (a as f64).powi(2);
+                noise += ((a - b) as f64).powi(2);
+            }
+            10.0 * (sig / noise.max(1e-30)).log10()
+        };
+        let (o3, o4) = (sqnr(&oq3), sqnr(&oq4));
+        eprintln!(
+            "oq3 SQNR={o3:.2} dB  oq4 SQNR={o4:.2} dB  ({:.1} dB)",
+            o3 - o4
+        );
+        assert!(
+            o3 > 4.0,
+            "oq3 SQNR {o3:.2} dB too low (broken bit-plane/sext?)"
+        );
+        assert!(
+            o3 < o4,
+            "oq3 {o3:.2} dB should be below oq4 {o4:.2} dB (one fewer bit)"
+        );
+    }
+
+    /// Oq3 on-disk block is exactly 98 B per 256-group (3.0625 b/w): [f16][8×3 u32].
+    #[test]
+    fn oq3_block_size_is_98_bytes() {
+        let x = det_input(256, 7);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        assert_eq!(quantize_oq3g256(&x, &s1, &s2).len(), 98);
     }
 
     /// W8A8 weight codec (Oq8G256) is near-lossless and far better than the W4A4

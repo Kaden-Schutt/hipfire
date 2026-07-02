@@ -356,6 +356,131 @@ pub fn oq4_ldlq_pack(
     Some(out)
 }
 
+/// Opus W3A4 (oq3) LDLQ: Hessian error-feedback **symmetric int3** weight quant,
+/// emitting the SAME bit-plane `[f16 scale][8×(3 u32)]` per-256-group layout as
+/// `codecs::quantize_oq3g256` (98 B/group = 3.0625 b/w), but with GPTQ/OBS error
+/// feedback the plain RTN codec lacks. At 3 bits the quant grid is coarse (±3), so
+/// error feedback matters MORE than at int4 — this is the calibrated `oq3++` packer.
+///
+/// Same machinery as [`oq4_ldlq_pack`]: FWHT-rotate H + W into the incoherent domain
+/// (oq3 stores PRE-rotated weights, so the packed output stays rotated — no
+/// un-rotate), `L` with `LLᵀ=(H_rot+λI)⁻¹`, then for each 256-column block in order,
+/// per row: clip-search scale + round the OBS-adjusted residual to signed int3
+/// `[-3,3]`, bit-plane pack, and propagate `(w−ŵ)/L[c,c]` to all later columns. Only
+/// the inner quant range + packing differ from `oq4_ldlq_pack`. `None` on Cholesky
+/// breakdown → caller falls back to plain `quantize_oq3g256`.
+pub fn oq3_ldlq_pack(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    h_rowmajor_f32: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    damp: f64,
+) -> Option<Vec<u8>> {
+    use rayon::prelude::*;
+    assert_eq!(weights_f32.len(), m * k);
+    assert_eq!(h_rowmajor_f32.len(), k * k);
+    assert_eq!(k % 256, 0, "oq3_ldlq_pack requires k % 256 == 0");
+
+    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
+    rotate_hessian(&mut h, k, signs1, signs2);
+    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+
+    let nb = k / 256;
+    let mut residual = vec![0.0f64; m * k];
+    residual
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(row, rr)| {
+            let base = row * k;
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = weights_f32[base + b * 256 + c];
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    rr[b * 256 + c] = buf[c] as f64;
+                }
+            }
+        });
+
+    const BLOCK_BYTES: usize = 98; // 2 (f16 scale) + 8×3 u32 bit-planes
+    let mut out = vec![0u8; m * nb * BLOCK_BYTES];
+
+    for blk in 0..nb {
+        let c0 = blk * 256;
+        let c1 = c0 + 256;
+        let results: Vec<(Vec<f64>, [u8; BLOCK_BYTES])> = residual
+            .par_chunks(k)
+            .map(|rr_row| {
+                let mut grp = [0.0f32; 256];
+                for (c, g) in grp.iter_mut().enumerate() {
+                    *g = rr_row[c0 + c] as f32;
+                }
+                let scale = crate::codecs::symmetric_clipsearch(&grp, 3.0);
+                let inv = 1.0 / scale;
+                let mut block = [0u8; BLOCK_BYTES];
+                let s16 = crate::f32_to_f16(scale);
+                block[0] = (s16 & 0xFF) as u8;
+                block[1] = (s16 >> 8) as u8;
+                let mut err = vec![0.0f64; 256];
+                for s in 0..8 {
+                    let (mut p0, mut p1, mut p2) = (0u32, 0u32, 0u32);
+                    for i in 0..32 {
+                        let idx = s * 32 + i;
+                        let q = (grp[idx] * inv).round().clamp(-3.0, 3.0);
+                        let u = (q as i8 as u8) & 7; // 3-bit two's-complement
+                        p0 |= ((u & 1) as u32) << i;
+                        p1 |= (((u >> 1) & 1) as u32) << i;
+                        p2 |= (((u >> 2) & 1) as u32) << i;
+                        let col = c0 + idx;
+                        let ucc = l[(col, col)];
+                        err[idx] = if ucc > 0.0 {
+                            (grp[idx] as f64 - (q * scale) as f64) / ucc
+                        } else {
+                            0.0
+                        };
+                    }
+                    let bo = 2 + s * 12;
+                    block[bo..bo + 4].copy_from_slice(&p0.to_le_bytes());
+                    block[bo + 4..bo + 8].copy_from_slice(&p1.to_le_bytes());
+                    block[bo + 8..bo + 12].copy_from_slice(&p2.to_le_bytes());
+                }
+                (err, block)
+            })
+            .collect();
+
+        for (row, (_, block)) in results.iter().enumerate() {
+            let off = (row * nb + blk) * BLOCK_BYTES;
+            out[off..off + BLOCK_BYTES].copy_from_slice(block);
+        }
+
+        if c1 < k {
+            residual
+                .par_chunks_mut(k)
+                .zip(results.par_iter())
+                .for_each(|(rr, (err, _))| {
+                    for (c, &ec) in err.iter().enumerate() {
+                        if ec == 0.0 {
+                            continue;
+                        }
+                        let col = c0 + c;
+                        for f in c1..k {
+                            let usf = l[(f, col)];
+                            if usf != 0.0 {
+                                rr[f] -= ec * usf;
+                            }
+                        }
+                    }
+                });
+        }
+    }
+
+    Some(out)
+}
+
 /// Opus W8A8 (oq8) LDLQ: Hessian error-feedback symmetric int8 weight quant,
 /// emitting the same `[f16 scale][256 signed int8]` per-256-group layout as
 /// `codecs::quantize_oq8g256`. This is the calibrated `op8+` packer: FWHT-rotate
@@ -876,6 +1001,81 @@ mod tests {
         let (eh, ei) = (out_err(&deq_h), out_err(&deq_i));
         eprintln!(
             "qtip2-ldlq output-err: H-OBS={eh:.4} no-fb={ei:.4} ratio={:.3}",
+            eh / ei
+        );
+        assert!(eh < ei, "OBS feedback must beat no-feedback: {eh} !< {ei}");
+    }
+
+    /// The int3 packer's OBS feedback (real H) must reduce the H-weighted *output*
+    /// error vs no feedback (identity H) on column-correlated weights — the same
+    /// LDLQ claim as the QTIP path, for the coarse ±3 grid where it matters most.
+    /// Round-trips through the codec's `dequant_oq3g256` oracle (bit-plane decode).
+    #[test]
+    fn oq3_ldlq_obs_beats_no_feedback() {
+        let (m, k) = (512usize, 512usize);
+        let mut rng = Lcg(0x2468);
+        let mut w = vec![0.0f32; m * k];
+        for row in 0..m {
+            let mut prev = 0.0f64;
+            for c in 0..k {
+                prev = 0.85 * prev + rng.next(); // AR(1) across columns
+                w[row * k + c] = prev as f32;
+            }
+        }
+        // H = (1/m) Σ w_rowᵀ w_row + ridge.
+        let mut h = vec![0.0f32; k * k];
+        for row in 0..m {
+            let base = row * k;
+            for i in 0..k {
+                let wi = w[base + i];
+                if wi == 0.0 {
+                    continue;
+                }
+                for j in 0..k {
+                    h[i * k + j] += wi * w[base + j];
+                }
+            }
+        }
+        for v in h.iter_mut() {
+            *v /= m as f32;
+        }
+        for i in 0..k {
+            h[i * k + i] += 1e-2;
+        }
+        let ident: Vec<f32> = (0..k * k)
+            .map(|x| if x / k == x % k { 1.0 } else { 0.0 })
+            .collect();
+        let s1 = crate::gen_fwht_signs(42, 256);
+        let s2 = crate::gen_fwht_signs(1042, 256);
+
+        let pk_h = oq3_ldlq_pack(&w, m, k, &h, &s1, &s2, 1e-2).expect("oq3 ldlq H");
+        let pk_i = oq3_ldlq_pack(&w, m, k, &ident, &s1, &s2, 1e-2).expect("oq3 ldlq I");
+        let deq_h = crate::codecs::dequant_oq3g256(&pk_h, m * k, &s1, &s2);
+        let deq_i = crate::codecs::dequant_oq3g256(&pk_i, m * k, &s1, &s2);
+
+        let out_err = |deq: &[f32]| -> f64 {
+            let mut tot = 0.0f64;
+            for row in 0..m {
+                let base = row * k;
+                let d: Vec<f64> = (0..k)
+                    .map(|c| (w[base + c] - deq[base + c]) as f64)
+                    .collect();
+                for i in 0..k {
+                    if d[i] == 0.0 {
+                        continue;
+                    }
+                    let mut acc = 0.0;
+                    for j in 0..k {
+                        acc += h[i * k + j] as f64 * d[j];
+                    }
+                    tot += d[i] * acc;
+                }
+            }
+            tot
+        };
+        let (eh, ei) = (out_err(&deq_h), out_err(&deq_i));
+        eprintln!(
+            "oq3-ldlq output-err: H-OBS={eh:.4} no-fb={ei:.4} ratio={:.3}",
             eh / ei
         );
         assert!(eh < ei, "OBS feedback must beat no-feedback: {eh} !< {ei}");

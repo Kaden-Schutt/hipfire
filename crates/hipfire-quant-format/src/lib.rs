@@ -110,6 +110,15 @@ pub enum QuantType {
     /// `Oq4G256` — no repack. Distinct id so the byte length is validated
     /// against `oq4_arch_combined_len`, not the 130 B/group on-disk form.
     Oq4G256ArchPacked = 37,
+    /// Opus Quant W3A4 — symmetric signed-INT3, FWHT-rotated, per-group f32 scale.
+    /// On-disk block = `[f16 scale][8 × (3 u32 bit-planes)]` = 98 B/256-group
+    /// (codec `quantize_oq3g256`), 3.0625 b/w — the memory-ceiling lever (25% less
+    /// weight traffic than Oq4). Bit-plane storage IS the W3A4 kernel layout (tuned
+    /// iu4 GEMM + W3 decode GEMV, cheap Morton spread-to-int4 unpack). Forward
+    /// int4-quantizes activations and runs the W3A4 iu4·iu4 GEMM. Id 38 = the next
+    /// free Opus-family slot. 3-bit is only viable atop the SpinQuant learned
+    /// rotation (see the W3A4 / SpinQuant memory notes).
+    Oq3G256 = 38,
 }
 
 impl QuantType {
@@ -157,6 +166,7 @@ impl QuantType {
             35 => Oq8G256,
             36 => OqPlusCompact,
             37 => Oq4G256ArchPacked,
+            38 => Oq3G256,
             _ => return None,
         })
     }
@@ -189,5 +199,7 @@ mod tests {
         assert_eq!(QuantType::Oq4G256.code(), 34);
         assert_eq!(QuantType::Oq8G256.code(), 35);
         assert_eq!(QuantType::OqPlusCompact.code(), 36);
+        assert_eq!(QuantType::Oq4G256ArchPacked.code(), 37);
+        assert_eq!(QuantType::Oq3G256.code(), 38);
     }
 }
