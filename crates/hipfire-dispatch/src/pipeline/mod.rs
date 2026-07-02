@@ -548,6 +548,15 @@ pub fn run_moe_decode(
             // ~5us/layer slower). The merged kernel still serves the graded down via
             // the down dispatch below (it reads the same tag table). Byte-identical
             // gate_up to the all-MQ4 arm.
+            //
+            // Native-required manifest (Task 8): same scalar decode-GEMV
+            // kernel as the default MQ4G256 arm below — sibling call site,
+            // same expected-fallback report.
+            crate::native_manifest::report_fallback(
+                crate::native_manifest::Family::GateUp,
+                gpu.arch_caps.arch(),
+                crate::native_manifest::FallbackReason::ExpectedInManifest,
+            );
             hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,

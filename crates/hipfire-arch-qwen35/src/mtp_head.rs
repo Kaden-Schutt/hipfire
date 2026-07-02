@@ -1751,6 +1751,14 @@ fn mtp_moe_ffn_decode(
         "MoE MTP routed down currently requires MQ4G256"
     );
     rotate_x_mq_for(gpu, &e0.gate_up, x_norm, x_rot, dim)?;
+    // Native-required manifest (Task 8): MQ4G256 decode gate_up GEMV —
+    // Dp4aDecodeGemvCoverage.gate_up is false for every arch in Phase A, so
+    // this is an EXPECTED scalar fallback, not a regression.
+    hipfire_dispatch::native_manifest::report_fallback(
+        hipfire_dispatch::native_manifest::Family::GateUp,
+        gpu.arch_caps.arch(),
+        hipfire_dispatch::native_manifest::FallbackReason::ExpectedInManifest,
+    );
     gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
         &ffn.expert_gate_up_ptrs,
         topk_indices,
@@ -1764,6 +1772,14 @@ fn mtp_moe_ffn_decode(
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
     )?;
+    // Native-required manifest (Task 8): MQ4G256 decode-down GEMV —
+    // Dp4aDecodeGemvCoverage.down is false for every arch in Phase A, so
+    // this is an EXPECTED scalar fallback, not a regression.
+    hipfire_dispatch::native_manifest::report_fallback(
+        hipfire_dispatch::native_manifest::Family::Down,
+        gpu.arch_caps.arch(),
+        hipfire_dispatch::native_manifest::FallbackReason::ExpectedInManifest,
+    );
     gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         &ffn.expert_down_ptrs,
         topk_indices,

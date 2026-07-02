@@ -351,8 +351,17 @@ fn decode_step_body(
         // weighted combine into the down GEMV, accumulating into h directly).
         let edt = layer.experts[0].gate_up.gpu_dtype;
         match edt {
-            DType::MQ4G256 | DType::HFQ4G256 => gpu
-                .gemv_hfq4g256_moe_gate_up_k8_indexed(
+            DType::MQ4G256 | DType::HFQ4G256 => {
+                // Native-required manifest (Task 8): MQ4G256 decode gate_up
+                // GEMV — Dp4aDecodeGemvCoverage.gate_up is false for every
+                // arch in Phase A, so this is an EXPECTED scalar fallback,
+                // not a regression.
+                hipfire_dispatch::native_manifest::report_fallback(
+                    hipfire_dispatch::native_manifest::Family::GateUp,
+                    gpu.arch_caps.arch(),
+                    hipfire_dispatch::native_manifest::FallbackReason::ExpectedInManifest,
+                );
+                gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
                     &layer.expert_gate_up_ptrs,
                     &state.topk_indices,
                     &state.ffn_x_rot,
@@ -362,7 +371,8 @@ fn decode_step_body(
                     hidden,
                     k_top,
                 )
-                .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?,
+                .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?
+            }
             DType::MQ6G256 | DType::HFQ6G256 => gpu
                 .gemv_hfq6g256_moe_gate_up_k8_indexed(
                     &layer.expert_gate_up_ptrs,
@@ -418,6 +428,15 @@ fn decode_step_body(
         let ddt = layer.experts[0].down.gpu_dtype;
         match ddt {
             DType::MQ4G256 | DType::HFQ4G256 => {
+                // Native-required manifest (Task 8): MQ4G256 decode-down
+                // GEMV — Dp4aDecodeGemvCoverage.down is false for every arch
+                // in Phase A, so this is an EXPECTED scalar fallback, not a
+                // regression.
+                hipfire_dispatch::native_manifest::report_fallback(
+                    hipfire_dispatch::native_manifest::Family::Down,
+                    gpu.arch_caps.arch(),
+                    hipfire_dispatch::native_manifest::FallbackReason::ExpectedInManifest,
+                );
                 gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                     &layer.expert_down_ptrs,
                     &state.topk_indices,
@@ -658,8 +677,17 @@ fn minimax_moe_block(
     .map_err(|e| format!("minimax L{l}: topk: {e:?}"))?;
     let edt = layer.experts[0].gate_up.gpu_dtype;
     match edt {
-        DType::MQ4G256 | DType::HFQ4G256 => gpu
-            .gemv_hfq4g256_moe_gate_up_k8_indexed(
+        DType::MQ4G256 | DType::HFQ4G256 => {
+            // Native-required manifest (Task 8): MQ4G256 decode gate_up
+            // GEMV — Dp4aDecodeGemvCoverage.gate_up is false for every arch
+            // in Phase A, so this is an EXPECTED scalar fallback, not a
+            // regression.
+            hipfire_dispatch::native_manifest::report_fallback(
+                hipfire_dispatch::native_manifest::Family::GateUp,
+                gpu.arch_caps.arch(),
+                hipfire_dispatch::native_manifest::FallbackReason::ExpectedInManifest,
+            );
+            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
                 &layer.expert_gate_up_ptrs,
                 &state.topk_indices,
                 &state.ffn_x_rot,
@@ -669,7 +697,8 @@ fn minimax_moe_block(
                 hidden,
                 k_top,
             )
-            .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?,
+            .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?
+        }
         DType::MQ6G256 | DType::HFQ6G256 => gpu
             .gemv_hfq6g256_moe_gate_up_k8_indexed(
                 &layer.expert_gate_up_ptrs,
@@ -721,6 +750,14 @@ fn minimax_moe_block(
     let ddt = layer.experts[0].down.gpu_dtype;
     match ddt {
         DType::MQ4G256 | DType::HFQ4G256 => {
+            // Native-required manifest (Task 8): MQ4G256 decode-down GEMV —
+            // Dp4aDecodeGemvCoverage.down is false for every arch in Phase
+            // A, so this is an EXPECTED scalar fallback, not a regression.
+            hipfire_dispatch::native_manifest::report_fallback(
+                hipfire_dispatch::native_manifest::Family::Down,
+                gpu.arch_caps.arch(),
+                hipfire_dispatch::native_manifest::FallbackReason::ExpectedInManifest,
+            );
             gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                 &layer.expert_down_ptrs,
                 &state.topk_indices,

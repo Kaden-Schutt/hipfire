@@ -153,6 +153,15 @@ fn reported_set() -> &'static Mutex<HashSet<(Family, FallbackReason)>> {
     REPORTED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Returns `true` the FIRST time this `(family, reason)` key is seen
+/// (process-global), `false` on every repeat. Split out from
+/// [`report_fallback`] so the dedup logic itself — not just the
+/// `Severity` it happens to return — is directly unit-testable.
+fn should_log(family: Family, reason: FallbackReason) -> bool {
+    let mut set = reported_set().lock().unwrap_or_else(|e| e.into_inner());
+    set.insert((family, reason))
+}
+
 /// Report a scalar-kernel fallback for `family` on `arch` with `reason`.
 ///
 /// Logs once per distinct `(family, reason)` key — repeat calls with the
@@ -169,11 +178,7 @@ pub fn report_fallback(family: Family, arch: &str, reason: FallbackReason) -> Se
     } else {
         Severity::Warn
     };
-    let first_seen = {
-        let mut set = reported_set().lock().unwrap_or_else(|e| e.into_inner());
-        set.insert((family, reason))
-    };
-    if first_seen {
+    if should_log(family, reason) {
         eprintln!(
             "[native-manifest] {arch}/{}: {reason:?} ({})",
             family.as_str(),
@@ -194,13 +199,26 @@ pub fn report_fallback(family: Family, arch: &str, reason: FallbackReason) -> Se
     severity
 }
 
-/// Emit the coverage summary exactly once per process (idempotent across
-/// repeated `DispatchCtx::new` calls in a per-layer hot loop).
+/// Returns `true` the FIRST time `arch` is seen by [`emit_summary_once`]
+/// (process-global, but keyed per-arch — NOT a single process-wide flag), and
+/// `false` on every repeat for that same arch. Split out for direct unit
+/// testing (see `emit_summary_once_per_arch_not_process`).
+fn should_emit_summary(arch: &str) -> bool {
+    static EMITTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let set = EMITTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut set = set.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(arch.to_string())
+}
+
+/// Emit the coverage summary exactly once per (process, arch) — idempotent
+/// across repeated `DispatchCtx::new` calls in a per-layer hot loop, but a
+/// SECOND distinct arch seen by the same process (e.g. a heterogeneous
+/// multi-GPU session) still gets its own summary line rather than being
+/// silently swallowed by a single process-wide flag.
 pub fn emit_summary_once(caps: &ArchCaps) {
-    static EMITTED: OnceLock<()> = OnceLock::new();
-    EMITTED.get_or_init(|| {
+    if should_emit_summary(caps.arch()) {
         eprintln!("{}", NativeManifest::snapshot(caps).summary());
-    });
+    }
 }
 
 #[cfg(test)]
@@ -270,11 +288,9 @@ mod tests {
         assert!(!FallbackReason::PreconditionFailed.is_hard_block());
         assert!(FallbackReason::NativeLost.is_hard_block());
 
-        // Telemetry split: reporting the SAME (family, reason) key twice is
-        // deduped (second call is silent); a DIFFERENT reason for the same
-        // family is a distinct key and reports again. Use a family unused by
-        // other tests in this module to avoid cross-test interference on the
-        // process-global dedup set.
+        // `Severity` alone doesn't distinguish first-seen from a repeat (both
+        // are Warn) — that's exercised for real below via `should_log`. This
+        // just checks report_fallback doesn't blow up across repeats/reasons.
         let first = report_fallback(
             Family::Down,
             "gfx1201-synthetic-2",
@@ -293,5 +309,46 @@ mod tests {
         assert_eq!(first, Severity::Warn);
         assert_eq!(second, Severity::Warn);
         assert_eq!(third, Severity::Warn);
+    }
+
+    // Direct test of the dedup logic itself (not just the Severity it
+    // happens to return, which is identical whether or not the log line
+    // fires). Uses (Qkvza, PreconditionFailed) — a (family, reason) pair no
+    // other test in this module touches — so it's independent of test
+    // execution order on the process-global dedup set.
+    #[test]
+    fn should_log_dedups_by_family_reason_key() {
+        assert!(
+            should_log(Family::Qkvza, FallbackReason::PreconditionFailed),
+            "first report of a (family, reason) key must log"
+        );
+        assert!(
+            !should_log(Family::Qkvza, FallbackReason::PreconditionFailed),
+            "repeat of the SAME (family, reason) key must be deduped/silent"
+        );
+        assert!(
+            should_log(Family::Qkvza, FallbackReason::ExpectedInManifest),
+            "a DIFFERENT reason for the same family is a distinct key and logs again"
+        );
+    }
+
+    // Regression test for the process-global-not-per-arch bug: a naive
+    // `OnceLock<()>` implementation would only ever emit for the FIRST arch
+    // seen by the process and silently swallow every other arch. Uses
+    // arch strings no other test touches.
+    #[test]
+    fn emit_summary_once_per_arch_not_process() {
+        assert!(
+            should_emit_summary("gfx1201-emit-test-a"),
+            "first time this arch is seen must emit"
+        );
+        assert!(
+            !should_emit_summary("gfx1201-emit-test-a"),
+            "repeat of the SAME arch must be deduped/silent"
+        );
+        assert!(
+            should_emit_summary("gfx1100-emit-test-b"),
+            "a DIFFERENT arch in the same process must still emit its own summary"
+        );
     }
 }

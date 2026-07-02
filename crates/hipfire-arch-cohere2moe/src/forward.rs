@@ -368,6 +368,15 @@ fn decode_step_body(
                             )
                             .map_err(|e| format!("cohere2moe L{l}: down(mq6): {e:?}"))?;
                         } else {
+                            // Native-required manifest (Task 8): MQ4G256
+                            // decode-down GEMV — Dp4aDecodeGemvCoverage.down
+                            // is false for every arch in Phase A, so this is
+                            // an EXPECTED scalar fallback, not a regression.
+                            hipfire_dispatch::native_manifest::report_fallback(
+                                hipfire_dispatch::native_manifest::Family::Down,
+                                gpu.arch_caps.arch(),
+                                hipfire_dispatch::native_manifest::FallbackReason::ExpectedInManifest,
+                            );
                             gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                                 &m.expert_down_ptrs,
                                 &state.topk_indices,
