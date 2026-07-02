@@ -292,7 +292,11 @@ mod tests {
         let profile = ChipProfile::load_committed("gfx1201")
             .expect("tests/chip-profiles/gfx1201.json must load");
         assert_eq!(profile.wavefront_size, 32, "gfx1201 is wave32-native RDNA4");
-        assert_eq!(profile.cu_count, 56, "R9700 gfx1201 = 56 CU");
+        assert_eq!(
+            profile.cu_count, 64,
+            "R9700 gfx1201 = 64 CU (full Navi 48; verified via rocminfo on the \
+             live R9700 and the local RX 9070 XT). 56 is the RX 9070 non-XT SKU."
+        );
         assert_eq!(profile.vgprs_per_simd, 1536, "RDNA4 VGPR file per SIMD");
         assert_eq!(
             profile.lds_bytes_per_cu, 65536,
