@@ -4,6 +4,14 @@
 
 //! Perplexity / NLL eval on a text corpus (single-window).
 //!
+//! This is the qwen3.5 KV-cache-quant harness: `--kv-mode` selects the resident
+//! KV representation (f32/q8/asym*/fwht*/kvarn) so PPL/KLD can be measured under
+//! each, and `HIPFIRE_KVARN_SIM=1` degrades K per group in-place. NLL + top-K KLD
+//! go through the shared `hipfire_kld` math (the same `log_z`/`score_position` the
+//! daemon `kld_eval` op uses), so this binary and the daemon cannot diverge.
+//! Plain multi-arch perplexity (default KV) is served by the daemon `kld_eval`;
+//! this binary keeps the qwen3.5-only KV-quant sweep.
+//!
 //! Usage:
 //!   perplexity <model.hfq> <corpus.txt> [--ctx 2048] [--warmup 8] [--offset 0]
 //!
@@ -16,6 +24,8 @@
 //! 8K+ if you want stable second-decimal numbers.
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+use hipfire_kld::math::{log_z, score_position, top_k_log_softmax};
+use hipfire_kld::refblock::RefBlock;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 use rdna_compute::Gpu;
@@ -421,35 +431,55 @@ fn main() {
 
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         let target = window[pos + 1] as usize;
-        let nll = neg_log_softmax_at(&logits, target);
+        // NLL via the shared hipfire_kld reduction: log_z is the same max-shifted
+        // fp64 log-sum-exp the daemon's scorer uses, so `lz - logit[target]` is
+        // byte-identical to the former neg_log_softmax_at → PPL is unchanged.
+        let lz = log_z(&logits);
+        if target >= logits.len() {
+            eprintln!("  warn: target {target} out of range at pos={pos}, skipping");
+            continue;
+        }
+        let nll = (lz - logits[target] as f64) as f32;
         if !nll.is_finite() {
             eprintln!("  warn: non-finite NLL at pos={pos} target={target}, skipping");
             continue;
         }
         total_nll += nll as f64;
 
-        // logZ (full-vocab log-sum-exp) of THIS model's logits — needed for both
-        // dumping the reference and scoring KLD of a candidate.
-        if dump_ref.is_some() || kld_records.is_some() {
-            let logz = logsumexp(&logits);
-            if let Some(_) = dump_ref {
-                ref_records.push((logz, topk_logits(&logits, top_k)));
-            }
-            if let Some(ref recs) = kld_records {
-                if scored < recs.len() {
-                    let (ref_logz, ref_topk) = &recs[scored];
-                    // top-K KLD(P_ref ‖ P_cand) = Σ_k p_ref[k]·(logp_ref[k]-logp_cand[k]),
-                    // over the reference's top-K token ids.
-                    let mut kl = 0.0f64;
-                    for &(idx, rlogit) in ref_topk {
-                        let lp_ref = (rlogit - ref_logz) as f64;
-                        let lp_cand = (logits[idx as usize] - logz) as f64;
-                        kl += lp_ref.exp() * (lp_ref - lp_cand);
-                    }
-                    if kl.is_finite() {
-                        total_kld += kl;
-                        kld_scored += 1;
-                    }
+        // Reference dump / KLD scoring — both share hipfire_kld so this binary and
+        // the daemon kld_eval cannot diverge. The .pkld on-disk format is kept
+        // byte-compatible (logZ + raw top-K logits); KLD itself goes through
+        // hipfire_kld::score_position (top-K cross-entropy + residual cross-term).
+        if dump_ref.is_some() {
+            let red = top_k_log_softmax(&logits, top_k);
+            let topk: Vec<(u32, f32)> = red
+                .indices
+                .iter()
+                .map(|&i| (i, logits[i as usize]))
+                .collect();
+            ref_records.push((lz as f32, topk));
+        }
+        if let Some(ref recs) = kld_records {
+            if scored < recs.len() {
+                let (ref_logz, ref_topk) = &recs[scored];
+                // Rebuild the reference's top-K log-prob block from the .pkld
+                // record (raw logit − logZ), then score via the shared math.
+                let idxs: Vec<u32> = ref_topk.iter().map(|&(i, _)| i).collect();
+                let lps: Vec<f32> = ref_topk.iter().map(|&(_, lg)| lg - ref_logz).collect();
+                let mut p_sum = 0.0f64;
+                for &lp in &lps {
+                    p_sum += (lp as f64).exp();
+                }
+                let residual = (1.0 - p_sum).max(0.0) as f32;
+                let rb = RefBlock {
+                    top_indices: &idxs,
+                    top_log_probs: &lps,
+                    residual_mass: residual,
+                };
+                let ps = score_position(&rb, &logits, target);
+                if ps.kld.is_finite() {
+                    total_kld += ps.kld as f64;
+                    kld_scored += 1;
                 }
             }
         }
@@ -506,34 +536,6 @@ fn main() {
     }
 }
 
-/// Full-vocab log-sum-exp of logits (the log normalizer logZ).
-fn logsumexp(logits: &[f32]) -> f32 {
-    let mut max = f32::NEG_INFINITY;
-    for &v in logits {
-        if v > max {
-            max = v;
-        }
-    }
-    let mut sum = 0.0f64;
-    for &v in logits {
-        sum += ((v - max) as f64).exp();
-    }
-    (max as f64 + sum.ln()) as f32
-}
-
-/// Indices+logits of the top-`k` logits (descending), for the KLD reference.
-fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    let k = k.min(logits.len());
-    idx.select_nth_unstable_by(k.saturating_sub(1), |&a, &b| {
-        logits[b as usize]
-            .partial_cmp(&logits[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    idx.truncate(k);
-    idx.into_iter().map(|i| (i, logits[i as usize])).collect()
-}
-
 /// KLD-reference file: magic "PKLD", u32 top_k, u64 n_pos, then per position:
 /// f32 logZ, u32 n, n×(u32 idx, f32 logit).
 fn write_kldref(path: &str, records: &[(f32, Vec<(u32, f32)>)], top_k: usize) {
@@ -576,22 +578,4 @@ fn read_kldref(path: &str) -> Vec<(f32, Vec<(u32, f32)>)> {
         out.push((logz, topk));
     }
     out
-}
-
-fn neg_log_softmax_at(logits: &[f32], target: usize) -> f32 {
-    if target >= logits.len() {
-        return f32::NAN;
-    }
-    let mut max = f32::NEG_INFINITY;
-    for &v in logits {
-        if v > max {
-            max = v;
-        }
-    }
-    let mut sum = 0.0f64;
-    for &v in logits {
-        sum += ((v - max) as f64).exp();
-    }
-    let log_sum = max as f64 + sum.ln();
-    (log_sum - logits[target] as f64) as f32
 }

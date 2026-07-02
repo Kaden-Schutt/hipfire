@@ -45,6 +45,7 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     }
     Json(json!({
         "status": "ok",
+        "version": hipfire_build_info::VERSION,
         "model": loaded,
         "active_model": active_model,
         "diffusion": diffusion,

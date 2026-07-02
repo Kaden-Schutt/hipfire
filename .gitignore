@@ -37,10 +37,9 @@ kernels/compiled/
 # Agent / tool state
 .serena/
 .remember/
-graphify-out/cache/
-# Regenerable AST graph — rebuild locally with `graphify update .`.
-# The durable semantic state lives in manifest.json + .graphify_labels.json.
-graphify-out/graph.json
+# graphify knowledge graph — fully regenerable (rebuild with `graphify update .`).
+# Ignore the whole tree; force-add a specific file only for a deliberate snapshot.
+graphify-out/
 # Machine-specific generated hooks (embed a local interpreter path).
 # Each user/agent runs `graphify hook install` on their end.
 .githooks/post-commit

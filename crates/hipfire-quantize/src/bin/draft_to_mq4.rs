@@ -9,6 +9,8 @@
     clippy::too_many_arguments
 )]
 
+use hipfire_primitives::conv::f16_to_f32;
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::Write;
@@ -16,70 +18,6 @@ use std::path::Path;
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-    if exp == 0 {
-        if frac == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 {
-            f <<= 1;
-            e -= 1;
-        }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { frac << 13 | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
-}
-
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
-
-fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert!(x.len() == 256);
-    for i in 0..256 {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let scale = 0.0625;
-    for i in 0..256 {
-        x[i] *= scale * signs2[i];
-    }
-}
 
 fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let group_size = 256;

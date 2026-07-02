@@ -81,6 +81,9 @@ use qwen35_decode::*;
 use qwen35_prefill::*;
 use request::ThinkMode;
 use session::*;
+// Rich session protocol (qwen35/lfm2) is dispatched through this trait
+// (impl'd on `LoadedModel`) instead of a per-arch `if is_qwen35 {} else …` ladder.
+use hipfire_runtime::arch::SessionServingBackend;
 
 fn invalid_kld_ref(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
@@ -2657,6 +2660,10 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
+                // A steer session is process-global and outlives the model it was
+                // captured/applied against; drop it before swapping models so a
+                // stale apply can't perturb the freshly-loaded one.
+                hipfire_steer::clear();
                 let requested_worker_id = message_worker_id(&msg);
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -3080,6 +3087,7 @@ fn main() {
                             13 => "gemma3_vl",
                             14 => "nemotron_h",
                             15 => "mamba2",
+                            16 => "zaya",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some()
@@ -3156,6 +3164,34 @@ fn main() {
                                 .as_ref()
                                 .and_then(|w| w.mtp_layer.as_ref())
                                 .is_some();
+
+                        // Auto-apply a bundled abliteration/LoRA adapter if this
+                        // model carries one (a `--merge-lora` artifact: the adapter
+                        // HFQM section + a trailer appended to the `.hfq`). Additive
+                        // and best-effort — a plain model has no trailer, so this is
+                        // a 16-byte read + magic miss. The load arm already cleared
+                        // the steer session up top, so this seeds a fresh apply
+                        // stack that lives for the model's lifetime.
+                        match hipfire_lora_hfq::read_bundled_lora(std::path::Path::new(
+                            &m.model_path,
+                        )) {
+                            Ok(Some(adapter)) => {
+                                let (id, n) = (adapter.id.clone(), adapter.deltas.len());
+                                match hipfire_steer::load_lora_adapter(&adapter) {
+                                    Ok(()) => eprintln!(
+                                        "[hipfire-daemon] auto-applied bundled LoRA '{id}' ({n} deltas, scale {:.2})",
+                                        adapter.scale
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[hipfire-daemon] bundled LoRA '{id}' load failed: {e}"
+                                    ),
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                eprintln!("[hipfire-daemon] bundled LoRA probe failed: {e}")
+                            }
+                        }
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -3442,20 +3478,18 @@ fn main() {
                 let is_lfm2_generate_session = m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1;
                 #[cfg(not(feature = "arch-lfm2moe"))]
                 let is_lfm2_generate_session = false;
-                if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 {
-                    let target_session_id = session_id.unwrap_or(QWEN35_LEGACY_SESSION_ID);
-                    if let Err(e) = qwen35_activate_session(m, &mut gpu, target_session_id) {
+                // S4: one `SessionServingBackend::activate_session` dispatch for the
+                // rich-session arches (qwen35 5/6, lfm2 11) instead of the per-arch
+                // `qwen35_*`/`lfm2_*` activate ladder. The arch-specific default
+                // ("legacy") session id is resolved by `loaded_model_default_session_id`.
+                let supports_generate_session =
+                    (is_qwen35_family_arch_id(m.arch_id) && m.pp == 1) || is_lfm2_generate_session;
+                if supports_generate_session {
+                    let target_session_id =
+                        session_id.unwrap_or_else(|| loaded_model_default_session_id(m));
+                    if let Err(e) = m.activate_session(&mut gpu, target_session_id) {
                         emit_error_with_id(&mut stdout, id, e);
                         continue;
-                    }
-                } else if is_lfm2_generate_session {
-                    #[cfg(feature = "arch-lfm2moe")]
-                    {
-                        let target_session_id = session_id.unwrap_or(LFM2_LEGACY_SESSION_ID);
-                        if let Err(e) = lfm2_activate_session(m, &mut gpu, target_session_id) {
-                            emit_error_with_id(&mut stdout, id, e);
-                            continue;
-                        }
                     }
                 } else if session_id.is_some() || prefill_already_done {
                     emit_error_with_id(
@@ -4556,17 +4590,17 @@ fn main() {
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
                     generic_state_arena.release_worker(&target_worker_id);
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
-                    m.q35_sessions.clear();
-                    m.q35_active_session_id = if is_qwen35_family_arch_id(m.arch_id)
+                    m.active.cursor.seq_pos = 0;
+                    m.active.cursor.conversation_tokens.clear();
+                    m.q35_registry.sessions.clear();
+                    m.q35_registry.active_session_id = if is_qwen35_family_arch_id(m.arch_id)
                         && m.pp == 1
-                        && m.sequence_state.is_some()
+                        && m.active.sequence_state.is_some()
                     {
-                        m.q35_active_state_allocation_epoch = next_qwen35_state_allocation_epoch();
+                        m.q35_registry.allocation_epoch = next_qwen35_state_allocation_epoch();
                         Some(QWEN35_LEGACY_SESSION_ID.to_string())
                     } else {
-                        m.q35_active_state_allocation_epoch = 0;
+                        m.q35_registry.allocation_epoch = 0;
                         None
                     };
                     // Multi-GPU branch: route per-LA-layer memsets through
@@ -4576,7 +4610,8 @@ fn main() {
                     // tensors when pp > 1.
                     if m.pp > 1 {
                         if let (Some(dn), Some(ref mut gpus), Some(ref la)) = (
-                            m.sequence_state
+                            m.active
+                                .sequence_state
                                 .as_ref()
                                 .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>()),
                             m.pp_gpus.as_mut(),
@@ -4599,6 +4634,7 @@ fn main() {
                             }
                         }
                     } else if let Some(dn) = m
+                        .active
                         .sequence_state
                         .as_ref()
                         .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
@@ -4614,7 +4650,7 @@ fn main() {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
-                    if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
+                    if let Some(kv) = m.active.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
                         kv.compact_offset = 0;
                     }
                     if let Some(kv) = m.llama_kv.as_mut() {
@@ -4664,17 +4700,20 @@ fn main() {
                     // states on-GPU, so it takes `gpu` and returns Result.
                     #[cfg(feature = "arch-lfm2moe")]
                     {
-                        if let Some(ref mut s) = m.lfm2moe_state {
+                        if let Some(ref mut s) = m.active.lfm2moe_state {
                             let _ = s.reset(&mut gpu);
                         }
-                        m.lfm2_sessions.clear();
-                        if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 && m.lfm2moe_state.is_some() {
-                            m.lfm2_active_session_id = Some(LFM2_LEGACY_SESSION_ID.to_string());
-                            m.lfm2_active_state_allocation_epoch =
-                                next_qwen35_state_allocation_epoch();
+                        m.lfm2_registry.sessions.clear();
+                        if m.arch_id == ARCH_ID_LFM2_MOE
+                            && m.pp == 1
+                            && m.active.lfm2moe_state.is_some()
+                        {
+                            m.lfm2_registry.active_session_id =
+                                Some(LFM2_LEGACY_SESSION_ID.to_string());
+                            m.lfm2_registry.allocation_epoch = next_qwen35_state_allocation_epoch();
                         } else {
-                            m.lfm2_active_session_id = None;
-                            m.lfm2_active_state_allocation_epoch = 0;
+                            m.lfm2_registry.active_session_id = None;
+                            m.lfm2_registry.allocation_epoch = 0;
                         }
                     }
                     // arch_id=12/13 (Gemma3 text / Gemma3-VL text): rewind the
@@ -4723,6 +4762,9 @@ fn main() {
                 generic_state_arena.clear();
                 dummy_model = None;
                 active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
+                // Drop any steer session so a stale capture/apply can't leak its
+                // process-global state across model loads.
+                hipfire_steer::clear();
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
             }
@@ -4807,16 +4849,15 @@ fn main() {
                     );
                     continue;
                 }
-                let (Some(weights), Some(config), Some(tokenizer)) = (
-                    m.q35_weights.as_ref(),
-                    m.q35_config.as_ref(),
-                    m.tokenizer.as_ref(),
-                ) else {
+                // Only the tokenizer is needed up front (to encode the corpus);
+                // the per-arch calibration backend is resolved below. Every arch
+                // with a collector reaches it through the one CalibratableBackend
+                // seam — no qwen3.5-only gate.
+                let Some(tokenizer) = m.tokenizer.as_ref() else {
                     emit_error_with_id(
                         &mut stdout,
                         "",
-                        "collect: resident model is not a qwen3.5-family model with a tokenizer"
-                            .to_string(),
+                        "collect: resident model has no tokenizer".to_string(),
                     );
                     continue;
                 };
@@ -4831,29 +4872,85 @@ fn main() {
                         continue;
                     }
                 };
-                let all = tokenizer.encode(&text);
+                // Bound tokenization to `max_tokens`: the tokenizer is superlinear
+                // in input length, so encoding a whole multi-MB corpus would grind
+                // for hours (the same stall fixed for kld_eval in 8571b79b). Only
+                // the first `max_tokens` are ever calibrated on; tokenize just that
+                // prefix (+ headroom).
+                let take_chars = max_tokens.saturating_mul(8);
+                let bounded: String = text.chars().take(take_chars).collect();
+                let all = tokenizer.encode(&bounded);
                 let n_tok = all.len().min(max_tokens);
-                let tokens = &all[..n_tok];
-                let opts = qwen35::CalibOpts {
-                    kldref,
-                    kldref_topk: 64,
-                };
+                let tokens = all[..n_tok].to_vec();
                 let provenance = [
                     ("source_model", serde_json::json!(m.model_path)),
                     ("corpus", serde_json::json!(corpus)),
                     ("n_calib_tokens", serde_json::json!(n_tok)),
                 ];
-                // Streams the .calib.hfq directly to `output` one tensor at a
-                // time (no full-RAM materialization), returning a summary.
-                match qwen35::collect_calibration_artifacts(
-                    &mut gpu,
-                    weights,
-                    config,
-                    tokens,
-                    &opts,
-                    std::path::Path::new(&output),
-                    &provenance,
-                ) {
+                let out_path = std::path::Path::new(&output);
+                // Arch-agnostic calibration seam: resolve the resident backend's
+                // collector and delegate. Each impl streams the .calib.hfq directly
+                // to `output` one tensor at a time (no full-RAM materialization),
+                // returning a summary. Probe order matches the resident slot layout.
+                use hipfire_runtime::calibration::CalibratableBackend;
+                let result: Result<hipfire_runtime::calibration::CalibSummary, String> = 'pick: {
+                    if let Some(b) = m.zaya_backend.as_ref() {
+                        break 'pick b.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    if let Some(b) = m.gemma3_text.as_ref() {
+                        break 'pick b.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    #[cfg(feature = "arch-lfm2moe")]
+                    if let (Some(w), Some(c)) =
+                        (m.lfm2moe_weights.as_ref(), m.lfm2moe_config.as_ref())
+                    {
+                        let be = lfm2moe::calibration::Lfm2MoeCalibBackend {
+                            weights: w,
+                            config: c,
+                        };
+                        break 'pick be.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
+                        let be = qwen35::Qwen35CalibBackend {
+                            weights: w,
+                            config: c,
+                        };
+                        break 'pick be.collect_calibration(
+                            &mut gpu,
+                            tokenizer,
+                            &tokens,
+                            kldref,
+                            out_path,
+                            &provenance,
+                        );
+                    }
+                    Err(format!(
+                        "collect: arch_id {} has no calibration-capable backend",
+                        m.arch_id
+                    ))
+                };
+                match result {
                     Ok(summary) => {
                         let resp = serde_json::json!({
                             "type": "collected",
@@ -4897,7 +4994,7 @@ fn main() {
                     .map(|v| v as usize)
                     .unwrap_or(256);
                 let output = msg.get("output").and_then(|v| v.as_str()).map(String::from);
-                let Some(m) = model.as_ref() else {
+                let Some(m) = model.as_mut() else {
                     emit_error_with_id(&mut stdout, "", "kld_eval: no model loaded".to_string());
                     continue;
                 };
@@ -4909,19 +5006,6 @@ fn main() {
                     );
                     continue;
                 }
-                let (Some(weights), Some(config), Some(tokenizer)) = (
-                    m.q35_weights.as_ref(),
-                    m.q35_config.as_ref(),
-                    m.tokenizer.as_ref(),
-                ) else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "kld_eval: resident model is not a qwen3.5-family model with a tokenizer"
-                            .to_string(),
-                    );
-                    continue;
-                };
                 let arch_id = m.arch_id;
                 let base_model = m.model_path.clone();
                 let cfg: hipfire_kld::KldConfig = msg
@@ -4929,6 +5013,138 @@ fn main() {
                     .and_then(|c| serde_json::from_value(c.clone()).ok())
                     .unwrap_or_default();
                 let version = hipfire_build_info::VERSION.to_string();
+                // Encode the corpus up front — needs the tokenizer, which must be
+                // borrowed BEFORE the mutable backend borrow below. `score` mode
+                // reads its tokens from the reference archive, so it needs none.
+                let tokens: Vec<u32> = if mode == "self_score" || mode == "build_ref" {
+                    let Some(corpus_path) = corpus.clone() else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("kld_eval: mode={mode} requires 'corpus'"),
+                        );
+                        continue;
+                    };
+                    let text = match std::fs::read_to_string(&corpus_path) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("kld_eval: read {corpus_path}: {e}"),
+                            );
+                            continue;
+                        }
+                    };
+                    let Some(tk) = m.tokenizer.as_ref() else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "kld_eval: resident model has no tokenizer".to_string(),
+                        );
+                        continue;
+                    };
+                    // Only the first `n_ctx × max_chunks` tokens are ever scored, so
+                    // tokenize just that prefix (+ a chunk of headroom). The tokenizer
+                    // is superlinear in input length, so encoding a whole multi-MB
+                    // corpus slice would grind for hours — this is the reference-load
+                    // stall. With no chunk cap we still encode the full slice.
+                    match max_chunks {
+                        Some(mc) => {
+                            let want = n_ctx.saturating_mul(mc.saturating_add(1)).max(n_ctx);
+                            let take_chars = want.saturating_mul(8);
+                            let bounded: String = text.chars().take(take_chars).collect();
+                            tk.encode(&bounded)
+                        }
+                        None => tk.encode(&text),
+                    }
+                } else {
+                    Vec::new()
+                };
+                // Clamp the KLD window to the corpus: chunks are non-overlapping
+                // `n_ctx` windows counted by floor (`tokens.len() / n_ctx`) with the
+                // partial tail discarded, so a corpus shorter than n_ctx would yield
+                // ZERO chunks and silently score nothing. Clamping makes any corpus
+                // with ≥2 tokens form exactly one chunk; no effect once the corpus is
+                // ≥ n_ctx. `score` reads its window from the archive, and `tokens` is
+                // empty there, so this only adjusts build_ref / self_score. The
+                // clamped value flows into KldRefPayloads.n_ctx → RefMeta, keeping
+                // scoring_start (= n_ctx/2) consistent for the later score pass.
+                let n_ctx = if tokens.is_empty() {
+                    n_ctx
+                } else {
+                    n_ctx.min(tokens.len())
+                };
+                // Arch-agnostic forward seam: owned AR backends ride the blanket
+                // SimpleAr impl; loose-slot arches (qwen3.5, lfm2moe, deepseek4,
+                // minimax) go through their `*KldForward` adapter. All arches
+                // equal. Probe order matches the resident slot layout; the
+                // labeled block keeps the lfm2moe `#[cfg]` arm clean.
+                use hipfire_runtime::kld_eval::ChunkScoredForward;
+                let fwd_opt: Option<Box<dyn ChunkScoredForward + '_>> = 'pick: {
+                    if let Some(b) = m.zaya_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.gemma3_text.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.gemma3_vl.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.qwen2_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.nemotron_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let Some(b) = m.llama_backend.as_mut() {
+                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    }
+                    if let (Some(w), Some(c)) =
+                        (m.deepseek4_weights.as_ref(), m.deepseek4_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(deepseek4::kld::DeepseekV4KldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    if let (Some(w), Some(c)) =
+                        (m.minimax_weights.as_ref(), m.minimax_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(minimax::kld::MiniMaxKldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    #[cfg(feature = "arch-lfm2moe")]
+                    if let (Some(w), Some(c)) =
+                        (m.lfm2moe_weights.as_ref(), m.lfm2moe_config.as_ref())
+                    {
+                        break 'pick Some(Box::new(lfm2moe::kld::Lfm2MoeKldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    if let (Some(w), Some(c)) = (m.q35_weights.as_ref(), m.q35_config.as_ref()) {
+                        break 'pick Some(Box::new(qwen35::Qwen35KldForward {
+                            weights: w,
+                            config: c,
+                        }));
+                    }
+                    None
+                };
+                let mut fwd = match fwd_opt {
+                    Some(f) => f,
+                    None => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("kld_eval: arch_id {arch_id} has no KLD-scorable backend"),
+                        );
+                        continue;
+                    }
+                };
+                let n_vocab = fwd.kld_vocab_size();
 
                 macro_rules! kld_chunk_cb {
                     () => {
@@ -4958,31 +5174,10 @@ fn main() {
 
                 match mode {
                     "self_score" | "build_ref" => {
-                        let Some(corpus) = corpus.clone() else {
-                            emit_error_with_id(
-                                &mut stdout,
-                                "",
-                                format!("kld_eval: mode={mode} requires 'corpus'"),
-                            );
-                            continue;
-                        };
-                        let text = match std::fs::read_to_string(&corpus) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                emit_error_with_id(
-                                    &mut stdout,
-                                    "",
-                                    format!("kld_eval: read {corpus}: {e}"),
-                                );
-                                continue;
-                            }
-                        };
-                        let tokens = tokenizer.encode(&text);
                         if mode == "self_score" {
-                            match qwen35::kld_eval_self_score(
+                            match hipfire_runtime::kld_eval::kld_self_score(
+                                &mut *fwd,
                                 &mut gpu,
-                                weights,
-                                config,
                                 &tokens,
                                 n_ctx,
                                 top_k,
@@ -5019,10 +5214,9 @@ fn main() {
                                 );
                                 continue;
                             };
-                            match qwen35::kld_build_ref(
+                            match hipfire_runtime::kld_eval::kld_build_ref(
+                                &mut *fwd,
                                 &mut gpu,
-                                weights,
-                                config,
                                 &tokens,
                                 n_ctx,
                                 top_k,
@@ -5050,7 +5244,7 @@ fn main() {
                                         scoring_start: p.n_ctx / 2,
                                         top_k: p.top_k,
                                         total_scored: p.n_chunk * p.scored_per_chunk,
-                                        slice_path: corpus.clone(),
+                                        slice_path: corpus.clone().unwrap_or_default(),
                                         slice_md5: String::new(),
                                         config: cfg.clone(),
                                         producer: hipfire_kld::ProducerInfo {
@@ -5119,7 +5313,7 @@ fn main() {
                             git_commit: Some(version.clone()),
                             gpu_arch: gpu.arch.clone(),
                             arch_id,
-                            n_vocab: config.vocab_size,
+                            n_vocab,
                             tokenizer_sha256: None,
                             config: cfg.clone(),
                         };
@@ -5144,10 +5338,9 @@ fn main() {
                             .iter()
                             .map(|m| format!("{:?} {}: {}", m.severity, m.field, m.detail))
                             .collect();
-                        match qwen35::kld_score(
+                        match hipfire_runtime::kld_eval::kld_score(
+                            &mut *fwd,
                             &mut gpu,
-                            weights,
-                            config,
                             &archive,
                             max_chunks,
                             kld_chunk_cb!(),
@@ -5178,6 +5371,313 @@ fn main() {
                         format!("kld_eval: unknown mode {other:?}"),
                     ),
                 }
+            }
+
+            // Refusal-direction steering / abliteration session control. The
+            // in-forward `maybe_steer_block` hook (compiled into the gemma3
+            // forward) keeps a process-global capture/apply session; these arms
+            // expose control over it so a client (hipfire-steer-harness) can drive
+            // capture→derive→apply→score through the daemon's correct inference +
+            // templating instead of a reimplemented harness. See
+            // docs/plans/2026-06-30-steer-daemon-pivot.md.
+            "steer_begin_capture" => {
+                let num_layers = msg
+                    .get("num_layers")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let hidden = msg
+                    .get("hidden")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let (Some(num_layers), Some(hidden)) = (num_layers, hidden) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_begin_capture: missing 'num_layers'/'hidden'".to_string(),
+                    );
+                    continue;
+                };
+                hipfire_steer::begin_capture(num_layers, hidden);
+                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = stdout.flush();
+            }
+
+            // Prefill ONE chat turn through the hooked forward (no decode) and fold
+            // its last-prompt-token residuals into the capture means. Prefill-only:
+            // a decoded token's forward would overwrite the residual the hook just
+            // recorded (the `collect` arm is prefill-only for the same reason).
+            "steer_capture" => {
+                let system = msg
+                    .get("system")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let Some(user) = msg.get("user").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: missing 'user'".to_string(),
+                    );
+                    continue;
+                };
+                let Some(m) = model.as_mut() else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: no model loaded".to_string(),
+                    );
+                    continue;
+                };
+                if m.pp != 1 {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: requires a single-GPU resident model (pp == 1)".to_string(),
+                    );
+                    continue;
+                }
+                let Some(tokenizer) = m.tokenizer.as_ref() else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: resident model has no tokenizer".to_string(),
+                    );
+                    continue;
+                };
+                // Frame the turn byte-identically to the `generate` path so capture
+                // sees the exact residuals serving would (BOS + gemma3 turn frame).
+                let system_opt = (!system.is_empty()).then_some(system.as_str());
+                let framed =
+                    hipfire_serving_core::generate_arch::framed_gemma3_prompt(&user, system_opt);
+                let tokens = tokenizer.encode(&framed);
+                if tokens.is_empty() {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_capture: empty prompt after framing".to_string(),
+                    );
+                    continue;
+                }
+                // Prefill-only through whichever gemma3 backend is resident; both
+                // fire the block-boundary hook (batched last-position for arch 12,
+                // per-token last-wins for arch 13), so the hook observes the
+                // last-prompt-token residual per block. No decode loop.
+                use hipfire_runtime::arch::SimpleAr;
+                let result: Result<(), String> = if let Some(b) = m.gemma3_text.as_mut() {
+                    b.state.reset();
+                    SimpleAr::prefill(b, &mut gpu, &tokens)
+                } else if let Some(b) = m.gemma3_vl.as_mut() {
+                    b.state.reset();
+                    SimpleAr::prefill(b, &mut gpu, &tokens)
+                } else {
+                    Err(format!(
+                        "steer_capture: arch_id {} is not gemma3 (12|13)",
+                        m.arch_id
+                    ))
+                };
+                match result {
+                    Ok(()) => {
+                        hipfire_steer::commit_capture();
+                        let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, "", format!("steer_capture: {e}")),
+                }
+            }
+
+            // End the capture session and return the per-block means as a
+            // num_layers × hidden f32 matrix (the client derives directions from
+            // the +/- means it collected).
+            "steer_finish_capture" => match hipfire_steer::finish_capture() {
+                Some(means) => {
+                    let resp = serde_json::json!({
+                        "type": "steer_captured",
+                        "means": means.0,
+                    });
+                    let _ = writeln!(stdout, "{resp}");
+                    let _ = stdout.flush();
+                }
+                None => emit_error_with_id(
+                    &mut stdout,
+                    "",
+                    "steer_finish_capture: no capture session active".to_string(),
+                ),
+            },
+
+            // Begin an apply session: steer (additive) or ablate (projective) each
+            // block in [layer_start, layer_end) along the per-block `directions`.
+            "steer_begin_apply" => {
+                let directions: Option<Vec<Vec<f32>>> = msg
+                    .get("directions")
+                    .and_then(|v| v.as_array())
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| {
+                                row.as_array()
+                                    .map(|cols| {
+                                        cols.iter()
+                                            .filter_map(|x| x.as_f64().map(|f| f as f32))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    });
+                let Some(directions) = directions else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "steer_begin_apply: missing 'directions'".to_string(),
+                    );
+                    continue;
+                };
+                let mode = match msg.get("mode").and_then(|v| v.as_str()).unwrap_or("ablate") {
+                    "steer" => hipfire_steer::SteerMode::Steer,
+                    "ablate" => hipfire_steer::SteerMode::Ablate,
+                    other => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("steer_begin_apply: unknown mode {other:?} (steer|ablate)"),
+                        );
+                        continue;
+                    }
+                };
+                let strength = msg.get("strength").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let layer_start =
+                    msg.get("layer_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let layer_end = msg
+                    .get("layer_end")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(directions.len());
+                hipfire_steer::begin_apply(hipfire_steer::SteerSpec {
+                    directions,
+                    mode,
+                    strength,
+                    layer_range: layer_start..layer_end,
+                });
+                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = stdout.flush();
+            }
+
+            // Tear down any active steer session (back to the base model).
+            "steer_clear" => {
+                hipfire_steer::clear();
+                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = stdout.flush();
+            }
+
+            // LoRA adapter stack (shares the steer APPLY session). Load a `.lora`
+            // container onto the live model, adjust per-adapter intensity, stack or
+            // remove adapters, and list — all without reload. The abliteration
+            // directions materialized by `lora_export`/the harness become a portable
+            // adapter served here. See docs/plans/2026-06-30-abliteration-lora.md.
+            "lora_load" => {
+                let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(&mut stdout, "", "lora_load: missing 'path'".to_string());
+                    continue;
+                };
+                let scale_override = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let id_override = msg.get("id").and_then(|v| v.as_str()).map(String::from);
+                let mut adapter = match hipfire_lora_hfq::read_lora_any(std::path::Path::new(&path))
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("lora_load: {e}"));
+                        continue;
+                    }
+                };
+                if let Some(new_id) = id_override {
+                    adapter.id = new_id;
+                }
+                // The adapter is base-specific (directions sized to the model's
+                // hidden width); reject a mismatched load before it faults at apply.
+                let model_hidden = model.as_ref().and_then(|m| {
+                    m.gemma3_text
+                        .as_ref()
+                        .map(|b| b.config.hidden_size)
+                        .or_else(|| m.gemma3_vl.as_ref().map(|b| b.text_cfg.hidden_size))
+                });
+                if let Some(h) = model_hidden {
+                    if adapter.meta.hidden != h {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!(
+                                "lora_load: adapter hidden {} != model hidden {h}",
+                                adapter.meta.hidden
+                            ),
+                        );
+                        continue;
+                    }
+                }
+                let id = adapter.id.clone();
+                if let Err(e) = hipfire_steer::load_lora_adapter(&adapter) {
+                    emit_error_with_id(&mut stdout, "", format!("lora_load: {e}"));
+                    continue;
+                }
+                if let Some(s) = scale_override {
+                    hipfire_steer::set_adapter_scale(&id, s);
+                }
+                let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
+                let _ = stdout.flush();
+            }
+
+            "lora_set_scale" => {
+                let id = msg.get("id").and_then(|v| v.as_str()).map(String::from);
+                let scale = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let (Some(id), Some(scale)) = (id, scale) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "lora_set_scale: missing 'id'/'scale'".to_string(),
+                    );
+                    continue;
+                };
+                if hipfire_steer::set_adapter_scale(&id, scale) {
+                    let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
+                    let _ = stdout.flush();
+                } else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("lora_set_scale: no adapter {id:?} loaded"),
+                    );
+                }
+            }
+
+            "lora_unload" => {
+                let Some(id) = msg.get("id").and_then(|v| v.as_str()).map(String::from) else {
+                    emit_error_with_id(&mut stdout, "", "lora_unload: missing 'id'".to_string());
+                    continue;
+                };
+                if hipfire_steer::unload_adapter(&id) {
+                    let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
+                    let _ = stdout.flush();
+                } else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("lora_unload: no adapter {id:?} loaded"),
+                    );
+                }
+            }
+
+            "lora_clear" => {
+                hipfire_steer::clear();
+                let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
+                let _ = stdout.flush();
+            }
+
+            "lora_list" => {
+                let adapters: Vec<_> = hipfire_steer::loaded_adapters()
+                    .into_iter()
+                    .map(|(id, scale)| serde_json::json!({ "id": id, "scale": scale }))
+                    .collect();
+                let resp = serde_json::json!({ "type": "lora_listed", "adapters": adapters });
+                let _ = writeln!(stdout, "{resp}");
+                let _ = stdout.flush();
             }
 
             // PFlash drafter TEACHER: forward the resident qwen3.5 target over a
@@ -5567,6 +6067,7 @@ fn main() {
                         10 => "minimax_m2",
                         11 => "lfm2moe",
                         14 => "nemotron_h",
+                        16 => "zaya",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -5681,9 +6182,10 @@ fn main() {
 
                 // Reset state BEFORE timing so we're measuring cold prefill, not
                 // prefill-on-top-of-prior-state.
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                m.active.cursor.seq_pos = 0;
+                m.active.cursor.conversation_tokens.clear();
                 if let Some(dn) = m
+                    .active
                     .sequence_state
                     .as_ref()
                     .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
@@ -5712,7 +6214,7 @@ fn main() {
                 // LFM2.5-MoE (arch_id=11): same — KV + conv-state cache share
                 // Lfm2MoeState; reset cursors (takes gpu) for a cold bench.
                 #[cfg(feature = "arch-lfm2moe")]
-                if let Some(ref mut s) = m.lfm2moe_state {
+                if let Some(ref mut s) = m.active.lfm2moe_state {
                     let _ = s.reset(&mut gpu);
                 }
 
@@ -5727,6 +6229,7 @@ fn main() {
                     let weights = m.q35_weights.as_ref().unwrap();
                     let scratch = m.q35_scratch.as_ref().unwrap();
                     let ss = m
+                        .active
                         .sequence_state
                         .as_mut()
                         .expect("qwen35 active state present");
@@ -5810,7 +6313,7 @@ fn main() {
                     {
                         let config = m.lfm2moe_config.as_ref().unwrap();
                         let weights = m.lfm2moe_weights.as_ref().unwrap();
-                        let state = m.lfm2moe_state.as_mut().unwrap();
+                        let state = m.active.lfm2moe_state.as_mut().unwrap();
                         let mut ok = true;
                         for (i, &tok) in synthetic.iter().enumerate() {
                             if lfm2moe::forward::decode_step(
@@ -5854,9 +6357,10 @@ fn main() {
 
                 // Reset state AFTER measurement — we've written N KV slots and a
                 // DeltaNet state that the next real request must not inherit.
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
+                m.active.cursor.seq_pos = 0;
+                m.active.cursor.conversation_tokens.clear();
                 if let Some(dn) = m
+                    .active
                     .sequence_state
                     .as_ref()
                     .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())

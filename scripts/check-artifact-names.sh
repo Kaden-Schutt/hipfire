@@ -23,11 +23,17 @@ done
 
 status=0
 
+# benchmarks/results/** is generated run output: model paths + eval-dir names
+# record what was actually evaluated (a historical log, e.g. older hfq4/hfq6
+# runs). The gate keeps *authored* artifacts/scripts/docs canonical; it must not
+# rewrite past experiment records, so those trees are excluded below.
+
 echo "check-artifact-names: dotted quant artifact suffixes"
 if rg -n \
     --glob '!target/**' \
     --glob '!**/*.lock' \
     --glob '!scripts/check-artifact-names.sh' \
+    --glob '!benchmarks/results/**' \
     -- '\.hfq-(?:hf|mq)[1-8]|\.q[1-8]\.hfq|[-.]hfq[1-8]\.hfq' \
     "${EXISTING_SEARCH_PATHS[@]}"; then
     status=1
@@ -38,6 +44,7 @@ if rg -n \
     --glob '!target/**' \
     --glob '!**/*.lock' \
     --glob '!scripts/check-artifact-names.sh' \
+    --glob '!benchmarks/results/**' \
     -- '(?:qwen3[._-]?[56]|qwen3[56])-[A-Za-z0-9_.-]+-dflash-(?:hf|mq)[1-8]|dflash-(?:hf|mq)[1-8]' \
     "${EXISTING_SEARCH_PATHS[@]}"; then
     status=1

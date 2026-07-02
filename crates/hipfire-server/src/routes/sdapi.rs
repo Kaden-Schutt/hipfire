@@ -460,8 +460,11 @@ async fn execute_hfq_diffusion_txt2img(
     };
     let iteration_steps =
         request.steps as usize + sdapi_txt2img_highres_steps(&body, highres_target);
-    let runtime_options =
-        sd_request_generation_runtime_options(&body, &sdapi_options, state.diffusion_runtime_default());
+    let runtime_options = sd_request_generation_runtime_options(
+        &body,
+        &sdapi_options,
+        state.diffusion_runtime_default(),
+    );
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
         &progress_state,
@@ -635,8 +638,11 @@ async fn execute_hfq_diffusion_img2img(
         Ok(inpainting_fill) => inpainting_fill,
         Err(error) => return diffusion_error_response(error),
     };
-    let runtime_options =
-        sd_request_generation_runtime_options(&body, &sdapi_options, state.diffusion_runtime_default());
+    let runtime_options = sd_request_generation_runtime_options(
+        &body,
+        &sdapi_options,
+        state.diffusion_runtime_default(),
+    );
     let progress_state = state.sdapi_progress.clone();
     start_sdapi_progress(
         &progress_state,
@@ -2816,7 +2822,10 @@ fn sd_request_generation_runtime_options(
     // An explicit per-request device overrides the daemon default; otherwise use
     // the backend the daemon resolved at launch (GPU by default; CPU only when
     // HIPFIRE_DIFFUSION_CPU_REFERENCE was set).
-    rocm_device_id.map_or(daemon_default, DiffusionGenerationRuntimeOptions::rocm_hybrid)
+    rocm_device_id.map_or(
+        daemon_default,
+        DiffusionGenerationRuntimeOptions::rocm_hybrid,
+    )
 }
 
 fn sd_override_i32(body: &SdGenerationRequest, key: &str) -> Option<i32> {
@@ -6164,7 +6173,11 @@ mod tests {
             ..empty_request()
         };
         assert_eq!(
-            sd_request_generation_runtime_options(&override_settings, &empty_options, daemon_default),
+            sd_request_generation_runtime_options(
+                &override_settings,
+                &empty_options,
+                daemon_default
+            ),
             DiffusionGenerationRuntimeOptions::rocm_hybrid(4)
         );
 

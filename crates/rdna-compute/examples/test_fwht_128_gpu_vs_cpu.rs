@@ -12,37 +12,10 @@
 //!   cargo run -p rdna-compute --release --example test_fwht_128_gpu_vs_cpu
 //!   hipfire gpu-lock release
 
+use hipfire_primitives::fwht::signed_fwht;
 use rdna_compute::{gen_fwht_signs, DType, Gpu};
 
 const GROUP: usize = 128;
-
-fn cpu_fwht_128(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert_eq!(x.len(), GROUP);
-    // Pre-multiply by signs1
-    for i in 0..GROUP {
-        x[i] *= signs1[i];
-    }
-    // Walsh-Hadamard butterfly
-    let mut stride = 1;
-    while stride < GROUP {
-        let mut i = 0;
-        while i < GROUP {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    // Scale and post-multiply by signs2
-    let scale = 1.0f32 / (GROUP as f32).sqrt(); // 0.0883883476...
-    for i in 0..GROUP {
-        x[i] *= scale * signs2[i];
-    }
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");
@@ -61,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu_out = x_host.clone();
     for g in 0..n_groups {
         let start = g * GROUP;
-        cpu_fwht_128(&mut cpu_out[start..start + GROUP], &signs1, &signs2);
+        signed_fwht(&mut cpu_out[start..start + GROUP], &signs1, &signs2);
     }
 
     // GPU path — rotate_x_mq_128 (T5-preview stub, minimal dispatch added in dispatch.rs)

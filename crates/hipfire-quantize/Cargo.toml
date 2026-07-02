@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
+hipfire-primitives = { path = "../hipfire-primitives" }
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

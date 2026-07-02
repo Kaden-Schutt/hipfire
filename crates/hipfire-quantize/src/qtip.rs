@@ -23,6 +23,8 @@
 // (the post-rotation weight distribution). Full-model wiring + `astrea`
 // KLD/PPL gating vs MQ4/MQ3 is the next increment, BEFORE the decode kernel.
 
+use hipfire_primitives::conv::f16_bits_to_f32;
+
 /// Bits per weight (2-bit target).
 pub const BITS_PER_WEIGHT: u32 = 2;
 
@@ -64,6 +66,50 @@ fn decode_1mad(state: u32) -> f32 {
 pub fn build_codebook() -> Vec<f32> {
     let mut cb: Vec<f64> = (0..NUM_STATES as u32)
         .map(|s| decode_1mad(s) as f64)
+        .collect();
+    let mean = cb.iter().sum::<f64>() / cb.len() as f64;
+    for v in cb.iter_mut() {
+        *v -= mean;
+    }
+    let var = cb.iter().map(|v| v * v).sum::<f64>() / cb.len() as f64;
+    let inv_std = if var > 0.0 { 1.0 / var.sqrt() } else { 1.0 };
+    cb.iter().map(|v| (v * inv_std) as f32).collect()
+}
+
+/// QTIP "3INST" computed-codebook hash (QTIP §3 / Algorithm 3INST; constants
+/// from the reference `lib/codebook/bitshift.py::decode_3inst`): LCG, then mask
+/// + XOR a packed fp16 constant, then split the 32-bit word into two binary16
+/// values and SUM them → a closer-to-Gaussian code than 1MAD's 4-byte central
+/// limit (the residual-gap closer the QTIP paper cites). `fpmask`/`mask` set a
+/// controlled exponent so each half is a finite ~N(0,1)-scale fp16.
+#[inline]
+fn decode_3inst(state: u32) -> f32 {
+    const A: u64 = 89_226_354;
+    const B: u64 = 64_248_484;
+    const FPMASK: u32 = 996_162_400;
+    let x = (((state as u64).wrapping_mul(A).wrapping_add(B)) & 0xFFFF_FFFF) as u32;
+    let half_mask: u32 = (1 << 15) | ((1 << 12) - 1); // 0x8FFF: sign + low 12 bits
+    let mask = (half_mask << 16) | half_mask; // 0x8FFF8FFF
+    let res = (mask & x) ^ FPMASK;
+    let top = f16_bits_to_f32((res >> 16) as u16);
+    let bottom = f16_bits_to_f32((res & 0xFFFF) as u16);
+    top + bottom
+}
+
+/// 3INST codebook (state → value), renormalized like [`build_codebook`]. NaN/inf
+/// entries (rare, from the fp16 reinterpret) are zeroed before the renorm so the
+/// mean/variance stay finite — they map to a near-zero code, which the trellis
+/// simply avoids selecting.
+pub fn build_codebook_3inst() -> Vec<f32> {
+    let mut cb: Vec<f64> = (0..NUM_STATES as u32)
+        .map(|s| {
+            let v = decode_3inst(s);
+            if v.is_finite() {
+                v as f64
+            } else {
+                0.0
+            }
+        })
         .collect();
     let mean = cb.iter().sum::<f64>() / cb.len() as f64;
     for v in cb.iter_mut() {
@@ -556,6 +602,44 @@ pub fn optimal_scale_bits(weights: &[f32], symbols: &[u8], codebook: &[f32], bit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codebook_3inst_is_sane_and_more_gaussian() {
+        let cb1 = build_codebook();
+        let cb3 = build_codebook_3inst();
+        assert_eq!(cb3.len(), NUM_STATES);
+        assert!(
+            cb3.iter().all(|v| v.is_finite()),
+            "3inst codebook has non-finite entries"
+        );
+        // Renormalized: ~zero mean, ~unit variance.
+        let mean = cb3.iter().map(|&v| v as f64).sum::<f64>() / cb3.len() as f64;
+        let var = cb3.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / cb3.len() as f64;
+        assert!(mean.abs() < 1e-3, "3inst mean {mean} not ~0");
+        assert!((var - 1.0).abs() < 1e-2, "3inst var {var} not ~1");
+        // It must differ from 1MAD (else the toggle is a no-op).
+        let diff = cb1
+            .iter()
+            .zip(&cb3)
+            .filter(|(a, b)| (*a - *b).abs() > 1e-6)
+            .count();
+        assert!(
+            diff > NUM_STATES / 2,
+            "3inst codebook ~= 1mad (diff={diff})"
+        );
+        // Excess kurtosis closer to 0 (Gaussian) than 1MAD's 4-byte central limit.
+        let kurt = |cb: &[f32]| {
+            let m = cb.iter().map(|&v| v as f64).sum::<f64>() / cb.len() as f64;
+            let m2 = cb.iter().map(|&v| (v as f64 - m).powi(2)).sum::<f64>() / cb.len() as f64;
+            let m4 = cb.iter().map(|&v| (v as f64 - m).powi(4)).sum::<f64>() / cb.len() as f64;
+            m4 / (m2 * m2) - 3.0
+        };
+        println!(
+            "1mad excess-kurtosis={:.4}, 3inst={:.4}",
+            kurt(&cb1),
+            kurt(&cb3)
+        );
+    }
 
     // Deterministic LCG → standard-normal via Box–Muller. Avoids a dev-dep on
     // `rand`; we only need a reproducible Gaussian sample for the quality test.

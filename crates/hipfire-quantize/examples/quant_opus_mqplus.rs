@@ -44,6 +44,8 @@
 //! "permutation can replace SmoothQuant" idea; this harness does neither, so its
 //! numbers reflect the smooth-first-global ordering only.
 
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs as signs, signed_fwht};
+
 fn lcg_gauss(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
     let mut u = || {
@@ -81,48 +83,13 @@ fn gain(mut w: Vec<f32>, rows: usize, k: usize, h: &[bool], g: f32) -> Vec<f32> 
     }
     w
 }
-fn signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut st = seed;
-    (0..n)
-        .map(|_| {
-            st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 {
-                1.0
-            } else {
-                -1.0
-            }
-        })
-        .collect()
-}
-fn fwht256(x: &mut [f32; 256], s1: &[f32], s2: &[f32]) {
-    for i in 0..256 {
-        x[i] *= s1[i];
-    }
-    let mut st = 1;
-    while st < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..st {
-                let a = x[i + j];
-                let b = x[i + j + st];
-                x[i + j] = a + b;
-                x[i + j + st] = a - b;
-            }
-            i += st * 2;
-        }
-        st <<= 1;
-    }
-    for i in 0..256 {
-        x[i] *= 0.0625 * s2[i];
-    }
-}
 fn rotate(m: &mut [f32], rows: usize, k: usize, s1: &[f32], s2: &[f32]) {
     let mut buf = [0.0f32; 256];
     for r in 0..rows {
         for seg in 0..(k / 256) {
             let base = r * k + seg * 256;
             buf.copy_from_slice(&m[base..base + 256]);
-            fwht256(&mut buf, s1, s2);
+            cpu_fwht_256(&mut buf, s1, s2);
             m[base..base + 256].copy_from_slice(&buf);
         }
     }
@@ -457,32 +424,6 @@ fn out_sqnr(x: &[f32], w: &[f32], yref: &[f32], m: usize, k: usize, b: usize) ->
     10.0 * (sig / noise.max(1e-30)).log10()
 }
 
-/// Generic power-of-2 FWHT block (g64/g128/g256), 1/sqrt(n) normalized.
-fn fwht_block(x: &mut [f32], s1: &[f32], s2: &[f32]) {
-    let n = x.len();
-    for i in 0..n {
-        x[i] *= s1[i];
-    }
-    let mut st = 1;
-    while st < n {
-        let mut i = 0;
-        while i < n {
-            for j in 0..st {
-                let a = x[i + j];
-                let bb = x[i + j + st];
-                x[i + j] = a + bb;
-                x[i + j + st] = a - bb;
-            }
-            i += st * 2;
-        }
-        st <<= 1;
-    }
-    let norm = 1.0 / (n as f32).sqrt();
-    for i in 0..n {
-        x[i] *= norm * s2[i];
-    }
-}
-
 /// FWHT-rotate each `group`-sized segment in place (g64 = finer than the g256 default).
 fn rotate_g(m: &mut [f32], rows: usize, k: usize, group: usize, s1: &[f32], s2: &[f32]) {
     let mut buf = vec![0.0f32; group];
@@ -490,7 +431,7 @@ fn rotate_g(m: &mut [f32], rows: usize, k: usize, group: usize, s1: &[f32], s2: 
         for seg in 0..(k / group) {
             let base = r * k + seg * group;
             buf.copy_from_slice(&m[base..base + group]);
-            fwht_block(&mut buf, s1, s2);
+            signed_fwht(&mut buf, s1, s2);
             m[base..base + group].copy_from_slice(&buf);
         }
     }

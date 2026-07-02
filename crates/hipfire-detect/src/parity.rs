@@ -92,12 +92,24 @@ mod tests {
     #[test]
     fn identical_streams_match() {
         let v: Vec<u32> = (0..50).collect();
-        assert_eq!(compare(&v, &v), ParityReport::Match { ok: true, tokens: 50 });
+        assert_eq!(
+            compare(&v, &v),
+            ParityReport::Match {
+                ok: true,
+                tokens: 50
+            }
+        );
     }
 
     #[test]
     fn empty_streams_match() {
-        assert_eq!(compare(&[], &[]), ParityReport::Match { ok: true, tokens: 0 });
+        assert_eq!(
+            compare(&[], &[]),
+            ParityReport::Match {
+                ok: true,
+                tokens: 0
+            }
+        );
     }
 
     #[test]

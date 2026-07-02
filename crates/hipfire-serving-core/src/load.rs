@@ -45,8 +45,10 @@ use crate::memory::{hfq_model_memory, unknown_model_memory};
 use crate::model::CaskConfig;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::model::Lfm2DflashState;
-use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel};
-use crate::session::{next_qwen35_state_allocation_epoch, QWEN35_LEGACY_SESSION_ID};
+use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel, ResidentSession};
+use crate::session::{
+    next_qwen35_state_allocation_epoch, SessionRegistry, QWEN35_LEGACY_SESSION_ID,
+};
 use hipfire_runtime::sequence_state::SequenceState;
 
 /// Matrix-backed admission gate: refuse a request for `feature` on a model whose
@@ -595,19 +597,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -629,13 +628,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -645,11 +638,100 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
+            dflash: None,
+            chat_template,
+            chat_template_profile,
+        });
+    }
+
+    if hfq.arch_id == 16 {
+        // ZAYA1 (CCA attention + EDA/MoD-routed MoE). Served through the shared
+        // ServingBackend seam on ZayaModel (O(1) KV-cache decode).
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=16 (zaya).".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|e| format!("zaya metadata parse: {e}"))?;
+        let cfg_json = meta
+            .get("config")
+            .ok_or("zaya: metadata_json missing 'config'")?;
+        let cfg = hipfire_arch_zaya::ZayaConfig::from_json(cfg_json)
+            .map_err(|e| format!("zaya config: {e}"))?;
+        eprintln!(
+            "  zaya: hidden={}, blocks={}, experts={}, vocab={}, eos={}",
+            cfg.hidden_size, cfg.num_blocks, cfg.moe.num_experts, cfg.vocab_size, cfg.eos_token_id,
+        );
+        let model = hipfire_arch_zaya::arch::ZayaModel::from_hfq(gpu, &hfq, cfg, max_seq)
+            .map_err(|e| format!("ZayaModel::from_hfq: {e}"))?;
+        let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_registry: SessionRegistry::default(),
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            llama_backend: None,
+            nemotron_backend: None,
+            zaya_backend: Some(model),
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            qwen2_backend: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_config: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_weights: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_registry: SessionRegistry::default(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_eos_tok: 0,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            gemma3_vl: None,
+            gemma3_text: None,
+            tokenizer: Some(tokenizer),
+            active: ResidentSession::default(),
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -730,19 +812,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: Some(model),
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -764,13 +843,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -780,11 +853,10 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -837,19 +909,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -871,13 +940,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -887,11 +950,10 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: Some(backend),
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -948,19 +1010,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -982,13 +1041,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -998,11 +1051,10 @@ pub fn load_model(
             gemma3_vl: Some(backend),
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -1055,19 +1107,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: Some(state),
@@ -1089,13 +1138,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: Some(config),
@@ -1105,11 +1148,10 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -1183,19 +1225,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1217,13 +1256,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1233,11 +1266,10 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -1317,19 +1349,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1351,13 +1380,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1367,11 +1390,10 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -1556,19 +1578,16 @@ pub fn load_model(
                 q35_config: None,
                 q35_weights: None,
                 q35_scratch: None,
-                sequence_state: None,
                 q35_kv_mode: None,
                 q35_state_quant: None,
-                q35_sessions: std::collections::HashMap::new(),
-                q35_active_session_id: None,
-                q35_active_state_allocation_epoch: 0,
-                q35_active_prefilled_generated_suffix_len: 0,
+                q35_registry: SessionRegistry::default(),
                 llama_config: None,
                 llama_weights: None,
                 llama_scratch: None,
                 llama_kv: None,
                 llama_backend: None,
                 nemotron_backend: None,
+                zaya_backend: None,
                 qwen2_config: None,
                 qwen2_weights: None,
                 qwen2_state: None,
@@ -1587,10 +1606,11 @@ pub fn load_model(
                 minimax_eos_tok: 0,
                 lfm2moe_config: Some(config),
                 lfm2moe_weights: Some(weights),
-                lfm2moe_state: Some(state),
-                lfm2_sessions: std::collections::HashMap::new(),
-                lfm2_active_session_id: Some(crate::session::LFM2_LEGACY_SESSION_ID.to_string()),
-                lfm2_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
+                lfm2_registry: SessionRegistry {
+                    sessions: std::collections::HashMap::new(),
+                    active_session_id: Some(crate::session::LFM2_LEGACY_SESSION_ID.to_string()),
+                    allocation_epoch: next_qwen35_state_allocation_epoch(),
+                },
                 lfm2moe_eos_tok: eos_tok,
                 dots_ocr_config: None,
                 dots_ocr_weights: None,
@@ -1599,11 +1619,13 @@ pub fn load_model(
                 gemma3_vl: None,
                 gemma3_text: None,
                 tokenizer: Some(tokenizer),
-                seq_pos: 0,
+                active: ResidentSession {
+                    lfm2moe_state: Some(state),
+                    ..Default::default()
+                },
                 max_seq,
                 physical_cap,
                 eviction,
-                conversation_tokens: Vec::new(),
                 asst_turn_cache: std::collections::HashMap::new(),
                 decoded_vocab: None,
                 model_path: path.to_string(),
@@ -1904,19 +1926,20 @@ pub fn load_model(
             q35_config: Some(config),
             q35_weights: Some(weights),
             q35_scratch: Some(scratch),
-            sequence_state,
             q35_kv_mode: Some(kv_mode.clone()),
             q35_state_quant: Some(dn_quant),
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
-            q35_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry {
+                sessions: std::collections::HashMap::new(),
+                active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+                allocation_epoch: next_qwen35_state_allocation_epoch(),
+            },
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -1938,13 +1961,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -1954,11 +1971,13 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession {
+                sequence_state,
+                ..Default::default()
+            },
             max_seq,
             physical_cap,
             eviction,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -2033,19 +2052,16 @@ pub fn load_model(
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: Some(llama_backend),
             nemotron_backend: None,
+            zaya_backend: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
@@ -2067,13 +2083,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             dots_ocr_config: None,
@@ -2083,11 +2093,10 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -2237,19 +2246,16 @@ pub fn load_model_safetensors(
             qwen2_backend: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: Some(llama_backend),
             nemotron_backend: None,
+            zaya_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -2267,13 +2273,7 @@ pub fn load_model_safetensors(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             vision_config: None,
@@ -2281,11 +2281,10 @@ pub fn load_model_safetensors(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -2361,19 +2360,16 @@ pub fn load_model_safetensors(
             qwen2_backend: None,
             dots_ocr_config: None,
             dots_ocr_weights: None,
-            sequence_state: None,
             q35_kv_mode: None,
             q35_state_quant: None,
-            q35_sessions: std::collections::HashMap::new(),
-            q35_active_session_id: None,
-            q35_active_state_allocation_epoch: 0,
-            q35_active_prefilled_generated_suffix_len: 0,
+            q35_registry: SessionRegistry::default(),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
             llama_kv: None,
             llama_backend: None,
             nemotron_backend: Some(model),
+            zaya_backend: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
@@ -2391,13 +2387,7 @@ pub fn load_model_safetensors(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_weights: None,
             #[cfg(feature = "arch-lfm2moe")]
-            lfm2moe_state: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_sessions: std::collections::HashMap::new(),
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_session_id: None,
-            #[cfg(feature = "arch-lfm2moe")]
-            lfm2_active_state_allocation_epoch: 0,
+            lfm2_registry: SessionRegistry::default(),
             #[cfg(feature = "arch-lfm2moe")]
             lfm2moe_eos_tok: 0,
             vision_config: None,
@@ -2405,11 +2395,10 @@ pub fn load_model_safetensors(
             gemma3_vl: None,
             gemma3_text: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0,
+            active: ResidentSession::default(),
             max_seq,
             physical_cap: max_seq,
             eviction: None,
-            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
@@ -2503,19 +2492,20 @@ pub fn load_model_safetensors(
         qwen2_backend: None,
         dots_ocr_config: None,
         dots_ocr_weights: None,
-        sequence_state,
         q35_kv_mode: Some(kv_mode.to_string()),
         q35_state_quant: Some(hipfire_arch_qwen35::qwen35::StateQuant::Q8),
-        q35_sessions: std::collections::HashMap::new(),
-        q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
-        q35_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
-        q35_active_prefilled_generated_suffix_len: 0,
+        q35_registry: SessionRegistry {
+            sessions: std::collections::HashMap::new(),
+            active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+            allocation_epoch: next_qwen35_state_allocation_epoch(),
+        },
         llama_config: None,
         llama_weights: None,
         llama_scratch: None,
         llama_kv: None,
         llama_backend: None,
         nemotron_backend: None,
+        zaya_backend: None,
         deepseek4_config: None,
         deepseek4_weights: None,
         deepseek4_state: None,
@@ -2533,13 +2523,7 @@ pub fn load_model_safetensors(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_weights: None,
         #[cfg(feature = "arch-lfm2moe")]
-        lfm2moe_state: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_sessions: std::collections::HashMap::new(),
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_session_id: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_state_allocation_epoch: 0,
+        lfm2_registry: SessionRegistry::default(),
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_eos_tok: 0,
         vision_config: None,
@@ -2547,11 +2531,13 @@ pub fn load_model_safetensors(
         gemma3_vl: None,
         gemma3_text: None,
         tokenizer: Some(tokenizer),
-        seq_pos: 0,
+        active: ResidentSession {
+            sequence_state,
+            ..Default::default()
+        },
         max_seq: effective_max_seq,
         physical_cap: effective_max_seq,
         eviction: None,
-        conversation_tokens: Vec::new(),
         asst_turn_cache: std::collections::HashMap::new(),
         decoded_vocab: None,
         model_path: path.to_string(),
@@ -2797,19 +2783,16 @@ pub fn load_model_pp(
         q35_config: Some(config),
         q35_weights: Some(weights),
         q35_scratch: None,
-        sequence_state,
         q35_kv_mode: None,
         q35_state_quant: None,
-        q35_sessions: std::collections::HashMap::new(),
-        q35_active_session_id: None,
-        q35_active_state_allocation_epoch: 0,
-        q35_active_prefilled_generated_suffix_len: 0,
+        q35_registry: SessionRegistry::default(),
         llama_config: None,
         llama_weights: None,
         llama_scratch: None,
         llama_kv: None,
         llama_backend: None,
         nemotron_backend: None,
+        zaya_backend: None,
         qwen2_config: None,
         qwen2_weights: None,
         qwen2_state: None,
@@ -2831,13 +2814,7 @@ pub fn load_model_pp(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_weights: None,
         #[cfg(feature = "arch-lfm2moe")]
-        lfm2moe_state: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_sessions: std::collections::HashMap::new(),
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_session_id: None,
-        #[cfg(feature = "arch-lfm2moe")]
-        lfm2_active_state_allocation_epoch: 0,
+        lfm2_registry: SessionRegistry::default(),
         #[cfg(feature = "arch-lfm2moe")]
         lfm2moe_eos_tok: 0,
         dots_ocr_config: None,
@@ -2847,11 +2824,13 @@ pub fn load_model_pp(
         gemma3_vl: None,
         gemma3_text: None,
         tokenizer: Some(tokenizer),
-        seq_pos: 0,
+        active: ResidentSession {
+            sequence_state,
+            ..Default::default()
+        },
         max_seq,
         physical_cap: max_seq,
         eviction: None,
-        conversation_tokens: Vec::new(),
         asst_turn_cache: std::collections::HashMap::new(),
         decoded_vocab: None,
         model_path: path.to_string(),
@@ -2945,7 +2924,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         if let Some(scratch_set) = m.pp_scratch_set {
             scratch_set.free_gpu_multi(&mut gpus);
         }
-        if let Some(ss) = m.sequence_state.take() {
+        if let Some(ss) = m.active.sequence_state.take() {
             let (kv, recurrent) = ss.into_parts();
             if let Some(kv) = kv {
                 kv.free_gpu_multi(&mut gpus);
@@ -2970,14 +2949,20 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         let _ = gpu;
         return;
     }
-    // DFlash state: draft weights have free_gpu; ring / snapshot / tape /
-    // verify_scratch don't expose one — their GpuTensors / DeviceBuffers will
-    // leak until daemon exit if the caller cycles load/unload mid-session.
-    // Acceptable for the daemon since unload is rare and the weights are the
-    // bulk of the VRAM anyway.
+    // DFlash state: free every GPU-resident component explicitly. No `Drop` on
+    // GpuTensor/DeviceBuffer, so the ring buffer, verify scratch, snapshot, tape,
+    // and (optional) DDTree state must each be returned to the pool — otherwise a
+    // mid-session load/unload cycle strands them until daemon exit.
     if let Some(df) = m.dflash {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
+        df.hidden_rb.free_gpu(gpu);
+        df.verify_scratch.free_gpu(gpu);
+        df.target_snap.free_gpu(gpu);
+        df.gdn_tape.free_gpu(gpu);
+        if let Some(ddtree) = df.ddtree {
+            ddtree.free_gpu(gpu);
+        }
     }
     #[cfg(feature = "arch-lfm2moe")]
     if let Some(df) = m.lfm2_dflash {
@@ -2990,7 +2975,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         ev.free_gpu(gpu);
     }
     // Free KV cache + DeltaNet state + scratch first (small fraction of VRAM).
-    if let Some(ss) = m.sequence_state.take() {
+    if let Some(ss) = m.active.sequence_state.take() {
         let (kv, recurrent) = ss.into_parts();
         if let Some(kv) = kv {
             kv.free_gpu(gpu);
@@ -3028,19 +3013,25 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
     }
-    // MiniMax-M2 (arch_id=10): MiniMaxState / MiniMaxWeights expose no
-    // free_gpu in the scaffold, so they drop here without returning their
-    // device tensors to the pool. KNOWN LEAK on load/unload churn — there
-    // is no eviction wired for arch_id=10 yet, so the model stays resident
-    // for the daemon's lifetime in the bring-up scope. Add free_gpu to the
-    // minimax crate + explicit frees here when eviction lands.
-    let _ = (&m.minimax_state, &m.minimax_weights);
-    // LFM2.5-MoE (arch_id=11): same bring-up scope as minimax — Lfm2MoeState /
-    // Lfm2MoeWeights expose no free_gpu in the scaffold, so they drop here
-    // without returning their device tensors to the pool. KNOWN LEAK on
-    // load/unload churn until eviction is wired for arch_id=11.
+    // MiniMax-M2 (arch_id=10): state (KV + scratch + device pos scalar) then
+    // weights (the VRAM bulk). Both expose free_gpu so a load/unload cycle
+    // returns their device buffers to the pool instead of leaking.
+    if let Some(s) = m.minimax_state {
+        s.free_gpu(gpu);
+    }
+    if let Some(w) = m.minimax_weights {
+        w.free_gpu(gpu);
+    }
+    // LFM2.5-MoE (arch_id=11): state (KV + conv ring + scratch + pos scalar)
+    // then weights. Same explicit-free contract as minimax.
     #[cfg(feature = "arch-lfm2moe")]
-    let _ = (&m.lfm2moe_state, &m.lfm2moe_weights);
+    if let Some(s) = m.active.lfm2moe_state {
+        s.free_gpu(gpu);
+    }
+    #[cfg(feature = "arch-lfm2moe")]
+    if let Some(w) = m.lfm2moe_weights {
+        w.free_gpu(gpu);
+    }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights {
@@ -3068,6 +3059,30 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if let Some(w) = m.deepseek4_weights {
         w.free_gpu(gpu);
+    }
+    // Assembled ServingBackend wrappers (arch_id 0/1 llama, 7 qwen2, 14/15
+    // nemotron, 16 zaya) own their GPU weights + decode state internally and
+    // have no Drop. Unlike the loose-slot paths above, dropping the LoadedModel
+    // does NOT return their device buffers to the pool — so without an explicit
+    // unload they leak across a load/unload cycle. For a bf16 reference (~34 GB)
+    // that OOMs the very next load (the multi-model quality-battery failure).
+    // Each backend's `ServingBackend::unload` frees exactly what it allocated;
+    // the loose `*_weights`/`*_state` frees above are no-ops on these paths
+    // (those fields stay None when the backend wrapper is populated).
+    {
+        use hipfire_runtime::arch::ServingBackend;
+        if let Some(b) = m.zaya_backend {
+            Box::new(b).unload(gpu);
+        }
+        if let Some(b) = m.nemotron_backend {
+            Box::new(b).unload(gpu);
+        }
+        if let Some(b) = m.qwen2_backend {
+            Box::new(b).unload(gpu);
+        }
+        if let Some(b) = m.llama_backend {
+            Box::new(b).unload(gpu);
+        }
     }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded

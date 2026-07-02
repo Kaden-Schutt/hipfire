@@ -17,6 +17,7 @@
 //!
 //!   cargo run --release -p rdna-compute --example validate_opus_w4a4_e2e [M K B]
 
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs as signs};
 use rdna_compute::Gpu;
 
 fn lcg_gauss(seed: u32, n: usize) -> Vec<f32> {
@@ -56,48 +57,13 @@ fn gain(mut w: Vec<f32>, rows: usize, k: usize, h: &[bool], g: f32) -> Vec<f32> 
     }
     w
 }
-fn signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut st = seed;
-    (0..n)
-        .map(|_| {
-            st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 {
-                1.0
-            } else {
-                -1.0
-            }
-        })
-        .collect()
-}
-fn fwht256(x: &mut [f32; 256], s1: &[f32], s2: &[f32]) {
-    for i in 0..256 {
-        x[i] *= s1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    for i in 0..256 {
-        x[i] *= 0.0625 * s2[i];
-    }
-}
 fn rotate(m: &mut [f32], rows: usize, k: usize, s1: &[f32], s2: &[f32]) {
     let mut buf = [0.0f32; 256];
     for r in 0..rows {
         for seg in 0..(k / 256) {
             let base = r * k + seg * 256;
             buf.copy_from_slice(&m[base..base + 256]);
-            fwht256(&mut buf, s1, s2);
+            cpu_fwht_256(&mut buf, s1, s2);
             m[base..base + 256].copy_from_slice(&buf);
         }
     }

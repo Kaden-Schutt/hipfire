@@ -16,8 +16,9 @@
 //!
 //!   cargo run --release -p hipfire-runtime --example oq4_weight_gemv_parity [M K]
 
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use hipfire_runtime::weights::{weight_gemv, WeightTensor};
-use rdna_compute::{gen_fwht_signs, DType, Gpu};
+use rdna_compute::{DType, Gpu};
 
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
@@ -32,31 +33,6 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
             } // sparse outliers
         })
         .collect()
-}
-
-/// Faithful copy of the quantizer's `cpu_fwht_256` (signs1 pre, Hadamard,
-/// 1/16·signs2 post) — the same transform `gpu.rotate_x_mq` inverts.
-fn fwht256(x: &mut [f32; 256], s1: &[f32], s2: &[f32]) {
-    for i in 0..256 {
-        x[i] *= s1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    for i in 0..256 {
-        x[i] *= 0.0625 * s2[i];
-    }
 }
 
 fn main() {
@@ -99,7 +75,7 @@ fn main() {
         for g in 0..ng {
             let mut grp = [0.0f32; 256];
             grp.copy_from_slice(&w[r * k + g * GROUP..r * k + g * GROUP + GROUP]);
-            fwht256(&mut grp, &s1, &s2);
+            cpu_fwht_256(&mut grp, &s1, &s2);
             let amax = grp.iter().fold(1e-12f32, |a, &v| a.max(v.abs()));
             // Clip-search the symmetric scale (MSE-optimal), as the production
             // codec does — confirms the forward path reaches the validated band.

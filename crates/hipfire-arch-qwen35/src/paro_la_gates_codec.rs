@@ -14,43 +14,13 @@
 //! storing `min_v` at zero is correct: `scale * 0 + min_v = min_v`. Nibble formula:
 //! `q = round((x - min_v) * inv_scale).clamp(0, 15)`.
 
+use hipfire_primitives::fwht::signed_fwht;
 use hipfire_runtime::quant::f16_to_f32;
 
 const GROUP_SIZE: usize = 128;
 const BYTES_PER_GROUP: usize = 72; // 4-byte scale + 4-byte zero + 64 packed nibbles
 const SIGNS1_SEED: u32 = 43;
 const SIGNS2_SEED: u32 = 1043;
-
-/// Walsh-Hadamard butterfly with pre/post sign-multiplication, scale 1/sqrt(128).
-/// MUST produce bit-identical output to gemv_mq4g128.hip's mq_rotate_x_128 kernel
-/// when given the same sign tables (seeds 43, 1043). T3 test already verifies this
-/// for the kernel side; this CPU version is the encoder counterpart.
-fn cpu_fwht_128(x: &mut [f32; GROUP_SIZE], signs1: &[f32], signs2: &[f32]) {
-    debug_assert_eq!(signs1.len(), GROUP_SIZE);
-    debug_assert_eq!(signs2.len(), GROUP_SIZE);
-    for i in 0..GROUP_SIZE {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1;
-    while stride < GROUP_SIZE {
-        let mut i = 0;
-        while i < GROUP_SIZE {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    // 1/sqrt(128) = 0.0883883476...
-    let scale = 1.0f32 / (GROUP_SIZE as f32).sqrt();
-    for i in 0..GROUP_SIZE {
-        x[i] *= scale * signs2[i];
-    }
-}
 
 /// Encoded weight buffer in MQ4G128 byte layout.
 pub struct EncodedMQ4G128 {
@@ -93,7 +63,7 @@ pub fn encode_mq4g128_from_fp16(weight_fp16: &[u16], rows: usize, cols: usize) -
                 group[i] = f16_to_f32(weight_fp16[m * cols + g * GROUP_SIZE + i]);
             }
             // 2. FWHT-128 in place (matching kernel exactly)
-            cpu_fwht_128(&mut group, &signs1_vec, &signs2_vec);
+            signed_fwht(&mut group, &signs1_vec, &signs2_vec);
             // 3. Find min/max
             let (min_v, max_v) = group
                 .iter()
@@ -197,7 +167,7 @@ mod tests {
     /// Both the weight FWHT (applied during encode) and the activation FWHT
     /// (applied at decode time by the kernel) are the same orthogonal transform.
     /// In the dot product they cancel: (H*w)·(H*x) = w·(H^T*H*x) = w·x.
-    /// We simulate this here by rotating the activation through cpu_fwht_128 and
+    /// We simulate this here by rotating the activation through shared signed FWHT and
     /// then computing dot products against the dequantized rotated weights.
     #[test]
     fn round_trip_dot_product() {
@@ -237,7 +207,7 @@ mod tests {
         let mut act_rot = act_f32.clone();
         for g in 0..(cols / GROUP_SIZE) {
             let mut grp: [f32; 128] = act_rot[g * 128..(g + 1) * 128].try_into().unwrap();
-            cpu_fwht_128(&mut grp, &signs1, &signs2);
+            signed_fwht(&mut grp, &signs1, &signs2);
             act_rot[g * 128..(g + 1) * 128].copy_from_slice(&grp);
         }
 

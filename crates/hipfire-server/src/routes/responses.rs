@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use crate::routes::chat::{
     effective_request_max_tokens, ensure_model_loaded, execute_blocking_chat,
-    generate_request_from_chat, normalize_stop_sequences, request_generation_controls,
-    required_load_max_seq, strip_visible_thinking, wait_for_prefill_scheduler_turn, AssistantDelta,
-    ChatMessage, ChatRequest, ThinkStreamFilter,
+    extract_request_image_base64, generate_request_from_chat, normalize_stop_sequences,
+    request_generation_controls, required_load_max_seq, strip_visible_thinking,
+    wait_for_prefill_scheduler_turn, AssistantDelta, ChatMessage, ChatRequest, ThinkStreamFilter,
 };
 use crate::state::{SharedState, StoredResponsesContext};
 use hipfire_daemon_adapter::{GenerateStreamControl, GenerateStreamEvent};
@@ -75,7 +75,7 @@ pub(crate) async fn execute_responses(
 ) -> Result<Value, Value> {
     let messages = prepare_response_messages(&state, &body).await?;
 
-    let chat_body = ChatRequest {
+    let mut chat_body = ChatRequest {
         model: body.model.clone(),
         messages: messages
             .iter()
@@ -97,6 +97,10 @@ pub(crate) async fn execute_responses(
         stream_options: None,
         chat_template_kwargs: body.chat_template_kwargs.clone(),
     };
+    // Forward the current turn's image (if any) so the chat vision path and its
+    // embedding cache pick it up; non-stream extraction happens inside
+    // execute_blocking_chat.
+    apply_vision_content(&mut chat_body.messages, &body.input);
 
     let generated = match execute_blocking_chat(state.clone(), chat_body).await {
         Ok(generated) => generated,
@@ -227,10 +231,23 @@ async fn stream_responses(state: SharedState, body: ResponsesRequest) -> impl In
             }
         };
 
-        let chat_messages = messages
+        let mut chat_messages = messages
             .iter()
             .map(prompt_message_to_chat_message)
             .collect::<Vec<_>>();
+        apply_vision_content(&mut chat_messages, &body.input);
+        let image_base64 = match extract_request_image_base64(&chat_messages) {
+            Ok(image) => image,
+            Err(message) => {
+                let _ = tx
+                    .send(Ok(sse_json_event(
+                        "error",
+                        json!({"error": {"message": message, "type": "invalid_request_error"}}),
+                    )))
+                    .await;
+                return;
+            }
+        };
 
         let (request_max_tokens, required_max_seq) = {
             let cfg = state.config.lock().await;
@@ -238,7 +255,7 @@ async fn stream_responses(state: SharedState, body: ResponsesRequest) -> impl In
             let request_max_tokens = effective_request_max_tokens(cfg.max_tokens, requested);
             (
                 request_max_tokens,
-                required_load_max_seq(cfg.max_seq, request_max_tokens, false),
+                required_load_max_seq(cfg.max_seq, request_max_tokens, image_base64.is_some()),
             )
         };
 
@@ -300,7 +317,7 @@ async fn stream_responses(state: SharedState, body: ResponsesRequest) -> impl In
                 None,
                 None,
                 stop,
-                None,
+                image_base64,
                 controls,
             )
         };
@@ -514,6 +531,43 @@ fn response_output_item_done_json(response_id: &str, message_id: &str, text: &st
             }],
         }
     })
+}
+
+/// The raw content of the last user item in `input`, returned only when it
+/// carries an image part. Forwarding this (rather than the flattened text) to
+/// the chat path is what gives the Responses API vision — and, downstream, the
+/// shared vision-embedding cache.
+fn last_user_image_content(input: &Value) -> Option<Value> {
+    let items = match input {
+        Value::Array(items) => items.as_slice(),
+        Value::Object(obj) => obj.get("messages").and_then(Value::as_array)?.as_slice(),
+        _ => return None,
+    };
+    let last_user = items
+        .iter()
+        .rev()
+        .find(|it| it.get("role").and_then(Value::as_str) == Some("user"))?;
+    let content = last_user.get("content")?;
+    let has_image = content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .any(|p| p.get("type").and_then(Value::as_str) == Some("image_url"))
+        })
+        .unwrap_or(false);
+    has_image.then(|| content.clone())
+}
+
+/// Override the last user message's content with the original multimodal input
+/// (text + image parts) so the chat vision path can extract the image. Image
+/// constraints match chat: a single png/jpeg data URL in the last user turn.
+fn apply_vision_content(messages: &mut [ChatMessage], input: &Value) {
+    if let Some(content) = last_user_image_content(input) {
+        if let Some(message) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            message.content = Some(content);
+        }
+    }
 }
 
 fn responses_input_to_chat_messages(input: &Value) -> Result<Vec<Message>, String> {

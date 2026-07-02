@@ -44,12 +44,9 @@ pub async fn get_admin_logs(Query(query): Query<AdminLogsQuery>) -> Json<Value> 
     }))
 }
 
-/// Live host/GPU telemetry snapshot for the dashboard (sysfs-backed).
+/// Live host/GPU telemetry snapshot for the dashboard (sysfs + `/proc`-backed).
 pub async fn get_admin_stats() -> Json<hipfire_admin_types::AdminStats> {
-    Json(hipfire_admin_types::AdminStats {
-        generated_unix: now_unix_secs(),
-        gpus: crate::telemetry::read_gpu_telemetry(),
-    })
+    Json(hipfire_sysinfo::snapshot(now_unix_secs()))
 }
 
 fn now_unix_secs() -> u64 {

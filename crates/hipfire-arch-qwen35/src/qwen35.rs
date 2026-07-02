@@ -2441,7 +2441,7 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 /// via the loader's catch-all (honest capability gap) instead of reading as
 /// garbage. The decoded `WeightTensor` is identical to the qt=34 path
 /// (`DType::Oq4G256`) — only the on-disk parse differs.
-pub const OQ4_ARCH_PACKED_QT: u8 = 37;
+pub const OQ4_ARCH_PACKED_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256ArchPacked.code();
 
 /// Byte length of the OQ4 arch combined device layout for an `[m, k]` matrix:
 /// `[split nibbles m*(k/2)] [split f32 scales m*ng] [interleaved m*ng*132]`.
@@ -4295,25 +4295,9 @@ fn gpu_slab_bank_size() -> usize {
 }
 
 fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
-    match qt {
-        3 => Some(DType::Q8_0),
-        6 => Some(DType::HFQ4G256),
-        7 => Some(DType::HFQ4G128),
-        8 => Some(DType::HFQ6G256),
-        11 => Some(DType::HFQ3G256),
-        12 => Some(DType::HFQ3G128),
-        13 => Some(DType::MQ4G256),
-        14 => Some(DType::MQ8G256),
-        15 => Some(DType::MQ6G256),
-        17 => Some(DType::MQ3G256),
-        31 => Some(DType::Qtip3G256),
-        18 => Some(DType::MQ2G256),
-        19 => Some(DType::MQ2G256Lloyd),
-        20 => Some(DType::MQ3G256Lloyd),
-        21 if k % 256 == 0 => Some(DType::HFP4G32),
-        24 if k % 256 == 0 => Some(DType::MFP4G32),
-        _ => None,
-    }
+    // Canonical map lives in hipfire_runtime::quant (shared across all arch
+    // loaders). Thin alias retained for the slab-planning call sites.
+    hipfire_runtime::quant::dtype_for_quant_type(qt, k)
 }
 
 fn build_slab_banks(hfq: &HfqFile, bank_size: usize) -> Vec<SlabPlanBank> {
@@ -4750,14 +4734,14 @@ fn rq_apply_reader(
         np,
     } = corr
     {
-        let xs = gpu.zeros(&[*np], DType::F32)?;
+        let xs = gpu.zeros_owned(&[*np], DType::F32)?;
         gpu.rq_gather_f32(src_normed, idx, &xs, *n_idx, *np)?;
-        let tmp = gpu.zeros(&[*m], DType::F32)?;
+        let tmp = gpu.zeros_owned(&[*m], DType::F32)?;
         gpu.gemv_f32(corr, &xs, &tmp)?;
         gpu.add_inplace_f32(out, &tmp)?;
-        gpu.free_tensor(xs)?;
-        gpu.free_tensor(tmp)?;
     }
+    // `xs`/`tmp` (RAII `OwnedTensor`) dropped at the block end; drain the pool.
+    gpu.reclaim_pending();
     Ok(())
 }
 
@@ -4782,14 +4766,15 @@ fn rq_apply_readers(
     {
         return Ok(());
     }
-    let src = gpu.zeros(&[dim], DType::F32)?;
+    let src = gpu.zeros_owned(&[dim], DType::F32)?;
     gpu.rmsnorm_f32(x, norm_weight, &src, eps)?;
     for (p, out) in sites {
         if let Some(c) = weights.rq_corrections.get(&(li, *p)) {
             rq_apply_reader(gpu, c, &src, out)?;
         }
     }
-    gpu.free_tensor(src)?;
+    drop(src); // enqueue the RAII `OwnedTensor` before draining the pool below.
+    gpu.reclaim_pending();
     Ok(())
 }
 
@@ -4808,11 +4793,12 @@ fn rq_apply_writer(
         k: _,
     } = corr
     {
-        let c = gpu.zeros(&[*n_s], DType::F32)?;
+        let c = gpu.zeros_owned(&[*n_s], DType::F32)?;
         gpu.gemv_f32(corr, input, &c)?;
         gpu.rq_scatter_add_f32(out_resid, idx, &c, *n_s)?;
-        gpu.free_tensor(c)?;
     }
+    // `c` (RAII `OwnedTensor`) dropped at the block end; drain the pool.
+    gpu.reclaim_pending();
     Ok(())
 }
 
@@ -4921,14 +4907,11 @@ impl Default for CalibOpts {
 }
 
 /// Summary of a calibration pass after the `.calib.hfq` has been streamed to
-/// disk. The tensors themselves are NOT returned — they are written one at a
-/// time (see [`CalibCollector::write_streaming`]) so a 9B's ~32 GB of Hessians
-/// never sits in host RAM at once.
-pub struct CalibSummary {
-    pub n_hessian: usize,
-    pub n_imatrix: usize,
-    pub max_consistency: f32,
-}
+/// disk (re-exported from the shared driver). The tensors themselves are NOT
+/// returned — they are written one at a time (see
+/// [`CalibCollector::write_streaming`]) so a 9B's ~32 GB of Hessians never sits
+/// in host RAM at once.
+pub use hipfire_runtime::calibration::CalibSummary;
 
 /// FullAttention layer indices, in order. (LinearAttention/DeltaNet layers are
 /// SSM and do not populate the KV cache's `k_gpu`, so PFlash scoring — and the
@@ -4989,7 +4972,7 @@ pub fn capture_pflash_block_scores(
     let n_blocks = n_tok.div_ceil(block_size);
     let mut out = Vec::with_capacity(layers.len());
     for &layer in layers {
-        let scores = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let scores = gpu.alloc_owned(&[n_blocks], DType::F32)?;
         gpu.pflash_score_f32_fwd(
             &kv.k_gpu[layer],
             &scores,
@@ -4999,8 +4982,10 @@ pub fn capture_pflash_block_scores(
             n_blocks,
             n_tok - 1,
         )?;
-        out.push(gpu.download_f32(&scores)?);
-        let _ = gpu.free_tensor(scores);
+        let row = gpu.download_f32(&scores)?;
+        drop(scores); // enqueue this iteration's RAII scratch, then drain.
+        gpu.reclaim_pending();
+        out.push(row);
     }
     Ok(out)
 }
@@ -5047,35 +5032,6 @@ pub fn dump_embed_fp32(
     Ok((vocab, dim))
 }
 
-/// Outcome of a daemon-resident KLD evaluation pass.
-pub struct KldEvalOutcome {
-    pub n_chunk: usize,
-    pub total_scored: usize,
-    pub mean_kld: f32,
-    pub p99_kld: f32,
-    pub mean_nll: f32,
-    pub per_chunk: Vec<hipfire_kld::ChunkResult>,
-}
-
-fn kld_mean_f32(v: &[f32]) -> f32 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    (v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64) as f32
-}
-
-fn kld_p99_f32(v: &[f32]) -> f32 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let mut s = v.to_vec();
-    s.sort_by(|a, b| a.total_cmp(b));
-    let idx = (((s.len() as f64) * 0.99).ceil() as usize)
-        .saturating_sub(1)
-        .min(s.len() - 1);
-    s[idx]
-}
-
 /// Run the resident model over `chunk` (per-token decode, fresh KV + DeltaNet
 /// state) and invoke `at_scored(j, full_logits, actual_next)` for each scored
 /// position `j` in `[scoring_start, n_ctx-1)`. The single forward path that both
@@ -5110,247 +5066,73 @@ fn forward_chunk_scored(
     Ok(())
 }
 
-/// Self-consistency KLD against the resident model, no reload.
-///
-/// Pass 1 builds a reference (top-K log-softmax per scored position) from the
-/// loaded model over each `n_ctx` chunk; pass 2 scores the SAME model against
-/// that in-memory reference via a second forward through the identical code.
-/// Because reference build and scoring share one forward path on one loaded
-/// model + config, a healthy run returns ≈0 on ANY arch — this is the guard that
-/// would have caught the historical two-binary 2.85-nat drift in seconds. A
-/// non-zero result is a real forward non-determinism or plumbing bug.
-#[allow(clippy::too_many_arguments)]
-pub fn kld_eval_self_score(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    tokens: &[u32],
-    n_ctx: usize,
-    top_k: usize,
-    max_chunks: Option<usize>,
-    mut on_chunk: impl FnMut(usize, usize, usize, f32),
-) -> HipResult<KldEvalOutcome> {
-    use hipfire_kld::{score_position, top_k_log_softmax, RefBlock, TopKReduction};
+/// Adapter making a resident Qwen3.5 (the loose `weights`+`config` slots, which
+/// don't implement [`hipfire_runtime::arch::SimpleAr`]) KLD-scorable through the
+/// generic [`hipfire_runtime::kld_eval`] driver — reusing the per-token
+/// `forward_chunk_scored` path above. Every other arch gets the blanket impl.
+pub struct Qwen35KldForward<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
+}
 
-    let scoring_start = n_ctx / 2;
-    let n_chunk_avail = tokens.len() / n_ctx;
-    let n_chunk = max_chunks.map_or(n_chunk_avail, |m| m.min(n_chunk_avail));
-
-    let mut per_chunk = Vec::with_capacity(n_chunk);
-    let mut global_kld_sum = 0.0f64;
-    let mut total_scored = 0usize;
-    let mut global_nll_sum = 0.0f64;
-    let mut global_nll_n = 0usize;
-
-    for c in 0..n_chunk {
-        let chunk = &tokens[c * n_ctx..c * n_ctx + n_ctx];
-
-        // Pass 1: reference top-K reductions for the scored positions.
-        let mut reds: Vec<TopKReduction> = Vec::new();
+impl hipfire_runtime::kld_eval::ChunkScoredForward for Qwen35KldForward<'_> {
+    fn forward_chunk_scored(
+        &mut self,
+        gpu: &mut Gpu,
+        chunk: &[u32],
+        scoring_start: usize,
+        at_scored: &mut dyn FnMut(usize, &[f32], usize),
+    ) -> Result<(), String> {
         forward_chunk_scored(
             gpu,
-            weights,
-            config,
+            self.weights,
+            self.config,
             chunk,
             scoring_start,
-            |_j, lg, _next| {
-                reds.push(top_k_log_softmax(lg, top_k));
-            },
-        )?;
-
-        // Pass 2: score the same model against the in-memory reference.
-        let mut klds: Vec<f32> = Vec::with_capacity(reds.len());
-        let mut nlls: Vec<f32> = Vec::new();
-        forward_chunk_scored(gpu, weights, config, chunk, scoring_start, |j, lg, next| {
-            let red = &reds[j];
-            let rb = RefBlock {
-                top_indices: &red.indices,
-                top_log_probs: &red.log_probs,
-                residual_mass: red.residual_mass,
-            };
-            let s = score_position(&rb, lg, next);
-            klds.push(s.kld);
-            if let Some(n) = s.nll {
-                nlls.push(n);
-            }
-        })?;
-
-        let mean_kld = kld_mean_f32(&klds);
-        global_kld_sum += klds.iter().map(|&x| x as f64).sum::<f64>();
-        total_scored += klds.len();
-        global_nll_sum += nlls.iter().map(|&x| x as f64).sum::<f64>();
-        global_nll_n += nlls.len();
-        on_chunk(c, n_chunk, klds.len(), mean_kld);
-        per_chunk.push(hipfire_kld::ChunkResult {
-            mean_kld: mean_kld as f64,
-            p99_kld: kld_p99_f32(&klds) as f64,
-            mean_nll: kld_mean_f32(&nlls) as f64,
-        });
+            |j, lg, next| at_scored(j, lg, next),
+        )
+        .map_err(|e| format!("qwen35 kld forward: {e:?}"))
     }
 
-    let mean_kld = if total_scored > 0 {
-        (global_kld_sum / total_scored as f64) as f32
-    } else {
-        0.0
-    };
-    let mean_nll = if global_nll_n > 0 {
-        (global_nll_sum / global_nll_n as f64) as f32
-    } else {
-        0.0
-    };
-    let chunk_means: Vec<f32> = per_chunk.iter().map(|c| c.mean_kld as f32).collect();
-
-    Ok(KldEvalOutcome {
-        n_chunk,
-        total_scored,
-        mean_kld,
-        p99_kld: kld_p99_f32(&chunk_means),
-        mean_nll,
-        per_chunk,
-    })
+    fn kld_vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
 }
 
-/// Reference payloads built from the resident model. The daemon wraps these in a
-/// `hipfire_kld::RefArchive` with full provenance metadata (`RefMeta`).
-pub struct KldRefPayloads {
-    pub n_chunk: usize,
-    pub n_ctx: usize,
-    pub scored_per_chunk: usize,
-    pub top_k: usize,
-    pub n_vocab: usize,
-    pub tokens: Vec<u32>,
-    pub top_indices: Vec<u32>,
-    pub top_log_probs: Vec<f32>,
-    pub residual_mass: Vec<f32>,
+/// Thin `&weights`/`&config` adapter so the daemon's loose Qwen3.5 resident slots
+/// satisfy the calibration seam ([`hipfire_runtime::calibration::CalibratableBackend`])
+/// without a bundled backend type — the calibration analogue of
+/// [`Qwen35KldForward`].
+pub struct Qwen35CalibBackend<'a> {
+    pub weights: &'a Qwen35Weights,
+    pub config: &'a Qwen35Config,
 }
 
-/// Build a KLD reference from the resident model: per `n_ctx` chunk, capture the
-/// top-K log-softmax reduction at each scored position `[scoring_start, n_ctx-1)`.
-/// One forward path (the same `forward_chunk_scored` that `score` uses).
-#[allow(clippy::too_many_arguments)]
-pub fn kld_build_ref(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    tokens: &[u32],
-    n_ctx: usize,
-    top_k: usize,
-    max_chunks: Option<usize>,
-    mut on_chunk: impl FnMut(usize, usize, usize),
-) -> HipResult<KldRefPayloads> {
-    use hipfire_kld::top_k_log_softmax;
-
-    let scoring_start = n_ctx / 2;
-    let scored_per_chunk = (n_ctx - 1).saturating_sub(scoring_start);
-    let n_chunk_avail = tokens.len() / n_ctx;
-    let n_chunk = max_chunks.map_or(n_chunk_avail, |m| m.min(n_chunk_avail));
-
-    let mut out_tokens = Vec::with_capacity(n_chunk * n_ctx);
-    let mut top_indices = Vec::with_capacity(n_chunk * scored_per_chunk * top_k);
-    let mut top_log_probs = Vec::with_capacity(n_chunk * scored_per_chunk * top_k);
-    let mut residual_mass = Vec::with_capacity(n_chunk * scored_per_chunk);
-
-    for c in 0..n_chunk {
-        let chunk = &tokens[c * n_ctx..c * n_ctx + n_ctx];
-        out_tokens.extend_from_slice(chunk);
-        forward_chunk_scored(
+impl hipfire_runtime::calibration::CalibratableBackend for Qwen35CalibBackend<'_> {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        _tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let opts = CalibOpts {
+            kldref,
+            kldref_topk: 64,
+        };
+        collect_calibration_artifacts(
             gpu,
-            weights,
-            config,
-            chunk,
-            scoring_start,
-            |_j, lg, _next| {
-                let r = top_k_log_softmax(lg, top_k);
-                top_indices.extend_from_slice(&r.indices);
-                top_log_probs.extend_from_slice(&r.log_probs);
-                residual_mass.push(r.residual_mass);
-            },
-        )?;
-        on_chunk(c, n_chunk, scored_per_chunk);
+            self.weights,
+            self.config,
+            tokens,
+            &opts,
+            output,
+            provenance,
+        )
+        .map_err(|e| e.to_string())
     }
-
-    Ok(KldRefPayloads {
-        n_chunk,
-        n_ctx,
-        scored_per_chunk,
-        top_k,
-        n_vocab: config.vocab_size,
-        tokens: out_tokens,
-        top_indices,
-        top_log_probs,
-        residual_mass,
-    })
-}
-
-/// Score the resident model against a persisted reference: forward over the
-/// reference's embedded token stream and compute KLD per scored position against
-/// the stored top-K blocks. The candidate forward is the SAME `forward_chunk_scored`
-/// the reference was built with, so a same-model score returns ≈0.
-pub fn kld_score(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    archive: &hipfire_kld::RefArchive,
-    max_chunks: Option<usize>,
-    mut on_chunk: impl FnMut(usize, usize, usize, f32),
-) -> HipResult<KldEvalOutcome> {
-    use hipfire_kld::score_position;
-
-    let n_ctx = archive.meta.n_ctx;
-    let scoring_start = archive.meta.scoring_start;
-    let n_chunk = max_chunks.map_or(archive.meta.n_chunk, |m| m.min(archive.meta.n_chunk));
-
-    let mut per_chunk = Vec::with_capacity(n_chunk);
-    let mut global_kld_sum = 0.0f64;
-    let mut total_scored = 0usize;
-    let mut global_nll_sum = 0.0f64;
-    let mut global_nll_n = 0usize;
-
-    for c in 0..n_chunk {
-        let chunk = &archive.tokens[c * n_ctx..c * n_ctx + n_ctx];
-        let mut klds: Vec<f32> = Vec::new();
-        let mut nlls: Vec<f32> = Vec::new();
-        forward_chunk_scored(gpu, weights, config, chunk, scoring_start, |j, lg, next| {
-            let s = score_position(&archive.block(c, j), lg, next);
-            klds.push(s.kld);
-            if let Some(n) = s.nll {
-                nlls.push(n);
-            }
-        })?;
-
-        let mean_kld = kld_mean_f32(&klds);
-        global_kld_sum += klds.iter().map(|&x| x as f64).sum::<f64>();
-        total_scored += klds.len();
-        global_nll_sum += nlls.iter().map(|&x| x as f64).sum::<f64>();
-        global_nll_n += nlls.len();
-        on_chunk(c, n_chunk, klds.len(), mean_kld);
-        per_chunk.push(hipfire_kld::ChunkResult {
-            mean_kld: mean_kld as f64,
-            p99_kld: kld_p99_f32(&klds) as f64,
-            mean_nll: kld_mean_f32(&nlls) as f64,
-        });
-    }
-
-    let mean_kld = if total_scored > 0 {
-        (global_kld_sum / total_scored as f64) as f32
-    } else {
-        0.0
-    };
-    let mean_nll = if global_nll_n > 0 {
-        (global_nll_sum / global_nll_n as f64) as f32
-    } else {
-        0.0
-    };
-    let chunk_means: Vec<f32> = per_chunk.iter().map(|c| c.mean_kld as f32).collect();
-
-    Ok(KldEvalOutcome {
-        n_chunk,
-        total_scored,
-        mean_kld,
-        p99_kld: kld_p99_f32(&chunk_means),
-        mean_nll,
-        per_chunk,
-    })
 }
 
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident
@@ -5369,162 +5151,142 @@ pub fn collect_calibration_artifacts(
     output: &std::path::Path,
     provenance: &[(&str, serde_json::Value)],
 ) -> HipResult<CalibSummary> {
-    use hipfire_runtime::calibration::{logsumexp, topk_logits, CalibCollector};
+    use hipfire_runtime::calibration::{collect, logsumexp, topk_logits, CalibForward};
     use hipfire_runtime::hfq::HfqMemTensor;
 
+    let is_moe = config.num_experts > 0;
     // Routed MoE experts are imatrix-only: a full per-expert Hessian
     // (num_experts × n_layers × [K,K]) does not fit (~196 GB for A3B), but the
     // imatrix is ~100 MB and is the importance signal quant needs. Dense
-    // projections (attention + router + shared expert) keep full Hessians.
-    let collector = std::sync::Arc::new(CalibCollector::with_imatrix_only(vec![
-        ".experts.".to_string()
-    ]));
-    gpu.capture_names = build_capture_names(weights);
-    gpu.active_capture = Some(collector.clone());
-
-    let is_moe = config.num_experts > 0;
-    if is_moe {
-        reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
-    }
-
-    let n_tok = tokens.len();
-    let mut kv = kv::KvCache::new_gpu(
+    // projections (attention + router + shared expert) keep full Hessians. The
+    // shared driver owns the collector + streaming; the closure runs the engine
+    // forward and returns the qwen-specific extras (router histogram + KLDREF).
+    collect(
         gpu,
-        config.n_layers,
-        config.n_kv_heads,
-        config.head_dim,
-        n_tok + 16,
-    )?;
-    let mut dn = DeltaNetState::new(gpu, config)?;
-    let scratch = Qwen35Scratch::new(gpu, config, 64)?;
+        0,
+        build_capture_names(weights),
+        vec![".experts.".to_string()],
+        output,
+        provenance,
+        |gpu| {
+            if is_moe {
+                reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
+            }
+            let n_tok = tokens.len();
+            let mut kv = kv::KvCache::new_gpu(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                n_tok + 16,
+            )
+            .map_err(|e| format!("qwen35 calib kv: {e}"))?;
+            let mut dn =
+                DeltaNetState::new(gpu, config).map_err(|e| format!("qwen35 calib dn: {e}"))?;
+            let scratch = Qwen35Scratch::new(gpu, config, 64)
+                .map_err(|e| format!("qwen35 calib scratch: {e}"))?;
 
-    let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-    for (pos, &tok) in tokens.iter().enumerate() {
-        forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)?;
-        if opts.kldref {
-            let lg = gpu.download_f32(&scratch.logits)?;
-            kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk)));
-        }
-    }
-    gpu.active_capture = None;
-    gpu.capture_names = std::collections::HashMap::new();
-
-    let f32_bytes = |v: &[f32]| -> Vec<u8> {
-        let mut b = Vec::with_capacity(v.len() * 4);
-        for &x in v {
-            b.extend_from_slice(&x.to_le_bytes());
-        }
-        b
-    };
-
-    // Descriptors are cheap (no GPU download): counts + per-tensor token map for
-    // the metadata, which the HFQM layout requires written BEFORE the payloads.
-    let descriptors = collector.tensor_descriptors();
-    // Every captured tensor emits `.imatrix`; dense projections also emit
-    // `.hessian` (MoE routed experts are imatrix-only).
-    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-    let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
-
-    // MoE router histogram (summed co-occurrence = scheduler-affinity signal).
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
-    });
-    if is_moe {
-        if let Some(h) = take_moe_router_histogram() {
-            let mut cooc: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-            for l in &h.per_layer {
-                for (&k, &v) in &l.cooccurrence {
-                    *cooc.entry(k).or_insert(0) += v;
+            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)
+                    .map_err(|e| format!("qwen35 calib forward: {e}"))?;
+                if opts.kldref {
+                    let lg = gpu
+                        .download_f32(&scratch.logits)
+                        .map_err(|e| format!("qwen35 calib logits: {e}"))?;
+                    kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk)));
                 }
             }
-            let mut pairs: Vec<(u64, u64)> = cooc.into_iter().collect();
-            pairs.sort_by(|a, b| b.1.cmp(&a.1));
-            pairs.truncate(64);
-            let ne = h.num_experts as u64;
-            let cooc_json: Vec<serde_json::Value> = pairs
-                .iter()
-                .map(|(key, cnt)| serde_json::json!([key / ne, key % ne, cnt]))
-                .collect();
-            meta.as_object_mut().unwrap().insert(
-                "moe_router_histogram".to_string(),
-                serde_json::json!({
-                    "num_experts": h.num_experts,
-                    "k_top": h.k_top,
-                    "routed_tokens": h.routed_tokens,
-                    "routed_slots": h.routed_slots,
-                    "top1_histogram": h.top1_histogram,
-                    "topk_histogram": h.topk_histogram,
-                    "per_layer_topk": h.per_layer.iter().map(|l| serde_json::json!(l.topk_histogram)).collect::<Vec<_>>(),
-                    "top_cooccurrence": cooc_json,
-                }),
-            );
-            artifacts.push(serde_json::json!("moe_router_histogram"));
-        }
-    }
 
-    // KLDREF tensors — small, already in host RAM; passed as `extra` to the
-    // streaming writer (the big Hessians stream straight from GPU).
-    let mut extra: Vec<HfqMemTensor> = Vec::new();
-    if !kldref.is_empty() {
-        let np = kldref.len();
-        let kk = kldref[0].1.len();
-        let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
-        for (logz, tk) in &kldref {
-            lz_v.push(*logz);
-            for j in 0..kk {
-                let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
-                idx_v.push(i as f32);
-                lg_v.push(l);
+            let f32_bytes = |v: &[f32]| -> Vec<u8> {
+                let mut b = Vec::with_capacity(v.len() * 4);
+                for &x in v {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                b
+            };
+
+            let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
+            let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
+
+            // MoE router histogram (summed co-occurrence = scheduler-affinity signal).
+            if is_moe {
+                if let Some(h) = take_moe_router_histogram() {
+                    let mut cooc: std::collections::HashMap<u64, u64> =
+                        std::collections::HashMap::new();
+                    for l in &h.per_layer {
+                        for (&k, &v) in &l.cooccurrence {
+                            *cooc.entry(k).or_insert(0) += v;
+                        }
+                    }
+                    let mut pairs: Vec<(u64, u64)> = cooc.into_iter().collect();
+                    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+                    pairs.truncate(64);
+                    let ne = h.num_experts as u64;
+                    let cooc_json: Vec<serde_json::Value> = pairs
+                        .iter()
+                        .map(|(key, cnt)| serde_json::json!([key / ne, key % ne, cnt]))
+                        .collect();
+                    extra_meta.push((
+                        "moe_router_histogram".to_string(),
+                        serde_json::json!({
+                            "num_experts": h.num_experts,
+                            "k_top": h.k_top,
+                            "routed_tokens": h.routed_tokens,
+                            "routed_slots": h.routed_slots,
+                            "top1_histogram": h.top1_histogram,
+                            "topk_histogram": h.topk_histogram,
+                            "per_layer_topk": h.per_layer.iter().map(|l| serde_json::json!(l.topk_histogram)).collect::<Vec<_>>(),
+                            "top_cooccurrence": cooc_json,
+                        }),
+                    ));
+                    artifacts.push(serde_json::json!("moe_router_histogram"));
+                }
             }
-        }
-        for (nm, shape, data) in [
-            ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
-            ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
-            ("lm_head.kldref_logz", vec![np as u32], lz_v),
-        ] {
-            extra.push(HfqMemTensor {
-                name: nm.to_string(),
-                quant_type: 2,
-                shape,
-                group_size: 0,
-                data: f32_bytes(&data),
-            });
-        }
-        meta.as_object_mut().unwrap().insert(
-            "kldref".to_string(),
-            serde_json::json!({ "n_positions": np, "top_k": kk }),
-        );
-        artifacts.push(serde_json::json!("kldref"));
-    }
-    meta.as_object_mut()
-        .unwrap()
-        .insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
 
-    // Caller-known provenance (source_model, corpus, n_calib_tokens) layered
-    // onto the technical metadata, then the package is streamed to `output`.
-    if let Some(obj) = meta.as_object_mut() {
-        for (k, v) in provenance {
-            obj.insert((*k).to_string(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
-    let max_consistency = collector
-        .write_streaming(gpu, output, 0, &metadata_json, &extra)
-        .map_err(|e| HipError::new(0, &format!("write .calib.hfq: {e}")))?;
+            // KLDREF tensors — small, already in host RAM; passed as `extra` to the
+            // streaming writer (the big Hessians stream straight from GPU).
+            let mut extra_tensors: Vec<HfqMemTensor> = Vec::new();
+            if !kldref.is_empty() {
+                let np = kldref.len();
+                let kk = kldref[0].1.len();
+                let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
+                for (logz, tk) in &kldref {
+                    lz_v.push(*logz);
+                    for j in 0..kk {
+                        let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
+                        idx_v.push(i as f32);
+                        lg_v.push(l);
+                    }
+                }
+                for (nm, shape, data) in [
+                    ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
+                    ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
+                    ("lm_head.kldref_logz", vec![np as u32], lz_v),
+                ] {
+                    extra_tensors.push(HfqMemTensor {
+                        name: nm.to_string(),
+                        quant_type: 2,
+                        shape,
+                        group_size: 0,
+                        data: f32_bytes(&data),
+                    });
+                }
+                extra_meta.push((
+                    "kldref".to_string(),
+                    serde_json::json!({ "n_positions": np, "top_k": kk }),
+                ));
+                artifacts.push(serde_json::json!("kldref"));
+            }
+            extra_meta.push(("artifacts".to_string(), serde_json::Value::Array(artifacts)));
 
-    Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
-        max_consistency,
-    })
+            Ok(CalibForward {
+                extra_tensors,
+                extra_meta,
+            })
+        },
+    )
+    .map_err(|e| HipError::new(0, &e))
 }
 
 pub fn load_weights(
@@ -8941,16 +8703,20 @@ pub fn forward(
 
     // Embedding lookup
     let x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    match weights.embd_format {
+    let embed_result = match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)
         }
         EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)
         }
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim),
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim),
         _ => panic!("unsupported embedding format"),
+    };
+    if let Err(e) = embed_result {
+        let _ = gpu.free_tensor(x);
+        return Err(e);
     }
 
     forward_from_x(gpu, weights, config, x, pos, kv_cache, dn_state)
@@ -8967,7 +8733,13 @@ fn forward_from_x(
     dn_state: &mut DeltaNetState,
 ) -> HipResult<Vec<f32>> {
     let logits_gpu = forward_from_x_gpu(gpu, weights, config, x, pos, kv_cache, dn_state)?;
-    let logits_data = gpu.download_f32(&logits_gpu)?;
+    let logits_data = match gpu.download_f32(&logits_gpu) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = gpu.free_tensor(logits_gpu);
+            return Err(e);
+        }
+    };
     gpu.free_tensor(logits_gpu)?;
     Ok(logits_data)
 }
@@ -10145,7 +9917,7 @@ pub fn dense_prefill_session_batch_write_f32_kv_layer(
     )
 }
 
-pub fn grouped_moe_prefill_session_batch_write_q8_kv_layer(
+pub fn prefill_session_batch_write_q8_kv_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -10232,7 +10004,7 @@ pub fn dense_prefill_session_batch_attention_f32_layer(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_moe_prefill_session_batch_attention_q8_layer(
+pub fn prefill_session_batch_attention_q8_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -10387,6 +10159,31 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
             weights.output.k,
             row_count,
         ),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::MQ4G256 => {
+            let rot = gpu.alloc_tensor(&[row_count * weights.output.k], DType::F32)?;
+            let rotated = gpu
+                .rotate_x_mq_batched(&normed_rows, &rot, weights.output.k, row_count)
+                .and_then(|()| {
+                    gpu.gemm_hfq4g256(
+                        &weights.output.buf,
+                        &rot,
+                        &batch_logits,
+                        weights.output.m,
+                        weights.output.k,
+                        row_count,
+                    )
+                });
+            let _ = gpu.free_tensor(rot);
+            rotated
+        }
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
@@ -10439,8 +10236,8 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
         config.norm_eps,
     )?;
 
-    let batch_logits = gpu.alloc_tensor(&[row_count * config.vocab_size], DType::F32)?;
-    let result = match weights.output.gpu_dtype {
+    let batch_logits = gpu.alloc_owned(&[row_count * config.vocab_size], DType::F32)?;
+    match weights.output.gpu_dtype {
         DType::F32 => gpu.gemm_f32_register_tiled(
             &weights.output.buf,
             &normed_rows,
@@ -10482,15 +10279,17 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
                 &rotated,
                 config.dim,
                 row_count,
-            )?;
-            gpu.gemm_hfq4g256(
-                &weights.output.buf,
-                &rotated,
-                &batch_logits,
-                weights.output.m,
-                weights.output.k,
-                row_count,
             )
+            .and_then(|()| {
+                gpu.gemm_hfq4g256(
+                    &weights.output.buf,
+                    &rotated,
+                    &batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            })
         }
         DType::MQ6G256 => {
             let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
@@ -10501,15 +10300,17 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
                 &rotated,
                 config.dim,
                 row_count,
-            )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &weights.output.buf,
-                &rotated,
-                &batch_logits,
-                weights.output.m,
-                weights.output.k,
-                row_count,
             )
+            .and_then(|()| {
+                gpu.gemm_hfq6g256_batched_lmhead(
+                    &weights.output.buf,
+                    &rotated,
+                    &batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            })
         }
         DType::MQ3G256 => {
             let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
@@ -10520,15 +10321,17 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
                 &rotated,
                 config.dim,
                 row_count,
-            )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
-                &weights.output.buf,
-                &rotated,
-                &batch_logits,
-                weights.output.m,
-                weights.output.k,
-                row_count,
             )
+            .and_then(|()| {
+                gpu.gemm_hfq3g256_batched_lmhead(
+                    &weights.output.buf,
+                    &rotated,
+                    &batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            })
         }
         other => Err(hip_bridge::HipError::new(
             0,
@@ -10536,18 +10339,18 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
                 "grouped MoE session prefill final logits does not yet support lm_head dtype {other:?}; use serial_reference backend"
             ),
         )),
-    }
-    .and_then(|()| {
-        dense_prefill_session_batch_scatter_last_logits(
-            gpu,
-            device_tables,
-            &batch_logits,
-            config.vocab_size,
-            sessions,
-        )
-    });
-    let _ = gpu.free_tensor(batch_logits);
-    result
+    }?;
+    dense_prefill_session_batch_scatter_last_logits(
+        gpu,
+        device_tables,
+        &batch_logits,
+        config.vocab_size,
+        sessions,
+    )?;
+    // `batch_logits` (RAII `OwnedTensor`) returns to the pool on drop.
+    drop(batch_logits);
+    gpu.reclaim_pending();
+    Ok(())
 }
 
 pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
@@ -10574,15 +10377,20 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
                 signature.kv_compact_offset,
             ));
         }
-        if signature.kv_quantized
-            || signature.kv_quant_q8
-            || signature.kv_quant_asym2
+        // KV may be plain Q8 (Q8_0, inline per-block scale) or full precision —
+        // the per-layer KV write + attention branch on `kv_q8` in
+        // `forward_prefill_dense_session_batch_prefix_full_precision`. Asym/FWHT
+        // KV and any other quantized-but-not-plain-Q8 state stay on
+        // serial_reference (not fused). (Row uniformity is already enforced by
+        // `validate_dense_prefill_session_batch_state_signatures`.)
+        if signature.kv_quant_asym2
             || signature.kv_quant_asym3
             || signature.kv_quant_asym4
             || signature.kv_quant_fwht
+            || (signature.kv_quantized && !signature.kv_quant_q8)
         {
             return Err(format!(
-                "dense session fused prefix row {idx} has quantized KV state; first fused target is FP32 KV"
+                "dense session fused prefix row {idx} has unsupported KV quantization; only plain Q8 or FP32 KV is fused"
             ));
         }
         if signature.dn_quant != StateQuant::FP32 {
@@ -10658,10 +10466,14 @@ pub fn validate_grouped_moe_prefill_session_batch_q8_state_contract(
     Ok(())
 }
 
+// Weight dtypes the dense fused prefill GEMM helpers can dispatch. Full precision
+// (F32/F16/BF16/Raw) plus plain Q8_0 and MQ4G256 (quantized dense models). MQ6G256
+// and other quant formats have no batched non-residual kernel yet, so models using
+// them fall back to serial_reference via the contract. (Name kept to avoid churn.)
 fn dense_prefill_weight_full_precision_supported(weight: &WeightTensor) -> bool {
     matches!(
         weight.gpu_dtype,
-        DType::F32 | DType::F16 | DType::BF16 | DType::Raw
+        DType::F32 | DType::F16 | DType::BF16 | DType::Raw | DType::Q8_0 | DType::MQ4G256
     )
 }
 
@@ -11449,6 +11261,10 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
+    // Per-batch KV quant (uniform across rows — see the state-signature contract).
+    // true = the sessions' KV caches are plain Q8 (Q8_0); the KV write +
+    // attention use the Q8 path. false = full-precision F32 KV.
+    kv_q8: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -11719,30 +11535,62 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     row_count,
                     0,
                 )?;
-                dense_prefill_session_batch_write_f32_kv_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    layer_idx,
-                    &pbs.fa_k_batch,
-                    &pbs.fa_v_batch,
-                    kv_dim,
-                    row_count,
-                )?;
-                dense_prefill_session_batch_attention_f32_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    layer_idx,
-                    &pbs.fa_q_batch,
-                    &pbs.fa_attn_out_batch,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    max_ctx_len,
-                    max_ctx_len,
-                    row_count,
-                )?;
+                if kv_q8 {
+                    // Plain-Q8 KV: the routed write/attention helpers are shared
+                    // with the grouped-MoE fused path — they are FFN-agnostic and
+                    // operate on Q8_0 (inline-scale) KV buffers via the same
+                    // device pointer tables.
+                    prefill_session_batch_write_q8_kv_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        row_count,
+                    )?;
+                    prefill_session_batch_attention_q8_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                } else {
+                    dense_prefill_session_batch_write_f32_kv_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        kv_dim,
+                        row_count,
+                    )?;
+                    dense_prefill_session_batch_attention_f32_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                }
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 dense_session_prefill_gemm_full_precision_residual(
                     gpu,
@@ -11908,6 +11756,9 @@ pub fn forward_prefill_dense_session_batch(
             ));
         }
     }
+    // Row signatures are uniform (state-signature contract), so row 0's KV quant
+    // decides the per-layer KV write/attention path for the whole batch.
+    let kv_q8 = signatures.first().map(|s| s.kv_quant_q8).unwrap_or(false);
     let result = forward_prefill_dense_session_batch_prefix_full_precision(
         gpu,
         weights,
@@ -11918,6 +11769,7 @@ pub fn forward_prefill_dense_session_batch(
         execution_plan.multi_state_prefix_rows,
         rows.len(),
         max_ctx_len,
+        kv_q8,
     );
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
@@ -12411,7 +12263,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     row_count,
                     0,
                 )?;
-                grouped_moe_prefill_session_batch_write_q8_kv_layer(
+                prefill_session_batch_write_q8_kv_layer(
                     gpu,
                     device_tables,
                     route_shape,
@@ -12422,7 +12274,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     config.head_dim,
                     row_count,
                 )?;
-                grouped_moe_prefill_session_batch_attention_q8_layer(
+                prefill_session_batch_attention_q8_layer(
                     gpu,
                     device_tables,
                     route_shape,
@@ -13261,6 +13113,13 @@ fn gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
     }
 }
 
+// Batched single-projection GEMM for the dense fused prefill. Despite the
+// `_full_precision` name (kept to avoid churning ~10 call sites), this now
+// dispatches plain Q8_0 and MQ4G256 weights too — quantized dense models route
+// here. MQ4 needs the shared FWHT pre-rotation (rotate_x_mq_batched) into a
+// scratch first; the rotation is allocated internally (prefill is one-shot, so
+// the small per-GEMM alloc is acceptable). MQ6G256 non-residual has no batched
+// kernel yet, so those weights fall back to serial_reference via the contract.
 fn dense_session_prefill_gemm_full_precision(
     gpu: &mut Gpu,
     weight: &WeightTensor,
@@ -13273,15 +13132,27 @@ fn dense_session_prefill_gemm_full_precision(
         DType::F16 | DType::BF16 | DType::Raw => {
             gemm_fp16_or_bf16_x_f32_wmma(gpu, &weight.buf, x, y, weight.m, weight.k, n)
         }
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&weight.buf, x, y, weight.m, weight.k, n),
+        DType::MQ4G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            let result = gpu.gemm_hfq4g256(&weight.buf, &rot, y, weight.m, weight.k, n);
+            let _ = gpu.free_tensor(rot);
+            result
+        }
         other => Err(hip_bridge::HipError::new(
             0,
-            &format!(
-                "dense session fused prefix full-precision GEMM does not support dtype {other:?}"
-            ),
+            &format!("dense session fused prefix GEMM does not support dtype {other:?}"),
         )),
     }
 }
 
+// Residual variant of [`dense_session_prefill_gemm_full_precision`] (adds the
+// GEMM result into `y_residual`). Also dispatches plain Q8_0 + MQ4G256 now: Q8
+// runs the chunked GEMM into `scratch` then adds it into the residual; MQ4 runs
+// the FWHT-rotated `gemm_hfq4g256_residual` which accumulates directly. MQ6G256
+// residual has a kernel (`gemm_hfq6g256_residual`) but is left for a follow-up so
+// the contract gates MQ6 to serial uniformly with the non-residual path.
 fn dense_session_prefill_gemm_full_precision_residual(
     gpu: &mut Gpu,
     weight: &WeightTensor,
@@ -13301,23 +13172,33 @@ fn dense_session_prefill_gemm_full_precision_residual(
             weight.k,
             n,
         ),
-        DType::F16 | DType::BF16 | DType::Raw => {
-            gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
-                gpu,
-                &weight.buf,
-                x,
-                y_residual,
-                scratch,
-                weight.m,
-                weight.k,
-                n,
-            )
+        DType::F16 | DType::BF16 | DType::Raw => gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+            gpu,
+            &weight.buf,
+            x,
+            y_residual,
+            scratch,
+            weight.m,
+            weight.k,
+            n,
+        ),
+        DType::Q8_0 => {
+            let out = scratch.sub_offset(0, n * weight.m);
+            gpu.gemm_q8_0_batched_chunked(&weight.buf, x, &out, weight.m, weight.k, n)?;
+            let accum = y_residual.sub_offset(0, n * weight.m);
+            gpu.add_inplace_f32(&accum, &out)
+        }
+        DType::MQ4G256 => {
+            let rot = gpu.alloc_tensor(&[n * weight.k], DType::F32)?;
+            gpu.rotate_x_mq_batched(x, &rot, weight.k, n)?;
+            let result =
+                gpu.gemm_hfq4g256_residual(&weight.buf, &rot, y_residual, weight.m, weight.k, n);
+            let _ = gpu.free_tensor(rot);
+            result
         }
         other => Err(hip_bridge::HipError::new(
             0,
-            &format!(
-                "dense session fused prefix full-precision residual GEMM does not support dtype {other:?}"
-            ),
+            &format!("dense session fused prefix residual GEMM does not support dtype {other:?}"),
         )),
     }
 }
@@ -19878,42 +19759,46 @@ fn forward_prefill_chunk(
                     let q_dim = config.n_heads * config.head_dim;
                     let kv_dim = config.n_kv_heads * config.head_dim;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
-                    for b in 0..n {
-                        let pos_b = position_at_row(b);
-                        let pos_i32 = pos_b as i32;
-                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                        let k_b = pbs.fa_k_batch.sub_offset(b * kv_dim, kv_dim);
-                        let v_b = pbs.fa_v_batch.sub_offset(b * kv_dim, kv_dim);
-                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                        gpu.kv_cache_write_q8_0(
-                            &kv_cache.k_gpu[layer_idx],
-                            &k_b,
-                            &pos_buf_tmp,
-                            config.n_kv_heads,
-                            config.head_dim,
-                        )?;
-                        gpu.kv_cache_write_q8_0(
-                            &kv_cache.v_gpu[layer_idx],
-                            &v_b,
-                            &pos_buf_tmp,
-                            config.n_kv_heads,
-                            config.head_dim,
-                        )?;
-                        gpu.attention_q8_0_kv(
-                            &q_b,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &out_b,
-                            &pos_buf_tmp,
-                            pos_b + 1,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                        )?;
-                    }
+                    let pos_buf_result = (|| -> HipResult<()> {
+                        for b in 0..n {
+                            let pos_b = position_at_row(b);
+                            let pos_i32 = pos_b as i32;
+                            gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                            let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                            let k_b = pbs.fa_k_batch.sub_offset(b * kv_dim, kv_dim);
+                            let v_b = pbs.fa_v_batch.sub_offset(b * kv_dim, kv_dim);
+                            let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                            gpu.kv_cache_write_q8_0(
+                                &kv_cache.k_gpu[layer_idx],
+                                &k_b,
+                                &pos_buf_tmp,
+                                config.n_kv_heads,
+                                config.head_dim,
+                            )?;
+                            gpu.kv_cache_write_q8_0(
+                                &kv_cache.v_gpu[layer_idx],
+                                &v_b,
+                                &pos_buf_tmp,
+                                config.n_kv_heads,
+                                config.head_dim,
+                            )?;
+                            gpu.attention_q8_0_kv(
+                                &q_b,
+                                &kv_cache.k_gpu[layer_idx],
+                                &kv_cache.v_gpu[layer_idx],
+                                &out_b,
+                                &pos_buf_tmp,
+                                pos_b + 1,
+                                config.n_heads,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kv_cache.physical_cap,
+                            )?;
+                        }
+                        Ok(())
+                    })();
                     let _ = gpu.hip.free(pos_buf_tmp);
+                    pos_buf_result?;
                 } else if kv_cache.quant_q8 && max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
                         tree_verify.is_none(),
@@ -19932,51 +19817,59 @@ fn forward_prefill_chunk(
                     // host-side row position directly.
                     let q_dim = config.n_heads * config.head_dim;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
-                    for b in 0..n {
-                        let pos_b = position_at_row(b);
-                        let seq_len_b = pos_b + 1;
-                        let pos_i32 = pos_b as i32;
-                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                        gpu.attention_flash_q8_0(
-                            &q_b,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &out_b,
-                            &pos_buf_tmp,
-                            seq_len_b,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
-                    }
+                    let pos_buf_result = (|| -> HipResult<()> {
+                        for b in 0..n {
+                            let pos_b = position_at_row(b);
+                            let seq_len_b = pos_b + 1;
+                            let pos_i32 = pos_b as i32;
+                            gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                            let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                            let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                            gpu.attention_flash_q8_0(
+                                &q_b,
+                                &kv_cache.k_gpu[layer_idx],
+                                &kv_cache.v_gpu[layer_idx],
+                                &out_b,
+                                &pos_buf_tmp,
+                                seq_len_b,
+                                config.n_heads,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
+                        Ok(())
+                    })();
                     let _ = gpu.hip.free(pos_buf_tmp);
+                    pos_buf_result?;
                 } else if kv_cache.quant_q8 && q8_fa_attention_scalar_loop_enabled() {
                     let q_dim = config.n_heads * config.head_dim;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
-                    for b in 0..n {
-                        let pos_b = position_at_row(b);
-                        let pos_i32 = pos_b as i32;
-                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                        gpu.attention_q8_0_kv(
-                            &q_b,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &out_b,
-                            &pos_buf_tmp,
-                            pos_b + 1,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                        )?;
-                    }
+                    let pos_buf_result = (|| -> HipResult<()> {
+                        for b in 0..n {
+                            let pos_b = position_at_row(b);
+                            let pos_i32 = pos_b as i32;
+                            gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                            let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                            let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                            gpu.attention_q8_0_kv(
+                                &q_b,
+                                &kv_cache.k_gpu[layer_idx],
+                                &kv_cache.v_gpu[layer_idx],
+                                &out_b,
+                                &pos_buf_tmp,
+                                pos_b + 1,
+                                config.n_heads,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kv_cache.physical_cap,
+                            )?;
+                        }
+                        Ok(())
+                    })();
                     let _ = gpu.hip.free(pos_buf_tmp);
+                    pos_buf_result?;
                 } else if kv_cache.quant_q8 && q8_fa_attention_row_loop_enabled() {
                     let q8_tree_bias = if q8_fa_attention_ignore_tree_bias_enabled() {
                         None
@@ -22293,30 +22186,34 @@ fn forward_prefill_chunk(
                     // position directly.
                     let q_dim_local = config.n_heads * config.head_dim;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
-                    for b in 0..n {
-                        let pos_b = position_at_row(b);
-                        let seq_len_b = pos_b + 1;
-                        let pos_i32 = pos_b as i32;
-                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim_local, q_dim_local);
-                        let out_b = pbs
-                            .fa_attn_out_batch
-                            .sub_offset(b * q_dim_local, q_dim_local);
-                        gpu.attention_flash_q8_0(
-                            &q_b,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &out_b,
-                            &pos_buf_tmp,
-                            seq_len_b,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
-                    }
+                    let pos_buf_result = (|| -> HipResult<()> {
+                        for b in 0..n {
+                            let pos_b = position_at_row(b);
+                            let seq_len_b = pos_b + 1;
+                            let pos_i32 = pos_b as i32;
+                            gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                            let q_b = pbs.fa_q_batch.sub_offset(b * q_dim_local, q_dim_local);
+                            let out_b = pbs
+                                .fa_attn_out_batch
+                                .sub_offset(b * q_dim_local, q_dim_local);
+                            gpu.attention_flash_q8_0(
+                                &q_b,
+                                &kv_cache.k_gpu[layer_idx],
+                                &kv_cache.v_gpu[layer_idx],
+                                &out_b,
+                                &pos_buf_tmp,
+                                seq_len_b,
+                                config.n_heads,
+                                config.n_kv_heads,
+                                config.head_dim,
+                                kv_cache.physical_cap,
+                                &s.flash_partials,
+                            )?;
+                        }
+                        Ok(())
+                    })();
                     let _ = gpu.hip.free(pos_buf_tmp);
+                    pos_buf_result?;
                 } else if kv_cache.quant_q8 {
                     gpu.attention_q8_0_kv_batched_masked(
                         &pbs.fa_q_batch,
@@ -24436,10 +24333,11 @@ fn forward_scratch_layers(
                     .rq_corrections
                     .get(&(layer_idx as u32, RqProj::Wdown))
                 {
-                    let inp = gpu.zeros(&[layer.w_down.k], DType::F32)?;
+                    let inp = gpu.zeros_owned(&[layer.w_down.k], DType::F32)?;
                     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &inp)?;
                     rq_apply_writer(gpu, c, &inp, &s.x)?;
-                    gpu.free_tensor(inp)?;
+                    drop(inp); // enqueue this layer's RAII scratch, then drain.
+                    gpu.reclaim_pending();
                 }
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 FFN residual", &s.x)?;
@@ -25386,10 +25284,11 @@ fn forward_scratch_layers(
                     .rq_corrections
                     .get(&(layer_idx as u32, RqProj::Wdown))
                 {
-                    let inp = gpu.zeros(&[layer.w_down.k], DType::F32)?;
+                    let inp = gpu.zeros_owned(&[layer.w_down.k], DType::F32)?;
                     gpu.silu_mul_f32(&s.gate_ffn, &s.up, &inp)?;
                     rq_apply_writer(gpu, c, &inp, &s.x)?;
-                    gpu.free_tensor(inp)?;
+                    drop(inp); // enqueue this layer's RAII scratch, then drain.
+                    gpu.reclaim_pending();
                 }
                 kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 

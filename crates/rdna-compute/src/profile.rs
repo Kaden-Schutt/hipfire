@@ -151,6 +151,19 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// OQ4-G256 indexed-MoE GEMV bytes: per routed expert, the 132 B/group weight
+/// + input + output. `n` = batch_size * k_top routed streams.
+pub fn gemv_oq4g256_moe_bytes(m: usize, k: usize, n: usize) -> usize {
+    let groups = k / 256;
+    n * (m * groups * 132 + k * 4 + m * 4)
+}
+
+/// OQ8-G256 indexed-MoE GEMV bytes: 260 B/group weight + input + output.
+pub fn gemv_oq8g256_moe_bytes(m: usize, k: usize, n: usize) -> usize {
+    let groups = k / 256;
+    n * (m * groups * 260 + k * 4 + m * 4)
+}
+
 /// HFQ4-G128 weight footprint: 72 B per 128-element group (4 B scale +
 /// 4 B zero + 64 B packed 4-bit weights).
 pub fn hfq4g128_weight_bytes(m: usize, k: usize) -> usize {

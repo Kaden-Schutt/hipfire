@@ -555,19 +555,45 @@ impl Tokenizer {
                 // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
                 // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
                 // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
-                // HF source; override from it when present + scalar (an array eos =
-                // multi-eos: keep the heuristic). Embedded by the quantizer at convert
-                // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
+                // HF source. Embedded by the quantizer at convert time.
+                // (LFM2.5-350M daemon bring-up, 2026-06-07.)
                 if let Some(gc) = meta.get("generation_config") {
                     if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
                         if (b as usize) < t.vocab.len() {
                             t.bos_id = b as u32;
                         }
                     }
-                    if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
-                        if (e as usize) < t.vocab.len() {
-                            t.eos_id = e as u32;
+                    match gc.get("eos_token_id") {
+                        Some(v) if v.is_u64() => {
+                            let e = v.as_u64().unwrap();
+                            if (e as usize) < t.vocab.len() {
+                                t.eos_id = e as u32;
+                            }
                         }
+                        // Multi-EOS (e.g. Llama-3 `[end_of_text, eom_id, eot_id]`):
+                        // the heuristic in `from_hf_json` is family-blind to
+                        // `<|eot_id|>` and lands on a garbage default, so the model
+                        // never terminates. `is_terminator` covers two ids — take the
+                        // LAST (the instruct turn-end, e.g. `<|eot_id|>`) as the
+                        // primary eos and the first distinct one as the auxiliary eot,
+                        // so both the base and the turn-end stop generation.
+                        Some(v) if v.is_array() => {
+                            let ids: Vec<u32> = v
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|x| x.as_u64())
+                                .map(|x| x as u32)
+                                .filter(|&x| (x as usize) < t.vocab.len())
+                                .collect();
+                            if let Some(&primary) = ids.last() {
+                                t.eos_id = primary;
+                            }
+                            if let Some(&aux) = ids.iter().find(|&&x| x != t.eos_id) {
+                                t.eot_id = Some(aux);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(t)

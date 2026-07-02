@@ -33,6 +33,7 @@ pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
 pub mod host_profile;
+pub mod kld_eval;
 pub mod kv;
 pub mod kv_hier;
 pub mod llama;
@@ -49,6 +50,7 @@ pub mod speed_bench;
 pub mod tokenizer;
 pub mod tool_call;
 pub mod tp_shard;
+pub mod transformer;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 #[cfg(feature = "deltanet")]

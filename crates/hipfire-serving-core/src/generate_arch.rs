@@ -369,7 +369,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     //
     // Compare the freshly-tokenized prompt against the tokens we know
     // are already resident in the V4F KV / SWA / compressed-KV rings
-    // from the prior request (`m.conversation_tokens`). If the new
+    // from the prior request (`m.active.cursor.conversation_tokens`). If the new
     // prompt FULLY EXTENDS the prior conversation — i.e., starts with
     // the entire `conversation_tokens` — we can skip prefill for those
     // tokens and only prefill the suffix.
@@ -405,12 +405,12 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     // prior.len()` (full match, nothing to do) with a noop check
     // downstream (suffix_tokens is empty).
     //
-    // After the daemon's `reset` handler clears `m.conversation_tokens`
+    // After the daemon's `reset` handler clears `m.active.cursor.conversation_tokens`
     // (legacy stateless path), `prior` is empty and `lcp = 0` → full
     // prefill. For prefix-cache mode the serve stops calling reset for
     // V4F and lets this LCP detection drive cache-hit accounting.
     let lcp: usize = {
-        let prior = &m.conversation_tokens;
+        let prior = &m.active.cursor.conversation_tokens;
         if prior.is_empty() || prompt_ids.len() < prior.len() {
             0
         } else {
@@ -436,7 +436,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
-        m.conversation_tokens.clear();
+        m.active.cursor.conversation_tokens.clear();
         // Tear down the captured V4F decode hipGraph alongside the
         // state, same rationale as the daemon's `"reset"` handler:
         // a fresh-context turn invalidates every device-buffer pointer
@@ -500,7 +500,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if !spec_mode {
         state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
     }
-    // Keep `m.conversation_tokens` in lockstep with what's actually
+    // Keep `m.active.cursor.conversation_tokens` in lockstep with what's actually
     // resident in the KV/SWA/compressed-KV rings:
     //   - On a CACHE MISS (lcp==0): replace with prompt_ids (we just
     //     full-prefilled the whole prompt).
@@ -513,11 +513,17 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     //     comparison run off the end of what's actually cached and
     //     make divergent assumptions about ring contents.
     if lcp == 0 {
-        m.conversation_tokens.clear();
-        m.conversation_tokens.extend_from_slice(&prompt_ids);
+        m.active.cursor.conversation_tokens.clear();
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(&prompt_ids);
     } else {
-        m.conversation_tokens.truncate(lcp);
-        m.conversation_tokens.extend_from_slice(suffix_tokens);
+        m.active.cursor.conversation_tokens.truncate(lcp);
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(suffix_tokens);
     }
     let cached_tokens: usize = lcp;
 
@@ -707,7 +713,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     decode_t0.elapsed().as_millis() as u64,
                 );
                 let _ = stdout.flush();
-                m.conversation_tokens.push(t);
+                m.active.cursor.conversation_tokens.push(t);
                 generated_count += 1;
             }
             if let Some(&t) = r.accepted_tokens.last() {
@@ -857,7 +863,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // assembled from `<｜DSML｜tool_calls>` blocks). Replaying that
         // here once captures all the logical structure without a
         // second tokenizer pass.
-        let decode_start_tokens_idx = m.conversation_tokens.len();
+        let decode_start_tokens_idx = m.active.cursor.conversation_tokens.len();
         let mut emit_text_buf = String::new();
         let mut emit_tool_calls_buf: Vec<prompt_frame::ToolCall> = Vec::new();
         use hipfire_arch_deepseek4::dsml::StreamEvent;
@@ -902,7 +908,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 decode_t0.elapsed().as_millis() as u64,
             );
             let _ = stdout.flush();
-            m.conversation_tokens.push(next_tok);
+            m.active.cursor.conversation_tokens.push(next_tok);
             if grammar_active {
                 matcher.advance(&frag);
             }
@@ -963,9 +969,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
         if have_replayable_payload
             && generated_count > 0
-            && m.conversation_tokens.len() > decode_start_tokens_idx
+            && m.active.cursor.conversation_tokens.len() > decode_start_tokens_idx
         {
-            let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
+            let cached_seq: Vec<u32> =
+                m.active.cursor.conversation_tokens[decode_start_tokens_idx..].to_vec();
             let fp = prompt_frame::assistant_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
@@ -984,7 +991,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         }
     }
 
-    m.seq_pos = state.n_tokens as usize;
+    m.active.cursor.seq_pos = state.n_tokens as usize;
 
     let _ = gpu.hip.device_synchronize();
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
@@ -1335,6 +1342,179 @@ pub fn generate_nemotron(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn generate_zaya(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_think_tokens: usize,
+    assistant_prefix: prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+    evidence_dir: Option<&str>,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.zaya_backend.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "zaya backend not loaded (arch 16 not active)".to_string(),
+        );
+        return;
+    }
+
+    // Frame the prompt up front (releases the shared `m` borrows before the
+    // backend `&mut` borrow below). Same scaffold as generate_llama.
+    let raw = effective_raw(m);
+    let prompt_tokens: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // nemotron_h ships a correct ChatML jinja template (`<|im_start|>` /
+        // `<|im_end|>`), so default to it when present (opt out with
+        // HIPFIRE_JINJA_CHAT=0). The hand-rolled Plain ChatFrame is the fallback.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(mh) => mh,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match rendered {
+                Ok(text) => tokenizer.encode(&text),
+                Err(e) => {
+                    eprintln!("[daemon] zaya jinja render failed ({e}) — Plain fallback");
+                    prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix,
+                        raw,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix,
+                raw,
+            }
+            .build()
+        }
+    };
+    if prompt_tokens.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after framing".to_string());
+        return;
+    }
+
+    let tok = m.tokenizer.as_ref().unwrap();
+    let backend = m.zaya_backend.as_mut().unwrap();
+    let eos = backend.eos_token();
+
+    let prefill_t0 = Instant::now();
+    if let Err(e) = SimpleAr::prefill(backend, gpu, &prompt_tokens) {
+        emit_error_with_id(stdout, id, format!("zaya prefill: {e}"));
+        return;
+    }
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1000.0;
+    let n = prompt_tokens.len();
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: "", // unused: prefill already consumed the framed tokens
+        temperature: temp,
+        top_p,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_think_tokens: 0,
+        stop_sequences: &[],
+        images: &no_images,
+        sink: stdout,
+    };
+    let result = decode_loop_with_timing(
+        gpu,
+        backend,
+        tok,
+        eos,
+        &mut ctx,
+        n,
+        n,
+        DecodeLoopTiming {
+            prefill_ms: Some(prefill_ms),
+        },
+    );
+    drop(ctx);
+    match result {
+        Ok(outcome) => {
+            if let (Some(dir), Some(prefill_ms), Some(decode_ms)) =
+                (evidence_dir, outcome.prefill_ms, outcome.decode_ms)
+            {
+                write_daemon_runtime_oneshot_evidence(
+                    dir,
+                    m,
+                    gpu,
+                    id,
+                    outcome.prompt_tokens,
+                    outcome.tokens_generated,
+                    prefill_ms / 1000.0,
+                    decode_ms / 1000.0,
+                    outcome.ttft_ms.unwrap_or(prefill_ms),
+                );
+            }
+        }
+        Err(e) => emit_error_with_id(stdout, id, format!("zaya decode: {e}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_llama(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1662,15 +1842,15 @@ pub fn generate_minimax(
         };
         eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
         m.minimax_state.as_mut().unwrap().reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.active.cursor.seq_pos = 0;
+        m.active.cursor.conversation_tokens.clear();
     }
 
     let t0 = Instant::now();
 
     // ── Prefill: decode_step per prompt token. Disjoint field borrows of
     // `m` (config / weights / state) let us also push to
-    // `m.conversation_tokens` in the same scope (same pattern as
+    // `m.active.cursor.conversation_tokens` in the same scope (same pattern as
     // generate_qwen2). The LAST decode_step's logits are the predictions
     // for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
@@ -1691,7 +1871,7 @@ pub fn generate_minimax(
         }
     }
     for &tok in &prompt_ids {
-        m.conversation_tokens.push(tok);
+        m.active.cursor.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
 
@@ -1749,7 +1929,7 @@ pub fn generate_minimax(
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
+        m.active.cursor.conversation_tokens.push(next_tok);
         generated_count += 1;
 
         // Advance one step on the freshly sampled token.
@@ -1769,7 +1949,7 @@ pub fn generate_minimax(
         }
     }
 
-    m.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
+    m.active.cursor.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -1935,7 +2115,7 @@ pub fn generate_lfm2moe(
     // With CASK/TriAttention active, `n_tokens` is the physical cursor and
     // `compact_offset` carries the logical prefix already compacted away.
     let overflow = {
-        let state = m.lfm2moe_state.as_ref().unwrap();
+        let state = m.active.lfm2moe_state.as_ref().unwrap();
         let current = if m.eviction.is_some() {
             state.n_tokens + state.kv.compact_offset
         } else {
@@ -1950,7 +2130,7 @@ pub fn generate_lfm2moe(
     };
     if overflow {
         let (n, logical, cap) = {
-            let state = m.lfm2moe_state.as_ref().unwrap();
+            let state = m.active.lfm2moe_state.as_ref().unwrap();
             (
                 state.n_tokens,
                 state.n_tokens + state.kv.compact_offset,
@@ -1971,9 +2151,9 @@ pub fn generate_lfm2moe(
         eprintln!(
             "[daemon] arch_id=11 context full (physical={n} logical={logical}/{cap}) — resetting Lfm2MoeState",
         );
-        let _ = m.lfm2moe_state.as_mut().unwrap().reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        let _ = m.active.lfm2moe_state.as_mut().unwrap().reset(gpu);
+        m.active.cursor.seq_pos = 0;
+        m.active.cursor.conversation_tokens.clear();
     }
 
     let t0 = Instant::now();
@@ -1985,6 +2165,7 @@ pub fn generate_lfm2moe(
     if prefill_already_done {
         let current_position = {
             let state = m
+                .active
                 .lfm2moe_state
                 .as_ref()
                 .expect("lfm2moe_state missing on arch_id=11 generate");
@@ -2011,6 +2192,7 @@ pub fn generate_lfm2moe(
             return;
         }
         let state = m
+            .active
             .lfm2moe_state
             .as_ref()
             .expect("lfm2moe_state missing on arch_id=11 generate");
@@ -2033,7 +2215,7 @@ pub fn generate_lfm2moe(
     } else {
         let cfg = m.lfm2moe_config.as_ref().unwrap();
         let weights = m.lfm2moe_weights.as_ref().unwrap();
-        let state = m.lfm2moe_state.as_mut().unwrap();
+        let state = m.active.lfm2moe_state.as_mut().unwrap();
         if let Some(ref ev) = m.eviction {
             let mut logits = Vec::new();
             for &tok in &prompt_ids {
@@ -2075,7 +2257,7 @@ pub fn generate_lfm2moe(
             }
         }
         for &tok in &prompt_ids {
-            m.conversation_tokens.push(tok);
+            m.active.cursor.conversation_tokens.push(tok);
         }
         prefill_ms = t0.elapsed().as_millis();
     }
@@ -2109,13 +2291,13 @@ pub fn generate_lfm2moe(
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
+        m.active.cursor.conversation_tokens.push(next_tok);
         generated_count += 1;
 
         let step = {
             let cfg = m.lfm2moe_config.as_ref().unwrap();
             let weights = m.lfm2moe_weights.as_ref().unwrap();
-            let state = m.lfm2moe_state.as_mut().unwrap();
+            let state = m.active.lfm2moe_state.as_mut().unwrap();
             let position = state.n_tokens as u32;
             let step = lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position);
             if step.is_ok() {
@@ -2149,8 +2331,8 @@ pub fn generate_lfm2moe(
         }
     }
 
-    m.seq_pos = {
-        let state = m.lfm2moe_state.as_ref().unwrap();
+    m.active.cursor.seq_pos = {
+        let state = m.active.lfm2moe_state.as_ref().unwrap();
         state.n_tokens + state.kv.compact_offset
     };
 
@@ -2295,6 +2477,7 @@ fn generate_lfm2moe_dflash(
         (df.ctx_capacity, df.block_size)
     };
     let target_capacity = m
+        .active
         .lfm2moe_state
         .as_ref()
         .map(|s| s.max_seq)
@@ -2317,7 +2500,7 @@ fn generate_lfm2moe_dflash(
     let t0 = Instant::now();
     let first_token = if let Some(expected_position) = expected_prefilled_position {
         let current_position = {
-            let state = m.lfm2moe_state.as_ref().unwrap();
+            let state = m.active.lfm2moe_state.as_ref().unwrap();
             state.n_tokens + state.kv.compact_offset
         };
         if current_position != expected_position {
@@ -2361,7 +2544,7 @@ fn generate_lfm2moe_dflash(
             df.draft_scratch.reset_upload_tracking();
         }
         let logits = {
-            let state = m.lfm2moe_state.as_ref().unwrap();
+            let state = m.active.lfm2moe_state.as_ref().unwrap();
             match gpu.download_f32(&state.logits) {
                 Ok(logits) => logits,
                 Err(e) => {
@@ -2382,7 +2565,7 @@ fn generate_lfm2moe_dflash(
     } else {
         let cfg = m.lfm2moe_config.as_ref().unwrap();
         let weights = m.lfm2moe_weights.as_ref().unwrap();
-        let state = m.lfm2moe_state.as_mut().unwrap();
+        let state = m.active.lfm2moe_state.as_mut().unwrap();
         let df = m.lfm2_dflash.as_mut().unwrap();
         if let Err(e) = state.reset(gpu) {
             emit_error_with_id(stdout, id, format!("lfm2moe dflash reset failed: {e}"));
@@ -2443,8 +2626,11 @@ fn generate_lfm2moe_dflash(
         t0.elapsed().as_millis()
     };
     if !prefill_already_done {
-        m.conversation_tokens.clear();
-        m.conversation_tokens.extend_from_slice(&prompt_ids);
+        m.active.cursor.conversation_tokens.clear();
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(&prompt_ids);
     }
 
     if first_token == eos_tok
@@ -2491,7 +2677,7 @@ fn generate_lfm2moe_dflash(
             tokenizer,
         );
     }
-    m.conversation_tokens.push(first_token);
+    m.active.cursor.conversation_tokens.push(first_token);
 
     let decode_t0 = Instant::now();
     let mut generated_count = 1usize;
@@ -2508,7 +2694,7 @@ fn generate_lfm2moe_dflash(
         let step = {
             let cfg = m.lfm2moe_config.as_ref().unwrap();
             let weights = m.lfm2moe_weights.as_ref().unwrap();
-            let state = m.lfm2moe_state.as_mut().unwrap();
+            let state = m.active.lfm2moe_state.as_mut().unwrap();
             let df = m.lfm2_dflash.as_mut().unwrap();
             lfm2moe::spec_step_dflash(
                 gpu,
@@ -2561,7 +2747,7 @@ fn generate_lfm2moe_dflash(
                     tokenizer,
                 );
             }
-            m.conversation_tokens.push(tok);
+            m.active.cursor.conversation_tokens.push(tok);
             generated_count += 1;
         }
         position += step.advance;
@@ -2571,7 +2757,8 @@ fn generate_lfm2moe_dflash(
         }
     }
 
-    m.seq_pos = m
+    m.active.cursor.seq_pos = m
+        .active
         .lfm2moe_state
         .as_ref()
         .map(|s| s.n_tokens)
@@ -2605,7 +2792,10 @@ fn lfm2_argmax(row: &[f32]) -> u32 {
     best_idx as u32
 }
 
-fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
+/// Frame a `{system, user}` turn into the gemma3 chat template the generate path
+/// uses (literal `<bos>` + `<start_of_turn>` framing). Public so the daemon's
+/// steer-capture op templates a turn byte-identically to `generate`.
+pub fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
     let mut framed = String::from("<bos><start_of_turn>user\n");
     if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
         // gemma3 has no system role — HF folds system content into the user turn.

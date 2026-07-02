@@ -1190,8 +1190,16 @@ impl KvCacheRowsSnapshot {
             let row_bytes = tensor.buf.size() / physical_cap;
             let bytes = row_bytes.saturating_mul(rows);
             let buf = gpu.hip.malloc(bytes)?;
-            gpu.hip
-                .memcpy_dtod_at(&buf, 0, &tensor.buf, start_pos * row_bytes, bytes)?;
+            if let Err(e) =
+                gpu.hip
+                    .memcpy_dtod_at(&buf, 0, &tensor.buf, start_pos * row_bytes, bytes)
+            {
+                let _ = gpu.hip.free(buf);
+                for b in bufs.drain(..) {
+                    let _ = gpu.hip.free(b);
+                }
+                return Err(e);
+            }
             bufs.push(buf);
         }
         Ok(bufs)
@@ -5668,6 +5676,18 @@ impl HiddenStateRingBuffer {
             staging_bufs,
             max_batch,
         })
+    }
+
+    /// Return all ring + staging buffers to the pool. Consumes self; call from
+    /// the model-unload teardown (`GpuTensor`/`DeviceBuffer` have no `Drop`, so
+    /// these leak until `drain_pool` otherwise).
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in self.layer_bufs {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.staging_bufs {
+            let _ = gpu.free_tensor(t);
+        }
     }
 
     /// If `target_layer_idx` matches one of the extraction layers, return the
@@ -10363,7 +10383,7 @@ fn run_dflash_draft_for_logits(
     // the full (B-1) × vocab logits so the tree builder can compute top-K.
     let batch = b - 1;
     let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
-    let logits_batch = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+    let logits_batch = gpu.alloc_owned(&[batch * vocab], rdna_compute::DType::F32)?;
     let w_out = &target.weights.output;
 
     let gemm_result = match w_out.gpu_dtype {
@@ -10390,7 +10410,6 @@ fn run_dflash_draft_for_logits(
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
             let r2 = run_spec_gemm_key(
@@ -10412,7 +10431,6 @@ fn run_dflash_draft_for_logits(
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
             // MQ3 has no scalar batched gemm (unlike MQ4), so use the
@@ -10454,7 +10472,6 @@ fn run_dflash_draft_for_logits(
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
             let r2 = run_spec_gemm_key(
@@ -10476,19 +10493,12 @@ fn run_dflash_draft_for_logits(
             "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
-    if let Err(e) = gemm_result {
-        let _ = gpu.free_tensor(logits_batch);
-        return Err(e);
-    }
+    gemm_result?;
 
-    let host_logits = match gpu.download_f32(&logits_batch) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = gpu.free_tensor(logits_batch);
-            return Err(e);
-        }
-    };
-    let _ = gpu.free_tensor(logits_batch);
+    let host_logits = gpu.download_f32(&logits_batch)?;
+    // `logits_batch` (RAII `OwnedTensor`) returns to the pool on drop.
+    drop(logits_batch);
+    gpu.reclaim_pending();
     debug_assert_eq!(host_logits.len(), batch * vocab);
     Ok(host_logits)
 }
@@ -10571,7 +10581,7 @@ fn run_dflash_draft_for_topk_gpu(
     // Step 4: lm_head → [batch × vocab] logits (GPU-resident).
     let batch = b - 1;
     let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
-    let logits_batch = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+    let logits_batch = gpu.alloc_owned(&[batch * vocab], rdna_compute::DType::F32)?;
     let w_out = &target.weights.output;
     let gemm_result = match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
@@ -10597,7 +10607,6 @@ fn run_dflash_draft_for_topk_gpu(
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
             let r2 = run_spec_gemm_key(
@@ -10619,7 +10628,6 @@ fn run_dflash_draft_for_topk_gpu(
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
             let r2 = run_spec_gemm_key(
@@ -10655,7 +10663,6 @@ fn run_dflash_draft_for_topk_gpu(
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
-                let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
             let r2 = run_spec_gemm_key(
@@ -10677,14 +10684,11 @@ fn run_dflash_draft_for_topk_gpu(
             "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
-    if let Err(e) = gemm_result {
-        let _ = gpu.free_tensor(logits_batch);
-        return Err(e);
-    }
+    gemm_result?;
 
     // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
-    let topk_idx_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
-    let topk_val_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
+    let topk_idx_gpu = gpu.alloc_owned(&[batch * k], rdna_compute::DType::F32)?;
+    let topk_val_gpu = gpu.alloc_owned(&[batch * k], rdna_compute::DType::F32)?;
     let topk_result = gpu.topk_logsumexp_batched_f32(
         &logits_batch,
         &topk_idx_gpu,
@@ -10693,12 +10697,10 @@ fn run_dflash_draft_for_topk_gpu(
         k,
         batch,
     );
-    let _ = gpu.free_tensor(logits_batch);
-    if let Err(e) = topk_result {
-        let _ = gpu.free_tensor(topk_idx_gpu);
-        let _ = gpu.free_tensor(topk_val_gpu);
-        return Err(e);
-    }
+    // `logits_batch` is done; release it (RAII drop) before the D2H, matching the
+    // original eager free at this point.
+    drop(logits_batch);
+    topk_result?;
 
     // Step 6: D2H just the top-K outputs (tiny — 8 × 15 × 4 = 480 bytes for k=8).
     let mut idx_host: Vec<i32> = vec![0i32; batch * k];
@@ -10707,10 +10709,15 @@ fn run_dflash_draft_for_topk_gpu(
         unsafe { std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, batch * k * 4) };
     let val_bytes: &mut [u8] =
         unsafe { std::slice::from_raw_parts_mut(val_host.as_mut_ptr() as *mut u8, batch * k * 4) };
-    gpu.hip.memcpy_dtoh(idx_bytes, &topk_idx_gpu.buf)?;
-    gpu.hip.memcpy_dtoh(val_bytes, &topk_val_gpu.buf)?;
-    let _ = gpu.free_tensor(topk_idx_gpu);
-    let _ = gpu.free_tensor(topk_val_gpu);
+    let copy_result = gpu
+        .hip
+        .memcpy_dtoh(idx_bytes, &topk_idx_gpu.buf)
+        .and_then(|()| gpu.hip.memcpy_dtoh(val_bytes, &topk_val_gpu.buf));
+    // `topk_idx_gpu`/`topk_val_gpu` (RAII `OwnedTensor`) return to the pool on drop.
+    drop(topk_idx_gpu);
+    drop(topk_val_gpu);
+    gpu.reclaim_pending();
+    copy_result?;
 
     let top_tokens: Vec<u32> = idx_host.into_iter().map(|x| x as u32).collect();
     Ok((top_tokens, val_host))

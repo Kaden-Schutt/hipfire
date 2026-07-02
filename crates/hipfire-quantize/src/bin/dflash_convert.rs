@@ -47,6 +47,8 @@
 //! dflash drafts from Qwen3/Qwen3.5 by both arch_id and the presence of
 //! the top-level `dflash` key in metadata.
 
+use hipfire_primitives::conv::{f32_slice_to_f16_bytes, plain_dtype_to_f32 as to_f32};
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -111,87 +113,6 @@ impl SafetensorsFile {
     }
 }
 
-// ─── FP conversions ────────────────────────────────────────────────────────
-
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-    if exp == 0 {
-        if frac == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 {
-            f <<= 1;
-            e -= 1;
-        }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { (frac << 13) | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
-}
-
-fn f32_to_f16(val: f32) -> u16 {
-    let bits = val.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let frac = bits & 0x7FFFFF;
-    if exp == 0xFF {
-        let f16_frac = if frac == 0 { 0 } else { (frac >> 13) | 1 };
-        return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
-    }
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 31 {
-        return ((sign << 15) | (0x1F << 10)) as u16;
-    }
-    if new_exp <= 0 {
-        if new_exp < -10 {
-            return (sign << 15) as u16;
-        }
-        let f = frac | 0x800000;
-        let shift = (1 - new_exp + 13) as u32;
-        return ((sign << 15) | (f >> shift)) as u16;
-    }
-    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
-}
-
-fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
-    match dtype {
-        "F16" => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        "BF16" => data
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        "F32" => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        other => panic!("unsupported input dtype: {other}"),
-    }
-}
-
-fn f32_slice_to_f16_bytes(f32_data: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(f32_data.len() * 2);
-    for &v in f32_data {
-        out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
-    }
-    out
-}
-
 fn f32_slice_to_f32_bytes(f32_data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(f32_data.len() * 4);
     for &v in f32_data {
@@ -201,49 +122,6 @@ fn f32_slice_to_f32_bytes(f32_data: &[f32]) -> Vec<u8> {
 }
 
 // ─── FWHT + MQ quantization ───────────────────────────────────────────────
-
-/// CPU-side FWHT on a 256-element group. Matches the GPU-side
-/// fwht_forward_256 in rdna_compute: signs1 → butterfly → scale → signs2.
-fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert!(x.len() == 256);
-    for i in 0..256 {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 {
-        x[i] *= scale * signs2[i];
-    }
-}
-
-/// Generate FWHT sign table matching the engine's gen_fwht_signs.
-/// Standard MQ4 seeds are 42 (signs1) and 1042 (signs2).
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// 104 bytes per 256 weights (0.406 B/w). Same binary layout as HFQ3-G256.

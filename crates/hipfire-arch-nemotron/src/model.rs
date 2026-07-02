@@ -539,6 +539,29 @@ impl NemotronModel {
         &self.cfg
     }
 
+    /// Capture-name map (weight-buffer ptr → checkpoint tensor name, without the
+    /// `.weight` suffix) for every dense projection — the calibration seam for
+    /// `hipfire_runtime::calibration::collect`. Names match the loader/quantizer
+    /// keys `backbone.layers.{i}.mixer.{proj}`. MoE routed experts are
+    /// imatrix-only and a follow-on, so they are skipped here.
+    pub fn build_capture_names(&self) -> std::collections::HashMap<usize, String> {
+        let mut m = std::collections::HashMap::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let mut put = |projs: &[(usize, &'static str)]| {
+                for &(ptr, suffix) in projs {
+                    m.insert(ptr, format!("backbone.layers.{i}.mixer.{suffix}"));
+                }
+            };
+            match layer {
+                Block::Mamba2(b) => put(&b.calib_projections()),
+                Block::Mlp(b) => put(&b.calib_projections()),
+                Block::Attn(b) => put(&b.calib_projections()),
+                Block::Moe(_) => {} // routed experts: imatrix-only, follow-on
+            }
+        }
+        m
+    }
+
     pub fn attention_kv_state_summary(&self) -> Option<(usize, Vec<usize>)> {
         let mut block_count = 0usize;
         let mut bytes = 0usize;

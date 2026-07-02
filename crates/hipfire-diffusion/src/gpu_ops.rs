@@ -8,7 +8,6 @@
 //! keep activations device-resident across ops (Phase 1b). The rest are shared
 //! launch/transfer helpers.
 
-
 use super::*;
 
 pub(crate) fn ensure_and_launch_diffusion_kernel(
@@ -1438,7 +1437,10 @@ pub(crate) fn group_norm_nchw_hip_on_gpu(
     })
 }
 
-pub(crate) fn silu_hip_on_gpu(gpu: &mut rdna_compute::Gpu, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+pub(crate) fn silu_hip_on_gpu(
+    gpu: &mut rdna_compute::Gpu,
+    input: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
     let elements = checked_shape_elements("SiLU input", &input.shape)?;
     if elements == 0 {
         return Ok(CpuTensor::zeros(&input.shape));

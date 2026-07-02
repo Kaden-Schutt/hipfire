@@ -54,12 +54,16 @@ arch-dots-ocr = []
 experimental-examples = []
 [dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
+hipfire-primitives = { path = "../hipfire-primitives" }
+hipfire-kld = { path = "../hipfire-kld" }
 hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-eval = { path = "../hipfire-eval" }
 hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
+hipfire-state = { path = "../hipfire-state" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-mixer = { path = "../hipfire-mixer" }
@@ -110,7 +114,9 @@ hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
-# hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }    # chaingun: needs gpu.graphs (not yet on this branch)
+hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
+hipfire-arch-nemotron = { path = "../hipfire-arch-nemotron" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 # hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" } # chaingun: needs swa_topk_wmma methods (not yet on this branch)
 # hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }  # chaingun: unclosed delimiter from merge
 hipfire-atlas = { path = "../hipfire-atlas" }

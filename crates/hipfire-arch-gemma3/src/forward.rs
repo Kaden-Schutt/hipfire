@@ -357,6 +357,9 @@ fn forward_after_x(
         // post_feedforward_layernorm, also inside the residual.
         gpu.rmsnorm_f32(&state.o, &layer.post_ffn_norm, &state.tmp, eps)?;
         gpu.add_f32(&state.x, &state.tmp, &state.x)?;
+        // Block-boundary steering/abliteration hook (no-op unless a session is
+        // active). `state.x` is the settled post-residual stream — fusion-proof.
+        hipfire_steer::maybe_steer_block(gpu, &state.x, layer_idx)?;
         maybe_dump_lm(
             gpu,
             &state.x,
@@ -431,22 +434,23 @@ pub fn forward_prefill_batch(
     // Absolute positions start_pos..start_pos+m as an i32 device table (dtype is
     // cosmetic — the rope/attention/kv kernels read it as `const int*`).
     let pos_vals: Vec<i32> = (start_pos as i32..(start_pos + m) as i32).collect();
-    let positions = gpu.alloc_tensor(&[m], DType::F32)?;
+    let positions = gpu.alloc_owned(&[m], DType::F32)?;
     {
         let bytes: Vec<u8> = pos_vals.iter().flat_map(|p| p.to_ne_bytes()).collect();
         gpu.hip.memcpy_htod(&positions.buf, &bytes)?;
     }
 
-    // Batched scratch.
-    let tmp = gpu.alloc_tensor(&[m * dim], DType::F32)?;
-    let q = gpu.alloc_tensor(&[m * q_dim], DType::F32)?;
-    let k = gpu.alloc_tensor(&[m * kv_dim], DType::F32)?;
-    let v = gpu.alloc_tensor(&[m * kv_dim], DType::F32)?;
-    let attn_out = gpu.alloc_tensor(&[m * q_dim], DType::F32)?;
-    let o = gpu.alloc_tensor(&[m * dim], DType::F32)?;
-    let gate = gpu.alloc_tensor(&[m * inter], DType::F32)?;
-    let up = gpu.alloc_tensor(&[m * inter], DType::F32)?;
-    let ffn = gpu.alloc_tensor(&[m * inter], DType::F32)?;
+    // Batched scratch. `OwnedTensor` frees itself back to the pool on drop, on
+    // EVERY exit path (`?` errors and panics included).
+    let tmp = gpu.alloc_owned(&[m * dim], DType::F32)?;
+    let q = gpu.alloc_owned(&[m * q_dim], DType::F32)?;
+    let k = gpu.alloc_owned(&[m * kv_dim], DType::F32)?;
+    let v = gpu.alloc_owned(&[m * kv_dim], DType::F32)?;
+    let attn_out = gpu.alloc_owned(&[m * q_dim], DType::F32)?;
+    let o = gpu.alloc_owned(&[m * dim], DType::F32)?;
+    let gate = gpu.alloc_owned(&[m * inter], DType::F32)?;
+    let up = gpu.alloc_owned(&[m * inter], DType::F32)?;
+    let ffn = gpu.alloc_owned(&[m * inter], DType::F32)?;
 
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
@@ -532,6 +536,9 @@ pub fn forward_prefill_batch(
         weight_gemm(gpu, &layer.w_down, &ffn, &o, m)?;
         gpu.rmsnorm_batched(&o, &layer.post_ffn_norm, &tmp, m, dim, eps)?;
         gpu.add_f32(x_batch, &tmp, x_batch)?;
+        // Block-boundary steering/abliteration hook (no-op unless active).
+        // Prefill convention: capture folds the last position, apply hits all.
+        hipfire_steer::maybe_steer_block_batched(gpu, x_batch, layer_idx, m, dim)?;
     }
 
     // Final norm + lm_head on the LAST position only (the next-token logits).
@@ -539,9 +546,9 @@ pub fn forward_prefill_batch(
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, eps)?;
     weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
 
-    for t in [tmp, q, k, v, attn_out, o, gate, up, ffn, positions] {
-        let _ = gpu.free_tensor(t);
-    }
+    // The per-call pooled scratch above (`OwnedTensor`) returned itself to the
+    // deferred-free mailbox on drop; drain the mailbox at this forward boundary.
+    gpu.reclaim_pending();
     state.next_pos = start_pos + m;
     Ok(())
 }

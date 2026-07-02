@@ -13,6 +13,9 @@
 //! needed. `cpu_fwht_256` is orthogonal ((1/16)²·H² = I, signs involutive), so
 //! the inverse rotation is the same routine with the sign vectors swapped.
 
+use hipfire_primitives::fwht::cpu_fwht_256;
+pub use hipfire_primitives::fwht::gen_fwht_signs;
+
 const STATE_BITS: u32 = 12;
 const NUM_STATES: usize = 1 << STATE_BITS;
 const STATE_MASK: u32 = (NUM_STATES as u32) - 1;
@@ -130,48 +133,6 @@ fn optimal_scale_bits(weights: &[f32], symbols: &[u8], codebook: &[f32], bits: u
         (num / den) as f32
     } else {
         group_scale(weights)
-    }
-}
-
-/// Deterministic ±1 sign vector (LCG), matching hipfire-quantize.
-pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
-
-/// FWHT-256 with sign pre/post-multiply: `out = signs2 ∘ (1/16·H·(signs1∘x))`.
-/// Orthogonal; inverse = same call with signs1/signs2 swapped.
-fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert!(x.len() == 256);
-    for i in 0..256 {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let scale = 0.0625; // 1/sqrt(256)
-    for i in 0..256 {
-        x[i] *= scale * signs2[i];
     }
 }
 

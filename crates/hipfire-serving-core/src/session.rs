@@ -28,6 +28,7 @@ use hipfire_model::{
     is_qwen35_family_arch_id, is_qwen35_moe_arch_id, parse_model_worker_id, AcceleratorDeviceInfo,
     AcceleratorInventory, ModelWorkerId, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
 };
+use hipfire_runtime::arch::SessionServingBackend;
 use hipfire_runtime::kv;
 use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_state::{
@@ -44,7 +45,7 @@ use crate::events::write_error;
 use crate::memory::{
     kv_cache_bytes, loaded_model_memory_view, minimax_state_bytes, tensor_bytes, tensor_vec_bytes,
 };
-use crate::model::LoadedModel;
+use crate::model::{LoadedModel, ResidentSession};
 
 /// Synthetic session id used by the legacy single-session `generate` path (the
 /// pre-multi-session code that didn't supply its own session id).
@@ -54,6 +55,44 @@ pub const LFM2_LEGACY_SESSION_ID: &str = "__legacy_generate__";
 /// Worker id assigned when a load message carries no explicit `worker_id`.
 pub const DEFAULT_MODEL_WORKER_ID: &str = "__default__";
 static QWEN35_STATE_ALLOCATION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Generic per-arch session bookkeeping: resident sessions keyed by id, the
+/// active session id, and the allocation epoch. The qwen35 and lfm2 rich serving
+/// paths carry an identical-shaped registry over their own per-session state `S`
+/// (`Qwen35RequestSessionState` / `Lfm2RequestSessionState`); unifying the three
+/// common fields here is S0 of the `SessionServingBackend` hoist (the future trait
+/// operates on one shape). Arch-specific extras (e.g. qwen35's
+/// `q35_active_prefilled_generated_suffix_len`) intentionally stay separate.
+pub struct SessionRegistry<S> {
+    pub sessions: std::collections::HashMap<String, S>,
+    pub active_session_id: Option<String>,
+    pub allocation_epoch: u64,
+}
+
+// Manual `Default` (not derived) so it does not impose `S: Default` — the
+// per-session state types are not `Default`-constructible.
+impl<S> Default for SessionRegistry<S> {
+    fn default() -> Self {
+        Self {
+            sessions: std::collections::HashMap::new(),
+            active_session_id: None,
+            allocation_epoch: 0,
+        }
+    }
+}
+
+/// The active session's generation cursor: absolute token position + the full
+/// conversation token history (for repeat penalty). C1a groups the former
+/// `LoadedModel::{seq_pos, conversation_tokens}` working-copy fields into one
+/// value so it can be relocated into the per-session state in C1b. Unlike
+/// accessor methods, `m.active.cursor.seq_pos` stays a **disjoint field borrow**, so it
+/// does not conflict with the long-lived borrows of other `m` fields (tokenizer,
+/// `sequence_state`) that the generation loop holds across cursor mutations.
+#[derive(Clone, Debug, Default)]
+pub struct SessionCursor {
+    pub seq_pos: usize,
+    pub conversation_tokens: Vec<u32>,
+}
 
 /// Monotonic epoch stamped onto each allocated session state, so a stale handle
 /// referencing freed/reallocated state can be detected and rejected.
@@ -67,8 +106,10 @@ pub fn next_qwen35_state_allocation_epoch() -> u64 {
 /// session out of and back into the single resident model slot. `allocation_epoch`
 /// stamps the generation so stale handles are rejected.
 pub struct Qwen35RequestSessionState {
-    pub seq_pos: usize,
-    pub conversation_tokens: Vec<u32>,
+    /// This session's generation cursor (C1b: same `SessionCursor` type the
+    /// active slot carries, so the swap moves one value and C1b's elimination of
+    /// the working copy is a straight reuse of the resident session's cursor).
+    pub cursor: SessionCursor,
     pub prefix_hash: Option<SequenceStatePrefixHash>,
     /// Unified per-sequence decode state (KV cache + DeltaNet recurrent state),
     /// keyed by the qwen35 hybrid MixerProfile. P2c: replaces the former separate
@@ -215,8 +256,7 @@ impl Qwen35RequestSessionState {
         let kv = Self::clone_kv_cache(gpu, source.kv_cache())?;
         let dn = Self::clone_dn_state(gpu, source.dn_state())?;
         Ok(Self {
-            seq_pos: source.seq_pos,
-            conversation_tokens: source.conversation_tokens.clone(),
+            cursor: source.cursor.clone(),
             prefix_hash: source.prefix_hash.clone(),
             sequence_state: SequenceState::new(
                 source.sequence_state.profile.clone(),
@@ -236,7 +276,7 @@ impl Qwen35RequestSessionState {
         m: &mut LoadedModel,
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<Self, String> {
-        if m.sequence_state.is_none() {
+        if m.active.sequence_state.is_none() {
             return Err("qwen35 session missing decode state".to_string());
         }
         let scratch = m
@@ -249,12 +289,17 @@ impl Qwen35RequestSessionState {
         gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
             .map_err(|e| format!("save qwen35 session logits snapshot: {e:?}"))?;
         Ok(Self {
-            seq_pos: m.seq_pos,
-            conversation_tokens: std::mem::take(&mut m.conversation_tokens),
+            // Move the whole active cursor into the parked snapshot (the slot's
+            // `m.active.cursor` is overwritten by the next restore).
+            cursor: std::mem::take(&mut m.active.cursor),
             prefix_hash: None,
-            sequence_state: m.sequence_state.take().expect("checked is_none above"),
+            sequence_state: m
+                .active
+                .sequence_state
+                .take()
+                .expect("checked is_none above"),
             logits,
-            prefilled_generated_suffix_len: m.q35_active_prefilled_generated_suffix_len,
+            prefilled_generated_suffix_len: m.active.q35_active_prefilled_generated_suffix_len,
             allocation_epoch: next_qwen35_state_allocation_epoch(),
         })
     }
@@ -276,20 +321,26 @@ impl Qwen35RequestSessionState {
             )
             .map_err(|e| format!("restore qwen35 session logits snapshot: {e:?}"))?;
         }
-        m.seq_pos = self.seq_pos;
-        m.conversation_tokens = self.conversation_tokens;
-        // Prefix hash metadata is kept with saved Qwen35 request sessions.
-        // The loaded singleton path computes it when checkpointable prefill
-        // sessions are saved back into the session map.
-        restore_sequence_state_into_model(m, self.sequence_state);
-        m.q35_active_state_allocation_epoch = allocation_epoch;
-        m.q35_active_prefilled_generated_suffix_len = self.prefilled_generated_suffix_len;
+        // Install the saved session as the active resident slot in one move (C2b)
+        // — replaces the former field-by-field spread of cursor / sequence_state /
+        // suffix-len into `m.active`.
+        m.active = ResidentSession {
+            cursor: self.cursor,
+            sequence_state: Some(self.sequence_state),
+            q35_active_prefilled_generated_suffix_len: self.prefilled_generated_suffix_len,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_state: None,
+        };
+        // Prefix hash metadata is kept with saved Qwen35 request sessions; the
+        // loaded singleton path computes it when checkpointable prefill sessions
+        // are saved back into the session map.
+        m.q35_registry.allocation_epoch = allocation_epoch;
         Ok(())
     }
 
     pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
+        self.cursor.seq_pos = 0;
+        self.cursor.conversation_tokens.clear();
         self.prefix_hash = None;
         self.prefilled_generated_suffix_len = 0;
         for s in &self.dn_state().s_matrices {
@@ -307,8 +358,8 @@ impl Qwen35RequestSessionState {
 
 #[cfg(feature = "arch-lfm2moe")]
 pub struct Lfm2RequestSessionState {
-    pub seq_pos: usize,
-    pub conversation_tokens: Vec<u32>,
+    /// This session's generation cursor (C1b — see `Qwen35RequestSessionState`).
+    pub cursor: SessionCursor,
     pub prefix_hash: Option<SequenceStatePrefixHash>,
     pub state: lfm2moe::lfm2moe::Lfm2MoeState,
     pub dflash_target_hidden_host: Option<Vec<f32>>,
@@ -331,8 +382,7 @@ impl Lfm2RequestSessionState {
         )
         .map_err(|e| format!("lfm2 session state allocation failed: {e}"))?;
         Ok(Self {
-            seq_pos: 0,
-            conversation_tokens: Vec::new(),
+            cursor: SessionCursor::default(),
             prefix_hash: None,
             state,
             dflash_target_hidden_host: None,
@@ -342,36 +392,44 @@ impl Lfm2RequestSessionState {
 
     pub fn take_from_loaded(m: &mut LoadedModel) -> Result<Self, String> {
         let state = m
+            .active
             .lfm2moe_state
             .take()
             .ok_or_else(|| "lfm2 active session missing state".to_string())?;
         Ok(Self {
-            seq_pos: state.n_tokens,
-            conversation_tokens: std::mem::take(&mut m.conversation_tokens),
+            cursor: SessionCursor {
+                seq_pos: state.n_tokens,
+                conversation_tokens: std::mem::take(&mut m.active.cursor.conversation_tokens),
+            },
             prefix_hash: None,
             state,
             dflash_target_hidden_host: m
                 .lfm2_dflash
                 .as_mut()
                 .map(|df| std::mem::take(&mut df.target_hidden_host)),
-            allocation_epoch: m.lfm2_active_state_allocation_epoch,
+            allocation_epoch: m.lfm2_registry.allocation_epoch,
         })
     }
 
     pub fn restore_into_loaded(self, m: &mut LoadedModel) {
-        m.seq_pos = self.seq_pos;
-        m.conversation_tokens = self.conversation_tokens;
-        m.lfm2moe_state = Some(self.state);
+        // Install the saved lfm2 session as the active resident slot in one move
+        // (C2b) — replaces the former cursor/state field spread into `m.active`.
+        m.active = ResidentSession {
+            cursor: self.cursor,
+            sequence_state: None,
+            q35_active_prefilled_generated_suffix_len: 0,
+            lfm2moe_state: Some(self.state),
+        };
         if let Some(df) = m.lfm2_dflash.as_mut() {
             df.target_hidden_host = self.dflash_target_hidden_host.unwrap_or_default();
         }
-        m.lfm2_active_state_allocation_epoch = self.allocation_epoch;
+        m.lfm2_registry.allocation_epoch = self.allocation_epoch;
     }
 
     pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
         self.state.reset(gpu)?;
-        self.seq_pos = 0;
-        self.conversation_tokens.clear();
+        self.cursor.seq_pos = 0;
+        self.cursor.conversation_tokens.clear();
         self.prefix_hash = None;
         if let Some(hidden) = self.dflash_target_hidden_host.as_mut() {
             hidden.clear();
@@ -502,19 +560,13 @@ impl Lfm2RequestSessionState {
         source: &Lfm2RequestSessionState,
     ) -> Result<Self, String> {
         Ok(Self {
-            seq_pos: source.seq_pos,
-            conversation_tokens: source.conversation_tokens.clone(),
+            cursor: source.cursor.clone(),
             prefix_hash: source.prefix_hash.clone(),
             state: Self::clone_state(gpu, &source.state)?,
             dflash_target_hidden_host: source.dflash_target_hidden_host.clone(),
             allocation_epoch: next_qwen35_state_allocation_epoch(),
         })
     }
-}
-
-/// Install a session's unified `SequenceState` as the model's active state.
-pub(crate) fn restore_sequence_state_into_model(m: &mut LoadedModel, ss: SequenceState) {
-    m.sequence_state = Some(ss);
 }
 
 /// Build the model's active `SequenceState` from raw KV + DeltaNet parts (e.g.
@@ -526,11 +578,11 @@ pub(crate) fn put_qwen35_state_into_model(m: &mut LoadedModel, kv: kv::KvCache, 
         .as_ref()
         .map(|c| qwen35_mixer_profile(&c.layer_types))
         .expect("qwen35 config present when installing active state");
-    m.sequence_state = Some(SequenceState::new(profile, Some(kv), Some(Box::new(dn))));
+    m.active.sequence_state = Some(SequenceState::new(profile, Some(kv), Some(Box::new(dn))));
 }
 
 /// Take the model's active state out as raw KV + DeltaNet parts (e.g. to build a
-/// transient spec-decode `ModelSlot`). Leaves `m.sequence_state == None`.
+/// transient spec-decode `ModelSlot`). Leaves `m.active.sequence_state == None`.
 pub(crate) fn take_qwen35_state_from_model(
     seq: &mut Option<SequenceState>,
 ) -> (kv::KvCache, DeltaNetState) {
@@ -548,18 +600,20 @@ pub(crate) fn take_qwen35_state_from_model(
 }
 
 pub fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
-    m.q35_active_session_id.as_deref() == Some(session_id)
-        || m.q35_sessions.contains_key(session_id)
+    m.q35_registry.active_session_id.as_deref() == Some(session_id)
+        || m.q35_registry.sessions.contains_key(session_id)
 }
 
 pub fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     let saved = m
-        .q35_sessions
+        .q35_registry
+        .sessions
         .keys()
         .filter(|id| id.as_str() != QWEN35_LEGACY_SESSION_ID)
         .count();
     let active = usize::from(
-        m.q35_active_session_id
+        m.q35_registry
+            .active_session_id
             .as_deref()
             .is_some_and(|id| id != QWEN35_LEGACY_SESSION_ID),
     );
@@ -573,7 +627,7 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
         if session_id == QWEN35_LEGACY_SESSION_ID {
             return;
         }
-        let logical_position = session.seq_pos + session.kv_cache().compact_offset;
+        let logical_position = session.cursor.seq_pos + session.kv_cache().compact_offset;
         let handle = qwen35_sequence_state_handle(session_id, session.allocation_epoch);
         let owns_pages = session.allocation_epoch != 0;
         let kv_bytes = session
@@ -659,14 +713,14 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
             role: role.to_string(),
         });
     };
-    for (session_id, session) in &m.q35_sessions {
+    for (session_id, session) in &m.q35_registry.sessions {
         push_session(session_id, session, "resident");
     }
-    if let Some(active_id) = m.q35_active_session_id.as_deref() {
+    if let Some(active_id) = m.q35_registry.active_session_id.as_deref() {
         if active_id != QWEN35_LEGACY_SESSION_ID {
             let compact_offset = m.kv_cache().map(|kv| kv.compact_offset).unwrap_or(0);
-            let logical_position = m.seq_pos + compact_offset;
-            let allocation_epoch = m.q35_active_state_allocation_epoch;
+            let logical_position = m.active.cursor.seq_pos + compact_offset;
+            let allocation_epoch = m.q35_registry.allocation_epoch;
             let owns_pages = allocation_epoch != 0;
             let handle = qwen35_sequence_state_handle(active_id, allocation_epoch);
             descriptors.push(SequenceStatePageDescriptor {
@@ -763,19 +817,21 @@ pub fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_session_resident(m: &LoadedModel, session_id: &str) -> bool {
-    m.lfm2_active_session_id.as_deref() == Some(session_id)
-        || m.lfm2_sessions.contains_key(session_id)
+    m.lfm2_registry.active_session_id.as_deref() == Some(session_id)
+        || m.lfm2_registry.sessions.contains_key(session_id)
 }
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_request_session_count(m: &LoadedModel) -> usize {
     let saved = m
-        .lfm2_sessions
+        .lfm2_registry
+        .sessions
         .keys()
         .filter(|id| id.as_str() != LFM2_LEGACY_SESSION_ID)
         .count();
     let active = usize::from(
-        m.lfm2_active_session_id
+        m.lfm2_registry
+            .active_session_id
             .as_deref()
             .is_some_and(|id| id != LFM2_LEGACY_SESSION_ID),
     );
@@ -861,7 +917,7 @@ fn lfm2_push_state_descriptors(
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_session_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
     let mut descriptors = Vec::new();
-    for (session_id, session) in &m.lfm2_sessions {
+    for (session_id, session) in &m.lfm2_registry.sessions {
         lfm2_push_state_descriptors(
             m,
             &mut descriptors,
@@ -873,8 +929,8 @@ pub fn lfm2_session_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
         );
     }
     if let (Some(active_id), Some(state)) = (
-        m.lfm2_active_session_id.as_deref(),
-        m.lfm2moe_state.as_ref(),
+        m.lfm2_registry.active_session_id.as_deref(),
+        m.active.lfm2moe_state.as_ref(),
     ) {
         lfm2_push_state_descriptors(
             m,
@@ -882,7 +938,7 @@ pub fn lfm2_session_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDe
             active_id,
             state,
             state.n_tokens + state.kv.compact_offset,
-            m.lfm2_active_state_allocation_epoch,
+            m.lfm2_registry.allocation_epoch,
             "active",
         );
     }
@@ -931,7 +987,7 @@ pub fn minimax_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageD
     };
     let session_id = backend_owned_session_id(m).to_string();
     let handle = backend_owned_sequence_state_handle(m);
-    let logical_position = m.seq_pos;
+    let logical_position = m.active.cursor.seq_pos;
     let placement = format!("hip:arch{}:device0", m.arch_id);
     let kv_bytes = kv_cache_bytes(&state.kv);
     let logits_bytes = tensor_bytes(&state.logits);
@@ -988,12 +1044,12 @@ pub fn minimax_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageD
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
-    let Some(state) = m.lfm2moe_state.as_ref() else {
+    let Some(state) = m.active.lfm2moe_state.as_ref() else {
         return Vec::new();
     };
     let session_id = backend_owned_session_id(m).to_string();
     let handle = backend_owned_sequence_state_handle(m);
-    let logical_position = m.seq_pos;
+    let logical_position = m.active.cursor.seq_pos;
     let placement = format!("hip:arch{}:device0", m.arch_id);
     let conv_bytes = tensor_vec_bytes(&state.conv_states);
     let conv_shape = m
@@ -1066,7 +1122,7 @@ pub fn nemotron_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePage
     };
     let session_id = backend_owned_session_id(m).to_string();
     let handle = backend_owned_sequence_state_handle(m);
-    let logical_position = m.seq_pos;
+    let logical_position = m.active.cursor.seq_pos;
     let placement = format!("hip:arch{}:device0", m.arch_id);
     let mut descriptors = Vec::new();
     let mut push = |kind: SequenceStatePageKind,
@@ -1372,7 +1428,7 @@ pub fn daemon_accelerator_inventory(gpu: &mut rdna_compute::Gpu) -> AcceleratorI
         );
     }
 
-    devices.extend(hipfire_npu::xdna1_inventory_devices_from_env());
+    devices.extend(hipfire_npu::xdna_inventory_devices_from_env());
 
     AcceleratorInventory::from_devices("daemon", devices)
 }
@@ -1509,15 +1565,15 @@ pub fn qwen35_release_sessions(
         if session_id == QWEN35_LEGACY_SESSION_ID {
             continue;
         }
-        if m.q35_active_session_id.as_deref() == Some(session_id.as_str()) {
+        if m.q35_registry.active_session_id.as_deref() == Some(session_id.as_str()) {
             qwen35_save_active_session(m, gpu)?;
         }
-        if m.q35_sessions.remove(session_id).is_some() {
+        if m.q35_registry.sessions.remove(session_id).is_some() {
             released += 1;
         }
     }
 
-    if m.q35_active_session_id.is_none() {
+    if m.q35_registry.active_session_id.is_none() {
         let created = qwen35_activate_session(m, gpu, QWEN35_LEGACY_SESSION_ID)?;
         if created {
             qwen35_reset_active_session(m, gpu)?;
@@ -1534,7 +1590,7 @@ pub fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> 
         .kv_cache()
         .ok_or_else(|| "qwen35 active session missing KV cache".to_string())?
         .compact_offset;
-    Ok(m.seq_pos + compact_offset)
+    Ok(m.active.cursor.seq_pos + compact_offset)
 }
 
 /// Per-layer token-mixer profile for a qwen3.5 hybrid stack: `FullAttention`
@@ -1668,8 +1724,7 @@ pub fn qwen35_allocate_session_state(
         Some(Box::new(dn_state)),
     );
     Ok(Qwen35RequestSessionState {
-        seq_pos: 0,
-        conversation_tokens: Vec::new(),
+        cursor: SessionCursor::default(),
         prefix_hash: None,
         sequence_state,
         logits: gpu
@@ -1686,11 +1741,11 @@ pub fn qwen35_save_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<(), String> {
-    if let Some(active_id) = m.q35_active_session_id.take() {
+    if let Some(active_id) = m.q35_registry.active_session_id.take() {
         let session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
             .map_err(|e| format!("failed to save active qwen35 session: {e}"))?;
-        m.q35_sessions.insert(active_id, session);
-        m.q35_active_state_allocation_epoch = 0;
+        m.q35_registry.sessions.insert(active_id, session);
+        m.q35_registry.allocation_epoch = 0;
     }
     Ok(())
 }
@@ -1702,28 +1757,28 @@ pub fn qwen35_activate_session(
     gpu: &mut rdna_compute::Gpu,
     session_id: &str,
 ) -> Result<bool, String> {
-    if m.q35_active_session_id.as_deref() == Some(session_id) {
+    if m.q35_registry.active_session_id.as_deref() == Some(session_id) {
         return Ok(false);
     }
-    let existed = m.q35_sessions.contains_key(session_id);
+    let existed = m.q35_registry.sessions.contains_key(session_id);
     qwen35_save_active_session(m, gpu)?;
-    let session = match m.q35_sessions.remove(session_id) {
+    let session = match m.q35_registry.sessions.remove(session_id) {
         Some(session) => session,
         None => qwen35_allocate_session_state(m, gpu)?,
     };
     session.restore_into_loaded(m, gpu)?;
-    m.q35_active_session_id = Some(session_id.to_string());
+    m.q35_registry.active_session_id = Some(session_id.to_string());
     Ok(!existed)
 }
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_save_active_session(m: &mut LoadedModel) -> Result<(), String> {
-    if let Some(active_id) = m.lfm2_active_session_id.take() {
+    if let Some(active_id) = m.lfm2_registry.active_session_id.take() {
         let mut session = Lfm2RequestSessionState::take_from_loaded(m)
             .map_err(|e| format!("failed to save active lfm2 session: {e}"))?;
-        session.seq_pos = session.state.n_tokens;
-        m.lfm2_sessions.insert(active_id, session);
-        m.lfm2_active_state_allocation_epoch = 0;
+        session.cursor.seq_pos = session.state.n_tokens;
+        m.lfm2_registry.sessions.insert(active_id, session);
+        m.lfm2_registry.allocation_epoch = 0;
     }
     Ok(())
 }
@@ -1746,17 +1801,17 @@ pub fn lfm2_activate_session(
     gpu: &mut rdna_compute::Gpu,
     session_id: &str,
 ) -> Result<bool, String> {
-    if m.lfm2_active_session_id.as_deref() == Some(session_id) {
+    if m.lfm2_registry.active_session_id.as_deref() == Some(session_id) {
         return Ok(false);
     }
-    let existed = m.lfm2_sessions.contains_key(session_id);
+    let existed = m.lfm2_registry.sessions.contains_key(session_id);
     lfm2_save_active_session(m)?;
-    let session = match m.lfm2_sessions.remove(session_id) {
+    let session = match m.lfm2_registry.sessions.remove(session_id) {
         Some(session) => session,
         None => lfm2_allocate_session_state(m, gpu)?,
     };
     session.restore_into_loaded(m);
-    m.lfm2_active_session_id = Some(session_id.to_string());
+    m.lfm2_registry.active_session_id = Some(session_id.to_string());
     Ok(!existed)
 }
 
@@ -1766,6 +1821,7 @@ pub fn lfm2_reset_active_session(
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<(), String> {
     let state = m
+        .active
         .lfm2moe_state
         .as_mut()
         .ok_or_else(|| "lfm2 active session missing state".to_string())?;
@@ -1773,14 +1829,15 @@ pub fn lfm2_reset_active_session(
     if let Some(df) = m.lfm2_dflash.as_mut() {
         df.target_hidden_host.clear();
     }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.active.cursor.seq_pos = 0;
+    m.active.cursor.conversation_tokens.clear();
     Ok(())
 }
 
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
     let state = m
+        .active
         .lfm2moe_state
         .as_ref()
         .ok_or_else(|| "lfm2 active session missing state".to_string())?;
@@ -1804,14 +1861,14 @@ pub fn lfm2_release_sessions(
         if session_id == LFM2_LEGACY_SESSION_ID {
             continue;
         }
-        if m.lfm2_active_session_id.as_deref() == Some(session_id.as_str()) {
+        if m.lfm2_registry.active_session_id.as_deref() == Some(session_id.as_str()) {
             lfm2_save_active_session(m)?;
         }
-        if m.lfm2_sessions.remove(session_id).is_some() {
+        if m.lfm2_registry.sessions.remove(session_id).is_some() {
             released += 1;
         }
     }
-    if m.lfm2_active_session_id.is_none() {
+    if m.lfm2_registry.active_session_id.is_none() {
         let created = lfm2_activate_session(m, gpu, LFM2_LEGACY_SESSION_ID)?;
         if created {
             lfm2_reset_active_session(m, gpu)?;
@@ -1828,10 +1885,11 @@ pub fn lfm2_validate_prefix_hash(
 ) -> Result<(), String> {
     validate_checkpoint_source_resident(
         source_session_id,
-        m.lfm2_sessions.contains_key(source_session_id),
+        m.lfm2_registry.sessions.contains_key(source_session_id),
     )?;
     let source = m
-        .lfm2_sessions
+        .lfm2_registry
+        .sessions
         .get(source_session_id)
         .expect("source residency was validated");
     validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)
@@ -1850,14 +1908,18 @@ pub fn lfm2_fork_session_state(
     }
     validate_checkpoint_source_resident(
         request.source_session_id,
-        m.lfm2_sessions.contains_key(request.source_session_id),
+        m.lfm2_registry
+            .sessions
+            .contains_key(request.source_session_id),
     )?;
     let source = m
-        .lfm2_sessions
+        .lfm2_registry
+        .sessions
         .get(request.source_session_id)
         .expect("source residency was validated");
     let forked = Lfm2RequestSessionState::fork_from(gpu, source)?;
-    m.lfm2_sessions
+    m.lfm2_registry
+        .sessions
         .insert(request.dest_session_id.to_string(), forked);
     Ok(())
 }
@@ -1875,10 +1937,13 @@ pub fn lfm2_checkpoint_session_state(
     {
         validate_checkpoint_source_resident(
             request.source_session_id,
-            m.lfm2_sessions.contains_key(request.source_session_id),
+            m.lfm2_registry
+                .sessions
+                .contains_key(request.source_session_id),
         )?;
         let source = m
-            .lfm2_sessions
+            .lfm2_registry
+            .sessions
             .get(request.source_session_id)
             .expect("source residency was validated");
         let logical_position = source.state.n_tokens + source.state.kv.compact_offset;
@@ -1889,7 +1954,7 @@ pub fn lfm2_checkpoint_session_state(
         )?;
     }
     if let Some(prefix_hash) = request.checkpoint_prefix_hash {
-        if let Some(source) = m.lfm2_sessions.get_mut(request.source_session_id) {
+        if let Some(source) = m.lfm2_registry.sessions.get_mut(request.source_session_id) {
             source.prefix_hash = Some(prefix_hash.clone());
         }
     }
@@ -1914,7 +1979,8 @@ pub fn qwen35_fork_session_state(
     if request.source_session_id == request.dest_session_id {
         return Ok(());
     }
-    let source_is_active = m.q35_active_session_id.as_deref() == Some(request.source_session_id);
+    let source_is_active =
+        m.q35_registry.active_session_id.as_deref() == Some(request.source_session_id);
     if !source_is_active {
         qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)?;
     }
@@ -1929,14 +1995,18 @@ pub fn qwen35_fork_session_state(
     }
     validate_checkpoint_source_resident(
         request.source_session_id,
-        m.q35_sessions.contains_key(request.source_session_id),
+        m.q35_registry
+            .sessions
+            .contains_key(request.source_session_id),
     )?;
     let source = m
-        .q35_sessions
+        .q35_registry
+        .sessions
         .get(request.source_session_id)
         .expect("source residency was validated");
     let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
-    m.q35_sessions
+    m.q35_registry
+        .sessions
         .insert(request.dest_session_id.to_string(), forked);
     Ok(())
 }
@@ -1956,13 +2026,16 @@ pub fn qwen35_checkpoint_session_state(
     {
         validate_checkpoint_source_resident(
             request.source_session_id,
-            m.q35_sessions.contains_key(request.source_session_id),
+            m.q35_registry
+                .sessions
+                .contains_key(request.source_session_id),
         )?;
         let source = m
-            .q35_sessions
+            .q35_registry
+            .sessions
             .get(request.source_session_id)
             .expect("source residency was validated");
-        let logical_position = source.seq_pos + source.kv_cache().compact_offset;
+        let logical_position = source.cursor.seq_pos + source.kv_cache().compact_offset;
         validate_checkpoint_logical_position(
             request.source_session_id,
             request.expected_logical_position,
@@ -1970,7 +2043,7 @@ pub fn qwen35_checkpoint_session_state(
         )?;
     }
     if let Some(prefix_hash) = request.checkpoint_prefix_hash {
-        if let Some(source) = m.q35_sessions.get_mut(request.source_session_id) {
+        if let Some(source) = m.q35_registry.sessions.get_mut(request.source_session_id) {
             source.prefix_hash = Some(prefix_hash.clone());
         }
     }
@@ -1994,10 +2067,11 @@ pub fn qwen35_validate_prefix_hash(
 ) -> Result<(), String> {
     validate_checkpoint_source_resident(
         source_session_id,
-        m.q35_sessions.contains_key(source_session_id),
+        m.q35_registry.sessions.contains_key(source_session_id),
     )?;
     let source = m
-        .q35_sessions
+        .q35_registry
+        .sessions
         .get(source_session_id)
         .expect("source residency was validated");
     validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)
@@ -2209,5 +2283,153 @@ pub fn qwen35_restore_or_error(
             id,
             &format!("failed to restore qwen35 request session: {e}"),
         );
+    }
+}
+
+fn session_op_unsupported(arch_id: u32, op: &str) -> String {
+    format!("{op}: rich session protocol unsupported for arch_id={arch_id} (qwen35/lfm2 only)")
+}
+
+/// The arch's default ("legacy") session id used when a generate request omits an
+/// explicit `session_id`. qwen35 and lfm2 use different legacy ids; returns the
+/// qwen35 legacy id as a harmless default for other arches (callers gate on
+/// session support before using it). Lets the daemon resolve the default without
+/// an `if is_qwen35 {} else if is_lfm2 {}` branch at the call site.
+pub fn loaded_model_default_session_id(m: &LoadedModel) -> &'static str {
+    #[cfg(feature = "arch-lfm2moe")]
+    if m.arch_id == ARCH_ID_LFM2_MOE {
+        return LFM2_LEGACY_SESSION_ID;
+    }
+    let _ = m;
+    QWEN35_LEGACY_SESSION_ID
+}
+
+/// C0 of the SessionServingBackend hoist
+/// (docs/plans/2026-06-29-session-serving-backend.md): the rich session protocol
+/// implemented on `LoadedModel`, dispatching by `arch_id` to the existing per-arch
+/// `qwen35_*` / `lfm2_*` functions. This gives the daemon ONE
+/// `&mut dyn SessionServingBackend` session-op surface — collapsing the
+/// `if is_qwen35 {} else if is_lfm2 {}` ladder at the call sites (S4) — without
+/// relocating session state off the single resident slot. The per-arch backend
+/// impls + state relocation land with the per-session-slot restructure
+/// (docs/plans/2026-06-29-concurrent-session-execution.md, C1+).
+impl SessionServingBackend for LoadedModel {
+    fn state_arena_backend(&self) -> SequenceStateArenaBackend {
+        loaded_model_state_arena_backend(self)
+    }
+
+    fn state_page_descriptors(&self) -> Vec<SequenceStatePageDescriptor> {
+        sequence_state_arena_page_descriptors(loaded_model_state_arena_backend(self), self)
+    }
+
+    fn request_session_count(&self) -> usize {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_request_session_count(self);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_request_session_count(self);
+        }
+        0
+    }
+
+    fn active_logical_position(&self) -> Result<usize, String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_active_logical_position(self);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_active_logical_position(self);
+        }
+        Err(session_op_unsupported(
+            self.arch_id,
+            "active_logical_position",
+        ))
+    }
+
+    fn activate_session(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_activate_session(self, gpu, session_id);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_activate_session(self, gpu, session_id);
+        }
+        Err(session_op_unsupported(self.arch_id, "activate_session"))
+    }
+
+    fn save_active_session(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_save_active_session(self, gpu);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            // lfm2 save is GPU-free (host-side cursor snapshot).
+            return lfm2_save_active_session(self);
+        }
+        Err(session_op_unsupported(self.arch_id, "save_active_session"))
+    }
+
+    fn reset_active_session(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_reset_active_session(self, gpu);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_reset_active_session(self, gpu);
+        }
+        Err(session_op_unsupported(self.arch_id, "reset_active_session"))
+    }
+
+    fn release_sessions(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        session_ids: &[String],
+    ) -> Result<usize, String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_release_sessions(self, gpu, session_ids);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_release_sessions(self, gpu, session_ids);
+        }
+        Err(session_op_unsupported(self.arch_id, "release_sessions"))
+    }
+
+    fn fork_session_state(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        request: SequenceStateForkRequest<'_>,
+    ) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_fork_session_state(self, gpu, request);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_fork_session_state(self, gpu, request);
+        }
+        Err(session_op_unsupported(self.arch_id, "fork_session_state"))
+    }
+
+    fn checkpoint_session_state(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        request: SequenceStateCheckpointRequest<'_>,
+    ) -> Result<(), String> {
+        if is_qwen35_family_arch_id(self.arch_id) {
+            return qwen35_checkpoint_session_state(self, gpu, request);
+        }
+        #[cfg(feature = "arch-lfm2moe")]
+        if self.arch_id == ARCH_ID_LFM2_MOE {
+            return lfm2_checkpoint_session_state(self, gpu, request);
+        }
+        Err(session_op_unsupported(
+            self.arch_id,
+            "checkpoint_session_state",
+        ))
     }
 }

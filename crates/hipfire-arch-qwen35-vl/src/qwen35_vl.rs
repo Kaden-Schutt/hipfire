@@ -8,7 +8,7 @@
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -704,6 +704,11 @@ mod tests {
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
 
 /// gemm_f16 produces Y[M,N]. We need [N,M]. This helper does GEMM + transpose + bias.
+///
+/// Returns an [`OwnedTensor`]: the caller owns the result and it frees itself on
+/// drop (on success OR on any `?`-propagated error — plain `?` is leak-free). The
+/// internal transpose scratch `yt` is an `OwnedTensor` too, so it enqueues for
+/// reclaim on drop. `&y` deref-coerces to `&GpuTensor` at the kernel call sites.
 fn linear_f16(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -712,14 +717,14 @@ fn linear_f16(
     out_dim: usize,
     in_dim: usize,
     n: usize,
-) -> HipResult<GpuTensor> {
+) -> HipResult<OwnedTensor> {
     // GEMM: Y_t[out_dim, n] = W[out_dim, in_dim] @ X[n, in_dim]^T
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
+    let yt = gpu.alloc_owned(&[out_dim * n], DType::F32)?;
     gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
     // Transpose: Y[n, out_dim]
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
+    let y = gpu.alloc_owned(&[n * out_dim], DType::F32)?;
     gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
+    drop(yt);
     // Bias
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
@@ -744,9 +749,11 @@ pub fn vision_forward(
     );
 
     // Upload patches [n, patch_dim]
-    let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
+    let x_patches = gpu.upload_owned_f32(patches, &[n * patch_dim])?;
 
-    // Patch embedding: linear_f16 → [n, h]
+    // Patch embedding: linear_f16 → [n, h]. `x` is the residual stream: an
+    // `OwnedTensor` that stays alive across every layer (so the per-layer reclaim
+    // never returns it) and is dropped + reclaimed at the merge boundary below.
     let x = linear_f16(
         gpu,
         &weights.patch_embed_w,
@@ -756,7 +763,7 @@ pub fn vision_forward(
         patch_dim,
         n,
     )?;
-    gpu.free_tensor(x_patches)?;
+    drop(x_patches); // scratch consumed — enqueue for the next reclaim.
 
     // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
     // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
@@ -780,9 +787,9 @@ pub fn vision_forward(
         num_grid_per_side,
         config.spatial_merge_size,
     );
-    let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
+    let pos_embed_gpu = gpu.upload_owned_f32(&pos_embed_interp, &[n * h])?;
     gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
-    gpu.free_tensor(pos_embed_gpu)?;
+    drop(pos_embed_gpu); // scratch consumed — enqueue for the next reclaim.
 
     // Compute the 2D rotary cos/sin tables once per image and upload. The
     // kernel reads `head_dim/2` floats per token for each of cos/sin (HF's
@@ -796,32 +803,42 @@ pub fn vision_forward(
         config.spatial_merge_size,
         config.rope_theta,
     );
-    let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
-    let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
+    // 2D-RoPE cos/sin: per-call `OwnedTensor`s held alive across every layer
+    // (borrowed each iteration, never dropped inside the loop, so the per-layer
+    // reclaim leaves them untouched). Dropped + reclaimed after the loop.
+    let rope_cos_gpu = gpu.upload_owned_f32(&rope_cos, &[n * rot_dim_half])?;
+    let rope_sin_gpu = gpu.upload_owned_f32(&rope_sin, &[n * rot_dim_half])?;
 
     // Scratch buffers reused across layers
     let qkv_dim = 3 * h;
 
+    // Per-layer scratch (`tmp`, `qkv`, `attn_out`, `proj`, `tmp2`, `fc1`, `fc2`)
+    // are `OwnedTensor`s: each drops at the end of its lifetime (or instantly on
+    // a `?` error), enqueueing its pooled buffer into the deferred-free mailbox.
+    // No manual frees and no error-path bookkeeping — plain `?` is leak-free. A
+    // single `reclaim_pending()` at the bottom of each iteration returns that
+    // layer's scratch to the pool for the next layer (peak VRAM stays flat across
+    // all layers); the residual `x` and the RoPE tables stay alive and are not
+    // reclaimed there.
+    //
     // Stream invariant: every kernel below is enqueued on the same default
-    // stream (`gpu.stream_ref()`), and per-layer scratch tensors (`tmp`,
-    // `qkv`, `attn_out`, `proj`, `tmp2`, `fc1`, `fc2`) are freed within the
-    // same iteration. Correctness depends on submission-order serialization:
-    // pool reuse of a freed buffer is fine because the next kernel using
-    // that VRAM is queued AFTER the previous one on the same stream. If
-    // anyone ever refactors `rdna_compute` to use multiple streams for the
-    // vision path (e.g., async memcpy on a side stream), this pattern must
-    // be revisited — either add per-layer syncs or attach kernels to the
-    // freeing buffer's stream. See review notes in `vision_rev_claude.md`.
+    // stream (`gpu.stream_ref()`). Correctness depends on submission-order
+    // serialization: pool reuse of a reclaimed buffer is fine because the next
+    // kernel using that VRAM is queued AFTER the previous one on the same stream.
+    // If anyone ever refactors `rdna_compute` to use multiple streams for the
+    // vision path (e.g., async memcpy on a side stream), this pattern must be
+    // revisited — either add per-layer syncs or attach kernels to the freeing
+    // buffer's stream. See review notes in `vision_rev_claude.md`.
     for li in 0..config.num_layers {
         let lw = &weights.layers[li];
 
         // LayerNorm1 → tmp
-        let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        let tmp = gpu.alloc_owned(&[n * h], DType::F32)?;
         gpu.layernorm_batched(&x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps)?;
 
         // QKV projection → [n, 3h]
         let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, qkv_dim, h, n)?;
-        gpu.free_tensor(tmp)?;
+        drop(tmp);
 
         // 2D rotary applied in-place to Q and K halves of the QKV buffer.
         gpu.apply_rope_2d_vision_f32(
@@ -835,39 +852,44 @@ pub fn vision_forward(
         )?;
 
         // Self-attention on GPU: qkv[n, 3h] → attn_out[n, h]
-        let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        let attn_out = gpu.alloc_owned(&[n * h], DType::F32)?;
         gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
-        gpu.free_tensor(qkv)?;
+        drop(qkv);
 
         // Output projection → [n, h]
         let proj = linear_f16(gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
-        gpu.free_tensor(attn_out)?;
+        drop(attn_out);
 
         // Residual: x += proj
         gpu.add_inplace_f32(&x, &proj)?;
-        gpu.free_tensor(proj)?;
+        drop(proj);
 
         // LayerNorm2 → tmp
-        let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        let tmp2 = gpu.alloc_owned(&[n * h], DType::F32)?;
         gpu.layernorm_batched(&x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, config.norm_eps)?;
 
         // MLP: fc1 → GELU → fc2
         let fc1 = linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
-        gpu.free_tensor(tmp2)?;
+        drop(tmp2);
         gpu.gelu_tanh_f32(&fc1, &fc1, n * config.mlp_dim)?;
 
         let fc2 = linear_f16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n)?;
-        gpu.free_tensor(fc1)?;
+        drop(fc1);
 
         // Residual: x += fc2
         gpu.add_inplace_f32(&x, &fc2)?;
-        gpu.free_tensor(fc2)?;
+        drop(fc2);
+        // Per-iteration reclaim: this layer's scratch goes back to the pool so the
+        // next layer reuses it — peak VRAM stays flat across layers. No-op while a
+        // graph is live (self-gated); `x` and the RoPE tables are still alive, so
+        // they are not reclaimed here.
+        gpu.reclaim_pending();
     }
 
     // Single sync at end of all layers (avoids per-layer sync overhead)
     gpu.hip.device_synchronize()?;
-    gpu.free_tensor(rope_cos_gpu)?;
-    gpu.free_tensor(rope_sin_gpu)?;
+    drop(rope_cos_gpu); // per-call RoPE scratch — enqueue for the final reclaim.
+    drop(rope_sin_gpu);
     eprintln!(
         "  vision forward complete ({:.2}s)",
         t0.elapsed().as_secs_f32()
@@ -881,7 +903,7 @@ pub fn vision_forward(
     let merge_dim = h * sms * sms;
 
     // LayerNorm all patches
-    let normed = gpu.alloc_tensor(&[n * h], DType::F32)?;
+    let normed = gpu.alloc_owned(&[n * h], DType::F32)?;
     gpu.layernorm_batched(
         &x,
         &weights.merger_norm_w,
@@ -891,11 +913,11 @@ pub fn vision_forward(
         h,
         config.norm_eps,
     )?;
-    gpu.free_tensor(x)?;
+    drop(x); // residual stream consumed — enqueue for the final reclaim.
 
     // Download for 2x2 rearrange (only ~3.6MB, one-time cost)
     let normed_data = gpu.download_f32(&normed)?;
-    gpu.free_tensor(normed)?;
+    drop(normed);
 
     // Patches in `normed_data` are stored in 2x2-block-grouped order (see
     // `extract_patches`), so the 4 patches that merge into one output token
@@ -913,7 +935,7 @@ pub fn vision_forward(
     }
 
     // Merger MLP on GPU
-    let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
+    let merged_gpu = gpu.upload_owned_f32(&merged, &[n_merged * merge_dim])?;
     let m1 = linear_f16(
         gpu,
         &weights.merger_fc1_w,
@@ -923,7 +945,7 @@ pub fn vision_forward(
         merge_dim,
         n_merged,
     )?;
-    gpu.free_tensor(merged_gpu)?;
+    drop(merged_gpu);
     gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
 
     let m2 = linear_f16(
@@ -935,10 +957,14 @@ pub fn vision_forward(
         merge_dim,
         n_merged,
     )?;
-    gpu.free_tensor(m1)?;
+    drop(m1);
 
     let result = gpu.download_f32(&m2)?;
-    gpu.free_tensor(m2)?;
+    drop(m2);
+
+    // Boundary reclaim: return the residual stream, RoPE tables, and merger
+    // scratch (all enqueued above) to the pool. No-op under capture.
+    gpu.reclaim_pending();
 
     eprintln!(
         "  vision done: {} tokens × {} dims ({:.2}s)",

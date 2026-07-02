@@ -1190,6 +1190,49 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// OQ4G256 (Opus Quant W4 experts) indexed MoE GEMV family. Same indexed
+/// dispatch + expert-pointer contract as the HFQ4G256 siblings; the only
+/// difference is the per-group expert block (132 B `[f32 scale | 128 signed
+/// nibbles]`, symmetric `w = sc * sext4(nib)`, no zero-point — vs HFQ4's 136 B
+/// affine). See docs/plans/2026-06-30-minimax-moe-oq4-kernels.md.
+pub const GEMV_OQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4g256_moe_gate_up_indexed.hip");
+pub const GEMV_OQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4g256_moe_gate_up_indexed_batched.hip");
+pub const GEMV_OQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq4g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// OQ8G256 (Opus Quant W8 experts) indexed MoE GEMV family — the int8 runtime
+/// weight that OQ+ magnitude-tiered (OqPlusCompact, top-w8_frac int8 outliers)
+/// experts expand to at load. 260 B/group `[f32 scale | 256 int8]`, dequant
+/// `w = sc * (int8)`. Same indexed dispatch as the OQ4/HFQ4 siblings.
+pub const GEMV_OQ8G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8g256_moe_gate_up_indexed.hip");
+pub const GEMV_OQ8G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8g256_moe_gate_up_indexed_batched.hip");
+pub const GEMV_OQ8G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// QTIP3 (trellis-coded 3-bit) indexed MoE GEMV family. Same indexed dispatch +
+/// expert-pointer contract as the OQ4/HFQ4 siblings; the per-group expert block
+/// is the QTIP 100 B layout `[f32 scale | 96 B of 3-bit trellis symbols]` with
+/// the codebook COMPUTED on-device (1MAD), so there is no codebook in the weight
+/// stream. See kernels/src/gemv_qtip3g256.hip (the dense kernel) + the low-bit
+/// sweep (project_lowbit_quant_findings): qtip3+LDLQ+low-rank is the competitive
+/// 3-bit expert point.
+pub const GEMV_QTIP3G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_qtip3g256_moe_gate_up_indexed.hip");
+pub const GEMV_QTIP3G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_qtip3g256_moe_gate_up_indexed_batched.hip");
+pub const GEMV_QTIP3G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_qtip3g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// Indexed-MoE low-rank weight-error correction (LQER/CALDERA): the two-stage
+/// `out += U_e·(V_e·x)` term that composes with any expert format (run after the
+/// main GEMV). One source file, two kernels: `gemv_lowrank_moe_proj` (V·x→t) and
+/// `gemv_lowrank_moe_expand` (U·t→ +=out).
+pub const GEMV_LOWRANK_MOE_SRC: &str = include_str!("../../../kernels/src/gemv_lowrank_moe.hip");
+
 /// gfx1151 two-row probe for the atomic-free batched indexed MoE down path.
 /// Same math/output contract as
 /// `GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`, but packs two
@@ -2923,6 +2966,12 @@ pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_decode.hip");
 
+/// ZAYA1 CCA + EDA/MoD custom elementwise kernels (grouped causal conv1d, q/k
+/// residual mix, conv-residual add, compositional value, L2 qk-norm + temp,
+/// exact GELU, affine residual merge, EDA cross-layer add). All register-only
+/// (no LDS). See kernels/src/zaya_cca.hip.
+pub const ZAYA_CCA_SRC: &str = include_str!("../../../kernels/src/zaya_cca.hip");
+
 /// LFM2 LIV double-gated short-conv, single-token decode (runtime kernel_size).
 /// Fuses the B*x pre-gate, depthwise causal conv, C*conv_out post-gate, and the
 /// rolling conv-state ring-buffer advance into one launch. conv_bias is always
@@ -2944,6 +2993,10 @@ pub const MAMBA2_SSD_SEQ_SRC: &str = include_str!("../../../kernels/src/mamba2_s
 pub const MAMBA2_SSD_DECODE_Q8_SRC: &str =
     include_str!("../../../kernels/src/mamba2_ssd_decode_q8.hip");
 pub const MAMBA2_SSD_SEQ_Q8_SRC: &str = include_str!("../../../kernels/src/mamba2_ssd_seq_q8.hip");
+pub const MAMBA2_SSD_CHUNK_SRC: &str =
+    include_str!("../../../kernels/src/mamba2_ssd_chunk_f32.hip");
+pub const MAMBA2_SSD_CHUNK_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/mamba2_ssd_chunk_wmma.hip");
 pub const RELU2_SRC: &str = include_str!("../../../kernels/src/relu2.hip");
 pub const MAMBA2_GATED_NORM_SRC: &str = include_str!("../../../kernels/src/mamba2_gated_norm.hip");
 pub const MAMBA2_GATED_NORM_SEQ_SRC: &str =

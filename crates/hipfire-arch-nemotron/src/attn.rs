@@ -92,6 +92,17 @@ pub struct NemotronAttnGpu {
 }
 
 impl NemotronAttnGpu {
+    /// (weight-buf ptr, `mixer.`-relative name) per dense projection — calibration
+    /// capture-name map. See `calibration::build_capture_names`.
+    pub(crate) fn calib_projections(&self) -> [(usize, &'static str); 4] {
+        [
+            (self.q_proj.buf_ptr(), "q_proj"),
+            (self.k_proj.buf_ptr(), "k_proj"),
+            (self.v_proj.buf_ptr(), "v_proj"),
+            (self.o_proj.buf_ptr(), "o_proj"),
+        ]
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         gpu: &mut Gpu,

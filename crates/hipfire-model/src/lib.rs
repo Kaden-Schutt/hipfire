@@ -160,6 +160,7 @@ pub const ARCH_ID_GEMMA3_TEXT: u32 = 12;
 pub const ARCH_ID_GEMMA3_VL: u32 = 13;
 pub const ARCH_ID_NEMOTRON_H: u32 = 14;
 pub const ARCH_ID_MAMBA2: u32 = 15;
+pub const ARCH_ID_ZAYA: u32 = 16;
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
 pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
@@ -176,6 +177,7 @@ pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
     (ARCH_ID_GEMMA3_VL, "gemma3-vl"),
     (ARCH_ID_NEMOTRON_H, "nemotron_h"),
     (ARCH_ID_MAMBA2, "mamba2"),
+    (ARCH_ID_ZAYA, "zaya"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,6 +195,7 @@ pub enum ModelArchFamily {
     Gemma3Vl,
     NemotronH,
     Mamba2,
+    Zaya,
     Unknown,
 }
 
@@ -211,6 +214,7 @@ pub fn model_arch_family(arch_id: u32) -> ModelArchFamily {
         ARCH_ID_GEMMA3_VL => ModelArchFamily::Gemma3Vl,
         ARCH_ID_NEMOTRON_H => ModelArchFamily::NemotronH,
         ARCH_ID_MAMBA2 => ModelArchFamily::Mamba2,
+        ARCH_ID_ZAYA => ModelArchFamily::Zaya,
         _ => ModelArchFamily::Unknown,
     }
 }
@@ -337,7 +341,7 @@ impl AcceleratorDeviceInfo {
         }
     }
 
-    pub fn npu_xdna1(
+    pub fn npu_xdna(
         device_id: impl Into<String>,
         ordinal: Option<usize>,
         runtime: Option<String>,
@@ -348,8 +352,8 @@ impl AcceleratorDeviceInfo {
             kind: "npu".to_string(),
             device_id: device_id.into(),
             ordinal,
-            arch: Some("xdna1".to_string()),
-            name: Some("XDNA1 NPU".to_string()),
+            arch: Some("xdna".to_string()),
+            name: Some("XDNA NPU".to_string()),
             runtime,
             available,
             reason,

@@ -1086,7 +1086,7 @@ pub fn compute_scores_batched_gpu(
         .unwrap_or(auto_layer);
     let n_blocks = (n + block_size - 1) / block_size;
 
-    let scores_buf = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+    let scores_buf = gpu.alloc_owned(&[n_blocks], DType::F32)?;
     // Dispatch on the drafter's KV cache mode. All four kernels emit
     // the same f32 cosine-per-block scores; they only differ in K
     // dequant. Cosine is rotation-invariant under any orthonormal
@@ -1150,7 +1150,9 @@ pub fn compute_scores_batched_gpu(
         );
     }
     let scores = gpu.download_f32(&scores_buf)?;
-    let _ = gpu.free_tensor(scores_buf);
+    // `scores_buf` (RAII `OwnedTensor`) returns to the pool on drop.
+    drop(scores_buf);
+    gpu.reclaim_pending();
 
     Ok(BlockScores {
         scores,

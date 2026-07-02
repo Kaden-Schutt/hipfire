@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-xdna"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AMD XDNA (Ryzen AI NPU) device layer for hipfire: /dev/accel ioctl telemetry and (later) runtime dispatch"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

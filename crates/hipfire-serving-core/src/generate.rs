@@ -38,7 +38,7 @@ use crate::evidence::{
 use crate::generate_arch::generate_lfm2moe;
 use crate::generate_arch::{
     generate_deepseek4, generate_gemma3, generate_gemma3_vl_text, generate_llama, generate_minimax,
-    generate_nemotron, generate_qwen2,
+    generate_nemotron, generate_qwen2, generate_zaya,
 };
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
@@ -156,8 +156,8 @@ pub fn generate_mtp(
     };
 
     // Fresh target state — MTP runs its own prefill from position 0.
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.active.cursor.seq_pos = 0;
+    m.active.cursor.conversation_tokens.clear();
     {
         let dn = m.dn_state().unwrap();
         for s in &dn.s_matrices {
@@ -174,7 +174,7 @@ pub fn generate_mtp(
     // Assemble a transient ModelSlot, mirroring generate_dflash's take/putback.
     let target_config = m.q35_config.as_ref().unwrap().clone();
     let weights = m.q35_weights.take().expect("q35 weights");
-    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.sequence_state);
+    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.active.sequence_state);
     let scratch = m.q35_scratch.take().expect("q35 scratch");
     macro_rules! putback {
         ($t:expr) => {{
@@ -586,8 +586,8 @@ pub fn generate_dflash(
 
     // Fresh target state — DFlash seed_target_hidden_from_prompt does its own
     // full prefill, so we reset first to avoid double-accounting.
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
+    m.active.cursor.seq_pos = 0;
+    m.active.cursor.conversation_tokens.clear();
     {
         let dn = m.dn_state().unwrap();
         for s in &dn.s_matrices {
@@ -613,7 +613,7 @@ pub fn generate_dflash(
     // actually touch it. Reopening via mmap is essentially free (few µs).
     let target_config = m.q35_config.as_ref().unwrap().clone();
     let weights = m.q35_weights.take().expect("q35 weights");
-    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.sequence_state);
+    let (kv_cache, dn_state) = take_qwen35_state_from_model(&mut m.active.sequence_state);
     let scratch = m.q35_scratch.take().expect("q35 scratch");
     let hfq = match HfqFile::open(Path::new(&m.model_path)) {
         Ok(h) => h,
@@ -1077,8 +1077,8 @@ pub fn generate_dflash(
     m.q35_weights = Some(target.weights);
     put_qwen35_state_into_model(m, target.kv_cache, target.dn_state);
     m.q35_scratch = Some(target.scratch);
-    m.seq_pos = position;
-    m.conversation_tokens = emitted.clone();
+    m.active.cursor.seq_pos = position;
+    m.active.cursor.conversation_tokens = emitted.clone();
 
     let t_end = Instant::now();
     let total_s = t_end.duration_since(t0).as_secs_f64();
@@ -1174,15 +1174,16 @@ pub fn generate_multi(
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.active.cursor.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
-            m.seq_pos, m.max_seq
+            m.active.cursor.seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.active.cursor.seq_pos = 0;
+        m.active.cursor.conversation_tokens.clear();
         if let (Some(dn), Some(ref mut gpus), Some(ref la)) = (
-            m.sequence_state
+            m.active
+                .sequence_state
                 .as_ref()
                 .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>()),
             m.pp_gpus.as_mut(),
@@ -1204,7 +1205,7 @@ pub fn generate_multi(
                 let _ = g.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
+        if let Some(kv) = m.active.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
             kv.compact_offset = 0;
         }
     }
@@ -1235,7 +1236,7 @@ pub fn generate_multi(
         None => hipfire_arch_qwen35::pflash::RequestKind::Text,
     };
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        if m.seq_pos == 0 {
+        if m.active.cursor.seq_pos == 0 {
             match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
                 gpu,
                 state,
@@ -1303,7 +1304,7 @@ pub fn generate_multi(
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    let try_jinja = jinja_enabled && m.active.cursor.seq_pos == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = prompt_frame::JinjaChatFrame {
@@ -1348,7 +1349,11 @@ pub fn generate_multi(
                 eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
                 prompt_frame::ChatFrame {
                     tokenizer,
-                    system: if m.seq_pos == 0 { system_prompt } else { None },
+                    system: if m.active.cursor.seq_pos == 0 {
+                        system_prompt
+                    } else {
+                        None
+                    },
                     user: "",
                     assistant_prefix,
                     raw: effective_raw(m),
@@ -1359,7 +1364,11 @@ pub fn generate_multi(
     } else {
         prompt_frame::ChatFrame {
             tokenizer,
-            system: if m.seq_pos == 0 { system_prompt } else { None },
+            system: if m.active.cursor.seq_pos == 0 {
+                system_prompt
+            } else {
+                None
+            },
             user: "",
             assistant_prefix,
             raw: effective_raw(m),
@@ -1368,12 +1377,12 @@ pub fn generate_multi(
     };
 
     let trailer = nl.len();
-    if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+    if m.active.cursor.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
             id,
-            m.seq_pos,
+            m.active.cursor.seq_pos,
             new_tokens.len(),
             max_tokens,
             trailer,
@@ -1411,6 +1420,7 @@ pub fn generate_multi(
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch_set = m.pp_scratch_set.as_ref().unwrap();
     let ss = m
+        .active
         .sequence_state
         .as_mut()
         .expect("qwen35 active state present");
@@ -1434,7 +1444,7 @@ pub fn generate_multi(
         weights,
         config,
         &new_tokens,
-        m.seq_pos,
+        m.active.cursor.seq_pos,
         kv,
         dn,
         scratch_set,
@@ -1447,11 +1457,14 @@ pub fn generate_multi(
         let _ = stdout.flush();
         return;
     }
-    m.seq_pos += new_tokens.len();
-    m.conversation_tokens.extend_from_slice(&new_tokens);
+    m.active.cursor.seq_pos += new_tokens.len();
+    m.active
+        .cursor
+        .conversation_tokens
+        .extend_from_slice(&new_tokens);
 
     // ngram scope: generated tokens only (matches pp=1).
-    let ngram_scope_start = m.conversation_tokens.len();
+    let ngram_scope_start = m.active.cursor.conversation_tokens.len();
 
     let mut rng_state: u32 = 0x13579BDFu32;
 
@@ -1461,7 +1474,7 @@ pub fn generate_multi(
         .collect();
 
     // First sample on the output device.
-    let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+    let ngram_scope = &m.active.cursor.conversation_tokens[ngram_scope_start..];
     let mut blocked0: Vec<u32> = Vec::new();
     collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked0);
     let cfg0 = SamplerConfig {
@@ -1502,7 +1515,7 @@ pub fn generate_multi(
 
     while generated < max_tokens {
         generated += 1;
-        m.conversation_tokens.push(next_token);
+        m.active.cursor.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
         emit_committed_event(
             stdout,
@@ -1521,7 +1534,7 @@ pub fn generate_multi(
             weights,
             config,
             next_token,
-            m.seq_pos,
+            m.active.cursor.seq_pos,
             kv,
             dn,
             scratch_set,
@@ -1534,7 +1547,7 @@ pub fn generate_multi(
             let _ = stdout.flush();
             return;
         }
-        m.seq_pos += 1;
+        m.active.cursor.seq_pos += 1;
 
         if next_token == config.eos_token {
             break;
@@ -1581,7 +1594,7 @@ pub fn generate_multi(
                         weights,
                         config,
                         t,
-                        m.seq_pos,
+                        m.active.cursor.seq_pos,
                         kv,
                         dn,
                         scratch_set,
@@ -1589,8 +1602,8 @@ pub fn generate_multi(
                         eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
                         break;
                     }
-                    m.seq_pos += 1;
-                    m.conversation_tokens.push(t);
+                    m.active.cursor.seq_pos += 1;
+                    m.active.cursor.conversation_tokens.push(t);
                     streamed_tokens.push(t);
                     emit_committed_event(
                         stdout,
@@ -1646,7 +1659,7 @@ pub fn generate_multi(
                     id
                 );
                 let _ = stdout.flush();
-                let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+                let ngram_scope = &m.active.cursor.conversation_tokens[ngram_scope_start..];
                 let mut blocked: Vec<u32> = Vec::new();
                 collect_unclosed_attractor_blocks(
                     ngram_scope,
@@ -1683,10 +1696,13 @@ pub fn generate_multi(
             let nudge_tokens = tokenizer.encode(budget_alert_text);
             let budget_left = max_tokens.saturating_sub(generated);
             let nudge_len = nudge_tokens.len().min(budget_left);
-            let need_kv = m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+            let need_kv = m.active.cursor.seq_pos
+                + nudge_len
+                + (max_tokens - generated - nudge_len)
+                + nl.len();
             if nudge_len > 0 && need_kv <= m.physical_cap {
                 for &tok in &nudge_tokens[..nudge_len] {
-                    m.conversation_tokens.push(tok);
+                    m.active.cursor.conversation_tokens.push(tok);
                     streamed_tokens.push(tok);
                     emit_committed_event(
                         stdout,
@@ -1704,7 +1720,7 @@ pub fn generate_multi(
                         weights,
                         config,
                         tok,
-                        m.seq_pos,
+                        m.active.cursor.seq_pos,
                         kv,
                         dn,
                         scratch_set,
@@ -1712,7 +1728,7 @@ pub fn generate_multi(
                         eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
                         break;
                     }
-                    m.seq_pos += 1;
+                    m.active.cursor.seq_pos += 1;
                     generated += 1;
                 }
             } else if nudge_len < nudge_tokens.len() {
@@ -1736,7 +1752,7 @@ pub fn generate_multi(
         }
 
         // Steady-state sample.
-        let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+        let ngram_scope = &m.active.cursor.conversation_tokens[ngram_scope_start..];
         let mut blocked: Vec<u32> = Vec::new();
         collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
         let cfg = SamplerConfig {
@@ -1765,14 +1781,16 @@ pub fn generate_multi(
     }
 
     // ChatML \n trailer so the next turn opens cleanly.
-    if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+    if im_end_token == Some(*m.active.cursor.conversation_tokens.last().unwrap_or(&0))
+        && !nl.is_empty()
+    {
         for &t in &nl {
             if let Err(e) = qwen35::forward_scratch_multi(
                 gpus,
                 weights,
                 config,
                 t,
-                m.seq_pos,
+                m.active.cursor.seq_pos,
                 kv,
                 dn,
                 scratch_set,
@@ -1780,8 +1798,8 @@ pub fn generate_multi(
                 eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
                 break;
             }
-            m.seq_pos += 1;
-            m.conversation_tokens.push(t);
+            m.active.cursor.seq_pos += 1;
+            m.active.cursor.conversation_tokens.push(t);
         }
     }
 
@@ -1882,6 +1900,36 @@ pub fn generate(
             prefill_already_done,
         );
         generate_llama(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            max_think_tokens,
+            assistant_prefix,
+            tools,
+            messages_history,
+            evidence_dir,
+        );
+        return;
+    }
+    if m.arch_id == 16 {
+        // ZAYA1 — CCA attention + EDA/MoD MoE, routed through the shared
+        // ServingBackend seam (same dense-AR path as nemotron). No fast paths.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+            prefill_already_done,
+        );
+        generate_zaya(
             m,
             gpu,
             stdout,
@@ -2304,7 +2352,10 @@ pub fn generate(
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    let current_seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+    let current_seq_pos = q35_session
+        .as_ref()
+        .map(|s| s.cursor.seq_pos)
+        .unwrap_or(m.active.cursor.seq_pos);
     if !prefill_already_done
         && m.eviction.is_none()
         && current_seq_pos + prompt_est + max_tokens > m.max_seq
@@ -2316,8 +2367,8 @@ pub fn generate(
         if let Some(session) = q35_session.as_mut() {
             session.reset(gpu);
         } else {
-            m.seq_pos = 0;
-            m.conversation_tokens.clear();
+            m.active.cursor.seq_pos = 0;
+            m.active.cursor.conversation_tokens.clear();
             if let Some(kv) = m.llama_kv.as_mut() {
                 kv.compact_offset = 0;
             }
@@ -2424,13 +2475,19 @@ pub fn generate(
         eprintln!(
             "[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
             pflash_state.is_some(),
-            q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos),
+            q35_session
+                .as_ref()
+                .map(|s| s.cursor.seq_pos)
+                .unwrap_or(m.active.cursor.seq_pos),
             raw_q_tokens.len(),
             drafter_gpu.is_some()
         );
     }
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        let seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+        let seq_pos = q35_session
+            .as_ref()
+            .map(|s| s.cursor.seq_pos)
+            .unwrap_or(m.active.cursor.seq_pos);
         if seq_pos == 0 {
             let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
             // Sibling-device drafter: bind its device before compress, then
@@ -2543,7 +2600,10 @@ pub fn generate(
     let seq_pos_for_prompt = if prefill_already_done {
         0
     } else {
-        q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos)
+        q35_session
+            .as_ref()
+            .map(|s| s.cursor.seq_pos)
+            .unwrap_or(m.active.cursor.seq_pos)
     };
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
@@ -2631,16 +2691,19 @@ pub fn generate(
     // the advertised context window (max_seq) — refuse requests that would
     // overflow it in absolute position terms (current absolute + new).
     let trailer = nl.len();
-    let current_seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+    let current_seq_pos = q35_session
+        .as_ref()
+        .map(|s| s.cursor.seq_pos)
+        .unwrap_or(m.active.cursor.seq_pos);
     let budget_prefill_tokens = if prefill_already_done {
         0
     } else {
         new_tokens.len()
     };
     let absolute_pos = if let Some(session) = q35_session.as_ref() {
-        session.seq_pos + session.kv_cache().compact_offset
+        session.cursor.seq_pos + session.kv_cache().compact_offset
     } else {
-        m.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
+        m.active.cursor.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
     };
     if m.eviction.is_none() {
         if current_seq_pos + budget_prefill_tokens + max_tokens + trailer > m.physical_cap {
@@ -2697,10 +2760,10 @@ pub fn generate(
 
     if is_qwen35_family_arch_id(m.arch_id) {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
-        // continuing from session.seq_pos (KV cache + DeltaNet state are cumulative)
+        // continuing from session.cursor.seq_pos (KV cache + DeltaNet state are cumulative)
         let mut session = q35_session.take().expect("qwen35 request session state");
         if prefill_already_done {
-            let current_position = session.seq_pos + session.kv_cache().compact_offset;
+            let current_position = session.cursor.seq_pos + session.kv_cache().compact_offset;
             let expected_position = prefilled_prompt_tokens.unwrap_or(new_tokens.len());
             if current_position != expected_position {
                 write_error(
@@ -2761,7 +2824,7 @@ pub fn generate(
             // gap, off the decode critical path — before the new prompt tokens append.
             // (The batch-protocol path does this in qwen35_prefill_active_session;
             // single `generate` prefills inline, so mirror it here.)
-            if session.seq_pos > 0 {
+            if session.cursor.seq_pos > 0 {
                 if let Some(h) = kv.hier.as_mut() {
                     if h.enabled {
                         let keep = std::env::var("HIPFIRE_KV_IDLE_KEEP")
@@ -2787,19 +2850,19 @@ pub fn generate(
                         weights,
                         config,
                         tok,
-                        session.seq_pos,
+                        session.cursor.seq_pos,
                         kv,
                         dn,
                         scratch,
                     )
                     .unwrap();
-                    session.seq_pos += 1;
+                    session.cursor.seq_pos += 1;
                 }
             } else if let Some(ref ev) = m.eviction {
                 let window = ev.budget() + ev.beta();
                 let mut remaining: &[u32] = &new_tokens;
                 while !remaining.is_empty() {
-                    let space = window.saturating_sub(session.seq_pos).max(1);
+                    let space = window.saturating_sub(session.cursor.seq_pos).max(1);
                     let chunk_len = remaining.len().min(space);
                     let (chunk, rest) = remaining.split_at(chunk_len);
                     qwen35::forward_prefill_batch(
@@ -2807,7 +2870,7 @@ pub fn generate(
                         weights,
                         config,
                         chunk,
-                        session.seq_pos,
+                        session.cursor.seq_pos,
                         kv,
                         dn,
                         scratch,
@@ -2817,13 +2880,13 @@ pub fn generate(
                         None,
                     )
                     .unwrap();
-                    session.seq_pos += chunk_len;
+                    session.cursor.seq_pos += chunk_len;
                     if let Some(hipfire_runtime::triattn::EvictionResult {
                         new_physical: new_phys,
                         ..
-                    }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                    }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                     {
-                        session.seq_pos = new_phys;
+                        session.cursor.seq_pos = new_phys;
                     }
                     remaining = rest;
                 }
@@ -2833,7 +2896,7 @@ pub fn generate(
                     weights,
                     config,
                     &new_tokens,
-                    session.seq_pos,
+                    session.cursor.seq_pos,
                     kv,
                     dn,
                     scratch,
@@ -2843,9 +2906,12 @@ pub fn generate(
                     None,
                 )
                 .unwrap();
-                session.seq_pos += new_tokens.len();
+                session.cursor.seq_pos += new_tokens.len();
             }
-            session.conversation_tokens.extend_from_slice(&new_tokens);
+            session
+                .cursor
+                .conversation_tokens
+                .extend_from_slice(&new_tokens);
         }
 
         // ngram scope for the repeat penalty: ONLY generated tokens (never the
@@ -2856,11 +2922,12 @@ pub fn generate(
         // generated tokens yet); subsequent samples: generated-so-far only.
         let ngram_scope_start = if prefill_already_done {
             session
+                .cursor
                 .conversation_tokens
                 .len()
                 .saturating_sub(session.prefilled_generated_suffix_len)
         } else {
-            session.conversation_tokens.len()
+            session.cursor.conversation_tokens.len()
         };
         session.prefilled_generated_suffix_len = 0;
 
@@ -2886,7 +2953,7 @@ pub fn generate(
             .collect();
 
         // First sample: use conversation so far as scope.
-        let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
+        let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
         // #111 attractor block: empty `ngram_scope` on first sample (no
         // generated tokens yet), so the unclosed-depth is always 0 and
         // `blocked` is empty. Still call collect_* for symmetry with
@@ -2960,7 +3027,7 @@ pub fn generate(
         // push generated past max_tokens: each loop start rechecks the cap.
         while generated < max_tokens {
             generated += 1;
-            session.conversation_tokens.push(next_token);
+            session.cursor.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
             emit_committed_event(
                 stdout,
@@ -2983,7 +3050,7 @@ pub fn generate(
             // position — the next turn then attended over zero-init K/V
             // at that slot.
             //
-            // Under eviction, session.seq_pos is the *physical* write slot; we
+            // Under eviction, session.cursor.seq_pos is the *physical* write slot; we
             // advance and call maybe_evict immediately so the next write
             // never overruns physical_cap. compact_offset bookkeeping on
             // the cache itself keeps RoPE phase correct across evictions.
@@ -2992,7 +3059,7 @@ pub fn generate(
                 weights,
                 config,
                 next_token,
-                session.seq_pos,
+                session.cursor.seq_pos,
                 kv,
                 dn,
                 scratch,
@@ -3005,14 +3072,14 @@ pub fn generate(
                 qwen35_restore_or_error(stdout, id, m, gpu, session);
                 return;
             }
-            session.seq_pos += 1;
+            session.cursor.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
-                }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                 {
-                    session.seq_pos = new_phys;
+                    session.cursor.seq_pos = new_phys;
                 }
             }
             if filter_stop {
@@ -3074,23 +3141,23 @@ pub fn generate(
                             weights,
                             config,
                             t,
-                            session.seq_pos,
+                            session.cursor.seq_pos,
                             kv,
                             dn,
                             scratch,
                         )
                         .unwrap();
-                        session.seq_pos += 1;
+                        session.cursor.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
                                 new_physical: new_phys,
                                 ..
-                            }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                            }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                             {
-                                session.seq_pos = new_phys;
+                                session.cursor.seq_pos = new_phys;
                             }
                         }
-                        session.conversation_tokens.push(t);
+                        session.cursor.conversation_tokens.push(t);
                         streamed_tokens.push(t);
                         emit_committed_event(
                             stdout,
@@ -3166,7 +3233,7 @@ pub fn generate(
                     );
                     let _ = stdout.flush();
                     // Fall through — resample next token as normal
-                    let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
+                    let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
                     let mut blocked: Vec<u32> = Vec::new();
                     collect_unclosed_attractor_blocks(
                         ngram_scope,
@@ -3205,11 +3272,13 @@ pub fn generate(
                 // eviction the physical check is trivially satisfied (budget
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
-                let need_kv =
-                    session.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                let need_kv = session.cursor.seq_pos
+                    + nudge_len
+                    + (max_tokens - generated - nudge_len)
+                    + nl.len();
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
-                        session.conversation_tokens.push(tok);
+                        session.cursor.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
                         emit_committed_event(
                             stdout,
@@ -3231,7 +3300,7 @@ pub fn generate(
                             weights,
                             config,
                             tok,
-                            session.seq_pos,
+                            session.cursor.seq_pos,
                             kv,
                             dn,
                             scratch,
@@ -3244,14 +3313,14 @@ pub fn generate(
                             qwen35_restore_or_error(stdout, id, m, gpu, session);
                             return;
                         }
-                        session.seq_pos += 1;
+                        session.cursor.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
                                 new_physical: new_phys,
                                 ..
-                            }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                            }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                             {
-                                session.seq_pos = new_phys;
+                                session.cursor.seq_pos = new_phys;
                             }
                         }
                         generated += 1;
@@ -3283,7 +3352,7 @@ pub fn generate(
             // cheap when not tripped, ~5 µs per blocked token when
             // tripped (single 4-byte H2D into the logits buffer
             // performed inside sampler::sample).
-            let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
+            let ngram_scope = &session.cursor.conversation_tokens[ngram_scope_start..];
             let mut blocked: Vec<u32> = Vec::new();
             collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
             let cfg = SamplerConfig {
@@ -3309,13 +3378,14 @@ pub fn generate(
                 &mut rng_state,
             );
         }
-        // session.seq_pos is already the "next physical write slot" — advanced
+        // session.cursor.seq_pos is already the "next physical write slot" — advanced
         // per-token in the decode loop above, and evicted back down to
         // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
 
         // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
         // and DeltaNet state stay in sync with seq_pos.
-        if im_end_token == Some(*session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty()
+        if im_end_token == Some(*session.cursor.conversation_tokens.last().unwrap_or(&0))
+            && !nl.is_empty()
         {
             for &t in &nl {
                 if let Err(e) = qwen35::forward_scratch(
@@ -3323,7 +3393,7 @@ pub fn generate(
                     weights,
                     config,
                     t,
-                    session.seq_pos,
+                    session.cursor.seq_pos,
                     kv,
                     dn,
                     scratch,
@@ -3336,17 +3406,17 @@ pub fn generate(
                     qwen35_restore_or_error(stdout, id, m, gpu, session);
                     return;
                 }
-                session.seq_pos += 1;
+                session.cursor.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
                     if let Some(hipfire_runtime::triattn::EvictionResult {
                         new_physical: new_phys,
                         ..
-                    }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                    }) = ev.maybe_evict(gpu, kv, session.cursor.seq_pos).unwrap()
                     {
-                        session.seq_pos = new_phys;
+                        session.cursor.seq_pos = new_phys;
                     }
                 }
-                session.conversation_tokens.push(t);
+                session.cursor.conversation_tokens.push(t);
             }
         }
 
@@ -3427,7 +3497,7 @@ pub fn generate(
 
         let mut rng_state = 42u32;
         for (i, &tok) in new_tokens.iter().enumerate() {
-            let pos = m.seq_pos + i;
+            let pos = m.active.cursor.seq_pos + i;
             let (_, rng) = llama::forward_scratch(
                 gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
             )
@@ -3435,9 +3505,13 @@ pub fn generate(
             rng_state = rng;
         }
         let this_turn_prompt_len_llama = new_tokens.len();
-        m.seq_pos += new_tokens.len();
-        m.conversation_tokens.extend_from_slice(&new_tokens);
-        let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
+        m.active.cursor.seq_pos += new_tokens.len();
+        m.active
+            .cursor
+            .conversation_tokens
+            .extend_from_slice(&new_tokens);
+        let ngram_scope_start_llama =
+            m.active.cursor.conversation_tokens.len() - this_turn_prompt_len_llama;
 
         let mut out_bytes = [0u8; 8];
         gpu.hip
@@ -3464,7 +3538,7 @@ pub fn generate(
 
         for _ in 0..max_tokens {
             generated += 1;
-            m.conversation_tokens.push(next_token);
+            m.active.cursor.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
             emit_committed_event(
                 stdout,
@@ -3481,9 +3555,9 @@ pub fn generate(
             // Scope repeat_buf to this turn's prompt + generated tokens
             // (same logic as the Qwen3.5 path: prompt anchor + current turn).
             let rw = repeat_window.min(64);
-            let scope_start =
-                ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
-            let hist_slice = &m.conversation_tokens[scope_start..];
+            let scope_start = ngram_scope_start_llama
+                .max(m.active.cursor.conversation_tokens.len().saturating_sub(rw));
+            let hist_slice = &m.active.cursor.conversation_tokens[scope_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
             gpu.hip
                 .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
@@ -3493,7 +3567,7 @@ pub fn generate(
             // always fully populated. The sampled next_token from this call
             // is discarded when we break on im_end/eos — wasteful by one
             // launch but avoids a KV cache gap at the terminator.
-            let pos = m.seq_pos + generated - 1;
+            let pos = m.active.cursor.seq_pos + generated - 1;
             let (tok, rng) = llama::forward_scratch(
                 gpu,
                 weights,
@@ -3526,18 +3600,31 @@ pub fn generate(
             next_token = tok;
             rng_state = rng;
         }
-        m.seq_pos += generated;
+        m.active.cursor.seq_pos += generated;
 
         // ChatML \n boundary — run through forward to keep KV cache in sync
-        if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+        if im_end_token == Some(*m.active.cursor.conversation_tokens.last().unwrap_or(&0))
+            && !nl.is_empty()
+        {
             for &t in &nl {
                 let (_, rng2) = llama::forward_scratch(
-                    gpu, weights, config, t, m.seq_pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
+                    gpu,
+                    weights,
+                    config,
+                    t,
+                    m.active.cursor.seq_pos,
+                    kv,
+                    scratch,
+                    temp,
+                    top_p,
+                    rng_state,
+                    0,
+                    1.0,
                 )
                 .unwrap();
                 rng_state = rng2;
-                m.seq_pos += 1;
-                m.conversation_tokens.push(t);
+                m.active.cursor.seq_pos += 1;
+                m.active.cursor.conversation_tokens.push(t);
             }
         }
 

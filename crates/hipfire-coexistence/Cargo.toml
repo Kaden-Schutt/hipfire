@@ -1,0 +1,16 @@
+[package]
+name = "hipfire-coexistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline coexistence / compatibility tooling for hipfire: import/export, format conversion, and interop that must stay OUT of the inference binaries (daemon, server, runtime hot path) per AGENTS.md. Today: LoRA/abliteration adapter export, container conversion, and merge-into-model bundling."
+
+[[bin]]
+name = "hipfire-coexistence"
+path = "src/main.rs"
+
+[dependencies]
+hipfire-steer = { path = "../hipfire-steer" }
+hipfire-steer-harness = { path = "../hipfire-steer-harness" }
+hipfire-lora-hfq = { path = "../hipfire-lora-hfq" }
+hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }

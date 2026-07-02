@@ -12,13 +12,13 @@
 //! `use hipfire_quantize::…`.
 //!
 //! Crate-root helpers (`cpu_fwht_256`, `gen_fwht_signs`, `f16_to_f32`,
-//! `f32_to_f16`) are re-exported from `hipfire-kvquant` so the in-crate
+//! `f32_to_f16`) are re-exported from `hipfire-primitives` so the in-crate
 //! `crate::{…}` references inside the modules below keep resolving unchanged.
 
 use std::sync::OnceLock;
 
-pub use hipfire_kvquant::conv::{f16_to_f32, f32_to_f16};
-pub use hipfire_kvquant::fwht::{cpu_fwht_256, gen_fwht_signs};
+pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
+pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 pub use hipfire_kvquant::{kv_compact, kvarn};
 
 pub mod codecs;

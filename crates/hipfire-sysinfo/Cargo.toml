@@ -1,0 +1,10 @@
+[package]
+name = "hipfire-sysinfo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Portable host/GPU memory + telemetry collection from sysfs and /proc — HIP-independent, shared by the server and TUI."
+
+[dependencies]
+hipfire-admin-types = { path = "../hipfire-admin-types" }
+hipfire-xdna = { path = "../hipfire-xdna" }

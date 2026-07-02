@@ -39,6 +39,8 @@ The richer hand-maintained roster (microbatch / PP / EP columns) follows.
 
 Machine-readable subset consumed by `arch_features` / admission. Edit `docs/model-support.toml`.
 
+This per-arch chart is the **`family × feature` projection** of the 5-axis capability space (`family × gfx-class × quant × kv × feature`), collapsed at the reference gfx (`rdna3.5`/gfx1151), the family's best stable quant, and its best KV mode. The gfx/quant cross-sections it flattens are rendered as separate derived projections below.
+
 | Arch (arch_id) | Batched prefill | DFlash spec | MTP spec | KV quant | Vision |
 |---|---|---|---|---|---|
 | qwen3.5 (5, 6) | ✅ | ✅ | ✅ | full | 🟡 |
@@ -47,6 +49,7 @@ Machine-readable subset consumed by `arch_features` / admission. Edit `docs/mode
 | lfm2-moe (11) | 🟡 | ❌ | ❌ | fp32 | ❌ |
 | nemotron_h (14) | ✅ | ❌ | ❌ | fp32 | ❌ |
 | mamba2 (15) | ✅ | ❌ | ❌ | no-kv | ❌ |
+| zaya (16) | ❌ | ❌ | ❌ | none | ❌ |
 | gemma3 (12) | ✅ | ❌ | ❌ | fp32+q8 | ❌ |
 | gemma3-vl (13) | ✅ | ❌ | ❌ | fp32+q8 | ✅ |
 | qwen2 (7) | ✅ | ❌ | ❌ | fp32 | ❌ |
@@ -81,6 +84,52 @@ Per-quant overrides of an arch capability (admission consults these before green
 | 11 | oq4+ | prefill | 🟡 | LFM2 OQ4+ W4A8 prefill routes through int8 activation MMQ; full calibration/quality pending |
 | 11 | oq8 | prefill | 🟡 | LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity |
 | 11 | oq8+ | prefill | 🟡 | LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending |
+
+### Batched prefill: quant × gfx-class (derived)
+
+Projection of the prefill axis over **weight-quant × gfx-class**, computed from the runtime predicate `is_batchable_la` (GPU-free). ✅ = batched-prefill GEMM exists; ❌ = falls back to per-token decode; 🔒 = governed by a quality `[[gate]]` (OQ activation-quant formats), see the gates table. This is the kernel-availability truth the per-arch chart collapses to the reference gfx.
+
+| Quant | cdna | rdna12 | rdna3 | rdna3.5 | rdna4 |
+|---|---|---|---|---|---|
+| bf16 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| q8 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| mq4 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| mq6 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| oq4 | 🔒 | 🔒 | 🔒 | 🔒 | 🔒 |
+| oq4+ | 🔒 | 🔒 | 🔒 | 🔒 | 🔒 |
+| oq8 | 🔒 | 🔒 | 🔒 | 🔒 | 🔒 |
+| oq8+ | 🔒 | 🔒 | 🔒 | 🔒 | 🔒 |
+| mq3 | ❌ | ✅ | ✅ | ✅ | ✅ |
+
+### Batched prefill: kv-mode (derived)
+
+Projection of the prefill axis over **kv-mode**, from `kv_mode_prefill_batchable`. Only Q8 and the rotated asym K modes have a batched flash-masked prefill kernel; fp32 and no-kv (SSM) fall back to per-token decode.
+
+| KV mode | Batched prefill |
+|---|---|
+| fp32 | ❌ |
+| q8 | ✅ |
+| asym{2,3,4} | ✅ |
+| no-kv (SSM) | ❌ |
+
+### DFlash spec-decode: family × gfx-class (derived)
+
+Projection of the dflash axis over **family × gfx-class**: the per-family `[[arch]]` intent capped by the gfx WMMA gate `dflash_gfx_supported` (GPU-free, shares `arch_caps.has_wmma`). ✅/🟡 = family intent on a WMMA gfx; ❌ = no spec path for the family, or a non-WMMA gfx where dflash falls back to plain decode.
+
+| Family (arch_id) | cdna | rdna12 | rdna3 | rdna3.5 | rdna4 |
+|---|---|---|---|---|---|
+| qwen3.5 (5, 6) | ❌ | ❌ | ✅ | ✅ | ✅ |
+| deepseek4 (9) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| minimax (10) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| lfm2-moe (11) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| nemotron_h (14) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| mamba2 (15) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| zaya (16) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| gemma3 (12) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| gemma3-vl (13) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| qwen2 (7) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| dots-ocr (8) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| llama (0, 1) | ❌ | ❌ | ❌ | ❌ | ❌ |
 <!-- END GENERATED model-support -->
 
 ## Feature matrix vs flagship qwen3.5

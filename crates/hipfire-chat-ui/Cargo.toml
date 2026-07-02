@@ -10,21 +10,31 @@ description = "Leptos (WASM) browser chat console for hipfire - built standalone
 
 [dependencies]
 leptos = { version = "0.7", features = ["csr"] }
+hipfire-web-ui = { path = "../hipfire-web-ui" }
 gloo-file = { version = "0.4", features = ["futures"] }
 gloo-net = { version = "0.6", features = ["http"] }
 console_error_panic_hook = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 js-sys = "0.3"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    "AbortController",
+    "AbortSignal",
+    "Clipboard",
+    "CssStyleDeclaration",
     "DataTransfer",
     "DragEvent",
+    "Element",
     "File",
     "FileList",
     "Headers",
+    "HtmlElement",
+    "HtmlTextAreaElement",
     "KeyboardEvent",
+    "Navigator",
     "ReadableStream",
     "ReadableStreamDefaultReader",
     "Request",

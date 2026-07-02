@@ -1213,6 +1213,11 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.wo_a_out_rot);
         free_opt(gpu, &mut self.head_hc_pre);
         free_opt(gpu, &mut self.head_hc_out);
+        // Batched verify lm_head staging (spec-decode); `head_logits_batch` is
+        // [K, vocab] and dominates this group.
+        free_opt(gpu, &mut self.head_norm_batch);
+        free_opt(gpu, &mut self.head_x_f16);
+        free_opt(gpu, &mut self.head_logits_batch);
     }
 }
 

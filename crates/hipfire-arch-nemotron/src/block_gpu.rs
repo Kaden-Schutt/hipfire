@@ -81,6 +81,15 @@ pub struct Mamba2BlockGpu {
 }
 
 impl Mamba2BlockGpu {
+    /// (weight-buf ptr, `mixer.`-relative name) per dense projection — calibration
+    /// capture-name map. See `calibration::build_capture_names`.
+    pub(crate) fn calib_projections(&self) -> [(usize, &'static str); 2] {
+        [
+            (self.in_proj.buf_ptr(), "in_proj"),
+            (self.out_proj.buf_ptr(), "out_proj"),
+        ]
+    }
+
     /// Upload `w` (host f32 slices) and allocate state + scratch. State starts
     /// at zero (matching the CPU oracle's `Mamba2BlockState::zeros`).
     pub fn new(gpu: &mut Gpu, dims: Mamba2Dims, w: &Mamba2BlockWeights) -> HipResult<Self> {

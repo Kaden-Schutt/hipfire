@@ -35,6 +35,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use byteorder::{ByteOrder, LittleEndian};
+use hipfire_primitives::conv::bf16_bits_to_f32 as bf16_to_f32;
 use memmap2::{Advice, Mmap};
 use std::collections::HashMap;
 use std::fs::File;
@@ -121,10 +122,6 @@ impl HessianDtype {
             HessianDtype::Bf16TrilDiagF32 => 0,
         }
     }
-}
-
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
 }
 
 fn compact_hessian_bytes(k: usize) -> usize {
@@ -627,16 +624,9 @@ mod tests {
         tf
     }
 
-    fn f32_to_bf16_bits(f: f32) -> u16 {
-        let bits = f.to_bits();
-        if (bits >> 23) & 0xff == 0xff {
-            return (bits >> 16) as u16;
-        }
-        let bias = 0x7fff + ((bits >> 16) & 1);
-        (bits.wrapping_add(bias) >> 16) as u16
-    }
-
     fn make_compact_test_package() -> NamedTempFile {
+        use hipfire_primitives::conv::f32_to_bf16_bits;
+
         struct Entry {
             name: &'static str,
             quant_type: u8,

@@ -8,4 +8,5 @@ description = "NPU module opt-in contracts and artifact admission policy for hip
 [dependencies]
 hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-xdna = { path = "../hipfire-xdna" }
 serde_json = "1"

@@ -1382,6 +1382,16 @@ pub fn weight_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    // Calibration tap (batched analog of `weight_gemv`): when a Hessian/imatrix
+    // collector is armed (`gpu.active_capture`) and this weight is a known target
+    // (`gpu.capture_names`), accumulate the WHOLE batch of input activations in
+    // one shot (`batch_size` rows of width `w.k`). Zero-cost (`is_none()` branch)
+    // and byte-identical to the prior forward when no collector is armed. Capture
+    // the pre-rotation `x` so the imatrix matches `weight_gemv`'s decode-path tap.
+    // This is what makes wide batched-prefill calibration possible — every arch
+    // routing its prefill linears through `weight_gemm` (gemma3, qwen2, …) now
+    // captures `batch_size`× more samples per launch instead of N=1 per token.
+    gpu.maybe_capture_activation(&w.buf, x, batch_size, w.k);
     match w.gpu_dtype {
         DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),

@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
     CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, KldChunkEvent, KldEvalRequest,
-    KldEvalResponse, RequestControl,
+    KldEvalResponse, LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest, RequestControl,
+    SteerApplyRequest, SteerBeginCaptureRequest, SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
@@ -303,6 +304,151 @@ impl DaemonEngine {
                 DaemonResponse::Error(e) => anyhow::bail!("daemon kld_eval error: {}", e.message),
                 DaemonResponse::Unknown => {}
                 other => tracing::warn!("unexpected response during kld_eval: {other:?}"),
+            }
+        }
+    }
+
+    /// Begin a steering CAPTURE session in the daemon (`maybe_steer_block` starts
+    /// accumulating per-block residual means). Waits for `steer_ok`.
+    pub async fn steer_begin_capture(
+        &mut self,
+        num_layers: usize,
+        hidden: usize,
+    ) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerBeginCapture(
+            SteerBeginCaptureRequest { num_layers, hidden },
+        ))
+        .await?;
+        self.expect_steer_ok("steer_begin_capture").await
+    }
+
+    /// Prefill one chat turn through the hooked forward (no decode) and commit its
+    /// last-prompt-token residuals into the capture means. Waits for `steer_ok`.
+    pub async fn steer_capture(
+        &mut self,
+        system: impl Into<String>,
+        user: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerCapture(SteerCaptureRequest {
+            system: system.into(),
+            user: user.into(),
+        }))
+        .await?;
+        self.expect_steer_ok("steer_capture").await
+    }
+
+    /// End the CAPTURE session and return the accumulated per-block means.
+    pub async fn steer_finish_capture(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.send(&DaemonRequest::SteerFinishCapture).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::SteerCaptured(resp) => return Ok(resp.means),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon steer_finish_capture error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during steer_finish_capture: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Begin an APPLY session in the daemon: each in-range block boundary steers
+    /// or ablates along `directions`. Waits for `steer_ok`.
+    pub async fn steer_begin_apply(&mut self, req: SteerApplyRequest) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerBeginApply(req)).await?;
+        self.expect_steer_ok("steer_begin_apply").await
+    }
+
+    /// Tear down any active steer session in the daemon. Waits for `steer_ok`.
+    pub async fn steer_clear(&mut self) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::SteerClear).await?;
+        self.expect_steer_ok("steer_clear").await
+    }
+
+    /// Drain to the `steer_ok` ack shared by the fire-and-forget steer ops.
+    async fn expect_steer_ok(&mut self, op: &str) -> anyhow::Result<()> {
+        loop {
+            match self.recv().await? {
+                DaemonResponse::SteerOk => return Ok(()),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon {op} error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during {op}: {other:?}"),
+            }
+        }
+    }
+
+    /// Load a `.lora` adapter container (path on the daemon host) onto the live
+    /// APPLY stack; `scale` overrides the adapter's default intensity and `id`
+    /// renames it on load (both optional).
+    pub async fn lora_load(
+        &mut self,
+        path: impl Into<String>,
+        scale: Option<f32>,
+        id: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::LoraLoad(LoraLoadRequest {
+            path: path.into(),
+            scale,
+            id,
+        }))
+        .await?;
+        self.expect_lora_ok("lora_load").await
+    }
+
+    /// Adjust a loaded adapter's live `scale` (intensity).
+    pub async fn lora_set_scale(
+        &mut self,
+        id: impl Into<String>,
+        scale: f32,
+    ) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::LoraSetScale(LoraSetScaleRequest {
+            id: id.into(),
+            scale,
+        }))
+        .await?;
+        self.expect_lora_ok("lora_set_scale").await
+    }
+
+    /// Remove a loaded adapter by id.
+    pub async fn lora_unload(&mut self, id: impl Into<String>) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::LoraUnload(LoraUnloadRequest {
+            id: id.into(),
+        }))
+        .await?;
+        self.expect_lora_ok("lora_unload").await
+    }
+
+    /// Drop the whole adapter stack.
+    pub async fn lora_clear(&mut self) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::LoraClear).await?;
+        self.expect_lora_ok("lora_clear").await
+    }
+
+    /// List the loaded adapter stack as `(id, scale)` pairs.
+    pub async fn lora_list(&mut self) -> anyhow::Result<Vec<(String, f32)>> {
+        self.send(&DaemonRequest::LoraList).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::LoraListed(resp) => {
+                    return Ok(resp.adapters.into_iter().map(|a| (a.id, a.scale)).collect())
+                }
+                DaemonResponse::Error(e) => anyhow::bail!("daemon lora_list error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during lora_list: {other:?}"),
+            }
+        }
+    }
+
+    /// Drain to the `lora_ok` ack shared by the load/scale/unload/clear ops.
+    async fn expect_lora_ok(&mut self, op: &str) -> anyhow::Result<()> {
+        loop {
+            match self.recv().await? {
+                DaemonResponse::LoraOk => return Ok(()),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon {op} error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during {op}: {other:?}"),
             }
         }
     }

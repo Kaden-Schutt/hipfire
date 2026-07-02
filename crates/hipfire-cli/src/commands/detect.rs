@@ -185,7 +185,11 @@ fn finish(ok: bool, exit_code: bool) -> anyhow::Result<()> {
 /// AR vs DFlash token-parity comparison (replaces the gate's PARITY_PY). Reads
 /// the `AR tokens:` line from `ar_path` and the `DFlash tokens:` line from
 /// `df_path`, then reports exact-equality with a first-mismatch window.
-fn run_parity(ar_path: &std::path::Path, df_path: &std::path::Path, exit_code: bool) -> anyhow::Result<()> {
+fn run_parity(
+    ar_path: &std::path::Path,
+    df_path: &std::path::Path,
+    exit_code: bool,
+) -> anyhow::Result<()> {
     // Match PARITY_PY: read bytes, lossy-decode, grep the labelled line.
     let ar_txt = String::from_utf8_lossy(&std::fs::read(ar_path)?).into_owned();
     let df_txt = String::from_utf8_lossy(&std::fs::read(df_path)?).into_owned();
@@ -212,7 +216,11 @@ fn run_parity(ar_path: &std::path::Path, df_path: &std::path::Path, exit_code: b
 
 /// Rollback stat-line parsers (replaces the gate's ROLLBACK_REPLAY_PY /
 /// VERIFY_GRAPH_PY). Reads `file` (lossy-decoded like the Python) or stdin.
-fn run_rollback(kind: RollbackKind, file: Option<&std::path::Path>, exit_code: bool) -> anyhow::Result<()> {
+fn run_rollback(
+    kind: RollbackKind,
+    file: Option<&std::path::Path>,
+    exit_code: bool,
+) -> anyhow::Result<()> {
     let text = match file {
         Some(path) => String::from_utf8_lossy(&std::fs::read(path)?).into_owned(),
         None => {
@@ -224,11 +232,17 @@ fn run_rollback(kind: RollbackKind, file: Option<&std::path::Path>, exit_code: b
     let (value, ok) = match kind {
         RollbackKind::Replay => {
             let r = rollback::replay_parity(&text);
-            (serde_json::to_value(&r).expect("serialize replay report"), r.ok())
+            (
+                serde_json::to_value(&r).expect("serialize replay report"),
+                r.ok(),
+            )
         }
         RollbackKind::VerifyGraph => {
             let r = rollback::verify_graph(&text);
-            (serde_json::to_value(&r).expect("serialize verify_graph report"), r.ok())
+            (
+                serde_json::to_value(&r).expect("serialize verify_graph report"),
+                r.ok(),
+            )
         }
     };
     emit(&value);

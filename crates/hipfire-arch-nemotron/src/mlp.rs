@@ -58,6 +58,15 @@ pub struct MlpRelu2Gpu {
 }
 
 impl MlpRelu2Gpu {
+    /// (weight-buf ptr, `mixer.`-relative name) per dense projection — calibration
+    /// capture-name map. See `calibration::build_capture_names`.
+    pub(crate) fn calib_projections(&self) -> [(usize, &'static str); 2] {
+        [
+            (self.up.buf_ptr(), "up_proj"),
+            (self.down.buf_ptr(), "down_proj"),
+        ]
+    }
+
     pub fn new(
         gpu: &mut Gpu,
         hidden: usize,

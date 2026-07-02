@@ -730,7 +730,9 @@ pub(crate) fn normalize_stop_sequences(
     Ok((!out.is_empty()).then_some(out))
 }
 
-fn extract_request_image_base64(messages: &[ChatMessage]) -> Result<Option<String>, String> {
+pub(crate) fn extract_request_image_base64(
+    messages: &[ChatMessage],
+) -> Result<Option<String>, String> {
     let last_user_index = messages.iter().rposition(|m| m.role == "user");
     let mut images = Vec::new();
 

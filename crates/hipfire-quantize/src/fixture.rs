@@ -11,6 +11,7 @@
 // ingest path expects; as new archs gain support, add a `tiny_*` builder.
 // See TODO.md "Tiny random-init fixtures + golden-output tripwire".
 
+use hipfire_primitives::conv::f32_to_bf16_bits as bf16_bits;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
@@ -51,16 +52,6 @@ impl Dt {
             Dt::F16 => "F16",
         }
     }
-}
-
-/// f32 → bf16 bits, round-to-nearest-even.
-fn bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-        return 0x7FC0; // NaN
-    }
-    let rounding_bias = 0x7FFF + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
 }
 
 /// How a tensor's elements are initialized.

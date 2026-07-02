@@ -158,14 +158,15 @@ pub fn generate_vl(
         .unwrap_or(0);
     let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
 
-    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    if m.eviction.is_none() && m.active.cursor.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!(
             "[daemon/vl] context full ({}/{}) — resetting conversation",
-            m.seq_pos, m.max_seq
+            m.active.cursor.seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
+        m.active.cursor.seq_pos = 0;
+        m.active.cursor.conversation_tokens.clear();
         if let Some(dn) = m
+            .active
             .sequence_state
             .as_ref()
             .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
@@ -180,7 +181,7 @@ pub fn generate_vl(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(kv) = m.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
+        if let Some(kv) = m.active.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
             kv.compact_offset = 0;
         }
     }
@@ -205,6 +206,7 @@ pub fn generate_vl(
     // Compute the raw-prompt flag before the mutable kv/dn borrows below.
     let vl_raw = effective_raw(m);
     let ss = m
+        .active
         .sequence_state
         .as_mut()
         .expect("qwen35 active state present");
@@ -236,7 +238,11 @@ pub fn generate_vl(
 
     let prompt_tokens = prompt_frame::ChatFrame {
         tokenizer,
-        system: if m.seq_pos == 0 { system_prompt } else { None },
+        system: if m.active.cursor.seq_pos == 0 {
+            system_prompt
+        } else {
+            None
+        },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
         assistant_prefix: prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
         raw: vl_raw,
@@ -247,16 +253,16 @@ pub fn generate_vl(
     // Mirrors the textual generate() contract; reserves trailer slots so
     // natural im_end termination can still write the ChatML \n.
     let trailer = nl.len();
-    let absolute_pos_vl = m.seq_pos + kv.compact_offset;
+    let absolute_pos_vl = m.active.cursor.seq_pos + kv.compact_offset;
     let over_budget = if m.eviction.is_none() {
-        m.seq_pos + prompt_tokens.len() + max_tokens + trailer > m.physical_cap
+        m.active.cursor.seq_pos + prompt_tokens.len() + max_tokens + trailer > m.physical_cap
     } else {
         absolute_pos_vl + prompt_tokens.len() + max_tokens + trailer > m.max_seq
     };
     if over_budget {
         write_error(stdout, id, &format!(
             "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
-            m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
+            m.active.cursor.seq_pos, prompt_tokens.len(), max_tokens, trailer,
             if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
         ));
         return;
@@ -299,31 +305,52 @@ pub fn generate_vl(
 
     // Prefill with vision token embedding for image_pad positions. VL
     // prefill is per-token (forward_scratch_embed isn't batched), so we
-    // advance m.seq_pos in-loop and call maybe_evict after every write.
+    // advance m.active.cursor.seq_pos in-loop and call maybe_evict after every write.
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
         if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
-            qwen35::forward_scratch_embed(gpu, weights, config, emb, m.seq_pos, kv, dn, scratch)
-                .expect("forward_scratch_embed failed");
+            qwen35::forward_scratch_embed(
+                gpu,
+                weights,
+                config,
+                emb,
+                m.active.cursor.seq_pos,
+                kv,
+                dn,
+                scratch,
+            )
+            .expect("forward_scratch_embed failed");
             visual_idx += 1;
         } else {
-            qwen35::forward_scratch(gpu, weights, config, token, m.seq_pos, kv, dn, scratch)
-                .expect("forward_scratch failed");
+            qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                token,
+                m.active.cursor.seq_pos,
+                kv,
+                dn,
+                scratch,
+            )
+            .expect("forward_scratch failed");
         }
-        m.seq_pos += 1;
+        m.active.cursor.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
             if let Some(hipfire_runtime::triattn::EvictionResult {
                 new_physical: new_phys,
                 ..
-            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+            }) = ev.maybe_evict(gpu, kv, m.active.cursor.seq_pos).unwrap()
             {
-                m.seq_pos = new_phys;
+                m.active.cursor.seq_pos = new_phys;
             }
         }
     }
 
-    m.conversation_tokens.extend_from_slice(&prompt_tokens);
+    m.active
+        .cursor
+        .conversation_tokens
+        .extend_from_slice(&prompt_tokens);
 
     // Generate. CPU-side sampling — VL path predates the GPU sampler
     // and downloads logits each step. The order of ops is preserved
@@ -337,7 +364,14 @@ pub fn generate_vl(
     // GPU memcpy + redownload — saves a full vocab-sized DMA per token.
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     if let Some((open, close)) = think_pair {
-        block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+        block_attractor_unclosed_cpu(
+            &mut logits,
+            &m.active.cursor.conversation_tokens,
+            open,
+            close,
+            20,
+            2,
+        );
     }
     let vl_cfg_first = SamplerConfig {
         temperature: temp,
@@ -371,7 +405,7 @@ pub fn generate_vl(
 
     while generated < max_tokens {
         generated += 1;
-        m.conversation_tokens.push(next_token);
+        m.active.cursor.conversation_tokens.push(next_token);
         emit_committed_event(
             stdout,
             id,
@@ -420,25 +454,45 @@ pub fn generate_vl(
             break;
         }
 
-        qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
-            .unwrap();
-        m.seq_pos += 1;
+        qwen35::forward_scratch(
+            gpu,
+            weights,
+            config,
+            next_token,
+            m.active.cursor.seq_pos,
+            kv,
+            dn,
+            scratch,
+        )
+        .unwrap();
+        m.active.cursor.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
             if let Some(hipfire_runtime::triattn::EvictionResult {
                 new_physical: new_phys,
                 ..
-            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+            }) = ev.maybe_evict(gpu, kv, m.active.cursor.seq_pos).unwrap()
             {
-                m.seq_pos = new_phys;
+                m.active.cursor.seq_pos = new_phys;
             }
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
-        hipfire_runtime::sampler::apply_ngram_block(&mut logits, &m.conversation_tokens);
+        hipfire_runtime::sampler::apply_ngram_block(
+            &mut logits,
+            &m.active.cursor.conversation_tokens,
+        );
         if let Some((open, close)) = think_pair {
-            block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+            block_attractor_unclosed_cpu(
+                &mut logits,
+                &m.active.cursor.conversation_tokens,
+                open,
+                close,
+                20,
+                2,
+            );
         }
 
-        next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+        next_token =
+            sampler::sample_cpu(&mut logits, &m.active.cursor.conversation_tokens, &vl_cfg);
 
         if max_think_tokens > 0 {
             let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
@@ -466,19 +520,28 @@ pub fn generate_vl(
                 let budget_left = max_tokens.saturating_sub(generated);
                 let take = close_tokens.len().min(budget_left);
                 for &t in &close_tokens[..take] {
-                    qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
-                        .unwrap();
-                    m.seq_pos += 1;
+                    qwen35::forward_scratch(
+                        gpu,
+                        weights,
+                        config,
+                        t,
+                        m.active.cursor.seq_pos,
+                        kv,
+                        dn,
+                        scratch,
+                    )
+                    .unwrap();
+                    m.active.cursor.seq_pos += 1;
                     if let Some(ref ev) = m.eviction {
                         if let Some(hipfire_runtime::triattn::EvictionResult {
                             new_physical: new_phys,
                             ..
-                        }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                        }) = ev.maybe_evict(gpu, kv, m.active.cursor.seq_pos).unwrap()
                         {
-                            m.seq_pos = new_phys;
+                            m.active.cursor.seq_pos = new_phys;
                         }
                     }
-                    m.conversation_tokens.push(t);
+                    m.active.cursor.conversation_tokens.push(t);
                     streamed_tokens.push(t);
 
                     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
@@ -509,33 +572,46 @@ pub fn generate_vl(
                 if let Some((open, close)) = think_pair {
                     block_attractor_unclosed_cpu(
                         &mut logits,
-                        &m.conversation_tokens,
+                        &m.active.cursor.conversation_tokens,
                         open,
                         close,
                         20,
                         2,
                     );
                 }
-                next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+                next_token =
+                    sampler::sample_cpu(&mut logits, &m.active.cursor.conversation_tokens, &vl_cfg);
             }
         }
     }
 
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
-    if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+    if im_end_token == Some(*m.active.cursor.conversation_tokens.last().unwrap_or(&0))
+        && !nl.is_empty()
+    {
         for &t in &nl {
-            qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
-            m.seq_pos += 1;
+            qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                t,
+                m.active.cursor.seq_pos,
+                kv,
+                dn,
+                scratch,
+            )
+            .unwrap();
+            m.active.cursor.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                }) = ev.maybe_evict(gpu, kv, m.active.cursor.seq_pos).unwrap()
                 {
-                    m.seq_pos = new_phys;
+                    m.active.cursor.seq_pos = new_phys;
                 }
             }
-            m.conversation_tokens.push(t);
+            m.active.cursor.conversation_tokens.push(t);
         }
     }
 

@@ -78,6 +78,21 @@ pub struct ArchCaps {
     flags: std::sync::Arc<FeatureFlags>,
 }
 
+/// Whether GPU arch `arch` has WMMA matrix units — true for RDNA3 (incl. RDNA3.5
+/// APUs) and RDNA4. Pure function of the arch string (env-independent), the
+/// single source of truth behind `ArchCaps::has_wmma`. GPU-free, so doc/matrix
+/// tooling and the dflash gfx predicate can call it without building an
+/// `ArchCaps` or touching the GPU.
+pub fn gfx_has_wmma(arch: &str) -> bool {
+    matches!(
+        arch,
+        // RDNA3 dGPU + RDNA3.5 APU
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152"
+        // RDNA4
+        | "gfx1200" | "gfx1201"
+    )
+}
+
 impl ArchCaps {
     pub fn new(arch: &str, flags: std::sync::Arc<FeatureFlags>) -> Self {
         // Atoms
@@ -121,7 +136,11 @@ impl ArchCaps {
         let is_cdna3 = is_gfx940 || is_gfx941 || is_gfx942;
 
         // Capabilities
-        let has_wmma = is_rdna3 || is_rdna4;
+        // WMMA presence is a pure function of the arch string; `gfx_has_wmma` is
+        // its single definition so GPU-free callers (the model-support matrix
+        // generator's dflash predicate) can't drift from this constructor.
+        let has_wmma = gfx_has_wmma(arch);
+        debug_assert_eq!(has_wmma, is_rdna3 || is_rdna4);
         let has_wmma_w32 = is_rdna3;
         let has_wmma_w32_gfx12 = is_rdna4;
         let has_dot2_f32_f16 = is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;

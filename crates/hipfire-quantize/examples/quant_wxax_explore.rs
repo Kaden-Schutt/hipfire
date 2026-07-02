@@ -18,6 +18,8 @@
 //!
 //!   cargo run -p hipfire-quantize --example quant_wxax_explore [M] [K] [B]
 
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+
 fn lcg_gauss(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
     let mut u = || {
@@ -61,44 +63,6 @@ fn with_channel_outliers(
         }
     }
     w
-}
-
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut st = seed;
-    (0..n)
-        .map(|_| {
-            st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (st >> 16) & 1 == 1 {
-                1.0
-            } else {
-                -1.0
-            }
-        })
-        .collect()
-}
-
-fn cpu_fwht_256(x: &mut [f32; 256], signs1: &[f32], signs2: &[f32]) {
-    for i in 0..256 {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let sc = 0.0625;
-    for i in 0..256 {
-        x[i] *= sc * signs2[i];
-    }
 }
 
 /// Rotate every row's K dimension in 256-blocks in place (K must be %256).

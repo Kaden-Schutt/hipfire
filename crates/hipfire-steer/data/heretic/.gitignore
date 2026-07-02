@@ -1,0 +1,4 @@
+# Fetched Heretic prompt corpora — regenerate via scripts/fetch_heretic_prompts.sh.
+# Not committed: harmful_behaviors carries sensitive jailbreak prompts, and the
+# sets are reproducible from the HF datasets-server. Only this .gitignore is tracked.
+*.txt

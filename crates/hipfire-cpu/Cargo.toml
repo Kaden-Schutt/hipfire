@@ -6,4 +6,5 @@ license.workspace = true
 description = "Deterministic CPU oracle backends and module evidence contracts for hipfire"
 
 [dependencies]
+hipfire-primitives = { path = "../hipfire-primitives" }
 serde_json = "1"

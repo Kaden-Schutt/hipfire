@@ -76,16 +76,18 @@ impl Gpu {
             &dt_min as *const _ as *mut c_void,
             &dt_max as *const _ as *mut c_void,
         ];
-        let total = (num_heads * head_dim) as u32;
-        let block = 256u32;
-        let grid = total.div_ceil(block);
+        // One block per head; threads cover head_dim channels. B/C are staged in
+        // LDS (2*state_size f32) and reused across the block.
+        let grid = num_heads as u32;
+        let block = (head_dim as u32).min(256).max(1);
+        let shared = (2 * state_size * std::mem::size_of::<f32>()) as u32;
         let func = &self.functions["mamba2_ssd_decode_f32"];
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [grid, 1, 1],
                 [block, 1, 1],
-                0,
+                shared,
                 self.stream_ref(),
                 &mut params,
             )
@@ -153,16 +155,17 @@ impl Gpu {
             &dt_min as *const _ as *mut c_void,
             &dt_max as *const _ as *mut c_void,
         ];
-        let total = (num_heads * head_dim) as u32;
-        let block = 256u32;
-        let grid = total.div_ceil(block);
+        // One block per head (same layout as the f32 decode); B/C staged in LDS.
+        let grid = num_heads as u32;
+        let block = (head_dim as u32).min(256).max(1);
+        let shared = (2 * state_size * std::mem::size_of::<f32>()) as u32;
         let func = &self.functions["mamba2_ssd_decode_q8"];
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [grid, 1, 1],
                 [block, 1, 1],
-                0,
+                shared,
                 self.stream_ref(),
                 &mut params,
             )
@@ -328,6 +331,191 @@ impl Gpu {
                 [grid, 1, 1],
                 [block, 1, 1],
                 0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Mamba-2 SSD **chunked** prefill scan — GPU port of the CPU oracle
+    /// `ssd_chunked` (the parallel intra-chunk decomposition). Correctness floor
+    /// for the bf16-WMMA prefill kernel; `state` is advanced in place to the
+    /// post-sequence value (decode hand-off), matching `ssd_sequence` within
+    /// ~1e-4. `chunk_size` is the GPU chunk tile and is capped at 64 (the
+    /// kernel's `MAMBA2_CHUNK_MAX`); a larger model chunk is processed as several
+    /// tiles, still equivalent to the sequential scan. See
+    /// `kernels/src/mamba2_ssd_chunk_f32.hip`.
+    ///
+    /// - `y` (out): `[seq_len * num_heads * head_dim]`
+    /// - `state`: `[num_heads * head_dim * state_size]` (in/out)
+    /// - `x`: `[seq_len * num_heads * head_dim]`
+    /// - `b`, `c`: `[seq_len * n_groups * state_size]`
+    /// - `dt_raw`: `[seq_len * num_heads]`
+    /// - `a_log`, `d`, `dt_bias`: `[num_heads]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_ssd_chunk_f32(
+        &mut self,
+        y: &GpuTensor,
+        state: &GpuTensor,
+        x: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        dt_raw: &GpuTensor,
+        a_log: &GpuTensor,
+        d: &GpuTensor,
+        dt_bias: &GpuTensor,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        state_size: usize,
+        n_groups: usize,
+        dt_min: f32,
+        dt_max: f32,
+        chunk_size: usize,
+    ) -> HipResult<()> {
+        const MAMBA2_CHUNK_MAX: usize = 64; // mirrors the kernel #define
+        let chunk_size = chunk_size.clamp(1, MAMBA2_CHUNK_MAX);
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "mamba2_ssd_chunk",
+            kernels::MAMBA2_SSD_CHUNK_SRC,
+            "mamba2_ssd_chunk_f32",
+        )?;
+        let yp = y.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let bp = b.buf.as_ptr();
+        let cp = c.buf.as_ptr();
+        let dtp = dt_raw.buf.as_ptr();
+        let ap = a_log.buf.as_ptr();
+        let dp = d.buf.as_ptr();
+        let dbp = dt_bias.buf.as_ptr();
+        let sl = seq_len as i32;
+        let nh = num_heads as i32;
+        let hd = head_dim as i32;
+        let ns = state_size as i32;
+        let ng = n_groups as i32;
+        let cs = chunk_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &dbp as *const _ as *mut c_void,
+            &sl as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ns as *const _ as *mut c_void,
+            &ng as *const _ as *mut c_void,
+            &dt_min as *const _ as *mut c_void,
+            &dt_max as *const _ as *mut c_void,
+            &cs as *const _ as *mut c_void,
+        ];
+        let total = (num_heads * head_dim) as u32;
+        let block = 256u32;
+        let grid = total.div_ceil(block);
+        let func = &self.functions["mamba2_ssd_chunk_f32"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Mamba-2 SSD chunked prefill on **bf16-WMMA** (RDNA3+ wave32). Matrix-core
+    /// path validated by relative/cosine against [`Self::mamba2_ssd_chunk_f32`]
+    /// (bf16 inputs → ~1% rel, NOT the 1e-4 f32 bar). **Milestone 1**: a single
+    /// chunk (`L = min(chunk_size, seq) ≤ 16`) from zero initial state — the
+    /// inter-chunk `C·h_in` term and the serial chunk loop are milestone 2. One
+    /// wave per head. See `kernels/src/mamba2_ssd_chunk_wmma.hip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_ssd_chunk_wmma(
+        &mut self,
+        y: &GpuTensor,
+        state: &GpuTensor,
+        x: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        dt_raw: &GpuTensor,
+        a_log: &GpuTensor,
+        d: &GpuTensor,
+        dt_bias: &GpuTensor,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        state_size: usize,
+        n_groups: usize,
+        dt_min: f32,
+        dt_max: f32,
+        chunk_size: usize,
+    ) -> HipResult<()> {
+        assert!(
+            head_dim <= 128 && state_size <= 128,
+            "mamba2_ssd_chunk_wmma: head_dim/state_size must be <= 128 (got {head_dim}/{state_size})"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "mamba2_ssd_chunk_wmma",
+            kernels::MAMBA2_SSD_CHUNK_WMMA_SRC,
+            "mamba2_ssd_chunk_wmma",
+        )?;
+        let yp = y.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let bp = b.buf.as_ptr();
+        let cp = c.buf.as_ptr();
+        let dtp = dt_raw.buf.as_ptr();
+        let ap = a_log.buf.as_ptr();
+        let dp = d.buf.as_ptr();
+        let dbp = dt_bias.buf.as_ptr();
+        let sl = seq_len as i32;
+        let nh = num_heads as i32;
+        let hd = head_dim as i32;
+        let ns = state_size as i32;
+        let ng = n_groups as i32;
+        let cs = chunk_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &dbp as *const _ as *mut c_void,
+            &sl as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ns as *const _ as *mut c_void,
+            &ng as *const _ as *mut c_void,
+            &dt_min as *const _ as *mut c_void,
+            &dt_max as *const _ as *mut c_void,
+            &cs as *const _ as *mut c_void,
+        ];
+        // One block per head. Block size MUST equal 32 * WAVES in the kernel
+        // (mamba2_ssd_chunk_wmma.hip `#define WAVES`); they desync silently
+        // (missing warps skip work) if changed independently. WAVES=16 → 512.
+        // Dynamic shared mem holds the resident SSM state St[P][ND] (f32), so it
+        // round-trips global state once per prefill instead of once per chunk.
+        let nd = state_size.next_multiple_of(16);
+        let shared = (head_dim * nd * std::mem::size_of::<f32>()) as u32;
+        let func = &self.functions["mamba2_ssd_chunk_wmma"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [num_heads as u32, 1, 1],
+                [512, 1, 1],
+                shared,
                 self.stream_ref(),
                 &mut params,
             )

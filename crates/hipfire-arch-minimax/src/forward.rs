@@ -39,6 +39,81 @@ use hipfire_runtime::weights::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Calibration-only: download a small i32 routing tensor to host.
+fn download_i32_tensor(gpu: &mut Gpu, tensor: &GpuTensor, len: usize) -> Result<Vec<i32>, String> {
+    gpu.bind_thread()
+        .map_err(|e| format!("minimax capture bind: {e:?}"))?;
+    let mut data = vec![0i32; len];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, len * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .map_err(|e| format!("minimax capture dtoh: {e:?}"))?;
+    Ok(data)
+}
+
+fn capture_named_activation(gpu: &mut Gpu, name: &str, input: &GpuTensor, n: usize, k: usize) {
+    if let Some(cap) = gpu.active_capture.clone() {
+        cap.capture(gpu, name, input, n, k);
+    }
+}
+
+/// Calibration tap (no-op unless `gpu.active_capture` is armed): record the
+/// per-expert gate_up input imatrix. The routed-expert GEMV is fused/indexed
+/// (one blob + a pointer table), so it cannot be tapped by weight-buffer pointer
+/// like the dense projections — we capture explicitly by expert name here,
+/// mirroring `lfm2moe::maybe_capture_moe_gate_up_inputs`. The captured input is
+/// `ffn_tmp` (post-RMSNorm, PRE-FWHT/AWQ) so the imatrix is in the original
+/// channel space the expert AWQ scales operate in. Returns the routed expert ids
+/// (decode batch=1: `k_top` of them, all sharing the single `ffn_tmp` row).
+fn maybe_capture_moe_gate_up_inputs(
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    topk_indices: &GpuTensor,
+    ffn_tmp: &GpuTensor,
+    hidden: usize,
+    n_exp: usize,
+    k_top: usize,
+) -> Result<Option<Vec<usize>>, String> {
+    if gpu.active_capture.is_none() {
+        return Ok(None);
+    }
+    let raw = download_i32_tensor(gpu, topk_indices, k_top)?;
+    let mut indices = Vec::with_capacity(k_top);
+    for (slot, r) in raw.into_iter().enumerate() {
+        if r < 0 || r as usize >= n_exp {
+            return Err(format!(
+                "minimax L{layer_idx}: topk slot {slot} expert id {r} out of range 0..{n_exp}"
+            ));
+        }
+        let e = r as usize;
+        let prefix = format!("model.layers.{layer_idx}.block_sparse_moe.experts.{e}");
+        capture_named_activation(gpu, &format!("{prefix}.w1"), ffn_tmp, 1, hidden);
+        capture_named_activation(gpu, &format!("{prefix}.w3"), ffn_tmp, 1, hidden);
+        indices.push(e);
+    }
+    Ok(Some(indices))
+}
+
+/// Calibration tap: per-expert down (`w2`) input imatrix. Captures each routed
+/// slot's `rot_batch` row (the silu·mul intermediate). down-AWQ is disabled for
+/// MiniMax, so this feeds the imatrix only (not an AWQ scale).
+fn maybe_capture_moe_down_inputs(
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    expert_indices: &[usize],
+    rot_batch: &GpuTensor,
+    inter: usize,
+) {
+    if gpu.active_capture.is_none() {
+        return;
+    }
+    for (slot, &e) in expert_indices.iter().enumerate() {
+        let rot_row = rot_batch.sub_offset(slot * inter, inter);
+        let name = format!("model.layers.{layer_idx}.block_sparse_moe.experts.{e}.w2");
+        capture_named_activation(gpu, &name, &rot_row, 1, inter);
+    }
+}
+
 /// Decode one token (eager); returns the full logits vector. Used for prefill,
 /// the warm pass, and as the `HIPFIRE_MINIMAX_GRAPH=0` fallback.
 pub fn decode_step(
@@ -145,7 +220,28 @@ fn decode_step_body(
     // per-layer decode through the super-op executor (run_layer_program). Skipped
     // when capturing (oracle dumper needs the hand path). Default off (opt-in)
     // until hipx byte-parity validated (minimax only fits on hipx).
-    if minimax_forward_lowered_enabled() && capture.is_none() {
+    // Lowered is the default fast path, but the super-op executor does not run
+    // the per-expert calibration taps below — so when activation capture is armed
+    // (Collect / collect_artifacts), force the eager hand path. Mirrors the
+    // `capture.is_none()` carve-out for the oracle dumper.
+    // The lowered super-op builder does not yet carry the QTIP3 trellis expert
+    // ops nor the LQER low-rank down correction — both are only in the eager
+    // hand path below. Route those models to eager regardless of the toggle.
+    let lowered_supports = weights
+        .layers
+        .first()
+        .map(|l0| {
+            l0.experts[0].down.gpu_dtype != DType::Qtip3G256
+                && l0.gate_lr.is_none()
+                && l0.up_lr.is_none()
+                && l0.down_lr.is_none()
+        })
+        .unwrap_or(true);
+    if minimax_forward_lowered_enabled()
+        && lowered_supports
+        && capture.is_none()
+        && gpu.active_capture.is_none()
+    {
         return decode_step_body_lowered(cfg, weights, state, gpu, position);
     }
 
@@ -260,6 +356,17 @@ fn decode_step_body(
         )
         .map_err(|e| format!("minimax L{l}: topk: {e:?}"))?;
 
+        // Calibration taps (no-op unless capture is armed): per-expert imatrix.
+        let capture_experts = maybe_capture_moe_gate_up_inputs(
+            gpu,
+            l,
+            &state.topk_indices,
+            &state.ffn_tmp,
+            hidden,
+            n_exp,
+            k_top,
+        )?;
+
         // Routed experts: gate_up (rotated input) → silu·mul·rotate → down → combine.
         // Dispatch the indexed-MoE GEMV by expert dtype. MQ4/MQ6/MQ2-Lloyd are
         // FWHT-pre-rotated (byte-compatible with the matching hfq/lloyd kernels
@@ -314,7 +421,82 @@ fn decode_step_body(
                     k_top,
                 )
                 .map_err(|e| format!("minimax L{l}: gate_up mq3l: {e:?}"))?,
+            DType::Oq4G256 => gpu
+                .gemv_oq4g256_moe_gate_up_k8_indexed(
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                )
+                .map_err(|e| format!("minimax L{l}: gate_up oq4: {e:?}"))?,
+            DType::Oq8G256 => gpu
+                .gemv_oq8g256_moe_gate_up_k8_indexed(
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                )
+                .map_err(|e| format!("minimax L{l}: gate_up oq8: {e:?}"))?,
+            // QTIP3 trellis experts: same FWHT-pre-rotated `ffn_x_rot` input as
+            // the MQ/HFQ family; the kernel decodes the 100 B/group trellis on
+            // the fly. Low-rank error correction (U,V) is applied separately
+            // after this GEMV when the expert carries lr sidecars.
+            DType::Qtip3G256 => gpu
+                .gemv_qtip3g256_moe_gate_up_k8_indexed(
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                )
+                .map_err(|e| format!("minimax L{l}: gate_up qtip3: {e:?}"))?,
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
+        }
+
+        // LQER low-rank correction for gate (w1 → gate_batch) and up (w3 →
+        // up_batch). Both share the rotated token input ffn_x_rot (x_stride=0)
+        // and write the contiguous [k_top×inter] gate/up buffers directly, before
+        // silu fuses them — w1/w3 are independent tensors with their own U/V, so
+        // no fused split-output kernel is needed.
+        for (lr, out) in [
+            (layer.gate_lr.as_ref(), &state.gate_batch),
+            (layer.up_lr.as_ref(), &state.up_batch),
+        ] {
+            if let Some(lr) = lr {
+                let t = gpu
+                    .alloc_tensor(&[k_top, lr.rank], DType::F32)
+                    .map_err(|e| format!("minimax L{l}: alloc gate/up lr t: {e:?}"))?;
+                gpu.gemv_lowrank_moe_proj(
+                    &lr.v_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &t,
+                    lr.rank,
+                    hidden,
+                    k_top,
+                    0,
+                )
+                .map_err(|e| format!("minimax L{l}: gate/up lr proj: {e:?}"))?;
+                gpu.gemv_lowrank_moe_expand(
+                    &lr.u_ptrs,
+                    &state.topk_indices,
+                    &t,
+                    out,
+                    inter,
+                    lr.rank,
+                    k_top,
+                )
+                .map_err(|e| format!("minimax L{l}: gate/up lr expand: {e:?}"))?;
+                let _ = gpu.free_tensor(t);
+            }
         }
 
         fused_silu_mul_rotate_mq_batched_for(
@@ -327,6 +509,10 @@ fn decode_step_body(
             k_top,
         )
         .map_err(|e| format!("minimax L{l}: silu_mul_rotate: {e:?}"))?;
+
+        if let Some(ref idx) = capture_experts {
+            maybe_capture_moe_down_inputs(gpu, l, idx, &state.rot_batch, inter);
+        }
 
         // Down dispatches on the DOWN proj's own dtype (may differ from gate_up:
         // e.g. gate_up=mq2-lloyd + down=mq4, since down carries ~24x the energy).
@@ -403,6 +589,103 @@ fn decode_step_body(
                     k_top,
                 )
                 .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
+            }
+            DType::Oq4G256 => {
+                gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.rot_batch,
+                    &state.down_expanded,
+                    hidden,
+                    inter,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: down oq4: {e:?}"))?;
+                gpu.moe_down_combine_k8_batched(
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    &state.h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
+            }
+            DType::Oq8G256 => {
+                gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.rot_batch,
+                    &state.down_expanded,
+                    hidden,
+                    inter,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: down oq8: {e:?}"))?;
+                gpu.moe_down_combine_k8_batched(
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    &state.h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
+            }
+            DType::Qtip3G256 => {
+                gpu.gemv_qtip3g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.rot_batch,
+                    &state.down_expanded,
+                    hidden,
+                    inter,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: down qtip3: {e:?}"))?;
+                // LQER low-rank correction: down_expanded += U_e·(V_e·rot_batch_e).
+                // V_e·x uses the PER-EXPERT input (x_stride = inter); the result is
+                // accumulated into the contiguous [k_top×hidden] down output before
+                // the weighted combine, so it picks up the same topk weighting.
+                if let Some(lr) = &layer.down_lr {
+                    let t = gpu
+                        .alloc_tensor(&[k_top, lr.rank], DType::F32)
+                        .map_err(|e| format!("minimax L{l}: alloc lr t: {e:?}"))?;
+                    gpu.gemv_lowrank_moe_proj(
+                        &lr.v_ptrs,
+                        &state.topk_indices,
+                        &state.rot_batch,
+                        &t,
+                        lr.rank,
+                        inter,
+                        k_top,
+                        inter,
+                    )
+                    .map_err(|e| format!("minimax L{l}: down lr proj: {e:?}"))?;
+                    gpu.gemv_lowrank_moe_expand(
+                        &lr.u_ptrs,
+                        &state.topk_indices,
+                        &t,
+                        &state.down_expanded,
+                        hidden,
+                        lr.rank,
+                        k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l}: down lr expand: {e:?}"))?;
+                    let _ = gpu.free_tensor(t);
+                }
+                gpu.moe_down_combine_k8_batched(
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    &state.h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
             }
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }
@@ -599,6 +882,28 @@ fn minimax_moe_block(
                 k_top,
             )
             .map_err(|e| format!("minimax L{l}: gate_up mq3l: {e:?}"))?,
+        DType::Oq4G256 => gpu
+            .gemv_oq4g256_moe_gate_up_k8_indexed(
+                &layer.expert_gate_up_ptrs,
+                &state.topk_indices,
+                &state.ffn_x_rot,
+                &state.gate_batch,
+                &state.up_batch,
+                2 * inter,
+                hidden,
+            )
+            .map_err(|e| format!("minimax L{l}: gate_up oq4: {e:?}"))?,
+        DType::Oq8G256 => gpu
+            .gemv_oq8g256_moe_gate_up_k8_indexed(
+                &layer.expert_gate_up_ptrs,
+                &state.topk_indices,
+                &state.ffn_x_rot,
+                &state.gate_batch,
+                &state.up_batch,
+                2 * inter,
+                hidden,
+            )
+            .map_err(|e| format!("minimax L{l}: gate_up oq8: {e:?}"))?,
         other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
     }
     fused_silu_mul_rotate_mq_batched_for(
@@ -682,6 +987,50 @@ fn minimax_moe_block(
                 k_top,
             )
             .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
+        }
+        DType::Oq4G256 => {
+            gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                &layer.expert_down_ptrs,
+                &state.topk_indices,
+                &state.rot_batch,
+                &state.down_expanded,
+                hidden,
+                inter,
+                k_top,
+                1,
+            )
+            .map_err(|e| format!("minimax L{l}: down oq4: {e:?}"))?;
+            gpu.moe_down_combine_k8_batched(
+                &state.down_expanded,
+                &state.topk_weights,
+                out_target,
+                hidden,
+                k_top,
+                1,
+            )
+            .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
+        }
+        DType::Oq8G256 => {
+            gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
+                &layer.expert_down_ptrs,
+                &state.topk_indices,
+                &state.rot_batch,
+                &state.down_expanded,
+                hidden,
+                inter,
+                k_top,
+                1,
+            )
+            .map_err(|e| format!("minimax L{l}: down oq8: {e:?}"))?;
+            gpu.moe_down_combine_k8_batched(
+                &state.down_expanded,
+                &state.topk_weights,
+                out_target,
+                hidden,
+                k_top,
+                1,
+            )
+            .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
         }
         other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
     }
@@ -1115,6 +1464,32 @@ pub fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("minimax L{l} batch gate_up mq2l: {e:?}"))?,
+            DType::Oq4G256 => gpu
+                .gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                    &layer.expert_gate_up_ptrs,
+                    &topk_idx,
+                    &ffn_x_rot,
+                    &gate,
+                    &up,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch gate_up oq4: {e:?}"))?,
+            DType::Oq8G256 => gpu
+                .gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                    &layer.expert_gate_up_ptrs,
+                    &topk_idx,
+                    &ffn_x_rot,
+                    &gate,
+                    &up,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch gate_up oq8: {e:?}"))?,
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: gate_up dtype {other:?} has no batched kernel yet"
@@ -1179,6 +1554,36 @@ pub fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("minimax L{l} batch down mq2l: {e:?}"))?,
+            DType::Oq4G256 => {
+                gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &rot,
+                    &down_exp,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch down oq4: {e:?}"))?;
+                gpu.moe_down_combine_k8_batched(&down_exp, &topk_w, &x, hidden, k_top, b)
+                    .map_err(|e| format!("minimax L{l} batch combine: {e:?}"))?;
+            }
+            DType::Oq8G256 => {
+                gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &rot,
+                    &down_exp,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch down oq8: {e:?}"))?;
+                gpu.moe_down_combine_k8_batched(&down_exp, &topk_w, &x, hidden, k_top, b)
+                    .map_err(|e| format!("minimax L{l} batch combine: {e:?}"))?;
+            }
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: down dtype {other:?} has no batched kernel yet"

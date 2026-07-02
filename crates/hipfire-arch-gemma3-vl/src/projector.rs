@@ -140,16 +140,20 @@ pub fn project(
     let pool = cfg.pool_side();
     let n_tok = cfg.mm_tokens_per_image;
 
-    // Avg-pool host-side (download → pool → upload).
+    // Avg-pool host-side (download → pool → upload). `pooled_gpu` and `normed`
+    // are per-call scratch held as `OwnedTensor`: each drops itself into the
+    // deferred-free mailbox (on success OR any `?` error), so plain `?` is
+    // leak-free and a single `reclaim_pending()` at the end returns them to the
+    // pool. `out` is the result the caller owns, so it stays a plain `GpuTensor`.
     let feats = gpu.download_f32(vision_out)?;
     debug_assert_eq!(feats.len(), grid * grid * vh);
     let pooled = avg_pool(&feats, grid, pool, vh);
-    let pooled_gpu = gpu.upload_f32(&pooled, &[n_tok * vh])?;
+    let pooled_gpu = gpu.upload_owned_f32(&pooled, &[n_tok * vh])?;
 
     // mm_soft_emb_norm (RMSNorm over vision_hidden, per token).
-    let normed = gpu.alloc_tensor(&[n_tok * vh], DType::F32)?;
+    let normed = gpu.alloc_owned(&[n_tok * vh], DType::F32)?;
     gpu.rmsnorm_batched(&pooled_gpu, &proj.soft_emb_norm, &normed, n_tok, vh, 1e-6)?;
-    gpu.free_tensor(pooled_gpu)?;
+    drop(pooled_gpu); // consumed by the norm — enqueue for the boundary reclaim.
 
     // Projection: out[n_tok, th] = normed[n_tok, vh] @ W[vh, th], with
     // input_projection_t = Wᵀ [th, vh]. gemm_f32_batched writes its result as
@@ -159,7 +163,8 @@ pub fn project(
     // values — bisected vs the HF SigLIP reference).
     let out = gpu.alloc_tensor(&[n_tok * th], DType::F32)?;
     gpu.gemm_f32_batched(&proj.input_projection_t, &normed, &out, th, vh, n_tok)?;
-    gpu.free_tensor(normed)?;
+    drop(normed); // consumed by the projection — enqueue for the reclaim below.
     crate::forward::maybe_dump_stage(gpu, &out, "post_merger", &[n_tok, th]);
+    gpu.reclaim_pending();
     Ok(out)
 }

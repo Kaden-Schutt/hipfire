@@ -17,4 +17,5 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-steer = { path = "../hipfire-steer" }
 serde_json = "1"

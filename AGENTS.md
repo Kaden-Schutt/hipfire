@@ -24,6 +24,13 @@ the relevant docs under `docs/`.
   use `hipfire lock {acquire,release,status}`; `gpu-lock` is only an alias. Do
   not add sentinel files, pidfile liveness locks, `create_dir` mutexes,
   alternate lockfiles, or shell-only mutexes.
+- Keep coexistence and compatibility tooling out of the inference binaries. Any
+  import/export, format conversion, or interop tool (e.g. safetensors/GGUF
+  import, model or LoRA conversion, adapter merge/bundle, external-format export)
+  belongs in the `hipfire-coexistence` binary (or another dedicated tooling
+  crate), not folded into the daemon, server, or runtime hot path. The inference
+  path stays lean and HIP-direct; conversion and compatibility concerns are
+  offline tooling.
 
 ## Branch And Git
 

@@ -126,7 +126,7 @@ pub fn rocm_backend_path_for_selected_backend(
     match selected_backend {
         DenseFfnBackend::CpuOracle => RocmBackendPath::CpuOracleBypass,
         DenseFfnBackend::GpuProduction => RocmBackendPath::HipRdnaCompute,
-        DenseFfnBackend::NpuXdna1 => RocmBackendPath::NpuHybridFallback,
+        DenseFfnBackend::NpuXdna => RocmBackendPath::NpuHybridFallback,
     }
 }
 
@@ -246,7 +246,7 @@ mod tests {
             RocmBackendPath::CpuOracleBypass
         );
         assert_eq!(
-            rocm_backend_path_for_selected_backend(DenseFfnBackend::NpuXdna1),
+            rocm_backend_path_for_selected_backend(DenseFfnBackend::NpuXdna),
             RocmBackendPath::NpuHybridFallback
         );
     }

@@ -46,6 +46,10 @@
 //!      time.
 
 use crate::hfq::HfqFile;
+use hipfire_state::{
+    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
+    SequenceStatePageDescriptor,
+};
 use rdna_compute::{Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -435,6 +439,109 @@ pub trait ServingBackend: Send {
     /// Release GPU resources (consumes the boxed backend on unload).
     fn unload(self: Box<Self>, gpu: &mut Gpu);
 }
+
+/// Rich, **stateful** serving surface for the multi-session arches — qwen3.5
+/// (5/6) and lfm2-moe (11) — layered on top of [`ServingBackend`]. Where the
+/// `SimpleAr`/`run_simple_ar` tier is stateless one-shot generation, this tier
+/// adds the multi-turn session protocol: resident-session swap, prefix-hash
+/// prompt-cache, semantic checkpoints, and session fork — the operations the
+/// daemon previously drove through the duplicated per-arch `qwen35_*` / `lfm2_*`
+/// free functions over `&mut LoadedModel`.
+///
+/// # Hoist (S1 of docs/plans/2026-06-29-session-serving-backend.md)
+///
+/// This trait is the keystone the two arches will implement (S2/S3), so the
+/// daemon dispatches one `&mut dyn SessionServingBackend` instead of an
+/// `if is_qwen35 {} else if is_lfm2 {}` ladder (S4). The shared session-state
+/// arena (`hipfire_state::GenericSequenceStateArena`) and the request/handle/
+/// descriptor types it consumes already exist — the method param types here are
+/// those existing `hipfire_state` types, not new ones.
+///
+/// # Ownership taxonomy
+///
+/// [`SessionServingBackend::state_arena_backend`] reports how this backend's
+/// pages are owned ([`SequenceStateArenaBackend::Qwen35Wrapped`] vs
+/// [`SequenceStateArenaBackend::BackendOwned`]); the scheduler/batcher reads it
+/// for cross-session accounting. **Both ownership modes expose the full session
+/// op set on this trait** (activate/save/reset/fork/checkpoint/release) — the
+/// `BackendOwned` arches (lfm2/minimax/nemotron) are not limited to describe-only
+/// at the trait level.
+///
+/// # Object-safe
+///
+/// All methods take `&self`/`&mut self`, `&mut Gpu`, slices, and the borrowed
+/// `hipfire_state` request structs, returning owned values — so the daemon can
+/// hold `Box<dyn SessionServingBackend>` and the dyn boundary is per-request, not
+/// per-token.
+///
+/// Prefill/materialize orchestration (`run_generate_batch_prefill_serial`) and
+/// the DFlash spec-decode fast path are NOT on this trait yet — they are the
+/// driver surface, refined in S2/S3 as the per-arch bodies move onto the backend.
+///
+/// # Not bound to [`ServingBackend`]
+///
+/// Intentionally a standalone trait, not `: ServingBackend`. On today's
+/// single-resident-slot daemon the session state (incl. the shared `seq_pos` /
+/// `conversation_tokens` cursor) lives in `LoadedModel`, so the C0 hoist
+/// implements this trait on `LoadedModel` (dispatching by `arch_id`) — and
+/// `LoadedModel` is not itself a `ServingBackend`. Once the per-session-slot
+/// restructure (docs/plans/2026-06-29-concurrent-session-execution.md, C1) moves
+/// session state into per-arch backends, those backends implement both traits;
+/// keeping them unbound avoids forcing a `ServingBackend` impl onto `LoadedModel`
+/// now.
+pub trait SessionServingBackend {
+    /// How this backend's sequence-state pages are owned, for the scheduler's
+    /// cross-session accounting (`Qwen35Wrapped` = arena-managed, `BackendOwned`
+    /// = the backend owns its pages).
+    fn state_arena_backend(&self) -> SequenceStateArenaBackend;
+
+    /// Per-page descriptors for the resident state, for the worker runtime view /
+    /// arena `describe`. Mirrors the per-arch `*_state_page_descriptors`.
+    fn state_page_descriptors(&self) -> Vec<SequenceStatePageDescriptor>;
+
+    /// Number of resident sessions (the registry's session count).
+    fn request_session_count(&self) -> usize;
+
+    /// Absolute logical token position of the active session — the resume point
+    /// for the next prefill/decode.
+    fn active_logical_position(&self) -> Result<usize, String>;
+
+    /// Restore a saved session into the active slot (parking the current one).
+    /// Returns `true` if the session id was newly created (no saved state).
+    fn activate_session(&mut self, gpu: &mut Gpu, session_id: &str) -> Result<bool, String>;
+
+    /// Snapshot the active session back into the resident map without giving up
+    /// the slot (checkpoint without swap).
+    fn save_active_session(&mut self, gpu: &mut Gpu) -> Result<(), String>;
+
+    /// Reset the active session's multi-turn state (KV cursor, conv tokens, …).
+    fn reset_active_session(&mut self, gpu: &mut Gpu) -> Result<(), String>;
+
+    /// Release the named sessions; returns how many resident sessions were freed.
+    fn release_sessions(&mut self, gpu: &mut Gpu, session_ids: &[String]) -> Result<usize, String>;
+
+    /// Fork a (validated) source session into a new id, deep-copying its state so
+    /// a conversation can branch without disturbing the original.
+    fn fork_session_state(
+        &mut self,
+        gpu: &mut Gpu,
+        request: SequenceStateForkRequest<'_>,
+    ) -> Result<(), String>;
+
+    /// Checkpoint a session at a validated logical position / prefix hash (guards
+    /// against stale or mismatched checkpoint requests), then fork it.
+    fn checkpoint_session_state(
+        &mut self,
+        gpu: &mut Gpu,
+        request: SequenceStateCheckpointRequest<'_>,
+    ) -> Result<(), String>;
+}
+
+// Object-safety guard: the daemon will hold `Box<dyn SessionServingBackend>`
+// (S4). Naming the `dyn` type here forces a compile error at the trait
+// definition if a method is ever made non-dispatchable, instead of at the S4
+// boundary.
+const _: Option<&dyn SessionServingBackend> = None;
 
 /// Shared dense-AR serving loop: tokenize the (pre-framed) prompt → prefill →
 /// greedy-decode, streaming JSONL `token` events to `ctx.sink` and a final

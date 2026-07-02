@@ -16,6 +16,7 @@
 //! Sweeps groups_per_row ∈ {2, 4, 5, 6, 7, 8} (K = groups_per_row × 256) to exercise
 //! the same kernel paths as the HFP4 anchor test, including all 3 tail-by-g%4 paths.
 
+use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use rdna_compute::{DType, Gpu};
 
 const E2M1_LUT: [f32; 16] = [
@@ -84,48 +85,6 @@ fn f16_le_bits_to_f32(h: u16) -> f32 {
         (sign << 31) | (((exp - 15 + 127) as u32) << 23) | (mant << 13)
     };
     f32::from_bits(bits)
-}
-
-/// FWHT on a 256-element segment. Mirrors `cpu_fwht_256` in hipfire-quantize and
-/// the GPU `mq_rotate_x` kernel: signs1 → butterfly → 1/sqrt(256) scale → signs2.
-fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert_eq!(x.len(), 256);
-    for i in 0..256 {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1usize;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 {
-        x[i] *= scale * signs2[i];
-    }
-}
-
-/// Same LCG sign generator MQ4 ships with (`gen_fwht_signs(seed, 256)`).
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
 }
 
 /// Quantize one row of K f32 weights to HFP4G32 byte format with `format_flags=0x05`

@@ -67,61 +67,11 @@ pub fn dequantize_q8_0(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-pub fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-
-    if exp == 0 {
-        if frac == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        // Denormalized
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 {
-            f <<= 1;
-            e -= 1;
-        }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { frac << 13 | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    let exp32 = exp + 127 - 15;
-    f32::from_bits((sign << 31) | (exp32 << 23) | (frac << 13))
-}
-
-pub fn f32_to_f16(val: f32) -> u16 {
-    let bits = val.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let frac = bits & 0x7FFFFF;
-
-    if exp == 0xFF {
-        let f16_frac = if frac == 0 { 0 } else { (frac >> 13) | 1 };
-        return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
-    }
-
-    let new_exp = exp - 127 + 15;
-
-    if new_exp >= 31 {
-        return ((sign << 15) | (0x1F << 10)) as u16; // overflow → inf
-    }
-    if new_exp <= 0 {
-        if new_exp < -10 {
-            return (sign << 15) as u16; // underflow → zero
-        }
-        let f = frac | 0x800000;
-        let shift = (1 - new_exp + 13) as u32;
-        return ((sign << 15) | (f >> shift)) as u16;
-    }
-
-    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
-}
+// f16↔f32 conversions are now the canonical implementations in the shared
+// `hipfire-primitives` leaf (they were byte-identical copies). Re-exported here
+// so the ~20 arch/loader call sites importing `hipfire_runtime::quant::*` stay
+// unchanged and transitively share one implementation.
+pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
 
 /// Dequantize Q4_K data to f32.
 /// Q4_K super-block: 256 elements
@@ -379,4 +329,56 @@ pub fn dequantize_q6_k(data: &[u8], n: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Re-export the canonical on-disk byte-contract so arch loaders can reach it
+/// as `hipfire_runtime::quant::QuantType` without each depending on the leaf
+/// `hipfire-quant-format` crate directly.
+pub use hipfire_quant_format::QuantType;
+
+/// Canonical map from an on-disk HFQ `quant_type` byte to the GPU dispatch
+/// [`DType`], for the **pure** formats: ones the loader handles as a plain
+/// `upload_raw` + dtype tag with no host-side repack.
+///
+/// This is the single source of truth that replaces the per-arch
+/// `slab_dtype_for_quant` / `dtype_for_quant` copies that drifted across
+/// qwen35, minimax, lfm2, gemma3, and qwen2 (each carried a divergent subset —
+/// e.g. only qwen35 mapped `31 => Qtip3G256`). Routing every loader through
+/// here means a new pure format lands in all arches with one edit.
+///
+/// Returns `None` for:
+/// - unknown codes, and
+/// - formats that require a host-side transform before upload (bf16 buffer
+///   retag `16`; Opus-Quant arch-repack `33/34/35/37`). Callers keep those
+///   transform branches and fall through to this map for the pure cases.
+///
+/// `k` (the input/column dim) gates the FP4 group-32 formats, which require
+/// `k % 256 == 0`.
+///
+/// Matches on the canonical [`QuantType`] (the shared byte-contract) rather
+/// than raw integers, so the on-disk ids stay authoritative in one crate.
+pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<rdna_compute::DType> {
+    use hipfire_quant_format::QuantType as Q;
+    use rdna_compute::DType;
+    Some(match Q::from_code(qt)? {
+        Q::F16 => DType::F16,
+        Q::Q8F16 => DType::Q8_0,
+        Q::HFQ4G256 => DType::HFQ4G256,
+        Q::HFQ4G128 => DType::HFQ4G128,
+        Q::HFQ6G256 => DType::HFQ6G256,
+        Q::HFQ3G256 => DType::HFQ3G256,
+        Q::HFQ3G128 => DType::HFQ3G128,
+        Q::MQ4G256 => DType::MQ4G256,
+        Q::MQ8G256 => DType::MQ8G256,
+        Q::MQ6G256 => DType::MQ6G256,
+        Q::MQ3G256 => DType::MQ3G256,
+        Q::MQ2G256 => DType::MQ2G256,
+        Q::MQ2G256Lloyd => DType::MQ2G256Lloyd,
+        Q::MQ3G256Lloyd => DType::MQ3G256Lloyd,
+        Q::HFP4G32 if k % 256 == 0 => DType::HFP4G32,
+        Q::MFP4G32 if k % 256 == 0 => DType::MFP4G32,
+        Q::MQ4G256Lloyd => DType::MQ4G256Lloyd,
+        Q::Qtip3G256 => DType::Qtip3G256,
+        _ => return None,
+    })
 }

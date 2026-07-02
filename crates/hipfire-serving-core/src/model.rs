@@ -39,6 +39,8 @@ use hipfire_state::ModelArtifactMemory;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::session::Lfm2RequestSessionState;
 use crate::session::Qwen35RequestSessionState;
+use crate::session::SessionCursor;
+use crate::session::SessionRegistry;
 
 /// CASK/TriAttention params forwarded by the CLI at load time. Zero-initialized
 /// CaskConfig{sidecar: None, ..} means no eviction — matches 0.1.7-alpha behavior.
@@ -164,6 +166,17 @@ pub struct DdtreeState {
     pub path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+impl DdtreeState {
+    /// Return every GPU-resident snapshot + scratch buffer to the pool.
+    /// Consumes self; called from `unload_model`'s DFlash teardown.
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        self.post_seed_snap.free_gpu(gpu);
+        self.scratch.free_gpu(gpu);
+        self.path_c_parent_pre_snap.free_gpu(gpu);
+        self.path_c_main_end_snap.free_gpu(gpu);
+    }
+}
+
 thread_local! {
     /// Per-request raw-prompt override, parsed from the generate message's
     /// optional `"raw"` field. `None` = use the auto default (raw iff the model
@@ -181,6 +194,43 @@ pub fn effective_raw(m: &LoadedModel) -> bool {
     RAW_OVERRIDE
         .with(|c| c.get())
         .unwrap_or(m.chat_template.is_none())
+}
+
+/// The currently-resident session as one cohesive struct (C2a). Groups the four
+/// formerly-decomposed `LoadedModel` working-copy fields — the generation cursor,
+/// the qwen35 unified KV+DeltaNet `sequence_state`, its prefilled-suffix
+/// bookkeeping, and the lfm2 recurrent/KV `lfm2moe_state` — so the forward reads
+/// `m.active.cursor` / `m.active.sequence_state` as one resident unit instead of
+/// spreading/recomposing them on every session swap.
+///
+/// Field grouping (not an enum, not accessors): `m.active.cursor` and
+/// `m.active.sequence_state` are plain field paths, so Rust still grants the
+/// disjoint borrows the generation loop relies on (the C1a finding — accessors
+/// borrow all of `*m`; an enum can't yield `cursor` + `sequence_state` disjointly
+/// without a threaded `match`). C2b will let the registry session structs hold a
+/// `ResidentSession` so activate/save become a single move; C2c lifts this to N
+/// concurrent residents.
+#[derive(Default)]
+pub struct ResidentSession {
+    /// The active session's generation cursor (absolute position +
+    /// conversation-token history). See [`SessionCursor`].
+    ///
+    /// `seq_pos` is the *physical* write position in the KV cache (the value
+    /// passed to `forward_scratch(..., pos, ...)`). With no eviction, physical
+    /// == absolute, so it simply grows. Under eviction, it is bounded to
+    /// `physical_cap`; absolute position = `seq_pos + kv.compact_offset`.
+    pub cursor: SessionCursor,
+    /// Active session's live qwen35 decode state (KV cache + DeltaNet recurrent
+    /// state) as one unified container. `None` when no session is resident or the
+    /// arch carries no such state.
+    pub sequence_state: Option<SequenceState>,
+    /// qwen35 prefilled-then-generated suffix length carried with the active
+    /// session's `sequence_state`.
+    pub q35_active_prefilled_generated_suffix_len: usize,
+    /// Active session's live LFM2.5-MoE decode state (KV + conv-state cache).
+    /// `None` when no lfm2 session is resident.
+    #[cfg(feature = "arch-lfm2moe")]
+    pub lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
 }
 
 /// Everything resident for the currently-loaded model: an `arch_id` tag plus the
@@ -211,17 +261,14 @@ pub struct LoadedModel {
     pub q35_config: Option<qwen35::Qwen35Config>,
     pub q35_weights: Option<qwen35::Qwen35Weights>,
     pub q35_scratch: Option<qwen35::Qwen35Scratch>,
-    /// Active session's live decode state (KV cache + DeltaNet recurrent state)
-    /// as one unified container. `None` when no session is resident or the arch
-    /// carries no such state. P2c Slice 3: replaces the former separate
-    /// `kv_cache: Option<KvCache>` + `dn_state: Option<DeltaNetState>` fields.
-    pub sequence_state: Option<SequenceState>,
+    /// The currently-resident session (cursor + qwen35/lfm2 decode state) as one
+    /// cohesive unit. P2c/C2a: replaces the former separate `sequence_state` +
+    /// `q35_active_prefilled_generated_suffix_len` + `lfm2moe_state` + `cursor`
+    /// working-copy fields. See [`ResidentSession`].
+    pub active: ResidentSession,
     pub q35_kv_mode: Option<String>,
     pub q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
-    pub q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
-    pub q35_active_session_id: Option<String>,
-    pub q35_active_state_allocation_epoch: u64,
-    pub q35_active_prefilled_generated_suffix_len: usize,
+    pub q35_registry: SessionRegistry<Qwen35RequestSessionState>,
     // Qwen3 state
     pub llama_config: Option<llama::LlamaConfig>,
     pub llama_weights: Option<llama::LlamaWeights>,
@@ -237,6 +284,10 @@ pub struct LoadedModel {
     /// `NemotronModel` owns its own weights + per-block recurrent/KV state;
     /// there are no separate `nemotron_*` Option fields. N5b.
     pub nemotron_backend: Option<hipfire_arch_nemotron::model::NemotronModel>,
+    /// Assembled ZAYA1 serving backend (arch_id 16 — hipfire-arch-zaya). CCA
+    /// attention + EDA/MoD-routed MoE; owns its GPU weights + rolling sequence.
+    /// Driven through the shared `ServingBackend::serve` seam. None on other archs.
+    pub zaya_backend: Option<hipfire_arch_zaya::arch::ZayaModel>,
     // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
     // KV cache lives inside Qwen2State, so there's no separate
     // qwen2_kv field. None on every other arch path.
@@ -298,13 +349,7 @@ pub struct LoadedModel {
     #[cfg(feature = "arch-lfm2moe")]
     pub lfm2moe_weights: Option<lfm2moe::lfm2moe::Lfm2MoeWeights>,
     #[cfg(feature = "arch-lfm2moe")]
-    pub lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
-    #[cfg(feature = "arch-lfm2moe")]
-    pub lfm2_sessions: std::collections::HashMap<String, Lfm2RequestSessionState>,
-    #[cfg(feature = "arch-lfm2moe")]
-    pub lfm2_active_session_id: Option<String>,
-    #[cfg(feature = "arch-lfm2moe")]
-    pub lfm2_active_state_allocation_epoch: u64,
+    pub lfm2_registry: SessionRegistry<Lfm2RequestSessionState>,
     /// Cached EOS token id resolved at load time. Falls back to 1 if the
     /// tokenizer lacks the special-token entry.
     #[cfg(feature = "arch-lfm2moe")]
@@ -334,13 +379,6 @@ pub struct LoadedModel {
     pub gemma3_text: Option<Gemma3Backend>,
     // Shared
     pub tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
-    // Multi-turn conversation state
-    //
-    // `seq_pos` is the *physical* write position in the KV cache (the value
-    // passed to `forward_scratch(..., pos, ...)`). With no eviction, physical
-    // == absolute, so seq_pos simply grows. Under eviction, seq_pos is bounded
-    // to `physical_cap`; absolute position = seq_pos + kv.compact_offset.
-    pub seq_pos: usize,
     /// Advertised context window — client-facing capacity, the upper bound on
     /// absolute conversation length. Without eviction this equals
     /// `physical_cap` (the buffer size); under eviction it can be much larger.
@@ -354,7 +392,6 @@ pub struct LoadedModel {
     /// and every decode-forward so the physical cache stays bounded by
     /// `physical_cap` even when `max_seq` advertises a much larger window.
     pub eviction: Option<Eviction>,
-    pub conversation_tokens: Vec<u32>, // full token history for repeat penalty
 
     /// Per-turn token cache for V4F prefix-cache stability.
     ///
@@ -416,21 +453,23 @@ impl LoadedModel {
     /// simultaneously bind `sequence_state.as_mut()` once, then borrow its
     /// disjoint `.kv` / `.recurrent` fields.
     pub fn kv_cache(&self) -> Option<&kv::KvCache> {
-        self.sequence_state.as_ref().and_then(|s| s.kv())
+        self.active.sequence_state.as_ref().and_then(|s| s.kv())
     }
     /// Mutable active KV cache (single-access only — see [`Self::kv_cache`]).
     pub fn kv_cache_mut(&mut self) -> Option<&mut kv::KvCache> {
-        self.sequence_state.as_mut().and_then(|s| s.kv_mut())
+        self.active.sequence_state.as_mut().and_then(|s| s.kv_mut())
     }
     /// Active session's DeltaNet recurrent state, if any.
     pub fn dn_state(&self) -> Option<&DeltaNetState> {
-        self.sequence_state
+        self.active
+            .sequence_state
             .as_ref()
             .and_then(|s| s.recurrent_as::<DeltaNetState>())
     }
     /// Mutable active DeltaNet recurrent state (single-access only).
     pub fn dn_state_mut(&mut self) -> Option<&mut DeltaNetState> {
-        self.sequence_state
+        self.active
+            .sequence_state
             .as_mut()
             .and_then(|s| s.recurrent_as_mut::<DeltaNetState>())
     }
