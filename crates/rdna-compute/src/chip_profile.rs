@@ -76,6 +76,14 @@ pub struct ChipProfile {
     pub max_waves_per_simd: u32,
     pub lds_bytes_per_cu: u32,
     pub wavefront_size: u32,
+    /// VRAM capacity in MB. `None` withholds the check (e.g. `for_unprofiled`,
+    /// or an older committed row from before this field existed) rather than
+    /// comparing against a bogus zero. When `Some`, `verify_live` fails loud
+    /// on a mismatch — VRAM capacity is a SKU-identifying static field (the
+    /// gfx1201 family alone spans 16GB RX 9070/9070 XT vs 32GB Radeon AI PRO
+    /// R9700), exactly the "driver/firmware/SKU change" case the module docs
+    /// call out.
+    pub vram_mb: Option<u32>,
     /// DRAM pointer-chase latency in nanoseconds. `None` until the Task-3
     /// microbench (`pointer_chase_latency` example, GPU-required) has
     /// actually measured this arch — NEVER filled with an unlabeled
@@ -147,6 +155,10 @@ impl ChipProfile {
             max_waves_per_simd: static_cap.max_waves_per_simd,
             lds_bytes_per_cu: static_cap.lds_per_cu_bytes,
             wavefront_size: if caps.is_wave32() { 32 } else { 64 },
+            // `static_capability` sets vram_mb=0 as its "unknown" sentinel
+            // (no sysfs/HIP query performed) — withhold rather than commit
+            // to a bogus zero-byte card.
+            vram_mb: None,
             mem_latency_ns: None,
             peak_bw_gbps: None,
             intrinsics: caps.dump_json(),
@@ -181,6 +193,14 @@ impl ChipProfile {
                 self.lds_bytes_per_cu, live.lds_per_cu_bytes
             ));
         }
+        if let Some(vram_mb) = self.vram_mb {
+            if vram_mb != live.vram_mb {
+                mismatches.push(format!(
+                    "vram_mb: committed={} live={}",
+                    vram_mb, live.vram_mb
+                ));
+            }
+        }
         let live_wavefront = wavefront_size_for_arch(&live.arch);
         if self.wavefront_size != live_wavefront {
             mismatches.push(format!(
@@ -207,6 +227,7 @@ impl ChipProfile {
             "max_waves_per_simd": self.max_waves_per_simd,
             "lds_bytes_per_cu": self.lds_bytes_per_cu,
             "wavefront_size": self.wavefront_size,
+            "vram_mb": self.vram_mb,
             "mem_latency_ns": self.mem_latency_ns,
             "peak_bw_gbps": self.peak_bw_gbps,
             "intrinsics": self.intrinsics,
@@ -237,6 +258,10 @@ impl ChipProfile {
             .as_u64()
             .ok_or_else(|| format!("ChipProfile({arch}) JSON missing u64 field 'wavefront_size'"))?
             as u32;
+        // Optional: absent (older committed rows / for_unprofiled) => None,
+        // i.e. verify_live withholds the VRAM check rather than comparing
+        // against a fabricated value.
+        let vram_mb = v["vram_mb"].as_u64().map(|x| x as u32);
         let mem_latency_ns = v["mem_latency_ns"].as_f64();
         let peak_bw_gbps = v["peak_bw_gbps"].as_f64();
         let intrinsics = v["intrinsics"].clone();
@@ -249,6 +274,7 @@ impl ChipProfile {
             max_waves_per_simd,
             lds_bytes_per_cu,
             wavefront_size,
+            vram_mb,
             mem_latency_ns,
             peak_bw_gbps,
             intrinsics,
@@ -268,6 +294,18 @@ mod tests {
         assert_eq!(profile.wavefront_size, 32, "gfx1201 is wave32-native RDNA4");
         assert_eq!(profile.cu_count, 56, "R9700 gfx1201 = 56 CU");
         assert_eq!(profile.vgprs_per_simd, 1536, "RDNA4 VGPR file per SIMD");
+        assert_eq!(
+            profile.lds_bytes_per_cu, 65536,
+            "64 KiB per CU — matches profiler.rs::arch_spec (the single source \
+             of truth for every RDNA1-4 arch), i.e. what ROCm/HIP reports as the \
+             per-CU LDS partition. NOT 128 KiB (131072): that's the physical LDS \
+             size per WGP, shared by the 2 CUs in the pair, not per-CU."
+        );
+        assert_eq!(
+            profile.vram_mb,
+            Some(32768),
+            "R9700 (Radeon AI PRO, gfx1201 hiptrx fleet card) = 32GB"
+        );
     }
 
     #[test]
@@ -300,6 +338,113 @@ mod tests {
         let msg = result.unwrap_err();
         assert!(
             msg.contains("cu_count"),
+            "error message should name the mismatched field: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_live_fails_loud_on_vram_mismatch() {
+        let profile = ChipProfile::load_committed("gfx1201")
+            .expect("tests/chip-profiles/gfx1201.json must load");
+        // Every static field matches EXCEPT vram — as if the same die were
+        // plugged into a different-VRAM SKU (e.g. RX 9070 XT 16GB card
+        // reporting under a committed row meant for the 32GB R9700).
+        let live = GpuCapability {
+            arch: "gfx1201".to_string(),
+            generation: "RDNA4",
+            cu_count: profile.cu_count,
+            simds_per_cu: 2,
+            max_waves_per_simd: profile.max_waves_per_simd,
+            vgprs_per_simd: profile.vgprs_per_simd,
+            lds_per_cu_bytes: profile.lds_bytes_per_cu,
+            l2_cache_mb: 4.0,
+            infinity_cache_mb: 64.0,
+            peak_bw_gbs: 800.0,
+            boost_clock_mhz: 2900,
+            mem_clock_mhz: 2500,
+            mem_bus_width_bits: 256,
+            vram_mb: 16384,
+        };
+        let result = profile.verify_live(&live);
+        assert!(
+            result.is_err(),
+            "verify_live must fail loud on a vram_mb mismatch, got Ok"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("vram_mb"),
+            "error message should name the mismatched field: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_live_withholds_vram_check_when_committed_row_lacks_it() {
+        // Simulate an older-format committed row (pre-vram_mb field) by
+        // round-tripping through JSON with the key stripped: `from_json`
+        // must leave `vram_mb: None`, and `verify_live` must NOT fail loud
+        // on a live vram_mb it was never told to expect.
+        let mut json = ChipProfile::load_committed("gfx1201")
+            .expect("tests/chip-profiles/gfx1201.json must load")
+            .to_json();
+        json.as_object_mut().unwrap().remove("vram_mb");
+        let profile = ChipProfile::from_json(&json).expect("must parse without vram_mb");
+        assert!(profile.vram_mb.is_none());
+
+        let live = GpuCapability {
+            arch: "gfx1201".to_string(),
+            generation: "RDNA4",
+            cu_count: profile.cu_count,
+            simds_per_cu: 2,
+            max_waves_per_simd: profile.max_waves_per_simd,
+            vgprs_per_simd: profile.vgprs_per_simd,
+            lds_per_cu_bytes: profile.lds_bytes_per_cu,
+            l2_cache_mb: 4.0,
+            infinity_cache_mb: 64.0,
+            peak_bw_gbs: 800.0,
+            boost_clock_mhz: 2900,
+            mem_clock_mhz: 2500,
+            mem_bus_width_bits: 256,
+            vram_mb: 999, // any value — must be ignored, not compared
+        };
+        assert!(
+            profile.verify_live(&live).is_ok(),
+            "verify_live must withhold (not fail) the vram check when the \
+             committed row doesn't carry vram_mb"
+        );
+    }
+
+    #[test]
+    fn verify_live_fails_loud_on_wavefront_mismatch() {
+        let mut profile = ChipProfile::load_committed("gfx1201")
+            .expect("tests/chip-profiles/gfx1201.json must load");
+        // Corrupt only the committed wavefront_size (as if the row were
+        // authored against the wrong arch's wave width) — every other field,
+        // including live.arch, stays gfx1201/wave32-correct.
+        profile.wavefront_size = 64;
+        let live = GpuCapability {
+            arch: "gfx1201".to_string(),
+            generation: "RDNA4",
+            cu_count: profile.cu_count,
+            simds_per_cu: 2,
+            max_waves_per_simd: profile.max_waves_per_simd,
+            vgprs_per_simd: profile.vgprs_per_simd,
+            lds_per_cu_bytes: profile.lds_bytes_per_cu,
+            l2_cache_mb: 4.0,
+            infinity_cache_mb: 64.0,
+            peak_bw_gbs: 800.0,
+            boost_clock_mhz: 2900,
+            mem_clock_mhz: 2500,
+            mem_bus_width_bits: 256,
+            vram_mb: 32768,
+        };
+        let result = profile.verify_live(&live);
+        assert!(
+            result.is_err(),
+            "verify_live must fail loud on a wavefront_size mismatch, got Ok"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("wavefront_size"),
             "error message should name the mismatched field: {msg}"
         );
     }
