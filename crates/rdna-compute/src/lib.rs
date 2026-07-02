@@ -18,6 +18,7 @@ pub mod feature_flags;
 pub mod gemm;
 pub mod gemv;
 pub mod graph;
+pub mod isa_histogram;
 mod kernels;
 pub mod moe;
 pub mod norm;
@@ -25,6 +26,7 @@ pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
+pub mod roofline;
 pub mod sampling;
 pub mod scratch;
 
