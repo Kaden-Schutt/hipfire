@@ -107,10 +107,39 @@ struct FixtureMeasurement {
     roofline: Roofline,
 }
 
+/// Resolve the full shape-keyed [`LedgerKey`] for a fixture. The kernel
+/// symbol name (`path.file_stem()`) is the identity anchor — it's
+/// filesystem-guaranteed unique within the scanned directory, unlike the
+/// ELF-embedded `.kd` symbol `module_collision_scan` checks (which CAN
+/// legitimately collide across distinct files — that's the bug it exists
+/// to catch). When a committed baseline shares that kernel identity, its
+/// `quant`/`workload`/`phase`/`shape_bucket` are the real, curated
+/// serving-context values (not recoverable from raw ISA bytes alone) —
+/// adopt them wholesale so `KernelLedger::find`/`diff` run a genuine
+/// FULL-key match instead of the kernel-name-only shortcut this replaces.
+/// A fixture with no committed baseline (e.g. the deliberate
+/// `collision_probe_*` demo pair) has no known serving-context identity to
+/// recover, so its `quant`/`workload` genuinely are "unknown" — and since
+/// no baseline exists, the diff is skipped for it regardless.
+fn resolve_ledger_key(kernel: &str, arch: &str, ledger: &KernelLedger) -> LedgerKey {
+    if let Some(row) = ledger.rows.iter().find(|r| r.key.kernel == kernel) {
+        return row.key.clone();
+    }
+    LedgerKey {
+        arch: arch.to_string(),
+        kernel: kernel.to_string(),
+        shape_bucket: "decode_gemv".to_string(),
+        quant: "unknown".to_string(),
+        workload: "unknown".to_string(),
+        phase: "decode".to_string(),
+    }
+}
+
 fn measure_fixture(
     path: &Path,
     arch: &str,
     chip: &ChipProfile,
+    ledger: &KernelLedger,
 ) -> Result<FixtureMeasurement, String> {
     let kernel = path
         .file_stem()
@@ -129,15 +158,9 @@ fn measure_fixture(
 
     let roofline = Roofline::analyze(&hist, &kprofile, chip, None);
 
+    let key = resolve_ledger_key(&kernel, arch, ledger);
     let mut row = LedgerRow::from_fixture(
-        LedgerKey {
-            arch: arch.to_string(),
-            kernel: kernel.clone(),
-            shape_bucket: "decode_gemv".to_string(),
-            quant: "unknown".to_string(),
-            workload: "unknown".to_string(),
-            phase: "decode".to_string(),
-        },
+        key,
         &hist,
         &kprofile,
         Reproducer {
@@ -227,7 +250,7 @@ fn main() {
     let mut hard_regressions = 0usize;
     let mut measurements = Vec::new();
     for path in &files {
-        match measure_fixture(path, &args.arch, &chip) {
+        match measure_fixture(path, &args.arch, &chip, &ledger) {
             Ok(m) => measurements.push(m),
             Err(e) => {
                 eprintln!("kernel_perf_instrument: FAIL measuring {path:?}: {e}");
@@ -237,7 +260,11 @@ fn main() {
     }
 
     for m in &measurements {
-        let baseline = ledger.rows.iter().find(|r| r.key.kernel == m.kernel);
+        // Full shape-key match (arch/kernel/quant/workload/phase/shape_bucket)
+        // — `measure_fixture` already adopted the matching committed row's
+        // real key via `resolve_ledger_key`, so this is a genuine
+        // `KernelLedger::find` lookup, not a kernel-name-only shortcut.
+        let baseline = ledger.find(&m.row.key);
         let deltas = match baseline {
             Some(committed) => KernelLedger::diff(committed, &m.row),
             None => Vec::new(),

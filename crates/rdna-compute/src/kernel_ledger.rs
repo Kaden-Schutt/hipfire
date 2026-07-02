@@ -768,6 +768,47 @@ mod tests {
         assert!(gate_up.vgpr > 0);
     }
 
+    /// `find` (and therefore `diff`, which callers should always gate
+    /// behind a `find`) is a FULL `LedgerKey` match — same `kernel` symbol
+    /// but a different `quant`/`workload` must NOT be treated as the same
+    /// baseline. This is the exact hazard a kernel-name-only lookup (the
+    /// bug `kernel_perf_instrument`'s driver had before shape-keying the
+    /// self-check row via `resolve_ledger_key`) would silently paper over.
+    #[test]
+    fn find_does_not_match_same_kernel_with_different_quant() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/kernel-ledger/gfx1201.jsonl");
+        let ledger = KernelLedger::load(&path)
+            .unwrap_or_else(|e| panic!("committed ledger seed must load: {e}"));
+
+        let wrong_quant_key = LedgerKey {
+            arch: "gfx1201".to_string(),
+            kernel: "gemv_hfq4g256_moe_gate_up_indexed_batched".to_string(),
+            shape_bucket: "decode_gemv".to_string(),
+            quant: "mq4".to_string(), // WRONG — committed seed row is "hfq4g256"
+            workload: "moe_gate_up".to_string(),
+            phase: "decode".to_string(),
+        };
+        assert!(
+            ledger.find(&wrong_quant_key).is_none(),
+            "a same-kernel-name row with a different quant must not match — \
+             a kernel-name-only lookup would incorrectly return the hfq4g256 row here"
+        );
+
+        let wrong_workload_key = LedgerKey {
+            workload: "moe_down".to_string(), // WRONG — this kernel's real workload is moe_gate_up
+            ..wrong_quant_key.clone()
+        };
+        let wrong_workload_key = LedgerKey {
+            quant: "hfq4g256".to_string(),
+            ..wrong_workload_key
+        };
+        assert!(
+            ledger.find(&wrong_workload_key).is_none(),
+            "a same-kernel-name row with a different workload must not match"
+        );
+    }
+
     #[test]
     fn module_collision_scan_finds_deliberate_pair() {
         let collisions = module_collision_scan(fixture_dir(), "gfx1201")
