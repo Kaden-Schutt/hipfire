@@ -104,6 +104,89 @@ impl DebtRow {
             DebtRow::Withheld { .. } => None,
         }
     }
+
+    /// Map into `AtlasRow` for committed JSONL — RAW fields ONLY. `phase` is
+    /// the fixed `"bill_of_debt"` tag; `workload_kind = domain`,
+    /// `model_size = model`; `arch`/`kernel`/`debt_kind`/`withheld_reason` go
+    /// through `set_extra`; numeric raw fields through `set_metric_f64`. The
+    /// DERIVED debt magnitude / bound_class / unevenness are NEVER written.
+    pub fn to_atlas_row(&self) -> AtlasRow {
+        let key = self.key();
+        let mut row = AtlasRow::new("bill_of_debt", key.domain.clone());
+        row.model_size = key.model.clone();
+        row.set_extra("arch", Value::String(key.arch.clone()));
+        row.set_extra("kernel", Value::String(key.kernel.clone()));
+        match self {
+            DebtRow::Measured {
+                in_model_walltime_ms,
+                roofline_ms,
+                pct_off_roofline,
+                ..
+            } => {
+                row.set_extra("debt_kind", Value::String("measured".to_string()));
+                row.set_metric_f64("in_model_walltime_ms", *in_model_walltime_ms);
+                row.set_metric_f64("roofline_ms", *roofline_ms);
+                row.set_metric_f64("pct_off_roofline", *pct_off_roofline);
+            }
+            DebtRow::Structural {
+                fallback_penalty_ms,
+                ..
+            } => {
+                row.set_extra("debt_kind", Value::String("structural".to_string()));
+                row.set_metric_f64("fallback_penalty_ms", *fallback_penalty_ms);
+            }
+            DebtRow::Withheld { reason, .. } => {
+                row.set_extra("debt_kind", Value::String("withheld".to_string()));
+                row.set_extra("withheld_reason", Value::String(reason.clone()));
+            }
+        }
+        row
+    }
+
+    /// Inverse of [`Self::to_atlas_row`]. `Err` on any missing/malformed
+    /// required field — a corrupted committed row must fail loud, not
+    /// silently coerce to a default.
+    pub fn from_atlas_row(row: &AtlasRow) -> Result<Self, String> {
+        let key = DebtKey {
+            arch: extra_str(row, "arch")?,
+            model: row.model_size.clone(),
+            kernel: extra_str(row, "kernel")?,
+            domain: row.workload_kind.clone(),
+        };
+        let debt_kind = extra_str(row, "debt_kind")?;
+        match debt_kind.as_str() {
+            "measured" => Ok(DebtRow::Measured {
+                key,
+                in_model_walltime_ms: metric(row, "in_model_walltime_ms")?,
+                roofline_ms: metric(row, "roofline_ms")?,
+                pct_off_roofline: metric(row, "pct_off_roofline")?,
+            }),
+            "structural" => Ok(DebtRow::Structural {
+                key,
+                fallback_penalty_ms: metric(row, "fallback_penalty_ms")?,
+            }),
+            "withheld" => Ok(DebtRow::Withheld {
+                key,
+                reason: extra_str(row, "withheld_reason")?,
+            }),
+            other => Err(format!(
+                "DebtRow::from_atlas_row: unknown debt_kind '{other}'"
+            )),
+        }
+    }
+}
+
+fn extra_str(row: &AtlasRow, key: &str) -> Result<String, String> {
+    row.extra
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("DebtRow::from_atlas_row: missing extra.{key}"))
+}
+
+fn metric(row: &AtlasRow, key: &str) -> Result<f64, String> {
+    row.metric_f64(key)
+        .ok_or_else(|| format!("DebtRow::from_atlas_row: missing metrics.{key}"))
 }
 
 /// A committed corpus of [`DebtRow`]s — the per-arch "bill of debt". Query
@@ -114,6 +197,31 @@ pub struct BillOfDebt {
 }
 
 impl BillOfDebt {
+    /// Load a committed bill-of-debt JSONL. NO GPU — pure file I/O via
+    /// `hipfire_atlas::schema::load_rows`.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
+        let atlas_rows = hipfire_atlas::schema::load_rows(path)?;
+        let rows = atlas_rows
+            .iter()
+            .map(DebtRow::from_atlas_row)
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { rows })
+    }
+
+    /// Emit this bill as JSONL (truncating any existing file), one raw-fields
+    /// row per [`DebtRow`]. NO derived column is ever written.
+    pub fn emit(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        hipfire_atlas::schema::truncate_jsonl(path)
+            .map_err(|e| format!("BillOfDebt::emit: truncate {}: {e}", path.display()))?;
+        for row in &self.rows {
+            row.to_atlas_row()
+                .append_to_jsonl(path)
+                .map_err(|e| format!("BillOfDebt::emit: append {}: {e}", path.display()))?;
+        }
+        Ok(())
+    }
+
     /// Rows ranked by recoverable REAL time (`debt_magnitude_ms`, descending),
     /// excluding withheld rows (no honest magnitude). This ranks by the
     /// actual lever — recoverable wall-time — NOT by roofline efficiency: a
@@ -404,6 +512,45 @@ mod tests {
             report.any_arch_worsened,
             "any per-arch debt growth violates §4d, no band"
         );
+    }
+
+    #[test]
+    fn bill_round_trips_through_jsonl_raw_fields_only() {
+        let bill = BillOfDebt {
+            rows: vec![
+                measured("gfx1100", "k1", "attention", 100.0, 50.0, 90.0),
+                structural("gfx1010", "k2", "moe_gate_up", 42.0),
+                withheld("gfx1201", "k3", "lm_head", "oom"),
+            ],
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "hipfire-bill-of-debt-roundtrip-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        bill.emit(&tmp).expect("emit must succeed");
+
+        // Raw fields only — no DERIVED column may ever be persisted.
+        let raw = std::fs::read_to_string(&tmp).expect("read raw jsonl");
+        for forbidden in [
+            "recoverable",
+            "debt_magnitude",
+            "debt_ms",
+            "bound_class",
+            "unevenness",
+        ] {
+            assert!(
+                !raw.contains(forbidden),
+                "derived field '{forbidden}' must NOT be persisted; found in:\n{raw}"
+            );
+        }
+
+        let loaded = BillOfDebt::load(&tmp).expect("load must succeed");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(loaded.rows.len(), bill.rows.len());
+        for (orig, round) in bill.rows.iter().zip(loaded.rows.iter()) {
+            assert_eq!(orig, round, "every row must round-trip value-for-value");
+        }
     }
 
     #[test]
