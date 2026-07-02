@@ -9,6 +9,7 @@
 
 pub mod context;
 pub mod families;
+pub mod native_manifest;
 pub mod ops;
 pub mod pipeline;
 pub mod resource;

@@ -18,3 +18,8 @@ new-attention = []
 new-moe = []
 from-hip-error = []
 deltanet = ["rdna-compute/deltanet"]
+# Dev/CI-only: NativeManifest::report_fallback panics at report time on any
+# FallbackReason::NativeLost, instead of the release warn+degrade. See
+# crates/hipfire-dispatch/src/native_manifest.rs and
+# docs/superpowers/plans/2026-07-01-gfx1201-phaseA-perf-instrument.md Task 8.
+native_manifest_strict = []

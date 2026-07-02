@@ -636,6 +636,15 @@ pub fn run_moe_decode(
                 gate_up_k,
             ))?;
         } else {
+            // Native-required manifest (Task 8): Dp4aDecodeGemvCoverage.gate_up
+            // is false for every arch in Phase A, so this default MQ4G256
+            // decode-GEMV path is an EXPECTED scalar fallback, not a
+            // regression. Deduped by (family, reason) — cheap per decode step.
+            crate::native_manifest::report_fallback(
+                crate::native_manifest::Family::GateUp,
+                gpu.arch_caps.arch(),
+                crate::native_manifest::FallbackReason::ExpectedInManifest,
+            );
             hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
@@ -787,6 +796,15 @@ pub fn run_moe_decode(
                 1,
             ))?;
         } else {
+            // Native-required manifest (Task 8): Dp4aDecodeGemvCoverage.down
+            // is false for every arch in Phase A, so this default MQ4G256
+            // decode-GEMV path is an EXPECTED scalar fallback, not a
+            // regression. Deduped by (family, reason) — cheap per decode step.
+            crate::native_manifest::report_fallback(
+                crate::native_manifest::Family::Down,
+                gpu.arch_caps.arch(),
+                crate::native_manifest::FallbackReason::ExpectedInManifest,
+            );
             hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
                 p.topk_indices,

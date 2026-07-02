@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
-use std::sync::Arc;
+use crate::resource::ResourceManager;
 use rdna_compute::arch_caps::ArchCaps;
 use rdna_compute::feature_flags::FeatureFlags;
 use rdna_compute::Gpu;
-use crate::resource::ResourceManager;
+use std::sync::Arc;
 
 /// Per-session context resolved once at Gpu::init().
 /// Shared immutably across all dispatch calls.
@@ -23,6 +23,10 @@ impl DispatchCtx {
     pub fn new(gpu: &Gpu) -> Self {
         let flags = Arc::new(FeatureFlags::from_env(&gpu.arch));
         let arch = ArchCaps::new(&gpu.arch, flags.clone());
+        // Native-required manifest (Task 8): computed and logged exactly
+        // once per process via `emit_summary_once`, even though `new` is
+        // called cheaply per-layer — no per-layer log spam.
+        crate::native_manifest::emit_summary_once(&arch);
         Self {
             arch,
             flags,

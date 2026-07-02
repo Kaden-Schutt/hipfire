@@ -304,10 +304,22 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 None if gpu.arch_caps.gemv_dp4a_enabled() => hip!(gpu.fused_qkvza_hfq6g256_dp4a(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
                 )),
-                None => hip!(gpu.gemm_qkvza_hfq6g256(
-                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
-                    1
-                )),
+                None => {
+                    // Native-required manifest (Task 8): every arch's
+                    // Dp4aDecodeGemvCoverage.qkvza is false in Phase A, so
+                    // this scalar decode path is an EXPECTED fallback, not a
+                    // regression. `report_fallback` dedups by
+                    // (family, reason) — safe to call every decode step.
+                    crate::native_manifest::report_fallback(
+                        crate::native_manifest::Family::Qkvza,
+                        gpu.arch_caps.arch(),
+                        crate::native_manifest::FallbackReason::ExpectedInManifest,
+                    );
+                    hip!(gpu.gemm_qkvza_hfq6g256(
+                        wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha,
+                        k, 1
+                    ))
+                }
             }
         }
         // ── Q8_0 fused QKVZA ──
