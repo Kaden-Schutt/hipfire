@@ -7950,43 +7950,58 @@ pub fn spec_step_dflash(
     {
         let replay_tokens = &committed[..accept_len + 1];
         let serial_frame_start = gpu.debug_gdn_requant_frame();
-        let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, replay_tokens.len())?;
-        for (i, &tok) in replay_tokens.iter().enumerate() {
-            qwen35::forward_scratch_capture_gdn_tape(
+        // Free the top-level rollback scratch (serial_tape / serial_result /
+        // production_result) on EVERY path. `free_gpu` takes `self`, and the
+        // diagnostic-heavy body below has many `?` sites; any GPU error (which
+        // fires during a wedge cascade) would otherwise leak them. Hoist to
+        // Option, run the fallible body in a closure, free after. (The nested
+        // compare scratch is env-gated off by default and not covered here.)
+        let mut serial_tape: Option<GdnTape> = None;
+        let mut serial_result: Option<DeltaNetSnapshot> = None;
+        let mut production_result: Option<DeltaNetSnapshot> = None;
+        let serial_tape_rollback: HipResult<()> = (|| {
+            let serial_tape = serial_tape.insert(GdnTape::new_for_config(
                 gpu,
-                &target.weights,
                 &target.config,
-                tok,
-                position + i,
-                &mut target.kv_cache,
-                &mut target.dn_state,
-                &target.scratch,
-                &mut serial_tape,
-                i,
-            )?;
-        }
-        let mut serial_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
-        serial_result.save_from(&target.dn_state, gpu)?;
-        let serial_frame_end = gpu.debug_gdn_requant_frame();
-        target_snap.restore_to(&mut target.dn_state, gpu)?;
-        gpu.debug_set_gdn_requant_frame(serial_frame_start);
-        let serial_tape_attn_out_diff = serial_tape
-            .replay_gdn_fused_gate_conv_token_major_for_compare(
-                gpu,
-                &target.weights,
-                &target.config,
-                &mut target.dn_state,
                 replay_tokens.len(),
-            )?;
-        let serial_tape_replay_frame_end = gpu.debug_gdn_requant_frame();
-        gpu.debug_set_gdn_requant_frame(serial_frame_end);
-        match serial_tape_attn_out_diff {
+            )?);
+            for (i, &tok) in replay_tokens.iter().enumerate() {
+                qwen35::forward_scratch_capture_gdn_tape(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    tok,
+                    position + i,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    &mut *serial_tape,
+                    i,
+                )?;
+            }
+            let serial_result =
+                serial_result.insert(DeltaNetSnapshot::new_for(gpu, &target.dn_state)?);
+            serial_result.save_from(&target.dn_state, gpu)?;
+            let serial_frame_end = gpu.debug_gdn_requant_frame();
+            target_snap.restore_to(&mut target.dn_state, gpu)?;
+            gpu.debug_set_gdn_requant_frame(serial_frame_start);
+            let serial_tape_attn_out_diff = serial_tape
+                .replay_gdn_fused_gate_conv_token_major_for_compare(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    replay_tokens.len(),
+                )?;
+            let serial_tape_replay_frame_end = gpu.debug_gdn_requant_frame();
+            gpu.debug_set_gdn_requant_frame(serial_frame_end);
+            match serial_tape_attn_out_diff {
             Some((step, diff)) => {
                 let context = format!(
                     "{}{}",
-                    rollback_input_diff_context(&target.config, &serial_tape, &diff, position),
+                    rollback_input_diff_context(&target.config, &*serial_tape, &diff, position),
                     rollback_frame_order_context(
-                        &serial_tape,
+                        &*serial_tape,
                         &diff,
                         serial_frame_start,
                         replay_tokens.len(),
@@ -8015,7 +8030,7 @@ pub fn spec_step_dflash(
                 replay_tokens.len(),
             ),
         }
-        eprintln!(
+            eprintln!(
             "[dflash-rollback-fast-token-major-serial-tape-frame-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 serial_start={} serial_end={} replay_end={}",
             position,
             accept_len,
@@ -8024,9 +8039,10 @@ pub fn spec_step_dflash(
             serial_frame_end,
             serial_tape_replay_frame_end,
         );
-        let mut production_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
-        production_result.save_from(&target.dn_state, gpu)?;
-        match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
+            let production_result =
+                production_result.insert(DeltaNetSnapshot::new_for(gpu, &target.dn_state)?);
+            production_result.save_from(&target.dn_state, gpu)?;
+            match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &*serial_result)? {
             Some(diff) => {
                 let context = rollback_snapshot_diff_context(&diff);
                 eprintln!(
@@ -8051,11 +8067,11 @@ pub fn spec_step_dflash(
                 replay_tokens.len(),
             ),
         }
-        if let Some(tape) = gdn_tape_opt.as_deref() {
-            if dflash_compare_rollback_replay_from_env()
-                && (trace_position.is_none() || trace_this_position)
-            {
-                match serial_tape.compare_captured_inputs_to(gpu, tape, replay_tokens.len())? {
+            if let Some(tape) = gdn_tape_opt.as_deref() {
+                if dflash_compare_rollback_replay_from_env()
+                    && (trace_position.is_none() || trace_this_position)
+                {
+                    match serial_tape.compare_captured_inputs_to(gpu, tape, replay_tokens.len())? {
                     Some(diff) => {
                         let context = format!(
                             "{}{}",
@@ -8089,7 +8105,7 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                match serial_tape.compare_x_inputs_to(gpu, tape, replay_tokens.len())? {
+                    match serial_tape.compare_x_inputs_to(gpu, tape, replay_tokens.len())? {
                     Some(diff) => {
                         let context =
                             rollback_input_diff_context(&target.config, tape, &diff, position);
@@ -8115,7 +8131,7 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                match serial_tape.compare_hidden_boundaries_to(gpu, tape, replay_tokens.len())? {
+                    match serial_tape.compare_hidden_boundaries_to(gpu, tape, replay_tokens.len())? {
                     Some(diff) => {
                         let context = format!(
                             "{}{}",
@@ -8149,7 +8165,7 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                match serial_tape.compare_wo_projection_deltas_to(gpu, tape, replay_tokens.len())? {
+                    match serial_tape.compare_wo_projection_deltas_to(gpu, tape, replay_tokens.len())? {
                     Some(diff) => {
                         let context = format!(
                             "{}{}",
@@ -8183,13 +8199,13 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                let (qkvza_layer, qkvza_route_compare) = serial_tape
-                    .compare_first_batched_qkvza_from_captured_x_to_serial(
-                        gpu,
-                        &target.weights,
-                        replay_tokens.len(),
-                    )?;
-                match qkvza_route_compare {
+                    let (qkvza_layer, qkvza_route_compare) = serial_tape
+                        .compare_first_batched_qkvza_from_captured_x_to_serial(
+                            gpu,
+                            &target.weights,
+                            replay_tokens.len(),
+                        )?;
+                    match qkvza_route_compare {
                     QkvzaRouteCompare::Mismatch(diff) => {
                         let context = rollback_input_diff_context(
                             &target.config,
@@ -8229,7 +8245,7 @@ pub fn spec_step_dflash(
                         reason,
                     ),
                 }
-                match serial_tape.compare_gdn_inputs_layer_to(gpu, tape, 0, replay_tokens.len())? {
+                    match serial_tape.compare_gdn_inputs_layer_to(gpu, tape, 0, replay_tokens.len())? {
                     Some(diff) => {
                         let context = format!(
                             "{}{}",
@@ -8263,7 +8279,7 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                match serial_tape.compare_gdn_inputs_to(gpu, tape, replay_tokens.len())? {
+                    match serial_tape.compare_gdn_inputs_to(gpu, tape, replay_tokens.len())? {
                     Some(diff) => {
                         let context = format!(
                             "{}{}",
@@ -8298,18 +8314,18 @@ pub fn spec_step_dflash(
                     ),
                 }
 
-                target_snap.restore_to(&mut target.dn_state, gpu)?;
-                gpu.debug_set_gdn_requant_frame(serial_frame_start);
-                let fast_token_major_attn_out_diff = tape
-                    .replay_gdn_fused_gate_conv_token_major_for_compare(
-                        gpu,
-                        &target.weights,
-                        &target.config,
-                        &mut target.dn_state,
-                        replay_tokens.len(),
-                    )?;
-                let fast_token_major_frame_end = gpu.debug_gdn_requant_frame();
-                eprintln!(
+                    target_snap.restore_to(&mut target.dn_state, gpu)?;
+                    gpu.debug_set_gdn_requant_frame(serial_frame_start);
+                    let fast_token_major_attn_out_diff = tape
+                        .replay_gdn_fused_gate_conv_token_major_for_compare(
+                            gpu,
+                            &target.weights,
+                            &target.config,
+                            &mut target.dn_state,
+                            replay_tokens.len(),
+                        )?;
+                    let fast_token_major_frame_end = gpu.debug_gdn_requant_frame();
+                    eprintln!(
                     "[dflash-rollback-fast-token-major-frame-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 serial_start={} serial_end={} replay_end={}",
                     position,
                     accept_len,
@@ -8318,8 +8334,8 @@ pub fn spec_step_dflash(
                     serial_frame_end,
                     fast_token_major_frame_end,
                 );
-                gpu.debug_set_gdn_requant_frame(serial_frame_end);
-                match fast_token_major_attn_out_diff {
+                    gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                    match fast_token_major_attn_out_diff {
                     Some((step, diff)) => {
                         let context = format!(
                             "{}{}",
@@ -8354,10 +8370,14 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
-                    Some(diff) => {
-                        let context = rollback_snapshot_diff_context(&diff);
-                        eprintln!(
+                    match compare_delta_net_state_to_snapshot(
+                        gpu,
+                        &target.dn_state,
+                        &*serial_result,
+                    )? {
+                        Some(diff) => {
+                            let context = rollback_snapshot_diff_context(&diff);
+                            eprintln!(
                             "[dflash-rollback-fast-token-major-serial-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} fast_token_major_byte={}{}",
                             position,
                             accept_len,
@@ -8371,7 +8391,7 @@ pub fn spec_step_dflash(
                             diff.actual_byte,
                             context,
                         );
-                        eprintln!(
+                            eprintln!(
                             "[dflash-rollback-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}{}",
                             position,
                             accept_len,
@@ -8385,23 +8405,23 @@ pub fn spec_step_dflash(
                             diff.actual_byte,
                             context,
                         );
-                    }
-                    None => {
-                        eprintln!(
+                        }
+                        None => {
+                            eprintln!(
                             "[dflash-rollback-fast-token-major-serial-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 match",
                             position,
                             accept_len,
                             replay_tokens.len(),
                         );
-                        eprintln!(
+                            eprintln!(
                             "[dflash-rollback-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 match",
                             position,
                             accept_len,
                             replay_tokens.len(),
                         );
+                        }
                     }
-                }
-                match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &production_result)?
+                    match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &production_result)?
                 {
                     Some(diff) => {
                         let context = rollback_snapshot_diff_context(&diff);
@@ -8427,21 +8447,21 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                let mut fast_replay_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
-                fast_replay_result.save_from(&target.dn_state, gpu)?;
-                target_snap.restore_to(&mut target.dn_state, gpu)?;
-                gpu.debug_set_gdn_requant_frame(serial_frame_start);
-                let layer_major_attn_out_diff = tape
-                    .replay_gdn_fused_gate_conv_token_major_layer_major_frames_for_compare(
-                        gpu,
-                        &target.weights,
-                        &target.config,
-                        &mut target.dn_state,
-                        replay_tokens.len(),
-                        serial_frame_start,
-                    )?;
-                let layer_major_frame_end = gpu.debug_gdn_requant_frame();
-                eprintln!(
+                    let mut fast_replay_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
+                    fast_replay_result.save_from(&target.dn_state, gpu)?;
+                    target_snap.restore_to(&mut target.dn_state, gpu)?;
+                    gpu.debug_set_gdn_requant_frame(serial_frame_start);
+                    let layer_major_attn_out_diff = tape
+                        .replay_gdn_fused_gate_conv_token_major_layer_major_frames_for_compare(
+                            gpu,
+                            &target.weights,
+                            &target.config,
+                            &mut target.dn_state,
+                            replay_tokens.len(),
+                            serial_frame_start,
+                        )?;
+                    let layer_major_frame_end = gpu.debug_gdn_requant_frame();
+                    eprintln!(
                     "[dflash-rollback-fast-token-major-layer-major-frame-compare] pos={} accepted={} replay_steps={} serial_start={} serial_end={} replay_end={}",
                     position,
                     accept_len,
@@ -8450,8 +8470,8 @@ pub fn spec_step_dflash(
                     serial_frame_end,
                     layer_major_frame_end,
                 );
-                gpu.debug_set_gdn_requant_frame(serial_frame_end);
-                match layer_major_attn_out_diff {
+                    gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                    match layer_major_attn_out_diff {
                     Some((step, diff)) => {
                         let context = format!(
                             "{}{}",
@@ -8486,7 +8506,7 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
+                    match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &*serial_result)? {
                     Some(diff) => {
                         let context = rollback_snapshot_diff_context(&diff);
                         eprintln!(
@@ -8511,92 +8531,93 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                let serial_accepted_kv_rows = KvCacheRowsSnapshot::new_for(
-                    gpu,
-                    &target.kv_cache,
-                    position,
-                    replay_tokens.len(),
-                )?;
-                let logit_compare_steps = dflash_rollback_logit_compare_steps_from_env();
-                let bonus_position = position + accept_len + 1;
-                let kv_rows = KvCacheRowsSnapshot::new_for(
-                    gpu,
-                    &target.kv_cache,
-                    bonus_position,
-                    logit_compare_steps,
-                )?;
-                let mut serial_logit_rows = Vec::with_capacity(logit_compare_steps);
-                let mut compare_token = bonus_token;
-                serial_result.restore_to(&mut target.dn_state, gpu)?;
-                serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
-                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
-                gpu.debug_set_gdn_requant_frame(serial_frame_end);
-                for step in 0..logit_compare_steps {
-                    let step_position = bonus_position + step;
-                    qwen35::forward_scratch(
+                    let serial_accepted_kv_rows = KvCacheRowsSnapshot::new_for(
                         gpu,
-                        &target.weights,
-                        &target.config,
-                        compare_token,
-                        step_position,
-                        &mut target.kv_cache,
-                        &mut target.dn_state,
-                        &target.scratch,
+                        &target.kv_cache,
+                        position,
+                        replay_tokens.len(),
                     )?;
-                    let serial_logits = gpu.download_f32(&target.scratch.logits)?;
-                    let (
-                        serial_argmax,
-                        serial_argmax_logit,
-                        serial_runner_up_logit,
-                        serial_argmax_margin,
-                    ) = argmax_u32_with_margin(&serial_logits);
-                    serial_logit_rows.push((
-                        compare_token,
-                        step_position,
-                        serial_argmax,
-                        serial_argmax_logit,
-                        serial_runner_up_logit,
-                        serial_argmax_margin,
-                        serial_logits,
-                    ));
-                    compare_token = serial_argmax;
-                }
+                    let logit_compare_steps = dflash_rollback_logit_compare_steps_from_env();
+                    let bonus_position = position + accept_len + 1;
+                    let kv_rows = KvCacheRowsSnapshot::new_for(
+                        gpu,
+                        &target.kv_cache,
+                        bonus_position,
+                        logit_compare_steps,
+                    )?;
+                    let mut serial_logit_rows = Vec::with_capacity(logit_compare_steps);
+                    let mut compare_token = bonus_token;
+                    serial_result.restore_to(&mut target.dn_state, gpu)?;
+                    serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                    kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                    gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                    for step in 0..logit_compare_steps {
+                        let step_position = bonus_position + step;
+                        qwen35::forward_scratch(
+                            gpu,
+                            &target.weights,
+                            &target.config,
+                            compare_token,
+                            step_position,
+                            &mut target.kv_cache,
+                            &mut target.dn_state,
+                            &target.scratch,
+                        )?;
+                        let serial_logits = gpu.download_f32(&target.scratch.logits)?;
+                        let (
+                            serial_argmax,
+                            serial_argmax_logit,
+                            serial_runner_up_logit,
+                            serial_argmax_margin,
+                        ) = argmax_u32_with_margin(&serial_logits);
+                        serial_logit_rows.push((
+                            compare_token,
+                            step_position,
+                            serial_argmax,
+                            serial_argmax_logit,
+                            serial_runner_up_logit,
+                            serial_argmax_margin,
+                            serial_logits,
+                        ));
+                        compare_token = serial_argmax;
+                    }
 
-                fast_replay_result.restore_to(&mut target.dn_state, gpu)?;
-                serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
-                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
-                gpu.debug_set_gdn_requant_frame(serial_frame_end);
-                for (
-                    step,
-                    (
-                        step_token,
-                        step_position,
-                        serial_argmax,
-                        serial_argmax_logit,
-                        serial_runner_up_logit,
-                        serial_argmax_margin,
-                        serial_logits,
-                    ),
-                ) in serial_logit_rows.iter().enumerate()
-                {
-                    qwen35::forward_scratch(
-                        gpu,
-                        &target.weights,
-                        &target.config,
-                        *step_token,
-                        *step_position,
-                        &mut target.kv_cache,
-                        &mut target.dn_state,
-                        &target.scratch,
-                    )?;
-                    let fast_logits = gpu.download_f32(&target.scratch.logits)?;
-                    let logit_stats = logit_diff_stats(&fast_logits, serial_logits);
-                    let fast_argmax = argmax_u32(&fast_logits);
-                    let token_idx = *step_token as usize;
-                    let serial_token_logit =
-                        serial_logits.get(token_idx).copied().unwrap_or(f32::NAN);
-                    let fast_token_logit = fast_logits.get(token_idx).copied().unwrap_or(f32::NAN);
-                    eprintln!(
+                    fast_replay_result.restore_to(&mut target.dn_state, gpu)?;
+                    serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                    kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                    gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                    for (
+                        step,
+                        (
+                            step_token,
+                            step_position,
+                            serial_argmax,
+                            serial_argmax_logit,
+                            serial_runner_up_logit,
+                            serial_argmax_margin,
+                            serial_logits,
+                        ),
+                    ) in serial_logit_rows.iter().enumerate()
+                    {
+                        qwen35::forward_scratch(
+                            gpu,
+                            &target.weights,
+                            &target.config,
+                            *step_token,
+                            *step_position,
+                            &mut target.kv_cache,
+                            &mut target.dn_state,
+                            &target.scratch,
+                        )?;
+                        let fast_logits = gpu.download_f32(&target.scratch.logits)?;
+                        let logit_stats = logit_diff_stats(&fast_logits, serial_logits);
+                        let fast_argmax = argmax_u32(&fast_logits);
+                        let token_idx = *step_token as usize;
+                        let serial_token_logit =
+                            serial_logits.get(token_idx).copied().unwrap_or(f32::NAN);
+                        let fast_token_logit =
+                            fast_logits.get(token_idx).copied().unwrap_or(f32::NAN);
+                        eprintln!(
                         "[dflash-rollback-next-logit-compare] pos={} step={} compare_steps={} token_pos={} token={} serial_argmax={} fast_argmax={} serial_token_logit={:.8e} fast_token_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e} serial_argmax_logit={:.8e} serial_runner_up_logit={:.8e} serial_argmax_margin={:.8e}",
                         position,
                         step,
@@ -8616,19 +8637,31 @@ pub fn spec_step_dflash(
                         serial_runner_up_logit,
                         serial_argmax_margin,
                     );
+                    }
+                    fast_replay_result.free_gpu(gpu);
+                    serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                    kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                    serial_accepted_kv_rows.free_gpu(gpu);
+                    kv_rows.free_gpu(gpu);
+                    gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                    production_result.restore_to(&mut target.dn_state, gpu)?;
                 }
-                fast_replay_result.free_gpu(gpu);
-                serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
-                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
-                serial_accepted_kv_rows.free_gpu(gpu);
-                kv_rows.free_gpu(gpu);
-                gpu.debug_set_gdn_requant_frame(serial_frame_end);
-                production_result.restore_to(&mut target.dn_state, gpu)?;
             }
+            Ok(())
+        })();
+        // Free whatever the closure managed to allocate (Some only for the
+        // objects that were reached before any error), on both the Ok and Err
+        // paths, then propagate the error.
+        if let Some(t) = serial_tape {
+            t.free_gpu(gpu);
         }
-        serial_tape.free_gpu(gpu);
-        serial_result.free_gpu(gpu);
-        production_result.free_gpu(gpu);
+        if let Some(s) = serial_result {
+            s.free_gpu(gpu);
+        }
+        if let Some(p) = production_result {
+            p.free_gpu(gpu);
+        }
+        serial_tape_rollback?;
         SpecRollbackReplayKind::SerialTape
     } else if force_serial_rollback {
         let serial_frame_start = gpu.debug_gdn_requant_frame();

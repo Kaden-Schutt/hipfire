@@ -16,7 +16,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `CARGO_FEATURE_NPU_KERNELS` | Runtime variable controlling cargo feature npu kernels in hipfire | `crates/hipfire-arch-qwen35/build.rs:29` |
 | `CARGO_MANIFEST_DIR` | CARGO_MANIFEST_DIR = <workspace>/crates/hipfire-arch-qwen35 | `crates/hipfire-arch-qwen35/build.rs:591` |
 | `CARGO_PKG_VERSION` | Defaults to unknown when unset | `crates/hipfire-build-info/build.rs:24` |
-| `DDTREE_TIMING` | pre_verify / verify. The draft and top-K are fused into one GPU- | `crates/hipfire-arch-qwen35/src/speculative.rs:11133` |
+| `DDTREE_TIMING` | pre_verify / verify. The draft and top-K are fused into one GPU- | `crates/hipfire-arch-qwen35/src/speculative.rs:11166` |
 | `DEBUG_LAYERS` | Runtime variable controlling debug layers in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:8784` |
 | `DFLASH_LIVE_TAU` | Runtime variable controlling dflash live tau in hipfire | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:1514` |
 | `FP32_STATE` | Runtime variable controlling fp32 state in hipfire | `crates/hipfire-runtime/examples/infer_qwen35.rs:205` |
@@ -57,15 +57,15 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:1125` |
 | `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1444` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `crates/hipfire-serving-core/src/load.rs:3207` |
-| `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:11360` |
+| `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:11393` |
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:2519` |
-| `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `crates/hipfire-arch-qwen35/src/speculative.rs:11399` |
+| `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `crates/hipfire-arch-qwen35/src/speculative.rs:11432` |
 | `HIPFIRE_DDTREE_PATH_C` | Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The | `crates/hipfire-serving-core/src/generate.rs:843` |
-| `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:11924` |
+| `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:11957` |
 | `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` | Runtime variable controlling DDTree path c verify graph in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:203` |
-| `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:11379` |
+| `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:11412` |
 | `HIPFIRE_DDTREE_TOPK` | Runtime variable controlling DDTree topk in hipfire | `crates/hipfire-serving-core/src/load.rs:3279` |
-| `HIPFIRE_DDTREE_TREE_LA` | Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected | `crates/hipfire-arch-qwen35/src/speculative.rs:11241` |
+| `HIPFIRE_DDTREE_TREE_LA` | Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected | `crates/hipfire-arch-qwen35/src/speculative.rs:11274` |
 | `HIPFIRE_DEBUG_CHAT` | Enabled when set to 1 | `crates/hipfire-server/src/routes/chat.rs:112` |
 | `HIPFIRE_DEBUG_PREFILL_ELIGIBLE` | Environment toggle value controls runtime behavior | `crates/hipfire-arch-qwen35/src/qwen35.rs:13929` |
 | `HIPFIRE_DEBUG_PREFIX_BOUNDARIES` | Runtime variable controlling debug prefix boundaries in hipfire | `crates/hipfire-serving-core/src/qwen35_prefill.rs:639` |
@@ -135,13 +135,13 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` | Runtime variable controlling dflash moe verify graph lmhead in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:6494` |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | Enabled when set to 1 | `crates/hipfire-server/src/routes/chat.rs:181` |
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | Selects behavior from recognized values | `crates/hipfire-arch-qwen35/src/speculative.rs:114` |
-| `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_COMPARE" | `crates/hipfire-arch-qwen35/src/speculative.rs:12454` |
+| `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_COMPARE" | `crates/hipfire-arch-qwen35/src/speculative.rs:12487` |
 | `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` | Runtime variable controlling dflash rollback fa raw atol in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:1090` |
-| `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS" | `crates/hipfire-arch-qwen35/src/speculative.rs:12478` |
-| `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY" | `crates/hipfire-arch-qwen35/src/speculative.rs:12382` |
-| `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY" | `crates/hipfire-arch-qwen35/src/speculative.rs:12350` |
-| `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE" | `crates/hipfire-arch-qwen35/src/speculative.rs:12430` |
-| `HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES" | `crates/hipfire-arch-qwen35/src/speculative.rs:12406` |
+| `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS" | `crates/hipfire-arch-qwen35/src/speculative.rs:12511` |
+| `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY" | `crates/hipfire-arch-qwen35/src/speculative.rs:12415` |
+| `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY" | `crates/hipfire-arch-qwen35/src/speculative.rs:12383` |
+| `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE" | `crates/hipfire-arch-qwen35/src/speculative.rs:12463` |
+| `HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES" | `crates/hipfire-arch-qwen35/src/speculative.rs:12439` |
 | `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` | Parses "HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL" with fallback defaults | `crates/hipfire-arch-qwen35/src/speculative.rs:1098` |
 | `HIPFIRE_DFLASH_SEED_ORACLE` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:7763` |
 | `HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE` | Runtime variable controlling dflash serial qKVza self compare in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:14369` |
