@@ -222,6 +222,103 @@ impl ArchPmcCensus {
     pub fn only_accumulators_revived(&self) -> bool {
         self.accumulators_alive() && !self.derived_revived()
     }
+
+    /// Serialize to the committed on-disk form: **raw counts + capture context
+    /// only**. The `CounterKind`, `nonzero_fraction`, and revival verdicts are
+    /// deliberately NOT written — they are re-derived on load (data-not-tags),
+    /// so a future threshold or classification change re-derives cleanly rather
+    /// than reading a stale baked-in tag.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut counters = serde_json::Map::new();
+        for (name, c) in &self.counters {
+            counters.insert(
+                name.clone(),
+                serde_json::json!({
+                    "rows": c.rows,
+                    "nonzero_rows": c.nonzero_rows,
+                    "value_sum": c.value_sum,
+                }),
+            );
+        }
+        serde_json::json!({
+            "arch": self.arch,
+            "perf_level": self.perf_level,
+            "min_nonzero_fraction": self.min_nonzero_fraction,
+            "counters": serde_json::Value::Object(counters),
+        })
+    }
+
+    /// Parse the committed on-disk form. **Fail-loud** on any missing/malformed
+    /// field — never silently default a raw count. Verdicts are re-derived from
+    /// the loaded raw counts, never read from disk.
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        let arch = v["arch"]
+            .as_str()
+            .ok_or_else(|| "PMC census JSON missing string field 'arch'".to_string())?
+            .to_string();
+        let perf_level = v["perf_level"]
+            .as_str()
+            .ok_or_else(|| "PMC census JSON missing string field 'perf_level'".to_string())?
+            .to_string();
+        let min_nonzero_fraction = v["min_nonzero_fraction"].as_f64().ok_or_else(|| {
+            "PMC census JSON missing number field 'min_nonzero_fraction'".to_string()
+        })?;
+        let counters_obj = v["counters"]
+            .as_object()
+            .ok_or_else(|| "PMC census JSON missing object field 'counters'".to_string())?;
+
+        let mut counters = BTreeMap::new();
+        for (name, cv) in counters_obj {
+            let rows = cv["rows"].as_u64().ok_or_else(|| {
+                format!("PMC census counter '{name}' missing integer field 'rows'")
+            })?;
+            let nonzero_rows = cv["nonzero_rows"].as_u64().ok_or_else(|| {
+                format!("PMC census counter '{name}' missing integer field 'nonzero_rows'")
+            })?;
+            let value_sum = cv["value_sum"].as_f64().ok_or_else(|| {
+                format!("PMC census counter '{name}' missing number field 'value_sum'")
+            })?;
+            counters.insert(
+                name.clone(),
+                CounterCounts {
+                    rows,
+                    nonzero_rows,
+                    value_sum,
+                },
+            );
+        }
+
+        Ok(ArchPmcCensus {
+            arch,
+            perf_level,
+            min_nonzero_fraction,
+            counters,
+        })
+    }
+
+    /// Relative path (from the workspace root) of the committed census JSON for
+    /// `arch`, mirroring `chip_profile::ChipProfile::committed_path`.
+    pub fn committed_path(arch: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/pmc-census")
+            .join(format!("{arch}.json"))
+    }
+
+    /// Load a census from a JSON file (fail-loud on read/parse/schema error).
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("ArchPmcCensus::load: failed to read {path:?}: {e}"))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("ArchPmcCensus::load: invalid JSON in {path:?}: {e}"))?;
+        Self::from_json(&value)
+    }
+
+    /// Load the committed reference census for `arch` from
+    /// `tests/pmc-census/<arch>.json`.
+    pub fn load_committed(arch: &str) -> Result<Self, String> {
+        Self::load(Self::committed_path(arch))
+    }
 }
 
 /// Parse a rocprofv3 `--pmc` counter-collection CSV into a per-arch census.
@@ -466,6 +563,71 @@ k,Wavefronts,64
         );
         // Raw accumulators are governor-independent — still a working control.
         assert!(c.accumulators_alive());
+    }
+
+    #[test]
+    fn census_json_is_raw_counts_only_and_round_trips() {
+        let c = census_from_counter_csv_text("gfx1201", REQUIRED_PERF_LEVEL, 0.5, CSV_ALL_REVIVED)
+            .unwrap();
+        let json = c.to_json();
+        let text = serde_json::to_string_pretty(&json).unwrap();
+
+        // data-not-tags: the DERIVED verdict fields must NOT be on disk.
+        assert!(
+            !text.contains("revived"),
+            "revival is derived at load, never persisted:\n{text}"
+        );
+        assert!(
+            !text.contains("\"kind\""),
+            "counter kind is derived at load, never persisted:\n{text}"
+        );
+        // The per-counter DERIVED fraction verdict must NOT be persisted. Note
+        // `min_nonzero_fraction` (the THRESHOLD / capture context) IS persisted;
+        // match the quoted verdict field name so we don't false-positive on it.
+        assert!(
+            !text.contains("\"nonzero_fraction\""),
+            "per-counter fraction is derived at load, never persisted:\n{text}"
+        );
+        assert!(
+            !text.contains("\"alive\""),
+            "revival flag is derived at load, never persisted:\n{text}"
+        );
+        // Raw counts + capture context ARE on disk.
+        assert!(text.contains("\"rows\""));
+        assert!(text.contains("\"nonzero_rows\""));
+        assert!(text.contains("\"value_sum\""));
+        assert!(text.contains("\"min_nonzero_fraction\""));
+        assert!(text.contains("profile_standard"));
+
+        // Round-trips byte-for-byte back to the same census, and verdicts
+        // re-derive identically.
+        let back = ArchPmcCensus::from_json(&json).expect("from_json ok");
+        assert_eq!(back, c);
+        assert!(back.derived_revived());
+    }
+
+    #[test]
+    fn from_json_fails_loud_on_missing_field() {
+        let c = census_from_counter_csv_text("gfx1201", REQUIRED_PERF_LEVEL, 0.5, CSV_ALL_REVIVED)
+            .unwrap();
+        // Drop a required top-level field.
+        let mut v = c.to_json();
+        v.as_object_mut().unwrap().remove("perf_level");
+        assert!(
+            ArchPmcCensus::from_json(&v).is_err(),
+            "missing perf_level must fail loud, not default"
+        );
+
+        // Drop a required per-counter field.
+        let mut v2 = c.to_json();
+        v2["counters"]["FetchSize"]
+            .as_object_mut()
+            .unwrap()
+            .remove("nonzero_rows");
+        assert!(
+            ArchPmcCensus::from_json(&v2).is_err(),
+            "missing per-counter nonzero_rows must fail loud"
+        );
     }
 
     #[test]
