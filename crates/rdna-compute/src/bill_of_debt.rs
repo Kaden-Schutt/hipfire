@@ -402,7 +402,11 @@ mod tests {
             ],
         };
         let ranked = bill.ranked_by_lever();
-        assert_eq!(ranked.len(), 2, "withheld rows must be excluded from ranking");
+        assert_eq!(
+            ranked.len(),
+            2,
+            "withheld rows must be excluded from ranking"
+        );
         assert_eq!(
             ranked[0].key().kernel,
             "real_lever",
@@ -474,10 +478,18 @@ mod tests {
         }; // -20 -> improvement
         let report = BillOfDebt::no_arch_clobber_delta(&baseline, &candidate);
         assert!(report.any_arch_worsened);
-        let g1010 = report.per_arch.iter().find(|d| d.arch == "gfx1010").unwrap();
+        let g1010 = report
+            .per_arch
+            .iter()
+            .find(|d| d.arch == "gfx1010")
+            .unwrap();
         assert_eq!(g1010.delta_ms, 50.0);
         assert!(g1010.worsened);
-        let g1100 = report.per_arch.iter().find(|d| d.arch == "gfx1100").unwrap();
+        let g1100 = report
+            .per_arch
+            .iter()
+            .find(|d| d.arch == "gfx1100")
+            .unwrap();
         assert_eq!(g1100.delta_ms, -20.0);
         assert!(!g1100.worsened);
     }
