@@ -171,6 +171,65 @@ impl BillOfDebt {
         }
         (max - min) / mean
     }
+
+    /// No-arch-clobber delta (spec §4d): per-arch debt delta (candidate -
+    /// baseline). §4d requires candidate debt <= baseline for EVERY arch, so an
+    /// arch is *worsened* whenever its debt rises by more than DEBT_EPS_MS —
+    /// there is NO tolerated percentage band. The CI invariant Phase-2 enforces
+    /// is `any_arch_worsened == false`.
+    pub fn no_arch_clobber_delta(baseline: &BillOfDebt, candidate: &BillOfDebt) -> ClobberReport {
+        let base_totals = baseline.per_arch_total_debt();
+        let cand_totals = candidate.per_arch_total_debt();
+        let mut arches: Vec<String> = base_totals
+            .keys()
+            .chain(cand_totals.keys())
+            .cloned()
+            .collect();
+        arches.sort();
+        arches.dedup();
+        let mut per_arch = Vec::new();
+        let mut any_arch_worsened = false;
+        for arch in arches {
+            let b = base_totals.get(&arch).copied().unwrap_or(0.0);
+            let c = cand_totals.get(&arch).copied().unwrap_or(0.0);
+            let delta_ms = c - b;
+            let worsened = delta_ms > DEBT_EPS_MS; // any real growth is a clobber (§4d)
+            if worsened {
+                any_arch_worsened = true;
+            }
+            per_arch.push(ArchDebtDelta {
+                arch,
+                baseline_debt_ms: b,
+                candidate_debt_ms: c,
+                delta_ms,
+                worsened,
+            });
+        }
+        ClobberReport {
+            per_arch,
+            any_arch_worsened,
+        }
+    }
+}
+
+/// One arch's baseline→candidate recoverable-debt delta.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchDebtDelta {
+    pub arch: String,
+    pub baseline_debt_ms: f64,
+    pub candidate_debt_ms: f64,
+    pub delta_ms: f64,
+    /// `true` iff the candidate's debt for this arch grew beyond
+    /// `DEBT_EPS_MS` — a §4d clobber (no tolerated percentage band).
+    pub worsened: bool,
+}
+
+/// The result of a no-arch-clobber check. `any_arch_worsened == false` is the
+/// CI invariant a candidate must hold to land (spec §4d).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClobberReport {
+    pub per_arch: Vec<ArchDebtDelta>,
+    pub any_arch_worsened: bool,
 }
 
 #[cfg(test)]
@@ -289,6 +348,62 @@ mod tests {
         // Empty / zero-mean → 0.
         let empty = BillOfDebt { rows: vec![] };
         assert_eq!(empty.cross_arch_unevenness(), 0.0);
+    }
+
+    #[test]
+    fn no_arch_clobber_delta_flags_worsened_arch() {
+        let baseline = BillOfDebt {
+            rows: vec![
+                measured("gfx1010", "k1", "d1", 100.0, 50.0, 100.0),
+                measured("gfx1100", "k2", "d2", 100.0, 50.0, 100.0),
+            ],
+        };
+        let candidate = BillOfDebt {
+            rows: vec![
+                measured("gfx1010", "k1", "d1", 100.0, 50.0, 150.0), // +50 -> clobber
+                measured("gfx1100", "k2", "d2", 100.0, 50.0, 80.0),
+            ],
+        }; // -20 -> improvement
+        let report = BillOfDebt::no_arch_clobber_delta(&baseline, &candidate);
+        assert!(report.any_arch_worsened);
+        let g1010 = report.per_arch.iter().find(|d| d.arch == "gfx1010").unwrap();
+        assert_eq!(g1010.delta_ms, 50.0);
+        assert!(g1010.worsened);
+        let g1100 = report.per_arch.iter().find(|d| d.arch == "gfx1100").unwrap();
+        assert_eq!(g1100.delta_ms, -20.0);
+        assert!(!g1100.worsened);
+    }
+    #[test]
+    fn no_arch_clobber_delta_clean_when_all_improve() {
+        let baseline = BillOfDebt {
+            rows: vec![
+                measured("gfx1010", "k1", "d1", 100.0, 50.0, 100.0),
+                measured("gfx1100", "k2", "d2", 100.0, 50.0, 100.0),
+            ],
+        };
+        let candidate = BillOfDebt {
+            rows: vec![
+                measured("gfx1010", "k1", "d1", 100.0, 50.0, 90.0),
+                measured("gfx1100", "k2", "d2", 100.0, 50.0, 95.0),
+            ],
+        };
+        assert!(!BillOfDebt::no_arch_clobber_delta(&baseline, &candidate).any_arch_worsened);
+    }
+    #[test]
+    fn no_arch_clobber_delta_any_positive_growth_is_a_clobber() {
+        // Spec §4d: candidate per-arch debt must be <= baseline for EVERY arch.
+        // Even a small +2% growth is a clobber — there is NO tolerated noise band.
+        let baseline = BillOfDebt {
+            rows: vec![measured("gfx1100", "k", "d", 100.0, 50.0, 100.0)],
+        };
+        let candidate = BillOfDebt {
+            rows: vec![measured("gfx1100", "k", "d", 100.0, 50.0, 102.0)],
+        };
+        let report = BillOfDebt::no_arch_clobber_delta(&baseline, &candidate);
+        assert!(
+            report.any_arch_worsened,
+            "any per-arch debt growth violates §4d, no band"
+        );
     }
 
     #[test]
