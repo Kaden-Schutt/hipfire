@@ -360,3 +360,156 @@ figure is **not reachable** and should not be quoted.
    aggregate/PC-sampling mode; or an older rocprof with working dispatch-scoped
    gfx1100 capture). Do not build on the assumption of ALU-headroom that the
    pre-check failed to establish.
+
+---
+
+## moe_down re-tile check + Phase-B final decision — 2026-07-02
+
+**Framing.** The `FINAL Phase-B decision: NO-GO` above rejected a *broad dp4a
+decode-GEMV port*. This section resolves a distinct, narrower question raised by
+Probe-3's byte model: the two sub-roofline outliers `moe_down` (44.1% of peak)
+and `residual` (51.1%) — are they capturable by a **source-supported multirow
+re-tile** (a block/grid remap, **not** dp4a, **not** LDS tiling)? Two probes (a
+kernel-source audit + a gfx1100 inflated-dispatch PMC run) were adjudicated by
+Codex.
+
+### 1. Kernel-source findings (moe_down / residual re-tile feasibility)
+
+- **Current tiling (both kernels)** — `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`
+  (`kernels/src/…moe_down….hip`, grid `[M,K_TOP,batch]`) and
+  `gemv_hfq4g256_residual` (grid `[M,1,1]`): block `[32,1,1]`, **one output row
+  per 32-thread wave**, pure register-accumulator GEMV, **0 LDS**, one 4-byte
+  (dword) scalar load per thread (already wave-coalesced *within* a row; no
+  `dwordx4`/`uint4`). No arch branch — the same kernel runs on every arch incl.
+  gfx1201.
+- **272 B/block is model-shape-forced, not a coalescing bug.** A3B
+  `moe_intermediate=512` → `K=512` → `groups_per_row = K/256 = 2` → the kernel
+  runs its **2-group TAIL-ONLY path** (never enters the 4-group "quads" main
+  loop); `2 × 136 B = 272 B` is simply how little weight one MoE-down row *is* at
+  this expert width.
+- **Occupancy confirmed** (no-GPU static extract): moe_down 80 VGPR / 22 SGPR /
+  0 LDS / 0 spill; residual 72 VGPR / 22 SGPR / 0 LDS / 0 spill — both already at
+  the **100% hardware 16-wave/SIMD cap**, not register-limited. Because both are
+  0-LDS register GEMVs, the only source-supported lever is a **VGPR-resident
+  multirow** (fold `R` adjacent rows into one wave, hoist the x-vector loads once,
+  per-block A traffic → `R×272 B` contiguous) — **not** LDS tiling.
+- **Mechanism already exists in-tree:** `gemv_hfq4g256_multirow_r{2,4,8}`
+  (`kernels/src/gemv_hfq4g256_multirow.hip`, `.gfx1100.hip`) + residual sibling,
+  numerics-preserving by construction (same `DOG`/`TAIL_DOG` macros, same
+  accumulator order, the tail-must-stay-in-`acc[r][g%4]` discipline from commit
+  `5302926`). **Coherence risk: low** — a pure block/grid remap; the dequant
+  math, the indexed-expert gather (`topk_indices[…]` / `expert_ptrs[expert_id]`),
+  and the K8-expanded output layout are all untouched.
+- **Real risk flagged:** both kernels sit only ~16 VGPR under the 96-VGPR /
+  16-wave threshold (80 / 72 used vs 96 ceiling). Multirow's extra
+  accumulators/row-pointers could push VGPR over that line and *cost* occupancy
+  even as it grows the per-block transaction — this needs a `gfx-kernel-metadata`
+  VGPR check on the compiled R=2 variant **before** on-device trust, not an
+  accept-on-faith port.
+- **Prior-attempt scan:** `remotes/hiptrx/feat/gfx1201-kernel-tuning` (`ea69403b`,
+  never merged; not an ancestor of master) already ported
+  `multirow_r{2,4,8}.gfx1201` + the residual sister and returned a **NULL
+  verdict** (`39a670f4`, real R9700): R=1/2/4 within 0.1% on 9B/27B **dense AR +
+  DFlash**, "BW-saturated ~500 GiB/s." **That null does NOT falsify the current
+  case** — it tested near-saturated dense-model large-K rows and (critically)
+  **never touched `moe_down` at all** (which has zero multirow variant on any
+  arch), and the residual multirow path is hard-gated to `is_rdna3_dgpu()` so
+  gfx1201 never reaches it even with `HIPFIRE_GEMV_ROWS` set. The one regime
+  where multirow *did* win (gfx1010, +2.7% at R=2, 48.5% of peak) is the
+  low-utilization analogue to where moe_down/residual sit now.
+
+### 2. gfx1100 inflated-dispatch PMC — **ROCm-limited, not a latch floor**
+
+Following `(d)`-section recommendation 3 ("inflate per-dispatch work so counters
+latch above the ROCm 7.2.2 floor"), a long-dispatch microbench
+(`bench_gemv_moe_down_pmc_loop`, `ITERS=4000`, 32-block × 4.46 MB weight rotation
+= 136 MB to defeat L2/Infinity-Cache residency, moe_down proxy M=2048/K=4096) ran
+**24–25 ms per dispatch** (host wall + rocprof `Start/End_Timestamp` agree, e.g.
+24.97 ms) — **~2500× longer** than the ~9–10 µs floor blamed for the prior
+zero-reads. **The short-dispatch-floor hypothesis is FALSIFIED:**
+
+| Counter | Value on the 24–25 ms dispatch |
+|---|---|
+| `MemUnitBusy` | **0.0** |
+| `GPUBusy` | **0.0** |
+| `WriteUnitStalled` (nearest `MemUnitStalled` analog available) | **0.0** |
+| `SQ_BUSY_CYCLES` (control) | 2,900,237,047 — scales sanely vs 43.6 M @ 300 µs warmup |
+| `Wavefronts` (control) | 2048 — exactly == grid M |
+
+All %-busy metrics still read **exactly zero** on the 2500×-longer dispatch,
+while the raw accumulators scaled correctly — **PMC collection works; the derived
+%-busy-metric computation is broken for gfx1100 in ROCm 7.2.2**, independent of
+dispatch duration (the duration variable is now eliminated). New failure mode:
+`SQ_INSTS_VALU` alone **SIGSEGVs rocprofv3** (exit 139), worse than the prior
+SIGABRT-hang, so no VALU-side signal is obtainable at all.
+
+**Verdict: inconclusive by tool limitation — the ALU-vs-mem split is unobtainable
+on this box/ROCm; per the task's fallback rule, the source analysis is the best
+available evidence.** This is the **second** independent PMC attempt (short + now
+long dispatch) to fail on the same limitation → further rocprofv3 PMC on this
+box/ROCm is unproductive without a ROCm upgrade or a different tool
+(rocprof-compute / Omniperf). CSVs left at `hipx:/tmp/pmc-moe-down-longdispatch/`
+(ephemeral); GPU lock cleanly released, DPM untouched (`--setperflevel` lacked
+permission, ran at `auto`).
+
+### 3. Codex decision
+
+> `lever_real=true, recommend_attempt=true, coherence_risk="low".` Attempt a
+> **bounded R=2 spike, only for the unfalsified shape**:
+> `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` on A3B `mq4r` / gfx1201.
+> The lever is real — K=512 forces 272 B/row, the wave already coalesces within a
+> row, and multirow is the one source-supported way to enlarge per-block
+> contiguous A traffic while reusing x without changing dequant math. The prior
+> gfx1201 multirow null does not apply (it tested dense AR/DFlash already near
+> saturation, not the small-K MoE-down kernel at 44.1% of peak). **Do not** spend
+> time on dp4a, LDS tiling, or wider per-thread vector loads — the source rules
+> those out. **Residual is weaker** (the diagnosed problem is a small grid, and
+> rows-per-block makes the grid *smaller*) — include it only as a cheap follow-on
+> if moe_down R=2 metadata stays under the VGPR/occupancy threshold. **Hard
+> stops:** R=2 VGPR > 96, spills, no clear per-kernel BW/timing lift on the A3B
+> fixture, or any coherence/channel anomaly. Worth a **half-day experiment, not a
+> multi-day pivot.**
+> **Expected gain:** best case ~**+3–4% end-to-end** from moe_down if its 44%
+> peak-BW rises toward ~75–80%; residual likely **0–2%** and possibly
+> neutral/negative (multirow shrinks an already-small grid). **Combined realistic
+> expectation ~1–4%, not a new perf tier.**
+
+### FINAL CALL: **GO — bounded moe_down R=2 re-tile spike (half-day, hard-stopped)**
+
+**Decision: GO**, narrowly scoped. This does **not** reopen the broad-dp4a NO-GO
+above (that stands) — it is a **different lever** (a block/grid multirow remap of
+one kernel, zero dequant-math change) against the single unfalsified sub-roofline
+shape, `moe_down`.
+
+**Execute exactly this, in order:**
+
+1. Port a `gemv_hfq4g256_multirow_r2` variant of
+   `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` (which currently has **no**
+   multirow variant on any arch), preserving the `DOG`/`TAIL_DOG` tail-in-
+   `acc[r][g%4]` discipline verbatim.
+2. `gfx-kernel-metadata` VGPR check on the compiled R=2 `.hsaco` — **abort if
+   VGPR > 96 or any spill** (the ~16-VGPR headroom is the binding risk).
+3. Bench on the **actual A3B `.mq4r` K=512 moe_down shape** (not the dense-27B
+   null), per-kernel BW/timing on gfx1201/R9700.
+4. `./scripts/coherence-gate.sh` before any claim.
+5. Optional cheap follow-on: admit gfx1201 into the `is_rdna3_dgpu()`-gated
+   residual multirow path — **only** if step 2 passes and moe_down showed a lift.
+
+**Expected payoff: ~+1–4% end-to-end (best case ~+3–4% from moe_down alone);
+success is not guaranteed given the narrow occupancy headroom.** This is a
+half-day spike, not a perf tier — the Amdahl/roofline ceiling on the whole
+decode-GEMV surface remains as bounded as `(d)` and the NO-GO established.
+
+**Strategic note (the re-tile does not change this).** Even in its best case this
+is a single-digit-% decode tweak. The **real competitive lever on gfx1201 is
+wiring A3B MTP into the daemon.** Per the ROCmFP4 H2H
+(`project_rocmfp4_h2h_gfx1201_2026_07_01`), on R9700 the competitor's llama.cpp
+fork **leads hipfire on raw AR** (131–147 vs our `mq4r` ~124 tok/s) and hipfire
+wins **only via MTP** (152.7 tok/s, τ=3.02 coherent) — which is currently
+**`mtp_only_demo`-only and NOT daemon-wired for A3B** (the daemon ships AR-only
+for this tag). That is a *multiplicative* decode win the re-tile cannot approach,
+and it targets the axis where we actually trail on this arch. But it is an
+**engineering task needing user greenlight** — and carries the **A3B R̄≈0.39
+acceptance caveat** (`feedback_a3b_r_not_acceptable`: default A3B = AR-only + no
+eviction until R̄ improves) — **NOT another kernel gamble.** Prioritize the MTP
+wiring conversation over, or in parallel with, the half-day re-tile spike.
