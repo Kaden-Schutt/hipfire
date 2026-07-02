@@ -513,3 +513,101 @@ and it targets the axis where we actually trail on this arch. But it is an
 acceptance caveat** (`feedback_a3b_r_not_acceptable`: default A3B = AR-only + no
 eviction until R̄ improves) — **NOT another kernel gamble.** Prioritize the MTP
 wiring conversation over, or in parallel with, the half-day re-tile spike.
+
+## R=2 multirow spike result — 2026-07-02
+
+The bounded, hard-stopped R=2 spike from the FINAL CALL above was implemented
+(commit `d2fe517a`, branch `worktree-perfmaxx-gfx1201-pkf16-gemv`) and measured
+on-device (gfx1201 / R9700, hiptrx). Two new opt-in gfx1201 kernels —
+`gemv_hfq4g256_moe_down_..._multirow` and `gemv_hfq4g256_residual_multirow` — fold
+2 adjacent output rows per block, hoisting the expert gather + x-load once and
+reusing the exact `DOG`/`TAIL_DOG` tail-in-`acc[r][g%4]` discipline. Both gate
+strictly on `HIPFIRE_GEMV_ROWS=2`; default (unset) is byte-identical to before.
+
+### VGPR / occupancy — PASS (hard stop cleared)
+
+Independently re-verified via the `gfx-kernel-metadata` skill on the compiled
+`.hsaco` (not just the commit message):
+
+| Kernel (gfx1201 R=2) | VGPR | SGPR | Spill | Occupancy |
+|---|---:|---:|---:|---|
+| `gemv_hfq4g256_moe_down_multirow` | **96** | 30 | 0 | 16 waves/SIMD (max) |
+| `gemv_hfq4g256_residual_multirow` | **96** | 36 | 0 | 16 waves/SIMD (max) |
+
+Both land **exactly** at the boundary: 1536 ÷ 96 = 16 waves/SIMD, zero spill
+(`private_segment_fixed_size=0`, `vgpr_spill_count=0`). VGPR ≤ 96 and occupancy is
+**preserved at the max 16 waves/SIMD** — the binding "abort if VGPR > 96 or any
+spill" hard stop is cleared with no headroom to spare.
+
+### Warm A/B — real signal, +4.24% (bands do not overlap)
+
+Model `qwen3.6:35b-a3b-mq4r`, `--kv-mode q8`, `--spec off`, 200 tok, DPM forced
+high, `HIP_VISIBLE_DEVICES=0`. Prompt `"Explain the quicksort algorithm."`
+(md5 `195ebebaf38d280b6002a66ad94756c6`), 5 fresh-process runs per cell after a
+throwaway per-config warmup (no cold-run outliers observed):
+
+| config | 5 runs (tok/s) | median | band |
+|---|---|---:|---|
+| baseline (`HIPFIRE_GEMV_ROWS` **unset** — true prod default) | 124.9, 125.2, 125.1, 124.9, 125.0 | **125.0** | 124.9–125.2 (±0.15%) |
+| treatment (`HIPFIRE_GEMV_ROWS=2`) | 130.3, 130.5, 130.1, 130.3, 130.3 | **130.3** | 130.1–130.5 (±0.15%) |
+
+**Delta: +4.24%** (130.3 vs 125.0). The bands are disjoint (max baseline 125.2 <
+min treatment 130.1) and the per-cell noise band is only **±0.15%** — this is
+real signal, not DPM/thermal/JIT noise, even though the point estimate sits just
+under the formal ±5% investigation trigger. Magnitude is consistent with
+re-tiling only 2 of ~40 decode-GEMV kernels (moe_down tail-K=512 + residual),
+matching the design doc's best-case ~+3–4% moe_down projection.
+
+**Control-selection note (mandatory):** the baseline **must** be
+`HIPFIRE_GEMV_ROWS` *unset*, **not** `=1`. On gfx1201 the *pre-existing, unrelated*
+base `gemv_hfq4g256` dense kernel already defaults to `rows=2` via
+`arch_caps.rs::gemv_rows_default()` (`_ => 2` catch-all), so forcing `=1` does not
+mean "no multirow" — it drops into a rarely-exercised R=1 fallback that produces
+**garbage/repetition-loop output** on this A3B `mq4r` + q8-KV combo (degenerate
+loop, truncated ~35/200 tok). That is a real, reproducible, **orthogonal**
+pre-existing bug (the commit's new kernels never engage under R=1) — file it
+separately; it is not a blocker and gfx1201 never runs R=1 in production.
+
+### Coherence — PASS
+
+- **Greedy (temp=0) numerics:** `unset` and `HIPFIRE_GEMV_ROWS=2` produced
+  **byte-identical** token IDs through the sampled window on the exact
+  `qwen3.6:35b-a3b-mq4r` model — strongest possible numerics-preservation evidence
+  (substituted for `coherence-gate.sh --full`, which does not cover `mq4r`).
+- **Stochastic 200-tok eyeball (5/5 R=2 runs):** fully on-topic, fluent,
+  structured quicksort walkthrough (divide-and-conquer, pivot/partition,
+  O(n log n)) — no attractors, no loops, no special-token leaks.
+
+### THE CALL: **WIN** — real, coherent, occupancy-preserving
+
+R=2 is a **coherent, real (> noise band), occupancy-preserving decode win**:
+**+4.24%** end-to-end on the A3B `mq4r` moe_down shape, byte-exact greedy numerics,
+96 VGPR / 16 waves preserved with zero spill. This is the one sub-roofline shape
+(moe_down at 44% peak BW) the earlier gfx1201 multirow null did **not** cover, and
+the lever landed as projected.
+
+**Recommendation: keep it opt-in** behind `HIPFIRE_GEMV_ROWS=2` (default unset =
+byte-identical to prior). The measured gain is **+4.24%** on the canonical A3B
+`mq4r` / q8-KV / gfx1201 fixture — surfaced here for the user to decide a **default
+flip**. A default-on change is a default-behavior flip (per
+`feedback_pr_gating_policy`) and should be its own greenlight decision; before
+flipping, re-confirm on a second prompt shape and, ideally, the broader A3B bench
+matrix (the +4.24% is single-shape). The opt-in kernels are gated and
+coherence-safe, so they ship as-is regardless of the flip decision.
+
+### Standing recommendation (unchanged by the win)
+
+Even as a validated win this is a **single-digit-% decode tweak**, and the
+decode-GEMV kernel surface is now **effectively exhausted** on gfx1201 — the
+last unfalsified shape (moe_down R=2) has been converted, and the broad-dp4a /
+LDS-tiling / wider-load NO-GO from section (d) stands. The **real competitive
+lever on gfx1201 remains wiring A3B MTP into the daemon.** Per the ROCmFP4 H2H
+(`project_rocmfp4_h2h_gfx1201_2026_07_01`), on R9700 the competitor's llama.cpp
+fork **leads hipfire on raw AR** (131–147 vs `mq4r` ~124 tok/s) and hipfire wins
+**only via MTP** (152.7 tok/s, τ=3.02 coherent) — currently **`mtp_only_demo`-only
+and NOT daemon-wired for A3B**. That multiplicative decode win — on the axis where
+we actually trail this arch — dwarfs the +4.24% re-tile, but it is a
+**greenlight-gated engineering task**, carrying the **A3B R̄≈0.39 acceptance
+caveat** (`feedback_a3b_r_not_acceptable`: default A3B = AR-only + no eviction
+until R̄ improves) — **NOT another kernel gamble.** Prioritize the MTP-wiring
+conversation over any further decode-GEMV kernel work on this arch.
