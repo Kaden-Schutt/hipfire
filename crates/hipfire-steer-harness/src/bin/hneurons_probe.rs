@@ -258,6 +258,10 @@ impl Session {
             .map_err(|e| format!("respawn daemon: {e}"))?;
         let params = ModelLoadParams {
             max_seq: self.max_seq,
+            // q8 KV cache: near-lossless, and (for llama) it makes the prefill
+            // batch-eligible so capture runs on the fast WMMA forward_prefill_batch
+            // instead of the ~40× slower generic prefill_forward.
+            kv_cache: Some("q8".to_string()),
             ..Default::default()
         };
         engine

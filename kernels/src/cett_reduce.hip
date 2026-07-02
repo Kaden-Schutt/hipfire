@@ -28,6 +28,28 @@ extern "C" __global__ void cett_out_norm(const float *__restrict__ down_out, // 
     out_norm[t] = sqrtf(sum);
 }
 
+// Same as cett_out_norm, but the down_proj output is recovered from a residual
+// snapshot: down_out[t,:] = x_after[t,:] - x_before[t,:]. The fast serving
+// prefill (forward_prefill_chunk) FUSES down_proj into the residual, so the
+// output isn't separately materialized; snapshotting x_batch before/after the
+// fused add recovers it. One thread per token, serial register sum, no LDS.
+extern "C" __global__ void cett_out_norm_diff(const float *__restrict__ x_after,  // [positions * hidden]
+                                              const float *__restrict__ x_before, // [positions * hidden]
+                                              float *__restrict__ out_norm,        // [positions]
+                                              int positions, int hidden) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= positions)
+        return;
+    const float *a = x_after + (size_t)t * (size_t)hidden;
+    const float *b = x_before + (size_t)t * (size_t)hidden;
+    float sum = 0.0f;
+    for (int h = 0; h < hidden; h++) {
+        float d = a[h] - b[h];
+        sum += d * d;
+    }
+    out_norm[t] = sqrtf(sum);
+}
+
 // Accumulate per-neuron CETT summed over the response tokens into `sums`:
 //   sums[j] += sum_{t in [resp_start, positions)} |act[t,j]| * col_norm[j]
 //              / (out_norm[t] + 1e-8)

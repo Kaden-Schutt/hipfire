@@ -31,9 +31,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("cett_reduce", kernels::CETT_REDUCE_SRC, "cett_out_norm")?;
-        self.ensure_kernel("cett_reduce", kernels::CETT_REDUCE_SRC, "cett_accumulate")?;
-
-        // Pass 1: per-token output norms.
+        // Pass 1: per-token output norms directly from the materialized down_out.
         {
             let d_ptr = down_out.buf.as_ptr();
             let o_ptr = out_norm.buf.as_ptr();
@@ -59,28 +57,58 @@ impl Gpu {
                 )?;
             }
         }
+        self.cett_accumulate_pass(
+            act,
+            col_norm,
+            out_norm,
+            sums,
+            positions,
+            intermediate,
+            resp_start,
+        )
+    }
 
-        // Pass 2: accumulate per-neuron CETT over the response tokens.
+    /// Like [`Gpu::cett_accumulate_layer`] but the down_proj output is recovered
+    /// from a residual snapshot: `down_out = x_after - x_before`. Used on the fast
+    /// serving prefill path (`forward_prefill_chunk`), which fuses down_proj into
+    /// the residual so the output isn't separately materialized.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cett_accumulate_layer_residual(
+        &mut self,
+        act: &GpuTensor,      // [positions * intermediate] down_proj input
+        col_norm: &GpuTensor, // [intermediate] this layer's column norms
+        x_after: &GpuTensor,  // [positions * hidden] residual after the fused down add
+        x_before: &GpuTensor, // [positions * hidden] residual snapshot before it
+        out_norm: &GpuTensor, // [positions] scratch
+        sums: &GpuTensor,     // [intermediate] this layer's accumulator
+        positions: usize,
+        intermediate: usize,
+        hidden: usize,
+        resp_start: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "cett_reduce",
+            kernels::CETT_REDUCE_SRC,
+            "cett_out_norm_diff",
+        )?;
+        // Pass 1: per-token output norms from the residual delta.
         {
-            let a_ptr = act.buf.as_ptr();
-            let c_ptr = col_norm.buf.as_ptr();
+            let a_ptr = x_after.buf.as_ptr();
+            let b_ptr = x_before.buf.as_ptr();
             let o_ptr = out_norm.buf.as_ptr();
-            let s_ptr = sums.buf.as_ptr();
             let p = positions as i32;
-            let i = intermediate as i32;
-            let rs = resp_start as i32;
+            let h = hidden as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &a_ptr as *const _ as *mut c_void,
-                &c_ptr as *const _ as *mut c_void,
+                &b_ptr as *const _ as *mut c_void,
                 &o_ptr as *const _ as *mut c_void,
-                &s_ptr as *const _ as *mut c_void,
                 &p as *const _ as *mut c_void,
-                &i as *const _ as *mut c_void,
-                &rs as *const _ as *mut c_void,
+                &h as *const _ as *mut c_void,
             ];
-            let block = 256u32;
-            let grid = (intermediate as u32).div_ceil(block).max(1);
-            let func = &self.functions["cett_accumulate"];
+            let block = 64u32;
+            let grid = (positions as u32).div_ceil(block).max(1);
+            let func = &self.functions["cett_out_norm_diff"];
             unsafe {
                 self.hip.launch_kernel(
                     func,
@@ -91,6 +119,60 @@ impl Gpu {
                     &mut params,
                 )?;
             }
+        }
+        self.cett_accumulate_pass(
+            act,
+            col_norm,
+            out_norm,
+            sums,
+            positions,
+            intermediate,
+            resp_start,
+        )
+    }
+
+    /// Shared Pass 2 for the CETT reduction: accumulate per-neuron
+    /// `|act|·col_norm/(‖out‖+1e-8)` over the response tokens into `sums`.
+    #[allow(clippy::too_many_arguments)]
+    fn cett_accumulate_pass(
+        &mut self,
+        act: &GpuTensor,
+        col_norm: &GpuTensor,
+        out_norm: &GpuTensor,
+        sums: &GpuTensor,
+        positions: usize,
+        intermediate: usize,
+        resp_start: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("cett_reduce", kernels::CETT_REDUCE_SRC, "cett_accumulate")?;
+        let a_ptr = act.buf.as_ptr();
+        let c_ptr = col_norm.buf.as_ptr();
+        let o_ptr = out_norm.buf.as_ptr();
+        let s_ptr = sums.buf.as_ptr();
+        let p = positions as i32;
+        let i = intermediate as i32;
+        let rs = resp_start as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void,
+            &i as *const _ as *mut c_void,
+            &rs as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (intermediate as u32).div_ceil(block).max(1);
+        let func = &self.functions["cett_accumulate"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
         }
         Ok(())
     }

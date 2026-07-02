@@ -5762,17 +5762,15 @@ fn main() {
                         ) {
                             Err(format!("begin_capture: {e:?}"))
                         } else {
-                            match hipfire_runtime::llama::prefill_forward(
-                                &mut gpu,
-                                &b.weights,
-                                &b.config,
-                                &full,
-                                &mut b.kv_cache,
-                            ) {
-                                Ok(_) => finish(&mut gpu),
+                            // Fast path: the WMMA forward_prefill_batch (tapped via
+                            // the residual snapshot), not the ~40× slower generic
+                            // prefill_forward. Requires a q8 KV cache for batch
+                            // eligibility (the probe loads with kv_cache=q8).
+                            match SimpleAr::prefill(b, &mut gpu, &full) {
+                                Ok(()) => finish(&mut gpu),
                                 Err(e) => {
                                     hipfire_hneurons::capture::clear();
-                                    Err(format!("prefill: {e:?}"))
+                                    Err(format!("prefill: {e}"))
                                 }
                             }
                         }

@@ -1417,6 +1417,19 @@ fn forward_prefill_chunk(
         } else {
             gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
         }
+        // H-Neurons CETT: snapshot the residual before the FUSED down-proj add so
+        // the tap below can recover down_out = x_after - x_before (this fast path
+        // fuses down_proj into x_batch, unlike the generic prefill_forward). Gated:
+        // only when a capture session is active, so serving is untouched.
+        let cett_x_before = if hipfire_hneurons::capture::is_active() {
+            let d = layer.w_down.m;
+            let snap = gpu.alloc_owned(&[n, d], DType::F32)?;
+            gpu.hip
+                .memcpy_dtod_at(&snap.buf, 0, &pbs.x_batch.buf, 0, n * d * 4)?;
+            Some((snap, d))
+        } else {
+            None
+        };
         if w_down_is_6bit {
             gpu.gemm_hfq6g256_residual(
                 &layer.w_down.buf,
@@ -1473,6 +1486,18 @@ fn forward_prefill_chunk(
                 &pbs.x_batch,
                 layer.w_down.m,
                 layer.w_down.k,
+                n,
+            )?;
+        }
+        if let Some((x_before, d)) = cett_x_before {
+            let x_after = pbs.x_batch.sub_offset(0, n * d);
+            hipfire_hneurons::capture::maybe_capture_ffn_residual(
+                gpu,
+                &pbs.ffn_hidden_batch,
+                &x_before,
+                &x_after,
+                layer_idx,
+                start_pos,
                 n,
             )?;
         }

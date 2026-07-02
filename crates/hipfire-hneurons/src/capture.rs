@@ -173,3 +173,56 @@ pub fn maybe_capture_ffn(
         Ok(())
     })
 }
+
+/// Like [`maybe_capture_ffn`] but for the fast serving prefill path, which fuses
+/// down_proj into the residual. The down_proj output is recovered from a
+/// before/after residual snapshot: `down_out = x_after - x_before`. `x_before` is
+/// `x_batch` captured just before the fused down-residual add; `x_after` is
+/// `x_batch` after it. No-op unless a session is active.
+pub fn maybe_capture_ffn_residual(
+    gpu: &mut Gpu,
+    ffn_hidden: &GpuTensor,
+    x_before: &GpuTensor,
+    x_after: &GpuTensor,
+    layer_idx: usize,
+    batch_start: usize,
+    num_positions: usize,
+) -> HipResult<()> {
+    if !is_active() {
+        return Ok(());
+    }
+    CAPTURE.with(|c| -> HipResult<()> {
+        let mut slot = c.borrow_mut();
+        let Some(acc) = slot.as_mut() else {
+            return Ok(());
+        };
+        if batch_start + num_positions <= acc.response_start {
+            return Ok(());
+        }
+        let inter = acc.intermediate;
+        let hidden = acc.hidden;
+        let local_resp_start = acc
+            .response_start
+            .saturating_sub(batch_start)
+            .min(num_positions);
+        let col_norm = acc.col_norm_gpu.sub_offset(layer_idx * inter, inter);
+        let sums = acc.sums_gpu.sub_offset(layer_idx * inter, inter);
+        let out_norm = gpu.alloc_owned(&[num_positions.max(1)], DType::F32)?;
+        gpu.cett_accumulate_layer_residual(
+            ffn_hidden,
+            &col_norm,
+            x_after,
+            x_before,
+            &out_norm,
+            &sums,
+            num_positions,
+            inter,
+            hidden,
+            local_resp_start,
+        )?;
+        if layer_idx == 0 {
+            acc.count += num_positions - local_resp_start;
+        }
+        Ok(())
+    })
+}
