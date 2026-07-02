@@ -92,7 +92,30 @@ pub struct ChipProfile {
     /// Theoretical peak memory bandwidth in GB/s. `None` withholds any
     /// roofline BW-bound verdict downstream (Task 5) rather than silently
     /// treating an unknown chip as zero-bandwidth.
+    ///
+    /// NOTE (2026-07-02, `peak_bw_probe` multi-tier finding): despite the
+    /// field name this is the DRAM-bound large-buffer PLATEAU, i.e. the
+    /// correct roofline denominator — never the small-buffer cache-resident
+    /// ceiling. Prior to the multi-tier fix, `peak_bw_probe` folded over a
+    /// `GpuCapability::l2_cache_mb + infinity_cache_mb` threshold that is
+    /// wrong for unified-memory APUs (gfx1151/Strix Halo), so a committed row
+    /// authored against that probe could actually hold the CACHE tier's BW
+    /// mislabeled as DRAM peak. See [`detect_bw_tiers`] and `cache_bw_gbps`.
     pub peak_bw_gbps: Option<f64>,
+    /// Small-buffer (cache-resident) bandwidth ceiling in GB/s, when the
+    /// swept curve shows a distinct tier below the DRAM plateau (see
+    /// [`detect_bw_tiers`]). `None` for a chip whose sweep never showed a
+    /// meaningful cache tier (e.g. a dGPU where even the smallest swept
+    /// buffer is already DRAM-bound) — NOT the same as "not yet measured";
+    /// `for_unprofiled` also returns `None` for that latter reason.
+    pub cache_bw_gbps: Option<f64>,
+    /// Empirically-inferred effective cache size in MiB: the largest swept
+    /// buffer size that still landed in the cache tier (i.e. the last row
+    /// before the curve transitions to the DRAM plateau). This EMPIRICALLY
+    /// CORRECTS `GpuCapability::l2_cache_mb + infinity_cache_mb`, which is
+    /// wrong for unified-memory APUs — see [`detect_bw_tiers`] module docs.
+    /// `None` alongside `cache_bw_gbps == None`.
+    pub effective_cache_mib: Option<f64>,
     /// `ArchCaps::dump_json()` — the full atom/molecule/capability/tuning
     /// set for this arch, so the committed row is self-describing without
     /// re-deriving intrinsics from `FeatureFlags::from_env` at read time.
@@ -161,6 +184,8 @@ impl ChipProfile {
             vram_mb: None,
             mem_latency_ns: None,
             peak_bw_gbps: None,
+            cache_bw_gbps: None,
+            effective_cache_mib: None,
             intrinsics: caps.dump_json(),
             provenance: ChipProfileProvenance::default(),
         }
@@ -230,6 +255,8 @@ impl ChipProfile {
             "vram_mb": self.vram_mb,
             "mem_latency_ns": self.mem_latency_ns,
             "peak_bw_gbps": self.peak_bw_gbps,
+            "cache_bw_gbps": self.cache_bw_gbps,
+            "effective_cache_mib": self.effective_cache_mib,
             "intrinsics": self.intrinsics,
             "provenance": self.provenance.to_json(),
         })
@@ -264,6 +291,11 @@ impl ChipProfile {
         let vram_mb = v["vram_mb"].as_u64().map(|x| x as u32);
         let mem_latency_ns = v["mem_latency_ns"].as_f64();
         let peak_bw_gbps = v["peak_bw_gbps"].as_f64();
+        // Optional, and absent on any committed row authored before the
+        // multi-tier bandwidth finding (2026-07-02) — withhold (None) rather
+        // than fabricate a cache-tier figure for an older row.
+        let cache_bw_gbps = v["cache_bw_gbps"].as_f64();
+        let effective_cache_mib = v["effective_cache_mib"].as_f64();
         let intrinsics = v["intrinsics"].clone();
         let provenance = ChipProfileProvenance::from_json(&v["provenance"]);
 
@@ -277,10 +309,142 @@ impl ChipProfile {
             vram_mb,
             mem_latency_ns,
             peak_bw_gbps,
+            cache_bw_gbps,
+            effective_cache_mib,
             intrinsics,
             provenance,
         })
     }
+}
+
+/// One (buffer-size-in-MiB, achieved-GB/s) sample from a bandwidth sweep
+/// (e.g. `peak_bw_probe`'s `SweepRow`), ordered ascending by `mib`. Used only
+/// by [`detect_bw_tiers`] — kept as a small standalone struct (rather than
+/// depending on the example's private `SweepRow`) so both a library
+/// consumer and the `peak_bw_probe` example can share one tier-detection
+/// implementation instead of hand-rolling separate copies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BwSweepPoint {
+    pub mib: f64,
+    pub gbps: f64,
+}
+
+/// Output of [`detect_bw_tiers`]: the DRAM-bound plateau bandwidth (the
+/// correct roofline denominator, i.e. what `ChipProfile::peak_bw_gbps`
+/// should hold) plus, when the swept curve shows a distinct small-size
+/// cache-resident tier, that tier's ceiling BW and its empirical size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BwTiers {
+    /// DRAM-bound plateau bandwidth in GB/s — the BW at the largest swept
+    /// size, once verified that the top of the curve has actually
+    /// converged (see module docs on the `plateau_tolerance_pct` check).
+    pub dram_peak_gbps: f64,
+    /// Max achieved GB/s among the sweep rows below the DRAM plateau's
+    /// start. `None` when the DRAM plateau covers the whole swept range
+    /// (no distinct cache tier observed).
+    pub cache_bw_gbps: Option<f64>,
+    /// MiB of the largest swept size that is still cache-resident (i.e. the
+    /// row immediately below the DRAM plateau's start) — the empirical
+    /// cache-size estimate. `None` alongside `cache_bw_gbps == None`.
+    pub effective_cache_mib: Option<f64>,
+}
+
+/// Detect the DRAM-bound plateau (and optional cache tier) in a bandwidth
+/// sweep, WITHOUT relying on `GpuCapability::l2_cache_mb`/`infinity_cache_mb`
+/// — those arch_spec cache-footprint constants are correct for discrete GPUs
+/// but WRONG for unified-memory APUs (Strix Halo gfx1151 measured
+/// `peak_bw_gbps=952` under the old L2+IC-threshold fold, which was actually
+/// the *cache* tier; DRAM is ~230 GB/s — see `tests/chip-profiles/gfx1201.json`
+/// provenance and `peak_bw_probe.rs`).
+///
+/// Algorithm: `points` MUST be sorted strictly ascending by `mib`. Starting
+/// from the largest swept size, greedily extend a "DRAM plateau" backward
+/// while each additional point's GB/s agrees with the largest size's GB/s
+/// within `plateau_tolerance_pct` (empirically ~2-3%: the gfx1151 64/128/
+/// 256/512 MiB rows — 229/230/231/232 GB/s — agree within ~1.3%, while the
+/// jump from the 16 MiB cache row (952 GB/s) is >300%). The plateau must
+/// span >= 2 points; if even the two largest swept sizes disagree by more
+/// than the tolerance, the curve hasn't converged (still climbing/monotonic
+/// at the top of the sweep) and this fails loud rather than mis-reporting
+/// the top row as a trustworthy DRAM peak.
+///
+/// `dram_peak_gbps` is the GB/s at the largest swept size (once the plateau
+/// check above passes). `cache_bw_gbps` is the max GB/s among the rows
+/// below the plateau's start (`None` if the plateau starts at row 0, i.e.
+/// no distinct cache tier showed up in the sweep at all — e.g. a dGPU).
+/// `effective_cache_mib` is the MiB of the last cache-resident row before
+/// the plateau begins.
+pub fn detect_bw_tiers(
+    points: &[BwSweepPoint],
+    plateau_tolerance_pct: f64,
+) -> Result<BwTiers, String> {
+    if points.len() < 2 {
+        return Err(format!(
+            "detect_bw_tiers: need >= 2 sweep points to detect a DRAM plateau, got {}",
+            points.len()
+        ));
+    }
+    for w in points.windows(2) {
+        // `partial_cmp` (not a bare `<`/`>=`) so a NaN `mib` (which cannot
+        // compare `Less` to anything) is correctly rejected as non-ascending
+        // rather than silently accepted.
+        if w[0].mib.partial_cmp(&w[1].mib) != Some(std::cmp::Ordering::Less) {
+            return Err(format!(
+                "detect_bw_tiers: points must be strictly ascending by mib, got {} then {}",
+                w[0].mib, w[1].mib
+            ));
+        }
+    }
+
+    let n = points.len();
+    let last = points[n - 1];
+
+    let mut start = n - 1;
+    for i in (0..n - 1).rev() {
+        let diff_pct = (points[i].gbps - last.gbps).abs() / last.gbps * 100.0;
+        if diff_pct <= plateau_tolerance_pct {
+            start = i;
+        } else {
+            break;
+        }
+    }
+
+    if start == n - 1 {
+        return Err(format!(
+            "detect_bw_tiers: no DRAM plateau found — the two largest swept sizes \
+             ({} MiB={:.1} GB/s, {} MiB={:.1} GB/s) differ by more than \
+             plateau_tolerance_pct={plateau_tolerance_pct}% — the curve is still \
+             climbing/monotonic at the top of the sweep. Extend the sweep to larger \
+             sizes before trusting a DRAM peak_bw figure; do NOT fall back to \
+             reporting the top row as peak.",
+            points[n - 2].mib,
+            points[n - 2].gbps,
+            last.mib,
+            last.gbps
+        ));
+    }
+
+    let dram_peak_gbps = last.gbps;
+
+    let (cache_bw_gbps, effective_cache_mib) = if start == 0 {
+        (None, None)
+    } else {
+        let cache_rows = &points[..start];
+        let cache_peak = cache_rows.iter().copied().fold(cache_rows[0], |best, p| {
+            if p.gbps > best.gbps {
+                p
+            } else {
+                best
+            }
+        });
+        (Some(cache_peak.gbps), Some(points[start - 1].mib))
+    };
+
+    Ok(BwTiers {
+        dram_peak_gbps,
+        cache_bw_gbps,
+        effective_cache_mib,
+    })
 }
 
 #[cfg(test)]
@@ -310,6 +474,17 @@ mod tests {
             Some(32768),
             "R9700 (Radeon AI PRO, gfx1201 hiptrx fleet card) = 32GB"
         );
+        assert_eq!(
+            profile.peak_bw_gbps,
+            Some(611.8),
+            "DRAM-plateau peak, per peak_bw_probe multi-tier detection"
+        );
+        assert_eq!(
+            profile.cache_bw_gbps, None,
+            "R9700 is a dGPU with no meaningful on-chip cache tier visible in the \
+             probe's sweep range — withheld (None), not fabricated"
+        );
+        assert_eq!(profile.effective_cache_mib, None);
     }
 
     #[test]
@@ -490,6 +665,14 @@ mod tests {
             profile.mem_latency_ns.is_none(),
             "unprofiled arch must withhold mem_latency (roofline latency-bound verdict WITHHELD)"
         );
+        assert!(
+            profile.cache_bw_gbps.is_none(),
+            "unprofiled arch must withhold cache_bw (never measured)"
+        );
+        assert!(
+            profile.effective_cache_mib.is_none(),
+            "unprofiled arch must withhold effective_cache_mib (never measured)"
+        );
         assert_eq!(profile.arch, "gfx9999");
     }
 
@@ -500,5 +683,182 @@ mod tests {
         let json = profile.to_json();
         let reloaded = ChipProfile::from_json(&json).expect("round-trip JSON must parse");
         assert_eq!(profile, reloaded);
+    }
+
+    #[test]
+    fn round_trip_json_with_cache_tier() {
+        // Round-trip a profile that DOES carry a cache tier (unlike the
+        // committed gfx1201/R9700 row, which is dGPU-cacheless) — covers the
+        // `Some`/`Some` branch of the new fields' serde path.
+        let mut profile = ChipProfile::load_committed("gfx1201")
+            .expect("tests/chip-profiles/gfx1201.json must load");
+        profile.cache_bw_gbps = Some(952.0);
+        profile.effective_cache_mib = Some(16.0);
+        let json = profile.to_json();
+        let reloaded = ChipProfile::from_json(&json).expect("round-trip JSON must parse");
+        assert_eq!(profile, reloaded);
+        assert_eq!(reloaded.cache_bw_gbps, Some(952.0));
+        assert_eq!(reloaded.effective_cache_mib, Some(16.0));
+    }
+
+    #[test]
+    fn from_json_missing_cache_fields_withholds() {
+        // Older committed rows authored before the multi-tier fix don't
+        // carry cache_bw_gbps/effective_cache_mib at all — from_json must
+        // withhold (None), not error or fabricate a value.
+        let mut json = ChipProfile::load_committed("gfx1201")
+            .expect("tests/chip-profiles/gfx1201.json must load")
+            .to_json();
+        json.as_object_mut().unwrap().remove("cache_bw_gbps");
+        json.as_object_mut().unwrap().remove("effective_cache_mib");
+        let profile = ChipProfile::from_json(&json)
+            .expect("must parse without cache_bw_gbps/effective_cache_mib");
+        assert!(profile.cache_bw_gbps.is_none());
+        assert!(profile.effective_cache_mib.is_none());
+    }
+
+    /// Empirical gfx1151 (Strix Halo) `peak_bw_probe` sweep (multi-tier
+    /// bandwidth finding, 2026-07-02): 1MiB=593, 4MiB=799, 16MiB=952
+    /// (cache-resident tier), 64/128/256/512 MiB = 229/230/231/232
+    /// (DRAM-bound plateau). The OLD fold-max-over-arch_spec-threshold logic
+    /// reported `peak_bw_gbps=952` — the cache tier, not DRAM — because
+    /// `GpuCapability::l2_cache_mb + infinity_cache_mb` (derived from
+    /// `arch_spec`) is wrong for this unified-memory APU. See
+    /// `tests/chip-profiles/gfx1201.json`'s provenance note
+    /// ("gfx1151=950 (SUSPECT...)").
+    #[test]
+    fn detect_bw_tiers_gfx1151_curve() {
+        let points = [
+            BwSweepPoint {
+                mib: 1.0,
+                gbps: 593.0,
+            },
+            BwSweepPoint {
+                mib: 4.0,
+                gbps: 799.0,
+            },
+            BwSweepPoint {
+                mib: 16.0,
+                gbps: 952.0,
+            },
+            BwSweepPoint {
+                mib: 64.0,
+                gbps: 229.0,
+            },
+            BwSweepPoint {
+                mib: 128.0,
+                gbps: 230.0,
+            },
+            BwSweepPoint {
+                mib: 256.0,
+                gbps: 231.0,
+            },
+            BwSweepPoint {
+                mib: 512.0,
+                gbps: 232.0,
+            },
+        ];
+        let tiers = detect_bw_tiers(&points, 3.0).expect("gfx1151 curve must yield a DRAM plateau");
+        assert!(
+            (tiers.dram_peak_gbps - 232.0).abs() < 1e-9,
+            "DRAM peak must be the 512 MiB plateau BW (232), NOT the cache-tier max \
+             (952) that the old threshold-fold mis-reported: got {}",
+            tiers.dram_peak_gbps
+        );
+        assert_eq!(
+            tiers.cache_bw_gbps,
+            Some(952.0),
+            "cache tier ceiling = max GB/s among the sub-plateau rows (16 MiB)"
+        );
+        assert_eq!(
+            tiers.effective_cache_mib,
+            Some(16.0),
+            "effective cache size = last cache-resident sweep row (16 MiB) before the \
+             DRAM plateau begins (64 MiB)"
+        );
+    }
+
+    #[test]
+    fn detect_bw_tiers_monotonic_curve_fails_loud() {
+        // A curve that is still climbing at the top of the sweep (no two
+        // largest sizes agree) must fail loud, not silently report the top
+        // row as "peak" — HAZARD requirement #6.
+        let points = [
+            BwSweepPoint {
+                mib: 1.0,
+                gbps: 100.0,
+            },
+            BwSweepPoint {
+                mib: 4.0,
+                gbps: 200.0,
+            },
+            BwSweepPoint {
+                mib: 16.0,
+                gbps: 400.0,
+            },
+        ];
+        let result = detect_bw_tiers(&points, 3.0);
+        assert!(
+            result.is_err(),
+            "monotonic/no-plateau curve must fail loud, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn detect_bw_tiers_no_cache_tier_for_dgpu() {
+        // A dGPU-style curve where every swept size is already DRAM-bound
+        // (no small-size cache advantage large enough to show up) — the
+        // whole range is one plateau, so cache_bw_gbps/effective_cache_mib
+        // must both withhold (None), not fabricate a value.
+        let points = [
+            BwSweepPoint {
+                mib: 64.0,
+                gbps: 610.0,
+            },
+            BwSweepPoint {
+                mib: 128.0,
+                gbps: 611.0,
+            },
+            BwSweepPoint {
+                mib: 256.0,
+                gbps: 611.8,
+            },
+            BwSweepPoint {
+                mib: 512.0,
+                gbps: 612.0,
+            },
+        ];
+        let tiers = detect_bw_tiers(&points, 3.0).expect("all-plateau curve must still succeed");
+        assert!((tiers.dram_peak_gbps - 612.0).abs() < 1e-9);
+        assert!(tiers.cache_bw_gbps.is_none());
+        assert!(tiers.effective_cache_mib.is_none());
+    }
+
+    #[test]
+    fn detect_bw_tiers_rejects_too_few_points() {
+        let points = [BwSweepPoint {
+            mib: 1.0,
+            gbps: 100.0,
+        }];
+        assert!(detect_bw_tiers(&points, 3.0).is_err());
+    }
+
+    #[test]
+    fn detect_bw_tiers_rejects_unsorted_points() {
+        let points = [
+            BwSweepPoint {
+                mib: 16.0,
+                gbps: 400.0,
+            },
+            BwSweepPoint {
+                mib: 4.0,
+                gbps: 200.0,
+            },
+        ];
+        let result = detect_bw_tiers(&points, 3.0);
+        assert!(
+            result.is_err(),
+            "unsorted input must fail loud, not silently mis-sort"
+        );
     }
 }

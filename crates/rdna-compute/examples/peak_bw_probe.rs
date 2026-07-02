@@ -17,19 +17,33 @@
 //! buffer sizes, timed with the same `hipEvent` pattern as
 //! `profile.rs::begin_timer`/`end_timer` and `pointer_chase_latency`.
 //!
-//! **Folded sweep:** a single point-measurement at one buffer size can't
-//! distinguish "genuinely DRAM-bound" from "still partly L2/Infinity-Cache
-//! resident" (the same on-chip-cache-vs-DRAM distinction `pointer_chase_latency`
-//! has to defeat for latency). So this probe sweeps buffer sizes from small
-//! (fits in L2) up through well past the arch's L2+Infinity-Cache footprint
-//! (`profiler::GpuCapability::detect().l2_cache_mb + infinity_cache_mb`, 2x
-//! headroom — the same margin `pointer_chase_latency` uses), prints every
-//! sweep row, then FOLDS (`Iterator::fold`, i.e. reduces) the rows whose
-//! buffer size clears the cache-footprint threshold down to their maximum
-//! achieved GB/s — that max is `peak_bw_gbps`. Sizes below the threshold are
-//! diagnostic only (they legitimately read faster, cache-resident) and are
-//! excluded from the fold so cache speedup can never be misreported as
-//! DRAM peak BW.
+//! **Multi-tier sweep (2026-07-02 fix):** a single point-measurement at one
+//! buffer size can't distinguish "genuinely DRAM-bound" from "still partly
+//! cache-resident" (the same on-chip-cache-vs-DRAM distinction
+//! `pointer_chase_latency` has to defeat for latency). This probe sweeps
+//! buffer sizes from small (cache-resident) up through comfortably past any
+//! current arch's on-chip cache, prints every sweep row, then hands the full
+//! curve to [`rdna_compute::chip_profile::detect_bw_tiers`], which detects
+//! the DRAM-bound large-size PLATEAU directly from the curve's own shape
+//! (the top rows mutually agreeing within a few percent) rather than from
+//! `profiler::GpuCapability`'s `l2_cache_mb`/`infinity_cache_mb` fields.
+//!
+//! That arch_spec-threshold approach was tried first and found WRONG for
+//! unified-memory APUs: gfx1151 (Strix Halo) measured 1MiB=593, 4MiB=799,
+//! 16MiB=952 (cache-resident), then 64/128/256/512 MiB=229/230/231/232
+//! (the real DRAM-bound LPDDR5X plateau) GB/s. The old fold-over-
+//! `l2_cache_mb+infinity_cache_mb`-threshold logic classified the 16 MiB row
+//! as "past the cache footprint" and reported `peak_bw_gbps=952` — the
+//! CACHE tier, mislabeled as DRAM peak (see `tests/chip-profiles/gfx1201.json`
+//! provenance note "gfx1151=950 (SUSPECT...)"). `detect_bw_tiers` instead
+//! reports BOTH tiers explicitly: `peak_bw_gbps` (DRAM plateau, the roofline
+//! denominator) and `cache_bw_gbps` (the cache-tier ceiling), plus
+//! `effective_cache_mib` — the empirical transition point, which corrects
+//! (rather than trusts) the arch_spec cache-footprint constant. On a dGPU
+//! whose whole swept range is already DRAM-bound (no distinct cache tier),
+//! `cache_bw_gbps`/`effective_cache_mib` are `None` rather than fabricated.
+//! On a curve that never converges to a plateau at the top of the sweep,
+//! `detect_bw_tiers` fails loud instead of mis-reporting the top row.
 //!
 //! Per `docs/methodology/perf-benchmarking.md` and this session's warm-DPM
 //! finding (`tests/chip-profiles/gfx1201.json` provenance / commits
@@ -53,6 +67,7 @@
 //!     HIP_VISIBLE_DEVICES=0 cargo run --release -p rdna-compute --example peak_bw_probe ; \
 //!     gpu_release
 
+use rdna_compute::chip_profile::{detect_bw_tiers, BwSweepPoint};
 use rdna_compute::profiler::GpuCapability;
 use rdna_compute::{profile, Gpu, KernelCompiler};
 use std::ffi::c_void;
@@ -62,20 +77,31 @@ const ELEM_BYTES: usize = 16;
 
 /// Sweep of buffer sizes (MiB) for ONE of the two DtoD copy buffers (src and
 /// dst are each this size, so live VRAM usage per sweep step is 2x this).
-/// Spans well below a typical RDNA L2+Infinity-Cache footprint (cache-
-/// resident, diagnostic only) up through comfortably past it (the
-/// DRAM-bound region the fold reduces over). Kept small enough (max 1024 MiB
-/// total across both buffers) to run unmodified across the whole fleet
-/// (k9lin 24GB / hiptrx 32GB / hipx 96GB+5700XT) without a VRAM budget arg.
+/// Spans well below a typical RDNA on-chip-cache footprint (cache-resident,
+/// feeds [`detect_bw_tiers`]'s cache-tier estimate) up through comfortably
+/// past it (the DRAM-bound plateau `detect_bw_tiers` detects directly from
+/// the curve's shape — see the module docs on the gfx1151 multi-tier
+/// finding). Kept small enough (max 1024 MiB total across both buffers) to
+/// run unmodified across the whole fleet (k9lin 24GB / hiptrx 32GB / hipx
+/// 96GB+5700XT) without a VRAM budget arg.
 ///
-/// The max entry MUST clear `cache_clear_mib` (2x L2+IC) for every arch in
+/// The max entry MUST comfortably clear every arch's on-chip cache in
 /// `profiler::arch_spec`, not just the ones in the current physical fleet —
-/// RDNA2 (gfx1030-class, 4 MiB L2 + 128 MiB Infinity Cache) needs 264 MiB,
-/// which the prior max-256 sweep never reached, so the fold's `filter` found
-/// no qualifying row and the probe exited loud on any RDNA2 discrete card.
-/// 512 clears that with margin; keep the max entry >= `2 * (max L2+IC across
-/// arch_spec)` if a future arch adds a bigger cache.
+/// RDNA2 (gfx1030-class, 4 MiB L2 + 128 MiB Infinity Cache) needs the sweep
+/// to reach past ~256 MiB before the curve can plateau at DRAM speed; a
+/// prior max-256 sweep never reached that margin. 512 clears that with
+/// headroom; if a future arch adds a bigger on-chip cache, extend the sweep
+/// (and expect `detect_bw_tiers` to fail loud — not silently mis-report —
+/// if it doesn't).
 const SWEEP_MIB: &[usize] = &[1, 4, 16, 64, 128, 256, 512];
+
+/// [`detect_bw_tiers`]'s plateau-agreement tolerance: consecutive
+/// large-size sweep rows within this many percent of each other are
+/// considered the same DRAM-bound plateau. Empirically ~1.3% on the gfx1151
+/// 64..512 MiB rows (229/230/231/232 GB/s) vs the >300% jump down from the
+/// cache tier — 3.0 comfortably separates "plateau noise" from "still a
+/// different tier" (see `chip_profile::detect_bw_tiers` module docs).
+const PLATEAU_TOLERANCE_PCT: f64 = 3.0;
 
 /// Untimed warmup launches per sweep size — primes DPM/clocks + page
 /// mappings before the timed trials (same rationale as
@@ -113,7 +139,6 @@ extern "C" __global__ void bw_copy(
 /// One sweep row's result.
 struct SweepRow {
     mib: usize,
-    bytes_per_buf: usize,
     gbps: f64,
 }
 
@@ -131,14 +156,14 @@ fn main() {
         .unwrap_or(0);
     let theoretical = GpuCapability::detect(&gpu.arch, vram_bytes);
     let theoretical_peak_gbps = theoretical.peak_bw_gbs as f64;
-    // 2x headroom above L2+Infinity-Cache, same margin
-    // `pointer_chase_latency::BUFFER_BYTES` uses for its arch (gfx1201:
-    // 4 MiB L2 + 64 MiB IC = 68 MiB -> 136 MiB threshold here).
-    let cache_clear_mib =
-        ((theoretical.l2_cache_mb + theoretical.infinity_cache_mb) * 2.0).ceil() as usize;
+    // NOTE: `theoretical.l2_cache_mb`/`infinity_cache_mb` (from
+    // `profiler::arch_spec`) are printed below for reference only — they are
+    // NOT used to decide the DRAM-vs-cache split (see module docs: they are
+    // wrong for unified-memory APUs). The split is detected empirically from
+    // the swept curve's own shape via `detect_bw_tiers`, below.
     println!("theoretical_peak_gbps (analytic, GpuCapability::detect): {theoretical_peak_gbps:.1}");
     println!(
-        "cache_clear_threshold_mib (2x L2+IC={:.1}+{:.1} MiB): {cache_clear_mib}",
+        "arch_spec_l2_infinity_cache_mib (reference only, NOT used for tier detection): {:.1}+{:.1}",
         theoretical.l2_cache_mb, theoretical.infinity_cache_mb
     );
     println!(
@@ -256,48 +281,53 @@ fn main() {
             gbps / theoretical_peak_gbps * 100.0
         );
 
-        rows.push(SweepRow {
-            mib,
-            bytes_per_buf,
-            gbps,
-        });
+        rows.push(SweepRow { mib, gbps });
     }
 
-    // Fold: reduce the sweep to the max achieved GB/s among rows that clear
-    // the cache footprint (i.e. genuinely DRAM-bound, not cache-resident).
-    // `None` (no row cleared the threshold) means SWEEP_MIB doesn't reach
-    // far enough past this arch's cache for a trustworthy DRAM-peak number
-    // — fail loud rather than silently reporting a cache-inflated figure.
-    let folded =
-        rows.iter()
-            .filter(|r| r.mib >= cache_clear_mib)
-            .fold(None::<&SweepRow>, |best, row| match best {
-                Some(b) if b.gbps >= row.gbps => Some(b),
-                _ => Some(row),
-            });
-
-    let peak_row = folded.unwrap_or_else(|| {
+    // Hand the full curve to the shared library detector — SWEEP_MIB is
+    // already ascending, so `rows` is too (points pushed in loop order).
+    let points: Vec<BwSweepPoint> = rows
+        .iter()
+        .map(|r| BwSweepPoint {
+            mib: r.mib as f64,
+            gbps: r.gbps,
+        })
+        .collect();
+    let tiers = detect_bw_tiers(&points, PLATEAU_TOLERANCE_PCT).unwrap_or_else(|e| {
         eprintln!(
-            "no swept buffer size ({SWEEP_MIB:?} MiB) clears the cache_clear_threshold_mib \
-             ({cache_clear_mib}) — extend SWEEP_MIB for this arch before trusting peak_bw_gbps"
+            "{e}\nfull sweep: {rows_dbg:?}",
+            rows_dbg = rows.iter().map(|r| (r.mib, r.gbps)).collect::<Vec<_>>()
         );
         std::process::exit(1);
     });
 
-    let peak_bw_gbps = peak_row.gbps;
+    let peak_bw_gbps = tiers.dram_peak_gbps;
     let pct_of_theoretical = peak_bw_gbps / theoretical_peak_gbps * 100.0;
 
     println!("---");
-    // Clean `key: value` line first (matches the sibling
-    // `pointer_chase_latency.rs`'s `mem_latency_ns: {value}` convention) so a
-    // consumer can grep/parse a single unambiguous field; the annotated line
-    // right after carries the same read+write-bytes and fold provenance.
+    // Clean `key: value` lines (matches the sibling `pointer_chase_latency.rs`'s
+    // `mem_latency_ns: {value}` convention) so a consumer can grep/parse a
+    // single unambiguous field per line.
+    //
+    // peak_bw_gbps is the DRAM-bound plateau — the roofline denominator.
+    // cache_bw_gbps / effective_cache_mib are the (optional) cache-tier
+    // ceiling and its empirical size; both print as `none` when the sweep
+    // showed no distinct cache tier (e.g. a dGPU where every swept size is
+    // already DRAM-bound).
     println!("peak_bw_gbps: {peak_bw_gbps:.1}");
     println!(
-        "  (read+write GB/s; folded max over sweep rows >= cache_clear_threshold_mib={cache_clear_mib}, \
-         row size={} MiB, bytes_per_buf={})",
-        peak_row.mib, peak_row.bytes_per_buf
+        "  (read+write GB/s; DRAM-bound plateau, largest swept size={} MiB, \
+         plateau_tolerance_pct={PLATEAU_TOLERANCE_PCT})",
+        SWEEP_MIB[SWEEP_MIB.len() - 1]
     );
+    match tiers.cache_bw_gbps {
+        Some(cache_gbps) => println!("cache_bw_gbps: {cache_gbps:.1}"),
+        None => println!("cache_bw_gbps: none (no distinct cache tier observed in sweep)"),
+    }
+    match tiers.effective_cache_mib {
+        Some(mib) => println!("effective_cache_mib: {mib:.1}"),
+        None => println!("effective_cache_mib: none"),
+    }
     println!("pct_of_theoretical_peak: {pct_of_theoretical:.1}%");
 
     // Sanity assert: fails loud on a broken measurement (near-zero elapsed
