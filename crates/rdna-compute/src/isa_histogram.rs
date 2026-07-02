@@ -278,7 +278,12 @@ fn unbundle(bundler: &str, path: &Path, target: &str) -> Result<std::path::PathB
     // Unique-enough scratch name: pid + a cheap hash of the input path +
     // target, so concurrent `cargo test` runs / repeated calls don't clash.
     let mut hash: u64 = 1469598103934665603; // FNV offset basis
-    for b in path.as_os_str().to_string_lossy().bytes().chain(target.bytes()) {
+    for b in path
+        .as_os_str()
+        .to_string_lossy()
+        .bytes()
+        .chain(target.bytes())
+    {
         hash ^= b as u64;
         hash = hash.wrapping_mul(1099511628211); // FNV prime
     }
@@ -371,6 +376,9 @@ mod tests {
     #[test]
     fn from_hsaco_missing_file_errors() {
         let result = IsaHistogram::from_hsaco(fixture_path("does_not_exist.hsaco"), "gfx1201");
-        assert!(result.is_err(), "missing fixture must fail loud, not panic/silently-empty");
+        assert!(
+            result.is_err(),
+            "missing fixture must fail loud, not panic/silently-empty"
+        );
     }
 }

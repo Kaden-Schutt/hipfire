@@ -92,16 +92,17 @@ impl Roofline {
         // Latency) — an intentional bias toward the "hardest to fix"
         // explanation when scores are exactly equal (e.g. all-zero
         // degenerate input).
-        let (binding, top) = scores
-            .iter()
-            .copied()
-            .fold((BoundClass::Bandwidth, f64::MIN), |acc, cur| {
-                if cur.1 > acc.1 {
-                    cur
-                } else {
-                    acc
-                }
-            });
+        let (binding, top) =
+            scores
+                .iter()
+                .copied()
+                .fold((BoundClass::Bandwidth, f64::MIN), |acc, cur| {
+                    if cur.1 > acc.1 {
+                        cur
+                    } else {
+                        acc
+                    }
+                });
         let runner_up = scores
             .iter()
             .filter(|(b, _)| *b != binding)
@@ -238,13 +239,19 @@ mod tests {
             private_segment_red: false,
         };
         let kprofile = synthetic_kprofile();
-        let chip = synthetic_chip(/* peak_bw_gbps */ Some(800.0), /* mem_latency_ns */ Some(280.0));
+        let chip = synthetic_chip(
+            /* peak_bw_gbps */ Some(800.0),
+            /* mem_latency_ns */ Some(280.0),
+        );
 
         // achieved_bw is far below peak — this kernel is NOT saturating BW.
         let roofline = Roofline::analyze(&hist, &kprofile, &chip, Some(120.0));
 
         assert!(
-            matches!(roofline.binding, BoundClass::ValuIssue | BoundClass::Latency),
+            matches!(
+                roofline.binding,
+                BoundClass::ValuIssue | BoundClass::Latency
+            ),
             "low-BW-utilization + heavy VALU/scalar-dequant shape must bind on \
              ValuIssue or Latency, got {:?}",
             roofline.binding
@@ -310,7 +317,10 @@ mod tests {
         let chip = crate::chip_profile::ChipProfile::for_unprofiled("gfx9999");
 
         let roofline = Roofline::analyze(&hist, &kprofile, &chip, None);
-        assert_eq!(roofline.bw, 0.0, "no achieved_bw / no peak_bw => BW score withheld at 0");
+        assert_eq!(
+            roofline.bw, 0.0,
+            "no achieved_bw / no peak_bw => BW score withheld at 0"
+        );
         assert_eq!(
             roofline.latency, 0.0,
             "unprofiled chip (mem_latency_ns=None) => latency score withheld at 0"
