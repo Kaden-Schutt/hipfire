@@ -24,6 +24,7 @@ pub mod kernel_ledger;
 mod kernels;
 pub mod moe;
 pub mod norm;
+pub mod pmc_census;
 pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
