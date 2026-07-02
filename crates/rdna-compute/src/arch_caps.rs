@@ -17,6 +17,7 @@
 use crate::feature_flags::FeatureFlags;
 
 /// Three-layer architecture descriptor computed once at `Gpu::init()` time.
+#[derive(Debug)]
 pub struct ArchCaps {
     arch: String,
 
@@ -409,6 +410,70 @@ impl ArchCaps {
     pub fn arch(&self) -> &str {
         &self.arch
     }
+
+    /// Dump the full atom/molecule/capability set + tuning knobs as JSON.
+    /// Consumed by `dump_chip_profile` (no-GPU `--arch <gfx>` path) and the
+    /// chip-profile instrument; never re-hardcode this set elsewhere — read
+    /// it from here.
+    pub fn dump_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "arch": self.arch,
+
+            // ── Atoms ─────────────────────────────────────────────
+            "is_gfx906": self.is_gfx906,
+            "is_gfx908": self.is_gfx908,
+            "is_gfx1010": self.is_gfx1010,
+            "is_gfx1011": self.is_gfx1011,
+            "is_gfx1012": self.is_gfx1012,
+            "is_gfx1030": self.is_gfx1030,
+            "is_gfx1031": self.is_gfx1031,
+            "is_gfx1032": self.is_gfx1032,
+            "is_gfx1100": self.is_gfx1100,
+            "is_gfx1101": self.is_gfx1101,
+            "is_gfx1102": self.is_gfx1102,
+            "is_gfx1103": self.is_gfx1103,
+            "is_gfx1150": self.is_gfx1150,
+            "is_gfx1151": self.is_gfx1151,
+            "is_gfx1152": self.is_gfx1152,
+            "is_gfx1200": self.is_gfx1200,
+            "is_gfx1201": self.is_gfx1201,
+            "is_gfx940": self.is_gfx940,
+            "is_gfx941": self.is_gfx941,
+            "is_gfx942": self.is_gfx942,
+
+            // ── Molecules ─────────────────────────────────────────
+            "is_gcn5": self.is_gcn5,
+            "is_cdna1": self.is_cdna1,
+            "is_rdna1": self.is_rdna1,
+            "is_rdna1p1": self.is_rdna1p1,
+            "is_rdna2": self.is_rdna2,
+            "is_rdna3": self.is_rdna3,
+            "is_rdna3_dgpu": self.is_rdna3_dgpu,
+            "is_rdna3p5": self.is_rdna3p5,
+            "is_rdna4": self.is_rdna4,
+            "is_cdna3": self.is_cdna3,
+
+            // ── Capabilities ────────────────────────────────────────
+            "has_wmma": self.has_wmma,
+            "has_wmma_w32": self.has_wmma_w32,
+            "has_wmma_w32_gfx12": self.has_wmma_w32_gfx12,
+            "has_dot2_f32_f16": self.has_dot2_f32_f16,
+            "has_mmq": self.has_mmq,
+            "is_gcn5_wave64": self.is_gcn5_wave64,
+            "is_wave32": self.is_wave32,
+            "is_wave64_native": self.is_wave64_native,
+            "has_hfq3_sdot4": self.has_hfq3_sdot4,
+            "has_hfq3_dp4a": self.has_hfq3_dp4a,
+            "has_hfq3_mmq": self.has_hfq3_mmq,
+            "has_hfq4_mmq": self.has_hfq4_mmq,
+            "has_cdna3_lds_gemv": self.has_cdna3_lds_gemv,
+
+            // ── Env-overridable tuning parameters ──────────────────
+            "gemv_dp4a": self.gemv_dp4a,
+            "gemv_prefetch": self.gemv_prefetch,
+            "gemv_rows_default": self.gemv_rows_default,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +726,28 @@ mod tests {
                 "mq3-lloyd mb4 must NOT admit {arch}"
             );
         }
+    }
+
+    // ── Task 1: Debug derive + dump_json ────────────────────────────
+
+    #[test]
+    fn dump() {
+        let flags = Arc::new(FeatureFlags::from_env_for_test("gfx1201"));
+        let caps = ArchCaps::new("gfx1201", flags);
+        let debug_str = format!("{:?}", caps);
+        assert!(
+            debug_str.contains("is_gfx1201: true"),
+            "Debug output missing is_gfx1201: true: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("has_wmma_w32_gfx12: true"),
+            "Debug output missing has_wmma_w32_gfx12: true: {debug_str}"
+        );
+        let json = caps.dump_json();
+        assert_eq!(
+            json["gemv_dp4a"], false,
+            "gemv_dp4a should be false for gfx1201"
+        );
     }
 
     #[test]

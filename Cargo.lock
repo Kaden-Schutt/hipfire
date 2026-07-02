@@ -1018,6 +1018,7 @@ version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]
