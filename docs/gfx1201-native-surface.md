@@ -837,3 +837,170 @@ dwarfs both the +4.24% re-tile and (a fortiori) this dp4a NULL, but it is a
 caveat** (`feedback_a3b_r_not_acceptable`: default A3B = AR-only + no eviction
 until R̄ improves) — **not another kernel gamble.** Prioritize the MTP-wiring
 conversation over any further decode-GEMV kernel work on this arch.
+
+## CORRECTION: decode is overhead-bound, not weight-GEMV-bound — 2026-07-02
+
+**Own the error plainly.** Everything above this line — the `(a)`–`(d)` surface
+map, the dp4a NO-GO, the +4.24% multirow win, the −1.52% dp4a NULL — pointed the
+whole Phase-A/B campaign at the **58.38% weight-GEMV family**. That framing was
+half right and strategically wrong. The weight GEMVs *are* the biggest single
+bucket, but they are **near-bandwidth-bound and therefore nearly tapped**: the
+roofline table in `(b)`/Probe-3 already showed the family blended at ~74% of the
+611.8 GB/s DRAM peak with lm_head pinned at ~100%, and the two empirical spikes
+**confirmed the ceiling is low** — multirow bought +4.24% by fixing one
+transaction-granularity outlier (`moe_down` at 44% peak), dp4a *lost* −1.52%
+because there was no ALU headroom to convert. Both were **correct experiments on
+the wrong 58%.**
+
+The fork's ~147-vs-our-~125 gap, and any path toward ~300, do **not** live in the
+weight stream. They live in the **41.62% non-weight overhead** — Q8 attention plus
+the ~16% norm/rotate/glue cluster spread across 10+ tiny kernels — which the
+`(c)` Amdahl treated as a **fixed** `(1−p)` term and never attacked. That was the
+mistake: the overhead is not fixed, it is **launch-count- and round-trip-bound**,
+and it is exactly the surface the competitor's pre-capture fusion pass targets.
+
+### The launch surface the earlier Amdahl treated as fixed
+
+Reconstructed exactly from `crates/hipfire-arch-qwen35/src/qwen35.rs`
+(`forward_scratch_layers` :11976-12533, MoE dispatch :12978-13002) and
+`crates/hipfire-dispatch/src/pipeline/mod.rs` (`run_moe_decode` :232-862):
+
+| Layer type | count | launches/layer | subtotal |
+|---|---:|---:|---:|
+| DeltaNetMoe (linear-attn + MoE-FFN) | 30 | 20 | 600 |
+| FullAttnMoe (Q8 flash-attn + MoE-FFN) | 10 | 21 | 210 |
+| Per-token non-layer (embed, final rmsnorm, lm_head, 2× sample) | — | 5 | 5 |
+| **Total** | **40** | **~20.4 avg** | **≈815 launches/token** |
+
+(The itemized 23-row surface-map sums to 787.3/token; the doc's own ~2.2%
+un-itemized tail adds ~25-30 more → **≈810-820**, canonical **815**. This
+supersedes the "~600 launches/token" rough figure used in earlier framing — the
+true count is higher, and the MoE-FFN block alone is 10 launches × 40 layers =
+400 of them.)
+
+**hipGraph does not obsolete this.** Decode is hipGraph-captured by default on
+gfx1201 (`graph_arch_default` + `HIPFIRE_GRAPH_MOE` + `HIPFIRE_AR_GRAPH` all
+default-on, qwen35.rs:5044-5127), so the **host** does not pay 815 separate launch
+calls per token — CPU dispatch latency is already amortized. What a captured graph
+does **not** remove, and what fusion **does** remove: (1) per-kernel
+occupancy/wave-launch ramp on tiny grids inside the `hipGraphLaunch` timeline, and
+(2) the **HBM/L2 round-trip of every intermediate tensor** written by one kernel
+and immediately re-read by the next (e.g. `y_gate`/`y_up` written by
+`gemv_…_moe_gate_up` then re-read by a separate `silu_mul_f32`). That round-trip is
+pure overhead a fused kernel keeps in registers — and it is why "we already graph
+decode" is **not** a counter-argument to the fusion campaign.
+
+### Corrected Amdahl — the overhead term is reducible
+
+Baseline (wall-anchored): **8.0 ms/token = 125 tok/s.** Split by the measured
+shares: weight-GEMV family 58.38% = **4.67 ms/tok**, non-weight overhead 41.62% =
+**3.33 ms/tok**. The `(c)` error was locking that 3.33 ms as `(1−p)`. Correcting it:
+
+| Scenario | weight ms | overhead ms | total ms | tok/s |
+|---|---:|---:|---:|---:|
+| Baseline (measured) | 4.67 | 3.33 | 8.00 | **125** |
+| Fusion only (overhead → 2.50, ~25% of overhead reclaimed) | 4.67 | 2.50 | 7.17 | ~139 |
+| Fusion + modest weight util → 74% BW | 4.11 | 2.50 | 6.61 | **~151** |
+| Fusion + perfect weight streaming (100% BW, 3.04 ms floor) | 3.04 | 2.50 | 5.54 | **~181** |
+| 300 tok/s would require | — | — | **3.33** | 300 (impossible) |
+
+- **Fusion-reducible slice:** a conservative **~25% of the overhead** (≈10.4 points
+  of total decode time, ≈0.83 ms/tok) is launch-ramp / round-trip waste on tiny
+  operands (2048-dim hidden, 256-dim heads, 256-expert router logits) — real ALU
+  work there is negligible. The independent no-GPU launch analysis put the same
+  quantity at a **+12-15% tok/s fusion ceiling**; these bracket each other.
+- **Irreducible floor fusion cannot touch (~17%):** Q8 FlashAttention 11.95% (KV
+  reads/softmax — already single-kernel, GQA-aware on both engines) + DeltaNet
+  recurrence core 3.56% (sequential-state math) + `moe_down_combine` 1.55%
+  (**deliberately** split from the down-GEMV; qwen35.rs:5001-5024 documents that
+  re-fusing the atomicAdd-combine reopens the task-#100 hipGraph-replay drift
+  attractor — do **not** re-fuse it).
+
+### Corrected realistic ceiling, and the two fork targets
+
+- **Realistic ceiling ≈ 181 tok/s** (fusion of the reducible overhead **plus**
+  perfect weight streaming). Even 181 assumes the weight family reaches 100% of
+  DRAM peak — the multirow/dp4a spikes show that last stretch is hard, so a
+  *pragmatic* target is the ~151-181 band.
+- **Fork's 147 tok/s: REACHABLE.** ~151 tok/s falls out of *modest* fusion (25% of
+  overhead) plus *modest* weight-utilization improvement (blended 74% BW, already
+  near current) — it does not require perfect anything. This is the correct near
+  target and it lands on the axis where we actually trail (raw AR).
+- **~300 tok/s: NOT REACHABLE.** 300 tok/s = 3.33 ms/tok total, which is **below**
+  the 3.04 ms pure weight-streaming floor plus **any** of the ~17% irreducible
+  overhead. Even infinite fusion + perfect weight BW tops out at ~181. 300 on this
+  arch/model requires a different regime entirely (MTP/spec-decode multiplier), not
+  a faster decode loop.
+
+### RANKED levers — attack the 42%, not the 58%
+
+Headroom estimates are end-to-end tok/s, cheapest-first within the fusion tier:
+
+1. **Fused SwiGLU MoE FFN — `gate_up` GEMV ⊕ SiLU ⊕ mul (~+3-5%, HIGH confidence,
+   #1 lever).** Today `gemv_hfq4g256_moe_gate_up_k8_indexed` (`gemv.rs:5812`)
+   writes `y_gate`/`y_up` to VRAM and a **separate** `silu_mul_f32`
+   (`qwen35.rs:9187/:10012`) reads them back before down-proj — one extra launch
+   **and** a full `[k_top × moe_intermediate]` HBM round-trip, every MoE layer,
+   every token. Keep gate/up in-kernel and emit the activated product directly.
+   This mirrors llama.cpp's `mul_mat_vec_q` GLU fusion (`fusion_data.gate`,
+   ggml-cuda.cu:3800-3921) one-for-one and is the single highest-leverage fix.
+2. **Fused MoE router — `softmax_f32` ⊕ `moe_topk_renorm_k8` (~+2-3%).** Two passes
+   over the same 256-element router-logit vector (1.45% + 3.48% = 4.93% raw share,
+   almost all launch/round-trip). Collapse to one softmax+top-8+renorm kernel —
+   the analogue of llama.cpp's `topk_moe_cuda` (`topk-moe.cu`, ggml-cuda.cu:3153).
+3. **Collapse the DeltaNet post-QKVZA glue chain (~+1.5-2.5%).**
+   `fused_sigmoid_alpha_gate_f32` → `conv1d_silu_split_f32` →
+   `fused_qk_l2_norm_scale_f32` → `repeat_interleave_qk_f32`: 4 launches × 30
+   layers × 200 tok = 24,000 launches for **3.36%** of time — all sequential on the
+   same tiny per-token vector, avg a few hundred ns/launch, pure launch overhead.
+   Collapsible to 1-2 kernels.
+4. **Fuse `mq_rotate_x` → `gemv_hfq4g256_residual` (wo projection) (~+1%).** Every
+   other GEMV group in-tree already fuses rotate/rmsnorm into the following GEMV
+   (`fused_qkvza`/`fused_qkv`/MoE-gate pattern); the wo step (`Step::GemvResidual`
+   + `GemvInput::Raw`, qwen35.rs:12093-12106 / :12214-12227) is the **one** place
+   the template was not applied. Fold `gated_norm_f32` (1.04%) into an adjacent
+   epilogue at the same time — low-risk, template already exists.
+5. **rope + KV-cache-write fusion (~+0.5-1%).** `rope_partial_halfsplit_f32` /
+   `rope_interleaved_f32` and `kv_cache_write_*` are separate entry points; the
+   fork folds ROPE→VIEW→SET_ROWS into one kernel that rotates K directly into the
+   paged KV cache (ggml-cuda.cu:3754). Smaller, but same launch/round-trip class.
+6. **Attention optimization (~0-2%, LOW headroom — NOT a top lever).** `(a)` shows
+   FA at 11.95%, but it is already a single fused, GQA-aware tile kernel, as is the
+   fork's WMMA FA path — the cross-engine comparison rules attention **out** as a
+   structural gap. Only marginal tile/occupancy tuning remains; do not lead here.
+7. **Launch reduction / better graph capture (subsumed, ~0% standalone).** Decode
+   is already hipGraph-captured, so there is **no** standalone CPU-dispatch win
+   left. Fewer kernels in the captured graph is a *consequence* of levers 1-5, not
+   an independent lever — the value is the GPU-side ramp + round-trip elimination
+   those fusions deliver, already counted above.
+
+### The two spikes, in honest perspective
+
+- **+4.24% multirow (moe_down R=2): a real, coherent win — but on the 58%.** It
+  fixed a genuine transaction-granularity outlier and it ships opt-in. It is not
+  wrong; it is **small and near the ceiling of its lever class** (the weight GEMVs
+  were already ~74% BW-bound). Keep it.
+- **−1.52% dp4a (moe_gate_up): a correct NULL — and on the 58%.** It empirically
+  proved the weight GEMV was DRAM/latency-bound with no ALU headroom, plus a Q8_1
+  quant-launch tax. It closed the dp4a question the right way. Also on the wrong
+  bucket.
+
+Neither result is retracted. The correction is **strategic, not numerical**: the
+weight-GEMV surface is now empirically exhausted (one win, one null, roofline
+confirmed), and the remaining decode headroom — the path to the fork's 147 and the
+realistic ~181 ceiling — is **entirely in the 42% overhead**, reachable by fusing
+the norm/router/glue cluster, not by porting more weight-GEMV kernels.
+
+### Recommended next campaign phase: **decode-loop FUSION** (not more weight GEMVs)
+
+Stop building weight-GEMV kernels on this arch — dp4a, LDS-tiling, wider loads,
+and now multirow are all resolved (NO-GO / done). The next phase is a **decode-loop
+fusion pass** in ranked order above, starting with **lever 1 (fused SwiGLU MoE
+FFN)** as the single highest-leverage change. Target the fork's **147 tok/s** (raw
+AR, reachable per the corrected Amdahl) as the near milestone and ~**151-181** as
+the ceiling band; do **not** attach a 300 tok/s target to the decode loop (the
+roofline forbids it — 300 is an MTP/spec-decode regime, tracked separately as the
+standing A3B-MTP-into-daemon lever, `project_rocmfp4_h2h_gfx1201_2026_07_01`).
+Each fusion lands behind the coherence gate and, being a pure kernel-boundary
+merge with unchanged math, carries **low** coherence risk (the one exception —
+`moe_down_combine` — is explicitly excluded above).
