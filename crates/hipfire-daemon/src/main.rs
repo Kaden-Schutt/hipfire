@@ -5741,8 +5741,9 @@ fn main() {
                 // the shared, tapped forward_prefill_batch. Both feed the same
                 // capture session. Helper to finalize identically per backend.
                 use hipfire_runtime::arch::SimpleAr;
-                fn finish() -> Result<Vec<Vec<f32>>, String> {
-                    hipfire_hneurons::capture::finish_capture()
+                fn finish(gpu: &mut rdna_compute::Gpu) -> Result<Vec<Vec<f32>>, String> {
+                    hipfire_hneurons::capture::finish_capture(gpu)
+                        .map_err(|e| format!("finish: {e:?}"))?
                         .ok_or_else(|| "capture produced no feature".to_string())
                 }
                 let outcome: Result<Vec<Vec<f32>>, String> =
@@ -5753,12 +5754,14 @@ fn main() {
                                 colnorms.len(),
                                 b.config.n_layers
                             ))
+                        } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
+                            &mut gpu,
+                            colnorms,
+                            response_start,
+                            b.config.dim,
+                        ) {
+                            Err(format!("begin_capture: {e:?}"))
                         } else {
-                            hipfire_hneurons::capture::begin_capture(
-                                colnorms,
-                                response_start,
-                                b.config.dim,
-                            );
                             match hipfire_runtime::llama::prefill_forward(
                                 &mut gpu,
                                 &b.weights,
@@ -5766,7 +5769,7 @@ fn main() {
                                 &full,
                                 &mut b.kv_cache,
                             ) {
-                                Ok(_) => finish(),
+                                Ok(_) => finish(&mut gpu),
                                 Err(e) => {
                                     hipfire_hneurons::capture::clear();
                                     Err(format!("prefill: {e:?}"))
@@ -5780,15 +5783,17 @@ fn main() {
                                 colnorms.len(),
                                 b.config.num_hidden_layers
                             ))
+                        } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
+                            &mut gpu,
+                            colnorms,
+                            response_start,
+                            b.config.hidden_size,
+                        ) {
+                            Err(format!("begin_capture: {e:?}"))
                         } else {
-                            hipfire_hneurons::capture::begin_capture(
-                                colnorms,
-                                response_start,
-                                b.config.hidden_size,
-                            );
                             b.state.reset();
                             match SimpleAr::prefill(b, &mut gpu, &full) {
-                                Ok(()) => finish(),
+                                Ok(()) => finish(&mut gpu),
                                 Err(e) => {
                                     hipfire_hneurons::capture::clear();
                                     Err(format!("prefill: {e}"))
@@ -5802,15 +5807,17 @@ fn main() {
                                 colnorms.len(),
                                 b.text_cfg.num_hidden_layers
                             ))
+                        } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
+                            &mut gpu,
+                            colnorms,
+                            response_start,
+                            b.text_cfg.hidden_size,
+                        ) {
+                            Err(format!("begin_capture: {e:?}"))
                         } else {
-                            hipfire_hneurons::capture::begin_capture(
-                                colnorms,
-                                response_start,
-                                b.text_cfg.hidden_size,
-                            );
                             b.state.reset();
                             match SimpleAr::prefill(b, &mut gpu, &full) {
-                                Ok(()) => finish(),
+                                Ok(()) => finish(&mut gpu),
                                 Err(e) => {
                                     hipfire_hneurons::capture::clear();
                                     Err(format!("prefill: {e}"))

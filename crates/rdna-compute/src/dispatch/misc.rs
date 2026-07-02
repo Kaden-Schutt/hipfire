@@ -10,6 +10,91 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 
 impl Gpu {
+    /// H-Neurons CETT GPU reduction for one transformer layer. Computes the
+    /// per-response-token down_proj output norm, then accumulates
+    /// `|act[t,j]|·col_norm[j]/(‖out[t]‖+1e-8)` over the response tokens into
+    /// `sums[j]` (this layer's `[intermediate]` accumulator slice). Replaces the
+    /// per-layer host download+reduce that forced ~2 device syncs per layer and
+    /// serialized the capture forward. No LDS (gfx1103 fault class).
+    #[allow(clippy::too_many_arguments)]
+    pub fn cett_accumulate_layer(
+        &mut self,
+        act: &GpuTensor,      // [positions * intermediate] down_proj input
+        col_norm: &GpuTensor, // [intermediate] this layer's column norms
+        down_out: &GpuTensor, // [positions * hidden] down_proj output
+        out_norm: &GpuTensor, // [positions] scratch
+        sums: &GpuTensor,     // [intermediate] this layer's accumulator
+        positions: usize,
+        intermediate: usize,
+        hidden: usize,
+        resp_start: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("cett_reduce", kernels::CETT_REDUCE_SRC, "cett_out_norm")?;
+        self.ensure_kernel("cett_reduce", kernels::CETT_REDUCE_SRC, "cett_accumulate")?;
+
+        // Pass 1: per-token output norms.
+        {
+            let d_ptr = down_out.buf.as_ptr();
+            let o_ptr = out_norm.buf.as_ptr();
+            let p = positions as i32;
+            let h = hidden as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &d_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &p as *const _ as *mut c_void,
+                &h as *const _ as *mut c_void,
+            ];
+            let block = 64u32;
+            let grid = (positions as u32).div_ceil(block).max(1);
+            let func = &self.functions["cett_out_norm"];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [grid, 1, 1],
+                    [block, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        // Pass 2: accumulate per-neuron CETT over the response tokens.
+        {
+            let a_ptr = act.buf.as_ptr();
+            let c_ptr = col_norm.buf.as_ptr();
+            let o_ptr = out_norm.buf.as_ptr();
+            let s_ptr = sums.buf.as_ptr();
+            let p = positions as i32;
+            let i = intermediate as i32;
+            let rs = resp_start as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &c_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &s_ptr as *const _ as *mut c_void,
+                &p as *const _ as *mut c_void,
+                &i as *const _ as *mut c_void,
+                &rs as *const _ as *mut c_void,
+            ];
+            let block = 256u32;
+            let grid = (intermediate as u32).div_ceil(block).max(1);
+            let func = &self.functions["cett_accumulate"];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [grid, 1, 1],
+                    [block, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
     /// scaling to activation vector x in-place. Called before GEMV on
     /// ParoQ4G128 weights.
