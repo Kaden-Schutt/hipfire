@@ -3389,6 +3389,7 @@ enum HfqInputFormat {
     Mq3,
     Qtip3,
     Oq3,
+    Oq6,
     Oq4,
     OqPlus,
     OqPlusTiered,
@@ -3410,6 +3411,7 @@ impl HfqInputFormat {
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
             "op3" | "op3g256" | "oq3" | "oq3g256" => Some(Self::Oq3),
+            "op6" | "op6g256" | "oq6" | "oq6g256" => Some(Self::Oq6),
             "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4+"
             | "oq4++" | "oq4g256" => Some(Self::Oq4),
             "opplus" | "op4-plus" => Some(Self::OqPlus),
@@ -3586,6 +3588,21 @@ fn quantize_hfq_source_tensor(
                 QuantType::MQ3G256,
                 256,
                 "MQ3G256",
+            )
+        }
+        HfqInputFormat::Oq6 => {
+            // Opus Quant W6 — symmetric signed-int6, FWHT-256, 6-bit packed (Oq6G256,
+            // 194 B/group, the near-lossless mid-tier between Oq4 and Oq8). Requires
+            // 256-aligned K; ragged dims fall back to Q8. Family completion; LDLQ + the
+            // iu8 W6A8 loader/kernel are pending.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            (
+                quantize_oq6g256(&f32_data, &signs1, &signs2),
+                QuantType::Oq6G256,
+                256,
+                "OQ6G256",
             )
         }
         HfqInputFormat::Oq3 => {
@@ -13996,6 +14013,7 @@ mod codec_golden {
         );
         h("oq4g256", &quantize_oq4g256(&x, &s1, &s2));
         h("oq3g256", &quantize_oq3g256(&x, &s1, &s2));
+        h("oq6g256", &quantize_oq6g256(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
         h("mq3g256", &quantize_mq3g256(&x, &s1, &s2));
@@ -14042,6 +14060,7 @@ mod codec_golden {
         ("mq8g256_clipsearch", "8987f0aa7fdfb487"),
         ("oq4g256", "fceec61d1cb735b3"),
         ("oq3g256", "2e40f019fba65028"),
+        ("oq6g256", "694673ac9a654c7d"),
         ("mq6g256", "c43cbf518aae87fe"),
         ("mq8g256", "8987f0aa7fdfb487"),
         ("mq3g256", "0c2f928a4236cf57"),
@@ -14183,6 +14202,30 @@ mod codec_golden {
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
         assert_eq!(quantize_oq3g256(&x, &s1, &s2).len(), 98);
+    }
+
+    /// Opus OQ6 (symmetric signed-int6) is the near-lossless mid-tier: well above Oq4
+    /// (2 extra bits ≈ +12 dB) and below Oq8 — proves the 6-bit pack + sext6 are right.
+    #[test]
+    fn oq6_roundtrip_between_oq4_and_oq8() {
+        let x = det_input(1024, 5);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq6 = dequant_oq6g256(&quantize_oq6g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq8 = dequant_oq8g256(&quantize_oq8g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let sqnr = |rec: &[f32]| -> f64 {
+            let (mut sig, mut noise) = (0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(rec) {
+                sig += (a as f64).powi(2);
+                noise += ((a - b) as f64).powi(2);
+            }
+            10.0 * (sig / noise.max(1e-30)).log10()
+        };
+        let (o4, o6, o8) = (sqnr(&oq4), sqnr(&oq6), sqnr(&oq8));
+        eprintln!("oq4 SQNR={o4:.2}  oq6={o6:.2}  oq8={o8:.2} dB");
+        assert!(o6 > o4 + 6.0, "oq6 {o6:.2} dB not >6 dB over oq4 {o4:.2}");
+        assert!(o6 < o8, "oq6 {o6:.2} dB should be below oq8 {o8:.2}");
     }
 
     /// W8A8 weight codec (Oq8G256) is near-lossless and far better than the W4A4

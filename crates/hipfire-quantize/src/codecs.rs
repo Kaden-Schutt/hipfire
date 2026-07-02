@@ -825,6 +825,77 @@ pub fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
     output
 }
 
+/// Opus-Quant W6 weight codec (Oq6G256) — the symmetric-INT6 mid-tier between Oq4
+/// and Oq8 (near-lossless, ~+12 dB over Oq4). Per 256-group block = `[f16 scale]
+/// [192 B 6-bit-packed]` = 194 B/group (6.0625 b/w). FWHT-256 rotated, symmetric
+/// clip-searched scale, `q in [-31, 31]` (avoids the asymmetric −32, matching the
+/// Opus convention). 6-bit two's-complement, 4 weights per 3 bytes (same bit layout
+/// as MQ6, but signed). Dequant: `scale · sext6`, inverse FWHT. Expands to int8 for
+/// the iu8 W6A8 path — family completion; loader/kernel pending.
+pub(crate) fn quantize_oq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, 194usize); // 2 (f16 scale) + 192 (6-bit×256)
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 31.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for j in 0..64 {
+            let q = |k: usize| -> u8 {
+                ((group[4 * j + k] * inv).round().clamp(-31.0, 31.0) as i8 as u8) & 0x3f
+            };
+            let (q0, q1, q2, q3) = (q(0), q(1), q(2), q(3));
+            let bo = out_off + 2 + j * 3;
+            output[bo] = q0 | (q1 << 6);
+            output[bo + 1] = (q1 >> 2) | (q2 << 4);
+            output[bo + 2] = (q2 >> 4) | (q3 << 2);
+        }
+    }
+    output
+}
+
+/// Dequantize OQ6G256 (round-trip oracle). `[f16 scale][192 B 6-bit]` → `scale·sext6`,
+/// inverse FWHT. Test-only.
+#[cfg(test)]
+pub(crate) fn dequant_oq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let (group_size, block_bytes) = (256usize, 194usize);
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    let sext6 = |q: u8| -> f32 {
+        let q = (q & 0x3f) as i32;
+        (if q > 31 { q - 64 } else { q }) as f32
+    };
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; 256];
+        for j in 0..64 {
+            let bo = off + 2 + j * 3;
+            let (b0, b1, b2) = (data[bo], data[bo + 1], data[bo + 2]);
+            grp[4 * j] = scale * sext6(b0 & 0x3f);
+            grp[4 * j + 1] = scale * sext6((b0 >> 6) | ((b1 & 0xf) << 2));
+            grp[4 * j + 2] = scale * sext6((b1 >> 4) | ((b2 & 0x3) << 4));
+            grp[4 * j + 3] = scale * sext6(b2 >> 2);
+        }
+        cpu_fwht_256(&mut grp, signs2, signs1);
+        out.extend_from_slice(&grp);
+    }
+    out.truncate(n);
+    out
+}
+
 /// OQ+ magnitude-tiered (Opus Plus W4A8 with the top-`w8_frac` weights kept at
 /// W8A8) — a SINGLE iu8 grouped-WMMA kernel, mixed weight precision. Per
 /// 256-group: FWHT-rotate, pick an INT4-tuned clip-search scale (so the bulk
