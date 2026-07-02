@@ -433,11 +433,10 @@ mod tests {
         let chip = crate::chip_profile::ChipProfile::load_committed("gfx1201")
             .expect("tests/chip-profiles/gfx1201.json must load");
         assert!(
-            chip.mem_latency_ns.is_none(),
-            "committed gfx1201 row has no measured mem_latency yet (Task 3's \
-             pointer-chase microbench is GPU-required and hasn't landed) — \
-             this test documents that the latency bound stays WITHHELD (not a \
-             false positive) rather than assuming a value"
+            chip.mem_latency_ns.is_some(),
+            "committed gfx1201 row now carries a MEASURED mem_latency (warm \
+             pointer-chase, 205.9 ns, 2026-07-02) — the latency/Little's-Law \
+             roofline is ACTIVE here, not withheld"
         );
 
         // Static path (`achieved_bw: None`, matching the `--self-check`
