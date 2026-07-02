@@ -466,38 +466,55 @@ mod a3b_decode_byte_model_tests {
     #[test]
     fn moe_gate_up_indexed_matches_gfx1201_a3b_surface_map() {
         let bytes = gemv_hfq4g256_moe_gate_up_k8_indexed_bytes(HIDDEN, MOE_INTERMEDIATE, K_TOP);
-        // Validated: 8,912,896 B/call @ 20.087 us = 443.7 GB/s (72.5% of the
-        // 611.8 GB/s gfx1201 DRAM peak) — best dp4a candidate per the surface map.
+        // This byte model returns 8,953,856 B/call (8 × 1,114,112 weight +
+        // 8,192 shared-x + 32,768 per-rank-y) — the surface map's own
+        // "bytes/call" column (8,912,896) is weight-ONLY and omits the
+        // small activation-vector terms, so an exact-byte match against
+        // that column isn't expected here; instead compare the resulting
+        // achieved-BW to the map's measured 443.7 GB/s (72.5% of the
+        // 611.8 GB/s gfx1201 DRAM peak — best dp4a candidate) with
+        // tolerance.
         assert_gbps_close(bytes, 20.087, 443.7, 0.02);
     }
 
     #[test]
     fn moe_down_indexed_matches_gfx1201_a3b_surface_map() {
         let bytes = gemv_hfq4g256_moe_down_k8_indexed_bytes(HIDDEN, MOE_INTERMEDIATE, K_TOP);
-        // Validated: 4,456,448 B/call @ 16.529 us = 269.6 GB/s (44.1%) —
-        // small-transaction bound, not ALU, per the surface map.
+        // Returns 4,538,368 B/call (8 × 557,056 weight + 16,384 x + 65,536
+        // y) vs. the surface map's weight-only 4,456,448 B/call column —
+        // same weight-only-vs-inclusive gap as gate_up above. Compare
+        // achieved-BW to the map's measured 269.6 GB/s (44.1%,
+        // small-transaction bound, not ALU) with tolerance.
         assert_gbps_close(bytes, 16.529, 269.6, 0.02);
     }
 
     #[test]
     fn residual_wo_matches_gfx1201_a3b_surface_map() {
-        // attn_concat_dim solved from the validated byte count:
-        // hfq4g256_weight_bytes(2048, k) == 4,456,448 ⇒ k/256 == 16 ⇒ k=4096
-        // == n_heads(16) × head_dim(256), the documented Qwen3.5/3.6 full-
-        // attention head_dim (`docs/investigations/2026-05-19-a3b-moe-mq4-awq-gptq/
+        // attn_concat_dim solved from the surface map's weight-only byte
+        // count: hfq4g256_weight_bytes(2048, k) == 4,456,448 ⇒ k/256 == 16
+        // ⇒ k=4096 == n_heads(16) × head_dim(256), the documented
+        // Qwen3.5/3.6 full-attention head_dim
+        // (`docs/investigations/2026-05-19-a3b-moe-mq4-awq-gptq/
         // paroquant-comparison.md:121`).
         let attn_concat_dim = 16 * 256;
         let bytes = gemv_hfq4g256_residual_bytes(HIDDEN, attn_concat_dim);
-        // Validated: 4,456,448 B/call @ 14.263 us = 312.4 GB/s (51.1%) —
-        // small grid (2048 blocks), occupancy/batching bound not dp4a.
+        // Returns 4,481,024 B/call (4,456,448 weight + 16,384 x + 8,192 y)
+        // vs. the surface map's weight-only 4,456,448 B/call column.
+        // Compare achieved-BW to the map's measured 312.4 GB/s (51.1%,
+        // small grid — occupancy/batching bound, not dp4a) with tolerance.
         assert_gbps_close(bytes, 14.263, 312.4, 0.02);
     }
 
     #[test]
     fn lm_head_multirow_matches_gfx1201_a3b_surface_map() {
         let bytes = gemv_hfq4g256_multirow_bytes(VOCAB, HIDDEN);
-        // Validated: 270,172,160 B/call @ 441.957 us = 611.3 GB/s (~100% of
-        // DRAM peak — DRAM-saturated, dp4a dead here, excluded from Phase B scope).
+        // Returns 271,173,632 B/call (270,172,160 weight + 8,192 x +
+        // 993,280 y) vs. the surface map's weight-only 270,172,160 B/call
+        // column — the map itself already documents this as a
+        // 611.3-613.6 GB/s RANGE for exactly this reason (weight-only vs.
+        // weight+activation-inclusive byte accounting). Compare against
+        // the lower (weight-only) bound with tolerance — DRAM-saturated
+        // either way, dp4a dead here, excluded from Phase B scope.
         assert_gbps_close(bytes, 441.957, 611.3, 0.02);
     }
 
@@ -528,9 +545,11 @@ mod a3b_decode_byte_model_tests {
         // experts / moe_intermediate / vocab are). Reconstructed as a 1.5×
         // value-expand DeltaNet config (24 key/value heads × 128 head_dim =
         // 3072 d_inner) scaling up the documented Qwen3.5/3.6 DeltaNet
-        // head_dim=128 convention (`Qwen35Config` doc comments,
-        // `crates/hipfire-arch-qwen35/src/qwen35.rs:171-174`) to this larger
-        // 35B checkpoint; validated below against the real blended figure.
+        // head_dim=128 convention — note the DOCUMENTED head COUNT there is
+        // 16, not 24 (`Qwen35Config` doc comments,
+        // `crates/hipfire-arch-qwen35/src/qwen35.rs:171-174`); 24 is this
+        // test's own 1.5× guess for a larger 35B checkpoint, not a value
+        // read off a live checkpoint header.
         let n_heads = 24;
         let head_dim = 128;
         let qkv_m = 2 * n_heads * head_dim + n_heads * head_dim; // Q+K (×2) + V
@@ -542,7 +561,14 @@ mod a3b_decode_byte_model_tests {
         let blended = (ATTN_QKVZA_CALLS * deltanet_site + MOE_GATE_FUSION_CALLS * router_site)
             / (ATTN_QKVZA_CALLS + MOE_GATE_FUSION_CALLS);
 
-        // Validated: 6,555,977 B/call @ 13.139 us = 499.0 GB/s (81.6%).
+        // blended = 6,604,736 B/call here vs. the surface map's weight-only
+        // 6,555,977 B/call figure (same weight-only-vs-inclusive gap as
+        // the other four kernels above). This is the WEAKEST of the five
+        // checks in this module: unlike the other four, one of its two
+        // inputs (the DeltaNet n_heads=24 guess above) is not itself a
+        // real shape, so this is a plausibility check against the
+        // measured 499.0 GB/s (81.6%) achieved-BW, not an independent
+        // byte-count reproduction the way the other four are.
         assert_gbps_close(blended, 13.139, 499.0, 0.02);
     }
 }
