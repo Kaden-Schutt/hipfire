@@ -381,7 +381,7 @@ pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling daemon resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1437",
+    source: "crates/hipfire-serving-core/src/session.rs:1444",
 };
 
 /// `HIPFIRE_DDTREE_BUDGET` — Runtime variable controlling DDTree budget in hipfire
@@ -2388,14 +2388,14 @@ pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_PREFILL_ACT_BITS",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-runtime/src/weights.rs:1408",
+    source: "crates/hipfire-runtime/src/weights.rs:1417",
 };
 
 /// `HIPFIRE_OQ4_TRACE` — Runtime variable controlling oQ4 trace in hipfire
 pub const ENV_HIPFIRE_OQ4_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_TRACE",
     description: "Runtime variable controlling oQ4 trace in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:646",
+    source: "crates/hipfire-runtime/src/weights.rs:652",
 };
 
 /// `HIPFIRE_PAGED_MOE_DEBUG` — Enabled when set to 1
@@ -2430,7 +2430,7 @@ pub const ENV_HIPFIRE_PARO_FUSED_PACK2: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_FUSE_RMSNORM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FUSE_RMSNORM",
     description: "time per call. Net loss on every site. Default OFF; explicit opt-in for",
-    source: "crates/hipfire-runtime/src/weights.rs:759",
+    source: "crates/hipfire-runtime/src/weights.rs:765",
 };
 
 /// `HIPFIRE_PARO_GATE_UP_FUSED` — Runtime variable controlling paro gate up fused in hipfire
@@ -2486,7 +2486,7 @@ pub const ENV_HIPFIRE_PARO_PACK4: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_PREROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PREROTATE",
     description: "Runtime variable controlling paro prerotate in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1331",
+    source: "crates/hipfire-runtime/src/weights.rs:1340",
 };
 
 /// `HIPFIRE_PARO_SHARED_PAIRS` — Runtime variable controlling paro shared pairs in hipfire
@@ -2500,7 +2500,7 @@ pub const ENV_HIPFIRE_PARO_SHARED_PAIRS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_SWIGLU_FUSED",
     description: "Runtime variable controlling paro swiglu fused in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1348",
+    source: "crates/hipfire-runtime/src/weights.rs:1357",
 };
 
 /// `HIPFIRE_PERF_BASELINE` — Runtime variable controlling perf baseline in hipfire
@@ -3352,7 +3352,7 @@ pub const ENV_HIPFIRE_SCORE_TAIL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling server resident state budget mb in hipfire",
-    source: "crates/hipfire-serving-core/src/session.rs:1438",
+    source: "crates/hipfire-serving-core/src/session.rs:1445",
 };
 
 /// `HIPFIRE_SMOKE_KV` — Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the

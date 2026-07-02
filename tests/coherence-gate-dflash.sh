@@ -105,6 +105,13 @@ select_27b_pair() {
     try_27b_pair "qwen3.5-27b-mq3+dflash" \
         "$MODELS_DIR/qwen3.5-27b-mq3.hfq" \
         "$DFLASH_DIR/qwen3.5-27b-mq3.dflash.hfq" && return 0
+    # 9B fallback: smaller qwen3.5 target+dflash pair. Exercises the same
+    # spec_step_dflash / spec_step_ddtree paths as the 27B pairs (same qwen35
+    # arch), so it provides real coverage on boxes without a 27B pair staged
+    # (e.g. gfx1103). Tried last so a 27B pair is still preferred when present.
+    try_27b_pair "qwen3.5-9b-mq4+dflash" \
+        "$MODELS_DIR/qwen3.5-9b-mq4.hfq" \
+        "$DFLASH_DIR/qwen3.5-9b-mq4.dflash.hfq" && return 0
     return 1
 }
 
@@ -254,11 +261,11 @@ append_trace_json_record() {
     trace_json_records=$((trace_json_records + 1))
 }
 
-# Skip everything if 27B model + draft aren't both present.
+# Skip everything if no target+draft dflash pair is present.
 if [ ! -f "$TARGET_27B" ] || [ ! -f "$DRAFT_27B" ]; then
     printf '\n]}\n' >> "$TRACE_JSON_OUT"
     {
-        echo "## SKIPPED — 27B target or draft model not found"
+        echo "## SKIPPED — no dflash target+draft pair found (27B or 9B)"
         echo
         echo "- target present: $( [ -f "$TARGET_27B" ] && echo yes || echo no )"
         echo "- draft present:  $( [ -f "$DRAFT_27B" ] && echo yes || echo no )"
@@ -269,7 +276,7 @@ if [ ! -f "$TARGET_27B" ] || [ ! -f "$DRAFT_27B" ]; then
         echo "\`HIPFIRE_MODELS_DIR\` and DFlash sidecars under \`HIPFIRE_DFLASH_DIR\`,"
         echo "or use the default \`$HIPFIRE_HOME/models\` and \`$HIPFIRE_HOME/drafts\`."
     } >> "$OUT"
-    echo "coherence-gate-dflash: 27B models not present, skipping (no hard error)"
+    echo "coherence-gate-dflash: no dflash pair present, skipping (no hard error)"
     echo "report: $OUT"
     echo "dflash trace json: $TRACE_JSON_OUT"
     exit 0

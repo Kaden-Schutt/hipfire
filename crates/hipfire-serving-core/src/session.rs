@@ -286,8 +286,15 @@ impl Qwen35RequestSessionState {
         let logits = gpu
             .alloc_tensor(&scratch.logits.shape, scratch.logits.dtype)
             .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?;
-        gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
-            .map_err(|e| format!("save qwen35 session logits snapshot: {e:?}"))?;
+        // On success `logits` is moved into `Self` and freed via the eviction
+        // path; free it here on the memcpy-error branch (the only path between the
+        // alloc and the move) so a failed snapshot copy doesn't strand it.
+        if let Err(e) =
+            gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
+        {
+            let _ = gpu.free_tensor(logits);
+            return Err(format!("save qwen35 session logits snapshot: {e:?}"));
+        }
         Ok(Self {
             // Move the whole active cursor into the parked snapshot (the slot's
             // `m.active.cursor` is overwritten by the next restore).

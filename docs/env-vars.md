@@ -55,7 +55,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_COMP_DUMP` | Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each | `crates/hipfire-arch-deepseek4/src/forward.rs:643` |
 | `HIPFIRE_CONV1D_TREE_GFX1151` | Environment toggle value controls runtime behavior | `crates/rdna-compute/examples/bench_conv1d_tree_gfx1151.rs:22` |
 | `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:1125` |
-| `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1437` |
+| `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1444` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `crates/hipfire-serving-core/src/load.rs:3207` |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:11360` |
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:2519` |
@@ -341,13 +341,13 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_NPU_SOFTMAX_CONFIGS` | Parse "n_heads:ctx_len1+ctx_len2+..." entries | `crates/hipfire-arch-qwen35/build.rs:232` |
 | `HIPFIRE_NPU_TARGETS` | Runtime variable controlling npu targets in hipfire | `crates/hipfire-arch-qwen35/build.rs:60` |
 | `HIPFIRE_OQ4_BATCHED_PREFILL` | Environment toggle value controls runtime behavior | `crates/hipfire-arch-qwen35/src/qwen35.rs:14270` |
-| `HIPFIRE_OQ4_PREFILL_ACT_BITS` | Selects behavior from recognized values | `crates/hipfire-runtime/src/weights.rs:1408` |
-| `HIPFIRE_OQ4_TRACE` | Runtime variable controlling oQ4 trace in hipfire | `crates/hipfire-runtime/src/weights.rs:646` |
+| `HIPFIRE_OQ4_PREFILL_ACT_BITS` | Selects behavior from recognized values | `crates/hipfire-runtime/src/weights.rs:1417` |
+| `HIPFIRE_OQ4_TRACE` | Runtime variable controlling oQ4 trace in hipfire | `crates/hipfire-runtime/src/weights.rs:652` |
 | `HIPFIRE_PAGED_MOE_DEBUG` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/qwen35.rs:7845` |
 | `HIPFIRE_PARO_BATCHED` | Runtime variable controlling paro batched in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:14862` |
 | `HIPFIRE_PARO_FA3_FUSED` | Runtime variable controlling paro fa3 fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29589` |
 | `HIPFIRE_PARO_FUSED_PACK2` | Runtime variable controlling paro fused pack2 in hipfire | `crates/rdna-compute/src/dispatch/fused.rs:422` |
-| `HIPFIRE_PARO_FUSE_RMSNORM` | time per call. Net loss on every site. Default OFF; explicit opt-in for | `crates/hipfire-runtime/src/weights.rs:759` |
+| `HIPFIRE_PARO_FUSE_RMSNORM` | time per call. Net loss on every site. Default OFF; explicit opt-in for | `crates/hipfire-runtime/src/weights.rs:765` |
 | `HIPFIRE_PARO_GATE_UP_FUSED` | Runtime variable controlling paro gate up fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29187` |
 | `HIPFIRE_PARO_LA2_FUSED` | Runtime variable controlling paro la2 fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29289` |
 | `HIPFIRE_PARO_LA4_FUSED` | Runtime variable controlling paro la4 fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29285` |
@@ -355,9 +355,9 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_PARO_PACK1` | Runtime variable controlling paro pack1 in hipfire | `crates/rdna-compute/src/dispatch/gemv.rs:1371` |
 | `HIPFIRE_PARO_PACK2` | Runtime variable controlling paro pack2 in hipfire | `crates/rdna-compute/src/dispatch/gemv.rs:1374` |
 | `HIPFIRE_PARO_PACK4` | Runtime variable controlling paro pack4 in hipfire | `crates/rdna-compute/src/dispatch/gemv.rs:1377` |
-| `HIPFIRE_PARO_PREROTATE` | Runtime variable controlling paro prerotate in hipfire | `crates/hipfire-runtime/src/weights.rs:1331` |
+| `HIPFIRE_PARO_PREROTATE` | Runtime variable controlling paro prerotate in hipfire | `crates/hipfire-runtime/src/weights.rs:1340` |
 | `HIPFIRE_PARO_SHARED_PAIRS` | Runtime variable controlling paro shared pairs in hipfire | `crates/rdna-compute/src/dispatch/fused.rs:416` |
-| `HIPFIRE_PARO_SWIGLU_FUSED` | Runtime variable controlling paro swiglu fused in hipfire | `crates/hipfire-runtime/src/weights.rs:1348` |
+| `HIPFIRE_PARO_SWIGLU_FUSED` | Runtime variable controlling paro swiglu fused in hipfire | `crates/hipfire-runtime/src/weights.rs:1357` |
 | `HIPFIRE_PERF_BASELINE` | Runtime variable controlling perf baseline in hipfire | `crates/hipfire-eval/src/executor_examples.rs:1325` |
 | `HIPFIRE_PERF_BASELINE_DIR` | Runtime variable controlling perf baseline dir in hipfire | `crates/hipfire-eval/src/executor_examples.rs:1338` |
 | `HIPFIRE_PERPLEXITY_BIN` | Runtime variable controlling perplexity bin in hipfire | `crates/hipfire-eval/src/lib.rs:1226` |
@@ -477,7 +477,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_RUN_EXAMPLE_BIN` | Runtime variable controlling run example bin in hipfire | `crates/hipfire-eval/src/lib.rs:1196` |
 | `HIPFIRE_SAMPLE_COMPARE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/infer_qwen35.rs:236` |
 | `HIPFIRE_SCORE_TAIL` | HIPFIRE_SCORE_TAIL=N → score only the last N query positions (leak-free for | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:143` |
-| `HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling server resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1438` |
+| `HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling server resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1445` |
 | `HIPFIRE_SMOKE_KV` | Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the | `crates/hipfire-runtime/examples/a3b_smoke_forward.rs:110` |
 | `HIPFIRE_SMOKE_KV_SEQ` | production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit | `crates/hipfire-runtime/examples/a3b_smoke_forward.rs:103` |
 | `HIPFIRE_SMOKE_MODE` | raw (default for back-compat): tokenize "Hello" and decode from pos=0 | `crates/hipfire-runtime/examples/a3b_smoke_forward.rs:158` |

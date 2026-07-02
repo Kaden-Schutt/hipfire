@@ -587,13 +587,19 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             let xs = gpu.alloc_tensor(&[1], DType::F32)?;
             let yi = gpu.alloc_tensor(&[w.m * 4], DType::Raw)?; // int32
             let w_scale = w.buf.sub_offset(w.m * w.k, w.m * 4);
-            gpu.quantize_act_int8_per_token(x, &xq, &xs, 1, w.k)?;
-            gpu.gemm_iu8_i32_wmma(&w.buf, &xq, &yi, w.m, w.k, 1)?;
-            gpu.dequant_i32_rowcol(&yi, &xs, &w_scale, y, 1, w.m)?;
+            // Fallible span in a closure so an intermediate `?` still frees the
+            // per-call scratch (mirrors the Oq4/Oq8 sibling arms). This matters on
+            // a faulting GPU, where these kernels DO error and would otherwise leak.
+            let result: HipResult<()> = (|| {
+                gpu.quantize_act_int8_per_token(x, &xq, &xs, 1, w.k)?;
+                gpu.gemm_iu8_i32_wmma(&w.buf, &xq, &yi, w.m, w.k, 1)?;
+                gpu.dequant_i32_rowcol(&yi, &xs, &w_scale, y, 1, w.m)?;
+                Ok(())
+            })();
             gpu.free_tensor(xq)?;
             gpu.free_tensor(xs)?;
             gpu.free_tensor(yi)?;
-            Ok(())
+            result
         }
         // Opus Quant W8A8 (Oq8G256) — int8 activations + int8 weights, near-lossless.
         // The int8 generalization of the Oq4 arm (no nibble packing; iu8 WMMA).
@@ -1224,10 +1230,13 @@ pub fn weight_gemv_residual(
         }
         _ => {
             let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
-            weight_gemv(gpu, w, x, &tmp)?;
-            gpu.add_inplace_f32(y, &tmp)?;
+            let result: HipResult<()> = (|| {
+                weight_gemv(gpu, w, x, &tmp)?;
+                gpu.add_inplace_f32(y, &tmp)?;
+                Ok(())
+            })();
             gpu.free_tensor(tmp)?;
-            Ok(())
+            result
         }
     }
 }
@@ -1460,13 +1469,17 @@ pub fn weight_gemm(
             let yi = gpu.alloc_tensor(&[batch_size * w.m * 4], DType::Raw)?; // int32
                                                                              // Per-channel scale lives in the byte tail of buf (W8A8Ref is byte-level).
             let w_scale = w.buf.sub_offset(w.m * w.k, w.m * 4);
-            gpu.quantize_act_int8_per_token(x, &xq, &xs, batch_size, w.k)?;
-            gpu.gemm_iu8_i32_wmma(&w.buf, &xq, &yi, w.m, w.k, batch_size)?;
-            gpu.dequant_i32_rowcol(&yi, &xs, &w_scale, y, batch_size, w.m)?;
+            // Fallible span in a closure so an intermediate `?` still frees.
+            let result: HipResult<()> = (|| {
+                gpu.quantize_act_int8_per_token(x, &xq, &xs, batch_size, w.k)?;
+                gpu.gemm_iu8_i32_wmma(&w.buf, &xq, &yi, w.m, w.k, batch_size)?;
+                gpu.dequant_i32_rowcol(&yi, &xs, &w_scale, y, batch_size, w.m)?;
+                Ok(())
+            })();
             gpu.free_tensor(xq)?;
             gpu.free_tensor(xs)?;
             gpu.free_tensor(yi)?;
-            Ok(())
+            result
         }
         _ => {
             // Generic fallback: no batched kernel for this weight dtype, so loop a
@@ -1487,16 +1500,20 @@ pub fn weight_gemm(
             // Fallback: repeated GEMV (no batched kernel for this format)
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
             let y_tok = gpu.alloc_tensor(&[w.m], DType::F32)?;
-            for b in 0..batch_size {
-                gpu.hip
-                    .memcpy_dtod_at(&x_tok.buf, 0, &x.buf, b * w.k * 4, w.k * 4)?;
-                weight_gemv(gpu, w, &x_tok, &y_tok)?;
-                gpu.hip
-                    .memcpy_dtod_at(&y.buf, b * w.m * 4, &y_tok.buf, 0, w.m * 4)?;
-            }
+            // Fallible loop in a closure so a per-iteration `?` still frees.
+            let result: HipResult<()> = (|| {
+                for b in 0..batch_size {
+                    gpu.hip
+                        .memcpy_dtod_at(&x_tok.buf, 0, &x.buf, b * w.k * 4, w.k * 4)?;
+                    weight_gemv(gpu, w, &x_tok, &y_tok)?;
+                    gpu.hip
+                        .memcpy_dtod_at(&y.buf, b * w.m * 4, &y_tok.buf, 0, w.m * 4)?;
+                }
+                Ok(())
+            })();
             gpu.free_tensor(x_tok)?;
             gpu.free_tensor(y_tok)?;
-            Ok(())
+            result
         }
     }
 }
