@@ -168,8 +168,35 @@ else
 fi
 log "devices to sweep: ${DEV_LIST[*]}"
 
-# ── GPU lock (best-effort, matches scripts/mq3-mq2-sweep.sh) ────────────
+# ── Cleanup trap — installed BEFORE any state-mutating action below (GPU
+# lock acquire, DPM force) so a crash/signal between "state mutated" and
+# "trap installed" can never leak the GPU lock or leave DPM forced-high.
+# All vars cleanup() reads are initialized here, ahead of the trap, so it's
+# always safe to fire even if the very next line is what dies.
 USE_GPU_LOCK=0
+PRIOR_PERFLEVEL="auto"
+DPM_FORCED=0
+
+try_rocm_smi_set() {
+    rocm-smi --setperflevel "$1" >/dev/null 2>&1 \
+        || sudo -n rocm-smi --setperflevel "$1" >/dev/null 2>&1
+}
+
+cleanup() {
+    if [ "$DPM_FORCED" = 1 ]; then
+        if try_rocm_smi_set "$PRIOR_PERFLEVEL"; then
+            log "DPM: restored power_dpm_force_performance_level=$PRIOR_PERFLEVEL"
+        else
+            log "WARN: failed to restore prior DPM perf level ($PRIOR_PERFLEVEL)"
+        fi
+    fi
+    if [ "$USE_GPU_LOCK" = 1 ]; then
+        gpu_release 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# ── GPU lock (best-effort, matches scripts/mq3-mq2-sweep.sh) ────────────
 if [ -r "$LOCK_SCRIPT" ]; then
     # shellcheck disable=SC1090
     . "$LOCK_SCRIPT"
@@ -183,13 +210,10 @@ fi
 # (observed reversed on hipx: rocm-smi GPU[0]=6950XT was HIP index 1).
 # Forcing the perf level box-wide sidesteps the mismatch entirely; it is
 # harmless to also force-high a device this sweep isn't currently measuring.
-try_rocm_smi_set() {
-    rocm-smi --setperflevel "$1" >/dev/null 2>&1 \
-        || sudo -n rocm-smi --setperflevel "$1" >/dev/null 2>&1
-}
-
-PRIOR_PERFLEVEL="auto"
-DPM_FORCED=0
+# (For the same reason this never reads a per-card `pp_dpm_mclk`/sysfs star
+# line either — that requires a /sys/class/drm/cardN -> HIP-index mapping,
+# i.e. exactly the enumeration this comment says to never rely on. DPM
+# provenance below is recorded box-wide only, not per-device.)
 if [ "$FORCE_DPM" = 1 ] && command -v rocm-smi >/dev/null 2>&1; then
     parsed=$(rocm-smi --showperflevel 2>/dev/null \
         | grep -oE 'Performance Level:.*' | head -1 | awk -F': ' '{print $2}')
@@ -208,29 +232,34 @@ OUT_DIR="${OUT_DIR:-benchmarks/results/$(date +%Y%m%d-%H%M%S)-chip-profile-sweep
 mkdir -p "$OUT_DIR"
 log "output dir: $OUT_DIR"
 
-cleanup() {
-    if [ "$DPM_FORCED" = 1 ]; then
-        if try_rocm_smi_set "$PRIOR_PERFLEVEL"; then
-            log "DPM: restored power_dpm_force_performance_level=$PRIOR_PERFLEVEL"
-        else
-            log "WARN: failed to restore prior DPM perf level ($PRIOR_PERFLEVEL)"
-        fi
-    fi
-    if [ "$USE_GPU_LOCK" = 1 ]; then
-        gpu_release 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
+# Box-wide DPM provenance (matches the `provenance.dpm_state` field consumed
+# by ChipProfile / tests/chip-profiles/<arch>.json — see the "INSTRUMENT
+# TODO: ... record dpm_state/mclk in provenance" note left in gfx1201.json).
+# Deliberately box-wide, not per-device: see the rocm-smi-index-mismatch
+# comment above the DPM force-high block for why a per-card mclk/dpm_state
+# reading is NOT attempted here.
+if [ "$DPM_FORCED" = 1 ]; then
+    DPM_STATE_NOTE="high-forced (power_dpm_force_performance_level=high box-wide; was: $PRIOR_PERFLEVEL)"
+elif [ "$FORCE_DPM" = 1 ]; then
+    DPM_STATE_NOTE="force-high FAILED (no permission?) — warm pass is NOT DPM-warmed, treat as cold-adjacent"
+else
+    DPM_STATE_NOTE="force-high skipped (--no-force-dpm)"
+fi
 
 SUMMARY_TSV="$OUT_DIR/summary.tsv"
 SUMMARY_MD="$OUT_DIR/summary.md"
-printf 'device\tarch\tmetric\tcold\twarm\tfolded\tanomaly\n' > "$SUMMARY_TSV"
+{
+    printf '# dpm_state_boxwide\t%s\n' "$DPM_STATE_NOTE"
+    printf 'device\tarch\tmetric\tcold\twarm\tfolded\tanomaly\n'
+} > "$SUMMARY_TSV"
 {
     echo "# chip-profile-sweep — $(date -Is 2>/dev/null || date)"
     echo
     echo "Folded (warm, sanity-checked against cold) chip-profile measurements."
     echo "Copy the warm figures below into \`tests/chip-profiles/<arch>.json\`"
     echo "per \`crates/rdna-compute/src/chip_profile.rs\` (Task 4) — never the cold ones."
+    echo
+    echo "**DPM state (box-wide):** $DPM_STATE_NOTE"
     echo
     echo "| device | arch | metric | cold | warm | folded | anomaly |"
     echo "|---|---|---|---|---|---|---|"
