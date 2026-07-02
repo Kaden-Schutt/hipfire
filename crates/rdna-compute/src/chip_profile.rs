@@ -339,6 +339,50 @@ pub fn pointer_chase_buffer_bytes(arch: &str) -> usize {
     target_mib as usize * MIB
 }
 
+/// Cache-residency guard for a pointer-chase latency measurement (issue #490).
+///
+/// The bare `[50, 2000) ns` plausibility assert CANNOT prove the working set
+/// reached DRAM — a fully cache-resident chase still lands in that window. A
+/// genuine DRAM round trip has per-hop latency substantially HIGHER than a
+/// deliberately cache-resident chase on the same device. If the DRAM-sized
+/// chase is not at least `min_dram_over_cache_ratio`x the cache-resident chase,
+/// the large buffer never left cache and the number is cache-DEFLATED -> `Err`
+/// (WITHHELD, never shipped as a clean DRAM latency).
+///
+/// PURE + NO-GPU: operates on two already-measured latencies.
+pub fn check_residency(
+    cache_resident_ns: f64,
+    candidate_dram_ns: f64,
+    min_dram_over_cache_ratio: f64,
+) -> Result<(), String> {
+    if !cache_resident_ns.is_finite() || cache_resident_ns <= 0.0 {
+        return Err(format!(
+            "check_residency: cache_resident_ns must be finite and positive, got {cache_resident_ns}"
+        ));
+    }
+    if !candidate_dram_ns.is_finite() || candidate_dram_ns <= 0.0 {
+        return Err(format!(
+            "check_residency: candidate_dram_ns must be finite and positive, got {candidate_dram_ns}"
+        ));
+    }
+    if !min_dram_over_cache_ratio.is_finite() || min_dram_over_cache_ratio <= 1.0 {
+        return Err(format!(
+            "check_residency: min_dram_over_cache_ratio must be finite and > 1.0, got {min_dram_over_cache_ratio}"
+        ));
+    }
+    let required = cache_resident_ns * min_dram_over_cache_ratio;
+    if candidate_dram_ns >= required {
+        Ok(())
+    } else {
+        Err(format!(
+            "check_residency: DRAM-sized chase {candidate_dram_ns:.3} ns is not >= \
+             {min_dram_over_cache_ratio:.2}x the cache-resident chase {cache_resident_ns:.3} ns \
+             (required >= {required:.3} ns) — the 'DRAM' buffer is still CACHE-RESIDENT and this \
+             latency is cache-DEFLATED (issue #490). WITHHELD, not shipped."
+        ))
+    }
+}
+
 /// One (buffer-size-in-MiB, achieved-GB/s) sample from a bandwidth sweep
 /// (e.g. `peak_bw_probe`'s `SweepRow`), ordered ascending by `mib`. Used only
 /// by [`detect_bw_tiers`] — kept as a small standalone struct (rather than
@@ -537,6 +581,36 @@ mod tests {
         // gfx1201 (RDNA4): 4x(4+64) = 272 MiB; gfx1100 (RDNA3): 4x(6+96) = 408 MiB.
         assert_eq!(pointer_chase_buffer_bytes("gfx1201"), 272 * 1024 * 1024);
         assert_eq!(pointer_chase_buffer_bytes("gfx1100"), 408 * 1024 * 1024);
+    }
+
+    #[test]
+    fn check_residency_flags_cache_deflated_gfx1030() {
+        // The #490 signature: the shipped "DRAM" latency is barely above a
+        // genuine L2-hit reference — within noise, NOT a real >1.5x DRAM step.
+        let result = check_residency(140.0, 148.035, 1.5);
+        assert!(
+            result.is_err(),
+            "a within-noise DRAM/cache ratio must fail, got {result:?}"
+        );
+        assert!(result.unwrap_err().contains("cache-DEFLATED"));
+    }
+
+    #[test]
+    fn check_residency_passes_genuine_dram() {
+        assert!(check_residency(140.0, 300.0, 1.5).is_ok());
+    }
+
+    #[test]
+    fn check_residency_boundary_is_inclusive() {
+        assert!(check_residency(100.0, 150.0, 1.5).is_ok());
+        assert!(check_residency(100.0, 149.999, 1.5).is_err());
+    }
+
+    #[test]
+    fn check_residency_rejects_bad_inputs() {
+        assert!(check_residency(0.0, 300.0, 1.5).is_err()); // non-positive cache
+        assert!(check_residency(140.0, f64::NAN, 1.5).is_err()); // non-finite dram
+        assert!(check_residency(140.0, 300.0, 1.0).is_err()); // ratio must be > 1.0
     }
 
     #[test]
