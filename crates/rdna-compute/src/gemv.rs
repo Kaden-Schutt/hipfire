@@ -4611,13 +4611,20 @@ impl Gpu {
         // regardless of HIPFIRE_GEMV_ROWS. (TODO: port the multi-row residual
         // kernel to the default path if/when the non-residual multi-row wins
         // scale to justify residual too.)
+        //
+        // gfx1201 (RDNA4): admitted for the bounded R=2 spike (see
+        // docs/gfx1201-native-surface.md "moe_down re-tile check + Phase-B
+        // final decision") — only R=2 has a gfx1201 kernel today, so R=4/R=8
+        // stay RDNA3-dgpu-only until ported. Opt-in via HIPFIRE_GEMV_ROWS=2;
+        // default (R=1) behavior is unchanged on every arch.
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
-        let rows = if rdna3 {
+        let gfx1201 = self.arch_caps.is_gfx1201();
+        let rows = if rdna3 || gfx1201 {
             self.flags.gemv_rows.unwrap_or(1)
         } else {
             1
         };
-        let use_multirow = rdna3 && rows > 1;
+        let use_multirow = (rdna3 && rows > 1) || (gfx1201 && rows == 2);
 
         // Bandwidth: weight + x + y_read (for residual) + y_write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
@@ -4700,17 +4707,28 @@ impl Gpu {
                 })
             }
         } else if use_multirow {
-            let (func_name, grid_div) = match rows {
-                2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
-                4 => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
-                8 => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
-                _ => unreachable!(),
+            let (module_name, src, func_name, grid_div): (&str, &str, &str, u32) = if gfx1201 {
+                (
+                    "gemv_hfq4g256_residual_multirow_gfx1201",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1201_SRC,
+                    "gemv_hfq4g256_residual_multirow_r2_gfx1201",
+                    2,
+                )
+            } else {
+                let (func_name, grid_div) = match rows {
+                    2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
+                    4 => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
+                    8 => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
+                    _ => unreachable!(),
+                };
+                (
+                    "gemv_hfq4g256_residual_multirow_rdna3",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
+                    func_name,
+                    grid_div,
+                )
             };
-            self.ensure_kernel(
-                "gemv_hfq4g256_residual_multirow_rdna3",
-                kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
-                func_name,
-            )?;
+            self.ensure_kernel(module_name, src, func_name)?;
             let grid = ((m as u32) + grid_div - 1) / grid_div;
             self.launch_maybe_blob(func_name, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -6341,6 +6359,16 @@ impl Gpu {
     /// (RDNA) for now — the CDNA wave64 path stays on the residual_scaled
     /// kernel; atomicAdd on HBM is faster there and the contention pattern
     /// is different.
+    ///
+    /// gfx1201 (RDNA4) bounded R=2 spike: opt-in via `HIPFIRE_GEMV_ROWS=2`
+    /// folds R adjacent output ROWS (same expert + same x row, since routing
+    /// is per (token, krank) not per output row) into one 32-thread wave,
+    /// hoisting the x-vector load and growing per-block A traffic from
+    /// 272 B (A3B's K=512 tail-only shape) to R×272 B contiguous. Grid
+    /// becomes `[ceil(M/2), K_TOP, batch]`. See
+    /// docs/gfx1201-native-surface.md "moe_down re-tile check + Phase-B
+    /// final decision". Default (`HIPFIRE_GEMV_ROWS` unset / =1) keeps the
+    /// single-row kernel on every arch — no default behavior change.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         &mut self,
@@ -6354,11 +6382,6 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-            kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-        )?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let rbp = rot_batch.buf.as_ptr();
@@ -6375,6 +6398,12 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
         ];
+
+        // gfx1201-only, opt-in, R=2 only (bounded spike scope). Any other
+        // arch or HIPFIRE_GEMV_ROWS value falls through to the single-row
+        // kernel unchanged.
+        let use_multirow = self.arch_caps.is_gfx1201() && self.flags.gemv_rows == Some(2);
+
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -6382,24 +6411,58 @@ impl Gpu {
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
             bytes,
         );
-        let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-            [m as u32, k_top as u32, batch_size as u32],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(rbp);
-                b.push_ptr(eop);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(kt_val);
-                b
-            },
-        );
+        let result = if use_multirow {
+            let func_name =
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_multirow_r2_gfx1201";
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_down_multirow_gfx1201",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_MULTIROW_GFX1201_SRC,
+                func_name,
+            )?;
+            let grid_x = ((m as u32) + 1) / 2;
+            self.launch_maybe_blob(
+                func_name,
+                [grid_x, k_top as u32, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pp);
+                    b.push_ptr(ip);
+                    b.push_ptr(rbp);
+                    b.push_ptr(eop);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(kt_val);
+                    b
+                },
+            )
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+            )?;
+            self.launch_maybe_blob(
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+                [m as u32, k_top as u32, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pp);
+                    b.push_ptr(ip);
+                    b.push_ptr(rbp);
+                    b.push_ptr(eop);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(kt_val);
+                    b
+                },
+            )
+        };
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

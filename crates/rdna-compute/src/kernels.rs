@@ -2261,6 +2261,19 @@ pub const GEMV_HFQ4G256_MULTIROW_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
+// gfx1201 (RDNA4) bounded R=2 spike sibling — own module name + `_gfx1201`
+// symbol suffix per the kernel-module-cache-collision rule (a gfx1201
+// variant reusing the gfx1100 module name would be dead code). See
+// docs/gfx1201-native-surface.md "moe_down re-tile check + Phase-B final
+// decision". Opt-in via HIPFIRE_GEMV_ROWS=2; R=1 default is unchanged.
+pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1201.hip");
+// gfx1201 (RDNA4) bounded R=2 multirow sibling of the atomic-free indexed
+// batched expanded MoE-down GEMV (has NO multirow variant on any other
+// arch). Own module name + `_gfx1201` symbol suffix, same rule as above.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_MULTIROW_GFX1201_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_multirow.gfx1201.hip"
+);
 
 // 4-way fused HFQ4-G256 projection for Qwen3.5 DeltaNet LA preamble:
 // wqkv + wz + w_beta + w_alpha in a single launch. Same 4x-unroll inner
