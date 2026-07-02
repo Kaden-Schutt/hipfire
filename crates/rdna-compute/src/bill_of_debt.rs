@@ -106,6 +106,39 @@ impl DebtRow {
     }
 }
 
+/// A committed corpus of [`DebtRow`]s — the per-arch "bill of debt". Query
+/// methods derive debt magnitude / ranking / per-arch totals / cross-arch
+/// unevenness on the fly; nothing derived is stored.
+pub struct BillOfDebt {
+    pub rows: Vec<DebtRow>,
+}
+
+impl BillOfDebt {
+    /// Rows ranked by recoverable REAL time (`debt_magnitude_ms`, descending),
+    /// excluding withheld rows (no honest magnitude). This ranks by the
+    /// actual lever — recoverable wall-time — NOT by roofline efficiency: a
+    /// kernel 90% off roofline but only 1ms in-model is a smaller lever than
+    /// one 20% off roofline but 500ms in-model.
+    pub fn ranked_by_lever(&self) -> Vec<&DebtRow> {
+        let mut ranked: Vec<(&DebtRow, f64)> = self
+            .rows
+            .iter()
+            .filter_map(|r| r.debt_magnitude_ms().map(|m| (r, m)))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked.into_iter().map(|(r, _)| r).collect()
+    }
+
+    /// The withheld cells — targets for future measurement (the honest gaps
+    /// in the corpus). Recorded, never faked.
+    pub fn withheld_targets(&self) -> Vec<&DebtRow> {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r, DebtRow::Withheld { .. }))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +186,35 @@ mod tests {
             },
             reason: reason.to_string(),
         }
+    }
+
+    #[test]
+    fn ranked_by_lever_uses_real_time_not_efficiency() {
+        let bill = BillOfDebt {
+            rows: vec![
+                // 90% off roofline but only 1ms in-model → tiny recoverable time.
+                measured("gfx1100", "efficiency_trap", "d", 1.0, 0.1, 90.0), // debt = 0.9
+                // 20% off roofline but 500ms in-model → large recoverable time.
+                measured("gfx1100", "real_lever", "d", 500.0, 400.0, 20.0), // debt = 100.0
+                // Withheld: no honest magnitude → must be excluded from ranking.
+                withheld("gfx1100", "unmeasured", "d", "oom"),
+            ],
+        };
+        let ranked = bill.ranked_by_lever();
+        assert_eq!(ranked.len(), 2, "withheld rows must be excluded from ranking");
+        assert_eq!(
+            ranked[0].key().kernel,
+            "real_lever",
+            "the 100ms lever must outrank the 0.9ms efficiency trap (real time, not % efficiency)"
+        );
+        assert_eq!(ranked[1].key().kernel, "efficiency_trap");
+
+        let withheld_kernels: Vec<&str> = bill
+            .withheld_targets()
+            .iter()
+            .map(|r| r.key().kernel.as_str())
+            .collect();
+        assert_eq!(withheld_kernels, vec!["unmeasured"]);
     }
 
     #[test]
