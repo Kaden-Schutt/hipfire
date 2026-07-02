@@ -1939,6 +1939,7 @@ name = "hipfire-train"
 version = "0.3.0"
 dependencies = [
  "crossterm",
+ "faer",
  "glob",
  "half",
  "hipfire-kvquant",

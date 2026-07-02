@@ -24,6 +24,11 @@ glob = "0.3"
 ratatui = "0.29"
 crossterm = "0.28"
 
+[dev-dependencies]
+# LDLQ inverse-Cholesky for the W×A precision-matrix sweep example (mirrors the
+# faer backend hipfire-quantize::ldlq uses; example-only).
+faer = "0.22"
+
 [[example]]
 name = "train_load_supra50m"
 path = "examples/train_load_supra50m.rs"
