@@ -1728,21 +1728,21 @@ pub const ENV_HIPFIRE_KVNOISE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KVNOISE_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVNOISE_BITS",
     description: "Defaults to 4 when unset",
-    source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:88",
+    source: "crates/hipfire-train/examples/qat_w3_kvarn.rs:138",
 };
 
 /// `HIPFIRE_KVNOISE_FOLD` — Defaults to 4 when unset
 pub const ENV_HIPFIRE_KVNOISE_FOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVNOISE_FOLD",
     description: "Defaults to 4 when unset",
-    source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:87",
+    source: "crates/hipfire-train/examples/qat_w3_kvarn.rs:140",
 };
 
 /// `HIPFIRE_KVNOISE_HOT` — Defaults to 4 when unset
 pub const ENV_HIPFIRE_KVNOISE_HOT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVNOISE_HOT",
     description: "Defaults to 4 when unset",
-    source: "crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:86",
+    source: "crates/hipfire-train/examples/qat_w3_kvarn.rs:139",
 };
 
 /// `HIPFIRE_KVNOISE_LR` — Runtime variable controlling KVnoise lr in hipfire
@@ -2388,14 +2388,14 @@ pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_PREFILL_ACT_BITS",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-runtime/src/weights.rs:1408",
+    source: "crates/hipfire-runtime/src/weights.rs:1409",
 };
 
 /// `HIPFIRE_OQ4_TRACE` — Runtime variable controlling oQ4 trace in hipfire
 pub const ENV_HIPFIRE_OQ4_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_TRACE",
     description: "Runtime variable controlling oQ4 trace in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:646",
+    source: "crates/hipfire-runtime/src/weights.rs:647",
 };
 
 /// `HIPFIRE_PAGED_MOE_DEBUG` — Enabled when set to 1
@@ -2430,7 +2430,7 @@ pub const ENV_HIPFIRE_PARO_FUSED_PACK2: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_FUSE_RMSNORM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FUSE_RMSNORM",
     description: "time per call. Net loss on every site. Default OFF; explicit opt-in for",
-    source: "crates/hipfire-runtime/src/weights.rs:759",
+    source: "crates/hipfire-runtime/src/weights.rs:760",
 };
 
 /// `HIPFIRE_PARO_GATE_UP_FUSED` — Runtime variable controlling paro gate up fused in hipfire
@@ -2486,7 +2486,7 @@ pub const ENV_HIPFIRE_PARO_PACK4: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_PREROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PREROTATE",
     description: "Runtime variable controlling paro prerotate in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1331",
+    source: "crates/hipfire-runtime/src/weights.rs:1332",
 };
 
 /// `HIPFIRE_PARO_SHARED_PAIRS` — Runtime variable controlling paro shared pairs in hipfire
@@ -2500,7 +2500,7 @@ pub const ENV_HIPFIRE_PARO_SHARED_PAIRS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_SWIGLU_FUSED",
     description: "Runtime variable controlling paro swiglu fused in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1348",
+    source: "crates/hipfire-runtime/src/weights.rs:1349",
 };
 
 /// `HIPFIRE_PERF_BASELINE` — Runtime variable controlling perf baseline in hipfire
@@ -2872,6 +2872,13 @@ pub const ENV_HIPFIRE_Q8_WMMA_X64: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_WMMA_X64",
     description: "Environment toggle value controls runtime behavior",
     source: "crates/rdna-compute/src/dispatch/gemm_misc.rs:778",
+};
+
+/// `HIPFIRE_QAT_KVNOISE` — Teacher must run CLEAN — force KV-noise off during its precompute
+pub const ENV_HIPFIRE_QAT_KVNOISE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_QAT_KVNOISE",
+    description: "Teacher must run CLEAN — force KV-noise off during its precompute",
+    source: "crates/hipfire-train/examples/qat_w3_kvarn.rs:89",
 };
 
 /// `HIPFIRE_QA_KV_MODES` — Defaults to q8,asym4,asym3,asym2 when unset
@@ -3558,6 +3565,28 @@ pub const ENV_HIPFIRE_WARN_GENERIC: EnvVarDoc = EnvVarDoc {
     source: "crates/rdna-compute/src/generic_warn.rs:53",
 };
 
+/// `HIPFIRE_WA_CODEC` — HIPFIRE_WA_CODEC=qtip3 swaps the symmetric-int weight quant for the QTIP3 trellis;
+pub const ENV_HIPFIRE_WA_CODEC: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_WA_CODEC",
+    description:
+        "HIPFIRE_WA_CODEC=qtip3 swaps the symmetric-int weight quant for the QTIP3 trellis;",
+    source: "crates/hipfire-train/examples/wa_matrix_sweep.rs:634",
+};
+
+/// `HIPFIRE_WA_LEARNED` — Learn dense R1 (h×h) on CALIB residual activations
+pub const ENV_HIPFIRE_WA_LEARNED: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_WA_LEARNED",
+    description: "Learn dense R1 (h×h) on CALIB residual activations",
+    source: "crates/hipfire-train/examples/wa_matrix_sweep.rs:541",
+};
+
+/// `HIPFIRE_WA_R1_ITERS` — heavier M is affordable at h=2048. HIPFIRE_WA_R1_ITERS tunes it (default 100)
+pub const ENV_HIPFIRE_WA_R1_ITERS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_WA_R1_ITERS",
+    description: "heavier M is affordable at h=2048. HIPFIRE_WA_R1_ITERS tunes it (default 100)",
+    source: "crates/hipfire-train/examples/wa_matrix_sweep.rs:560",
+};
+
 /// `HIPFIRE_WO_MMQ` — Enabled when set to 1
 pub const ENV_HIPFIRE_WO_MMQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_WO_MMQ",
@@ -4135,6 +4164,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES,
     ENV_HIPFIRE_Q8_WMMA_4W,
     ENV_HIPFIRE_Q8_WMMA_X64,
+    ENV_HIPFIRE_QAT_KVNOISE,
     ENV_HIPFIRE_QA_KV_MODES,
     ENV_HIPFIRE_QTIP_BBT_ALPHA,
     ENV_HIPFIRE_QTIP_CODEBOOK,
@@ -4232,6 +4262,9 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_VISION_PROFILE,
     ENV_HIPFIRE_VL_DUMP_DIR,
     ENV_HIPFIRE_WARN_GENERIC,
+    ENV_HIPFIRE_WA_CODEC,
+    ENV_HIPFIRE_WA_LEARNED,
+    ENV_HIPFIRE_WA_R1_ITERS,
     ENV_HIPFIRE_WO_MMQ,
     ENV_HIPFIRE_WO_WMMA_VARIANT,
     ENV_HIPFIRE_XDNA1_LIB,

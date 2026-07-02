@@ -247,9 +247,9 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_KVARN_ROTATE` | In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle | `crates/hipfire-arch-qwen35/src/qwen35.rs:27068` |
 | `HIPFIRE_KVARN_SIM` | Environment toggle value controls runtime behavior | `crates/hipfire-runtime/examples/perplexity.rs:220` |
 | `HIPFIRE_KVNOISE` | Environment toggle value controls runtime behavior | `crates/hipfire-train/src/kv_noise.rs:36` |
-| `HIPFIRE_KVNOISE_BITS` | Defaults to 4 when unset | `crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:88` |
-| `HIPFIRE_KVNOISE_FOLD` | Defaults to 4 when unset | `crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:87` |
-| `HIPFIRE_KVNOISE_HOT` | Defaults to 4 when unset | `crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:86` |
+| `HIPFIRE_KVNOISE_BITS` | Defaults to 4 when unset | `crates/hipfire-train/examples/qat_w3_kvarn.rs:138` |
+| `HIPFIRE_KVNOISE_FOLD` | Defaults to 4 when unset | `crates/hipfire-train/examples/qat_w3_kvarn.rs:140` |
+| `HIPFIRE_KVNOISE_HOT` | Defaults to 4 when unset | `crates/hipfire-train/examples/qat_w3_kvarn.rs:139` |
 | `HIPFIRE_KVNOISE_LR` | Runtime variable controlling KVnoise lr in hipfire | `crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:41` |
 | `HIPFIRE_KV_COLD_BITS` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:174` |
 | `HIPFIRE_KV_CORE_FRAC` | Runtime variable controlling KV core frac in hipfire | `crates/hipfire-runtime/src/kv_hier.rs:164` |
@@ -341,13 +341,13 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_NPU_SOFTMAX_CONFIGS` | Parse "n_heads:ctx_len1+ctx_len2+..." entries | `crates/hipfire-arch-qwen35/build.rs:232` |
 | `HIPFIRE_NPU_TARGETS` | Runtime variable controlling npu targets in hipfire | `crates/hipfire-arch-qwen35/build.rs:60` |
 | `HIPFIRE_OQ4_BATCHED_PREFILL` | Environment toggle value controls runtime behavior | `crates/hipfire-arch-qwen35/src/qwen35.rs:14226` |
-| `HIPFIRE_OQ4_PREFILL_ACT_BITS` | Selects behavior from recognized values | `crates/hipfire-runtime/src/weights.rs:1408` |
-| `HIPFIRE_OQ4_TRACE` | Runtime variable controlling oQ4 trace in hipfire | `crates/hipfire-runtime/src/weights.rs:646` |
+| `HIPFIRE_OQ4_PREFILL_ACT_BITS` | Selects behavior from recognized values | `crates/hipfire-runtime/src/weights.rs:1409` |
+| `HIPFIRE_OQ4_TRACE` | Runtime variable controlling oQ4 trace in hipfire | `crates/hipfire-runtime/src/weights.rs:647` |
 | `HIPFIRE_PAGED_MOE_DEBUG` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/qwen35.rs:7801` |
 | `HIPFIRE_PARO_BATCHED` | Runtime variable controlling paro batched in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:14818` |
 | `HIPFIRE_PARO_FA3_FUSED` | Runtime variable controlling paro fa3 fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29545` |
 | `HIPFIRE_PARO_FUSED_PACK2` | Runtime variable controlling paro fused pack2 in hipfire | `crates/rdna-compute/src/dispatch/fused.rs:422` |
-| `HIPFIRE_PARO_FUSE_RMSNORM` | time per call. Net loss on every site. Default OFF; explicit opt-in for | `crates/hipfire-runtime/src/weights.rs:759` |
+| `HIPFIRE_PARO_FUSE_RMSNORM` | time per call. Net loss on every site. Default OFF; explicit opt-in for | `crates/hipfire-runtime/src/weights.rs:760` |
 | `HIPFIRE_PARO_GATE_UP_FUSED` | Runtime variable controlling paro gate up fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29143` |
 | `HIPFIRE_PARO_LA2_FUSED` | Runtime variable controlling paro la2 fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29245` |
 | `HIPFIRE_PARO_LA4_FUSED` | Runtime variable controlling paro la4 fused in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:29241` |
@@ -355,9 +355,9 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_PARO_PACK1` | Runtime variable controlling paro pack1 in hipfire | `crates/rdna-compute/src/dispatch/gemv.rs:1371` |
 | `HIPFIRE_PARO_PACK2` | Runtime variable controlling paro pack2 in hipfire | `crates/rdna-compute/src/dispatch/gemv.rs:1374` |
 | `HIPFIRE_PARO_PACK4` | Runtime variable controlling paro pack4 in hipfire | `crates/rdna-compute/src/dispatch/gemv.rs:1377` |
-| `HIPFIRE_PARO_PREROTATE` | Runtime variable controlling paro prerotate in hipfire | `crates/hipfire-runtime/src/weights.rs:1331` |
+| `HIPFIRE_PARO_PREROTATE` | Runtime variable controlling paro prerotate in hipfire | `crates/hipfire-runtime/src/weights.rs:1332` |
 | `HIPFIRE_PARO_SHARED_PAIRS` | Runtime variable controlling paro shared pairs in hipfire | `crates/rdna-compute/src/dispatch/fused.rs:416` |
-| `HIPFIRE_PARO_SWIGLU_FUSED` | Runtime variable controlling paro swiglu fused in hipfire | `crates/hipfire-runtime/src/weights.rs:1348` |
+| `HIPFIRE_PARO_SWIGLU_FUSED` | Runtime variable controlling paro swiglu fused in hipfire | `crates/hipfire-runtime/src/weights.rs:1349` |
 | `HIPFIRE_PERF_BASELINE` | Runtime variable controlling perf baseline in hipfire | `crates/hipfire-eval/src/executor_examples.rs:1325` |
 | `HIPFIRE_PERF_BASELINE_DIR` | Runtime variable controlling perf baseline dir in hipfire | `crates/hipfire-eval/src/executor_examples.rs:1338` |
 | `HIPFIRE_PERPLEXITY_BIN` | Runtime variable controlling perplexity bin in hipfire | `crates/hipfire-eval/src/lib.rs:1226` |
@@ -410,6 +410,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES` | Interprets "HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES" from environment to select behavior | `crates/hipfire-arch-qwen35/src/qwen35.rs:12948` |
 | `HIPFIRE_Q8_WMMA_4W` | Environment toggle value controls runtime behavior | `crates/rdna-compute/src/dispatch/gemm_misc.rs:964` |
 | `HIPFIRE_Q8_WMMA_X64` | Environment toggle value controls runtime behavior | `crates/rdna-compute/src/dispatch/gemm_misc.rs:778` |
+| `HIPFIRE_QAT_KVNOISE` | Teacher must run CLEAN — force KV-noise off during its precompute | `crates/hipfire-train/examples/qat_w3_kvarn.rs:89` |
 | `HIPFIRE_QA_KV_MODES` | Defaults to q8,asym4,asym3,asym2 when unset | `crates/hipfire-runtime/examples/test_inferenceQA.rs:762` |
 | `HIPFIRE_QTIP_BBT_ALPHA` | BBT-spectral influence scaling (SpectralLLM): HIPFIRE_QTIP_BBT_ALPHA=α | `crates/hipfire-quantize/src/main.rs:9818` |
 | `HIPFIRE_QTIP_CODEBOOK` | Environment toggle value controls runtime behavior | `crates/hipfire-quantize/src/main.rs:5974` |
@@ -507,6 +508,9 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_VISION_PROFILE` | Optional per-category timing (HIPFIRE_VISION_PROFILE=1): device-sync around | `crates/hipfire-arch-gemma3-vl/src/forward.rs:140` |
 | `HIPFIRE_VL_DUMP_DIR` | little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR | `crates/hipfire-runtime/examples/infer.rs:149` |
 | `HIPFIRE_WARN_GENERIC` | Enabled by default; set to 0 to disable | `crates/rdna-compute/src/generic_warn.rs:53` |
+| `HIPFIRE_WA_CODEC` | HIPFIRE_WA_CODEC=qtip3 swaps the symmetric-int weight quant for the QTIP3 trellis; | `crates/hipfire-train/examples/wa_matrix_sweep.rs:634` |
+| `HIPFIRE_WA_LEARNED` | Learn dense R1 (h×h) on CALIB residual activations | `crates/hipfire-train/examples/wa_matrix_sweep.rs:541` |
+| `HIPFIRE_WA_R1_ITERS` | heavier M is affordable at h=2048. HIPFIRE_WA_R1_ITERS tunes it (default 100) | `crates/hipfire-train/examples/wa_matrix_sweep.rs:560` |
 | `HIPFIRE_WO_MMQ` | Enabled when set to 1 | `crates/rdna-compute/src/feature_flags.rs:219` |
 | `HIPFIRE_WO_WMMA_VARIANT` | Runtime variable controlling wo wmma variant in hipfire | `crates/rdna-compute/src/feature_flags.rs:300` |
 | `HIPFIRE_XDNA1_LIB` | Runtime variable controlling xdna1 lib in hipfire | `crates/hipfire-npu/src/lib.rs:69` |
@@ -532,6 +536,6 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/rdna-compute/src/compiler.rs:228` |
 | `USE_SAMPLE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:118` |
 
-- Total env vars: **527**
-- `HIPFIRE_*` vars: **483**
+- Total env vars: **531**
+- `HIPFIRE_*` vars: **487**
 - non-`HIPFIRE_*` vars: **44**
