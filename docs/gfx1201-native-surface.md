@@ -1004,3 +1004,162 @@ standing A3B-MTP-into-daemon lever, `project_rocmfp4_h2h_gfx1201_2026_07_01`).
 Each fusion lands behind the coherence gate and, being a pure kernel-boundary
 merge with unchanged math, carries **low** coherence risk (the one exception —
 `moe_down_combine` — is explicitly excluded above).
+
+## MEASURED bound-class (profile_standard PMC ground-truth) — 2026-07-02
+
+**Everything above this line inferred bound-class from a byte model + a failed
+PMC split.** The direct VALU-busy-vs-mem-busy split that `(b)`'s footnote and the
+`(d)` Pre-check gated the whole Phase-B call behind **never materialized** — it
+failed *twice* (short-dispatch, then 2500×-longer inflated-dispatch), both times
+reading **exactly 0.0** on every `%`-busy / occupancy counter while raw
+accumulators (`SQ_BUSY_CYCLES`, `Wavefronts`) scaled sanely. Those writeups blamed
+a "ROCm 7.2.2 dispatch-scoped-counter capture floor." **That root cause was
+wrong.** This section obtains the ground-truth split and records the actual fix.
+
+### Methodology fix (record this — future PMC measurements depend on it)
+
+**The all-zero PMC problem was a DPM perf-level gate, not a ROCm/rocprofv3 bug.**
+On RDNA3/4 the SQ/GRBM/TA perfmon counters are **clock-gated off** unless the GPU
+is at a *stable* DPM perf level. `auto` and forced-`high`/`manual` (what every
+prior attempt used) leave the perfmon clock ungated → every derived `%`-busy
+metric computes against a stopped counter → reads `0.0`. The fix:
+
+```
+echo profile_standard | sudo tee /sys/class/drm/card0/device/power_dpm_force_performance_level
+# verify (sysfs read-back is "Device or resource busy" on this box — use amd-smi):
+amd-smi metric --gpu 0 --perf-level      # → AMDSMI_DEV_PERF_LEVEL_STABLE_STD
+```
+
+Under `profile_standard`, a single-counter `rocprofv3 --pmc VALUBusy` pass over a
+real 200-token decode produced **169,593 / 169,593 (100%) non-zero counter
+samples across 49 distinct kernels** — the identical run under `auto`/`high` is
+the documented all-zero failure. This **retroactively resolves** the "PMC reads
+zero" saga (`(d)` Probe 1 twice, the "capture floor" framing): the floor was
+never real; the perfmon clock was gated. **Use `profile_standard` for any future
+on-device PMC measurement on gfx11xx/gfx12xx; never `auto`/`high`.**
+
+Supporting technique (both still required):
+- **≤2 counters/pass** spanning ≤2 HW blocks (the anti-hang rule held: `VALUBusy`
+  alone in pass 1; `MemUnitBusy` + `OccupancyPercent` together in pass 2, clean,
+  no SIGABRT).
+- **Drive the daemon binary directly** under `rocprofv3 --pmc … -- ./target/release/examples/daemon`,
+  speak JSON-lines to its stdin/stdout, then `SIGTERM` the `daemon` child (via
+  `pgrep -x daemon`, **not** the rocprofv3 wrapper PID). SIGTERM did **not** exit
+  within 8s either pass (GPU-teardown-blocked under `profile_standard`'s reduced
+  clocks); a `SIGKILL` fallback was needed both times — **but the counter CSV is
+  streamed per-dispatch, not buffered-to-exit, so data integrity survived the
+  hard kill** (all rows flushed).
+- **Absolute-number caveat:** decode ran **6–7 tok/s** instrumented (vs ~124 tok/s
+  uninstrumented mq4r) from per-dispatch PMC serialization + `profile_standard`'s
+  non-boost clocks. The table `%`s are valid **relative** ALU-vs-mem-vs-occupancy
+  ratios per kernel — **not** absolute production-clock numbers.
+
+### Per-kernel ALU-busy% / mem-busy% / occupancy% (measured)
+
+Model `qwen3.6-35b-a3b.mq4r`, `--kv-mode q8`, `--spec off`, greedy (temp=0), prompt
+`"Explain the quicksort algorithm."`, 200 tokens, gfx1201 GPU 0, `profile_standard`.
+`VALUBusy` (SQ block, pass 1); `MemUnitBusy` + `OccupancyPercent` (pass 2).
+
+| kernel | ALU-busy % (mean/med) | mem-busy % (mean/med) | occupancy % (mean/med) | measured read |
+|---|---:|---:|---:|---|
+| `gemv_hfq4g256_moe_gate_up_k8_indexed` | 45.6 / 43.2 | 56.3 / 47.9 | 54.6 / 46.4 | **mixed, mem-leaning** — both ALU and mem meaningfully active, neither saturated |
+| `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` | 44.3 / 39.2 | 45.5 / 36.4 | 45.4 / 36.4 | **balanced mixed** — ALU≈mem near-parity, moderate occupancy |
+| `fused_qkvza_hfq4g256` | 34.2 / 27.3 | 44.1 / 40.0 | 37.0 / 24.4 | **mixed, mem-leaning** |
+| `attention_flash_q8_0_tile` | 1.76 / 1.61 | 60.4 / 61.5 | 1.06 / 1.02 | **mem-bound within its active window, but occupancy-starved (<2%)** — chip mostly idle waiting on it → likely latency/launch-floor gated, not full-chip BW-saturated |
+| `fused_rmsnorm_mq_rotate` | 0.11 / 0.13 | 28.3 / 19.6 | 0.15 / 0.10 | **launch-overhead-bound** — ALU and occupancy both ≈0; classic small-glue signature |
+| `fused_qk_l2_norm_scale_f32` | 0.17 / 0.20 | 14.4 / 7.6 | 0.19 / 0.09 | **launch-overhead-bound**, most pronounced of the set |
+
+Codex adjudication of the measurement vs the night's inferences: **`refuted:true,
+confidence 0.84`** — the glue and attention interpretations are confirmed, but the
+stronger "weight GEMVs are simply DRAM-bound with no ALU headroom" story is
+contradicted.
+
+### Verdict reconciliation — CONFIRMED vs REVISED
+
+| Night's inferred verdict | Measurement | Status |
+|---|---|---|
+| **gate_up DRAM-bound → dp4a-null** | ALU 45.6 / mem 56.3 / occ 54.6 — **mixed, mem-leaning; not DRAM-saturated, not ALU-idle** | **REVISED** (premise) — dp4a-null *outcome* stands, mechanism corrected |
+| **moe_down mem-bound → multirow-win** | ALU 44.3 ≈ mem 45.5 / occ 45.4 — **balanced mixed, moderate occupancy** | **REVISED** (premise) — +4.24% win stands, re-attributed to granularity/occupancy |
+| **norm/glue launch-overhead → fusion-lever** | ALU 0.11–0.17 / occ 0.10–0.19 — near-zero ALU & occupancy | **CONFIRMED** (strongly) — fusion lever validated |
+| **attention mem-bound** | mem 60.4 within window, occ 1.06 | **CONFIRMED + REFINED** — mem-bound in-window, but occupancy-starved → latency/launch-floor gated at chip scale |
+
+**1. gate_up DRAM-bound → dp4a-null — REVISED premise, unchanged conclusion.**
+We inferred a *pure DRAM-bound* kernel (`(b)`/Probe-3: 72.5% of peak, "no ALU
+headroom"). Measured: **mixed and mem-leaning** — ALU 45.6% and mem 56.3% are
+*both* meaningfully active, neither saturated. The "pure DRAM-bound / zero ALU
+headroom" premise is **refuted**. **But this does NOT reopen dp4a:** the kernel is
+*not* ALU-bound either (ALU 45.6% < mem 56.3%), and 45.6% ALU is already
+meaningful pressure — so folding *more* ALU work (dp4a) into a kernel with a real
+ALU load and only a modest mem lead is exactly what *should* regress. The measured
+mixed profile **explains** the empirical dp4a −1.52% daemon loss better than the
+old DRAM-only story did. dp4a stays a NO-GO; the *reason* is now "mixed, already
+ALU-loaded," not "pure bandwidth wall."
+
+**2. moe_down mem-bound → multirow-win — REVISED premise, win stands.** We
+inferred memory-bound (44.1% of peak → "transaction-granularity"). Measured:
+**balanced mixed** (ALU 44.3% ≈ mem 45.5%) with **moderate occupancy (45.4%)** —
+not clean memory-bound. The +4.24% R=2 multirow win is still fully consistent, but
+re-attributed: it worked by improving **transaction granularity / occupancy**
+(bigger per-block contiguous traffic, x reused once), **not** by relieving a pure
+bandwidth wall. The moderate 45.4% occupancy is the tell — there was room for the
+remap to raise effective utilization. Win unretracted; framing corrected.
+
+**3. norm/glue launch-overhead → fusion-lever — CONFIRMED (strongly).**
+`fused_rmsnorm_mq_rotate` (ALU 0.11%, occ 0.15%) and `fused_qk_l2_norm_scale_f32`
+(ALU 0.17%, occ 0.19%) are the textbook launch-overhead / chip-underutilization
+signature: near-zero ALU, near-zero occupancy, only modest transient mem. This is
+**direct measured confirmation** of the "CORRECTION" section's central thesis —
+the 42% non-weight overhead is launch-count/round-trip-bound and reducible by
+fusion. The **fusion campaign (levers 1–5) is the validated lever**; the
+independent no-GPU +12–15% fusion-ceiling estimate stands corroborated.
+
+**4. attention mem-bound — CONFIRMED, with an important refinement.**
+`attention_flash_q8_0_tile` reads **mem 60.4%** — a genuine KV-read memory-bound
+signature *inside its active window*. But **occupancy is 1.06%**: the chip is
+almost entirely idle waiting on this kernel, so full-chip effective throughput is
+**latency / launch-floor gated, not raw-BW saturated**. This *sharpens* lever 6's
+"attention is NOT a top lever" call: it is not that attention is BW-maxed and
+untouchable — it is a low-occupancy single-token flash kernel whose ceiling is
+structural (already single fused + GQA-aware on both engines), so only marginal
+tile/occupancy tuning remains. Do not lead here.
+
+### SURPRISE (flagged) — the weight GEMVs are MIXED, not DRAM-bound
+
+**The load-bearing surprise: both `gate_up` and `moe_down` measured MIXED /
+mem-leaning (ALU 44–46%, mem 45–56%), not the DRAM-saturated kernels the byte
+model inferred.** The entire `(b)`/`(d)`/Probe-3 roofline framing — "hot family at
+~74% of DRAM peak, essentially no ALU headroom" — was **too strong**. Real,
+measured ALU pressure sits at ~45% on the two hot GEMVs.
+
+Does the surprise **reopen** any lever? **No — and this is the important part.**
+An ALU-bound reading would have reopened dp4a; a mem-*bound* reading would have
+confirmed the old story. The *actual* mixed reading does neither: 45% ALU is not
+idle headroom (so dp4a has nothing to convert and, being already loaded, regresses
+— exactly as measured, −1.52%), and 56% mem is not saturation (so the "DRAM wall"
+that justified the broad NO-GO was overstated). **Net: the dp4a NO-GO and the
+multirow win both hold on the empirical numbers, but the analytic *reason* behind
+them — "bandwidth wall, no ALU headroom" — is measured false and should not be
+re-quoted.** The strategic conclusion of the "CORRECTION" section is *strengthened*,
+not weakened: if the weight GEMVs are only ~45–56% busy on *either* axis (not
+pinned to the DRAM roofline), then decode is even more clearly **underutilization /
+overhead-bound**, and the fusion campaign (lever 1 = fused SwiGLU MoE FFN) is even
+more clearly the right next phase than a roofline-pinned reading implied.
+
+### Artifacts
+
+On `hiptrx`: `/tmp/pmc-gfx1201-groundtruth/confirm/confirm_counter_collection.csv`
+(`VALUBusy`, all kernels, 169,593 rows), `/tmp/pmc-gfx1201-groundtruth/mem/mem_counter_collection.csv`
+(`MemUnitBusy` + `OccupancyPercent`). Driver scripts `/tmp/remote_driver.sh`,
+`/tmp/pmc_session.py`, `/tmp/analyze_pmc.py`. Repo synced to `177cd964` in
+`/home/kaden/hipfire-perfmaxx` on hiptrx, daemon built release+deltanet. Cleanup
+verified: all 4 R9700s restored to `AMDSMI_DEV_PERF_LEVEL_AUTO`
+(`amd-smi metric --gpu 0 1 2 3 --perf-level`), GPU lock released, no leftover
+`daemon`/`rocprofv3` processes, stale `~/.hipfire/daemon.pid` cleaned.
+
+**Bottom line.** Two of four inferred verdicts are **REVISED** (gate_up, moe_down —
+both "mem/DRAM-bound" premises measured *mixed*; but the dp4a-null and the +4.24%
+multirow-win *outcomes* both stand), two are **CONFIRMED** (norm/glue
+launch-overhead; attention mem-bound, refined to occupancy-starved/latency-gated).
+The surprise (weight GEMVs are mixed, not DRAM-bound) does **not reopen dp4a** but
+does **retire the "bandwidth wall" reasoning** and **reinforce the fusion-first
+strategic pivot**.
