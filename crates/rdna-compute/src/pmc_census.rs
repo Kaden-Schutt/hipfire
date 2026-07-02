@@ -182,6 +182,46 @@ impl ArchPmcCensus {
         self.counts_ci(name)
             .map(|c| counter_verdict(name, c, self.min_nonzero_fraction))
     }
+
+    /// A single named counter is alive iff it was captured AND revived (nonzero
+    /// in at least `min_nonzero_fraction` of its rows).
+    fn counter_alive(&self, name: &str) -> bool {
+        self.verdict(name).map(|v| v.alive).unwrap_or(false)
+    }
+
+    /// True iff this capture ran under [`REQUIRED_PERF_LEVEL`]
+    /// (`profile_standard`). Under any other governor the perfmon clock may be
+    /// gated, so the DERIVED counters cannot be trusted even when nonzero.
+    pub fn is_valid_capture(&self) -> bool {
+        self.perf_level == REQUIRED_PERF_LEVEL
+    }
+
+    /// True iff EVERY [`REQUIRED_DERIVED_COUNTERS`] entry was captured and
+    /// revived AND the capture perf level is valid. Any of: invalid capture,
+    /// a missing required derived counter, or a dead (perfmon-gated) one blocks
+    /// revival — WITHHELD, never a fabricated pass.
+    pub fn derived_revived(&self) -> bool {
+        self.is_valid_capture()
+            && REQUIRED_DERIVED_COUNTERS
+                .iter()
+                .all(|c| self.counter_alive(c))
+    }
+
+    /// True iff EVERY raw accumulator control was captured and revived. These
+    /// tick regardless of DPM governor, so this does NOT require a valid
+    /// capture perf level — it is the "the profiling session actually ran"
+    /// control.
+    pub fn accumulators_alive(&self) -> bool {
+        RAW_ACCUMULATOR_COUNTERS
+            .iter()
+            .all(|c| self.counter_alive(c))
+    }
+
+    /// True iff the working controls survived but the derived metrics did not —
+    /// the diagnostic "profile_standard un-gated nothing new on this arch" arm.
+    pub fn only_accumulators_revived(&self) -> bool {
+        self.accumulators_alive() && !self.derived_revived()
+    }
 }
 
 /// Parse a rocprofv3 `--pmc` counter-collection CSV into a per-arch census.
@@ -355,6 +395,77 @@ void gemm<32, 64, false>(float*, int),Wavefronts,64
         assert_eq!(fetch.value_sum, 2048.0);
         let waves = c.counters.get("Wavefronts").expect("Wavefronts parsed");
         assert_eq!(waves.value_sum, 64.0);
+    }
+
+    #[test]
+    fn all_revived_arm() {
+        let c = census_from_counter_csv_text("gfx1201", REQUIRED_PERF_LEVEL, 0.5, CSV_ALL_REVIVED)
+            .unwrap();
+        assert!(c.is_valid_capture());
+        assert!(c.derived_revived(), "all 5 derived counters nonzero");
+        assert!(c.accumulators_alive());
+        assert!(!c.only_accumulators_revived());
+    }
+
+    #[test]
+    fn only_accumulators_arm() {
+        let c = census_from_counter_csv_text(
+            "gfx1201",
+            REQUIRED_PERF_LEVEL,
+            0.5,
+            CSV_ONLY_ACCUMULATORS,
+        )
+        .unwrap();
+        assert!(c.is_valid_capture());
+        assert!(
+            !c.derived_revived(),
+            "derived counters all read zero → dead"
+        );
+        assert!(c.accumulators_alive(), "raw controls still ticked");
+        assert!(
+            c.only_accumulators_revived(),
+            "accumulators alive but derived withheld"
+        );
+    }
+
+    #[test]
+    fn missing_required_derived_counter_blocks_revival() {
+        // VALUBusy is absent entirely (e.g. not in this arch's metrics DB).
+        // A missing required derived counter blocks revival even though the
+        // present ones are nonzero.
+        let csv = "\
+Kernel_Name,Counter_Name,Counter_Value
+k,FetchSize,1024
+k,WriteSize,512
+k,MemUnitBusy,30.0
+k,OccupancyPercent,75.0
+k,SQ_BUSY_CYCLES,999
+k,Wavefronts,64
+";
+        let c = census_from_counter_csv_text("gfx1100", REQUIRED_PERF_LEVEL, 0.5, csv).unwrap();
+        assert!(c.is_valid_capture());
+        assert!(
+            !c.derived_revived(),
+            "VALUBusy absent → required-derived set incomplete → not revived"
+        );
+        assert!(c.accumulators_alive());
+        assert!(c.only_accumulators_revived());
+    }
+
+    #[test]
+    fn invalid_perf_level_forces_derived_withheld_even_if_nonzero() {
+        // Same all-nonzero CSV, but captured under `auto` (perfmon gated).
+        // Even though every derived counter reads nonzero, an invalid capture
+        // perf level WITHHOLDS the derived verdict — we do not trust a derived
+        // number that could be a perfmon-clock artifact.
+        let c = census_from_counter_csv_text("gfx1201", "auto", 0.5, CSV_ALL_REVIVED).unwrap();
+        assert!(!c.is_valid_capture(), "auto is not profile_standard");
+        assert!(
+            !c.derived_revived(),
+            "invalid perf level withholds derived revival regardless of values"
+        );
+        // Raw accumulators are governor-independent — still a working control.
+        assert!(c.accumulators_alive());
     }
 
     #[test]
