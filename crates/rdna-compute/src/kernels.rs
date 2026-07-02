@@ -2274,6 +2274,14 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1201_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_MULTIROW_GFX1201_SRC: &str = include_str!(
     "../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_multirow.gfx1201.hip"
 );
+// gfx1201 (RDNA4) dp4a Phase-B spike of the indexed MoE gate_up decode GEMV
+// (int8 v_dot4_i32_iu8 instead of scalar FMA). Opt-in via
+// HIPFIRE_GFX1201_DP4A=1; default OFF keeps the scalar
+// GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC kernel unchanged on every arch. Own
+// module name + `_gfx1201` symbol suffix, same rule as above. See
+// docs/gfx1201-native-surface.md.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_DP4A_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_dp4a.gfx1201.hip");
 
 // 4-way fused HFQ4-G256 projection for Qwen3.5 DeltaNet LA preamble:
 // wqkv + wz + w_beta + w_alpha in a single launch. Same 4x-unroll inner

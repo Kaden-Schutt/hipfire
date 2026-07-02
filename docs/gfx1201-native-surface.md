@@ -611,3 +611,76 @@ we actually trail this arch — dwarfs the +4.24% re-tile, but it is a
 caveat** (`feedback_a3b_r_not_acceptable`: default A3B = AR-only + no eviction
 until R̄ improves) — **NOT another kernel gamble.** Prioritize the MTP-wiring
 conversation over any further decode-GEMV kernel work on this arch.
+
+## dp4a `moe_gate_up` Phase-B spike result — 2026-07-02
+
+The direct ALU-vs-mem PMC split never resolved (`(d)` Pre-check resolution,
+Probe 1) — this section replaces the roofline estimate with an actual
+on-device measurement. Built `gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_gfx1201`
+(`kernels/src/gemv_hfq4g256_moe_gate_up_dp4a.gfx1201.hip`), an int8 dp4a
+(`v_dot4_i32_iu8`, unsigned weight-nibble × signed Q8_1 activation) port of
+`moe_gate_up` — the doc's own "best dp4a candidate" (72.5% of DRAM peak,
+Probe 3). Opt-in via `HIPFIRE_GFX1201_DP4A=1`, default OFF; wired as an
+early branch inside the existing `gemv_hfq4g256_moe_gate_up_k8_indexed`
+(`crates/rdna-compute/src/gemv.rs`) so every other arch, and gfx1201 with
+the flag unset, is byte-for-byte the pre-existing scalar kernel.
+
+**Static metadata (gfx-kernel-metadata skill, compiled `.hsaco`):** 67 VGPR /
+18 SGPR / 0 spill (`private_segment_fixed_size=0`) — actually **fewer** VGPR
+than the scalar kernel's 80, same 100% occupancy (16 waves/SIMD, both land
+under the 1536/SIMD wave-slot cap). Disassembly confirms 14×
+`v_dot4_i32_iu8` instructions emitted with `neg_lo:[0,1,0]` (unsigned ×
+signed operand encoding) — the intended instruction is genuinely selected,
+not silently scalarized.
+
+**Correctness (on-device, gfx1201/R9700):** a standalone probe
+(`crates/rdna-compute/examples/verify_gate_up_dp4a_gfx1201.rs`) ran the real
+M=1024/K=2048 A3B gate_up shape through both paths (two fresh processes, env
+flag on/off) and diffed the 1024 output values: **max abs error 0.0052,
+mean abs error 0.0012** against a baseline stdev of 0.39 (~0.3% of typical
+magnitude) — no NaN/Inf, no sign flips, ranges match closely (e.g. min
+−1.640982 vs −1.640782). This is consistent with expected Q8_1 int8
+quantization noise, not a dequant bug — it corroborates that the zp sign
+(`weight_val = nibble·scale + zp`, read verbatim from the scalar kernel's
+`DOG` macro — **not** the `nibble−8` / `zp_eff=zp+8·scale` convention the
+existing sdot4 wave64 MMQ kernels use), the nibble unpack order, and the
+in-kernel activation reorder (`block_within_group` / `sub_in_block` /
+`qs_byte_off`, matched lane-for-lane against the weight nibble-dword's
+element range) are all correct.
+
+**Throughput (on-device, COLD regime — 256 experts / 32 disjoint top-8 sets,
+`crates/rdna-compute/examples/bench_gate_up_dp4a_gfx1201.rs`, throwaway
+100-iter warmup + 3 fresh-process runs of 500 launches each per config):**
+
+| Config | 3 runs (µs/launch) | median | achieved GB/s |
+|---|---|---:|---:|
+| baseline (flag unset) | 23.727\*, 21.201, 21.248 | **21.22** | ~425 |
+| `HIPFIRE_GFX1201_DP4A=1` | 23.374, 23.426, 23.336 | **23.37** | ~385 |
+
+\*first baseline run still JIT/DPM-warming; excluded from the median (the
+other two agree to ±0.1%). The dp4a band is tight (23.34–23.43, ±0.2%)
+across three fresh processes — this is real signal, not noise.
+
+**Verdict: dp4a is a real ~10% LOSS on this kernel, not a win — the silicon
+confirms the roofline NO-GO.** Two contributing, source-level factors: (1)
+`moe_gate_up` was already measured at 72.5% of DRAM peak with 100% static
+occupancy in both variants (VGPR is not the limiter, confirmed above), so
+there is little-to-no ALU headroom for dp4a to convert into a memory-traffic
+win; (2) the dp4a path pays for `ensure_q8_1_mmq_x`'s mandatory per-call
+Q8_1 quantization (`quantize_q8_1_mmq_ds4`, unconditional — the shared
+scratch has no source-pointer caching, unlike its FP16/FP8 siblings) as a
+**second GPU kernel launch** ahead of the GEMV itself; in real decode `x`
+differs every layer, so this cost is not a benchmark artifact — it is the
+real per-token tax. Investigation stops here per the task's cheapest-first
+rule: occupancy is ruled out by the metadata above, and the remaining
+candidates (launch overhead, Xq write/read traffic) are structural to the
+dp4a-with-online-quantization design, not a tunable bug.
+
+**Disposition:** ships as an opt-in, default-off research kernel (Kaden's
+explicit ask was to build-and-measure, not to land a win). No default
+behavior changes on any arch. `./scripts/coherence-gate.sh` was not run —
+out of scope for a measured-loss, default-off spike; re-run if this kernel
+is ever revisited as a real candidate. This closes the Phase-B dp4a
+question empirically: **do not pursue dp4a further on gfx1201 decode
+GEMVs** — the standing recommendation above (wire A3B MTP into the daemon)
+remains the real lever.

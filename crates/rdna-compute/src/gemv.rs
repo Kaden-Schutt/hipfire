@@ -5821,6 +5821,27 @@ impl Gpu {
         n_ranks: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+
+        // gfx1201-only, opt-in dp4a Phase-B spike (docs/gfx1201-native-surface.md
+        // — "best dp4a candidate" per the roofline pre-check). Gated on
+        // HIPFIRE_GFX1201_DP4A=1 + gfx1201 + K a multiple of 256 (format
+        // constraint shared with the scalar path). Every other arch/flag
+        // state — including gfx1201 with the flag unset — falls straight
+        // through to the unchanged scalar kernel below: NO default
+        // behavior change.
+        if self.flags.gfx1201_dp4a && self.arch_caps.is_gfx1201() && k % 256 == 0 {
+            return self.gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_gfx1201(
+                expert_ptrs,
+                topk_indices,
+                x,
+                y_gate,
+                y_up,
+                m,
+                k,
+                n_ranks,
+            );
+        }
+
         let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -5879,6 +5900,96 @@ impl Gpu {
                 b.push_ptr(pp);
                 b.push_ptr(ip);
                 b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1201 (RDNA4) dp4a Phase-B spike of `gemv_hfq4g256_moe_gate_up_k8_indexed`
+    /// above — same expert-pointer gather, same expanded gate/up output
+    /// layout, same asymmetric dequant convention
+    /// (`weight_val = nibble*scale + zp`, nibble unsigned [0,15] — read
+    /// verbatim from the scalar kernel's `DOG` macro, NOT re-derived), but
+    /// the inner dot product runs as int8 dp4a (`v_dot4_i32_iu8`, unsigned
+    /// weight-nibble × signed Q8_1-quantized activation) instead of
+    /// per-element FMA against raw fp32 `x`.
+    ///
+    /// Pre-quantizes `x` to the shared llama.cpp-style `block_q8_1_mmq`
+    /// layout (QK8_1=32) via `ensure_q8_1_mmq_x` — the same scratch/kernel
+    /// the existing wave64 MMQ dp4a family (gfx906) and RDNA3 WMMA-MMQ
+    /// family already use, so there is zero new quantizer code, only a new
+    /// GEMV consumer.
+    ///
+    /// Only reachable via the opt-in gate in the caller above
+    /// (`HIPFIRE_GFX1201_DP4A=1` + gfx1201 + `K % 256 == 0`); never called
+    /// on any other arch or with the flag unset.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_gfx1201(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        n_ranks: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Single-token decode GEMV: batch_size=1, so the resulting
+        // block_q8_1_mmq scratch is indexed directly by kblock (no
+        // per-token stride) inside the kernel.
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_gate_up_dp4a_gfx1201",
+            kernels::GEMV_HFQ4G256_MOE_GATE_UP_DP4A_GFX1201_SRC,
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_gfx1201",
+        )?;
+
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_gfx1201",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_gfx1201",
+            [m as u32, n_ranks as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xq_ptr);
                 b.push_ptr(ygp);
                 b.push_ptr(yup);
                 b.push_i32(m_val);

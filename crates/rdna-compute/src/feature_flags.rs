@@ -29,6 +29,11 @@ pub struct FeatureFlags {
     pub gfx942_lds_gemv_default_on: bool,
     pub gemv_rows_default: u32,
     pub gemv_dp4a: Option<bool>,
+    /// gfx1201 (RDNA4) dp4a Phase-B decode-GEMV spike (moe_gate_up only).
+    /// Env: HIPFIRE_GFX1201_DP4A=1. Default OFF — the scalar kernel is the
+    /// production default on every arch including gfx1201. See
+    /// docs/gfx1201-native-surface.md.
+    pub gfx1201_dp4a: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -159,6 +164,7 @@ impl FeatureFlags {
                 }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
+            gfx1201_dp4a: std::env::var("HIPFIRE_GFX1201_DP4A").as_deref() == Ok("1"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -346,6 +352,7 @@ impl FeatureFlags {
             gemv_rows: None,
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
+            gfx1201_dp4a: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
