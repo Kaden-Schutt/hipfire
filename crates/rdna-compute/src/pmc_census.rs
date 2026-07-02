@@ -501,6 +501,31 @@ pub fn evaluate_cell(ev: &CellEvidence) -> PromotionState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// §5.5 — source composition (no-arch-transfer, analytic-not-independent)
+// ---------------------------------------------------------------------------
+
+/// Independent-measurement contribution of a SINGLE arch's PMC census: `1` iff
+/// that arch's derived counters actually revived under `profile_standard`, else
+/// `0`. Because it takes exactly one arch's census, a revived gfx1100 census can
+/// never contribute a source to a gfx1201 cell — no arch-invariance transfer.
+pub fn pmc_source_count(census: &ArchPmcCensus) -> usize {
+    if census.derived_revived() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Independent-measurement contribution of the analytic (byte-model-derived)
+/// roofline bound-class: ALWAYS `0`. The analytic verdict is a DERIVED
+/// heuristic, not a hardware measurement — no matter how confident it looks it
+/// is never counted as an independent promotion source. A real measured
+/// bound-class enters through a live PMC read ([`pmc_source_count`]), not here.
+pub fn dynamic_bound_class_evidence(_bound_class: crate::roofline::BoundClass) -> usize {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +839,83 @@ k,Wavefronts,64
             }
             _ => panic!("expected Withheld"),
         }
+    }
+
+    #[test]
+    fn withheld_never_fakes_a_value() {
+        // A census whose derived counters did NOT revive contributes 0 sources.
+        let census = census_from_counter_csv_text(
+            "gfx1201",
+            REQUIRED_PERF_LEVEL,
+            0.5,
+            CSV_ONLY_ACCUMULATORS,
+        )
+        .unwrap();
+        assert_eq!(pmc_source_count(&census), 0);
+        // The analytic bound-class is never an independent source.
+        assert_eq!(
+            dynamic_bound_class_evidence(crate::roofline::BoundClass::Bandwidth),
+            0
+        );
+
+        // Compose a cell that has a (real, nonzero) candidate value but too few
+        // sources → WITHHELD, and its gate_value() is None despite the value.
+        let ev = CellEvidence {
+            arch: "gfx1201".to_string(),
+            candidate_value: 42.0,
+            independent_sources: pmc_source_count(&census)
+                + dynamic_bound_class_evidence(crate::roofline::BoundClass::Bandwidth),
+            behavior_verified: true,
+            unmitigated_high_risk: false,
+        };
+        let state = evaluate_cell(&ev);
+        assert!(!state.is_promoted());
+        assert_eq!(
+            state.gate_value(),
+            None,
+            "a withheld cell must never surface its candidate value"
+        );
+    }
+
+    #[test]
+    fn no_arch_invariance_transfer_gfx1100_promotion_does_not_promote_gfx1201() {
+        // gfx1100 revived its derived PMC; gfx1201 did NOT (or the counter is
+        // absent from its metrics DB). Each cell draws sources from ITS OWN
+        // arch's census — gfx1100's promotion cannot leak into gfx1201.
+        let gfx1100 =
+            census_from_counter_csv_text("gfx1100", REQUIRED_PERF_LEVEL, 0.5, CSV_ALL_REVIVED)
+                .unwrap();
+        let gfx1201 = census_from_counter_csv_text(
+            "gfx1201",
+            REQUIRED_PERF_LEVEL,
+            0.5,
+            CSV_ONLY_ACCUMULATORS,
+        )
+        .unwrap();
+        assert_eq!(pmc_source_count(&gfx1100), 1, "gfx1100 revived");
+        assert_eq!(pmc_source_count(&gfx1201), 0, "gfx1201 not revived");
+
+        // Each cell composes from its OWN census + one other real measurement.
+        let cell_1100 = CellEvidence {
+            arch: "gfx1100".to_string(),
+            candidate_value: 10.0,
+            independent_sources: pmc_source_count(&gfx1100) + 1,
+            behavior_verified: true,
+            unmitigated_high_risk: false,
+        };
+        let cell_1201 = CellEvidence {
+            arch: "gfx1201".to_string(),
+            candidate_value: 10.0,
+            independent_sources: pmc_source_count(&gfx1201) + 1,
+            behavior_verified: true,
+            unmitigated_high_risk: false,
+        };
+
+        assert!(evaluate_cell(&cell_1100).is_promoted(), "gfx1100 promotes");
+        assert!(
+            !evaluate_cell(&cell_1201).is_promoted(),
+            "gfx1100's promotion must NOT transfer to gfx1201"
+        );
     }
 
     #[test]
