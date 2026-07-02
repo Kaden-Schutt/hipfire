@@ -16,6 +16,20 @@
 
 use crate::feature_flags::FeatureFlags;
 
+/// Native-required manifest coverage for the wave32-native dp4a decode-GEMV
+/// kernel family (`gate_up` / `down` / `qkvza`). Declare-only in Phase A:
+/// every arch reports all-false today (see `ArchCaps::dp4a_decode_gemv_coverage`
+/// for why the existing wave64 CDNA `has_hfq3_dp4a`/`gemv_dp4a` arm does NOT
+/// count). Phase B flips `gate_up: true` for gfx1201 once the wave32-native
+/// kernel lands — see
+/// `docs/superpowers/plans/2026-07-01-gfx1201-phaseA-perf-instrument.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dp4aDecodeGemvCoverage {
+    pub gate_up: bool,
+    pub down: bool,
+    pub qkvza: bool,
+}
+
 /// Three-layer architecture descriptor computed once at `Gpu::init()` time.
 #[derive(Debug)]
 pub struct ArchCaps {
@@ -350,6 +364,19 @@ impl ArchCaps {
     /// bandwidth tuning knob — kept as the exclusion form to mirror the select.
     pub fn supports_mq3_lloyd_mb4(&self) -> bool {
         self.is_rdna3 && !self.is_gfx1152 && !self.is_gfx1103
+    }
+    /// Native-required manifest: does a wave32-native dp4a decode-GEMV
+    /// kernel exist for `(arch, family)`? All-false for every arch today —
+    /// the existing `has_hfq3_dp4a`/`gemv_dp4a` fields track the wave64 CDNA
+    /// (gfx906) dp4a arm, which is NOT the wave32-native kernel this
+    /// manifest is scoped to. Phase B: gfx1201 `gate_up` flips true when the
+    /// wave32 dp4a kernel lands.
+    pub fn dp4a_decode_gemv_coverage(&self) -> Dp4aDecodeGemvCoverage {
+        Dp4aDecodeGemvCoverage {
+            gate_up: false,
+            down: false,
+            qkvza: false,
+        }
     }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
@@ -762,6 +789,39 @@ mod tests {
                 "{arch} should not use mmq below 128"
             );
             assert!(caps.should_use_mmq(128), "{arch} should use mmq at 128");
+        }
+    }
+
+    // ── Task 7: Dp4aDecodeGemvCoverage (declare-only, all-false) ────────
+
+    #[test]
+    fn dp4a_coverage() {
+        // gfx1201-by-name: no native wave32 dp4a decode-GEMV kernel exists
+        // yet; Phase A only declares the manifest shape (all-false).
+        let gfx1201 = ArchCaps::new("gfx1201", default_flags());
+        assert_eq!(
+            gfx1201.dp4a_decode_gemv_coverage(),
+            Dp4aDecodeGemvCoverage {
+                gate_up: false,
+                down: false,
+                qkvza: false,
+            },
+            "gfx1201 dp4a decode-gemv coverage must be all-false in Phase A"
+        );
+
+        // ANTIBLEED: same all-false result for every other arch too — this
+        // is a declare-only manifest, not a capability that varies by arch
+        // yet (Phase B is where gfx1201 gate_up flips true).
+        for arch in &["gfx1100", "gfx906", "gfx1151"] {
+            assert_eq!(
+                make_caps(arch).dp4a_decode_gemv_coverage(),
+                Dp4aDecodeGemvCoverage {
+                    gate_up: false,
+                    down: false,
+                    qkvza: false,
+                },
+                "{arch} dp4a decode-gemv coverage must be all-false in Phase A"
+            );
         }
     }
 }
