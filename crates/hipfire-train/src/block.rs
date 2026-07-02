@@ -302,6 +302,19 @@ pub fn free_block_acts(gpu: &mut Gpu, b: BlockActivations) -> HipResult<()> {
 }
 
 /// Recovery-FT backward: base frozen, returns LoRA + norm grads only.
+/// Per-linear OUTPUT adjoints (∂ℓ/∂z) captured during backward, downloaded to host —
+/// the input to a GuidedQuant Fisher weight `w[n] = mean_c adj[n,c]²`. Row-major, seq
+/// rows: d_q [seq,qd], d_k/d_v [seq,kvd], d_attn (o_proj output) [seq,h], d_gate/d_up
+/// [seq,inter].
+pub struct BlockAdjoints {
+    pub d_q: Vec<f32>,
+    pub d_k: Vec<f32>,
+    pub d_v: Vec<f32>,
+    pub d_attn: Vec<f32>,
+    pub d_gate: Vec<f32>,
+    pub d_up: Vec<f32>,
+}
+
 pub fn block_backward(
     gpu: &mut Gpu,
     d_x_out: &GpuTensor,
@@ -311,7 +324,8 @@ pub fn block_backward(
     acts: &BlockActivations,
     dims: &BlockDims,
 ) -> HipResult<(GpuTensor, BlockLoraGrad)> {
-    let (d_x, lora_g, _) = block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false)?;
+    let (d_x, lora_g, _, _) =
+        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false, false)?;
     Ok((d_x, lora_g))
 }
 
@@ -325,8 +339,25 @@ pub fn block_backward_full(
     acts: &BlockActivations,
     dims: &BlockDims,
 ) -> HipResult<(GpuTensor, BlockLoraGrad, BlockWeightGrad)> {
-    let (d_x, lora_g, wg) = block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, true)?;
+    let (d_x, lora_g, wg, _) =
+        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, true, false)?;
     Ok((d_x, lora_g, wg.expect("want_w=true ⇒ Some")))
+}
+
+/// Backward that additionally captures the per-linear output adjoints (for the
+/// GuidedQuant Fisher-weighted Hessian). Opt-in; existing paths are unchanged.
+pub fn block_backward_capture(
+    gpu: &mut Gpu,
+    d_x_out: &GpuTensor,
+    x: &GpuTensor,
+    w: &BlockWeights,
+    lora: &BlockLora,
+    acts: &BlockActivations,
+    dims: &BlockDims,
+) -> HipResult<(GpuTensor, BlockLoraGrad, BlockAdjoints)> {
+    let (d_x, lora_g, _, adj) =
+        block_backward_inner(gpu, d_x_out, x, w, lora, acts, dims, false, true)?;
+    Ok((d_x, lora_g, adj.expect("want_capture=true ⇒ Some")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,7 +370,13 @@ fn block_backward_inner(
     acts: &BlockActivations,
     dims: &BlockDims,
     want_w: bool,
-) -> HipResult<(GpuTensor, BlockLoraGrad, Option<BlockWeightGrad>)> {
+    want_capture: bool,
+) -> HipResult<(
+    GpuTensor,
+    BlockLoraGrad,
+    Option<BlockWeightGrad>,
+    Option<BlockAdjoints>,
+)> {
     let (seq, h, inter) = (dims.seq, dims.h, dims.inter);
     let (qd, kvd, r) = (dims.q_dim(), dims.kv_dim(), dims.lora_rank);
     let dnorm1 = gpu.zeros(&[h], DType::F32)?; // trainable RMSNorm grads
@@ -529,6 +566,20 @@ fn block_backward_inner(
         None
     };
 
+    // GuidedQuant: capture the six output adjoints (still alive) to host before free.
+    let adjoints = if want_capture {
+        Some(BlockAdjoints {
+            d_q: gpu.download_f32(&d_q)?,
+            d_k: gpu.download_f32(&d_k)?,
+            d_v: gpu.download_f32(&d_v)?,
+            d_attn: gpu.download_f32(&d_x_mid)?,
+            d_gate: gpu.download_f32(&d_gate)?,
+            d_up: gpu.download_f32(&d_up)?,
+        })
+    } else {
+        None
+    };
+
     // Return internal temporaries to the pool — GpuTensor has no Drop, so without
     // this the per-step training graph climbs ~50 MB/layer and OOMs. Only the
     // returned grads (d_x, BlockLoraGrad, BlockWeightGrad) survive.
@@ -566,5 +617,6 @@ fn block_backward_inner(
             dnorm2,
         },
         wg,
+        adjoints,
     ))
 }

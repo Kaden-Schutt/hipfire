@@ -36,59 +36,59 @@
 //! [`crate::rotation::apply_r1`] once learned); `O(h³)`/step, fine for a bake.
 
 use crate::rotation::Rotation;
+use rayon::prelude::*;
+
+// These are parallelized over OUTPUT ROWS: each row's inner sum stays serial within one
+// thread, so results are bit-identical to the serial version (no float-reassociation) —
+// only the wall-clock changes. This matters at h=2048 where the learn was the long pole.
 
 /// Row-major `[p,q]·[q,c] → [p,c]`.
 fn matmul(a: &[f32], b: &[f32], p: usize, q: usize, c: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; p * c];
-    for i in 0..p {
+    out.par_chunks_mut(c).enumerate().for_each(|(i, orow)| {
         for k in 0..q {
             let aik = a[i * q + k];
             if aik == 0.0 {
                 continue;
             }
             let brow = &b[k * c..k * c + c];
-            let orow = &mut out[i * c..i * c + c];
             for (o, &bv) in orow.iter_mut().zip(brow.iter()) {
                 *o += aik * bv;
             }
         }
-    }
+    });
     out
 }
 
 /// Row-major `A·Bᵀ`: `[p,q]·([c,q])ᵀ → [p,c]`.
 fn matmul_bt(a: &[f32], b: &[f32], p: usize, q: usize, c: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; p * c];
-    for i in 0..p {
+    out.par_chunks_mut(c).enumerate().for_each(|(i, orow)| {
         let arow = &a[i * q..i * q + q];
-        for j in 0..c {
+        for (j, o) in orow.iter_mut().enumerate() {
             let brow = &b[j * q..j * q + q];
-            let mut acc = 0.0f32;
-            for (&av, &bv) in arow.iter().zip(brow.iter()) {
-                acc += av * bv;
-            }
-            out[i * c + j] = acc;
+            *o = arow.iter().zip(brow).map(|(&av, &bv)| av * bv).sum();
         }
-    }
+    });
     out
 }
 
-/// `Aᵀ·B`: `([p,q])ᵀ·[p,c] → [q,c]`.
+/// `Aᵀ·B`: `([p,q])ᵀ·[p,c] → [q,c]`. Parallel over the `q` output rows (k), each
+/// summing over all `i` in i-order — identical accumulation to the serial loop.
 fn matmul_at(a: &[f32], b: &[f32], p: usize, q: usize, c: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; q * c];
-    for i in 0..p {
-        let arow = &a[i * q..i * q + q];
-        let brow = &b[i * c..i * c + c];
-        for (k, &av) in arow.iter().enumerate() {
+    out.par_chunks_mut(c).enumerate().for_each(|(k, orow)| {
+        for i in 0..p {
+            let av = a[i * q + k];
             if av == 0.0 {
                 continue;
             }
-            let orow = &mut out[k * c..k * c + c];
+            let brow = &b[i * c..i * c + c];
             for (o, &bv) in orow.iter_mut().zip(brow.iter()) {
                 *o += av * bv;
             }
         }
-    }
+    });
     out
 }
 

@@ -7,8 +7,8 @@
 //! bookends plus the block loop and its reverse.
 
 use crate::block::{
-    block_backward, block_forward, BlockActivations, BlockDims, BlockLora, BlockLoraGrad,
-    BlockWeights,
+    block_backward, block_backward_capture, block_forward, BlockActivations, BlockAdjoints,
+    BlockDims, BlockLora, BlockLoraGrad, BlockWeights,
 };
 use crate::config::LlamaConfig;
 use crate::loader::LlamaWeightsF32;
@@ -495,6 +495,70 @@ pub fn model_loss_backward(
     }
     grads.reverse(); // align with layer order
     Ok((loss_sum, grads))
+}
+
+/// Forward+backward that returns the per-layer per-linear OUTPUT adjoints (∂ℓ/∂z)
+/// instead of the LoRA grads — the raw material for GuidedQuant Fisher weights. Same
+/// reverse walk as [`model_loss_backward`] but via [`block_backward_capture`]. Layer
+/// order. `acts` must be the forward of the SAME model.
+pub fn model_guided_adjoints(
+    gpu: &mut Gpu,
+    model: &LlamaModel,
+    acts: &ModelActivations,
+    targets: &[f32],
+    ignore_index: i32,
+) -> HipResult<(f32, Vec<BlockAdjoints>)> {
+    let (seq, h, vocab) = (model.dims.seq, model.dims.h, model.vocab);
+    let tgt = gpu.upload_f32(targets, &[seq])?;
+    let loss = gpu.zeros(&[seq], DType::F32)?;
+    let d_logits = gpu.zeros(&[seq * vocab], DType::F32)?;
+    cross_entropy(
+        gpu,
+        &acts.logits,
+        &tgt,
+        &loss,
+        &d_logits,
+        seq,
+        vocab,
+        ignore_index,
+    )?;
+    let loss_sum: f32 = gpu.download_f32(&loss)?.iter().sum();
+
+    let out_proj = model.lm_head.as_ref().unwrap_or(&model.embed);
+    let d_xf = gpu.zeros(&[seq * h], DType::F32)?;
+    linear_backward_x(gpu, &d_logits, out_proj, &d_xf, seq, h, vocab, false)?;
+    let d_x_last = gpu.zeros(&[seq * h], DType::F32)?;
+    let dw_dummy = gpu.zeros(&[h], DType::F32)?;
+    rmsnorm_backward(
+        gpu,
+        &d_xf,
+        &acts.x_last,
+        &model.final_norm,
+        &acts.rinv_final,
+        &d_x_last,
+        &dw_dummy,
+        seq,
+        h,
+    )?;
+
+    let mut adj: Vec<BlockAdjoints> = Vec::with_capacity(model.layers.len());
+    let mut d_x = d_x_last;
+    for i in (0..model.layers.len()).rev() {
+        let (lw, ll) = &model.layers[i];
+        let (d_in, _lora_g, a) = block_backward_capture(
+            gpu,
+            &d_x,
+            &acts.layer_inputs[i],
+            &lw.as_block(),
+            &ll.as_block(),
+            &acts.layer_acts[i],
+            &model.dims,
+        )?;
+        adj.push(a);
+        d_x = d_in;
+    }
+    adj.reverse();
+    Ok((loss_sum, adj))
 }
 
 /// GuidedQuant down_proj capture: form the per-token Fisher weight
