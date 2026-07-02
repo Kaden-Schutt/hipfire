@@ -10,6 +10,7 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod bill_of_debt;
 pub mod chip_profile;
 mod compiler;
 mod dispatch;
