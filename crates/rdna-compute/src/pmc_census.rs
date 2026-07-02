@@ -526,6 +526,39 @@ pub fn dynamic_bound_class_evidence(_bound_class: crate::roofline::BoundClass) -
     0
 }
 
+/// Fold several rocprofv3 `--pmc` CSV texts (one per counter-limited pass) into
+/// a single per-arch census. rocprofv3 caps the counters per pass, so a full
+/// census is assembled from several passes; this unions their counter sets and
+/// SUMS a counter that appears in more than one pass. Every CSV must share the
+/// same right-anchored `Counter_Name,Counter_Value` header contract.
+pub fn fold_counter_csv_texts(
+    arch: &str,
+    perf_level: &str,
+    min_nonzero_fraction: f64,
+    csv_texts: &[&str],
+) -> Result<ArchPmcCensus, String> {
+    let mut merged: BTreeMap<String, CounterCounts> = BTreeMap::new();
+    for text in csv_texts {
+        let c = census_from_counter_csv_text(arch, perf_level, min_nonzero_fraction, text)?;
+        for (name, counts) in c.counters {
+            let entry = merged.entry(name).or_insert(CounterCounts {
+                rows: 0,
+                nonzero_rows: 0,
+                value_sum: 0.0,
+            });
+            entry.rows += counts.rows;
+            entry.nonzero_rows += counts.nonzero_rows;
+            entry.value_sum += counts.value_sum;
+        }
+    }
+    Ok(ArchPmcCensus {
+        arch: arch.to_string(),
+        perf_level: perf_level.to_string(),
+        min_nonzero_fraction,
+        counters: merged,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +949,63 @@ k,Wavefronts,64
             !evaluate_cell(&cell_1201).is_promoted(),
             "gfx1100's promotion must NOT transfer to gfx1201"
         );
+    }
+
+    #[test]
+    fn fold_merges_multi_pass_csvs_under_one_header() {
+        // rocprofv3 caps counters per pass, so a full census is FOLDED from
+        // several passes' CSVs. Union the counter sets; sum a shared counter.
+        let p1 = "\
+Kernel_Name,Counter_Name,Counter_Value
+k,VALUBusy,42.0
+k,SQ_BUSY_CYCLES,100
+";
+        let p2 = "\
+Kernel_Name,Counter_Name,Counter_Value
+k,MemUnitBusy,30.0
+k,SQ_BUSY_CYCLES,50
+";
+        let c = fold_counter_csv_texts("gfx1201", REQUIRED_PERF_LEVEL, 0.5, &[p1, p2])
+            .expect("fold ok");
+        // Union of both passes' counters.
+        assert!(c.counters.contains_key("VALUBusy"));
+        assert!(c.counters.contains_key("MemUnitBusy"));
+        // Shared counter summed across passes.
+        let sq = c.counters.get("SQ_BUSY_CYCLES").expect("SQ present");
+        assert_eq!(sq.rows, 2);
+        assert_eq!(sq.nonzero_rows, 2);
+        assert_eq!(sq.value_sum, 150.0);
+    }
+
+    #[test]
+    fn committed_censuses_are_valid_captures_with_working_controls() {
+        // Loader guard for the committed per-arch census rows. These are REAL
+        // GPU-captured rows ([GPU: hipx], task 0c Cycle 7); until an arch's row
+        // is captured, its file is absent and this test SKIPS it (never fakes a
+        // row). For a present row we assert only capture-VALIDITY + working
+        // CONTROLS — NOT the measured `derived_revived`, which legitimately
+        // varies per arch (e.g. VALUBusy is absent from the gfx1100 metrics DB).
+        let mut checked = 0usize;
+        for arch in ["gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
+            let path = ArchPmcCensus::committed_path(arch);
+            if !path.exists() {
+                eprintln!("skip {arch}: committed census absent (awaiting [GPU: hipx] capture)");
+                continue;
+            }
+            let c = ArchPmcCensus::load_committed(arch)
+                .unwrap_or_else(|e| panic!("committed {arch} census failed to load: {e}"));
+            assert_eq!(c.arch, arch, "committed row arch must match filename");
+            assert!(
+                c.is_valid_capture(),
+                "{arch}: committed census must be a profile_standard capture"
+            );
+            assert!(
+                c.accumulators_alive(),
+                "{arch}: raw-accumulator controls must be alive (proves capture ran)"
+            );
+            checked += 1;
+        }
+        eprintln!("committed census loader guard checked {checked} present arch row(s)");
     }
 
     #[test]
