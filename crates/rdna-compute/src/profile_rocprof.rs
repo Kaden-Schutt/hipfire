@@ -31,7 +31,9 @@
 //! substring search: a rocprof entry is "covered" if any internal alias appears
 //! as a substring of the rocprof `Name` (case-insensitive for robustness).
 
+use crate::chip_profile::ChipProfile;
 use crate::profile::{stop, ProfileEntry};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// A single kernel as reported by rocprofv3's `--stats` aggregate CSV.
@@ -248,6 +250,162 @@ pub fn stop_with_rocprof(csv_path: &Path) -> Option<ProfileReport> {
     Some(compute_coverage(&internal, &rocprof))
 }
 
+// --- Dynamic achieved-BW (Task 9 "dynamic" half) ---------------------------
+//
+// `--kernel-trace --stats` (the CSV format this module parses, see the
+// module docs) reports only `Name,Calls,TotalDurationNs,...` — it never
+// carries a per-kernel bytes-moved column. Getting a REAL hardware byte
+// counter (e.g. a `FetchSize`-class PMC) requires a DIFFERENT rocprofv3
+// invocation (`--pmc <counter>`), which this CSV-analysis path deliberately
+// does not attempt (see `kernel_perf_instrument --dynamic`'s module docs for
+// why: a decode-orchestrating live-`--pmc` run risks the rocprof hang this
+// instrument exists to avoid). So `achieved_bw` here is ALWAYS an analytic
+// (byte-model-derived) estimate, never a live counter read — the
+// `trust_score` below exists to make that explicit rather than let an
+// analytic number masquerade as a measurement.
+
+/// Trust score for an analytic (byte-model) achieved-BW estimate on an arch
+/// where a real hardware byte counter (`FetchSize`-class PMC) is at least in
+/// principle obtainable via a separate `rocprofv3 --pmc` invocation (this
+/// CSV-analysis path just doesn't attempt one). `1.0` is reserved for an
+/// actual live counter read, which this module never produces — see
+/// [`TRUST_ANALYTIC_GFX12_PMC_ZERO`] for the strictly-lower gfx12 case.
+pub const TRUST_ANALYTIC_DEFAULT: f64 = 0.8;
+
+/// Trust score for an analytic achieved-BW estimate on gfx12 (gfx1200,
+/// gfx1201, ...), where a live byte-counter PMC is not merely "not attempted
+/// by this CSV-analysis path" but **structurally unavailable** on the
+/// current ROCm/rocprofv3 stack: `docs/gfx1201-native-surface.md`
+/// ("gfx1100 PMC ALU-vs-mem split") documents every %-busy/occupancy-style
+/// rocprofv3 counter (`MemUnitBusy`, `TA_BUSY_avr`, `VALUBusy`, ...) reading
+/// exactly `0.0` across hundreds of sampled dispatches — "the known 'gfx12
+/// PMC reads zero' issue" — while the two simplest raw accumulators
+/// (`SQ_BUSY_CYCLES`, `Wavefronts`) read sane values in the SAME runs,
+/// proving PMC collection itself works on this stack, just not the
+/// byte/busy-style counters a `FetchSize` cross-check would need. On gfx12
+/// the analytic byte model is therefore not a fallback FROM a real counter
+/// that was simply skipped — it's the only viable signal at all — hence one
+/// notch lower than [`TRUST_ANALYTIC_DEFAULT`].
+pub const TRUST_ANALYTIC_GFX12_PMC_ZERO: f64 = 0.6;
+
+/// `chip.arch`-keyed trust-score selection: `gfx12*` gets the PMC-zero
+/// floor, everything else gets the general analytic-fallback score. See the
+/// two constants' docs for the rationale split.
+fn trust_score_for_arch(arch: &str) -> f64 {
+    if arch.starts_with("gfx12") {
+        TRUST_ANALYTIC_GFX12_PMC_ZERO
+    } else {
+        TRUST_ANALYTIC_DEFAULT
+    }
+}
+
+/// One kernel's dynamic (rocprofv3-CSV + byte-model-derived) achieved-
+/// bandwidth measurement, computed by [`compute_achieved_bw`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AchievedBw {
+    /// The byte-model alias key (from the caller's `byte_model` map) that
+    /// matched this rocprof row — see [`compute_achieved_bw`]'s matching
+    /// rule.
+    pub kernel: String,
+    /// The full rocprofv3 `Name` column (mangled symbol) this row came from.
+    pub rocprof_name: String,
+    pub calls: u64,
+    /// Bytes moved per call, from the caller's byte-model map.
+    pub bytes_per_call: usize,
+    /// `TotalDurationNs / Calls / 1000.0` — average wall time per call, in
+    /// microseconds.
+    pub us_per_call: f64,
+    /// The rocprof row's total wall time (us) across all `calls` — i.e. this
+    /// kernel's raw contribution to the profiled window, the natural
+    /// "ranked by decode-time" sort key.
+    pub total_us: f64,
+    /// `bytes_per_call / (us_per_call * 1000.0)` == GB/s (bytes per
+    /// nanosecond, no further unit conversion needed).
+    pub achieved_gbps: f64,
+    /// `achieved_gbps / chip.peak_bw_gbps`, `None` when the chip's
+    /// `peak_bw_gbps` is unset (unprofiled arch) rather than a fabricated
+    /// zero. Deliberately NOT clamped to `1.0` — a reading modestly above
+    /// 100% is a legitimate weight-only-vs-inclusive byte-accounting
+    /// artifact (see `docs/gfx1201-native-surface.md`'s lm_head row,
+    /// 99.9-100.3%), not something to hide by clamping.
+    pub pct_of_peak: Option<f64>,
+    /// See [`TRUST_ANALYTIC_DEFAULT`] / [`TRUST_ANALYTIC_GFX12_PMC_ZERO`].
+    pub trust_score: f64,
+}
+
+/// Match a rocprofv3 kernel `Name` (mangled) against a byte-model alias map,
+/// using the same case-insensitive substring convention as
+/// [`compute_coverage`]: an alias matches when it is found inside the
+/// mangled name. When more than one alias matches (e.g. a short alias like
+/// `"gemv_hfq4g256_residual"` is itself a substring of a longer, more
+/// specific one like `"gemv_hfq4g256_residual_sigmoid_scaled"` that ALSO
+/// matches), the LONGEST matching alias wins — the most specific key, not
+/// whichever key `HashMap` iteration happens to visit first.
+fn match_byte_model<'a>(
+    rocprof_name: &str,
+    byte_model: &'a HashMap<String, usize>,
+) -> Option<(&'a str, usize)> {
+    let name_lower = rocprof_name.to_ascii_lowercase();
+    byte_model
+        .iter()
+        .filter(|(alias, _)| name_lower.contains(alias.to_ascii_lowercase().as_str()))
+        .max_by_key(|(alias, _)| alias.len())
+        .map(|(alias, bytes)| (alias.as_str(), *bytes))
+}
+
+/// Compute per-kernel achieved bandwidth from a parsed rocprofv3
+/// `--kernel-trace --stats` CSV (see module docs), a `kernel-alias ->
+/// bytes-moved-per-call` byte-model map, and the target [`ChipProfile`]
+/// (for `pct_of_peak` and the arch-keyed `trust_score`).
+///
+/// `achieved_bw = bytes_moved_per_call / (TotalDurationNs / Calls)` — see
+/// [`AchievedBw::achieved_gbps`].
+///
+/// rocprof rows with no matching byte-model alias are silently skipped
+/// (nothing to compute an achieved-BW for) — this is a filter, not an
+/// error: a real CSV legitimately contains hundreds of kernels this
+/// instrument doesn't have a byte model for yet. Rows with `calls == 0` or
+/// a non-positive average call time are also skipped (nothing to divide
+/// by).
+pub fn compute_achieved_bw(
+    rocprof: &[RocprofKernel],
+    byte_model: &HashMap<String, usize>,
+    chip: &ChipProfile,
+) -> Vec<AchievedBw> {
+    let trust_score = trust_score_for_arch(&chip.arch);
+    let mut out = Vec::new();
+    for rk in rocprof {
+        let Some((alias, bytes_per_call)) = match_byte_model(&rk.name, byte_model) else {
+            continue;
+        };
+        if rk.calls == 0 {
+            continue;
+        }
+        let us_per_call = rk.duration_us / rk.calls as f64;
+        if !(us_per_call > 0.0) {
+            continue;
+        }
+        let achieved_gbps = bytes_per_call as f64 / (us_per_call * 1000.0);
+        let pct_of_peak = chip
+            .peak_bw_gbps
+            .filter(|peak| *peak > 0.0)
+            .map(|peak| (achieved_gbps / peak).max(0.0));
+
+        out.push(AchievedBw {
+            kernel: alias.to_string(),
+            rocprof_name: rk.name.clone(),
+            calls: rk.calls,
+            bytes_per_call,
+            us_per_call,
+            total_us: rk.duration_us,
+            achieved_gbps,
+            pct_of_peak,
+            trust_score,
+        });
+    }
+    out
+}
+
 // --- Tests ----------------------------------------------------------------
 
 #[cfg(test)]
@@ -339,5 +497,217 @@ _Z22gemm_hfq4g256_residual_kd,200,100000000,500000,20.0,480000,520000,8000
         let text = "not,a,valid,header\nfoo,1,1000,1000,50.0,900,1100,50\n";
         let result = parse_rocprof_stats_csv_text(text);
         assert!(result.is_err(), "should error on unrecognized header");
+    }
+
+    // --- compute_achieved_bw ------------------------------------------------
+    //
+    // Validation targets: the gfx1201 A3B `mq4r` decode surface map
+    // (`docs/gfx1201-native-surface.md`, "Precise per-kernel achieved-BW
+    // table", commit cb8c9e26), DRAM peak 611.8 GB/s. A synthetic
+    // `RocprofKernel` with `calls: 1` and `duration_us` set to the
+    // documented per-call µs reproduces `TotalDurationNs / Calls` exactly
+    // (`duration_us / 1 == duration_us`), so `compute_achieved_bw` must
+    // reproduce the documented achieved-GB/s and %-of-peak figures to
+    // within the ±2% this module asks for (tighter than, and unrelated to,
+    // the ±1-3% session A/B noise band in `docs/methodology/perf-benchmarking.md`
+    // — this checks an arithmetic reproduction, not a fresh measurement).
+
+    fn gfx1201_chip() -> ChipProfile {
+        let mut chip = ChipProfile::for_unprofiled("gfx1201");
+        chip.peak_bw_gbps = Some(611.8);
+        chip
+    }
+
+    fn one_call_kernel(mangled_name: &str, us_per_call: f64) -> RocprofKernel {
+        RocprofKernel {
+            name: mangled_name.to_string(),
+            calls: 1,
+            duration_us: us_per_call,
+            percent: 0.0, // unused by compute_achieved_bw
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64, pct: f64, what: &str) {
+        let rel_err = (actual - expected).abs() / expected;
+        assert!(
+            rel_err <= pct,
+            "{what}: {actual:.2} vs validated {expected:.2}: {:.3}% off (tolerance {:.1}%)",
+            rel_err * 100.0,
+            pct * 100.0
+        );
+    }
+
+    #[test]
+    fn achieved_bw_reproduces_gfx1201_a3b_surface_map_all_five_hot_kernels() {
+        // (kernel alias, mangled rocprof Name substring, bytes/call,
+        // us/call, expected achieved GB/s, expected %-of-611.8-peak)
+        let cases: &[(&str, &str, usize, f64, f64, f64)] = &[
+            (
+                "fused_qkvza_hfq4g256",
+                "_Z20fused_qkvza_hfq4g256PKjS0_Pfi.kd",
+                6_555_977,
+                13.139,
+                499.0,
+                0.816,
+            ),
+            (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed",
+                "_Z37gemv_hfq4g256_moe_gate_up_k8_indexedPKjS0_Pfi.kd",
+                8_912_896,
+                20.087,
+                443.7,
+                0.725,
+            ),
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed",
+                "_Z34gemv_hfq4g256_moe_down_k8_indexedPKjS0_Pfi.kd",
+                4_456_448,
+                16.529,
+                269.6,
+                0.441,
+            ),
+            (
+                "gemv_hfq4g256_residual",
+                "_Z22gemv_hfq4g256_residualPKjS0_Pfi.kd",
+                4_456_448,
+                14.263,
+                312.4,
+                0.511,
+            ),
+            (
+                "gemv_hfq4g256_multirow_r2",
+                "_Z25gemv_hfq4g256_multirow_r2PKjS0_Pfi.kd",
+                270_172_160,
+                441.957,
+                611.3,
+                0.999,
+            ),
+        ];
+
+        let mut byte_model = HashMap::new();
+        let mut rocprof = Vec::new();
+        for (alias, mangled, bytes, us, _, _) in cases {
+            byte_model.insert(alias.to_string(), *bytes);
+            rocprof.push(one_call_kernel(mangled, *us));
+        }
+
+        let chip = gfx1201_chip();
+        let achieved = compute_achieved_bw(&rocprof, &byte_model, &chip);
+        assert_eq!(
+            achieved.len(),
+            cases.len(),
+            "all 5 hot kernels must match a byte-model alias"
+        );
+
+        for (alias, _, bytes, us, expected_gbps, expected_pct) in cases {
+            let entry = achieved
+                .iter()
+                .find(|a| a.kernel == *alias)
+                .unwrap_or_else(|| panic!("no achieved-BW entry matched alias {alias:?}"));
+            assert_eq!(entry.bytes_per_call, *bytes);
+            assert!((entry.us_per_call - us).abs() < 1e-6);
+            assert_close(
+                entry.achieved_gbps,
+                *expected_gbps,
+                0.02,
+                &format!("{alias} achieved_gbps"),
+            );
+            let pct = entry
+                .pct_of_peak
+                .unwrap_or_else(|| panic!("{alias}: pct_of_peak withheld, peak_bw_gbps missing"));
+            assert_close(pct, *expected_pct, 0.02, &format!("{alias} pct_of_peak"));
+            // gfx1201 is a gfx12 arch: analytic-only, PMC-zero fallback.
+            assert_eq!(entry.trust_score, TRUST_ANALYTIC_GFX12_PMC_ZERO);
+        }
+    }
+
+    #[test]
+    fn trust_score_lower_on_gfx12_pmc_zero_than_other_analytic_archs() {
+        assert_eq!(
+            trust_score_for_arch("gfx1201"),
+            TRUST_ANALYTIC_GFX12_PMC_ZERO
+        );
+        assert_eq!(
+            trust_score_for_arch("gfx1200"),
+            TRUST_ANALYTIC_GFX12_PMC_ZERO
+        );
+        assert_eq!(trust_score_for_arch("gfx1100"), TRUST_ANALYTIC_DEFAULT);
+        assert_eq!(trust_score_for_arch("gfx906"), TRUST_ANALYTIC_DEFAULT);
+        assert!(
+            TRUST_ANALYTIC_GFX12_PMC_ZERO < TRUST_ANALYTIC_DEFAULT,
+            "gfx12 PMC-zero fallback must trust LESS than the general analytic case, \
+             which in turn must trust less than a real (never-produced-here) 1.0 counter read"
+        );
+        assert!(TRUST_ANALYTIC_DEFAULT < 1.0);
+    }
+
+    #[test]
+    fn compute_achieved_bw_longest_alias_wins_on_ambiguous_match() {
+        // "gemv_hfq4g256_residual" is itself a substring of the longer,
+        // more specific "gemv_hfq4g256_residual_sigmoid_scaled" -- a
+        // mangled name containing the LONGER alias must match the longer
+        // (more specific) one, not whichever HashMap iteration visits first.
+        let mut byte_model = HashMap::new();
+        byte_model.insert("gemv_hfq4g256_residual".to_string(), 1_000usize);
+        byte_model.insert(
+            "gemv_hfq4g256_residual_sigmoid_scaled".to_string(),
+            2_000usize,
+        );
+
+        let rocprof = vec![one_call_kernel(
+            "_Z40gemv_hfq4g256_residual_sigmoid_scaled_gpuPKjS0_Pfi.kd",
+            10.0,
+        )];
+        let chip = gfx1201_chip();
+        let achieved = compute_achieved_bw(&rocprof, &byte_model, &chip);
+        assert_eq!(achieved.len(), 1);
+        assert_eq!(achieved[0].kernel, "gemv_hfq4g256_residual_sigmoid_scaled");
+        assert_eq!(achieved[0].bytes_per_call, 2_000);
+    }
+
+    #[test]
+    fn compute_achieved_bw_skips_unmatched_and_zero_call_rows() {
+        let mut byte_model = HashMap::new();
+        byte_model.insert("gemv_hfq4g256_residual".to_string(), 1_000usize);
+
+        let rocprof = vec![
+            // No alias matches this name at all.
+            one_call_kernel("_Z9rmsnormPfPKfS0_i.kd", 5.0),
+            // Matches, but zero calls -- nothing to divide by.
+            RocprofKernel {
+                name: "_Z22gemv_hfq4g256_residualPKjS0_Pfi.kd".to_string(),
+                calls: 0,
+                duration_us: 100.0,
+                percent: 0.0,
+            },
+        ];
+        let chip = gfx1201_chip();
+        let achieved = compute_achieved_bw(&rocprof, &byte_model, &chip);
+        assert!(
+            achieved.is_empty(),
+            "unmatched and zero-call rows must both be skipped, got {achieved:?}"
+        );
+    }
+
+    #[test]
+    fn compute_achieved_bw_withholds_pct_of_peak_when_chip_unprofiled() {
+        let mut byte_model = HashMap::new();
+        byte_model.insert("gemv_hfq4g256_residual".to_string(), 1_000usize);
+        let rocprof = vec![one_call_kernel(
+            "_Z22gemv_hfq4g256_residualPKjS0_Pfi.kd",
+            10.0,
+        )];
+        // peak_bw_gbps stays None -- an arch that was never measured.
+        let chip = ChipProfile::for_unprofiled("gfx9999");
+        let achieved = compute_achieved_bw(&rocprof, &byte_model, &chip);
+        assert_eq!(achieved.len(), 1);
+        assert!(
+            achieved[0].pct_of_peak.is_none(),
+            "pct_of_peak must be withheld (None), not a fabricated value, when \
+             chip.peak_bw_gbps is unset"
+        );
+        // achieved_gbps itself is still computed -- only the %-of-peak
+        // denominator is unavailable.
+        assert!(achieved[0].achieved_gbps > 0.0);
     }
 }

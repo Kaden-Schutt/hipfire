@@ -94,6 +94,18 @@ pub struct KernelCompiler {
     /// hash so blobs built by a different compiler/ROCm don't get reused across
     /// builds sharing one `.hipfire_kernels` dir (the "invalid device image" trap).
     toolchain_id: String,
+    /// First-seen source hash per module `name`, for the JIT module-name
+    /// collision guard in `compile()`. See `reference_kernel_module_cache_collision`:
+    /// `self.compiled` (above) is keyed by `name` ALONE, so a second call
+    /// reusing an already-loaded module name with a DIFFERENT source used to
+    /// be silently short-circuited (dead code) instead of failing loud.
+    source_hashes: HashMap<String, String>,
+    /// First-seen owning module per kernel symbol `func_name`, for the
+    /// companion guard in `scratch.rs::compile_and_load_kernel`. That
+    /// function's `functions` cache is keyed by `func_name` ALONE across
+    /// modules, so two distinct modules exporting the same symbol name would
+    /// silently share one `Function` handle. Debug-only cross-check.
+    func_owner: HashMap<String, String>,
 }
 
 impl KernelCompiler {
@@ -156,7 +168,10 @@ impl KernelCompiler {
         let hot_dir = cache_dir.clone();
         if let Some(ref cold) = precompiled_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
-                eprintln!("  hot-path seed failed at {} ({e}) — falling back to install dir reads", hot_dir.display());
+                eprintln!(
+                    "  hot-path seed failed at {} ({e}) — falling back to install dir reads",
+                    hot_dir.display()
+                );
             }
         }
         // Prefer the hot-path (tmpfs) dir when it exists and has contents.
@@ -207,12 +222,41 @@ impl KernelCompiler {
             has_hipcc,
             extra_flags,
             toolchain_id,
+            source_hashes: HashMap::new(),
+            func_owner: HashMap::new(),
         })
     }
 
     /// Returns a reference to all compiled kernel paths (name → .hsaco path).
     pub fn compiled_kernels(&self) -> &HashMap<String, PathBuf> {
         &self.compiled
+    }
+
+    /// Debug-only companion guard for `scratch.rs::compile_and_load_kernel`'s
+    /// `functions` cache, which is keyed by `func_name` ALONE across modules
+    /// (unlike `compile()` above, which is now guarded by source hash per
+    /// module `name`). Records the first module a symbol was loaded from and
+    /// asserts later loads of the same symbol name come from the same
+    /// module — a mismatch means two distinct modules export the same
+    /// symbol name and the second one's `Function` handle would be silently
+    /// dropped in favor of the first (the func-name-collision sibling of the
+    /// module-name collision fixed in `compile()`). No-op in release builds.
+    pub(crate) fn check_func_owner(&mut self, func_name: &str, module_name: &str) {
+        match self.func_owner.get(func_name) {
+            Some(owner) => {
+                debug_assert_eq!(
+                    owner, module_name,
+                    "JIT function-name collision: '{func_name}' first loaded from module \
+                     '{owner}', now requested from module '{module_name}' — the functions \
+                     cache in scratch.rs is keyed by func_name alone, so this second load \
+                     would silently reuse the first module's Function handle"
+                );
+            }
+            None => {
+                self.func_owner
+                    .insert(func_name.to_string(), module_name.to_string());
+            }
+        }
     }
 
     fn cache_hash(&self, source: &str) -> String {
@@ -225,18 +269,56 @@ impl KernelCompiler {
         format!("{:016x}", hasher.finish())
     }
 
+    /// Shared JIT module-name collision guard for BOTH `compile()` and
+    /// `compile_batch()` — `self.compiled` is keyed by module `name` ALONE
+    /// in both entry points, so either one's `contains_key(name)` cache-hit
+    /// early return/skip could silently keep serving a blob compiled from a
+    /// DIFFERENT source under the same name. Records the first-seen source
+    /// hash per name and fails loud on a mismatch instead of silently
+    /// reusing the wrong blob. MUST be called before any `self.compiled`
+    /// cache-hit check in a compile entry point — calling it after would
+    /// let the early return fire first and defeat the guard.  Burned
+    /// 2026-06-06 (gfx12 MMQ HFQ4G256: RDNA3 source pre-loaded under the
+    /// gfx12 module name → empty-stub kernels → ~100% NRMSE). See
+    /// reference_kernel_module_cache_collision.
+    fn guard_module_collision(&mut self, name: &str, src_hash: &str) -> HipResult<()> {
+        match self.source_hashes.get(name) {
+            Some(prev) if prev != src_hash => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "JIT module-name collision: '{name}' compiled with two different \
+                     sources (hash {prev} vs {src_hash}); distinct module name required \
+                     per arch-variant (see reference_kernel_module_cache_collision)"
+                ),
+            )),
+            None => {
+                self.source_hashes
+                    .insert(name.to_string(), src_hash.to_string());
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
-        if self.compiled.contains_key(name) {
-            return Ok(&self.compiled[name]);
-        }
-
         // Hash source + arch + flags + toolchain + ABI for cache validation (used by
         // both pre-compiled and runtime paths). Flags and toolchain matter: identical
         // source compiled with different hipcc flags / ROCm versions yields a different
         // .hsaco, and reusing the wrong one surfaces as "device kernel image is invalid".
         let src_hash = self.cache_hash(source);
+
+        // JIT module-name collision guard — see `guard_module_collision` doc
+        // comment. Must run before the `self.compiled.contains_key` cache-hit
+        // check just below, which is keyed by `name` alone and would
+        // otherwise silently short-circuit a second call reusing an
+        // already-loaded module name with DIFFERENT source.
+        self.guard_module_collision(name, &src_hash)?;
+
+        if self.compiled.contains_key(name) {
+            return Ok(&self.compiled[name]);
+        }
 
         // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
         // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
@@ -469,11 +551,22 @@ impl KernelCompiler {
         let mut to_compile: Vec<(String, String, String, PathBuf, PathBuf, PathBuf)> = Vec::new();
 
         for &(name, source) in kernels {
+            let src_hash = self.cache_hash(source);
+
+            // JIT module-name collision guard (same as `compile()` — see
+            // `guard_module_collision` doc comment). Must run before the
+            // `self.compiled.contains_key` skip just below: that skip is
+            // keyed by `name` alone, so without this guard a second
+            // `compile_batch()` call reusing a module name with DIFFERENT
+            // source would silently `continue` past it, leaving the stale
+            // blob in place with no error — the exact bug class this guard
+            // exists to catch, just via the batch entry point instead of
+            // `compile()`.
+            self.guard_module_collision(name, &src_hash)?;
+
             if self.compiled.contains_key(name) {
                 continue;
             }
-
-            let src_hash = self.cache_hash(source);
 
             // Check precompiled with valid hash
             if let Some(ref dir) = self.precompiled_dir {
@@ -614,6 +707,8 @@ mod tests {
             has_hipcc: false,
             extra_flags: extra_flags.to_string(),
             toolchain_id: toolchain_id.to_string(),
+            source_hashes: HashMap::new(),
+            func_owner: HashMap::new(),
         }
     }
 
@@ -632,6 +727,110 @@ mod tests {
         assert_ne!(
             base, toolchain_changed,
             "cache key must change when hipcc toolchain changes"
+        );
+    }
+
+    // NOTE on fixture design: `test_compiler` sets `has_hipcc: false` and a
+    // `cache_dir` that doesn't exist on disk (".test-cache"), and
+    // `precompiled_dir: None`. That means a REAL first `compile()` call in
+    // this fixture fails before `self.compiled` is ever populated (hipcc
+    // writes the source to `cache_dir/{name}.hip` first, which errors with
+    // "No such file or directory" since the parent dir is missing) — so
+    // driving these tests through two real `compile()` calls would never
+    // actually reach the `self.compiled.contains_key(name)` early-return
+    // this guard sits in front of, and would silently pass even if the
+    // guard were deleted (both calls just error out independently). Instead,
+    // seed `compiled` / `source_hashes` directly to simulate the state after
+    // a real prior compile() success, so these tests genuinely exercise the
+    // cache-hit path the guard is protecting.
+
+    #[test]
+    fn collision_same_module_name_different_source_returns_err() {
+        let mut compiler = test_compiler("", "hipcc 7.2");
+        // Seed state as if "modA" had already been compiled once from
+        // `kernel_v1_source` (mirrors a real prior `compile()` success).
+        let src_hash_v1 = compiler.cache_hash("kernel_v1_source");
+        compiler
+            .compiled
+            .insert("modA".to_string(), PathBuf::from("modA.hsaco"));
+        compiler
+            .source_hashes
+            .insert("modA".to_string(), src_hash_v1);
+
+        // Reusing "modA" with a DIFFERENT source is the exact bug class from
+        // reference_kernel_module_cache_collision: without this guard, the
+        // `self.compiled.contains_key(name)` early return right after it
+        // would silently hand back "modA.hsaco" (compiled from
+        // kernel_v1_source) to a caller that asked for
+        // kernel_v2_DIFFERENT_source — never surfacing that two distinct
+        // kernel sources are fighting over one module name.
+        let result = compiler.compile("modA", "kernel_v2_DIFFERENT_source");
+        let err = result.expect_err(
+            "second compile() with a different source under the same module name must fail",
+        );
+        assert!(
+            err.message.contains("module-name collision"),
+            "error message should mention module-name collision, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("modA"),
+            "error message should mention the colliding module name, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn identical_source_recompile_is_not_a_collision() {
+        let mut compiler = test_compiler("", "hipcc 7.2");
+        // Same seeding as above, but the "recompile" request that follows
+        // uses the IDENTICAL source. This must be a plain cache hit — the
+        // guard must not fire on a matching hash, and the caller gets back
+        // the already-compiled path.
+        let src_hash_v1 = compiler.cache_hash("kernel_v1_source");
+        compiler
+            .compiled
+            .insert("modA".to_string(), PathBuf::from("modA.hsaco"));
+        compiler
+            .source_hashes
+            .insert("modA".to_string(), src_hash_v1);
+
+        let result = compiler.compile("modA", "kernel_v1_source");
+        let path = result.expect(
+            "recompiling the same module name with the IDENTICAL source must succeed, not be treated as a collision",
+        );
+        assert_eq!(
+            path,
+            Path::new("modA.hsaco"),
+            "identical-source recompile must return the already-compiled cache entry"
+        );
+    }
+
+    #[test]
+    fn compile_batch_enforces_the_same_collision_guard() {
+        // The companion gap this test closes: `compile_batch()` has its own
+        // `self.compiled.contains_key(name)` skip (parallel to `compile()`'s),
+        // so it needs the identical guard — otherwise a caller that only
+        // ever goes through `compile_batch()` (never following up with a
+        // `compile()` call for a mismatched name) would silently keep the
+        // stale blob with no error.
+        let mut compiler = test_compiler("", "hipcc 7.2");
+        let src_hash_v1 = compiler.cache_hash("kernel_v1_source");
+        compiler
+            .compiled
+            .insert("modA".to_string(), PathBuf::from("modA.hsaco"));
+        compiler
+            .source_hashes
+            .insert("modA".to_string(), src_hash_v1);
+
+        let result = compiler.compile_batch(&[("modA", "kernel_v2_DIFFERENT_source")]);
+        let err = result.expect_err(
+            "compile_batch() reusing a module name with a different source must fail, not silently skip",
+        );
+        assert!(
+            err.message.contains("module-name collision"),
+            "error message should mention module-name collision, got: {}",
+            err.message
         );
     }
 }

@@ -4,8 +4,13 @@
 
 //! rdna-compute: Kernel compilation, caching, and dispatch for RDNA GPUs.
 
+// `arch_caps::ArchCaps::dump_json` builds a large flat `serde_json::json!`
+// object (60+ fields) — past the default macro recursion limit.
+#![recursion_limit = "256"]
+
 pub mod arch_caps;
 pub mod attention;
+pub mod chip_profile;
 mod compiler;
 mod dispatch;
 pub mod embedding;
@@ -13,6 +18,8 @@ pub mod feature_flags;
 pub mod gemm;
 pub mod gemv;
 pub mod graph;
+pub mod isa_histogram;
+pub mod kernel_ledger;
 mod kernels;
 pub mod moe;
 pub mod norm;
@@ -20,6 +27,7 @@ pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
+pub mod roofline;
 pub mod sampling;
 pub mod scratch;
 

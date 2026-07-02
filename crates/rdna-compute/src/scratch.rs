@@ -66,6 +66,12 @@ pub(crate) fn compile_and_load_kernel(
     source: &str,
     func_name: &str,
 ) -> HipResult<()> {
+    // Debug-only cross-check: `functions` below is keyed by `func_name`
+    // ALONE across modules, so a second module exporting the same symbol
+    // name would silently reuse the first module's cached `Function` handle
+    // via the `contains_key` early return just below. Catches that before
+    // it can happen; see `KernelCompiler::check_func_owner`.
+    compiler.check_func_owner(func_name, module_name);
     if functions.contains_key(func_name) {
         return Ok(());
     }
