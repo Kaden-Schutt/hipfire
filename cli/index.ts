@@ -6284,6 +6284,144 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
   console.log(`\n${fullOcc}/${filtered.length} kernels at max occupancy`);
 }
 
+// ─── Profile: --instrument (Task 9 CLI) ──────────────────
+// Additive `hipfire profile --instrument` — spawns the NO-GPU-capable
+// gfx1201 Phase-A instrument binaries (`kernel_perf_instrument`, and
+// `dump_chip_profile` for `--chip`) and inherits their stdout so the JSONL
+// they emit reaches the caller unmodified. This is a SEPARATE path from
+// `profile()` above — it never starts the daemon/Engine, and by default
+// (`--self-check`, matching the binary's own default) never touches the
+// GPU either: it runs purely off the committed `.hsaco` fixtures + ledger
+// under `tests/`. Only `--dynamic --rocprof-csv <path>` consumes
+// GPU-derived data, and even then only via a CSV a prior, separate,
+// out-of-process `rocprof-wrap.sh` run already produced — this command
+// never invokes rocprofv3 itself. See
+// docs/superpowers/plans/2026-07-01-gfx1201-phaseA-perf-instrument.md Task 9
+// Step 5.
+
+/** Pure arg-forwarding core of `hipfire profile --instrument`, split out so
+ * it's unit-testable without spawning the real binary (no GPU / no cargo
+ * build needed — see cli/profile_instrument.test.ts). `restIn` is whatever
+ * remains of the `profile` subcommand's argv after `--instrument` itself
+ * has already been spliced out by the caller via `takeFlag`. Never mutates
+ * `restIn` (takes an internal copy first, like `parseRestartPort`) and
+ * never calls `process.exit` — a dangling value-flag (e.g. a trailing
+ * `--rocprof-csv` with nothing after it) is reported via the `{ error }`
+ * arm instead, for the caller to print + exit on. */
+export function buildInstrumentSpawnPlan(
+  restIn: string[],
+  detectedArch: string,
+): { binary: "kernel_perf_instrument" | "dump_chip_profile"; args: string[] } | { error: string } {
+  const rest = restIn.slice();
+
+  const chipFlag = takeFlag(rest, "--chip");
+  const dynamicFlag = takeFlag(rest, "--dynamic");
+  const diffFlag = takeFlag(rest, "--diff");
+
+  let rocprofCsv: string | undefined;
+  let fixturesDir: string | undefined;
+  let currentDir: string | undefined;
+  let ledgerPath: string | undefined;
+  let arch = detectedArch;
+
+  const valueFlags: Array<[string, (v: string) => void]> = [
+    ["--rocprof-csv", (v) => { rocprofCsv = v; }],
+    ["--fixtures-dir", (v) => { fixturesDir = v; }],
+    ["--current-dir", (v) => { currentDir = v; }],
+    ["--ledger", (v) => { ledgerPath = v; }],
+    ["--arch", (v) => { arch = v; }],
+  ];
+  for (const [name, assign] of valueFlags) {
+    const r = peekFlagValue(rest, name);
+    if (r.kind === "missing") return { error: `${name} requires a value` };
+    if (r.kind === "value") {
+      rest.splice(r.splice[0], r.splice[1]);
+      assign(r.value);
+    }
+  }
+
+  if (dynamicFlag && !rocprofCsv) {
+    return {
+      error:
+        "--dynamic requires --rocprof-csv <path> (a pre-generated rocprofv3 " +
+        "--kernel-trace --stats CSV; this mode never invokes rocprofv3 itself)",
+    };
+  }
+
+  if (chipFlag) {
+    return { binary: "dump_chip_profile", args: ["--arch", arch] };
+  }
+
+  const args = ["--arch", arch];
+  if (dynamicFlag) {
+    args.push("--dynamic", "--rocprof-csv", rocprofCsv as string);
+  } else if (diffFlag) {
+    args.push("--diff");
+  }
+  if (fixturesDir) args.push("--fixtures-dir", fixturesDir);
+  if (currentDir) args.push("--current-dir", currentDir);
+  if (ledgerPath) args.push("--ledger", ledgerPath);
+  return { binary: "kernel_perf_instrument", args };
+}
+
+// Resolve a prebuilt Task-9 `rdna-compute` example binary — dev checkout
+// (`target/release/examples/<name>`) first, then the installed location
+// (`~/.hipfire/bin/<name>`, if `update` ever starts shipping these).
+// Mirrors `findTriAttnValidateBinary`'s dev/installed dual lookup. Returns
+// null when neither exists; the caller falls back to a cold `cargo build`.
+function findRdnaComputeExampleBinary(name: string): string | null {
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const devCandidate = resolve(__dirname, `../target/release/examples/${name}${exe}`);
+  if (existsSync(devCandidate)) return devCandidate;
+  const installedCandidate = join(HIPFIRE_DIR, "bin", `${name}${exe}`);
+  if (existsSync(installedCandidate)) return installedCandidate;
+  return null;
+}
+
+// Cold-start fallback when no prebuilt binary is found — builds the named
+// `rdna-compute` example in release mode. Unlike the `triattn_validate`
+// build fallback in `sidecar-gen`, this needs no `--features` and no PATH
+// augmentation for `hipcc`: `kernel_perf_instrument`/`dump_chip_profile`
+// are plain no-GPU examples (HIP is dlopen'd at runtime, not link-time —
+// see the workspace build note in CLAUDE.md), so a bare `cargo build`
+// suffices as long as `cargo` itself is already on PATH.
+function buildRdnaComputeExample(name: string): string | null {
+  const workspaceRoot = resolve(__dirname, "..");
+  if (!existsSync(join(workspaceRoot, "Cargo.toml"))) return null;
+  console.error(`hipfire profile --instrument: building ${name} (cold start — no prebuilt binary found)...`);
+  const build = Bun.spawnSync(
+    ["cargo", "build", "--release", "-p", "rdna-compute", "--example", name],
+    { cwd: workspaceRoot, stdio: ["inherit", "inherit", "inherit"] },
+  );
+  if (build.exitCode !== 0) return null;
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const binPath = join(workspaceRoot, `target/release/examples/${name}${exe}`);
+  return existsSync(binPath) ? binPath : null;
+}
+
+async function profileInstrument(rest: string[]) {
+  const detected = detectGpuArch();
+  const arch = detected !== "unknown" ? detected : "gfx1201";
+  const plan = buildInstrumentSpawnPlan(rest, arch);
+  if ("error" in plan) {
+    console.error(`hipfire profile --instrument: ${plan.error}`);
+    process.exit(EXIT.USAGE);
+  }
+
+  const bin = findRdnaComputeExampleBinary(plan.binary) ?? buildRdnaComputeExample(plan.binary);
+  if (!bin) {
+    console.error(`hipfire profile --instrument: ${plan.binary} binary not found and could not be built.`);
+    console.error(`  Build manually: cargo build --release -p rdna-compute --example ${plan.binary}`);
+    process.exit(EXIT.ERROR);
+  }
+
+  // Inherit stdio: the binary's JSONL goes to stdout, its human TL;DR to
+  // stderr — exactly like running it directly. We just resolve the path
+  // and forward argv.
+  const proc = Bun.spawnSync([bin, ...plan.args], { stdio: ["inherit", "inherit", "inherit"] });
+  process.exit(proc.exitCode ?? EXIT.ERROR);
+}
+
 // ─── Config TUI ─────────────────────────────────────────
 // Keyboard-driven settings editor. Raw ANSI, no deps.
 //   ↑/↓     — move between rows
@@ -7960,6 +8098,8 @@ Examples:
   case "profile": {
     if (rest.includes("-h") || rest.includes("--help")) {
       console.error(`Usage: hipfire profile [model] [--kernel <substr>] [--json]
+       hipfire profile --instrument [--chip] [--diff] [--dynamic --rocprof-csv <path>]
+                        [--arch <gfx>] [--fixtures-dir <dir>] [--current-dir <dir>] [--ledger <path>]
 
   Roofline + compiled-kernel report for the detected GPU. Pass a [model] to
   load it first (forces its kernels to JIT-compile so they show up).
@@ -7968,11 +8108,36 @@ Flags:
   --kernel <substr>   Only report kernels whose name contains <substr>
   -j, --json          Emit the full machine-readable hardware + kernel report
 
+  --instrument        NO-GPU static (or CSV-driven dynamic) kernel roofline
+                       report — spawns kernel_perf_instrument (default:
+                       --self-check over the committed .hsaco fixtures +
+                       ledger) and inherits its JSONL. Bypasses the daemon
+                       entirely.
+    --chip               Spawn dump_chip_profile instead (ArchCaps JSON dump)
+    --diff               kernel_perf_instrument --diff (ledger deltas only)
+    --dynamic            kernel_perf_instrument --dynamic (requires --rocprof-csv)
+    --rocprof-csv <path> Pre-generated rocprofv3 --kernel-trace --stats CSV
+    --arch <gfx>         Override the detected GPU arch
+    --fixtures-dir <dir> Override the .hsaco fixtures directory
+    --current-dir <dir>  Override --diff's "current" fixtures directory
+    --ledger <path>      Override the committed ledger JSONL path
+
 Examples:
   hipfire profile
   hipfire profile qwen3.5:9b
-  hipfire profile qwen3.5:9b --kernel gemm --json`);
+  hipfire profile qwen3.5:9b --kernel gemm --json
+  hipfire profile --instrument
+  hipfire profile --instrument --chip
+  hipfire profile --instrument --dynamic --rocprof-csv /tmp/a3b_decode.csv`);
       process.exit(0);
+    }
+    // Additive: --instrument bypasses the daemon/Engine flow entirely and
+    // spawns the no-GPU-capable Task-9 instrument binaries instead (see
+    // buildInstrumentSpawnPlan above `profile()`). Early, separate branch —
+    // the existing daemon-backed `hipfire profile` path below is unchanged.
+    if (takeFlag(rest, "--instrument")) {
+      await profileInstrument(rest);
+      break;
     }
     // takeFlag/takeFlagValue splice their tokens out of `rest`, so whatever
     // survives is purely positional (the optional model). Supports -j alias.
