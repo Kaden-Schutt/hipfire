@@ -317,6 +317,28 @@ impl ChipProfile {
     }
 }
 
+/// Minimum pointer-chase buffer size in **bytes** for `arch` such that the
+/// working set is genuinely DRAM-resident: >= 4x the on-chip (L2 + Infinity
+/// Cache) footprint from `arch_spec`, floored at 128 MiB.
+///
+/// Issue #490: the microbench shipped a FIXED 128 MiB buffer, which fits inside
+/// the Infinity Cache on every IC-bearing RDNA part. Sizing to >= 4x(L2+IC)
+/// spills the working set well past the last cache level so each hop is a true
+/// DRAM round trip. The 128 MiB floor keeps the historically proven size on
+/// no-IC parts (gfx1010, gfx1151).
+///
+/// PURE + NO-GPU: reads only `GpuCapability::static_capability(arch)`'s
+/// arch_spec cache constants — deterministic, unit-testable without a device.
+pub fn pointer_chase_buffer_bytes(arch: &str) -> usize {
+    const MIB: usize = 1024 * 1024;
+    const FLOOR_MIB: f64 = 128.0;
+    const SAFETY_MULT: f64 = 4.0;
+    let cap = GpuCapability::static_capability(arch);
+    let on_chip_mib = (cap.l2_cache_mb + cap.infinity_cache_mb) as f64;
+    let target_mib = (SAFETY_MULT * on_chip_mib).ceil().max(FLOOR_MIB);
+    target_mib as usize * MIB
+}
+
 /// One (buffer-size-in-MiB, achieved-GB/s) sample from a bandwidth sweep
 /// (e.g. `peak_bw_probe`'s `SweepRow`), ordered ascending by `mib`. Used only
 /// by [`detect_bw_tiers`] — kept as a small standalone struct (rather than
@@ -461,6 +483,61 @@ pub fn detect_bw_tiers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Explicit import: the parent module's `use crate::profiler::GpuCapability;`
+    // is a private alias, so we bind it directly here rather than rely on the
+    // `use super::*` glob re-exporting it into this child module (issue #490 /
+    // adversarial-review fix).
+    use crate::profiler::GpuCapability;
+
+    #[test]
+    fn pointer_chase_buffer_exceeds_4x_onchip_cache() {
+        // Every arch's chase buffer must clear 4x its (L2 + Infinity Cache)
+        // footprint so the working set is genuinely DRAM-resident (issue #490).
+        for arch in ["gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
+            let cap = GpuCapability::static_capability(arch);
+            let onchip_bytes =
+                ((cap.l2_cache_mb + cap.infinity_cache_mb) as f64 * 1024.0 * 1024.0) as usize;
+            let buf = pointer_chase_buffer_bytes(arch);
+            assert!(
+                buf >= 4 * onchip_bytes,
+                "{arch}: pointer-chase buffer {buf} must be >= 4x on-chip cache {}",
+                4 * onchip_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_chase_buffer_rdna2_exceeds_512mib() {
+        // gfx1030 (RDNA2): L2 4 MiB + IC 128 MiB -> 4x(132) = 528 MiB, clearing
+        // the spec's ">= 512 MiB on RDNA2" floor. The OLD fixed 128 MiB buffer
+        // fit ENTIRELY inside the 128 MiB IC — the exact #490 deflation.
+        let buf = pointer_chase_buffer_bytes("gfx1030");
+        assert_eq!(buf, 528 * 1024 * 1024, "gfx1030 = 4*(4+128) = 528 MiB");
+        assert!(
+            buf >= 512 * 1024 * 1024,
+            "RDNA2 buffer must clear the 512 MiB floor, got {buf}"
+        );
+        assert!(
+            buf > 128 * 1024 * 1024,
+            "must exceed the deflated 128 MiB buffer that fit inside the 128 MiB IC"
+        );
+    }
+
+    #[test]
+    fn pointer_chase_buffer_floors_at_128mib_for_no_ic_parts() {
+        // gfx1010 (RDNA1, no IC) and gfx1151 (RDNA3.5, no discrete IC) fall
+        // below the floor, so the 128 MiB minimum applies — these rows were
+        // never cache-deflated (128 MiB already >> their L2).
+        assert_eq!(pointer_chase_buffer_bytes("gfx1010"), 128 * 1024 * 1024);
+        assert_eq!(pointer_chase_buffer_bytes("gfx1151"), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn pointer_chase_buffer_rdna4_and_rdna3() {
+        // gfx1201 (RDNA4): 4x(4+64) = 272 MiB; gfx1100 (RDNA3): 4x(6+96) = 408 MiB.
+        assert_eq!(pointer_chase_buffer_bytes("gfx1201"), 272 * 1024 * 1024);
+        assert_eq!(pointer_chase_buffer_bytes("gfx1100"), 408 * 1024 * 1024);
+    }
 
     #[test]
     fn load_committed_gfx1201() {
