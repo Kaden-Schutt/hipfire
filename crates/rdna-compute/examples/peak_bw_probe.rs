@@ -64,10 +64,18 @@ const ELEM_BYTES: usize = 16;
 /// dst are each this size, so live VRAM usage per sweep step is 2x this).
 /// Spans well below a typical RDNA L2+Infinity-Cache footprint (cache-
 /// resident, diagnostic only) up through comfortably past it (the
-/// DRAM-bound region the fold reduces over). Kept small enough (max 512 MiB
+/// DRAM-bound region the fold reduces over). Kept small enough (max 1024 MiB
 /// total across both buffers) to run unmodified across the whole fleet
 /// (k9lin 24GB / hiptrx 32GB / hipx 96GB+5700XT) without a VRAM budget arg.
-const SWEEP_MIB: &[usize] = &[1, 4, 16, 64, 128, 256];
+///
+/// The max entry MUST clear `cache_clear_mib` (2x L2+IC) for every arch in
+/// `profiler::arch_spec`, not just the ones in the current physical fleet —
+/// RDNA2 (gfx1030-class, 4 MiB L2 + 128 MiB Infinity Cache) needs 264 MiB,
+/// which the prior max-256 sweep never reached, so the fold's `filter` found
+/// no qualifying row and the probe exited loud on any RDNA2 discrete card.
+/// 512 clears that with margin; keep the max entry >= `2 * (max L2+IC across
+/// arch_spec)` if a future arch adds a bigger cache.
+const SWEEP_MIB: &[usize] = &[1, 4, 16, 64, 128, 256, 512];
 
 /// Untimed warmup launches per sweep size — primes DPM/clocks + page
 /// mappings before the timed trials (same rationale as
@@ -132,6 +140,11 @@ fn main() {
     println!(
         "cache_clear_threshold_mib (2x L2+IC={:.1}+{:.1} MiB): {cache_clear_mib}",
         theoretical.l2_cache_mb, theoretical.infinity_cache_mb
+    );
+    println!(
+        "note: every GB/s figure below counts total bytes MOVED per call — \
+         the read of src[i] AND the write to dst[i] (bytes_per_buf * 2), \
+         the standard STREAM-Copy convention"
     );
 
     // Compile once, reuse the module across every sweep size (only `n4`
@@ -275,8 +288,14 @@ fn main() {
     let pct_of_theoretical = peak_bw_gbps / theoretical_peak_gbps * 100.0;
 
     println!("---");
+    // Clean `key: value` line first (matches the sibling
+    // `pointer_chase_latency.rs`'s `mem_latency_ns: {value}` convention) so a
+    // consumer can grep/parse a single unambiguous field; the annotated line
+    // right after carries the same read+write-bytes and fold provenance.
+    println!("peak_bw_gbps: {peak_bw_gbps:.1}");
     println!(
-        "peak_bw_gbps (folded max, size={} MiB, bytes_per_buf={}): {peak_bw_gbps:.1}",
+        "  (read+write GB/s; folded max over sweep rows >= cache_clear_threshold_mib={cache_clear_mib}, \
+         row size={} MiB, bytes_per_buf={})",
         peak_row.mib, peak_row.bytes_per_buf
     );
     println!("pct_of_theoretical_peak: {pct_of_theoretical:.1}%");
