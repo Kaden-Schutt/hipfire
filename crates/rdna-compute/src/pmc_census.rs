@@ -401,6 +401,106 @@ pub fn census_from_counter_csv_text(
     })
 }
 
+// ---------------------------------------------------------------------------
+// §5.5 — per-cell / per-arch promotion gate
+// ---------------------------------------------------------------------------
+
+/// A cell (arch × fitting-model × kernel × domain) must have at least this many
+/// INDEPENDENT measured sources before its value may be promoted. The analytic
+/// byte-model bound-class is NOT an independent source (see
+/// [`dynamic_bound_class_evidence`]); a real revived-PMC read is (see
+/// [`pmc_source_count`]).
+pub const MIN_INDEPENDENT_SOURCES: usize = 2;
+
+/// Why a cell's value was WITHHELD. A withheld cell records EVERY failing
+/// reason (the gate never short-circuits) so the bill-of-debt can surface the
+/// full honest picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithheldReason {
+    /// Fewer than [`MIN_INDEPENDENT_SOURCES`] independent measured sources.
+    InsufficientSources,
+    /// The kernel's output behavior was not verified (coherence/correctness).
+    UnverifiedBehavior,
+    /// A known high-risk factor for this cell was not mitigated.
+    UnmitigatedHighRisk,
+}
+
+/// The gate outcome for one cell: either a PROMOTED value, or WITHHELD with the
+/// reasons. A WITHHELD cell NEVER carries a value — [`PromotionState::gate_value`]
+/// returns `None`, so a withheld cell can never leak a fabricated number.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromotionState {
+    /// All three criteria held — the measured value is promoted.
+    Promoted {
+        /// The measured value being promoted for this cell.
+        value: f64,
+    },
+    /// One or more criteria failed — the value is withheld with every reason.
+    Withheld {
+        /// Every failing criterion (never short-circuited to just the first).
+        reasons: Vec<WithheldReason>,
+    },
+}
+
+impl PromotionState {
+    /// True iff this cell was promoted.
+    pub fn is_promoted(&self) -> bool {
+        matches!(self, PromotionState::Promoted { .. })
+    }
+
+    /// The promoted value, or `None` when WITHHELD. A withheld cell never fakes
+    /// a value — this is the structural guarantee behind "withheld-never-faked".
+    pub fn gate_value(&self) -> Option<f64> {
+        match self {
+            PromotionState::Promoted { value } => Some(*value),
+            PromotionState::Withheld { .. } => None,
+        }
+    }
+}
+
+/// The evidence assembled for a single cell, evaluated by [`evaluate_cell`].
+/// This is a pure INPUT — dynamic-domain risk flows in via
+/// `unmitigated_high_risk` at data-population time, not as a build dependency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellEvidence {
+    /// The arch this cell belongs to. Present so a cell is always evaluated in
+    /// its own arch's context — promotion is per-arch, never transferred.
+    pub arch: String,
+    /// The candidate value that would be promoted if the gate passes.
+    pub candidate_value: f64,
+    /// Count of INDEPENDENT measured sources supporting `candidate_value`
+    /// (compose via [`pmc_source_count`] + other real measurements; the
+    /// analytic model contributes 0 per [`dynamic_bound_class_evidence`]).
+    pub independent_sources: usize,
+    /// Whether the kernel's output behavior was verified (coherence/correctness).
+    pub behavior_verified: bool,
+    /// Whether a known high-risk factor for this cell remains unmitigated.
+    pub unmitigated_high_risk: bool,
+}
+
+/// Evaluate a cell against the §5.5 gate. PROMOTED iff ALL THREE criteria hold:
+/// enough independent sources, verified behavior, and no unmitigated high risk.
+/// Otherwise WITHHELD with EVERY failing reason recorded.
+pub fn evaluate_cell(ev: &CellEvidence) -> PromotionState {
+    let mut reasons = Vec::new();
+    if ev.independent_sources < MIN_INDEPENDENT_SOURCES {
+        reasons.push(WithheldReason::InsufficientSources);
+    }
+    if !ev.behavior_verified {
+        reasons.push(WithheldReason::UnverifiedBehavior);
+    }
+    if ev.unmitigated_high_risk {
+        reasons.push(WithheldReason::UnmitigatedHighRisk);
+    }
+    if reasons.is_empty() {
+        PromotionState::Promoted {
+            value: ev.candidate_value,
+        }
+    } else {
+        PromotionState::Withheld { reasons }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +728,92 @@ k,Wavefronts,64
             ArchPmcCensus::from_json(&v2).is_err(),
             "missing per-counter nonzero_rows must fail loud"
         );
+    }
+
+    /// A cell that meets all three promotion criteria.
+    fn promotable_cell() -> CellEvidence {
+        CellEvidence {
+            arch: "gfx1201".to_string(),
+            candidate_value: 12.5,
+            independent_sources: MIN_INDEPENDENT_SOURCES,
+            behavior_verified: true,
+            unmitigated_high_risk: false,
+        }
+    }
+
+    #[test]
+    fn gate_promotes_only_when_all_three_criteria_hold() {
+        let ev = promotable_cell();
+        let state = evaluate_cell(&ev);
+        assert!(state.is_promoted());
+        assert_eq!(state.gate_value(), Some(12.5));
+    }
+
+    #[test]
+    fn gate_withholds_on_insufficient_sources() {
+        let mut ev = promotable_cell();
+        ev.independent_sources = MIN_INDEPENDENT_SOURCES - 1;
+        let state = evaluate_cell(&ev);
+        assert!(!state.is_promoted());
+        assert_eq!(state.gate_value(), None);
+        match state {
+            PromotionState::Withheld { reasons } => {
+                assert!(reasons.contains(&WithheldReason::InsufficientSources));
+            }
+            _ => panic!("expected Withheld"),
+        }
+    }
+
+    #[test]
+    fn gate_withholds_on_unverified_behavior() {
+        let mut ev = promotable_cell();
+        ev.behavior_verified = false;
+        let state = evaluate_cell(&ev);
+        assert!(!state.is_promoted());
+        match state {
+            PromotionState::Withheld { reasons } => {
+                assert!(reasons.contains(&WithheldReason::UnverifiedBehavior));
+            }
+            _ => panic!("expected Withheld"),
+        }
+    }
+
+    #[test]
+    fn gate_withholds_on_unmitigated_high_risk() {
+        let mut ev = promotable_cell();
+        ev.unmitigated_high_risk = true;
+        let state = evaluate_cell(&ev);
+        assert!(!state.is_promoted());
+        match state {
+            PromotionState::Withheld { reasons } => {
+                assert!(reasons.contains(&WithheldReason::UnmitigatedHighRisk));
+            }
+            _ => panic!("expected Withheld"),
+        }
+    }
+
+    #[test]
+    fn gate_records_every_failing_reason() {
+        // A cell that fails ALL THREE criteria records ALL THREE reasons — the
+        // gate never short-circuits on the first failure.
+        let ev = CellEvidence {
+            arch: "gfx1100".to_string(),
+            candidate_value: 99.0,
+            independent_sources: 0,
+            behavior_verified: false,
+            unmitigated_high_risk: true,
+        };
+        let state = evaluate_cell(&ev);
+        assert!(!state.is_promoted());
+        match state {
+            PromotionState::Withheld { reasons } => {
+                assert!(reasons.contains(&WithheldReason::InsufficientSources));
+                assert!(reasons.contains(&WithheldReason::UnverifiedBehavior));
+                assert!(reasons.contains(&WithheldReason::UnmitigatedHighRisk));
+                assert_eq!(reasons.len(), 3);
+            }
+            _ => panic!("expected Withheld"),
+        }
     }
 
     #[test]
