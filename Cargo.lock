@@ -1017,6 +1017,7 @@ name = "rdna-compute"
 version = "0.2.1"
 dependencies = [
  "hip-bridge",
+ "hipfire-atlas",
  "rayon",
  "serde_json",
 ]

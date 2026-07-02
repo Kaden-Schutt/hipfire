@@ -19,6 +19,7 @@ pub mod gemm;
 pub mod gemv;
 pub mod graph;
 pub mod isa_histogram;
+pub mod kernel_ledger;
 mod kernels;
 pub mod moe;
 pub mod norm;

@@ -210,7 +210,7 @@ fn is_f32_fma(opcode: &str) -> bool {
         || opcode.starts_with("v_dual_fmac_f32")
 }
 
-fn is_offload_bundle(data: &[u8]) -> bool {
+pub(crate) fn is_offload_bundle(data: &[u8]) -> bool {
     data.len() > 24 && &data[0..24] == b"__CLANG_OFFLOAD_BUNDLE__"
 }
 
@@ -219,7 +219,7 @@ fn is_offload_bundle(data: &[u8]) -> bool {
 /// `$HIP_PATH/llvm/bin/<name>` (default `/opt/rocm/llvm/bin/<name>`) — the
 /// standard ROCm install layout, where these tools live even when NOT on
 /// `$PATH` (only `/opt/rocm/bin` typically is).
-fn find_llvm_tool(name: &str) -> Option<String> {
+pub(crate) fn find_llvm_tool(name: &str) -> Option<String> {
     if Command::new(name).arg("--version").output().is_ok() {
         return Some(name.to_string());
     }
@@ -235,7 +235,7 @@ fn find_llvm_tool(name: &str) -> Option<String> {
 
 /// `clang-offload-bundler --list --type=o --input=<path>` — the bundled
 /// target-triple strings (e.g. `hipv4-amdgcn-amd-amdhsa--gfx1201`).
-fn list_bundle_targets(bundler: &str, path: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn list_bundle_targets(bundler: &str, path: &Path) -> Result<Vec<String>, String> {
     let output = Command::new(bundler)
         .arg("--list")
         .arg("--type=o")
@@ -259,7 +259,7 @@ fn list_bundle_targets(bundler: &str, path: &Path) -> Result<Vec<String>, String
 /// Pick the bundle target for `arch` — prefer an exact `--{arch}` suffix
 /// match (same rule as `kernel_atlas.py::choose_bundle_target`), falling
 /// back to any `amdgcn-amd-amdhsa` device target, then the first entry.
-fn choose_bundle_target(targets: &[String], arch: &str) -> Option<String> {
+pub(crate) fn choose_bundle_target(targets: &[String], arch: &str) -> Option<String> {
     if targets.is_empty() {
         return None;
     }
@@ -274,7 +274,11 @@ fn choose_bundle_target(targets: &[String], arch: &str) -> Option<String> {
 
 /// Extract `target` from the bundle at `path` into a fresh scratch file
 /// under `std::env::temp_dir()`, returning its path.
-fn unbundle(bundler: &str, path: &Path, target: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn unbundle(
+    bundler: &str,
+    path: &Path,
+    target: &str,
+) -> Result<std::path::PathBuf, String> {
     // Unique-enough scratch name: pid + a cheap hash of the input path +
     // target, so concurrent `cargo test` runs / repeated calls don't clash.
     let mut hash: u64 = 1469598103934665603; // FNV offset basis
@@ -310,7 +314,7 @@ fn unbundle(bundler: &str, path: &Path, target: &str) -> Result<std::path::PathB
 }
 
 /// RAII cleanup for the scratch file written by [`unbundle`].
-struct TempExtract(std::path::PathBuf);
+pub(crate) struct TempExtract(pub(crate) std::path::PathBuf);
 impl Drop for TempExtract {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
