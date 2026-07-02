@@ -81,6 +81,21 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// recompile instead of loading a stale "invalid device image".
 const KERNEL_CACHE_ABI: u32 = 1;
 
+/// The `--offload-arch` target string for `arch`. RDNA1 (gfx101x — 5700 XT class)
+/// parts expose `xnack` as a target feature; hipfire never uses HMM / page-fault
+/// (unified) memory, so xnack's per-memory-op replay path is pure overhead. hipcc's
+/// default is already `xnack-` on these parts on most setups, but pinning it makes
+/// the code object deterministic across ROCm/hipcc versions and any config whose
+/// default differs. Folded into `cache_hash` too, so only gfx101x re-JITs when this
+/// changes — no global cache bump. Other RDNA gens (gfx1030+) have no xnack feature.
+fn offload_arch_for(arch: &str) -> String {
+    if arch.starts_with("gfx101") {
+        format!("{arch}:xnack-")
+    } else {
+        arch.to_string()
+    }
+}
+
 /// Compiles HIP kernel sources to code objects, with caching.
 /// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
 pub struct KernelCompiler {
@@ -262,7 +277,7 @@ impl KernelCompiler {
     fn cache_hash(&self, source: &str) -> String {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
-        self.arch.hash(&mut hasher);
+        offload_arch_for(&self.arch).hash(&mut hasher);
         self.extra_flags.hash(&mut hasher);
         self.toolchain_id.hash(&mut hasher);
         KERNEL_CACHE_ABI.hash(&mut hasher);
@@ -491,7 +506,7 @@ impl KernelCompiler {
         let per_kernel = Self::per_kernel_flags(source);
         let mut args: Vec<String> = vec![
             "--genco".into(),
-            format!("--offload-arch={arch}"),
+            format!("--offload-arch={}", offload_arch_for(arch)),
             "-O3".into(),
         ];
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
