@@ -19,8 +19,7 @@
 //!   source ./scripts/rocm-env.sh
 //!   hipfire lock acquire "wa-matrix"; cargo run -p hipfire-train --release --example wa_matrix_sweep; hipfire lock release
 
-use faer::prelude::Solve;
-use faer::{Mat, Side};
+use faer::Mat;
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use hipfire_train::block::BlockAdjoints;
@@ -29,6 +28,9 @@ use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, model_guided_adjoints, LlamaModel};
 use hipfire_train::qtip_quant::{build_codebook, qtip_group_requant};
 use hipfire_train::rotation::{rotate_rows, Rotation};
+// Shared codec math (clip-search + LDLQ core) — no longer inlined here.
+use hipfire_quant_codecs::clipsearch::symmetric_clipsearch;
+use hipfire_quant_codecs::ldlq::inv_cholesky_lower_rotated;
 use rayon::prelude::*;
 use rdna_compute::{Gpu, GpuTensor, HipResult};
 use std::path::Path;
@@ -61,28 +63,6 @@ fn fwht_rows(x: &[f32], rows: usize, feat: usize, inv: bool) -> Vec<f32> {
         }
     }
     out
-}
-
-fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
-    const GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
-    let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-    let (mut bs, mut be) = ((amax / qmax).max(1e-12), f32::INFINITY);
-    for &c in &GRID {
-        let s = (c * amax / qmax).max(1e-12);
-        let inv = 1.0 / s;
-        let e: f32 = group
-            .iter()
-            .map(|&v| {
-                let d = v - (v * inv).round().clamp(-qmax, qmax) * s;
-                d * d
-            })
-            .sum();
-        if e < be {
-            be = e;
-            bs = s;
-        }
-    }
-    bs
 }
 
 /// Per-256-group symmetric-int activation round-trip (absmax — the online grid).
@@ -296,33 +276,11 @@ fn adjoint_of<'a>(
     }
 }
 
-/// H ← R H Rᵀ for R = per-256-group FWHT (row-pass then col-pass).
+/// H ← R H Rᵀ for R = per-256-group FWHT (row-pass then col-pass). Thin wrapper
+/// over the shared LDLQ core with this harness's fixed sign seeds.
 fn rotate_hessian_fwht(h: &mut [f64], k: usize) {
     let (s1, s2) = signs();
-    let nb = k / GROUP;
-    let mut buf = [0.0f32; GROUP];
-    for r in 0..k {
-        for b in 0..nb {
-            for c in 0..GROUP {
-                buf[c] = h[r * k + b * GROUP + c] as f32;
-            }
-            cpu_fwht_256(&mut buf, &s1, &s2);
-            for c in 0..GROUP {
-                h[r * k + b * GROUP + c] = buf[c] as f64;
-            }
-        }
-    }
-    for col in 0..k {
-        for b in 0..nb {
-            for r in 0..GROUP {
-                buf[r] = h[(b * GROUP + r) * k + col] as f32;
-            }
-            cpu_fwht_256(&mut buf, &s1, &s2);
-            for r in 0..GROUP {
-                h[(b * GROUP + r) * k + col] = buf[r] as f64;
-            }
-        }
-    }
+    hipfire_quant_codecs::ldlq::rotate_hessian(h, k, &s1, &s2);
 }
 
 fn transpose(a: &[f32], n: usize) -> Vec<f32> {
@@ -342,25 +300,6 @@ fn rotate_hessian_dense(h: &[f64], k: usize, m: &Rotation) -> Vec<f64> {
     let at = transpose(&a, k); // (H Mᵀ)ᵀ = M H  (H symmetric)
     let hm = rotate_rows(&at, m, k); // M H Mᵀ
     hm.iter().map(|&v| v as f64).collect()
-}
-
-fn inv_cholesky_lower_rotated(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
-    let base = damp.max(1e-12);
-    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
-        let lambda = base * mult;
-        let hd = Mat::<f64>::from_fn(k, k, |i, j| {
-            h[i * k + j] + if i == j { lambda } else { 0.0 }
-        });
-        let Ok(chol) = hd.llt(Side::Lower) else {
-            continue;
-        };
-        let hinv = chol.solve(Mat::<f64>::identity(k, k));
-        let Ok(chol2) = hinv.llt(Side::Lower) else {
-            continue;
-        };
-        return Some(chol2.L().to_owned());
-    }
-    None
 }
 
 fn l_for(h_rot: &[f64], feat: usize) -> Option<Mat<f64>> {
