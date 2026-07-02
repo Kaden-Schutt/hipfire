@@ -191,3 +191,172 @@ scope entirely (already at DRAM peak).
 3. **DPM read caveat:** `power_dpm_force_performance_level` returned
    "Device or resource busy" on read (pre-existing box quirk); `auto` was written
    back (exit 0) but unverifiable by read.
+
+---
+
+## Pre-check resolution (ALU-vs-mem) — 2026-07-02
+
+The `(d)` verdict above gated the dp4a spike behind a cheap ALU-vs-mem
+pre-check. That pre-check ran as three parallel probes (gfx1100 rocprofv3 PMC
+split, no-GPU static occupancy, precise per-kernel byte-model BW) adjudicated by
+Codex. **Resolved bound-class: `mixed` — and the adjudicated decision is NO-GO
+for a broad Phase-B dp4a build.** Details below.
+
+### 1. gfx1100 PMC ALU-vs-mem split — **could not be obtained** (tool-limited, not methodology)
+
+The direct VALU-busy-vs-mem-busy split failed on hipx's gfx1100 (7900 XTX) —
+not from a methodology error (every step through kernel dispatch worked) but
+from two stacked ROCm 7.2.2 / rocprofv3 limitations found live:
+
+- **Daemon path OOM'd (anticipated).** `qwen3.6-35b-a3b.mq4r` (18.7 GB) + q8 KV
+  OOM'd on the 25.8 GB-reported card. The MQ4 "MMQ safety screening" flagged
+  68/190 weight matrices UNSAFE and **duplicated them into a WMMA-precision
+  fallback copy in addition to the hfq4g256 copy**, pushing effective footprint
+  over budget — not simply "18.7 GB doesn't fit in 24 GB." Fell back to a
+  `bench_gemv_pmc_a3b` microbench driving `gemv_hfq4g256` at the two real A3B
+  decode shapes read off the OOM log (gate_up-proxy M=8192,K=2048;
+  down-proxy M=2048,K=4096).
+- **`VALUBusy` does not exist for gfx1100 in this metrics DB.** In this
+  multi-arch box, `rocprofv3 --list-avail` registers `VALUBusy` **only** under
+  the gfx1201 block — contrary to the framing that gfx1100 counters work
+  generically. `MemUnitBusy`, `TA_BUSY_avr`, `SQ_INSTS_VALU`, `GRBM_GUI_ACTIVE`,
+  `SQ_BUSY_CYCLES`, `Wavefronts` are present.
+- **Every %-busy / occupancy-style counter read exactly 0.0** across all 640
+  sampled dispatches per counter (`MemUnitBusy`, `TA_BUSY_avr`, `GRBM_GUI_ACTIVE`,
+  `SQ_WAVE_CYCLES`, `SQ_WAIT_INST_ANY`, `SQ_INSTS_VALU` all zero), while the two
+  simplest raw accumulators (`SQ_BUSY_CYCLES` ~0.9–1.0 M cycles/dispatch,
+  `Wavefronts` = M exactly) read sane values in the **same** runs — proving PMC
+  collection was functioning, not silently no-op'ing. This is a genuine ROCm
+  7.2.2 dispatch-scoped-counter capture floor on very short (~9–10 µs),
+  low-occupancy (single wave32/workgroup) dispatches on gfx1100 — distinct from
+  the known "gfx12 PMC reads zero" issue.
+- **Anti-hang note (reconfirmed):** requesting >2 counters spanning different HW
+  blocks in one `--pmc` pass SIGABRTs rocprofv3 (`error code 38`) but the wrapped
+  child spins at 150–200% CPU forever and must be manually killed. Valid combos:
+  ≤2 counters, or counters within one HW block.
+
+**Net:** no usable VALU-busy% vs mem-busy% signal on either shape. The direct
+ALU-vs-mem confirmation this doc asked for **never materialized** — it provides
+neither positive ALU-bound evidence nor a DRAM-saturation refutation. Raw CSVs
+left at `/tmp/pmc-a3b-gemv/*.csv` on hipx; GPU perf level restored to `auto`.
+
+### 2. Occupancy verdict — **100% occupancy, wave-slot-cap bound, NOT VGPR/SGPR/LDS/spill limited**
+
+No-GPU static extraction (unbundled `.hsaco` → `llvm-readelf --notes`), hardware
+constants from `tests/chip-profiles/gfx1201.json` (`vgprs_per_simd=1536`,
+`max_waves_per_simd=16`, wave32). Two kernels from committed gfx1201 fixtures;
+`fused_qkvza` + `gemv_hfq4g256_residual` compiled fresh via the runtime JIT
+invocation (dispatch traced to confirm gfx1201 falls through to the generic
+kernel bodies, not the RDNA3 `_gfx1100` variant).
+
+| Kernel | VGPR | SGPR | LDS | Scratch | VGPR-limited waves/SIMD | Waves/SIMD (capped@16) | Occupancy |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `fused_qkvza_hfq4g256` | 72 | 22 | 0 | 0 | 21 | 16 | **100%** |
+| `gemv_hfq4g256_moe_gate_up_k8_indexed_batched` | 80 | 26 | 0 | 0 | 19 | 16 | **100%** |
+| `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` | 80 | 22 | 0 | 0 | 19 | 16 | **100%** |
+| `gemv_hfq4g256_residual` | 72 | 22 | 0 | 0 | 21 | 16 | **100%** |
+
+**Zero spills across all four** (`private_segment_fixed_size=0`). The limiter is
+the architectural 16-waves/SIMD wave-slot cap, **not** register/LDS pressure: the
+VGPR-only ceiling (19–21 waves/SIMD) already exceeds the hardware max of 16, so
+latency-hiding is saturated and shrinking VGPR buys **zero** additional
+occupancy. This **falsifies the "occupancy-limited" hypothesis** for the sub-
+roofline gap — but it cannot distinguish (1) achieved-vs-theoretical DRAM
+ceiling from (2) VALU/dequant issue-rate bound; only the (failed) PMC split
+could, and dp4a helps only in case (2). (Skill-doc nit surfaced: the
+`gfx-kernel-metadata` cheat-sheet's "128 KB LDS for gfx1200/1201" is the
+per-WGP figure shared by 2 CUs; 65536 is the correct per-CU value — immaterial
+here since all four kernels use 0 LDS.)
+
+### 3. Precise per-kernel achieved-BW table (real shapes, real dispatch counts)
+
+Byte model rebuilt from the **live `.mq4r` checkpoint header** (not the "~3B
+active" headline): `hidden=2048`, 40 layers (30 linear-attn + 10 full-attn),
+256 experts / 8 per-tok, `moe_intermediate=512`, all HFQ4G256. gfx1201 DRAM peak
+= 611.8 GB/s.
+
+| Kernel | bytes/call | µs/call | achieved GB/s | % of 611.8 peak | read |
+|---|---:|---:|---:|---:|---|
+| `fused_qkvza_hfq4g256` (blended, 2 call-sites) | 6,555,977 | 13.139 | **499.0** | **81.6%** | near-roofline; mixed bucket |
+| `gemv_hfq4g256_moe_gate_up_k8_indexed` | 8,912,896 | 20.087 | **443.7** | **72.5%** | headroom + good grid → **best dp4a candidate** |
+| `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` | 4,456,448 | 16.529 | **269.6** | **44.1%** | small-transaction (272 B/block) → **granularity, not ALU** |
+| `gemv_hfq4g256_residual` (wo/out_proj) | 4,456,448 | 14.263 | **312.4** | **51.1%** | small grid (2048 blocks) → **occupancy/batching, not dp4a** |
+| `gemv_hfq4g256_multirow_r2` (lm_head) | 270,172,160 | 441.957 | **611.3–613.6** | **99.9–100.3%** | DRAM-saturated → dp4a dead, EXCLUDE |
+
+Key correctness check: the `fused_qkvza` 14000-call bucket is **two structurally
+different call-sites** under one rocprof name — attention QKVZA (6000 calls,
+13.4 MB/call) + MoE gate-fusion router/shared-expert (8000 calls, 1.4 MB/call);
+6000+8000=14000 exact. Treating all 14000 as the attention shape yields
+**1023 GB/s = 167% of DRAM peak (physically impossible)**; the correctly-blended
+total gives a sane **499.0 GB/s**. This refines the doc's flat "~74% blended"
+into a **heterogeneous family**: only `moe_gate_up` looks genuinely
+ALU-capturable; `moe_down`/`residual` have larger numeric gaps but for
+transaction-granularity / grid-occupancy reasons dp4a likely won't fix; lm_head
+is at peak.
+
+### 4. Codex adjudication
+
+Codex adjudicated the three probes: **`bound_class = "mixed"`, `dp4a_go = false`,
+confidence 0.73.**
+
+> Probe 1 (PMC) is non-decisive — the split failed, so no positive ALU-bound
+> evidence. Probe 2 (occupancy) is useful **negative** evidence — not
+> VGPR/SGPR/LDS/spill or static-occupancy limited, so dp4a will not unlock more
+> residency. Probe 3 (byte model) carries the most weight — a **heterogeneous**
+> family, not one broad ALU-bound bucket: lm_head fully DRAM-saturated
+> (excluded); `fused_qkvza` already ~82% of peak and a mixed call-site bucket;
+> `moe_gate_up` at ~72.5% the only credible dp4a candidate; `moe_down`/`residual`
+> look like transaction-granularity / launch / latency inefficiency, not compute
+> issue. The Probe-2-vs-3 "conflict" is terminology: static occupancy is full,
+> yet short/small-memory-shape latency and transaction efficiency can still cap
+> achieved BW. Since **gfx1201 has less bandwidth than gfx1100 (612 vs 809
+> GB/s), any DRAM-ish result transfers *against* dp4a**, and the direct gfx1100
+> ALU-vs-mem confirmation never materialized. Net: mixed bound-class, but not
+> enough ALU-bound surface to justify Phase-B dp4a as a build priority.
+
+### FINAL Phase-B decision: **NO-GO** (broad dp4a decode-GEMV rejected)
+
+**Resolved bound-class: `mixed`, but DRAM/latency/transaction-dominated, not
+ALU-bound.** This supersedes the `(d)` "QUALIFIED GO." **Phase-B dp4a is a
+NO-GO as a build priority.**
+
+**Why.** The one thing that could have justified the spike — direct evidence
+that the hot GEMVs are VALU/dequant-issue-bound *below* the DRAM plateau — never
+materialized (Probe 1 failed). Everything that *did* resolve points the other
+way: occupancy is already 100% (dp4a unlocks no residency), and the precise byte
+model shows the family is heterogeneous with only **one** kernel (`moe_gate_up`,
+72.5%) plausibly ALU-capturable — the rest are DRAM-saturated (lm_head ~100%,
+`fused_qkvza` ~82%) or bounded by transaction granularity / small grids
+(`moe_down` 44%, `residual` 51%) that dp4a cannot address. Critically, **gfx1201
+has *less* DRAM bandwidth than the gfx1100 we probed (612 vs 809 GB/s), so any
+memory-bound result transfers against dp4a, making the target arch *more*
+mem-bound, not less.** The +15–18% Amdahl ceiling from `(d)` required *most* of
+the hot family to be ALU-capturable; these probes do not support that
+premise.
+
+**Realistic ceiling if pursued anyway:** ~**0–3% end-to-end** if only
+`moe_gate_up` benefits; perhaps **~5–6%** in an optimistic narrow spike that also
+captures part of `fused_qkvza`'s attention sub-component. The `(d)` +15–18%
+figure is **not reachable** and should not be quoted.
+
+**Recommended alternative levers** (better ROI than a decode-GEMV port):
+
+1. **Wire A3B MTP into the daemon** — the single highest-value lever. Per the
+   ROCmFP4 gfx1201 H2H (`project_rocmfp4_h2h_gfx1201_2026_07_01`), on R9700 the
+   competitor leads hipfire on **raw AR** decode (131–147 vs our mq4r ~124
+   tok/s); hipfire only wins via **MTP (152.7 tok/s, τ=3.02 coherent)**, which is
+   currently **`mtp_only_demo`-only and NOT daemon-wired for A3B** (ships
+   AR-only). Closing that gap is a multiplicative decode win the dp4a spike's
+   best case (+5–6%) cannot approach, and it targets the axis where we actually
+   trail on this arch.
+2. **Attack the non-GEMV surface the map already exposed** — the decode surface
+   is not only the 58% GEMV family: **norm/glue ≈ 16%** and **attention ≈ 12%**
+   are unattacked and are not roofline-pinned the way the weight-stream GEMVs
+   are. Fusion / launch-count reduction there sidesteps the DRAM wall entirely.
+3. **If dp4a is ever revisited, scope it to `moe_gate_up` ONLY** (not the `(d)`
+   `fused_qkvza + moe_gate_up` pairing), and only after obtaining the real
+   VALU-vs-mem split — via the Probe-1 follow-ups (inflate per-dispatch work so
+   GRBM/SQ/TA counters latch above the ROCm 7.2.2 sampling floor; try
+   aggregate/PC-sampling mode; or an older rocprof with working dispatch-scoped
+   gfx1100 capture). Do not build on the assumption of ALU-headroom that the
+   pre-check failed to establish.
