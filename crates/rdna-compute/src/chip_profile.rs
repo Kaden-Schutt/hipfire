@@ -437,7 +437,18 @@ pub fn detect_bw_tiers(
                 best
             }
         });
-        (Some(cache_peak.gbps), Some(points[start - 1].mib))
+        // A real cache tier must be FASTER than the DRAM plateau — that's
+        // the whole point of it being a cache. A sub-plateau row that is
+        // merely SLOWER (e.g. small-buffer ramp-up noise on a chip with no
+        // Infinity Cache, like RDNA1/gfx1010: cache-row peak 351.8 GB/s <
+        // DRAM plateau 384.1 GB/s) is not a meaningful distinct tier — report
+        // it as withheld (None) rather than fabricating a "cache tier" out of
+        // a row that's actually just slower than DRAM.
+        if cache_peak.gbps > dram_peak_gbps {
+            (Some(cache_peak.gbps), Some(points[start - 1].mib))
+        } else {
+            (None, None)
+        }
     };
 
     Ok(BwTiers {
@@ -480,11 +491,87 @@ mod tests {
             "DRAM-plateau peak, per peak_bw_probe multi-tier detection"
         );
         assert_eq!(
-            profile.cache_bw_gbps, None,
-            "R9700 is a dGPU with no meaningful on-chip cache tier visible in the \
-             probe's sweep range — withheld (None), not fabricated"
+            profile.cache_bw_gbps,
+            Some(1352.4),
+            "R9700's 64MB Infinity Cache DOES show a real cache tier in a wider \
+             re-sweep (2026-07-02 correction) — the cache-resident row's peak BW \
+             (1352.4 GB/s) clears the DRAM plateau (611.8 GB/s), so it is a genuine \
+             tier per the detect_bw_tiers 'cache peak must exceed DRAM plateau' guard, \
+             not the earlier no-GPU deduction that withheld it as null"
         );
-        assert_eq!(profile.effective_cache_mib, None);
+        assert_eq!(profile.effective_cache_mib, Some(64.0));
+    }
+
+    /// Load EVERY committed `tests/chip-profiles/*.json` row (not just
+    /// gfx1201) and assert each parses cleanly and carries its expected
+    /// arch-identifying static/measured fields — a regression guard so a
+    /// future committed row can't silently bit-rot (bad JSON, wrong
+    /// cu_count, a withheld `mem_latency_ns`, or a cache tier that
+    /// mysteriously vanishes/appears) without a test noticing. Deliberately
+    /// enumerates the directory (rather than hardcoding an arch list) so a
+    /// newly-added `tests/chip-profiles/<gfx>.json` MUST also get an arm
+    /// added to `expected` below — an unrecognized file panics loud instead
+    /// of silently passing unchecked.
+    #[test]
+    fn load_all_committed_chip_profiles() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/chip-profiles");
+        let mut archs: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("failed to read {dir:?}: {e}"))
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                name.strip_suffix(".json").map(str::to_string)
+            })
+            .collect();
+        archs.sort();
+
+        assert!(
+            !archs.is_empty(),
+            "tests/chip-profiles/*.json must contain at least one committed row"
+        );
+
+        for arch in &archs {
+            let profile = ChipProfile::load_committed(arch)
+                .unwrap_or_else(|e| panic!("tests/chip-profiles/{arch}.json must parse: {e}"));
+            assert_eq!(&profile.arch, arch, "arch field must match filename stem");
+
+            // (expected cu_count, expected mem_latency_ns, expected cache_bw_gbps)
+            // cu_count/mem_latency are from rocminfo + pointer_chase_latency on the
+            // hipx zoo, 2026-07-02 WARM force-high-mclk campaign; cache_bw_gbps is
+            // `None` only when the sub-plateau sweep row does NOT clear the DRAM
+            // plateau (gfx1010: RDNA1 has no Infinity Cache).
+            let (expected_cu, expected_latency, expected_cache_bw): (u32, f64, Option<f64>) =
+                match arch.as_str() {
+                    "gfx1010" => (40, 276.058, None),
+                    "gfx1030" => (80, 148.035, Some(1586.5)),
+                    "gfx1100" => (96, 169.719, Some(1778.8)),
+                    "gfx1151" => (40, 219.932, Some(952.5)),
+                    "gfx1201" => (64, 205.888, Some(1352.4)),
+                    other => panic!(
+                        "load_all_committed_chip_profiles: unrecognized committed row \
+                         {other:?} — add an expected-value arm here (this test must \
+                         know about every tests/chip-profiles/*.json row, not silently \
+                         skip a new one)"
+                    ),
+                };
+
+            assert_eq!(profile.cu_count, expected_cu, "{arch}: cu_count");
+            assert_eq!(
+                profile.mem_latency_ns,
+                Some(expected_latency),
+                "{arch}: mem_latency_ns must be measured (Some), not withheld"
+            );
+            assert_eq!(
+                profile.cache_bw_gbps, expected_cache_bw,
+                "{arch}: cache_bw_gbps"
+            );
+            assert_eq!(
+                profile.effective_cache_mib.is_some(),
+                expected_cache_bw.is_some(),
+                "{arch}: effective_cache_mib must be Some iff cache_bw_gbps is Some"
+            );
+        }
     }
 
     #[test]
@@ -832,6 +919,45 @@ mod tests {
         assert!((tiers.dram_peak_gbps - 612.0).abs() < 1e-9);
         assert!(tiers.cache_bw_gbps.is_none());
         assert!(tiers.effective_cache_mib.is_none());
+    }
+
+    /// Empirical gfx1010 (RDNA1, RX 5700 XT) `peak_bw_probe` sweep (2026-07-02
+    /// cross-arch campaign): a sub-plateau row (351.8 GB/s) does NOT clear the
+    /// DRAM plateau (384.1 GB/s) — RDNA1 has no Infinity Cache
+    /// (`profiler.rs::arch_spec` sets `infinity_cache_mb=0.0` for this family),
+    /// so the "cache row" is just small-buffer ramp-up noise, not a real
+    /// cache-resident bandwidth advantage. `detect_bw_tiers` must withhold
+    /// `cache_bw_gbps`/`effective_cache_mib` (None) here, NOT report 351.8 as
+    /// a fabricated "cache tier" — a real cache tier is by definition FASTER
+    /// than DRAM. See `tests/chip-profiles/gfx1010.json`'s provenance note.
+    #[test]
+    fn detect_bw_tiers_gfx1010_sub_dram_row_is_not_a_cache_tier() {
+        let points = [
+            BwSweepPoint {
+                mib: 16.0,
+                gbps: 351.8,
+            },
+            BwSweepPoint {
+                mib: 128.0,
+                gbps: 384.0,
+            },
+            BwSweepPoint {
+                mib: 256.0,
+                gbps: 384.1,
+            },
+        ];
+        let tiers = detect_bw_tiers(&points, 3.0).expect("gfx1010 curve must yield a DRAM plateau");
+        assert!(
+            (tiers.dram_peak_gbps - 384.1).abs() < 1e-9,
+            "DRAM peak must be the 256 MiB plateau BW (384.1): got {}",
+            tiers.dram_peak_gbps
+        );
+        assert_eq!(
+            tiers.cache_bw_gbps, None,
+            "the 16 MiB row (351.8 GB/s) is SLOWER than the DRAM plateau (384.1 GB/s) \
+             — not a real cache tier, must be withheld rather than fabricated"
+        );
+        assert_eq!(tiers.effective_cache_mib, None);
     }
 
     #[test]
