@@ -684,3 +684,156 @@ is ever revisited as a real candidate. This closes the Phase-B dp4a
 question empirically: **do not pursue dp4a further on gfx1201 decode
 GEMVs** — the standing recommendation above (wire A3B MTP into the daemon)
 remains the real lever.
+
+## dp4a moe_gate_up spike — EMPIRICAL result — 2026-07-02
+
+The section above measured the dp4a kernel on the **standalone microbench**
+(~10% kernel-level loss). This section closes the loop with the **production
+daemon serving path** on `hiptrx`/gfx1201 (R9700), commit `b86172a8`
+synced to `~/hipfire-perfmaxx` and `daemon` rebuilt fresh
+(`cargo build --release --example daemon --features deltanet -p hipfire-runtime`).
+This is the strong prod-falsify (real serve path, not a synthetic harness),
+not an analytic guess. GPU lock (`dp4a-ab`) held, all four R9700s forced to
+`high`, `HIP_VISIBLE_DEVICES=0` pinned, perf level restored to `auto` and
+lock released at hand-back.
+
+**dp4a VGPR / occupancy (independently re-verified via gfx-kernel-metadata,
+not just trusting the microbench section):**
+
+| Kernel | VGPR | SGPR | Spill | Occupancy (gfx1201, 1536 VGPR/SIMD, 16-wave cap) |
+|---|---:|---:|---:|---|
+| `gemv_hfq4g256_moe_gate_up_k8_indexed_dp4a_gfx1201` | 67 | 18 | 0 | ⌊1536/67⌋=22 → capped **16/16 (100%)** |
+| `gemv_hfq4g256_moe_gate_up_indexed` (scalar baseline) | 80 | 18 | 0 | ⌊1536/80⌋=19 → capped **16/16 (100%)** |
+
+Both are at the wave-slot cap already and **occupancy-identical** — VGPR is
+not the differentiator (dp4a even uses *fewer* VGPR, 67 < 80). This confirms
+the "wave-slot-cap bound, not register-limited" conclusion: dp4a unlocks no
+additional residency.
+
+**`v_dot4_i32_iu8` fired — confirmed both statically AND dynamically:**
+
+- **Static disassembly** (`llvm-objdump --mcpu=gfx1201`): **14× `v_dot4_i32_iu8`**
+  instructions in the dp4a kernel ELF (with `neg_lo:[0,1,0]` = unsigned-weight ×
+  signed-activation operand encoding), **0** in the scalar kernel — genuinely
+  selected, not scalarized.
+- **Dynamic** (rocprofv3 `--kernel-trace`) on a live `HIPFIRE_GFX1201_DP4A=1`
+  daemon run (32 tokens): the dp4a kernel dispatched **1280 times** (32 tokens ×
+  40 layers — exact match), avg **20.46 µs/launch**, consistent with the
+  microbench 23.37 µs/launch. The dp4a path fires on **every** decode step of
+  **every** layer when the flag is set — no intermittent or silent fallback.
+
+**Warm daemon A/B — median of 5 fresh-process runs each.** Model
+`qwen3.6-35b-a3b.mq4r`, `--kv-mode q8 --spec off` (confirmed pure AR,
+`[hipfire] DFlash disabled (dflash_mode=off)`). `--kv-mode` forces the CLI to
+spawn a local daemon per invocation, so each measured run is a cold
+`Engine::start()` (a genuinely fresh process). Each config warmed with a
+throwaway `-n 16` before the 5 measured `-n 200` runs. Prompt
+`"Explain the quicksort algorithm."` — md5 `195ebebaf38d280b6002a66ad94756c6`.
+
+| Config | 5 runs (tok/s) | median | band |
+|---|---|---:|---:|
+| baseline (`HIPFIRE_GFX1201_DP4A` unset) | 125.2, 125.1, 124.8, 125.0, 124.8 | **125.0** | ±0.32% |
+| `HIPFIRE_GFX1201_DP4A=1` | 123.1, 123.1, 123.2, 123.6, 123.0 | **123.1** | ±0.49% |
+
+**Delta: −1.52% end-to-end** (median-to-median). Both bands are tight (<0.5%)
+and **non-overlapping** (baseline min 124.8 > dp4a max 123.6) — a real,
+reproducible LOSS, not session noise. It is consistent in direction with the
+microbench's ~10% kernel-level loss on `moe_gate_up`, diluted by Amdahl's law
+(gate_up is one of ~40 decode kernels for this MoE model). The −1.52% does not
+cross the ±5% mandatory-investigation threshold, but it independently confirms —
+via the real daemon serving path — that dp4a is not a win.
+
+**Coherence verdict: PASS (coherent, both configs).** Both configs produce
+fluent, on-topic, structurally sound quicksort reasoning at 200 tokens (the
+budget is consumed inside the model's `<think>` trace — expected reasoning-first
+behavior, not a bug). No attractor, no repetition loop, no garbage, no
+special-token leak. Output was **byte-identical across all 5 repeats within each
+config** (deterministic decode); the dp4a text differs from baseline only in
+wording from int8-quant-noise-shifted argmax — not corruption. dp4a verbatim
+sample (200-tok run, identical across all 5 dp4a repeats):
+
+```
+Here's a thinking process:
+
+1.  **Understand User Request**: The user wants an explanation of the quicksort algorithm. This is a classic computer science topic. I need to explain it clearly, covering the key concepts, how it works step-by-step, its complexity, and possibly its pros/cons.
+
+2.  **Identify Key Components of Quicksort**:
+   - Divide and conquer algorithm
+   - Pivot selection
+   - Partitioning process
+   - Recursive sorting of subarrays
+   - Time complexity (best/average/worst cases)
+   - Space complexity
+   - Stability (not stable)
+   - Practical considerations
+
+3.  **Structure the Explanation**:
+   - Introduction/Definition
+   - Core Idea (Divide & Conquer)
+   - Step-by-Step Process
+   - Example (optional but helpful)
+   - Complexity Analysis
+   - Pros & Cons
+   - Practical Notes/Improvements
+```
+
+(Baseline sample is textually near-identical in structure/content — the expected
+small-quant-noise divergence, not a coherence failure.) `./scripts/coherence-gate.sh`
+was not run — it is a Qwen3.5 ChatML/AWQ-specific battery (no `mq4r` row, does
+not exercise `HIPFIRE_GFX1201_DP4A`), so it adds no signal beyond the direct
+eyeball + byte-identical-repeats evidence above; skipped as impractical for this
+opt-in flag.
+
+### THE CALL: **EMPIRICAL-NULL** — coherent, but a real ~1.5% daemon LOSS
+
+dp4a is **coherent** but **slower** (−1.52% daemon end-to-end / ~10%
+kernel-level), so the analytic DRAM-bound verdict from section `(d)` and the
+Pre-check resolution is now **EMPIRICALLY CONFIRMED**, not an analytic guess:
+dp4a streams the same 4-bit weight bytes as the scalar kernel — cutting ALU work
+does **not** help a bandwidth-bound kernel. The daemon A/B resolves the
+long-standing ALU-vs-mem question that the failed rocprofv3 PMC split
+(`(d)` Probe 1, twice) never could: `moe_gate_up` is **DRAM/latency-bound, not
+ALU-bound**. Both variants sit at 100% occupancy with no ALU headroom, and the
+dp4a path additionally pays for `ensure_q8_1_mmq_x`'s mandatory per-call Q8_1
+quantization as a **second GPU kernel launch** — a real per-token tax in decode
+(where `x` differs every layer), not a benchmark artifact. This is the strong
+prod-falsify: a synthetic win that survives to the daemon would matter; here even
+the microbench was a loss and the daemon confirms it. **Do not pursue dp4a
+further on gfx1201 decode GEMVs.** The kernel ships closed: opt-in, default-off,
+no default behavior changed on any arch.
+
+### Reconciliation with the +4.24% multirow win (both stand)
+
+**dp4a and the R=2 multirow re-tile are orthogonal levers — the multirow win
+stands regardless of this NULL.** The +4.24% multirow win (section "R=2 multirow
+spike result") is a **block/grid remap** of `moe_down` + `residual` that enlarges
+per-block contiguous weight-traffic and reuses the x-vector once — it attacks
+**transaction-granularity / small-grid** sub-roofline inefficiency (moe_down at
+44% of peak BW) with **zero dequant-math change**. dp4a instead attacks the
+(non-existent) **ALU/dequant** bound on `moe_gate_up` (already at 72.5% of peak),
+and adds a quantize kernel launch. They touch different kernels, different
+bottlenecks, and do not interact: the multirow win is real, coherent, byte-exact
+greedy, occupancy-preserving (96 VGPR / 16 waves, zero spill) and remains
+opt-in behind `HIPFIRE_GEMV_ROWS=2`; this dp4a NULL neither strengthens nor
+weakens it.
+
+### Honest ceiling + the real lever (unchanged)
+
+The decode-GEMV kernel surface on gfx1201 is now **empirically exhausted**: the
+one sub-roofline shape a source-supported re-tile could convert (`moe_down`) was
+converted (+4.24% multirow), and the one shape with claimed ALU headroom
+(`moe_gate_up`) is now measured DRAM-bound (this dp4a NULL). The honest
+end-to-end ceiling on the whole decode-GEMV family stays as `(d)`/`(c)` bounded
+it: **~146–168 tok/s** (s=1.35× DRAM-roofline row: ~146 wall / ~168 kernel,
+i.e. +15–18%), and the broad-dp4a / LDS-tiling / wider-load NO-GO stands. The
+**real competitive lever on gfx1201 remains wiring A3B MTP into the daemon** —
+per the ROCmFP4 H2H (`project_rocmfp4_h2h_gfx1201_2026_07_01`), on R9700 the
+competitor's llama.cpp fork **leads hipfire on raw AR** (131–147 vs `mq4r` ~124
+tok/s) and hipfire wins **only via MTP** (152.7 tok/s, τ=3.02 coherent), which is
+currently **`mtp_only_demo`-only and NOT daemon-wired for A3B** (ships AR-only).
+That multiplicative decode win — on the axis where we actually trail this arch —
+dwarfs both the +4.24% re-tile and (a fortiori) this dp4a NULL, but it is a
+**greenlight-gated engineering task** carrying the **A3B R̄≈0.39 acceptance
+caveat** (`feedback_a3b_r_not_acceptable`: default A3B = AR-only + no eviction
+until R̄ improves) — **not another kernel gamble.** Prioritize the MTP-wiring
+conversation over any further decode-GEMV kernel work on this arch.
