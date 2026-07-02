@@ -183,7 +183,7 @@ fn latency_score(hist: &IsaHistogram, kprofile: &KernelProfile, chip: &ChipProfi
 }
 
 fn verdict_for(binding: BoundClass, hist: &IsaHistogram, score: f64) -> String {
-    match binding {
+    let base = match binding {
         BoundClass::Bandwidth => format!(
             "BW-bound ({:.0}% of peak) — genuinely memory-bandwidth-limited; \
              fix hint: cut bytes moved (tighter quant / avoid re-reads), a \
@@ -213,6 +213,23 @@ fn verdict_for(binding: BoundClass, hist: &IsaHistogram, score: f64) -> String {
              to prefetch further ahead and hide DRAM latency",
             score * 100.0
         ),
+    };
+    // `private_segment_red` (register spill to the private/scratch segment,
+    // sourced from the hsaco kernel descriptor — see `IsaHistogram::from_hsaco`)
+    // caps occupancy independently of which bound class won, so it's surfaced
+    // as an always-on suffix rather than folded into any one bound's score:
+    // a BW- or VALU-bound verdict computed on a spilling kernel is still
+    // pessimistically-biased (the spill is itself suppressing achievable
+    // occupancy/throughput), and a spill fix is a standing fix hint
+    // regardless of today's binding class.
+    if hist.private_segment_red {
+        format!(
+            "{base} — ALSO register-spilled (private_segment_fixed_size > 0): \
+             occupancy is artificially capped, so this verdict is pessimistically \
+             biased until the spill is fixed"
+        )
+    } else {
+        base
     }
 }
 
@@ -222,20 +239,24 @@ mod tests {
 
     #[test]
     fn compute_serialized_binds_valu_or_latency() {
-        // Synthetic "dequant-heavy scalar GEMV" shape: lots of v_bfe /
-        // f32_fma / s_delay_alu, NO v_dot4 (matches the real gfx1201
-        // hfq4g256 fixture), and enough VALU that vmem_valu_ratio is small
-        // (VALU dominates the instruction stream relative to VMEM).
+        // "Dequant-heavy scalar GEMV" shape, matching the ACTUAL measured
+        // histogram of the committed gfx1201 gate_up fixture
+        // (`tests/kernel-fixtures/gfx1201/gemv_hfq4g256_moe_gate_up_indexed_batched.hsaco`,
+        // cross-checked via `clang-offload-bundler`+`llvm-objdump` outside
+        // this test — see `real_fixture_binds_valu_issue_under_committed_chip`
+        // below for the live from-disassembly version of this same shape):
+        // lots of v_bfe/f32_fma/s_delay_alu, NO v_dot4, and VALU heavily
+        // dominating the vmem+valu instruction mix (vmem=29, valu=281).
         let hist = IsaHistogram {
             v_bfe: 42,
             v_cvt: 56,
-            f32_fma: 90,
+            f32_fma: 98,
             v_dot4: 0,
             v_wmma: 0,
             global_load_b128: 14,
             s_delay_alu: 49,
-            s_wait: 27,
-            vmem_valu_ratio: 0.05, // VALU heavily dominates VMEM traffic
+            s_wait: 60,
+            vmem_valu_ratio: 29.0 / 281.0, // VALU heavily dominates VMEM traffic
             private_segment_red: false,
         };
         let kprofile = synthetic_kprofile();
@@ -271,13 +292,13 @@ mod tests {
         let hist = IsaHistogram {
             v_bfe: 42,
             v_cvt: 56,
-            f32_fma: 90,
+            f32_fma: 98,
             v_dot4: 0,
             v_wmma: 0,
             global_load_b128: 14,
             s_delay_alu: 49,
-            s_wait: 27,
-            vmem_valu_ratio: 0.05,
+            s_wait: 60,
+            vmem_valu_ratio: 29.0 / 281.0,
             private_segment_red: false,
         };
         let kprofile = synthetic_kprofile();
@@ -324,6 +345,128 @@ mod tests {
         assert_eq!(
             roofline.latency, 0.0,
             "unprofiled chip (mem_latency_ns=None) => latency score withheld at 0"
+        );
+    }
+
+    #[test]
+    fn verdict_flags_register_spill_regardless_of_binding() {
+        // A cross-model review flagged that `private_segment_red` was parsed
+        // by `IsaHistogram` but never consumed by `Roofline` (the plan's
+        // Task 5 spec calls for the verdict to be a function of
+        // "binding × v_dot4==0? × private_segment_red"). Assert the spill
+        // note actually shows up in the rendered verdict string.
+        let hist = IsaHistogram {
+            v_bfe: 42,
+            v_cvt: 56,
+            f32_fma: 98,
+            v_dot4: 0,
+            v_wmma: 0,
+            global_load_b128: 14,
+            s_delay_alu: 49,
+            s_wait: 60,
+            vmem_valu_ratio: 29.0 / 281.0,
+            private_segment_red: true,
+        };
+        let kprofile = synthetic_kprofile();
+        let chip = synthetic_chip(Some(800.0), Some(280.0));
+
+        let roofline = Roofline::analyze(&hist, &kprofile, &chip, Some(120.0));
+
+        assert!(
+            roofline.verdict.to_lowercase().contains("spill"),
+            "verdict must flag register spill (private_segment_red) \
+             regardless of which bound class won, got: {}",
+            roofline.verdict
+        );
+    }
+
+    #[test]
+    fn verdict_omits_spill_note_when_not_spilling() {
+        let hist = IsaHistogram {
+            v_bfe: 42,
+            v_cvt: 56,
+            f32_fma: 98,
+            v_dot4: 0,
+            v_wmma: 0,
+            global_load_b128: 14,
+            s_delay_alu: 49,
+            s_wait: 60,
+            vmem_valu_ratio: 29.0 / 281.0,
+            private_segment_red: false,
+        };
+        let kprofile = synthetic_kprofile();
+        let chip = synthetic_chip(Some(800.0), Some(280.0));
+
+        let roofline = Roofline::analyze(&hist, &kprofile, &chip, Some(120.0));
+
+        assert!(
+            !roofline.verdict.to_lowercase().contains("spill"),
+            "verdict must NOT mention spill when private_segment_red is false, got: {}",
+            roofline.verdict
+        );
+    }
+
+    #[test]
+    fn real_fixture_binds_valu_issue_under_committed_chip() {
+        // End-to-end (no-GPU): real `IsaHistogram` + real `KernelProfile`,
+        // both derived from the committed gfx1201 gate_up `.hsaco` fixture
+        // (the same file `isa_histogram::tests::from_hsaco_gate_up_gfx1201`
+        // exercises), fed through `Roofline::analyze` under the committed
+        // `tests/chip-profiles/gfx1201.json` chip row. A cross-model review
+        // flagged that no test previously ran real fixture data end-to-end
+        // through the roofline model to prove the classification lands on
+        // VALU-issue rather than Bandwidth.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/kernel-fixtures/gfx1201")
+            .join("gemv_hfq4g256_moe_gate_up_indexed_batched.hsaco");
+        let hist = IsaHistogram::from_hsaco(&path, "gfx1201")
+            .expect("committed gfx1201 fixture must disassemble");
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("real_fixture_probe".to_string(), path.clone());
+        let (_cap, profiles) = crate::profiler::profile_kernels("gfx1201", 0, &map);
+        let kprofile = profiles
+            .into_iter()
+            .next()
+            .expect("profile_kernels must find the fixture's kernel descriptor");
+
+        let chip = crate::chip_profile::ChipProfile::load_committed("gfx1201")
+            .expect("tests/chip-profiles/gfx1201.json must load");
+        assert!(
+            chip.mem_latency_ns.is_none(),
+            "committed gfx1201 row has no measured mem_latency yet (Task 3's \
+             pointer-chase microbench is GPU-required and hasn't landed) — \
+             this test documents that the latency bound stays WITHHELD (not a \
+             false positive) rather than assuming a value"
+        );
+
+        // Static path (`achieved_bw: None`, matching the `--self-check`
+        // no-GPU flow): BW is withheld (no achieved_bw) and latency is
+        // withheld (no measured mem_latency), so only the real VALU-issue
+        // shape carries signal — it must win.
+        let roofline = Roofline::analyze(&hist, &kprofile, &chip, None);
+        assert_eq!(
+            roofline.binding,
+            BoundClass::ValuIssue,
+            "real gfx1201 gate_up fixture (v_bfe={}, f32_fma={}, vmem_valu_ratio={:.4}) \
+             with no achieved_bw / no measured mem_latency must classify as \
+             VALU-issue-bound (bw={}, valu_issue={}, latency={}), got {:?}",
+            hist.v_bfe,
+            hist.f32_fma,
+            hist.vmem_valu_ratio,
+            roofline.bw,
+            roofline.valu_issue,
+            roofline.latency,
+            roofline.binding
+        );
+        assert!(
+            !hist.private_segment_red,
+            "committed-good fixture must not show a register spill"
+        );
+        assert!(
+            !roofline.verdict.to_lowercase().contains("spill"),
+            "non-spilling fixture must not carry a spill note, got: {}",
+            roofline.verdict
         );
     }
 
