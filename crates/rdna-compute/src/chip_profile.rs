@@ -688,17 +688,19 @@ mod tests {
             assert_eq!(&profile.arch, arch, "arch field must match filename stem");
 
             // (expected cu_count, expected mem_latency_ns, expected cache_bw_gbps)
-            // mem_latency_ns is WITHHELD (None) on the three Infinity-Cache
-            // parts (gfx1030/1100/1201): issue #490 — the old 128 MiB buffer fit
-            // inside their IC, so shipped latencies were cache-DEFLATED. They
-            // stay WITHHELD until re-measured. gfx1010/gfx1151 (no IC) stay Some.
+            // mem_latency_ns RE-MEASURED 2026-07-02 on hipx warm force-high with
+            // the per-arch pointer-chase buffer (issue #490 CLOSED): the three
+            // Infinity-Cache parts (gfx1030/1100/1201) were previously WITHHELD
+            // because the old 128 MiB buffer fit inside their IC (cache-DEFLATED);
+            // now un-WITHHELD with the real DRAM latency (median of 3, residency
+            // guard passed). gfx1010/gfx1151 (no IC deflation) unchanged.
             let (expected_cu, expected_latency, expected_cache_bw): (u32, Option<f64>, Option<f64>) =
                 match arch.as_str() {
                     "gfx1010" => (40, Some(276.058), None),
-                    "gfx1030" => (80, None, Some(1586.5)),
-                    "gfx1100" => (96, None, Some(1778.8)),
+                    "gfx1030" => (80, Some(248.744), Some(1586.5)),
+                    "gfx1100" => (96, Some(214.124), Some(1778.8)),
                     "gfx1151" => (40, Some(219.932), Some(952.5)),
-                    "gfx1201" => (64, None, Some(1352.4)),
+                    "gfx1201" => (64, Some(237.999), Some(1352.4)),
                     other => panic!(
                         "load_all_committed_chip_profiles: unrecognized committed row {other:?} — \
                          add an expected-value arm here"

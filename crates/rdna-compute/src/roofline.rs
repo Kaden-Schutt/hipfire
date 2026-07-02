@@ -433,18 +433,16 @@ mod tests {
         let chip = crate::chip_profile::ChipProfile::load_committed("gfx1201")
             .expect("tests/chip-profiles/gfx1201.json must load");
         assert!(
-            chip.mem_latency_ns.is_none(),
-            "committed gfx1201 row's mem_latency is WITHHELD (None) per issue #490 — \
-             the prior 205.9 ns warm pointer-chase was CACHE-DEFLATED (the fixed \
-             128 MiB buffer fit inside the 64 MiB Infinity Cache), so the \
-             latency/Little's-Law roofline arm is correctly inactive here until \
-             re-measured under the per-arch >=4x(L2+IC) buffer + residency guard"
+            chip.mem_latency_ns.is_some(),
+            "committed gfx1201 row's mem_latency was RE-MEASURED 2026-07-02 on hipx \
+             (237.999 ns real DRAM latency under the per-arch >=4x(L2+IC) buffer + \
+             residency guard); issue #490 CLOSED, it is no longer WITHHELD"
         );
 
         // Static path (`achieved_bw: None`, matching the `--self-check`
-        // no-GPU flow): BW is withheld (no achieved_bw) and latency is
-        // withheld (no measured mem_latency), so only the real VALU-issue
-        // shape carries signal — it must win.
+        // no-GPU flow): BW is withheld (no achieved_bw). Latency is now
+        // measured, but on this VALU-heavy gate_up fixture the real VALU-issue
+        // shape must still carry the strongest signal — it must win.
         let roofline = Roofline::analyze(&hist, &kprofile, &chip, None);
         assert_eq!(
             roofline.binding,
