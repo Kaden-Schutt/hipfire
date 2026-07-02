@@ -137,6 +137,40 @@ impl BillOfDebt {
             .filter(|r| matches!(r, DebtRow::Withheld { .. }))
             .collect()
     }
+
+    /// Total recoverable debt per arch (ms). Every arch that appears in the
+    /// corpus gets an entry (a fully-withheld arch appears with `0.0`);
+    /// withheld rows contribute NOTHING to the magnitude. Ordered for
+    /// deterministic iteration via `BTreeMap`.
+    pub fn per_arch_total_debt(&self) -> BTreeMap<String, f64> {
+        let mut totals: BTreeMap<String, f64> = BTreeMap::new();
+        for row in &self.rows {
+            let entry = totals.entry(row.key().arch.clone()).or_insert(0.0);
+            if let Some(d) = row.debt_magnitude_ms() {
+                *entry += d;
+            }
+        }
+        totals
+    }
+
+    /// Cross-arch unevenness score `(max - min) / mean` over per-arch total
+    /// debt — how lopsidedly the recoverable debt is distributed across the
+    /// fleet. `0.0` for fewer than 2 arches or a zero mean (nothing to
+    /// compare / no debt at all).
+    pub fn cross_arch_unevenness(&self) -> f64 {
+        let totals = self.per_arch_total_debt();
+        if totals.len() < 2 {
+            return 0.0;
+        }
+        let vals: Vec<f64> = totals.values().copied().collect();
+        let max = vals.iter().copied().fold(f64::MIN, f64::max);
+        let min = vals.iter().copied().fold(f64::MAX, f64::min);
+        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+        if mean.abs() < DEBT_EPS_MS {
+            return 0.0;
+        }
+        (max - min) / mean
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +249,46 @@ mod tests {
             .map(|r| r.key().kernel.as_str())
             .collect();
         assert_eq!(withheld_kernels, vec!["unmeasured"]);
+    }
+
+    #[test]
+    fn per_arch_totals_and_unevenness() {
+        let bill = BillOfDebt {
+            rows: vec![
+                measured("gfx1010", "k1", "d", 100.0, 0.0, 10.0), // debt 10
+                measured("gfx1010", "k2", "d", 100.0, 0.0, 20.0), // debt 20 → gfx1010 = 30
+                measured("gfx1100", "k1", "d", 100.0, 0.0, 90.0), // debt 90 → gfx1100 = 90
+                withheld("gfx1100", "kw", "d", "oom"),            // contributes nothing
+            ],
+        };
+        let totals = bill.per_arch_total_debt();
+        assert_eq!(totals.get("gfx1010").copied(), Some(30.0));
+        assert_eq!(totals.get("gfx1100").copied(), Some(90.0));
+        // (max - min) / mean = (90 - 30) / ((30 + 90) / 2) = 60 / 60 = 1.0
+        let u = bill.cross_arch_unevenness();
+        assert!(
+            (u - 1.0).abs() < 1e-9,
+            "unevenness = (90-30)/60 = 1.0, got {u}"
+        );
+    }
+
+    #[test]
+    fn unevenness_zero_when_even() {
+        let even = BillOfDebt {
+            rows: vec![
+                measured("gfx1010", "k", "d", 100.0, 0.0, 50.0), // debt 50
+                measured("gfx1100", "k", "d", 100.0, 0.0, 50.0), // debt 50
+            ],
+        };
+        assert!(even.cross_arch_unevenness().abs() < 1e-9);
+        // <2 arches → 0 (no cross-arch spread to score).
+        let single = BillOfDebt {
+            rows: vec![measured("gfx1010", "k", "d", 100.0, 0.0, 50.0)],
+        };
+        assert_eq!(single.cross_arch_unevenness(), 0.0);
+        // Empty / zero-mean → 0.
+        let empty = BillOfDebt { rows: vec![] };
+        assert_eq!(empty.cross_arch_unevenness(), 0.0);
     }
 
     #[test]
