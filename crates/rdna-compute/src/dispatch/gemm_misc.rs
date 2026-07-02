@@ -1374,6 +1374,62 @@ impl Gpu {
             )
         }
     }
+    /// Tuned wave64 LDS-staged **W3A4** GEMM — same contract as
+    /// [`Self::gemm_iu4_i32_wmma_lds`] except the weight operand is a 3-bit
+    /// bit-plane: `a_w3` [M, 3K/32] u32 (per 32-weight K-group, 3 contiguous u32
+    /// planes), `x_i4` [B, K/2], `y_i32` [B, M]. The kernel unpacks the planes to
+    /// int4 in LDS (Morton spread) then runs the identical iu4·iu4 core — 25% less
+    /// weight traffic, ~1.3× in the weight-bandwidth-bound prefill regime. `K % 64
+    /// == 0` (Oq3G256 guarantees %256). Caller gates to RDNA3.5+ prefill. Parity:
+    /// `parity_gemm_w3a4_i32_wmma_lds`.
+    pub fn gemm_w3a4_i32_wmma_lds(
+        &mut self,
+        a_w3: &GpuTensor,
+        x_i4: &GpuTensor,
+        y_i32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % 64,
+            0,
+            "gemm_w3a4_i32_wmma_lds: K must be a multiple of 64"
+        );
+        self.ensure_kernel(
+            "gemm_w3a4_i32_wmma_lds",
+            kernels::GEMM_W3A4_I32_WMMA_LDS_SRC,
+            "gemm_w3a4_i32_wmma_lds",
+        )?;
+        let ap = a_w3.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let yp = y_i32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 63) / 64) as u32; // BM = 64
+        let grid_b = ((batch_size + 255) / 256) as u32; // BN = 256
+        let func = &self.functions["gemm_w3a4_i32_wmma_lds"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [256, 1, 1], // 4 wave64 waves
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     /// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
     /// rescale in the f32 epilogue. `w_i4` [M,K/2] + `w_scales` [M,K/group] (f32),
     /// `x_i4` [B,K/2] + `x_scales` [B,K/group] (f32), `y_f32` [B,M]. Requires
