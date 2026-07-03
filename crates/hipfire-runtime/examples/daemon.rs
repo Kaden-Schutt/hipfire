@@ -593,7 +593,36 @@ fn acquire_daemon_lock() -> std::fs::File {
     f.seek(std::io::SeekFrom::Start(0)).ok();
     writeln!(f, "{}", std::process::id()).ok();
     f.flush().ok();
+    warn_if_perf_level_forced_high();
     f
+}
+
+/// Best-effort startup guard: warn (once, non-fatal) if any GPU is pinned to
+/// `power_dpm_force_performance_level=high`. The engine NEVER forces a DPM level
+/// itself — but `high` PINS a MID sclk on RDNA3/4 that UNDER-clocks the GPU ~14%
+/// below `auto`'s boost (measured 2026-07-03: R9700 high=2350MHz/116tok-s vs
+/// auto=2838-3260MHz/132tok-s). Flagging an externally-forced `high` here keeps a
+/// choked clock from being mistaken for a kernel regression. `auto` is the regime
+/// the engine runs best in — do not "optimize" by forcing high.
+fn warn_if_perf_level_forced_high() {
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else { return };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // real render nodes are `cardN`; skip connector entries like `card0-DP-1`
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let p = entry.path().join("device/power_dpm_force_performance_level");
+        if let Ok(v) = std::fs::read_to_string(&p) {
+            if v.trim() == "high" {
+                eprintln!(
+                    "  \u{26a0} {name}: perf_level=high is forced — this UNDER-clocks RDNA3/4 (~14% below auto). \
+                     The engine runs best at 'auto'; forcing 'high' chokes performance."
+                );
+            }
+        }
+    }
 }
 
 /// Cap on the *encoded* base64 string length the daemon will accept on the

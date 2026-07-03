@@ -218,11 +218,15 @@ if [ "$FORCE_DPM" = 1 ] && command -v rocm-smi >/dev/null 2>&1; then
     parsed=$(rocm-smi --showperflevel 2>/dev/null \
         | grep -oE 'Performance Level:.*' | head -1 | awk -F': ' '{print $2}')
     [ -n "$parsed" ] && PRIOR_PERFLEVEL="$parsed"
-    if try_rocm_smi_set high; then
+    # NEVER force `high`: on RDNA3/4 perf_level=high PINS a MID sclk state that
+    # UNDER-clocks the GPU (~14% below auto's boost — measured 2026-07-03: R9700
+    # high=2350MHz/116tok-s vs auto=2838-3260MHz/132tok-s). `auto` is the
+    # representative regime the user actually gets. See feedback_rdna4_perf_level.
+    if try_rocm_smi_set auto; then
         DPM_FORCED=1
-        log "DPM: forced power_dpm_force_performance_level=high box-wide (was: $PRIOR_PERFLEVEL)"
+        log "DPM: set power_dpm_force_performance_level=auto box-wide (was: $PRIOR_PERFLEVEL) — auto boosts higher than high on RDNA3/4"
     else
-        log "WARN: rocm-smi --setperflevel high failed (no permission?) — continuing WITHOUT forced DPM; the cold/warm delta below will likely be smaller than the gfx1201.json precedent"
+        log "WARN: rocm-smi --setperflevel auto failed (no permission?) — continuing on the prior DPM state"
     fi
 else
     log "DPM force-high skipped (--no-force-dpm or rocm-smi unavailable)"
@@ -239,9 +243,9 @@ log "output dir: $OUT_DIR"
 # comment above the DPM force-high block for why a per-card mclk/dpm_state
 # reading is NOT attempted here.
 if [ "$DPM_FORCED" = 1 ]; then
-    DPM_STATE_NOTE="high-forced (power_dpm_force_performance_level=high box-wide; was: $PRIOR_PERFLEVEL)"
+    DPM_STATE_NOTE="auto (power_dpm_force_performance_level=auto box-wide; was: $PRIOR_PERFLEVEL) — auto is the representative regime; high under-clocks RDNA3/4"
 elif [ "$FORCE_DPM" = 1 ]; then
-    DPM_STATE_NOTE="force-high FAILED (no permission?) — warm pass is NOT DPM-warmed, treat as cold-adjacent"
+    DPM_STATE_NOTE="set-auto FAILED (no permission?) — running on the prior DPM state"
 else
     DPM_STATE_NOTE="force-high skipped (--no-force-dpm)"
 fi
