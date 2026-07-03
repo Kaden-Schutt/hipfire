@@ -1,5 +1,12 @@
     use super::*;
+    // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+    use hipfire_diffusion_coexist::{
+        import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
+        parse_pytorch_state_dict, pytorch_tensor_is_contiguous,
+        reorder_pytorch_storage_to_contiguous, DiffusersImportOptions,
+    };
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use std::fs;
 
     const DEFAULT_TINY_SD_HFQ: &str = "/tmp/hipfire-tiny-sd-diffusion.hfq";
 

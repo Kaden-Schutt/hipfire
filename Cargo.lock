@@ -1547,6 +1547,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-detect",
  "hipfire-diffusion",
+ "hipfire-diffusion-coexist",
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",
@@ -1688,6 +1689,7 @@ dependencies = [
  "anyhow",
  "base64",
  "hip-bridge",
+ "hipfire-diffusion-coexist",
  "hipfire-model",
  "hipfire-primitives",
  "hipfire-quantize",
@@ -1697,6 +1699,16 @@ dependencies = [
  "rdna-compute",
  "regex",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-diffusion-coexist"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "hipfire-diffusion",
+ "hipfire-runtime",
  "serde_json",
 ]
 

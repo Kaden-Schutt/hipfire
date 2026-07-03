@@ -63,6 +63,7 @@ members = [
     "crates/hipfire-quant-format",
     "crates/hipfire-detect",
     "crates/hipfire-diffusion",
+    "crates/hipfire-diffusion-coexist",
     "crates/hipfire-atlas",
     "crates/hipfire-cli",
     "crates/hipfire-tui",

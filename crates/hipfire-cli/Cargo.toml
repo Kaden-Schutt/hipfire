@@ -22,6 +22,7 @@ hipfire-build-info = { path = "../hipfire-build-info" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-diffusion = { path = "../hipfire-diffusion" }
+hipfire-diffusion-coexist = { path = "../hipfire-diffusion-coexist" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
