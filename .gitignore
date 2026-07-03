@@ -128,3 +128,13 @@ NIGHT-WORK.md
 # transient / vendored — never commit
 node_modules/
 .smallcode/
+
+# Local reference clones (H-Neurons paper repo; transformers is the zyphra-transformers submodule dup)
+third_party/H-Neurons/
+third_party/transformers/
+
+# benchmarks: keep curated .md/.json baselines; ignore raw per-run spew
+benchmarks/results/**/*.out
+benchmarks/results/**/*.stderr
+benchmarks/results/**/*.stdout
+benchmarks/results/**/*.bak

@@ -1,8 +1,0 @@
-/home/sadara/hipfire/benchmarks/results/quant-kv-matrix-20260626T2120Z/eval/qwen3.5-4b.oq4.asym3
-admission: measured (no --compare or --reference provided; comparison skipped)
-results: 2
-  [pass] speed/daemon_prefill_decode_first suite=- item=- model=qwen3.5-4b.oq4.hfq elapsed_ms=13955 tok_s=11.8 decode_tok_s=14.1 prefill_tok_s=267.9 ttft_ms=896 prefill_ms=896 gen_tok_s=14.1 implemented=true
-  [pass] speed/daemon_prefill_decode_reset suite=- item=- model=qwen3.5-4b.oq4.hfq elapsed_ms=13955 tok_s=11.8 decode_tok_s=14.1 prefill_tok_s=272.3 ttft_ms=881.3 prefill_ms=881.3 gen_tok_s=14.1 implemented=true
-findings: 0
-admission findings: 0
-row findings: 0
