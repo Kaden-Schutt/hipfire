@@ -578,7 +578,15 @@ fn load_bias_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResul
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        qt => panic!("dots-ocr: expected F16/F32 for bias {name}, got qt={qt}"),
+        // BF16 (qt=16): the Qwen2 backbone's attention biases arrive as BF16
+        // whenever the source checkpoint is BF16. BF16→F32 is the exact
+        // high-16-bit widening, and the bias uploads as F32 regardless. Mirrors
+        // the hipfire-arch-qwen2 fix.
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
+        qt => panic!("dots-ocr: expected F16/F32/BF16 for bias {name}, got qt={qt}"),
     };
     assert_eq!(
         f32_data.len(),
