@@ -187,6 +187,82 @@ impl QuantType {
             _ => return None,
         })
     }
+
+    /// Elements per quantization group/block for this format.
+    ///
+    /// This is the divisor for `n_groups = ceil(n_elems / group_size())`.
+    /// Per-element formats (F16/F32/BF16) report 1. Variable-layout formats
+    /// still report their nominal group width; callers that need the byte
+    /// geometry should consult [`QuantType::block_bytes`], which is `None` for
+    /// variable formats.
+    pub const fn group_size(self) -> usize {
+        use QuantType::*;
+        match self {
+            F16 | F32 | BF16 => 1,
+            Q8F16 => 32,
+            Q4F16G64 => 64,
+            HFP4G32 | MFP4G32 => 32,
+            HFQ4G128 | HFQ2G128 | HFQ3G128 | PARO4G128 | PARO4G128T => 128,
+            // Everything else is a 256-wide group: the G256 families, the Q4K
+            // superblock, Qtip/Oq/Mq G256, the Lloyd codebook variants, OqPlus.
+            _ => 256,
+        }
+    }
+
+    /// Bytes per packed block for fixed-geometry formats, or `None` for formats
+    /// whose block byte length varies with tensor shape / per-block metadata
+    /// (Q8HFQ, HFP4/MFP4 row-scaled, OqPlus tiered/compact, Paro, arch-packed,
+    /// and any not-yet-single-sourced trellis variant).
+    ///
+    /// Single source of truth for the block geometry that was previously
+    /// re-hardcoded across codecs, loaders, and arch crates (review 2026-07-03
+    /// §3.9). `tensor_bytes(n) = ceil(n / group_size()) * block_bytes()`.
+    pub const fn block_bytes(self) -> Option<usize> {
+        use QuantType::*;
+        match self {
+            // Dense / GGUF-style
+            F32 => Some(4),
+            F16 | BF16 => Some(2),
+            Q8F16 => Some(34),      // 2 (f16 scale) + 32 int8
+            Q4F16G64 => Some(36),   // 4 (f16 scale+min) + 32 nibbles
+            Q4K => Some(144),       // llama.cpp Q4_K superblock
+            // HFQ (rotation-free) + MQ (FWHT-rotated) share byte geometry
+            HFQ4G256 | MQ4G256 => Some(136), // 8 meta + 128 nibbles
+            HFQ4G128 => Some(72),
+            HFQ6G256 | MQ6G256 => Some(200), // 8 meta + 192 (6-bit×256)
+            HFQ3G256 | MQ3G256 => Some(104), // 8 meta + 96 packed 3-bit
+            HFQ3G128 => Some(56),
+            HFQ2G256 | MQ2G256 | MQ2G256Lloyd => Some(72), // 8 meta + 64 packed
+            HFQ2G128 => Some(40),
+            MQ8G256 => Some(258),   // 2 (f16 scale) + 256 int8
+            MQ3G256Lloyd => Some(112),
+            MQ4G256Lloyd => Some(160),
+            // Opus Quant (symmetric)
+            Oq4G256 => Some(130),   // 2 (f16 scale) + 128 nibbles
+            Oq3G256 => Some(98),    // 2 (f16 scale) + 8×3 u32 bit-planes
+            Oq6G256 => Some(194),   // 2 (f16 scale) + 192 (6-bit×256)
+            Oq8G256 => Some(258),   // 2 (f16 scale) + 256 int8
+            // QTIP trellis (f32 scale + packed symbols)
+            Qtip3G256 => Some(100), // 4 + 96 (256×3-bit)
+            Qtip4G256 => Some(132), // 4 + 128 (256×4-bit)
+            // Variable-length or not-yet-single-sourced here:
+            //  - Q8HFQ: row-dependent
+            //  - HFP4G32 / MFP4G32: per-row FP scale
+            //  - OqPlusG256 / OqPlusCompact: tiered / 130 + 2·N_out
+            //  - Oq2G256 / Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
+            //  - Paro / TidI32: engine-tiled, arch-specific
+            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq2G256
+            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 => None,
+        }
+    }
+
+    /// Total packed byte length for `n_elems` of a fixed-geometry format, or
+    /// `None` for variable-layout formats. `ceil(n / group) * block_bytes`.
+    pub fn tensor_bytes(self, n_elems: usize) -> Option<usize> {
+        let block = self.block_bytes()?;
+        let groups = n_elems.div_ceil(self.group_size());
+        Some(groups * block)
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +281,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn block_bytes_match_the_on_disk_geometry() {
+        // On-disk contract: these byte counts are the format's block size and
+        // must never move. Mirrors the codecs.rs encoders + arch-crate loaders.
+        let cases = [
+            (QuantType::F32, 4usize),
+            (QuantType::F16, 2),
+            (QuantType::BF16, 2),
+            (QuantType::Q8F16, 34),
+            (QuantType::Q4F16G64, 36),
+            (QuantType::Q4K, 144),
+            (QuantType::HFQ4G256, 136),
+            (QuantType::MQ4G256, 136),
+            (QuantType::HFQ4G128, 72),
+            (QuantType::HFQ6G256, 200),
+            (QuantType::MQ6G256, 200),
+            (QuantType::HFQ3G256, 104),
+            (QuantType::MQ3G256, 104),
+            (QuantType::HFQ3G128, 56),
+            (QuantType::HFQ2G256, 72),
+            (QuantType::MQ2G256, 72),
+            (QuantType::MQ2G256Lloyd, 72),
+            (QuantType::HFQ2G128, 40),
+            (QuantType::MQ8G256, 258),
+            (QuantType::MQ3G256Lloyd, 112),
+            (QuantType::MQ4G256Lloyd, 160),
+            (QuantType::Oq4G256, 130),
+            (QuantType::Oq3G256, 98),
+            (QuantType::Oq6G256, 194),
+            (QuantType::Oq8G256, 258),
+            (QuantType::Qtip3G256, 100),
+            (QuantType::Qtip4G256, 132),
+        ];
+        for (qt, bytes) in cases {
+            assert_eq!(qt.block_bytes(), Some(bytes), "{qt:?} block_bytes");
+        }
+    }
+
+    #[test]
+    fn variable_layout_formats_have_no_fixed_block_bytes() {
+        for qt in [
+            QuantType::Q8HFQ,
+            QuantType::HFP4G32,
+            QuantType::MFP4G32,
+            QuantType::OqPlusG256,
+            QuantType::OqPlusCompact,
+            QuantType::Oq2G256,
+            QuantType::Oq4G256ArchPacked,
+            QuantType::Qtip2G256,
+            QuantType::PARO4G128,
+            QuantType::PARO4G128T,
+            QuantType::TidI32,
+        ] {
+            assert_eq!(qt.block_bytes(), None, "{qt:?} must be variable-layout");
+            assert_eq!(qt.tensor_bytes(1024), None, "{qt:?} tensor_bytes");
+        }
+    }
+
+    #[test]
+    fn group_size_and_tensor_bytes_compose() {
+        assert_eq!(QuantType::MQ4G256.group_size(), 256);
+        assert_eq!(QuantType::HFQ4G128.group_size(), 128);
+        assert_eq!(QuantType::Q4F16G64.group_size(), 64);
+        assert_eq!(QuantType::Q8F16.group_size(), 32);
+        assert_eq!(QuantType::F16.group_size(), 1);
+        // 300 elems of MQ4G256 = 2 groups of 256 × 136 B.
+        assert_eq!(QuantType::MQ4G256.tensor_bytes(300), Some(2 * 136));
+        // Exact multiple: 512 elems = 2 groups.
+        assert_eq!(QuantType::Oq4G256.tensor_bytes(512), Some(2 * 130));
+        // Empty tensor = 0 groups.
+        assert_eq!(QuantType::MQ4G256.tensor_bytes(0), Some(0));
     }
 
     #[test]
