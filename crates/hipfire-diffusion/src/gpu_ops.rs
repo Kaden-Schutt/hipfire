@@ -3003,12 +3003,16 @@ pub(crate) fn linear_optional_bias_resident(
     // Progressive precision schedule: when an oq4 rung is active and the input
     // dim is 256-aligned (the oq4 GEMM constraint), run the linear at reduced
     // precision (oq4 weight + FWHT-rotated activation). Other linears (e.g.
-    // in=320/640) and the F16 setting fall through to the f16 WMMA path.
-    if cache.linear_precision != LinearPrecision::F16
+    // in=320/640) and the F16 setting fall through to the f16 WMMA path. The
+    // per-layer index is advanced for every resident linear so the per-layer
+    // policy (every Nth layer, skip first/last) indexes consistently.
+    let layer_idx = cache.linear_index;
+    cache.linear_index = cache.linear_index.wrapping_add(1);
+    let precision = cache.resolve_linear_precision(layer_idx);
+    if precision != LinearPrecision::F16
         && in_features % 256 == 0
         && gpu.arch_caps.has_wmma_w32()
     {
-        let precision = cache.linear_precision;
         let w_ptr = cache.resident_oq4_ptr(gpu, weight, out_features, in_features)?;
         let packed_len = oq4_arch_combined_len(out_features, in_features);
         let w_view = rdna_compute::GpuTensor {

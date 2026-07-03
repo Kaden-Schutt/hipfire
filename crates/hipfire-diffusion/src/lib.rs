@@ -274,8 +274,44 @@ struct RocmWeightCache {
     /// oq4 arch-combined device buffers, for the W4A* schedule rungs. Keyed the
     /// same way; built once by quantize_oq4g256 → pack_oq4_arch_combined → upload.
     oq4_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
-    /// Active activation precision for the resident linear path this step.
+    /// Active activation precision for the resident linear path this step (the
+    /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
     linear_precision: LinearPrecision,
+    /// Per-LAYER schedule policy. When `layer_stride > 0`, the precision of each
+    /// resident linear is decided by its call index this forward (not the per-step
+    /// `linear_precision`): every `layer_stride`-th linear runs `layer_rung`, the
+    /// first `layer_skip_first` and last `layer_skip_last` stay F16.
+    layer_stride: usize,
+    layer_skip_first: usize,
+    layer_skip_last: usize,
+    layer_rung: LinearPrecision,
+    /// Resident-linear call index within the current forward (reset per step).
+    linear_index: usize,
+    /// Total resident-linear calls in the previous forward (for `layer_skip_last`;
+    /// 0 on the first step, so skip_last activates from step 1).
+    linear_total: usize,
+}
+
+impl RocmWeightCache {
+    /// Resolve the activation precision for the resident linear at call index
+    /// `idx` this forward, applying the per-layer policy when active else the
+    /// per-step precision.
+    fn resolve_linear_precision(&self, idx: usize) -> LinearPrecision {
+        if self.layer_stride == 0 {
+            return self.linear_precision;
+        }
+        if idx < self.layer_skip_first {
+            return LinearPrecision::F16;
+        }
+        if self.linear_total > 0 && idx >= self.linear_total.saturating_sub(self.layer_skip_last) {
+            return LinearPrecision::F16;
+        }
+        if (idx - self.layer_skip_first) % self.layer_stride == 0 {
+            self.layer_rung
+        } else {
+            LinearPrecision::F16
+        }
+    }
 }
 
 impl RocmWeightCache {
@@ -953,6 +989,13 @@ pub struct SchedulerConfig {
     pub invert_sigmas: Option<bool>,
     pub use_dynamic_shifting: Option<bool>,
     pub time_shift_type: Option<String>,
+    // Resolution-dependent dynamic shifting (FlowMatchEuler): the shift `mu` is
+    // interpolated between `base_shift`/`max_shift` over the image token count
+    // `[base_image_seq_len, max_image_seq_len]`.
+    pub base_shift: Option<f32>,
+    pub max_shift: Option<f32>,
+    pub base_image_seq_len: Option<usize>,
+    pub max_image_seq_len: Option<usize>,
 }
 
 impl SchedulerConfig {
@@ -1406,6 +1449,37 @@ fn linear_precision_for_step(step: usize, total: usize) -> LinearPrecision {
     }
 }
 
+/// Configure the per-layer precision policy on the weight cache from env (opt-in;
+/// `HIPFIRE_DIFFUSION_LAYER_STRIDE=0` = off, the default). When active, every
+/// `STRIDE`-th resident linear runs `RUNG` (default W4A4), except the first
+/// `SKIP_FIRST` and last `SKIP_LAST` linears (kept F16). This is orthogonal to the
+/// per-step schedule and overrides it when `STRIDE > 0`.
+///   `HIPFIRE_DIFFUSION_LAYER_STRIDE`     — N (every Nth linear; 0=off)
+///   `HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST` — keep the first X linears F16
+///   `HIPFIRE_DIFFUSION_LAYER_SKIP_LAST`  — keep the last Y linears F16 (from step 1)
+///   `HIPFIRE_DIFFUSION_LAYER_RUNG`       — w4a4 | w4a8 | w4a16 (default w4a4)
+fn configure_layer_policy(cache: &mut RocmWeightCache) {
+    let usize_env = |name: &str| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    cache.layer_stride = usize_env("HIPFIRE_DIFFUSION_LAYER_STRIDE");
+    cache.layer_skip_first = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST");
+    cache.layer_skip_last = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_LAST");
+    cache.layer_rung = match std::env::var("HIPFIRE_DIFFUSION_LAYER_RUNG")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "w4a8" => LinearPrecision::W4A8,
+        "w4a16" => LinearPrecision::W4A16,
+        _ => LinearPrecision::W4A4,
+    };
+    cache.linear_total = 0;
+}
+
 fn denoise_latents_with_cfg_progress_and_runtime_context(
     mut latents: LatentBatch,
     schedule: &DiffusionSchedule,
@@ -1448,10 +1522,18 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
     let mut scheduler_state = SchedulerStepState::default();
     let mut runtime_kind = DiffusionRuntimeKind::CpuSourceReference;
     let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
+    configure_layer_policy(&mut runtime_context.rocm_weights);
     let total_steps = schedule.timesteps.len();
     for step in 0..total_steps {
         // Progressive precision schedule: pick the resident-linear activation
         // precision for this step (early/high-noise steps tolerate cheaper rungs).
+        // `linear_total` carries the previous forward's linear count (for the
+        // per-layer skip_last); reset the per-forward index before this step.
+        if step > 0 {
+            runtime_context.rocm_weights.linear_total =
+                runtime_context.rocm_weights.linear_index;
+        }
+        runtime_context.rocm_weights.linear_index = 0;
         runtime_context.rocm_weights.linear_precision =
             linear_precision_for_step(step, total_steps);
         let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
@@ -1844,6 +1926,31 @@ fn cfg_guidance(
 
 fn classifier_free_guidance_is_identity(cfg_scale: f32) -> bool {
     (cfg_scale - 1.0).abs() <= f32::EPSILON
+}
+
+/// Stack per-prompt Krea2 conditioning `[1, seq, hidden]` tensors into a
+/// `[n_prompts, seq, hidden]` batch. Prompts must share `seq`/`hidden` (batching
+/// unequal prompt lengths needs padding + attention masks — not yet supported).
+fn stack_krea2_conditioning(items: &[CpuTensor]) -> DiffusionResult<CpuTensor> {
+    let first = items.first().ok_or_else(|| {
+        DiffusionError::InvalidRequest("Krea2 conditioning batch is empty".to_string())
+    })?;
+    let [_, seq, hidden] = shape3(first)?;
+    let mut data = Vec::with_capacity(items.len() * seq * hidden);
+    for item in items {
+        let [batch, item_seq, item_hidden] = shape3(item)?;
+        if batch != 1 || item_seq != seq || item_hidden != hidden {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "Krea2 conditioning batch requires equal prompt lengths; got {:?} vs [1, {seq}, {hidden}]",
+                item.shape
+            )));
+        }
+        data.extend_from_slice(&item.data);
+    }
+    Ok(CpuTensor {
+        shape: vec![items.len(), seq, hidden],
+        data,
+    })
 }
 
 fn scale_model_input_with_runtime_context(
@@ -2457,6 +2564,121 @@ pub struct CpuTensor {
     pub data: Vec<f32>,
 }
 
+/// Parity-debug tensor dump: when `HIPFIRE_DIFFUSION_DUMP_DIR` is set, write
+/// `<dir>/<name>.npy` (numpy v1, `<f4`) so intermediate activations can be diffed
+/// against a diffusers reference. No-op (and never errors the run) otherwise.
+pub(crate) fn dump_debug_tensor(name: &str, tensor: &CpuTensor) {
+    let Ok(dir) = std::env::var("HIPFIRE_DIFFUSION_DUMP_DIR") else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let shape = tensor
+        .shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shape = if tensor.shape.len() == 1 {
+        format!("{shape},")
+    } else {
+        shape
+    };
+    let header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape}), }}");
+    // Pad so total (magic 8 + len 2 + header) is a multiple of 64, header ends '\n'.
+    let mut header = header.into_bytes();
+    let total = 10 + header.len() + 1;
+    let pad = (64 - total % 64) % 64;
+    header.extend(std::iter::repeat_n(b' ', pad));
+    header.push(b'\n');
+    let mut out = Vec::with_capacity(10 + header.len() + tensor.data.len() * 4);
+    out.extend_from_slice(&[0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0]);
+    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    out.extend_from_slice(&header);
+    for value in &tensor.data {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.npy")), out);
+}
+
+/// Decode a raw tensor payload (`quant_type` + bytes) into `f32`. Shared by
+/// `CpuTensor::from_hfq` (decode-at-load) and `ResidentWeight` (decode-on-use).
+pub(crate) fn decode_tensor_payload(
+    name: &str,
+    quant_type: u8,
+    bytes: &[u8],
+    elem_count: usize,
+) -> DiffusionResult<Vec<f32>> {
+    Ok(match quant_type {
+        QT_DIFFUSION_TENSOR_Q4F16_G64 => decode_q4f16_g64_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_F16 => decode_f16_slice(bytes),
+        QT_DIFFUSION_TENSOR_BF16 => decode_bf16_slice(bytes),
+        QT_DIFFUSION_TENSOR_F32 => decode_f32_slice(bytes),
+        QT_DIFFUSION_TENSOR_Q8F16 => decode_q8f16_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_Q4_K => decode_q4_k_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_HFQ4_G256 => decode_hfq4_slice(name, bytes, elem_count, 256, 136, "HFQ4G256")?,
+        QT_DIFFUSION_TENSOR_HFQ4_G128 => decode_hfq4_slice(name, bytes, elem_count, 128, 72, "HFQ4G128")?,
+        QT_DIFFUSION_TENSOR_HFQ6_G256 => decode_hfq6_g256_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_OQ4_G256 => decode_oq4g256_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_OQ8_G256 => decode_oq8g256_slice(name, bytes, elem_count)?,
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "tensor {name:?} has unsupported quant_type {other}; native diffusion tensor decoding currently supports Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G256, HFQ4G128, HFQ6G256, OQ4G256, and OQ8G256 tensor payloads. Other packed or quantized payloads require a diffusion dequantizer/runtime implementation"
+            )))
+        }
+    })
+}
+
+/// A weight kept resident in its **on-disk packed form** (bf16 ~2 B/elem, oq4
+/// ~0.5 B/elem, etc.) and decoded to `f32` **transiently per forward call**,
+/// instead of holding the expanded `f32` (4 B/elem) for the lifetime of the
+/// model. This roughly halves resident memory for a bf16 model (and cuts it ~8x
+/// for oq4), letting the full Krea2 model fit where the f32 working set would
+/// OOM. `decode()` allocates the f32 only for the duration of one op.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResidentWeight {
+    name: String,
+    quant_type: u8,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl ResidentWeight {
+    pub(crate) fn from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<Self> {
+        let (info, bytes) = hfq.tensor_data_vec(name).ok_or_else(|| {
+            DiffusionError::InvalidMetadata(format!("tensor {name:?} is missing"))
+        })?;
+        Ok(Self {
+            name: name.to_string(),
+            quant_type: info.quant_type,
+            shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+            bytes,
+        })
+    }
+
+    pub(crate) fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Decode the packed payload into an f32 `CpuTensor` (transient; drop it
+    /// immediately after the op to keep only one weight expanded at a time).
+    pub(crate) fn decode(&self) -> DiffusionResult<CpuTensor> {
+        let elem_count = self.shape.iter().product();
+        let data = decode_tensor_payload(&self.name, self.quant_type, &self.bytes, elem_count)?;
+        // Register this decode's data pointer for activation calibration so the
+        // per-linear Hessian is captured for resident-packed weights too (the
+        // `CpuTensor::from_hfq` calibration hook does not see them). No-op unless
+        // a calibration run is armed.
+        if quant_calib::calib_active() {
+            quant_calib::calib_register(data.as_ptr() as usize, &self.name);
+        }
+        Ok(CpuTensor {
+            shape: self.shape.clone(),
+            data,
+        })
+    }
+}
+
 impl CpuTensor {
     pub fn from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<Self> {
         let (info, bytes) = hfq.tensor_data_vec(name).ok_or_else(|| {
@@ -2469,28 +2691,7 @@ impl CpuTensor {
             .ok_or_else(|| {
                 DiffusionError::InvalidMetadata(format!("tensor {name:?} shape overflows"))
             })?;
-        let data = match info.quant_type {
-            QT_DIFFUSION_TENSOR_Q4F16_G64 => decode_q4f16_g64_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_F16 => decode_f16_slice(&bytes),
-            QT_DIFFUSION_TENSOR_BF16 => decode_bf16_slice(&bytes),
-            QT_DIFFUSION_TENSOR_F32 => decode_f32_slice(&bytes),
-            QT_DIFFUSION_TENSOR_Q8F16 => decode_q8f16_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_Q4_K => decode_q4_k_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_HFQ4_G256 => {
-                decode_hfq4_slice(name, &bytes, elem_count, 256, 136, "HFQ4G256")?
-            }
-            QT_DIFFUSION_TENSOR_HFQ4_G128 => {
-                decode_hfq4_slice(name, &bytes, elem_count, 128, 72, "HFQ4G128")?
-            }
-            QT_DIFFUSION_TENSOR_HFQ6_G256 => decode_hfq6_g256_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_OQ4_G256 => decode_oq4g256_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_OQ8_G256 => decode_oq8g256_slice(name, &bytes, elem_count)?,
-            other => {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "tensor {name:?} has unsupported quant_type {other}; native diffusion tensor decoding currently supports Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G256, HFQ4G128, HFQ6G256, OQ4G256, and OQ8G256 tensor payloads. Other packed or quantized payloads require a diffusion dequantizer/runtime implementation"
-                )))
-            }
-        };
+        let data = decode_tensor_payload(name, info.quant_type, &bytes, elem_count)?;
         if data.len() != elem_count {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "tensor {name:?} decoded {} elements but shape expects {elem_count}",
@@ -4249,6 +4450,56 @@ impl DiffusionPipeline {
         self.prepare_conditioning_batch_with_runtime_context(request, &mut runtime_context)
     }
 
+    /// Krea2 conditioning: tokenize each prompt with the Qwen2 tokenizer, run the
+    /// Qwen3-VL encoder + text_fusion, and stack the per-prompt `[1, seq, hidden]`
+    /// conditioning into the batch the transformer denoiser consumes as its text
+    /// embeddings. (Numerically unvalidated — see encoder/DiT parity caveats.)
+    fn prepare_krea2_conditioning_batch(
+        &self,
+        request: &DiffusionBatchRequest,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<DiffusionConditioningBatch> {
+        let runtime = self.native_runtime()?;
+        let missing = || {
+            DiffusionError::BackendUnavailable("Krea2 text conditioner unavailable".to_string())
+        };
+        let cfg_is_identity = classifier_free_guidance_is_identity(request.cfg_scale);
+        let mut prompt_conds = Vec::with_capacity(request.prompts.len());
+        let mut negative_conds = Vec::with_capacity(request.prompts.len());
+        for prompt in &request.prompts {
+            let cond = runtime
+                .krea2_conditioning_from_prompt(&prompt.prompt, runtime_context)?
+                .ok_or_else(missing)?;
+            if cfg_is_identity {
+                negative_conds.push(cond.clone());
+            } else {
+                negative_conds.push(
+                    runtime
+                        .krea2_conditioning_from_prompt(&prompt.negative_prompt, runtime_context)?
+                        .ok_or_else(missing)?,
+                );
+            }
+            prompt_conds.push(cond);
+        }
+        let empty_tokens = vec![Vec::new(); request.prompts.len()];
+        Ok(DiffusionConditioningBatch {
+            prompt_tokens: empty_tokens.clone(),
+            negative_tokens: empty_tokens,
+            prompt_tokens_2: None,
+            negative_tokens_2: None,
+            prompt_embeddings: Some(stack_krea2_conditioning(&prompt_conds)?),
+            negative_embeddings: Some(stack_krea2_conditioning(&negative_conds)?),
+            prompt_embeddings_2: None,
+            negative_embeddings_2: None,
+            prompt_cross_attention_embeddings: None,
+            negative_cross_attention_embeddings: None,
+            prompt_attention_mask: None,
+            negative_attention_mask: None,
+            prompt_pooled_embeddings: None,
+            negative_pooled_embeddings: None,
+        })
+    }
+
     fn prepare_conditioning_batch_with_runtime_context(
         &self,
         request: &DiffusionBatchRequest,
@@ -4260,6 +4511,16 @@ impl DiffusionPipeline {
                 conditioning,
                 request.prompts.len(),
             ));
+        }
+        // Krea2: the Qwen3-VL encoder + text_fusion produce the DiT conditioning
+        // in-runtime (no CLIP). NOTE: numerically unvalidated against a diffusers
+        // reference — see the parity caveats on the encoder/DiT.
+        if self
+            .native_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.text_conditioner.is_some())
+        {
+            return self.prepare_krea2_conditioning_batch(request, runtime_context);
         }
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             DiffusionError::BackendUnavailable(
@@ -4639,6 +4900,11 @@ struct NativeDiffusionRuntime {
     noise: Box<dyn DiffusionNoiseBackend>,
     encoder: Option<NativeVaeEncoder>,
     decoder: Box<dyn DiffusionImageDecoder>,
+    // Krea2 text conditioning (Qwen3-VL encoder + text_fusion). Present only for
+    // `Krea2Pipeline`; the pipeline drives it to build the DiT conditioning.
+    text_conditioner: Option<Krea2TextConditioner>,
+    // Qwen2 byte-level BPE tokenizer for the Krea2 prompt (from `tokenizer.json`).
+    krea2_tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
 }
 
 impl NativeDiffusionRuntime {
@@ -4647,6 +4913,11 @@ impl NativeDiffusionRuntime {
         metadata: &DiffusionHfqMetadata,
         config: &StableDiffusionConfig,
     ) -> DiffusionResult<Self> {
+        let transformer_family = metadata
+            .components
+            .get("transformer")
+            .map(transformer_denoiser_weight_topology)
+            .map(|topology| topology.family);
         let noise: Box<dyn DiffusionNoiseBackend> =
             if let Some(transformer) = metadata.components.get("transformer") {
                 let topology = transformer_denoiser_weight_topology(transformer);
@@ -4654,12 +4925,105 @@ impl NativeDiffusionRuntime {
             } else {
                 Box::new(NativeUnet2DConditionModel::from_hfq(hfq, &config.unet)?)
             };
+        let is_krea2 = matches!(transformer_family, Some(TransformerDenoiserFamily::Krea2));
+        let text_conditioner = if is_krea2 {
+            Self::load_krea2_conditioner(hfq, metadata, config)?
+        } else {
+            None
+        };
+        let krea2_tokenizer = if is_krea2 {
+            hfq.tensor_data_vec("tokenizer/tokenizer.json")
+                .and_then(|(_, bytes)| String::from_utf8(bytes).ok())
+                .and_then(|json| hipfire_model::tokenizer::Tokenizer::from_hf_json(&json).ok())
+        } else {
+            None
+        };
         Ok(Self {
             kind: DiffusionRuntimeKind::CpuSourceReference,
             noise,
             encoder: NativeVaeEncoder::from_hfq(hfq, &config.vae).ok(),
             decoder: Box::new(NativeVaeDecoder::from_hfq(hfq, &config.vae)?),
+            text_conditioner,
+            krea2_tokenizer,
         })
+    }
+
+    /// Tokenize a prompt and build the Krea2 DiT conditioning `[1, seq, hidden]`.
+    /// `None` for non-Krea2 runtimes or when the tokenizer/conditioner is absent.
+    fn krea2_conditioning_from_prompt(
+        &self,
+        prompt: &str,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Option<CpuTensor>> {
+        let (Some(tokenizer), Some(_)) = (&self.krea2_tokenizer, &self.text_conditioner) else {
+            return Ok(None);
+        };
+        let token_ids = tokenizer.encode(prompt);
+        self.krea2_conditioning_from_token_ids(&token_ids, runtime_context)
+    }
+
+    /// Krea2 conditioning for a tokenized prompt (`None` for non-Krea2 runtimes).
+    /// The pipeline drives this then feeds the result through the transformer
+    /// denoiser's external-conditioning seam. (Generate-path call site is the
+    /// remaining pipeline glue.)
+    #[allow(dead_code)]
+    fn krea2_conditioning_from_token_ids(
+        &self,
+        token_ids: &[u32],
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Option<CpuTensor>> {
+        match &self.text_conditioner {
+            Some(conditioner) => conditioner
+                .conditioning_from_token_ids(token_ids, runtime_context)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Build the Krea2 text conditioner from the artifact: encoder geometry from
+    /// the `text_encoder` (Qwen3-VL `text_config`), the selected layers from
+    /// `model_index.text_encoder_select_layers`, and the fusion head count from
+    /// the transformer config.
+    fn load_krea2_conditioner(
+        hfq: &HfqFile,
+        metadata: &DiffusionHfqMetadata,
+        config: &StableDiffusionConfig,
+    ) -> DiffusionResult<Option<Krea2TextConditioner>> {
+        let text_encoder = component_json(hfq, metadata, "text_encoder")?.unwrap_or_else(|| json!({}));
+        let text_config = text_encoder
+            .get("text_config")
+            .cloned()
+            .unwrap_or_else(|| text_encoder.clone());
+        let heads = json_usize(&text_config, "num_attention_heads").unwrap_or(32);
+        let kv_heads = json_usize(&text_config, "num_key_value_heads").unwrap_or(8);
+        let head_dim = json_usize(&text_config, "head_dim").unwrap_or(128);
+        let rope_theta = text_config
+            .get("rope_parameters")
+            .and_then(|params| json_f32(params, "rope_theta"))
+            .or_else(|| json_f32(&text_config, "rope_theta"))
+            .unwrap_or(5_000_000.0);
+        // select_layers live in model_index.json (stored verbatim on import).
+        let model_index = hfq
+            .tensor_data_vec("diffusers/model_index.json")
+            .and_then(|(_, bytes)| String::from_utf8(bytes).ok())
+            .and_then(|text| parse_json_lenient(&text).ok())
+            .unwrap_or_else(|| json!({}));
+        let select_layers = json_usize_vec(&model_index, "text_encoder_select_layers");
+        let fusion_heads = config
+            .transformer
+            .as_ref()
+            .and_then(|transformer| transformer.text_num_attention_heads)
+            .unwrap_or(20);
+        Krea2TextConditioner::from_hfq(
+            hfq,
+            "text_encoder/tensors/language_model",
+            heads,
+            kv_heads,
+            head_dim,
+            rope_theta,
+            fusion_heads,
+            select_layers,
+        )
     }
 }
 
@@ -4845,6 +5209,10 @@ impl StableDiffusionConfig {
             invert_sigmas: json_bool(&scheduler_json, "invert_sigmas"),
             use_dynamic_shifting: json_bool(&scheduler_json, "use_dynamic_shifting"),
             time_shift_type: json_optional_string(&scheduler_json, "time_shift_type"),
+            base_shift: json_f32(&scheduler_json, "base_shift"),
+            max_shift: json_f32(&scheduler_json, "max_shift"),
+            base_image_seq_len: json_usize(&scheduler_json, "base_image_seq_len"),
+            max_image_seq_len: json_usize(&scheduler_json, "max_image_seq_len"),
         };
         let latent_channels = metadata
             .pipeline
@@ -7954,9 +8322,12 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
         .components
         .get("transformer")
         .map(transformer_denoiser_weight_topology);
-    let uses_supported_transformer = transformer_topology
-        .as_ref()
-        .is_some_and(|topology| matches!(topology.family, TransformerDenoiserFamily::QwenImage));
+    let uses_supported_transformer = transformer_topology.as_ref().is_some_and(|topology| {
+        matches!(
+            topology.family,
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Krea2
+        )
+    });
     if !is_native_unet_pipeline_class(&metadata.pipeline.class_name) && !uses_supported_transformer
     {
         let denoiser = transformer_topology
@@ -7970,13 +8341,19 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
     }
     if uses_supported_transformer {
         if let Some(topology) = transformer_topology.as_ref() {
+            // QwenImage (double-stream) carries text modulation; Krea2 conditions
+            // via the separate text_fusion module instead.
+            let text_conditioning_ok = match topology.family {
+                TransformerDenoiserFamily::Krea2 => topology.has_text_fusion,
+                _ => topology.has_text_modulation,
+            };
             if topology.block_count == 0
                 || !topology.has_input_projection
                 || !topology.has_output_projection
-                || !topology.has_text_modulation
+                || !text_conditioning_ok
             {
                 return Some(format!(
-                    "native transformer runtime requires complete Qwen image transformer weights; artifact has {}",
+                    "native transformer runtime requires complete Qwen image / Krea2 transformer weights; artifact has {}",
                     topology.diagnostic_label()
                 ));
             }
@@ -8184,12 +8561,18 @@ pub fn import_diffusers_to_hfq(
     )?;
     add_component(&source, &mut entries, &mut components, "scheduler", &[])?;
 
-    for name in [
+    // `vocab.json`/`merges.txt` are the CLIP-BPE layout; `tokenizer.json` is the
+    // HF fast-tokenizer bundle (Qwen2 and friends pack vocab+merges into it);
+    // `chat_template.jinja` carries the prompt wrapping some text encoders need.
+    const TOKENIZER_FILES: [&str; 6] = [
         "vocab.json",
         "merges.txt",
+        "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
-    ] {
+        "chat_template.jinja",
+    ];
+    for name in TOKENIZER_FILES {
         let path = source.join("tokenizer").join(name);
         if path.is_file() {
             let entry_name = format!("tokenizer/{name}");
@@ -8197,12 +8580,7 @@ pub fn import_diffusers_to_hfq(
             tokenizer_entries.push(entry_name);
         }
     }
-    for name in [
-        "vocab.json",
-        "merges.txt",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-    ] {
+    for name in TOKENIZER_FILES {
         let path = source.join("tokenizer_2").join(name);
         if path.is_file() {
             let entry_name = format!("tokenizer_2/{name}");
@@ -8210,14 +8588,25 @@ pub fn import_diffusers_to_hfq(
             tokenizer_2_entries.push(entry_name);
         }
     }
+    let (tokenizer_kind, tokenizer_max_length) = tokenizer_descriptor(&source.join("tokenizer"));
+    let (tokenizer_2_kind, tokenizer_2_max_length) =
+        tokenizer_descriptor(&source.join("tokenizer_2"));
 
     let unet_config = read_json(source.join("unet/config.json")).unwrap_or_else(|_| json!({}));
     let transformer_config =
         read_json(source.join("transformer/config.json")).unwrap_or_else(|_| json!({}));
     let vae_config = read_json(source.join("vae/config.json")).unwrap_or_else(|_| json!({}));
-    let latent_channels = unet_config
-        .get("in_channels")
+    // Latent channels = the VAE latent space (what the scheduler denoises).
+    // Prefer the VAE's own channel count: for patchified DiTs the transformer
+    // `in_channels` is the patch-flattened width (e.g. Krea2 64 = z_dim 16 x a
+    // 2x2 patch), and for inpaint UNets `in_channels` folds in mask/masked-latent
+    // concat, so the denoiser input width is not the latent width. Fall back to
+    // the denoiser channels only when the VAE config lacks a latent-channel field.
+    let latent_channels = vae_config
+        .get("latent_channels")
         .and_then(Value::as_u64)
+        .or_else(|| vae_config.get("z_dim").and_then(Value::as_u64))
+        .or_else(|| unet_config.get("in_channels").and_then(Value::as_u64))
         .or_else(|| {
             transformer_config
                 .get("out_channels")
@@ -8228,8 +8617,6 @@ pub fn import_diffusers_to_hfq(
                 .get("in_channels")
                 .and_then(Value::as_u64)
         })
-        .or_else(|| vae_config.get("latent_channels").and_then(Value::as_u64))
-        .or_else(|| vae_config.get("z_dim").and_then(Value::as_u64))
         .map(|value| value as u32);
     let latent_size = unet_config
         .get("sample_size")
@@ -8259,13 +8646,13 @@ pub fn import_diffusers_to_hfq(
             supported_heights: Vec::new(),
         },
         tokenizer: DiffusionTokenizerMetadata {
-            kind: "clip-bpe".to_string(),
-            max_length: Some(77),
+            kind: tokenizer_kind,
+            max_length: tokenizer_max_length,
             entries: tokenizer_entries,
         },
         tokenizer_2: (!tokenizer_2_entries.is_empty()).then_some(DiffusionTokenizerMetadata {
-            kind: "clip-bpe".to_string(),
-            max_length: Some(77),
+            kind: tokenizer_2_kind,
+            max_length: tokenizer_2_max_length,
             entries: tokenizer_2_entries,
         }),
         batch: DiffusionBatchMetadata {
@@ -8897,6 +9284,38 @@ fn split_usize_prefix(value: &str) -> Option<(usize, &str)> {
     Some((head.parse().ok()?, tail))
 }
 
+/// Describe a Diffusers tokenizer directory: `(kind, max_length)`.
+///
+/// `kind` is a coarse family tag the runtime uses to pick a tokenizer backend
+/// (`clip-bpe` for CLIP, `qwen2-bpe` for the Qwen2 fast tokenizer that packs its
+/// vocab/merges into `tokenizer.json`). `max_length` is the tokenizer's declared
+/// `model_max_length` (the conditioning path may cap lower). Missing or
+/// unreadable configs fall back to the CLIP defaults (`clip-bpe`, 77).
+fn tokenizer_descriptor(dir: &Path) -> (String, Option<u32>) {
+    let config = read_json(dir.join("tokenizer_config.json")).unwrap_or_else(|_| json!({}));
+    let class = config
+        .get("tokenizer_class")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = if class.contains("Qwen") {
+        "qwen2-bpe"
+    } else if class.contains("CLIP") || class.is_empty() {
+        "clip-bpe"
+    } else if class.contains("Llama") || class.contains("T5") {
+        "sentencepiece"
+    } else {
+        "bpe"
+    }
+    .to_string();
+    let max_length = config
+        .get("model_max_length")
+        .and_then(Value::as_u64)
+        .filter(|&value| value > 0 && value <= 10_000_000)
+        .map(|value| value as u32)
+        .or(Some(77));
+    (kind, max_length)
+}
+
 fn add_component(
     source: &Path,
     entries: &mut Vec<DiffusionImportEntry>,
@@ -8916,9 +9335,18 @@ fn add_component(
     if config_path.is_file() {
         let entry_name = format!("{component}/{config_name}");
         let config = read_json(&config_path).unwrap_or_else(|_| json!({}));
+        // Diffusers components use `_class_name`; transformers text encoders
+        // (e.g. Qwen3VLModel) declare `architectures: [..]` instead.
         metadata.class_name = config
             .get("_class_name")
             .and_then(Value::as_str)
+            .or_else(|| {
+                config
+                    .get("architectures")
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.first())
+                    .and_then(Value::as_str)
+            })
             .map(str::to_string);
         metadata.config_entry = Some(entry_name.clone());
         push_import_file_entry(entries, &entry_name, QT_DIFFUSION_JSON, config_path)?;

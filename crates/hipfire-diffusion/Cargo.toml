@@ -16,5 +16,7 @@ serde_json = "1"
 hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 hipfire-quantize = { path = "../hipfire-quantize" }
+# Qwen2 byte-level BPE tokenizer (tokenizer.json) for the Krea2 Qwen3-VL encoder.
+hipfire-model = { path = "../hipfire-model" }
 rdna-compute = { path = "../rdna-compute" }
 hip-bridge = { path = "../hip-bridge" }

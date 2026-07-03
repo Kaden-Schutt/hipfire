@@ -260,6 +260,32 @@ removes the Python/torch tooling dependency from the quant pipeline.
 Reference: the validated Tier-2 `scripts/collect_hessian.py` + the existing
 scaffold's documented deliverables.
 
+## MQ4++ Hessian/LDLQ producer track
+
+Treat `mq4++` as a distinct format/recipe from `mq4+`, not merely as "MQ4+
+with a better offline rounding pass". The first implementation should try the
+cheap path: reuse the existing Hessian collection, ordering, AWQ scale rebasing,
+and rotated-basis alignment to add an affine-MQ LDLQ packer that still emits
+plain `MQ4G256` blocks (`scale`, `zero/min`, packed nibbles). If that is not
+enough quality, `mq4++` is allowed to carry an extra sidecar or correction
+contract; do that explicitly under the `mq4++` token instead of pretending it is
+runtime-identical to `mq4+`.
+
+Implementation sketch:
+- Add an `ldlq::mq4_ldlq_pack` path that mirrors the OQ4/OQ8 LDLQ structure but
+  projects onto MQ4's affine lattice `zero + scale*q`, `q in [0, 15]`.
+- Wire CLI/token parsing so `mq4+` remains the same-layout clip/AWQ recipe, while
+  `mq4++` selects the Hessian/LDLQ producer path and can request/emit any new
+  sidecar metadata needed by that contract.
+- Compose AWQ the same way the OQ LDLQ path does: pre-scale weights, rebase the
+  Hessian with `diag(1/s) H diag(1/s)`, and keep runtime inverse-scale handling
+  explicit.
+- If a sidecar is added, implement loader/runtime ownership, kernel dispatch,
+  artifact naming, and perf gates together. Base `mq4+` must remain the
+  same-kernel fallback.
+- Acceptance: compare `mq4`, `mq4+`, and `mq4++` on KLD/PPL and Atlas runtime
+  rows before making any quality or admission claim.
+
 ## GPU (HIP) trellis-encode kernel for QTIP quantization
 
 The QTIP encode (`qtip::beam_encode_group_bits` + the LDLQ block loop in

@@ -52,7 +52,10 @@
     }
 
     #[test]
-    fn native_source_runtime_support_rejects_transformer_pipeline_classes() {
+    fn native_source_runtime_support_rejects_incomplete_transformer_weights() {
+        // A Krea2 pipeline with no transformer weights is a recognized family but
+        // an incomplete artifact, so it is rejected as incomplete (not as an
+        // unsupported family — Krea2/QwenImage transformers are supported).
         let mut metadata = minimal_metadata();
         metadata.pipeline.class_name = "Krea2Pipeline".to_string();
         metadata.components.remove("unet");
@@ -68,9 +71,7 @@
 
         let error = native_runtime_metadata_support_error(&metadata).unwrap();
 
-        assert!(error.contains("Stable Diffusion UNet-family"));
-        assert!(error.contains("Krea2Pipeline"));
-        assert!(error.contains("transformer denoiser"));
+        assert!(error.contains("requires complete"));
         assert!(error.contains("krea2-mmdit"));
     }
 
@@ -297,6 +298,68 @@
             )
             .unwrap();
         assert_eq!(output.data, vec![7.25, 2.25, 6.0, 7.5]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_transformer_krea_block_zero_gate_preserves_residual() {
+        // A Krea2 single-stream block with an all-zero scale_shift_table and zero
+        // time modulation drives every adaLN gate (pregate/postgate) to zero, so
+        // the gated residuals collapse to the identity regardless of the
+        // attention / feed-forward weights. This exercises the full Krea block
+        // forward (RMSNorm -> adaLN -> GQA+gate attention -> SwiGLU) and asserts
+        // the residual structure is wired correctly.
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-block-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-block.hfq");
+        let zeros4 = [0.0f32; 4];
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                // hidden = 2, heads = 1, head_dim = 2, ffn = 2.
+                f32_mem_tensor(
+                    "transformer/tensors/transformer_blocks.0.scale_shift_table",
+                    &[6, 2],
+                    &[0.0f32; 12],
+                ),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.norm1.weight", &[2], &[1.0, 1.0]),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.norm2.weight", &[2], &[1.0, 1.0]),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.attn.to_q.weight", &[2, 2], &zeros4),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.attn.to_k.weight", &[2, 2], &zeros4),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.attn.to_v.weight", &[2, 2], &zeros4),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.attn.to_gate.weight", &[2, 2], &zeros4),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.attn.to_out.0.weight", &[2, 2], &zeros4),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.ff.gate.weight", &[2, 2], &zeros4),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.ff.up.weight", &[2, 2], &zeros4),
+                f32_mem_tensor("transformer/tensors/transformer_blocks.0.ff.down.weight", &[2, 2], &zeros4),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let block =
+            NativeTransformerBlock::from_hfq(&hfq, TransformerDenoiserFamily::Krea2, 0, 1).unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+        // Joint [text; image] sequence of 3 tokens, hidden width 2.
+        let hidden = CpuTensor {
+            shape: vec![1, 3, 2],
+            data: vec![1.0, 2.0, -3.0, 0.5, 4.0, -1.0],
+        };
+        let time_modulation = CpuTensor {
+            shape: vec![1, 12],
+            data: vec![0.0f32; 12],
+        };
+        let output = block
+            .forward_krea_with_runtime_context(&hidden, &time_modulation, None, &mut runtime_context)
+            .unwrap();
+        assert_eq!(output.shape, hidden.shape);
+        assert_eq!(output.data, hidden.data);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1944,13 +2007,15 @@
             config.scheduler.time_shift_type.as_deref(),
             Some("exponential")
         );
+        // Krea2 is a supported transformer family, but this import carries no
+        // transformer weights, so it is rejected as an incomplete artifact.
         assert!(!inspection.runtime_support.supported);
         assert!(inspection
             .runtime_support
             .reason
             .as_deref()
             .unwrap()
-            .contains("transformer denoiser"));
+            .contains("requires complete"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -8120,6 +8185,8 @@
                 noise: Box::new(TestNoiseBackend),
                 encoder: None,
                 decoder: Box::new(TestImageDecoder),
+                text_conditioner: None,
+                krea2_tokenizer: None,
             }),
             native_runtime_error: None,
         };
@@ -8657,6 +8724,8 @@
                 }),
                 encoder: None,
                 decoder: Box::new(TestImageDecoder),
+                text_conditioner: None,
+                krea2_tokenizer: None,
             }),
             native_runtime_error: None,
         };
@@ -10355,13 +10424,19 @@
         let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
         let decoder = NativeVaeDecoder::from_hfq(&hfq, &config.vae).unwrap();
 
-        assert_eq!(decoder.conv_in.weight.shape, vec![512, 4, 3, 3]);
+        assert_eq!(
+            decoder.conv_in.as_ref().unwrap().weight.shape,
+            vec![512, 4, 3, 3]
+        );
         assert_eq!(decoder.up_blocks.len(), 4);
         assert!(decoder.up_blocks[0].upsampler.is_some());
         assert!(decoder.up_blocks[1].upsampler.is_some());
         assert!(decoder.up_blocks[2].upsampler.is_some());
         assert!(decoder.up_blocks[3].upsampler.is_none());
-        assert_eq!(decoder.conv_out.weight.shape, vec![3, 128, 3, 3]);
+        assert_eq!(
+            decoder.conv_out.as_ref().unwrap().weight.shape,
+            vec![3, 128, 3, 3]
+        );
     }
 
     #[test]
@@ -12143,6 +12218,8 @@
                 noise: Box::new(TestNoiseBackend),
                 encoder: None,
                 decoder,
+                text_conditioner: None,
+                krea2_tokenizer: None,
             }),
             native_runtime_error: None,
         }
@@ -12221,6 +12298,8 @@
                 }),
                 encoder: Some(encoder),
                 decoder,
+                text_conditioner: None,
+                krea2_tokenizer: None,
             }),
             native_runtime_error: None,
         };
@@ -12316,6 +12395,427 @@
             ),
             f32_mem_tensor(&format!("{block}.txt_mlp.net.2.bias"), &[2], &[0.0; 2]),
         ]
+    }
+
+    fn krea_tiny_transformer_denoiser_tensors() -> Vec<HfqMemTensor> {
+        let block = "transformer/tensors/transformer_blocks.0";
+        let attn = format!("{block}.attn");
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        vec![
+            f32_mem_tensor(
+                "transformer/tensors/img_in.weight",
+                &[2, 4],
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            ),
+            f32_mem_tensor("transformer/tensors/img_in.bias", &[2], &[0.0, 0.0]),
+            f32_mem_tensor(
+                "transformer/tensors/final_layer.linear.weight",
+                &[4, 2],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0],
+            ),
+            f32_mem_tensor("transformer/tensors/final_layer.linear.bias", &[4], &[0.0; 4]),
+            f32_mem_tensor("transformer/tensors/final_layer.norm.weight", &[2], &[1.0, 1.0]),
+            f32_mem_tensor(
+                "transformer/tensors/final_layer.scale_shift_table",
+                &[2, 2],
+                &[0.0; 4],
+            ),
+            f32_mem_tensor("transformer/tensors/time_embed.linear_1.weight", &[2, 2], &identity2),
+            f32_mem_tensor("transformer/tensors/time_embed.linear_1.bias", &[2], &[0.0; 2]),
+            f32_mem_tensor("transformer/tensors/time_embed.linear_2.weight", &[2, 2], &identity2),
+            f32_mem_tensor("transformer/tensors/time_embed.linear_2.bias", &[2], &[0.0; 2]),
+            // Zero time modulation + zero block scale_shift_table => all adaLN
+            // gates are zero => each block is the identity (stable smoke test).
+            f32_mem_tensor("transformer/tensors/time_mod_proj.weight", &[12, 2], &[0.0; 24]),
+            f32_mem_tensor("transformer/tensors/time_mod_proj.bias", &[12], &[0.0; 12]),
+            f32_mem_tensor("transformer/tensors/txt_in.weight", &[2, 2], &identity2),
+            f32_mem_tensor("transformer/tensors/txt_in.bias", &[2], &[0.0; 2]),
+            f32_mem_tensor(&format!("{block}.scale_shift_table"), &[6, 2], &[0.0; 12]),
+            f32_mem_tensor(&format!("{block}.norm1.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{block}.norm2.weight"), &[2], &[1.0, 1.0]),
+            f32_mem_tensor(&format!("{attn}.to_q.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_k.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_v.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{attn}.to_gate.weight"), &[2, 2], &[0.0; 4]),
+            f32_mem_tensor(&format!("{attn}.to_out.0.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{block}.ff.gate.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{block}.ff.up.weight"), &[2, 2], &identity2),
+            f32_mem_tensor(&format!("{block}.ff.down.weight"), &[2, 2], &identity2),
+        ]
+    }
+
+    #[test]
+    fn native_transformer_denoiser_runs_krea_tiny_single_block() {
+        // Full Krea2 single-stream denoiser assembly + forward on a tiny fixture:
+        // img_in -> txt_in -> concat[text;image] -> block(forward_krea) -> split
+        // image -> final adaLN -> latents. Zero-gate blocks keep it stable; we
+        // assert the round-trip shape and that every output is finite.
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-transformer-denoiser-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-transformer-denoiser.hfq");
+        let tensors = krea_tiny_transformer_denoiser_tensors();
+        let weight_entries = tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let mut config = tiny_runtime_config();
+        config.latent_channels = 1;
+        config.transformer = Some(TransformerDenoiserConfig {
+            class_name: "Krea2Transformer2DModel".into(),
+            in_channels: Some(4),
+            out_channels: Some(1),
+            patch_size: Some(2),
+            num_attention_heads: Some(1),
+            ..TransformerDenoiserConfig::default()
+        });
+        let topology = transformer_denoiser_weight_topology(&DiffusionComponentMetadata {
+            class_name: Some("Krea2Transformer2DModel".to_string()),
+            weight_entries,
+            ..DiffusionComponentMetadata::default()
+        });
+        let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
+        let latents = LatentBatch {
+            batch: 1,
+            channels: 1,
+            height: 2,
+            width: 2,
+            data: vec![1.0, -1.0, 0.5, -0.5],
+        };
+        let text_hidden = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![0.5, -0.5],
+        };
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+        let output = denoiser
+            .forward_krea_with_runtime_context(
+                &latents,
+                &[0.0],
+                &text_hidden,
+                None,
+                &mut runtime_context,
+            )
+            .unwrap();
+        assert_eq!(output.batch, 1);
+        assert_eq!(output.channels, 1);
+        assert_eq!(output.height, 2);
+        assert_eq!(output.width, 2);
+        assert_eq!(output.data.len(), 4);
+        assert!(
+            output.data.iter().all(|value| value.is_finite()),
+            "krea denoiser produced non-finite latents: {:?}",
+            output.data
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_text_fusion_projector_collapses_encoder_layers() {
+        // With zero attention output projections and zero SwiGLU down weights,
+        // each layerwise/refiner block is the identity, so text_fusion reduces to
+        // the projector's weighted sum over the selected encoder layers.
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-krea-text-fusion-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-text-fusion.hfq");
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        let zeros4 = [0.0f32; 4];
+        let identity_block = |prefix: &str| {
+            vec![
+                f32_mem_tensor(&format!("{prefix}.norm1.weight"), &[2], &[1.0, 1.0]),
+                f32_mem_tensor(&format!("{prefix}.norm2.weight"), &[2], &[1.0, 1.0]),
+                f32_mem_tensor(&format!("{prefix}.attn.to_q.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.attn.to_k.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.attn.to_v.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.attn.to_gate.weight"), &[2, 2], &zeros4),
+                f32_mem_tensor(&format!("{prefix}.attn.to_out.0.weight"), &[2, 2], &zeros4),
+                f32_mem_tensor(&format!("{prefix}.ff.gate.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.ff.up.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.ff.down.weight"), &[2, 2], &zeros4),
+            ]
+        };
+        let mut tensors = vec![f32_mem_tensor(
+            "transformer/tensors/text_fusion.projector.weight",
+            &[1, 2],
+            &[0.5, 0.5],
+        )];
+        tensors.extend(identity_block("transformer/tensors/text_fusion.layerwise_blocks.0"));
+        tensors.extend(identity_block("transformer/tensors/text_fusion.refiner_blocks.0"));
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let fusion = NativeTextFusion::from_hfq(&hfq, 1).unwrap().unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+        // [batch=1, seq=1, layers=2, dim=2]: layer0 = [1,2], layer1 = [3,4].
+        let layer_stack = CpuTensor {
+            shape: vec![1, 1, 2, 2],
+            data: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let fused = fusion
+            .forward_with_runtime_context(&layer_stack, &mut runtime_context)
+            .unwrap();
+        assert_eq!(fused.shape, vec![1, 1, 2]);
+        // 0.5 * [1,2] + 0.5 * [3,4] = [2,3].
+        assert_eq!(fused.data, vec![2.0, 3.0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wan_resnet_block_zero_conv_preserves_residual() {
+        // conv2 weight/bias zero => the block contributes zero => output == input
+        // (same in/out channels, no shortcut). Exercises the Wan resnet path:
+        // RMSNorm -> SiLU -> causal conv -> RMSNorm -> SiLU -> causal conv -> add.
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-wan-resnet-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wan-resnet.hfq");
+        let prefix = "decoder.mid_block.resnets.0";
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.norm1.gamma"), &[1, 1, 1, 1], &[1.0]),
+                f32_mem_tensor(&format!("{prefix}.conv1.weight"), &[1, 1, 3, 3, 3], &[0.0; 27]),
+                f32_mem_tensor(&format!("{prefix}.conv1.bias"), &[1], &[0.0]),
+                f32_mem_tensor(&format!("{prefix}.norm2.gamma"), &[1, 1, 1, 1], &[1.0]),
+                f32_mem_tensor(&format!("{prefix}.conv2.weight"), &[1, 1, 3, 3, 3], &[0.0; 27]),
+                f32_mem_tensor(&format!("{prefix}.conv2.bias"), &[1], &[0.0]),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let block = WanResnetBlock::from_hfq(&hfq, prefix).unwrap();
+        let input = CpuTensor {
+            shape: vec![1, 1, 2, 2],
+            data: vec![1.0, -2.0, 3.0, 0.5],
+        };
+        let out = block.forward(&input).unwrap();
+        assert_eq!(out.shape, input.shape);
+        assert_eq!(out.data, input.data);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wan_mid_attention_zero_proj_preserves_residual() {
+        // A zero output projection makes the attention contribution zero, so the
+        // block is the identity. Exercises RMSNorm -> 1x1 qkv -> spatial softmax
+        // attention -> 1x1 proj -> residual add.
+        let dir = std::env::temp_dir()
+            .join(format!("hipfire-wan-mid-attn-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wan-mid-attn.hfq");
+        let prefix = "decoder.mid_block.attentions.0";
+        write_hfqm_package_mem(
+            &path,
+            HFQ_ARCH_DIFFUSION,
+            "{}",
+            &[
+                f32_mem_tensor(&format!("{prefix}.norm.gamma"), &[1, 1, 1], &[1.0]),
+                f32_mem_tensor(&format!("{prefix}.to_qkv.weight"), &[3, 1, 1, 1], &[1.0, 1.0, 1.0]),
+                f32_mem_tensor(&format!("{prefix}.to_qkv.bias"), &[3], &[0.0, 0.0, 0.0]),
+                f32_mem_tensor(&format!("{prefix}.proj.weight"), &[1, 1, 1, 1], &[0.0]),
+                f32_mem_tensor(&format!("{prefix}.proj.bias"), &[1], &[0.0]),
+            ],
+        )
+        .unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let attn = WanMidAttention::from_hfq(&hfq, prefix).unwrap();
+        let input = CpuTensor {
+            shape: vec![1, 1, 2, 2],
+            data: vec![1.0, -2.0, 3.0, 0.5],
+        };
+        let out = attn.forward(&input).unwrap();
+        assert_eq!(out.shape, input.shape);
+        assert_eq!(out.data, input.data);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wan_image_decoder_assembles_and_runs_end_to_end() {
+        // Minimal 1-channel decoder (conv_in -> mid{resnet,attn,resnet} -> one
+        // up_block{resnet, upsampler} -> norm_out -> conv_out). All conv weights
+        // are zero, so zeros propagate through the residual/attention/upsample
+        // path and conv_out emits its per-channel bias -> deterministic output.
+        let dir = std::env::temp_dir()
+            .join(format!("hipfire-wan-decoder-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wan-decoder.hfq");
+        let conv3d = |name: &str| f32_mem_tensor(name, &[1, 1, 3, 3, 3], &[0.0; 27]);
+        let resnet = |prefix: &str| {
+            vec![
+                f32_mem_tensor(&format!("{prefix}.norm1.gamma"), &[1, 1, 1, 1], &[1.0]),
+                conv3d(&format!("{prefix}.conv1.weight")),
+                f32_mem_tensor(&format!("{prefix}.conv1.bias"), &[1], &[0.0]),
+                f32_mem_tensor(&format!("{prefix}.norm2.gamma"), &[1, 1, 1, 1], &[1.0]),
+                conv3d(&format!("{prefix}.conv2.weight")),
+                f32_mem_tensor(&format!("{prefix}.conv2.bias"), &[1], &[0.0]),
+            ]
+        };
+        let mut tensors = vec![
+            conv3d("decoder.conv_in.weight"),
+            f32_mem_tensor("decoder.conv_in.bias", &[1], &[0.0]),
+            f32_mem_tensor("decoder.mid_block.attentions.0.norm.gamma", &[1, 1, 1], &[1.0]),
+            f32_mem_tensor(
+                "decoder.mid_block.attentions.0.to_qkv.weight",
+                &[3, 1, 1, 1],
+                &[0.0, 0.0, 0.0],
+            ),
+            f32_mem_tensor("decoder.mid_block.attentions.0.to_qkv.bias", &[3], &[0.0; 3]),
+            f32_mem_tensor("decoder.mid_block.attentions.0.proj.weight", &[1, 1, 1, 1], &[0.0]),
+            f32_mem_tensor("decoder.mid_block.attentions.0.proj.bias", &[1], &[0.0]),
+            f32_mem_tensor("decoder.up_blocks.0.upsamplers.0.resample.1.weight", &[1, 1, 3, 3], &[0.0; 9]),
+            f32_mem_tensor("decoder.up_blocks.0.upsamplers.0.resample.1.bias", &[1], &[0.0]),
+            f32_mem_tensor("decoder.norm_out.gamma", &[1, 1, 1, 1], &[1.0]),
+            f32_mem_tensor("decoder.conv_out.weight", &[3, 1, 3, 3, 3], &[0.0; 81]),
+            f32_mem_tensor("decoder.conv_out.bias", &[3], &[0.1, 0.2, 0.3]),
+        ];
+        tensors.extend(resnet("decoder.mid_block.resnets.0"));
+        tensors.extend(resnet("decoder.mid_block.resnets.1"));
+        tensors.extend(resnet("decoder.up_blocks.0.resnets.0"));
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let decoder = WanImageDecoder::from_hfq(&hfq, "decoder").unwrap().unwrap();
+        let latent = CpuTensor {
+            shape: vec![1, 1, 2, 2],
+            data: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let out = decoder.decode(&latent).unwrap();
+        // one up_block upsamples 2x2 -> 4x4; conv_out has 3 channels.
+        assert_eq!(out.shape, vec![1, 3, 4, 4]);
+        assert!(out.data.iter().all(|v| v.is_finite()));
+        // Each channel is filled with its conv_out bias.
+        for (channel, bias) in [0.1f32, 0.2, 0.3].iter().enumerate() {
+            for pos in 0..16 {
+                assert!((out.data[channel * 16 + pos] - bias).abs() < 1e-6);
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_text_fusion_encode_from_layers_stacks_and_fuses() {
+        // Same identity-block fixture as the projector test, but driven through
+        // the encoder adapter with two separate per-layer hidden states. The
+        // stack + projector([0.5,0.5]) must give 0.5*layer0 + 0.5*layer1.
+        let dir = std::env::temp_dir()
+            .join(format!("hipfire-krea-text-fusion-adapter-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("krea-text-fusion-adapter.hfq");
+        let identity2 = [1.0, 0.0, 0.0, 1.0];
+        let zeros4 = [0.0f32; 4];
+        let identity_block = |prefix: &str| {
+            vec![
+                f32_mem_tensor(&format!("{prefix}.norm1.weight"), &[2], &[1.0, 1.0]),
+                f32_mem_tensor(&format!("{prefix}.norm2.weight"), &[2], &[1.0, 1.0]),
+                f32_mem_tensor(&format!("{prefix}.attn.to_q.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.attn.to_k.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.attn.to_v.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.attn.to_gate.weight"), &[2, 2], &zeros4),
+                f32_mem_tensor(&format!("{prefix}.attn.to_out.0.weight"), &[2, 2], &zeros4),
+                f32_mem_tensor(&format!("{prefix}.ff.gate.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.ff.up.weight"), &[2, 2], &identity2),
+                f32_mem_tensor(&format!("{prefix}.ff.down.weight"), &[2, 2], &zeros4),
+            ]
+        };
+        let mut tensors = vec![f32_mem_tensor(
+            "transformer/tensors/text_fusion.projector.weight",
+            &[1, 2],
+            &[0.5, 0.5],
+        )];
+        tensors.extend(identity_block("transformer/tensors/text_fusion.layerwise_blocks.0"));
+        tensors.extend(identity_block("transformer/tensors/text_fusion.refiner_blocks.0"));
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let fusion = NativeTextFusion::from_hfq(&hfq, 1).unwrap().unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+        let layer0 = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![1.0, 2.0],
+        };
+        let layer1 = CpuTensor {
+            shape: vec![1, 1, 2],
+            data: vec![3.0, 4.0],
+        };
+        let fused = fusion
+            .encode_from_layers_with_runtime_context(&[layer0, layer1], &mut runtime_context)
+            .unwrap();
+        assert_eq!(fused.shape, vec![1, 1, 2]);
+        assert_eq!(fused.data, vec![2.0, 3.0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_qwen3_text_encoder_runs_and_captures_selected_layers() {
+        // Tiny 2-layer Qwen3 encoder (hidden 4, heads 2, kv_heads 1, head_dim 2).
+        // Zero o_proj and mlp.down_proj make every layer the identity, so the
+        // captured hidden states equal the token embeddings. Exercises embed ->
+        // RMSNorm -> GQA(QK-norm, RoPE, causal) -> SwiGLU -> residual + capture.
+        let dir = std::env::temp_dir()
+            .join(format!("hipfire-qwen3-encoder-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qwen3-encoder.hfq");
+        let ident4 = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let layer = |idx: usize| {
+            let p = format!("language_model.layers.{idx}");
+            vec![
+                f32_mem_tensor(&format!("{p}.input_layernorm.weight"), &[4], &[1.0; 4]),
+                f32_mem_tensor(&format!("{p}.self_attn.q_proj.weight"), &[4, 4], &ident4),
+                f32_mem_tensor(&format!("{p}.self_attn.k_proj.weight"), &[2, 4], &[0.0; 8]),
+                f32_mem_tensor(&format!("{p}.self_attn.v_proj.weight"), &[2, 4], &[0.0; 8]),
+                f32_mem_tensor(&format!("{p}.self_attn.q_norm.weight"), &[2], &[1.0, 1.0]),
+                f32_mem_tensor(&format!("{p}.self_attn.k_norm.weight"), &[2], &[1.0, 1.0]),
+                f32_mem_tensor(&format!("{p}.self_attn.o_proj.weight"), &[4, 4], &[0.0; 16]),
+                f32_mem_tensor(&format!("{p}.post_attention_layernorm.weight"), &[4], &[1.0; 4]),
+                f32_mem_tensor(&format!("{p}.mlp.gate_proj.weight"), &[4, 4], &ident4),
+                f32_mem_tensor(&format!("{p}.mlp.up_proj.weight"), &[4, 4], &ident4),
+                f32_mem_tensor(&format!("{p}.mlp.down_proj.weight"), &[4, 4], &[0.0; 16]),
+            ]
+        };
+        let mut tensors = vec![f32_mem_tensor(
+            "language_model.embed_tokens.weight",
+            &[8, 4],
+            &[
+                0.0, 0.0, 0.0, 0.0, // token 0
+                1.0, 2.0, 3.0, 4.0, // token 1
+                5.0, 6.0, 7.0, 8.0, // token 2
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
+            ],
+        )];
+        tensors.extend(layer(0));
+        tensors.extend(layer(1));
+        write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open_index_only(&path).unwrap();
+        let encoder =
+            NativeQwen3TextEncoder::from_hfq(&hfq, "language_model", 2, 1, 2, 5_000_000.0)
+                .unwrap()
+                .unwrap();
+        let mut runtime_context =
+            DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+        let captured = encoder
+            .encode(&[1, 2], &[1, 2], &mut runtime_context)
+            .unwrap();
+        assert_eq!(captured.len(), 2);
+        for hidden in &captured {
+            assert_eq!(hidden.shape, vec![1, 2, 4]);
+            assert_eq!(hidden.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn assert_f32_close(actual: &[f32], expected: &[f32], tolerance: f32) {
