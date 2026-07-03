@@ -34,7 +34,7 @@ def main() -> int:
     }
     # Order by layer index parsed from `model.layers.{i}.mlp.down_proj.weight`.
     def layer_of(name: str) -> int:
-        return int(name.split("model.layers.")[1].split(".")[0])
+        return int(name.split("model.layers.")[1].split(".", maxsplit=1)[0])
 
     names = sorted(down, key=layer_of)
     n_layers = len(names)
