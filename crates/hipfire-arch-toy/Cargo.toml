@@ -12,6 +12,7 @@ description = "Reference template for new arch crates: minimum-viable Architectu
 # "Crate topology" for where it fits.
 
 [dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

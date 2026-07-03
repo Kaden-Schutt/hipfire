@@ -62,6 +62,27 @@ impl ToyWeights {
             embeddings: vec![0.0; cfg.vocab_size * cfg.dim],
         })
     }
+
+    /// Deterministic toy weights seeded from `seed` — a
+    /// `generate_toy_model_from_seed`-style helper CO-LOCATED with the arch and
+    /// exposed through the [`ToyModel`] capability, rather than scattered in a
+    /// test harness. A real arch synthesizes a tiny but structurally-valid
+    /// checkpoint here (correct tensor names/shapes) so CI can round-trip it.
+    ///
+    /// [`ToyModel`]: hipfire_arch_api::ToyModel
+    pub fn from_seed(cfg: &ToyConfig, seed: u64) -> Self {
+        let mut s = seed | 1;
+        let mut lcg = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // ~uniform in [-1, 1)
+            ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+        };
+        ToyWeights {
+            embeddings: (0..cfg.vocab_size * cfg.dim).map(|_| lcg()).collect(),
+        }
+    }
 }
 
 /// Toy state: a bare token counter. A real arch's state holds GPU

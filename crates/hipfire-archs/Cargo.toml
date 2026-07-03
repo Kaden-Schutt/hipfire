@@ -1,0 +1,15 @@
+[package]
+name = "hipfire-archs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aggregation crate: depends on every arch crate so their register_arch! link-time registrations are all present, and exposes the process-wide ArchRegistry."
+
+# The daemon / quantizer link THIS crate and call `registry()`. Adding support for
+# a new architecture is a one-line change here (add its crate to [dependencies] and
+# to the force-link list in lib.rs) plus the arch crate itself — no daemon edits,
+# and the completeness gate fails if a catalog id has no registered arch.
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-arch-toy = { path = "../hipfire-arch-toy" }

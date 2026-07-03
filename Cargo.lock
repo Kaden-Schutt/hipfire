@@ -1382,6 +1382,7 @@ name = "hipfire-arch-toy"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-api",
  "hipfire-runtime",
  "rdna-compute",
 ]
@@ -1399,6 +1400,14 @@ dependencies = [
  "rdna-compute",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-archs"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+ "hipfire-arch-toy",
 ]
 
 [[package]]

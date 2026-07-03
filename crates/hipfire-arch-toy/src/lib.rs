@@ -15,6 +15,8 @@
 //! production reference, read `crates/hipfire-arch-qwen35/`.
 
 pub mod arch;
+pub mod caps;
 pub mod toy_model;
 
 pub use arch::Toy;
+pub use caps::TOY_ARCH_ID;
