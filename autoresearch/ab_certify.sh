@@ -23,7 +23,11 @@ REPO=~/hipfire; cd "$REPO" || exit 1
 export PATH=$HOME/.bun/bin:$PATH
 KSRC="kernels/src/${KERNEL}.hip"
 PL="/sys/class/drm/card${CARD}/device/power_dpm_force_performance_level"
-NOISE="${NOISE:-3.0}"; ROUNDS="${ROUNDS:-3}"; PERF="${PERF:-auto}"; CLK_TOL="${CLK_TOL:-4.0}"
+# NOISE = anti-churn floor only (acceptance is by rank SEPARATION, not this band).
+# A cleanly-separated win/loss above this tiny floor is taken/rejected regardless
+# of magnitude — the compound-interest engine (take every real small win).
+NOISE="${NOISE:-0.3}"; ROUNDS="${ROUNDS:-4}"; PERF="${PERF:-auto}"; CLK_TOL="${CLK_TOL:-4.0}"
+PROFILE="${PROFILE:-0}"
 LEDGER="${LEDGER:-$REPO/autoresearch/ledger/${ARCH}_${KERNEL}.jsonl}"
 BASE_BIN=/tmp/ab_daemon_base_$$; VAR_BIN=/tmp/ab_daemon_var_$$
 DBIN=target/release/examples/daemon
@@ -79,12 +83,37 @@ for r in $(seq 1 "$ROUNDS"); do
   read d c k < <(measure "$BASE_BIN" "");    BASE+=("$d"); BCLK+=("$k"); [ "$c" = BAD ] && BC=BAD
   read d c k < <(measure "$VAR_BIN" "$BENV"); VAR+=("$d");  VCLK+=("$k"); [ "$c" = BAD ] && VC=BAD
 done
+# --- PHASE 2.5: BOD-v2 roofline of the TARGET kernel (mechanistic: did occ/L2/wall
+#     actually move?) + top-kernel wall% diff (kernel-level no-clobber / knock-on) ---
+PROF_JSON="{}"
+if [ "$PROFILE" = 1 ] && [ -f /tmp/oracle_profile.sh ]; then
+  prof(){ cp "$1" "$DBIN"; bash /tmp/oracle_profile.sh "$ARCH" "$DEV" "$CARD" "$MODEL" 24 2>/dev/null | tail -1; }
+  BPROF=$(prof "$BASE_BIN"); VPROF=$(prof "$VAR_BIN"); set_perf "$PERF"
+  PROF_JSON=$(python3 - "$KERNEL" "$BPROF" "$VPROF" <<'PY'
+import json,sys
+kern=sys.argv[1]
+try: b=json.loads(sys.argv[2]); v=json.loads(sys.argv[3])
+except Exception: print("{}"); raise SystemExit
+def row(p,k):
+    for r in p.get("rows",[]):
+        if r["kernel"].startswith(k): return r
+def keep(r): return {x:r.get(x) for x in("wall_pct","l2_hit_pct","occ","mem_busy","roofline","vgpr","accum_vgpr","sgpr","lds","scratch")} if r else None
+bm={r["kernel"]:r.get("wall_pct",0) for r in b.get("rows",[])[:8]}
+vm={r["kernel"]:r.get("wall_pct",0) for r in v.get("rows",[])[:8]}
+moved=[{"kernel":k[:40],"base_wall":bm.get(k),"var_wall":vm.get(k)} for k in set(bm)|set(vm)
+       if abs(vm.get(k,0)-bm.get(k,0))>2.0 and not k.startswith(kern)]
+print(json.dumps({"target":kern,"target_base":keep(row(b,kern)),"target_var":keep(row(v,kern)),"knock_on":moved}))
+PY
+)
+fi
 rm -f "$BASE_BIN" "$VAR_BIN"
-# --- PHASE 3: certify (clock-consistency + coherence + noise) + ledger ---
-python3 - "$ARCH" "$KERNEL" "$LABEL" "$NOISE" "$LEDGER" "$BENV" "$BSWAP" "$BC" "$VC" "$CLK_TOL" "$PERF" "${BASE[*]}" "${VAR[*]}" "${BCLK[*]}" "${VCLK[*]}" <<'PY'
+# --- PHASE 3: certify (separation + coherence + clock) + roofline + ledger ---
+python3 - "$ARCH" "$KERNEL" "$LABEL" "$NOISE" "$LEDGER" "$BENV" "$BSWAP" "$BC" "$VC" "$CLK_TOL" "$PERF" "$PROF_JSON" "${BASE[*]}" "${VAR[*]}" "${BCLK[*]}" "${VCLK[*]}" <<'PY'
 import sys,json,os,statistics as st
-(arch,kern,label,noise,ledger,benv,bswap,bc,vc,ctol,perf,bs,vs,bk,vk)=sys.argv[1:16]
+(arch,kern,label,noise,ledger,benv,bswap,bc,vc,ctol,perf,prof,bs,vs,bk,vk)=sys.argv[1:17]
 noise=float(noise); ctol=float(ctol)
+try: roofline=json.loads(prof) if prof and prof!="{}" else None
+except Exception: roofline=None
 base=[float(x) for x in bs.split()]; var=[float(x) for x in vs.split()]
 bclk=[int(x) for x in bk.split() if x]; vclk=[int(x) for x in vk.split() if x]
 bmed=st.median(base); vmed=st.median(var)
@@ -92,13 +121,22 @@ bck=int(st.median(bclk)) if bclk else 0; vck=int(st.median(vclk)) if vclk else 0
 delta=100*(vmed-bmed)/bmed if bmed else 0.0
 clk_captured = bool(bck and vck)
 clk_mismatch = bool(clk_captured and abs(bck-vck)/max(bck,vck)*100 >= ctol)  # only a VERIFIED disagreement voids
+# ACCEPTANCE = rank SEPARATION, not a magnitude band. Clean separation (all var
+# runs above/below all base runs) is a confident win/loss at ANY magnitude —
+# take every real small win (compound), reject every real small loss, discard
+# only genuine overlap. `noise` is now just a tiny anti-churn floor (skip trivial
+# deltas whose rebuild cost isn't worth banking), NOT a discard band.
+sep_win  = min(var) > max(base)
+sep_loss = max(var) < min(base)
+gated = (vc=="OK" and bc=="OK" and not clk_mismatch)
+WIN  = bool(sep_win  and delta >  noise and gated)   # noise here = MINWIN churn floor (default small)
+LOSS = bool(sep_loss and delta < -noise and gated)
 rec={"arch":arch,"kernel":kern,"label":label,"benv":benv,"bswap":os.path.basename(bswap) if bswap else "","perf_level":perf,
      "base_runs":base,"var_runs":var,"base_decode":round(bmed,2),"var_decode":round(vmed,2),
      "base_sclk":bck,"var_sclk":vck,"clock_matched":(None if not clk_captured else not clk_mismatch),
-     "base_coh":bc,"var_coh":vc,"delta_pct":round(delta,2),"noise_band_pct":noise,
-     "WIN":bool(delta>noise and vc=="OK" and bc=="OK" and not clk_mismatch),
-     "within_noise":bool(abs(delta)<noise and vc=="OK" and bc=="OK"),
-     "VOID":bool(clk_mismatch or bc=="BAD" or vc=="BAD")}
+     "base_coh":bc,"var_coh":vc,"delta_pct":round(delta,2),"min_win_pct":noise,"separated":bool(sep_win or sep_loss),
+     "verdict":("WIN" if WIN else "LOSS" if LOSS else "NOISE"),"WIN":WIN,"LOSS":LOSS,
+     "VOID":bool(clk_mismatch or bc=="BAD" or vc=="BAD"),"roofline":roofline}
 os.makedirs(os.path.dirname(ledger),exist_ok=True)
 open(ledger,"a").write(json.dumps(rec)+"\n")
 print(json.dumps(rec))

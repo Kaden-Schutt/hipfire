@@ -11,10 +11,27 @@ winner, log every round. **The ledger IS the research.**
 2. **Mutate** the kernel `.hip` (variant in `variants/`).
 3. **`ab_certify.sh`** — the fixed eval: baseline vs variant, median-of-N
    `kernel_decode_tok_s` (daemon instrument) + coherence, warm + JIT-cleared.
-4. **Certify** a WIN only if **Δ clears the noise band (±3%) AND both stay
-   coherent** (and, for the champion, no-clobber across the fleet).
-5. **Ledger** every run (win or loss + why) → `ledger/<arch>_<kernel>.jsonl`.
-   Champion → dispatch invoice (wire into `dispatch.rs` after).
+4. **Certify** by rank SEPARATION, not a magnitude band: a WIN is when all N
+   variant runs sit above all N baseline runs (clean separation) — a confident
+   win at ANY magnitude, coherent + clock-matched. **Take every real small win,
+   reject every real small loss, discard only genuine overlap** — the compound-
+   interest engine (+0.3% ten times is a real +3%; a symmetric ±3% band throws
+   both real small wins and losses away and compounds to zero).
+5. **Log the WHY** (`PROFILE=1`): the target kernel's roofline (did occ/L2/mem
+   move?) + its **VGPR/SGPR/LDS/scratch** (registers→occupancy = the mechanism) +
+   a top-kernel wall% diff (kernel-level no-clobber / knock-on). Profile on wins.
+6. **Ledger** every run → `ledger/<arch>_<kernel>.jsonl`. Champion source →
+   `variants/`, then dispatch invoice (wire into `dispatch.rs`).
+
+## The corpus — permanent, shared, queried
+Everything is **git-tracked in the repo**, so `git pull` gives every contributor
+the full research history (the history IS the research):
+- `ledger/<arch>_<kernel>.jsonl` — append-only, one line per A/B (verdict · decode
+  · clock · coherence · roofline · VGPR/LDS/scratch · knock-on). Boxes write to
+  their local `~/hipfire/autoresearch/ledger/`; sync back + commit to share.
+- `variants/*.hip` — winning kernel sources (reproducible).
+- `oracle_db.py` — indexes/queries the ledgers:
+  `oracle_db.py wins | best <arch> <k> | history <arch> <k> | kernel <arch> <k> | summary`
 
 ## Mechanism (embedded kernels)
 Kernels are `include_str!`-embedded in `rdna-compute/src/kernels.rs`, so a variant
