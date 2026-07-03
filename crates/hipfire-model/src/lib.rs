@@ -233,6 +233,21 @@ pub fn is_qwen35_family_arch_id(arch_id: u32) -> bool {
     )
 }
 
+/// Resolve an `arch_id` *string* to its canonical [`ModelArchFamily`].
+///
+/// The production form is the numeric arch_id stringified from the HFQ header
+/// (`hfq.arch_id: u32`), so this parses that and defers to [`model_arch_family`]
+/// — the single source of truth. Non-numeric strings (legacy names) return
+/// [`ModelArchFamily::Unknown`]; callers that still accept names should apply
+/// their own fallback. Lets control-plane crates (e.g. the scheduler) classify
+/// arch families through the canonical table instead of magic arch_id literals.
+pub fn model_arch_family_from_str(arch_id: &str) -> ModelArchFamily {
+    match arch_id.trim().parse::<u32>() {
+        Ok(id) => model_arch_family(id),
+        Err(_) => ModelArchFamily::Unknown,
+    }
+}
+
 pub fn normalize_feature_flags(flags: &[String]) -> Vec<String> {
     let mut flags = flags.to_vec();
     flags.sort();
@@ -2461,6 +2476,40 @@ mod tests {
             );
         }
         assert_eq!(model_arch_family(999), ModelArchFamily::Unknown);
+    }
+
+    #[test]
+    fn model_arch_family_from_str_resolves_numeric_arch_ids() {
+        // Production form: the numeric arch_id stringified from the HFQ header.
+        assert_eq!(
+            model_arch_family_from_str("5"),
+            ModelArchFamily::Qwen35Dense
+        );
+        assert_eq!(model_arch_family_from_str("6"), ModelArchFamily::Qwen35Moe);
+        assert_eq!(
+            model_arch_family_from_str("10"),
+            ModelArchFamily::MiniMaxM2
+        );
+        assert_eq!(model_arch_family_from_str("11"), ModelArchFamily::Lfm2Moe);
+        assert_eq!(
+            model_arch_family_from_str("14"),
+            ModelArchFamily::NemotronH
+        );
+        assert_eq!(model_arch_family_from_str(" 6 "), ModelArchFamily::Qwen35Moe);
+        // Every canonical numeric arch_id round-trips through the string form.
+        for &(arch_id, label) in KNOWN_RUNTIME_ARCH_IDS {
+            assert_eq!(
+                model_arch_family_from_str(&arch_id.to_string()),
+                model_arch_family(arch_id),
+                "{label}({arch_id}) string form must match the numeric table"
+            );
+        }
+        // Non-numeric legacy names are not resolved here (callers fall back).
+        assert_eq!(
+            model_arch_family_from_str("nemotron3"),
+            ModelArchFamily::Unknown
+        );
+        assert_eq!(model_arch_family_from_str(""), ModelArchFamily::Unknown);
     }
 
     #[test]

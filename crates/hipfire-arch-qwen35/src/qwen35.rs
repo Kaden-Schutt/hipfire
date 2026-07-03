@@ -2826,7 +2826,11 @@ fn load_weight_tensor_raw(
             // upcast the `quantize_oq4g256` doc names. AWQ smooth, when present, is
             // applied to x by the wrapper via the awq_scale sidecar (unchanged).
             const GROUP: usize = 256;
-            const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
+            // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 on-disk
+            // block = 2 (f16 scale) + 128 nibbles = 130.
+            const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+                .block_bytes()
+                .unwrap();
             assert_eq!(k % GROUP, 0, "OQPLUS requires K % 256 == 0 (got K={k})");
             let ng = k / GROUP;
             let weight_bytes = m * k; // one int8 per weight after expand
@@ -2939,7 +2943,11 @@ fn load_weight_tensor_raw(
             // (`quantize_act_oq8`); weights are FWHT-rotated offline so the forward
             // FWHT-rotates x to match.
             const GROUP: usize = 256;
-            const BLOCK: usize = 258; // 2 (f16 scale) + 256 int8
+            // Single-sourced from hipfire-quant-format (WP-3.3): Oq8G256 on-disk
+            // block = 2 (f16 scale) + 256 int8 = 258.
+            const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq8G256
+                .block_bytes()
+                .unwrap();
             assert_eq!(k % GROUP, 0, "OQ8G256 requires K % 256 == 0 (got K={k})");
             let ng = k / GROUP;
             let weight_bytes = m * k;

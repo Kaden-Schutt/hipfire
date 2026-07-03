@@ -63,6 +63,7 @@ members = [
     "crates/hipfire-quant-format",
     "crates/hipfire-detect",
     "crates/hipfire-diffusion",
+    "crates/hipfire-diffusion-coexist",
     "crates/hipfire-atlas",
     "crates/hipfire-cli",
     "crates/hipfire-tui",
@@ -79,6 +80,7 @@ members = [
     "crates/hipfire-steer-harness",
     "crates/hipfire-coexistence",
     "crates/hipfire-gguf",
+    "crates/hipfire-gpu-types",
     "crates/hipfire-hneurons",
 ]
 # The Leptos browser UIs target wasm32 (leptos CSR + web-sys) and are built

@@ -709,7 +709,7 @@ class AstreaTests(unittest.TestCase):
             methods=["imatrix-scale"],
             imatrix="/mnt/nas/imatrix.gguf",
             eval_commands=["python3 crates/hipfire-runtime/examples/eval_hipfire.rs"],
-            atlas_commands=["python3 scripts/kernel_atlas.py collect-ar"],
+            atlas_commands=["python3 scripts/adhoc/kernel_atlas.py collect-ar"],
             output="/tmp/qwen3.5-9b.mfp4.astrea",
             plan_id="astrea-mfp4-smoke",
         )

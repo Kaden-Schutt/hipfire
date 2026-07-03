@@ -34,6 +34,15 @@ the relevant docs under `docs/`.
 
 ## Branch And Git
 
+- Branch model: `chaingun` is this fork's main branch — the active development
+  line where all work lands. `master` is NOT downstream of `chaingun`; it is
+  kept only as a landing spot for cherry-picks from `origin`/upstream. The two
+  have diverged and are not meant to be reconciled by merging.
+- Because of that model, do **not** merge `chaingun` into `master` (nor treat a
+  `chaingun`→`master` merge as a routine "merge and push"). Integration flows the
+  other way: cherry-pick specific upstream commits from `master` into `chaingun`
+  when you want them. Only touch `master` when the user explicitly asks to
+  land or cherry-pick an upstream commit there.
 - Use `chaingun` as the reference branch for further work. New work should
   happen directly on `chaingun` or be explicitly based on and compared against
   `chaingun`; do not treat `master` as the active baseline unless the user says

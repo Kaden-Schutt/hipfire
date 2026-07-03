@@ -17,7 +17,7 @@
   "entry": "./SKILL.md",
   "interpret": "./SKILL.md",
   "requires": {
-    "repo": "hipfire checkout with scripts/kernel_atlas.py",
+    "repo": "hipfire checkout with scripts/adhoc/kernel_atlas.py",
     "python": "python3",
     "optional_rocm_tools": "clang-offload-bundler, llvm-readobj, llvm-objdump for ISA manifests"
   },

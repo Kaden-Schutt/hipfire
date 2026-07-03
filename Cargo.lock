@@ -1547,6 +1547,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-detect",
  "hipfire-diffusion",
+ "hipfire-diffusion-coexist",
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",
@@ -1688,6 +1689,7 @@ dependencies = [
  "anyhow",
  "base64",
  "hip-bridge",
+ "hipfire-diffusion-coexist",
  "hipfire-model",
  "hipfire-primitives",
  "hipfire-quantize",
@@ -1697,6 +1699,16 @@ dependencies = [
  "rdna-compute",
  "regex",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-diffusion-coexist"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "hipfire-diffusion",
+ "hipfire-runtime",
  "serde_json",
 ]
 
@@ -1768,6 +1780,13 @@ dependencies = [
  "hipfire-primitives",
  "memmap2",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-gpu-types"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
 ]
 
 [[package]]
@@ -1892,6 +1911,7 @@ dependencies = [
  "hipfire-gguf",
  "hipfire-kvquant",
  "hipfire-lock",
+ "hipfire-model",
  "hipfire-primitives",
  "hipfire-quant-format",
  "memmap2",
@@ -3303,6 +3323,7 @@ name = "rdna-compute"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-gpu-types",
  "hipfire-kvquant",
  "hipfire-primitives",
 ]

@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-diffusion-coexist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline diffusion import/conversion tooling: diffusers + single-file checkpoint → .hfq, including the hand-rolled PyTorch pickle interpreter and zip reader. Kept OUT of the inference/serving crates (AGENTS.md: untrusted-format parsing must not ship in the server binary)."
+
+[dependencies]
+hipfire-diffusion = { path = "../hipfire-diffusion" }
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
+anyhow.workspace = true
+serde_json = "1"
