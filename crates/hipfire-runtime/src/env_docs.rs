@@ -1103,21 +1103,21 @@ pub const ENV_HIPFIRE_DOT2_GEMV: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DOTS_OCR_BF16_RESIDUAL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DOTS_OCR_BF16_RESIDUAL",
     description: "HF cast x to bf16 at vision forward entry (modeling_dots_vision.py",
-    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1119",
+    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1127",
 };
 
 /// `HIPFIRE_DOTS_OCR_DUMP_DIR` — HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor
 pub const ENV_HIPFIRE_DOTS_OCR_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DOTS_OCR_DUMP_DIR",
     description: "HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor",
-    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1021",
+    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1029",
 };
 
 /// `HIPFIRE_DOTS_OCR_TRACE` — HIPFIRE_DOTS_OCR_TRACE=1: sync after every step + print probe so
 pub const ENV_HIPFIRE_DOTS_OCR_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DOTS_OCR_TRACE",
     description: "HIPFIRE_DOTS_OCR_TRACE=1: sync after every step + print probe so",
-    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1149",
+    source: "crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1157",
 };
 
 /// `HIPFIRE_DPM_WARMUP_SECS` — Runtime variable controlling dpm warmup secs in hipfire
