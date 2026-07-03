@@ -722,7 +722,7 @@ pub fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) ->
 /// per position, `scale · sext3`, inverse FWHT. NB: 3-bit is only viable with the
 /// SpinQuant learned rotation on top of the FWHT (`project_spinquant_w4a4`); the
 /// FWHT here is the fixed-rotation floor.
-pub(crate) fn quantize_oq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_oq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 98usize); // 2 (f16 scale) + 8×3 u32 bit-planes
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
@@ -759,10 +759,9 @@ pub(crate) fn quantize_oq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 
 /// Dequantize OQ3G256 (round-trip oracle for the Opus W3 codec / tests).
 /// `[f16 scale][8 × (3 u32 bit-planes)]` per 256-group → reconstruct signed 3-bit
-/// two's-complement `scale·sext3`, inverse FWHT. Test-only oracle (gated on
-/// `cfg(test)` so non-test builds don't compile it as dead code).
-#[cfg(test)]
-pub(crate) fn dequant_oq3g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+/// two's-complement `scale·sext3`, inverse FWHT. Pub oracle — the bin's golden
+/// battery consumes it cross-target, so it can't be `cfg(test)`-gated in the lib.
+pub fn dequant_oq3g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
     let (group_size, block_bytes) = (256usize, 98usize);
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);
@@ -832,7 +831,7 @@ pub fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
 /// Opus convention). 6-bit two's-complement, 4 weights per 3 bytes (same bit layout
 /// as MQ6, but signed). Dequant: `scale · sext6`, inverse FWHT. Expands to int8 for
 /// the iu8 W6A8 path — family completion; loader/kernel pending.
-pub(crate) fn quantize_oq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub fn quantize_oq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, 194usize); // 2 (f16 scale) + 192 (6-bit×256)
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
@@ -864,9 +863,8 @@ pub(crate) fn quantize_oq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 }
 
 /// Dequantize OQ6G256 (round-trip oracle). `[f16 scale][192 B 6-bit]` → `scale·sext6`,
-/// inverse FWHT. Test-only.
-#[cfg(test)]
-pub(crate) fn dequant_oq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+/// inverse FWHT. Pub oracle (consumed cross-target by the bin's golden battery).
+pub fn dequant_oq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
     let (group_size, block_bytes) = (256usize, 194usize);
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);

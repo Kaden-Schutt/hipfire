@@ -14031,6 +14031,12 @@ mod tests {
 #[cfg(test)]
 mod codec_golden {
     use super::*;
+    // oq3/oq6 live in the `codecs` library module; the parent's private
+    // `use codecs::*` glob isn't re-exported through `use super::*`, so import
+    // the ones this battery characterizes explicitly.
+    use crate::codecs::{
+        dequant_oq3g256, dequant_oq6g256, quantize_oq3g256, quantize_oq6g256,
+    };
 
     /// Deterministic f32 stream with a few outliers (LCG; no rng dep).
     fn det_input(n: usize, seed: u32) -> Vec<f32> {
