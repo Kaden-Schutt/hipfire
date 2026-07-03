@@ -6,5 +6,7 @@ license.workspace = true
 description = "LLaMA / Mistral / plain-Qwen3 architecture for hipfire"
 
 [dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 rdna-compute = { path = "../rdna-compute" }

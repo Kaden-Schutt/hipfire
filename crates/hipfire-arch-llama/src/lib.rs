@@ -48,6 +48,7 @@
 //! physically moved here without breaking arch-qwen35's pflash branch.
 
 pub mod arch;
+pub mod caps;
 
 /// Re-export the LLaMA-family model module so callers can write
 /// `hipfire_arch_llama::llama::forward_scratch(...)` etc., matching the

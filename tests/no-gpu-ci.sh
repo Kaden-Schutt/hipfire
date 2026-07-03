@@ -21,6 +21,7 @@ cargo test -p hipfire-arch-api --lib
 cargo test -p hipfire-arch-llama-spec --lib
 cargo test -p hipfire-arch-toy --lib
 cargo test -p hipfire-archs --lib
+cargo test -p hipfire-arch-llama --lib caps
 
 echo "== Tiny-fixture round-trip (CPU: emit → quantize, no GPU) =="
 bash tests/fixture-roundtrip-nogpu.sh
