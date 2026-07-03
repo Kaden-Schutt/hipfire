@@ -3926,25 +3926,33 @@ fn gpu_encode_symbols(
     n_groups: usize,
     bits: u32,
 ) -> Result<Vec<u8>, String> {
-    const CHUNK: usize = 2048; // groups/launch → ~2 GB backpointer scratch, reused
+    use rdna_compute::DType;
+    // Per-chunk backpointer scratch = chunk×256×4096 B (uninitialized — the kernel
+    // writes it before backtrack, so use a device alloc with NO host zero-copy;
+    // on the shared-UMA APU a host zero-vec would compete for the same pool). The
+    // APU may not have a big contiguous block free with a model resident, so start
+    // modest and halve on OOM until it fits. Allocated once, reused across chunks.
+    let mut chunk = 512usize.min(n_groups.max(1));
+    let backptr = loop {
+        match gpu.alloc_tensor(&[chunk * 256 * 4096], DType::Raw) {
+            Ok(b) => break b,
+            Err(_) if chunk > 64 => chunk /= 2,
+            Err(e) => return Err(format!("backptr alloc (chunk={chunk}): {e}")),
+        }
+    };
     let mut symbols = vec![0u8; n_groups * 256];
-    let backptr = gpu
-        .upload_raw(&vec![0u8; CHUNK * 256 * 4096], &[CHUNK * 256 * 4096])
-        .map_err(|e| format!("gpu backptr alloc: {e}"))?;
     let mut done = 0usize;
     while done < n_groups {
-        let cn = (n_groups - done).min(CHUNK);
+        let cn = (n_groups - done).min(chunk);
         let wbytes: Vec<u8> = rotated[done * 256..(done + cn) * 256]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
         let wd = gpu.upload_raw(&wbytes, &[cn, 256]).map_err(|e| e.to_string())?;
         let sd = gpu
-            .upload_raw(&vec![0u8; cn * 256], &[cn, 256])
+            .alloc_tensor(&[cn * 256], DType::Raw)
             .map_err(|e| e.to_string())?;
-        let scd = gpu
-            .upload_raw(&vec![0u8; cn * 4], &[cn])
-            .map_err(|e| e.to_string())?;
+        let scd = gpu.alloc_tensor(&[cn], DType::F32).map_err(|e| e.to_string())?;
         gpu.qtip_viterbi_encode(&wd, &sd, &backptr, &scd, cn, bits)
             .map_err(|e| e.to_string())?;
         gpu.device_synchronize().map_err(|e| e.to_string())?;
@@ -4137,8 +4145,17 @@ fn pack_qtip_real_tensors(
         let ng = m * groups;
         #[cfg(feature = "gpu")]
         let symbols: Vec<u8> = match gpu.as_mut() {
-            Some(g) => gpu_encode_symbols(g, &rotated, ng, bits)
-                .unwrap_or_else(|e| panic!("GPU qtip encode failed: {e}")),
+            Some(g) => match gpu_encode_symbols(g, &rotated, ng, bits) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Never fail the quantize on a GPU hiccup — the CPU beam is the
+                    // reference and always works (AGENTS.md: CPU-only functionality).
+                    eprintln!(
+                        "  qtip{bits}: GPU encode failed ({e}) — falling back to CPU beam for this tensor"
+                    );
+                    cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
+                }
+            },
             None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
         };
         #[cfg(not(feature = "gpu"))]
