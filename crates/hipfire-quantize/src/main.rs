@@ -3203,18 +3203,20 @@ use hipfire_arch_specs as _;
 static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
     std::sync::OnceLock::new();
 
-/// Capability-layer replacement for `is_q8_tensor`, for arches migrated onto
-/// `hipfire-arch-api`. Returns `Some(true)` = keep high precision (Q8), `Some(false)`
-/// = compressible, or `None` when this arch has NOT declared an `Ingest` policy — the
-/// caller then falls back to the legacy `is_q8_tensor` name-matching.
+/// Should this tensor be kept at HIGH PRECISION (vs. compressed), for arches
+/// migrated onto `hipfire-arch-api`? Returns `Some(true)` = keep high precision,
+/// `Some(false)` = compressible, or `None` when this arch has NOT declared an
+/// `Ingest` policy — the caller then falls back to the legacy `is_q8_tensor`
+/// name-matching.
 ///
-/// The arch states only needs (importance + requirements); the codec choice is made
-/// here by matching those against a 2-codec menu with `allocate`. Its
-/// group-divisibility filter reproduces the existing "non-256-aligned → Q8 fallback",
-/// and an unsatisfiable requirement lands on the safe high-precision option. This is
-/// the boolean the selection matrix needs; the downstream compressed format
-/// (Q4_K / Q4_as8) is still chosen by the format mode, unchanged.
-fn q8_precision_via_caps(arch_id: u32, name: &str, k: usize) -> Option<bool> {
+/// Named for the decision it makes, not a format: it does not choose "Q8". The arch
+/// states only needs (importance + requirements); the codec choice is made here by
+/// matching those against a 2-codec (high vs compressed) menu with `allocate`. Its
+/// group-divisibility filter reproduces the existing "non-256-aligned → high
+/// precision" fallback, and an unsatisfiable requirement lands on the high-precision
+/// option. This is the boolean the selection matrix needs; whichever concrete
+/// format the true/false branch maps to is still the format mode's decision downstream.
+fn high_precision_via_ingest(arch_id: u32, name: &str, k: usize) -> Option<bool> {
     use hipfire_arch_api::{allocate, ArchId, CodecCaps};
     let ingest = ARCH_REGISTRY
         .get_or_init(hipfire_arch_api::ArchRegistry::build)
@@ -3222,7 +3224,7 @@ fn q8_precision_via_caps(arch_id: u32, name: &str, k: usize) -> Option<bool> {
         .caps
         .ingest?;
     // High-precision random-access option vs a compressed grouped option. Only the
-    // chosen bit-width matters here (>=8 → keep Q8); the names are illustrative.
+    // chosen bit-width matters here (>= 8 → keep high precision); names are illustrative.
     const MENU: [CodecCaps; 2] = [
         CodecCaps {
             name: "hi",
@@ -9131,14 +9133,14 @@ fn main() {
                         name.contains("embed") || name.contains("lm_head") // only embed/output Q8
                     } else if use_mixed || use_fast {
                         // Arches migrated onto the capability layer (e.g. llama)
-                        // decide Q8-vs-compressed from their declared Ingest
-                        // quant-policy; unmigrated arches keep is_q8_tensor.
+                        // decide high-precision-vs-compressed from their declared
+                        // Ingest quant-policy; unmigrated arches keep is_q8_tensor.
                         let k = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
                             n_elements
                         };
-                        q8_precision_via_caps(arch_id, name, k)
+                        high_precision_via_ingest(arch_id, name, k)
                             .unwrap_or_else(|| is_q8_tensor(name))
                     } else {
                         use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
@@ -13930,50 +13932,56 @@ mod tests {
     }
 
     #[test]
-    fn caps_ingest_drives_llama_q8_and_falls_back_otherwise() {
+    fn caps_ingest_drives_high_precision_and_falls_back_otherwise() {
         // llama (arch_id 0) is migrated onto the capability layer: its Ingest keeps
         // the protected set (embed/lm_head/attn) high-precision and compresses the
         // MLP bulk — DERIVED from importance/requirements, no is_q8_tensor matching.
         assert_eq!(
-            q8_precision_via_caps(0, "model.embed_tokens.weight", 4096),
+            high_precision_via_ingest(0, "model.embed_tokens.weight", 4096),
             Some(true)
         );
         assert_eq!(
-            q8_precision_via_caps(0, "model.layers.0.self_attn.q_proj.weight", 4096),
+            high_precision_via_ingest(0, "model.layers.0.self_attn.q_proj.weight", 4096),
             Some(true)
         );
-        assert_eq!(q8_precision_via_caps(0, "lm_head.weight", 4096), Some(true));
         assert_eq!(
-            q8_precision_via_caps(0, "model.layers.0.mlp.up_proj.weight", 4096),
+            high_precision_via_ingest(0, "lm_head.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            high_precision_via_ingest(0, "model.layers.0.mlp.up_proj.weight", 4096),
             Some(false)
         );
         // Non-256-aligned inner dim → the grouped compressed codec is filtered out,
         // reproducing the legacy "non-256 → Q8 fallback".
         assert_eq!(
-            q8_precision_via_caps(0, "model.layers.0.mlp.up_proj.weight", 300),
+            high_precision_via_ingest(0, "model.layers.0.mlp.up_proj.weight", 300),
             Some(true)
         );
         // gemma3 (12) resolves through the same registry — no per-arch quantizer code.
         assert_eq!(
-            q8_precision_via_caps(12, "model.embed_tokens.weight", 4096),
+            high_precision_via_ingest(12, "model.embed_tokens.weight", 4096),
             Some(true)
         );
         assert_eq!(
-            q8_precision_via_caps(12, "model.layers.0.mlp.up_proj.weight", 4096),
+            high_precision_via_ingest(12, "model.layers.0.mlp.up_proj.weight", 4096),
             Some(false)
         );
         // Every family is migrated now: e.g. deepseek4 (9) protects its MLA
         // compressor (the old is_deepseek4_keep_f16), and a MoE expert (11) compresses.
         assert_eq!(
-            q8_precision_via_caps(9, "model.layers.0.self_attn.compressor.wkv.weight", 4096),
+            high_precision_via_ingest(9, "model.layers.0.self_attn.compressor.wkv.weight", 4096),
             Some(true)
         );
         assert_eq!(
-            q8_precision_via_caps(11, "model.layers.0.mlp.experts.2.up_proj.weight", 4096),
+            high_precision_via_ingest(11, "model.layers.0.mlp.experts.2.up_proj.weight", 4096),
             Some(false)
         );
         // A genuinely unregistered arch id → None → caller uses is_q8_tensor.
-        assert_eq!(q8_precision_via_caps(200, "whatever.weight", 4096), None);
+        assert_eq!(
+            high_precision_via_ingest(200, "whatever.weight", 4096),
+            None
+        );
     }
 
     #[test]
