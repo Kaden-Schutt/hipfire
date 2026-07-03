@@ -24,6 +24,8 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire diffusion txt2img`↴](#hipfire-diffusion-txt2img)
 * [`hipfire diffusion img2img`↴](#hipfire-diffusion-img2img)
 * [`hipfire diffusion smoke`↴](#hipfire-diffusion-smoke)
+* [`hipfire diffusion quantize`↴](#hipfire-diffusion-quantize)
+* [`hipfire diffusion calibrate`↴](#hipfire-diffusion-calibrate)
 * [`hipfire admin`↴](#hipfire-admin)
 * [`hipfire admin status`↴](#hipfire-admin-status)
 * [`hipfire admin chat`↴](#hipfire-admin-chat)
@@ -264,6 +266,8 @@ The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, 
 * `txt2img` — Generate PNG images directly from a diffusion .hfq artifact
 * `img2img` — Generate PNG images from init images with a diffusion .hfq artifact
 * `smoke` — Run an end-to-end diffusion admission smoke and validate output PNGs
+* `quantize` — Re-encode the weight tensors of a source .hfq into a packed quant format
+* `calibrate` — Run an activation-calibration pass and write a .calib.hfq sidecar
 
 
 
@@ -488,6 +492,62 @@ Run an end-to-end diffusion admission smoke and validate output PNGs
 * `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id ROCm device to generate on. Omit to auto-detect (a single GPU is used silently; the first of several with a warning). The CPU reference oracle is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable
 * `--txt2img-only` — Only run txt2img; skip the img2img leg
 * `--skip-masked-img2img` — Skip the masked img2img leg
+
+
+
+## `hipfire diffusion quantize`
+
+Re-encode the weight tensors of a source .hfq into a packed quant format
+
+Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source), re-encodes the large 2D+ `.weight` tensors into the requested format, and copies every other entry (biases, norms, configs, tokenizers) verbatim. Decoding is per-tensor by quant_type, so the output loads unchanged.
+
+**Usage:** `hipfire diffusion quantize [OPTIONS] --output <OUTPUT> <SOURCE>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — Source diffusion .hfq artifact (typically `weight_format: source`)
+
+###### **Options:**
+
+* `-o`, `--output <OUTPUT>` — Output quantized .hfq artifact path
+* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+ (data-free) or oq4/oq4++/oq8 (Opus, calibrated)
+
+  Default value: `q8`
+* `--calib <CALIB>` — Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ
+
+
+
+## `hipfire diffusion calibrate`
+
+Run an activation-calibration pass and write a .calib.hfq sidecar
+
+Generates a few CPU-reference denoise steps over sample prompts, capturing per-weight activation statistics (imatrix + per-linear Hessian). The resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
+
+**Usage:** `hipfire diffusion calibrate [OPTIONS] --output <OUTPUT> <MODEL>`
+
+###### **Arguments:**
+
+* `<MODEL>` — Source diffusion .hfq artifact to calibrate
+
+###### **Options:**
+
+* `-o`, `--output <OUTPUT>` — Output .calib.hfq sidecar path
+* `-p`, `--prompt <PROMPTS>` — Calibration prompts (repeatable); defaults to a small built-in set
+* `--steps <STEPS>` — Denoise steps per prompt
+
+  Default value: `4`
+* `--width <WIDTH>`
+
+  Default value: `256`
+* `--height <HEIGHT>`
+
+  Default value: `256`
+* `--cfg-scale <CFG_SCALE>` — CFG scale (>1 captures both conditional and unconditional activations)
+
+  Default value: `7.5`
+* `--hessian-max-k <HESSIAN_MAX_K>` — Max linear input dim K to capture a full [K,K] Hessian for (else imatrix only)
+
+  Default value: `2048`
 
 
 
