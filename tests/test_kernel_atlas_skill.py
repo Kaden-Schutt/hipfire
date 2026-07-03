@@ -27,7 +27,7 @@ class KernelAtlasSkillTest(unittest.TestCase):
         wrapper = SKILL_DIR / "render-fit.sh"
         text = wrapper.read_text(encoding="utf-8")
 
-        self.assertIn("scripts/kernel_atlas.py", text)
+        self.assertIn("scripts/adhoc/kernel_atlas.py", text)
         self.assertIn("render-fit", text)
 
         proc = subprocess.run(
