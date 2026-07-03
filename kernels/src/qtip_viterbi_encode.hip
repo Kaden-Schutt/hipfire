@@ -52,12 +52,12 @@ __device__ __forceinline__ float qtip_decode(unsigned int state) {
 
 // W: [n_groups*256] FWHT-rotated weights (row-major groups).
 // symbols_out: [n_groups*256] u8 (0..2^bits-1).
-// backptr: [n_groups*256*4096] u8 predecessor selector h.
+// backptr: [n_groups*256*256*2] u32 — packed 4-bit selectors (see per-group note).
 // scales_out: [n_groups] f32 RMS seed scale used for the encode.
 extern "C" __global__ __launch_bounds__(256) void qtip_viterbi_encode(
     const float* __restrict__ W,
     unsigned char* __restrict__ symbols_out,
-    unsigned char* __restrict__ backptr,
+    unsigned int* __restrict__ backptr,
     float* __restrict__ scales_out,
     int n_groups,
     int bits
@@ -66,7 +66,12 @@ extern "C" __global__ __launch_bounds__(256) void qtip_viterbi_encode(
     if (g >= n_groups) return;
     const int tid = threadIdx.x;      // blockDim.x == 256
     const float* w = W + (long long)g * 256;
-    unsigned char* bp = backptr + (long long)g * 256 * QTIP_NSTATES;
+    // Packed backpointer: each thread owns the 16 states s_new = tid + slot*256
+    // (slot 0..15); it packs their 4-bit selectors into 2 u32 (nibbles) and writes
+    // them once per position. Layout per group: [pos][256 threads][2 u32] =
+    // 256*256*2 u32 = 512 KB (half the old u8-per-state 1 MB). No inter-thread
+    // coordination, coalesced.
+    unsigned int* bp = backptr + (long long)g * 256 * 256 * 2;
 
     __shared__ float dp[2][QTIP_NSTATES]; // 32 KB ping-pong
     __shared__ float wl[256];             // staged group weights
@@ -97,7 +102,9 @@ extern "C" __global__ __launch_bounds__(256) void qtip_viterbi_encode(
     for (int pos = 0; pos < 256; pos++) {
         const float wv = wl[pos];
         const int nxt = cur ^ 1;
-        for (int s_new = tid; s_new < QTIP_NSTATES; s_new += 256) {
+        unsigned int bp_lo = 0u, bp_hi = 0u; // this thread's 16 selectors (nibbles)
+        for (int slot = 0; slot < 16; slot++) {
+            const int s_new = tid + (slot << 8); // slot*256
             const float cbv = scale * qtip_decode((unsigned int)s_new);
             const float diff = wv - cbv;
             const float d2 = diff * diff;
@@ -111,8 +118,11 @@ extern "C" __global__ __launch_bounds__(256) void qtip_viterbi_encode(
                 if (c < best) { best = c; besth = h; }
             }
             dp[nxt][QTIP_ROTL(s_new, bits, hshift)] = best + d2;
-            bp[(long long)pos * QTIP_NSTATES + s_new] = (unsigned char)besth;
+            if (slot < 8) bp_lo |= ((unsigned int)besth & 0xfu) << (slot * 4);
+            else          bp_hi |= ((unsigned int)besth & 0xfu) << ((slot - 8) * 4);
         }
+        bp[((long long)pos * 256 + tid) * 2 + 0] = bp_lo;
+        bp[((long long)pos * 256 + tid) * 2 + 1] = bp_hi;
         __syncthreads();
         cur = nxt;
     }
@@ -128,7 +138,11 @@ extern "C" __global__ __launch_bounds__(256) void qtip_viterbi_encode(
         int state = (int)QTIP_ROTR(pidx, bits, hshift);
         for (int pos = 255; pos >= 0; pos--) {
             symbols_out[(long long)g * 256 + pos] = (unsigned char)(state & symmask);
-            const int h = bp[(long long)pos * QTIP_NSTATES + state];
+            // Unpack this state's selector: owning thread = state&255, slot = state>>8.
+            const int t = state & 255;
+            const int slot = state >> 8;
+            const unsigned int word = bp[((long long)pos * 256 + t) * 2 + (slot >> 3)];
+            const int h = (int)((word >> ((slot & 7) * 4)) & 0xfu);
             state = (h << hshift) | (state >> bits);
         }
     }

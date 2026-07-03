@@ -3927,14 +3927,15 @@ fn gpu_encode_symbols(
     bits: u32,
 ) -> Result<Vec<u8>, String> {
     use rdna_compute::DType;
-    // Per-chunk backpointer scratch = chunk×256×4096 B (uninitialized — the kernel
-    // writes it before backtrack, so use a device alloc with NO host zero-copy;
-    // on the shared-UMA APU a host zero-vec would compete for the same pool). The
-    // APU may not have a big contiguous block free with a model resident, so start
-    // modest and halve on OOM until it fits. Allocated once, reused across chunks.
-    let mut chunk = 512usize.min(n_groups.max(1));
+    // Per-chunk packed backpointer scratch = chunk×256×256×2 u32 = chunk×512 KB
+    // (uninitialized — the kernel writes it before backtrack, so use a device alloc
+    // with NO host zero-copy; on the shared-UMA APU a host zero-vec competes for the
+    // same pool). The APU may not have a big contiguous block free with a model
+    // resident, so start modest and halve on OOM until it fits. Allocated once,
+    // reused across chunks.
+    let mut chunk = 1024usize.min(n_groups.max(1));
     let backptr = loop {
-        match gpu.alloc_tensor(&[chunk * 256 * 4096], DType::Raw) {
+        match gpu.alloc_tensor(&[chunk * 256 * 256 * 2], DType::F32) {
             Ok(b) => break b,
             Err(_) if chunk > 64 => chunk /= 2,
             Err(e) => return Err(format!("backptr alloc (chunk={chunk}): {e}")),

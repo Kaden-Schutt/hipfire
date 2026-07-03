@@ -157,8 +157,12 @@ fn main() {
         )
         .unwrap();
     let symbols = gpu.upload_raw(&vec![0u8; n_groups * 256], &[n_groups, 256]).unwrap();
+    // Packed backpointer: [n_groups][256 pos][256 threads][2 u32] = n_groups*512 KB.
     let backptr = gpu
-        .upload_raw(&vec![0u8; n_groups * 256 * NUM_STATES], &[n_groups * 256 * NUM_STATES])
+        .upload_raw(
+            &vec![0u8; n_groups * 256 * 256 * 2 * 4],
+            &[n_groups * 256 * 256 * 2],
+        )
         .unwrap();
     let scales = gpu.upload_raw(&vec![0u8; n_groups * 4], &[n_groups]).unwrap();
 
