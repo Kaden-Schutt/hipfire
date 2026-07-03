@@ -393,7 +393,6 @@ pub fn quantize_mq4g256_clipsearch(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();
@@ -408,30 +407,9 @@ pub fn quantize_mq4g256_clipsearch(
         group[..actual_len].copy_from_slice(&f32_data[start..end]);
         cpu_fwht_256(&mut group, signs1, signs2);
 
-        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mid = 0.5 * (min_val + max_val);
-        let half = 0.5 * (max_val - min_val);
-
-        // MSE-optimal symmetric clip of the affine range over the grid.
-        let (mut best_lo, mut best_scale) = (min_val, (max_val - min_val) / 15.0);
-        let mut best_err = f32::INFINITY;
-        for &c in &CLIP_GRID {
-            let lo = mid - c * half;
-            let scale = (2.0 * c * half / 15.0).max(1e-12);
-            let inv = 1.0 / scale;
-            let mut err = 0.0f32;
-            for &v in group.iter() {
-                let q = ((v - lo) * inv + 0.5).clamp(0.0, 15.0);
-                let d = v - (q * scale + lo);
-                err += d * d;
-            }
-            if err < best_err {
-                best_err = err;
-                best_lo = lo;
-                best_scale = scale;
-            }
-        }
+        // Shared search (same helper as mq6+/mq3+/mq2+); this used to be an
+        // inline copy whose error model lacked the encoder's rounding.
+        let (best_lo, best_scale) = affine_clipsearch(&group, 15.0);
         let scale = if best_scale > 0.0 { best_scale } else { 1.0 };
         let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
 
@@ -465,7 +443,13 @@ fn affine_clipsearch(group: &[f32], levels: f32) -> (f32, f32) {
         let inv = 1.0 / scale;
         let mut err = 0.0f32;
         for &v in group.iter() {
-            let q = ((v - lo) * inv + 0.5).clamp(0.0, levels);
+            // Mirror the encoder exactly: `(x + 0.5) as u8` is floor(x + 0.5)
+            // saturating at 0, then .min(levels). Without the floor the model
+            // scores a continuous q whose in-range error is 0.25·scale² per
+            // element (vs the true ~scale²/12), overweighting scale and
+            // biasing the search toward over-clipping — measurably WORSE than
+            // plain min/max on outlier-heavy groups.
+            let q = ((v - lo) * inv + 0.5).floor().clamp(0.0, levels);
             let d = v - (q * scale + lo);
             err += d * d;
         }
@@ -2392,4 +2376,227 @@ pub fn quantize_mq2g256_lloyd_k3(
             }
         });
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deterministic pseudo-random data (no rand dep; mirrors qtip.rs's Lcg).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // top 24 bits -> [-1, 1)
+            ((self.0 >> 40) as f32 / (1u32 << 23) as f32) - 1.0
+        }
+    }
+
+    fn test_data(n: usize) -> Vec<f32> {
+        let mut lcg = Lcg(0x5eed_cafe);
+        (0..n).map(|_| lcg.next_f32()).collect()
+    }
+
+    /// ±1 sign vectors like the engine's; deterministic, not all-ones so the
+    /// sign-swap inverse is actually exercised.
+    fn test_signs() -> (Vec<f32>, Vec<f32>) {
+        let mut lcg = Lcg(0x0dd_b011);
+        let s = |lcg: &mut Lcg| {
+            (0..256)
+                .map(|_| if lcg.next_f32() >= 0.0 { 1.0 } else { -1.0 })
+                .collect::<Vec<f32>>()
+        };
+        (s(&mut lcg), s(&mut lcg))
+    }
+
+    fn rmse(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        let sum: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+        (sum / a.len() as f32).sqrt()
+    }
+
+    /// The OnceLock toggle must stay unset in the test process: every base MQ
+    /// encoder routes through it, so arming it here would silently flip other
+    /// tests to the clip-searched variants (first set wins, process-wide).
+    #[test]
+    fn clipsearch_toggle_defaults_off() {
+        assert!(!crate::mq_clipsearch_enabled());
+    }
+
+    /// Regression pin for the FWHT inverse convention: inverse = forward with
+    /// signs swapped (orthonormal 1/16 both directions). Every decode path
+    /// depends on this exact identity.
+    #[test]
+    fn fwht_inverse_is_forward_with_signs_swapped() {
+        let (s1, s2) = test_signs();
+        let original = test_data(256);
+        let mut x: [f32; 256] = original.clone().try_into().unwrap();
+        cpu_fwht_256(&mut x, &s1, &s2);
+        cpu_fwht_256(&mut x, &s2, &s1);
+        for (a, b) in x.iter().zip(&original) {
+            assert!((a - b).abs() < 1e-5, "FWHT round-trip drifted: {a} vs {b}");
+        }
+    }
+
+    // ── encode/decode round-trips (in-module pairs) ─────────────────────
+    // Bounds are ~2× the theoretical quantization RMSE for each bit width
+    // (orthonormal FWHT preserves RMSE across the rotation).
+
+    #[test]
+    fn mq4g256_roundtrip_within_tolerance() {
+        let (s1, s2) = test_signs();
+        let data = test_data(600); // 2 full blocks + partial
+        let encoded = quantize_mq4g256(&data, &s1, &s2);
+        let decoded = dequant_mq4g256(&encoded, data.len(), &s1, &s2);
+        assert!(rmse(&data, &decoded) < 0.08, "rmse {}", rmse(&data, &decoded));
+    }
+
+    #[test]
+    fn mq4g256_clipsearch_matches_layout_and_decodes_via_same_path() {
+        let (s1, s2) = test_signs();
+        // Outlier-laden input: clip search exists exactly for this shape.
+        let mut data = test_data(512);
+        data[17] = 40.0;
+        data[300] = -35.0;
+        let plain = quantize_mq4g256(&data, &s1, &s2);
+        let clipped = quantize_mq4g256_clipsearch(&data, &s1, &s2);
+        assert_eq!(plain.len(), clipped.len(), "mq4+ must keep the 136-byte layout");
+        let plain_rmse = rmse(&data, &dequant_mq4g256(&plain, data.len(), &s1, &s2));
+        let clip_rmse = rmse(&data, &dequant_mq4g256(&clipped, data.len(), &s1, &s2));
+        assert!(
+            clip_rmse <= plain_rmse * 1.05,
+            "clip search must not lose to plain min/max: {clip_rmse} vs {plain_rmse}"
+        );
+    }
+
+    #[test]
+    fn oq4g256_roundtrip_within_tolerance() {
+        let (s1, s2) = test_signs();
+        let data = test_data(600);
+        let decoded = dequant_oq4g256(&quantize_oq4g256(&data, &s1, &s2), data.len(), &s1, &s2);
+        assert!(rmse(&data, &decoded) < 0.12, "rmse {}", rmse(&data, &decoded));
+    }
+
+    #[test]
+    fn oq3g256_roundtrip_within_tolerance() {
+        let (s1, s2) = test_signs();
+        let data = test_data(600);
+        let decoded = dequant_oq3g256(&quantize_oq3g256(&data, &s1, &s2), data.len(), &s1, &s2);
+        assert!(rmse(&data, &decoded) < 0.25, "rmse {}", rmse(&data, &decoded));
+    }
+
+    #[test]
+    fn oq6g256_roundtrip_within_tolerance() {
+        let (s1, s2) = test_signs();
+        let data = test_data(600);
+        let decoded = dequant_oq6g256(&quantize_oq6g256(&data, &s1, &s2), data.len(), &s1, &s2);
+        assert!(rmse(&data, &decoded) < 0.03, "rmse {}", rmse(&data, &decoded));
+    }
+
+    #[test]
+    fn oq8g256_roundtrip_within_tolerance() {
+        let (s1, s2) = test_signs();
+        let data = test_data(600);
+        let decoded = dequant_oq8g256(&quantize_oq8g256(&data, &s1, &s2), data.len(), &s1, &s2);
+        assert!(rmse(&data, &decoded) < 0.012, "rmse {}", rmse(&data, &decoded));
+    }
+
+    #[test]
+    fn hfp4g32_row_roundtrip_within_tolerance() {
+        let data = test_data(96); // 3 groups of 32
+        let decoded = dequant_hfp4g32_row(&quantize_hfp4g32_row(&data), data.len());
+        // e2m1 has ~1 mantissa bit: generous relative bound.
+        assert!(rmse(&data, &decoded) < 0.2, "rmse {}", rmse(&data, &decoded));
+    }
+
+    // ── block-geometry byte stability ───────────────────────────────────
+    // These literals are the on-disk format contract (review 2026-07-03
+    // §3.9). When they move into hipfire-quant-format, these tests are the
+    // net proving the swap was byte-neutral.
+
+    #[test]
+    fn block_geometry_bytes_are_stable() {
+        let (s1, s2) = test_signs();
+        let g256 = |n: usize| n.div_ceil(256);
+        let g128 = |n: usize| n.div_ceil(128);
+        for n in [1usize, 256, 257, 600] {
+            let d = test_data(n);
+            assert_eq!(quantize_mq4g256(&d, &s1, &s2).len(), g256(n) * 136);
+            assert_eq!(quantize_mq4g256_clipsearch(&d, &s1, &s2).len(), g256(n) * 136);
+            assert_eq!(quantize_mq6g256(&d, &s1, &s2).len(), g256(n) * 200);
+            assert_eq!(quantize_mq3g256(&d, &s1, &s2).len(), g256(n) * 104);
+            assert_eq!(quantize_mq2g256(&d, &s1, &s2).len(), g256(n) * 72);
+            assert_eq!(quantize_oq4g256(&d, &s1, &s2).len(), g256(n) * 130);
+            assert_eq!(quantize_oq3g256(&d, &s1, &s2).len(), g256(n) * 98);
+            assert_eq!(quantize_oq6g256(&d, &s1, &s2).len(), g256(n) * 194);
+            assert_eq!(quantize_oq8g256(&d, &s1, &s2).len(), g256(n) * 258);
+            assert_eq!(quantize_hfq4g256(&d).len(), g256(n) * 136);
+            assert_eq!(quantize_hfq3g256(&d).len(), g256(n) * 104);
+            assert_eq!(quantize_hfq2g256(&d).len(), g256(n) * 72);
+            assert_eq!(quantize_hfq6g256(&d).len(), g256(n) * 200);
+            assert_eq!(quantize_hfq3g128(&d).len(), g128(n) * 56);
+            assert_eq!(quantize_hfq2g128(&d).len(), g128(n) * 40);
+            assert_eq!(quantize_hfq4g128(&d).len(), g128(n) * 72);
+        }
+    }
+
+    // ── edge cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn encoders_handle_empty_input() {
+        let (s1, s2) = test_signs();
+        assert!(quantize_mq4g256(&[], &s1, &s2).is_empty());
+        assert!(quantize_oq4g256(&[], &s1, &s2).is_empty());
+        assert!(quantize_oq3g256(&[], &s1, &s2).is_empty());
+        assert!(quantize_hfq4g256(&[]).is_empty());
+        assert!(dequant_mq4g256(&[], 0, &s1, &s2).is_empty());
+        assert!(dequant_oq4g256(&[], 0, &s1, &s2).is_empty());
+    }
+
+    #[test]
+    fn constant_and_zero_groups_roundtrip() {
+        let (s1, s2) = test_signs();
+        // Constant input is NOT constant after the signed FWHT (signs flip
+        // elements before the butterfly), so it takes the normal quant path.
+        // The FWHT of a sign-modulated constant concentrates energy into few
+        // large coefficients, so the quant step (range/15) is coarser than
+        // for spread data — hence the looser bound than the random case.
+        let data = vec![0.75f32; 300];
+        let decoded = dequant_mq4g256(&quantize_mq4g256(&data, &s1, &s2), 300, &s1, &s2);
+        let e = rmse(&data, &decoded);
+        assert!(e < 0.15, "constant-input rmse {e}");
+        // All-zero input IS all-zero after rotation: hits the range==0 scale
+        // fallback and must reconstruct exactly.
+        let zeros = vec![0.0f32; 300];
+        let dm = dequant_mq4g256(&quantize_mq4g256(&zeros, &s1, &s2), 300, &s1, &s2);
+        assert!(rmse(&zeros, &dm) < 1e-6);
+        let dz = dequant_oq4g256(&quantize_oq4g256(&zeros, &s1, &s2), 300, &s1, &s2);
+        assert!(rmse(&zeros, &dz) < 1e-6);
+    }
+
+    #[test]
+    fn non_finite_input_does_not_panic() {
+        let (s1, s2) = test_signs();
+        for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut data = test_data(300);
+            data[7] = poison;
+            // No panic and stable output size is the contract; the poisoned
+            // block's contents are unspecified.
+            assert_eq!(quantize_mq4g256(&data, &s1, &s2).len(), 2 * 136);
+            assert_eq!(quantize_mq4g256_clipsearch(&data, &s1, &s2).len(), 2 * 136);
+            assert_eq!(quantize_oq4g256(&data, &s1, &s2).len(), 2 * 130);
+            assert_eq!(quantize_hfq4g256(&data).len(), 2 * 136);
+            let _ = symmetric_clipsearch(&data[..256], 7.0);
+        }
+    }
+
+    #[test]
+    fn symmetric_clipsearch_degenerate_groups() {
+        let empty = symmetric_clipsearch(&[], 7.0);
+        assert!(empty.is_finite() && empty >= 0.0);
+        let one = symmetric_clipsearch(&[0.5], 7.0);
+        assert!(one.is_finite() && one >= 0.0);
+        let zeros = symmetric_clipsearch(&[0.0; 256], 7.0);
+        assert!(zeros.is_finite());
+    }
 }
