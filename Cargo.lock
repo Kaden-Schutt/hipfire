@@ -1892,6 +1892,7 @@ dependencies = [
  "hipfire-gguf",
  "hipfire-kvquant",
  "hipfire-lock",
+ "hipfire-model",
  "hipfire-primitives",
  "hipfire-quant-format",
  "memmap2",

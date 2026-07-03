@@ -1300,6 +1300,53 @@ fn write_safetensors(
 
 /// Emit a tiny random-init fixture for `arch` into `out_dir` (created if absent).
 /// Writes `config.json` + `model.safetensors`. Reproducible for a given `seed`.
+/// GPT-2 byte→unicode mapping (the fixed table every byte-level BPE uses). MUST
+/// match `hipfire_model::tokenizer::byte_to_gpt2_char` exactly, or the loader's
+/// `build_byte_to_id` rejects the vocab. Printable bytes map to themselves; the
+/// rest map to U+0100.. in byte order. Validated by `tests::tiny_tokenizer_loads`.
+fn gpt2_byte_chars() -> [char; 256] {
+    let mut out = ['?'; 256];
+    let mut n = 0u32;
+    for b in 0u32..256 {
+        let printable = matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
+        out[b as usize] = if printable {
+            char::from_u32(b).unwrap()
+        } else {
+            let c = char::from_u32(256 + n).unwrap();
+            n += 1;
+            c
+        };
+    }
+    out
+}
+
+/// A minimal, arch-agnostic byte-level BPE `tokenizer.json` for the tiny fixtures.
+/// Every model's real tokenizer is fused to its trained weights and can't be
+/// swapped — but a random-init fixture's tokenizer is arbitrary, so ALL fixtures
+/// share this one: 256 single-byte tokens (no merges) + `<|endoftext|>`, with a
+/// `ByteLevel` pre-tokenizer/decoder so hipfire detects it as byte-level BPE. This
+/// makes each tiny `.hfq` a COMPLETE model the real `serving-core` loader accepts,
+/// so quant-testing runs on the production load+forward path (no bespoke harness).
+fn byte_level_tokenizer_json() -> serde_json::Value {
+    let chars = gpt2_byte_chars();
+    let mut vocab = serde_json::Map::new();
+    for (i, c) in chars.iter().enumerate() {
+        vocab.insert(c.to_string(), serde_json::Value::from(i as u64));
+    }
+    let eot = 256u64;
+    vocab.insert("<|endoftext|>".to_string(), serde_json::Value::from(eot));
+    serde_json::json!({
+        "version": "1.0",
+        "model": { "type": "BPE", "vocab": vocab, "merges": [] },
+        "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true },
+        "decoder": { "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true },
+        "added_tokens": [{
+            "id": eot, "content": "<|endoftext|>", "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": false, "special": true,
+        }],
+    })
+}
+
 pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String> {
     let arch_norm = arch.trim().to_ascii_lowercase().replace(['-', '.'], "_");
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {out_dir:?}: {e}"))?;
@@ -1356,6 +1403,15 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
     )
     .map_err(|e| format!("write config.json: {e}"))?;
 
+    // Shared byte-level tokenizer → the quantizer embeds it into the .hfq metadata
+    // ("tokenizer"), making the fixture a COMPLETE model the real serving-core
+    // loader accepts (so quant tests run on the production path, not a bypass).
+    std::fs::write(
+        out_dir.join("tokenizer.json"),
+        serde_json::to_string(&byte_level_tokenizer_json()).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write tokenizer.json: {e}"))?;
+
     let n_params: usize = specs
         .iter()
         .map(|s| s.shape.iter().product::<usize>())
@@ -1372,6 +1428,29 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_tokenizer_loads() {
+        // Emit a fixture and load its tokenizer.json through hipfire's REAL
+        // tokenizer. `from_hf_json` runs `build_byte_to_id`, which errors if any
+        // byte 0..=255 is missing from the vocab — so this fails loudly if our
+        // `gpt2_byte_chars` ever drifts from `byte_to_gpt2_char`.
+        let dir = tempfile::tempdir().unwrap();
+        emit_fixture("llama", dir.path(), 42).unwrap();
+        let tok_path = dir.path().join("tokenizer.json");
+        assert!(tok_path.exists(), "emit_fixture must write tokenizer.json");
+        let tok = hipfire_model::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
+            .expect("tokenizer.json parses")
+            .expect("tokenizer present");
+        // Every byte encodes to an id within the fixture's vocab (4096), so the
+        // synthetic prompt used for KLD indexes valid embedding rows.
+        let ids = tok.encode("hello, hipfire! 42");
+        assert!(!ids.is_empty());
+        assert!(
+            ids.iter().all(|&id| id < 4096),
+            "ids must fit vocab: {ids:?}"
+        );
+    }
 
     #[test]
     fn bf16_roundtrip_basic() {

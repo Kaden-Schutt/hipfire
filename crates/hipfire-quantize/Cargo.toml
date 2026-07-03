@@ -43,3 +43,6 @@ faer = "0.22"
 [dev-dependencies]
 # hessian_io.rs unit tests (round-trip HFHS via a temp file).
 tempfile = "3"
+# Validate the emitted tiny tokenizer.json actually loads through hipfire's real
+# tokenizer (its build_byte_to_id rejects a vocab that misses any byte).
+hipfire-model = { path = "../hipfire-model" }
