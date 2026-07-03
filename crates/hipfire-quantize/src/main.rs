@@ -3885,6 +3885,19 @@ fn quantize_hfq_source_tensor(
     Ok(out)
 }
 
+/// QTIP beam-search width for the real trellis encoder. Default 128 (near-
+/// Viterbi); override with `--beam N` / `HIPFIRE_QTIP_BEAM=N` to trade a little
+/// quality for a large encode speedup on big models (the beam search is the
+/// offline bottleneck). `--beam` sets this env in `main`, so both the
+/// `.hfq`-requantize and direct-source paths read it here.
+fn qtip_beam_width() -> usize {
+    std::env::var("HIPFIRE_QTIP_BEAM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(128)
+}
+
 /// Pack the real QTIP format (`bits`-bit trellis) over a set of staged BF16
 /// tensors, in place.
 ///
@@ -3899,7 +3912,9 @@ fn quantize_hfq_source_tensor(
 ///     + scale.
 /// All other tensors (norms, 1D scalars, ragged dims) are left untouched.
 /// `bits` is 3 or 4; the trellis codebook/state is bit-agnostic, only the
-/// per-symbol width and the on-disk packing change.
+/// per-symbol width and the on-disk packing change. `beam` is the beam-search
+/// width — 128 is near-Viterbi; smaller trades a little quality for a large
+/// encode speedup (the beam search is the offline bottleneck on big models).
 fn pack_qtip_real_tensors(
     tensors: &mut Vec<HfqTensor>,
     qtip_cb: &[f32],
@@ -3907,6 +3922,7 @@ fn pack_qtip_real_tensors(
     qtip_s2: &[f32],
     lowrank_r: usize,
     bits: u32,
+    beam: usize,
 ) {
     assert!(bits == 3 || bits == 4, "QTIP real pack supports 3 or 4 bits");
     let block_bytes = if bits == 4 {
@@ -3994,7 +4010,7 @@ fn pack_qtip_real_tensors(
                     grp.copy_from_slice(&row[g * 256..g * 256 + 256]);
                     cpu_fwht_256(&mut grp, qtip_s1, qtip_s2); // rotate
                     let scale0 = qtip::group_scale(&grp);
-                    let sym = qtip::beam_encode_group_bits(&grp, scale0, qtip_cb, 128, bits);
+                    let sym = qtip::beam_encode_group_bits(&grp, scale0, qtip_cb, beam, bits);
                     let scale = qtip::optimal_scale_bits(&grp, &sym, qtip_cb, bits);
                     // Self-check: decode in the rotated frame vs the encode target.
                     let deq = qtip::decode_group_bits(&sym, scale, qtip_cb, bits);
@@ -4168,6 +4184,7 @@ fn run_hfq_source_pipeline(
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             bits,
+            qtip_beam_width(),
         );
         // Recount rewritten params: the post-pass changes quant types after the
         // per-tensor loop above bumped the counter for the BF16 staging.
@@ -5517,6 +5534,8 @@ OPTIONS:
                                with --awq (smooths activations + rebases the Hessian)
     --chat-template-file <P>   override the embedded chat template (Jinja file)
     --threads <N>              rayon worker threads (default 80% of cores; env HIPFIRE_QUANT_THREADS)
+    --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
+                               much faster encode on big models, slight quality loss (env HIPFIRE_QTIP_BEAM)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
 
   MoE / K-map:
@@ -6579,6 +6598,19 @@ fn main() {
             "OQ+ magnitude-tiering: ENABLED (top-{:.2}% weights/group kept at W8A8, bulk W4A8, single iu8 kernel)",
             frac * 100.0
         );
+    }
+
+    // `--beam N` sets the QTIP trellis beam-search width (default 128, near-
+    // Viterbi). Smaller = much faster offline encode on big models, slightly
+    // lower quality. Bridged through HIPFIRE_QTIP_BEAM so both the .hfq-requant
+    // and direct-source pack paths (`qtip_beam_width`) read one value.
+    if let Some(i) = args.iter().position(|a| a == "--beam") {
+        if let Some(b) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()).filter(|&b| b > 0) {
+            std::env::set_var("HIPFIRE_QTIP_BEAM", b.to_string());
+            eprintln!("QTIP trellis beam width: {b} (--beam)");
+        } else {
+            eprintln!("--beam requires a positive integer; ignoring");
+        }
     }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
@@ -11081,6 +11113,7 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             qtip_bits,
+            qtip_beam_width(),
         );
     }
 
