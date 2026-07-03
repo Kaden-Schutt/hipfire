@@ -691,6 +691,18 @@ fn normalize_answer(s: &str) -> String {
         .join(" ")
 }
 
+/// Paper's rule-based abstention pre-filter (collect_responses.py
+/// `uncertain_terms`): the answer expresses uncertainty rather than committing.
+/// Checked BEFORE correctness in the intervention sweep — an abstention is the
+/// opposite of over-compliance, not a hallucination, even though it never
+/// matches the gold aliases.
+fn is_abstention(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["don't know", "cannot", "not provided", "no information"]
+        .iter()
+        .any(|term| t.contains(term))
+}
+
 /// Label = 1 (hallucinated) unless a gold alias is a word-boundary substring of
 /// the normalized prediction (the lenient TriviaQA open-generation match).
 fn is_hallucinated(prediction: &str, aliases: &[String]) -> bool {
@@ -856,10 +868,18 @@ async fn run_sweep(
         hneurons_path.display()
     );
     println!("questions:      {}", questions.len());
-    println!("{:>6}  {:>12}  {:>6}", "gain", "halluc_rate", "n");
+    // Paper's over-compliance protocol (collect_responses.py): classify each
+    // answer three ways — abstained (uncertainty terms), correct (gold-alias
+    // match), or hallucinated (committed to a wrong answer instead of
+    // abstaining). Over-compliance = hallucinated. Causal claim: ablating
+    // H-Neurons (gain<1) raises abstention and lowers hallucination.
+    println!(
+        "{:>6}  {:>9}  {:>9}  {:>9}  {:>5}",
+        "gain", "abstain", "halluc", "correct", "n"
+    );
     for &gain in gains {
         session.set_intervention(indices.clone(), gain).await?;
-        let (mut hall, mut n) = (0usize, 0usize);
+        let (mut abstain, mut hall, mut correct, mut n) = (0usize, 0usize, 0usize, 0usize);
         for (i, q) in questions.iter().enumerate() {
             let text = session
                 .generate_retry(&format!("sweep-{gain}-{i}"), &q.question, &sampling, 4)
@@ -867,13 +887,22 @@ async fn run_sweep(
             if text.trim().is_empty() {
                 continue;
             }
-            if is_hallucinated(&text, &q.aliases) {
-                hall += 1;
-            }
             n += 1;
+            if is_abstention(&text) {
+                abstain += 1;
+            } else if is_hallucinated(&text, &q.aliases) {
+                hall += 1;
+            } else {
+                correct += 1;
+            }
         }
-        let rate = if n > 0 { hall as f64 / n as f64 } else { 0.0 };
-        println!("{gain:>6.2}  {rate:>12.4}  {n:>6}");
+        let d = n.max(1) as f64;
+        println!(
+            "{gain:>6.2}  {:>9.4}  {:>9.4}  {:>9.4}  {n:>5}",
+            abstain as f64 / d,
+            hall as f64 / d,
+            correct as f64 / d,
+        );
     }
     // Clear the intervention on the way out (identity).
     session.set_intervention(Vec::new(), 1.0).await?;
