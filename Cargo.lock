@@ -1307,6 +1307,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-llama-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-minimax"
 version = "0.3.0"
 dependencies = [
@@ -1407,6 +1414,7 @@ name = "hipfire-archs"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "hipfire-arch-llama-spec",
  "hipfire-arch-toy",
 ]
 

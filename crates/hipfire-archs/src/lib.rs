@@ -25,6 +25,8 @@ use std::sync::OnceLock;
 /// the final binary. Referencing the crate (even as `_`) creates the link edge.
 mod force_link {
     #[allow(unused_imports)]
+    use hipfire_arch_llama_spec as _;
+    #[allow(unused_imports)]
     use hipfire_arch_toy as _;
 }
 
@@ -55,6 +57,17 @@ mod tests {
         assert!(toy.caps.batched_prefill.is_none());
     }
 
+    #[test]
+    fn bundle_exposes_llama_spec_ingest() {
+        // The lean llama `-spec` crate's Ingest quant-policy is reachable through
+        // the bundle — the path the quantizer will use to consult an arch's needs.
+        let llama = registry()
+            .get(ArchId(0x00))
+            .expect("llama spec reachable through the bundle");
+        assert_eq!(llama.family, "llama");
+        assert!(llama.caps.ingest.is_some(), "llama declares Ingest");
+    }
+
     /// Completeness gate. Two invariants that hold today and guard migration:
     ///  1. no two archs claim the same id, and every arch has a family name;
     ///  2. a migration LEDGER — the exact set of ids on the capability layer.
@@ -81,8 +94,8 @@ mod tests {
 
         // Ids CURRENTLY migrated onto the capability layer. Add one per family as
         // it moves over; a mismatch means either a dropped registration or an
-        // untracked addition.
-        let expected: BTreeSet<u16> = [0xFF].into_iter().collect();
+        // untracked addition. (0x00 = llama offline spec, 0xFF = toy.)
+        let expected: BTreeSet<u16> = [0x00, 0xFF].into_iter().collect();
         assert_eq!(
             unique, expected,
             "arch migration ledger drift — update the expected set as families \

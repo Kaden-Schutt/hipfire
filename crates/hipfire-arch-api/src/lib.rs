@@ -113,6 +113,29 @@ impl Caps {
             ingest: None,
         }
     }
+
+    /// Fill any capability this table is missing from `other` (used when an arch
+    /// registers from more than one crate). Panics if both tables declare the same
+    /// capability — that's two crates claiming one capability for one arch, a bug.
+    /// Keep one line per `Caps` field.
+    pub(crate) fn merge_from(&mut self, other: Caps, id: ArchId) {
+        macro_rules! merge_field {
+            ($field:ident) => {
+                match (self.$field.is_some(), other.$field.is_some()) {
+                    (false, true) => self.$field = other.$field,
+                    (true, true) => panic!(
+                        "{id}: capability `{}` registered by two crates — one arch, one owner per capability",
+                        stringify!($field)
+                    ),
+                    _ => {}
+                }
+            };
+        }
+        merge_field!(batched_prefill);
+        merge_field!(spec_decode_chain);
+        merge_field!(toy_model);
+        merge_field!(ingest);
+    }
 }
 
 /// One link-time registration record. Constructed by [`register_arch!`] and
@@ -148,14 +171,24 @@ pub struct ArchRegistry {
 impl ArchRegistry {
     /// Collect all link-time registrations. Cheap; call once and cache.
     pub fn build() -> Self {
-        let mut archs = Vec::new();
+        let mut archs: Vec<RegisteredArch> = Vec::new();
         for entry in inventory::iter::<ArchEntry> {
-            archs.push(RegisteredArch {
-                id: entry.base.id(),
-                family: entry.base.family(),
-                base: entry.base,
-                caps: (entry.make_caps)(),
-            });
+            let id = entry.base.id();
+            let caps = (entry.make_caps)();
+            // An arch may register from more than one crate (its lean offline
+            // `-spec` crate declares Ingest; its serving crate declares
+            // BatchedPrefill, …). Merge entries sharing an ArchId into one arch,
+            // unioning their capability tables. Conflicting claims panic.
+            if let Some(existing) = archs.iter_mut().find(|a| a.id == id) {
+                existing.caps.merge_from(caps, id);
+            } else {
+                archs.push(RegisteredArch {
+                    id,
+                    family: entry.base.family(),
+                    base: entry.base,
+                    caps,
+                });
+            }
         }
         ArchRegistry { archs }
     }
@@ -299,5 +332,71 @@ mod tests {
                 .unwrap(),
             "test-fixture"
         );
+    }
+
+    // Two crates registering the SAME arch id with DISJOINT capabilities — the
+    // offline `-spec` / serving split. The registry unions them into one arch.
+    struct MergeOffline;
+    impl Arch for MergeOffline {
+        fn id(&self) -> ArchId {
+            ArchId(0x7E58)
+        }
+        fn family(&self) -> &'static str {
+            "merge"
+        }
+    }
+    impl ToyModel for MergeOffline {
+        fn emit_fixture(&self, _o: &std::path::Path, _s: u64) -> Result<String, String> {
+            Ok("m".into())
+        }
+    }
+    static MERGE_OFFLINE: MergeOffline = MergeOffline;
+    register_arch!(MERGE_OFFLINE, ToyModel);
+
+    struct MergeServing;
+    impl Arch for MergeServing {
+        fn id(&self) -> ArchId {
+            ArchId(0x7E58) // same id as MergeOffline
+        }
+        fn family(&self) -> &'static str {
+            "merge"
+        }
+    }
+    impl BatchedPrefill for MergeServing {
+        fn max_prefill_batch(&self) -> usize {
+            512
+        }
+    }
+    static MERGE_SERVING: MergeServing = MergeServing;
+    register_arch!(MERGE_SERVING, BatchedPrefill);
+
+    #[test]
+    fn registry_merges_caps_across_crates_for_one_id() {
+        let reg = ArchRegistry::build();
+        // Entries merged, not duplicated: exactly one arch for the shared id.
+        assert_eq!(
+            reg.iter().filter(|a| a.id == ArchId(0x7E58)).count(),
+            1,
+            "the two registrations must collapse to one arch"
+        );
+        let a = reg.get(ArchId(0x7E58)).unwrap();
+        // Union of both registrations' capabilities.
+        assert!(a.caps.toy_model.is_some(), "offline cap merged in");
+        assert!(a.caps.batched_prefill.is_some(), "serving cap merged in");
+        assert_eq!(a.caps.batched_prefill.unwrap().max_prefill_batch(), 512);
+    }
+
+    #[test]
+    #[should_panic(expected = "registered by two crates")]
+    fn merge_conflict_panics() {
+        let mut a = Caps {
+            toy_model: Some(&TEST_INSTANCE),
+            ..Caps::none()
+        };
+        let b = Caps {
+            toy_model: Some(&TEST_INSTANCE),
+            ..Caps::none()
+        };
+        a.merge_from(b, ArchId(0x7E57));
     }
 }

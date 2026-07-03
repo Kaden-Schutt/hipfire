@@ -13,3 +13,4 @@ description = "Aggregation crate: depends on every arch crate so their register_
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-arch-toy = { path = "../hipfire-arch-toy" }
+hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
