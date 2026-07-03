@@ -39,6 +39,9 @@
 //! definitions without pulling in the serving/kernel stack. Serving-heavy method
 //! bodies live in the arch crates that `impl` them, not here.
 
+pub mod ingest;
+pub use ingest::{allocate, target_bits, CapReq, CodecCaps, Ingest, TensorRole};
+
 /// Stable numeric identity of an architecture family (the on-disk/header id).
 ///
 /// Named constants for the concrete families live alongside the registry as they
@@ -97,6 +100,7 @@ pub struct Caps {
     pub batched_prefill: Option<&'static dyn BatchedPrefill>,
     pub spec_decode_chain: Option<&'static dyn SpecDecodeChain>,
     pub toy_model: Option<&'static dyn ToyModel>,
+    pub ingest: Option<&'static dyn Ingest>,
 }
 
 impl Caps {
@@ -106,6 +110,7 @@ impl Caps {
             batched_prefill: None,
             spec_decode_chain: None,
             toy_model: None,
+            ingest: None,
         }
     }
 }
@@ -190,6 +195,9 @@ macro_rules! __set_cap {
     };
     ($caps:ident, $inst:expr, ToyModel) => {
         $caps.toy_model = ::core::option::Option::Some($inst as &'static dyn $crate::ToyModel);
+    };
+    ($caps:ident, $inst:expr, Ingest) => {
+        $caps.ingest = ::core::option::Option::Some($inst as &'static dyn $crate::Ingest);
     };
     ($caps:ident, $inst:expr, $other:ident) => {
         ::core::compile_error!(::core::concat!(

@@ -19,7 +19,7 @@
 
 use crate::arch::Toy;
 use crate::toy_model::{ToyConfig, ToyWeights};
-use hipfire_arch_api::{register_arch, Arch, ArchId, ToyModel};
+use hipfire_arch_api::{register_arch, Arch, ArchId, CapReq, Ingest, TensorRole, ToyModel};
 use std::path::Path;
 
 /// Reserved toy id — never shipped in a real `.hfq`. Kept as a named constant so
@@ -54,10 +54,46 @@ impl ToyModel for Toy {
     }
 }
 
+impl Ingest for Toy {
+    // NOTE what does NOT appear below: any format name (Q8, oq4, f16) or any
+    // decision about *how* a tensor is stored. The arch states only WHAT each
+    // tensor is and how much it matters; the deployment's `allocate()` picks the
+    // codec. This is the shape that replaces the quantizer's is_q8_tensor /
+    // is_deepseek4_keep_f16 name-matching.
+    fn role(&self, tensor: &str) -> TensorRole {
+        if tensor.contains("embed") {
+            TensorRole::Embed
+        } else if tensor.contains("lm_head") {
+            TensorRole::LmHead
+        } else if tensor.contains("norm") {
+            TensorRole::Norm
+        } else {
+            TensorRole::Other
+        }
+    }
+
+    fn importance(&self, tensor: &str) -> u8 {
+        match self.role(tensor) {
+            // Gather-indexed tables are numerically critical → max saliency.
+            TensorRole::Embed | TensorRole::LmHead => 255,
+            TensorRole::Norm => 200,
+            _ => 128,
+        }
+    }
+
+    fn requires(&self, tensor: &str) -> CapReq {
+        match self.role(tensor) {
+            // Embeddings / lm_head are gathered a row at a time → need random access.
+            TensorRole::Embed | TensorRole::LmHead => CapReq::RANDOM_ACCESS,
+            _ => CapReq::NONE,
+        }
+    }
+}
+
 /// The arch singleton. Trait dispatch uses the type; the registry needs a
 /// `'static` value to hand out as `&dyn Arch` / `&dyn Cap`.
 static TOY_INSTANCE: Toy = Toy;
-register_arch!(TOY_INSTANCE, ToyModel);
+register_arch!(TOY_INSTANCE, ToyModel, Ingest);
 
 #[cfg(test)]
 mod tests {
@@ -81,5 +117,50 @@ mod tests {
         // Unsupported capability → None → the daemon's safe fallback branch. This
         // is the whole point: the daemon can't call batched prefill on the toy.
         assert!(a.caps.batched_prefill.is_none());
+    }
+
+    /// End-to-end proof the is_q8_tensor smell is gone: the arch states needs, the
+    /// DEPLOYMENT's codec menu (names live here, not arch-side) is matched by
+    /// `allocate`, and the embedding lands on a random-access high-bit codec —
+    /// the old is_q8_tensor outcome, DERIVED, with no format name in the arch.
+    #[test]
+    fn ingest_derives_codec_without_naming_formats_arch_side() {
+        use hipfire_arch_api::{allocate, CodecCaps};
+        let reg = ArchRegistry::build();
+        let a = reg.get(TOY_ARCH_ID).unwrap();
+        let ing = a.caps.ingest.expect("toy declares Ingest");
+
+        // The codec menu is the DEPLOYMENT's — format names appear only here.
+        let codecs = [
+            CodecCaps {
+                name: "qtip4",
+                bits_per_weight: 4.0,
+                group_size: 256,
+                random_access: false,
+            },
+            CodecCaps {
+                name: "oq8",
+                bits_per_weight: 8.0,
+                group_size: 0,
+                random_access: true,
+            },
+            CodecCaps {
+                name: "oq4",
+                bits_per_weight: 4.0,
+                group_size: 256,
+                random_access: false,
+            },
+        ];
+
+        // Embedding table: arch says important + random-access → the 8b random-
+        // access codec is derived. (is_q8_tensor's result, no "Q8" written arch-side.)
+        let embed = "model.embed_tokens.weight";
+        let sel = allocate(ing.importance(embed), ing.requires(embed), 4096, &codecs).unwrap();
+        assert_eq!(sel.name, "oq8");
+
+        // A generic projection: medium importance, no requirement → a 4b codec.
+        let mlp = "model.layers.0.mlp.up_proj.weight";
+        let sel = allocate(ing.importance(mlp), ing.requires(mlp), 4096, &codecs).unwrap();
+        assert_eq!(sel.bits_per_weight, 4.0);
     }
 }
