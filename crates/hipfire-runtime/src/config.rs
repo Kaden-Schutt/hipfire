@@ -125,6 +125,22 @@ impl RuntimeConfig {
     }
 }
 
+/// Decide the effective `(pp, tp)` parallelism degrees for a load. An
+/// explicitly-requested `pp > 1` or `tp > 1` (from the load message) always
+/// wins. Only when neither is requested does `HIPFIRE_EMULATE_GPUS` default
+/// the mode — to TP (EP), the primary multi-GPU path; PP stays opt-in via an
+/// explicit `pp`. The pp/tp mutual-exclusion check remains with the caller.
+pub fn resolve_parallelism(pp: usize, tp: usize, emulate_gpus: Option<usize>) -> (usize, usize) {
+    if pp == 1 && tp == 1 {
+        if let Some(n) = emulate_gpus {
+            if n >= 2 {
+                return (pp, n);
+            }
+        }
+    }
+    (pp, tp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::RuntimeConfig;
@@ -168,5 +184,17 @@ mod tests {
             Some(v) => std::env::set_var("HIPFIRE_EMULATE_GPUS", v),
             None => std::env::remove_var("HIPFIRE_EMULATE_GPUS"),
         }
+    }
+
+    #[test]
+    fn resolve_parallelism_defaults_tp_only_when_unset() {
+        // Neither requested + emulate -> default TP.
+        assert_eq!(super::resolve_parallelism(1, 1, Some(2)), (1, 2));
+        // Explicit pp wins; no tp default.
+        assert_eq!(super::resolve_parallelism(2, 1, Some(2)), (2, 1));
+        // Explicit tp wins.
+        assert_eq!(super::resolve_parallelism(1, 4, Some(2)), (1, 4));
+        // No emulate -> unchanged.
+        assert_eq!(super::resolve_parallelism(1, 1, None), (1, 1));
     }
 }

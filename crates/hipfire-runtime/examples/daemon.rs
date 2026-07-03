@@ -1845,6 +1845,16 @@ fn main() {
                     .and_then(|p| p.get("tp"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
+                // Debug dual-GPU emulation (HIPFIRE_EMULATE_GPUS): when neither
+                // pp nor tp is explicitly requested, default the mode to TP so
+                // the EP path runs on a single card. PP stays opt-in via pp.
+                // Shadows pp/tp; the mutual-exclusion check below still holds
+                // because defaulting never sets both > 1.
+                let (pp, tp) = hipfire_runtime::config::resolve_parallelism(
+                    pp,
+                    tp,
+                    hipfire_runtime::config::get().emulate_gpus,
+                );
                 if tp > 1 && pp > 1 {
                     let _ = writeln!(
                         stdout,
