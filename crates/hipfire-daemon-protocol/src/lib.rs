@@ -182,6 +182,18 @@ pub struct CettCaptureRequest {
     pub response: String,
 }
 
+/// Set a process-global H-Neuron intervention gain on the resident dense model.
+/// `indices` are FLAT feature indices (`layer * intermediate + neuron`) — the
+/// positive-weight probe set; each is scaled by `gain` in the FFN forward
+/// (prefill + decode). `gain == 1.0` or an empty `indices` clears the session
+/// (the identity control point of the dose-response sweep).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct HneuronInterveneRequest {
+    #[serde(default)]
+    pub indices: Vec<u32>,
+    pub gain: f32,
+}
+
 /// Load a `.lora` adapter container (path on the daemon host) onto the APPLY
 /// stack. `scale` overrides the adapter's baked-in default intensity if present;
 /// `id` renames the adapter on load (so the same container can be stacked under
@@ -247,6 +259,7 @@ pub enum DaemonRequest {
     LoraList,
     CettLoadColnorms(CettLoadColnormsRequest),
     CettCapture(CettCaptureRequest),
+    HneuronIntervene(HneuronInterveneRequest),
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +290,10 @@ pub enum DaemonResponse {
     },
     CettFeature {
         feature: Vec<Vec<f32>>,
+    },
+    HneuronOk {
+        n_intervened: usize,
+        gain: f32,
     },
     #[serde(other)]
     Unknown,

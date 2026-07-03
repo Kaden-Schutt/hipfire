@@ -5571,6 +5571,79 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            // ── H-Neurons intervention gain (arXiv 2512.01797) ──────────────
+            // Set a process-global per-neuron activation gain on the resident
+            // dense model: each FLAT feature index (`layer*intermediate+neuron`)
+            // is scaled by `gain` in the FFN forward (prefill + decode); every
+            // other neuron by 1.0. `gain == 1.0` or an empty set clears the
+            // session — the identity control point of the dose-response sweep.
+            "hneuron_intervene" => {
+                let gain = msg.get("gain").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let indices: Vec<usize> = msg
+                    .get("indices")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_u64().map(|u| u as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Mask geometry from the resident model config (immutable borrow,
+                // dropped before the mutable `gpu` use below).
+                let dims = match model.as_ref() {
+                    Some(m) => {
+                        if let Some(b) = m.gemma3_text.as_ref() {
+                            Some((b.config.num_hidden_layers, b.config.intermediate_size))
+                        } else if let Some(b) = m.gemma3_vl.as_ref() {
+                            Some((b.text_cfg.num_hidden_layers, b.text_cfg.intermediate_size))
+                        } else if let Some(b) = m.llama_backend.as_ref() {
+                            Some((b.config.n_layers, b.config.hidden_dim))
+                        } else {
+                            None
+                        }
+                    }
+                    None => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "hneuron_intervene: no model loaded".to_string(),
+                        );
+                        continue;
+                    }
+                };
+                let Some((n_layers, inter)) = dims else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        "hneuron_intervene: no resident dense backend (llama|gemma3)".to_string(),
+                    );
+                    continue;
+                };
+                let n_intervened = indices.len();
+                let result = if indices.is_empty() || (gain - 1.0).abs() < f32::EPSILON {
+                    hipfire_hneurons::intervene::clear();
+                    Ok(())
+                } else {
+                    hipfire_hneurons::intervene::begin_intervention(
+                        &mut gpu, n_layers, inter, &indices, gain,
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        let resp = serde_json::json!({
+                            "type": "hneuron_ok",
+                            "n_intervened": n_intervened,
+                            "gain": gain,
+                        });
+                        let _ = writeln!(stdout, "{resp}");
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, "", format!("hneuron_intervene: {e:?}"))
+                    }
+                }
+            }
+
             // ── H-Neurons CETT capture (arXiv 2512.01797) ───────────────────
             // Load the per-layer down_proj column norms (`‖W_down[:,j]‖`) once
             // from a compact little-endian binary produced host-side from the

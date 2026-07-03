@@ -45,12 +45,23 @@ struct Args {
     limit: Option<usize>,
     l1: f32,
     max_seq: usize,
+    // Persist the derived H-Neuron set (flat feature indices) as JSON for the
+    // intervention sweep, so the ~1h capture doesn't have to be repeated.
+    save_hneurons: Option<PathBuf>,
+    // Intervention-sweep mode: load a saved H-Neuron set and run the
+    // bidirectional gain dose-response (needs `--gen-test` for held-out
+    // questions with aliases). `sweep_gains` is a CSV; default 0,0.5,1,1.5,2.
+    sweep_hneurons: Option<PathBuf>,
+    sweep_gains: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut daemon = None;
     let mut model = None;
     let mut colnorms = None;
+    let mut save_hneurons = None;
+    let mut sweep_hneurons = None;
+    let mut sweep_gains = None;
     let mut data_dir = None;
     let mut data_prefix = "Llama33_TriviaQA".to_string();
     let mut gen_train = None;
@@ -87,6 +98,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--l1" => l1 = val()?.parse().map_err(|e| format!("--l1: {e}"))?,
             "--max-seq" => max_seq = val()?.parse().map_err(|e| format!("--max-seq: {e}"))?,
+            "--save-hneurons" => save_hneurons = Some(PathBuf::from(val()?)),
+            "--sweep-hneurons" => sweep_hneurons = Some(PathBuf::from(val()?)),
+            "--sweep-gains" => sweep_gains = Some(val()?),
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -109,6 +123,9 @@ fn parse_args() -> Result<Args, String> {
         limit,
         l1,
         max_seq,
+        save_hneurons,
+        sweep_hneurons,
+        sweep_gains,
     })
 }
 
@@ -221,6 +238,10 @@ struct Session {
     max_seq: u32,
     colnorms: String,
     respawns: usize,
+    /// Active H-Neuron intervention `(flat indices, gain)`, remembered so a wedge
+    /// respawn re-applies it (otherwise the sweep would silently run at gain 1.0).
+    /// `None` = identity/no intervention.
+    intervention: Option<(Vec<u32>, f32)>,
 }
 
 impl Session {
@@ -237,6 +258,7 @@ impl Session {
             max_seq,
             colnorms,
             respawns: 0,
+            intervention: None,
         };
         s.reprime(false).await?;
         Ok(s)
@@ -273,7 +295,37 @@ impl Session {
             .await
             .map_err(|e| format!("reload colnorms: {e}"))?;
         self.engine = Some(engine);
+        // Re-apply any active H-Neuron intervention — a wedge respawn otherwise
+        // silently drops it and the rest of that gain point runs unperturbed.
+        if let Some((indices, gain)) = self.intervention.clone() {
+            self.engine
+                .as_mut()
+                .unwrap()
+                .hneuron_intervene(indices, gain)
+                .await
+                .map_err(|e| format!("reapply intervention: {e}"))?;
+        }
         Ok(())
+    }
+
+    /// Set (or clear) the H-Neuron intervention on the daemon and remember it for
+    /// wedge-respawn re-apply. `gain == 1.0` or empty `indices` clears (identity).
+    async fn set_intervention(&mut self, indices: Vec<u32>, gain: f32) -> Result<(), String> {
+        if self.engine.is_none() {
+            self.reprime(true).await?;
+        }
+        let is_identity = indices.is_empty() || (gain - 1.0).abs() < f32::EPSILON;
+        self.intervention = if is_identity {
+            None
+        } else {
+            Some((indices.clone(), gain))
+        };
+        self.engine
+            .as_mut()
+            .unwrap()
+            .hneuron_intervene(indices, gain)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn generate_retry(
@@ -400,6 +452,36 @@ fn run() -> Result<(), String> {
         .to_string();
 
     let max_seq_u32 = params.max_seq;
+
+    // Intervention-sweep mode: load a saved H-Neuron set and run the
+    // bidirectional gain dose-response, then return (no capture/fit).
+    if let Some(hn_path) = args.sweep_hneurons.clone() {
+        let qpath = args
+            .gen_test
+            .clone()
+            .ok_or("--sweep-hneurons requires --gen-test (held-out questions with aliases)")?;
+        let gains = parse_gains(args.sweep_gains.as_deref());
+        return rt.block_on(async {
+            let mut session = Session::connect(
+                daemon_bin.clone(),
+                model.clone(),
+                max_seq_u32,
+                colnorms.clone(),
+            )
+            .await?;
+            eprintln!("[model] loaded {model} + colnorms (resilient session)");
+            let questions = load_gen_questions(&qpath, args.gen_limit)?;
+            run_sweep(
+                &mut session,
+                &hn_path,
+                &questions,
+                &gains,
+                args.gen_max_tokens,
+            )
+            .await
+        });
+    }
+
     let (feat_train, ytr, feat_test, yte) = rt.block_on(async {
         let mut session = Session::connect(
             daemon_bin.clone(),
@@ -495,6 +577,27 @@ fn run() -> Result<(), String> {
     // Show the top few by index for a sanity peek.
     let preview: Vec<usize> = hn.iter().take(16).copied().collect();
     println!("  first {} indices: {:?}", preview.len(), preview);
+
+    // Persist the H-Neuron set for the intervention sweep. Flat feature indices
+    // (`layer * intermediate + neuron`) are exactly what the intervention mask
+    // consumes; `feature_dim` lets the loader sanity-check against the model.
+    if let Some(path) = &args.save_hneurons {
+        let doc = serde_json::json!({
+            "model": args.model.to_string_lossy(),
+            "dataset": args.data_prefix,
+            "feature_dim": d,
+            "test_balanced": bal_acc,
+            "nonzero": nz,
+            "l1": args.l1,
+            "hneurons": hn,
+        });
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("--save-hneurons {}: {e}", path.display()))?;
+        println!("saved {} H-Neurons → {}", hn.len(), path.display());
+    }
     Ok(())
 }
 
@@ -696,6 +799,85 @@ async fn selfgen_split(
         }
     }
     Ok((feats, labels))
+}
+
+/// Parse the `--sweep-gains` CSV; default to the standard dose-response points.
+fn parse_gains(spec: Option<&str>) -> Vec<f32> {
+    match spec {
+        Some(s) => s
+            .split(',')
+            .filter_map(|x| x.trim().parse::<f32>().ok())
+            .collect(),
+        None => vec![0.0, 0.5, 1.0, 1.5, 2.0],
+    }
+}
+
+/// H-Neuron intervention dose-response sweep. For each `gain`, set the
+/// process-global per-neuron gain on the daemon, regenerate answers to the
+/// held-out `questions` (labeled by gold aliases), and report the hallucination
+/// rate — a causal test of whether down-weighting (`gain < 1`) cuts hallucination
+/// and up-weighting (`gain > 1`) raises it. `gain == 1.0` is the identity control.
+async fn run_sweep(
+    session: &mut Session,
+    hneurons_path: &Path,
+    questions: &[GenQuestion],
+    gains: &[f32],
+    max_tokens: u32,
+) -> Result<(), String> {
+    let raw = std::fs::read_to_string(hneurons_path)
+        .map_err(|e| format!("read {}: {e}", hneurons_path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let indices: Vec<u32> = doc["hneurons"]
+        .as_array()
+        .ok_or("hneurons json: missing 'hneurons' array")?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|u| u as u32))
+        .collect();
+    if indices.is_empty() {
+        return Err("hneurons json: empty 'hneurons' array".to_string());
+    }
+    let feature_dim = doc["feature_dim"].as_u64().unwrap_or(0);
+    eprintln!(
+        "[sweep] {} H-Neurons (feature_dim {feature_dim}), {} questions, gains {gains:?}",
+        indices.len(),
+        questions.len(),
+    );
+    let sampling = GenerationSamplingPolicy {
+        temperature: 0.0,
+        top_p: None,
+        repeat_penalty: None,
+        max_tokens,
+    };
+
+    println!("=== H-Neuron intervention sweep ===");
+    println!(
+        "hneurons:       {} ({})",
+        indices.len(),
+        hneurons_path.display()
+    );
+    println!("questions:      {}", questions.len());
+    println!("{:>6}  {:>12}  {:>6}", "gain", "halluc_rate", "n");
+    for &gain in gains {
+        session.set_intervention(indices.clone(), gain).await?;
+        let (mut hall, mut n) = (0usize, 0usize);
+        for (i, q) in questions.iter().enumerate() {
+            let text = session
+                .generate_retry(&format!("sweep-{gain}-{i}"), &q.question, &sampling, 4)
+                .await?;
+            if text.trim().is_empty() {
+                continue;
+            }
+            if is_hallucinated(&text, &q.aliases) {
+                hall += 1;
+            }
+            n += 1;
+        }
+        let rate = if n > 0 { hall as f64 / n as f64 } else { 0.0 };
+        println!("{gain:>6.2}  {rate:>12.4}  {n:>6}");
+    }
+    // Clear the intervention on the way out (identity).
+    session.set_intervention(Vec::new(), 1.0).await?;
+    Ok(())
 }
 
 /// Capture the flattened CETT feature (`n_layers*intermediate`) for every sample,

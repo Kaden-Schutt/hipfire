@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
     CettCaptureRequest, CettLoadColnormsRequest, CollectRequest, CollectResponse, DaemonRequest,
-    DaemonResponse, KldChunkEvent, KldEvalRequest, KldEvalResponse, LoraLoadRequest,
-    LoraSetScaleRequest, LoraUnloadRequest, RequestControl, SteerApplyRequest,
+    DaemonResponse, HneuronInterveneRequest, KldChunkEvent, KldEvalRequest, KldEvalResponse,
+    LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest, RequestControl, SteerApplyRequest,
     SteerBeginCaptureRequest, SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
@@ -415,6 +415,28 @@ impl DaemonEngine {
                 }
                 DaemonResponse::Unknown => {}
                 other => tracing::warn!("unexpected response during cett_capture: {other:?}"),
+            }
+        }
+    }
+
+    /// Set a process-global H-Neuron intervention gain on the resident model:
+    /// each flat feature index in `indices` is scaled by `gain` in the FFN
+    /// forward. `gain == 1.0` or an empty `indices` clears the session (identity
+    /// control). Waits for the `hneuron_ok` ack.
+    pub async fn hneuron_intervene(&mut self, indices: Vec<u32>, gain: f32) -> anyhow::Result<()> {
+        self.send(&DaemonRequest::HneuronIntervene(HneuronInterveneRequest {
+            indices,
+            gain,
+        }))
+        .await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::HneuronOk { .. } => return Ok(()),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon hneuron_intervene error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during hneuron_intervene: {other:?}"),
             }
         }
     }

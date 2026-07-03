@@ -353,6 +353,9 @@ fn forward_after_x(
         weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
         weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
         gpu.gelu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
+        // H-Neuron intervention gain (no-op unless a session is active): scale the
+        // down_proj input in place before down. Decode is a single position.
+        hipfire_hneurons::intervene::maybe_intervene_ffn(gpu, &state.ffn_hidden, layer_idx, 1)?;
         weight_gemv(gpu, &layer.w_down, &state.ffn_hidden, &state.o)?;
         // post_feedforward_layernorm, also inside the residual.
         gpu.rmsnorm_f32(&state.o, &layer.post_ffn_norm, &state.tmp, eps)?;
@@ -558,6 +561,9 @@ pub fn forward_prefill_batch(
         prefill_linear(gpu, &layer.w_gate, &tmp, &gate, m)?;
         prefill_linear(gpu, &layer.w_up, &tmp, &up, m)?;
         gpu.gelu_mul_f32(&gate, &up, &ffn)?;
+        // H-Neuron intervention gain (no-op unless active): scale the down_proj
+        // input in place before down, across all m positions.
+        hipfire_hneurons::intervene::maybe_intervene_ffn(gpu, &ffn, layer_idx, m)?;
         prefill_linear(gpu, &layer.w_down, &ffn, &o, m)?;
         // H-Neurons CETT tap (no-op unless a capture session is active). `o` holds
         // the raw down_proj output here — the residual add below folds
