@@ -95,17 +95,17 @@ fn main() {
     }
     let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
-    let census =
-        match fold_counter_csv_texts(&arch, &perf_level, min_nonzero_fraction, &text_refs) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("pmc_census: census fold failed: {e}");
-                exit(1);
-            }
-        };
+    let census = match fold_counter_csv_texts(&arch, &perf_level, min_nonzero_fraction, &text_refs)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pmc_census: census fold failed: {e}");
+            exit(1);
+        }
+    };
 
-    let pretty = serde_json::to_string_pretty(&census.to_json())
-        .expect("census JSON always serializes");
+    let pretty =
+        serde_json::to_string_pretty(&census.to_json()).expect("census JSON always serializes");
 
     match &out {
         Some(path) => {
