@@ -180,6 +180,14 @@ pub struct CettCaptureRequest {
     pub user: String,
     #[serde(default)]
     pub response: String,
+    /// Optional factual-answer-token span WITHIN the response (token offset +
+    /// length, from the dataset's tokenized_response/answer_tokens). When set,
+    /// CETT is captured over just that span (paper's answer-token features);
+    /// otherwise over the whole response.
+    #[serde(default)]
+    pub answer_offset: Option<usize>,
+    #[serde(default)]
+    pub answer_len: Option<usize>,
 }
 
 /// Set a process-global H-Neuron intervention gain on the resident dense model.
@@ -290,6 +298,8 @@ pub enum DaemonResponse {
     },
     CettFeature {
         feature: Vec<Vec<f32>>,
+        #[serde(default)]
+        count: usize,
     },
     HneuronOk {
         n_intervened: usize,

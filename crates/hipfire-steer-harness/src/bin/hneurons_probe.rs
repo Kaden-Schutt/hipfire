@@ -53,6 +53,9 @@ struct Args {
     // questions with aliases). `sweep_gains` is a CSV; default 0,0.5,1,1.5,2.
     sweep_hneurons: Option<PathBuf>,
     sweep_gains: Option<String>,
+    // Reframe sweep questions to permit "I don't know" (suppression regime: gives
+    // over-compliance an abstention outlet so down-weighting H-Neurons can move it).
+    abstain_prompt: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -62,6 +65,7 @@ fn parse_args() -> Result<Args, String> {
     let mut save_hneurons = None;
     let mut sweep_hneurons = None;
     let mut sweep_gains = None;
+    let mut abstain_prompt = false;
     let mut data_dir = None;
     let mut data_prefix = "Llama33_TriviaQA".to_string();
     let mut gen_train = None;
@@ -101,6 +105,7 @@ fn parse_args() -> Result<Args, String> {
             "--save-hneurons" => save_hneurons = Some(PathBuf::from(val()?)),
             "--sweep-hneurons" => sweep_hneurons = Some(PathBuf::from(val()?)),
             "--sweep-gains" => sweep_gains = Some(val()?),
+            "--abstain-prompt" => abstain_prompt = true,
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -126,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
         save_hneurons,
         sweep_hneurons,
         sweep_gains,
+        abstain_prompt,
     })
 }
 
@@ -376,8 +382,10 @@ impl Session {
         &mut self,
         user: &str,
         response: &str,
+        answer_offset: Option<usize>,
+        answer_len: Option<usize>,
         max_attempts: usize,
-    ) -> Result<Vec<Vec<f32>>, String> {
+    ) -> Result<(Vec<Vec<f32>>, usize), String> {
         let mut last = String::new();
         for attempt in 0..max_attempts {
             if self.engine.is_none() {
@@ -387,7 +395,7 @@ impl Session {
                 .engine
                 .as_mut()
                 .unwrap()
-                .cett_capture("", user, response)
+                .cett_capture("", user, response, answer_offset, answer_len)
                 .await
             {
                 Ok(f) => return Ok(f),
@@ -477,6 +485,7 @@ fn run() -> Result<(), String> {
                 &questions,
                 &gains,
                 args.gen_max_tokens,
+                args.abstain_prompt,
             )
             .await
         });
@@ -698,9 +707,51 @@ fn normalize_answer(s: &str) -> String {
 /// matches the gold aliases.
 fn is_abstention(text: &str) -> bool {
     let t = text.to_lowercase();
-    ["don't know", "cannot", "not provided", "no information"]
-        .iter()
-        .any(|term| t.contains(term))
+    [
+        // Paper's uncertainty terms (collect_responses.py).
+        "don't know",
+        "do not know",
+        "cannot",
+        "can't answer",
+        "not provided",
+        "no information",
+        // False-premise pushback: declining because the question presupposes
+        // something untrue is the correct (non-over-compliant) behavior.
+        "no such",
+        "does not exist",
+        "doesn't exist",
+        "there is no",
+        "there's no",
+        "not a real",
+        "isn't a real",
+        "is fictional",
+        "are fictional",
+        "no record",
+        "not aware",
+        "false premise",
+        "incorrect premise",
+        "unable to",
+        "did not exist",
+    ]
+    .iter()
+    .any(|term| t.contains(term))
+}
+
+/// Reframe a TriviaQA question to PERMIT abstention. The shipped questions bake
+/// in "Respond with the answer only" (no outlet), so ablating the hallucination
+/// drive has nowhere to move the probability mass. Stripping that and offering an
+/// explicit "I don't know" gives over-compliance somewhere to go — the regime
+/// where suppressing H-Neurons should convert confident-wrong answers to honest
+/// abstentions.
+fn abstain_frame(question: &str) -> String {
+    let q = question
+        .replace("Respond with the answer only, without any explanation.", "")
+        .trim()
+        .to_string();
+    format!(
+        "{q}\nAnswer in a few words. If you are not confident you know the answer, \
+respond with exactly: I don't know."
+    )
 }
 
 /// Label = 1 (hallucinated) unless a gold alias is a word-boundary substring of
@@ -796,8 +847,8 @@ async fn selfgen_split(
     let mut feats = Vec::with_capacity(kept.len());
     let mut labels = Vec::with_capacity(kept.len());
     for (i, (question, response, label)) in kept.iter().enumerate() {
-        let feat = session
-            .capture_retry(question, response, 4)
+        let (feat, _n) = session
+            .capture_retry(question, response, None, None, 4)
             .await
             .map_err(|e| format!("cett_capture[{tag} #{i}]: {e}"))?;
         let mut row = Vec::with_capacity(feat.iter().map(|l| l.len()).sum());
@@ -835,6 +886,7 @@ async fn run_sweep(
     questions: &[GenQuestion],
     gains: &[f32],
     max_tokens: u32,
+    abstain_prompt: bool,
 ) -> Result<(), String> {
     let raw = std::fs::read_to_string(hneurons_path)
         .map_err(|e| format!("read {}: {e}", hneurons_path.display()))?;
@@ -873,21 +925,40 @@ async fn run_sweep(
     // match), or hallucinated (committed to a wrong answer instead of
     // abstaining). Over-compliance = hallucinated. Causal claim: ablating
     // H-Neurons (gain<1) raises abstention and lowers hallucination.
+    // `uniq` = mean unique-word ratio (a coherence/degeneracy proxy: garbage
+    // output loops a few tokens → low ratio); the abstain/halluc/correct rates
+    // can't tell a coherent-but-wrong answer from degenerate garbage (both miss
+    // the alias match), so this column distinguishes the two regimes.
     println!(
-        "{:>6}  {:>9}  {:>9}  {:>9}  {:>5}",
-        "gain", "abstain", "halluc", "correct", "n"
+        "{:>6}  {:>9}  {:>9}  {:>9}  {:>6}  {:>5}",
+        "gain", "abstain", "halluc", "correct", "uniq", "n"
     );
     for &gain in gains {
         session.set_intervention(indices.clone(), gain).await?;
         let (mut abstain, mut hall, mut correct, mut n) = (0usize, 0usize, 0usize, 0usize);
+        let mut uniq_sum = 0.0f64;
+        let mut samples: Vec<String> = Vec::new();
         for (i, q) in questions.iter().enumerate() {
+            let prompt = if abstain_prompt {
+                abstain_frame(&q.question)
+            } else {
+                q.question.clone()
+            };
             let text = session
-                .generate_retry(&format!("sweep-{gain}-{i}"), &q.question, &sampling, 4)
+                .generate_retry(&format!("sweep-{gain}-{i}"), &prompt, &sampling, 4)
                 .await?;
             if text.trim().is_empty() {
                 continue;
             }
             n += 1;
+            let words: Vec<&str> = text.split_whitespace().collect();
+            if !words.is_empty() {
+                let uniq: std::collections::HashSet<&str> = words.iter().copied().collect();
+                uniq_sum += uniq.len() as f64 / words.len() as f64;
+            }
+            if samples.len() < 3 {
+                samples.push(text.trim().replace('\n', " ").chars().take(80).collect());
+            }
             if is_abstention(&text) {
                 abstain += 1;
             } else if is_hallucinated(&text, &q.aliases) {
@@ -897,11 +968,15 @@ async fn run_sweep(
             }
         }
         let d = n.max(1) as f64;
+        for s in &samples {
+            eprintln!("[sample gain={gain}] {s:?}");
+        }
         println!(
-            "{gain:>6.2}  {:>9.4}  {:>9.4}  {:>9.4}  {n:>5}",
+            "{gain:>6.2}  {:>9.4}  {:>9.4}  {:>9.4}  {:>6.3}  {n:>5}",
             abstain as f64 / d,
             hall as f64 / d,
             correct as f64 / d,
+            uniq_sum / d,
         );
     }
     // Clear the intervention on the way out (identity).
@@ -918,8 +993,8 @@ async fn capture_all(
 ) -> Result<Vec<Vec<f32>>, String> {
     let mut out = Vec::with_capacity(samples.len());
     for (i, s) in samples.iter().enumerate() {
-        let feat = session
-            .capture_retry(&s.question, &s.response, 4)
+        let (feat, _n) = session
+            .capture_retry(&s.question, &s.response, None, None, 4)
             .await
             .map_err(|e| format!("cett_capture[{tag} #{i}]: {e}"))?;
         // Flatten [n_layers][intermediate] → row-major feature vector.

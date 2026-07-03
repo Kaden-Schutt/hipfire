@@ -400,16 +400,20 @@ impl DaemonEngine {
         system: impl Into<String>,
         user: impl Into<String>,
         response: impl Into<String>,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        answer_offset: Option<usize>,
+        answer_len: Option<usize>,
+    ) -> anyhow::Result<(Vec<Vec<f32>>, usize)> {
         self.send(&DaemonRequest::CettCapture(CettCaptureRequest {
             system: system.into(),
             user: user.into(),
             response: response.into(),
+            answer_offset,
+            answer_len,
         }))
         .await?;
         loop {
             match self.recv().await? {
-                DaemonResponse::CettFeature { feature } => return Ok(feature),
+                DaemonResponse::CettFeature { feature, count } => return Ok((feature, count)),
                 DaemonResponse::Error(e) => {
                     anyhow::bail!("daemon cett_capture error: {}", e.message)
                 }

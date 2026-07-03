@@ -26,9 +26,14 @@ struct CaptureAcc {
     num_layers: usize,
     intermediate: usize,
     hidden: usize,
-    /// First GLOBAL token position belonging to the response.
+    /// First GLOBAL token position of the captured region (inclusive).
     response_start: usize,
-    /// Number of response tokens folded so far (same for every layer).
+    /// One-past-last GLOBAL token position of the captured region (exclusive).
+    /// `usize::MAX` = to the end of the sequence (whole response). Bounding this
+    /// lets one capture target the factual answer-token span rather than the
+    /// whole response — the paper's answer-token vs other-token CETT split.
+    response_end: usize,
+    /// Number of tokens folded so far (same for every layer).
     count: usize,
 }
 
@@ -54,6 +59,7 @@ pub fn begin_capture(
     gpu: &mut Gpu,
     col_norms: Vec<Vec<f32>>,
     response_start: usize,
+    response_end: usize,
     hidden: usize,
 ) -> HipResult<()> {
     let num_layers = col_norms.len();
@@ -79,6 +85,7 @@ pub fn begin_capture(
             intermediate,
             hidden,
             response_start,
+            response_end,
             count: 0,
         });
     });
@@ -89,7 +96,7 @@ pub fn begin_capture(
 /// End the session and return the per-layer mean CETT feature
 /// (`[layers][neurons]`), or `None` if no capture was active. Downloads the GPU
 /// sum accumulator once and divides by the response-token count.
-pub fn finish_capture(gpu: &mut Gpu) -> HipResult<Option<Vec<Vec<f32>>>> {
+pub fn finish_capture(gpu: &mut Gpu) -> HipResult<Option<(Vec<Vec<f32>>, usize)>> {
     // Take the acc out of TLS (clears the session) so the RefCell borrow isn't
     // held across the download and the OwnedTensors drop at end of scope.
     let acc = CAPTURE.with(|c| c.borrow_mut().take());
@@ -110,7 +117,9 @@ pub fn finish_capture(gpu: &mut Gpu) -> HipResult<Option<Vec<Vec<f32>>>> {
         feature.push(row);
     }
     // `acc` drops here → OwnedTensors return to the pool (deferred mailbox).
-    Ok(Some(feature))
+    // Returns the mean feature AND the captured-token count so callers can
+    // recombine regions (e.g. other = (full·n_full − answer·n_ans)/(n_full−n_ans)).
+    Ok(Some((feature, acc.count)))
 }
 
 /// Tear down any active capture session (drops the GPU accumulator).
@@ -140,17 +149,22 @@ pub fn maybe_capture_ffn(
         let Some(acc) = slot.as_mut() else {
             return Ok(());
         };
-        // Skip the chunk entirely if it's all prompt.
-        if batch_start + num_positions <= acc.response_start {
-            return Ok(());
-        }
-        let inter = acc.intermediate;
-        let hidden = acc.hidden;
-        // Local index of the first response token in this chunk.
+        // Local [start, end) of the captured region within this chunk.
         let local_resp_start = acc
             .response_start
             .saturating_sub(batch_start)
             .min(num_positions);
+        let local_resp_end = acc
+            .response_end
+            .min(batch_start + num_positions)
+            .saturating_sub(batch_start);
+        // Skip if no captured token lands in this chunk (all prompt, or the
+        // answer span is entirely in another chunk).
+        if local_resp_end <= local_resp_start {
+            return Ok(());
+        }
+        let inter = acc.intermediate;
+        let hidden = acc.hidden;
         // Non-owning views into this layer's slice of the [nl*inter] buffers.
         let col_norm = acc.col_norm_gpu.sub_offset(layer_idx * inter, inter);
         let sums = acc.sums_gpu.sub_offset(layer_idx * inter, inter);
@@ -165,10 +179,11 @@ pub fn maybe_capture_ffn(
             inter,
             hidden,
             local_resp_start,
+            local_resp_end,
         )?;
-        // Count response tokens once per chunk (all layers see the same tokens).
+        // Count captured tokens once per chunk (all layers see the same tokens).
         if layer_idx == 0 {
-            acc.count += num_positions - local_resp_start;
+            acc.count += local_resp_end - local_resp_start;
         }
         Ok(())
     })
@@ -196,15 +211,19 @@ pub fn maybe_capture_ffn_residual(
         let Some(acc) = slot.as_mut() else {
             return Ok(());
         };
-        if batch_start + num_positions <= acc.response_start {
-            return Ok(());
-        }
-        let inter = acc.intermediate;
-        let hidden = acc.hidden;
         let local_resp_start = acc
             .response_start
             .saturating_sub(batch_start)
             .min(num_positions);
+        let local_resp_end = acc
+            .response_end
+            .min(batch_start + num_positions)
+            .saturating_sub(batch_start);
+        if local_resp_end <= local_resp_start {
+            return Ok(());
+        }
+        let inter = acc.intermediate;
+        let hidden = acc.hidden;
         let col_norm = acc.col_norm_gpu.sub_offset(layer_idx * inter, inter);
         let sums = acc.sums_gpu.sub_offset(layer_idx * inter, inter);
         let out_norm = gpu.alloc_owned(&[num_positions.max(1)], DType::F32)?;
@@ -219,9 +238,10 @@ pub fn maybe_capture_ffn_residual(
             inter,
             hidden,
             local_resp_start,
+            local_resp_end,
         )?;
         if layer_idx == 0 {
-            acc.count += num_positions - local_resp_start;
+            acc.count += local_resp_end - local_resp_start;
         }
         Ok(())
     })

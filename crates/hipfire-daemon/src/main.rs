@@ -5808,18 +5808,33 @@ fn main() {
                     );
                     continue;
                 }
+                // Optional answer-token span (paper's answer-token CETT). The probe
+                // passes the token offset+len of the factual answer WITHIN the
+                // response (computed from the dataset's tokenized_response +
+                // answer_tokens); we capture only that span. Absent → whole response.
+                let (cap_start, cap_end) = match (
+                    msg.get("answer_offset").and_then(|v| v.as_u64()),
+                    msg.get("answer_len").and_then(|v| v.as_u64()),
+                ) {
+                    (Some(off), Some(len)) if len > 0 => {
+                        let s = (response_start + off as usize).min(full.len().saturating_sub(1));
+                        let e = (s + len as usize).min(full.len());
+                        (s, e.max(s + 1))
+                    }
+                    _ => (response_start, usize::MAX),
+                };
                 // Run the tapped prefill on whichever dense backend is resident.
                 // llama uses the generic prefill_forward (materializes down_proj
                 // in+out); gemma3 (text + vl) route through SimpleAr::prefill →
                 // the shared, tapped forward_prefill_batch. Both feed the same
                 // capture session. Helper to finalize identically per backend.
                 use hipfire_runtime::arch::SimpleAr;
-                fn finish(gpu: &mut rdna_compute::Gpu) -> Result<Vec<Vec<f32>>, String> {
+                fn finish(gpu: &mut rdna_compute::Gpu) -> Result<(Vec<Vec<f32>>, usize), String> {
                     hipfire_hneurons::capture::finish_capture(gpu)
                         .map_err(|e| format!("finish: {e:?}"))?
                         .ok_or_else(|| "capture produced no feature".to_string())
                 }
-                let outcome: Result<Vec<Vec<f32>>, String> =
+                let outcome: Result<(Vec<Vec<f32>>, usize), String> =
                     if let Some(b) = m.llama_backend.as_mut() {
                         if colnorms.len() != b.config.n_layers {
                             Err(format!(
@@ -5830,7 +5845,8 @@ fn main() {
                         } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
                             &mut gpu,
                             colnorms,
-                            response_start,
+                            cap_start,
+                            cap_end,
                             b.config.dim,
                         ) {
                             Err(format!("begin_capture: {e:?}"))
@@ -5857,7 +5873,8 @@ fn main() {
                         } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
                             &mut gpu,
                             colnorms,
-                            response_start,
+                            cap_start,
+                            cap_end,
                             b.config.hidden_size,
                         ) {
                             Err(format!("begin_capture: {e:?}"))
@@ -5881,7 +5898,8 @@ fn main() {
                         } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
                             &mut gpu,
                             colnorms,
-                            response_start,
+                            cap_start,
+                            cap_end,
                             b.text_cfg.hidden_size,
                         ) {
                             Err(format!("begin_capture: {e:?}"))
@@ -5901,10 +5919,11 @@ fn main() {
                         ))
                     };
                 match outcome {
-                    Ok(feature) => {
+                    Ok((feature, count)) => {
                         let resp = serde_json::json!({
                             "type": "cett_feature",
                             "feature": feature,
+                            "count": count,
                         });
                         let _ = writeln!(stdout, "{resp}");
                         let _ = stdout.flush();

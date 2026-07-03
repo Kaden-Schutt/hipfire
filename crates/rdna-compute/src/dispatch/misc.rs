@@ -28,6 +28,7 @@ impl Gpu {
         intermediate: usize,
         hidden: usize,
         resp_start: usize,
+        resp_end: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("cett_reduce", kernels::CETT_REDUCE_SRC, "cett_out_norm")?;
@@ -65,6 +66,7 @@ impl Gpu {
             positions,
             intermediate,
             resp_start,
+            resp_end,
         )
     }
 
@@ -85,6 +87,7 @@ impl Gpu {
         intermediate: usize,
         hidden: usize,
         resp_start: usize,
+        resp_end: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -128,6 +131,7 @@ impl Gpu {
             positions,
             intermediate,
             resp_start,
+            resp_end,
         )
     }
 
@@ -143,6 +147,7 @@ impl Gpu {
         positions: usize,
         intermediate: usize,
         resp_start: usize,
+        resp_end: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("cett_reduce", kernels::CETT_REDUCE_SRC, "cett_accumulate")?;
         let a_ptr = act.buf.as_ptr();
@@ -152,6 +157,7 @@ impl Gpu {
         let p = positions as i32;
         let i = intermediate as i32;
         let rs = resp_start as i32;
+        let re = resp_end as i32;
         let mut params: Vec<*mut c_void> = vec![
             &a_ptr as *const _ as *mut c_void,
             &c_ptr as *const _ as *mut c_void,
@@ -160,6 +166,7 @@ impl Gpu {
             &p as *const _ as *mut c_void,
             &i as *const _ as *mut c_void,
             &rs as *const _ as *mut c_void,
+            &re as *const _ as *mut c_void,
         ];
         let block = 256u32;
         let grid = (intermediate as u32).div_ceil(block).max(1);

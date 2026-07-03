@@ -50,23 +50,27 @@ extern "C" __global__ void cett_out_norm_diff(const float *__restrict__ x_after,
     out_norm[t] = sqrtf(sum);
 }
 
-// Accumulate per-neuron CETT summed over the response tokens into `sums`:
-//   sums[j] += sum_{t in [resp_start, positions)} |act[t,j]| * col_norm[j]
+// Accumulate per-neuron CETT summed over a token range into `sums`:
+//   sums[j] += sum_{t in [resp_start, resp_end)} |act[t,j]| * col_norm[j]
 //              / (out_norm[t] + 1e-8)
-// One thread per neuron j; it accumulates over the (few) response tokens in a
-// register and does a single read-modify-write into sums[j]. Each j is owned by
-// exactly one thread, so no atomics are needed. No LDS.
+// `resp_end` bounds the range so the same kernel can target the whole response
+// (resp_end = positions) OR just the factual answer-token span (resp_end =
+// ans_end) — the paper's answer-token vs other-token CETT split. One thread per
+// neuron j; accumulates over the (few) tokens in a register with a single
+// read-modify-write into sums[j]. Each j is owned by one thread, no atomics, no
+// LDS. `positions` is retained for signature stability (out_norm sizing).
 extern "C" __global__ void cett_accumulate(const float *__restrict__ act,      // [positions * intermediate]
                                            const float *__restrict__ col_norm, // [intermediate]
                                            const float *__restrict__ out_norm, // [positions]
                                            float *__restrict__ sums,           // [intermediate]
-                                           int positions, int intermediate, int resp_start) {
+                                           int positions, int intermediate, int resp_start, int resp_end) {
+    (void)positions;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= intermediate)
         return;
     float cn = col_norm[j];
     float acc = 0.0f;
-    for (int t = resp_start; t < positions; t++) {
+    for (int t = resp_start; t < resp_end; t++) {
         float a = act[(size_t)t * (size_t)intermediate + j];
         float inv = 1.0f / (out_norm[t] + 1e-8f);
         acc += fabsf(a) * cn * inv;
