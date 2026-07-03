@@ -85,8 +85,23 @@ replicate Rust's `sort_unstable`/`dedup`/`select_nth` semantics.
 
 ## Sequencing
 
-1. `--beam` stopgap [DONE this session].
-2. Prototype the single-group GPU beam encoder in scratchpad; validate MSE ≤ CPU
-   on random Gaussian groups.
-3. Productionize kernel + dispatch + driver `--gpu-encode` + parity + gate.
-4. Retune top-k primitive (bitonic vs per-state-min LDS) by measurement.
+1. `--beam` stopgap [DONE].
+2. Prototype + validate [DONE — commit adding qtip_viterbi_encode.hip]. Chose
+   **full Viterbi** over beam: STATE_BITS=12 → only 4096 states, enumerable, so no
+   top-k primitive needed and the result is OPTIMAL. kernels/src/qtip_viterbi_encode.hip
+   (one block/group, dp[4096] ping-pong in 32KB LDS, per-state min over 2^bits
+   predecessors, predecessor-selector backptr to global scratch, sequential
+   backtrack). Gpu::qtip_viterbi_encode + parity_qtip_viterbi_encode example.
+   VALIDATED gfx1151 vs CPU beam-128: mean MSE ratio 0.968 (GPU BETTER — optimal
+   beats beam), scale match 1.2e-7, **253× faster than 1-core CPU** (325ms vs 82s
+   @8192 groups) ≈ 20× vs the 25-core production path → ~1h/1B down to ~3min.
+   worst_group_ratio ~1.05 is the expected optimal-scale-refit artifact (encode
+   optimizes at the RMS seed; MSE measured at the refit scale), mean is better.
+3. Productionize [NEXT]: hipfire-quantize is CPU-only today; add `rdna-compute` as
+   a dep + a `--gpu-encode` path in pack_qtip_real_tensors (CPU FWHT-rotate → upload
+   rotated weights → qtip_viterbi_encode → download symbols → CPU optimal_scale +
+   pack). Default stays CPU beam (no GPU requirement unless --gpu-encode). Keep the
+   CPU path as the reference. NOTE: this is the first OFFLINE tool to link rdna-compute.
+4. Perf: the backptr global-scratch traffic (256×4096 B/group) likely dominates at
+   scale — could shrink to `bits`-bit selectors or tile groups/block. LDS 32KB caps
+   occupancy at 2 blocks/CU; measure before optimizing.
