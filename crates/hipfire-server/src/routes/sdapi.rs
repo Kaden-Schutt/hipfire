@@ -217,6 +217,9 @@ pub async fn post_txt2img(
     if let Err(error) = sdapi_validate_supported_scripts(&body) {
         return diffusion_error_response(error);
     }
+    if let Err(error) = sdapi_validate_request_geometry(&body) {
+        return diffusion_error_response(error);
+    }
     execute_sd_generation(state, body, None).await
 }
 
@@ -226,6 +229,9 @@ pub async fn post_img2img(
 ) -> Response {
     let body = sdapi_apply_infotext_defaults(body);
     if let Err(error) = sdapi_validate_supported_scripts(&body) {
+        return diffusion_error_response(error);
+    }
+    if let Err(error) = sdapi_validate_request_geometry(&body) {
         return diffusion_error_response(error);
     }
     let images = body.init_images.clone().filter(|images| !images.is_empty());
@@ -944,6 +950,104 @@ fn sdapi_validate_supported_scripts(body: &SdGenerationRequest) -> Result<(), Di
             "alwayson_scripts contains active or unsupported script payloads; Hipfire accepts only empty or disabled always-on script defaults"
                 .to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Upper bounds for client-supplied SD API geometry.
+///
+/// Request geometry drives `batch × channels × height × width` allocations
+/// before any model-specific validation runs, so unbounded values are a
+/// remote OOM/compute-DoS vector on the network-facing routes. Caps are
+/// portability-safe for the smallest supported GPU class (UMA APUs): a
+/// request above them could not complete there anyway.
+const SDAPI_MAX_DIMENSION: u32 = 4096;
+const SDAPI_MAX_STEPS: u32 = 200;
+const SDAPI_MAX_BATCH_SIZE: u32 = 8;
+const SDAPI_MAX_N_ITER: u32 = 16;
+const SDAPI_MAX_TOTAL_BATCHES: u32 = 32;
+
+/// Boundary gate on raw client fields, called from `post_txt2img` /
+/// `post_img2img` so oversized requests get a clear 400 before any work.
+/// Highres/firstphase fields are capped here too: they become real
+/// width/height in the cloned second-pass request.
+fn sdapi_validate_request_geometry(body: &SdGenerationRequest) -> Result<(), DiffusionError> {
+    for (field, value) in [
+        ("width", body.width),
+        ("height", body.height),
+        ("firstphase_width", body.firstphase_width),
+        ("firstphase_height", body.firstphase_height),
+        ("hr_resize_x", body.hr_resize_x),
+        ("hr_resize_y", body.hr_resize_y),
+    ] {
+        if value.is_some_and(|value| value > SDAPI_MAX_DIMENSION) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "{field} {} exceeds the maximum supported dimension {SDAPI_MAX_DIMENSION}",
+                value.unwrap_or_default()
+            )));
+        }
+    }
+    // Divisibility is deliberately NOT checked here: it is model-specific
+    // (latent_shape_for_request validates against the pipeline's actual
+    // VAE scale factor) and the test fixtures prove scales below 8 exist.
+    for (field, value) in [
+        ("steps", body.steps),
+        ("hr_second_pass_steps", body.hr_second_pass_steps),
+    ] {
+        if value.is_some_and(|value| value > SDAPI_MAX_STEPS) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "{field} {} exceeds the maximum supported step count {SDAPI_MAX_STEPS}",
+                value.unwrap_or_default()
+            )));
+        }
+    }
+    let batch_size = body.batch_size.unwrap_or(1).max(1);
+    if batch_size > SDAPI_MAX_BATCH_SIZE {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batch_size {batch_size} exceeds the maximum supported batch size {SDAPI_MAX_BATCH_SIZE}"
+        )));
+    }
+    let n_iter = body.n_iter.unwrap_or(1).max(1);
+    if n_iter > SDAPI_MAX_N_ITER {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "n_iter {n_iter} exceeds the maximum supported iteration count {SDAPI_MAX_N_ITER}"
+        )));
+    }
+    // Both factors are already capped above, so the product cannot overflow.
+    if batch_size * n_iter > SDAPI_MAX_TOTAL_BATCHES {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batch_size × n_iter = {} exceeds the maximum total batch count {SDAPI_MAX_TOTAL_BATCHES}",
+            batch_size * n_iter
+        )));
+    }
+    Ok(())
+}
+
+/// Funnel gate on RESOLVED geometry, called from
+/// `sd_request_to_diffusion_batch_request` — the one chokepoint every
+/// generation passes through. Covers values that arrive via defaults or via
+/// the cloned highres second-pass request (whose width/height are *derived*,
+/// e.g. from a large `hr_scale`) rather than raw client fields.
+fn sdapi_validate_resolved_geometry(
+    width: u32,
+    height: u32,
+    batch_size: u32,
+    steps: u32,
+) -> Result<(), DiffusionError> {
+    if width > SDAPI_MAX_DIMENSION || height > SDAPI_MAX_DIMENSION {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "resolved dimensions {width}×{height} exceed the maximum supported dimension {SDAPI_MAX_DIMENSION}"
+        )));
+    }
+    if steps > SDAPI_MAX_STEPS {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "resolved steps {steps} exceeds the maximum supported step count {SDAPI_MAX_STEPS}"
+        )));
+    }
+    if batch_size > SDAPI_MAX_BATCH_SIZE {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "resolved batch_size {batch_size} exceeds the maximum supported batch size {SDAPI_MAX_BATCH_SIZE}"
+        )));
     }
     Ok(())
 }
@@ -1740,6 +1844,8 @@ fn sd_request_to_diffusion_batch_request(
         .height
         .or_else(|| default_dimensions.map(|dimensions| dimensions.1))
         .unwrap_or(512);
+    let steps = body.steps.unwrap_or(20);
+    sdapi_validate_resolved_geometry(width, height, batch_size, steps)?;
     let conditioning = sdapi_external_conditioning(body, batch_size as usize)?;
     Ok(DiffusionBatchRequest {
         prompts,
@@ -1760,7 +1866,7 @@ fn sd_request_to_diffusion_batch_request(
             .filter(|value| *value > 0),
         crop_x: body.crop_x.unwrap_or(0),
         crop_y: body.crop_y.unwrap_or(0),
-        steps: body.steps.unwrap_or(20),
+        steps,
         cfg_scale: body.cfg_scale.unwrap_or(7.0) as f32,
         distilled_guidance_scale: body
             .hipfire_distilled_guidance_scale
@@ -7742,6 +7848,126 @@ mod tests {
         assert_eq!(second.sampler_name.as_deref(), Some("Euler"));
         assert_eq!(second.scheduler.as_deref(), Some("Karras"));
         assert_eq!(request.scheduler, "Euler Karras");
+    }
+
+    #[test]
+    fn request_geometry_gate_rejects_oversized_dimensions() {
+        // The review's DoS payload: a tiny JSON body driving a
+        // batch×channels×height×width allocation in the hundreds of GB.
+        let err = sdapi_validate_request_geometry(&SdGenerationRequest {
+            width: Some(100_000),
+            height: Some(100_000),
+            ..empty_request()
+        })
+        .unwrap_err();
+        assert!(matches!(err, DiffusionError::InvalidRequest(_)));
+
+        for (field_req, _label) in [
+            (
+                SdGenerationRequest {
+                    firstphase_width: Some(SDAPI_MAX_DIMENSION + 8),
+                    ..empty_request()
+                },
+                "firstphase_width",
+            ),
+            (
+                SdGenerationRequest {
+                    hr_resize_x: Some(100_000),
+                    ..empty_request()
+                },
+                "hr_resize_x",
+            ),
+            (
+                SdGenerationRequest {
+                    hr_resize_y: Some(SDAPI_MAX_DIMENSION + 1),
+                    ..empty_request()
+                },
+                "hr_resize_y",
+            ),
+        ] {
+            assert!(sdapi_validate_request_geometry(&field_req).is_err());
+        }
+    }
+
+    #[test]
+    fn request_geometry_gate_accepts_supported_geometry() {
+        for dim in [512, 1024, SDAPI_MAX_DIMENSION] {
+            assert!(
+                sdapi_validate_request_geometry(&SdGenerationRequest {
+                    width: Some(dim),
+                    height: Some(dim),
+                    steps: Some(SDAPI_MAX_STEPS),
+                    batch_size: Some(SDAPI_MAX_BATCH_SIZE),
+                    n_iter: Some(SDAPI_MAX_TOTAL_BATCHES / SDAPI_MAX_BATCH_SIZE),
+                    ..empty_request()
+                })
+                .is_ok(),
+                "dim {dim} should be accepted"
+            );
+        }
+        // Absent fields fall back to safe defaults and must pass.
+        assert!(sdapi_validate_request_geometry(&empty_request()).is_ok());
+    }
+
+    #[test]
+    fn request_geometry_gate_caps_steps_batch_and_iterations() {
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            steps: Some(SDAPI_MAX_STEPS + 1),
+            ..empty_request()
+        })
+        .is_err());
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            hr_second_pass_steps: Some(999),
+            ..empty_request()
+        })
+        .is_err());
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            batch_size: Some(SDAPI_MAX_BATCH_SIZE + 1),
+            ..empty_request()
+        })
+        .is_err());
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            n_iter: Some(SDAPI_MAX_N_ITER + 1),
+            ..empty_request()
+        })
+        .is_err());
+        // Individually legal factors whose product exceeds the total cap.
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            batch_size: Some(SDAPI_MAX_BATCH_SIZE),
+            n_iter: Some(SDAPI_MAX_TOTAL_BATCHES / SDAPI_MAX_BATCH_SIZE + 1),
+            ..empty_request()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn batch_request_funnel_rejects_oversized_resolved_geometry() {
+        // Direct client geometry.
+        assert!(sd_request_to_diffusion_batch_request(
+            &SdGenerationRequest {
+                width: Some(100_000),
+                height: Some(100_000),
+                ..empty_request()
+            },
+            None,
+            0,
+        )
+        .is_err());
+        // The cloned highres second-pass body carries DERIVED width/height
+        // (e.g. small base × large hr_scale) that never hit the boundary
+        // gate as raw fields — the funnel must stop them.
+        assert!(sd_request_to_diffusion_batch_request(
+            &SdGenerationRequest {
+                width: Some(SDAPI_MAX_DIMENSION * 2),
+                height: Some(512),
+                ..empty_request()
+            },
+            None,
+            0,
+        )
+        .is_err());
+        // Defaults resolve to 512×512 and pass.
+        assert!(sd_request_to_diffusion_batch_request(&empty_request(), None, 0).is_ok());
     }
 
     fn empty_request() -> SdGenerationRequest {
