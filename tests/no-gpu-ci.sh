@@ -17,6 +17,9 @@ cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
 cargo test -p hipfire-quantize fixture
+cargo test -p hipfire-arch-api --lib
+cargo test -p hipfire-arch-toy --lib
+cargo test -p hipfire-archs --lib
 
 echo "== Tiny-fixture round-trip (CPU: emit → quantize, no GPU) =="
 bash tests/fixture-roundtrip-nogpu.sh
@@ -46,6 +49,9 @@ cargo run -q -p hipfire-cli -- gen-config-schema --format markdown --output docs
 
 echo "== Artifact naming check =="
 bash scripts/check-artifact-names.sh
+
+echo "== Arch capability-layer purity (no format tokens in arch-api / *-spec) =="
+bash scripts/check-arch-spec-purity.sh
 
 echo "== Eval smoke script syntax =="
 bash -n tests/smoke/eval-harness-nogpu-smoke.sh

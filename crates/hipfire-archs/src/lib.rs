@@ -54,4 +54,39 @@ mod tests {
         assert!(toy.caps.toy_model.is_some());
         assert!(toy.caps.batched_prefill.is_none());
     }
+
+    /// Completeness gate. Two invariants that hold today and guard migration:
+    ///  1. no two archs claim the same id, and every arch has a family name;
+    ///  2. a migration LEDGER — the exact set of ids on the capability layer.
+    ///
+    /// Bullet 2 forces every migration to be an intentional one-line edit here
+    /// (and catches an accidental dropped registration). Full catalog
+    /// completeness — asserting every *shipped* catalog id is registered — turns
+    /// on once all families have migrated; until then this ledger tracks progress.
+    #[test]
+    fn registry_integrity_and_migration_ledger() {
+        use std::collections::BTreeSet;
+        let reg = registry();
+
+        let ids: Vec<u16> = reg.iter().map(|a| a.id.0).collect();
+        let unique: BTreeSet<u16> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "duplicate arch ids registered: {ids:?}"
+        );
+        for a in reg.iter() {
+            assert!(!a.family.is_empty(), "arch {} has an empty family", a.id);
+        }
+
+        // Ids CURRENTLY migrated onto the capability layer. Add one per family as
+        // it moves over; a mismatch means either a dropped registration or an
+        // untracked addition.
+        let expected: BTreeSet<u16> = [0xFF].into_iter().collect();
+        assert_eq!(
+            unique, expected,
+            "arch migration ledger drift — update the expected set as families \
+             move onto the capability layer (added or dropped id detected)"
+        );
+    }
 }
