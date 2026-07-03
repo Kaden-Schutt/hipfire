@@ -40,9 +40,7 @@
 // `crate::…` / `super::…` (test modules) references keep resolving unchanged.
 #[allow(unused_imports)]
 use codecs::*;
-pub use hipfire_quantize::{
-    codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
-};
+pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant};
 // HFQ writer + provenance/metadata machinery now lives in the library so the
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
@@ -61,9 +59,9 @@ use hipfire_gguf as gguf_input;
 // library (so hipfire-coexistence can drive the import). Re-imported here for
 // the native safetensors path + the deprecation shim.
 use hipfire_quantize::gguf_import::{is_gguf_input, parse_arch_id_override};
-use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
 #[cfg(test)]
 use hipfire_quantize::quant_plan::{is_positional_promote, kmap_resolve, parse_layer_idx};
+use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
 // Clip-search toggle now lives in the library too.
 pub use hipfire_quantize::{mq_clipsearch_enabled, set_mq_clipsearch};
 // KVarN codec + deferred KV-compaction live in the leaf `hipfire-kvquant`
@@ -341,7 +339,6 @@ impl SafetensorsFile {
 }
 
 // ─── FP16/BF16 Conversion ───────────────────────────────────────────────────
-
 
 // ─── FP8 E4M3 + UE8M0-scale dequant (DeepSeek V4 Flash) ─────────────────────
 //
@@ -2226,20 +2223,6 @@ fn dequantize_mq2g256_lloyd_to_f32(
 // `t.quant_type as u8` byte emission keep working unchanged.
 pub use hipfire_quant_format::QuantType;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn insert_quant_format_metadata(metadata: &mut serde_json::Value, format: &str) {
     if let serde_json::Value::Object(ref mut map) = metadata {
         map.insert("quant_format".to_string(), serde_json::json!(format));
@@ -2426,27 +2409,12 @@ impl HfqInputFile {
 
 // ─── XXH64 provenance hashing ───────────────────────────────────────────────
 
-
-
 #[cfg(test)]
 fn xxh64_hex(bytes: &[u8]) -> String {
     let mut h = Xxh64::new(0);
     h.update(bytes);
     format!("{:016x}", h.digest())
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
@@ -2468,7 +2436,6 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     let _ = spill.flush();
 }
-
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
@@ -2543,29 +2510,6 @@ fn is_deepseek4_keep_f16(name: &str) -> bool {
         || name.ends_with(".indexer.weights_proj.weight")
 }
 
-/// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
-/// Q8: attention weights, embeddings, lm_head (need occupancy)
-/// Q4: FFN weights (bulk of model, benefits from compression)
-fn is_q8_tensor(name: &str) -> bool {
-    name.contains("self_attn") || name.contains("attn_q") || name.contains("attn_k")
-        || name.contains("attn_v") || name.contains("attn_output")
-        || name.contains("q_proj") || name.contains("k_proj")
-        || name.contains("v_proj") || name.contains("o_proj")
-        || name.contains("embed") || name.contains("lm_head")
-        // Qwen3.5 DeltaNet attention
-        || name.contains("linear_attn")
-        // Qwen3.5-MoE: the router (`mlp.gate.weight`, hidden_size × num_experts)
-        // is small but precision-sensitive — flat-routing on a quantized router
-        // shifts which experts a token sees. Same for the per-layer scalar
-        // `mlp.shared_expert_gate.weight` that scales the shared expert. Keep
-        // both at Q8 even in Q4-bulk modes.
-        || name.ends_with("mlp.gate.weight")
-        || name.ends_with("mlp.shared_expert_gate.weight")
-        // Nemotron-H Nano-30B A3B: routed MoE router lives under the flat
-        // block's mixer namespace.
-        || name.ends_with(".mixer.gate.weight")
-}
-
 // Force-link the offline specs bundle so every migrated arch's `register_arch!`
 // Ingest registration is present (Rust drops unreferenced rlibs). The bundle and
 // all its `-spec` crates are CPU-only (deps only hipfire-arch-api), so the quantizer
@@ -2578,8 +2522,9 @@ static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
 /// Should this tensor be kept at HIGH PRECISION (vs. compressed), for arches
 /// migrated onto `hipfire-arch-api`? Returns `Some(true)` = keep high precision,
 /// `Some(false)` = compressible, or `None` when this arch has NOT declared an
-/// `Ingest` policy — the caller then falls back to the legacy `is_q8_tensor`
-/// name-matching.
+/// `Ingest` policy. Every family is migrated, so `None` only means "arch id not in
+/// the registry" (a completeness-gate failure), and callers protect (treat as high
+/// precision) as the safe default rather than name-match.
 ///
 /// Named for the decision it makes, not a format: it does not choose "Q8". The arch
 /// states only needs (importance + requirements); the codec choice is made here by
@@ -2618,10 +2563,13 @@ fn high_precision_via_ingest(arch_id: u32, name: &str, k: usize) -> Option<bool>
     )
 }
 
-/// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
-/// shape [conv_channels, 1, 4]. Small (~32K elem) and runs every token —
-/// Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3) measurably
-/// hurt the gated-delta path.
+/// Structural (not arch-specific) test for a short-conv recurrence filter:
+/// `{prefix}.conv1d.weight`, shape [conv_channels, 1, K]. Small (~32K elem) and
+/// runs every token — Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3)
+/// measurably hurt the gated-delta path. Names no family (any arch with a conv1d
+/// filter matches), so this is arch-GENERIC quant-plan policy that stays in the
+/// quantizer — it is NOT one of the `arch_id ==`/`is_<family>` matchers the
+/// capability layer drains (cf. `is_positional_promote`, LDLQ, FWHT packers).
 fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
 }
@@ -2791,7 +2739,6 @@ fn tokenizer_config_with_chat_template(
 }
 
 // ─── GGUF input pipeline ────────────────────────────────────────────────────
-
 
 fn is_hfq_input(p: &Path) -> bool {
     p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("hfq")
@@ -3847,8 +3794,6 @@ fn run_hfq_source_pipeline(
     Ok(())
 }
 
-
-
 /// Translate a hipfire safetensors-style tensor name to the ggml-style name
 /// used by llama.cpp's imatrix output (and the rest of llama.cpp's tooling).
 ///
@@ -4427,12 +4372,6 @@ fn awq_eligible(name: &str) -> bool {
     f1_match || f2_match
 }
 
-
-
-
-
-
-
 fn source_precision_tensor_bytes(
     raw_data: &[u8],
     dtype: &str,
@@ -4445,7 +4384,6 @@ fn source_precision_tensor_bytes(
         other => panic!("unsupported dtype for source-precision HFQ: {other}"),
     }
 }
-
 
 /// Full `--help` / `-h` text. Printed to stdout; exits 0 from `main`.
 fn print_help() {
@@ -7496,6 +7434,15 @@ fn main() {
             && name.starts_with("mtp.")
             && !name.contains(".ffn.experts.")
             && should_quantize(name);
+        // SEAM (arch-name matcher not yet drained): `is_deepseek4_keep_f16` is a
+        // NARROW, namespace-scoped keep-list (4 MLA compressor/indexer tensors → f16
+        // source precision). The deepseek4 `-spec` already encodes these as
+        // importance 255 (`is_critical_stream`), but the coarse hi/lo `Ingest` seam
+        // can't isolate them from the rest of the importance-255 protected set
+        // (attn/embed), so routing this through `high_precision_via_ingest` would keep
+        // embeddings at f16 and bloat the artifact. Drains cleanly once per-tensor
+        // model definitions (RON / arch-crate model defs) give the allocator a
+        // format/bits target instead of a bool. Until then this stays name-matched.
         if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
             && n_elements >= 32
         {
@@ -7849,16 +7796,18 @@ fn main() {
                     } else if use_q4k_q8embed {
                         name.contains("embed") || name.contains("lm_head") // only embed/output Q8
                     } else if use_mixed || use_fast {
-                        // Arches migrated onto the capability layer (e.g. llama)
-                        // decide high-precision-vs-compressed from their declared
-                        // Ingest quant-policy; unmigrated arches keep is_q8_tensor.
+                        // Every family is migrated onto the capability layer, so the
+                        // high-precision-vs-compressed decision comes from the arch's
+                        // declared Ingest quant-policy. An unregistered arch is a
+                        // completeness-gate failure, not a runtime path, so we protect
+                        // (keep high precision) as the safe default rather than fall
+                        // back to a name-matcher.
                         let k = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
                             n_elements
                         };
-                        high_precision_via_ingest(arch_id, name, k)
-                            .unwrap_or_else(|| is_q8_tensor(name))
+                        high_precision_via_ingest(arch_id, name, k).unwrap_or(true)
                     } else {
                         use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
                     };
@@ -7932,9 +7881,23 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if q8_router && is_q8_tensor(name) {
-                        // Q8 router for MoE: keep mlp.gate.weight and
-                        // shared_expert_gate.weight at Q8 regardless of --format.
+                    } else if q8_router
+                        && high_precision_via_ingest(
+                            arch_id,
+                            name,
+                            if meta.shape.len() == 2 {
+                                meta.shape[1]
+                            } else {
+                                n_elements
+                            },
+                        ) == Some(true)
+                    {
+                        // Q8 router for MoE: keep the protected set — routers
+                        // (mlp.gate/shared_expert_gate/mixer.gate), attention, and the
+                        // gather tables — at Q8 regardless of --format. The arch's
+                        // Ingest importance is the single source for "protected"; this
+                        // reproduces the old is_q8_tensor set (conv1d/norm never reach
+                        // this 2D-weight selection — should_quantize keeps them f16).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq8g256 && is_embed {
@@ -7960,6 +7923,15 @@ fn main() {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq4_family && is_nemotron_h_mq4_q8_protected(name) {
+                        // SEAM (arch-name matcher not yet drained): this is scoped to
+                        // nemotron's `backbone.layers.` namespace. Coarsening it to
+                        // `high_precision_via_ingest` would spill Q8 protection onto
+                        // OTHER families' attention in mq4 mode (e.g. Qwen3.5's
+                        // flagship mq4), and the spec's default_importance also
+                        // mis-tiers `mixer.down_proj` (Mlp=128, not the residual-writer
+                        // 255 this needs). Drains cleanly once per-tensor model
+                        // definitions let the arch name its exact protected set without
+                        // over-reaching. Until then this stays name-matched.
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq4_family {
@@ -12630,9 +12602,10 @@ mod tests {
             QuantLevel::Q8
         );
         assert_eq!(kmap_resolve("lm_head.weight", 42, false), QuantLevel::Q8);
-        assert!(
-            is_q8_tensor("backbone.layers.1.mixer.gate.weight"),
-            "Nemotron MoE router should be Q8-protected"
+        assert_eq!(
+            high_precision_via_ingest(14, "backbone.layers.1.mixer.gate.weight", 4096),
+            Some(true),
+            "Nemotron MoE router should be Q8-protected via its Ingest policy"
         );
 
         for n in [
@@ -12694,7 +12667,7 @@ mod tests {
             high_precision_via_ingest(11, "model.layers.0.mlp.experts.2.up_proj.weight", 4096),
             Some(false)
         );
-        // A genuinely unregistered arch id → None → caller uses is_q8_tensor.
+        // A genuinely unregistered arch id → None → caller protects (unwrap_or(true)).
         assert_eq!(
             high_precision_via_ingest(200, "whatever.weight", 4096),
             None
