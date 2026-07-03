@@ -442,7 +442,6 @@ pub trait ModelSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelArtifactFormat {
     Hfq,
-    Gguf,
     SafetensorsDirectory,
     Unknown,
 }
@@ -462,7 +461,6 @@ pub fn detect_model_artifact_format(path: &Path) -> ModelArtifactFormat {
             .as_deref()
         {
             Some("hfq") => ModelArtifactFormat::Hfq,
-            Some("gguf") => ModelArtifactFormat::Gguf,
             _ => ModelArtifactFormat::Unknown,
         }
     }
@@ -2706,10 +2704,6 @@ mod tests {
         assert_eq!(
             detect_model_artifact_format(Path::new("model.hfq")),
             ModelArtifactFormat::Hfq
-        );
-        assert_eq!(
-            detect_model_artifact_format(Path::new("model.gguf")),
-            ModelArtifactFormat::Gguf
         );
         assert_eq!(
             detect_model_artifact_format(Path::new("model.bin")),

@@ -358,10 +358,6 @@ required-features = []
 # imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
 # llama-imatrix for the activation-weighted-LS calibration pipeline.
 # Stdlib only; no GPU / arch features.
-[[example]]
-name = "imatrix_collect"
-required-features = []
-
 # ─── Tier 1 calibration ────────────────────────────────────────────────
 # The native single-load calibration collector is the `collect_artifacts`
 # example (Hessian + imatrix + MoE router histogram + KLDREF → one HFQM

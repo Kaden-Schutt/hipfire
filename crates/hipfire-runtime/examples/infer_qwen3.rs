@@ -132,17 +132,10 @@ fn main() {
         eprintln!("Tokenizer: {} tokens (from HFQ)", t.vocab_size());
         t
     } else {
-        let gguf_path = if config.arch == llama::ModelArch::Qwen3 {
-            "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf"
-        } else {
-            "/home/kaden/llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
-        };
-        let gguf = hipfire_runtime::gguf::GgufFile::open(Path::new(gguf_path))
-            .expect("need GGUF for tokenizer");
-        let t = hipfire_runtime::tokenizer::Tokenizer::from_gguf(&gguf)
-            .expect("failed to load tokenizer");
-        eprintln!("Tokenizer: {} tokens (from GGUF)", t.vocab_size());
-        t
+        panic!(
+            "HFQ tokenizer metadata missing; the GGUF tokenizer fallback was removed \
+             (GGUF is import-only, in hipfire-coexistence)"
+        );
     };
 
     let prompt_tokens = if use_guards {

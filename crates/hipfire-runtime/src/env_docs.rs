@@ -129,7 +129,7 @@ pub const ENV_DFLASH_LIVE_TAU: EnvVarDoc = EnvVarDoc {
 pub const ENV_FP32_STATE: EnvVarDoc = EnvVarDoc {
     name: "FP32_STATE",
     description: "Runtime variable controlling fp32 state in hipfire",
-    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:205",
+    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:202",
 };
 
 /// `GPU_LOCK_TIMEOUT` — Runtime variable controlling gpu lock timeout in hipfire
@@ -1516,7 +1516,7 @@ pub const ENV_HIPFIRE_GPU_SLAB_MIB: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GPU_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GPU_TOPK",
     description: "HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU",
-    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:235",
+    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:232",
 };
 
 /// `HIPFIRE_GQA_CHUNK` — Runtime variable controlling gqa chunk in hipfire
@@ -1974,7 +1974,7 @@ pub const ENV_HIPFIRE_LOWRANK_R: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MAX_GEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MAX_GEN",
     description: "Runtime variable controlling max gen in hipfire",
-    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:295",
+    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:292",
 };
 
 /// `HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE` — Interprets "HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE" from environment to select behavior
@@ -2899,7 +2899,7 @@ pub const ENV_HIPFIRE_QAT_KVNOISE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QA_KV_MODES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QA_KV_MODES",
     description: "Defaults to q8,asym4,asym3,asym2 when unset",
-    source: "crates/hipfire-runtime/examples/test_inferenceQA.rs:762",
+    source: "crates/hipfire-runtime/examples/test_inferenceQA.rs:750",
 };
 
 /// `HIPFIRE_QTIP_BBT_ALPHA` — BBT-spectral influence scaling (SpectralLLM): HIPFIRE_QTIP_BBT_ALPHA=α
@@ -3387,7 +3387,7 @@ pub const ENV_HIPFIRE_RUN_EXAMPLE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SAMPLE_COMPARE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SAMPLE_COMPARE",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:236",
+    source: "crates/hipfire-runtime/examples/infer_qwen35.rs:233",
 };
 
 /// `HIPFIRE_SCORE_TAIL` — HIPFIRE_SCORE_TAIL=N → score only the last N query positions (leak-free for
@@ -3746,7 +3746,7 @@ pub const ENV_PROMPT_MODE: EnvVarDoc = EnvVarDoc {
 pub const ENV_QWEN35_TEST_MODEL: EnvVarDoc = EnvVarDoc {
     name: "QWEN35_TEST_MODEL",
     description: "Runtime variable controlling qwen35 test model in hipfire",
-    source: "crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:22",
+    source: "crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:20",
 };
 
 /// `ROCM_DEVICE_LIB_PATH` — Runtime variable controlling rocm device lib path in hipfire
@@ -3768,13 +3768,6 @@ pub const ENV_ROCR_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "ROCR_VISIBLE_DEVICES",
     description: "Runtime variable controlling rocr visible devices in hipfire",
     source: "crates/hipfire-daemon-adapter/src/lib.rs:735",
-};
-
-/// `TINYLLAMA_GGUF` — Runtime variable controlling tinyllama gguf in hipfire
-pub const ENV_TINYLLAMA_GGUF: EnvVarDoc = EnvVarDoc {
-    name: "TINYLLAMA_GGUF",
-    description: "Runtime variable controlling tinyllama gguf in hipfire",
-    source: "crates/hipfire-runtime/examples/test_q4f16QA.rs:38",
 };
 
 /// `TRIALS` — Runtime variable controlling trials in hipfire
@@ -4333,7 +4326,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_ROCM_DEVICE_LIB_PATH,
     ENV_ROCM_PATH,
     ENV_ROCR_VISIBLE_DEVICES,
-    ENV_TINYLLAMA_GGUF,
     ENV_TRIALS,
     ENV_USERPROFILE,
     ENV_USE_SAMPLE,
