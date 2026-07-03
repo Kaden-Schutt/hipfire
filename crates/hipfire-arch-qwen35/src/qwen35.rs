@@ -4373,7 +4373,10 @@ fn load_gpu_slabs(hfq: &HfqFile, gpu: &mut Gpu) -> HipResult<SlabTensorIndex> {
             .iter()
             .map(|b| {
                 let start = align_down(b.offset, GPU_SLAB_ALIGN);
-                let end = align_up((b.offset + b.len).min(file_len), GPU_SLAB_ALIGN).min(file_len);
+                // NB: do NOT clamp the aligned end back to file_len — O_DIRECT
+                // requires a block-aligned length, and read_direct_allow_eof
+                // absorbs the short read when the last block extends past EOF.
+                let end = align_up((b.offset + b.len).min(file_len), GPU_SLAB_ALIGN);
                 end - start
             })
             .max()
@@ -4388,8 +4391,11 @@ fn load_gpu_slabs(hfq: &HfqFile, gpu: &mut Gpu) -> HipResult<SlabTensorIndex> {
         let t_load = std::time::Instant::now();
         for (bank_idx, bank) in banks.iter().enumerate() {
             let aligned_start = align_down(bank.offset, GPU_SLAB_ALIGN);
-            let aligned_end =
-                align_up((bank.offset + bank.len).min(file_len), GPU_SLAB_ALIGN).min(file_len);
+            // Aligned length must stay a GPU_SLAB_ALIGN multiple for O_DIRECT;
+            // clamping the end to the (unaligned) file_len is what produced the
+            // EINVAL "Invalid argument" on files whose size isn't 4K-aligned.
+            // The tail block reads short at EOF via read_direct_allow_eof.
+            let aligned_end = align_up((bank.offset + bank.len).min(file_len), GPU_SLAB_ALIGN);
             let aligned_len = aligned_end - aligned_start;
             let rel = bank.offset - aligned_start;
             let t_read = std::time::Instant::now();

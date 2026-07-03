@@ -1,5 +1,12 @@
 # gpu_arch  model_arch  format  logit_hash  (len=16 warmup=2 seed=42 mode=tf)
+gfx1103 qwen3_5_moe mq3 0x0595ac283ea75a44
+gfx1103 qwen3_5_moe mq4 0x2ef180e4b30eec48
+gfx1103 qwen3_5_moe mq6 0x2ef180e4b30eec48
+gfx1103 qwen3_5_moe q8f16 0xd2d2e07efd39dffd
+gfx1103 qwen3_5 mq3 0x6025f9cc20a3a7d5
+gfx1103 qwen3_5 mq4 0xfe6fdea9b93096bd
 gfx1103 qwen3_5 mq6 0xe7f52a2fa90f8dfc
+gfx1103 qwen3_5 q8f16 0xdb2674113cde4787
 gfx1151 qwen3_5_moe mq3 0x1cf58fef54d34b2d
 gfx1151 qwen3_5_moe mq4 0x3b7374e93a63353a
 gfx1151 qwen3_5_moe mq6 0x3b7374e93a63353a

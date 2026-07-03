@@ -620,7 +620,10 @@ fn open_probe_file(path: &Path, read_mode: &str) -> std::fs::File {
 fn aligned_read_window(bank: &Bank, file_len: usize) -> (usize, usize, usize) {
     let start = align_down(bank.offset, DIRECT_ALIGN);
     let end = (bank.offset + bank.len).min(file_len);
-    let aligned_end = align_up(end, DIRECT_ALIGN).min(file_len);
+    // O_DIRECT needs a block-aligned length; do NOT clamp back to the
+    // (unaligned) file_len — the tail block reads short at EOF. Matches the
+    // qwen35 slab-loader fix.
+    let aligned_end = align_up(end, DIRECT_ALIGN);
     (start, aligned_end - start, bank.offset - start)
 }
 
