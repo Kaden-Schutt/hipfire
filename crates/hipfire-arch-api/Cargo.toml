@@ -1,0 +1,18 @@
+[package]
+name = "hipfire-arch-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Base Arch trait + optional capability traits + declarative registration and link-time discovery. Leaf crate: no runtime/kernel deps."
+
+# The capability layer. Arch crates declare which capabilities they implement via
+# `register_arch!`; the daemon/scheduler/quantizer discover them at runtime through
+# `ArchRegistry` (Some/None per capability) instead of `arch_id == N` dispatch.
+#
+# INVARIANT: this is a LEAF crate. It must not depend on hipfire-runtime,
+# rdna-compute, or any kernel crate — those are the *consumers*. Capability trait
+# method signatures use only std / plain data so the offline quantizer can link the
+# trait definitions without pulling the serving stack.
+
+[dependencies]
+inventory = "0.3"

@@ -101,6 +101,15 @@ COMPILES if the impl exists (so you can't over-claim), paired with the 0.5 gate 
 catch under-claiming (impl'd but not listed). Decide autoref-vs-declarative by a
 spike in 0.2 before committing.
 
+SPIKE RESULT (2026-07-03): autoref specialization is too fragile — two call forms
+gave two wrong behaviours (`Probe(x)` errors on the unsatisfied bound instead of
+falling through; `(&Probe(x))` compiles but resolves inverted, `T: Cap → None`).
+**Decision: DECLARATIVE.** `register_arch!(Ty { caps: [SpecDecodeChain, …] })` where a
+fixed `set_cap!` dispatch maps each cap ident to its `Caps` field with a
+`Some($inst as &'static dyn Cap)` cast — compile-fails on over-claim; the 0.5 gate
+(caps ⟺ impls) catches under-claim. Adding a capability = one `set_cap!` arm + one
+`Caps` field (central, small). No unstable features, no toolchain fragility.
+
 ### 0.3 Auto-registration by linking (`inventory`)
 
 Each arch crate does `register_arch!(Foo)`, which `inventory::submit!`s an
