@@ -4,7 +4,6 @@
 
 //! Shared model artifact identity helpers and model-source contracts.
 
-pub mod gguf;
 /// Generated model-support tables (`ARCH_ROWS`/`QUANT_TABLE`/`GATE_TABLE`).
 /// Source of truth: `docs/model-support.toml`; regenerate with
 /// `cargo run -p hipfire-cli -- gen-model-support`.
