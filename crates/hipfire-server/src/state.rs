@@ -96,6 +96,9 @@ pub struct AppState {
     pub sdapi_progress: Arc<StdMutex<SdapiProgressState>>,
     pub last_request_unix_secs: Mutex<u64>,
     pub training_runs_dir: PathBuf,
+    /// Server-owned root for images saved by the SD API routes. Derived from
+    /// config at construction; request `outdir_*` overrides never reach it.
+    pub sdapi_output_root: PathBuf,
     /// Local admin bearer secret (`~/.hipfire/admin.secret`); same-box
     /// CLI/TUI present this to skip the `/admin` login flow.
     pub admin_secret: String,
@@ -120,6 +123,7 @@ impl AppState {
     ) -> Arc<Self> {
         let scheduler_env = SchedulerPolicyEnv::from_pairs(std::env::vars());
         let config = loaded_config.config.clone();
+        let sdapi_output_root = PathBuf::from(&config.sdapi_output_root);
         Arc::new(Self {
             engine: Mutex::new(None),
             loaded_config: Mutex::new(loaded_config),
@@ -145,6 +149,7 @@ impl AppState {
             sdapi_progress: Arc::new(StdMutex::new(SdapiProgressState::default())),
             last_request_unix_secs: Mutex::new(now_secs()),
             training_runs_dir,
+            sdapi_output_root,
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
         })

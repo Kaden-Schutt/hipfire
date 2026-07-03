@@ -33,6 +33,9 @@ fn default_cors_allowed_origins() -> Vec<String> {
 fn default_admin_user() -> String {
     "admin".to_string()
 }
+fn default_sdapi_output_root() -> String {
+    "/tmp/hipfire-sdapi".to_string()
+}
 fn default_max_seq() -> u32 {
     8192
 }
@@ -152,6 +155,11 @@ pub struct HipfireConfig {
     /// lands in `~/.hipfire/admin.passwd`).
     #[serde(default = "default_admin_user")]
     pub admin_user: String,
+    /// Root directory for images saved by the SD API compatibility routes
+    /// (`save_images: true`). Client-supplied `outdir_*` override_settings
+    /// are ignored; every SD API image write stays under this root.
+    #[serde(default = "default_sdapi_output_root")]
+    pub sdapi_output_root: String,
     #[serde(default)]
     pub default_model: Option<String>,
     #[serde(default = "default_max_seq")]
@@ -323,6 +331,7 @@ impl Default for HipfireConfig {
             port: default_port(),
             cors_allowed_origins: default_cors_allowed_origins(),
             admin_user: default_admin_user(),
+            sdapi_output_root: default_sdapi_output_root(),
             default_model: None,
             max_seq: default_max_seq(),
             max_tokens: default_max_tokens(),
