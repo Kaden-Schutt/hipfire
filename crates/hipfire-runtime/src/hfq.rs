@@ -1930,7 +1930,7 @@ pub fn load_weights_hfq(
         let (embd_t, data) = hfq.tensor_data("model.embed_tokens.weight").unwrap();
         let n = config.vocab_size * config.dim;
         let f32_data: Vec<f32> = match embd_t.quant_type {
-            3 => crate::quant::dequantize_q8_0(data, n), // Q8F16 == GGML Q8_0 blocks
+            3 => crate::quant::dequant_q8f16(data, n), // Q8F16: int8 + f16 scale, 34 B/block
             2 => data
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

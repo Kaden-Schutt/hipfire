@@ -6581,7 +6581,7 @@
     #[test]
     fn q4k_encoder_round_trips_through_diffusion_decoder() {
         // The Q4_K encoder is ported from hipfire-quantize but the decoder is
-        // hipfire_runtime::quant::dequantize_q4_k (a different crate) — this guards
+        // hipfire_runtime::quant::dequant_q4k (a different crate) — this guards
         // that their byte layouts agree, otherwise reused Q4_K weights are garbage.
         let data: Vec<f32> = (0..512)
             .map(|i| ((i as f32 - 256.0) * 0.011).sin() * (1.0 + (i % 11) as f32 * 0.3))

@@ -89,7 +89,7 @@ pub(crate) fn decode_q8f16_slice(
             bytes.len()
         )));
     }
-    Ok(hipfire_runtime::quant::dequantize_q8_0(bytes, elem_count))
+    Ok(hipfire_runtime::quant::dequant_q8f16(bytes, elem_count))
 }
 
 pub(crate) fn decode_q4_k_slice(
@@ -105,7 +105,7 @@ pub(crate) fn decode_q4_k_slice(
             bytes.len()
         )));
     }
-    Ok(hipfire_runtime::quant::dequantize_q4_k(bytes, elem_count))
+    Ok(hipfire_runtime::quant::dequant_q4k(bytes, elem_count))
 }
 
 pub(crate) fn decode_hfq4_slice(

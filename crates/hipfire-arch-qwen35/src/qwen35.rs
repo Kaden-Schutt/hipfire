@@ -3678,7 +3678,7 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
 
     let f32_data: Vec<f32> = match info.quant_type {
         1 | 2 | 16 => hfq_plain_tensor_as_f32(info, &data, name),
-        3 => hipfire_runtime::quant::dequantize_q8_0(&data, n),
+        3 => hipfire_runtime::quant::dequant_q8f16(&data, n),
         14 => {
             // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
             let group_size: usize = 256;

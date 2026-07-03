@@ -149,7 +149,7 @@ fn encode_opus_tensor(
 }
 
 /// q8_0 encoder: groups of 32, symmetric int8, `scale = max_abs / 127`, stored
-/// as `[f16 scale][32 x i8]` (34 bytes/block). Mirrors `dequantize_q8_0`.
+/// as `[f16 scale][32 x i8]` (34 bytes/block). Mirrors `dequant_q8f16`.
 pub(crate) fn encode_q8f16(data: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(data.len().div_ceil(32) * 34);
     for group in data.chunks(32) {
@@ -272,7 +272,7 @@ pub(crate) fn encode_q4f16_g64_clipsearch(data: &[f32]) -> Vec<u8> {
 /// LLM-path codec). 256-element super-blocks with 8 sub-blocks of 32, each with
 /// its own 6-bit scale+min under a per-super-block f16 `d`/`dmin` — finer and
 /// hierarchical vs the flat group-64 affine of `encode_q4f16_g64`. The byte
-/// layout must match `hipfire_runtime::quant::dequantize_q4_k` (the diffusion
+/// layout must match `hipfire_runtime::quant::dequant_q4k` (the diffusion
 /// decoder); `q4k_encoder_round_trips_through_diffusion_decoder` guards that.
 pub(crate) fn encode_q4k(f32_data: &[f32]) -> Vec<u8> {
     let super_block_size = 256;

@@ -5,17 +5,16 @@
 //! Block dequantization codecs for HFQ tensor types + half/bf16 ↔ f32
 //! conversions.
 //!
-//! Arch-agnostic numeric primitives used by the HFQ loaders. `dequantize_q8_0`
-//! decodes HFQ's `Q8F16` type and `dequantize_q4_k` its `Q4K` type — both
+//! Arch-agnostic numeric primitives used by the HFQ loaders. `dequant_q8f16`
+//! decodes HFQ's `Q8F16` type and `dequant_q4k` its `Q4K` type — both
 //! reuse the corresponding block byte layout but are native HFQ inference
 //! codecs, not GGUF readers. The GGUF-only decoders (Q4_0, Q6_K, and the
 //! Q4_K→Q4_F16 transcoders) were removed with the GGUF inference path — GGUF is
 //! import-only, in hipfire-coexistence.
 
-/// Dequantize a Q8F16 (int8, f16-scale) block tensor to f32.
-/// Block: 2 bytes (f16 scale) + 32 bytes (32 x int8)
-/// Q8_0 block: 2 bytes (f16 scale) + 32 bytes (32 x int8)
-pub fn dequantize_q8_0(data: &[u8], n: usize) -> Vec<f32> {
+/// Dequantize an HFQ Q8F16 (int8, f16-scale) block tensor to f32.
+/// Block: 2 bytes (f16 scale) + 32 bytes (32 x int8) = 34 bytes / 32 weights.
+pub fn dequant_q8f16(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 32;
     let nblocks = (n + block_size - 1) / block_size;
     let mut out = vec![0.0f32; n];
@@ -45,13 +44,13 @@ pub fn dequantize_q8_0(data: &[u8], n: usize) -> Vec<f32> {
 // unchanged and transitively share one implementation.
 pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
 
-/// Dequantize Q4_K data to f32.
-/// Q4_K super-block: 256 elements
+/// Dequantize an HFQ Q4K block tensor to f32.
+/// Super-block: 256 elements, 144 bytes
 ///   2 bytes: f16 d (super-block scale)
 ///   2 bytes: f16 dmin (super-block min)
 ///   12 bytes: scales/mins for 8 sub-blocks (6 bits each, packed)
 ///   128 bytes: 256 x 4-bit quantized values
-pub fn dequantize_q4_k(data: &[u8], n: usize) -> Vec<f32> {
+pub fn dequant_q4k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 144; // 2+2+12+128
     let nblocks = (n + block_size - 1) / block_size;
