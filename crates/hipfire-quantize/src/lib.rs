@@ -22,6 +22,7 @@ pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 pub use hipfire_kvquant::{kv_compact, kvarn};
 
 pub mod codecs;
+pub mod hfq_out;
 pub mod gptq;
 pub mod hessian_io;
 #[allow(dead_code)]

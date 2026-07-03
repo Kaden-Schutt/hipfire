@@ -43,6 +43,16 @@ use codecs::*;
 pub use hipfire_quantize::{
     codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
 };
+// HFQ writer + provenance/metadata machinery now lives in the library so the
+// GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
+// artifacts through the same code path the native quantizer uses.
+use hipfire_quantize::hfq_out::{
+    insert_parameter_counts_metadata, metadata_with_quantization_hash, write_hfq, HfqTensor,
+    TensorSpill, HFQ_MAGIC,
+};
+// Helpers exercised only by this binary's unit tests.
+#[cfg(test)]
+use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
 // The GGUF parser/dequant now lives in its own dedicated offline crate
 // (hipfire-gguf) — off the inference dependency surface. Alias keeps the
 // import pipeline's `gguf_input::` references source-compatible.
@@ -68,12 +78,9 @@ mod rotate;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::Hasher;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use twox_hash::XxHash64;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
 // ggml-style tensor name (see safetensors_to_ggml_name), value is the
@@ -2228,9 +2235,8 @@ fn dequantize_mq2g256_lloyd_to_f32(
 }
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
-
-const HFQ_MAGIC: &[u8; 4] = b"HFQM";
-const HFQ_VERSION: u32 = 1;
+// HFQ_MAGIC / HFQ_VERSION now live in hipfire_quantize::hfq_out (single source,
+// shared with the library writer); re-imported at the top of this file.
 
 // QuantType — the on-disk HFQ `quant_type` byte-contract — now lives in the
 // shared `hipfire-quant-format` leaf crate, depended on by BOTH this writer and
@@ -2423,176 +2429,13 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     QuantLevel::Base
 }
 
-struct HfqTensor {
-    name: String,
-    quant_type: QuantType,
-    shape: Vec<u32>,
-    group_size: u32,
-    data: Vec<u8>,
-    /// When data is spilled to disk, this holds the byte count.
-    /// `data` is empty and the bytes live in the spill file.
-    spilled_len: u64,
-}
 
-fn tensor_param_count(t: &HfqTensor) -> u64 {
-    t.shape
-        .iter()
-        .fold(1u64, |acc, &dim| acc.saturating_mul(dim as u64))
-}
 
-fn config_u64_any(config: &serde_json::Value, keys: &[&str]) -> Option<u64> {
-    fn get_from_scope(scope: &serde_json::Value, keys: &[&str]) -> Option<u64> {
-        keys.iter().find_map(|key| scope.get(*key)?.as_u64())
-    }
 
-    get_from_scope(config, keys)
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|scope| get_from_scope(scope, keys))
-        })
-        .or_else(|| {
-            config
-                .get("moe")
-                .and_then(|scope| get_from_scope(scope, keys))
-        })
-        .or_else(|| {
-            config
-                .get("ffn_config")
-                .and_then(|scope| get_from_scope(scope, keys))
-        })
-}
 
-fn model_config_from_metadata(metadata: &serde_json::Value) -> &serde_json::Value {
-    metadata.get("config").unwrap_or(metadata)
-}
 
-fn routed_moe_config(metadata: &serde_json::Value) -> Option<(u64, u64)> {
-    let config = model_config_from_metadata(metadata);
-    let num_experts = config_u64_any(
-        config,
-        &[
-            "num_experts",
-            "n_routed_experts",
-            "num_local_experts",
-            "n_experts",
-        ],
-    )?;
-    let top_k = config_u64_any(
-        config,
-        &[
-            "num_experts_per_tok",
-            "num_experts_per_token",
-            "n_experts_per_tok",
-            "moe_top_k",
-            "top_k",
-            "num_selected_experts",
-        ],
-    )?;
-    if num_experts == 0 || top_k == 0 {
-        None
-    } else {
-        Some((num_experts, top_k))
-    }
-}
 
-fn is_routed_expert_tensor_name(name: &str) -> bool {
-    if name.contains(".shared_expert") || name.contains(".shared_experts.") {
-        return false;
-    }
-    name.contains(".mlp.experts.")
-        || name.contains(".ffn.experts.")
-        || name.contains(".block_sparse_moe.experts.")
-        || name.contains(".feed_forward.experts.")
-        || name.contains(".mixer.experts.")
-}
 
-fn parameter_counts_metadata(
-    metadata: &serde_json::Value,
-    tensors: &[HfqTensor],
-    total_params: u64,
-    quantized_params: u64,
-    skipped_params: u64,
-) -> serde_json::Value {
-    let mut routed_expert_params = 0u64;
-    for t in tensors {
-        if is_routed_expert_tensor_name(&t.name) {
-            routed_expert_params = routed_expert_params.saturating_add(tensor_param_count(t));
-        }
-    }
-
-    let (active_params, effective_params, moe) = if routed_expert_params > 0 {
-        if let Some((num_experts, top_k)) = routed_moe_config(metadata) {
-            let numerator = routed_expert_params.saturating_mul(top_k);
-            let routed_active = numerator / num_experts;
-            let active = total_params
-                .saturating_sub(routed_expert_params)
-                .saturating_add(routed_active);
-            (
-                active,
-                active,
-                Some(serde_json::json!({
-                    "num_experts": num_experts,
-                    "num_experts_per_tok": top_k,
-                    "routed_expert_params": routed_expert_params,
-                    "routed_expert_active_params": routed_active,
-                    "active_rule": "dense_and_shared_full_plus_routed_top_k_over_num_experts",
-                    "routed_active_fraction": {
-                        "numerator": numerator,
-                        "denominator": num_experts,
-                    },
-                })),
-            )
-        } else {
-            (
-                total_params,
-                total_params,
-                Some(serde_json::json!({
-                    "routed_expert_params": routed_expert_params,
-                    "active_rule": "unknown_top_k_or_num_experts",
-                })),
-            )
-        }
-    } else {
-        (total_params, total_params, None)
-    };
-
-    let source_total_params = total_params.saturating_add(skipped_params);
-    let mut counts = serde_json::json!({
-        "schema": "hipfire.parameter_counts.v1",
-        "total_params": total_params,
-        "source_total_params": source_total_params,
-        "active_params": active_params,
-        "effective_params": effective_params,
-        "quantized_params": quantized_params,
-        "skipped_params": skipped_params,
-    });
-    if let Some(moe) = moe {
-        if let serde_json::Value::Object(ref mut map) = counts {
-            map.insert("moe".to_string(), moe);
-        }
-    }
-    counts
-}
-
-fn insert_parameter_counts_metadata(
-    metadata: &mut serde_json::Value,
-    tensors: &[HfqTensor],
-    total_params: u64,
-    quantized_params: u64,
-    skipped_params: u64,
-) {
-    let counts = parameter_counts_metadata(
-        metadata,
-        tensors,
-        total_params,
-        quantized_params,
-        skipped_params,
-    );
-    if let serde_json::Value::Object(ref mut map) = metadata {
-        map.insert("parameter_counts".to_string(), counts);
-    }
-}
 
 fn insert_quant_format_metadata(metadata: &mut serde_json::Value, format: &str) {
     if let serde_json::Value::Object(ref mut map) = metadata {
@@ -2780,25 +2623,7 @@ impl HfqInputFile {
 
 // ─── XXH64 provenance hashing ───────────────────────────────────────────────
 
-struct Xxh64 {
-    inner: XxHash64,
-}
 
-impl Xxh64 {
-    fn new(seed: u64) -> Self {
-        Self {
-            inner: XxHash64::with_seed(seed),
-        }
-    }
-
-    fn update(&mut self, input: &[u8]) {
-        self.inner.write(input);
-    }
-
-    fn digest(&self) -> u64 {
-        self.inner.finish()
-    }
-}
 
 #[cfg(test)]
 fn xxh64_hex(bytes: &[u8]) -> String {
@@ -2807,184 +2632,18 @@ fn xxh64_hex(bytes: &[u8]) -> String {
     format!("{:016x}", h.digest())
 }
 
-fn xxh64_update_u8(h: &mut Xxh64, v: u8) {
-    h.update(&[v]);
-}
 
-fn xxh64_update_u32(h: &mut Xxh64, v: u32) {
-    h.update(&v.to_le_bytes());
-}
 
-fn xxh64_update_u64(h: &mut Xxh64, v: u64) {
-    h.update(&v.to_le_bytes());
-}
 
-fn hfq_quantization_hash_metadata(
-    tensors: &[HfqTensor],
-    spill: Option<&TensorSpill>,
-) -> std::io::Result<serde_json::Value> {
-    let mut h = Xxh64::new(0);
-    let mut payload_bytes = 0u64;
-    h.update(b"hipfire-hfq-quantized-tensor-payload-v1");
 
-    let mut spill_reader = if let Some(spill) = spill {
-        Some(std::io::BufReader::new(File::open(&spill.path)?))
-    } else {
-        None
-    };
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
 
-    for t in tensors {
-        let name_bytes = t.name.as_bytes();
-        xxh64_update_u64(&mut h, name_bytes.len() as u64);
-        h.update(name_bytes);
-        xxh64_update_u8(&mut h, t.quant_type as u8);
-        xxh64_update_u64(&mut h, t.shape.len() as u64);
-        for &dim in &t.shape {
-            xxh64_update_u32(&mut h, dim);
-        }
-        xxh64_update_u32(&mut h, t.group_size);
-        let data_len = if t.spilled_len > 0 {
-            t.spilled_len
-        } else {
-            t.data.len() as u64
-        };
-        xxh64_update_u64(&mut h, data_len);
-        payload_bytes += data_len;
 
-        if t.spilled_len > 0 {
-            let reader = spill_reader
-                .as_mut()
-                .expect("spilled tensor requires spill reader");
-            let mut remaining = t.spilled_len as usize;
-            while remaining > 0 {
-                let chunk = remaining.min(buf.len());
-                use std::io::Read;
-                reader.read_exact(&mut buf[..chunk])?;
-                h.update(&buf[..chunk]);
-                remaining -= chunk;
-            }
-        } else {
-            h.update(&t.data);
-        }
-    }
 
-    Ok(serde_json::json!({
-        "algorithm": "xxh64",
-        "seed": 0,
-        "scope": "hfq_tensor_index_and_payload_v1",
-        "value": format!("{:016x}", h.digest()),
-        "tensor_count": tensors.len(),
-        "payload_bytes": payload_bytes,
-        "producer": {
-            "package": "hipfire-quantize",
-            "hipfire_version": env!("CARGO_PKG_VERSION"),
-            "git_commit": git_commit(),
-            "git_branch": git_branch(),
-            "git_describe": git_describe(),
-            "git_dirty": git_dirty(),
-        },
-    }))
-}
 
-fn metadata_with_quantization_hash(
-    mut metadata: serde_json::Value,
-    tensors: &[HfqTensor],
-    spill: Option<&TensorSpill>,
-) -> std::io::Result<String> {
-    let hash = hfq_quantization_hash_metadata(tensors, spill)?;
-    if let serde_json::Value::Object(ref mut map) = metadata {
-        map.insert("quantization_hash".to_string(), hash);
-    }
-    serde_json::to_string(&metadata)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
 
-fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
 
-fn git_commit() -> Option<String> {
-    command_stdout("git", &["rev-parse", "HEAD"])
-}
 
-fn git_branch() -> Option<String> {
-    command_stdout("git", &["rev-parse", "--abbrev-ref", "HEAD"])
-}
 
-fn git_describe() -> Option<String> {
-    command_stdout("git", &["describe", "--always", "--dirty", "--tags"])
-}
-
-fn git_dirty() -> Option<bool> {
-    let out = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(!out.stdout.is_empty())
-}
-
-/// Streaming tensor spill file. When the quantizer accumulates more than
-/// `SPILL_THRESHOLD` bytes of tensor data in memory, it flushes completed
-/// tensors to this file. At write_hfq time, spilled data is copied from
-/// the spill file instead of from memory, keeping peak RSS bounded.
-struct TensorSpill {
-    file: std::io::BufWriter<File>,
-    path: PathBuf,
-    offset: u64,
-}
-
-impl TensorSpill {
-    fn new(dir: &Path) -> std::io::Result<Self> {
-        // PID-unique so concurrent quantize runs in the same output dir don't
-        // share a spill path (a sibling run's Drop would otherwise delete this
-        // run's spill file → write_hfq NotFound panic).
-        let path = dir.join(format!(".hipfire_quant_spill.{}.tmp", std::process::id()));
-        let file = std::io::BufWriter::with_capacity(4 * 1024 * 1024, File::create(&path)?);
-        Ok(Self {
-            file,
-            path,
-            offset: 0,
-        })
-    }
-
-    /// Write tensor data to the spill file. Returns the byte count written.
-    fn spill(&mut self, data: &[u8]) -> std::io::Result<u64> {
-        use std::io::Write;
-        self.file.write_all(data)?;
-        self.offset += data.len() as u64;
-        Ok(data.len() as u64)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        use std::io::Write;
-        self.file.flush()
-    }
-
-    fn cleanup(self) {
-        // Explicit cleanup — Drop impl handles the actual removal.
-        drop(self);
-    }
-}
-
-impl Drop for TensorSpill {
-    fn drop(&mut self) {
-        // Ensure the temp file is removed even on panic.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
@@ -3007,100 +2666,6 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     let _ = spill.flush();
 }
 
-fn write_hfq(
-    path: &Path,
-    arch: u32,
-    metadata_json: &str,
-    tensors: &[HfqTensor],
-    spill: Option<&mut TensorSpill>,
-) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
-
-    let metadata_bytes = metadata_json.as_bytes();
-
-    // Calculate offsets
-    let header_size = 32u64;
-    let metadata_offset = header_size;
-    let metadata_size = metadata_bytes.len() as u64;
-
-    // Tensor index follows metadata
-    let index_offset = metadata_offset + metadata_size;
-    let mut index_bytes = Vec::new();
-    // Write tensor count
-    index_bytes.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
-    for t in tensors {
-        // name length + name
-        let name_bytes = t.name.as_bytes();
-        index_bytes.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        index_bytes.extend_from_slice(name_bytes);
-        // quant type
-        index_bytes.push(t.quant_type as u8);
-        // n_dims + shape
-        index_bytes.push(t.shape.len() as u8);
-        for &d in &t.shape {
-            index_bytes.extend_from_slice(&d.to_le_bytes());
-        }
-        // group size
-        index_bytes.extend_from_slice(&t.group_size.to_le_bytes());
-        // data size (offset computed at read time from cumulative sizes)
-        let data_len = if t.spilled_len > 0 {
-            t.spilled_len
-        } else {
-            t.data.len() as u64
-        };
-        index_bytes.extend_from_slice(&data_len.to_le_bytes());
-    }
-
-    // Data starts after index, aligned to 4096
-    let data_start_unaligned = index_offset + index_bytes.len() as u64;
-    let data_offset = (data_start_unaligned + 4095) & !4095;
-
-    // Write header (32 bytes)
-    f.write_all(HFQ_MAGIC)?;
-    f.write_all(&HFQ_VERSION.to_le_bytes())?;
-    f.write_all(&arch.to_le_bytes())?;
-    f.write_all(&(tensors.len() as u32).to_le_bytes())?;
-    f.write_all(&metadata_offset.to_le_bytes())?;
-    f.write_all(&data_offset.to_le_bytes())?;
-
-    // Write metadata
-    f.write_all(metadata_bytes)?;
-
-    // Write tensor index
-    f.write_all(&index_bytes)?;
-
-    // Pad to data alignment
-    let pad_size = (data_offset - data_start_unaligned) as usize;
-    f.write_all(&vec![0u8; pad_size])?;
-
-    // Write tensor data — from spill file or from memory
-    if let Some(spill) = spill {
-        let _ = spill.flush();
-        let mut spill_reader = std::io::BufReader::new(File::open(&spill.path)?);
-        let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB copy buffer
-        for t in tensors {
-            if t.spilled_len > 0 {
-                // Copy from spill file
-                let mut remaining = t.spilled_len as usize;
-                while remaining > 0 {
-                    let chunk = remaining.min(buf.len());
-                    use std::io::Read;
-                    spill_reader.read_exact(&mut buf[..chunk])?;
-                    f.write_all(&buf[..chunk])?;
-                    remaining -= chunk;
-                }
-            } else {
-                f.write_all(&t.data)?;
-            }
-        }
-    } else {
-        for t in tensors {
-            f.write_all(&t.data)?;
-        }
-    }
-
-    Ok(())
-}
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
@@ -14272,9 +13837,9 @@ mod codec_golden {
         ("q8f16", "43be8c0f93de9cb3"),
         ("q8hfq", "29ca0c52ad9b58dc"),
         ("mq4g256", "6e9d532bbe5d38eb"),
-        ("mq4g256_clipsearch", "7978e3644f11ed99"),
-        ("mq6g256_clipsearch", "f906f337b9bd4df7"),
-        ("mq3g256_clipsearch", "a57eada9ebb78586"),
+        ("mq4g256_clipsearch", "1385e9164d582b48"),
+        ("mq6g256_clipsearch", "2f1924bde478e0de"),
+        ("mq3g256_clipsearch", "0a284feb706411ab"),
         ("mq2g256_clipsearch", "a95cdd8e7672e915"),
         ("mq8g256_clipsearch", "8987f0aa7fdfb487"),
         ("oq4g256", "fceec61d1cb735b3"),
