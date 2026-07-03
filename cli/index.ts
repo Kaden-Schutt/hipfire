@@ -1448,8 +1448,14 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
 // `hipfire serve -d` forks to background; `hipfire stop` kills it.
 // `hipfire run` auto-detects and uses a running serve via HTTP.
 
-const SERVE_PID_FILE = join(HIPFIRE_DIR, "serve.pid");
-const SERVE_LOG_FILE = join(HIPFIRE_DIR, "serve.log");
+// Per-instance serve pid/log when HIPFIRE_DAEMON_ID is set, so MULTIPLE serves —
+// one pinned to each GPU — can run in parallel (the autoresearch loop runs every
+// card on a box at once). Mirrors the daemon's per-GPU pid (daemon.<id>.pid). The
+// id is sanitized to the pidfile-safe allowlist. Unset (the normal single serve)
+// keeps the classic ~/.hipfire/serve.pid + serve.log, unchanged.
+const SERVE_ID = (process.env.HIPFIRE_DAEMON_ID ?? "").trim().replace(/[^A-Za-z0-9._-]/g, "_");
+const SERVE_PID_FILE = join(HIPFIRE_DIR, SERVE_ID ? `serve.${SERVE_ID}.pid` : "serve.pid");
+const SERVE_LOG_FILE = join(HIPFIRE_DIR, SERVE_ID ? `serve.${SERVE_ID}.log` : "serve.log");
 
 // Small, scoped `--flag value` / `--flag=value` reader for the handful of
 // serve passthrough flags. NOT a general parser rewrite (W2) — it extracts a

@@ -99,11 +99,19 @@ PY
 
 DURABLE="n/a"; COMMIT_SHA=""
 if [ "$VERDICT" = WIN ]; then
-  # --- gate 3: DURABILITY — serve_harness, default sampling, MULTITURN (variant daemon is $DBIN in this worktree) ---
+  # --- gate 3: DURABILITY — serve_harness, default sampling, MULTITURN, PER-GPU SCOPED so
+  #     every card runs this at once: renamed daemon comm (scoped reap) + isolated HOME +
+  #     distinct port. serve_harness kills only its own serve tree (group-kill). ---
   if [ -f scripts/serve_harness.py ]; then
-    HIP_VISIBLE_DEVICES=$DEV timeout 500 python3 scripts/serve_harness.py --model "$MODEL" --kv q8 --sampling registry \
-        --mode chain --max-tokens 256 --port "1160${CARD}" > /tmp/abv2_dur_$$.log 2>&1
-    if grep -qE "attractor=[1-9]|empty=[1-9]|type.:.error" /tmp/abv2_dur_$$.log; then DURABLE=FAIL; VERDICT=BOUNCE; else DURABLE=PASS; fi
+    DNAME="hfd_c${CARD}"                                  # distinct comm (<=15ch) -> reapOrphans pkill -x is scoped
+    cp "$DBIN" "target/release/examples/${DNAME}" 2>/dev/null
+    DHOME="$HOME/.cache/aw_home_${HIPFIRE_DAEMON_ID}"     # isolated ~/.hipfire per instance
+    HIP_VISIBLE_DEVICES=$DEV HIPFIRE_DAEMON_BIN="$WT/target/release/examples/${DNAME}" HIPFIRE_DAEMON_NAME="$DNAME" \
+      timeout 600 python3 scripts/serve_harness.py --model "$MODEL" --kv q8 --sampling registry \
+        --mode chain --max-tokens 256 --port "1160${CARD}" --home "$DHOME" > /tmp/abv2_dur_$$.log 2>&1
+    rm -f "target/release/examples/${DNAME}"
+    # serve_harness DONE line: `... runaway=N empty=N attractor=N` — any non-zero (or error/panic) BOUNCES the win
+    if grep -qE "runaway=[1-9]|empty=[1-9]|attractor=[1-9]|\"type\":\"error\"|panic" /tmp/abv2_dur_$$.log; then DURABLE=FAIL; VERDICT=BOUNCE; else DURABLE=PASS; fi
   else DURABLE="no-harness"; fi
 fi
 
