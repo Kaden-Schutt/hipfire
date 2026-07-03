@@ -38,6 +38,76 @@
 
 use std::ffi::c_void;
 
+/// One kernel argument, tagged by its ABI kind.
+///
+/// A single `KernArg` list is the single source of truth for both launch
+/// ABIs: the packed [`KernargBlob`] (graph-capture path) is built with
+/// [`KernargBlob::push_arg`], and the `kernelParams` pointer array is derived
+/// with [`KernArg::param_ptr`]. Because both come from the same list, the two
+/// representations cannot silently disagree — the dual-maintenance hazard the
+/// old hand-written blob-closure + `Vec<*mut c_void>` pairs carried at every
+/// launch site (review 2026-07-03 §3.1).
+#[derive(Clone, Copy, Debug)]
+pub enum KernArg {
+    Ptr(*const c_void),
+    I32(i32),
+    U32(u32),
+    F32(f32),
+    U64(u64),
+}
+
+impl KernArg {
+    /// Address of this argument's payload, for the `kernelParams` array HIP's
+    /// non-capture launch path expects (a pointer to each argument value).
+    ///
+    /// The returned pointer borrows `self`, so it is valid only while the
+    /// `KernArg` (typically an element of a caller-owned `&[KernArg]` slice)
+    /// is alive. HIP copies the pointed-to bytes during the launch call, so
+    /// passing `&kernargs![...]` as a temporary that lives across the launch
+    /// statement is sound — the same lifetime guarantee the old per-site
+    /// `Vec<*mut c_void>` of addresses-of-locals relied on.
+    pub fn param_ptr(&self) -> *mut c_void {
+        match self {
+            KernArg::Ptr(p) => p as *const *const c_void as *mut c_void,
+            KernArg::I32(v) => v as *const i32 as *mut c_void,
+            KernArg::U32(v) => v as *const u32 as *mut c_void,
+            KernArg::F32(v) => v as *const f32 as *mut c_void,
+            KernArg::U64(v) => v as *const u64 as *mut c_void,
+        }
+    }
+}
+
+impl From<*const c_void> for KernArg {
+    fn from(p: *const c_void) -> Self {
+        KernArg::Ptr(p)
+    }
+}
+impl From<*mut c_void> for KernArg {
+    fn from(p: *mut c_void) -> Self {
+        KernArg::Ptr(p as *const c_void)
+    }
+}
+impl From<i32> for KernArg {
+    fn from(v: i32) -> Self {
+        KernArg::I32(v)
+    }
+}
+impl From<u32> for KernArg {
+    fn from(v: u32) -> Self {
+        KernArg::U32(v)
+    }
+}
+impl From<f32> for KernArg {
+    fn from(v: f32) -> Self {
+        KernArg::F32(v)
+    }
+}
+impl From<u64> for KernArg {
+    fn from(v: u64) -> Self {
+        KernArg::U64(v)
+    }
+}
+
 /// A growable kernarg byte buffer with natural-alignment padding semantics.
 ///
 /// Fields are appended with `push_ptr`, `push_u32`, `push_i32`, `push_f32`;
@@ -116,6 +186,19 @@ impl KernargBlob {
         self.buf.extend_from_slice(&v.to_ne_bytes());
     }
 
+    /// Append one typed argument, dispatching to the right `push_*` by kind.
+    /// This is the blob-side counterpart of [`KernArg::param_ptr`]; feeding a
+    /// `&[KernArg]` through both keeps the packed and pointer ABIs in lockstep.
+    pub fn push_arg(&mut self, arg: &KernArg) {
+        match *arg {
+            KernArg::Ptr(p) => self.push_ptr(p),
+            KernArg::I32(v) => self.push_i32(v),
+            KernArg::U32(v) => self.push_u32(v),
+            KernArg::F32(v) => self.push_f32(v),
+            KernArg::U64(v) => self.push_u64(v),
+        }
+    }
+
     /// Pad the buffer to a multiple of `align` bytes. Call before launch if
     /// the arch's loader is picky about tail padding; typically unnecessary
     /// on gfx1100 / ROCm 6.x.
@@ -178,5 +261,53 @@ mod tests {
         k.push_i32(42);
         k.pad_to(16);
         assert_eq!(k.len(), 16);
+    }
+
+    #[test]
+    fn push_arg_matches_manual_push_sequence() {
+        // The rmsnorm arg list: three pointers + i32 + f32.
+        let args = [
+            KernArg::Ptr(0x1000 as *const c_void),
+            KernArg::Ptr(0x2000 as *const c_void),
+            KernArg::Ptr(0x3000 as *const c_void),
+            KernArg::I32(256),
+            KernArg::F32(1e-6),
+        ];
+        let mut via_args = KernargBlob::new();
+        for a in &args {
+            via_args.push_arg(a);
+        }
+        let mut manual = KernargBlob::new();
+        manual.push_ptr(0x1000 as *const c_void);
+        manual.push_ptr(0x2000 as *const c_void);
+        manual.push_ptr(0x3000 as *const c_void);
+        manual.push_i32(256);
+        manual.push_f32(1e-6);
+        assert_eq!(via_args.as_bytes(), manual.as_bytes());
+        assert_eq!(via_args.len(), 32); // 8+8+8 ptrs + 4 i32 + 4 f32
+    }
+
+    #[test]
+    fn param_ptr_reads_back_the_payload() {
+        // A pointer arg's param_ptr points at the stored pointer value.
+        let arg = KernArg::Ptr(0xdead_beef as *const c_void);
+        let pp = arg.param_ptr() as *const *const c_void;
+        assert_eq!(unsafe { *pp }, 0xdead_beef as *const c_void);
+        // A scalar arg's param_ptr points at the stored scalar.
+        let arg = KernArg::I32(-7);
+        assert_eq!(unsafe { *(arg.param_ptr() as *const i32) }, -7);
+        let arg = KernArg::F32(2.5);
+        assert_eq!(unsafe { *(arg.param_ptr() as *const f32) }, 2.5);
+    }
+
+    #[test]
+    fn push_arg_alignment_pads_like_typed_pushes() {
+        // i32 then ptr must insert a 4-byte pad before the 8-aligned pointer.
+        let args = [KernArg::I32(1), KernArg::Ptr(0x10 as *const c_void)];
+        let mut b = KernargBlob::new();
+        for a in &args {
+            b.push_arg(a);
+        }
+        assert_eq!(b.len(), 16);
     }
 }
