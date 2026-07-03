@@ -165,7 +165,10 @@ fn sext4(nib: u8) -> i8 {
 }
 
 fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    const BLOCK: usize = 130; // [f16 scale][128 nibbles]
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+        .block_bytes()
+        .unwrap();
     const INTERLEAVED_BLOCK: usize = 132; // [f32 scale][128 nibbles]
     if k % OQ_GROUP != 0 {
         return Err(format!("OQ4G256 requires K % 256 == 0 (got K={k})"));
@@ -202,7 +205,11 @@ fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, St
 }
 
 fn expand_oq_plus_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    const BLOCK: usize = 130; // [f16 scale][128 nibbles]
+    // Single-sourced from hipfire-quant-format (WP-3.3): the OqPlus fixed base
+    // block is the Oq4G256 geometry = 130.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+        .block_bytes()
+        .unwrap();
     if k % OQ_GROUP != 0 {
         return Err(format!("OQPLUS requires K % 256 == 0 (got K={k})"));
     }
@@ -234,7 +241,10 @@ fn expand_oq_plus_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, Str
 }
 
 fn pack_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    const BLOCK: usize = 258; // [f16 scale][256 i8]
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq8G256 = 258.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq8G256
+        .block_bytes()
+        .unwrap();
     if k % OQ_GROUP != 0 {
         return Err(format!("OQ8G256 requires K % 256 == 0 (got K={k})"));
     }

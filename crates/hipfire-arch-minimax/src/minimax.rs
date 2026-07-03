@@ -227,7 +227,10 @@ fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
 /// On-disk OQ4 block [f16 scale | 128 nibbles] → arch-combined layout
 /// [packed nibbles | f32 scales | interleaved f32-scale+nibble blocks].
 fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    const BLOCK: usize = 130;
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+        .block_bytes()
+        .unwrap();
     const INTERLEAVED_BLOCK: usize = 132;
     if k % OQ_GROUP != 0 {
         return Err(format!("OQ4G256 requires K % 256 == 0 (got K={k})"));
@@ -263,7 +266,10 @@ fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, St
 
 /// On-disk OQ8 block [f16 scale | 256 i8] → [i8 weights | f32 scales].
 fn pack_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    const BLOCK: usize = 258;
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq8G256 = 258.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq8G256
+        .block_bytes()
+        .unwrap();
     if k % OQ_GROUP != 0 {
         return Err(format!("OQ8G256 requires K % 256 == 0 (got K={k})"));
     }
@@ -318,7 +324,10 @@ fn upload_wt_oq(
 /// byte-identical; only the scale widens f16 → f32. Called per expert before
 /// fusing w1/w3/w2 into the per-layer gate_up/down blobs.
 fn oq4_ondisk_to_moe_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    const SRC_BLK: usize = 130;
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
+    const SRC_BLK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+        .block_bytes()
+        .unwrap();
     const DST_BLK: usize = 132;
     if k % OQ_GROUP != 0 {
         return Err(format!("OQ4 expert requires K % 256 == 0 (got K={k})"));

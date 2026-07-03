@@ -555,7 +555,10 @@ fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
 
 fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     const GROUP: usize = 256;
-    const BLOCK: usize = 130;
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+        .block_bytes()
+        .unwrap();
     const ILB: usize = 132;
     assert_eq!(k % GROUP, 0, "OP4 requires K % 256 == 0 (got K={k})");
     let ng = k / GROUP;
@@ -589,7 +592,10 @@ fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
 
 fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     const GROUP: usize = 256;
-    const BLOCK: usize = 130;
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+        .block_bytes()
+        .unwrap();
     assert_eq!(k % GROUP, 0, "OP4-8 requires K % 256 == 0 (got K={k})");
     let ng = k / GROUP;
     let expect = m * ng * BLOCK;
@@ -619,7 +625,10 @@ fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
 
 fn oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     const GROUP: usize = 256;
-    const BLOCK: usize = 258;
+    // Single-sourced from hipfire-quant-format (WP-3.3): Oq8G256 = 258.
+    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq8G256
+        .block_bytes()
+        .unwrap();
     assert_eq!(k % GROUP, 0, "OP8 requires K % 256 == 0 (got K={k})");
     let ng = k / GROUP;
     let expect = m * ng * BLOCK;
