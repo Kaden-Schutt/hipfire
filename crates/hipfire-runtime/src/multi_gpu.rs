@@ -21,10 +21,10 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, RcclComms,
+    DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
@@ -119,10 +119,16 @@ impl Gpus {
     pub fn init_layers(per_device: &[usize]) -> HipResult<Self> {
         let n_devices = per_device.len();
         if n_devices == 0 {
-            return Err(HipError::new(0, "init_layers: per_device must be non-empty"));
+            return Err(HipError::new(
+                0,
+                "init_layers: per_device must be non-empty",
+            ));
         }
         if per_device.contains(&0) {
-            return Err(HipError::new(0, "init_layers: each device must own ≥1 layer"));
+            return Err(HipError::new(
+                0,
+                "init_layers: each device must own ≥1 layer",
+            ));
         }
         let n_layers: usize = per_device.iter().sum();
         let device_ids = resolve_device_ids(n_devices)?;
@@ -254,7 +260,10 @@ impl Gpus {
                     all_ok = false;
                     continue;
                 }
-                match self.devices[i].hip.enable_peer_access(self.devices[j].device_id) {
+                match self.devices[i]
+                    .hip
+                    .enable_peer_access(self.devices[j].device_id)
+                {
                     Ok(()) => {}
                     // ffi.rs already converts 704 → Ok(()); this arm is
                     // belt-and-suspenders against ROCm versions where the
@@ -325,12 +334,15 @@ impl Gpus {
         let dst_dev_id = self.devices[dst_dev].device_id;
         match src_gpu.active_stream.as_ref() {
             Some(stream) => {
-                src_gpu.hip.memcpy_peer_async(
-                    dst, dst_dev_id, src, src_dev_id, n_bytes, stream,
-                )?;
+                src_gpu
+                    .hip
+                    .memcpy_peer_async(dst, dst_dev_id, src, src_dev_id, n_bytes, stream)?;
                 let event = src_gpu.hip.event_create()?;
                 match src_gpu.hip.event_record(&event, Some(stream)) {
-                    Ok(()) => Ok(BoundaryEvent { dst_dev, completion: Some(event) }),
+                    Ok(()) => Ok(BoundaryEvent {
+                        dst_dev,
+                        completion: Some(event),
+                    }),
                     Err(e) => {
                         let _ = src_gpu.hip.event_destroy(event);
                         Err(e)
@@ -342,8 +354,13 @@ impl Gpus {
                 // lands. No event needed — recording into the HIP null
                 // stream is fragile across ROCm versions; skip it and
                 // signal "already done" via completion: None.
-                src_gpu.hip.memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
-                Ok(BoundaryEvent { dst_dev, completion: None })
+                src_gpu
+                    .hip
+                    .memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
+                Ok(BoundaryEvent {
+                    dst_dev,
+                    completion: None,
+                })
             }
         }
     }
@@ -380,11 +397,7 @@ impl Gpus {
         wait_result.and(destroy_result)
     }
 
-    fn from_parts(
-        devices: Vec<Gpu>,
-        per_device: Vec<usize>,
-        n_layers: usize,
-    ) -> HipResult<Self> {
+    fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());
         let n_devices = devices.len();
@@ -464,11 +477,7 @@ impl Gpus {
     /// immediately; the buffers are valid only after a subsequent
     /// `stream_synchronize` (or a downstream dispatch that's already
     /// ordered behind the same stream).
-    pub fn all_reduce_sum_f32(
-        &mut self,
-        buffers: &[&DeviceBuffer],
-        count: usize,
-    ) -> HipResult<()> {
+    pub fn all_reduce_sum_f32(&mut self, buffers: &[&DeviceBuffer], count: usize) -> HipResult<()> {
         if buffers.len() != self.devices.len() {
             return Err(HipError::new(
                 0,
@@ -536,7 +545,10 @@ impl Gpus {
         }
         // Free the old (too-small) set on its owning devices before regrowing.
         if !self.peer_ar_tmp.is_empty() {
-            for (r, row) in std::mem::take(&mut self.peer_ar_tmp).into_iter().enumerate() {
+            for (r, row) in std::mem::take(&mut self.peer_ar_tmp)
+                .into_iter()
+                .enumerate()
+            {
                 let _ = self.devices[r].bind_thread();
                 for buf in row {
                     let _ = self.devices[r].hip.free(buf);
@@ -581,7 +593,10 @@ impl Gpus {
         if buffers.len() != n {
             return Err(HipError::new(
                 0,
-                &format!("all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}", buffers.len()),
+                &format!(
+                    "all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}",
+                    buffers.len()
+                ),
             ));
         }
         if n == 1 {
@@ -598,7 +613,8 @@ impl Gpus {
                 if j == r {
                     continue;
                 }
-                let evt = self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
+                let evt =
+                    self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
                 evts.push(evt);
                 slot += 1;
             }
@@ -638,30 +654,54 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Map each requested logical device id into the physical range
+/// `[0, real_count)` by euclidean remainder. Used by `HIPFIRE_EMULATE_GPUS`
+/// to alias N logical devices onto the (fewer) physical devices — e.g.
+/// `[0, 1] -> [0, 0]` on a 1-GPU box, `[0, 1, 2, 3] -> [0, 1, 0, 1]` on a
+/// 2-GPU box. A non-positive `real_count` is left untouched (no physical
+/// devices to alias onto — the caller will surface the real error).
+fn alias_ids(ids: &[i32], real_count: i32) -> Vec<i32> {
+    if real_count <= 0 {
+        return ids.to_vec();
+    }
+    ids.iter().map(|&id| id.rem_euclid(real_count)).collect()
+}
+
 /// Resolve the device IDs to use. Logical IDs post-`HIP_VISIBLE_DEVICES`:
 /// `HIPFIRE_DEVICES=0,1` selects the first two HIP-visible devices. When
 /// unset, takes the first `n_devices` visible IDs.
 fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
-    if let Some(ref s) = crate::config::get().devices {
-        let ids: Vec<i32> = s
+    let ids: Vec<i32> = if let Some(ref s) = crate::config::get().devices {
+        let parsed: Vec<i32> = s
             .split(',')
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
             .map(|p| p.parse::<i32>())
             .collect::<Result<_, _>>()
             .map_err(|e| HipError::new(0, &format!("HIPFIRE_DEVICES parse: {e}")))?;
-        if ids.len() < n_devices {
+        if parsed.len() < n_devices {
             return Err(HipError::new(
                 0,
                 &format!(
                     "HIPFIRE_DEVICES has {} ids but n_devices = {n_devices}",
-                    ids.len(),
+                    parsed.len(),
                 ),
             ));
         }
-        return Ok(ids[..n_devices].to_vec());
+        parsed[..n_devices].to_vec()
+    } else {
+        (0..n_devices as i32).collect()
+    };
+
+    // Debug dual-GPU emulation: alias every logical id into the physical range
+    // so a single card can serve an N-way PP/EP load. Applies to both the
+    // explicit HIPFIRE_DEVICES list and the default 0..n so neither can leave
+    // an out-of-range id. See config::emulate_gpus.
+    if crate::config::get().emulate_gpus.is_some() {
+        let real = HipRuntime::load()?.device_count()?;
+        return Ok(alias_ids(&ids, real));
     }
-    Ok((0..n_devices as i32).collect())
+    Ok(ids)
 }
 
 fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
@@ -711,7 +751,8 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = crate::config::get().uniform_vram_tolerance_gb
+    let tol_gb = crate::config::get()
+        .uniform_vram_tolerance_gb
         .map(|t| t as f64)
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);
     if delta_gb > tol_gb {
@@ -730,6 +771,14 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alias_ids_maps_into_physical_range() {
+        assert_eq!(alias_ids(&[0, 1], 1), vec![0, 0]); // 2 logical -> 1 physical
+        assert_eq!(alias_ids(&[0, 1, 2, 3], 2), vec![0, 1, 0, 1]); // 4 -> 2
+        assert_eq!(alias_ids(&[0, 0], 1), vec![0, 0]); // idempotent
+        assert_eq!(alias_ids(&[0, 1], 2), vec![0, 1]); // no-op when in range
+    }
 
     #[test]
     fn uniform_split_basic() {
