@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod capture;
+pub mod intervene;
 
 /// Per-neuron CETT for one layer at one token.
 ///

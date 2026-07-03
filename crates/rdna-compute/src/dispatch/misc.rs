@@ -177,6 +177,48 @@ impl Gpu {
         Ok(())
     }
 
+    /// H-Neurons intervention gain for one transformer layer. Scales the FFN
+    /// neuron activations in place by this layer's per-neuron gain slice
+    /// (`gain[j]` = the swept scalar for an H-Neuron, else 1.0):
+    /// `ffn[t,j] *= gain[j]` over all `positions × inter` elements. Applied to
+    /// the down_proj input, on every position (prefill + decode). No LDS
+    /// (gfx1103 fault class).
+    pub fn hneuron_gain_layer(
+        &mut self,
+        ffn: &GpuTensor,  // [positions * inter] down_proj input, modified in place
+        gain: &GpuTensor, // [inter] this layer's per-neuron gain
+        positions: usize,
+        inter: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hneuron_gain", kernels::HNEURON_GAIN_SRC, "hneuron_gain")?;
+        let f_ptr = ffn.buf.as_ptr();
+        let m_ptr = gain.buf.as_ptr();
+        let p = positions as i32;
+        let i = inter as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &f_ptr as *const _ as *mut c_void,
+            &m_ptr as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void,
+            &i as *const _ as *mut c_void,
+        ];
+        let total = (positions.max(1) * inter.max(1)) as u32;
+        let block = 256u32;
+        let grid = total.div_ceil(block).max(1);
+        let func = &self.functions["hneuron_gain"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        Ok(())
+    }
+
     /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
     /// scaling to activation vector x in-place. Called before GEMV on
     /// ParoQ4G128 weights.

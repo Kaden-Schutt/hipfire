@@ -3133,6 +3133,7 @@ pub const KV_CACHE_WRITE_Q8_0_ROUTED_BATCHED_SRC: &str =
 /// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
 pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
 pub const CETT_REDUCE_SRC: &str = include_str!("../../../kernels/src/cett_reduce.hip");
+pub const HNEURON_GAIN_SRC: &str = include_str!("../../../kernels/src/hneuron_gain.hip");
 
 /// Scatter final per-session logits rows from a batch logits tensor into
 /// persistent session logits snapshots.
