@@ -10,6 +10,17 @@
 // Helpers still defined in main.rs (crate root); codecs is a descendant module
 // so it can reference these private items. They will move here in a later batch.
 use crate::{cpu_fwht_256, f16_to_f32, f32_to_f16};
+use hipfire_quant_format::QuantType;
+
+/// Block byte length for a fixed-geometry format — single-sourced from
+/// hipfire-quant-format (review 2026-07-03 §3.9). `expect` is sound: codecs
+/// only encode fixed-layout formats, whose `block_bytes()` is `Some` (pinned
+/// by the quant-format tests).
+#[inline]
+fn bb(qt: QuantType) -> usize {
+    qt.block_bytes()
+        .expect("codecs.rs only encodes fixed-geometry formats")
+}
 
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
@@ -17,7 +28,7 @@ use crate::{cpu_fwht_256, f16_to_f32, f32_to_f16};
 /// Little-endian bitstream within each 3-byte chunk.
 pub fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
-    let block_bytes = 104; // 8 metadata + 96 packed 3-bit
+    let block_bytes = bb(QuantType::HFQ3G256); // 8 metadata + 96 packed 3-bit
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -81,7 +92,7 @@ pub fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
 /// Block: [f32 scale][f32 zero][48B packed 3-bit] = 56 bytes per 128 weights (0.4375 B/w).
 pub fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
-    let block_bytes = 56; // 8 metadata + 48 packed 3-bit
+    let block_bytes = bb(QuantType::HFQ3G128); // 8 metadata + 48 packed 3-bit
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -134,7 +145,7 @@ pub fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
 /// Block: [f32 scale][f32 zero][64B packed 2-bit] = 72 bytes per 256 weights (0.281 B/w).
 pub fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
-    let block_bytes = 72; // 8 metadata + 64 packed
+    let block_bytes = bb(QuantType::HFQ2G256); // 8 metadata + 64 packed
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -180,7 +191,7 @@ pub fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
 /// Block: [f32 scale][f32 zero][32B packed 2-bit] = 40 bytes per 128 weights (0.3125 B/w).
 pub fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
-    let block_bytes = 40;
+    let block_bytes = bb(QuantType::HFQ2G128);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -225,7 +236,7 @@ pub fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
 /// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
 pub fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
-    let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
+    let block_bytes = bb(QuantType::HFQ6G256); // 8 (scale+zero) + 192 (packed 6-bit)
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -287,7 +298,7 @@ pub fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
 /// 14 VGPRs, 100% occupancy. Better quality for small K dimensions.
 pub fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
-    let block_bytes = 72;
+    let block_bytes = bb(QuantType::HFQ4G128);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -342,7 +353,7 @@ pub fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
         return quantize_mq4g256_clipsearch(f32_data, signs1, signs2);
     }
     let group_size = 256;
-    let block_bytes = 136;
+    let block_bytes = bb(QuantType::MQ4G256);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -394,7 +405,7 @@ pub fn quantize_mq4g256_clipsearch(
     signs2: &[f32],
 ) -> Vec<u8> {
     let group_size = 256;
-    let block_bytes = 136;
+    let block_bytes = bb(QuantType::MQ4G256);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -495,7 +506,7 @@ pub fn quantize_mq6g256_clipsearch(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 200usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::MQ6G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -528,7 +539,7 @@ pub fn quantize_mq3g256_clipsearch(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 104usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::MQ3G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -567,7 +578,7 @@ pub fn quantize_mq2g256_clipsearch(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 72usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::MQ2G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -600,7 +611,7 @@ pub fn quantize_mq8g256_clipsearch(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 258usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::MQ8G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -632,7 +643,7 @@ pub fn quantize_mq8g256_clipsearch(
 /// W4A4) directly, and the int8-activation variant (Opus-A8) by upcasting the
 /// signed nibbles to int8 for the iu8 path. Dequant: `scale · sext4(nibble)`.
 pub fn quantize_oq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 130usize); // 2 (f16 scale) + 128 nibbles
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq4G256)); // 2 (f16 scale) + 128 nibbles
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -666,7 +677,7 @@ pub fn quantize_oq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
 /// decoder parity tests.
 #[allow(dead_code)]
 pub fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
-    let (group_size, block_bytes) = (256usize, 130usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq4G256));
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);
     let sext4 = |nib: u8| -> f32 {
@@ -707,7 +718,7 @@ pub fn dequant_oq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) ->
 /// SpinQuant learned rotation on top of the FWHT (`project_spinquant_w4a4`); the
 /// FWHT here is the fixed-rotation floor.
 pub fn quantize_oq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 98usize); // 2 (f16 scale) + 8×3 u32 bit-planes
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq3G256)); // 2 (f16 scale) + 8×3 u32 bit-planes
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -746,7 +757,7 @@ pub fn quantize_oq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
 /// two's-complement `scale·sext3`, inverse FWHT. Pub oracle — the bin's golden
 /// battery consumes it cross-target, so it can't be `cfg(test)`-gated in the lib.
 pub fn dequant_oq3g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
-    let (group_size, block_bytes) = (256usize, 98usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq3G256));
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);
     for b in 0..n_blocks {
@@ -784,7 +795,7 @@ pub fn dequant_oq3g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) ->
 /// it feeds the iu8 grouped-WMMA path (Opus Quant W8A8) for near-lossless,
 /// matrix-core-fast inference.
 pub fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 258usize); // 2 (f16 scale) + 256 int8
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq8G256)); // 2 (f16 scale) + 256 int8
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -816,7 +827,7 @@ pub fn quantize_oq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
 /// as MQ6, but signed). Dequant: `scale · sext6`, inverse FWHT. Expands to int8 for
 /// the iu8 W6A8 path — family completion; loader/kernel pending.
 pub fn quantize_oq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
-    let (group_size, block_bytes) = (256usize, 194usize); // 2 (f16 scale) + 192 (6-bit×256)
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq6G256)); // 2 (f16 scale) + 192 (6-bit×256)
     let n = f32_data.len();
     let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -849,7 +860,7 @@ pub fn quantize_oq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
 /// Dequantize OQ6G256 (round-trip oracle). `[f16 scale][192 B 6-bit]` → `scale·sext6`,
 /// inverse FWHT. Pub oracle (consumed cross-target by the bin's golden battery).
 pub fn dequant_oq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
-    let (group_size, block_bytes) = (256usize, 194usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq6G256));
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);
     let sext6 = |q: u8| -> f32 {
@@ -1020,7 +1031,7 @@ pub fn quantize_oqplus_compact(
 /// Reference oq8g256 decoder; part of the library API (diffusion oq8 parity).
 #[allow(dead_code)]
 pub fn dequant_oq8g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
-    let (group_size, block_bytes) = (256usize, 258usize);
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq8G256));
     let n_blocks = n.div_ceil(group_size);
     let mut out = Vec::with_capacity(n_blocks * group_size);
     for b in 0..n_blocks {
@@ -1085,7 +1096,7 @@ pub fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
         return quantize_mq6g256_clipsearch(f32_data, signs1, signs2);
     }
     let group_size = 256;
-    let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
+    let block_bytes = bb(QuantType::MQ6G256); // 8 (scale+zero) + 192 (packed 6-bit)
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1143,7 +1154,7 @@ pub fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
         return quantize_mq8g256_clipsearch(f32_data, signs1, signs2);
     }
     let group_size = 256;
-    let block_bytes = 258; // 2 (f16 scale) + 256 (int8 values)
+    let block_bytes = bb(QuantType::MQ8G256); // 2 (f16 scale) + 256 (int8 values)
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1186,7 +1197,7 @@ pub fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
 
 pub fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
-    let block_bytes = 136;
+    let block_bytes = bb(QuantType::HFQ4G256);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1469,7 +1480,7 @@ pub fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
 /// Block: f16 scale (2B) + f16 min (2B) + u8[32] packed nibbles (32B).
 pub fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 64;
-    let block_bytes = 36;
+    let block_bytes = bb(QuantType::Q4F16G64);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1516,7 +1527,7 @@ pub fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
 /// This produces blocks that work with the existing gemv_q4k kernel.
 pub fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
     let super_block_size = 256;
-    let block_bytes = 144;
+    let block_bytes = bb(QuantType::Q4K);
     let n = f32_data.len();
     let n_blocks = (n + super_block_size - 1) / super_block_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1665,7 +1676,7 @@ pub fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
 /// Symmetric quantization: scale = max(|w|) / 127, q = round(w / scale).
 pub fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 32;
-    let block_bytes = 34;
+    let block_bytes = bb(QuantType::Q8F16);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1743,7 +1754,7 @@ pub fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
         return quantize_mq3g256_clipsearch(f32_data, signs1, signs2);
     }
     let group_size = 256;
-    let block_bytes = 104;
+    let block_bytes = bb(QuantType::MQ3G256);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1800,7 +1811,7 @@ pub fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
         return quantize_mq2g256_clipsearch(f32_data, signs1, signs2);
     }
     let group_size = 256;
-    let block_bytes = 72;
+    let block_bytes = bb(QuantType::MQ2G256);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -1897,7 +1908,7 @@ pub fn f32_to_fp16_bits(v: f32) -> u16 {
 pub fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
-    let block_bytes = 112;
+    let block_bytes = bb(QuantType::MQ3G256Lloyd);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -2026,7 +2037,7 @@ pub fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) 
 pub fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
-    let block_bytes = 160;
+    let block_bytes = bb(QuantType::MQ4G256Lloyd);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -2135,7 +2146,7 @@ pub fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) 
 pub fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
-    let block_bytes = 72;
+    let block_bytes = bb(QuantType::MQ2G256Lloyd);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -2283,7 +2294,7 @@ pub fn quantize_mq2g256_lloyd_k3(
 ) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
-    let block_bytes = 72;
+    let block_bytes = bb(QuantType::MQ2G256Lloyd);
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
     let mut output = vec![0u8; n_blocks * block_bytes];
