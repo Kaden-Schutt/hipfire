@@ -56,6 +56,11 @@ struct Args {
     // Reframe sweep questions to permit "I don't know" (suppression regime: gives
     // over-compliance an abstention outlet so down-weighting H-Neurons can move it).
     abstain_prompt: bool,
+    // Paper-faithful 3-vs-1 identification: capture answer-token + other-token
+    // CETT from the shipped-response set (--data-dir/--data-prefix), fit the
+    // 3-vs-1 classifier across an l1 grid, and write an H-Neuron JSON per l1 into
+    // this dir. Produces the causal factual-error set (unlike response-mean 1-vs-1).
+    identify_3v1: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
     let mut sweep_hneurons = None;
     let mut sweep_gains = None;
     let mut abstain_prompt = false;
+    let mut identify_3v1 = None;
     let mut data_dir = None;
     let mut data_prefix = "Llama33_TriviaQA".to_string();
     let mut gen_train = None;
@@ -106,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
             "--sweep-hneurons" => sweep_hneurons = Some(PathBuf::from(val()?)),
             "--sweep-gains" => sweep_gains = Some(val()?),
             "--abstain-prompt" => abstain_prompt = true,
+            "--identify-3v1" => identify_3v1 = Some(PathBuf::from(val()?)),
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -132,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
         sweep_hneurons,
         sweep_gains,
         abstain_prompt,
+        identify_3v1,
     })
 }
 
@@ -460,6 +468,31 @@ fn run() -> Result<(), String> {
         .to_string();
 
     let max_seq_u32 = params.max_seq;
+
+    // Paper-faithful 3-vs-1 identification mode: capture answer-token + other-token
+    // CETT from the shipped-response set, fit the 3-vs-1 classifier across an l1
+    // grid, write an H-Neuron JSON per l1. No generation, no sweep.
+    if let Some(out_dir) = args.identify_3v1.clone() {
+        let data_dir = args.data_dir.clone();
+        let prefix = args.data_prefix.clone();
+        let limit = args.limit;
+        return rt.block_on(async {
+            let mut session = Session::connect(
+                daemon_bin.clone(),
+                model.clone(),
+                max_seq_u32,
+                colnorms.clone(),
+            )
+            .await?;
+            eprintln!("[model] loaded {model} + colnorms (resilient session)");
+            let train = load_3v1(&data_dir, &prefix, "train", limit)?;
+            eprintln!(
+                "[3v1] {} train samples with located answer spans",
+                train.len()
+            );
+            identify_3v1(&mut session, &train, &out_dir).await
+        });
+    }
 
     // Intervention-sweep mode: load a saved H-Neuron set and run the
     // bidirectional gain dose-response, then return (no capture/fit).
@@ -959,13 +992,23 @@ async fn run_sweep(
             if samples.len() < 3 {
                 samples.push(text.trim().replace('\n', " ").chars().take(80).collect());
             }
-            if is_abstention(&text) {
+            let verdict = if is_abstention(&text) {
                 abstain += 1;
+                'A'
             } else if is_hallucinated(&text, &q.aliases) {
                 hall += 1;
+                'H'
             } else {
                 correct += 1;
-            }
+                'C'
+            };
+            // Per-answer dump for manual/LLM re-scoring + baseline-vs-ablate diff
+            // by index (the regex verdict is only a hint).
+            eprintln!(
+                "[ans g={gain} i={i} {verdict}] {:?} || gold={:?}",
+                text.trim().replace('\n', " "),
+                q.aliases
+            );
         }
         let d = n.max(1) as f64;
         for s in &samples {
@@ -981,6 +1024,225 @@ async fn run_sweep(
     }
     // Clear the intervention on the way out (identity).
     session.set_intervention(Vec::new(), 1.0).await?;
+    Ok(())
+}
+
+/// One 3-vs-1 identification sample: the factual answer-token span within the
+/// response, plus the correctness label (1 = hallucinated/false).
+struct Sample3v1 {
+    question: String,
+    response: String,
+    answer_offset: usize,
+    answer_len: usize,
+    /// Dataset's tokenized_response length — to detect daemon-vs-dataset
+    /// tokenization misalignment (which would corrupt the answer span).
+    resp_tok_len: usize,
+    label: u8,
+}
+
+/// Start index of `needle` as a contiguous subsequence of `haystack`, or None.
+fn find_token_span(haystack: &[String], needle: &[String]) -> Option<usize> {
+    let (h, n) = (haystack.len(), needle.len());
+    if n == 0 || n > h {
+        return None;
+    }
+    (0..=h - n).find(|&s| haystack[s..s + n] == needle[..])
+}
+
+/// Load the shipped answer-token set as 3-vs-1 samples: per qid, the located
+/// answer-token span within the response + the correctness label. Balanced up to
+/// `limit`/2 per class. Skips qids whose answer_tokens aren't found in
+/// tokenized_response.
+fn load_3v1(
+    dir: &Path,
+    prefix: &str,
+    split: &str,
+    limit: Option<usize>,
+) -> Result<Vec<Sample3v1>, String> {
+    let qids_path = dir.join(format!("{prefix}_{split}_qids.json"));
+    let jsonl = dir.join(format!("{prefix}_answer_tokens_{split}.jsonl"));
+    let qids: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&qids_path)
+            .map_err(|e| format!("read {}: {e}", qids_path.display()))?,
+    )
+    .map_err(|e| e.to_string())?;
+    let body =
+        std::fs::read_to_string(&jsonl).map_err(|e| format!("read {}: {e}", jsonl.display()))?;
+    // qid -> (question, response, tokenized_response, answer_tokens)
+    let mut rec: HashMap<String, (String, String, Vec<String>, Vec<String>)> = HashMap::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("parse jsonl: {e}"))?;
+        for (qid, r) in v.as_object().ok_or("jsonl line not object")? {
+            let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let a = |k: &str| {
+                r.get(k)
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            rec.insert(
+                qid.clone(),
+                (
+                    s("question"),
+                    s("response"),
+                    a("tokenized_response"),
+                    a("answer_tokens"),
+                ),
+            );
+        }
+    }
+    let per_class = limit.map(|l| l.div_ceil(2));
+    let mut out = Vec::new();
+    for (key, label) in [("t", 0u8), ("f", 1u8)] {
+        let mut taken = 0usize;
+        let Some(arr) = qids.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for q in arr {
+            if per_class.is_some_and(|cap| taken >= cap) {
+                break;
+            }
+            let Some(qid) = q.as_str() else { continue };
+            let Some((question, response, toks, ans)) = rec.get(qid) else {
+                continue;
+            };
+            if response.trim().is_empty() || ans.is_empty() {
+                continue;
+            }
+            let Some(off) = find_token_span(toks, ans) else {
+                continue;
+            };
+            out.push(Sample3v1 {
+                question: question.clone(),
+                response: response.clone(),
+                answer_offset: off,
+                answer_len: ans.len(),
+                resp_tok_len: toks.len(),
+                label,
+            });
+            taken += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Paper-faithful 3-vs-1 identification. Per qid: capture answer-token CETT and
+/// full-response CETT, derive the other-token CETT via
+/// `(full·n_full − ans·n_ans)/n_other`. Assemble the 3-vs-1 dataset —
+/// false-answer (label 1) vs {true-answer, true-other, false-other} (label 0) —
+/// fit L1 logreg across an l1 grid, and write the positive-weight H-Neuron set
+/// per l1 (the causal factual-error neurons).
+async fn identify_3v1(
+    session: &mut Session,
+    samples: &[Sample3v1],
+    out_dir: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
+    let mut x: Vec<Vec<f32>> = Vec::new();
+    let mut y: Vec<u8> = Vec::new();
+    let mut feature_dim = 0usize;
+    for (i, s) in samples.iter().enumerate() {
+        let (ans_f, n_ans) = session
+            .capture_retry(
+                &s.question,
+                &s.response,
+                Some(s.answer_offset),
+                Some(s.answer_len),
+                4,
+            )
+            .await
+            .map_err(|e| format!("capture answer[{i}]: {e}"))?;
+        let (full_f, n_full) = session
+            .capture_retry(&s.question, &s.response, None, None, 4)
+            .await
+            .map_err(|e| format!("capture full[{i}]: {e}"))?;
+        // Alignment check: the daemon should capture exactly answer_len answer
+        // tokens and resp_tok_len response tokens. Divergence => the daemon's
+        // response tokenization differs from the dataset's tokenized_response, so
+        // answer_offset points at the WRONG tokens (corrupts the 3-vs-1 set).
+        if i < 12 {
+            eprintln!(
+                "[align] qid{i} label={} n_ans={n_ans} answer_len={} | n_full={n_full} resp_tok_len={} {}",
+                s.label,
+                s.answer_len,
+                s.resp_tok_len,
+                if n_ans == s.answer_len && n_full == s.resp_tok_len { "OK" } else { "MISALIGNED" }
+            );
+        }
+        let ans: Vec<f32> = ans_f.iter().flatten().copied().collect();
+        let full: Vec<f32> = full_f.iter().flatten().copied().collect();
+        feature_dim = ans.len();
+        // Answer sample: label 1 only for hallucinated qids (3-vs-1 positive).
+        y.push(u8::from(s.label == 1));
+        x.push(ans.clone());
+        // Other-token sample (always negative) when non-answer tokens exist.
+        if n_full > n_ans {
+            let denom = (n_full - n_ans) as f32;
+            let other: Vec<f32> = full
+                .iter()
+                .zip(&ans)
+                .map(|(f, a)| ((f * n_full as f32) - (a * n_ans as f32)) / denom)
+                .collect();
+            x.push(other);
+            y.push(0);
+        }
+        if (i + 1) % 25 == 0 || i + 1 == samples.len() {
+            eprintln!(
+                "[3v1] captured {}/{} (rows={})",
+                i + 1,
+                samples.len(),
+                x.len()
+            );
+        }
+    }
+    let pos = y.iter().filter(|&&v| v == 1).count();
+    eprintln!(
+        "[3v1] dataset: {} rows ({pos} pos / {} neg), feature_dim {feature_dim}",
+        x.len(),
+        x.len() - pos
+    );
+    println!("=== 3-vs-1 identification ===");
+    println!("{:>10}  {:>9}  {:>9}", "l1", "hneurons", "nonzero");
+    for &l1 in &[5e-4f32, 1e-3, 2e-3, 4e-3, 8e-3] {
+        let model = L1Logreg::fit(
+            &x,
+            &y,
+            FitConfig {
+                l1,
+                ..Default::default()
+            },
+        );
+        let hn = model.h_neurons();
+        let doc = serde_json::json!({
+            "method": "3-vs-1-answer-token",
+            "l1": l1,
+            "feature_dim": feature_dim,
+            "n_hneurons": hn.len(),
+            "nonzero": model.nonzero(),
+            "hneurons": hn,
+        });
+        let path = out_dir.join(format!("hneurons-3v1-l1{l1:e}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+        println!(
+            "{l1:>10.0e}  {:>9}  {:>9}   → {}",
+            hn.len(),
+            model.nonzero(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
