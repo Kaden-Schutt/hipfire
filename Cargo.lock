@@ -1606,6 +1606,7 @@ dependencies = [
  "hipfire-generate",
  "hipfire-hash",
  "hipfire-model",
+ "hipfire-sysinfo",
  "libc",
  "serde",
  "serde_json",
@@ -1790,7 +1791,6 @@ dependencies = [
  "hipfire-coherence",
  "hipfire-detect",
  "hipfire-dispatch",
- "hipfire-eval",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-kld",
@@ -1801,6 +1801,7 @@ dependencies = [
  "hipfire-prompt",
  "hipfire-quant-format",
  "hipfire-state",
+ "hipfire-sysinfo",
  "libc",
  "memmap2",
  "minijinja",
@@ -1931,7 +1932,9 @@ name = "hipfire-sysinfo"
 version = "0.3.0"
 dependencies = [
  "hipfire-admin-types",
+ "hipfire-evidence",
  "hipfire-xdna",
+ "libc",
 ]
 
 [[package]]

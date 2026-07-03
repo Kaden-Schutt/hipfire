@@ -8,3 +8,8 @@ description = "Portable host/GPU memory + telemetry collection from sysfs and /p
 [dependencies]
 hipfire-admin-types = { path = "../hipfire-admin-types" }
 hipfire-xdna = { path = "../hipfire-xdna" }
+# Owns the HostProfile type + the pure host-profile math (hardware_bucket,
+# host_profile_hash, …); this crate only adds the sysfs/libdrm probing.
+hipfire-evidence = { path = "../hipfire-evidence" }
+# libdrm_amdgpu is dlopen'd (no link dep); libc provides dlopen/dlsym/open.
+libc.workspace = true

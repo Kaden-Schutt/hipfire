@@ -7,15 +7,42 @@
 //! Builds a `HostProfile` from KFD topology (`/sys/class/kfd`), sysfs DRM
 //! attributes, and an optional `libdrm_amdgpu` dlopen probe (CU count, VRAM
 //! size, memory class/width/clock). All probes degrade gracefully to `None` on
-//! non-AMD or headless hosts. Extracted verbatim from the former
-//! `hipfire-eval/src/lib.rs` monolith (no behavior change).
+//! non-AMD or headless hosts.
+//!
+//! Relocated from `hipfire-eval` into this HIP-independent leaf crate so the
+//! inference hot path (`hipfire-runtime`) can collect a host profile without
+//! pulling the eval harness (and its tokio-process / daemon-adapter closure)
+//! into its dependency graph. The pure host-profile math (`hardware_bucket`,
+//! `host_profile_hash`, `compute_peak_bandwidth_gbps`, `classify_hardware_kind`)
+//! stays in `hipfire-evidence`, which owns the `HostProfile` type; this module
+//! only owns the sysfs/libdrm probing and the arch detection.
 
-use crate::*;
+use hipfire_evidence::{
+    classify_hardware_kind, compute_peak_bandwidth_gbps, hardware_bucket, host_profile_hash,
+    EvalStatus, HostProfile, SourcedField,
+};
+use std::collections::BTreeMap;
+use std::ffi::{c_void, CString};
+use std::fs;
+use std::path::{Path, PathBuf};
 
-pub(crate) fn collect_host_profile(
-    arch: Option<String>,
-    overrides: HostProfileOverrides,
-) -> HostProfile {
+/// Operator-supplied overrides for host-profile fields that can't be probed
+/// reliably (or that a bench wants to pin). An unset field falls back to the
+/// libdrm probe / sysfs value.
+#[derive(Debug, Clone, Default)]
+pub struct HostProfileOverrides {
+    pub memory_class: Option<String>,
+    pub memory_width_bits: Option<u32>,
+    pub memory_bandwidth_gbps: Option<f64>,
+}
+
+/// Collect a full [`HostProfile`] with the default (empty) overrides and the
+/// arch auto-detected from KFD topology.
+pub fn collect_default_host_profile() -> HostProfile {
+    collect_host_profile(detect_arch(), HostProfileOverrides::default())
+}
+
+pub fn collect_host_profile(arch: Option<String>, overrides: HostProfileOverrides) -> HostProfile {
     let topology = read_primary_kfd_properties();
     let drm = topology
         .as_ref()
@@ -186,6 +213,42 @@ pub(crate) fn collect_host_profile(
     };
     profile.host_profile_hash = host_profile_hash(&profile);
     profile
+}
+
+/// Detect the primary GPU arch string (e.g. `gfx1103`) from KFD topology.
+pub fn detect_arch() -> Option<String> {
+    for node in ["1", "0"] {
+        let path = format!("/sys/class/kfd/kfd/topology/nodes/{node}/properties");
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        for line in raw.lines() {
+            if let Some(v) = line.strip_prefix("gfx_target_version") {
+                if let Ok(ver) = v.trim().parse() {
+                    return Some(gfx_target_version_to_arch(ver));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn gfx_target_version_to_arch(ver: u32) -> String {
+    match ver {
+        100100 => "gfx1010".to_string(),
+        100300 | 100302 => "gfx1030".to_string(),
+        110000 | 110001 => "gfx1100".to_string(),
+        110501 => "gfx1151".to_string(),
+        120000 => "gfx1200".to_string(),
+        120001 => "gfx1201".to_string(),
+        _ => {
+            let major = ver / 10000;
+            let minor = (ver % 10000) / 100;
+            let step = ver % 100;
+            format!("gfx{major}{minor}{step}")
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -393,7 +456,7 @@ fn read_sysfs_trimmed(path: &Path) -> Option<String> {
         .filter(|raw| !raw.is_empty())
 }
 
-pub(crate) fn parse_pp_dpm_mclk_max_mhz(raw: &str) -> Option<f64> {
+pub fn parse_pp_dpm_mclk_max_mhz(raw: &str) -> Option<f64> {
     raw.lines()
         .filter_map(|line| {
             let after_colon = line.split_once(':').map(|(_, rest)| rest).unwrap_or(line);
@@ -420,4 +483,36 @@ fn linux_mem_total_bytes() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pp_dpm_mclk_picks_max_mhz() {
+        let raw = "0: 400Mhz\n1: 800Mhz *\n2: 937Mhz\n";
+        assert_eq!(parse_pp_dpm_mclk_max_mhz(raw), Some(937.0));
+    }
+
+    #[test]
+    fn gfx_target_version_maps_known_and_unknown() {
+        assert_eq!(gfx_target_version_to_arch(110501), "gfx1151");
+        assert_eq!(gfx_target_version_to_arch(100300), "gfx1030");
+        // Unknown version falls back to the decomposed major/minor/step string.
+        assert_eq!(gfx_target_version_to_arch(110003), "gfx1103");
+        assert_eq!(gfx_target_version_to_arch(110300), "gfx1130");
+    }
+
+    #[test]
+    fn collect_host_profile_is_deterministic_and_self_consistent() {
+        // Environment-agnostic: same inputs must yield the same profile (no
+        // clock/randomness baked in), and the stored hash must equal a fresh
+        // hash of the profile. Holds whether or not this host has an AMD GPU.
+        let a = collect_host_profile(None, HostProfileOverrides::default());
+        let b = collect_host_profile(None, HostProfileOverrides::default());
+        assert_eq!(a.host_profile_hash, b.host_profile_hash);
+        assert_eq!(a.host_profile_hash, host_profile_hash(&a));
+        assert_eq!(a.schema, 1);
+    }
 }

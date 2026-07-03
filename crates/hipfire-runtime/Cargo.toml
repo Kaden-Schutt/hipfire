@@ -58,8 +58,11 @@ hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-kld = { path = "../hipfire-kld" }
 hipfire-coherence = { path = "../hipfire-coherence" }
-hipfire-eval = { path = "../hipfire-eval" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+# Host-profile collection (HIP-independent leaf). Replaces the former
+# hipfire-eval dependency, which pulled the eval harness + tokio-process into
+# the inference hot path for one symbol (collect_default_host_profile).
+hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
