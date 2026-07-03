@@ -1783,6 +1783,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-gpu-types"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+]
+
+[[package]]
 name = "hipfire-hash"
 version = "0.3.0"
 
@@ -3316,6 +3323,7 @@ name = "rdna-compute"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-gpu-types",
  "hipfire-kvquant",
  "hipfire-primitives",
 ]
