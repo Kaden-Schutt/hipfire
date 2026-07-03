@@ -321,13 +321,43 @@ impl ArchPmcCensus {
     }
 }
 
+/// Split one CSV line into fields, honoring RFC-4180 double-quoting: a comma
+/// inside a `"..."` field is literal (so a `Kernel_Name` carrying `<T1, T2>`
+/// template commas stays a single field), and `""` inside a quoted field is one
+/// literal quote. rocprofv3 1.1.0 quotes every string column, so this is what
+/// keeps kernel/counter names from splitting the row.
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => fields.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    fields.push(cur);
+    fields
+}
+
 /// Parse a rocprofv3 `--pmc` counter-collection CSV into a per-arch census.
 ///
-/// The header MUST end in `Counter_Name,Counter_Value` (case-insensitive) —
-/// a kernel-stats CSV (`Name,Calls,...`) is rejected rather than mis-parsed.
-/// Each data row is right-anchored on its final two columns so a mangled
-/// kernel name full of commas cannot corrupt the counter parse. Counts are
-/// aggregated per counter name into a `BTreeMap` (deterministic ordering).
+/// The `Counter_Name` / `Counter_Value` columns are located BY NAME
+/// (case-insensitive) from the header — NOT by right-anchoring on the last two
+/// columns. rocprofv3 1.1.0 places ~15 dispatch/resource columns BEFORE them and
+/// appends `Start_Timestamp,End_Timestamp` AFTER them, so their position is not
+/// fixed and the old "ends in Counter_Name,Counter_Value" contract mis-parsed
+/// every real capture. A CSV lacking those columns (e.g. a kernel-stats
+/// `Name,Calls,...` export) is still rejected rather than mis-parsed. Fields are
+/// split quote-aware (RFC-4180), so a quoted kernel name carrying commas cannot
+/// shift the column alignment. Counts aggregate per counter name into a
+/// `BTreeMap` (deterministic ordering).
 pub fn census_from_counter_csv_text(
     arch: &str,
     perf_level: &str,
@@ -335,17 +365,28 @@ pub fn census_from_counter_csv_text(
     text: &str,
 ) -> Result<ArchPmcCensus, String> {
     let mut lines = text.lines();
-    let header = match lines.next() {
-        Some(h) => h.trim().to_ascii_lowercase(),
+    let header_line = match lines.next() {
+        Some(h) => h.trim(),
         None => return Err("PMC counter CSV is empty".to_string()),
     };
-    // Right-anchoring contract: the final two columns are the counter name and
-    // its value. Reject anything that is not a --pmc counter-collection CSV.
-    if !header.ends_with("counter_name,counter_value") {
-        return Err(format!(
-            "PMC CSV header does not end in Counter_Name,Counter_Value: {header:?}"
-        ));
-    }
+    let header = split_csv_line(header_line);
+    let col = |want: &str| {
+        header
+            .iter()
+            .position(|f| f.trim().eq_ignore_ascii_case(want))
+    };
+    // Locate the counter columns by name. Absent → not a --pmc
+    // counter-collection CSV; reject rather than silently mis-parse.
+    let (name_idx, value_idx) = match (col("counter_name"), col("counter_value")) {
+        (Some(n), Some(v)) => (n, v),
+        _ => {
+            return Err(format!(
+                "PMC CSV header has no Counter_Name/Counter_Value columns \
+                 (not a --pmc counter-collection CSV): {header_line:?}"
+            ));
+        }
+    };
+    let need_cols = name_idx.max(value_idx) + 1;
 
     let mut counters: BTreeMap<String, CounterCounts> = BTreeMap::new();
     for (line_no, raw) in lines.enumerate() {
@@ -353,19 +394,19 @@ pub fn census_from_counter_csv_text(
         if line.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.split(',').collect();
-        // Need at least a kernel-name column + the two counter columns.
-        if parts.len() < 3 {
+        let parts = split_csv_line(line);
+        // Need enough columns to reach both located indices.
+        if parts.len() < need_cols {
             eprintln!(
-                "WARN PMC CSV line {}: expected >=3 columns, got {}; skipping",
+                "WARN PMC CSV line {}: expected >={} columns, got {}; skipping",
                 line_no + 2,
+                need_cols,
                 parts.len()
             );
             continue;
         }
-        let n = parts.len();
-        let counter_name = parts[n - 2].trim();
-        let value_str = parts[n - 1].trim();
+        let counter_name = parts[name_idx].trim();
+        let value_str = parts[value_idx].trim();
         if counter_name.is_empty() {
             continue;
         }
@@ -529,8 +570,8 @@ pub fn dynamic_bound_class_evidence(_bound_class: crate::roofline::BoundClass) -
 /// Fold several rocprofv3 `--pmc` CSV texts (one per counter-limited pass) into
 /// a single per-arch census. rocprofv3 caps the counters per pass, so a full
 /// census is assembled from several passes; this unions their counter sets and
-/// SUMS a counter that appears in more than one pass. Every CSV must share the
-/// same right-anchored `Counter_Name,Counter_Value` header contract.
+/// SUMS a counter that appears in more than one pass. Every CSV is parsed by the
+/// same locate-columns-by-name contract as [`census_from_counter_csv_text`].
 pub fn fold_counter_csv_texts(
     arch: &str,
     perf_level: &str,
@@ -622,9 +663,9 @@ gemm_q8_0_wmma,Wavefronts,320
     }
 
     #[test]
-    fn census_rejects_header_not_ending_in_counter_name_value() {
-        // A kernel-stats header (ends in the timing columns), not a --pmc
-        // counter-collection header → hard reject, never silently mis-parse.
+    fn census_rejects_non_counter_collection_header() {
+        // A kernel-stats header has no Counter_Name/Counter_Value columns, so it
+        // is not a --pmc counter-collection CSV → hard reject, never mis-parse.
         let bad = "\
 Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
 gemm_q8,1,1000,1000,100.0,1000,1000,0
@@ -634,14 +675,36 @@ gemm_q8,1,1000,1000,100.0,1000,1000,0
     }
 
     #[test]
-    fn census_right_anchors_past_commas_in_kernel_name() {
-        // Mangled kernel names carry commas; the parser must right-anchor on
-        // the final two columns (Counter_Name,Counter_Value) and NOT let the
-        // name's commas corrupt the counter parse.
+    fn census_parses_real_rocprofv3_1_1_0_layout() {
+        // The ACTUAL rocprofv3 1.1.0 layout: Counter_Name/Counter_Value sit in
+        // the MIDDLE (col 15/16 of 19), with Start/End_Timestamp AFTER them and
+        // ~15 dispatch/resource columns BEFORE — quoted string fields throughout.
+        // The old right-anchor parser grabbed the timestamps and rejected the
+        // header; locate-by-name must extract the counters correctly.
         let csv = "\
-Kernel_Name,Counter_Name,Counter_Value
-void gemm<32, 64, false>(float*, int),FetchSize,2048
-void gemm<32, 64, false>(float*, int),Wavefronts,64
+\"Correlation_Id\",\"Dispatch_Id\",\"Agent_Id\",\"Queue_Id\",\"Process_Id\",\"Thread_Id\",\"Grid_Size\",\"Kernel_Id\",\"Kernel_Name\",\"Workgroup_Size\",\"LDS_Block_Size\",\"Scratch_Size\",\"VGPR_Count\",\"Accum_VGPR_Count\",\"SGPR_Count\",\"Counter_Name\",\"Counter_Value\",\"Start_Timestamp\",\"End_Timestamp\"
+1,1,\"Agent 3\",1,36573,36573,512,6,\"__amd_rocclr_copyBuffer\",512,0,0,16,0,128,\"MemUnitBusy\",15.466506,3261507614273,3261507623273
+2,2,\"Agent 3\",1,36573,36573,512,6,\"gemm_q8_0_wmma\",512,0,0,16,0,128,\"VALUBusy\",42.0,3261507763021,3261507771181
+";
+        let c =
+            census_from_counter_csv_text("gfx1030", REQUIRED_PERF_LEVEL, 0.5, csv).expect("parse");
+        let mem = c.counters.get("MemUnitBusy").expect("MemUnitBusy parsed");
+        assert_eq!(mem.rows, 1);
+        assert_eq!(mem.nonzero_rows, 1);
+        assert!((mem.value_sum - 15.466506).abs() < 1e-6);
+        let valu = c.counters.get("VALUBusy").expect("VALUBusy parsed");
+        assert_eq!(valu.value_sum, 42.0);
+    }
+
+    #[test]
+    fn census_handles_quoted_comma_kernel_names() {
+        // Real rocprofv3 QUOTES kernel names, so template commas (`<32, 64>`)
+        // live inside a quoted field. Quote-aware splitting must keep the name
+        // one field and the located Counter_Name/Counter_Value columns aligned.
+        let csv = "\
+\"Kernel_Name\",\"Counter_Name\",\"Counter_Value\"
+\"void gemm<32, 64, false>(float*, int)\",FetchSize,2048
+\"void gemm<32, 64, false>(float*, int)\",Wavefronts,64
 ";
         let c =
             census_from_counter_csv_text("gfx1100", REQUIRED_PERF_LEVEL, 0.5, csv).expect("parse");
