@@ -104,11 +104,29 @@ for arch in "${ARCHS[@]}"; do
 done
 
 if [ "$RECORD" = 1 ]; then
+    if [ "${#RECORDED[@]}" -eq 0 ]; then
+        echo "fixture-golden-gate: nothing runnable to record on this box — $BASELINES left unchanged" >&2
+        exit 0
+    fi
+    # MERGE, don't overwrite: baselines are keyed by (gpu_arch, model_arch,
+    # format) and boxes only record their own runnable cells. A blind `>` here
+    # would wipe every OTHER fleet arch's committed baselines. Keep the header +
+    # all entries we did NOT just record, then append the fresh ones.
+    tmp_base="$(mktemp)"
+    echo "# gpu_arch  model_arch  format  logit_hash  (len=$LEN warmup=$WARMUP seed=$SEED mode=tf)" >"$tmp_base"
     {
-        echo "# gpu_arch  model_arch  format  logit_hash  (len=$LEN warmup=$WARMUP seed=$SEED mode=tf)"
+        if [ -f "$BASELINES" ]; then
+            # existing entries, minus the (gpu_arch, model_arch, format) cells
+            # we just re-recorded (those get the fresh hash below)
+            awk 'NR==FNR { key[$1" "$2" "$3]=1; next }
+                 /^#/ { next }
+                 !(($1" "$2" "$3) in key) { print }' \
+                <(printf '%s\n' "${RECORDED[@]}") "$BASELINES"
+        fi
         printf '%s\n' "${RECORDED[@]}"
-    } >"$BASELINES"
-    echo "fixture-golden-gate: wrote ${#RECORDED[@]} baselines to $BASELINES"
+    } | sort -k1,3 >>"$tmp_base"
+    mv "$tmp_base" "$BASELINES"
+    echo "fixture-golden-gate: merged ${#RECORDED[@]} baseline(s) for this box into $BASELINES"
     exit 0
 fi
 
