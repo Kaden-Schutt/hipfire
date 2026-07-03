@@ -1,0 +1,4 @@
+Profiling started.
+pass: ping-pong NPU fill and HIP compare completed with CPU-managed overlap
+json: /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-profile-2026-06-02/uprof-full.json
+Generated Cumulative data file path: /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-profile-2026-06-02/uprof-dc-full.csv

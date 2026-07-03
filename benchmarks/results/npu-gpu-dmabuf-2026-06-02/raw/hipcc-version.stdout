@@ -1,0 +1,5 @@
+HIP version: 7.13.26176-79e85e1468
+AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 43215c73116c407735c85a180d174f718798c328+PATCHED:2506c552d8428e2cc1778bef048b20f818e06bb3)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-7.13.26176-79e85e1468/lib/llvm/bin

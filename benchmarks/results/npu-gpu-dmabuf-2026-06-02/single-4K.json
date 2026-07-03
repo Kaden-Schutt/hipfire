@@ -1,0 +1,55 @@
+{
+  "mode": "single",
+  "size_bytes": 4096,
+  "alloc_bytes": 1073741824,
+  "iters": 1,
+  "xclbin": "/home/sadara/xdna-driver/build/vtd_extract/strx/validate_df_bandwidth.xclbin",
+  "elf": "/home/sadara/xdna-driver/build/vtd_extract/strx/df_bw.elf",
+  "kernel": "DPU",
+  "render_node": "/dev/dri/renderD128",
+  "xrt_device": 0,
+  "hip_device": 0,
+  "hip_device_name": "Radeon 8060S Graphics",
+  "hip_dmabuf_supported": 1,
+  "result": "pass",
+  "result_detail": "amdgpu GTT dma-buf imported by XRT and HIP; NPU write and HIP compare passed",
+  "timings_us": {
+    "total": 289481,
+    "npu": 33325,
+    "hip": 20049,
+    "cpu_spot": 145
+  },
+  "throughput": {
+    "expanded_bytes": 4096,
+    "compressed_source_bytes": 4096,
+    "expanded_output_bytes": 4096,
+    "npu_bytes_per_s": 122910.728,
+    "compressed_source_bytes_per_s": 122910.728,
+    "expanded_output_bytes_per_s": 122910.728,
+    "hip_bytes_per_s": 204299.466,
+    "end_to_end_bytes_per_s": 14149.461
+  },
+  "inverse_visibility": {
+    "attempted": false,
+    "status": "not_run",
+    "detail": ""
+  },
+  "stages": [
+    {"name":"preload:/opt/xilinx/xrt/lib/libxrt_core.so.2","status":"pass","detail":"","us":7},
+    {"name":"preload:/opt/xilinx/xrt/lib/libxrt_coreutil.so.2","status":"pass","detail":"","us":3},
+    {"name":"preload:/opt/xilinx/xrt/lib/libvxdna.so.1","status":"pass","detail":"","us":3},
+    {"name":"preload:/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2","status":"pass","detail":"","us":1},
+    {"name":"hip_device_preflight","status":"pass","detail":"Radeon 8060S Graphics","us":20225},
+    {"name":"amdgpu_open","status":"pass","detail":"/dev/dri/renderD128","us":56},
+    {"name":"xrt_context","status":"pass","detail":"","us":34662},
+    {"name":"xrt_input_host_bo","status":"pass","detail":"","us":112693},
+    {"name":"amdgpu_alloc_gtt[0]","status":"pass","detail":"","us":36180},
+    {"name":"amdgpu_export_dmabuf[0]","status":"pass","detail":"","us":21},
+    {"name":"xrt_import_amdgpu_dmabuf[0]","status":"pass","detail":"","us":28519},
+    {"name":"hip_import_amdgpu_dmabuf[0]","status":"pass","detail":"","us":243},
+    {"name":"input_fill_sync[0]","status":"pass","detail":"","us":5},
+    {"name":"npu_run_sync[0]","status":"pass","detail":"","us":33325},
+    {"name":"cpu_spot_check[0]","status":"pass","detail":"","us":145},
+    {"name":"hip_compare[0]","status":"pass","detail":"","us":20049}
+  ]
+}

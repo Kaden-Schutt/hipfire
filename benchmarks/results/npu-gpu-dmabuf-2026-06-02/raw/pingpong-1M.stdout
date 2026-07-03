@@ -1,0 +1,2 @@
+pass: ping-pong NPU fill and HIP compare completed with CPU-managed overlap
+json: /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-2026-06-02/pingpong-1M.json

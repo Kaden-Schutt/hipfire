@@ -1,0 +1,2 @@
+partial: ping-pong NPU path completed; HIP compare intentionally skipped
+json: /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-profile-2026-06-02/npu-only.json

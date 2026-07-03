@@ -1,0 +1,63 @@
+
+AMDuProfPcm Report
+
+Processor Name:,AMD RYZEN AI MAX+ 395 w/ Radeon 8060S          
+System:,Family(0x1a) Model(0x70) Stepping(0x0)
+Operating System:,Linux 7.0.0-15-generic
+Number of Sockets :,1
+Number of Core Complexes(CCX) :,2
+Number of Cores :,16
+Number of Threads :,32
+SMT Enabled in HW:,True
+SMT Enabled by OS :,True
+
+CPU Topology:
+Socket, CCX, Core(s)
+0,0, 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23
+0,1, 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31
+
+Socket-UMC Topology:
+Socket, IODie, UMC(s)
+0,0,0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 
+
+Core P0 state frequency (MHz):,3000.000000
+Multiplex interval for core (ms):,1
+Data Collection Driver:,Linux Perf Driver
+NMI Watchdog Enabled:,1
+Version:,5.3.518.0 (PUBLIC)
+
+Hypervisor Info:
+Hypervisor Enabled:,False
+Command:,"AMDuProfPcm -m dc -C -A system -o /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-profile-2026-06-02/uprof-dc-npu-only.csv -- target/npu_gpu_dmabuf/npu_gpu_dmabuf_bench --mode pingpong --size 64M --iters 100 --skip-cpu-spot --skip-hip-compare --json /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-profile-2026-06-02/uprof-npu-only.json"
+
+Abbreviation :
+IPC    : Instructions Per CPU Cycle
+CPI    : CPU Cycles Per Instructions
+pti    : Per Thousand Instructions
+ptc    : Per Thousand CPU Cycles
+pto    : Per Thousand Operations
+Topdown metrics are reported in "% slots"
+
+Profile Time: 2026/06/02 01:37:40:906
+CORE METRICS
+Metric,System (Aggregated)
+Retired Instructions,11376688131.00
+Retired Macro Ops,11029556360.00
+Cycles Not in Halt,3603258149.00
+All Data Cache (DC) Fills (pti),10.23
+DC Fills From Local L2 (pti),9.84
+DC Fills From Local L3 or different L2 in same CCX (pti),0.08
+DC Fills From another CCX in same node (pti),0.00
+DC Fills From Local Memory or I/O (pti),0.24
+DC Fills From another CCX in remote node (pti),0.00
+DC Fills From Remote Memory or I/O (pti),0.00
+Remote DRAM Reads %,0.00
+All Demand DC Fills (pti),0.17
+Demand DC Fills From Local L2 (pti),0.08
+Demand DC Fills From Local L3 or different L2 in same CCX (pti),0.05
+Demand DC Fills From another CCX in same node (pti),0.00
+Demand DC Fills From Local Memory or I/O (pti),0.05
+Demand DC Fills From another CCX in remote node (pti),0.00
+Demand DC Fills From Remote memory or I/O (pti),0.00
+
+

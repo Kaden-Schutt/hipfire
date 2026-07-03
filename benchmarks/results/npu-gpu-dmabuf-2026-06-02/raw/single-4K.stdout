@@ -1,0 +1,2 @@
+pass: amdgpu GTT dma-buf imported by XRT and HIP; NPU write and HIP compare passed
+json: /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-2026-06-02/single-4K.json

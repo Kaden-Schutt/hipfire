@@ -1,0 +1,26 @@
+[38;5;3m
+COMMAND: [38;5;140mvalidate
+[39m[38;5;3m
+DESCRIPTION: [38;5;111mValidates the given device by executing the platform's validate executable.
+[39m[38;5;3m
+USAGE: [38;5;252mxrt-smi validate [-h] [-d arg] [-f arg] [-o arg] [-r arg]
+[39m[38;5;3m
+OPTIONS:
+[39m[38;5;65m  -d, --device       [38;5;111m- The Bus:Device.Function (e.g., 0000:d8:00.0) device of interest
+[39m[38;5;65m  -f, --format       [38;5;111m- Report output format. Valid values are:
+                       	JSON        - Latest JSON schema
+                       	JSON-2020.2 - JSON 2020.2 schema
+[39m[38;5;65m  -h, --help         [38;5;111m- Help to use this sub-command
+[39m[38;5;65m  -o, --output       [38;5;111m- Direct the output to the given file
+[39m[38;5;65m  -r, --run          [38;5;111m- Run a subset of the test suite. Valid options are:
+                         all        - All applicable validate tests will be executed (default)
+                         gemm       - Measure the TOPS value of GEMM INT8operations
+                         latency    - Run end-to-end latency test
+                         throughput - Run end-to-end throughput test
+[39m
+[38;5;3m
+GLOBAL OPTIONS:
+[39m[38;5;65m  --verbose          [38;5;111m- Turn on verbosity
+[39m[38;5;65m  --batch            [38;5;111m- Enable batch mode (disables escape characters)
+[39m[38;5;65m  --force            [38;5;111m- When possible, force an operation
+[39m

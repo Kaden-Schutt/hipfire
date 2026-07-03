@@ -1,0 +1,19 @@
+
+ Performance counter stats for 'system wide':
+
+             35830      amd_iommu/mem_trans_total/                                            
+             14564      amd_iommu/mem_pass_untrans/                                           
+                 0      amd_iommu/mem_pass_pretrans/                                          
+             28346      amd_iommu/mem_iommu_tlb_pte_hit/                                      
+              7449      amd_iommu/mem_iommu_tlb_pte_mis/                                      
+                52      amdgpu:amdgpu_bo_move                                                 
+                32      amdgpu:amdgpu_bo_create                                               
+                13      amdgpu:amdgpu_vm_bo_map                                               
+                13      amdgpu:amdgpu_vm_bo_update                                            
+               408      amdxdna:xdna_job                                                      
+               114      gpu_scheduler:drm_sched_job_run                                       
+                 2      dma_buf:dma_buf_export                                                
+                 0      dma_buf:dma_buf_fd                                                    
+
+       4.215875478 seconds time elapsed
+

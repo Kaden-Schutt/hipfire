@@ -1,0 +1,4 @@
+Profiling started.
+partial: ping-pong NPU path completed; HIP compare intentionally skipped
+json: /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-profile-2026-06-02/uprof-npu-only.json
+Generated Cumulative data file path: /home/sadara/.hipfire/src/benchmarks/results/npu-gpu-dmabuf-profile-2026-06-02/uprof-dc-npu-only.csv

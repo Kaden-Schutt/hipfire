@@ -1,0 +1,28 @@
+System Configuration
+  OS Name              : Linux
+  Release              : 7.0.0-15-generic
+  Machine              : x86_64
+  CPU Cores            : 32
+  Memory               : 127933 MB
+  Distribution         : Ubuntu 26.04 LTS
+  GLIBC                : 2.43
+  Model                : YO Series
+  BIOS Vendor          : American Megatrends International, LLC.
+  BIOS Version         : 1.04
+  Processor            : AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+
+XRT
+  Version              : 2.25.0
+  Branch               : master
+  Hash                 : c63dac03a1dd0d4782befd127f65362ea12478c4
+  Hash Date            : Thu, 28 May 2026 08:54:04 -0700
+  amdxdna Version      : 2.25.0_20260601, 627cee46c6c40fd92147ba64cb1c596538aad750
+  virtio-pci Version   : 7.0.0-15-generic
+  NPU Firmware Version : 1.1.2.65
+
+Device(s) Present
+|BDF             |Name            |Architecture  |Topology  |
+|----------------|----------------|--------------|----------|
+|[0000:c5:00.1]  |NPU Strix Halo  |aie2p         |6x8       |
+
+

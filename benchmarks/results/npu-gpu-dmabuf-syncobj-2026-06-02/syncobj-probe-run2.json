@@ -1,0 +1,19 @@
+{
+  "result": "pass",
+  "result_detail": "XDNA context syncobj exported and imported by amdgpu; amdgpu CS timeline wait completed without a polling bridge",
+  "xdna_hwctx_handle": 1,
+  "xdna_ctx_syncobj": 1,
+  "xdna_ctx_fd": 3,
+  "wait_point": 0,
+  "stages": [
+    {"name":"xrt_context","status":"pass","detail":"","us":176356},
+    {"name":"export_xdna_context_syncobj","status":"pass","detail":"shared syncobj fd exported","us":73},
+    {"name":"amdgpu_open","status":"pass","detail":"","us":8361},
+    {"name":"amdgpu_import_xdna_syncobj","status":"pass","detail":"imported handle=1","us":5},
+    {"name":"npu_start","status":"pass","detail":"","us":26},
+    {"name":"amdgpu_cs_wait_only","status":"fail","detail":"amdgpu_cs_submit_raw2(wait-only) failed: Invalid argument","us":27},
+    {"name":"amdgpu_cs_wait_nop_ib","status":"pass","detail":"accepted and completed wait+NOP-IB CS on compute ring, seq=1","us":32505},
+    {"name":"amdgpu_cpu_timeline_wait","status":"pass","detail":"amdgpu waited on imported XDNA timeline point","us":10},
+    {"name":"xrt_run_wait_after_probe","status":"pass","detail":"","us":0}
+  ]
+}
