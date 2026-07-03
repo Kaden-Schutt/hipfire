@@ -542,7 +542,18 @@ fn acquire_daemon_lock() -> std::fs::File {
 
     let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
     std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
-    let pid_path = hipfire_dir.join("daemon.pid");
+    // Per-instance pid file when HIPFIRE_DAEMON_ID is set, so MULTIPLE daemons can
+    // co-exist — one pinned to each GPU (autoresearch runs a daemon per
+    // worktree/card in parallel). A distinct id → a distinct flock → no false
+    // "already running". Unset (the normal serve path) keeps the classic
+    // machine-wide ~/.hipfire/daemon.pid singleton, unchanged.
+    let pid_name = match std::env::var("HIPFIRE_DAEMON_ID") {
+        Ok(id) if !id.trim().is_empty() => {
+            format!("daemon.{}.pid", id.trim().replace([',', ':', '/', '.', ' '], "_"))
+        }
+        _ => "daemon.pid".to_string(),
+    };
+    let pid_path = hipfire_dir.join(pid_name);
 
     let mut f = {
         let mut opts = std::fs::OpenOptions::new();
