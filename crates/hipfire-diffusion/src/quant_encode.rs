@@ -102,7 +102,9 @@ impl DiffusionQuantFormat {
             Self::Q4F16G64Clip => encode_q4f16_g64_clipsearch(data),
             Self::Q4K => encode_q4k(data),
             // Opus formats are handled per-tensor in quantize_diffusion_hfq.
-            Self::Oq4 | Self::Oq4PlusPlus | Self::Oq8 => unreachable!("opus uses encode_opus_tensor"),
+            Self::Oq4 | Self::Oq4PlusPlus | Self::Oq8 => {
+                unreachable!("opus uses encode_opus_tensor")
+            }
         }
     }
 }
@@ -304,7 +306,11 @@ pub(crate) fn encode_q4k(f32_data: &[f32]) -> Vec<u8> {
 
         let max_scale = sub_scales.iter().cloned().fold(0.0f32, f32::max);
         let max_min = sub_mins.iter().map(|m| -m).fold(0.0f32, f32::max);
-        let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
+        let d = if max_scale > 0.0 {
+            max_scale / 63.0
+        } else {
+            0.0
+        };
         let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
         let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
         let inv_dmin = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
@@ -334,10 +340,18 @@ pub(crate) fn encode_q4k(f32_data: &[f32]) -> Vec<u8> {
             let sb_odd = group * 2 + 1;
             let eff_scale_e = d * scale_ints[sb_even] as f32;
             let eff_min_e = dmin * min_ints[sb_even] as f32;
-            let inv_se = if eff_scale_e > 0.0 { 1.0 / eff_scale_e } else { 0.0 };
+            let inv_se = if eff_scale_e > 0.0 {
+                1.0 / eff_scale_e
+            } else {
+                0.0
+            };
             let eff_scale_o = d * scale_ints[sb_odd] as f32;
             let eff_min_o = dmin * min_ints[sb_odd] as f32;
-            let inv_so = if eff_scale_o > 0.0 { 1.0 / eff_scale_o } else { 0.0 };
+            let inv_so = if eff_scale_o > 0.0 {
+                1.0 / eff_scale_o
+            } else {
+                0.0
+            };
             for l in 0..32 {
                 let idx_e = sb_start + group * 64 + l;
                 let idx_o = sb_start + group * 64 + 32 + l;
@@ -405,7 +419,13 @@ pub fn quantize_diffusion_hfq(
                 .map_err(|e| anyhow::anyhow!("decode {name:?}: {e}"))?;
             let (quant_type, group_size, data) = if format.is_opus() {
                 let (qt, gs, bytes, ldlq) = encode_opus_tensor(
-                    format, name, &info.shape, &decoded.data, calib, &signs1, &signs2,
+                    format,
+                    name,
+                    &info.shape,
+                    &decoded.data,
+                    calib,
+                    &signs1,
+                    &signs2,
                 );
                 if ldlq {
                     summary.ldlq_tensors += 1;
@@ -467,12 +487,20 @@ pub fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     const GROUP: usize = 256;
     const BLOCK: usize = 130;
     const ILB: usize = 4 + 128;
-    assert_eq!(k % GROUP, 0, "oq4 arch pack requires K % 256 == 0 (got K={k})");
+    assert_eq!(
+        k % GROUP,
+        0,
+        "oq4 arch pack requires K % 256 == 0 (got K={k})"
+    );
     let ng = k / GROUP;
     let packed_bytes = m * (k / 2);
     let scales_bytes = m * ng * 4;
     let il_bytes = m * ng * ILB;
-    assert_eq!(data.len(), m * ng * BLOCK, "oq4 weight byte length mismatch");
+    assert_eq!(
+        data.len(),
+        m * ng * BLOCK,
+        "oq4 weight byte length mismatch"
+    );
     let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
     let il_base = packed_bytes + scales_bytes;
     for r in 0..m {
@@ -500,7 +528,10 @@ pub fn open_calib_sidecar(path: &Path) -> anyhow::Result<HessianSidecar> {
 fn rewrite_weight_format(metadata_json: &str, label: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(metadata_json) {
         Ok(mut value) => {
-            if let Some(quant) = value.get_mut("quantization").and_then(|q| q.as_object_mut()) {
+            if let Some(quant) = value
+                .get_mut("quantization")
+                .and_then(|q| q.as_object_mut())
+            {
                 quant.insert(
                     "weight_format".to_string(),
                     serde_json::Value::String(label.to_string()),

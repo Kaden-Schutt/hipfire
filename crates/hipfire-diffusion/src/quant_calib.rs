@@ -73,9 +73,7 @@ pub fn calib_begin(hessian_max_k: usize) {
 pub(crate) fn calib_register(ptr: usize, name: &str) {
     CALIB.with(|c| {
         if let Some(s) = c.borrow_mut().as_mut() {
-            s.name_by_ptr
-                .entry(ptr)
-                .or_insert_with(|| name.to_string());
+            s.name_by_ptr.entry(ptr).or_insert_with(|| name.to_string());
         }
     });
 }
@@ -95,12 +93,15 @@ pub(crate) fn calib_observe_matrix(weight_ptr: usize, input: &[f32], rows: usize
             return; // not a registered weight (e.g. an activation×activation matmul)
         };
         let want_hessian = k <= state.hessian_max_k && k % 256 == 0;
-        let entry = state.accum.entry(weight_ptr).or_insert_with(|| TensorAccum {
-            name,
-            k,
-            imatrix: vec![0.0; k],
-            hessian: want_hessian.then(|| vec![0.0; k * k]),
-        });
+        let entry = state
+            .accum
+            .entry(weight_ptr)
+            .or_insert_with(|| TensorAccum {
+                name,
+                k,
+                imatrix: vec![0.0; k],
+                hessian: want_hessian.then(|| vec![0.0; k * k]),
+            });
         if entry.k != k {
             return; // shape changed unexpectedly; skip rather than corrupt
         }

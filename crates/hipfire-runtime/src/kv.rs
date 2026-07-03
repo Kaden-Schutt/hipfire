@@ -2751,7 +2751,11 @@ mod index_math_tests {
         // Equivalence guard: div_ceil(4) must be bit-for-bit the old
         // `(bytes + 3) / 4` for every byte count the cache can produce.
         for bytes in 0..4096usize {
-            assert_eq!(kv_f32_elems_for_bytes(bytes), (bytes + 3) / 4, "bytes={bytes}");
+            assert_eq!(
+                kv_f32_elems_for_bytes(bytes),
+                (bytes + 3) / 4,
+                "bytes={bytes}"
+            );
         }
     }
 
@@ -2782,20 +2786,56 @@ mod index_math_tests {
         use super::KvQuantMode::*;
         let f = kv_quant_mode_from_flags;
         // Unquantized ignores every other flag.
-        assert_eq!(f(false, true, true, true, true, true, true, true, true), Unquantized);
-        assert_eq!(f(false, false, false, false, false, false, false, false, false), Unquantized);
+        assert_eq!(
+            f(false, true, true, true, true, true, true, true, true),
+            Unquantized
+        );
+        assert_eq!(
+            f(false, false, false, false, false, false, false, false, false),
+            Unquantized
+        );
         // Each co-located / separate-scale tier.
-        assert_eq!(f(true, true, false, false, false, false, false, false, false), Q8);
-        assert_eq!(f(true, false, true, false, false, false, false, false, false), Int8);
-        assert_eq!(f(true, false, false, true, false, false, false, false, false), Hfq4);
-        assert_eq!(f(true, false, false, false, false, false, false, false, true), Kvarn);
+        assert_eq!(
+            f(true, true, false, false, false, false, false, false, false),
+            Q8
+        );
+        assert_eq!(
+            f(true, false, true, false, false, false, false, false, false),
+            Int8
+        );
+        assert_eq!(
+            f(true, false, false, true, false, false, false, false, false),
+            Hfq4
+        );
+        assert_eq!(
+            f(true, false, false, false, false, false, false, false, true),
+            Kvarn
+        );
         // Asym tiers, Givens (fwht=false) vs signed-FWHT (fwht=true).
-        assert_eq!(f(true, false, false, false, true, false, false, false, false), Asym4);
-        assert_eq!(f(true, false, false, false, true, false, false, true, false), Fwht4);
-        assert_eq!(f(true, false, false, false, false, true, false, false, false), Asym3);
-        assert_eq!(f(true, false, false, false, false, true, false, true, false), Fwht3);
-        assert_eq!(f(true, false, false, false, false, false, true, false, false), Asym2);
-        assert_eq!(f(true, false, false, false, false, false, true, true, false), Fwht2);
+        assert_eq!(
+            f(true, false, false, false, true, false, false, false, false),
+            Asym4
+        );
+        assert_eq!(
+            f(true, false, false, false, true, false, false, true, false),
+            Fwht4
+        );
+        assert_eq!(
+            f(true, false, false, false, false, true, false, false, false),
+            Asym3
+        );
+        assert_eq!(
+            f(true, false, false, false, false, true, false, true, false),
+            Fwht3
+        );
+        assert_eq!(
+            f(true, false, false, false, false, false, true, false, false),
+            Asym2
+        );
+        assert_eq!(
+            f(true, false, false, false, false, false, true, true, false),
+            Fwht2
+        );
     }
 
     #[test]

@@ -925,8 +925,13 @@ impl GeGluFeedForward {
         )?;
         let gated = geglu_gate_3d_resident(gpu, &projected)?;
         free_resident(gpu, projected)?;
-        let out =
-            linear_optional_bias_resident(gpu, cache, &gated, &self.out_weight, Some(&self.out_bias))?;
+        let out = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &gated,
+            &self.out_weight,
+            Some(&self.out_bias),
+        )?;
         free_resident(gpu, gated)?;
         Ok(out)
     }
@@ -1038,15 +1043,27 @@ impl BasicTransformerBlock {
         gpu: &mut rdna_compute::Gpu,
         cache: &mut RocmWeightCache,
     ) -> DiffusionResult<rdna_compute::GpuTensor> {
-        let normed =
-            layer_norm_resident(gpu, cache, hidden_states, &self.norm1_weight, &self.norm1_bias, 1e-5)?;
+        let normed = layer_norm_resident(
+            gpu,
+            cache,
+            hidden_states,
+            &self.norm1_weight,
+            &self.norm1_bias,
+            1e-5,
+        )?;
         let attn = self.attn1.forward_resident(&normed, None, gpu, cache)?;
         free_resident(gpu, normed)?;
         let mut hidden = tensor_add_resident(gpu, hidden_states, &attn)?;
         free_resident(gpu, attn)?;
 
-        let normed =
-            layer_norm_resident(gpu, cache, &hidden, &self.norm2_weight, &self.norm2_bias, 1e-5)?;
+        let normed = layer_norm_resident(
+            gpu,
+            cache,
+            &hidden,
+            &self.norm2_weight,
+            &self.norm2_bias,
+            1e-5,
+        )?;
         let attn = self
             .attn2
             .forward_resident(&normed, Some(encoder_states), gpu, cache)?;
@@ -1056,8 +1073,14 @@ impl BasicTransformerBlock {
         free_resident(gpu, hidden)?;
         hidden = next;
 
-        let normed =
-            layer_norm_resident(gpu, cache, &hidden, &self.norm3_weight, &self.norm3_bias, 1e-5)?;
+        let normed = layer_norm_resident(
+            gpu,
+            cache,
+            &hidden,
+            &self.norm3_weight,
+            &self.norm3_bias,
+            1e-5,
+        )?;
         let ff = self.feed_forward.forward_resident(&normed, gpu, cache)?;
         free_resident(gpu, normed)?;
         let next = tensor_add_resident(gpu, &hidden, &ff)?;
@@ -1066,4 +1089,3 @@ impl BasicTransformerBlock {
         Ok(next)
     }
 }
-

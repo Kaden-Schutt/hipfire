@@ -223,9 +223,9 @@ impl QuantType {
             // Dense / GGUF-style
             F32 => Some(4),
             F16 | BF16 => Some(2),
-            Q8F16 => Some(34),      // 2 (f16 scale) + 32 int8
-            Q4F16G64 => Some(36),   // 4 (f16 scale+min) + 32 nibbles
-            Q4K => Some(144),       // llama.cpp Q4_K superblock
+            Q8F16 => Some(34),    // 2 (f16 scale) + 32 int8
+            Q4F16G64 => Some(36), // 4 (f16 scale+min) + 32 nibbles
+            Q4K => Some(144),     // llama.cpp Q4_K superblock
             // HFQ (rotation-free) + MQ (FWHT-rotated) share byte geometry
             HFQ4G256 | MQ4G256 => Some(136), // 8 meta + 128 nibbles
             HFQ4G128 => Some(72),
@@ -234,14 +234,14 @@ impl QuantType {
             HFQ3G128 => Some(56),
             HFQ2G256 | MQ2G256 | MQ2G256Lloyd => Some(72), // 8 meta + 64 packed
             HFQ2G128 => Some(40),
-            MQ8G256 => Some(258),   // 2 (f16 scale) + 256 int8
+            MQ8G256 => Some(258), // 2 (f16 scale) + 256 int8
             MQ3G256Lloyd => Some(112),
             MQ4G256Lloyd => Some(160),
             // Opus Quant (symmetric)
-            Oq4G256 => Some(130),   // 2 (f16 scale) + 128 nibbles
-            Oq3G256 => Some(98),    // 2 (f16 scale) + 8×3 u32 bit-planes
-            Oq6G256 => Some(194),   // 2 (f16 scale) + 192 (6-bit×256)
-            Oq8G256 => Some(258),   // 2 (f16 scale) + 256 int8
+            Oq4G256 => Some(130), // 2 (f16 scale) + 128 nibbles
+            Oq3G256 => Some(98),  // 2 (f16 scale) + 8×3 u32 bit-planes
+            Oq6G256 => Some(194), // 2 (f16 scale) + 192 (6-bit×256)
+            Oq8G256 => Some(258), // 2 (f16 scale) + 256 int8
             // QTIP trellis (f32 scale + packed symbols)
             Qtip3G256 => Some(100), // 4 + 96 (256×3-bit)
             Qtip4G256 => Some(132), // 4 + 128 (256×4-bit)

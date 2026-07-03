@@ -64,7 +64,13 @@ fn optimal_scale_bits(w: &[f32], symbols: &[u8], cb: &[f32], bits: u32) -> f32 {
         group_scale(w)
     }
 }
-fn beam_encode_group_bits(w: &[f32], scale: f32, cb: &[f32], beam_width: usize, bits: u32) -> Vec<u8> {
+fn beam_encode_group_bits(
+    w: &[f32],
+    scale: f32,
+    cb: &[f32],
+    beam_width: usize,
+    bits: u32,
+) -> Vec<u8> {
     let num_symbols = 1usize << bits;
     let n = w.len();
     let mut beam: Vec<(u32, f64)> = vec![(0u32, 0.0)];
@@ -152,11 +158,16 @@ fn main() {
     let w_all = gaussian(0x51A7, n_groups * 256);
     let wd = gpu
         .upload_raw(
-            &w_all.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &w_all
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[n_groups, 256],
         )
         .unwrap();
-    let symbols = gpu.upload_raw(&vec![0u8; n_groups * 256], &[n_groups, 256]).unwrap();
+    let symbols = gpu
+        .upload_raw(&vec![0u8; n_groups * 256], &[n_groups, 256])
+        .unwrap();
     // Packed backpointer: [n_groups][256 pos][256 threads][2 u32] = n_groups*512 KB.
     let backptr = gpu
         .upload_raw(
@@ -164,7 +175,9 @@ fn main() {
             &[n_groups * 256 * 256 * 2],
         )
         .unwrap();
-    let scales = gpu.upload_raw(&vec![0u8; n_groups * 4], &[n_groups]).unwrap();
+    let scales = gpu
+        .upload_raw(&vec![0u8; n_groups * 4], &[n_groups])
+        .unwrap();
 
     let t0 = std::time::Instant::now();
     gpu.qtip_viterbi_encode(&wd, &symbols, &backptr, &scales, n_groups, bits)

@@ -17,25 +17,25 @@
 
 use std::sync::OnceLock;
 
+pub use hipfire_kvquant::{kv_compact, kvarn};
 pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
 pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
-pub use hipfire_kvquant::{kv_compact, kvarn};
 
 pub mod codecs;
 pub mod gguf_import;
-pub mod hfq_out;
-pub mod quant_plan;
 pub mod gptq;
 pub mod hessian_io;
 #[allow(dead_code)]
 pub mod hfhs_diag;
+pub mod hfq_out;
 #[allow(dead_code)]
 pub mod ldlq;
+pub mod quant_plan;
 // QTIP encoder core: some helpers are not yet wired into the dispatch.
+pub mod fixture;
 #[allow(dead_code)]
 pub mod qtip;
 pub mod roughquant;
-pub mod fixture;
 
 // Process-global toggle for the `mqN+` clip-search codec variant. Lives in the
 // library so the codecs (which read it via `crate::mq_clipsearch_enabled`) and

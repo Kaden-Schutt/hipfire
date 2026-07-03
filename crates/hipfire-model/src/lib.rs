@@ -2486,16 +2486,13 @@ mod tests {
             ModelArchFamily::Qwen35Dense
         );
         assert_eq!(model_arch_family_from_str("6"), ModelArchFamily::Qwen35Moe);
-        assert_eq!(
-            model_arch_family_from_str("10"),
-            ModelArchFamily::MiniMaxM2
-        );
+        assert_eq!(model_arch_family_from_str("10"), ModelArchFamily::MiniMaxM2);
         assert_eq!(model_arch_family_from_str("11"), ModelArchFamily::Lfm2Moe);
+        assert_eq!(model_arch_family_from_str("14"), ModelArchFamily::NemotronH);
         assert_eq!(
-            model_arch_family_from_str("14"),
-            ModelArchFamily::NemotronH
+            model_arch_family_from_str(" 6 "),
+            ModelArchFamily::Qwen35Moe
         );
-        assert_eq!(model_arch_family_from_str(" 6 "), ModelArchFamily::Qwen35Moe);
         // Every canonical numeric arch_id round-trips through the string form.
         for &(arch_id, label) in KNOWN_RUNTIME_ARCH_IDS {
             assert_eq!(

@@ -1393,9 +1393,7 @@ fn concat_batch_dim(a: &CpuTensor, b: &CpuTensor) -> DiffusionResult<CpuTensor> 
 
 /// Split a batched CFG prediction `[2N, ...]` back into the positive `[0..N]`
 /// and negative `[N..2N]` halves.
-fn split_batched_cfg_prediction(
-    batched: &CpuTensor,
-) -> DiffusionResult<(CpuTensor, CpuTensor)> {
+fn split_batched_cfg_prediction(batched: &CpuTensor) -> DiffusionResult<(CpuTensor, CpuTensor)> {
     if batched.shape.first().copied().unwrap_or(0) % 2 != 0 || batched.shape.is_empty() {
         return Err(DiffusionError::InvalidMetadata(format!(
             "batched CFG prediction must have an even leading dim, got {:?}",
@@ -1528,8 +1526,7 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
         // `linear_total` carries the previous forward's linear count (for the
         // per-layer skip_last); reset the per-forward index before this step.
         if step > 0 {
-            runtime_context.rocm_weights.linear_total =
-                runtime_context.rocm_weights.linear_index;
+            runtime_context.rocm_weights.linear_total = runtime_context.rocm_weights.linear_index;
         }
         runtime_context.rocm_weights.linear_index = 0;
         runtime_context.rocm_weights.linear_precision =
@@ -1553,7 +1550,8 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
         // and cond passes as one batch-2N forward — `[positive; negative]` —
         // instead of two sequential forwards. Halves launches and feeds bigger
         // GEMMs. SDXL / mixed-mask cases fall back to the sequential path.
-        let masks_batchable = positive_attention_mask.is_none() == negative_attention_mask.is_none();
+        let masks_batchable =
+            positive_attention_mask.is_none() == negative_attention_mask.is_none();
         let batched_cfg = !cfg_is_identity
             && positive_sdxl_conditioning.is_none()
             && negative_sdxl_conditioning.is_none()
@@ -2732,7 +2730,7 @@ use quant_decode::*;
 
 mod quant_encode;
 pub use quant_encode::{
-    oq4_arch_combined_len, open_calib_sidecar, pack_oq4_arch_combined, quantize_diffusion_hfq,
+    open_calib_sidecar, oq4_arch_combined_len, pack_oq4_arch_combined, quantize_diffusion_hfq,
     DiffusionQuantFormat, DiffusionQuantizeSummary, HessianSidecar,
 };
 
@@ -4458,9 +4456,8 @@ impl DiffusionPipeline {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<DiffusionConditioningBatch> {
         let runtime = self.native_runtime()?;
-        let missing = || {
-            DiffusionError::BackendUnavailable("Krea2 text conditioner unavailable".to_string())
-        };
+        let missing =
+            || DiffusionError::BackendUnavailable("Krea2 text conditioner unavailable".to_string());
         let cfg_is_identity = classifier_free_guidance_is_identity(request.cfg_scale);
         let mut prompt_conds = Vec::with_capacity(request.prompts.len());
         let mut negative_conds = Vec::with_capacity(request.prompts.len());
@@ -4987,7 +4984,8 @@ impl NativeDiffusionRuntime {
         metadata: &DiffusionHfqMetadata,
         config: &StableDiffusionConfig,
     ) -> DiffusionResult<Option<Krea2TextConditioner>> {
-        let text_encoder = component_json(hfq, metadata, "text_encoder")?.unwrap_or_else(|| json!({}));
+        let text_encoder =
+            component_json(hfq, metadata, "text_encoder")?.unwrap_or_else(|| json!({}));
         let text_config = text_encoder
             .get("text_config")
             .cloned()
@@ -6511,8 +6509,13 @@ impl ClipEncoderLayer {
             &self.layer_norm2_bias,
             1e-5,
         )?;
-        let hidden =
-            linear_optional_bias_resident(gpu, cache, &norm2, &self.fc1_weight, Some(&self.fc1_bias))?;
+        let hidden = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &norm2,
+            &self.fc1_weight,
+            Some(&self.fc1_bias),
+        )?;
         free_resident(gpu, norm2)?;
         let activated = quick_gelu_resident(gpu, &hidden)?;
         free_resident(gpu, hidden)?;
@@ -6539,9 +6542,27 @@ impl ClipEncoderLayer {
         gpu: &mut rdna_compute::Gpu,
         cache: &mut RocmWeightCache,
     ) -> DiffusionResult<rdna_compute::GpuTensor> {
-        let q = linear_optional_bias_resident(gpu, cache, x, &self.q_proj_weight, Some(&self.q_proj_bias))?;
-        let k = linear_optional_bias_resident(gpu, cache, x, &self.k_proj_weight, Some(&self.k_proj_bias))?;
-        let v = linear_optional_bias_resident(gpu, cache, x, &self.v_proj_weight, Some(&self.v_proj_bias))?;
+        let q = linear_optional_bias_resident(
+            gpu,
+            cache,
+            x,
+            &self.q_proj_weight,
+            Some(&self.q_proj_bias),
+        )?;
+        let k = linear_optional_bias_resident(
+            gpu,
+            cache,
+            x,
+            &self.k_proj_weight,
+            Some(&self.k_proj_bias),
+        )?;
+        let v = linear_optional_bias_resident(
+            gpu,
+            cache,
+            x,
+            &self.v_proj_weight,
+            Some(&self.v_proj_bias),
+        )?;
         let context = clip_causal_self_attention_resident(gpu, &q, &k, &v, n_heads)?;
         free_resident(gpu, q)?;
         free_resident(gpu, k)?;

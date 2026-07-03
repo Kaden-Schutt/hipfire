@@ -762,7 +762,9 @@ impl NativeVaeDecoder {
         hidden = self
             .conv_in
             .as_ref()
-            .ok_or_else(|| DiffusionError::InvalidMetadata("SD VAE decoder conv_in missing".into()))?
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata("SD VAE decoder conv_in missing".into())
+            })?
             .forward_with_runtime_context(&hidden, runtime_context)?;
         if let Some(resnet) = &self.mid_resnet_0 {
             hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
@@ -786,7 +788,9 @@ impl NativeVaeDecoder {
         hidden = silu_with_runtime_context(&hidden, runtime_context)?;
         self.conv_out
             .as_ref()
-            .ok_or_else(|| DiffusionError::InvalidMetadata("SD VAE decoder conv_out missing".into()))?
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata("SD VAE decoder conv_out missing".into())
+            })?
             .forward_with_runtime_context(&hidden, runtime_context)
     }
 
@@ -974,11 +978,7 @@ pub(crate) fn wan_causal_conv2d(
 pub(crate) fn wan_silu(input: &CpuTensor) -> CpuTensor {
     CpuTensor {
         shape: input.shape.clone(),
-        data: input
-            .data
-            .iter()
-            .map(|&x| x / (1.0 + (-x).exp()))
-            .collect(),
+        data: input.data.iter().map(|&x| x / (1.0 + (-x).exp())).collect(),
     }
 }
 
@@ -1166,8 +1166,17 @@ impl WanUpsample {
     pub(crate) fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
         let upsampled = upsample_nearest2d_nchw(input, 2)?;
         let [_, _, kh, kw] = shape4(&self.resample_weight)?;
-        let padding = if kh == kw { (kh.saturating_sub(1)) / 2 } else { 0 };
-        conv2d_nchw(&upsampled, &self.resample_weight, Some(&self.resample_bias), padding)
+        let padding = if kh == kw {
+            (kh.saturating_sub(1)) / 2
+        } else {
+            0
+        };
+        conv2d_nchw(
+            &upsampled,
+            &self.resample_weight,
+            Some(&self.resample_bias),
+            padding,
+        )
     }
 }
 
@@ -1270,7 +1279,11 @@ impl WanImageDecoder {
                 hidden = upsampler.forward(&hidden)?;
             }
         }
-        hidden = wan_silu(&wan_rms_norm_nchw(&hidden, &self.norm_out_gamma, Self::EPS)?);
+        hidden = wan_silu(&wan_rms_norm_nchw(
+            &hidden,
+            &self.norm_out_gamma,
+            Self::EPS,
+        )?);
         wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))
     }
 }

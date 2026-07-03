@@ -399,11 +399,7 @@ pub fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec
 /// same kernel/dtype as MQ4 — only the chosen scale/min differ. Pairs with AWQ
 /// (activation-aware pre-scaling) to form the MQ4+ format. See
 /// `docs/kernels/quant-exploration-gfx1103.md` (E4/E6).
-pub fn quantize_mq4g256_clipsearch(
-    f32_data: &[f32],
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
+pub fn quantize_mq4g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = bb(QuantType::MQ4G256);
     let n = f32_data.len();
@@ -501,11 +497,7 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
 }
 
 /// MQ6+ : MQ6G256 with clip-searched affine range (identical 200-byte layout).
-pub fn quantize_mq6g256_clipsearch(
-    f32_data: &[f32],
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
+pub fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, bb(QuantType::MQ6G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -534,11 +526,7 @@ pub fn quantize_mq6g256_clipsearch(
 }
 
 /// MQ3+ : MQ3G256 with clip-searched affine range (identical 104-byte layout).
-pub fn quantize_mq3g256_clipsearch(
-    f32_data: &[f32],
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
+pub fn quantize_mq3g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, bb(QuantType::MQ3G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -573,11 +561,7 @@ pub fn quantize_mq3g256_clipsearch(
 }
 
 /// MQ2+ : MQ2G256 with clip-searched affine range (identical 72-byte layout).
-pub fn quantize_mq2g256_clipsearch(
-    f32_data: &[f32],
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
+pub fn quantize_mq2g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, bb(QuantType::MQ2G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -606,11 +590,7 @@ pub fn quantize_mq2g256_clipsearch(
 }
 
 /// MQ8+ : MQ8G256 with clip-searched symmetric int8 scale (identical 258-byte layout).
-pub fn quantize_mq8g256_clipsearch(
-    f32_data: &[f32],
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
+pub fn quantize_mq8g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, bb(QuantType::MQ8G256));
     let n = f32_data.len();
     let n_blocks = (n + group_size - 1) / group_size;
@@ -2287,11 +2267,7 @@ pub fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) 
 /// 72 B/group (true 1.58-bpw packing — 5 ternary/byte — is a mechanical
 /// follow-up once coherence is established). Gated by HIPFIRE_LLOYD_K3=1 on the
 /// `--format lloyd-mq2` path. Output DType = MQ2G256Lloyd (kernel-agnostic to K).
-pub fn quantize_mq2g256_lloyd_k3(
-    f32_data: &[f32],
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
+pub fn quantize_mq2g256_lloyd_k3(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = bb(QuantType::MQ2G256Lloyd);
@@ -2459,7 +2435,11 @@ mod tests {
         let data = test_data(600); // 2 full blocks + partial
         let encoded = quantize_mq4g256(&data, &s1, &s2);
         let decoded = dequant_mq4g256(&encoded, data.len(), &s1, &s2);
-        assert!(rmse(&data, &decoded) < 0.08, "rmse {}", rmse(&data, &decoded));
+        assert!(
+            rmse(&data, &decoded) < 0.08,
+            "rmse {}",
+            rmse(&data, &decoded)
+        );
     }
 
     #[test]
@@ -2471,7 +2451,11 @@ mod tests {
         data[300] = -35.0;
         let plain = quantize_mq4g256(&data, &s1, &s2);
         let clipped = quantize_mq4g256_clipsearch(&data, &s1, &s2);
-        assert_eq!(plain.len(), clipped.len(), "mq4+ must keep the 136-byte layout");
+        assert_eq!(
+            plain.len(),
+            clipped.len(),
+            "mq4+ must keep the 136-byte layout"
+        );
         let plain_rmse = rmse(&data, &dequant_mq4g256(&plain, data.len(), &s1, &s2));
         let clip_rmse = rmse(&data, &dequant_mq4g256(&clipped, data.len(), &s1, &s2));
         assert!(
@@ -2485,7 +2469,11 @@ mod tests {
         let (s1, s2) = test_signs();
         let data = test_data(600);
         let decoded = dequant_oq4g256(&quantize_oq4g256(&data, &s1, &s2), data.len(), &s1, &s2);
-        assert!(rmse(&data, &decoded) < 0.12, "rmse {}", rmse(&data, &decoded));
+        assert!(
+            rmse(&data, &decoded) < 0.12,
+            "rmse {}",
+            rmse(&data, &decoded)
+        );
     }
 
     #[test]
@@ -2493,7 +2481,11 @@ mod tests {
         let (s1, s2) = test_signs();
         let data = test_data(600);
         let decoded = dequant_oq3g256(&quantize_oq3g256(&data, &s1, &s2), data.len(), &s1, &s2);
-        assert!(rmse(&data, &decoded) < 0.25, "rmse {}", rmse(&data, &decoded));
+        assert!(
+            rmse(&data, &decoded) < 0.25,
+            "rmse {}",
+            rmse(&data, &decoded)
+        );
     }
 
     #[test]
@@ -2501,7 +2493,11 @@ mod tests {
         let (s1, s2) = test_signs();
         let data = test_data(600);
         let decoded = dequant_oq6g256(&quantize_oq6g256(&data, &s1, &s2), data.len(), &s1, &s2);
-        assert!(rmse(&data, &decoded) < 0.03, "rmse {}", rmse(&data, &decoded));
+        assert!(
+            rmse(&data, &decoded) < 0.03,
+            "rmse {}",
+            rmse(&data, &decoded)
+        );
     }
 
     #[test]
@@ -2509,7 +2505,11 @@ mod tests {
         let (s1, s2) = test_signs();
         let data = test_data(600);
         let decoded = dequant_oq8g256(&quantize_oq8g256(&data, &s1, &s2), data.len(), &s1, &s2);
-        assert!(rmse(&data, &decoded) < 0.012, "rmse {}", rmse(&data, &decoded));
+        assert!(
+            rmse(&data, &decoded) < 0.012,
+            "rmse {}",
+            rmse(&data, &decoded)
+        );
     }
 
     #[test]
@@ -2517,7 +2517,11 @@ mod tests {
         let data = test_data(96); // 3 groups of 32
         let decoded = dequant_hfp4g32_row(&quantize_hfp4g32_row(&data), data.len());
         // e2m1 has ~1 mantissa bit: generous relative bound.
-        assert!(rmse(&data, &decoded) < 0.2, "rmse {}", rmse(&data, &decoded));
+        assert!(
+            rmse(&data, &decoded) < 0.2,
+            "rmse {}",
+            rmse(&data, &decoded)
+        );
     }
 
     // ── block-geometry byte stability ───────────────────────────────────
@@ -2533,7 +2537,10 @@ mod tests {
         for n in [1usize, 256, 257, 600] {
             let d = test_data(n);
             assert_eq!(quantize_mq4g256(&d, &s1, &s2).len(), g256(n) * 136);
-            assert_eq!(quantize_mq4g256_clipsearch(&d, &s1, &s2).len(), g256(n) * 136);
+            assert_eq!(
+                quantize_mq4g256_clipsearch(&d, &s1, &s2).len(),
+                g256(n) * 136
+            );
             assert_eq!(quantize_mq6g256(&d, &s1, &s2).len(), g256(n) * 200);
             assert_eq!(quantize_mq3g256(&d, &s1, &s2).len(), g256(n) * 104);
             assert_eq!(quantize_mq2g256(&d, &s1, &s2).len(), g256(n) * 72);

@@ -473,7 +473,10 @@ pub(crate) struct NativeTransformerTimestepEmbedding {
 
 #[allow(dead_code)]
 impl NativeTransformerTimestepEmbedding {
-    pub(crate) fn from_hfq(hfq: &HfqFile, family: TransformerDenoiserFamily) -> DiffusionResult<Self> {
+    pub(crate) fn from_hfq(
+        hfq: &HfqFile,
+        family: TransformerDenoiserFamily,
+    ) -> DiffusionResult<Self> {
         let prefix = match family {
             TransformerDenoiserFamily::Krea2 => "transformer/tensors/time_embed",
             TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
@@ -910,8 +913,18 @@ impl TransformerAttentionStreamProjection {
             )));
         }
         validate_attention_bias_shape(self.stream_label, "q", self.q_bias.as_ref(), inner_width)?;
-        validate_attention_bias_shape(self.stream_label, "k", self.k_bias.as_ref(), kv_inner_width)?;
-        validate_attention_bias_shape(self.stream_label, "v", self.v_bias.as_ref(), kv_inner_width)?;
+        validate_attention_bias_shape(
+            self.stream_label,
+            "k",
+            self.k_bias.as_ref(),
+            kv_inner_width,
+        )?;
+        validate_attention_bias_shape(
+            self.stream_label,
+            "v",
+            self.v_bias.as_ref(),
+            kv_inner_width,
+        )?;
         validate_attention_norm_shape(
             self.stream_label,
             "q",
@@ -972,7 +985,11 @@ impl TransformerAttentionStreamProjection {
         // the downstream RoPE / SDPA path stays multi-head. kv_heads == heads
         // (QwenImage) makes the expansion an identity.
         let [_, _, kv_width] = shape3(&k)?;
-        let kv_heads = if head_dim == 0 { heads } else { kv_width / head_dim };
+        let kv_heads = if head_dim == 0 {
+            heads
+        } else {
+            kv_width / head_dim
+        };
         let q = maybe_rms_norm_attention_heads_3d(
             q,
             self.norm_q_weight.as_ref(),
@@ -1160,7 +1177,8 @@ impl NativeTransformerAttentionProjection {
         .ok_or_else(|| {
             DiffusionError::InvalidMetadata(format!("attention stream {attn_prefix:?} is missing"))
         })?;
-        let (hidden_width, inner_width, head_dim) = image.validate_shapes(heads, None, None, None)?;
+        let (hidden_width, inner_width, head_dim) =
+            image.validate_shapes(heads, None, None, None)?;
         let gate_weight = optional_resident(hfq, &format!("{attn_prefix}.to_gate.weight"))?;
         let gate_bias = if gate_weight.is_some() {
             optional_tensor(hfq, &format!("{attn_prefix}.to_gate.bias"))?
@@ -1692,8 +1710,14 @@ impl NativeTransformerBlock {
         let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
         let (norm1_weight, norm2_weight) = match family {
             TransformerDenoiserFamily::Krea2 => (
-                Some(CpuTensor::from_hfq(hfq, &format!("{block_prefix}.norm1.weight"))?),
-                Some(CpuTensor::from_hfq(hfq, &format!("{block_prefix}.norm2.weight"))?),
+                Some(CpuTensor::from_hfq(
+                    hfq,
+                    &format!("{block_prefix}.norm1.weight"),
+                )?),
+                Some(CpuTensor::from_hfq(
+                    hfq,
+                    &format!("{block_prefix}.norm2.weight"),
+                )?),
             ),
             TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
                 (None, None)
@@ -1757,9 +1781,11 @@ impl NativeTransformerBlock {
             &preshift,
             &prescale,
         )?;
-        let attention = self
-            .attention
-            .attend_krea_self_gated_with_runtime_context(&attn_input, rotary, runtime_context)?;
+        let attention = self.attention.attend_krea_self_gated_with_runtime_context(
+            &attn_input,
+            rotary,
+            runtime_context,
+        )?;
         let hidden = gated_residual_3d(hidden, &attention, &pregate)?;
 
         let ff_input = modulate_3d(
@@ -2740,8 +2766,7 @@ pub(crate) fn repeat_kv_heads_3d(
                 let kv_head = head / group;
                 let src = in_base + kv_head * head_dim;
                 let dst = out_base + head * head_dim;
-                out.data[dst..dst + head_dim]
-                    .copy_from_slice(&input.data[src..src + head_dim]);
+                out.data[dst..dst + head_dim].copy_from_slice(&input.data[src..src + head_dim]);
             }
         }
     }
@@ -3040,7 +3065,10 @@ pub(crate) fn slice_sequence_3d(
 }
 
 #[allow(dead_code)]
-pub(crate) fn concat_sequence_3d(left: &CpuTensor, right: &CpuTensor) -> DiffusionResult<CpuTensor> {
+pub(crate) fn concat_sequence_3d(
+    left: &CpuTensor,
+    right: &CpuTensor,
+) -> DiffusionResult<CpuTensor> {
     let [left_batch, left_seq, left_width] = shape3(left)?;
     let [right_batch, right_seq, right_width] = shape3(right)?;
     if left_batch != right_batch || left_width != right_width {
@@ -3238,9 +3266,12 @@ impl Qwen3EncoderLayer {
             Self::EPS,
             runtime_context,
         )?;
-        let mut q = linear_3d_with_runtime_context(&normed, &self.q_proj.decode()?, None, runtime_context)?;
-        let mut k = linear_3d_with_runtime_context(&normed, &self.k_proj.decode()?, None, runtime_context)?;
-        let v = linear_3d_with_runtime_context(&normed, &self.v_proj.decode()?, None, runtime_context)?;
+        let mut q =
+            linear_3d_with_runtime_context(&normed, &self.q_proj.decode()?, None, runtime_context)?;
+        let mut k =
+            linear_3d_with_runtime_context(&normed, &self.k_proj.decode()?, None, runtime_context)?;
+        let v =
+            linear_3d_with_runtime_context(&normed, &self.v_proj.decode()?, None, runtime_context)?;
         q = rms_norm_attention_heads_3d(
             &q,
             &CpuTensor {
@@ -3282,8 +3313,12 @@ impl Qwen3EncoderLayer {
             shape: vec![1, seq, inner],
             data: attention.data,
         };
-        let attention =
-            linear_3d_with_runtime_context(&attention, &self.o_proj.decode()?, None, runtime_context)?;
+        let attention = linear_3d_with_runtime_context(
+            &attention,
+            &self.o_proj.decode()?,
+            None,
+            runtime_context,
+        )?;
         let hidden = residual_add_3d(input, &attention)?;
 
         let normed2 = rms_norm_3d_with_runtime_context(
@@ -3295,14 +3330,29 @@ impl Qwen3EncoderLayer {
             Self::EPS,
             runtime_context,
         )?;
-        let gate = linear_3d_with_runtime_context(&normed2, &self.gate_proj.decode()?, None, runtime_context)?;
-        let up = linear_3d_with_runtime_context(&normed2, &self.up_proj.decode()?, None, runtime_context)?;
+        let gate = linear_3d_with_runtime_context(
+            &normed2,
+            &self.gate_proj.decode()?,
+            None,
+            runtime_context,
+        )?;
+        let up = linear_3d_with_runtime_context(
+            &normed2,
+            &self.up_proj.decode()?,
+            None,
+            runtime_context,
+        )?;
         let mut swish = CpuTensor::zeros(&gate.shape);
         for (idx, slot) in swish.data.iter_mut().enumerate() {
             let g = gate.data[idx];
             *slot = (g / (1.0 + (-g).exp())) * up.data[idx];
         }
-        let ff = linear_3d_with_runtime_context(&swish, &self.down_proj.decode()?, None, runtime_context)?;
+        let ff = linear_3d_with_runtime_context(
+            &swish,
+            &self.down_proj.decode()?,
+            None,
+            runtime_context,
+        )?;
         residual_add_3d(&hidden, &ff)
     }
 }

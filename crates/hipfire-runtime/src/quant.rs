@@ -109,9 +109,6 @@ pub fn dequant_q4k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-
-
-
 /// Re-export the canonical on-disk byte-contract so arch loaders can reach it
 /// as `hipfire_runtime::quant::QuantType` without each depending on the leaf
 /// `hipfire-quant-format` crate directly.

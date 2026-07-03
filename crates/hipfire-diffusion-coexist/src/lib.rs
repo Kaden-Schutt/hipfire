@@ -1036,30 +1036,28 @@ fn add_component(
                                 quant_format: None,
                             });
                             metadata.weight_entries.push(entry_name.clone());
-                            let source = if pytorch_tensor_is_contiguous(
-                                &tensor.shape,
-                                &tensor.stride,
-                            ) {
-                                DiffusionImportSource::ZipMember {
-                                    archive_path: weight_path.clone(),
-                                    member_name: tensor.member_name,
-                                }
-                            } else {
-                                // Non-contiguous storage (e.g. channels_last conv
-                                // weights). Materialize the tensor in contiguous
-                                // row-major order so downstream layout matches the
-                                // logical shape.
-                                let archive = MiniZipArchive::open(&weight_path)?;
-                                let storage = archive.read_entry(&tensor.member_name)?;
-                                let data = reorder_pytorch_storage_to_contiguous(
-                                    &storage,
-                                    &tensor.shape,
-                                    &tensor.stride,
-                                    tensor.storage_offset,
-                                    pytorch_dtype_elem_size(&tensor.dtype),
-                                )?;
-                                DiffusionImportSource::Inline(data)
-                            };
+                            let source =
+                                if pytorch_tensor_is_contiguous(&tensor.shape, &tensor.stride) {
+                                    DiffusionImportSource::ZipMember {
+                                        archive_path: weight_path.clone(),
+                                        member_name: tensor.member_name,
+                                    }
+                                } else {
+                                    // Non-contiguous storage (e.g. channels_last conv
+                                    // weights). Materialize the tensor in contiguous
+                                    // row-major order so downstream layout matches the
+                                    // logical shape.
+                                    let archive = MiniZipArchive::open(&weight_path)?;
+                                    let storage = archive.read_entry(&tensor.member_name)?;
+                                    let data = reorder_pytorch_storage_to_contiguous(
+                                        &storage,
+                                        &tensor.shape,
+                                        &tensor.stride,
+                                        tensor.storage_offset,
+                                        pytorch_dtype_elem_size(&tensor.dtype),
+                                    )?;
+                                    DiffusionImportSource::Inline(data)
+                                };
                             entries.push(DiffusionImportEntry {
                                 name: entry_name,
                                 quant_type: tensor.quant_type,

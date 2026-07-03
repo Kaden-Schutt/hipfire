@@ -177,8 +177,8 @@ pub fn run_gguf_pipeline(
             let mut map = HashMap::new();
             let mut counts = [0u32; 4];
             for info in &gguf.tensors {
-                let out_name =
-                    gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+                let out_name = gguf_input::gguf_to_safetensors_name(&info.name)
+                    .unwrap_or_else(|| info.name.clone());
                 let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
                 match level {
                     QuantLevel::F16 => counts[0] += 1,
@@ -232,7 +232,8 @@ pub fn run_gguf_pipeline(
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
-        let out_name = gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+        let out_name =
+            gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 

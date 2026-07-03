@@ -12,15 +12,13 @@ use hipfire_diffusion::DiffusionHipRuntimeOptions;
 // GGUF-style split: the diffusers/checkpoint importer (pickle + zip parsing)
 // now lives in the offline hipfire-diffusion-coexist crate, out of the
 // server-linked hipfire-diffusion.
-use hipfire_diffusion_coexist::{import_diffusers_to_hfq, DiffusersImportOptions};
 use hipfire_diffusion::{
-    calibrate_diffusion_hfq, inspect_hfq_with_runtime_support,
-    quantize_diffusion_hfq, resize_rgb_batch_to_cover_nearest,
-    DiffusionBatchRequest,
-    DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
-    DiffusionPipeline, DiffusionProgress, DiffusionPrompt, DiffusionQuantFormat, DiffusionResult,
-    RgbImageBatch,
+    calibrate_diffusion_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
+    resize_rgb_batch_to_cover_nearest, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
+    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
+    DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RgbImageBatch,
 };
+use hipfire_diffusion_coexist::{import_diffusers_to_hfq, DiffusersImportOptions};
 use serde::Serialize;
 
 use crate::model::find_model;

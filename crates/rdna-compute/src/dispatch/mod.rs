@@ -11,8 +11,8 @@ use crate::kernels;
 // GpuTensor + DType now live in the leaf hipfire-gpu-types crate (review 3.11b).
 // Re-exported here so `dispatch::{GpuTensor, DType}` — and the crate-root
 // re-export in lib.rs — keep resolving, and bare references in this module work.
-pub use hipfire_gpu_types::{DType, GpuTensor};
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
+pub use hipfire_gpu_types::{DType, GpuTensor};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -148,7 +148,6 @@ const FP8_WMMA_MIN_BATCH: usize = 1024;
 /// than uniformly applying FP8 everywhere.
 const FP8_GEMV_MIN_M: usize = 4096;
 
-
 macro_rules! moe_scalar_indexed_wrappers {
     ($gate_fn:ident, $down_fn:ident, $gate_kernel:literal, $down_kernel:literal, $stride:expr) => {
         #[allow(clippy::too_many_arguments)]
@@ -208,7 +207,6 @@ macro_rules! moe_scalar_indexed_wrappers {
         }
     };
 }
-
 
 /// Cheap, `Clone`-able, `Send + Sync` handle to a single `Gpu`'s deferred-free
 /// mailbox. A dropped [`OwnedTensor`] pushes its raw pooled `DeviceBuffer` here;
@@ -284,8 +282,6 @@ impl Drop for OwnedTensor {
         }
     }
 }
-
-
 
 /// Activation-capture hook for the hipfire-native calibration path.
 ///
@@ -1394,8 +1390,14 @@ impl Gpu {
                 .as_ref()
                 .map(|s| s as &hip_bridge::Stream);
             unsafe {
-                self.hip
-                    .launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice())
+                self.hip.launch_kernel_blob(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    buf.as_mut_slice(),
+                )
             }
         } else {
             let mut params: Vec<*mut std::ffi::c_void> =

@@ -2395,7 +2395,9 @@ pub(crate) fn clone_resident(
     let elements = checked_shape_elements("resident clone", &src.shape)?;
     let bytes = elements
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| DiffusionError::InvalidMetadata("resident clone size overflows".to_string()))?;
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("resident clone size overflows".to_string())
+        })?;
     let dst = alloc_resident_f32(gpu, &src.shape)?;
     gpu.copy_d2d(src, &dst, bytes)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -2724,7 +2726,10 @@ pub(crate) fn group_norm_nchw_resident(
     apply_args.push_ptr(weight_ptr);
     apply_args.push_ptr(bias_ptr);
     apply_args.push_ptr(output.buf.as_ptr());
-    apply_args.push_i32(i32_kernel_dim("group_norm output elements", output_elements)?);
+    apply_args.push_i32(i32_kernel_dim(
+        "group_norm output elements",
+        output_elements,
+    )?);
     apply_args.push_i32(i32_kernel_dim("group_norm channels", channels)?);
     apply_args.push_i32(i32_kernel_dim("group_norm height", height)?);
     apply_args.push_i32(i32_kernel_dim("group_norm width", width)?);
@@ -3009,10 +3014,7 @@ pub(crate) fn linear_optional_bias_resident(
     let layer_idx = cache.linear_index;
     cache.linear_index = cache.linear_index.wrapping_add(1);
     let precision = cache.resolve_linear_precision(layer_idx);
-    if precision != LinearPrecision::F16
-        && in_features % 256 == 0
-        && gpu.arch_caps.has_wmma_w32()
-    {
+    if precision != LinearPrecision::F16 && in_features % 256 == 0 && gpu.arch_caps.has_wmma_w32() {
         let w_ptr = cache.resident_oq4_ptr(gpu, weight, out_features, in_features)?;
         let packed_len = oq4_arch_combined_len(out_features, in_features);
         let w_view = rdna_compute::GpuTensor {
@@ -3027,13 +3029,30 @@ pub(crate) fn linear_optional_bias_resident(
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         let launched = match precision {
             LinearPrecision::W4A16 => gpu.gemm_oq4_grouped_f16_wmma(
-                &w_view, &x_rot, &output, out_features, in_features, rows, 256,
+                &w_view,
+                &x_rot,
+                &output,
+                out_features,
+                in_features,
+                rows,
+                256,
             ),
             LinearPrecision::W4A8 => gpu.gemm_oq4_residual_mmq(
-                &w_view, &x_rot, &output, out_features, in_features, rows, false,
+                &w_view,
+                &x_rot,
+                &output,
+                out_features,
+                in_features,
+                rows,
+                false,
             ),
             LinearPrecision::W4A4 => gpu.gemm_oq4_grouped_act_batched(
-                &w_view, &x_rot, &output, out_features, in_features, rows,
+                &w_view,
+                &x_rot,
+                &output,
+                out_features,
+                in_features,
+                rows,
             ),
             LinearPrecision::F16 => unreachable!("F16 handled by the fall-through path"),
         };
@@ -3099,8 +3118,15 @@ pub(crate) fn linear_optional_bias_resident(
             shape: vec![out_features, in_features],
             dtype: rdna_compute::DType::F32,
         };
-        gpu.gemm_f16_wmma(&act_f16, &weight_view, &output, rows, in_features, out_features)
-            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        gpu.gemm_f16_wmma(
+            &act_f16,
+            &weight_view,
+            &output,
+            rows,
+            in_features,
+            out_features,
+        )
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         free_resident(gpu, act_f16)?;
         if let Some(bias) = bias {
             let bias_ptr = cache.resident_ptr(gpu, bias)?;
@@ -3330,7 +3356,10 @@ pub(crate) fn geglu_gate_3d_resident(
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(projected.buf.as_ptr());
     kernargs.push_ptr(output.buf.as_ptr());
-    kernargs.push_i32(i32_kernel_dim("GeGLU gate output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim(
+        "GeGLU gate output elements",
+        output_elements,
+    )?);
     kernargs.push_i32(i32_kernel_dim("GeGLU gate inner width", inner)?);
     kernargs.push_i32(i32_kernel_dim("GeGLU gate projected width", width)?);
     kernargs.pad_to(16);
@@ -3356,7 +3385,8 @@ pub(crate) fn concat_channels_nchw_resident(
     b: &rdna_compute::GpuTensor,
 ) -> DiffusionResult<rdna_compute::GpuTensor> {
     let [batch, a_channels, height, width] = resident_dims4(&a.shape, "channel concat left")?;
-    let [b_batch, b_channels, b_height, b_width] = resident_dims4(&b.shape, "channel concat right")?;
+    let [b_batch, b_channels, b_height, b_width] =
+        resident_dims4(&b.shape, "channel concat right")?;
     if batch != b_batch || height != b_height || width != b_width {
         return Err(DiffusionError::InvalidMetadata(format!(
             "cannot concatenate NCHW tensors with shapes {:?} and {:?}",

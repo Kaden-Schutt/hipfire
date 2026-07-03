@@ -41,8 +41,6 @@ pub struct LlamaConfig {
     pub has_qk_norm: bool, // Qwen3 feature
 }
 
-
-
 /// A weight matrix on GPU — may be quantized or F32.
 /// ParoQuant Givens rotation metadata for a single linear layer.
 /// Stored alongside the weight buffer; applied to activations before GEMV.
@@ -1414,7 +1412,6 @@ fn forward_prefill_chunk(
 
     Ok(())
 }
-
 
 /// Pre-allocated scratch buffers for the forward pass.
 /// Allocate once, reuse every token — zero hipMalloc in the hot loop.

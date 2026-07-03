@@ -126,7 +126,9 @@ impl Transformer2DModel {
         };
         let bsc = nchw_to_bsc_resident(gpu, &projected)?;
         free_resident(gpu, projected)?;
-        let blocked = self.block.forward_resident(&bsc, encoder_states, gpu, cache)?;
+        let blocked = self
+            .block
+            .forward_resident(&bsc, encoder_states, gpu, cache)?;
         free_resident(gpu, bsc)?;
         let nchw = bsc_to_nchw_resident(gpu, &blocked, batch, channels, height, width)?;
         free_resident(gpu, blocked)?;
@@ -1120,8 +1122,13 @@ impl NativeUnet2DConditionModel {
             )?;
             free_resident(gpu, sample)?;
             if let Some(mid_block) = &self.mid_block {
-                hidden =
-                    mid_block.forward_resident(hidden, &time_embedding, &encoder_states, gpu, cache)?;
+                hidden = mid_block.forward_resident(
+                    hidden,
+                    &time_embedding,
+                    &encoder_states,
+                    gpu,
+                    cache,
+                )?;
             }
             hidden = self.up_path.forward_resident(
                 hidden,
