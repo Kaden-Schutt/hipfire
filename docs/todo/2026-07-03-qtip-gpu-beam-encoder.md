@@ -102,6 +102,30 @@ replicate Rust's `sort_unstable`/`dedup`/`select_nth` semantics.
    rotated weights → qtip_viterbi_encode → download symbols → CPU optimal_scale +
    pack). Default stays CPU beam (no GPU requirement unless --gpu-encode). Keep the
    CPU path as the reference. NOTE: this is the first OFFLINE tool to link rdna-compute.
-4. Perf: the backptr global-scratch traffic (256×4096 B/group) likely dominates at
-   scale — could shrink to `bits`-bit selectors or tile groups/block. LDS 32KB caps
-   occupancy at 2 blocks/CU; measure before optimizing.
+4. Perf [INVESTIGATED — see below].
+
+## Perf investigation (2026-07-03) — encode is compute-bound, micro-opts flat
+
+MEASURED phase breakdown (Llama-3.2-1B → qtip4): **rotate 0.4s / encode 172.9s /
+pack 0.3s** — the encode is ~everything; rotate/pack micro-opts (fuse-FWHT,
+sample-self-check) are moot.
+
+Two encode micro-opts tried, BOTH FLAT at 1B (172.9s unchanged):
+- **LDS bank-conflict fix** (perm-index dp so a state's 2^bits predecessors are
+  contiguous, one/bank, not stride-2^(12-bits) same-bank): 325→283ms warm bits=4
+  @8192 microbench (~13%), but 0% at 1B. Committed (correct, parity bit-matches).
+- **Backpointer 4-bit packing** (1MB→512KB/group scratch, chunk 512→1024):
+  microbench flat, 1B flat. Committed as a MEMORY-footprint/robustness win (the APU
+  OOM'd on the u8 2GB scratch), NOT speed.
+
+ROOT CAUSE: the encode is COMPUTE-BOUND on the full-Viterbi transition count
+(256 pos × 4096 states × 2^bits preds ≈ 5×10¹³ transitions for 1B). Neither micro-opt
+reduces the transition count, so both are flat at model scale (they only surface when
+the kernel is LDS-bound, i.e. the single-launch microbench). The ~64s over the raw
+microbench rate is per-chunk upload/download/launch overhead + real-weight distro.
+
+THE ONLY REAL LEVER LEFT = fewer states = **beam on GPU** (track K≈256 not all 4096
+→ ~16× fewer transitions AND ~16× less backptr). Reintroduces the per-position
+top-k prune that full-Viterbi was chosen to avoid — a separate, larger, riskier
+project. Until then the encode is already **~25× the CPU beam** (172s vs >3600s for
+1B), so it's usable; pursue beam only if large-model (≥7B) encode time matters.
