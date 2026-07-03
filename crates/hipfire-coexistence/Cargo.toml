@@ -14,3 +14,4 @@ hipfire-steer = { path = "../hipfire-steer" }
 hipfire-steer-harness = { path = "../hipfire-steer-harness" }
 hipfire-lora-hfq = { path = "../hipfire-lora-hfq" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
+hipfire-quantize = { path = "../hipfire-quantize" }

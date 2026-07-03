@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("lora"), Some("export")) => lora_export(&args[2..]),
         (Some("lora"), Some("merge")) => lora_merge(&args[2..]),
         (Some("lora"), Some("convert")) => lora_convert(&args[2..]),
+        (Some("import"), Some("gguf")) => import_gguf(&args[2..]),
         _ => {
             usage();
             std::process::exit(2);
@@ -45,8 +46,64 @@ fn usage() {
          lora export  --hfq <model.hfq> --data-dir <dir> [--limit N] [--strength S] \
          [--no-orthogonalize] [--max-seq N] --out <adapter.lora.{{hfq,json}}>\n\
          lora merge   --hfq <base.hfq> --adapter <adapter.lora> --out <merged.hfq>\n\
-         lora convert --in <adapter.lora.{{hfq,json}}> --out <adapter.lora.{{hfq,json}}>"
+         lora convert --in <adapter.lora.{{hfq,json}}> --out <adapter.lora.{{hfq,json}}>\n\
+         import gguf  --in <model.gguf> --out <model.hfq> --format <FMT> \
+         [--no-kmap] [--kmap-dense] [--kmap-mode full|alt|typed] [--arch-id N]"
     );
+}
+
+/// Import a GGUF checkpoint, re-quantizing its weights to a native `.hfq`
+/// through the shared quant codecs (`--format`: bf16, fp16, hfq4, hfq6, mq4,
+/// mq6, mq3, mq2, lloyd-mq*, hfp4, mfp4). The re-quant pipeline lives in the
+/// `hipfire-quantize` library; this is the user-facing entry point, kept out of
+/// the quantize binary per AGENTS.md. Pure offline file op.
+fn import_gguf(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use hipfire_quantize::gguf_import::run_gguf_pipeline;
+    use hipfire_quantize::quant_plan::GgufFormat;
+
+    // --in/--out/--format take values; the kmap flags are parsed positionally
+    // (mirrors the quantize CLI) since `--no-kmap`/`--kmap-dense` are presence
+    // flags and `run_gguf_pipeline` also reads `--arch-id` from the process
+    // args directly.
+    let val = |k: &str| -> Option<&str> {
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    };
+    let input = val("--in").ok_or("import gguf: --in <model.gguf> is required")?;
+    let output = val("--out").ok_or("import gguf: --out <model.hfq> is required")?;
+    let format = val("--format").ok_or("import gguf: --format <FMT> is required")?;
+    let gguf_format = GgufFormat::from_flag(format).ok_or_else(|| {
+        format!(
+            "import gguf: --format '{format}' not recognized \
+             (bf16, fp16, hfq4, hfq6, mq4, mq6, mq3, mq2, lloyd-mq*, hfp4, mfp4)"
+        )
+    })?;
+    let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
+    let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
+    let kmap_mode: u8 = val("--kmap-mode")
+        .map(|v| match v {
+            "full" | "0" => 0,
+            "alternating" | "alt" | "1" => 1,
+            "typed" | "2" => 2,
+            other => {
+                eprintln!("warning: unknown --kmap-mode '{other}', using alternating");
+                1
+            }
+        })
+        .unwrap_or(1);
+
+    run_gguf_pipeline(
+        Path::new(input),
+        Path::new(output),
+        gguf_format,
+        format,
+        no_kmap,
+        kmap_dense,
+        kmap_mode,
+    )?;
+    Ok(())
 }
 
 /// Minimal `--key value` flag bag. `--no-orthogonalize` is a presence-only flag.

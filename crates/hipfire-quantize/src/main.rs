@@ -60,7 +60,7 @@ use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
 // library (so hipfire-coexistence can drive the import). Re-imported here for
 // the native safetensors path + the deprecation shim.
-use hipfire_quantize::gguf_import::{is_gguf_input, parse_arch_id_override, run_gguf_pipeline};
+use hipfire_quantize::gguf_import::{is_gguf_input, parse_arch_id_override};
 use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
 #[cfg(test)]
 use hipfire_quantize::quant_plan::{is_positional_promote, kmap_resolve, parse_layer_idx};
@@ -5737,27 +5737,24 @@ fn main() {
             return;
         }
         if is_gguf_input(raw_input) {
-            let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
-                eprintln!(
-                    "GGUF input: --format '{format}' not recognized. \
-                     Supported: bf16, fp16, hfq4, hfq6, mq4, mq6, mq3, mq2, lloyd-mq*, hfp4, mfp4."
-                );
-                std::process::exit(2);
-            });
-            let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(
-                raw_input,
-                out,
-                gguf_format,
-                format,
-                no_kmap,
-                kmap_dense,
-                kmap_mode,
-            ) {
-                eprintln!("GGUF pipeline failed: {e}");
-                std::process::exit(2);
-            }
-            return;
+            // GGUF import moved out of the inference-adjacent quantize binary.
+            // It is format-conversion tooling and now lives in
+            // hipfire-coexistence (AGENTS.md). The re-quant pipeline itself
+            // still lives in this crate's library (gguf_import), which
+            // coexistence drives; the binary only redirects.
+            eprintln!(
+                "error: GGUF import has moved out of hipfire-quantize.\n\
+                 \n\
+                 Convert with the offline coexistence tool instead:\n\
+                 \n    hipfire-coexistence import gguf --in {input} --out {output} --format {format}\n\
+                 \n\
+                 (GGUF is a format-conversion concern and lives in \
+                 hipfire-coexistence per AGENTS.md; the quantize binary no \
+                 longer parses .gguf.)",
+                input = raw_input.display(),
+                output = output_path,
+            );
+            std::process::exit(2);
         }
     }
 

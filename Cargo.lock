@@ -1571,6 +1571,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-lora-hfq",
+ "hipfire-quantize",
  "hipfire-steer",
  "hipfire-steer-harness",
 ]
