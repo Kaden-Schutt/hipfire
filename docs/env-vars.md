@@ -232,8 +232,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_HFQ4_QKVZA_FAST` | HIPFIRE_HFQ4_QKVZA_FAST=0 narrows the FP16/WMMA/dot2 prefill | `crates/rdna-compute/src/feature_flags.rs:206` |
 | `HIPFIRE_HFQ4_QKV_FAST` | HIPFIRE_HFQ4_QKV_FAST=0 narrows the escape hatch to the | `crates/rdna-compute/src/feature_flags.rs:210` |
 | `HIPFIRE_HFQ4_RESIDUAL_FAST` | HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection | `crates/rdna-compute/src/feature_flags.rs:218` |
-| `HIPFIRE_HFQ6_QKVZA_4W` | Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior | `crates/rdna-compute/src/dispatch/gemm_qkv.rs:4700` |
-| `HIPFIRE_HFQ6_QKV_4W` | Interprets "HIPFIRE_HFQ6_QKV_4W" from environment to select behavior | `crates/rdna-compute/src/dispatch/gemm_qkv.rs:5216` |
+| `HIPFIRE_HFQ6_QKVZA_4W` | Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior | `crates/rdna-compute/src/dispatch/gemm_qkv.rs:4606` |
+| `HIPFIRE_HFQ6_QKV_4W` | Interprets "HIPFIRE_HFQ6_QKV_4W" from environment to select behavior | `crates/rdna-compute/src/dispatch/gemm_qkv.rs:5122` |
 | `HIPFIRE_HFQ6_RESIDUAL_4W` | Interprets "HIPFIRE_HFQ6_RESIDUAL_4W" from environment to select behavior | `crates/rdna-compute/src/dispatch/gemm_hfq.rs:2672` |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | Parses "HIPFIRE_HIPCC_EXTRA_FLAGS" with fallback defaults | `crates/rdna-compute/src/feature_flags.rs:318` |
 | `HIPFIRE_HIP_WAIT` | Runtime variable controlling hip wait in hipfire | `crates/rdna-compute/src/dispatch/mod.rs:892` |

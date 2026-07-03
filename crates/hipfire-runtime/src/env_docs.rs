@@ -1621,14 +1621,14 @@ pub const ENV_HIPFIRE_HFQ4_RESIDUAL_FAST: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_HFQ6_QKVZA_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ6_QKVZA_4W",
     description: "Interprets \"HIPFIRE_HFQ6_QKVZA_4W\" from environment to select behavior",
-    source: "crates/rdna-compute/src/dispatch/gemm_qkv.rs:4700",
+    source: "crates/rdna-compute/src/dispatch/gemm_qkv.rs:4606",
 };
 
 /// `HIPFIRE_HFQ6_QKV_4W` — Interprets "HIPFIRE_HFQ6_QKV_4W" from environment to select behavior
 pub const ENV_HIPFIRE_HFQ6_QKV_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ6_QKV_4W",
     description: "Interprets \"HIPFIRE_HFQ6_QKV_4W\" from environment to select behavior",
-    source: "crates/rdna-compute/src/dispatch/gemm_qkv.rs:5216",
+    source: "crates/rdna-compute/src/dispatch/gemm_qkv.rs:5122",
 };
 
 /// `HIPFIRE_HFQ6_RESIDUAL_4W` — Interprets "HIPFIRE_HFQ6_RESIDUAL_4W" from environment to select behavior

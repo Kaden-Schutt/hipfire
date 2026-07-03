@@ -1295,8 +1295,6 @@ dependencies = [
 name = "hipfire-arch-llama"
 version = "0.3.0"
 dependencies = [
- "hip-bridge",
- "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
 ]
