@@ -22,6 +22,7 @@ hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-arch-specs = { path = "../hipfire-arch-specs" }
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-quant-format = { path = "../hipfire-quant-format" }
+hipfire-gguf = { path = "../hipfire-gguf" }
 hipfire-primitives = { path = "../hipfire-primitives" }
 # GPU QTIP trellis encoder (offline accel). Optional + runtime-autodetected.
 rdna-compute = { path = "../rdna-compute", optional = true }

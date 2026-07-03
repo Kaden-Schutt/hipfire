@@ -41,8 +41,12 @@
 #[allow(unused_imports)]
 use codecs::*;
 pub use hipfire_quantize::{
-    codecs, fixture, gguf_input, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
+    codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
 };
+// The GGUF parser/dequant now lives in its own dedicated offline crate
+// (hipfire-gguf) — off the inference dependency surface. Alias keeps the
+// import pipeline's `gguf_input::` references source-compatible.
+use hipfire_gguf as gguf_input;
 // Clip-search toggle now lives in the library too.
 pub use hipfire_quantize::{mq_clipsearch_enabled, set_mq_clipsearch};
 // KVarN codec + deferred KV-compaction live in the leaf `hipfire-kvquant`

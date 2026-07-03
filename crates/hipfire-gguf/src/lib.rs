@@ -2,9 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Minimal GGUF reader + dequant copied from `crates/engine/src/{gguf.rs,llama.rs}`.
-//! Self-contained so hipfire-quantize doesn't pull engine's GPU dependency tree.
-//! TODO: factor into a shared `gguf-codec` crate.
+//! GGUF codec — the dedicated offline home for GGUF parsing, dequant, and
+//! metadata→config extraction (the shared `gguf-codec` crate the quantize copy
+//! flagged as the endgame).
+//!
+//! HIP-independent and OFF the inference dependency surface: the runtime/model
+//! crates carry no GGUF code (GGUF is import-only). Consumed by the offline
+//! import tooling (`hipfire-quantize`'s GGUF→hfq pipeline, and any coexistence
+//! importer) to read a `.gguf` into f32 tensors + a config/tokenizer JSON.
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use hipfire_primitives::conv::{bf16_bits_to_f32 as bf16_to_f32, f16_to_f32};

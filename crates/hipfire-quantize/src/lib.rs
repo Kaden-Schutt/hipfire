@@ -23,7 +23,6 @@ pub use hipfire_kvquant::{kv_compact, kvarn};
 
 pub mod codecs;
 pub mod gptq;
-pub mod gguf_input;
 pub mod hessian_io;
 #[allow(dead_code)]
 pub mod hfhs_diag;

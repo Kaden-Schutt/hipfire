@@ -1750,6 +1750,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-gguf"
+version = "0.3.0"
+dependencies = [
+ "byteorder",
+ "hipfire-primitives",
+ "memmap2",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-hash"
 version = "0.3.0"
 
@@ -1866,6 +1876,7 @@ dependencies = [
  "faer",
  "hipfire-arch-api",
  "hipfire-arch-specs",
+ "hipfire-gguf",
  "hipfire-kvquant",
  "hipfire-lock",
  "hipfire-primitives",

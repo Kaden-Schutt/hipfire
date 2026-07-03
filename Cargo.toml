@@ -77,6 +77,7 @@ members = [
     "crates/hipfire-lora-hfq",
     "crates/hipfire-steer-harness",
     "crates/hipfire-coexistence",
+    "crates/hipfire-gguf",
     "crates/hipfire-hneurons",
 ]
 # The Leptos browser UIs target wasm32 (leptos CSR + web-sys) and are built
