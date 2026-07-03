@@ -7,8 +7,8 @@
 #[cfg(test)]
 use hipfire_model::model_worker_key_id;
 use hipfire_model::{
-    normalize_model_worker_key, same_model_worker_key, AcceleratorDeviceInfo, AcceleratorInventory,
-    ModelWorkerKey,
+    model_arch_family_from_str, normalize_model_worker_key, same_model_worker_key,
+    AcceleratorDeviceInfo, AcceleratorInventory, ModelArchFamily, ModelWorkerKey,
 };
 use hipfire_state::{generate_state_kind_sets_match_exactly, normalize_generate_state_kind_set};
 use std::collections::{BTreeMap, HashSet};
@@ -572,15 +572,30 @@ fn worker_key_family_contains(worker_key: &ModelWorkerKey, needle: &str) -> bool
             .any(|flag| flag.to_ascii_lowercase().contains(&needle))
 }
 
+/// Canonical arch family for a worker key, resolved from the numeric arch_id
+/// via the single-source [`model_arch_family_from_str`] table. Returns
+/// [`ModelArchFamily::Unknown`] for non-numeric (legacy-name) arch_ids, which
+/// the classifiers below still cover with a name substring fallback.
+fn worker_key_arch_family(worker_key: &ModelWorkerKey) -> ModelArchFamily {
+    model_arch_family_from_str(&worker_key.arch_id)
+}
+
 fn worker_key_is_qwen35(worker_key: &ModelWorkerKey) -> bool {
-    matches!(worker_key.arch_id.as_str(), "5" | "6")
-        || worker_key_family_contains(worker_key, "qwen35")
+    // Source of truth is the canonical arch-family table (arch_id 5/6). The
+    // name fallbacks remain for legacy string arch_ids / path-encoded families.
+    matches!(
+        worker_key_arch_family(worker_key),
+        ModelArchFamily::Qwen35Dense | ModelArchFamily::Qwen35Moe
+    ) || worker_key_family_contains(worker_key, "qwen35")
         || worker_key_family_contains(worker_key, "qwen3.5")
 }
 
 fn worker_key_is_state_arena_conservative(worker_key: &ModelWorkerKey) -> bool {
-    matches!(worker_key.arch_id.as_str(), "10" | "11" | "14")
-        || worker_key_family_contains(worker_key, "minimax")
+    // Canonical arch-family table (arch_id 10/11/14) + legacy name fallbacks.
+    matches!(
+        worker_key_arch_family(worker_key),
+        ModelArchFamily::MiniMaxM2 | ModelArchFamily::Lfm2Moe | ModelArchFamily::NemotronH
+    ) || worker_key_family_contains(worker_key, "minimax")
         || worker_key_family_contains(worker_key, "lfm2")
         || worker_key_family_contains(worker_key, "nemotron")
 }
