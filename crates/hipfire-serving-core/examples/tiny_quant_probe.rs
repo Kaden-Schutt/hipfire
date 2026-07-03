@@ -116,8 +116,63 @@ fn main() {
             println!("prompt_len: {}", out.prompt_len);
             println!("last_token: {}", out.last_token);
         }
+        // PROOF-OF-CONCEPT for re-pointing the probe at the REAL serving-core path:
+        // load the tiny .hfq through the production `load_model` (not tiny_harness),
+        // tokenize with its EMBEDDED tokenizer, and forward through the same
+        // `ChunkScoredForward` seam the daemon's KLD uses. Finite logits ⇒ the tiny
+        // model is a complete artifact that round-trips through production. (llama
+        // only for now; generalizing = hoisting the daemon's backend-slot pick block,
+        // then deleting tiny_harness.)
+        "real-load" => {
+            use hipfire_runtime::kld_eval::ChunkScoredForward;
+            let model = req(&args, "--model");
+            let prompt = flag(&args, "--prompt").unwrap_or_else(|| "hello hipfire tiny".into());
+            let mut m = hipfire_serving_core::load::load_model(
+                &model,
+                len + 16,
+                None,
+                None,
+                None,
+                None,
+                &hipfire_serving_core::model::CaskConfig::default(),
+                1,
+                &mut gpu,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("tiny_quant_probe real-load: load_model: {e}");
+                std::process::exit(1);
+            });
+            let ids = m
+                .tokenizer
+                .as_ref()
+                .expect("tiny .hfq must carry an embedded tokenizer")
+                .encode(&prompt);
+            println!("tokenizer_ok: {}", m.tokenizer.is_some());
+            println!("n_tokens: {}", ids.len());
+            let fwd: &mut dyn ChunkScoredForward = m
+                .llama_backend
+                .as_mut()
+                .expect("real-load proof currently wired for llama only");
+            let vocab = fwd.kld_vocab_size();
+            let (mut n_scored, mut n_finite) = (0usize, 0usize);
+            fwd.forward_chunk_scored(&mut gpu, &ids, 0, &mut |_j, lg, _next| {
+                n_scored += 1;
+                if lg.len() == vocab && lg.iter().all(|x| x.is_finite()) {
+                    n_finite += 1;
+                }
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("tiny_quant_probe real-load: forward: {e}");
+                std::process::exit(1);
+            });
+            println!("vocab: {vocab}");
+            println!("n_scored: {n_scored}");
+            println!("n_finite: {n_finite}");
+        }
         other => {
-            eprintln!("tiny_quant_probe: unknown subcommand {other:?} (kld|collect|ar-hash)");
+            eprintln!(
+                "tiny_quant_probe: unknown subcommand {other:?} (kld|collect|ar-hash|real-load)"
+            );
             std::process::exit(2);
         }
     }
