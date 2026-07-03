@@ -15,6 +15,11 @@ default = ["gpu"]
 gpu = ["dep:rdna-compute", "dep:hipfire-lock"]
 
 [dependencies]
+# Capability layer (both LEAF/CPU-only, no GPU/runtime deps): consult a migrated
+# arch's Ingest quant-policy instead of the legacy name-matching. llama-spec is the
+# first family so wired; more `-spec` crates are added here as families migrate.
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-primitives = { path = "../hipfire-primitives" }

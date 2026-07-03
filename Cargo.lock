@@ -1302,6 +1302,8 @@ dependencies = [
 name = "hipfire-arch-llama"
 version = "0.3.0"
 dependencies = [
+ "hipfire-arch-api",
+ "hipfire-arch-llama-spec",
  "hipfire-runtime",
  "rdna-compute",
 ]
@@ -1774,6 +1776,8 @@ version = "0.3.0"
 dependencies = [
  "byteorder",
  "faer",
+ "hipfire-arch-api",
+ "hipfire-arch-llama-spec",
  "hipfire-kvquant",
  "hipfire-lock",
  "hipfire-primitives",

@@ -38,11 +38,11 @@
 // crates (hipfire-diffusion) can reuse the codecs / LDLQ packers / Hessian I/O.
 // Re-export them here so this binary's existing bare (`codecs::…`) and
 // `crate::…` / `super::…` (test modules) references keep resolving unchanged.
+#[allow(unused_imports)]
+use codecs::*;
 pub use hipfire_quantize::{
     codecs, fixture, gguf_input, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
 };
-#[allow(unused_imports)]
-use codecs::*;
 // Clip-search toggle now lives in the library too.
 pub use hipfire_quantize::{mq_clipsearch_enabled, set_mq_clipsearch};
 // KVarN codec + deferred KV-compaction live in the leaf `hipfire-kvquant`
@@ -3194,6 +3194,56 @@ fn is_q8_tensor(name: &str) -> bool {
         || name.ends_with(".mixer.gate.weight")
 }
 
+// Force-link the migrated arch `-spec` crates so their `register_arch!`
+// link-time registrations are present (Rust drops unreferenced rlibs). Each lean
+// spec crate is CPU-only (deps only hipfire-arch-api), so the quantizer stays
+// GPU-free. Add a line here as each family migrates.
+use hipfire_arch_llama_spec as _;
+
+static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
+    std::sync::OnceLock::new();
+
+/// Capability-layer replacement for `is_q8_tensor`, for arches migrated onto
+/// `hipfire-arch-api`. Returns `Some(true)` = keep high precision (Q8), `Some(false)`
+/// = compressible, or `None` when this arch has NOT declared an `Ingest` policy — the
+/// caller then falls back to the legacy `is_q8_tensor` name-matching.
+///
+/// The arch states only needs (importance + requirements); the codec choice is made
+/// here by matching those against a 2-codec menu with `allocate`. Its
+/// group-divisibility filter reproduces the existing "non-256-aligned → Q8 fallback",
+/// and an unsatisfiable requirement lands on the safe high-precision option. This is
+/// the boolean the selection matrix needs; the downstream compressed format
+/// (Q4_K / Q4_as8) is still chosen by the format mode, unchanged.
+fn q8_precision_via_caps(arch_id: u32, name: &str, k: usize) -> Option<bool> {
+    use hipfire_arch_api::{allocate, ArchId, CodecCaps};
+    let ingest = ARCH_REGISTRY
+        .get_or_init(hipfire_arch_api::ArchRegistry::build)
+        .get(ArchId(arch_id as u16))?
+        .caps
+        .ingest?;
+    // High-precision random-access option vs a compressed grouped option. Only the
+    // chosen bit-width matters here (>=8 → keep Q8); the names are illustrative.
+    const MENU: [CodecCaps; 2] = [
+        CodecCaps {
+            name: "hi",
+            bits_per_weight: 8.0,
+            group_size: 0,
+            random_access: true,
+        },
+        CodecCaps {
+            name: "lo",
+            bits_per_weight: 4.0,
+            group_size: 256,
+            random_access: false,
+        },
+    ];
+    Some(
+        allocate(ingest.importance(name), ingest.requires(name), k, &MENU)
+            .map(|c| c.bits_per_weight >= 8.0)
+            .unwrap_or(true),
+    )
+}
+
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
 /// shape [conv_channels, 1, 4]. Small (~32K elem) and runs every token —
 /// Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3) measurably
@@ -3902,7 +3952,13 @@ fn qtip_beam_width() -> usize {
 /// `rotated` groups, each seeded at its RMS `group_scale` (the closed-form optimal
 /// scale is refit downstream at pack time). The reference path — always available,
 /// byte-preserving vs the historical qtip encode.
-fn cpu_encode_symbols(rotated: &[f32], n_groups: usize, cb: &[f32], beam: usize, bits: u32) -> Vec<u8> {
+fn cpu_encode_symbols(
+    rotated: &[f32],
+    n_groups: usize,
+    cb: &[f32],
+    beam: usize,
+    bits: u32,
+) -> Vec<u8> {
     use rayon::prelude::*;
     let mut symbols = vec![0u8; n_groups * 256];
     symbols
@@ -3949,11 +4005,15 @@ fn gpu_encode_symbols(
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let wd = gpu.upload_raw(&wbytes, &[cn, 256]).map_err(|e| e.to_string())?;
+        let wd = gpu
+            .upload_raw(&wbytes, &[cn, 256])
+            .map_err(|e| e.to_string())?;
         let sd = gpu
             .alloc_tensor(&[cn * 256], DType::Raw)
             .map_err(|e| e.to_string())?;
-        let scd = gpu.alloc_tensor(&[cn], DType::F32).map_err(|e| e.to_string())?;
+        let scd = gpu
+            .alloc_tensor(&[cn], DType::F32)
+            .map_err(|e| e.to_string())?;
         gpu.qtip_viterbi_encode(&wd, &sd, &backptr, &scd, cn, bits)
             .map_err(|e| e.to_string())?;
         gpu.device_synchronize().map_err(|e| e.to_string())?;
@@ -4024,7 +4084,10 @@ fn pack_qtip_real_tensors(
     bits: u32,
     beam: usize,
 ) {
-    assert!(bits == 3 || bits == 4, "QTIP real pack supports 3 or 4 bits");
+    assert!(
+        bits == 3 || bits == 4,
+        "QTIP real pack supports 3 or 4 bits"
+    );
     let block_bytes = if bits == 4 {
         qtip::QTIP4_BLOCK_BYTES
     } else {
@@ -4347,7 +4410,11 @@ fn run_hfq_source_pipeline(
     // the HF/GGUF dispatch so a bf16 `.hfq` requantized to qtip3 is byte-
     // identical to quantizing the original safetensors with `--format qtip3`.
     if matches!(format, HfqInputFormat::Qtip3 | HfqInputFormat::Qtip4) {
-        let bits = if format == HfqInputFormat::Qtip4 { 4 } else { 3 };
+        let bits = if format == HfqInputFormat::Qtip4 {
+            4
+        } else {
+            3
+        };
         let qtip_cb = qtip::build_codebook();
         let qtip_s1 = gen_fwht_signs(42, 256);
         let qtip_s2 = gen_fwht_signs(1042, 256);
@@ -6782,7 +6849,11 @@ fn main() {
     // lower quality. Bridged through HIPFIRE_QTIP_BEAM so both the .hfq-requant
     // and direct-source pack paths (`qtip_beam_width`) read one value.
     if let Some(i) = args.iter().position(|a| a == "--beam") {
-        if let Some(b) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()).filter(|&b| b > 0) {
+        if let Some(b) = args
+            .get(i + 1)
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&b| b > 0)
+        {
             std::env::set_var("HIPFIRE_QTIP_BEAM", b.to_string());
             eprintln!("QTIP trellis beam width: {b} (--beam)");
         } else {
@@ -9059,7 +9130,16 @@ fn main() {
                     } else if use_q4k_q8embed {
                         name.contains("embed") || name.contains("lm_head") // only embed/output Q8
                     } else if use_mixed || use_fast {
-                        is_q8_tensor(name)
+                        // Arches migrated onto the capability layer (e.g. llama)
+                        // decide Q8-vs-compressed from their declared Ingest
+                        // quant-policy; unmigrated arches keep is_q8_tensor.
+                        let k = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        q8_precision_via_caps(arch_id, name, k)
+                            .unwrap_or_else(|| is_q8_tensor(name))
                     } else {
                         use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
                     };
@@ -13850,6 +13930,37 @@ mod tests {
     }
 
     #[test]
+    fn caps_ingest_drives_llama_q8_and_falls_back_otherwise() {
+        // llama (arch_id 0) is migrated onto the capability layer: its Ingest keeps
+        // the protected set (embed/lm_head/attn) high-precision and compresses the
+        // MLP bulk — DERIVED from importance/requirements, no is_q8_tensor matching.
+        assert_eq!(
+            q8_precision_via_caps(0, "model.embed_tokens.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            q8_precision_via_caps(0, "model.layers.0.self_attn.q_proj.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(q8_precision_via_caps(0, "lm_head.weight", 4096), Some(true));
+        assert_eq!(
+            q8_precision_via_caps(0, "model.layers.0.mlp.up_proj.weight", 4096),
+            Some(false)
+        );
+        // Non-256-aligned inner dim → the grouped compressed codec is filtered out,
+        // reproducing the legacy "non-256 → Q8 fallback".
+        assert_eq!(
+            q8_precision_via_caps(0, "model.layers.0.mlp.up_proj.weight", 300),
+            Some(true)
+        );
+        // An unmigrated arch (no Ingest linked) → None → caller uses is_q8_tensor.
+        assert_eq!(
+            q8_precision_via_caps(14, "backbone.layers.0.mixer.up_proj.weight", 4096),
+            None
+        );
+    }
+
+    #[test]
     fn kmap_moe_router_q8() {
         assert_eq!(
             kmap_resolve("model.language_model.layers.5.mlp.gate.weight", 64, true),
@@ -14211,9 +14322,7 @@ mod codec_golden {
     // oq3/oq6 live in the `codecs` library module; the parent's private
     // `use codecs::*` glob isn't re-exported through `use super::*`, so import
     // the ones this battery characterizes explicitly.
-    use crate::codecs::{
-        dequant_oq3g256, dequant_oq6g256, quantize_oq3g256, quantize_oq6g256,
-    };
+    use crate::codecs::{dequant_oq3g256, dequant_oq6g256, quantize_oq3g256, quantize_oq6g256};
 
     /// Deterministic f32 stream with a few outliers (LCG; no rng dep).
     fn det_input(n: usize, seed: u32) -> Vec<f32> {

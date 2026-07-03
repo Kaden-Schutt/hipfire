@@ -56,10 +56,15 @@ impl Ingest for LlamaSpec {
 
     fn importance(&self, tensor: &str) -> u8 {
         // Structural prior only; the quantizer refines the actual bit assignment.
+        // The "protected" tensors (embed/lm_head/attn/norm) sit in the top tier so
+        // they keep high precision under the default budget — mirroring the current
+        // coherent high-precision-attention policy. Finer tiers (e.g. 4-bit attn
+        // with a learned rotation) are deferred to quantizer tuning. MLP bulk is
+        // compressible.
         match self.role(tensor) {
             TensorRole::Embed | TensorRole::LmHead => 255, // gather-indexed, critical
             TensorRole::Norm => 255,                       // tiny + numerically sensitive
-            TensorRole::AttnProj => 200,                   // error-sensitive
+            TensorRole::AttnProj => 255,                   // error-sensitive → protect
             TensorRole::Mlp => 128,                        // the bulk of the weights
             _ => 160,                                      // safe-ish default
         }
