@@ -52,7 +52,32 @@ The harness must pass two shots before it may judge a novel variant — the same
 
 Only no-op-nulls ∩ known-win-reproduces certifies the loop airworthy.
 
+## v2 — worktree-isolated, durability-gated, banked (`ab_certify_v2.sh`)
+v1 mutates a *shared* `~/hipfire` (swap file → rebuild shared binary → restore),
+which is fragile (a failed restore poisons the binary — observed: a slow variant
+bled a 2.6-tok/s number into a later re-measure) and serial (one arch per box).
+v2 fixes both with **git worktrees**:
+- **Isolation**: each arch/card runs in its own `git worktree` (`.aw/<arch>_card<N>`)
+  — own source, `target/`, `.hipfire_kernels`, and **per-GPU daemon** (the daemon
+  now keys its pid file by `HIPFIRE_DAEMON_ID`, so N daemons co-exist, one per GPU).
+- **Revert is git, cherry-precise**: a non-win is `git checkout -- <kernel>.hip`
+  (touches only the target kernel, can never leak into another arch's binary).
+- **Parallel scatter/gather**: N worktrees on N GPUs run *different* variants at
+  once (4 cards on hiptrx = 4 experiments). Watch box RAM (hipx 32 GB → cap fan-out).
+- **The gate chain to bank** (each REQUIRED, in order):
+  1. A/B decode **separation** (fast, 128-tok, auto-clock, sclk-verified)
+  2. **coherence** (fluency on the fast gate)
+  3. **DURABILITY** — `serve_harness --mode chain`, default sampling, multiturn.
+     A 128-tok decode win is *not* coherence or durability; fail → **BOUNCE**.
+- **Commit only on a durable WIN** → the variant diff is the git commit (the
+  dispatch invoice) + `variants/`. **Loss/bounce → force git-revert**, but the
+  **instrument record is still committed to the ledger** (losses are data).
+- **`banked` counter moves only on a committed, durable win** — the compound
+  scoreboard (`oracle_db.py banked`).
+
 ## Usage
 ```
-ab_certify.sh <arch> <dev> <card> <model> <kernel> <label> [B_env] [B_swap.hip]
+ab_certify.sh    <arch> <dev> <card> <model> <kernel> <label> [B_env] [B_swap.hip]   # v1 shared-tree
+ab_certify_v2.sh <arch> <dev> <card> <model> <kernel> <label> <variant.hip>          # v2 worktree
+oracle_db.py     banked | wins | best <a> <k> | history <a> <k> | kernel <a> <k> | summary
 ```

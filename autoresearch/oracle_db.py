@@ -13,6 +13,7 @@ Usage:
   oracle_db.py history <arch> <kernel> # full A/B history for a kernel
   oracle_db.py kernel <arch> <kernel>  # roofline + register history (the WHY)
   oracle_db.py summary                 # per-arch tally (wins/losses/noise/void)
+  oracle_db.py banked                  # compounded perf banked from committed durable wins
 """
 import json, sys, glob, os, collections
 
@@ -75,6 +76,31 @@ def kernel(arch, kernel):
               f"{str(rf.get('wall_pct')):>6}{str(rf.get('l2_hit_pct')):>7}{str(rf.get('occ')):>6}"
               f"{str(rf.get('mem_busy')):>6}{str(rf.get('vgpr')):>6}{str(rf.get('lds')):>6}{str(rf.get('scratch')):>5}  {rf.get('roofline','')}")
 
+def banked():
+    """Compounded perf BANKED from committed, durable wins — the reward-hack scoreboard.
+    Only wins that were git-committed AND passed the serve_harness durability gate
+    count (the ledger records losses too, but they never bank). Per kernel, successive
+    optimizations COMPOUND: product of (1+Δ)."""
+    comp = collections.defaultdict(lambda: [1.0, 0])   # (arch,kernel) -> [product, count]
+    for r in load():
+        if r.get("verdict") == "WIN" and r.get("committed") and r.get("durable") != "FAIL":
+            comp[(r["arch"], r["kernel"])][0] *= (1 + (r.get("delta_pct") or 0) / 100.0)
+            comp[(r["arch"], r["kernel"])][1] += 1
+    if not comp:
+        print("  no committed wins banked yet — the counter moves only on a committed, durable win")
+        return
+    per_arch = collections.defaultdict(lambda: [1.0, 0])
+    for (arch, k), (p, n) in sorted(comp.items(), key=lambda x: -x[1][0]):
+        print(f"  {arch:<8} {k:<42} {n} win(s) -> +{(p-1)*100:6.2f}% compounded")
+        per_arch[arch][0] *= p
+        per_arch[arch][1] += n
+    print("  " + "-" * 68)
+    total = 0
+    for arch, (p, n) in sorted(per_arch.items()):
+        print(f"  {arch:<8} TOTAL: {n} wins banked, +{(p-1)*100:.2f}% compounded across its kernels")
+        total += n
+    print(f"  ══ {total} wins banked across the fleet ══")
+
 def summary():
     tally = collections.defaultdict(lambda: collections.Counter())
     for r in load():
@@ -91,6 +117,7 @@ def main():
         return
     cmd = a[0]
     if cmd == "wins": wins()
+    elif cmd == "banked": banked()
     elif cmd == "summary": summary()
     elif cmd in ("best", "history", "kernel") and len(a) >= 3: globals()[cmd](a[1], a[2])
     else: print(__doc__)
