@@ -3842,6 +3842,12 @@ struct SpecRun {
     prefill_s: f64,
     total_s: f64,
     decode_s: f64,
+    /// Wall time spent strictly inside `spec.step` (forward + sample kernels)
+    /// summed across the decode loop — the kernel-only decode time. Excludes the
+    /// per-token programmatic layer (emit/detok/SSE/detectors/eviction), so
+    /// `generated / kernel_decode_s` is the kernel-only decode rate and
+    /// `decode_s - kernel_decode_s` is the per-token serving overhead.
+    kernel_decode_s: f64,
 }
 
 fn generate_dflash(
@@ -4161,6 +4167,16 @@ fn generate_dflash(
     } else {
         0.0
     };
+    // Kernel-only decode rate: the generated tokens over ONLY the summed
+    // `spec.step` time, excluding the per-token programmatic layer.
+    // `decode_overhead_ms` is that programmatic layer's total cost across the
+    // turn (serve decode time − kernel time).
+    let kernel_decode_tok_s = if run.kernel_decode_s > 0.0 {
+        run.generated as f64 / run.kernel_decode_s
+    } else {
+        decode_tok_s
+    };
+    let decode_overhead_ms = (run.decode_s - run.kernel_decode_s).max(0.0) * 1000.0;
     // New-token count (not full rendered length) so the prefill rate reflects
     // actual work on a cache HIT/resume — matches every other path's numerator.
     let prefill_tok_s = if run.prefill_s > 0.0 {
@@ -4195,7 +4211,7 @@ fn generate_dflash(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"kernel_decode_tok_s":{:.1},"decode_overhead_ms":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
         // `prefill_tokens` is the NEWLY-prefilled count (the suffix actually fed
         // through the model), NOT the full rendered length — the CLI computes
         // `prompt_tokens = cached + prefill`, so reporting the full length here
@@ -4207,6 +4223,8 @@ fn generate_dflash(
         run.prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
+        kernel_decode_tok_s,
+        decode_overhead_ms,
         run.prefill_s * 1000.0,
         tau,
         run.spec_cycles,
@@ -4491,6 +4509,10 @@ fn generate_spec(
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
     let mut generated = 0usize;
+    // Accumulates time strictly inside `spec.step` (forward + sample kernels) so
+    // the done event can report a kernel-only decode rate separately from the
+    // per-token programmatic overhead.
+    let mut kernel_decode_ns: u128 = 0;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -4590,7 +4612,10 @@ fn generate_spec(
         // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let step = match spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar()) {
+        let t_step = Instant::now();
+        let step_result = spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar());
+        kernel_decode_ns += t_step.elapsed().as_nanos();
+        let step = match step_result {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(
@@ -4784,6 +4809,7 @@ fn generate_spec(
         prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
         total_s: t_end.duration_since(t0).as_secs_f64(),
         decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
+        kernel_decode_s: kernel_decode_ns as f64 / 1e9,
     })
 }
 
@@ -8726,6 +8752,11 @@ fn generate(
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
+        // Accumulates the per-token programmatic render cost (emit_committed_event
+        // + detok + marker filter + SSE flush) so the done event can report a
+        // kernel-only decode rate (decode time minus this overhead) separately
+        // from the serving overhead.
+        let mut emit_overhead_ns: u128 = 0;
         while generated < max_tokens {
             // Decode-side abort check. Client cancel (Pi 4-min idle
             // timeout firing while the CLI buffers tokens for tool-call
@@ -8780,6 +8811,7 @@ fn generate(
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            let t_emit = Instant::now();
             emit_committed_event(
                 stdout,
                 id,
@@ -8803,6 +8835,7 @@ fn generate(
                 );
                 let _ = stdout.flush();
             }
+            emit_overhead_ns += t_emit.elapsed().as_nanos();
 
             // Write this token's K/V to the cache FIRST so the next turn
             // always starts from a fully-written context. Breaking before
@@ -9414,6 +9447,18 @@ fn generate(
         } else {
             0.0
         };
+        // Kernel-only decode rate: decode time minus the summed per-token
+        // programmatic render cost (emit/detok/filter/SSE). `decode_overhead_ms`
+        // is the serving overhead separating it from the user-facing
+        // `decode_tok_s`.
+        let emit_overhead_s = emit_overhead_ns as f64 / 1e9;
+        let kernel_decode_s = (decode_s - emit_overhead_s).max(0.0);
+        let kernel_decode_tok_s = if kernel_decode_s > 0.0 {
+            generated as f64 / kernel_decode_s
+        } else {
+            decode_tok_s
+        };
+        let decode_overhead_ms = emit_overhead_s * 1000.0;
         // finish_reason carried in `done` so the CLI doesn't have to
         // infer it from whether tool_calls were emitted (matches V4F).
         //
@@ -9437,7 +9482,7 @@ fn generate(
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"kernel_decode_tok_s":{:.1},"decode_overhead_ms":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
             id,
             generated,
             tok_s,
@@ -9445,6 +9490,8 @@ fn generate(
             prefill_s * 1000.0,
             prefill_tok_s,
             decode_tok_s,
+            kernel_decode_tok_s,
+            decode_overhead_ms,
             prefill_s * 1000.0,
             cached_tokens_count,
             finish_reason,
