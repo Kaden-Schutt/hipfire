@@ -1247,6 +1247,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-deepseek4-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-dots-ocr"
 version = "0.3.0"
 dependencies = [
@@ -1257,6 +1264,13 @@ dependencies = [
  "image",
  "rdna-compute",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-dots-ocr-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1294,6 +1308,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-gemma3-vl-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-lfm2moe"
 version = "0.1.0"
 dependencies = [
@@ -1303,6 +1324,13 @@ dependencies = [
  "rdna-compute",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-lfm2moe-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1335,6 +1363,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-minimax-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-nemotron"
 version = "0.3.0"
 dependencies = [
@@ -1351,6 +1386,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-nemotron-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-qwen2"
 version = "0.3.0"
 dependencies = [
@@ -1359,6 +1401,13 @@ dependencies = [
  "hipfire-runtime",
  "rdna-compute",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-qwen2-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1382,6 +1431,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen35-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-qwen35-vl"
 version = "0.3.0"
 dependencies = [
@@ -1391,6 +1447,24 @@ dependencies = [
  "rdna-compute",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-specs"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+ "hipfire-arch-deepseek4-spec",
+ "hipfire-arch-dots-ocr-spec",
+ "hipfire-arch-gemma3-spec",
+ "hipfire-arch-gemma3-vl-spec",
+ "hipfire-arch-lfm2moe-spec",
+ "hipfire-arch-llama-spec",
+ "hipfire-arch-minimax-spec",
+ "hipfire-arch-nemotron-spec",
+ "hipfire-arch-qwen2-spec",
+ "hipfire-arch-qwen35-spec",
+ "hipfire-arch-zaya-spec",
 ]
 
 [[package]]
@@ -1419,12 +1493,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-zaya-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-archs"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
- "hipfire-arch-gemma3-spec",
- "hipfire-arch-llama-spec",
+ "hipfire-arch-specs",
  "hipfire-arch-toy",
 ]
 
@@ -1785,8 +1865,7 @@ dependencies = [
  "byteorder",
  "faer",
  "hipfire-arch-api",
- "hipfire-arch-gemma3-spec",
- "hipfire-arch-llama-spec",
+ "hipfire-arch-specs",
  "hipfire-kvquant",
  "hipfire-lock",
  "hipfire-primitives",

@@ -40,7 +40,10 @@
 //! bodies live in the arch crates that `impl` them, not here.
 
 pub mod ingest;
-pub use ingest::{allocate, target_bits, CapReq, CodecCaps, Ingest, TensorRole};
+pub use ingest::{
+    allocate, default_importance, default_requires, target_bits, transformer_role, CapReq,
+    CodecCaps, Ingest, TensorRole,
+};
 
 /// Stable numeric identity of an architecture family (the on-disk/header id).
 ///

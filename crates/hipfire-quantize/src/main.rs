@@ -3194,12 +3194,11 @@ fn is_q8_tensor(name: &str) -> bool {
         || name.ends_with(".mixer.gate.weight")
 }
 
-// Force-link the migrated arch `-spec` crates so their `register_arch!`
-// link-time registrations are present (Rust drops unreferenced rlibs). Each lean
-// spec crate is CPU-only (deps only hipfire-arch-api), so the quantizer stays
-// GPU-free. Add a line here as each family migrates.
-use hipfire_arch_gemma3_spec as _;
-use hipfire_arch_llama_spec as _;
+// Force-link the offline specs bundle so every migrated arch's `register_arch!`
+// Ingest registration is present (Rust drops unreferenced rlibs). The bundle and
+// all its `-spec` crates are CPU-only (deps only hipfire-arch-api), so the quantizer
+// stays GPU-free. Adding a family touches hipfire-arch-specs, not this crate.
+use hipfire_arch_specs as _;
 
 static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
     std::sync::OnceLock::new();
@@ -13954,8 +13953,7 @@ mod tests {
             q8_precision_via_caps(0, "model.layers.0.mlp.up_proj.weight", 300),
             Some(true)
         );
-        // gemma3 (arch_id 12) is the second migrated family — its Ingest resolves
-        // through the same registry, no per-arch code in the quantizer.
+        // gemma3 (12) resolves through the same registry — no per-arch quantizer code.
         assert_eq!(
             q8_precision_via_caps(12, "model.embed_tokens.weight", 4096),
             Some(true)
@@ -13964,11 +13962,18 @@ mod tests {
             q8_precision_via_caps(12, "model.layers.0.mlp.up_proj.weight", 4096),
             Some(false)
         );
-        // An unmigrated arch (no Ingest linked) → None → caller uses is_q8_tensor.
+        // Every family is migrated now: e.g. deepseek4 (9) protects its MLA
+        // compressor (the old is_deepseek4_keep_f16), and a MoE expert (11) compresses.
         assert_eq!(
-            q8_precision_via_caps(14, "backbone.layers.0.mixer.up_proj.weight", 4096),
-            None
+            q8_precision_via_caps(9, "model.layers.0.self_attn.compressor.wkv.weight", 4096),
+            Some(true)
         );
+        assert_eq!(
+            q8_precision_via_caps(11, "model.layers.0.mlp.experts.2.up_proj.weight", 4096),
+            Some(false)
+        );
+        // A genuinely unregistered arch id → None → caller uses is_q8_tensor.
+        assert_eq!(q8_precision_via_caps(200, "whatever.weight", 4096), None);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-zaya-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the Zyphra ZAYA1 MoE family (arch_id 16): identity + Ingest quant-policy, no runtime/kernel deps."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

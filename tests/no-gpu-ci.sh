@@ -18,8 +18,7 @@ cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
 cargo test -p hipfire-quantize fixture
 cargo test -p hipfire-arch-api --lib
-cargo test -p hipfire-arch-llama-spec --lib
-cargo test -p hipfire-arch-gemma3-spec --lib
+cargo test -p hipfire-arch-specs --lib
 cargo test -p hipfire-arch-toy --lib
 cargo test -p hipfire-archs --lib
 cargo test -p hipfire-arch-llama --lib caps

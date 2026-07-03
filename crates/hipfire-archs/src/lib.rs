@@ -24,10 +24,10 @@ use std::sync::OnceLock;
 /// Force-link every arch crate so its `register_arch!` submissions are pulled into
 /// the final binary. Referencing the crate (even as `_`) creates the link edge.
 mod force_link {
+    // Every migrated family's offline Ingest spec (llama, qwen, gemma3, deepseek4,
+    // nemotron, …), via the lean bundle.
     #[allow(unused_imports)]
-    use hipfire_arch_gemma3_spec as _;
-    #[allow(unused_imports)]
-    use hipfire_arch_llama_spec as _;
+    use hipfire_arch_specs as _;
     #[allow(unused_imports)]
     use hipfire_arch_toy as _;
 }
@@ -96,8 +96,12 @@ mod tests {
 
         // Ids CURRENTLY migrated onto the capability layer. Add one per family as
         // it moves over; a mismatch means either a dropped registration or an
-        // untracked addition. (0x00 = llama, 0x0C = gemma3, 0xFF = toy.)
-        let expected: BTreeSet<u16> = [0x00, 0x0C, 0xFF].into_iter().collect();
+        // untracked addition. Ids: 0 llama, 1 qwen2/3, 5 qwen3.5, 6 qwen3.5-moe,
+        // 8 dots-ocr, 9 deepseek4, 10 minimax, 11 lfm2, 12 gemma3, 13 gemma3-vl,
+        // 14 nemotron-h, 15 mamba2, 16 zaya, 0xFF toy.
+        let expected: BTreeSet<u16> = [0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0xFF]
+            .into_iter()
+            .collect();
         assert_eq!(
             unique, expected,
             "arch migration ledger drift — update the expected set as families \

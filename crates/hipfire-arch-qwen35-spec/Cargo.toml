@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-qwen35-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the Qwen3.5 family (arch_id 5 dense, 6 MoE): identity + Ingest quant-policy, no runtime/kernel deps."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-nemotron-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the Nemotron-H (arch_id 14) and Mamba-2 (arch_id 15) families: identity + Ingest quant-policy, no runtime/kernel deps."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

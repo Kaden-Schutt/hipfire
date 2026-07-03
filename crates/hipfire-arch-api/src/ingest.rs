@@ -128,9 +128,129 @@ pub fn allocate<'a>(
         .max_by(|a, b| a.bits_per_weight.total_cmp(&b.bits_per_weight))
 }
 
+// ---------------------------------------------------------------------------
+// Shared policy helpers. Most families' quant policy is the same "protect the
+// gather tables + attention + norms, compress the FFN/expert bulk" prior; these
+// let a family's `-spec` crate be a ~6-line delegation. Families override where
+// they genuinely differ (MLA compressors, SSM protections, …).
+// ---------------------------------------------------------------------------
+
+/// Name→role classifier covering the transformer families (dense, MoE, and the
+/// SSM/hybrid mixers). Checked most-specific first.
+pub fn transformer_role(name: &str) -> TensorRole {
+    if name.contains("embed") {
+        TensorRole::Embed
+    } else if name.contains("lm_head") {
+        TensorRole::LmHead
+    // MoE routers: small but routing-sensitive (must resolve before generic mlp).
+    } else if name.ends_with("mlp.gate.weight")
+        || name.ends_with("shared_expert_gate.weight")
+        || name.ends_with(".mixer.gate.weight")
+        || name.ends_with(".router.weight")
+        || name.ends_with("block_sparse_moe.gate.weight")
+    {
+        TensorRole::Router
+    // MoE experts: the bulk of a sparse model.
+    } else if name.contains(".experts.") || name.contains(".expert.") {
+        TensorRole::Expert
+    // Short convolution (Mamba / LFM2 / DeltaNet): tiny, runs every token.
+    } else if name.contains("conv1d") {
+        TensorRole::Conv1d
+    // Attention / SSM ingress projections (incl. linear/delta attn, Mamba in_proj).
+    } else if name.contains("q_proj")
+        || name.contains("k_proj")
+        || name.contains("v_proj")
+        || name.contains("qkv")
+        || name.contains("self_attn")
+        || name.contains("linear_attn")
+        || name.contains("in_proj")
+    {
+        TensorRole::AttnProj
+    // Residual writers: attention/SSM output projections that accumulate into the
+    // residual stream.
+    } else if name.contains("o_proj") || name.contains("out_proj") {
+        TensorRole::ResidualWriter
+    } else if name.contains("gate_proj")
+        || name.contains("up_proj")
+        || name.contains("down_proj")
+        || name.contains("mlp.")
+        || name.contains("ffn")
+    {
+        TensorRole::Mlp
+    } else if name.contains("norm") {
+        TensorRole::Norm
+    } else {
+        TensorRole::Other
+    }
+}
+
+/// Default importance prior for a role: protect the gather tables, attention,
+/// residual writers, norms and routers at high precision; compress the FFN/expert
+/// bulk. A structural prior only — the quantizer refines the actual bits later.
+pub fn default_importance(role: TensorRole) -> u8 {
+    match role {
+        TensorRole::Embed
+        | TensorRole::LmHead
+        | TensorRole::Norm
+        | TensorRole::AttnProj
+        | TensorRole::ResidualWriter
+        | TensorRole::Router
+        | TensorRole::Conv1d => 255,
+        TensorRole::Mlp | TensorRole::Expert => 128,
+        TensorRole::Other => 160,
+    }
+}
+
+/// Default requirements for a role: only the gather-indexed tables need random
+/// access.
+pub fn default_requires(role: TensorRole) -> CapReq {
+    match role {
+        TensorRole::Embed | TensorRole::LmHead => CapReq::RANDOM_ACCESS,
+        _ => CapReq::NONE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transformer_role_classifies_families() {
+        assert_eq!(
+            transformer_role("model.embed_tokens.weight"),
+            TensorRole::Embed
+        );
+        assert_eq!(transformer_role("lm_head.weight"), TensorRole::LmHead);
+        assert_eq!(
+            transformer_role("model.layers.0.mlp.gate.weight"),
+            TensorRole::Router
+        );
+        assert_eq!(
+            transformer_role("model.layers.0.mlp.experts.3.up_proj.weight"),
+            TensorRole::Expert
+        );
+        assert_eq!(
+            transformer_role("model.layers.0.self_attn.q_proj.weight"),
+            TensorRole::AttnProj
+        );
+        assert_eq!(
+            transformer_role("backbone.layers.0.mixer.out_proj.weight"),
+            TensorRole::ResidualWriter
+        );
+        assert_eq!(
+            transformer_role("backbone.layers.0.mixer.conv1d.weight"),
+            TensorRole::Conv1d
+        );
+        assert_eq!(
+            transformer_role("model.layers.0.mlp.up_proj.weight"),
+            TensorRole::Mlp
+        );
+        assert_eq!(transformer_role("model.norm.weight"), TensorRole::Norm);
+        // The protected set is high-importance; the FFN/expert bulk is compressible.
+        assert!(default_importance(TensorRole::AttnProj) > default_importance(TensorRole::Mlp));
+        assert_eq!(default_requires(TensorRole::Embed), CapReq::RANDOM_ACCESS);
+        assert_eq!(default_requires(TensorRole::Mlp), CapReq::NONE);
+    }
 
     // Generic codec descriptors. NOTE: deliberately NOT real format names — this
     // crate must stay format-token-free (the purity gate greps it). The allocator
