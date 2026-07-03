@@ -32,6 +32,11 @@ pub struct RuntimeConfig {
     pub ngram_loop_threshold: usize,
     pub ngram_window: usize,
     pub devices: Option<String>,
+    /// Debug: `HIPFIRE_EMULATE_GPUS=N` makes the engine treat the single
+    /// physical GPU as N logical devices (all aliased to device 0), so the
+    /// multi-GPU (PP / EP) paths run on one card. Values < 2 = off. See
+    /// docs/superpowers/specs/2026-07-03-emulate-gpus-dual-gpu-design.md.
+    pub emulate_gpus: Option<usize>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub lm_head_f16: String,
@@ -100,6 +105,10 @@ impl RuntimeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
             devices: std::env::var("HIPFIRE_DEVICES").ok(),
+            emulate_gpus: std::env::var("HIPFIRE_EMULATE_GPUS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 2),
             allow_mixed_arch: std::env::var("HIPFIRE_ALLOW_MIXED_ARCH").ok().as_deref()
                 == Some("1"),
             uniform_vram_tolerance_gb: std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
@@ -135,6 +144,29 @@ mod tests {
         match prev {
             Some(value) => std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", value),
             None => std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT"),
+        }
+    }
+
+    #[test]
+    fn emulate_gpus_parses_and_filters() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HIPFIRE_EMULATE_GPUS").ok();
+
+        std::env::set_var("HIPFIRE_EMULATE_GPUS", "2");
+        assert_eq!(RuntimeConfig::from_env().emulate_gpus, Some(2));
+
+        std::env::set_var("HIPFIRE_EMULATE_GPUS", "1"); // < 2 = off
+        assert_eq!(RuntimeConfig::from_env().emulate_gpus, None);
+
+        std::env::set_var("HIPFIRE_EMULATE_GPUS", "abc"); // unparseable = off
+        assert_eq!(RuntimeConfig::from_env().emulate_gpus, None);
+
+        std::env::remove_var("HIPFIRE_EMULATE_GPUS");
+        assert_eq!(RuntimeConfig::from_env().emulate_gpus, None);
+
+        match prev {
+            Some(v) => std::env::set_var("HIPFIRE_EMULATE_GPUS", v),
+            None => std::env::remove_var("HIPFIRE_EMULATE_GPUS"),
         }
     }
 }
