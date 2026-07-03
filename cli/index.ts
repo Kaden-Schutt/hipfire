@@ -511,6 +511,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     if (Number.isInteger(tp) && tp > 1) params.tp = tp;
   }
 
+  // Pipeline-parallel degree (PP). `HIPFIRE_PP=N` routes qwen35 (dense/MoE)
+  // through the daemon's load_model_pp (layers banded across N ranks).
+  // Forwarded only when > 1 so single-GPU loads stay byte-identical; mutually
+  // exclusive with tp. Primary use: exercising PP under HIPFIRE_EMULATE_GPUS.
+  {
+    const pp = parseInt(process.env.HIPFIRE_PP ?? "1", 10);
+    if (Number.isInteger(pp) && pp > 1) params.pp = pp;
+  }
+
   // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
   // applies size-aware default so 27B+ gets asym4 automatically. Daemon
   // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
