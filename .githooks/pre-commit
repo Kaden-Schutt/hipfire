@@ -52,7 +52,14 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACMR)
 # otherwise trigger the full GPU gate battery on a docs-only commit. Strip
 # docs/markdown for the HEAVY-GATE hotspot decisions below (lint still runs on
 # the full staged set via STAGED_RS).
-CODE_CHANGED=$(echo "$CHANGED" | grep -vE '(^|/)docs/|\.md$' || true)
+#
+# `benchmarks/` is stripped for the same reason: bench harnesses, scratch
+# `.hip` files, and captured result JSON are NOT part of the shipped engine
+# build (each bench compiles standalone via its own build.sh), so they cannot
+# change forward-pass output or speed. Without this, a standalone bench `.hip`
+# (e.g. benchmarks/npu_gpu_dmabuf/*.hip) matches the `\.hip$` hotspot and
+# false-triggers the ~2-4 min coherence battery on a bench-only commit.
+CODE_CHANGED=$(echo "$CHANGED" | grep -vE '(^|/)docs/|(^|/)benchmarks/|\.md$' || true)
 
 # ── Fast-track lint gates (every commit that stages Rust) ────────────────
 # rustfmt + clippy run BEFORE the path-gated heavy GPU gates and regardless of
