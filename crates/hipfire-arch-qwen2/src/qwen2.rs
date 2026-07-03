@@ -37,7 +37,7 @@ use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
 use hipfire_runtime::dispatch::gemv_family;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::f16_to_f32;
-use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::weights::{weight_gemm, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -583,7 +583,15 @@ fn load_bias_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResul
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        qt => panic!("qwen2: expected F16/F32 for bias {name}, got qt={qt}"),
+        // BF16 (qt=16): Qwen2 attention biases come through as BF16 whenever
+        // the source checkpoint is BF16 (e.g. Qwen2.5 safetensors). BF16→F32
+        // is the exact high-16-bits widening, and the bias is uploaded as F32
+        // regardless, so accept it losslessly instead of panicking.
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
+        qt => panic!("qwen2: expected F16/F32/BF16 for bias {name}, got qt={qt}"),
     };
     assert_eq!(
         f32_data.len(),
@@ -1010,35 +1018,6 @@ fn forward_step_after_x(
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
 
-        // (1) RMSNorm(x → tmp) with input_layernorm.
-        gpu.rmsnorm_f32(&state.x, &layer.attn_norm, &state.tmp, cfg.rms_norm_eps)?;
-
-        // (2) QKV projection. fused_qkv_hfq4g256 expects all three weights
-        // to be HFQ4G256; otherwise fall through to three individual
-        // weight_gemv calls. This keeps the bring-up path open for F16
-        // weights (qt=1) while the HFQ4G256 fast path is the default.
-        let all_hfq4g256 = layer.wq.gpu_dtype == DType::HFQ4G256
-            && layer.wk.gpu_dtype == DType::HFQ4G256
-            && layer.wv.gpu_dtype == DType::HFQ4G256;
-        if all_hfq4g256 {
-            gpu.fused_qkv_hfq4g256(
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                &state.tmp,
-                &state.q,
-                &state.k,
-                &state.v,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-            )?;
-        } else {
-            weight_gemv(gpu, &layer.wq, &state.tmp, &state.q)?;
-            weight_gemv(gpu, &layer.wk, &state.tmp, &state.k)?;
-            weight_gemv(gpu, &layer.wv, &state.tmp, &state.v)?;
-        }
         // (1–2) RMSNorm + QKV projection via execute_steps.
         // The interpreter selects FusedQkvHfq4G256 / fused-MQ / per-op
         // based on dtype — no model-side branching.
@@ -1214,10 +1193,10 @@ fn forward_step_after_x(
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
-        // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
-        weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
-        weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
-        // SwiGLU activation + w_down + residual.
+        // (10) SwiGLU activation + w_down + residual. gate/up are produced by
+        // the execute_steps Prerotated Gemv above (the hand weight_gemv pair
+        // that used to recompute them from the un-rotated plain norm was dead
+        // double-compute — it overwrote the lowered result unread downstream).
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         let wrd = layer.w_down.dispatch_ref();
         execute_steps(
