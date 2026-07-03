@@ -4092,6 +4092,9 @@ fn pack_qtip_real_tensors(
         eprintln!("  qtip{bits} (real): embed/lm_head → Q8F16 ({n_q8} tensors, gather-friendly)");
     }
     let (mut n_packed, mut max_err) = (0usize, 0.0f32);
+    // Coarse per-phase wall-time (rotate / encode / pack), accumulated across tensors.
+    use std::time::{Duration, Instant};
+    let (mut t_rot, mut t_enc, mut t_pack) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     // Optional LQER low-rank correction: when `lowrank_r > 0`, each packed tensor
     // also emits a rank-r factorization (U,V) of its ROTATED-frame quant error
     // E_rot = W_rot − dequant(Q(W_rot)) as `<base>.lr_u/.lr_v` sidecars. The
@@ -4125,6 +4128,7 @@ fn pack_qtip_real_tensors(
             .collect();
         // Phase 1 — FWHT-rotate every group into the incoherent frame (CPU,
         // parallel over rows). `rotated` holds the [m*k] rotated weights.
+        let _t_rot = Instant::now();
         let mut rotated = vec![0.0f32; m * k];
         rotated
             .par_chunks_mut(k)
@@ -4137,11 +4141,13 @@ fn pack_qtip_real_tensors(
                     orow[g * 256..g * 256 + 256].copy_from_slice(&grp);
                 }
             });
+        t_rot += _t_rot.elapsed();
 
         // Phase 2 — trellis-encode the rotated groups → `symbols` [m*k]. GPU exact
         // Viterbi when a device was autodetected, else CPU beam. The CPU path is
         // byte-preserving vs the historical encode; the GPU path is optimal (≥ beam)
         // so its symbols differ (better) — a valid, self-consistent .hfq either way.
+        let _t_enc = Instant::now();
         let ng = m * groups;
         #[cfg(feature = "gpu")]
         let symbols: Vec<u8> = match gpu.as_mut() {
@@ -4160,9 +4166,11 @@ fn pack_qtip_real_tensors(
         };
         #[cfg(not(feature = "gpu"))]
         let symbols: Vec<u8> = cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits);
+        t_enc += _t_enc.elapsed();
 
         // Phase 3 — refit the closed-form optimal scale, self-check (rotated-frame
         // decode err), and pack (CPU, parallel over rows).
+        let _t_pack = Instant::now();
         let row_out: Vec<(Vec<u8>, f32, Vec<f32>)> = rotated
             .par_chunks(k)
             .zip(symbols.par_chunks(k))
@@ -4192,6 +4200,7 @@ fn pack_qtip_real_tensors(
                 (packed, rerr, erow)
             })
             .collect();
+        t_pack += _t_pack.elapsed();
         let mut data = Vec::with_capacity(row_out.len() * groups * block_bytes);
         let mut e_rot = if want_lr {
             Vec::with_capacity(m * k)
@@ -4245,6 +4254,12 @@ fn pack_qtip_real_tensors(
         } else {
             String::new()
         }
+    );
+    eprintln!(
+        "  qtip{bits} (real): phase wall-time — rotate {:.2}s  encode {:.2}s  pack {:.2}s",
+        t_rot.as_secs_f64(),
+        t_enc.as_secs_f64(),
+        t_pack.as_secs_f64()
     );
 }
 

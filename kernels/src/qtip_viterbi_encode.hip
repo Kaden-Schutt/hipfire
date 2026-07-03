@@ -33,6 +33,12 @@
 #define QTIP_INV_STD  (0.9959345134f)
 #define QTIP_NSTATES  4096
 #define QTIP_BIG      1e30f
+// 12-bit rotate. `dp` is indexed by ROTL(state, bits) so a state's 2^bits
+// predecessors (which differ in s_prev's top `bits` bits) map to contiguous LDS
+// slots in distinct banks, killing the stride-2^(12-bits) 16-way bank conflict.
+// hs = 12 - bits (passed to avoid recompute).
+#define QTIP_ROTL(x, b, hs) (((unsigned)((x) << (b)) | (unsigned)((x) >> (hs))) & 0xFFFu)
+#define QTIP_ROTR(x, b, hs) (((unsigned)((x) >> (b)) | (unsigned)((x) << (hs))) & 0xFFFu)
 
 // state (12-bit) -> ~N(0,1) computed codebook. Matches qtip::decode_1mad + renorm.
 __device__ __forceinline__ float qtip_decode(unsigned int state) {
@@ -95,28 +101,31 @@ extern "C" __global__ __launch_bounds__(256) void qtip_viterbi_encode(
             const float cbv = scale * qtip_decode((unsigned int)s_new);
             const float diff = wv - cbv;
             const float d2 = diff * diff;
-            const int base = s_new >> bits; // low (12-bits) bits of every predecessor
+            // The 2^bits predecessors of s_new are, in the permuted `dp` layout,
+            // the contiguous slots [pbase, pbase+2^bits) — one per LDS bank.
+            const int pbase = (s_new >> bits) << bits;
             float best = QTIP_BIG;
             int besth = 0;
             for (int h = 0; h < numsym; h++) {
-                const int s_prev = (h << hshift) | base;
-                const float c = dp[cur][s_prev];
+                const float c = dp[cur][pbase + h];
                 if (c < best) { best = c; besth = h; }
             }
-            dp[nxt][s_new] = best + d2;
+            dp[nxt][QTIP_ROTL(s_new, bits, hshift)] = best + d2;
             bp[(long long)pos * QTIP_NSTATES + s_new] = (unsigned char)besth;
         }
         __syncthreads();
         cur = nxt;
     }
 
-    // Backtrack (thread 0): argmin final state, then walk predecessors.
+    // Backtrack (thread 0): argmin over the permuted final dp → perm index, mapped
+    // back to the actual state; then walk predecessors (bp is actual-indexed).
     if (tid == 0) {
-        int state = 0;
+        int pidx = 0;
         float best = QTIP_BIG;
-        for (int s = 0; s < QTIP_NSTATES; s++) {
-            if (dp[cur][s] < best) { best = dp[cur][s]; state = s; }
+        for (int p = 0; p < QTIP_NSTATES; p++) {
+            if (dp[cur][p] < best) { best = dp[cur][p]; pidx = p; }
         }
+        int state = (int)QTIP_ROTR(pidx, bits, hshift);
         for (int pos = 255; pos >= 0; pos--) {
             symbols_out[(long long)g * 256 + pos] = (unsigned char)(state & symmask);
             const int h = bp[(long long)pos * QTIP_NSTATES + state];
