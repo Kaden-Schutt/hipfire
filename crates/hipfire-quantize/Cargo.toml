@@ -20,6 +20,7 @@ gpu = ["dep:rdna-compute", "dep:hipfire-lock"]
 # first family so wired; more `-spec` crates are added here as families migrate.
 hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
+hipfire-arch-gemma3-spec = { path = "../hipfire-arch-gemma3-spec" }
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-primitives = { path = "../hipfire-primitives" }

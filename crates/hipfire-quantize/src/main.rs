@@ -3198,6 +3198,7 @@ fn is_q8_tensor(name: &str) -> bool {
 // link-time registrations are present (Rust drops unreferenced rlibs). Each lean
 // spec crate is CPU-only (deps only hipfire-arch-api), so the quantizer stays
 // GPU-free. Add a line here as each family migrates.
+use hipfire_arch_gemma3_spec as _;
 use hipfire_arch_llama_spec as _;
 
 static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
@@ -13952,6 +13953,16 @@ mod tests {
         assert_eq!(
             q8_precision_via_caps(0, "model.layers.0.mlp.up_proj.weight", 300),
             Some(true)
+        );
+        // gemma3 (arch_id 12) is the second migrated family — its Ingest resolves
+        // through the same registry, no per-arch code in the quantizer.
+        assert_eq!(
+            q8_precision_via_caps(12, "model.embed_tokens.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            q8_precision_via_caps(12, "model.layers.0.mlp.up_proj.weight", 4096),
+            Some(false)
         );
         // An unmigrated arch (no Ingest linked) → None → caller uses is_q8_tensor.
         assert_eq!(

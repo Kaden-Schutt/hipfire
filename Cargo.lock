@@ -1272,6 +1272,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-gemma3-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-gemma3-vl"
 version = "0.3.0"
 dependencies = [
@@ -1416,6 +1423,7 @@ name = "hipfire-archs"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "hipfire-arch-gemma3-spec",
  "hipfire-arch-llama-spec",
  "hipfire-arch-toy",
 ]
@@ -1777,6 +1785,7 @@ dependencies = [
  "byteorder",
  "faer",
  "hipfire-arch-api",
+ "hipfire-arch-gemma3-spec",
  "hipfire-arch-llama-spec",
  "hipfire-kvquant",
  "hipfire-lock",

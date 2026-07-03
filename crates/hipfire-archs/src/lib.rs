@@ -25,6 +25,8 @@ use std::sync::OnceLock;
 /// the final binary. Referencing the crate (even as `_`) creates the link edge.
 mod force_link {
     #[allow(unused_imports)]
+    use hipfire_arch_gemma3_spec as _;
+    #[allow(unused_imports)]
     use hipfire_arch_llama_spec as _;
     #[allow(unused_imports)]
     use hipfire_arch_toy as _;
@@ -94,8 +96,8 @@ mod tests {
 
         // Ids CURRENTLY migrated onto the capability layer. Add one per family as
         // it moves over; a mismatch means either a dropped registration or an
-        // untracked addition. (0x00 = llama offline spec, 0xFF = toy.)
-        let expected: BTreeSet<u16> = [0x00, 0xFF].into_iter().collect();
+        // untracked addition. (0x00 = llama, 0x0C = gemma3, 0xFF = toy.)
+        let expected: BTreeSet<u16> = [0x00, 0x0C, 0xFF].into_iter().collect();
         assert_eq!(
             unique, expected,
             "arch migration ledger drift — update the expected set as families \
