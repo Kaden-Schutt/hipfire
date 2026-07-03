@@ -3,15 +3,37 @@ name = "hipfire-quantize"
 version.workspace = true
 edition.workspace = true
 
+# The quantizer is CPU-only by default-buildable: `--no-default-features` drops the
+# GPU dep entirely (pure-CPU build for HIP-less machines). With the default `gpu`
+# feature the GPU trellis encoder is LINKED but only USED when a device is
+# autodetected at runtime (Gpu::init); otherwise it falls back to the CPU beam
+# encoder. So all functionality is available CPU-only, and a GPU is used when present.
+[features]
+default = ["gpu"]
+# `gpu` pulls the GPU trellis encoder AND the shared flock so the quantizer
+# self-coordinates the GPU it acquires (no external `hipfire lock` needed).
+gpu = ["dep:rdna-compute", "dep:hipfire-lock"]
+
 [dependencies]
+# Capability layer (all LEAF/CPU-only, no GPU/runtime deps): consult a migrated
+# arch's Ingest quant-policy instead of the legacy name-matching. hipfire-arch-specs
+# force-links every family `-spec` crate, so adding a family never touches this crate.
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-quant-format = { path = "../hipfire-quant-format" }
+hipfire-gguf = { path = "../hipfire-gguf" }
 hipfire-primitives = { path = "../hipfire-primitives" }
-memmap2 = "0.9"
-serde = { version = "1", features = ["derive"] }
+# GPU QTIP trellis encoder (offline accel). Optional + runtime-autodetected.
+rdna-compute = { path = "../rdna-compute", optional = true }
+# Shared flock(2) GPU resource lock — held automatically while the quantizer uses
+# the GPU, so it cooperates with the daemon/benches (AGENTS.md: one lock primitive).
+hipfire-lock = { path = "../hipfire-lock", optional = true }
+memmap2.workspace = true
+serde.workspace = true
 serde_json = "1"
 byteorder = "1"
-rayon = "1"
+rayon.workspace = true
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 # Linear algebra for QTIP-LDLQ (Phase C1e): damped Cholesky / inverse-Cholesky
 # of per-layer Hessians. The LDLQ algorithm itself is clean-room; faer is just

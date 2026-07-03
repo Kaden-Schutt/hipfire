@@ -939,6 +939,27 @@
     "env": []
   },
   {
+    "key": "sdapi_output_root",
+    "type": {
+      "kind": "string"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "/tmp/hipfire-sdapi",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Root directory for images saved by the SD API compatibility routes (save_images: true). Client-supplied outdir_* override_settings are ignored; every SD API image write stays under this root.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "temperature",
     "type": {
       "kind": "f64"

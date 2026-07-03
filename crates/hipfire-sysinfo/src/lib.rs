@@ -24,12 +24,17 @@ mod fdinfo;
 mod gpu;
 mod gpu_metrics;
 mod host;
+mod host_profile;
 mod npu;
 
 pub use fdinfo::read_clients;
 pub use gpu::read_gpu_telemetry;
 pub use gpu_metrics::read_gpu_metrics;
 pub use host::read_host_memory;
+pub use host_profile::{
+    collect_default_host_profile, collect_host_profile, detect_arch, parse_pp_dpm_mclk_max_mhz,
+    HostProfileOverrides,
+};
 pub use npu::read_npus;
 
 /// One-shot snapshot of every AMD GPU (with firmware `gpu_metrics` extras),

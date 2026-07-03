@@ -22,10 +22,10 @@
 //! into directly — `KvCache`, `WeightTensor`, `EmbeddingFormat`, the
 //! GEMV dispatch helpers (`weight_gemv`, `weight_gemv_prerotated`,
 //! `weight_gemv_residual`, `weight_gemv_swiglu_residual`,
-//! `fused_rmsnorm_rotate_for_mq`), the dequantisers (`dequantize_q4_*`,
-//! `dequantize_q8_0`, `dequantize_q6_k`, `convert_q4k_to_q4f16_g{32,64}`),
-//! the f16/f32 conversions, the sampler primitives (re-exported from
-//! `hipfire_runtime::sampler`), and the Llama-shaped types
+//! `fused_rmsnorm_rotate_for_mq`), the HFQ block dequantisers
+//! (`dequant_q8f16`, `dequant_q4k`), the f16/f32 conversions, the sampler
+//! primitives (re-exported from `hipfire_runtime::sampler`), and the
+//! Llama-shaped types
 //! (`LlamaConfig`, `LlamaWeights`, `LayerWeights`, `ForwardScratch`,
 //! `PrefillBatchScratch`, `KvCache`, `SamplingConfig`).
 //!
@@ -48,6 +48,7 @@
 //! physically moved here without breaking arch-qwen35's pflash branch.
 
 pub mod arch;
+pub mod caps;
 
 /// Re-export the LLaMA-family model module so callers can write
 /// `hipfire_arch_llama::llama::forward_scratch(...)` etc., matching the

@@ -7,5 +7,5 @@ description = "Sequence-state handles, descriptors, and reservation helpers for 
 
 [dependencies]
 hipfire-model = { path = "../hipfire-model" }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = "1"

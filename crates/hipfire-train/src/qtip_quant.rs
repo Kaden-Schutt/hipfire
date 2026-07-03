@@ -167,3 +167,14 @@ pub fn qtip_quantize_dequant(w: &[f32], bits: u32, beam_width: usize) -> Vec<f32
         });
     out
 }
+
+/// Trellis quantize→dequant of ONE already-rotated 256-group (no FWHT here — the
+/// caller owns rotation + any LDLQ error feedback). `cb` = prebuilt [`build_codebook`].
+/// Lets the LDLQ / codec-compare harnesses drop the trellis in as their per-group quant
+/// in place of symmetric-int rounding.
+pub fn qtip_group_requant(group: &[f32], bits: u32, beam: usize, cb: &[f32]) -> Vec<f32> {
+    let s0 = group_scale(group);
+    let sym = beam_encode_group_bits(group, s0, cb, beam, bits);
+    let s = optimal_scale_bits(group, &sym, cb, bits);
+    decode_group_bits(&sym, s, cb, bits)
+}

@@ -17,8 +17,6 @@ use hipfire_arch_qwen35::qwen35;
 #[cfg(feature = "deltanet")]
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
 #[cfg(feature = "deltanet")]
-use hipfire_runtime::gguf::GgufFile;
-#[cfg(feature = "deltanet")]
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 #[cfg(feature = "deltanet")]
@@ -40,8 +38,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "deltanet")]
 const SKIP_EXIT: u8 = 10;
-#[cfg(feature = "deltanet")]
-const QWEN_GGUF_FALLBACK: &str = "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf";
 #[cfg(feature = "deltanet")]
 const PREFILL_MEAN_LOGIT_TOL: f64 = 0.15;
 #[cfg(feature = "deltanet")]
@@ -385,19 +381,11 @@ fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), CaseOutcome> {
         return Ok((tokenizer, "hfq-metadata".to_string()));
     }
 
-    let fallback = Path::new(QWEN_GGUF_FALLBACK);
-    if !fallback.exists() {
-        return Err(CaseOutcome::Skip(format!(
-            "tokenizer metadata missing and fallback GGUF not found at {}",
-            fallback.display()
-        )));
-    }
-
-    let gguf = GgufFile::open(fallback)
-        .map_err(|e| CaseOutcome::Skip(format!("failed to open fallback GGUF tokenizer: {e}")))?;
-    let tokenizer = Tokenizer::from_gguf(&gguf)
-        .map_err(|e| CaseOutcome::Skip(format!("failed to parse fallback GGUF tokenizer: {e}")))?;
-    Ok((tokenizer, format!("gguf:{}", fallback.display())))
+    // The GGUF tokenizer fallback was removed — GGUF is import-only, in
+    // hipfire-coexistence. A valid HFQ must carry its own tokenizer metadata.
+    Err(CaseOutcome::Skip(
+        "tokenizer metadata missing from HFQ (GGUF fallback removed)".to_string(),
+    ))
 }
 
 #[cfg(feature = "deltanet")]

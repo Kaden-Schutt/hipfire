@@ -724,3 +724,112 @@ pub fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header: u16) 
         header_atomic.store(header, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod aql_tests {
+    use super::*;
+    use crate::ffi::*;
+
+    #[test]
+    fn dispatch_header_is_the_standard_hip_dispatch_word() {
+        // KERNEL_DISPATCH(2)<<0 | barrier(1)<<8 | sys_acquire(2)<<9 |
+        // sys_release(2)<<11 = 0x1502. This exact word is what HIP writes for a
+        // barrier'd, system-fenced dispatch; a drift here silently changes
+        // memory ordering / packet type seen by the AQL engine.
+        assert_eq!(dispatch_packet_header(), 0x1502);
+        // And it decomposes back to the intended fields.
+        let h = dispatch_packet_header();
+        assert_eq!((h >> HSA_PACKET_HEADER_TYPE) & 0xff, HSA_PACKET_TYPE_KERNEL_DISPATCH);
+        assert_eq!((h >> HSA_PACKET_HEADER_BARRIER) & 0x1, 1);
+        assert_eq!(
+            (h >> HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) & 0x3,
+            HSA_FENCE_SCOPE_SYSTEM
+        );
+        assert_eq!(
+            (h >> HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE) & 0x3,
+            HSA_FENCE_SCOPE_SYSTEM
+        );
+    }
+
+    #[test]
+    fn dispatch_packet_abi_layout_is_frozen() {
+        // hsa_kernel_dispatch_packet_t: 64 bytes, 64B aligned, with the exact
+        // field offsets from hsa.h. The HSA runtime reads these by offset, so a
+        // field reorder / type-width change is silent memory corruption that no
+        // higher-level test would localize.
+        assert_eq!(std::mem::size_of::<HsaKernelDispatchPacket>(), 64);
+        assert_eq!(std::mem::align_of::<HsaKernelDispatchPacket>(), 64);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, header), 0);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, setup), 2);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, workgroup_size_x), 4);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, workgroup_size_z), 8);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, grid_size_x), 12);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, grid_size_z), 20);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, private_segment_size), 24);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, group_segment_size), 28);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, kernel_object), 32);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, kernarg_address), 40);
+        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, completion_signal), 56);
+    }
+
+    fn test_kernel() -> HsaKernel {
+        HsaKernel {
+            name: "test_kernel".to_string(),
+            kernel_object: 0xDEAD_BEEF_0000_1234,
+            kernarg_size: 32,
+            group_segment_size: 512,
+            private_segment_size: 256,
+        }
+    }
+
+    #[test]
+    fn build_dispatch_packet_sets_dims_grid_and_kernel_fields() {
+        let kernel = test_kernel();
+        let mut packet: HsaKernelDispatchPacket = unsafe { std::mem::zeroed() };
+        // Sentinel header must be left untouched (published separately, last).
+        packet.header = HSA_PACKET_TYPE_INVALID;
+        let kernarg = 0x1000usize as *mut u8;
+        unsafe {
+            build_dispatch_packet(&mut packet, &kernel, [4, 2, 3], [64, 1, 1], kernarg, 7);
+        }
+        // 3-D grid (grid[2] > 1).
+        assert_eq!(packet.setup, 3);
+        assert_eq!(packet.header, HSA_PACKET_TYPE_INVALID, "header must stay unpublished");
+        assert_eq!(packet.workgroup_size_x, 64);
+        assert_eq!(packet.workgroup_size_y, 1);
+        assert_eq!(packet.workgroup_size_z, 1);
+        // grid_size = grid (in workgroups) × block, i.e. total work-items.
+        assert_eq!(packet.grid_size_x, 4 * 64);
+        assert_eq!(packet.grid_size_y, 2 * 1);
+        assert_eq!(packet.grid_size_z, 3 * 1);
+        assert_eq!(packet.kernel_object, kernel.kernel_object);
+        assert_eq!(packet.private_segment_size, kernel.private_segment_size);
+        assert_eq!(packet.group_segment_size, kernel.group_segment_size);
+        assert_eq!(packet.kernarg_address, kernarg as *mut c_void);
+        assert_eq!(packet.completion_signal, 7);
+        assert_eq!(packet.reserved0, 0);
+        assert_eq!(packet.reserved2, 0);
+    }
+
+    #[test]
+    fn build_dispatch_packet_infers_1d_and_2d_dims() {
+        let kernel = test_kernel();
+        let mut p: HsaKernelDispatchPacket = unsafe { std::mem::zeroed() };
+        unsafe { build_dispatch_packet(&mut p, &kernel, [8, 1, 1], [32, 1, 1], std::ptr::null_mut(), 0) };
+        assert_eq!(p.setup, 1, "grid [8,1,1] is 1-D");
+        unsafe { build_dispatch_packet(&mut p, &kernel, [8, 4, 1], [32, 2, 1], std::ptr::null_mut(), 0) };
+        assert_eq!(p.setup, 2, "grid [8,4,1] is 2-D");
+    }
+
+    #[test]
+    fn build_dispatch_packet_grid_size_saturates_instead_of_wrapping() {
+        let kernel = test_kernel();
+        let mut p: HsaKernelDispatchPacket = unsafe { std::mem::zeroed() };
+        unsafe {
+            build_dispatch_packet(&mut p, &kernel, [u32::MAX, 1, 1], [64, 1, 1], std::ptr::null_mut(), 0)
+        };
+        // grid_size_x = MAX × 64 saturates to u32::MAX rather than wrapping to a
+        // tiny bogus launch size.
+        assert_eq!(p.grid_size_x, u32::MAX);
+    }
+}

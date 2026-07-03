@@ -346,6 +346,148 @@ extern "C" __global__ void diffusion_conv2d_nchw_f32(
 }
 "#;
 
+// Phase 3 — im2col + WMMA-GEMM convolution.
+//
+// The naive direct conv above is one thread per output element with an
+// in_channels*kh*kw inner loop; it is the dominant cost of the VAE decode
+// (high-resolution convs). These three kernels feed the matrix-core GEMM
+// (`Gpu::gemm_f16_wmma`, the no-LDS register-tiled WMMA kernel) instead:
+//   1. im2col lowers the activation into a [B*OH*OW, IC*KH*KW] column matrix,
+//   2. the conv weight is reshaped [OC, IC*KH*KW] and cast to F16 (once, cached),
+//   3. per batch, gemm computes Y[OC, OH*OW] = W_f16 @ X^T — which is exactly the
+//      NCHW output slice for that batch, so no transpose is needed,
+//   4. a per-output-channel bias is added.
+
+// Implicit-GEMM convolution: a WMMA GEMM that gathers the im2col columns from
+// the NCHW input on the fly instead of materializing a [B*OH*OW, K] column
+// matrix. This is the fused replacement for a separate im2col kernel + generic
+// gemm_f16_wmma — it removes the column-matrix allocation and its write+read
+// memory traffic.
+//
+// Per batch slice (blockIdx.z = b): Y_b[OC, OH*OW] = W_f16[OC, K] @ X_bᵀ where
+// X_b[n, c] is the im2col value for output position n=(oy,ox) and tap
+// c=(ic,ky,kx): input[b, ic, oy*stride-pad+ky, ox*stride-pad+kx] (0 if OOB).
+// Y_b[OC, OH*OW] lands directly as the NCHW output slice for batch b.
+//
+// WMMA layout matches gemm_f16_wmma (validated with the AMD matrix calculator):
+// A lane t holds row t cols 0..15; D[reg j][lane t] -> (2j+(t>>4), t&15).
+pub(crate) const DIFFUSION_CONV2D_IMPLICIT_WMMA_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
+typedef float    __attribute__((ext_vector_type(8)))  float8_t;
+
+__launch_bounds__(32, 2)
+extern "C" __global__ void diffusion_conv2d_implicit_wmma_f16(
+    const _Float16* __restrict__ W,     // [OC, K] f16, K = IC*KH*KW
+    const float*    __restrict__ input, // [B, IC, IH, IW] f32
+    float*          __restrict__ Y,     // [B, OC, OH*OW] f32
+    int OC, int K, int OHW,
+    int IC, int IH, int IW, int OH, int OW,
+    int KH, int KW, int pad, int stride
+) {
+    const int row_start = blockIdx.x * 16;   // output channels
+    const int col_start = blockIdx.y * 16;   // output positions n
+    const int b = blockIdx.z;
+    const int tid = threadIdx.x;
+    if (row_start >= OC || col_start >= OHW) return;
+
+    const _Float16* Wb = W;                              // weights shared across batch
+    const float* in_b = input + (long long)b * IC * IH * IW;
+    float* Yb = Y + (long long)b * OC * OHW;
+
+    const int my_a_row = row_start + (tid & 15);         // output channel
+    const int my_b_row = col_start + (tid & 15);         // output position n
+    const bool a_in = (my_a_row < OC);
+    const bool b_in = (my_b_row < OHW);
+    const int oy = b_in ? (my_b_row / OW) : 0;
+    const int ox = b_in ? (my_b_row % OW) : 0;
+
+    float8_t acc = {0,0,0,0,0,0,0,0};
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        half16_t a;
+        if (a_in) {
+            const _Float16* src = Wb + (long long)my_a_row * K + k0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) a[j] = (k0 + j < K) ? src[j] : (_Float16)0.0f;
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 16; j++) a[j] = (_Float16)0.0f;
+        }
+
+        half16_t bb;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            _Float16 val = (_Float16)0.0f;
+            int c = k0 + j;
+            if (b_in && c < K) {
+                int kx = c % KW;
+                int t = c / KW;
+                int ky = t % KH;
+                int ic = t / KH;
+                int iy = oy * stride - pad + ky;
+                int ix = ox * stride - pad + kx;
+                if (iy >= 0 && iy < IH && ix >= 0 && ix < IW) {
+                    val = (_Float16)in_b[((long long)ic * IH + iy) * IW + ix];
+                }
+            }
+            bb[j] = val;
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bb, acc);
+    }
+
+    const int out_col = col_start + (tid & 15);
+    if (out_col < OHW) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < OC) {
+                Yb[(long long)out_row * OHW + out_col] = acc[j];
+            }
+        }
+    }
+}
+"#;
+
+pub(crate) const DIFFUSION_F32_TO_F16_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+extern "C" __global__ void diffusion_f32_to_f16(
+    const float* input,
+    _Float16* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = (_Float16)input[idx];
+    }
+}
+"#;
+
+pub(crate) const DIFFUSION_CONV_BIAS_NCHW_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Add a per-output-channel bias to an NCHW output [B, OC, OH*OW].
+extern "C" __global__ void diffusion_conv_bias_nchw_f32(
+    float* output,
+    const float* bias,
+    int total,
+    int spatial,
+    int out_channels
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int oc = (idx / spatial) % out_channels;
+    output[idx] += bias[oc];
+}
+"#;
+
 pub(crate) const DIFFUSION_GROUP_NORM_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -397,6 +539,117 @@ extern "C" __global__ void diffusion_group_norm_nchw_f32(
         }
     }
     float inv_std = rsqrtf(var_sum / (float)elems_per_group + eps);
+    output[idx] = (input[idx] - mean) * inv_std * weight[c] + bias[c];
+}
+"#;
+
+// Phase 3 — two-pass group-norm.
+//
+// The single-kernel `diffusion_group_norm_nchw_f32` above recomputes the full
+// per-group mean and variance reduction *inside every output thread*, i.e.
+// O(N * group_size) ~ O((H*W)^2) per call. At VAE-decode resolutions that
+// dominates wall-clock. These two kernels split it into an O(N) reduction
+// (one wave per (batch, group), pure register + wave-shuffle, no LDS — so it
+// is wedge-safe on gfx1103) followed by an O(N) elementwise apply.
+
+// Phase 3 — per-row bias for the WMMA linear. The WMMA GEMM writes
+// Y[rows, out_features] row-major with no bias; this adds bias[out] to every row.
+pub(crate) const DIFFUSION_ROW_BIAS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_row_bias_f32(
+    float* output,
+    const float* bias,
+    int total,
+    int out_features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    output[idx] += bias[idx % out_features];
+}
+"#;
+
+pub(crate) const DIFFUSION_GROUP_NORM_STATS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// One wave (32 lanes) per (batch, group). A group's channels are contiguous in
+// NCHW within a batch, so its elements are one contiguous span. Two passes over
+// that span (mean, then sum of squared deviations) match the CPU reference
+// formula and avoid catastrophic cancellation.
+extern "C" __global__ void diffusion_group_norm_stats_f32(
+    const float* input,
+    float* mean_out,
+    float* inv_std_out,
+    int channels,
+    int height,
+    int width,
+    int groups,
+    float eps
+) {
+    int bg = blockIdx.x;                 // 0 .. batch*groups - 1
+    int group = bg % groups;
+    int b = bg / groups;
+    int cpg = channels / groups;
+    long hw = (long)height * (long)width;
+    long group_size = (long)cpg * hw;
+    long base = ((long)b * channels + (long)group * cpg) * hw;
+    int lane = threadIdx.x;              // 0 .. 31
+
+    float s = 0.0f;
+    for (long i = lane; i < group_size; i += 32) {
+        s += input[base + i];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down(s, off);
+    }
+    float total = __shfl(s, 0);
+    float mean = total / (float)group_size;
+
+    float vs = 0.0f;
+    for (long i = lane; i < group_size; i += 32) {
+        float d = input[base + i] - mean;
+        vs += d * d;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        vs += __shfl_down(vs, off);
+    }
+    if (lane == 0) {
+        mean_out[bg] = mean;
+        inv_std_out[bg] = rsqrtf(vs / (float)group_size + eps);
+    }
+}
+"#;
+
+pub(crate) const DIFFUSION_GROUP_NORM_APPLY_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_group_norm_apply_f32(
+    const float* input,
+    const float* mean_in,
+    const float* inv_std_in,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int total_elements,
+    int channels,
+    int height,
+    int width,
+    int groups
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) {
+        return;
+    }
+    long hw = (long)height * (long)width;
+    int c = (int)((idx / hw) % channels);
+    int b = (int)(idx / ((long)channels * hw));
+    int cpg = channels / groups;
+    int group = c / cpg;
+    int bg = b * groups + group;
+    float mean = mean_in[bg];
+    float inv_std = inv_std_in[bg];
     output[idx] = (input[idx] - mean) * inv_std * weight[c] + bias[c];
 }
 "#;
@@ -642,6 +895,57 @@ extern "C" __global__ void diffusion_linear_f32(
 }
 "#;
 
+// Phase 3 — wave-per-row layer-norm. The naive kernel below recomputes the full
+// per-row mean+variance reduction inside every output thread (O(rows*cols^2)).
+// This assigns one wave (32 lanes) per row: lanes stride over cols, reduce via
+// __shfl for mean then variance, and write the row's outputs — O(rows*cols), no
+// LDS (wedge-safe on gfx1103). Used by the resident path; the naive kernel stays
+// for the preflight probe.
+pub(crate) const DIFFUSION_LAYER_NORM_ROWS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_layer_norm_rows_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int rows,
+    int cols,
+    float eps
+) {
+    int lane = threadIdx.x & 31;
+    int wave = threadIdx.x >> 5;
+    int row = blockIdx.x * (blockDim.x >> 5) + wave;
+    if (row >= rows) {
+        return;
+    }
+    long base = (long)row * cols;
+
+    float s = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        s += input[base + c];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down(s, off);
+    }
+    float mean = __shfl(s, 0) / (float)cols;
+
+    float vs = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        float d = input[base + c] - mean;
+        vs += d * d;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        vs += __shfl_down(vs, off);
+    }
+    float inv_std = rsqrtf(__shfl(vs, 0) / (float)cols + eps);
+
+    for (int c = lane; c < cols; c += 32) {
+        output[base + c] = (input[base + c] - mean) * inv_std * weight[c] + bias[c];
+    }
+}
+"#;
+
 pub(crate) const DIFFUSION_LAYER_NORM_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
@@ -707,6 +1011,94 @@ extern "C" __global__ void diffusion_softmax_rows_f32(
         for (int col = 0; col < cols; ++col) {
             output[base + col] /= sum;
         }
+    }
+}
+"#;
+
+// Phase 3 — flash-style attention (online softmax, no seq×seq materialization).
+//
+// The naive `diffusion_sdpa_3d_f32` below is one thread per output element and
+// recomputes the full QKᵀ score row once PER output channel AND twice (a max
+// pass then a sum pass) — ~2·head_dim× redundant. This kernel assigns one wave
+// (32 lanes) to each (batch, head, query): the lanes split head_dim, compute
+// each score once via a wave-shuffle dot reduction, and stream keys with an
+// online-softmax running (max, sum, accumulator). No LDS (pure registers +
+// `__shfl` → wedge-safe on gfx1103), F32 throughout (matches the reference
+// closely). head_dim is capped at 16 channels/lane = 512; the host falls back
+// to the naive kernel above that.
+pub(crate) const DIFFUSION_FLASH_ATTENTION_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+#define FLASH_ACC_MAX 16
+
+extern "C" __global__ void diffusion_flash_attention_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* output,
+    int batch,
+    int q_seq,
+    int k_seq,
+    int hidden,
+    int heads,
+    int head_dim
+) {
+    int lane = threadIdx.x & 31;
+    int wave = threadIdx.x >> 5;
+    int waves_per_block = blockDim.x >> 5;
+    int gid = blockIdx.x * waves_per_block + wave;
+    int total = batch * heads * q_seq;
+    if (gid >= total) {
+        return;
+    }
+    int qi = gid % q_seq;
+    int t = gid / q_seq;
+    int head = t % heads;
+    int b = t / heads;
+    int head_off = head * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long qbase = ((long)(b * q_seq + qi) * hidden) + head_off;
+
+    float qreg[FLASH_ACC_MAX];
+    float acc[FLASH_ACC_MAX];
+    int np = 0;
+    for (int c = lane; c < head_dim; c += 32) {
+        qreg[np] = q[qbase + c];
+        acc[np] = 0.0f;
+        np++;
+    }
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int ki = 0; ki < k_seq; ++ki) {
+        long kbase = ((long)(b * k_seq + ki) * hidden) + head_off;
+        float part = 0.0f;
+        int ii = 0;
+        for (int c = lane; c < head_dim; c += 32) {
+            part += qreg[ii] * k[kbase + c];
+            ii++;
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            part += __shfl_down(part, off);
+        }
+        float s = __shfl(part, 0) * scale;
+        float new_m = fmaxf(m, s);
+        float corr = expf(m - new_m);
+        float p = expf(s - new_m);
+        l = l * corr + p;
+        long vbase = ((long)(b * k_seq + ki) * hidden) + head_off;
+        ii = 0;
+        for (int c = lane; c < head_dim; c += 32) {
+            acc[ii] = acc[ii] * corr + p * v[vbase + c];
+            ii++;
+        }
+        m = new_m;
+    }
+    float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    int ii = 0;
+    for (int c = lane; c < head_dim; c += 32) {
+        output[qbase + c] = acc[ii] * inv;
+        ii++;
     }
 }
 "#;

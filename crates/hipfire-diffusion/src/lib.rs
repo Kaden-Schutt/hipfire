@@ -37,6 +37,11 @@ pub const QT_DIFFUSION_TENSOR_Q4_K: u8 = 4;
 pub const QT_DIFFUSION_TENSOR_HFQ4_G256: u8 = 6;
 pub const QT_DIFFUSION_TENSOR_HFQ4_G128: u8 = 7;
 pub const QT_DIFFUSION_TENSOR_HFQ6_G256: u8 = 8;
+/// Opus Quant 4-bit, 256-group, FWHT-rotated (130 B/block: f16 scale + 128
+/// nibbles, range [-7,7]). Calibrated via hipfire_quantize::ldlq::oq4_ldlq_pack.
+pub const QT_DIFFUSION_TENSOR_OQ4_G256: u8 = 9;
+/// Opus Quant 8-bit, 256-group, FWHT-rotated (258 B/block: f16 scale + 256 i8).
+pub const QT_DIFFUSION_TENSOR_OQ8_G256: u8 = 10;
 pub const QT_DIFFUSION_TENSOR_BF16: u8 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,9 +246,72 @@ fn cpu_reference_env_enabled(value: Option<&str>) -> bool {
 /// the pipeline runtime and are not moved mid-generation). The cache lives for one
 /// generation (the runtime context is created per `generate_*` call), so resident
 /// buffers are released when the GPU/context tears down.
+/// Per-step activation precision for the resident linear path. The progressive
+/// schedule (set per denoise step) walks from cheap/lossy (W4A4) on the early,
+/// high-noise steps to full precision (F16) on the final steps. All oq4 rungs
+/// consume the same resident oq4-packed weight + FWHT-rotated activation; they
+/// only apply to linears with `in % 256 == 0` (others fall back to F16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinearPrecision {
+    /// f16 weight × f16 activation (the Phase-3 WMMA path).
+    #[default]
+    F16,
+    /// oq4 weight dequant→f16 × f16 activation (memory-bandwidth win).
+    W4A16,
+    /// oq4 weight × int8 (q8_1) activation.
+    W4A8,
+    /// oq4 weight × int4 activation (2× matrix rate on gfx1103).
+    W4A4,
+}
+
 #[derive(Default)]
 struct RocmWeightCache {
     entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    /// F16 copies of weights, for the Phase 3 WMMA-GEMM convolution path. Keyed
+    /// the same way as `entries`; populated lazily by converting the resident
+    /// F32 weight once.
+    f16_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    /// oq4 arch-combined device buffers, for the W4A* schedule rungs. Keyed the
+    /// same way; built once by quantize_oq4g256 → pack_oq4_arch_combined → upload.
+    oq4_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    /// Active activation precision for the resident linear path this step (the
+    /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
+    linear_precision: LinearPrecision,
+    /// Per-LAYER schedule policy. When `layer_stride > 0`, the precision of each
+    /// resident linear is decided by its call index this forward (not the per-step
+    /// `linear_precision`): every `layer_stride`-th linear runs `layer_rung`, the
+    /// first `layer_skip_first` and last `layer_skip_last` stay F16.
+    layer_stride: usize,
+    layer_skip_first: usize,
+    layer_skip_last: usize,
+    layer_rung: LinearPrecision,
+    /// Resident-linear call index within the current forward (reset per step).
+    linear_index: usize,
+    /// Total resident-linear calls in the previous forward (for `layer_skip_last`;
+    /// 0 on the first step, so skip_last activates from step 1).
+    linear_total: usize,
+}
+
+impl RocmWeightCache {
+    /// Resolve the activation precision for the resident linear at call index
+    /// `idx` this forward, applying the per-layer policy when active else the
+    /// per-step precision.
+    fn resolve_linear_precision(&self, idx: usize) -> LinearPrecision {
+        if self.layer_stride == 0 {
+            return self.linear_precision;
+        }
+        if idx < self.layer_skip_first {
+            return LinearPrecision::F16;
+        }
+        if self.linear_total > 0 && idx >= self.linear_total.saturating_sub(self.layer_skip_last) {
+            return LinearPrecision::F16;
+        }
+        if (idx - self.layer_skip_first) % self.layer_stride == 0 {
+            self.layer_rung
+        } else {
+            LinearPrecision::F16
+        }
+    }
 }
 
 impl RocmWeightCache {
@@ -264,6 +332,81 @@ impl RocmWeightCache {
             .entries
             .get(&key)
             .expect("weight just inserted")
+            .buf
+            .as_ptr())
+    }
+
+    /// Return the raw device pointer to an F16 copy of `tensor`, converting the
+    /// (resident) F32 weight once on first use. The F16 buffer holds the same
+    /// element count as `tensor`; the caller wraps it in a non-owning
+    /// [`rdna_compute::GpuTensor`] for the GEMM.
+    fn resident_f16_ptr(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        tensor: &CpuTensor,
+    ) -> DiffusionResult<*mut std::ffi::c_void> {
+        let key = (tensor.data.as_ptr() as usize, tensor.data.len());
+        if !self.f16_entries.contains_key(&key) {
+            let f32_ptr = self.resident_ptr(gpu, tensor)?;
+            let n = tensor.data.len();
+            let f16 = gpu
+                .alloc_tensor(&[n], rdna_compute::DType::F16)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let mut kernargs = hip_bridge::KernargBlob::new();
+            kernargs.push_ptr(f32_ptr);
+            kernargs.push_ptr(f16.buf.as_ptr());
+            kernargs.push_i32(i32_kernel_dim("f32->f16 element count", n)?);
+            kernargs.pad_to(16);
+            let grid = [((n as u32).saturating_add(255)) / 256, 1, 1];
+            // No sync: the convert runs on the same stream as, and is enqueued
+            // before, the GEMM that reads the F16 buffer.
+            ensure_and_launch_diffusion_kernel(
+                gpu,
+                "diffusion_f32_to_f16",
+                DIFFUSION_F32_TO_F16_HIP_SRC,
+                "diffusion_f32_to_f16",
+                grid,
+                [256, 1, 1],
+                0,
+                &mut kernargs,
+            )?;
+            self.f16_entries.insert(key, f16);
+        }
+        Ok(self
+            .f16_entries
+            .get(&key)
+            .expect("f16 weight just inserted")
+            .buf
+            .as_ptr())
+    }
+
+    /// Return the device pointer to the oq4 arch-combined buffer for `tensor`
+    /// (`[m, k]`, `k % 256 == 0`), building it once: quantize the resident f32
+    /// weight to oq4g256 (FWHT-rotated), repack to the arch combined layout, and
+    /// upload. Consumed by the W4A* GEMM kernels. The returned buffer is
+    /// `pack_oq4_arch_combined`-sized.
+    fn resident_oq4_ptr(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        tensor: &CpuTensor,
+        m: usize,
+        k: usize,
+    ) -> DiffusionResult<*mut std::ffi::c_void> {
+        let key = (tensor.data.as_ptr() as usize, tensor.data.len());
+        if !self.oq4_entries.contains_key(&key) {
+            let signs1 = hipfire_quantize::gen_fwht_signs(quant_decode::OQ_FWHT_SEED1, 256);
+            let signs2 = hipfire_quantize::gen_fwht_signs(quant_decode::OQ_FWHT_SEED2, 256);
+            let oq4 = hipfire_quantize::codecs::quantize_oq4g256(&tensor.data, &signs1, &signs2);
+            let packed = quant_encode::pack_oq4_arch_combined(&oq4, m, k);
+            let resident = gpu
+                .upload_raw(&packed, &[packed.len()])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            self.oq4_entries.insert(key, resident);
+        }
+        Ok(self
+            .oq4_entries
+            .get(&key)
+            .expect("oq4 weight just inserted")
             .buf
             .as_ptr())
     }
@@ -846,6 +989,13 @@ pub struct SchedulerConfig {
     pub invert_sigmas: Option<bool>,
     pub use_dynamic_shifting: Option<bool>,
     pub time_shift_type: Option<String>,
+    // Resolution-dependent dynamic shifting (FlowMatchEuler): the shift `mu` is
+    // interpolated between `base_shift`/`max_shift` over the image token count
+    // `[base_image_seq_len, max_image_seq_len]`.
+    pub base_shift: Option<f32>,
+    pub max_shift: Option<f32>,
+    pub base_image_seq_len: Option<usize>,
+    pub max_image_seq_len: Option<usize>,
 }
 
 impl SchedulerConfig {
@@ -1225,6 +1375,111 @@ fn denoise_latents_with_cfg_progress_and_runtime_options(
     )
 }
 
+/// Concatenate two tensors along the leading (batch) dimension. The trailing
+/// dims must match; the data is simply appended (both are batch-major
+/// row-major). Used to fuse the CFG uncond/cond passes into one batch-2N forward.
+fn concat_batch_dim(a: &CpuTensor, b: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    if a.shape.len() != b.shape.len() || a.shape.is_empty() || a.shape[1..] != b.shape[1..] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "cannot concatenate along batch: shapes {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let mut shape = a.shape.clone();
+    shape[0] = a.shape[0] + b.shape[0];
+    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+    data.extend_from_slice(&a.data);
+    data.extend_from_slice(&b.data);
+    Ok(CpuTensor { shape, data })
+}
+
+/// Split a batched CFG prediction `[2N, ...]` back into the positive `[0..N]`
+/// and negative `[N..2N]` halves.
+fn split_batched_cfg_prediction(
+    batched: &CpuTensor,
+) -> DiffusionResult<(CpuTensor, CpuTensor)> {
+    if batched.shape.first().copied().unwrap_or(0) % 2 != 0 || batched.shape.is_empty() {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "batched CFG prediction must have an even leading dim, got {:?}",
+            batched.shape
+        )));
+    }
+    let mut half_shape = batched.shape.clone();
+    half_shape[0] = batched.shape[0] / 2;
+    let half = batched.data.len() / 2;
+    let positive = CpuTensor {
+        shape: half_shape.clone(),
+        data: batched.data[..half].to_vec(),
+    };
+    let negative = CpuTensor {
+        shape: half_shape,
+        data: batched.data[half..].to_vec(),
+    };
+    Ok((positive, negative))
+}
+
+/// Resolve the resident-linear activation precision for denoise `step` of
+/// `total`, from the progressive schedule. Env-driven (opt-in; default is all
+/// F16, so behavior is unchanged unless set):
+///   `HIPFIRE_DIFFUSION_W4A4_UNTIL` — fraction of steps (0..1) to run at W4A4
+///   `HIPFIRE_DIFFUSION_W4A8_UNTIL` — fraction (0..1) to run at W4A8 (after W4A4)
+/// e.g. `W4A4_UNTIL=0.5 W4A8_UNTIL=0.8` → first 50% W4A4, next 30% W4A8, last
+/// 20% F16. Only affects linears with `in % 256 == 0`; others stay F16.
+fn linear_precision_for_step(step: usize, total: usize) -> LinearPrecision {
+    let frac_env = |name: &str| -> f32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    };
+    let w4a4_until = frac_env("HIPFIRE_DIFFUSION_W4A4_UNTIL");
+    let w4a8_until = frac_env("HIPFIRE_DIFFUSION_W4A8_UNTIL").max(w4a4_until);
+    let frac = if total <= 1 {
+        0.0
+    } else {
+        step as f32 / total as f32
+    };
+    if frac < w4a4_until {
+        LinearPrecision::W4A4
+    } else if frac < w4a8_until {
+        LinearPrecision::W4A8
+    } else {
+        LinearPrecision::F16
+    }
+}
+
+/// Configure the per-layer precision policy on the weight cache from env (opt-in;
+/// `HIPFIRE_DIFFUSION_LAYER_STRIDE=0` = off, the default). When active, every
+/// `STRIDE`-th resident linear runs `RUNG` (default W4A4), except the first
+/// `SKIP_FIRST` and last `SKIP_LAST` linears (kept F16). This is orthogonal to the
+/// per-step schedule and overrides it when `STRIDE > 0`.
+///   `HIPFIRE_DIFFUSION_LAYER_STRIDE`     — N (every Nth linear; 0=off)
+///   `HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST` — keep the first X linears F16
+///   `HIPFIRE_DIFFUSION_LAYER_SKIP_LAST`  — keep the last Y linears F16 (from step 1)
+///   `HIPFIRE_DIFFUSION_LAYER_RUNG`       — w4a4 | w4a8 | w4a16 (default w4a4)
+fn configure_layer_policy(cache: &mut RocmWeightCache) {
+    let usize_env = |name: &str| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    cache.layer_stride = usize_env("HIPFIRE_DIFFUSION_LAYER_STRIDE");
+    cache.layer_skip_first = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST");
+    cache.layer_skip_last = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_LAST");
+    cache.layer_rung = match std::env::var("HIPFIRE_DIFFUSION_LAYER_RUNG")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "w4a8" => LinearPrecision::W4A8,
+        "w4a16" => LinearPrecision::W4A16,
+        _ => LinearPrecision::W4A4,
+    };
+    cache.linear_total = 0;
+}
+
 fn denoise_latents_with_cfg_progress_and_runtime_context(
     mut latents: LatentBatch,
     schedule: &DiffusionSchedule,
@@ -1267,7 +1522,20 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
     let mut scheduler_state = SchedulerStepState::default();
     let mut runtime_kind = DiffusionRuntimeKind::CpuSourceReference;
     let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
-    for step in 0..schedule.timesteps.len() {
+    configure_layer_policy(&mut runtime_context.rocm_weights);
+    let total_steps = schedule.timesteps.len();
+    for step in 0..total_steps {
+        // Progressive precision schedule: pick the resident-linear activation
+        // precision for this step (early/high-noise steps tolerate cheaper rungs).
+        // `linear_total` carries the previous forward's linear count (for the
+        // per-layer skip_last); reset the per-forward index before this step.
+        if step > 0 {
+            runtime_context.rocm_weights.linear_total =
+                runtime_context.rocm_weights.linear_index;
+        }
+        runtime_context.rocm_weights.linear_index = 0;
+        runtime_context.rocm_weights.linear_precision =
+            linear_precision_for_step(step, total_steps);
         let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
             schedule,
             &latents.as_nchw_tensor(),
@@ -1282,18 +1550,65 @@ fn denoise_latents_with_cfg_progress_and_runtime_context(
         };
         let timestep = schedule.timesteps[step];
         let timesteps = vec![timestep; latents.batch];
-        let positive_pred = predict_noise(
-            &model_sample,
-            &timesteps,
-            positive_embeddings,
-            positive_attention_mask,
-            positive_sdxl_conditioning,
-            runtime_context,
-        )?;
-        validate_noise_prediction(&latents, &positive_pred)?;
+        // Batched CFG: when guidance is active and neither pass needs SDXL
+        // conditioning (and the attention masks are batchable), run the uncond
+        // and cond passes as one batch-2N forward — `[positive; negative]` —
+        // instead of two sequential forwards. Halves launches and feeds bigger
+        // GEMMs. SDXL / mixed-mask cases fall back to the sequential path.
+        let masks_batchable = positive_attention_mask.is_none() == negative_attention_mask.is_none();
+        let batched_cfg = !cfg_is_identity
+            && positive_sdxl_conditioning.is_none()
+            && negative_sdxl_conditioning.is_none()
+            && masks_batchable;
         let guided = if cfg_is_identity {
+            let positive_pred = predict_noise(
+                &model_sample,
+                &timesteps,
+                positive_embeddings,
+                positive_attention_mask,
+                positive_sdxl_conditioning,
+                runtime_context,
+            )?;
+            validate_noise_prediction(&latents, &positive_pred)?;
             positive_pred
+        } else if batched_cfg {
+            let batched_sample = concat_batch_dim(&model_sample, &model_sample)?;
+            let mut batched_timesteps = timesteps.clone();
+            batched_timesteps.extend_from_slice(&timesteps);
+            let batched_encoder = concat_batch_dim(positive_embeddings, negative_embeddings)?;
+            let batched_mask = match (positive_attention_mask, negative_attention_mask) {
+                (Some(p), Some(n)) => Some(concat_batch_dim(p, n)?),
+                _ => None,
+            };
+            let batched_pred = predict_noise(
+                &batched_sample,
+                &batched_timesteps,
+                &batched_encoder,
+                batched_mask.as_ref(),
+                None,
+                runtime_context,
+            )?;
+            let (positive_pred, negative_pred) = split_batched_cfg_prediction(&batched_pred)?;
+            validate_noise_prediction(&latents, &positive_pred)?;
+            validate_noise_prediction(&latents, &negative_pred)?;
+            let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_context(
+                &negative_pred,
+                &positive_pred,
+                cfg_scale,
+                runtime_context,
+            )?;
+            runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
+            guided
         } else {
+            let positive_pred = predict_noise(
+                &model_sample,
+                &timesteps,
+                positive_embeddings,
+                positive_attention_mask,
+                positive_sdxl_conditioning,
+                runtime_context,
+            )?;
+            validate_noise_prediction(&latents, &positive_pred)?;
             let negative_pred = predict_noise(
                 &model_sample,
                 &timesteps,
@@ -1613,6 +1928,31 @@ fn classifier_free_guidance_is_identity(cfg_scale: f32) -> bool {
     (cfg_scale - 1.0).abs() <= f32::EPSILON
 }
 
+/// Stack per-prompt Krea2 conditioning `[1, seq, hidden]` tensors into a
+/// `[n_prompts, seq, hidden]` batch. Prompts must share `seq`/`hidden` (batching
+/// unequal prompt lengths needs padding + attention masks — not yet supported).
+fn stack_krea2_conditioning(items: &[CpuTensor]) -> DiffusionResult<CpuTensor> {
+    let first = items.first().ok_or_else(|| {
+        DiffusionError::InvalidRequest("Krea2 conditioning batch is empty".to_string())
+    })?;
+    let [_, seq, hidden] = shape3(first)?;
+    let mut data = Vec::with_capacity(items.len() * seq * hidden);
+    for item in items {
+        let [batch, item_seq, item_hidden] = shape3(item)?;
+        if batch != 1 || item_seq != seq || item_hidden != hidden {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "Krea2 conditioning batch requires equal prompt lengths; got {:?} vs [1, {seq}, {hidden}]",
+                item.shape
+            )));
+        }
+        data.extend_from_slice(&item.data);
+    }
+    Ok(CpuTensor {
+        shape: vec![items.len(), seq, hidden],
+        data,
+    })
+}
+
 fn scale_model_input_with_runtime_context(
     schedule: &DiffusionSchedule,
     sample: &CpuTensor,
@@ -1786,6 +2126,7 @@ fn linear_optional_bias_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
+        calib_observe_linear(weight, input);
         return linear_optional_bias(input, weight, bias);
     };
     {
@@ -1795,6 +2136,23 @@ fn linear_optional_bias_with_runtime_context(
     }
 }
 
+/// Fold a linear layer's input activations into the calibration accumulators
+/// (no-op unless a calibration run is armed). `weight` is `[out, in]`; the input
+/// is row-major `[rows, in]`.
+fn calib_observe_linear(weight: &CpuTensor, input: &CpuTensor) {
+    if !quant_calib::calib_active() {
+        return;
+    }
+    let Some(&k) = weight.shape.get(1) else {
+        return;
+    };
+    if k == 0 || input.data.is_empty() || input.data.len() % k != 0 {
+        return;
+    }
+    let rows = input.data.len() / k;
+    quant_calib::calib_observe_matrix(weight.data.as_ptr() as usize, &input.data, rows, k);
+}
+
 fn linear_with_runtime_context(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -1802,6 +2160,7 @@ fn linear_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     if runtime_context.rocm_device_id().is_none() {
+        calib_observe_linear(weight, input);
         return linear(input, weight, bias);
     }
     linear_optional_bias_with_runtime_context(input, weight, Some(bias), runtime_context)
@@ -2205,6 +2564,121 @@ pub struct CpuTensor {
     pub data: Vec<f32>,
 }
 
+/// Parity-debug tensor dump: when `HIPFIRE_DIFFUSION_DUMP_DIR` is set, write
+/// `<dir>/<name>.npy` (numpy v1, `<f4`) so intermediate activations can be diffed
+/// against a diffusers reference. No-op (and never errors the run) otherwise.
+pub(crate) fn dump_debug_tensor(name: &str, tensor: &CpuTensor) {
+    let Ok(dir) = std::env::var("HIPFIRE_DIFFUSION_DUMP_DIR") else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let shape = tensor
+        .shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shape = if tensor.shape.len() == 1 {
+        format!("{shape},")
+    } else {
+        shape
+    };
+    let header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape}), }}");
+    // Pad so total (magic 8 + len 2 + header) is a multiple of 64, header ends '\n'.
+    let mut header = header.into_bytes();
+    let total = 10 + header.len() + 1;
+    let pad = (64 - total % 64) % 64;
+    header.extend(std::iter::repeat_n(b' ', pad));
+    header.push(b'\n');
+    let mut out = Vec::with_capacity(10 + header.len() + tensor.data.len() * 4);
+    out.extend_from_slice(&[0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0]);
+    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    out.extend_from_slice(&header);
+    for value in &tensor.data {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.npy")), out);
+}
+
+/// Decode a raw tensor payload (`quant_type` + bytes) into `f32`. Shared by
+/// `CpuTensor::from_hfq` (decode-at-load) and `ResidentWeight` (decode-on-use).
+pub(crate) fn decode_tensor_payload(
+    name: &str,
+    quant_type: u8,
+    bytes: &[u8],
+    elem_count: usize,
+) -> DiffusionResult<Vec<f32>> {
+    Ok(match quant_type {
+        QT_DIFFUSION_TENSOR_Q4F16_G64 => decode_q4f16_g64_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_F16 => decode_f16_slice(bytes),
+        QT_DIFFUSION_TENSOR_BF16 => decode_bf16_slice(bytes),
+        QT_DIFFUSION_TENSOR_F32 => decode_f32_slice(bytes),
+        QT_DIFFUSION_TENSOR_Q8F16 => decode_q8f16_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_Q4_K => decode_q4_k_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_HFQ4_G256 => decode_hfq4_slice(name, bytes, elem_count, 256, 136, "HFQ4G256")?,
+        QT_DIFFUSION_TENSOR_HFQ4_G128 => decode_hfq4_slice(name, bytes, elem_count, 128, 72, "HFQ4G128")?,
+        QT_DIFFUSION_TENSOR_HFQ6_G256 => decode_hfq6_g256_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_OQ4_G256 => decode_oq4g256_slice(name, bytes, elem_count)?,
+        QT_DIFFUSION_TENSOR_OQ8_G256 => decode_oq8g256_slice(name, bytes, elem_count)?,
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "tensor {name:?} has unsupported quant_type {other}; native diffusion tensor decoding currently supports Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G256, HFQ4G128, HFQ6G256, OQ4G256, and OQ8G256 tensor payloads. Other packed or quantized payloads require a diffusion dequantizer/runtime implementation"
+            )))
+        }
+    })
+}
+
+/// A weight kept resident in its **on-disk packed form** (bf16 ~2 B/elem, oq4
+/// ~0.5 B/elem, etc.) and decoded to `f32` **transiently per forward call**,
+/// instead of holding the expanded `f32` (4 B/elem) for the lifetime of the
+/// model. This roughly halves resident memory for a bf16 model (and cuts it ~8x
+/// for oq4), letting the full Krea2 model fit where the f32 working set would
+/// OOM. `decode()` allocates the f32 only for the duration of one op.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResidentWeight {
+    name: String,
+    quant_type: u8,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl ResidentWeight {
+    pub(crate) fn from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<Self> {
+        let (info, bytes) = hfq.tensor_data_vec(name).ok_or_else(|| {
+            DiffusionError::InvalidMetadata(format!("tensor {name:?} is missing"))
+        })?;
+        Ok(Self {
+            name: name.to_string(),
+            quant_type: info.quant_type,
+            shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+            bytes,
+        })
+    }
+
+    pub(crate) fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Decode the packed payload into an f32 `CpuTensor` (transient; drop it
+    /// immediately after the op to keep only one weight expanded at a time).
+    pub(crate) fn decode(&self) -> DiffusionResult<CpuTensor> {
+        let elem_count = self.shape.iter().product();
+        let data = decode_tensor_payload(&self.name, self.quant_type, &self.bytes, elem_count)?;
+        // Register this decode's data pointer for activation calibration so the
+        // per-linear Hessian is captured for resident-packed weights too (the
+        // `CpuTensor::from_hfq` calibration hook does not see them). No-op unless
+        // a calibration run is armed.
+        if quant_calib::calib_active() {
+            quant_calib::calib_register(data.as_ptr() as usize, &self.name);
+        }
+        Ok(CpuTensor {
+            shape: self.shape.clone(),
+            data,
+        })
+    }
+}
+
 impl CpuTensor {
     pub fn from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<Self> {
         let (info, bytes) = hfq.tensor_data_vec(name).ok_or_else(|| {
@@ -2217,31 +2691,18 @@ impl CpuTensor {
             .ok_or_else(|| {
                 DiffusionError::InvalidMetadata(format!("tensor {name:?} shape overflows"))
             })?;
-        let data = match info.quant_type {
-            QT_DIFFUSION_TENSOR_Q4F16_G64 => decode_q4f16_g64_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_F16 => decode_f16_slice(&bytes),
-            QT_DIFFUSION_TENSOR_BF16 => decode_bf16_slice(&bytes),
-            QT_DIFFUSION_TENSOR_F32 => decode_f32_slice(&bytes),
-            QT_DIFFUSION_TENSOR_Q8F16 => decode_q8f16_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_Q4_K => decode_q4_k_slice(name, &bytes, elem_count)?,
-            QT_DIFFUSION_TENSOR_HFQ4_G256 => {
-                decode_hfq4_slice(name, &bytes, elem_count, 256, 136, "HFQ4G256")?
-            }
-            QT_DIFFUSION_TENSOR_HFQ4_G128 => {
-                decode_hfq4_slice(name, &bytes, elem_count, 128, 72, "HFQ4G128")?
-            }
-            QT_DIFFUSION_TENSOR_HFQ6_G256 => decode_hfq6_g256_slice(name, &bytes, elem_count)?,
-            other => {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "tensor {name:?} has unsupported quant_type {other}; native diffusion tensor decoding currently supports Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G256, HFQ4G128, and HFQ6G256 tensor payloads. Other packed or quantized payloads require a diffusion dequantizer/runtime implementation"
-                )))
-            }
-        };
+        let data = decode_tensor_payload(name, info.quant_type, &bytes, elem_count)?;
         if data.len() != elem_count {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "tensor {name:?} decoded {} elements but shape expects {elem_count}",
                 data.len()
             )));
+        }
+        // Register this weight's data pointer for activation calibration (no-op
+        // unless a calibration run is armed). The Vec buffer is stable across the
+        // move into `Self`, so the pointer matches what the forward sees.
+        if quant_calib::calib_active() {
+            quant_calib::calib_register(data.as_ptr() as usize, name);
         }
         Ok(Self {
             shape: info.shape.iter().map(|&dim| dim as usize).collect(),
@@ -2270,6 +2731,20 @@ impl CpuTensor {
 
 mod quant_decode;
 use quant_decode::*;
+
+mod quant_encode;
+pub use quant_encode::{
+    oq4_arch_combined_len, open_calib_sidecar, pack_oq4_arch_combined, quantize_diffusion_hfq,
+    DiffusionQuantFormat, DiffusionQuantizeSummary, HessianSidecar,
+};
+
+mod quant_calib;
+pub use quant_calib::{
+    calib_active, calib_begin, calib_finish_and_write, calib_observed_count,
+    calibrate_diffusion_hfq, CalibrateSummary,
+};
+#[cfg(test)]
+use quant_encode::{encode_q4f16_g64, encode_q4k, encode_q8f16};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffusionError {
@@ -3975,6 +4450,56 @@ impl DiffusionPipeline {
         self.prepare_conditioning_batch_with_runtime_context(request, &mut runtime_context)
     }
 
+    /// Krea2 conditioning: tokenize each prompt with the Qwen2 tokenizer, run the
+    /// Qwen3-VL encoder + text_fusion, and stack the per-prompt `[1, seq, hidden]`
+    /// conditioning into the batch the transformer denoiser consumes as its text
+    /// embeddings. (Numerically unvalidated — see encoder/DiT parity caveats.)
+    fn prepare_krea2_conditioning_batch(
+        &self,
+        request: &DiffusionBatchRequest,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<DiffusionConditioningBatch> {
+        let runtime = self.native_runtime()?;
+        let missing = || {
+            DiffusionError::BackendUnavailable("Krea2 text conditioner unavailable".to_string())
+        };
+        let cfg_is_identity = classifier_free_guidance_is_identity(request.cfg_scale);
+        let mut prompt_conds = Vec::with_capacity(request.prompts.len());
+        let mut negative_conds = Vec::with_capacity(request.prompts.len());
+        for prompt in &request.prompts {
+            let cond = runtime
+                .krea2_conditioning_from_prompt(&prompt.prompt, runtime_context)?
+                .ok_or_else(missing)?;
+            if cfg_is_identity {
+                negative_conds.push(cond.clone());
+            } else {
+                negative_conds.push(
+                    runtime
+                        .krea2_conditioning_from_prompt(&prompt.negative_prompt, runtime_context)?
+                        .ok_or_else(missing)?,
+                );
+            }
+            prompt_conds.push(cond);
+        }
+        let empty_tokens = vec![Vec::new(); request.prompts.len()];
+        Ok(DiffusionConditioningBatch {
+            prompt_tokens: empty_tokens.clone(),
+            negative_tokens: empty_tokens,
+            prompt_tokens_2: None,
+            negative_tokens_2: None,
+            prompt_embeddings: Some(stack_krea2_conditioning(&prompt_conds)?),
+            negative_embeddings: Some(stack_krea2_conditioning(&negative_conds)?),
+            prompt_embeddings_2: None,
+            negative_embeddings_2: None,
+            prompt_cross_attention_embeddings: None,
+            negative_cross_attention_embeddings: None,
+            prompt_attention_mask: None,
+            negative_attention_mask: None,
+            prompt_pooled_embeddings: None,
+            negative_pooled_embeddings: None,
+        })
+    }
+
     fn prepare_conditioning_batch_with_runtime_context(
         &self,
         request: &DiffusionBatchRequest,
@@ -3986,6 +4511,16 @@ impl DiffusionPipeline {
                 conditioning,
                 request.prompts.len(),
             ));
+        }
+        // Krea2: the Qwen3-VL encoder + text_fusion produce the DiT conditioning
+        // in-runtime (no CLIP). NOTE: numerically unvalidated against a diffusers
+        // reference — see the parity caveats on the encoder/DiT.
+        if self
+            .native_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.text_conditioner.is_some())
+        {
+            return self.prepare_krea2_conditioning_batch(request, runtime_context);
         }
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             DiffusionError::BackendUnavailable(
@@ -4365,6 +4900,11 @@ struct NativeDiffusionRuntime {
     noise: Box<dyn DiffusionNoiseBackend>,
     encoder: Option<NativeVaeEncoder>,
     decoder: Box<dyn DiffusionImageDecoder>,
+    // Krea2 text conditioning (Qwen3-VL encoder + text_fusion). Present only for
+    // `Krea2Pipeline`; the pipeline drives it to build the DiT conditioning.
+    text_conditioner: Option<Krea2TextConditioner>,
+    // Qwen2 byte-level BPE tokenizer for the Krea2 prompt (from `tokenizer.json`).
+    krea2_tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
 }
 
 impl NativeDiffusionRuntime {
@@ -4373,6 +4913,11 @@ impl NativeDiffusionRuntime {
         metadata: &DiffusionHfqMetadata,
         config: &StableDiffusionConfig,
     ) -> DiffusionResult<Self> {
+        let transformer_family = metadata
+            .components
+            .get("transformer")
+            .map(transformer_denoiser_weight_topology)
+            .map(|topology| topology.family);
         let noise: Box<dyn DiffusionNoiseBackend> =
             if let Some(transformer) = metadata.components.get("transformer") {
                 let topology = transformer_denoiser_weight_topology(transformer);
@@ -4380,2257 +4925,110 @@ impl NativeDiffusionRuntime {
             } else {
                 Box::new(NativeUnet2DConditionModel::from_hfq(hfq, &config.unet)?)
             };
+        let is_krea2 = matches!(transformer_family, Some(TransformerDenoiserFamily::Krea2));
+        let text_conditioner = if is_krea2 {
+            Self::load_krea2_conditioner(hfq, metadata, config)?
+        } else {
+            None
+        };
+        let krea2_tokenizer = if is_krea2 {
+            hfq.tensor_data_vec("tokenizer/tokenizer.json")
+                .and_then(|(_, bytes)| String::from_utf8(bytes).ok())
+                .and_then(|json| hipfire_model::tokenizer::Tokenizer::from_hf_json(&json).ok())
+        } else {
+            None
+        };
         Ok(Self {
             kind: DiffusionRuntimeKind::CpuSourceReference,
             noise,
             encoder: NativeVaeEncoder::from_hfq(hfq, &config.vae).ok(),
             decoder: Box::new(NativeVaeDecoder::from_hfq(hfq, &config.vae)?),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct NativeTransformerDenoiserIo {
-    family: TransformerDenoiserFamily,
-    patch_size: usize,
-    input_channels: usize,
-    output_channels: usize,
-    input_token_width: usize,
-    hidden_width: usize,
-    output_token_width: usize,
-    img_in_weight: CpuTensor,
-    img_in_bias: CpuTensor,
-    output_weight: CpuTensor,
-    output_bias: CpuTensor,
-    text_norm_weight: Option<CpuTensor>,
-    text_in_weight: Option<CpuTensor>,
-    text_in_bias: Option<CpuTensor>,
-    output_norm_weight: Option<CpuTensor>,
-    output_norm_bias: Option<CpuTensor>,
-}
-
-#[allow(dead_code)]
-impl NativeTransformerDenoiserIo {
-    fn from_hfq(
-        hfq: &HfqFile,
-        config: &StableDiffusionConfig,
-        topology: &TransformerDenoiserWeightTopology,
-    ) -> DiffusionResult<Self> {
-        let transformer = config.transformer.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "transformer denoiser config is required for transformer IO".to_string(),
-            )
-        })?;
-        let patch_size = transformer
-            .patch_size
-            .or_else(|| default_transformer_patch_size(&transformer.class_name))
-            .unwrap_or(1)
-            .max(1);
-        let patch_feature_width = config
-            .latent_channels
-            .checked_mul(patch_size)
-            .and_then(|value| value.checked_mul(patch_size))
-            .ok_or_else(|| {
-                DiffusionError::InvalidMetadata(
-                    "transformer patch feature width overflow".to_string(),
-                )
-            })?;
-        let input_channels = transformer.in_channels.unwrap_or(patch_feature_width);
-        if input_channels < patch_feature_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer in_channels {input_channels} is smaller than latent patch feature width {patch_feature_width}"
-            )));
-        }
-        let output_channels = transformer.out_channels.unwrap_or(config.latent_channels);
-        let output_patch_feature_width = output_channels
-            .checked_mul(patch_size)
-            .and_then(|value| value.checked_mul(patch_size))
-            .ok_or_else(|| {
-                DiffusionError::InvalidMetadata(
-                    "transformer output patch feature width overflow".to_string(),
-                )
-            })?;
-
-        let img_in_weight = CpuTensor::from_hfq(hfq, "transformer/tensors/img_in.weight")?;
-        let img_in_bias = CpuTensor::from_hfq(hfq, "transformer/tensors/img_in.bias")?;
-        let [hidden_width, input_token_width] = shape2(&img_in_weight)?;
-        if input_token_width != input_channels {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer img_in input width {input_token_width} != configured in_channels {input_channels}"
-            )));
-        }
-        if img_in_bias.shape.as_slice() != [hidden_width] {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer img_in bias shape {:?} != [{hidden_width}]",
-                img_in_bias.shape
-            )));
-        }
-
-        let (output_weight_entry, output_bias_entry) = match topology.family {
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => (
-                "transformer/tensors/proj_out.weight",
-                "transformer/tensors/proj_out.bias",
-            ),
-            TransformerDenoiserFamily::Krea2 => (
-                "transformer/tensors/final_layer.linear.weight",
-                "transformer/tensors/final_layer.linear.bias",
-            ),
-        };
-        let output_weight = CpuTensor::from_hfq(hfq, output_weight_entry)?;
-        let output_bias = CpuTensor::from_hfq(hfq, output_bias_entry)?;
-        let [output_token_width, output_hidden_width] = shape2(&output_weight)?;
-        if output_hidden_width != hidden_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer output projection input width {output_hidden_width} != img_in hidden width {hidden_width}"
-            )));
-        }
-        if output_token_width < output_patch_feature_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer output token width {output_token_width} is smaller than output patch feature width {output_patch_feature_width}"
-            )));
-        }
-        if output_bias.shape.as_slice() != [output_token_width] {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer output projection bias shape {:?} != [{output_token_width}]",
-                output_bias.shape
-            )));
-        }
-        let text_norm_weight = optional_tensor(hfq, "transformer/tensors/txt_norm.weight")?;
-        if let Some(weight) = text_norm_weight.as_ref() {
-            let text_width = transformer
-                .cross_attention_dim
-                .or(transformer.text_hidden_dim)
-                .unwrap_or_else(|| weight.shape.first().copied().unwrap_or(0));
-            if weight.shape.as_slice() != [text_width] {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "transformer txt_norm weight shape {:?} != [{text_width}]",
-                    weight.shape
-                )));
-            }
-        }
-        let text_in_weight = optional_tensor(hfq, "transformer/tensors/txt_in.weight")?;
-        let text_in_bias = if text_in_weight.is_some() {
-            Some(CpuTensor::from_hfq(hfq, "transformer/tensors/txt_in.bias")?)
-        } else {
-            None
-        };
-        if let Some(weight) = text_in_weight.as_ref() {
-            let [text_out_width, text_in_width] = shape2(weight)?;
-            if text_out_width != hidden_width {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "transformer txt_in output width {text_out_width} != img_in hidden width {hidden_width}"
-                )));
-            }
-            if let Some(norm_weight) = text_norm_weight.as_ref() {
-                if norm_weight.shape.as_slice() != [text_in_width] {
-                    return Err(DiffusionError::InvalidMetadata(format!(
-                        "transformer txt_norm width {:?} != txt_in input width {text_in_width}",
-                        norm_weight.shape
-                    )));
-                }
-            }
-            if text_in_bias.as_ref().map(|bias| bias.shape.as_slice()) != Some(&[hidden_width][..])
-            {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "transformer txt_in bias shape {:?} != [{hidden_width}]",
-                    text_in_bias.as_ref().map(|bias| bias.shape.clone())
-                )));
-            }
-        }
-        let output_norm_weight =
-            optional_tensor(hfq, "transformer/tensors/norm_out.linear.weight")?;
-        let output_norm_bias = if output_norm_weight.is_some() {
-            Some(CpuTensor::from_hfq(
-                hfq,
-                "transformer/tensors/norm_out.linear.bias",
-            )?)
-        } else {
-            None
-        };
-        if let Some(weight) = output_norm_weight.as_ref() {
-            let [norm_rows, norm_cols] = shape2(weight)?;
-            if norm_rows != hidden_width * 2 || norm_cols != hidden_width {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "transformer norm_out.linear weight shape {:?} != [{}, {hidden_width}]",
-                    weight.shape,
-                    hidden_width * 2
-                )));
-            }
-            if output_norm_bias.as_ref().map(|bias| bias.shape.as_slice())
-                != Some(&[hidden_width * 2][..])
-            {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "transformer norm_out.linear bias shape {:?} != [{}]",
-                    output_norm_bias.as_ref().map(|bias| bias.shape.clone()),
-                    hidden_width * 2
-                )));
-            }
-        }
-
-        Ok(Self {
-            family: topology.family,
-            patch_size,
-            input_channels,
-            output_channels,
-            input_token_width,
-            hidden_width,
-            output_token_width,
-            img_in_weight,
-            img_in_bias,
-            output_weight,
-            output_bias,
-            text_norm_weight,
-            text_in_weight,
-            text_in_bias,
-            output_norm_weight,
-            output_norm_bias,
+            text_conditioner,
+            krea2_tokenizer,
         })
     }
 
-    fn project_latents_to_hidden_with_runtime_context(
+    /// Tokenize a prompt and build the Krea2 DiT conditioning `[1, seq, hidden]`.
+    /// `None` for non-Krea2 runtimes or when the tokenizer/conditioner is absent.
+    fn krea2_conditioning_from_prompt(
         &self,
-        latents: &LatentBatch,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let tokens =
-            latent_batch_to_patch_tokens(latents, self.patch_size, self.input_token_width)?;
-        linear_3d_with_runtime_context(
-            &tokens,
-            &self.img_in_weight,
-            Some(&self.img_in_bias),
-            runtime_context,
-        )
-    }
-
-    fn project_hidden_to_latents_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        timestep_embedding: &CpuTensor,
-        batch: usize,
-        height: usize,
-        width: usize,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<LatentBatch> {
-        let hidden =
-            self.output_norm_with_runtime_context(hidden, timestep_embedding, runtime_context)?;
-        let tokens = linear_3d_with_runtime_context(
-            &hidden,
-            &self.output_weight,
-            Some(&self.output_bias),
-            runtime_context,
-        )?;
-        patch_tokens_to_latent_batch(
-            &tokens,
-            batch,
-            self.output_channels,
-            height,
-            width,
-            self.patch_size,
-        )
-    }
-
-    fn project_text_to_hidden_with_runtime_context(
-        &self,
-        text_hidden: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let [_, _, input_width] = shape3(text_hidden)?;
-        let text_hidden = if let Some(weight) = self.text_norm_weight.as_ref() {
-            if weight.shape.as_slice() != [input_width] {
-                return Err(DiffusionError::InvalidRequest(format!(
-                    "transformer text hidden width {input_width} != txt_norm width {}",
-                    weight.shape.first().copied().unwrap_or(0)
-                )));
-            }
-            rms_norm_3d_with_runtime_context(text_hidden, weight, 1e-6, runtime_context)?
-        } else {
-            text_hidden.clone()
-        };
-        let Some(weight) = self.text_in_weight.as_ref() else {
-            if input_width != self.hidden_width {
-                return Err(DiffusionError::InvalidRequest(format!(
-                    "transformer text hidden width {input_width} != expected hidden width {}; artifact has no txt_in projection",
-                    self.hidden_width
-                )));
-            }
-            return Ok(text_hidden);
-        };
-        let bias = self.text_in_bias.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "transformer txt_in weight is present but bias is missing".to_string(),
-            )
-        })?;
-        linear_3d_with_runtime_context(&text_hidden, weight, Some(bias), runtime_context)
-    }
-
-    fn output_norm_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        timestep_embedding: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let Some(weight) = self.output_norm_weight.as_ref() else {
-            return Ok(hidden.clone());
-        };
-        let bias = self.output_norm_bias.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "transformer norm_out.linear weight is present but bias is missing".to_string(),
-            )
-        })?;
-        let [batch, _, width] = shape3(hidden)?;
-        if width != self.hidden_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer output hidden width {width} != expected {}",
-                self.hidden_width
-            )));
-        }
-        let [time_batch, time_width] = shape2(timestep_embedding)?;
-        if time_batch != batch || time_width != self.hidden_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer output norm timestep shape {:?} != [{batch}, {}]",
-                timestep_embedding.shape, self.hidden_width
-            )));
-        }
-        let activated = silu_with_runtime_context(timestep_embedding, runtime_context)?;
-        let projected = linear_with_runtime_context(&activated, weight, bias, runtime_context)?;
-        let [projected_batch, projected_width] = shape2(&projected)?;
-        if projected_batch != batch || projected_width != width * 2 {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer output norm projection shape {:?} != [{batch}, {}]",
-                projected.shape,
-                width * 2
-            )));
-        }
-        let normalized =
-            layer_norm_3d_no_affine_with_runtime_context(hidden, 1e-6, runtime_context)?;
-        let mut scale = CpuTensor::zeros(&[batch, width]);
-        let mut shift = CpuTensor::zeros(&[batch, width]);
-        for b in 0..batch {
-            let src = b * projected_width;
-            let dst = b * width;
-            scale.data[dst..dst + width].copy_from_slice(&projected.data[src..src + width]);
-            shift.data[dst..dst + width]
-                .copy_from_slice(&projected.data[src + width..src + projected_width]);
-        }
-        modulate_3d(&normalized, &shift, &scale)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct NativeTransformerTimestepEmbedding {
-    family: TransformerDenoiserFamily,
-    linear_1_weight: CpuTensor,
-    linear_1_bias: CpuTensor,
-    linear_2_weight: CpuTensor,
-    linear_2_bias: CpuTensor,
-    modulation_weight: Option<CpuTensor>,
-    modulation_bias: Option<CpuTensor>,
-}
-
-#[allow(dead_code)]
-impl NativeTransformerTimestepEmbedding {
-    fn from_hfq(hfq: &HfqFile, family: TransformerDenoiserFamily) -> DiffusionResult<Self> {
-        let prefix = match family {
-            TransformerDenoiserFamily::Krea2 => "transformer/tensors/time_embed",
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
-                "transformer/tensors/time_text_embed.timestep_embedder"
-            }
-        };
-        let modulation_weight = optional_tensor(hfq, "transformer/tensors/time_mod_proj.weight")?;
-        let modulation_bias = if modulation_weight.is_some() {
-            Some(CpuTensor::from_hfq(
-                hfq,
-                "transformer/tensors/time_mod_proj.bias",
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            family,
-            linear_1_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_1.weight"))?,
-            linear_1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_1.bias"))?,
-            linear_2_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_2.weight"))?,
-            linear_2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_2.bias"))?,
-            modulation_weight,
-            modulation_bias,
-        })
-    }
-
-    fn embedding_dim(&self) -> DiffusionResult<usize> {
-        let (_, embedding_dim) = self.linear_1_weight.rows_cols()?;
-        Ok(embedding_dim)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        timesteps: &[f32],
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let input = timestep_embedding_with_runtime_context(
-            timesteps,
-            self.embedding_dim()?,
-            true,
-            0.0,
-            runtime_context,
-        )?;
-        let hidden = linear_with_runtime_context(
-            &input,
-            &self.linear_1_weight,
-            &self.linear_1_bias,
-            runtime_context,
-        )?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        linear_with_runtime_context(
-            &hidden,
-            &self.linear_2_weight,
-            &self.linear_2_bias,
-            runtime_context,
-        )
-    }
-
-    fn modulation_with_runtime_context(
-        &self,
-        timestep_embedding: &CpuTensor,
+        prompt: &str,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<Option<CpuTensor>> {
-        let Some(weight) = self.modulation_weight.as_ref() else {
+        let (Some(tokenizer), Some(_)) = (&self.krea2_tokenizer, &self.text_conditioner) else {
             return Ok(None);
         };
-        let bias = self.modulation_bias.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "transformer time_mod_proj weight is present but bias is missing".to_string(),
-            )
-        })?;
-        linear_with_runtime_context(timestep_embedding, weight, bias, runtime_context).map(Some)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct TransformerModulationChunks {
-    shift_msa: CpuTensor,
-    scale_msa: CpuTensor,
-    gate_msa: CpuTensor,
-    shift_mlp: CpuTensor,
-    scale_mlp: CpuTensor,
-    gate_mlp: CpuTensor,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct NativeTransformerBlockModulation {
-    family: TransformerDenoiserFamily,
-    block_index: usize,
-    hidden_width: usize,
-    img_mod_weight: Option<CpuTensor>,
-    img_mod_bias: Option<CpuTensor>,
-    txt_mod_weight: Option<CpuTensor>,
-    txt_mod_bias: Option<CpuTensor>,
-    scale_shift_table: Option<CpuTensor>,
-}
-
-#[allow(dead_code)]
-impl NativeTransformerBlockModulation {
-    fn from_hfq(
-        hfq: &HfqFile,
-        family: TransformerDenoiserFamily,
-        block_index: usize,
-    ) -> DiffusionResult<Self> {
-        let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
-        match family {
-            TransformerDenoiserFamily::Krea2 => {
-                let scale_shift_table =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.scale_shift_table"))?;
-                let [chunks, hidden_width] = shape2(&scale_shift_table)?;
-                if chunks == 0 || hidden_width == 0 {
-                    return Err(DiffusionError::InvalidMetadata(format!(
-                        "Krea transformer block {block_index} scale_shift_table shape {:?} is empty",
-                        scale_shift_table.shape
-                    )));
-                }
-                Ok(Self {
-                    family,
-                    block_index,
-                    hidden_width,
-                    img_mod_weight: None,
-                    img_mod_bias: None,
-                    txt_mod_weight: None,
-                    txt_mod_bias: None,
-                    scale_shift_table: Some(scale_shift_table),
-                })
-            }
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
-                let img_mod_weight =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.img_mod.1.weight"))?;
-                let img_mod_bias =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.img_mod.1.bias"))?;
-                let txt_mod_weight =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.weight"))?;
-                let txt_mod_bias =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.bias"))?;
-                let [img_rows, hidden_width] = shape2(&img_mod_weight)?;
-                let [txt_rows, txt_hidden_width] = shape2(&txt_mod_weight)?;
-                if hidden_width == 0 || img_rows != hidden_width * 6 {
-                    return Err(DiffusionError::InvalidMetadata(format!(
-                        "Qwen transformer block {block_index} img_mod weight shape {:?} is not [6*hidden, hidden]",
-                        img_mod_weight.shape
-                    )));
-                }
-                if txt_hidden_width != hidden_width || txt_rows != hidden_width * 6 {
-                    return Err(DiffusionError::InvalidMetadata(format!(
-                        "Qwen transformer block {block_index} txt_mod weight shape {:?} does not match hidden width {hidden_width}",
-                        txt_mod_weight.shape
-                    )));
-                }
-                if img_mod_bias.shape.as_slice() != [img_rows] {
-                    return Err(DiffusionError::InvalidMetadata(format!(
-                        "Qwen transformer block {block_index} img_mod bias shape {:?} != [{img_rows}]",
-                        img_mod_bias.shape
-                    )));
-                }
-                if txt_mod_bias.shape.as_slice() != [txt_rows] {
-                    return Err(DiffusionError::InvalidMetadata(format!(
-                        "Qwen transformer block {block_index} txt_mod bias shape {:?} != [{txt_rows}]",
-                        txt_mod_bias.shape
-                    )));
-                }
-                Ok(Self {
-                    family,
-                    block_index,
-                    hidden_width,
-                    img_mod_weight: Some(img_mod_weight),
-                    img_mod_bias: Some(img_mod_bias),
-                    txt_mod_weight: Some(txt_mod_weight),
-                    txt_mod_bias: Some(txt_mod_bias),
-                    scale_shift_table: None,
-                })
-            }
-        }
+        let token_ids = tokenizer.encode(prompt);
+        self.krea2_conditioning_from_token_ids(&token_ids, runtime_context)
     }
 
-    fn qwen_image_modulation_with_runtime_context(
+    /// Krea2 conditioning for a tokenized prompt (`None` for non-Krea2 runtimes).
+    /// The pipeline drives this then feeds the result through the transformer
+    /// denoiser's external-conditioning seam. (Generate-path call site is the
+    /// remaining pipeline glue.)
+    #[allow(dead_code)]
+    fn krea2_conditioning_from_token_ids(
         &self,
-        timestep_embedding: &CpuTensor,
-        stream: TransformerModulationStream,
+        token_ids: &[u32],
         runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<TransformerModulationChunks> {
-        if !matches!(
-            self.family,
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown
-        ) {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer block {} family {:?} does not use Qwen image/text modulation",
-                self.block_index, self.family
-            )));
+    ) -> DiffusionResult<Option<CpuTensor>> {
+        match &self.text_conditioner {
+            Some(conditioner) => conditioner
+                .conditioning_from_token_ids(token_ids, runtime_context)
+                .map(Some),
+            None => Ok(None),
         }
-        let (weight, bias) = match stream {
-            TransformerModulationStream::Image => {
-                (self.img_mod_weight.as_ref(), self.img_mod_bias.as_ref())
-            }
-            TransformerModulationStream::Text => {
-                (self.txt_mod_weight.as_ref(), self.txt_mod_bias.as_ref())
-            }
-        };
-        let weight = weight.ok_or_else(|| {
-            DiffusionError::InvalidMetadata("Qwen transformer modulation weight is missing".into())
-        })?;
-        let bias = bias.ok_or_else(|| {
-            DiffusionError::InvalidMetadata("Qwen transformer modulation bias is missing".into())
-        })?;
-        let activated = silu_with_runtime_context(timestep_embedding, runtime_context)?;
-        let projected = linear_with_runtime_context(&activated, weight, bias, runtime_context)?;
-        split_modulation_chunks(projected, 6)
     }
 
-    fn krea_scale_shift_with_runtime_context(
-        &self,
-        time_modulation: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let _ = runtime_context;
-        let table = self.scale_shift_table.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata("Krea transformer scale_shift_table is missing".into())
-        })?;
-        let [chunks, hidden_width] = shape2(table)?;
-        let [batch, width] = shape2(time_modulation)?;
-        if hidden_width != self.hidden_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "Krea transformer block {} hidden width drifted from {} to {hidden_width}",
-                self.block_index, self.hidden_width
-            )));
-        }
-        if width != chunks * hidden_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "Krea time modulation width {width} != scale_shift_table chunks*hidden {}",
-                chunks * hidden_width
-            )));
-        }
-        let mut out = CpuTensor::zeros(&[batch, chunks, hidden_width]);
-        for b in 0..batch {
-            for chunk in 0..chunks {
-                for hidden in 0..hidden_width {
-                    let flat = chunk * hidden_width + hidden;
-                    out.data[(b * chunks + chunk) * hidden_width + hidden] = time_modulation.data
-                        [b * width + flat]
-                        + table.data[chunk * hidden_width + hidden];
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct TransformerAttentionQkv {
-    q: CpuTensor,
-    k: CpuTensor,
-    v: CpuTensor,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct TransformerAttentionStreamProjection {
-    stream_label: &'static str,
-    q_weight: CpuTensor,
-    q_bias: Option<CpuTensor>,
-    k_weight: CpuTensor,
-    k_bias: Option<CpuTensor>,
-    v_weight: CpuTensor,
-    v_bias: Option<CpuTensor>,
-    norm_q_weight: Option<CpuTensor>,
-    norm_k_weight: Option<CpuTensor>,
-    out_weight: CpuTensor,
-    out_bias: Option<CpuTensor>,
-}
-
-#[allow(dead_code)]
-impl TransformerAttentionStreamProjection {
-    #[allow(clippy::too_many_arguments)]
-    fn from_hfq(
+    /// Build the Krea2 text conditioner from the artifact: encoder geometry from
+    /// the `text_encoder` (Qwen3-VL `text_config`), the selected layers from
+    /// `model_index.text_encoder_select_layers`, and the fusion head count from
+    /// the transformer config.
+    fn load_krea2_conditioner(
         hfq: &HfqFile,
-        stream_label: &'static str,
-        q_weight_entry: &str,
-        q_bias_entry: &str,
-        k_weight_entry: &str,
-        k_bias_entry: &str,
-        v_weight_entry: &str,
-        v_bias_entry: &str,
-        norm_q_entry: &str,
-        norm_k_entry: &str,
-        out_weight_entry: &str,
-        out_bias_entry: &str,
-        required: bool,
-        heads: usize,
-        expected_hidden_width: Option<usize>,
-        expected_inner_width: Option<usize>,
-        expected_head_dim: Option<usize>,
-    ) -> DiffusionResult<Option<Self>> {
-        if hfq.find_tensor_info(q_weight_entry).is_none() {
-            if required {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "{stream_label} transformer attention q projection {q_weight_entry:?} is missing"
-                )));
-            }
-            return Ok(None);
-        }
-
-        let stream = Self {
-            stream_label,
-            q_weight: CpuTensor::from_hfq(hfq, q_weight_entry)?,
-            q_bias: optional_tensor(hfq, q_bias_entry)?,
-            k_weight: CpuTensor::from_hfq(hfq, k_weight_entry)?,
-            k_bias: optional_tensor(hfq, k_bias_entry)?,
-            v_weight: CpuTensor::from_hfq(hfq, v_weight_entry)?,
-            v_bias: optional_tensor(hfq, v_bias_entry)?,
-            norm_q_weight: optional_tensor(hfq, norm_q_entry)?,
-            norm_k_weight: optional_tensor(hfq, norm_k_entry)?,
-            out_weight: CpuTensor::from_hfq(hfq, out_weight_entry)?,
-            out_bias: optional_tensor(hfq, out_bias_entry)?,
-        };
-        stream.validate_shapes(
-            heads,
-            expected_hidden_width,
-            expected_inner_width,
-            expected_head_dim,
-        )?;
-        Ok(Some(stream))
-    }
-
-    fn validate_shapes(
-        &self,
-        heads: usize,
-        expected_hidden_width: Option<usize>,
-        expected_inner_width: Option<usize>,
-        expected_head_dim: Option<usize>,
-    ) -> DiffusionResult<(usize, usize, usize)> {
-        if heads == 0 {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{} transformer attention heads must be positive",
-                self.stream_label
-            )));
-        }
-        let [inner_width, hidden_width] = shape2(&self.q_weight)?;
-        if inner_width == 0 || hidden_width == 0 {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{} transformer attention q weight shape {:?} is empty",
-                self.stream_label, self.q_weight.shape
-            )));
-        }
-        if let Some(expected) = expected_hidden_width {
-            if hidden_width != expected {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "{} transformer attention hidden width {hidden_width} != expected {expected}",
-                    self.stream_label
-                )));
-            }
-        }
-        if let Some(expected) = expected_inner_width {
-            if inner_width != expected {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "{} transformer attention inner width {inner_width} != expected {expected}",
-                    self.stream_label
-                )));
-            }
-        }
-        let head_dim = self
-            .norm_q_weight
+        metadata: &DiffusionHfqMetadata,
+        config: &StableDiffusionConfig,
+    ) -> DiffusionResult<Option<Krea2TextConditioner>> {
+        let text_encoder = component_json(hfq, metadata, "text_encoder")?.unwrap_or_else(|| json!({}));
+        let text_config = text_encoder
+            .get("text_config")
+            .cloned()
+            .unwrap_or_else(|| text_encoder.clone());
+        let heads = json_usize(&text_config, "num_attention_heads").unwrap_or(32);
+        let kv_heads = json_usize(&text_config, "num_key_value_heads").unwrap_or(8);
+        let head_dim = json_usize(&text_config, "head_dim").unwrap_or(128);
+        let rope_theta = text_config
+            .get("rope_parameters")
+            .and_then(|params| json_f32(params, "rope_theta"))
+            .or_else(|| json_f32(&text_config, "rope_theta"))
+            .unwrap_or(5_000_000.0);
+        // select_layers live in model_index.json (stored verbatim on import).
+        let model_index = hfq
+            .tensor_data_vec("diffusers/model_index.json")
+            .and_then(|(_, bytes)| String::from_utf8(bytes).ok())
+            .and_then(|text| parse_json_lenient(&text).ok())
+            .unwrap_or_else(|| json!({}));
+        let select_layers = json_usize_vec(&model_index, "text_encoder_select_layers");
+        let fusion_heads = config
+            .transformer
             .as_ref()
-            .or(self.norm_k_weight.as_ref())
-            .map(attention_norm_weight_dim)
-            .transpose()?
-            .or(expected_head_dim)
-            .unwrap_or_else(|| inner_width / heads);
-        if head_dim == 0 || inner_width != heads * head_dim {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{} transformer attention inner width {inner_width} is incompatible with heads {heads} and head_dim {head_dim}",
-                self.stream_label
-            )));
-        }
-        validate_attention_linear_shape(
-            self.stream_label,
-            "k",
-            &self.k_weight,
-            inner_width,
-            hidden_width,
-        )?;
-        validate_attention_linear_shape(
-            self.stream_label,
-            "v",
-            &self.v_weight,
-            inner_width,
-            hidden_width,
-        )?;
-        validate_attention_bias_shape(self.stream_label, "q", self.q_bias.as_ref(), inner_width)?;
-        validate_attention_bias_shape(self.stream_label, "k", self.k_bias.as_ref(), inner_width)?;
-        validate_attention_bias_shape(self.stream_label, "v", self.v_bias.as_ref(), inner_width)?;
-        validate_attention_norm_shape(
-            self.stream_label,
-            "q",
-            self.norm_q_weight.as_ref(),
-            head_dim,
-        )?;
-        validate_attention_norm_shape(
-            self.stream_label,
-            "k",
-            self.norm_k_weight.as_ref(),
-            head_dim,
-        )?;
-        if self.out_weight.shape.as_slice() != [hidden_width, inner_width] {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{} transformer attention output weight shape {:?} != [{hidden_width}, {inner_width}]",
-                self.stream_label, self.out_weight.shape
-            )));
-        }
-        validate_attention_bias_shape(
-            self.stream_label,
-            "out",
-            self.out_bias.as_ref(),
-            hidden_width,
-        )?;
-        Ok((hidden_width, inner_width, head_dim))
-    }
-
-    fn project_qkv_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        heads: usize,
-        head_dim: usize,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<TransformerAttentionQkv> {
-        let q = linear_3d_with_runtime_context(
-            hidden,
-            &self.q_weight,
-            self.q_bias.as_ref(),
-            runtime_context,
-        )?;
-        let k = linear_3d_with_runtime_context(
-            hidden,
-            &self.k_weight,
-            self.k_bias.as_ref(),
-            runtime_context,
-        )?;
-        let v = linear_3d_with_runtime_context(
-            hidden,
-            &self.v_weight,
-            self.v_bias.as_ref(),
-            runtime_context,
-        )?;
-        let q = maybe_rms_norm_attention_heads_3d(
-            q,
-            self.norm_q_weight.as_ref(),
-            heads,
-            head_dim,
-            1e-6,
-        )?;
-        let k = maybe_rms_norm_attention_heads_3d(
-            k,
-            self.norm_k_weight.as_ref(),
-            heads,
-            head_dim,
-            1e-6,
-        )?;
-        Ok(TransformerAttentionQkv { q, k, v })
-    }
-
-    fn project_output_with_runtime_context(
-        &self,
-        attention: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        linear_3d_with_runtime_context(
-            attention,
-            &self.out_weight,
-            self.out_bias.as_ref(),
-            runtime_context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct NativeTransformerAttentionProjection {
-    family: TransformerDenoiserFamily,
-    block_index: usize,
-    heads: usize,
-    head_dim: usize,
-    hidden_width: usize,
-    inner_width: usize,
-    image: TransformerAttentionStreamProjection,
-    text: Option<TransformerAttentionStreamProjection>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct RotaryFrequencies {
-    cos: CpuTensor,
-    sin: CpuTensor,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct QwenRotaryEmbeddings {
-    image: RotaryFrequencies,
-    text: RotaryFrequencies,
-}
-
-#[allow(dead_code)]
-impl NativeTransformerAttentionProjection {
-    fn from_hfq(
-        hfq: &HfqFile,
-        family: TransformerDenoiserFamily,
-        block_index: usize,
-        heads: usize,
-    ) -> DiffusionResult<Self> {
-        let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}.attn");
-        let image = TransformerAttentionStreamProjection::from_hfq(
+            .and_then(|transformer| transformer.text_num_attention_heads)
+            .unwrap_or(20);
+        Krea2TextConditioner::from_hfq(
             hfq,
-            "image",
-            &format!("{block_prefix}.to_q.weight"),
-            &format!("{block_prefix}.to_q.bias"),
-            &format!("{block_prefix}.to_k.weight"),
-            &format!("{block_prefix}.to_k.bias"),
-            &format!("{block_prefix}.to_v.weight"),
-            &format!("{block_prefix}.to_v.bias"),
-            &format!("{block_prefix}.norm_q.weight"),
-            &format!("{block_prefix}.norm_k.weight"),
-            &format!("{block_prefix}.to_out.0.weight"),
-            &format!("{block_prefix}.to_out.0.bias"),
-            true,
+            "text_encoder/tensors/language_model",
             heads,
-            None,
-            None,
-            None,
-        )?
-        .ok_or_else(|| {
-            DiffusionError::InvalidMetadata(format!(
-                "transformer block {block_index} image attention stream is missing"
-            ))
-        })?;
-        let (hidden_width, inner_width, head_dim) =
-            image.validate_shapes(heads, None, None, None)?;
-
-        let text_required = matches!(
-            family,
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown
-        );
-        let text = TransformerAttentionStreamProjection::from_hfq(
-            hfq,
-            "text",
-            &format!("{block_prefix}.add_q_proj.weight"),
-            &format!("{block_prefix}.add_q_proj.bias"),
-            &format!("{block_prefix}.add_k_proj.weight"),
-            &format!("{block_prefix}.add_k_proj.bias"),
-            &format!("{block_prefix}.add_v_proj.weight"),
-            &format!("{block_prefix}.add_v_proj.bias"),
-            &format!("{block_prefix}.norm_added_q.weight"),
-            &format!("{block_prefix}.norm_added_k.weight"),
-            &format!("{block_prefix}.to_add_out.weight"),
-            &format!("{block_prefix}.to_add_out.bias"),
-            text_required,
-            heads,
-            Some(hidden_width),
-            Some(inner_width),
-            Some(head_dim),
-        )?;
-
-        Ok(Self {
-            family,
-            block_index,
-            heads,
+            kv_heads,
             head_dim,
-            hidden_width,
-            inner_width,
-            image,
-            text,
-        })
-    }
-
-    fn project_image_qkv_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<TransformerAttentionQkv> {
-        self.validate_hidden_input(hidden, TransformerModulationStream::Image)?;
-        self.image.project_qkv_with_runtime_context(
-            hidden,
-            self.heads,
-            self.head_dim,
-            runtime_context,
-        )
-    }
-
-    fn project_text_qkv_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<Option<TransformerAttentionQkv>> {
-        self.validate_hidden_input(hidden, TransformerModulationStream::Text)?;
-        let Some(text) = self.text.as_ref() else {
-            return Ok(None);
-        };
-        text.project_qkv_with_runtime_context(hidden, self.heads, self.head_dim, runtime_context)
-            .map(Some)
-    }
-
-    fn project_image_output_with_runtime_context(
-        &self,
-        attention: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        self.validate_attention_input(attention, TransformerModulationStream::Image)?;
-        self.image
-            .project_output_with_runtime_context(attention, runtime_context)
-    }
-
-    fn project_text_output_with_runtime_context(
-        &self,
-        attention: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<Option<CpuTensor>> {
-        self.validate_attention_input(attention, TransformerModulationStream::Text)?;
-        let Some(text) = self.text.as_ref() else {
-            return Ok(None);
-        };
-        text.project_output_with_runtime_context(attention, runtime_context)
-            .map(Some)
-    }
-
-    fn attend_image_text_with_runtime_context(
-        &self,
-        image_hidden: &CpuTensor,
-        text_hidden: Option<&CpuTensor>,
-        text_attention_mask: Option<&CpuTensor>,
-        qwen_rotary: Option<&QwenRotaryEmbeddings>,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<(CpuTensor, Option<CpuTensor>)> {
-        let mut image_qkv =
-            self.project_image_qkv_with_runtime_context(image_hidden, runtime_context)?;
-        if let Some(rotary) = qwen_rotary {
-            image_qkv.q = apply_qwen_rotary_embedding(
-                &image_qkv.q,
-                &rotary.image,
-                self.heads,
-                self.head_dim,
-            )?;
-            image_qkv.k = apply_qwen_rotary_embedding(
-                &image_qkv.k,
-                &rotary.image,
-                self.heads,
-                self.head_dim,
-            )?;
-        }
-        let Some(text_projection) = self.text.as_ref() else {
-            let image_attention = scaled_dot_product_attention_with_runtime_context(
-                &image_qkv.q,
-                &image_qkv.k,
-                &image_qkv.v,
-                self.heads,
-                runtime_context,
-            )?;
-            let image_output =
-                self.project_image_output_with_runtime_context(&image_attention, runtime_context)?;
-            return Ok((image_output, None));
-        };
-
-        let text_hidden = text_hidden.ok_or_else(|| {
-            DiffusionError::InvalidRequest(format!(
-                "transformer block {} {:?} attention requires text hidden states",
-                self.block_index, self.family
-            ))
-        })?;
-        self.validate_hidden_input(text_hidden, TransformerModulationStream::Text)?;
-        let mut text_qkv = text_projection.project_qkv_with_runtime_context(
-            text_hidden,
-            self.heads,
-            self.head_dim,
-            runtime_context,
-        )?;
-        if let Some(rotary) = qwen_rotary {
-            text_qkv.q =
-                apply_qwen_rotary_embedding(&text_qkv.q, &rotary.text, self.heads, self.head_dim)?;
-            text_qkv.k =
-                apply_qwen_rotary_embedding(&text_qkv.k, &rotary.text, self.heads, self.head_dim)?;
-        }
-        let joint_k = concat_sequence_3d(&text_qkv.k, &image_qkv.k)?;
-        let joint_v = concat_sequence_3d(&text_qkv.v, &image_qkv.v)?;
-        let [batch, image_seq, _] = shape3(&image_qkv.k)?;
-        let [text_batch, text_seq, _] = shape3(&text_qkv.k)?;
-        if text_batch != batch {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "Qwen joint attention text batch {text_batch} != image batch {batch}"
-            )));
-        }
-        let joint_key_mask = qwen_joint_key_mask(text_attention_mask, batch, text_seq, image_seq)?;
-        let image_attention = scaled_dot_product_attention_with_key_mask_and_runtime_context(
-            &image_qkv.q,
-            &joint_k,
-            &joint_v,
-            self.heads,
-            joint_key_mask.as_deref(),
-            runtime_context,
-        )?;
-        let text_attention = scaled_dot_product_attention_with_key_mask_and_runtime_context(
-            &text_qkv.q,
-            &joint_k,
-            &joint_v,
-            self.heads,
-            joint_key_mask.as_deref(),
-            runtime_context,
-        )?;
-        let image_output =
-            self.project_image_output_with_runtime_context(&image_attention, runtime_context)?;
-        let text_output = text_projection
-            .project_output_with_runtime_context(&text_attention, runtime_context)?;
-        Ok((image_output, Some(text_output)))
-    }
-
-    fn validate_hidden_input(
-        &self,
-        hidden: &CpuTensor,
-        stream: TransformerModulationStream,
-    ) -> DiffusionResult<()> {
-        let [_, _, width] = shape3(hidden)?;
-        if width != self.hidden_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer block {} {:?} hidden width {width} != expected {}",
-                self.block_index, stream, self.hidden_width
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_attention_input(
-        &self,
-        attention: &CpuTensor,
-        stream: TransformerModulationStream,
-    ) -> DiffusionResult<()> {
-        let [_, _, width] = shape3(attention)?;
-        if width != self.inner_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer block {} {:?} attention width {width} != expected {}",
-                self.block_index, stream, self.inner_width
-            )));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum TransformerFeedForwardActivation {
-    GeGlu,
-    SwiGlu,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct TransformerFeedForwardStream {
-    stream_label: &'static str,
-    activation: TransformerFeedForwardActivation,
-    hidden_width: usize,
-    inner_width: usize,
-    proj_weight: Option<CpuTensor>,
-    proj_bias: Option<CpuTensor>,
-    up_weight: Option<CpuTensor>,
-    up_bias: Option<CpuTensor>,
-    gate_weight: Option<CpuTensor>,
-    gate_bias: Option<CpuTensor>,
-    down_weight: CpuTensor,
-    down_bias: Option<CpuTensor>,
-}
-
-#[allow(dead_code)]
-impl TransformerFeedForwardStream {
-    fn qwen_geglu_from_hfq(
-        hfq: &HfqFile,
-        stream_label: &'static str,
-        prefix: &str,
-    ) -> DiffusionResult<Self> {
-        let proj_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.0.proj.weight"))?;
-        let proj_bias = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.0.proj.bias"))?;
-        let down_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.2.weight"))?;
-        let down_bias = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.2.bias"))?;
-        let [projected_width, hidden_width] = shape2(&proj_weight)?;
-        if projected_width == 0 || projected_width % 2 != 0 {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{stream_label} transformer GEGLU projection shape {:?} is not [2*inner, hidden]",
-                proj_weight.shape
-            )));
-        }
-        let inner_width = projected_width / 2;
-        if proj_bias.shape.as_slice() != [projected_width] {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{stream_label} transformer GEGLU projection bias shape {:?} != [{projected_width}]",
-                proj_bias.shape
-            )));
-        }
-        validate_transformer_ff_down_shape(
-            stream_label,
-            &down_weight,
-            Some(&down_bias),
-            hidden_width,
-            inner_width,
-        )?;
-        Ok(Self {
-            stream_label,
-            activation: TransformerFeedForwardActivation::GeGlu,
-            hidden_width,
-            inner_width,
-            proj_weight: Some(proj_weight),
-            proj_bias: Some(proj_bias),
-            up_weight: None,
-            up_bias: None,
-            gate_weight: None,
-            gate_bias: None,
-            down_weight,
-            down_bias: Some(down_bias),
-        })
-    }
-
-    fn krea_swiglu_from_hfq(
-        hfq: &HfqFile,
-        stream_label: &'static str,
-        prefix: &str,
-    ) -> DiffusionResult<Self> {
-        let up_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.up.weight"))?;
-        let gate_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.gate.weight"))?;
-        let down_weight = CpuTensor::from_hfq(hfq, &format!("{prefix}.down.weight"))?;
-        let up_bias = optional_tensor(hfq, &format!("{prefix}.up.bias"))?;
-        let gate_bias = optional_tensor(hfq, &format!("{prefix}.gate.bias"))?;
-        let down_bias = optional_tensor(hfq, &format!("{prefix}.down.bias"))?;
-        let [inner_width, hidden_width] = shape2(&up_weight)?;
-        if inner_width == 0 || hidden_width == 0 {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{stream_label} transformer SwiGLU up projection shape {:?} is empty",
-                up_weight.shape
-            )));
-        }
-        if gate_weight.shape.as_slice() != [inner_width, hidden_width] {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{stream_label} transformer SwiGLU gate weight shape {:?} != [{inner_width}, {hidden_width}]",
-                gate_weight.shape
-            )));
-        }
-        validate_attention_bias_shape(stream_label, "ff.up", up_bias.as_ref(), inner_width)?;
-        validate_attention_bias_shape(stream_label, "ff.gate", gate_bias.as_ref(), inner_width)?;
-        validate_transformer_ff_down_shape(
-            stream_label,
-            &down_weight,
-            down_bias.as_ref(),
-            hidden_width,
-            inner_width,
-        )?;
-        Ok(Self {
-            stream_label,
-            activation: TransformerFeedForwardActivation::SwiGlu,
-            hidden_width,
-            inner_width,
-            proj_weight: None,
-            proj_bias: None,
-            up_weight: Some(up_weight),
-            up_bias,
-            gate_weight: Some(gate_weight),
-            gate_bias,
-            down_weight,
-            down_bias,
-        })
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let [_, _, width] = shape3(hidden)?;
-        if width != self.hidden_width {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{} transformer feed-forward hidden width {width} != expected {}",
-                self.stream_label, self.hidden_width
-            )));
-        }
-        let activated = match self.activation {
-            TransformerFeedForwardActivation::GeGlu => {
-                let proj_weight = self.proj_weight.as_ref().ok_or_else(|| {
-                    DiffusionError::InvalidMetadata(
-                        "GEGLU transformer feed-forward projection weight is missing".into(),
-                    )
-                })?;
-                let proj_bias = self.proj_bias.as_ref().ok_or_else(|| {
-                    DiffusionError::InvalidMetadata(
-                        "GEGLU transformer feed-forward projection bias is missing".into(),
-                    )
-                })?;
-                let projected = linear_3d_with_runtime_context(
-                    hidden,
-                    proj_weight,
-                    Some(proj_bias),
-                    runtime_context,
-                )?;
-                geglu_gate_3d_with_runtime_context(&projected, runtime_context)?
-            }
-            TransformerFeedForwardActivation::SwiGlu => {
-                let up_weight = self.up_weight.as_ref().ok_or_else(|| {
-                    DiffusionError::InvalidMetadata(
-                        "SwiGLU transformer feed-forward up weight is missing".into(),
-                    )
-                })?;
-                let gate_weight = self.gate_weight.as_ref().ok_or_else(|| {
-                    DiffusionError::InvalidMetadata(
-                        "SwiGLU transformer feed-forward gate weight is missing".into(),
-                    )
-                })?;
-                let up = linear_3d_with_runtime_context(
-                    hidden,
-                    up_weight,
-                    self.up_bias.as_ref(),
-                    runtime_context,
-                )?;
-                let gate = linear_3d_with_runtime_context(
-                    hidden,
-                    gate_weight,
-                    self.gate_bias.as_ref(),
-                    runtime_context,
-                )?;
-                swiglu_gate_3d(&up, &gate)?
-            }
-        };
-        linear_3d_with_runtime_context(
-            &activated,
-            &self.down_weight,
-            self.down_bias.as_ref(),
-            runtime_context,
+            rope_theta,
+            fusion_heads,
+            select_layers,
         )
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct NativeTransformerFeedForward {
-    family: TransformerDenoiserFamily,
-    block_index: usize,
-    hidden_width: usize,
-    image: TransformerFeedForwardStream,
-    text: Option<TransformerFeedForwardStream>,
-}
-
-#[allow(dead_code)]
-impl NativeTransformerFeedForward {
-    fn from_hfq(
-        hfq: &HfqFile,
-        family: TransformerDenoiserFamily,
-        block_index: usize,
-    ) -> DiffusionResult<Self> {
-        let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
-        match family {
-            TransformerDenoiserFamily::Krea2 => {
-                let image = TransformerFeedForwardStream::krea_swiglu_from_hfq(
-                    hfq,
-                    "image",
-                    &format!("{block_prefix}.ff"),
-                )?;
-                Ok(Self {
-                    family,
-                    block_index,
-                    hidden_width: image.hidden_width,
-                    image,
-                    text: None,
-                })
-            }
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
-                let image = TransformerFeedForwardStream::qwen_geglu_from_hfq(
-                    hfq,
-                    "image",
-                    &format!("{block_prefix}.img_mlp"),
-                )?;
-                let text = TransformerFeedForwardStream::qwen_geglu_from_hfq(
-                    hfq,
-                    "text",
-                    &format!("{block_prefix}.txt_mlp"),
-                )?;
-                if text.hidden_width != image.hidden_width {
-                    return Err(DiffusionError::InvalidMetadata(format!(
-                        "Qwen transformer block {block_index} text MLP hidden width {} != image hidden width {}",
-                        text.hidden_width, image.hidden_width
-                    )));
-                }
-                Ok(Self {
-                    family,
-                    block_index,
-                    hidden_width: image.hidden_width,
-                    image,
-                    text: Some(text),
-                })
-            }
-        }
-    }
-
-    fn forward_image_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        self.image
-            .forward_with_runtime_context(hidden, runtime_context)
-    }
-
-    fn forward_text_with_runtime_context(
-        &self,
-        hidden: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<Option<CpuTensor>> {
-        let Some(text) = self.text.as_ref() else {
-            return Ok(None);
-        };
-        text.forward_with_runtime_context(hidden, runtime_context)
-            .map(Some)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct NativeTransformerBlock {
-    family: TransformerDenoiserFamily,
-    block_index: usize,
-    modulation: NativeTransformerBlockModulation,
-    attention: NativeTransformerAttentionProjection,
-    feed_forward: NativeTransformerFeedForward,
-}
-
-#[allow(dead_code)]
-impl NativeTransformerBlock {
-    fn from_hfq(
-        hfq: &HfqFile,
-        family: TransformerDenoiserFamily,
-        block_index: usize,
-        heads: usize,
-    ) -> DiffusionResult<Self> {
-        Ok(Self {
-            family,
-            block_index,
-            modulation: NativeTransformerBlockModulation::from_hfq(hfq, family, block_index)?,
-            attention: NativeTransformerAttentionProjection::from_hfq(
-                hfq,
-                family,
-                block_index,
-                heads,
-            )?,
-            feed_forward: NativeTransformerFeedForward::from_hfq(hfq, family, block_index)?,
-        })
-    }
-
-    fn forward_qwen_with_runtime_context(
-        &self,
-        image_hidden: &CpuTensor,
-        text_hidden: &CpuTensor,
-        text_attention_mask: Option<&CpuTensor>,
-        timestep_embedding: &CpuTensor,
-        qwen_rotary: Option<&QwenRotaryEmbeddings>,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<(CpuTensor, CpuTensor)> {
-        if !matches!(
-            self.family,
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown
-        ) {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "transformer block {} family {:?} is not Qwen-style",
-                self.block_index, self.family
-            )));
-        }
-
-        let image_mod = self.modulation.qwen_image_modulation_with_runtime_context(
-            timestep_embedding,
-            TransformerModulationStream::Image,
-            runtime_context,
-        )?;
-        let text_mod = self.modulation.qwen_image_modulation_with_runtime_context(
-            timestep_embedding,
-            TransformerModulationStream::Text,
-            runtime_context,
-        )?;
-
-        let image_attention_input = modulate_3d(
-            &layer_norm_3d_no_affine_with_runtime_context(image_hidden, 1e-6, runtime_context)?,
-            &image_mod.shift_msa,
-            &image_mod.scale_msa,
-        )?;
-        let text_attention_input = modulate_3d(
-            &layer_norm_3d_no_affine_with_runtime_context(text_hidden, 1e-6, runtime_context)?,
-            &text_mod.shift_msa,
-            &text_mod.scale_msa,
-        )?;
-        let (image_attention, text_attention) =
-            self.attention.attend_image_text_with_runtime_context(
-                &image_attention_input,
-                Some(&text_attention_input),
-                text_attention_mask,
-                qwen_rotary,
-                runtime_context,
-            )?;
-        let text_attention = text_attention.ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "Qwen transformer block attention returned no text stream".to_string(),
-            )
-        })?;
-        let image_after_attention =
-            gated_residual_3d(image_hidden, &image_attention, &image_mod.gate_msa)?;
-        let text_after_attention =
-            gated_residual_3d(text_hidden, &text_attention, &text_mod.gate_msa)?;
-
-        let image_mlp_input = modulate_3d(
-            &layer_norm_3d_no_affine_with_runtime_context(
-                &image_after_attention,
-                1e-6,
-                runtime_context,
-            )?,
-            &image_mod.shift_mlp,
-            &image_mod.scale_mlp,
-        )?;
-        let text_mlp_input = modulate_3d(
-            &layer_norm_3d_no_affine_with_runtime_context(
-                &text_after_attention,
-                1e-6,
-                runtime_context,
-            )?,
-            &text_mod.shift_mlp,
-            &text_mod.scale_mlp,
-        )?;
-        let image_mlp = self
-            .feed_forward
-            .forward_image_with_runtime_context(&image_mlp_input, runtime_context)?;
-        let text_mlp = self
-            .feed_forward
-            .forward_text_with_runtime_context(&text_mlp_input, runtime_context)?
-            .ok_or_else(|| {
-                DiffusionError::InvalidMetadata(
-                    "Qwen transformer block feed-forward returned no text stream".to_string(),
-                )
-            })?;
-        let image_out = gated_residual_3d(&image_after_attention, &image_mlp, &image_mod.gate_mlp)?;
-        let text_out = gated_residual_3d(&text_after_attention, &text_mlp, &text_mod.gate_mlp)?;
-        Ok((image_out, text_out))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-struct NativeTransformerDenoiser {
-    family: TransformerDenoiserFamily,
-    io: NativeTransformerDenoiserIo,
-    timestep_embedding: NativeTransformerTimestepEmbedding,
-    blocks: Vec<NativeTransformerBlock>,
-    heads: usize,
-    qwen_rope_axes: Option<[usize; 3]>,
-    qwen_rope_theta: f32,
-}
-
-#[allow(dead_code)]
-impl NativeTransformerDenoiser {
-    fn from_hfq(
-        hfq: &HfqFile,
-        config: &StableDiffusionConfig,
-        topology: &TransformerDenoiserWeightTopology,
-    ) -> DiffusionResult<Self> {
-        if !matches!(topology.family, TransformerDenoiserFamily::QwenImage) {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "native transformer denoiser assembly currently supports Qwen image MMDiT only; got {}",
-                topology.diagnostic_label()
-            )));
-        }
-        if topology.block_count == 0 {
-            return Err(DiffusionError::InvalidMetadata(
-                "transformer denoiser contains no transformer_blocks.* weights".to_string(),
-            ));
-        }
-        let transformer = config.transformer.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "transformer denoiser config is required for native transformer assembly"
-                    .to_string(),
-            )
-        })?;
-        if transformer.guidance_embeds.unwrap_or(false) {
-            return Err(DiffusionError::InvalidMetadata(
-                "Qwen guidance-distilled transformer embeddings are not implemented; guidance_embeds=true needs a separate guidance-scale embedding path, not classifier-free guidance".to_string(),
-            ));
-        }
-        let heads = transformer.num_attention_heads.unwrap_or(1);
-        if heads == 0 {
-            return Err(DiffusionError::InvalidMetadata(
-                "transformer num_attention_heads must be positive".to_string(),
-            ));
-        }
-        let io = NativeTransformerDenoiserIo::from_hfq(hfq, config, topology)?;
-        let timestep_embedding =
-            NativeTransformerTimestepEmbedding::from_hfq(hfq, topology.family)?;
-        let mut blocks = Vec::with_capacity(topology.block_count);
-        for block_index in 0..topology.block_count {
-            blocks.push(NativeTransformerBlock::from_hfq(
-                hfq,
-                topology.family,
-                block_index,
-                heads,
-            )?);
-        }
-        let head_dim = blocks
-            .first()
-            .map(|block| block.attention.head_dim)
-            .ok_or_else(|| {
-                DiffusionError::InvalidMetadata(
-                    "transformer denoiser contains no attention blocks".to_string(),
-                )
-            })?;
-        let qwen_rope_axes = qwen_rope_axes_from_transformer_config(transformer, head_dim)?;
-        let qwen_rope_theta = transformer.rope_theta.unwrap_or(10_000.0);
-        Ok(Self {
-            family: topology.family,
-            io,
-            timestep_embedding,
-            blocks,
-            heads,
-            qwen_rope_axes,
-            qwen_rope_theta,
-        })
-    }
-
-    fn forward_qwen_with_runtime_context(
-        &self,
-        latents: &LatentBatch,
-        timesteps: &[f32],
-        text_hidden: &CpuTensor,
-        text_attention_mask: Option<&CpuTensor>,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<LatentBatch> {
-        if !matches!(self.family, TransformerDenoiserFamily::QwenImage) {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "native transformer denoiser family {:?} is not Qwen image MMDiT",
-                self.family
-            )));
-        }
-        if timesteps.len() != latents.batch {
-            return Err(DiffusionError::InvalidRequest(format!(
-                "transformer timestep batch {} != latent batch {}",
-                timesteps.len(),
-                latents.batch
-            )));
-        }
-        let [text_batch, _, _] = shape3(text_hidden)?;
-        if text_batch != latents.batch {
-            return Err(DiffusionError::InvalidRequest(format!(
-                "transformer text hidden batch {text_batch} != latent batch {}",
-                latents.batch
-            )));
-        }
-
-        let mut image_hidden = self
-            .io
-            .project_latents_to_hidden_with_runtime_context(latents, runtime_context)?;
-        let mut text_hidden = self
-            .io
-            .project_text_to_hidden_with_runtime_context(text_hidden, runtime_context)?;
-        let [_, text_seq, _] = shape3(&text_hidden)?;
-        if let Some(mask) = text_attention_mask {
-            validate_text_attention_mask(mask, latents.batch, text_seq, "Qwen text")?;
-        }
-        let qwen_rotary = self.qwen_rotary_embeddings(latents, text_seq)?;
-        let timestep_embedding = self
-            .timestep_embedding
-            .forward_with_runtime_context(timesteps, runtime_context)?;
-        for block in &self.blocks {
-            let (next_image_hidden, next_text_hidden) = block.forward_qwen_with_runtime_context(
-                &image_hidden,
-                &text_hidden,
-                text_attention_mask,
-                &timestep_embedding,
-                qwen_rotary.as_ref(),
-                runtime_context,
-            )?;
-            image_hidden = next_image_hidden;
-            text_hidden = next_text_hidden;
-        }
-        self.io.project_hidden_to_latents_with_runtime_context(
-            &image_hidden,
-            &timestep_embedding,
-            latents.batch,
-            latents.height,
-            latents.width,
-            runtime_context,
-        )
-    }
-
-    fn qwen_rotary_embeddings(
-        &self,
-        latents: &LatentBatch,
-        text_seq_len: usize,
-    ) -> DiffusionResult<Option<QwenRotaryEmbeddings>> {
-        let Some(axes) = self.qwen_rope_axes else {
-            return Ok(None);
-        };
-        if latents.height % self.io.patch_size != 0 || latents.width % self.io.patch_size != 0 {
-            return Err(DiffusionError::InvalidRequest(format!(
-                "Qwen RoPE requires latent dimensions {}x{} to be divisible by patch size {}",
-                latents.height, latents.width, self.io.patch_size
-            )));
-        }
-        let grid_height = latents.height / self.io.patch_size;
-        let grid_width = latents.width / self.io.patch_size;
-        let image_seq_len = grid_height.checked_mul(grid_width).ok_or_else(|| {
-            DiffusionError::InvalidRequest("Qwen RoPE image token count overflow".to_string())
-        })?;
-        if image_seq_len == 0 || text_seq_len == 0 {
-            return Err(DiffusionError::InvalidRequest(
-                "Qwen RoPE requires non-empty image and text token sequences".to_string(),
-            ));
-        }
-        Ok(Some(qwen_rotary_embeddings_for_grid(
-            axes,
-            self.qwen_rope_theta,
-            self.blocks[0].attention.head_dim,
-            1,
-            grid_height,
-            grid_width,
-            text_seq_len,
-        )?))
-    }
-}
-
-impl DiffusionNoiseBackend for NativeTransformerDenoiser {
-    fn model_input_channels(&self) -> usize {
-        self.io.output_channels
-    }
-
-    fn denoise_latents_with_runtime_context(
-        &self,
-        latents: LatentBatch,
-        schedule: &DiffusionSchedule,
-        cfg_scale: f32,
-        positive_embeddings: &CpuTensor,
-        negative_embeddings: &CpuTensor,
-        positive_attention_mask: Option<&CpuTensor>,
-        negative_attention_mask: Option<&CpuTensor>,
-        positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
-        masked_reference: Option<&MaskedDenoiseReference<'_>>,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-        progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-    ) -> DiffusionResult<DenoiseLatentsOutput> {
-        if positive_sdxl_conditioning.is_some() || negative_sdxl_conditioning.is_some() {
-            return Err(DiffusionError::InvalidRequest(
-                "Qwen transformer denoiser does not accept SDXL auxiliary conditioning".to_string(),
-            ));
-        }
-        if inpaint_conditioning.is_some() || masked_reference.is_some() {
-            return Err(DiffusionError::InvalidRequest(
-                "Qwen transformer denoiser inpaint conditioning is not implemented".to_string(),
-            ));
-        }
-        denoise_latents_with_cfg_progress_and_runtime_context(
-            latents,
-            schedule,
-            cfg_scale,
-            positive_embeddings,
-            negative_embeddings,
-            |sample, timesteps, encoder_states, attention_mask, _sdxl, runtime_context| {
-                let model_latents = LatentBatch::from_nchw_tensor(sample.clone())?;
-                let prediction = self.forward_qwen_with_runtime_context(
-                    &model_latents,
-                    timesteps,
-                    encoder_states,
-                    attention_mask,
-                    runtime_context,
-                )?;
-                Ok(prediction.as_nchw_tensor())
-            },
-            positive_attention_mask,
-            negative_attention_mask,
-            None,
-            None,
-            None,
-            None,
-            runtime_context,
-            progress,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum TransformerModulationStream {
-    Image,
-    Text,
-}
-
-#[allow(dead_code)]
-fn attention_norm_weight_dim(weight: &CpuTensor) -> DiffusionResult<usize> {
-    match weight.shape.as_slice() {
-        [dim] if *dim > 0 => Ok(*dim),
-        _ => Err(DiffusionError::InvalidMetadata(format!(
-            "transformer attention norm weight shape {:?} is not [head_dim]",
-            weight.shape
-        ))),
-    }
-}
-
-#[allow(dead_code)]
-fn qwen_rope_axes_from_transformer_config(
-    transformer: &TransformerDenoiserConfig,
-    head_dim: usize,
-) -> DiffusionResult<Option<[usize; 3]>> {
-    let axes = if transformer.axes_dims_rope.is_empty() {
-        if head_dim == 128 {
-            vec![16, 56, 56]
-        } else {
-            return Ok(None);
-        }
-    } else {
-        transformer.axes_dims_rope.clone()
-    };
-    if axes.len() != 3 {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen axes_dims_rope {:?} must contain exactly 3 axes",
-            axes
-        )));
-    }
-    if axes.iter().any(|dim| *dim == 0 || dim % 2 != 0) {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen axes_dims_rope {:?} must contain non-zero even dimensions",
-            axes
-        )));
-    }
-    let sum = axes.iter().sum::<usize>();
-    if sum != head_dim {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen axes_dims_rope {:?} sum {sum} != attention head_dim {head_dim}",
-            axes
-        )));
-    }
-    Ok(Some([axes[0], axes[1], axes[2]]))
-}
-
-#[allow(dead_code)]
-fn qwen_rotary_embeddings_for_grid(
-    axes: [usize; 3],
-    theta: f32,
-    head_dim: usize,
-    frame: usize,
-    height: usize,
-    width: usize,
-    text_seq_len: usize,
-) -> DiffusionResult<QwenRotaryEmbeddings> {
-    if frame == 0 || height == 0 || width == 0 || text_seq_len == 0 {
-        return Err(DiffusionError::InvalidRequest(
-            "Qwen RoPE requires non-empty frame, height, width, and text sequence".to_string(),
-        ));
-    }
-    if axes.iter().sum::<usize>() != head_dim || head_dim % 2 != 0 {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen RoPE axes {:?} are incompatible with head_dim {head_dim}",
-            axes
-        )));
-    }
-    if theta <= 0.0 {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen rope_theta {theta} must be positive"
-        )));
-    }
-
-    let freq_width = head_dim / 2;
-    let image_seq_len = frame
-        .checked_mul(height)
-        .and_then(|value| value.checked_mul(width))
-        .ok_or_else(|| {
-            DiffusionError::InvalidRequest("Qwen RoPE image size overflow".to_string())
-        })?;
-    let mut image_cos = CpuTensor::zeros(&[image_seq_len, freq_width]);
-    let mut image_sin = CpuTensor::zeros(&[image_seq_len, freq_width]);
-    let max_vid_index = height.max(width);
-    let mut token = 0usize;
-    for f in 0..frame {
-        for y in 0..height {
-            for x in 0..width {
-                write_qwen_rope_token(
-                    &mut image_cos.data,
-                    &mut image_sin.data,
-                    token,
-                    freq_width,
-                    axes,
-                    theta,
-                    [f as isize, y as isize, x as isize],
-                );
-                token += 1;
-            }
-        }
-    }
-
-    let mut text_cos = CpuTensor::zeros(&[text_seq_len, freq_width]);
-    let mut text_sin = CpuTensor::zeros(&[text_seq_len, freq_width]);
-    for token in 0..text_seq_len {
-        write_qwen_rope_token(
-            &mut text_cos.data,
-            &mut text_sin.data,
-            token,
-            freq_width,
-            axes,
-            theta,
-            [
-                (max_vid_index + token) as isize,
-                (max_vid_index + token) as isize,
-                (max_vid_index + token) as isize,
-            ],
-        );
-    }
-
-    Ok(QwenRotaryEmbeddings {
-        image: RotaryFrequencies {
-            cos: image_cos,
-            sin: image_sin,
-        },
-        text: RotaryFrequencies {
-            cos: text_cos,
-            sin: text_sin,
-        },
-    })
-}
-
-fn write_qwen_rope_token(
-    cos: &mut [f32],
-    sin: &mut [f32],
-    token: usize,
-    freq_width: usize,
-    axes: [usize; 3],
-    theta: f32,
-    positions: [isize; 3],
-) {
-    let mut dst = token * freq_width;
-    for (axis_index, axis_dim) in axes.into_iter().enumerate() {
-        let axis_freqs = axis_dim / 2;
-        for freq_index in 0..axis_freqs {
-            let exponent = (2 * freq_index) as f32 / axis_dim as f32;
-            let angle = positions[axis_index] as f32 / theta.powf(exponent);
-            cos[dst] = angle.cos();
-            sin[dst] = angle.sin();
-            dst += 1;
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn apply_qwen_rotary_embedding(
-    input: &CpuTensor,
-    freqs: &RotaryFrequencies,
-    heads: usize,
-    head_dim: usize,
-) -> DiffusionResult<CpuTensor> {
-    let [batch, seq, width] = shape3(input)?;
-    if heads == 0 || head_dim == 0 || head_dim % 2 != 0 || width != heads * head_dim {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen RoPE input width {width} is incompatible with heads {heads} and head_dim {head_dim}"
-        )));
-    }
-    let freq_width = head_dim / 2;
-    if freqs.cos.shape.as_slice() != [seq, freq_width]
-        || freqs.sin.shape.as_slice() != [seq, freq_width]
-    {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen RoPE frequency shapes {:?}/{:?} != [{seq}, {freq_width}]",
-            freqs.cos.shape, freqs.sin.shape
-        )));
-    }
-    let mut out = CpuTensor::zeros(&[batch, seq, width]);
-    for b in 0..batch {
-        for token in 0..seq {
-            for head in 0..heads {
-                let token_base = (b * seq + token) * width + head * head_dim;
-                let freq_base = token * freq_width;
-                for pair in 0..freq_width {
-                    let real_idx = token_base + pair * 2;
-                    let imag_idx = real_idx + 1;
-                    let real = input.data[real_idx];
-                    let imag = input.data[imag_idx];
-                    let cos = freqs.cos.data[freq_base + pair];
-                    let sin = freqs.sin.data[freq_base + pair];
-                    out.data[real_idx] = real * cos - imag * sin;
-                    out.data[imag_idx] = real * sin + imag * cos;
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn validate_attention_linear_shape(
-    stream_label: &str,
-    name: &str,
-    weight: &CpuTensor,
-    expected_rows: usize,
-    expected_cols: usize,
-) -> DiffusionResult<()> {
-    if weight.shape.as_slice() != [expected_rows, expected_cols] {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "{stream_label} transformer attention {name} weight shape {:?} != [{expected_rows}, {expected_cols}]",
-            weight.shape
-        )));
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn validate_attention_bias_shape(
-    stream_label: &str,
-    name: &str,
-    bias: Option<&CpuTensor>,
-    expected_width: usize,
-) -> DiffusionResult<()> {
-    if let Some(bias) = bias {
-        if bias.shape.as_slice() != [expected_width] {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{stream_label} transformer attention {name} bias shape {:?} != [{expected_width}]",
-                bias.shape
-            )));
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn validate_attention_norm_shape(
-    stream_label: &str,
-    name: &str,
-    weight: Option<&CpuTensor>,
-    head_dim: usize,
-) -> DiffusionResult<()> {
-    if let Some(weight) = weight {
-        if weight.shape.as_slice() != [head_dim] {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "{stream_label} transformer attention {name} norm shape {:?} != [{head_dim}]",
-                weight.shape
-            )));
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn maybe_rms_norm_attention_heads_3d(
-    input: CpuTensor,
-    weight: Option<&CpuTensor>,
-    heads: usize,
-    head_dim: usize,
-    eps: f32,
-) -> DiffusionResult<CpuTensor> {
-    let Some(weight) = weight else {
-        return Ok(input);
-    };
-    rms_norm_attention_heads_3d(&input, weight, heads, head_dim, eps)
-}
-
-#[allow(dead_code)]
-fn rms_norm_attention_heads_3d(
-    input: &CpuTensor,
-    weight: &CpuTensor,
-    heads: usize,
-    head_dim: usize,
-    eps: f32,
-) -> DiffusionResult<CpuTensor> {
-    let [batch, seq, width] = shape3(input)?;
-    if heads == 0 || head_dim == 0 || width != heads * head_dim {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "attention-head RMSNorm input width {width} is incompatible with heads {heads} and head_dim {head_dim}"
-        )));
-    }
-    if weight.shape.as_slice() != [head_dim] {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "attention-head RMSNorm weight shape {:?} != [{head_dim}]",
-            weight.shape
-        )));
-    }
-    let mut out = CpuTensor::zeros(&[batch, seq, width]);
-    for b in 0..batch {
-        for token in 0..seq {
-            let token_base = (b * seq + token) * width;
-            for head in 0..heads {
-                let head_base = token_base + head * head_dim;
-                let mut square_sum = 0.0f32;
-                for dim in 0..head_dim {
-                    let value = input.data[head_base + dim];
-                    square_sum += value * value;
-                }
-                let inv_rms = (square_sum / head_dim as f32 + eps).sqrt().recip();
-                for dim in 0..head_dim {
-                    out.data[head_base + dim] =
-                        input.data[head_base + dim] * inv_rms * weight.data[dim];
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn rms_norm_3d_with_runtime_context(
-    input: &CpuTensor,
-    weight: &CpuTensor,
-    eps: f32,
-    runtime_context: &mut DiffusionGenerationRuntimeContext,
-) -> DiffusionResult<CpuTensor> {
-    let _ = runtime_context;
-    let [batch, seq, width] = shape3(input)?;
-    if weight.shape.as_slice() != [width] {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "RMSNorm weight shape {:?} != [{width}]",
-            weight.shape
-        )));
-    }
-    let mut out = CpuTensor::zeros(&[batch, seq, width]);
-    for b in 0..batch {
-        for token in 0..seq {
-            let token_base = (b * seq + token) * width;
-            let mut square_sum = 0.0f32;
-            for dim in 0..width {
-                let value = input.data[token_base + dim];
-                square_sum += value * value;
-            }
-            let inv_rms = (square_sum / width as f32 + eps).sqrt().recip();
-            for dim in 0..width {
-                out.data[token_base + dim] =
-                    input.data[token_base + dim] * inv_rms * weight.data[dim];
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn validate_transformer_ff_down_shape(
-    stream_label: &str,
-    down_weight: &CpuTensor,
-    down_bias: Option<&CpuTensor>,
-    hidden_width: usize,
-    inner_width: usize,
-) -> DiffusionResult<()> {
-    if down_weight.shape.as_slice() != [hidden_width, inner_width] {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "{stream_label} transformer feed-forward down weight shape {:?} != [{hidden_width}, {inner_width}]",
-            down_weight.shape
-        )));
-    }
-    validate_attention_bias_shape(stream_label, "ff.down", down_bias, hidden_width)
-}
-
-#[allow(dead_code)]
-fn swiglu_gate_3d(up: &CpuTensor, gate: &CpuTensor) -> DiffusionResult<CpuTensor> {
-    if up.shape != gate.shape {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "SwiGLU up/gate shape mismatch {:?} vs {:?}",
-            up.shape, gate.shape
-        )));
-    }
-    let [batch, seq, width] = shape3(up)?;
-    let mut out = CpuTensor::zeros(&[batch, seq, width]);
-    for (dst, (up, gate)) in out.data.iter_mut().zip(up.data.iter().zip(&gate.data)) {
-        *dst = *up * silu(*gate);
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn layer_norm_3d_no_affine_with_runtime_context(
-    input: &CpuTensor,
-    eps: f32,
-    runtime_context: &mut DiffusionGenerationRuntimeContext,
-) -> DiffusionResult<CpuTensor> {
-    let [_, _, width] = shape3(input)?;
-    let weight = CpuTensor {
-        shape: vec![width],
-        data: vec![1.0; width],
-    };
-    let bias = CpuTensor {
-        shape: vec![width],
-        data: vec![0.0; width],
-    };
-    layer_norm_3d_with_runtime_context(input, &weight, &bias, eps, runtime_context)
-}
-
-#[allow(dead_code)]
-fn modulate_3d(
-    input: &CpuTensor,
-    shift: &CpuTensor,
-    scale: &CpuTensor,
-) -> DiffusionResult<CpuTensor> {
-    let [batch, seq, width] = shape3(input)?;
-    if shift.shape.as_slice() != [batch, width] || scale.shape.as_slice() != [batch, width] {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "modulate_3d input shape {:?} requires shift/scale [{batch}, {width}], got {:?}/{:?}",
-            input.shape, shift.shape, scale.shape
-        )));
-    }
-    let mut out = CpuTensor::zeros(&[batch, seq, width]);
-    for b in 0..batch {
-        for s in 0..seq {
-            let token_base = (b * seq + s) * width;
-            let mod_base = b * width;
-            for col in 0..width {
-                out.data[token_base + col] = input.data[token_base + col]
-                    * (1.0 + scale.data[mod_base + col])
-                    + shift.data[mod_base + col];
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn gated_residual_3d(
-    residual: &CpuTensor,
-    update: &CpuTensor,
-    gate: &CpuTensor,
-) -> DiffusionResult<CpuTensor> {
-    let [batch, seq, width] = shape3(residual)?;
-    if update.shape != residual.shape || gate.shape.as_slice() != [batch, width] {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "gated residual shape mismatch residual/update/gate {:?}/{:?}/{:?}",
-            residual.shape, update.shape, gate.shape
-        )));
-    }
-    let mut out = CpuTensor::zeros(&[batch, seq, width]);
-    for b in 0..batch {
-        for s in 0..seq {
-            let token_base = (b * seq + s) * width;
-            let gate_base = b * width;
-            for col in 0..width {
-                out.data[token_base + col] = residual.data[token_base + col]
-                    + gate.data[gate_base + col] * update.data[token_base + col];
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn concat_sequence_3d(left: &CpuTensor, right: &CpuTensor) -> DiffusionResult<CpuTensor> {
-    let [left_batch, left_seq, left_width] = shape3(left)?;
-    let [right_batch, right_seq, right_width] = shape3(right)?;
-    if left_batch != right_batch || left_width != right_width {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "cannot concatenate BSC tensors with shapes {:?} and {:?}",
-            left.shape, right.shape
-        )));
-    }
-    let mut out = CpuTensor::zeros(&[left_batch, left_seq + right_seq, left_width]);
-    for batch in 0..left_batch {
-        let left_src = batch * left_seq * left_width;
-        let right_src = batch * right_seq * right_width;
-        let dst = batch * (left_seq + right_seq) * left_width;
-        out.data[dst..dst + left_seq * left_width]
-            .copy_from_slice(&left.data[left_src..left_src + left_seq * left_width]);
-        let right_dst = dst + left_seq * left_width;
-        out.data[right_dst..right_dst + right_seq * right_width]
-            .copy_from_slice(&right.data[right_src..right_src + right_seq * right_width]);
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn split_modulation_chunks(
-    projected: CpuTensor,
-    chunk_count: usize,
-) -> DiffusionResult<TransformerModulationChunks> {
-    if chunk_count != 6 {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "expected 6 modulation chunks, got {chunk_count}"
-        )));
-    }
-    let [batch, width] = shape2(&projected)?;
-    if width % chunk_count != 0 {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "modulation width {width} is not divisible by {chunk_count}"
-        )));
-    }
-    let chunk_width = width / chunk_count;
-    let chunk = |chunk_idx: usize| -> CpuTensor {
-        let mut data = vec![0.0; batch * chunk_width];
-        for b in 0..batch {
-            let src = b * width + chunk_idx * chunk_width;
-            let dst = b * chunk_width;
-            data[dst..dst + chunk_width].copy_from_slice(&projected.data[src..src + chunk_width]);
-        }
-        CpuTensor {
-            shape: vec![batch, chunk_width],
-            data,
-        }
-    };
-    Ok(TransformerModulationChunks {
-        shift_msa: chunk(0),
-        scale_msa: chunk(1),
-        gate_msa: chunk(2),
-        shift_mlp: chunk(3),
-        scale_mlp: chunk(4),
-        gate_mlp: chunk(5),
-    })
-}
+mod transformer;
+pub(crate) use transformer::*;
 
 fn diffusion_generation_info(
     summary: &DiffusionModelSummary,
@@ -6811,6 +5209,10 @@ impl StableDiffusionConfig {
             invert_sigmas: json_bool(&scheduler_json, "invert_sigmas"),
             use_dynamic_shifting: json_bool(&scheduler_json, "use_dynamic_shifting"),
             time_shift_type: json_optional_string(&scheduler_json, "time_shift_type"),
+            base_shift: json_f32(&scheduler_json, "base_shift"),
+            max_shift: json_f32(&scheduler_json, "max_shift"),
+            base_image_seq_len: json_usize(&scheduler_json, "base_image_seq_len"),
+            max_image_seq_len: json_usize(&scheduler_json, "max_image_seq_len"),
         };
         let latent_channels = metadata
             .pipeline
@@ -7217,2554 +5619,21 @@ fn checked_bytes(label: &str, elements: usize, element_bytes: usize) -> Diffusio
         .ok_or_else(|| DiffusionError::InvalidRequest(format!("{label} byte size overflows")))
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Conv2dLayer {
-    pub weight: CpuTensor,
-    pub bias: Option<CpuTensor>,
-    pub padding: usize,
-    pub stride: usize,
-}
+mod layers;
+pub use layers::*;
 
-impl Conv2dLayer {
-    pub fn from_hfq(
-        hfq: &HfqFile,
-        weight_entry: &str,
-        bias_entry: Option<&str>,
-        padding: usize,
-    ) -> DiffusionResult<Self> {
-        let weight = CpuTensor::from_hfq(hfq, weight_entry)?;
-        let bias = bias_entry
-            .map(|entry| CpuTensor::from_hfq(hfq, entry))
-            .transpose()?;
-        Ok(Self {
-            weight,
-            bias,
-            padding,
-            stride: 1,
-        })
-    }
+mod unet;
+pub use unet::*;
 
-    pub fn from_hfq_with_stride(
-        hfq: &HfqFile,
-        weight_entry: &str,
-        bias_entry: Option<&str>,
-        padding: usize,
-        stride: usize,
-    ) -> DiffusionResult<Self> {
-        let mut layer = Self::from_hfq(hfq, weight_entry, bias_entry, padding)?;
-        if stride == 0 {
-            return Err(DiffusionError::InvalidMetadata(
-                "conv2d stride must be positive".to_string(),
-            ));
-        }
-        layer.stride = stride;
-        Ok(layer)
-    }
-
-    pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        conv2d_nchw_with_stride(
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            self.padding,
-            self.stride,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        input: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        conv2d_with_runtime_context(
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            self.padding,
-            self.stride,
-            runtime_context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct GroupNormLayer {
-    pub weight: CpuTensor,
-    pub bias: CpuTensor,
-    pub groups: usize,
-    pub eps: f32,
-}
-
-impl GroupNormLayer {
-    pub fn from_hfq(
-        hfq: &HfqFile,
-        weight_entry: &str,
-        bias_entry: &str,
-        groups: usize,
-        eps: f32,
-    ) -> DiffusionResult<Self> {
-        Ok(Self {
-            weight: CpuTensor::from_hfq(hfq, weight_entry)?,
-            bias: CpuTensor::from_hfq(hfq, bias_entry)?,
-            groups,
-            eps,
-        })
-    }
-
-    pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        group_norm_nchw(input, &self.weight, &self.bias, self.groups, self.eps)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        input: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        group_norm_with_runtime_context(
-            input,
-            &self.weight,
-            &self.bias,
-            self.groups,
-            self.eps,
-            runtime_context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResnetBlock2D {
-    pub norm1: GroupNormLayer,
-    pub conv1: Conv2dLayer,
-    pub norm2: GroupNormLayer,
-    pub conv2: Conv2dLayer,
-    pub shortcut: Option<Conv2dLayer>,
-}
-
-impl ResnetBlock2D {
-    pub fn from_hfq(hfq: &HfqFile, prefix: &str, groups: usize) -> DiffusionResult<Self> {
-        let norm1 = GroupNormLayer::from_hfq(
-            hfq,
-            &format!("{prefix}.norm1.weight"),
-            &format!("{prefix}.norm1.bias"),
-            groups,
-            1e-6,
-        )?;
-        let conv1 = Conv2dLayer::from_hfq(
-            hfq,
-            &format!("{prefix}.conv1.weight"),
-            Some(&format!("{prefix}.conv1.bias")),
-            1,
-        )?;
-        let norm2 = GroupNormLayer::from_hfq(
-            hfq,
-            &format!("{prefix}.norm2.weight"),
-            &format!("{prefix}.norm2.bias"),
-            groups,
-            1e-6,
-        )?;
-        let conv2 = Conv2dLayer::from_hfq(
-            hfq,
-            &format!("{prefix}.conv2.weight"),
-            Some(&format!("{prefix}.conv2.bias")),
-            1,
-        )?;
-        let shortcut_weight = format!("{prefix}.conv_shortcut.weight");
-        let shortcut_bias = format!("{prefix}.conv_shortcut.bias");
-        let shortcut = if hfq.find_tensor_info(&shortcut_weight).is_some() {
-            Some(Conv2dLayer::from_hfq(
-                hfq,
-                &shortcut_weight,
-                Some(&shortcut_bias),
-                0,
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            norm1,
-            conv1,
-            norm2,
-            conv2,
-            shortcut,
-        })
-    }
-
-    pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(input, DiffusionGenerationRuntimeOptions::default())
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        input: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(input, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        input: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let hidden = self
-            .norm1
-            .forward_with_runtime_context(input, runtime_context)?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = self
-            .conv1
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = self
-            .norm2
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = self
-            .conv2
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let residual = if let Some(shortcut) = &self.shortcut {
-            shortcut.forward_with_runtime_context(input, runtime_context)?
-        } else {
-            input.clone()
-        };
-        tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetResnetBlock2D {
-    pub norm1: GroupNormLayer,
-    pub conv1: Conv2dLayer,
-    pub time_emb_proj_weight: CpuTensor,
-    pub time_emb_proj_bias: CpuTensor,
-    pub norm2: GroupNormLayer,
-    pub conv2: Conv2dLayer,
-    pub shortcut: Option<Conv2dLayer>,
-}
-
-impl UnetResnetBlock2D {
-    pub fn from_hfq(hfq: &HfqFile, prefix: &str, groups: usize, eps: f32) -> DiffusionResult<Self> {
-        let shortcut_weight = format!("{prefix}.conv_shortcut.weight");
-        let shortcut_bias = format!("{prefix}.conv_shortcut.bias");
-        let shortcut = if hfq.find_tensor_info(&shortcut_weight).is_some() {
-            Some(Conv2dLayer::from_hfq(
-                hfq,
-                &shortcut_weight,
-                Some(&shortcut_bias),
-                0,
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            norm1: GroupNormLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.norm1.weight"),
-                &format!("{prefix}.norm1.bias"),
-                groups,
-                eps,
-            )?,
-            conv1: Conv2dLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.conv1.weight"),
-                Some(&format!("{prefix}.conv1.bias")),
-                1,
-            )?,
-            time_emb_proj_weight: CpuTensor::from_hfq(
-                hfq,
-                &format!("{prefix}.time_emb_proj.weight"),
-            )?,
-            time_emb_proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.time_emb_proj.bias"))?,
-            norm2: GroupNormLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.norm2.weight"),
-                &format!("{prefix}.norm2.bias"),
-                groups,
-                eps,
-            )?,
-            conv2: Conv2dLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.conv2.weight"),
-                Some(&format!("{prefix}.conv2.bias")),
-                1,
-            )?,
-            shortcut,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        input: &CpuTensor,
-        time_embedding: &CpuTensor,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            input,
-            time_embedding,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        input: &CpuTensor,
-        time_embedding: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(input, time_embedding, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        input: &CpuTensor,
-        time_embedding: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let [batch, _, _, _] = shape4(input)?;
-        let [time_batch, _] = shape2(time_embedding)?;
-        if time_batch != batch {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "UNet ResNet time embedding batch {time_batch} != input batch {batch}"
-            )));
-        }
-        let hidden = self
-            .norm1
-            .forward_with_runtime_context(input, runtime_context)?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        let mut hidden = self
-            .conv1
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let projected_time = linear_with_runtime_context(
-            &silu_with_runtime_context(time_embedding, runtime_context)?,
-            &self.time_emb_proj_weight,
-            &self.time_emb_proj_bias,
-            runtime_context,
-        )?;
-        add_channel_bias_nchw_with_runtime_context(&mut hidden, &projected_time, runtime_context)?;
-        let hidden = self
-            .norm2
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = self
-            .conv2
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let residual = if let Some(shortcut) = &self.shortcut {
-            shortcut.forward_with_runtime_context(input, runtime_context)?
-        } else {
-            input.clone()
-        };
-        tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetTimeEmbedding {
-    pub linear_1_weight: CpuTensor,
-    pub linear_1_bias: CpuTensor,
-    pub linear_2_weight: CpuTensor,
-    pub linear_2_bias: CpuTensor,
-}
-
-impl UnetTimeEmbedding {
-    pub fn from_hfq(hfq: &HfqFile) -> DiffusionResult<Self> {
-        Ok(Self {
-            linear_1_weight: CpuTensor::from_hfq(
-                hfq,
-                "unet/tensors/time_embedding.linear_1.weight",
-            )?,
-            linear_1_bias: CpuTensor::from_hfq(hfq, "unet/tensors/time_embedding.linear_1.bias")?,
-            linear_2_weight: CpuTensor::from_hfq(
-                hfq,
-                "unet/tensors/time_embedding.linear_2.weight",
-            )?,
-            linear_2_bias: CpuTensor::from_hfq(hfq, "unet/tensors/time_embedding.linear_2.bias")?,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        timesteps: &[f32],
-        flip_sin_to_cos: bool,
-        freq_shift: f32,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            timesteps,
-            flip_sin_to_cos,
-            freq_shift,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        timesteps: &[f32],
-        flip_sin_to_cos: bool,
-        freq_shift: f32,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(
-            timesteps,
-            flip_sin_to_cos,
-            freq_shift,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        timesteps: &[f32],
-        flip_sin_to_cos: bool,
-        freq_shift: f32,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let (_, embedding_dim) = self.linear_1_weight.rows_cols()?;
-        let input = timestep_embedding_with_runtime_context(
-            timesteps,
-            embedding_dim,
-            flip_sin_to_cos,
-            freq_shift,
-            runtime_context,
-        )?;
-        let hidden = linear_with_runtime_context(
-            &input,
-            &self.linear_1_weight,
-            &self.linear_1_bias,
-            runtime_context,
-        )?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        linear_with_runtime_context(
-            &hidden,
-            &self.linear_2_weight,
-            &self.linear_2_bias,
-            runtime_context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetTextTimeEmbedding {
-    pub addition_time_embed_dim: usize,
-    pub linear_1_weight: CpuTensor,
-    pub linear_1_bias: CpuTensor,
-    pub linear_2_weight: CpuTensor,
-    pub linear_2_bias: CpuTensor,
-}
-
-impl UnetTextTimeEmbedding {
-    pub fn from_hfq(hfq: &HfqFile, config: &UnetConfig) -> DiffusionResult<Option<Self>> {
-        if config.addition_embed_type.as_deref() != Some("text_time") {
-            return Ok(None);
-        }
-        let addition_time_embed_dim = config.addition_time_embed_dim.ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "UNet text_time addition requires addition_time_embed_dim".to_string(),
-            )
-        })?;
-        let linear_1 = "unet/tensors/add_embedding.linear_1.weight";
-        if hfq.find_tensor_info(linear_1).is_none() {
-            return Err(DiffusionError::InvalidMetadata(
-                "UNet text_time addition is configured but add_embedding weights are missing"
-                    .to_string(),
-            ));
-        }
-        Ok(Some(Self {
-            addition_time_embed_dim,
-            linear_1_weight: CpuTensor::from_hfq(hfq, linear_1)?,
-            linear_1_bias: CpuTensor::from_hfq(hfq, "unet/tensors/add_embedding.linear_1.bias")?,
-            linear_2_weight: CpuTensor::from_hfq(
-                hfq,
-                "unet/tensors/add_embedding.linear_2.weight",
-            )?,
-            linear_2_bias: CpuTensor::from_hfq(hfq, "unet/tensors/add_embedding.linear_2.bias")?,
-        }))
-    }
-
-    pub fn forward(
-        &self,
-        text_embeds: &CpuTensor,
-        time_ids: &CpuTensor,
-        flip_sin_to_cos: bool,
-        freq_shift: f32,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            text_embeds,
-            time_ids,
-            flip_sin_to_cos,
-            freq_shift,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        text_embeds: &CpuTensor,
-        time_ids: &CpuTensor,
-        flip_sin_to_cos: bool,
-        freq_shift: f32,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(
-            text_embeds,
-            time_ids,
-            flip_sin_to_cos,
-            freq_shift,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        text_embeds: &CpuTensor,
-        time_ids: &CpuTensor,
-        flip_sin_to_cos: bool,
-        freq_shift: f32,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let [batch, _] = shape2(text_embeds)?;
-        let [time_batch, time_id_count] = shape2(time_ids)?;
-        if time_batch != batch {
-            return Err(DiffusionError::InvalidRequest(format!(
-                "SDXL time_ids batch {time_batch} != text_embeds batch {batch}"
-            )));
-        }
-        let time_embeds = timestep_embedding_with_runtime_context(
-            &time_ids.data,
-            self.addition_time_embed_dim,
-            flip_sin_to_cos,
-            freq_shift,
-            runtime_context,
-        )?;
-        let [flat_time, time_width] = shape2(&time_embeds)?;
-        if flat_time != batch * time_id_count {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "SDXL time embedding rows {flat_time} != batch*time_ids {}",
-                batch * time_id_count
-            )));
-        }
-        let mut flat = CpuTensor::zeros(&[batch, time_id_count * time_width]);
-        for b in 0..batch {
-            for t in 0..time_id_count {
-                let src = (b * time_id_count + t) * time_width;
-                let dst = b * time_id_count * time_width + t * time_width;
-                flat.data[dst..dst + time_width]
-                    .copy_from_slice(&time_embeds.data[src..src + time_width]);
-            }
-        }
-        let input = concat_last_dim_2d_with_runtime_context(text_embeds, &flat, runtime_context)?;
-        let hidden = linear_with_runtime_context(
-            &input,
-            &self.linear_1_weight,
-            &self.linear_1_bias,
-            runtime_context,
-        )?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        linear_with_runtime_context(
-            &hidden,
-            &self.linear_2_weight,
-            &self.linear_2_bias,
-            runtime_context,
-        )
-    }
-}
-
-pub fn timestep_embedding(
-    timesteps: &[f32],
-    dim: usize,
-    flip_sin_to_cos: bool,
-    freq_shift: f32,
-) -> DiffusionResult<CpuTensor> {
-    if dim == 0 {
-        return Err(DiffusionError::InvalidRequest(
-            "timestep embedding dimension must be positive".to_string(),
-        ));
-    }
-    let half = dim / 2;
-    if half == 0 {
-        return Ok(CpuTensor {
-            shape: vec![timesteps.len(), dim],
-            data: vec![0.0; timesteps.len() * dim],
-        });
-    }
-    let denom = (half as f32 - freq_shift).max(1.0);
-    let frequencies = (0..half)
-        .map(|idx| (-10000.0f32.ln() * idx as f32 / denom).exp())
-        .collect::<Vec<_>>();
-    let mut out = CpuTensor::zeros(&[timesteps.len(), dim]);
-    for (row, timestep) in timesteps.iter().enumerate() {
-        let base = row * dim;
-        for (idx, frequency) in frequencies.iter().enumerate() {
-            let value = timestep * frequency;
-            let (first, second) = if flip_sin_to_cos {
-                (value.cos(), value.sin())
-            } else {
-                (value.sin(), value.cos())
-            };
-            out.data[base + idx] = first;
-            out.data[base + half + idx] = second;
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AttentionLayer {
-    pub to_q_weight: CpuTensor,
-    pub to_q_bias: Option<CpuTensor>,
-    pub to_k_weight: CpuTensor,
-    pub to_k_bias: Option<CpuTensor>,
-    pub to_v_weight: CpuTensor,
-    pub to_v_bias: Option<CpuTensor>,
-    pub to_out_weight: CpuTensor,
-    pub to_out_bias: Option<CpuTensor>,
-    pub heads: usize,
-}
-
-impl AttentionLayer {
-    pub fn from_hfq(hfq: &HfqFile, prefix: &str, heads: usize) -> DiffusionResult<Self> {
-        Ok(Self {
-            to_q_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_q.weight"))?,
-            to_q_bias: optional_tensor(hfq, &format!("{prefix}.to_q.bias"))?,
-            to_k_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_k.weight"))?,
-            to_k_bias: optional_tensor(hfq, &format!("{prefix}.to_k.bias"))?,
-            to_v_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_v.weight"))?,
-            to_v_bias: optional_tensor(hfq, &format!("{prefix}.to_v.bias"))?,
-            to_out_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_out.0.weight"))?,
-            to_out_bias: optional_tensor(hfq, &format!("{prefix}.to_out.0.bias"))?,
-            heads: heads.max(1),
-        })
-    }
-
-    pub fn forward(
-        &self,
-        hidden_states: &CpuTensor,
-        encoder_states: Option<&CpuTensor>,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            hidden_states,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden_states: &CpuTensor,
-        encoder_states: Option<&CpuTensor>,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(hidden_states, encoder_states, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        hidden_states: &CpuTensor,
-        encoder_states: Option<&CpuTensor>,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let context = encoder_states.unwrap_or(hidden_states);
-        let q = linear_3d_with_runtime_context(
-            hidden_states,
-            &self.to_q_weight,
-            self.to_q_bias.as_ref(),
-            runtime_context,
-        )?;
-        let k = linear_3d_with_runtime_context(
-            context,
-            &self.to_k_weight,
-            self.to_k_bias.as_ref(),
-            runtime_context,
-        )?;
-        let v = linear_3d_with_runtime_context(
-            context,
-            &self.to_v_weight,
-            self.to_v_bias.as_ref(),
-            runtime_context,
-        )?;
-        let attended = scaled_dot_product_attention_with_runtime_context(
-            &q,
-            &k,
-            &v,
-            self.heads,
-            runtime_context,
-        )?;
-        linear_3d_with_runtime_context(
-            &attended,
-            &self.to_out_weight,
-            self.to_out_bias.as_ref(),
-            runtime_context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct GeGluFeedForward {
-    pub proj_weight: CpuTensor,
-    pub proj_bias: CpuTensor,
-    pub out_weight: CpuTensor,
-    pub out_bias: CpuTensor,
-}
-
-impl GeGluFeedForward {
-    pub fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Self> {
-        Ok(Self {
-            proj_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.0.proj.weight"))?,
-            proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.0.proj.bias"))?,
-            out_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.2.weight"))?,
-            out_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.2.bias"))?,
-        })
-    }
-
-    pub fn forward(&self, hidden_states: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            hidden_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(hidden_states, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        hidden_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let projected = linear_3d_with_runtime_context(
-            hidden_states,
-            &self.proj_weight,
-            Some(&self.proj_bias),
-            runtime_context,
-        )?;
-        let gated = geglu_gate_3d_with_runtime_context(&projected, runtime_context)?;
-        linear_3d_with_runtime_context(
-            &gated,
-            &self.out_weight,
-            Some(&self.out_bias),
-            runtime_context,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BasicTransformerBlock {
-    pub norm1_weight: CpuTensor,
-    pub norm1_bias: CpuTensor,
-    pub attn1: AttentionLayer,
-    pub norm2_weight: CpuTensor,
-    pub norm2_bias: CpuTensor,
-    pub attn2: AttentionLayer,
-    pub norm3_weight: CpuTensor,
-    pub norm3_bias: CpuTensor,
-    pub feed_forward: GeGluFeedForward,
-}
-
-impl BasicTransformerBlock {
-    pub fn from_hfq(hfq: &HfqFile, prefix: &str, heads: usize) -> DiffusionResult<Self> {
-        Ok(Self {
-            norm1_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm1.weight"))?,
-            norm1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm1.bias"))?,
-            attn1: AttentionLayer::from_hfq(hfq, &format!("{prefix}.attn1"), heads)?,
-            norm2_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm2.weight"))?,
-            norm2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm2.bias"))?,
-            attn2: AttentionLayer::from_hfq(hfq, &format!("{prefix}.attn2"), heads)?,
-            norm3_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm3.weight"))?,
-            norm3_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm3.bias"))?,
-            feed_forward: GeGluFeedForward::from_hfq(hfq, prefix)?,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        hidden_states: &CpuTensor,
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            hidden_states,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden_states: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(hidden_states, encoder_states, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        hidden_states: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let normed = layer_norm_3d_with_runtime_context(
-            hidden_states,
-            &self.norm1_weight,
-            &self.norm1_bias,
-            1e-5,
-            runtime_context,
-        )?;
-        let attn = self
-            .attn1
-            .forward_with_runtime_context(&normed, None, runtime_context)?;
-        let hidden_states = tensor_add_with_runtime_context(hidden_states, &attn, runtime_context)?;
-
-        let normed = layer_norm_3d_with_runtime_context(
-            &hidden_states,
-            &self.norm2_weight,
-            &self.norm2_bias,
-            1e-5,
-            runtime_context,
-        )?;
-        let attn = self.attn2.forward_with_runtime_context(
-            &normed,
-            Some(encoder_states),
-            runtime_context,
-        )?;
-        let hidden_states =
-            tensor_add_with_runtime_context(&hidden_states, &attn, runtime_context)?;
-
-        let normed = layer_norm_3d_with_runtime_context(
-            &hidden_states,
-            &self.norm3_weight,
-            &self.norm3_bias,
-            1e-5,
-            runtime_context,
-        )?;
-        let ff = self
-            .feed_forward
-            .forward_with_runtime_context(&normed, runtime_context)?;
-        tensor_add_with_runtime_context(&hidden_states, &ff, runtime_context)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Transformer2DModel {
-    pub norm: GroupNormLayer,
-    pub proj_in: Conv2dLayer,
-    pub block: BasicTransformerBlock,
-    pub proj_out: Conv2dLayer,
-}
-
-impl Transformer2DModel {
-    pub fn from_hfq(
-        hfq: &HfqFile,
-        prefix: &str,
-        heads: usize,
-        norm_groups: usize,
-        norm_eps: f32,
-    ) -> DiffusionResult<Self> {
-        Ok(Self {
-            norm: GroupNormLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.norm.weight"),
-                &format!("{prefix}.norm.bias"),
-                norm_groups,
-                norm_eps,
-            )?,
-            proj_in: Conv2dLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.proj_in.weight"),
-                Some(&format!("{prefix}.proj_in.bias")),
-                0,
-            )?,
-            block: BasicTransformerBlock::from_hfq(
-                hfq,
-                &format!("{prefix}.transformer_blocks.0"),
-                heads,
-            )?,
-            proj_out: Conv2dLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.proj_out.weight"),
-                Some(&format!("{prefix}.proj_out.bias")),
-                0,
-            )?,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        input: &CpuTensor,
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            input,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        input: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(input, encoder_states, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        input: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let residual = input.clone();
-        let hidden = self
-            .norm
-            .forward_with_runtime_context(input, runtime_context)?;
-        let hidden = self
-            .proj_in
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let [batch, channels, height, width] = shape4(&hidden)?;
-        let hidden = nchw_to_bsc_with_runtime_context(&hidden, runtime_context)?;
-        let hidden =
-            self.block
-                .forward_with_runtime_context(&hidden, encoder_states, runtime_context)?;
-        let hidden = bsc_to_nchw_with_runtime_context(
-            &hidden,
-            batch,
-            channels,
-            height,
-            width,
-            runtime_context,
-        )?;
-        let hidden = self
-            .proj_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetDownBlock2D {
-    pub resnets: Vec<UnetResnetBlock2D>,
-    pub attentions: Vec<Transformer2DModel>,
-    pub downsampler: Option<Conv2dLayer>,
-}
-
-impl UnetDownBlock2D {
-    pub fn from_hfq(
-        hfq: &HfqFile,
-        block_idx: usize,
-        layers_per_block: usize,
-        heads: usize,
-        norm_groups: usize,
-        norm_eps: f32,
-    ) -> DiffusionResult<Self> {
-        let prefix = format!("unet/tensors/down_blocks.{block_idx}");
-        let mut resnets = Vec::new();
-        let mut attentions = Vec::new();
-        for layer_idx in 0..layers_per_block {
-            let resnet_prefix = format!("{prefix}.resnets.{layer_idx}");
-            if hfq
-                .find_tensor_info(&format!("{resnet_prefix}.norm1.weight"))
-                .is_none()
-            {
-                break;
-            }
-            resnets.push(UnetResnetBlock2D::from_hfq(
-                hfq,
-                &resnet_prefix,
-                norm_groups,
-                norm_eps,
-            )?);
-            let attention_prefix = format!("{prefix}.attentions.{layer_idx}");
-            if hfq
-                .find_tensor_info(&format!("{attention_prefix}.norm.weight"))
-                .is_some()
-            {
-                attentions.push(Transformer2DModel::from_hfq(
-                    hfq,
-                    &attention_prefix,
-                    heads,
-                    norm_groups,
-                    norm_eps,
-                )?);
-            }
-        }
-        if resnets.is_empty() {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "UNet down block {block_idx} has no resnets"
-            )));
-        }
-        let down_weight = format!("{prefix}.downsamplers.0.conv.weight");
-        let down_bias = format!("{prefix}.downsamplers.0.conv.bias");
-        let downsampler = if hfq.find_tensor_info(&down_weight).is_some() {
-            Some(Conv2dLayer::from_hfq_with_stride(
-                hfq,
-                &down_weight,
-                Some(&down_bias),
-                1,
-                2,
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            resnets,
-            attentions,
-            downsampler,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        hidden: CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
-        self.forward_with_runtime_options(
-            hidden,
-            time_embedding,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden: CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(
-            hidden,
-            time_embedding,
-            encoder_states,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        mut hidden: CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
-        let mut skips = Vec::new();
-        for (idx, resnet) in self.resnets.iter().enumerate() {
-            hidden =
-                resnet.forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
-            if let Some(attention) = self.attentions.get(idx) {
-                hidden = attention.forward_with_runtime_context(
-                    &hidden,
-                    encoder_states,
-                    runtime_context,
-                )?;
-            }
-            skips.push(hidden.clone());
-        }
-        if let Some(downsampler) = &self.downsampler {
-            hidden = downsampler.forward_with_runtime_context(&hidden, runtime_context)?;
-            skips.push(hidden.clone());
-        }
-        Ok((hidden, skips))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetDownPath {
-    pub conv_in: Conv2dLayer,
-    pub blocks: Vec<UnetDownBlock2D>,
-}
-
-impl UnetDownPath {
-    pub fn from_hfq(hfq: &HfqFile, config: &UnetConfig) -> DiffusionResult<Self> {
-        let conv_in = Conv2dLayer::from_hfq(
-            hfq,
-            "unet/tensors/conv_in.weight",
-            Some("unet/tensors/conv_in.bias"),
-            1,
-        )?;
-        let block_count = if config.down_block_types.is_empty() {
-            config.block_out_channels.len()
-        } else {
-            config.down_block_types.len()
-        };
-        if block_count == 0 {
-            return Err(DiffusionError::InvalidMetadata(
-                "UNet config has no down blocks".to_string(),
-            ));
-        }
-        let layers_per_block = config.layers_per_block.unwrap_or(1).max(1);
-        let norm_groups = config.norm_num_groups.unwrap_or(32);
-        let norm_eps = config.norm_eps.unwrap_or(1e-5);
-        let mut blocks = Vec::new();
-        for block_idx in 0..block_count {
-            let channels = config
-                .block_out_channels
-                .get(block_idx)
-                .copied()
-                .unwrap_or_else(|| config.block_out_channels.last().copied().unwrap_or(1));
-            let head_dim = config
-                .attention_head_dim
-                .get(block_idx)
-                .copied()
-                .or_else(|| config.attention_head_dim.first().copied())
-                .unwrap_or(channels);
-            let heads = (channels / head_dim.max(1)).max(1);
-            blocks.push(UnetDownBlock2D::from_hfq(
-                hfq,
-                block_idx,
-                layers_per_block,
-                heads,
-                norm_groups,
-                norm_eps,
-            )?);
-        }
-        Ok(Self { conv_in, blocks })
-    }
-
-    pub fn forward(
-        &self,
-        sample: &CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
-        self.forward_with_runtime_options(
-            sample,
-            time_embedding,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        sample: &CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(
-            sample,
-            time_embedding,
-            encoder_states,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        sample: &CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<(CpuTensor, Vec<CpuTensor>)> {
-        let mut hidden = self
-            .conv_in
-            .forward_with_runtime_context(sample, runtime_context)?;
-        let mut skips = vec![hidden.clone()];
-        for block in &self.blocks {
-            let (next, mut block_skips) = block.forward_with_runtime_context(
-                hidden,
-                time_embedding,
-                encoder_states,
-                runtime_context,
-            )?;
-            hidden = next;
-            skips.append(&mut block_skips);
-        }
-        Ok((hidden, skips))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetUpBlock2D {
-    pub resnets: Vec<UnetResnetBlock2D>,
-    pub attentions: Vec<Transformer2DModel>,
-    pub upsampler: Option<Conv2dLayer>,
-}
-
-impl UnetUpBlock2D {
-    pub fn from_hfq(
-        hfq: &HfqFile,
-        block_idx: usize,
-        heads: usize,
-        norm_groups: usize,
-        norm_eps: f32,
-    ) -> DiffusionResult<Self> {
-        let prefix = format!("unet/tensors/up_blocks.{block_idx}");
-        let mut resnets = Vec::new();
-        let mut attentions = Vec::new();
-        for layer_idx in 0.. {
-            let resnet_prefix = format!("{prefix}.resnets.{layer_idx}");
-            if hfq
-                .find_tensor_info(&format!("{resnet_prefix}.norm1.weight"))
-                .is_none()
-            {
-                break;
-            }
-            resnets.push(UnetResnetBlock2D::from_hfq(
-                hfq,
-                &resnet_prefix,
-                norm_groups,
-                norm_eps,
-            )?);
-            let attention_prefix = format!("{prefix}.attentions.{layer_idx}");
-            if hfq
-                .find_tensor_info(&format!("{attention_prefix}.norm.weight"))
-                .is_some()
-            {
-                attentions.push(Transformer2DModel::from_hfq(
-                    hfq,
-                    &attention_prefix,
-                    heads,
-                    norm_groups,
-                    norm_eps,
-                )?);
-            }
-        }
-        if resnets.is_empty() {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "UNet up block {block_idx} has no resnets"
-            )));
-        }
-        let up_weight = format!("{prefix}.upsamplers.0.conv.weight");
-        let up_bias = format!("{prefix}.upsamplers.0.conv.bias");
-        let upsampler = if hfq.find_tensor_info(&up_weight).is_some() {
-            Some(Conv2dLayer::from_hfq(hfq, &up_weight, Some(&up_bias), 1)?)
-        } else {
-            None
-        };
-        Ok(Self {
-            resnets,
-            attentions,
-            upsampler,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        hidden: CpuTensor,
-        skips: &mut Vec<CpuTensor>,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            hidden,
-            skips,
-            time_embedding,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden: CpuTensor,
-        skips: &mut Vec<CpuTensor>,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(
-            hidden,
-            skips,
-            time_embedding,
-            encoder_states,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        mut hidden: CpuTensor,
-        skips: &mut Vec<CpuTensor>,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        for (idx, resnet) in self.resnets.iter().enumerate() {
-            let skip = skips.pop().ok_or_else(|| {
-                DiffusionError::InvalidMetadata("UNet up block ran out of skip tensors".to_string())
-            })?;
-            hidden = concat_channels_nchw_with_runtime_context(&hidden, &skip, runtime_context)?;
-            hidden =
-                resnet.forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
-            if let Some(attention) = self.attentions.get(idx) {
-                hidden = attention.forward_with_runtime_context(
-                    &hidden,
-                    encoder_states,
-                    runtime_context,
-                )?;
-            }
-        }
-        if let Some(upsampler) = &self.upsampler {
-            hidden = upsample_nearest2d_nchw_with_runtime_context(&hidden, 2, runtime_context)?;
-            hidden = upsampler.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        Ok(hidden)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetUpPath {
-    pub blocks: Vec<UnetUpBlock2D>,
-}
-
-impl UnetUpPath {
-    pub fn from_hfq(hfq: &HfqFile, config: &UnetConfig) -> DiffusionResult<Self> {
-        let block_count = if config.up_block_types.is_empty() {
-            config.block_out_channels.len()
-        } else {
-            config.up_block_types.len()
-        };
-        if block_count == 0 {
-            return Err(DiffusionError::InvalidMetadata(
-                "UNet config has no up blocks".to_string(),
-            ));
-        }
-        let norm_groups = config.norm_num_groups.unwrap_or(32);
-        let norm_eps = config.norm_eps.unwrap_or(1e-5);
-        let mut blocks = Vec::new();
-        for block_idx in 0..block_count {
-            let channels = config
-                .block_out_channels
-                .iter()
-                .rev()
-                .nth(block_idx)
-                .copied()
-                .unwrap_or_else(|| config.block_out_channels.first().copied().unwrap_or(1));
-            let head_dim = config
-                .attention_head_dim
-                .iter()
-                .rev()
-                .nth(block_idx)
-                .copied()
-                .or_else(|| config.attention_head_dim.first().copied())
-                .unwrap_or(channels);
-            let heads = (channels / head_dim.max(1)).max(1);
-            blocks.push(UnetUpBlock2D::from_hfq(
-                hfq,
-                block_idx,
-                heads,
-                norm_groups,
-                norm_eps,
-            )?);
-        }
-        Ok(Self { blocks })
-    }
-
-    pub fn forward(
-        &self,
-        hidden: CpuTensor,
-        skips: &mut Vec<CpuTensor>,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            hidden,
-            skips,
-            time_embedding,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden: CpuTensor,
-        skips: &mut Vec<CpuTensor>,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(
-            hidden,
-            skips,
-            time_embedding,
-            encoder_states,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        mut hidden: CpuTensor,
-        skips: &mut Vec<CpuTensor>,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        for block in &self.blocks {
-            hidden = block.forward_with_runtime_context(
-                hidden,
-                skips,
-                time_embedding,
-                encoder_states,
-                runtime_context,
-            )?;
-        }
-        Ok(hidden)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnetMidBlock2DCrossAttn {
-    pub resnet_0: UnetResnetBlock2D,
-    pub attention: Option<Transformer2DModel>,
-    pub resnet_1: Option<UnetResnetBlock2D>,
-}
-
-impl UnetMidBlock2DCrossAttn {
-    pub fn from_hfq(hfq: &HfqFile, config: &UnetConfig) -> DiffusionResult<Option<Self>> {
-        let prefix = "unet/tensors/mid_block";
-        let resnet_0_prefix = format!("{prefix}.resnets.0");
-        if hfq
-            .find_tensor_info(&format!("{resnet_0_prefix}.norm1.weight"))
-            .is_none()
-        {
-            return Ok(None);
-        }
-        let norm_groups = config.norm_num_groups.unwrap_or(32);
-        let norm_eps = config.norm_eps.unwrap_or(1e-5);
-        let channels = config.block_out_channels.last().copied().unwrap_or(1);
-        let head_dim = config
-            .attention_head_dim
-            .last()
-            .copied()
-            .or_else(|| config.attention_head_dim.first().copied())
-            .unwrap_or(channels);
-        let heads = (channels / head_dim.max(1)).max(1);
-        let attention_prefix = format!("{prefix}.attentions.0");
-        let attention = if hfq
-            .find_tensor_info(&format!("{attention_prefix}.norm.weight"))
-            .is_some()
-        {
-            Some(Transformer2DModel::from_hfq(
-                hfq,
-                &attention_prefix,
-                heads,
-                norm_groups,
-                norm_eps,
-            )?)
-        } else {
-            None
-        };
-        let resnet_1_prefix = format!("{prefix}.resnets.1");
-        let resnet_1 = if hfq
-            .find_tensor_info(&format!("{resnet_1_prefix}.norm1.weight"))
-            .is_some()
-        {
-            Some(UnetResnetBlock2D::from_hfq(
-                hfq,
-                &resnet_1_prefix,
-                norm_groups,
-                norm_eps,
-            )?)
-        } else {
-            None
-        };
-        Ok(Some(Self {
-            resnet_0: UnetResnetBlock2D::from_hfq(hfq, &resnet_0_prefix, norm_groups, norm_eps)?,
-            attention,
-            resnet_1,
-        }))
-    }
-
-    pub fn forward(
-        &self,
-        hidden: CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(
-            hidden,
-            time_embedding,
-            encoder_states,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden: CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(
-            hidden,
-            time_embedding,
-            encoder_states,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        mut hidden: CpuTensor,
-        time_embedding: &CpuTensor,
-        encoder_states: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        hidden =
-            self.resnet_0
-                .forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
-        if let Some(attention) = &self.attention {
-            hidden =
-                attention.forward_with_runtime_context(&hidden, encoder_states, runtime_context)?;
-        }
-        if let Some(resnet) = &self.resnet_1 {
-            hidden =
-                resnet.forward_with_runtime_context(&hidden, time_embedding, runtime_context)?;
-        }
-        Ok(hidden)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NativeUnet2DConditionModel {
-    pub time_embedding: UnetTimeEmbedding,
-    pub add_embedding: Option<UnetTextTimeEmbedding>,
-    pub down_path: UnetDownPath,
-    pub mid_block: Option<UnetMidBlock2DCrossAttn>,
-    pub up_path: UnetUpPath,
-    pub conv_norm_out: GroupNormLayer,
-    pub conv_out: Conv2dLayer,
-    pub center_input_sample: bool,
-    pub flip_sin_to_cos: bool,
-    pub freq_shift: f32,
-}
-
-impl NativeUnet2DConditionModel {
-    pub fn from_hfq(hfq: &HfqFile, config: &UnetConfig) -> DiffusionResult<Self> {
-        let norm_groups = config.norm_num_groups.unwrap_or(32);
-        let norm_eps = config.norm_eps.unwrap_or(1e-5);
-        Ok(Self {
-            time_embedding: UnetTimeEmbedding::from_hfq(hfq)?,
-            add_embedding: UnetTextTimeEmbedding::from_hfq(hfq, config)?,
-            down_path: UnetDownPath::from_hfq(hfq, config)?,
-            mid_block: UnetMidBlock2DCrossAttn::from_hfq(hfq, config)?,
-            up_path: UnetUpPath::from_hfq(hfq, config)?,
-            conv_norm_out: GroupNormLayer::from_hfq(
-                hfq,
-                "unet/tensors/conv_norm_out.weight",
-                "unet/tensors/conv_norm_out.bias",
-                norm_groups,
-                norm_eps,
-            )?,
-            conv_out: Conv2dLayer::from_hfq(
-                hfq,
-                "unet/tensors/conv_out.weight",
-                Some("unet/tensors/conv_out.bias"),
-                1,
-            )?,
-            center_input_sample: config.center_input_sample,
-            flip_sin_to_cos: config.flip_sin_to_cos,
-            freq_shift: config.freq_shift,
-        })
-    }
-
-    pub fn input_channels(&self) -> usize {
-        self.down_path
-            .conv_in
-            .weight
-            .shape
-            .get(1)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub fn forward(
-        &self,
-        sample: &CpuTensor,
-        timesteps: &[f32],
-        encoder_states: &CpuTensor,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_sdxl_conditioning(sample, timesteps, encoder_states, None)
-    }
-
-    pub fn forward_with_sdxl_conditioning(
-        &self,
-        sample: &CpuTensor,
-        timesteps: &[f32],
-        encoder_states: &CpuTensor,
-        sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_sdxl_conditioning_and_runtime_options(
-            sample,
-            timesteps,
-            encoder_states,
-            sdxl_conditioning,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    pub fn forward_with_runtime_options(
-        &self,
-        sample: &CpuTensor,
-        timesteps: &[f32],
-        encoder_states: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        self.forward_with_sdxl_conditioning_and_runtime_options(
-            sample,
-            timesteps,
-            encoder_states,
-            None,
-            runtime_options,
-        )
-    }
-
-    fn forward_with_sdxl_conditioning_and_runtime_options(
-        &self,
-        sample: &CpuTensor,
-        timesteps: &[f32],
-        encoder_states: &CpuTensor,
-        sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_sdxl_conditioning_and_runtime_context(
-            sample,
-            timesteps,
-            encoder_states,
-            sdxl_conditioning,
-            &mut runtime_context,
-        )
-    }
-
-    fn forward_with_sdxl_conditioning_and_runtime_context(
-        &self,
-        sample: &CpuTensor,
-        timesteps: &[f32],
-        encoder_states: &CpuTensor,
-        sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let [batch, _, _, _] = shape4(sample)?;
-        if timesteps.len() != batch {
-            return Err(DiffusionError::InvalidRequest(format!(
-                "UNet timestep batch {} != sample batch {batch}",
-                timesteps.len()
-            )));
-        }
-        let [encoder_batch, _, _] = shape3(encoder_states)?;
-        if encoder_batch != batch {
-            return Err(DiffusionError::InvalidRequest(format!(
-                "UNet encoder batch {encoder_batch} != sample batch {batch}"
-            )));
-        }
-        let sample = maybe_center_unet_input_with_runtime_context(
-            sample,
-            self.center_input_sample,
-            runtime_context,
-        )?;
-        let mut time_embedding = self.time_embedding.forward_with_runtime_context(
-            timesteps,
-            self.flip_sin_to_cos,
-            self.freq_shift,
-            runtime_context,
-        )?;
-        if let Some(sdxl_conditioning) = sdxl_conditioning {
-            let add_embedding = self.add_embedding.as_ref().ok_or_else(|| {
-                DiffusionError::BackendUnavailable(
-                    "SDXL text_time conditioning requires UNet add_embedding weights".to_string(),
-                )
-            })?;
-            let added = add_embedding.forward_with_runtime_context(
-                sdxl_conditioning.text_embeds,
-                sdxl_conditioning.time_ids,
-                self.flip_sin_to_cos,
-                self.freq_shift,
-                runtime_context,
-            )?;
-            time_embedding =
-                tensor_add_with_runtime_context(&time_embedding, &added, runtime_context)?;
-        }
-        let (hidden, mut skips) = self.down_path.forward_with_runtime_context(
-            &sample,
-            &time_embedding,
-            encoder_states,
-            runtime_context,
-        )?;
-        let hidden = if let Some(mid_block) = &self.mid_block {
-            mid_block.forward_with_runtime_context(
-                hidden,
-                &time_embedding,
-                encoder_states,
-                runtime_context,
-            )?
-        } else {
-            hidden
-        };
-        let hidden = self.up_path.forward_with_runtime_context(
-            hidden,
-            &mut skips,
-            &time_embedding,
-            encoder_states,
-            runtime_context,
-        )?;
-        let hidden = self
-            .conv_norm_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        self.conv_out
-            .forward_with_runtime_context(&hidden, runtime_context)
-    }
-
-    pub fn denoise_latents(
-        &self,
-        latents: LatentBatch,
-        schedule: &DiffusionSchedule,
-        cfg_scale: f32,
-        positive_embeddings: &CpuTensor,
-        negative_embeddings: &CpuTensor,
-        positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
-        masked_reference: Option<&MaskedDenoiseReference<'_>>,
-        progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-    ) -> DiffusionResult<LatentBatch> {
-        self.denoise_latents_with_runtime_options(
-            latents,
-            schedule,
-            cfg_scale,
-            positive_embeddings,
-            negative_embeddings,
-            None,
-            None,
-            positive_sdxl_conditioning,
-            negative_sdxl_conditioning,
-            inpaint_conditioning,
-            masked_reference,
-            DiffusionGenerationRuntimeOptions::default(),
-            progress,
-        )
-        .map(|output| output.latents)
-    }
-
-    fn denoise_latents_with_runtime_options(
-        &self,
-        latents: LatentBatch,
-        schedule: &DiffusionSchedule,
-        cfg_scale: f32,
-        positive_embeddings: &CpuTensor,
-        negative_embeddings: &CpuTensor,
-        positive_attention_mask: Option<&CpuTensor>,
-        negative_attention_mask: Option<&CpuTensor>,
-        positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
-        masked_reference: Option<&MaskedDenoiseReference<'_>>,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-        progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-    ) -> DiffusionResult<DenoiseLatentsOutput> {
-        denoise_latents_with_cfg_progress_and_runtime_options(
-            latents,
-            schedule,
-            cfg_scale,
-            positive_embeddings,
-            negative_embeddings,
-            |sample,
-             timesteps,
-             encoder_states,
-             _attention_mask,
-             sdxl_conditioning,
-             runtime_context| {
-                self.forward_with_sdxl_conditioning_and_runtime_context(
-                    sample,
-                    timesteps,
-                    encoder_states,
-                    sdxl_conditioning,
-                    runtime_context,
-                )
-            },
-            positive_attention_mask,
-            negative_attention_mask,
-            positive_sdxl_conditioning,
-            negative_sdxl_conditioning,
-            inpaint_conditioning,
-            masked_reference,
-            runtime_options,
-            progress,
-        )
-    }
-
-    fn denoise_latents_with_runtime_context(
-        &self,
-        latents: LatentBatch,
-        schedule: &DiffusionSchedule,
-        cfg_scale: f32,
-        positive_embeddings: &CpuTensor,
-        negative_embeddings: &CpuTensor,
-        positive_attention_mask: Option<&CpuTensor>,
-        negative_attention_mask: Option<&CpuTensor>,
-        positive_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        negative_sdxl_conditioning: Option<&SdxlDenoiseConditioning<'_>>,
-        inpaint_conditioning: Option<&InpaintDenoiseConditioning>,
-        masked_reference: Option<&MaskedDenoiseReference<'_>>,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-        progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
-    ) -> DiffusionResult<DenoiseLatentsOutput> {
-        denoise_latents_with_cfg_progress_and_runtime_context(
-            latents,
-            schedule,
-            cfg_scale,
-            positive_embeddings,
-            negative_embeddings,
-            |sample,
-             timesteps,
-             encoder_states,
-             _attention_mask,
-             sdxl_conditioning,
-             runtime_context| {
-                self.forward_with_sdxl_conditioning_and_runtime_context(
-                    sample,
-                    timesteps,
-                    encoder_states,
-                    sdxl_conditioning,
-                    runtime_context,
-                )
-            },
-            positive_attention_mask,
-            negative_attention_mask,
-            positive_sdxl_conditioning,
-            negative_sdxl_conditioning,
-            inpaint_conditioning,
-            masked_reference,
-            runtime_context,
-            progress,
-        )
-    }
-}
-
-fn maybe_center_unet_input(sample: &CpuTensor, center_input_sample: bool) -> CpuTensor {
-    if center_input_sample {
-        CpuTensor {
-            shape: sample.shape.clone(),
-            data: sample.data.iter().map(|value| value * 2.0 - 1.0).collect(),
-        }
-    } else {
-        sample.clone()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VaeAttentionBlock {
-    pub norm: GroupNormLayer,
-    pub attention: AttentionLayer,
-}
-
-impl VaeAttentionBlock {
-    pub fn from_hfq(hfq: &HfqFile, prefix: &str, groups: usize, eps: f32) -> DiffusionResult<Self> {
-        Ok(Self {
-            norm: GroupNormLayer::from_hfq(
-                hfq,
-                &format!("{prefix}.group_norm.weight"),
-                &format!("{prefix}.group_norm.bias"),
-                groups,
-                eps,
-            )?,
-            attention: AttentionLayer::from_hfq(hfq, prefix, 1)?,
-        })
-    }
-
-    pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(input, DiffusionGenerationRuntimeOptions::default())
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        input: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(input, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        input: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let residual = input.clone();
-        let [batch, channels, height, width] = shape4(input)?;
-        let hidden = self
-            .norm
-            .forward_with_runtime_context(input, runtime_context)?;
-        let hidden = nchw_to_bsc_with_runtime_context(&hidden, runtime_context)?;
-        let hidden = self
-            .attention
-            .forward_with_runtime_context(&hidden, None, runtime_context)?;
-        let hidden = bsc_to_nchw_with_runtime_context(
-            &hidden,
-            batch,
-            channels,
-            height,
-            width,
-            runtime_context,
-        )?;
-        tensor_add_with_runtime_context(&hidden, &residual, runtime_context)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VaeEncoderDownBlock {
-    pub resnets: Vec<ResnetBlock2D>,
-    pub downsampler: Option<Conv2dLayer>,
-}
-
-impl VaeEncoderDownBlock {
-    pub fn from_hfq(hfq: &HfqFile, block_idx: usize, groups: usize) -> DiffusionResult<Self> {
-        let prefix = format!("vae/tensors/encoder.down_blocks.{block_idx}");
-        let mut resnets = Vec::new();
-        for layer_idx in 0.. {
-            let resnet_prefix = format!("{prefix}.resnets.{layer_idx}");
-            if hfq
-                .find_tensor_info(&format!("{resnet_prefix}.norm1.weight"))
-                .is_none()
-            {
-                break;
-            }
-            resnets.push(ResnetBlock2D::from_hfq(hfq, &resnet_prefix, groups)?);
-        }
-        if resnets.is_empty() {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "VAE encoder down block {block_idx} has no resnets"
-            )));
-        }
-        let down_weight = format!("{prefix}.downsamplers.0.conv.weight");
-        let down_bias = format!("{prefix}.downsamplers.0.conv.bias");
-        let downsampler = if hfq.find_tensor_info(&down_weight).is_some() {
-            Some(Conv2dLayer::from_hfq_with_stride(
-                hfq,
-                &down_weight,
-                Some(&down_bias),
-                1,
-                2,
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            resnets,
-            downsampler,
-        })
-    }
-
-    pub fn forward(&self, hidden: CpuTensor) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(hidden, DiffusionGenerationRuntimeOptions::default())
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden: CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(hidden, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        mut hidden: CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        for resnet in &self.resnets {
-            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        if let Some(downsampler) = &self.downsampler {
-            hidden = downsampler.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        Ok(hidden)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NativeVaeEncoder {
-    pub conv_in: Conv2dLayer,
-    pub down_blocks: Vec<VaeEncoderDownBlock>,
-    pub mid_resnet_0: Option<ResnetBlock2D>,
-    pub mid_attention: Option<VaeAttentionBlock>,
-    pub mid_resnet_1: Option<ResnetBlock2D>,
-    pub conv_norm_out: GroupNormLayer,
-    pub conv_out: Conv2dLayer,
-    pub quant_conv: Option<Conv2dLayer>,
-    latent_norm: VaeLatentNorm,
-}
-
-impl NativeVaeEncoder {
-    pub fn from_hfq(hfq: &HfqFile, config: &VaeConfig) -> DiffusionResult<Self> {
-        let groups = config.norm_num_groups.unwrap_or(32);
-        let eps = config.norm_eps.unwrap_or(1e-6);
-        let block_count = config
-            .down_block_types
-            .len()
-            .max(config.block_out_channels.len());
-        if block_count == 0 {
-            return Err(DiffusionError::InvalidMetadata(
-                "VAE encoder config has no down blocks".to_string(),
-            ));
-        }
-        let mut down_blocks = Vec::new();
-        for block_idx in 0..block_count {
-            down_blocks.push(VaeEncoderDownBlock::from_hfq(hfq, block_idx, groups)?);
-        }
-        let mid_resnet_0_prefix = "vae/tensors/encoder.mid_block.resnets.0";
-        let mid_resnet_0 = if hfq
-            .find_tensor_info(&format!("{mid_resnet_0_prefix}.norm1.weight"))
-            .is_some()
-        {
-            Some(ResnetBlock2D::from_hfq(hfq, mid_resnet_0_prefix, groups)?)
-        } else {
-            None
-        };
-        let mid_attention_prefix = "vae/tensors/encoder.mid_block.attentions.0";
-        let mid_attention = if hfq
-            .find_tensor_info(&format!("{mid_attention_prefix}.group_norm.weight"))
-            .is_some()
-        {
-            Some(VaeAttentionBlock::from_hfq(
-                hfq,
-                mid_attention_prefix,
-                groups,
-                eps,
-            )?)
-        } else {
-            None
-        };
-        let mid_resnet_1_prefix = "vae/tensors/encoder.mid_block.resnets.1";
-        let mid_resnet_1 = if hfq
-            .find_tensor_info(&format!("{mid_resnet_1_prefix}.norm1.weight"))
-            .is_some()
-        {
-            Some(ResnetBlock2D::from_hfq(hfq, mid_resnet_1_prefix, groups)?)
-        } else {
-            None
-        };
-        let quant_conv = if hfq
-            .find_tensor_info("vae/tensors/quant_conv.weight")
-            .is_some()
-        {
-            Some(Conv2dLayer::from_hfq(
-                hfq,
-                "vae/tensors/quant_conv.weight",
-                Some("vae/tensors/quant_conv.bias"),
-                0,
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            conv_in: Conv2dLayer::from_hfq(
-                hfq,
-                "vae/tensors/encoder.conv_in.weight",
-                Some("vae/tensors/encoder.conv_in.bias"),
-                1,
-            )?,
-            down_blocks,
-            mid_resnet_0,
-            mid_attention,
-            mid_resnet_1,
-            conv_norm_out: GroupNormLayer::from_hfq(
-                hfq,
-                "vae/tensors/encoder.conv_norm_out.weight",
-                "vae/tensors/encoder.conv_norm_out.bias",
-                groups,
-                eps,
-            )?,
-            conv_out: Conv2dLayer::from_hfq(
-                hfq,
-                "vae/tensors/encoder.conv_out.weight",
-                Some("vae/tensors/encoder.conv_out.bias"),
-                1,
-            )?,
-            quant_conv,
-            latent_norm: VaeLatentNorm::from_config(config)?,
-        })
-    }
-
-    pub fn encode_tensor_moments(&self, image: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        self.encode_tensor_moments_with_runtime_options(
-            image,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn encode_tensor_moments_with_runtime_options(
-        &self,
-        image: &CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.encode_tensor_moments_with_runtime_context(image, &mut runtime_context)
-    }
-
-    fn encode_tensor_moments_with_runtime_context(
-        &self,
-        image: &CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut hidden = self
-            .conv_in
-            .forward_with_runtime_context(image, runtime_context)?;
-        for block in &self.down_blocks {
-            hidden = block.forward_with_runtime_context(hidden, runtime_context)?;
-        }
-        if let Some(resnet) = &self.mid_resnet_0 {
-            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        if let Some(attention) = &self.mid_attention {
-            hidden = attention.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        if let Some(resnet) = &self.mid_resnet_1 {
-            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        hidden = self
-            .conv_norm_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        hidden = self
-            .conv_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        if let Some(quant_conv) = &self.quant_conv {
-            hidden = quant_conv.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        Ok(hidden)
-    }
-
-    pub fn encode_to_latents(&self, image: &RgbImageBatch) -> DiffusionResult<LatentBatch> {
-        let image = rgb_batch_to_vae_tensor(image)?;
-        let moments = self.encode_tensor_moments(&image)?;
-        vae_moments_to_latents(&moments, &self.latent_norm)
-    }
-
-    #[cfg(test)]
-    fn encode_to_latents_with_runtime_options(
-        &self,
-        image: &RgbImageBatch,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<LatentBatch> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.encode_to_latents_with_runtime_context(image, &mut runtime_context)
-    }
-
-    fn encode_to_latents_with_runtime_context(
-        &self,
-        image: &RgbImageBatch,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<LatentBatch> {
-        let image_tensor = rgb_batch_to_vae_tensor_with_runtime_context(image, runtime_context)?;
-        let moments =
-            self.encode_tensor_moments_with_runtime_context(&image_tensor, runtime_context)?;
-        vae_moments_to_latents_with_runtime_context(&moments, &self.latent_norm, runtime_context)
-    }
-
-    /// Stochastic counterpart of [`encode_to_latents_with_runtime_context`]: sample
-    /// from the VAE's diagonal Gaussian using the supplied per-batch `seeds`.
-    fn encode_to_latents_sampled_with_runtime_context(
-        &self,
-        image: &RgbImageBatch,
-        seeds: &[i64],
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<LatentBatch> {
-        let image_tensor = rgb_batch_to_vae_tensor_with_runtime_context(image, runtime_context)?;
-        let moments =
-            self.encode_tensor_moments_with_runtime_context(&image_tensor, runtime_context)?;
-        vae_moments_to_latents_sampled(&moments, &self.latent_norm, seeds)
-    }
-}
-
-fn vae_moments_to_latents(
-    moments: &CpuTensor,
-    norm: &VaeLatentNorm,
-) -> DiffusionResult<LatentBatch> {
-    let [batch, channels, height, width] = shape4(moments)?;
-    if channels % 2 != 0 {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "VAE encoder moments channel count {channels} is not even"
-        )));
-    }
-    let latent_channels = channels / 2;
-    let mut data = Vec::with_capacity(batch * latent_channels * height * width);
-    for b in 0..batch {
-        for c in 0..latent_channels {
-            for y in 0..height {
-                for x in 0..width {
-                    data.push(moments.data[nchw_idx(b, c, y, x, channels, height, width)]);
-                }
-            }
-        }
-    }
-    norm.apply_encode(&mut data, latent_channels, height * width)?;
-    Ok(LatentBatch {
-        batch,
-        channels: latent_channels,
-        height,
-        width,
-        data,
-    })
-}
+mod vae;
+pub use vae::*;
 
 /// Domain-separation salts so VAE-encode Gaussian noise does not alias the
 /// initial-latent noise stream (which seeds the request seed directly) or other
-/// encode sites. The values are arbitrary fixed constants.
+/// encode sites. The values are arbitrary fixed constants. Consumed by the
+/// pipeline/inpaint encode sites via [`vae_encode_seeds`].
 const VAE_INIT_ENCODE_SEED_SALT: u64 = 0x7661_655f_696e_6974; // "vae_init"
 const VAE_MASKED_ENCODE_SEED_SALT: u64 = 0x7661_655f_6d61_736b; // "vae_mask"
-
-/// Derive decorrelated per-batch RNG seeds for a specific VAE encode site.
-fn vae_encode_seeds(seeds: &[i64], salt: u64) -> Vec<i64> {
-    seeds
-        .iter()
-        .map(|seed| ((*seed as u64) ^ salt) as i64)
-        .collect()
-}
-
-/// Stochastic VAE encode: sample from the diagonal Gaussian `mean + std * eps`
-/// (`std = exp(0.5 * clamp(logvar, -30, 20))`) instead of taking the distribution
-/// mode, then apply latent-space normalization. The moments tensor packs the mean
-/// in the first half of the channel axis and the log-variance in the second half.
-/// Sampling is deterministic given `seeds` and always runs on the CPU (the fused
-/// HIP kernel only covers the scalar-scaled mode path).
-fn vae_moments_to_latents_sampled(
-    moments: &CpuTensor,
-    norm: &VaeLatentNorm,
-    seeds: &[i64],
-) -> DiffusionResult<LatentBatch> {
-    let [batch, channels, height, width] = shape4(moments)?;
-    if channels % 2 != 0 {
-        return Err(DiffusionError::InvalidMetadata(format!(
-            "VAE encoder moments channel count {channels} is not even"
-        )));
-    }
-    let latent_channels = channels / 2;
-    let plane = height * width;
-    let mut data = Vec::with_capacity(batch * latent_channels * plane);
-    for b in 0..batch {
-        let mut rng = SplitMix64::new(seeds.get(b).copied().unwrap_or(-1) as u64);
-        let mut spare: Option<f32> = None;
-        for c in 0..latent_channels {
-            for y in 0..height {
-                for x in 0..width {
-                    let mean = moments.data[nchw_idx(b, c, y, x, channels, height, width)];
-                    let logvar = moments.data
-                        [nchw_idx(b, latent_channels + c, y, x, channels, height, width)];
-                    let std = (0.5 * logvar.clamp(-30.0, 20.0)).exp();
-                    let noise = match spare.take() {
-                        Some(value) => value,
-                        None => {
-                            let (first, second) = box_muller_pair(&mut rng);
-                            spare = Some(second);
-                            first
-                        }
-                    };
-                    data.push(mean + std * noise);
-                }
-            }
-        }
-    }
-    norm.apply_encode(&mut data, latent_channels, plane)?;
-    Ok(LatentBatch {
-        batch,
-        channels: latent_channels,
-        height,
-        width,
-        data,
-    })
-}
-
-fn rgb_batch_to_vae_tensor_with_runtime_context(
-    image: &RgbImageBatch,
-    runtime_context: &mut DiffusionGenerationRuntimeContext,
-) -> DiffusionResult<CpuTensor> {
-    let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return rgb_batch_to_vae_tensor(image);
-    };
-    {
-        runtime_context.with_rocm_gpu(|gpu| rgb_batch_to_vae_tensor_hip_on_gpu(gpu, image))
-    }
-}
-
-fn vae_moments_to_latents_with_runtime_context(
-    moments: &CpuTensor,
-    norm: &VaeLatentNorm,
-    runtime_context: &mut DiffusionGenerationRuntimeContext,
-) -> DiffusionResult<LatentBatch> {
-    let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return vae_moments_to_latents(moments, norm);
-    };
-    // The fused HIP kernel only applies the scalar scaling factor. Per-channel
-    // (Qwen-Image) or shifted (Flux/SD3) normalization falls back to the CPU
-    // reference, which is cheap on the small latent tensor.
-    if !norm.is_scalar_scale_only() {
-        return vae_moments_to_latents(moments, norm);
-    }
-    {
-        runtime_context.with_rocm_gpu(|gpu| {
-            vae_moments_to_latents_hip_on_gpu(gpu, moments, norm.scaling_factor)
-        })
-    }
-}
-
-/// Map latents (NCHW) back into VAE input space ahead of decoding. The scalar
-/// scale-only case routes through the GPU-capable scale kernel; per-channel or
-/// shifted normalization is applied on the CPU.
-fn denormalize_decode_latents(
-    hidden: &CpuTensor,
-    norm: &VaeLatentNorm,
-    runtime_context: &mut DiffusionGenerationRuntimeContext,
-) -> DiffusionResult<CpuTensor> {
-    if norm.is_scalar_scale_only() {
-        let scale = norm.scaling_factor.max(f32::MIN_POSITIVE);
-        return scale_tensor_with_runtime_context(hidden, scale.recip(), runtime_context);
-    }
-    let [_, channels, height, width] = shape4(hidden)?;
-    let mut data = hidden.data.clone();
-    norm.apply_decode(&mut data, channels, height * width)?;
-    Ok(CpuTensor {
-        shape: hidden.shape.clone(),
-        data,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VaeDecoderUpBlock {
-    pub resnets: Vec<ResnetBlock2D>,
-    pub upsampler: Option<Conv2dLayer>,
-}
-
-impl VaeDecoderUpBlock {
-    pub fn from_hfq(hfq: &HfqFile, block_idx: usize, groups: usize) -> DiffusionResult<Self> {
-        let prefix = format!("vae/tensors/decoder.up_blocks.{block_idx}");
-        let mut resnets = Vec::new();
-        for layer_idx in 0.. {
-            let resnet_prefix = format!("{prefix}.resnets.{layer_idx}");
-            if hfq
-                .find_tensor_info(&format!("{resnet_prefix}.norm1.weight"))
-                .is_none()
-            {
-                break;
-            }
-            resnets.push(ResnetBlock2D::from_hfq(hfq, &resnet_prefix, groups)?);
-        }
-        if resnets.is_empty() {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "VAE decoder up block {block_idx} has no resnets"
-            )));
-        }
-        let up_weight = format!("{prefix}.upsamplers.0.conv.weight");
-        let up_bias = format!("{prefix}.upsamplers.0.conv.bias");
-        let upsampler = if hfq.find_tensor_info(&up_weight).is_some() {
-            Some(Conv2dLayer::from_hfq(hfq, &up_weight, Some(&up_bias), 1)?)
-        } else {
-            None
-        };
-        Ok(Self { resnets, upsampler })
-    }
-
-    pub fn forward(&self, hidden: CpuTensor) -> DiffusionResult<CpuTensor> {
-        self.forward_with_runtime_options(hidden, DiffusionGenerationRuntimeOptions::default())
-    }
-
-    fn forward_with_runtime_options(
-        &self,
-        hidden: CpuTensor,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.forward_with_runtime_context(hidden, &mut runtime_context)
-    }
-
-    fn forward_with_runtime_context(
-        &self,
-        mut hidden: CpuTensor,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        for resnet in &self.resnets {
-            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        if let Some(upsampler) = &self.upsampler {
-            hidden = upsample_nearest2d_nchw_with_runtime_context(&hidden, 2, runtime_context)?;
-            hidden = upsampler.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        Ok(hidden)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NativeVaeDecoder {
-    pub post_quant_conv: Option<Conv2dLayer>,
-    pub conv_in: Conv2dLayer,
-    pub mid_resnet_0: Option<ResnetBlock2D>,
-    pub mid_attention: Option<VaeAttentionBlock>,
-    pub mid_resnet_1: Option<ResnetBlock2D>,
-    pub up_blocks: Vec<VaeDecoderUpBlock>,
-    pub conv_norm_out: GroupNormLayer,
-    pub conv_out: Conv2dLayer,
-    latent_norm: VaeLatentNorm,
-}
-
-impl NativeVaeDecoder {
-    pub fn from_hfq(hfq: &HfqFile, config: &VaeConfig) -> DiffusionResult<Self> {
-        let groups = config.norm_num_groups.unwrap_or(32);
-        let eps = config.norm_eps.unwrap_or(1e-6);
-        let post_quant_conv = if hfq
-            .find_tensor_info("vae/tensors/post_quant_conv.weight")
-            .is_some()
-        {
-            Some(Conv2dLayer::from_hfq(
-                hfq,
-                "vae/tensors/post_quant_conv.weight",
-                Some("vae/tensors/post_quant_conv.bias"),
-                0,
-            )?)
-        } else {
-            None
-        };
-        let mid_resnet_0_prefix = "vae/tensors/decoder.mid_block.resnets.0";
-        let mid_resnet_0 = if hfq
-            .find_tensor_info(&format!("{mid_resnet_0_prefix}.norm1.weight"))
-            .is_some()
-        {
-            Some(ResnetBlock2D::from_hfq(hfq, mid_resnet_0_prefix, groups)?)
-        } else {
-            None
-        };
-        let mid_attention_prefix = "vae/tensors/decoder.mid_block.attentions.0";
-        let mid_attention = if hfq
-            .find_tensor_info(&format!("{mid_attention_prefix}.group_norm.weight"))
-            .is_some()
-        {
-            Some(VaeAttentionBlock::from_hfq(
-                hfq,
-                mid_attention_prefix,
-                groups,
-                eps,
-            )?)
-        } else {
-            None
-        };
-        let mid_resnet_1_prefix = "vae/tensors/decoder.mid_block.resnets.1";
-        let mid_resnet_1 = if hfq
-            .find_tensor_info(&format!("{mid_resnet_1_prefix}.norm1.weight"))
-            .is_some()
-        {
-            Some(ResnetBlock2D::from_hfq(hfq, mid_resnet_1_prefix, groups)?)
-        } else {
-            None
-        };
-
-        let block_count = config
-            .up_block_types
-            .len()
-            .max(config.block_out_channels.len());
-        if block_count == 0 {
-            return Err(DiffusionError::InvalidMetadata(
-                "VAE decoder config has no up blocks".to_string(),
-            ));
-        }
-        let mut up_blocks = Vec::new();
-        for block_idx in 0..block_count {
-            up_blocks.push(VaeDecoderUpBlock::from_hfq(hfq, block_idx, groups)?);
-        }
-
-        Ok(Self {
-            post_quant_conv,
-            conv_in: Conv2dLayer::from_hfq(
-                hfq,
-                "vae/tensors/decoder.conv_in.weight",
-                Some("vae/tensors/decoder.conv_in.bias"),
-                1,
-            )?,
-            mid_resnet_0,
-            mid_attention,
-            mid_resnet_1,
-            up_blocks,
-            conv_norm_out: GroupNormLayer::from_hfq(
-                hfq,
-                "vae/tensors/decoder.conv_norm_out.weight",
-                "vae/tensors/decoder.conv_norm_out.bias",
-                groups,
-                eps,
-            )?,
-            conv_out: Conv2dLayer::from_hfq(
-                hfq,
-                "vae/tensors/decoder.conv_out.weight",
-                Some("vae/tensors/decoder.conv_out.bias"),
-                1,
-            )?,
-            latent_norm: VaeLatentNorm::from_config(config)?,
-        })
-    }
-
-    pub fn decode_latents(&self, latents: &LatentBatch) -> DiffusionResult<CpuTensor> {
-        self.decode_latents_with_runtime_options(
-            latents,
-            DiffusionGenerationRuntimeOptions::default(),
-        )
-    }
-
-    fn decode_latents_with_runtime_options(
-        &self,
-        latents: &LatentBatch,
-        runtime_options: DiffusionGenerationRuntimeOptions,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut runtime_context = DiffusionGenerationRuntimeContext::new(runtime_options);
-        self.decode_latents_with_runtime_context(latents, &mut runtime_context)
-    }
-
-    fn decode_latents_with_runtime_context(
-        &self,
-        latents: &LatentBatch,
-        runtime_context: &mut DiffusionGenerationRuntimeContext,
-    ) -> DiffusionResult<CpuTensor> {
-        let mut hidden = latents.as_nchw_tensor();
-        hidden = denormalize_decode_latents(&hidden, &self.latent_norm, runtime_context)?;
-        if let Some(post_quant_conv) = &self.post_quant_conv {
-            hidden = post_quant_conv.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        hidden = self
-            .conv_in
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        if let Some(resnet) = &self.mid_resnet_0 {
-            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        if let Some(attention) = &self.mid_attention {
-            hidden = attention.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        if let Some(resnet) = &self.mid_resnet_1 {
-            hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
-        }
-        for block in &self.up_blocks {
-            hidden = block.forward_with_runtime_context(hidden, runtime_context)?;
-        }
-        hidden = self
-            .conv_norm_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
-        hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        self.conv_out
-            .forward_with_runtime_context(&hidden, runtime_context)
-    }
-
-    pub fn decode_to_rgb8(&self, latents: &LatentBatch) -> DiffusionResult<RgbImageBatch> {
-        let decoded = self.decode_latents(latents)?;
-        rgb_tensor_to_u8(&decoded)
-    }
-}
 
 pub fn rgb_tensor_to_u8(tensor: &CpuTensor) -> DiffusionResult<RgbImageBatch> {
     let [batch, channels, height, width] = shape4(tensor)?;
@@ -10441,6 +6310,12 @@ impl ClipTextEncoder {
                 self.max_length
             )));
         }
+        // Phase 1b: when a GPU is present, keep the whole transformer stack
+        // device-resident — upload the embedded tokens once, run the 12 encoder
+        // layers + final layer-norm on-device, download once.
+        if runtime_context.rocm_device_id().is_some() {
+            return self.encode_resident(tokens, runtime_context);
+        }
         let mut x = clip_token_position_embeddings_with_runtime_context(
             &self.token_embedding,
             &self.position_embedding,
@@ -10465,6 +6340,54 @@ impl ClipTextEncoder {
             1e-5,
             runtime_context,
         )
+    }
+
+    /// Phase 1b device-resident CLIP encode. The token+position embedding gather
+    /// is a cheap host op (and avoids re-uploading the ~vocab×hidden embedding
+    /// table to the device every call); its result uploads once, the encoder
+    /// layers + final layer-norm run device-resident, and only the final
+    /// hidden states download.
+    fn encode_resident(
+        &self,
+        tokens: &[u32],
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let x_host = clip_token_position_embeddings(
+            &self.token_embedding,
+            &self.position_embedding,
+            tokens,
+        )?;
+        if x_host.shape.as_slice() != [tokens.len(), self.hidden_size] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "CLIP embedding output shape {:?} does not match [{}, {}]",
+                x_host.shape,
+                tokens.len(),
+                self.hidden_size
+            )));
+        }
+        let n_heads = self.n_heads;
+        runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+            gpu.bind_thread()
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let mut x = gpu
+                .upload_f32(&x_host.data, &x_host.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            for layer in &self.layers {
+                x = layer.forward_resident(x, n_heads, gpu, cache)?;
+            }
+            let normed = layer_norm_resident(
+                gpu,
+                cache,
+                &x,
+                &self.final_layer_norm_weight,
+                &self.final_layer_norm_bias,
+                1e-5,
+            )?;
+            free_resident(gpu, x)?;
+            let output = download_resident(gpu, &normed)?;
+            free_resident(gpu, normed)?;
+            Ok(output)
+        })
     }
 
     fn pooled_text_embedding_with_runtime_context(
@@ -10557,6 +6480,83 @@ impl ClipEncoderLayer {
             &self.out_proj_bias,
             runtime_context,
         )
+    }
+
+    /// Phase 1b device-resident CLIP encoder layer (LN → causal self-attn →
+    /// residual → LN → fc1 → QuickGELU → fc2 → residual). Takes ownership of the
+    /// resident `x` and frees it once the residual no longer needs it.
+    fn forward_resident(
+        &self,
+        x: rdna_compute::GpuTensor,
+        n_heads: usize,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let norm1 = layer_norm_resident(
+            gpu,
+            cache,
+            &x,
+            &self.layer_norm1_weight,
+            &self.layer_norm1_bias,
+            1e-5,
+        )?;
+        let attn = self.self_attention_resident(&norm1, n_heads, gpu, cache)?;
+        free_resident(gpu, norm1)?;
+        let residual1 = tensor_add_resident(gpu, &x, &attn)?;
+        free_resident(gpu, x)?;
+        free_resident(gpu, attn)?;
+        let norm2 = layer_norm_resident(
+            gpu,
+            cache,
+            &residual1,
+            &self.layer_norm2_weight,
+            &self.layer_norm2_bias,
+            1e-5,
+        )?;
+        let hidden =
+            linear_optional_bias_resident(gpu, cache, &norm2, &self.fc1_weight, Some(&self.fc1_bias))?;
+        free_resident(gpu, norm2)?;
+        let activated = quick_gelu_resident(gpu, &hidden)?;
+        free_resident(gpu, hidden)?;
+        let mlp = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &activated,
+            &self.fc2_weight,
+            Some(&self.fc2_bias),
+        )?;
+        free_resident(gpu, activated)?;
+        let out = tensor_add_resident(gpu, &residual1, &mlp)?;
+        free_resident(gpu, residual1)?;
+        free_resident(gpu, mlp)?;
+        Ok(out)
+    }
+
+    /// Phase 1b device-resident CLIP self-attention (q/k/v projections → causal
+    /// attention → out projection). `x` is resident (borrowed; caller owns it).
+    fn self_attention_resident(
+        &self,
+        x: &rdna_compute::GpuTensor,
+        n_heads: usize,
+        gpu: &mut rdna_compute::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+        let q = linear_optional_bias_resident(gpu, cache, x, &self.q_proj_weight, Some(&self.q_proj_bias))?;
+        let k = linear_optional_bias_resident(gpu, cache, x, &self.k_proj_weight, Some(&self.k_proj_bias))?;
+        let v = linear_optional_bias_resident(gpu, cache, x, &self.v_proj_weight, Some(&self.v_proj_bias))?;
+        let context = clip_causal_self_attention_resident(gpu, &q, &k, &v, n_heads)?;
+        free_resident(gpu, q)?;
+        free_resident(gpu, k)?;
+        free_resident(gpu, v)?;
+        let out = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &context,
+            &self.out_proj_weight,
+            Some(&self.out_proj_bias),
+        )?;
+        free_resident(gpu, context)?;
+        Ok(out)
     }
 }
 
@@ -12322,9 +8322,12 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
         .components
         .get("transformer")
         .map(transformer_denoiser_weight_topology);
-    let uses_supported_transformer = transformer_topology
-        .as_ref()
-        .is_some_and(|topology| matches!(topology.family, TransformerDenoiserFamily::QwenImage));
+    let uses_supported_transformer = transformer_topology.as_ref().is_some_and(|topology| {
+        matches!(
+            topology.family,
+            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Krea2
+        )
+    });
     if !is_native_unet_pipeline_class(&metadata.pipeline.class_name) && !uses_supported_transformer
     {
         let denoiser = transformer_topology
@@ -12338,13 +8341,19 @@ fn native_runtime_metadata_support_error(metadata: &DiffusionHfqMetadata) -> Opt
     }
     if uses_supported_transformer {
         if let Some(topology) = transformer_topology.as_ref() {
+            // QwenImage (double-stream) carries text modulation; Krea2 conditions
+            // via the separate text_fusion module instead.
+            let text_conditioning_ok = match topology.family {
+                TransformerDenoiserFamily::Krea2 => topology.has_text_fusion,
+                _ => topology.has_text_modulation,
+            };
             if topology.block_count == 0
                 || !topology.has_input_projection
                 || !topology.has_output_projection
-                || !topology.has_text_modulation
+                || !text_conditioning_ok
             {
                 return Some(format!(
-                    "native transformer runtime requires complete Qwen image transformer weights; artifact has {}",
+                    "native transformer runtime requires complete Qwen image / Krea2 transformer weights; artifact has {}",
                     topology.diagnostic_label()
                 ));
             }
@@ -12552,12 +8561,18 @@ pub fn import_diffusers_to_hfq(
     )?;
     add_component(&source, &mut entries, &mut components, "scheduler", &[])?;
 
-    for name in [
+    // `vocab.json`/`merges.txt` are the CLIP-BPE layout; `tokenizer.json` is the
+    // HF fast-tokenizer bundle (Qwen2 and friends pack vocab+merges into it);
+    // `chat_template.jinja` carries the prompt wrapping some text encoders need.
+    const TOKENIZER_FILES: [&str; 6] = [
         "vocab.json",
         "merges.txt",
+        "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
-    ] {
+        "chat_template.jinja",
+    ];
+    for name in TOKENIZER_FILES {
         let path = source.join("tokenizer").join(name);
         if path.is_file() {
             let entry_name = format!("tokenizer/{name}");
@@ -12565,12 +8580,7 @@ pub fn import_diffusers_to_hfq(
             tokenizer_entries.push(entry_name);
         }
     }
-    for name in [
-        "vocab.json",
-        "merges.txt",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-    ] {
+    for name in TOKENIZER_FILES {
         let path = source.join("tokenizer_2").join(name);
         if path.is_file() {
             let entry_name = format!("tokenizer_2/{name}");
@@ -12578,14 +8588,25 @@ pub fn import_diffusers_to_hfq(
             tokenizer_2_entries.push(entry_name);
         }
     }
+    let (tokenizer_kind, tokenizer_max_length) = tokenizer_descriptor(&source.join("tokenizer"));
+    let (tokenizer_2_kind, tokenizer_2_max_length) =
+        tokenizer_descriptor(&source.join("tokenizer_2"));
 
     let unet_config = read_json(source.join("unet/config.json")).unwrap_or_else(|_| json!({}));
     let transformer_config =
         read_json(source.join("transformer/config.json")).unwrap_or_else(|_| json!({}));
     let vae_config = read_json(source.join("vae/config.json")).unwrap_or_else(|_| json!({}));
-    let latent_channels = unet_config
-        .get("in_channels")
+    // Latent channels = the VAE latent space (what the scheduler denoises).
+    // Prefer the VAE's own channel count: for patchified DiTs the transformer
+    // `in_channels` is the patch-flattened width (e.g. Krea2 64 = z_dim 16 x a
+    // 2x2 patch), and for inpaint UNets `in_channels` folds in mask/masked-latent
+    // concat, so the denoiser input width is not the latent width. Fall back to
+    // the denoiser channels only when the VAE config lacks a latent-channel field.
+    let latent_channels = vae_config
+        .get("latent_channels")
         .and_then(Value::as_u64)
+        .or_else(|| vae_config.get("z_dim").and_then(Value::as_u64))
+        .or_else(|| unet_config.get("in_channels").and_then(Value::as_u64))
         .or_else(|| {
             transformer_config
                 .get("out_channels")
@@ -12596,8 +8617,6 @@ pub fn import_diffusers_to_hfq(
                 .get("in_channels")
                 .and_then(Value::as_u64)
         })
-        .or_else(|| vae_config.get("latent_channels").and_then(Value::as_u64))
-        .or_else(|| vae_config.get("z_dim").and_then(Value::as_u64))
         .map(|value| value as u32);
     let latent_size = unet_config
         .get("sample_size")
@@ -12627,13 +8646,13 @@ pub fn import_diffusers_to_hfq(
             supported_heights: Vec::new(),
         },
         tokenizer: DiffusionTokenizerMetadata {
-            kind: "clip-bpe".to_string(),
-            max_length: Some(77),
+            kind: tokenizer_kind,
+            max_length: tokenizer_max_length,
             entries: tokenizer_entries,
         },
         tokenizer_2: (!tokenizer_2_entries.is_empty()).then_some(DiffusionTokenizerMetadata {
-            kind: "clip-bpe".to_string(),
-            max_length: Some(77),
+            kind: tokenizer_2_kind,
+            max_length: tokenizer_2_max_length,
             entries: tokenizer_2_entries,
         }),
         batch: DiffusionBatchMetadata {
@@ -13265,6 +9284,38 @@ fn split_usize_prefix(value: &str) -> Option<(usize, &str)> {
     Some((head.parse().ok()?, tail))
 }
 
+/// Describe a Diffusers tokenizer directory: `(kind, max_length)`.
+///
+/// `kind` is a coarse family tag the runtime uses to pick a tokenizer backend
+/// (`clip-bpe` for CLIP, `qwen2-bpe` for the Qwen2 fast tokenizer that packs its
+/// vocab/merges into `tokenizer.json`). `max_length` is the tokenizer's declared
+/// `model_max_length` (the conditioning path may cap lower). Missing or
+/// unreadable configs fall back to the CLIP defaults (`clip-bpe`, 77).
+fn tokenizer_descriptor(dir: &Path) -> (String, Option<u32>) {
+    let config = read_json(dir.join("tokenizer_config.json")).unwrap_or_else(|_| json!({}));
+    let class = config
+        .get("tokenizer_class")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = if class.contains("Qwen") {
+        "qwen2-bpe"
+    } else if class.contains("CLIP") || class.is_empty() {
+        "clip-bpe"
+    } else if class.contains("Llama") || class.contains("T5") {
+        "sentencepiece"
+    } else {
+        "bpe"
+    }
+    .to_string();
+    let max_length = config
+        .get("model_max_length")
+        .and_then(Value::as_u64)
+        .filter(|&value| value > 0 && value <= 10_000_000)
+        .map(|value| value as u32)
+        .or(Some(77));
+    (kind, max_length)
+}
+
 fn add_component(
     source: &Path,
     entries: &mut Vec<DiffusionImportEntry>,
@@ -13284,9 +9335,18 @@ fn add_component(
     if config_path.is_file() {
         let entry_name = format!("{component}/{config_name}");
         let config = read_json(&config_path).unwrap_or_else(|_| json!({}));
+        // Diffusers components use `_class_name`; transformers text encoders
+        // (e.g. Qwen3VLModel) declare `architectures: [..]` instead.
         metadata.class_name = config
             .get("_class_name")
             .and_then(Value::as_str)
+            .or_else(|| {
+                config
+                    .get("architectures")
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.first())
+                    .and_then(Value::as_str)
+            })
             .map(str::to_string);
         metadata.config_entry = Some(entry_name.clone());
         push_import_file_entry(entries, &entry_name, QT_DIFFUSION_JSON, config_path)?;
@@ -13387,15 +9447,36 @@ fn add_component(
                                 quant_format: None,
                             });
                             metadata.weight_entries.push(entry_name.clone());
+                            let source = if pytorch_tensor_is_contiguous(
+                                &tensor.shape,
+                                &tensor.stride,
+                            ) {
+                                DiffusionImportSource::ZipMember {
+                                    archive_path: weight_path.clone(),
+                                    member_name: tensor.member_name,
+                                }
+                            } else {
+                                // Non-contiguous storage (e.g. channels_last conv
+                                // weights). Materialize the tensor in contiguous
+                                // row-major order so downstream layout matches the
+                                // logical shape.
+                                let archive = MiniZipArchive::open(&weight_path)?;
+                                let storage = archive.read_entry(&tensor.member_name)?;
+                                let data = reorder_pytorch_storage_to_contiguous(
+                                    &storage,
+                                    &tensor.shape,
+                                    &tensor.stride,
+                                    tensor.storage_offset,
+                                    pytorch_dtype_elem_size(&tensor.dtype),
+                                )?;
+                                DiffusionImportSource::Inline(data)
+                            };
                             entries.push(DiffusionImportEntry {
                                 name: entry_name,
                                 quant_type: tensor.quant_type,
                                 shape: tensor.shape,
                                 group_size: 0,
-                                source: DiffusionImportSource::ZipMember {
-                                    archive_path: weight_path.clone(),
-                                    member_name: tensor.member_name,
-                                },
+                                source,
                             });
                         }
                     }
@@ -13550,6 +9631,8 @@ struct PytorchTensorEntry {
     dtype: String,
     quant_type: u8,
     shape: Vec<u32>,
+    stride: Vec<i64>,
+    storage_offset: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -13711,6 +9794,84 @@ fn safetensors_dtype_info(dtype: &str) -> Option<(&'static str, u8, u64)> {
     }
 }
 
+fn pytorch_dtype_elem_size(dtype: &str) -> usize {
+    match dtype {
+        "F32" => 4,
+        "F16" | "BF16" => 2,
+        _ => 4,
+    }
+}
+
+/// Mirrors PyTorch's `is_contiguous`: a tensor is contiguous when, walking the
+/// dims from innermost to outermost, each stride equals the running product of
+/// the inner sizes. Size-1 (and empty) dims carry arbitrary strides and are
+/// skipped, exactly as PyTorch does.
+fn pytorch_tensor_is_contiguous(shape: &[u32], stride: &[i64]) -> bool {
+    if stride.is_empty() {
+        return true;
+    }
+    if stride.len() != shape.len() {
+        return true;
+    }
+    let mut expected: i64 = 1;
+    for dim in (0..shape.len()).rev() {
+        let size = shape[dim] as i64;
+        if size <= 1 {
+            continue;
+        }
+        if stride[dim] != expected {
+            return false;
+        }
+        expected *= size;
+    }
+    true
+}
+
+/// Gather a strided PyTorch storage into a contiguous row-major byte buffer for
+/// `shape`. Handles any stride layout (channels_last conv weights in practice).
+fn reorder_pytorch_storage_to_contiguous(
+    storage: &[u8],
+    shape: &[u32],
+    stride: &[i64],
+    storage_offset: i64,
+    elem_size: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let ndim = shape.len();
+    if stride.len() != ndim {
+        anyhow::bail!(
+            "pytorch tensor stride rank {} != shape rank {ndim}",
+            stride.len()
+        );
+    }
+    let count: usize = shape.iter().map(|&dim| dim as usize).product();
+    let mut out = vec![0u8; count * elem_size];
+    let mut index = vec![0usize; ndim];
+    for linear in 0..count {
+        let mut physical = storage_offset;
+        for dim in 0..ndim {
+            physical += index[dim] as i64 * stride[dim];
+        }
+        if physical < 0 {
+            anyhow::bail!("pytorch tensor negative element offset");
+        }
+        let src = physical as usize * elem_size;
+        let dst = linear * elem_size;
+        let src_end = src
+            .checked_add(elem_size)
+            .filter(|end| *end <= storage.len())
+            .ok_or_else(|| anyhow::anyhow!("pytorch tensor element out of storage bounds"))?;
+        out[dst..dst + elem_size].copy_from_slice(&storage[src..src_end]);
+        for dim in (0..ndim).rev() {
+            index[dim] += 1;
+            if index[dim] < shape[dim] as usize {
+                break;
+            }
+            index[dim] = 0;
+        }
+    }
+    Ok(out)
+}
+
 fn parse_pytorch_state_dict(path: &Path) -> anyhow::Result<Vec<PytorchTensorEntry>> {
     let archive = MiniZipArchive::open(path)?;
     let data_pkl_name = archive
@@ -13738,6 +9899,8 @@ fn parse_pytorch_state_dict(path: &Path) -> anyhow::Result<Vec<PytorchTensorEntr
             dtype: tensor.dtype,
             quant_type: tensor.quant_type,
             shape: tensor.shape,
+            stride: tensor.stride,
+            storage_offset: tensor.storage_offset,
         })
         .collect())
 }
@@ -13749,6 +9912,8 @@ struct ParsedPytorchTensor {
     dtype: String,
     quant_type: u8,
     shape: Vec<u32>,
+    stride: Vec<i64>,
+    storage_offset: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -13924,12 +10089,24 @@ fn tensor_from_rebuild_args(args: PickleValue) -> Option<ParsedPytorchTensor> {
         .into_iter()
         .map(|dim| dim as u32)
         .collect();
+    // `_rebuild_tensor_v2(storage, storage_offset, size, stride, ...)`. We must
+    // honor `storage_offset` and `stride`: tensors saved in a non-contiguous
+    // memory format (e.g. channels_last conv weights) keep a logical OIHW `size`
+    // while the underlying storage is physically reordered. Ignoring the stride
+    // loads such weights transposed.
+    let storage_offset = match items.get(1) {
+        Some(PickleValue::Int(value)) => *value,
+        _ => 0,
+    };
+    let stride = items.get(3).and_then(tuple_ints).unwrap_or_default();
     Some(ParsedPytorchTensor {
         name: String::new(),
         storage_key: storage.0,
         dtype: storage.1,
         quant_type: storage.2,
         shape,
+        stride,
+        storage_offset,
     })
 }
 

@@ -1,0 +1,19 @@
+[package]
+name = "hipfire-arch-template"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Copy-paste template for a new model family: the serving-side Architecture impl + capability-layer wiring (Arch/Ingest/ToyModel + register_arch!), intentionally stubbed with heavy explanatory comments."
+
+# This crate is a TEMPLATE, not a model. It exists so contributors adding a new
+# model architecture have a copy-paste starting point with all the pieces that pass
+# the workspace build, plus heavy explanatory comments. The lean OFFLINE half (the
+# Ingest quant-policy) lives in its sibling `hipfire-arch-template-spec`. See this
+# crate's README for the full add-a-family checklist and .github/CONTRIBUTING.md
+# "Crate topology".
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }

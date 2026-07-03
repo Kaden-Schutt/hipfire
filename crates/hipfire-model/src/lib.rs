@@ -4,7 +4,6 @@
 
 //! Shared model artifact identity helpers and model-source contracts.
 
-pub mod gguf;
 /// Generated model-support tables (`ARCH_ROWS`/`QUANT_TABLE`/`GATE_TABLE`).
 /// Source of truth: `docs/model-support.toml`; regenerate with
 /// `cargo run -p hipfire-cli -- gen-model-support`.
@@ -442,7 +441,6 @@ pub trait ModelSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelArtifactFormat {
     Hfq,
-    Gguf,
     SafetensorsDirectory,
     Unknown,
 }
@@ -462,7 +460,6 @@ pub fn detect_model_artifact_format(path: &Path) -> ModelArtifactFormat {
             .as_deref()
         {
             Some("hfq") => ModelArtifactFormat::Hfq,
-            Some("gguf") => ModelArtifactFormat::Gguf,
             _ => ModelArtifactFormat::Unknown,
         }
     }
@@ -2706,10 +2703,6 @@ mod tests {
         assert_eq!(
             detect_model_artifact_format(Path::new("model.hfq")),
             ModelArtifactFormat::Hfq
-        );
-        assert_eq!(
-            detect_model_artifact_format(Path::new("model.gguf")),
-            ModelArtifactFormat::Gguf
         );
         assert_eq!(
             detect_model_artifact_format(Path::new("model.bin")),

@@ -286,6 +286,7 @@ mod preflight_tests {
             DType::MQ4G256,
             DType::MQ3G256,
             DType::Qtip3G256,
+            DType::Qtip4G256,
             DType::MFP4G32,
             DType::MQ8G256,
             DType::MQ4G128,
@@ -352,6 +353,8 @@ mod preflight_tests {
                 "op8-16" => DType::Oq8G256,
                 "op8-16+" => DType::Oq8G256,
                 "mq3" => DType::MQ3G256,
+                "qtip3" => DType::Qtip3G256,
+                "qtip4" => DType::Qtip4G256,
                 _ => return None,
             })
         }

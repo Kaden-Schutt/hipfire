@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{c_void, CString, OsStr};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,15 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     admission_artifact_index_entry_json, admission_artifact_json, admission_metric_is_quality,
-    admission_verdict_policy, classify_hardware_kind, comparison_artifact_index_entry_json,
-    comparison_artifact_json, compute_peak_bandwidth_gbps, dflash_trace_metrics, directory_hash,
+    admission_verdict_policy, comparison_artifact_index_entry_json,
+    comparison_artifact_json, dflash_trace_metrics, directory_hash,
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
-    evidence_record_json, extract_external_evidence_records_json, hardware_bucket,
+    evidence_record_json, extract_external_evidence_records_json,
     has_launch_count_metric, has_memory_metric, has_module_evidence_metric, has_moe_router_metric,
     has_path_c_trace_metric, has_performance_metric, has_phase_timing_metric, has_profiling_metric,
     has_quality_metric as has_quality_signal_metric, host_profile_artifact_index_entry_json,
-    host_profile_hash, launch_count_metrics, list_files, memory_metrics, module_evidence_metrics,
+    launch_count_metrics, list_files, memory_metrics, module_evidence_metrics,
     moe_router_metrics, path_c_trace_metrics, phase_timing_metrics, profiling_metrics,
     prompt_artifact_index_entry_json, required_admission_evidence_requirements,
     run_metadata_artifact_json, run_provenance_json, standard_evidence_paths_in_dir,
@@ -38,7 +38,7 @@ use hipfire_evidence::{
     ComparisonArtifact as EvidenceComparisonArtifact, EvalStatus, EvidenceArtifact,
     EvidenceArtifactCollection, EvidenceArtifactConfig, EvidenceArtifactDatasetStatus,
     EvidenceArtifactIndexContext, EvidenceArtifactModels, EvidenceRecord, HostProfile,
-    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance, SourcedField,
+    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance,
     OBSERVED_ADMISSION_EVIDENCE_KINDS, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
@@ -61,8 +61,10 @@ mod executor_mock;
 use executor_mock::*;
 mod executor_tinyquant;
 use executor_tinyquant::*;
-mod host_profile;
-use host_profile::*;
+// Host-profile collection lives in the HIP-independent leaf crate
+// hipfire-sysinfo so hipfire-runtime can collect it without depending on this
+// eval harness (which pulls tokio-process via the daemon adapter).
+use hipfire_sysinfo::{collect_host_profile, detect_arch, HostProfileOverrides};
 mod evidence;
 use evidence::*;
 mod performance;
@@ -461,13 +463,6 @@ pub struct EvalConfig {
     pub fetch: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct HostProfileOverrides {
-    memory_class: Option<String>,
-    memory_width_bits: Option<u32>,
-    memory_bandwidth_gbps: Option<f64>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetManifestEntry {
     pub suite: SuiteId,
@@ -626,10 +621,6 @@ pub struct AdmissionFinding {
 
 fn eval_status_str(status: EvalStatus) -> &'static str {
     status.as_str()
-}
-
-pub fn collect_default_host_profile() -> HostProfile {
-    collect_host_profile(detect_arch(), HostProfileOverrides::default())
 }
 
 pub fn run_eval(config: EvalConfig) -> Result<(), String> {
@@ -1964,41 +1955,6 @@ fn model_manifest_entries(config: &EvalConfig) -> Vec<ModelManifestEntry> {
     out
 }
 
-fn detect_arch() -> Option<String> {
-    for node in ["1", "0"] {
-        let path = format!("/sys/class/kfd/kfd/topology/nodes/{node}/properties");
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(_) => continue,
-        };
-        for line in raw.lines() {
-            if let Some(v) = line.strip_prefix("gfx_target_version") {
-                if let Ok(ver) = v.trim().parse() {
-                    return Some(gfx_target_version_to_arch(ver));
-                }
-            }
-        }
-    }
-    None
-}
-
-fn gfx_target_version_to_arch(ver: u32) -> String {
-    match ver {
-        100100 => "gfx1010".to_string(),
-        100300 | 100302 => "gfx1030".to_string(),
-        110000 | 110001 => "gfx1100".to_string(),
-        110501 => "gfx1151".to_string(),
-        120000 => "gfx1200".to_string(),
-        120001 => "gfx1201".to_string(),
-        _ => {
-            let major = ver / 10000;
-            let minor = (ver % 10000) / 100;
-            let step = ver % 100;
-            format!("gfx{major}{minor}{step}")
-        }
-    }
-}
-
 fn rocm_version() -> Option<String> {
     command_stdout("hipconfig", &["--version"])
         .or_else(|| command_stdout("/opt/rocm/bin/hipconfig", &["--version"]))
@@ -2031,6 +1987,9 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Used only by the host-profile comparison tests below; the collection
+    // helpers themselves now live in hipfire-sysinfo.
+    use hipfire_evidence::host_profile_hash;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("hipfire-eval-test-{}-{name}", std::process::id()))
@@ -2239,12 +2198,6 @@ mod tests {
         assert_eq!(cfg.host_memory_class.as_deref(), Some("lpddr5x"));
         assert_eq!(cfg.host_memory_width_bits, Some(256));
         assert_eq!(cfg.host_memory_bandwidth_gbps, Some(273.5));
-    }
-
-    #[test]
-    fn parses_pp_dpm_mclk_max_clock() {
-        let raw = "0: 400Mhz \n1: 800Mhz *\n2: 937Mhz \n";
-        assert_eq!(parse_pp_dpm_mclk_max_mhz(raw), Some(937.0));
     }
 
     #[test]

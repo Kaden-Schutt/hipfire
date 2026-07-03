@@ -43,6 +43,7 @@
 | `prefill_threshold` | `u32` | optional | `32768` | `global`, `model`, `runtime` | `load_time` | `none` | Context length threshold for prefill compression. |
 | `prompt_normalize` | `bool` | optional | `true` | `global`, `model`, `request` | `request_only` | `none` | Whether prompts are normalized before tokenization. |
 | `repeat_penalty` | `f64` | optional | `1.05` | `global`, `model`, `request` | `request_only` | `none` | Default repeat penalty for generated text. |
+| `sdapi_output_root` | `string` | optional | `/tmp/hipfire-sdapi` | `global`, `runtime` | `static` | `none` | Root directory for images saved by the SD API compatibility routes (save_images: true). Client-supplied outdir_* override_settings are ignored; every SD API image write stays under this root. |
 | `temperature` | `f64` | optional | `0.3` | `global`, `model`, `request` | `request_only` | `none` | Default sampling temperature. |
 | `thinking` | `enum(off|on)` | optional | `off` | `global`, `model`, `request` | `request_only` | `none` | Reasoning/thinking display policy for compatible models. |
 | `top_p` | `f64` | optional | `0.8` | `global`, `model`, `request` | `request_only` | `none` | Default nucleus sampling probability. |

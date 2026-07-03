@@ -15,6 +15,25 @@ use hip_bridge::HipResult;
 use hipfire_primitives::fwht;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Number of F32 slots needed to back `bytes` of packed KV data (round up).
+///
+/// Quantized KV caches store bytes but allocate F32 buffers, so a partial
+/// trailing F32 word must still be reserved. Single-sources the `(bytes + 3)/4`
+/// ceil-div that was inlined at every quantized-KV constructor — an off-by-one
+/// here under-allocates the cache and corrupts the tail on write.
+#[inline]
+fn kv_f32_elems_for_bytes(bytes: usize) -> usize {
+    bytes.div_ceil(4)
+}
+
+/// Whether KV layer `kv_ordinal` is a boundary layer (bounds-checked index into
+/// the per-layer boundary flags). Pure so the index logic is unit-testable
+/// without constructing a full [`KvCache`].
+#[inline]
+fn is_boundary_ordinal(layer_is_boundary: &[bool], kv_ordinal: usize) -> bool {
+    kv_ordinal < layer_is_boundary.len() && layer_is_boundary[kv_ordinal]
+}
+
 /// GPU-resident KV cache for autoregressive generation.
 ///
 /// Two capacity axes live here:
@@ -98,7 +117,7 @@ pub struct KvCache {
 impl KvCache {
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
-        kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
+        is_boundary_ordinal(&self.layer_is_boundary, kv_ordinal)
     }
 }
 
@@ -232,7 +251,7 @@ impl KvCache {
         let bytes_per_pos = n_kv_heads * bytes_per_head;
         let cache_bytes = max_seq_len * bytes_per_pos;
         // Allocate as raw bytes (use F32 dtype but size in bytes)
-        let cache_elems = (cache_bytes + 3) / 4; // round up to F32 elements
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes); // round up to F32 elements
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
@@ -307,7 +326,7 @@ impl KvCache {
         let blocks_per_head = head_dim / 32;
         let total_blocks = n_kv_heads * blocks_per_head;
         let cache_bytes = physical_cap * total_blocks * 34;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
@@ -412,7 +431,7 @@ impl KvCache {
         let blocks_per_head = head_dim / 32;
         let total_blocks = n_kv_heads * blocks_per_head;
         let cache_bytes = physical_cap * total_blocks * 34;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
@@ -462,7 +481,7 @@ impl KvCache {
         let bph = 8 + head_dim; // 136 for head_dim=128 (8-byte header + data)
         let bpp = n_kv_heads * bph;
         let cache_bytes = max_seq_len * bpp;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
@@ -512,7 +531,7 @@ impl KvCache {
         let bytes_per_block = 8 + head_dim / 2; // 72 for head_dim=128
         let bytes_per_pos = n_kv_heads * bytes_per_block;
         let cache_bytes = max_seq_len * bytes_per_pos;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
@@ -1766,7 +1785,7 @@ impl KvCache {
         let bytes_per_head = 8 + head_dim / 2;
         let bytes_per_pos = n_kv_heads * bytes_per_head;
         let cache_bytes = max_seq_len * bytes_per_pos;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
         Ok(Self {
             k_gpu,
@@ -1829,7 +1848,7 @@ impl KvCache {
         let blocks_per_head = head_dim / 32;
         let total_blocks = n_kv_heads * blocks_per_head;
         let cache_bytes = physical_cap * total_blocks * 34;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
         Ok(Self {
             k_gpu,
@@ -1873,7 +1892,7 @@ impl KvCache {
         let bph = 8 + head_dim;
         let bpp = n_kv_heads * bph;
         let cache_bytes = max_seq_len * bpp;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
         Ok(Self {
             k_gpu,
@@ -1917,7 +1936,7 @@ impl KvCache {
         let bytes_per_block = 8 + head_dim / 2;
         let bytes_per_pos = n_kv_heads * bytes_per_block;
         let cache_bytes = max_seq_len * bytes_per_pos;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let cache_elems = kv_f32_elems_for_bytes(cache_bytes);
         let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
         Ok(Self {
             k_gpu,
@@ -2593,4 +2612,49 @@ fn replicate_fwht_signs_to_all_devices(gpus: &mut Gpus, n_signs: usize) -> HipRe
         gpus.givens_sin_per_dev.push(s2);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod index_math_tests {
+    use super::{is_boundary_ordinal, kv_f32_elems_for_bytes};
+
+    #[test]
+    fn f32_elems_rounds_bytes_up_to_whole_words() {
+        // 4 bytes = 1 F32; a partial word must still reserve a whole slot.
+        assert_eq!(kv_f32_elems_for_bytes(0), 0);
+        assert_eq!(kv_f32_elems_for_bytes(1), 1);
+        assert_eq!(kv_f32_elems_for_bytes(3), 1);
+        assert_eq!(kv_f32_elems_for_bytes(4), 1);
+        assert_eq!(kv_f32_elems_for_bytes(5), 2);
+        assert_eq!(kv_f32_elems_for_bytes(8), 2);
+        assert_eq!(kv_f32_elems_for_bytes(9), 3);
+    }
+
+    #[test]
+    fn f32_elems_matches_the_legacy_plus3_div4_formula() {
+        // Equivalence guard: div_ceil(4) must be bit-for-bit the old
+        // `(bytes + 3) / 4` for every byte count the cache can produce.
+        for bytes in 0..4096usize {
+            assert_eq!(kv_f32_elems_for_bytes(bytes), (bytes + 3) / 4, "bytes={bytes}");
+        }
+    }
+
+    #[test]
+    fn f32_elems_does_not_overflow_near_usize_max() {
+        // div_ceil saturates the +3 internally; the old (x+3) would wrap. Guard
+        // that huge (nonsensical but non-panicking) inputs stay monotonic.
+        assert_eq!(kv_f32_elems_for_bytes(usize::MAX), usize::MAX / 4 + 1);
+    }
+
+    #[test]
+    fn boundary_ordinal_is_bounds_checked() {
+        let flags = [true, false, false, true];
+        assert!(is_boundary_ordinal(&flags, 0));
+        assert!(!is_boundary_ordinal(&flags, 1));
+        assert!(is_boundary_ordinal(&flags, 3));
+        // Out-of-range ordinal must be false, not a panic.
+        assert!(!is_boundary_ordinal(&flags, 4));
+        assert!(!is_boundary_ordinal(&flags, usize::MAX));
+        assert!(!is_boundary_ordinal(&[], 0));
+    }
 }

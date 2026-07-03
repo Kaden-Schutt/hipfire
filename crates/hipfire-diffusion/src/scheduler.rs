@@ -333,9 +333,36 @@ impl DiffusionSchedule {
     }
 
     pub(crate) fn flow_match_euler(config: &SchedulerConfig, steps: u32) -> DiffusionResult<Self> {
+        Self::flow_match_euler_with_image_seq_len(config, steps, None)
+    }
+
+    /// FlowMatchEuler schedule. When `use_dynamic_shifting` is set, the shift is
+    /// resolution-dependent: `mu` is interpolated between `base_shift`/`max_shift`
+    /// over `[base_image_seq_len, max_image_seq_len]` and applied as an
+    /// exponential time shift `exp(mu) / (exp(mu) + (1/t - 1))`. `image_seq_len`
+    /// is the number of latent patch tokens for the request (falls back to
+    /// `base_image_seq_len` when the caller hasn't resolved the latent size yet).
+    /// Otherwise the static `shift` is used.
+    pub(crate) fn flow_match_euler_with_image_seq_len(
+        config: &SchedulerConfig,
+        steps: u32,
+        image_seq_len: Option<usize>,
+    ) -> DiffusionResult<Self> {
         let steps = steps as usize;
         let train_timesteps = config.num_train_timesteps.unwrap_or(1000).max(1);
         let shift = config.shift.unwrap_or(1.0).max(f32::MIN_POSITIVE);
+        let dynamic_mu = if config.use_dynamic_shifting.unwrap_or(false) {
+            let base_seq = config.base_image_seq_len.unwrap_or(256) as f32;
+            let max_seq = config.max_image_seq_len.unwrap_or(4096) as f32;
+            let base_shift = config.base_shift.unwrap_or(0.5);
+            let max_shift = config.max_shift.unwrap_or(1.15);
+            let seq =
+                image_seq_len.unwrap_or_else(|| config.base_image_seq_len.unwrap_or(256)) as f32;
+            let span = (max_seq - base_seq).abs().max(f32::MIN_POSITIVE);
+            Some(base_shift + (max_shift - base_shift) * (seq - base_seq) / span)
+        } else {
+            None
+        };
         let mut sigmas = Vec::with_capacity(steps + 1);
         for idx in 0..steps {
             let frac = if steps == 1 {
@@ -343,10 +370,15 @@ impl DiffusionSchedule {
             } else {
                 1.0 - idx as f32 / (steps - 1) as f32
             };
-            let sigma = if (shift - 1.0).abs() <= f32::EPSILON {
-                frac
-            } else {
-                (shift * frac) / (1.0 + (shift - 1.0) * frac)
+            let sigma = match dynamic_mu {
+                // Exponential time shift; frac == 0 -> sigma 0 (1/frac -> inf).
+                Some(mu) if frac > 0.0 => {
+                    let e = mu.exp();
+                    e / (e + (1.0 / frac - 1.0))
+                }
+                Some(_) => 0.0,
+                None if (shift - 1.0).abs() <= f32::EPSILON => frac,
+                None => (shift * frac) / (1.0 + (shift - 1.0) * frac),
             };
             sigmas.push(sigma.clamp(0.0, 1.0));
         }
@@ -1127,4 +1159,67 @@ fn dpm_solver_train_timesteps(
         out.push(timestep as usize);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod flow_match_dynamic_tests {
+    use super::*;
+    use crate::SchedulerConfig;
+
+    fn dynamic_config() -> SchedulerConfig {
+        SchedulerConfig {
+            class_name: "FlowMatchEulerDiscreteScheduler".into(),
+            num_train_timesteps: Some(1000),
+            shift: Some(1.0),
+            use_dynamic_shifting: Some(true),
+            base_shift: Some(0.5),
+            max_shift: Some(1.15),
+            base_image_seq_len: Some(256),
+            max_image_seq_len: Some(4096),
+            ..SchedulerConfig::default()
+        }
+    }
+
+    #[test]
+    fn flow_match_dynamic_shift_scales_with_resolution() {
+        // At base resolution mu = base_shift = 0.5; the mid sigma (frac = 0.5)
+        // under the exponential time shift is exp(mu) / (exp(mu) + 1).
+        let base = DiffusionSchedule::flow_match_euler_with_image_seq_len(
+            &dynamic_config(),
+            3,
+            Some(256),
+        )
+        .unwrap();
+        let e = 0.5f32.exp();
+        let expected_mid = e / (e + 1.0);
+        assert!(
+            (base.sigmas[1] - expected_mid).abs() < 1e-4,
+            "mid sigma {} != {expected_mid}",
+            base.sigmas[1]
+        );
+        assert!((base.sigmas[0] - 1.0).abs() < 1e-4);
+        assert_eq!(*base.sigmas.last().unwrap(), 0.0);
+        // Higher resolution -> larger mu -> larger mid sigma.
+        let big = DiffusionSchedule::flow_match_euler_with_image_seq_len(
+            &dynamic_config(),
+            3,
+            Some(4096),
+        )
+        .unwrap();
+        assert!(
+            big.sigmas[1] > base.sigmas[1],
+            "expected {} > {}",
+            big.sigmas[1],
+            base.sigmas[1]
+        );
+    }
+
+    #[test]
+    fn flow_match_static_shift_one_is_linear() {
+        let mut config = dynamic_config();
+        config.use_dynamic_shifting = Some(false);
+        let sched = DiffusionSchedule::flow_match_euler(&config, 3).unwrap();
+        // shift 1.0, no dynamic shifting -> sigma == frac (linear schedule).
+        assert!((sched.sigmas[1] - 0.5).abs() < 1e-6);
+    }
 }

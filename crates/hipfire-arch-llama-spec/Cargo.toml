@@ -1,0 +1,14 @@
+[package]
+name = "hipfire-arch-llama-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the Llama family: arch identity + Ingest quant-policy, no runtime/kernel deps. The quantizer links this; the serving crate (hipfire-arch-llama) adds runtime capabilities on the same ArchId."
+
+# First real `-spec` crate: the offline half of the spec/serving split. Depends on
+# NOTHING but hipfire-arch-api so the quantizer can consult an arch's quant policy
+# without linking the GPU/runtime stack. The purity gate enforces it stays
+# format-token-free.
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

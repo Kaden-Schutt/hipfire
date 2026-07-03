@@ -2,48 +2,19 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Generic dequantization codecs and half/bf16 ↔ f32 conversions.
+//! Block dequantization codecs for HFQ tensor types + half/bf16 ↔ f32
+//! conversions.
 //!
-//! These are arch-agnostic numeric primitives (GGML-format dequant, IEEE
-//! half-float conversion, Q4_K→Q4_F16 transcode). They historically lived in
-//! `llama.rs` but are not llama-specific — every arch and the HFQ/GGUF readers
-//! use them. Relocated here as part of the de-llama-ify cleanup.
+//! Arch-agnostic numeric primitives used by the HFQ loaders. `dequant_q8f16`
+//! decodes HFQ's `Q8F16` type and `dequant_q4k` its `Q4K` type — both
+//! reuse the corresponding block byte layout but are native HFQ inference
+//! codecs, not GGUF readers. The GGUF-only decoders (Q4_0, Q6_K, and the
+//! Q4_K→Q4_F16 transcoders) were removed with the GGUF inference path — GGUF is
+//! import-only, in hipfire-coexistence.
 
-/// Dequantize Q4_0 data to f32.
-/// Q4_0 block: 2 bytes (f16 scale) + 16 bytes (32 x 4-bit values)
-pub fn dequantize_q4_0(data: &[u8], n: usize) -> Vec<f32> {
-    let block_size = 32;
-    let nblocks = (n + block_size - 1) / block_size;
-    let mut out = vec![0.0f32; n];
-
-    for b in 0..nblocks {
-        let block_offset = b * 18; // 2 + 16 bytes per block
-        if block_offset + 18 > data.len() {
-            break;
-        }
-        let scale_bytes = [data[block_offset], data[block_offset + 1]];
-        let scale = f16_to_f32(u16::from_le_bytes(scale_bytes));
-
-        for j in 0..16 {
-            let byte = data[block_offset + 2 + j];
-            let lo = (byte & 0x0F) as i32 - 8;
-            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-
-            let idx = b * block_size + j * 2;
-            if idx < n {
-                out[idx] = lo as f32 * scale;
-            }
-            if idx + 1 < n {
-                out[idx + 1] = hi as f32 * scale;
-            }
-        }
-    }
-    out
-}
-
-/// Dequantize Q8_0 data to f32.
-/// Q8_0 block: 2 bytes (f16 scale) + 32 bytes (32 x int8)
-pub fn dequantize_q8_0(data: &[u8], n: usize) -> Vec<f32> {
+/// Dequantize an HFQ Q8F16 (int8, f16-scale) block tensor to f32.
+/// Block: 2 bytes (f16 scale) + 32 bytes (32 x int8) = 34 bytes / 32 weights.
+pub fn dequant_q8f16(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 32;
     let nblocks = (n + block_size - 1) / block_size;
     let mut out = vec![0.0f32; n];
@@ -73,13 +44,13 @@ pub fn dequantize_q8_0(data: &[u8], n: usize) -> Vec<f32> {
 // unchanged and transitively share one implementation.
 pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
 
-/// Dequantize Q4_K data to f32.
-/// Q4_K super-block: 256 elements
+/// Dequantize an HFQ Q4K block tensor to f32.
+/// Super-block: 256 elements, 144 bytes
 ///   2 bytes: f16 d (super-block scale)
 ///   2 bytes: f16 dmin (super-block min)
 ///   12 bytes: scales/mins for 8 sub-blocks (6 bits each, packed)
 ///   128 bytes: 256 x 4-bit quantized values
-pub fn dequantize_q4_k(data: &[u8], n: usize) -> Vec<f32> {
+pub fn dequant_q4k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 144; // 2+2+12+128
     let nblocks = (n + block_size - 1) / block_size;
@@ -138,198 +109,8 @@ pub fn dequantize_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-/// Convert Q4_K raw data to Q4_F16_G64 format.
-/// Dequantizes Q4_K to F32 intermediates, then re-quantizes to Q4_F16_G64.
-/// Q4_K: 144 bytes per 256 elements → Q4_F16_G64: 4×36=144 bytes per 256 elements (same size).
-pub fn convert_q4k_to_q4f16_g64(q4k_data: &[u8], n_elements: usize) -> Vec<u8> {
-    let f32_values = dequantize_q4_k(q4k_data, n_elements);
 
-    let group_size = 64;
-    let block_bytes = 36;
-    let n_blocks = (n_elements + group_size - 1) / group_size;
-    let mut output = vec![0u8; n_blocks * block_bytes];
 
-    for b in 0..n_blocks {
-        let start = b * group_size;
-        let end = (start + group_size).min(n_elements);
-        let group = &f32_values[start..end];
-
-        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-        let range = max_val - min_val;
-        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
-        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
-
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
-        output[out_off + 2..out_off + 4].copy_from_slice(&f32_to_f16(min_val).to_le_bytes());
-
-        // Pack nibbles: byte[i] = low_nibble(element i) | high_nibble(element i+32)
-        let actual_len = end - start;
-        for i in 0..32 {
-            let lo_val = if i < actual_len { group[i] } else { min_val };
-            let hi_val = if 32 + i < actual_len {
-                group[32 + i]
-            } else {
-                min_val
-            };
-
-            let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
-            let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
-
-            output[out_off + 4 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
-        }
-    }
-
-    output
-}
-
-/// Convert Q4_K raw data to Q4_F16_G32 format — nearly lossless.
-/// Each Q4_K sub-block (32 elements) maps directly to one Q4_F16_G32 block.
-/// Nibbles are preserved exactly; only scale/min are converted to FP16.
-/// Q4_K: 144 bytes per 256 elements → Q4_F16_G32: 8×20=160 bytes per 256 elements (11% larger).
-pub fn convert_q4k_to_q4f16_g32(q4k_data: &[u8], n_elements: usize) -> Vec<u8> {
-    let q4k_block_bytes = 144;
-    let q4k_block_elems = 256;
-    let g32_block_bytes = 20;
-    let nblocks = (n_elements + q4k_block_elems - 1) / q4k_block_elems;
-    // 8 sub-blocks per Q4_K super-block → 8 G32 blocks
-    let mut output = vec![0u8; nblocks * 8 * g32_block_bytes];
-
-    for b in 0..nblocks {
-        let off = b * q4k_block_bytes;
-        if off + q4k_block_bytes > q4k_data.len() {
-            break;
-        }
-
-        let d = f16_to_f32(u16::from_le_bytes([q4k_data[off], q4k_data[off + 1]]));
-        let dmin = f16_to_f32(u16::from_le_bytes([q4k_data[off + 2], q4k_data[off + 3]]));
-
-        let sc_data = &q4k_data[off + 4..off + 16];
-        let mut scales = [0u8; 8];
-        let mut mins = [0u8; 8];
-
-        for i in 0..4 {
-            scales[i] = sc_data[i] & 63;
-            mins[i] = sc_data[4 + i] & 63;
-        }
-        for i in 0..4 {
-            scales[4 + i] = (sc_data[8 + i] & 0xF) | ((sc_data[i] >> 6) << 4);
-            mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
-        }
-
-        let qdata = &q4k_data[off + 16..off + 16 + 128];
-
-        // Each of 4 groups has 2 sub-blocks (even=lower nibble, odd=upper nibble)
-        for group in 0..4 {
-            let sb_even = group * 2;
-            let sb_odd = group * 2 + 1;
-
-            // Sub-block even (elements group*64+0..group*64+31) → G32 block
-            let eff_scale_even = d * scales[sb_even] as f32;
-            let eff_min_even = -(dmin * mins[sb_even] as f32);
-            let out_off_even = (b * 8 + sb_even) * g32_block_bytes;
-            output[out_off_even..out_off_even + 2]
-                .copy_from_slice(&f32_to_f16(eff_scale_even).to_le_bytes());
-            output[out_off_even + 2..out_off_even + 4]
-                .copy_from_slice(&f32_to_f16(eff_min_even).to_le_bytes());
-
-            // Sub-block odd (elements group*64+32..group*64+63) → G32 block
-            let eff_scale_odd = d * scales[sb_odd] as f32;
-            let eff_min_odd = -(dmin * mins[sb_odd] as f32);
-            let out_off_odd = (b * 8 + sb_odd) * g32_block_bytes;
-            output[out_off_odd..out_off_odd + 2]
-                .copy_from_slice(&f32_to_f16(eff_scale_odd).to_le_bytes());
-            output[out_off_odd + 2..out_off_odd + 4]
-                .copy_from_slice(&f32_to_f16(eff_min_odd).to_le_bytes());
-
-            // Copy nibbles: Q4_K stores them as byte[l] where low=even, high=odd.
-            // G32 packing: byte[i] = lo_nibble(elem i) | hi_nibble(elem i+16)
-            // Q4_K byte[l] has: elem l in low nibble, elem l+32 in high nibble.
-            // For sub-block even: we want the 32 lower nibbles from group*32 bytes.
-            // For sub-block odd: we want the 32 upper nibbles.
-            // G32 block maps: thread t reads byte[t&15], lo nibble = elem t (t<16), hi nibble = elem t-16+16=t (t>=16)
-            // So G32 byte[i] = nibble(elem i) | nibble(elem i+16) << 4
-            for i in 0..16 {
-                let src_byte_0 = qdata[group * 32 + i];
-                let src_byte_1 = qdata[group * 32 + 16 + i];
-                // Even sub-block: lower nibbles
-                let nib_0 = src_byte_0 & 0xF;
-                let nib_1 = src_byte_1 & 0xF;
-                output[out_off_even + 4 + i] = nib_0 | (nib_1 << 4);
-                // Odd sub-block: upper nibbles
-                let nib_2 = src_byte_0 >> 4;
-                let nib_3 = src_byte_1 >> 4;
-                output[out_off_odd + 4 + i] = nib_2 | (nib_3 << 4);
-            }
-        }
-    }
-
-    output
-}
-
-/// Dequantize Q6_K data to f32 (matches GGML reference exactly).
-/// Q6_K super-block: 256 elements = 2 groups of 128
-///   ql[128]: lower 4 bits (shared between lo/hi nibble pairs)
-///   qh[64]: upper 2 bits (packed 4 per byte)
-///   scales[16]: int8 scales for sub-groups of 16 elements
-///   d: f16 super-block scale
-pub fn dequantize_q6_k(data: &[u8], n: usize) -> Vec<f32> {
-    let block_size = 256;
-    let block_bytes = 210; // 128 + 64 + 16 + 2
-    let nblocks = (n + block_size - 1) / block_size;
-    let mut out = vec![0.0f32; n];
-
-    for b in 0..nblocks {
-        let off = b * block_bytes;
-        if off + block_bytes > data.len() {
-            break;
-        }
-
-        let mut ql = &data[off..off + 128];
-        let mut qh = &data[off + 128..off + 192];
-        let mut sc = &data[off + 192..off + 208];
-        let d = f16_to_f32(u16::from_le_bytes([data[off + 208], data[off + 209]]));
-
-        let base = b * block_size;
-
-        // Process 2 groups of 128 elements each
-        for group in 0..2 {
-            let y_off = base + group * 128;
-            for l in 0..32 {
-                let is = l / 16;
-                let q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
-                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
-
-                let idx0 = y_off + l;
-                let idx1 = y_off + l + 32;
-                let idx2 = y_off + l + 64;
-                let idx3 = y_off + l + 96;
-
-                if idx0 < n {
-                    out[idx0] = d * sc[is] as i8 as f32 * q1 as f32;
-                }
-                if idx1 < n {
-                    out[idx1] = d * sc[is + 2] as i8 as f32 * q2 as f32;
-                }
-                if idx2 < n {
-                    out[idx2] = d * sc[is + 4] as i8 as f32 * q3 as f32;
-                }
-                if idx3 < n {
-                    out[idx3] = d * sc[is + 6] as i8 as f32 * q4 as f32;
-                }
-            }
-            // Advance pointers for next group
-            ql = &ql[64..];
-            qh = &qh[32..];
-            sc = &sc[8..];
-        }
-    }
-    out
-}
 
 /// Re-export the canonical on-disk byte-contract so arch loaders can reach it
 /// as `hipfire_runtime::quant::QuantType` without each depending on the leaf
@@ -379,6 +160,7 @@ pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<rdna_compute::DType> {
         Q::MFP4G32 if k % 256 == 0 => DType::MFP4G32,
         Q::MQ4G256Lloyd => DType::MQ4G256Lloyd,
         Q::Qtip3G256 => DType::Qtip3G256,
+        Q::Qtip4G256 => DType::Qtip4G256,
         _ => return None,
     })
 }

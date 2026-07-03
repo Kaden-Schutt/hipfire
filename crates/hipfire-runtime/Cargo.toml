@@ -58,8 +58,11 @@ hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-kld = { path = "../hipfire-kld" }
 hipfire-coherence = { path = "../hipfire-coherence" }
-hipfire-eval = { path = "../hipfire-eval" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+# Host-profile collection (HIP-independent leaf). Replaces the former
+# hipfire-eval dependency, which pulled the eval harness + tokio-process into
+# the inference hot path for one symbol (collect_default_host_profile).
+hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
@@ -69,20 +72,20 @@ rdna-compute = { path = "../rdna-compute" }
 hipfire-hneurons = { path = "../hipfire-hneurons" }
 hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
-memmap2 = "0.9"
-serde = { version = "1", features = ["derive"] }
-csv = "1"
+memmap2.workspace = true
+serde.workspace = true
+csv.workspace = true
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
 # default BTreeMap alphabetic sort. Required so request tool-definition key order
 # survives parse → render → `| tojson`, byte-matching the model's trained
 # chat_template (HF apply_chat_template preserves insertion order). Feature-
 # unifies across the workspace build.
 serde_json = { version = "1", features = ["preserve_order"] }
-base64 = "0.22"
-libc = "0.2"
-rayon = "1"
+base64.workspace = true
+libc.workspace = true
+rayon.workspace = true
 twox-hash = { version = "2", default-features = false, features = ["xxhash64", "xxhash3_128"] }
-tracing = "0.1"
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 hipfire-detect = { path = "../hipfire-detect" }
 # Renders the upstream HF chat_template (Jinja) when present in
@@ -356,10 +359,6 @@ required-features = []
 # imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
 # llama-imatrix for the activation-weighted-LS calibration pipeline.
 # Stdlib only; no GPU / arch features.
-[[example]]
-name = "imatrix_collect"
-required-features = []
-
 # ─── Tier 1 calibration ────────────────────────────────────────────────
 # The native single-load calibration collector is the `collect_artifacts`
 # example (Hessian + imatrix + MoE router histogram + KLDREF → one HFQM

@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Stub model types for the template arch.
+//!
+//! Every type here exists only to satisfy the [`Architecture`] trait's
+//! associated-type slots. None of these structs do real compute. A real
+//! arch replaces every body in this file with model logic; the *shapes*
+//! (Config / Weights / State as separate types, owned by the arch crate,
+//! constructable from an [`HfqFile`]) are what the trait expects.
+//!
+//! [`Architecture`]: hipfire_runtime::arch::Architecture
+//! [`HfqFile`]: hipfire_runtime::hfq::HfqFile
+
+use hipfire_runtime::hfq::HfqFile;
+
+/// Template config: tiny hardcoded constants. A real arch parses these out of
+/// `HfqFile::metadata_json` (see `hipfire_arch_qwen35::qwen35::config_from_hfq`
+/// for how Qwen3.5 walks the JSON tree, branches on `arch_id` for
+/// dense-vs-MoE shape, and falls back to defaults for missing keys).
+#[derive(Debug, Clone)]
+pub struct TemplateConfig {
+    pub vocab_size: usize,
+    pub dim: usize,
+    pub layers: usize,
+}
+
+impl TemplateConfig {
+    /// In a real arch, this method reads `hfq.metadata_json` (a JSON
+    /// blob) and returns either `Ok(config)` or `Err(reason)`. Here we
+    /// ignore the input entirely and return hardcoded constants.
+    pub fn from_hfq(_hfq: &HfqFile) -> Result<Self, String> {
+        Ok(TemplateConfig {
+            vocab_size: 256,
+            dim: 8,
+            layers: 1,
+        })
+    }
+}
+
+/// Template weights: a single embedding table, zero-initialized. A real arch
+/// holds GPU-resident `WeightTensor` handles for every projection
+/// (attention QKV, output, FFN gate/up/down, layernorm scales, embeddings,
+/// LM head). See `Qwen35Weights` in `hipfire-arch-qwen35` for a complete
+/// example.
+pub struct TemplateWeights {
+    /// Stub embedding table. In a real arch this would be a
+    /// `WeightTensor` (GPU-resident, possibly quantized). We keep a
+    /// host-side `Vec<f32>` here just to demonstrate the slot exists.
+    pub embeddings: Vec<f32>,
+}
+
+impl TemplateWeights {
+    /// Stub loader: ignores HFQ contents, returns a zero-initialized
+    /// embedding table. A real arch would walk `hfq.tensor_info(name)`
+    /// for each weight, dispatch to `WeightTensor::from_hfq_tensor` to
+    /// upload it to GPU memory in the appropriate quant format
+    /// (Q4F16G64 / F16 / F32), and assemble per-layer arrays.
+    pub fn load(_hfq: &HfqFile, cfg: &TemplateConfig) -> Result<Self, String> {
+        Ok(TemplateWeights {
+            embeddings: vec![0.0; cfg.vocab_size * cfg.dim],
+        })
+    }
+
+    /// Deterministic weights seeded from `seed` — a
+    /// `generate_toy_model_from_seed`-style helper CO-LOCATED with the arch and
+    /// exposed through the [`ToyModel`] capability, rather than scattered in a
+    /// test harness. A real arch synthesizes a tiny but structurally-valid
+    /// checkpoint here (correct tensor names/shapes) so CI can round-trip it.
+    ///
+    /// [`ToyModel`]: hipfire_arch_api::ToyModel
+    pub fn from_seed(cfg: &TemplateConfig, seed: u64) -> Self {
+        let mut s = seed | 1;
+        let mut lcg = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // ~uniform in [-1, 1)
+            ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+        };
+        TemplateWeights {
+            embeddings: (0..cfg.vocab_size * cfg.dim).map(|_| lcg()).collect(),
+        }
+    }
+}
+
+/// Template state: a bare token counter. A real arch's state holds GPU
+/// scratch buffers reused across decode steps, KV-cache handles,
+/// recurrent-state tensors (for hybrid linear-attention archs), and
+/// any per-step metadata the forward pass needs. See `DeltaNetState`
+/// in `hipfire-arch-qwen35` (hybrid LA + FA scratch) and
+/// `ForwardScratch` in `hipfire-runtime::llama` (dense FA scratch)
+/// for the two reference shapes.
+pub struct TemplateState {
+    pub token_count: usize,
+}
+
+impl TemplateState {
+    /// Stub state init: returns a bare counter. A real arch allocates
+    /// GPU buffers via `gpu.alloc(...)`, sized by `cfg`.
+    pub fn new(_cfg: &TemplateConfig) -> Result<Self, String> {
+        Ok(TemplateState { token_count: 0 })
+    }
+}

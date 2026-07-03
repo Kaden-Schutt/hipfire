@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-gemma3-vl-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the Gemma-3 multimodal family (arch_id 13): identity + Ingest quant-policy, no runtime/kernel deps."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

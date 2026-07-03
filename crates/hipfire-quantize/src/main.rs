@@ -32,54 +32,62 @@
 //!   - a HuggingFace model directory (safetensors) or HF model ID
 //!   - a single `.gguf` file
 //!   - an existing `.hfq` file (e.g. a bf16 `.hfq`) for requantization;
-//!     the `.hfq`-source path supports --format bf16/fp16/q8f16/hfq4/hfq6/mq4/mq6/mq3/qtip3.
+//!     the `.hfq`-source path supports --format bf16/fp16/q8f16/hfq4/hfq6/mq4/mq6/mq3/qtip3/qtip4.
 
-mod gguf_input;
-// QTIP (Phase C1) encoder core — wired into the quantize dispatch in a
-// follow-up increment; allow dead_code until then.
-#[allow(dead_code)]
-mod qtip;
-// QTIP-LDLQ (Phase C1e) — output-aware trellis encode.
-#[allow(dead_code)]
-mod ldlq;
-// HFQM `.calib.hfq` Hessian reader (wired for QTIP-LDLQ).
-#[allow(dead_code)]
-mod hessian_io;
-// Retired HFHS-v1 sidecar reader — diagonal-only, to bridge an existing
-// *.hessian.bin into AWQ's in_sum2 (SmoothQuant per-channel stat) for MQ+.
-#[allow(dead_code)]
-mod hfhs_diag;
-// Pure quantization codecs (decomposed from this file). Behavior locked by the
-// codec_golden battery below.
-mod codecs;
+// The quantization modules now live in the crate library (`lib.rs`) so other
+// crates (hipfire-diffusion) can reuse the codecs / LDLQ packers / Hessian I/O.
+// Re-export them here so this binary's existing bare (`codecs::…`) and
+// `crate::…` / `super::…` (test modules) references keep resolving unchanged.
 #[allow(unused_imports)]
 use codecs::*;
-// KVarN (Phase D) — variance-normalized 4-bit KV, clean-room CPU core.
-pub use hipfire_kvquant::{kv_compact, kvarn};
-#[allow(dead_code)]
-// KVarN codec + deferred KV-compaction now live in the leaf `hipfire-kvquant`
+pub use hipfire_quantize::{
+    codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
+};
+// HFQ writer + provenance/metadata machinery now lives in the library so the
+// GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
+// artifacts through the same code path the native quantizer uses.
+use hipfire_quantize::hfq_out::{
+    insert_parameter_counts_metadata, metadata_with_quantization_hash, write_hfq, HfqTensor,
+    TensorSpill, HFQ_MAGIC,
+};
+// Helpers exercised only by this binary's unit tests.
+#[cfg(test)]
+use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
+// The GGUF parser/dequant now lives in its own dedicated offline crate
+// (hipfire-gguf) — off the inference dependency surface. Alias keeps the
+// import pipeline's `gguf_input::` references source-compatible.
+use hipfire_gguf as gguf_input;
+// Quant-format/K-map planning + the GGUF import pipeline now live in the
+// library (so hipfire-coexistence can drive the import). Re-imported here for
+// the native safetensors path + the deprecation shim.
+use hipfire_quantize::gguf_import::{is_gguf_input, parse_arch_id_override};
+use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
+#[cfg(test)]
+use hipfire_quantize::quant_plan::{is_positional_promote, kmap_resolve, parse_layer_idx};
+// Clip-search toggle now lives in the library too.
+pub use hipfire_quantize::{mq_clipsearch_enabled, set_mq_clipsearch};
+// KVarN codec + deferred KV-compaction live in the leaf `hipfire-kvquant`
 // crate (so the engine read path can share them). Re-export at the crate root so
-// the existing `crate::kvarn` / conversion / FWHT references across this bin
-// (codecs.rs, qtip.rs, ldlq.rs, main.rs) keep resolving unchanged.
+// the existing `crate::kvarn` references across this bin keep resolving unchanged.
+pub use hipfire_kvquant::{kv_compact, kvarn};
+// Primitive conversions + FWHT live in the leaf `hipfire-primitives` crate; the
+// `fixture`/`roughquant` modules are owned by the library (re-exported above).
 pub use hipfire_primitives::conv::{
     bf16_bits_to_f32 as bf16_to_f32, f16_to_f32, f32_slice_to_bf16_bytes, f32_slice_to_f16_bytes,
     f32_to_bf16_bits, f32_to_f16, plain_dtype_to_f32 as to_f32,
 };
 pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
-// Tiny random-init model fixtures for fast kernel/plumbing gating.
-mod fixture;
-// RoughQuant Phase 2 — PCA rotation into the activation-Hessian eigenbasis.
-mod roughquant;
+// SpinQuant R1 deploy-time merge (--rotate): fold+rotate readers/writers by FᵀM
+// before the Oq4 quantize so the codec FWHT leaves the int4 grid in learned M.
+// (fixture/roughquant/codecs/qtip/ldlq are owned by the library, re-exported above.)
+mod rotate;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::Hasher;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use twox_hash::XxHash64;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
 // ggml-style tensor name (see safetensors_to_ggml_name), value is the
@@ -243,12 +251,14 @@ thread_local! {
 // MQ+ clip-search: when set (by an `mqN+` format), MQ codecs use the MSE-optimal
 // clip-searched affine range instead of plain min/max. Off by default, so the
 // baseline MQ path (and its golden hashes) is unchanged.
-static MQ_CLIPSEARCH: OnceLock<bool> = OnceLock::new();
+// `MQ_CLIPSEARCH` + `mq_clipsearch_enabled`/`set_mq_clipsearch` now live in the
+// library (re-exported above) so the codecs and this binary share one toggle.
 
-/// Whether the `mqN+` clip-search variant is active for MQ codecs.
-pub(crate) fn mq_clipsearch_enabled() -> bool {
-    MQ_CLIPSEARCH.get().copied().unwrap_or(false)
-}
+// SpinQuant R1 deploy merge (`--rotate`): pre-computed fold+rotate f32 overrides
+// keyed by tensor name. When set, `tensor_to_f32_with_optional_fp8_scale` returns
+// the rotated tensor instead of the raw source, so every codec branch quantizes
+// the R1-rotated weights transparently. See `rotate.rs`.
+static ROTATION_OVERRIDE: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -332,33 +342,6 @@ impl SafetensorsFile {
 
 // ─── FP16/BF16 Conversion ───────────────────────────────────────────────────
 
-/// Read `--arch-id <u32>` from `std::env::args` if present. Used by
-/// both the GGUF and safetensors entry paths to override the
-/// auto-detected `arch_id` stamped into the HFQ header.
-///
-/// Why an override exists: the auto-detection maps every Qwen2 input
-/// to `arch_id=1`, which the daemon dispatches through
-/// `hipfire-arch-llama`. That loader doesn't read Q/K/V proj bias,
-/// so a Qwen2 model loaded by default would produce wrong outputs.
-/// Plain Qwen2 should be `arch_id=7` (hipfire-arch-qwen2) and Qwen2-VL
-/// family (dots.ocr) should be `arch_id=8` (hipfire-arch-dots-ocr).
-/// See docs/architecture-ids.md and docs/plans/
-/// dots-ocr-devlog.md §7 (R1).
-fn parse_arch_id_override() -> Option<u32> {
-    let args: Vec<String> = std::env::args().collect();
-    let pos = args.iter().position(|a| a == "--arch-id")?;
-    let raw = args.get(pos + 1).unwrap_or_else(|| {
-        eprintln!("error: --arch-id requires a u32 value");
-        std::process::exit(1);
-    });
-    match raw.parse::<u32>() {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!("error: --arch-id value '{raw}' is not a valid u32: {e}");
-            std::process::exit(1);
-        }
-    }
-}
 
 // ─── FP8 E4M3 + UE8M0-scale dequant (DeepSeek V4 Flash) ─────────────────────
 //
@@ -425,6 +408,13 @@ fn tensor_to_f32_with_optional_fp8_scale(
     fp8_scale_for: &HashMap<String, (usize, String)>,
     st_files: &[SafetensorsFile],
 ) -> Vec<f32> {
+    // SpinQuant R1 deploy merge: if `--rotate` pre-computed a fold+rotated version
+    // of this tensor, return it so the codec quantizes the rotated weight. The
+    // override is built (from the raw source) before it is installed, so the
+    // pre-pass itself reads through this function and sees the raw tensor.
+    if let Some(rot) = ROTATION_OVERRIDE.get().and_then(|m| m.get(name)) {
+        return rot.clone();
+    }
     // FP8 E4M3 + UE8M0 paired storage (DeepSeek V4). The dtype tag is either
     // `I8` (older safetensors writer) or `F8_E4M3` (newer); both
     // store identical E4M3 bytes, so the dequant math is the same.
@@ -452,6 +442,163 @@ fn tensor_to_f32_with_optional_fp8_scale(
         );
     }
     to_f32(raw_data, &meta.dtype)
+}
+
+/// Read a learned-R1 `.r1` file (`b"HFR1"` + `h: u32 LE` + `h*h` f32 LE), the
+/// output of `hipfire-train`'s `learn_r1_dump`. Validates the magic, header size,
+/// and that `h` matches the model's hidden size.
+fn read_r1_file(path: &str, expect_h: usize) -> Result<Vec<f32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read --rotate {path}: {e}"))?;
+    if bytes.len() < 8 || &bytes[0..4] != b"HFR1" {
+        return Err(format!("--rotate {path}: bad magic (expected HFR1)"));
+    }
+    let h = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    if h != expect_h {
+        return Err(format!(
+            "--rotate {path}: rotation h={h} != model hidden_size {expect_h}"
+        ));
+    }
+    let want = 8 + h * h * 4;
+    if bytes.len() != want {
+        return Err(format!(
+            "--rotate {path}: size {} != {want} (HFR1 + h + {h}*{h} f32)",
+            bytes.len()
+        ));
+    }
+    let mut m = vec![0.0f32; h * h];
+    for (i, v) in m.iter_mut().enumerate() {
+        let o = 8 + i * 4;
+        *v = f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    }
+    Ok(m)
+}
+
+/// SpinQuant R1 deploy pre-pass (`--rotate`): fold each RMSNorm scale into its
+/// readers and rotate all residual readers/writers/embedding by `R1 = FᵀM`, so the
+/// codec's per-256-group FWHT cancels `Fᵀ` and the int4 grid sees the learned `M`.
+/// Returns the name→rotated-f32 override map (installed into `ROTATION_OVERRIDE`
+/// so every codec branch quantizes the rotated weights) and the synthesized untied
+/// `lm_head` f32 (`final_norm` folded, then rotated) that the caller emits — the
+/// runtime auto-prefers an explicit `lm_head.weight` over the tied embedding.
+///
+/// Dense-llama only (arch_id 0/1); the tensor names follow the HF llama layout.
+fn build_rotation_overrides(
+    rotate_path: &str,
+    config: &serde_json::Value,
+    n_layers: usize,
+    st_files: &[SafetensorsFile],
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+) -> Result<(HashMap<String, Vec<f32>>, Option<Vec<f32>>), String> {
+    let h = config
+        .get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .ok_or("config missing hidden_size")? as usize;
+    let vocab = config
+        .get("vocab_size")
+        .and_then(|v| v.as_u64())
+        .ok_or("config missing vocab_size")? as usize;
+    if h % 256 != 0 {
+        return Err(format!(
+            "--rotate needs hidden_size {h} %256==0 (codec FWHT)"
+        ));
+    }
+    let m = read_r1_file(rotate_path, h)?;
+    let plan = rotate::R1Plan::from_learned_m(&m, h);
+    eprintln!(
+        "  --rotate: R1=FᵀM built (h={h}); orthonormality {:.1e}",
+        plan.orthonormality_error()
+    );
+
+    // f32 fetch through the universal extractor. ROTATION_OVERRIDE is not yet set,
+    // so this returns the raw source tensor (dequantized as needed).
+    let get_f32 = |name: &str| -> Option<Vec<f32>> {
+        for st in st_files {
+            if let Some((meta, raw)) = st.tensor_data(name) {
+                return Some(tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw,
+                    meta,
+                    fp8_scale_for,
+                    st_files,
+                ));
+            }
+        }
+        None
+    };
+
+    // RMSNorm scales folded into their readers.
+    let mut norm1 = Vec::with_capacity(n_layers);
+    let mut norm2 = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        norm1.push(
+            get_f32(&format!("model.layers.{l}.input_layernorm.weight"))
+                .ok_or_else(|| format!("missing input_layernorm for layer {l}"))?,
+        );
+        norm2.push(
+            get_f32(&format!("model.layers.{l}.post_attention_layernorm.weight"))
+                .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
+        );
+    }
+    let final_norm = get_f32("model.norm.weight").ok_or("missing model.norm.weight")?;
+
+    let mut ov: HashMap<String, Vec<f32>> = HashMap::new();
+    for l in 0..n_layers {
+        // Attention readers: fold input_layernorm, then reader-rotate on h.
+        for suf in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] {
+            let name = format!("model.layers.{l}.{suf}.weight");
+            if let Some(mut w) = get_f32(&name) {
+                let out = w.len() / h;
+                rotate::fold_cols(&mut w, &norm1[l], out, h);
+                plan.rotate_reader(&mut w, out);
+                ov.insert(name, w);
+            }
+        }
+        // MLP readers: fold post_attention_layernorm, then reader-rotate on h.
+        for suf in ["mlp.gate_proj", "mlp.up_proj"] {
+            let name = format!("model.layers.{l}.{suf}.weight");
+            if let Some(mut w) = get_f32(&name) {
+                let out = w.len() / h;
+                rotate::fold_cols(&mut w, &norm2[l], out, h);
+                plan.rotate_reader(&mut w, out);
+                ov.insert(name, w);
+            }
+        }
+        // Writers (o_proj, down_proj): writer-rotate on the output h dim.
+        for suf in ["self_attn.o_proj", "mlp.down_proj"] {
+            let name = format!("model.layers.{l}.{suf}.weight");
+            if let Some(mut w) = get_f32(&name) {
+                let cols = w.len() / h;
+                plan.rotate_writer(&mut w, cols);
+                ov.insert(name, w);
+            }
+        }
+        // Folded norms → identity (ones).
+        ov.insert(
+            format!("model.layers.{l}.input_layernorm.weight"),
+            vec![1.0f32; h],
+        );
+        ov.insert(
+            format!("model.layers.{l}.post_attention_layernorm.weight"),
+            vec![1.0f32; h],
+        );
+    }
+
+    // Head: synthesize the untied lm_head (fold final_norm into the ORIGINAL embed,
+    // then reader-rotate) BEFORE rotating the input embedding.
+    let mut embed = get_f32("model.embed_tokens.weight").ok_or("missing embed_tokens")?;
+    let mut lm_head = embed.clone();
+    rotate::fold_cols(&mut lm_head, &final_norm, vocab, h);
+    plan.rotate_reader(&mut lm_head, vocab);
+    // Input embedding: reader-rotate on h (no fold).
+    plan.rotate_reader(&mut embed, vocab);
+    ov.insert("model.embed_tokens.weight".to_string(), embed);
+    ov.insert("model.norm.weight".to_string(), vec![1.0f32; h]);
+
+    eprintln!(
+        "  --rotate: {} tensors folded+rotated; synthesized untied lm_head [{vocab}×{h}]",
+        ov.len()
+    );
+    Ok((ov, Some(lm_head)))
 }
 
 /// Convert one E2M1 nibble (4-bit FP: 1 sign + 2 exp + 1 mantissa, bias=1) to f32.
@@ -2068,9 +2215,8 @@ fn dequantize_mq2g256_lloyd_to_f32(
 }
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
-
-const HFQ_MAGIC: &[u8; 4] = b"HFQM";
-const HFQ_VERSION: u32 = 1;
+// HFQ_MAGIC / HFQ_VERSION now live in hipfire_quantize::hfq_out (single source,
+// shared with the library writer); re-imported at the top of this file.
 
 // QuantType — the on-disk HFQ `quant_type` byte-contract — now lives in the
 // shared `hipfire-quant-format` leaf crate, depended on by BOTH this writer and
@@ -2080,359 +2226,19 @@ const HFQ_VERSION: u32 = 1;
 // `t.quant_type as u8` byte emission keep working unchanged.
 pub use hipfire_quant_format::QuantType;
 
-/// Per-tensor precision level assigned by the K-map pre-pass.
-/// Determines whether a tensor gets the base format, a 6-bit promotion,
-/// Q8, or F16. See docs/superpowers/specs/2026-05-08-mixed-quant-kmap-design.md.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum QuantLevel {
-    /// Store as F16 (norms, biases, 1D tensors).
-    F16,
-    /// Store as Q8_F16 (embeddings, lm_head, MoE routers).
-    Q8,
-    /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
-    Promote6,
-    /// Override the default for a specific tensor class (today: lm_head)
-    /// to a CLI-specified format. Currently unused on this branch (no emission
-    /// site); kept so origin/master's lm_head-format override match arms
-    /// compile after the merge. Re-wire to `--lm-head-format` when the
-    /// configurable-kmap-pair refactor lands here.
-    #[allow(dead_code)]
-    Override(GgufFormat),
-    /// Use the base format as-is.
-    Base,
-}
 
-/// Extract layer index from a tensor name.
-/// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
-/// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
-fn parse_layer_idx(name: &str) -> Option<usize> {
-    // Try safetensors pattern: "layers.{N}."
-    if let Some(pos) = name.find("layers.") {
-        let after = &name[pos + 7..]; // skip "layers."
-        if let Some(dot) = after.find('.') {
-            if let Ok(idx) = after[..dot].parse::<usize>() {
-                return Some(idx);
-            }
-        }
-    }
-    // Try GGUF pattern: "blk.{N}."
-    if let Some(pos) = name.find("blk.") {
-        let after = &name[pos + 4..]; // skip "blk."
-        if let Some(dot) = after.find('.') {
-            if let Ok(idx) = after[..dot].parse::<usize>() {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
 
-/// Stride for alternating-mode promotion: edge layers always promoted,
-/// plus every Nth middle layer. 3 was chosen empirically — promotes ~40%
-/// of middle layers, matching llama.cpp Q4_K_M's budget-allocation pattern.
-/// On MoE 3.6-35B-A3B: stride=3 gives PPL 8K=19.96 at 21.8 GB vs full
-/// K-map PPL 8K=20.07 at 27.7 GB.
-const ALTERNATING_STRIDE: usize = 3;
 
-/// llama.cpp-style alternating promotion: edge layers always promoted,
-/// middle layers promoted every `stride` layers.
-fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
-    if n_layers == 0 || stride == 0 {
-        return false;
-    }
-    if idx < 2 || idx >= n_layers.saturating_sub(2) {
-        return true;
-    }
-    (idx - 2) % stride == 0
-}
 
-/// Resolve the quantization level for a tensor based on its name, the model's
-/// layer count, whether the model is MoE, and the K-map mode.
-///
-/// `kmap_mode`: 0 = full (all candidates promoted), 1 = alternating
-/// (experts + ffn_down every 3rd middle layer, edge layers always),
-/// 2 = typed (ffn_down + attn_v everywhere).
-///
-/// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
-/// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
-#[cfg(test)]
-fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
-    kmap_resolve_mode(name, n_layers, is_moe, 0)
-}
 
-fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
-    // Rule 1: norms, biases, 1D (GGUF path mainly)
-    if name.contains("norm") || name.contains("bias") {
-        return QuantLevel::F16;
-    }
 
-    // Rule 2: embeddings, lm_head, output projection
-    if name.contains("embed_tokens")
-        || name.contains("token_embd")
-        || name.ends_with("embeddings.weight") // nemotron_h: backbone.embeddings.weight
-        || name.contains("lm_head")
-        || name.ends_with("output.weight")
-    {
-        return QuantLevel::Q8;
-    }
 
-    // Rule 3: MoE routers
-    if is_moe && (name.ends_with("mlp.gate.weight") || name.contains("shared_expert_gate")) {
-        return QuantLevel::Q8;
-    }
 
-    // Rule 4: MoE expert FFN weights
-    if is_moe && name.contains("mlp.experts.") {
-        if kmap_mode == 1 {
-            // Alternating: promote expert groups only in positional layers
-            if let Some(idx) = parse_layer_idx(name) {
-                if is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
-                    return QuantLevel::Promote6;
-                }
-                return QuantLevel::Base;
-            }
-        }
-        return QuantLevel::Promote6;
-    }
 
-    // Mode 2 (typed): promote ffn_down and attn_v in all layers.
-    if kmap_mode == 2 {
-        let is_down = name.contains("down_proj") || name.contains("ffn_down");
-        let is_v = name.contains("v_proj") || name.contains("attn_v");
-        if is_down || is_v {
-            return QuantLevel::Promote6;
-        }
-        if n_layers > 0 {
-            if let Some(idx) = parse_layer_idx(name) {
-                if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                    return QuantLevel::Promote6;
-                }
-            }
-        }
-        return QuantLevel::Base;
-    }
 
-    // Mode 1 (alternating): ffn_down in edge + every 3rd middle layer.
-    // Edge-layer rule mirrors mode 0 below: attn+FFN for MoE (full promotion
-    // gives -19.8% PPL on 3.6-35B-A3B), FFN only for dense (attn promotion
-    // regresses PPL +3.1% on 27B). Bench: asym4 KV, ctx=8192, wikitext-2-test.
-    // See ppl_kmap_20260508.md.
-    if kmap_mode == 1 {
-        let is_down = name.contains("down_proj") || name.contains("ffn_down");
-        if n_layers > 0 {
-            if let Some(idx) = parse_layer_idx(name) {
-                if is_down && is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
-                    return QuantLevel::Promote6;
-                }
-                // Edge layers: attn+FFN for MoE, FFN only for dense.
-                if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                    if is_moe {
-                        return QuantLevel::Promote6;
-                    }
-                    let is_ffn = name.contains("mlp.") || name.contains("ffn");
-                    if is_ffn {
-                        return QuantLevel::Promote6;
-                    }
-                }
-            }
-        }
-        return QuantLevel::Base;
-    }
 
-    // Rule 5 (full mode 0): edge layers (first 2 + last 2).
-    // Dense models: FFN only — attn promotion regresses PPL (+3.1% on 27B).
-    // MoE models: attn+FFN — full promotion gives -19.8% PPL on 3.6-35B-A3B.
-    // Bench: asym4 KV, ctx=8192, wikitext-2-test. See ppl_kmap_20260508.md.
-    if n_layers > 0 {
-        if let Some(idx) = parse_layer_idx(name) {
-            if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                if is_moe {
-                    // MoE: promote all tensors in edge layers (attn + FFN)
-                    return QuantLevel::Promote6;
-                }
-                // Dense: promote FFN only — attn stays at Base
-                let is_ffn = name.contains("mlp.") || name.contains("ffn");
-                if is_ffn {
-                    return QuantLevel::Promote6;
-                }
-            }
-        }
-    }
 
-    // Rule 6: everything else
-    QuantLevel::Base
-}
 
-struct HfqTensor {
-    name: String,
-    quant_type: QuantType,
-    shape: Vec<u32>,
-    group_size: u32,
-    data: Vec<u8>,
-    /// When data is spilled to disk, this holds the byte count.
-    /// `data` is empty and the bytes live in the spill file.
-    spilled_len: u64,
-}
-
-fn tensor_param_count(t: &HfqTensor) -> u64 {
-    t.shape
-        .iter()
-        .fold(1u64, |acc, &dim| acc.saturating_mul(dim as u64))
-}
-
-fn config_u64_any(config: &serde_json::Value, keys: &[&str]) -> Option<u64> {
-    fn get_from_scope(scope: &serde_json::Value, keys: &[&str]) -> Option<u64> {
-        keys.iter().find_map(|key| scope.get(*key)?.as_u64())
-    }
-
-    get_from_scope(config, keys)
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|scope| get_from_scope(scope, keys))
-        })
-        .or_else(|| {
-            config
-                .get("moe")
-                .and_then(|scope| get_from_scope(scope, keys))
-        })
-        .or_else(|| {
-            config
-                .get("ffn_config")
-                .and_then(|scope| get_from_scope(scope, keys))
-        })
-}
-
-fn model_config_from_metadata(metadata: &serde_json::Value) -> &serde_json::Value {
-    metadata.get("config").unwrap_or(metadata)
-}
-
-fn routed_moe_config(metadata: &serde_json::Value) -> Option<(u64, u64)> {
-    let config = model_config_from_metadata(metadata);
-    let num_experts = config_u64_any(
-        config,
-        &[
-            "num_experts",
-            "n_routed_experts",
-            "num_local_experts",
-            "n_experts",
-        ],
-    )?;
-    let top_k = config_u64_any(
-        config,
-        &[
-            "num_experts_per_tok",
-            "num_experts_per_token",
-            "n_experts_per_tok",
-            "moe_top_k",
-            "top_k",
-            "num_selected_experts",
-        ],
-    )?;
-    if num_experts == 0 || top_k == 0 {
-        None
-    } else {
-        Some((num_experts, top_k))
-    }
-}
-
-fn is_routed_expert_tensor_name(name: &str) -> bool {
-    if name.contains(".shared_expert") || name.contains(".shared_experts.") {
-        return false;
-    }
-    name.contains(".mlp.experts.")
-        || name.contains(".ffn.experts.")
-        || name.contains(".block_sparse_moe.experts.")
-        || name.contains(".feed_forward.experts.")
-        || name.contains(".mixer.experts.")
-}
-
-fn parameter_counts_metadata(
-    metadata: &serde_json::Value,
-    tensors: &[HfqTensor],
-    total_params: u64,
-    quantized_params: u64,
-    skipped_params: u64,
-) -> serde_json::Value {
-    let mut routed_expert_params = 0u64;
-    for t in tensors {
-        if is_routed_expert_tensor_name(&t.name) {
-            routed_expert_params = routed_expert_params.saturating_add(tensor_param_count(t));
-        }
-    }
-
-    let (active_params, effective_params, moe) = if routed_expert_params > 0 {
-        if let Some((num_experts, top_k)) = routed_moe_config(metadata) {
-            let numerator = routed_expert_params.saturating_mul(top_k);
-            let routed_active = numerator / num_experts;
-            let active = total_params
-                .saturating_sub(routed_expert_params)
-                .saturating_add(routed_active);
-            (
-                active,
-                active,
-                Some(serde_json::json!({
-                    "num_experts": num_experts,
-                    "num_experts_per_tok": top_k,
-                    "routed_expert_params": routed_expert_params,
-                    "routed_expert_active_params": routed_active,
-                    "active_rule": "dense_and_shared_full_plus_routed_top_k_over_num_experts",
-                    "routed_active_fraction": {
-                        "numerator": numerator,
-                        "denominator": num_experts,
-                    },
-                })),
-            )
-        } else {
-            (
-                total_params,
-                total_params,
-                Some(serde_json::json!({
-                    "routed_expert_params": routed_expert_params,
-                    "active_rule": "unknown_top_k_or_num_experts",
-                })),
-            )
-        }
-    } else {
-        (total_params, total_params, None)
-    };
-
-    let source_total_params = total_params.saturating_add(skipped_params);
-    let mut counts = serde_json::json!({
-        "schema": "hipfire.parameter_counts.v1",
-        "total_params": total_params,
-        "source_total_params": source_total_params,
-        "active_params": active_params,
-        "effective_params": effective_params,
-        "quantized_params": quantized_params,
-        "skipped_params": skipped_params,
-    });
-    if let Some(moe) = moe {
-        if let serde_json::Value::Object(ref mut map) = counts {
-            map.insert("moe".to_string(), moe);
-        }
-    }
-    counts
-}
-
-fn insert_parameter_counts_metadata(
-    metadata: &mut serde_json::Value,
-    tensors: &[HfqTensor],
-    total_params: u64,
-    quantized_params: u64,
-    skipped_params: u64,
-) {
-    let counts = parameter_counts_metadata(
-        metadata,
-        tensors,
-        total_params,
-        quantized_params,
-        skipped_params,
-    );
-    if let serde_json::Value::Object(ref mut map) = metadata {
-        map.insert("parameter_counts".to_string(), counts);
-    }
-}
 
 fn insert_quant_format_metadata(metadata: &mut serde_json::Value, format: &str) {
     if let serde_json::Value::Object(ref mut map) = metadata {
@@ -2620,25 +2426,7 @@ impl HfqInputFile {
 
 // ─── XXH64 provenance hashing ───────────────────────────────────────────────
 
-struct Xxh64 {
-    inner: XxHash64,
-}
 
-impl Xxh64 {
-    fn new(seed: u64) -> Self {
-        Self {
-            inner: XxHash64::with_seed(seed),
-        }
-    }
-
-    fn update(&mut self, input: &[u8]) {
-        self.inner.write(input);
-    }
-
-    fn digest(&self) -> u64 {
-        self.inner.finish()
-    }
-}
 
 #[cfg(test)]
 fn xxh64_hex(bytes: &[u8]) -> String {
@@ -2647,184 +2435,18 @@ fn xxh64_hex(bytes: &[u8]) -> String {
     format!("{:016x}", h.digest())
 }
 
-fn xxh64_update_u8(h: &mut Xxh64, v: u8) {
-    h.update(&[v]);
-}
 
-fn xxh64_update_u32(h: &mut Xxh64, v: u32) {
-    h.update(&v.to_le_bytes());
-}
 
-fn xxh64_update_u64(h: &mut Xxh64, v: u64) {
-    h.update(&v.to_le_bytes());
-}
 
-fn hfq_quantization_hash_metadata(
-    tensors: &[HfqTensor],
-    spill: Option<&TensorSpill>,
-) -> std::io::Result<serde_json::Value> {
-    let mut h = Xxh64::new(0);
-    let mut payload_bytes = 0u64;
-    h.update(b"hipfire-hfq-quantized-tensor-payload-v1");
 
-    let mut spill_reader = if let Some(spill) = spill {
-        Some(std::io::BufReader::new(File::open(&spill.path)?))
-    } else {
-        None
-    };
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
 
-    for t in tensors {
-        let name_bytes = t.name.as_bytes();
-        xxh64_update_u64(&mut h, name_bytes.len() as u64);
-        h.update(name_bytes);
-        xxh64_update_u8(&mut h, t.quant_type as u8);
-        xxh64_update_u64(&mut h, t.shape.len() as u64);
-        for &dim in &t.shape {
-            xxh64_update_u32(&mut h, dim);
-        }
-        xxh64_update_u32(&mut h, t.group_size);
-        let data_len = if t.spilled_len > 0 {
-            t.spilled_len
-        } else {
-            t.data.len() as u64
-        };
-        xxh64_update_u64(&mut h, data_len);
-        payload_bytes += data_len;
 
-        if t.spilled_len > 0 {
-            let reader = spill_reader
-                .as_mut()
-                .expect("spilled tensor requires spill reader");
-            let mut remaining = t.spilled_len as usize;
-            while remaining > 0 {
-                let chunk = remaining.min(buf.len());
-                use std::io::Read;
-                reader.read_exact(&mut buf[..chunk])?;
-                h.update(&buf[..chunk]);
-                remaining -= chunk;
-            }
-        } else {
-            h.update(&t.data);
-        }
-    }
 
-    Ok(serde_json::json!({
-        "algorithm": "xxh64",
-        "seed": 0,
-        "scope": "hfq_tensor_index_and_payload_v1",
-        "value": format!("{:016x}", h.digest()),
-        "tensor_count": tensors.len(),
-        "payload_bytes": payload_bytes,
-        "producer": {
-            "package": "hipfire-quantize",
-            "hipfire_version": env!("CARGO_PKG_VERSION"),
-            "git_commit": git_commit(),
-            "git_branch": git_branch(),
-            "git_describe": git_describe(),
-            "git_dirty": git_dirty(),
-        },
-    }))
-}
 
-fn metadata_with_quantization_hash(
-    mut metadata: serde_json::Value,
-    tensors: &[HfqTensor],
-    spill: Option<&TensorSpill>,
-) -> std::io::Result<String> {
-    let hash = hfq_quantization_hash_metadata(tensors, spill)?;
-    if let serde_json::Value::Object(ref mut map) = metadata {
-        map.insert("quantization_hash".to_string(), hash);
-    }
-    serde_json::to_string(&metadata)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
 
-fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
 
-fn git_commit() -> Option<String> {
-    command_stdout("git", &["rev-parse", "HEAD"])
-}
 
-fn git_branch() -> Option<String> {
-    command_stdout("git", &["rev-parse", "--abbrev-ref", "HEAD"])
-}
 
-fn git_describe() -> Option<String> {
-    command_stdout("git", &["describe", "--always", "--dirty", "--tags"])
-}
-
-fn git_dirty() -> Option<bool> {
-    let out = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(!out.stdout.is_empty())
-}
-
-/// Streaming tensor spill file. When the quantizer accumulates more than
-/// `SPILL_THRESHOLD` bytes of tensor data in memory, it flushes completed
-/// tensors to this file. At write_hfq time, spilled data is copied from
-/// the spill file instead of from memory, keeping peak RSS bounded.
-struct TensorSpill {
-    file: std::io::BufWriter<File>,
-    path: PathBuf,
-    offset: u64,
-}
-
-impl TensorSpill {
-    fn new(dir: &Path) -> std::io::Result<Self> {
-        // PID-unique so concurrent quantize runs in the same output dir don't
-        // share a spill path (a sibling run's Drop would otherwise delete this
-        // run's spill file → write_hfq NotFound panic).
-        let path = dir.join(format!(".hipfire_quant_spill.{}.tmp", std::process::id()));
-        let file = std::io::BufWriter::with_capacity(4 * 1024 * 1024, File::create(&path)?);
-        Ok(Self {
-            file,
-            path,
-            offset: 0,
-        })
-    }
-
-    /// Write tensor data to the spill file. Returns the byte count written.
-    fn spill(&mut self, data: &[u8]) -> std::io::Result<u64> {
-        use std::io::Write;
-        self.file.write_all(data)?;
-        self.offset += data.len() as u64;
-        Ok(data.len() as u64)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        use std::io::Write;
-        self.file.flush()
-    }
-
-    fn cleanup(self) {
-        // Explicit cleanup — Drop impl handles the actual removal.
-        drop(self);
-    }
-}
-
-impl Drop for TensorSpill {
-    fn drop(&mut self) {
-        // Ensure the temp file is removed even on panic.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
@@ -2847,100 +2469,6 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     let _ = spill.flush();
 }
 
-fn write_hfq(
-    path: &Path,
-    arch: u32,
-    metadata_json: &str,
-    tensors: &[HfqTensor],
-    spill: Option<&mut TensorSpill>,
-) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
-
-    let metadata_bytes = metadata_json.as_bytes();
-
-    // Calculate offsets
-    let header_size = 32u64;
-    let metadata_offset = header_size;
-    let metadata_size = metadata_bytes.len() as u64;
-
-    // Tensor index follows metadata
-    let index_offset = metadata_offset + metadata_size;
-    let mut index_bytes = Vec::new();
-    // Write tensor count
-    index_bytes.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
-    for t in tensors {
-        // name length + name
-        let name_bytes = t.name.as_bytes();
-        index_bytes.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        index_bytes.extend_from_slice(name_bytes);
-        // quant type
-        index_bytes.push(t.quant_type as u8);
-        // n_dims + shape
-        index_bytes.push(t.shape.len() as u8);
-        for &d in &t.shape {
-            index_bytes.extend_from_slice(&d.to_le_bytes());
-        }
-        // group size
-        index_bytes.extend_from_slice(&t.group_size.to_le_bytes());
-        // data size (offset computed at read time from cumulative sizes)
-        let data_len = if t.spilled_len > 0 {
-            t.spilled_len
-        } else {
-            t.data.len() as u64
-        };
-        index_bytes.extend_from_slice(&data_len.to_le_bytes());
-    }
-
-    // Data starts after index, aligned to 4096
-    let data_start_unaligned = index_offset + index_bytes.len() as u64;
-    let data_offset = (data_start_unaligned + 4095) & !4095;
-
-    // Write header (32 bytes)
-    f.write_all(HFQ_MAGIC)?;
-    f.write_all(&HFQ_VERSION.to_le_bytes())?;
-    f.write_all(&arch.to_le_bytes())?;
-    f.write_all(&(tensors.len() as u32).to_le_bytes())?;
-    f.write_all(&metadata_offset.to_le_bytes())?;
-    f.write_all(&data_offset.to_le_bytes())?;
-
-    // Write metadata
-    f.write_all(metadata_bytes)?;
-
-    // Write tensor index
-    f.write_all(&index_bytes)?;
-
-    // Pad to data alignment
-    let pad_size = (data_offset - data_start_unaligned) as usize;
-    f.write_all(&vec![0u8; pad_size])?;
-
-    // Write tensor data — from spill file or from memory
-    if let Some(spill) = spill {
-        let _ = spill.flush();
-        let mut spill_reader = std::io::BufReader::new(File::open(&spill.path)?);
-        let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB copy buffer
-        for t in tensors {
-            if t.spilled_len > 0 {
-                // Copy from spill file
-                let mut remaining = t.spilled_len as usize;
-                while remaining > 0 {
-                    let chunk = remaining.min(buf.len());
-                    use std::io::Read;
-                    spill_reader.read_exact(&mut buf[..chunk])?;
-                    f.write_all(&buf[..chunk])?;
-                    remaining -= chunk;
-                }
-            } else {
-                f.write_all(&t.data)?;
-            }
-        }
-    } else {
-        for t in tensors {
-            f.write_all(&t.data)?;
-        }
-    }
-
-    Ok(())
-}
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
@@ -3036,6 +2564,58 @@ fn is_q8_tensor(name: &str) -> bool {
         // Nemotron-H Nano-30B A3B: routed MoE router lives under the flat
         // block's mixer namespace.
         || name.ends_with(".mixer.gate.weight")
+}
+
+// Force-link the offline specs bundle so every migrated arch's `register_arch!`
+// Ingest registration is present (Rust drops unreferenced rlibs). The bundle and
+// all its `-spec` crates are CPU-only (deps only hipfire-arch-api), so the quantizer
+// stays GPU-free. Adding a family touches hipfire-arch-specs, not this crate.
+use hipfire_arch_specs as _;
+
+static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
+    std::sync::OnceLock::new();
+
+/// Should this tensor be kept at HIGH PRECISION (vs. compressed), for arches
+/// migrated onto `hipfire-arch-api`? Returns `Some(true)` = keep high precision,
+/// `Some(false)` = compressible, or `None` when this arch has NOT declared an
+/// `Ingest` policy — the caller then falls back to the legacy `is_q8_tensor`
+/// name-matching.
+///
+/// Named for the decision it makes, not a format: it does not choose "Q8". The arch
+/// states only needs (importance + requirements); the codec choice is made here by
+/// matching those against a 2-codec (high vs compressed) menu with `allocate`. Its
+/// group-divisibility filter reproduces the existing "non-256-aligned → high
+/// precision" fallback, and an unsatisfiable requirement lands on the high-precision
+/// option. This is the boolean the selection matrix needs; whichever concrete
+/// format the true/false branch maps to is still the format mode's decision downstream.
+fn high_precision_via_ingest(arch_id: u32, name: &str, k: usize) -> Option<bool> {
+    use hipfire_arch_api::{allocate, ArchId, CodecCaps};
+    let ingest = ARCH_REGISTRY
+        .get_or_init(hipfire_arch_api::ArchRegistry::build)
+        .get(ArchId(arch_id as u16))?
+        .caps
+        .ingest?;
+    // High-precision random-access option vs a compressed grouped option. Only the
+    // chosen bit-width matters here (>= 8 → keep high precision); names are illustrative.
+    const MENU: [CodecCaps; 2] = [
+        CodecCaps {
+            name: "hi",
+            bits_per_weight: 8.0,
+            group_size: 0,
+            random_access: true,
+        },
+        CodecCaps {
+            name: "lo",
+            bits_per_weight: 4.0,
+            group_size: 256,
+            random_access: false,
+        },
+    ];
+    Some(
+        allocate(ingest.importance(name), ingest.requires(name), k, &MENU)
+            .map(|c| c.bits_per_weight >= 8.0)
+            .unwrap_or(true),
+    )
 }
 
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
@@ -3212,10 +2792,6 @@ fn tokenizer_config_with_chat_template(
 
 // ─── GGUF input pipeline ────────────────────────────────────────────────────
 
-/// True if the path points to a `.gguf` file on disk.
-fn is_gguf_input(p: &Path) -> bool {
-    p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("gguf")
-}
 
 fn is_hfq_input(p: &Path) -> bool {
     p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("hfq")
@@ -3232,6 +2808,9 @@ enum HfqInputFormat {
     Mq6,
     Mq3,
     Qtip3,
+    Qtip4,
+    Oq3,
+    Oq6,
     Oq4,
     OqPlus,
     OqPlusTiered,
@@ -3252,6 +2831,9 @@ impl HfqInputFormat {
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
+            "qtip4" => Some(Self::Qtip4),
+            "op3" | "op3g256" | "oq3" | "oq3g256" => Some(Self::Oq3),
+            "op6" | "op6g256" | "oq6" | "oq6g256" => Some(Self::Oq6),
             "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4+"
             | "oq4++" | "oq4g256" => Some(Self::Oq4),
             "opplus" | "op4-plus" => Some(Self::OqPlus),
@@ -3309,8 +2891,8 @@ fn quantize_hfq_source_tensor(
         };
         return Ok((data, QuantType::F16, 0, "F16"));
     }
-    if format == HfqInputFormat::Qtip3 {
-        // Stage for the shared real-QTIP3 post-pass (`pack_qtip3_real_tensors`),
+    if matches!(format, HfqInputFormat::Qtip3 | HfqInputFormat::Qtip4) {
+        // Stage for the shared real-QTIP post-pass (`pack_qtip_real_tensors`),
         // mirroring the HF/GGUF dispatch: gather / elementwise tensors the
         // trellis can't serve are finalized now; 2D weights are staged BF16 and
         // the post-pass packs k%256==0 → Qtip3G256 (and embed/lm_head → Q8F16).
@@ -3429,6 +3011,79 @@ fn quantize_hfq_source_tensor(
                 256,
                 "MQ3G256",
             )
+        }
+        HfqInputFormat::Oq6 => {
+            // Opus Quant W6 — symmetric signed-int6, FWHT-256, 6-bit packed (Oq6G256,
+            // 194 B/group, the near-lossless mid-tier between Oq4 and Oq8). Requires
+            // 256-aligned K; ragged dims fall back to Q8. Family completion; LDLQ + the
+            // iu8 W6A8 loader/kernel are pending.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            (
+                quantize_oq6g256(&f32_data, &signs1, &signs2),
+                QuantType::Oq6G256,
+                256,
+                "OQ6G256",
+            )
+        }
+        HfqInputFormat::Oq3 => {
+            // Opus Quant W3A4 — symmetric signed-int3, FWHT-256, bit-plane packed
+            // (Oq3G256, 98 B/group). Requires 256-aligned K; ragged dims fall back to
+            // Q8. Shares the Oq4 calibration machinery: `--ldlq` (full-Hessian OBS
+            // error-feedback, `oq3++`) takes precedence, else `--awq` SmoothQuant
+            // (`oq3+`), else plain RTN+FWHT (`oq3`). At 3 bits the ±3 grid is coarse,
+            // so error feedback matters MORE than at int4. 3-bit is meant to ride the
+            // SpinQuant learned rotation — see the W3A4 memory note.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            let m_dim = shape[0] as usize;
+            let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
+                let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
+                // Optional AWQ composition (same as oq4): fold W·diag(s) and rebase
+                // H' = diag(1/s) H diag(1/s) so OBS minimizes the SMOOTHED output error.
+                let awq_scales = awq_scales_for(name);
+                let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
+                    let mut scaled = f32_data.clone();
+                    awq_pre_scale_weights(&mut scaled, m_dim, k, s);
+                    for i in 0..k {
+                        let si = s[i] as f64;
+                        for j in 0..k {
+                            h[i * k + j] = (h[i * k + j] as f64 / (si * s[j] as f64)) as f32;
+                        }
+                    }
+                    std::borrow::Cow::Owned(scaled)
+                } else {
+                    std::borrow::Cow::Borrowed(&f32_data[..])
+                };
+                let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                let out = ldlq::oq3_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
+                if out.is_some() {
+                    ldlq_record_success();
+                    if let Some(s) = awq_scales {
+                        OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
+                        eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int3 + smooth");
+                    } else {
+                        eprintln!("  ldlq: {name} [{m_dim}x{k}] OBS error-feedback int3");
+                    }
+                } else {
+                    ldlq_record_pack_failed(name);
+                }
+                out
+            });
+            let q = if let Some(q) = ldlq_q {
+                q
+            } else if let Some(scales) = awq_scales_for(name) {
+                let mut scaled = f32_data.clone();
+                awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                quantize_oq3g256(&scaled, &signs1, &signs2)
+            } else {
+                quantize_oq3g256(&f32_data, &signs1, &signs2)
+            };
+            (q, QuantType::Oq3G256, 256, "OQ3G256")
         }
         HfqInputFormat::Oq4 | HfqInputFormat::OqPlus => {
             // Opus Quant W4A4 (Oq4) / OQ+ Opus Plus W4A8 (OqPlus). IDENTICAL weight
@@ -3642,28 +3297,204 @@ fn quantize_hfq_source_tensor(
                 (q, QuantType::Oq8G256, 256, "OQ+T")
             }
         }
-        HfqInputFormat::F16 | HfqInputFormat::Bf16 | HfqInputFormat::Qtip3 => unreachable!(),
+        HfqInputFormat::F16
+        | HfqInputFormat::Bf16
+        | HfqInputFormat::Qtip3
+        | HfqInputFormat::Qtip4 => unreachable!(),
     };
     Ok(out)
 }
 
-/// Pack the real QTIP-3 format over a set of staged BF16 tensors, in place.
+/// QTIP beam-search width for the real trellis encoder. Default 128 (near-
+/// Viterbi); override with `--beam N` / `HIPFIRE_QTIP_BEAM=N` to trade a little
+/// quality for a large encode speedup on big models (the beam search is the
+/// offline bottleneck). `--beam` sets this env in `main`, so both the
+/// `.hfq`-requantize and direct-source paths read it here.
+fn qtip_beam_width() -> usize {
+    std::env::var("HIPFIRE_QTIP_BEAM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(128)
+}
+
+/// CPU beam-search trellis encode: `symbols` [n_groups*256] from the FWHT-rotated
+/// `rotated` groups, each seeded at its RMS `group_scale` (the closed-form optimal
+/// scale is refit downstream at pack time). The reference path — always available,
+/// byte-preserving vs the historical qtip encode.
+fn cpu_encode_symbols(
+    rotated: &[f32],
+    n_groups: usize,
+    cb: &[f32],
+    beam: usize,
+    bits: u32,
+) -> Vec<u8> {
+    use rayon::prelude::*;
+    let mut symbols = vec![0u8; n_groups * 256];
+    symbols
+        .par_chunks_mut(256)
+        .zip(rotated.par_chunks(256))
+        .for_each(|(srow, grp)| {
+            let scale0 = qtip::group_scale(grp);
+            let sym = qtip::beam_encode_group_bits(grp, scale0, cb, beam, bits);
+            srow.copy_from_slice(&sym);
+        });
+    symbols
+}
+
+/// GPU full-Viterbi trellis encode (exact, ≥ beam quality; ~250× the CPU beam).
+/// Groups are chunked so the per-group Viterbi backpointer scratch (256×4096 B)
+/// stays bounded; the scratch buffer is allocated once and reused across chunks.
+#[cfg(feature = "gpu")]
+fn gpu_encode_symbols(
+    gpu: &mut rdna_compute::Gpu,
+    rotated: &[f32],
+    n_groups: usize,
+    bits: u32,
+) -> Result<Vec<u8>, String> {
+    use rdna_compute::DType;
+    // Per-chunk packed backpointer scratch = chunk×256×256×2 u32 = chunk×512 KB
+    // (uninitialized — the kernel writes it before backtrack, so use a device alloc
+    // with NO host zero-copy; on the shared-UMA APU a host zero-vec competes for the
+    // same pool). The APU may not have a big contiguous block free with a model
+    // resident, so start modest and halve on OOM until it fits. Allocated once,
+    // reused across chunks.
+    let mut chunk = 1024usize.min(n_groups.max(1));
+    let backptr = loop {
+        match gpu.alloc_tensor(&[chunk * 256 * 256 * 2], DType::F32) {
+            Ok(b) => break b,
+            Err(_) if chunk > 64 => chunk /= 2,
+            Err(e) => return Err(format!("backptr alloc (chunk={chunk}): {e}")),
+        }
+    };
+    let mut symbols = vec![0u8; n_groups * 256];
+    let mut done = 0usize;
+    while done < n_groups {
+        let cn = (n_groups - done).min(chunk);
+        let wbytes: Vec<u8> = rotated[done * 256..(done + cn) * 256]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let wd = gpu
+            .upload_raw(&wbytes, &[cn, 256])
+            .map_err(|e| e.to_string())?;
+        let sd = gpu
+            .alloc_tensor(&[cn * 256], DType::Raw)
+            .map_err(|e| e.to_string())?;
+        let scd = gpu
+            .alloc_tensor(&[cn], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.qtip_viterbi_encode(&wd, &sd, &backptr, &scd, cn, bits)
+            .map_err(|e| e.to_string())?;
+        gpu.device_synchronize().map_err(|e| e.to_string())?;
+        let s = gpu.download_raw(&sd, cn * 256).map_err(|e| e.to_string())?;
+        symbols[done * 256..(done + cn) * 256].copy_from_slice(&s);
+        done += cn;
+    }
+    Ok(symbols)
+}
+
+/// Acquire the shared GPU flock so the quantizer cooperates with the daemon and
+/// other GPU tools while it runs the trellis encoder — AGENTS.md's one lock
+/// primitive (`hipfire-lock`), acquired automatically rather than by an external
+/// `hipfire lock`. Blocks (with a poll message) until the GPU is free; the guard
+/// is held for the duration of the GPU work via RAII. Returns None only if the
+/// lock file can't be opened, in which case we proceed lock-less rather than fail.
+#[cfg(feature = "gpu")]
+fn acquire_gpu_lock() -> Option<hipfire_lock::FlockGuard> {
+    let path = hipfire_lock::gpu_resource_lock_path();
+    let mut guard = match hipfire_lock::FlockGuard::open(&path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "  qtip: could not open GPU lock {}: {e}; proceeding without it",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let mut waited = 0u64;
+    let acquired = guard
+        .lock_blocking(std::time::Duration::from_secs(2), None, |holder| {
+            waited += 2;
+            let who = if holder.is_empty() { "unknown" } else { holder };
+            eprintln!("  qtip: GPU busy ({who}) — waited {waited}s for the GPU lock…");
+        })
+        .unwrap_or(false);
+    if !acquired {
+        return None;
+    }
+    let _ = guard.write_holder(&format!("{} hipfire-quantize", std::process::id()));
+    Some(guard)
+}
+
+/// Pack the real QTIP format (`bits`-bit trellis) over a set of staged BF16
+/// tensors, in place.
 ///
 /// Shared by the HF/GGUF dispatch and the `.hfq`-source requantization path so
-/// `--format qtip3` produces byte-identical artifacts regardless of input
-/// source. Expects 2D weight tensors staged as `QuantType::BF16`:
+/// `--format qtip3` / `--format qtip4` produce byte-identical artifacts
+/// regardless of input source. Expects 2D weight tensors staged as
+/// `QuantType::BF16`:
 ///   - tied embed / lm_head / output → Q8F16 (gather-friendly, the trellis
 ///     format can't be random-accessed by an embedding lookup),
-///   - every other 2D BF16 tensor with `k % 256 == 0` → Qtip3G256 (rotated-frame
-///     3-bit trellis symbols + scale, 100 B/group, decoded by `gemv_qtip3g256`).
+///   - every other 2D BF16 tensor with `k % 256 == 0` → Qtip3G256 (3-bit, 100
+///     B/group) or Qtip4G256 (4-bit, 132 B/group) rotated-frame trellis symbols
+///     + scale.
 /// All other tensors (norms, 1D scalars, ragged dims) are left untouched.
-fn pack_qtip3_real_tensors(
+/// `bits` is 3 or 4; the trellis codebook/state is bit-agnostic, only the
+/// per-symbol width and the on-disk packing change. `beam` is the beam-search
+/// width — 128 is near-Viterbi; smaller trades a little quality for a large
+/// encode speedup (the beam search is the offline bottleneck on big models).
+fn pack_qtip_real_tensors(
     tensors: &mut Vec<HfqTensor>,
     qtip_cb: &[f32],
     qtip_s1: &[f32],
     qtip_s2: &[f32],
     lowrank_r: usize,
+    bits: u32,
+    beam: usize,
 ) {
+    assert!(
+        bits == 3 || bits == 4,
+        "QTIP real pack supports 3 or 4 bits"
+    );
+    let block_bytes = if bits == 4 {
+        qtip::QTIP4_BLOCK_BYTES
+    } else {
+        qtip::QTIP3_BLOCK_BYTES
+    };
+    let tag = if bits == 4 {
+        QuantType::Qtip4G256
+    } else {
+        QuantType::Qtip3G256
+    };
+    // Autodetect a GPU for the trellis encode (exact Viterbi, ~250× the CPU beam).
+    // The CPU beam remains the fallback + reference; nothing here requires a GPU.
+    // When a device is found we self-acquire the shared GPU flock (`_gpu_lock`,
+    // held via RAII until this function returns) so we cooperate with the daemon
+    // and other GPU tools — no external `hipfire lock` needed.
+    #[cfg(feature = "gpu")]
+    let (mut gpu, _gpu_lock) = match rdna_compute::Gpu::init() {
+        Ok(g) => {
+            let lock = acquire_gpu_lock();
+            eprintln!(
+                "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi){}",
+                g.arch,
+                if lock.is_some() {
+                    " — GPU lock held"
+                } else {
+                    " — WARNING: proceeding without GPU lock"
+                }
+            );
+            (Some(g), lock)
+        }
+        Err(_) => {
+            eprintln!("  qtip{bits} (real): no GPU device — CPU beam encoder (beam={beam})");
+            (None, None)
+        }
+    };
+    #[cfg(not(feature = "gpu"))]
+    eprintln!("  qtip{bits} (real): CPU beam encoder (beam={beam}; built --no-default-features)");
     use rayon::prelude::*;
     // The tied embed/lm_head ([vocab × dim]) is gather-accessed (embedding
     // lookup), which the trellis format can't random-access — and it is the
@@ -3692,9 +3523,12 @@ fn pack_qtip3_real_tensors(
         n_q8 += 1;
     }
     if n_q8 > 0 {
-        eprintln!("  qtip3 (real): embed/lm_head → Q8F16 ({n_q8} tensors, gather-friendly)");
+        eprintln!("  qtip{bits} (real): embed/lm_head → Q8F16 ({n_q8} tensors, gather-friendly)");
     }
     let (mut n_packed, mut max_err) = (0usize, 0.0f32);
+    // Coarse per-phase wall-time (rotate / encode / pack), accumulated across tensors.
+    use std::time::{Duration, Instant};
+    let (mut t_rot, mut t_enc, mut t_pack) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     // Optional LQER low-rank correction: when `lowrank_r > 0`, each packed tensor
     // also emits a rank-r factorization (U,V) of its ROTATED-frame quant error
     // E_rot = W_rot − dequant(Q(W_rot)) as `<base>.lr_u/.lr_v` sidecars. The
@@ -3726,23 +3560,63 @@ fn pack_qtip3_real_tensors(
             .chunks_exact(2)
             .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
-        // Per row → packed records; collect per-row max-error (and, when low-rank
-        // is enabled, the per-row rotated-frame error E_rot) in parallel.
-        let row_out: Vec<(Vec<u8>, f32, Vec<f32>)> = wf
+        // Phase 1 — FWHT-rotate every group into the incoherent frame (CPU,
+        // parallel over rows). `rotated` holds the [m*k] rotated weights.
+        let _t_rot = Instant::now();
+        let mut rotated = vec![0.0f32; m * k];
+        rotated
+            .par_chunks_mut(k)
+            .zip(wf.par_chunks(k))
+            .for_each(|(orow, wrow)| {
+                for g in 0..groups {
+                    let mut grp = [0.0f32; 256];
+                    grp.copy_from_slice(&wrow[g * 256..g * 256 + 256]);
+                    cpu_fwht_256(&mut grp, qtip_s1, qtip_s2);
+                    orow[g * 256..g * 256 + 256].copy_from_slice(&grp);
+                }
+            });
+        t_rot += _t_rot.elapsed();
+
+        // Phase 2 — trellis-encode the rotated groups → `symbols` [m*k]. GPU exact
+        // Viterbi when a device was autodetected, else CPU beam. The CPU path is
+        // byte-preserving vs the historical encode; the GPU path is optimal (≥ beam)
+        // so its symbols differ (better) — a valid, self-consistent .hfq either way.
+        let _t_enc = Instant::now();
+        let ng = m * groups;
+        #[cfg(feature = "gpu")]
+        let symbols: Vec<u8> = match gpu.as_mut() {
+            Some(g) => match gpu_encode_symbols(g, &rotated, ng, bits) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Never fail the quantize on a GPU hiccup — the CPU beam is the
+                    // reference and always works (AGENTS.md: CPU-only functionality).
+                    eprintln!(
+                        "  qtip{bits}: GPU encode failed ({e}) — falling back to CPU beam for this tensor"
+                    );
+                    cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
+                }
+            },
+            None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
+        };
+        #[cfg(not(feature = "gpu"))]
+        let symbols: Vec<u8> = cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits);
+        t_enc += _t_enc.elapsed();
+
+        // Phase 3 — refit the closed-form optimal scale, self-check (rotated-frame
+        // decode err), and pack (CPU, parallel over rows).
+        let _t_pack = Instant::now();
+        let row_out: Vec<(Vec<u8>, f32, Vec<f32>)> = rotated
             .par_chunks(k)
-            .map(|row| {
-                let mut packed = Vec::with_capacity(groups * qtip::QTIP3_BLOCK_BYTES);
+            .zip(symbols.par_chunks(k))
+            .map(|(rrow, symrow)| {
+                let mut packed = Vec::with_capacity(groups * block_bytes);
                 let mut rerr = 0.0f32;
                 let mut erow = if want_lr { vec![0.0f32; k] } else { Vec::new() };
                 for g in 0..groups {
-                    let mut grp = [0.0f32; 256];
-                    grp.copy_from_slice(&row[g * 256..g * 256 + 256]);
-                    cpu_fwht_256(&mut grp, qtip_s1, qtip_s2); // rotate
-                    let scale0 = qtip::group_scale(&grp);
-                    let sym = qtip::beam_encode_group_bits(&grp, scale0, qtip_cb, 128, 3);
-                    let scale = qtip::optimal_scale_bits(&grp, &sym, qtip_cb, 3);
-                    // Self-check: decode in the rotated frame vs the encode target.
-                    let deq = qtip::decode_group_bits(&sym, scale, qtip_cb, 3);
+                    let grp = &rrow[g * 256..g * 256 + 256];
+                    let sym = &symrow[g * 256..g * 256 + 256];
+                    let scale = qtip::optimal_scale_bits(grp, sym, qtip_cb, bits);
+                    let deq = qtip::decode_group_bits(sym, scale, qtip_cb, bits);
                     for (idx, (a, b)) in grp.iter().zip(&deq).enumerate() {
                         let d = a - b;
                         rerr = rerr.max(d.abs());
@@ -3750,12 +3624,18 @@ fn pack_qtip3_real_tensors(
                             erow[g * 256 + idx] = d;
                         }
                     }
-                    packed.extend_from_slice(&qtip::pack_qtip3_group(&sym, scale));
+                    let group_bytes = if bits == 4 {
+                        qtip::pack_qtip4_group(sym, scale)
+                    } else {
+                        qtip::pack_qtip3_group(sym, scale)
+                    };
+                    packed.extend_from_slice(&group_bytes);
                 }
                 (packed, rerr, erow)
             })
             .collect();
-        let mut data = Vec::with_capacity(row_out.len() * groups * qtip::QTIP3_BLOCK_BYTES);
+        t_pack += _t_pack.elapsed();
+        let mut data = Vec::with_capacity(row_out.len() * groups * block_bytes);
         let mut e_rot = if want_lr {
             Vec::with_capacity(m * k)
         } else {
@@ -3769,7 +3649,7 @@ fn pack_qtip3_real_tensors(
             }
         }
         t.data = data;
-        t.quant_type = QuantType::Qtip3G256;
+        t.quant_type = tag;
         t.group_size = 256;
         n_packed += 1;
 
@@ -3800,13 +3680,20 @@ fn pack_qtip3_real_tensors(
         tensors.extend(new_sidecars);
     }
     eprintln!(
-        "  qtip3 (real): packed {n_packed} tensors as Qtip3G256 (100 B/group, 0.391 B/w); \
-         rotated-frame decode max-abs-err {max_err:.5}{}",
+        "  qtip{bits} (real): packed {n_packed} tensors as {tag:?} ({block_bytes} B/group, \
+         {:.3} B/w); rotated-frame decode max-abs-err {max_err:.5}{}",
+        block_bytes as f32 / 256.0,
         if want_lr {
             format!("; emitted rank-{lowrank_r} lr_u/lr_v for {n_lr} tensors")
         } else {
             String::new()
         }
+    );
+    eprintln!(
+        "  qtip{bits} (real): phase wall-time — rotate {:.2}s  encode {:.2}s  pack {:.2}s",
+        t_rot.as_secs_f64(),
+        t_enc.as_secs_f64(),
+        t_pack.as_secs_f64()
     );
 }
 
@@ -3892,11 +3779,16 @@ fn run_hfq_source_pipeline(
     // Real QTIP-3 is a post-pass over the BF16-staged 2D weights, shared with
     // the HF/GGUF dispatch so a bf16 `.hfq` requantized to qtip3 is byte-
     // identical to quantizing the original safetensors with `--format qtip3`.
-    if format == HfqInputFormat::Qtip3 {
+    if matches!(format, HfqInputFormat::Qtip3 | HfqInputFormat::Qtip4) {
+        let bits = if format == HfqInputFormat::Qtip4 {
+            4
+        } else {
+            3
+        };
         let qtip_cb = qtip::build_codebook();
         let qtip_s1 = gen_fwht_signs(42, 256);
         let qtip_s2 = gen_fwht_signs(1042, 256);
-        pack_qtip3_real_tensors(
+        pack_qtip_real_tensors(
             &mut hfq_tensors,
             &qtip_cb,
             &qtip_s1,
@@ -3905,14 +3797,18 @@ fn run_hfq_source_pipeline(
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            bits,
+            qtip_beam_width(),
         );
         // Recount rewritten params: the post-pass changes quant types after the
         // per-tensor loop above bumped the counter for the BF16 staging.
         quantized_params = hfq_tensors
             .iter()
             .filter(|t| {
-                matches!(t.quant_type, QuantType::Qtip3G256 | QuantType::Q8F16)
-                    && t.shape.len() == 2
+                matches!(
+                    t.quant_type,
+                    QuantType::Qtip3G256 | QuantType::Qtip4G256 | QuantType::Q8F16
+                ) && t.shape.len() == 2
             })
             .map(|t| t.shape.iter().map(|&d| d as u64).product::<u64>())
             .sum();
@@ -3951,53 +3847,7 @@ fn run_hfq_source_pipeline(
     Ok(())
 }
 
-/// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
-/// names that `hipfire_runtime::hfq::load_weights_hfq` expects. The mapping is
-/// the canonical llama.cpp ↔ HF convention.
-///
-/// Returns None for tensors that don't have a known safetensors equivalent
-/// (we then keep them under their GGUF name; the future loader can decide
-/// what to do, or they're skipped).
-fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
-    // Top-level tensors.
-    match gguf_name {
-        "token_embd.weight" => return Some("model.embed_tokens.weight".to_string()),
-        "output.weight" => return Some("lm_head.weight".to_string()),
-        "output_norm.weight" => return Some("model.norm.weight".to_string()),
-        _ => {}
-    }
-    // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
-    if let Some(rest) = gguf_name.strip_prefix("blk.") {
-        // rest = "{N}.<slot>.weight"
-        let dot = rest.find('.')?;
-        let layer_idx = &rest[..dot];
-        let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
-        let slot = slot_full.strip_suffix(".weight")?;
-        let translated = match slot {
-            "attn_norm" => "input_layernorm".to_string(),
-            "ffn_norm" => "post_attention_layernorm".to_string(),
-            "attn_q" => "self_attn.q_proj".to_string(),
-            "attn_k" => "self_attn.k_proj".to_string(),
-            "attn_v" => "self_attn.v_proj".to_string(),
-            "attn_output" => "self_attn.o_proj".to_string(),
-            "attn_q_norm" => "self_attn.q_norm".to_string(),
-            "attn_k_norm" => "self_attn.k_norm".to_string(),
-            "ffn_gate" => "mlp.gate_proj".to_string(),
-            "ffn_up" => "mlp.up_proj".to_string(),
-            "ffn_down" => "mlp.down_proj".to_string(),
-            other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
-        };
-        return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
-    }
-    None
-}
 
-/// True if the GGUF tensor's name is a 1D norm / RMSNorm scaling vector.
-/// These stay F16 in the .hfq (no benefit from quantization, precision-sensitive).
-fn gguf_is_norm_tensor(name: &str) -> bool {
-    name.contains("_norm") || name.contains("norm.weight")
-}
 
 /// Translate a hipfire safetensors-style tensor name to the ggml-style name
 /// used by llama.cpp's imatrix output (and the rest of llama.cpp's tooling).
@@ -4577,221 +4427,11 @@ fn awq_eligible(name: &str) -> bool {
     f1_match || f2_match
 }
 
-/// True if the tensor is the token embedding. We Q8 these (matches the
-/// safetensors path's `is_embed` rule — Q4 is too lossy for embedding tables).
-fn gguf_is_embed_tensor(name: &str) -> bool {
-    name == "token_embd.weight"
-}
 
-/// Build the `config` JSON object that `hipfire_runtime::hfq::config_from_hfq`
-/// reads. Mirrors the field names HuggingFace uses in `config.json` for
-/// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
-/// `<arch>.*` metadata keys.
-fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_json::Value {
-    // GGUF prefixes its model hyperparameters with the architecture name —
-    // e.g. for `general.architecture=llama` the keys live under `llama.*`.
-    let prefix = arch_str;
 
-    let read_u = |k: &str| -> Option<u64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::U8(x) => Some(*x as u64),
-            gguf_input::MetaValue::I8(x) => Some(*x as u64),
-            gguf_input::MetaValue::U16(x) => Some(*x as u64),
-            gguf_input::MetaValue::I16(x) => Some(*x as u64),
-            gguf_input::MetaValue::U32(x) => Some(*x as u64),
-            gguf_input::MetaValue::I32(x) => Some(*x as u64),
-            gguf_input::MetaValue::U64(x) => Some(*x),
-            gguf_input::MetaValue::I64(x) => Some(*x as u64),
-            _ => None,
-        })
-    };
-    let read_f = |k: &str| -> Option<f64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::F32(x) => Some(*x as f64),
-            gguf_input::MetaValue::F64(x) => Some(*x),
-            _ => None,
-        })
-    };
 
-    let dim = read_u(&format!("{prefix}.embedding_length"));
-    let n_layers = read_u(&format!("{prefix}.block_count"));
-    let n_heads = read_u(&format!("{prefix}.attention.head_count"));
-    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv")).or(n_heads);
-    let hidden_dim = read_u(&format!("{prefix}.feed_forward_length"));
-    // vocab_size: prefer metadata, fall back to token_embd shape[1].
-    let vocab_size = read_u(&format!("{prefix}.vocab_size")).or_else(|| {
-        gguf.tensors
-            .iter()
-            .find(|t| t.name == "token_embd.weight")
-            .and_then(|t| t.shape.get(1).map(|&s| s as u64))
-    });
-    let max_seq_len = read_u(&format!("{prefix}.context_length"));
-    let rope_theta = read_f(&format!("{prefix}.rope.freq_base"));
-    let rms_eps = read_f(&format!("{prefix}.attention.layer_norm_rms_epsilon"));
-    let head_dim = read_u(&format!("{prefix}.attention.key_length")).or_else(|| {
-        // Fall back: head_dim = dim / n_heads.
-        dim.zip(n_heads).map(|(d, h)| if h > 0 { d / h } else { d })
-    });
-    let bos = read_u("tokenizer.ggml.bos_token_id").unwrap_or(1);
-    let eos = read_u("tokenizer.ggml.eos_token_id").unwrap_or(2);
 
-    let mut cfg = serde_json::Map::new();
-    cfg.insert(
-        "model_type".to_string(),
-        serde_json::Value::from(arch_str.to_string()),
-    );
-    if let Some(v) = dim {
-        cfg.insert("hidden_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = n_layers {
-        cfg.insert("num_hidden_layers".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = n_heads {
-        cfg.insert(
-            "num_attention_heads".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = n_kv_heads {
-        cfg.insert(
-            "num_key_value_heads".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = hidden_dim {
-        cfg.insert("intermediate_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = vocab_size {
-        cfg.insert("vocab_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = max_seq_len {
-        cfg.insert(
-            "max_position_embeddings".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = rope_theta {
-        cfg.insert("rope_theta".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = rms_eps {
-        cfg.insert("rms_norm_eps".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = head_dim {
-        cfg.insert("head_dim".to_string(), serde_json::Value::from(v));
-    }
-    cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
-    cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
-    serde_json::Value::Object(cfg)
-}
 
-/// Translate the GGUF metadata HashMap into a JSON object that ends up in
-/// the `.hfq` header's metadata blob. A future engine-side `from_hfq` for
-/// Llama-style models can read these fields the same way the existing
-/// `from_gguf` reads them today.
-fn gguf_meta_to_json(meta: &HashMap<String, gguf_input::MetaValue>) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    for (k, v) in meta {
-        let json_v = mv_to_json(v);
-        map.insert(k.clone(), json_v);
-    }
-    serde_json::Value::Object(map)
-}
-
-fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
-    use gguf_input::MetaValue as MV;
-    match v {
-        MV::U8(x) => serde_json::Value::from(*x),
-        MV::I8(x) => serde_json::Value::from(*x),
-        MV::U16(x) => serde_json::Value::from(*x),
-        MV::I16(x) => serde_json::Value::from(*x),
-        MV::U32(x) => serde_json::Value::from(*x),
-        MV::I32(x) => serde_json::Value::from(*x),
-        MV::F32(x) => serde_json::Value::from(*x),
-        MV::Bool(x) => serde_json::Value::from(*x),
-        MV::String(s) => serde_json::Value::from(s.clone()),
-        MV::U64(x) => serde_json::Value::from(*x),
-        MV::I64(x) => serde_json::Value::from(*x),
-        MV::F64(x) => serde_json::Value::from(*x),
-        // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
-        // serialize them as JSON arrays so the engine side can re-parse.
-        MV::Array(arr) => serde_json::Value::Array(arr.iter().map(mv_to_json).collect()),
-    }
-}
-
-/// 2D-weight quantization target chosen at the per-tensor level. The choice
-/// per format flag:
-///
-/// | --format | 2D weights      | embedding | comment                          |
-/// |----------|-----------------|-----------|----------------------------------|
-/// | fp16     | F16             | F16       | reference / maximum-size smoke   |
-/// | bf16     | BF16/F16        | BF16/F16  | source-precision smoke container |
-/// | hfq4     | HFQ4G256        | Q8F16     | dense plain format — no FWHT     |
-/// | hfq6     | HFQ6G256        | Q8F16     | dense + higher quality           |
-/// | mq4      | MQ4G256         | Q8F16     | Qwen3.5+ (DeltaNet) — FWHT-rot   |
-/// | mq6      | MQ6G256         | Q8F16     | Qwen3.5+ (DeltaNet) + higher q   |
-/// | mq3      | MQ3G256         | Q8F16     | Sub-4-bit FWHT (3.25 bpw)        |
-/// | mq2      | MQ2G256         | Q8F16     | Sub-4-bit FWHT (2.25 bpw)        |
-///
-/// **MQ4/MQ6 for non-Qwen3.5 dense produces correct output on the Llama path
-/// (the rotation cancels via `gemv_mq4g256_with_rotate`) but adds per-layer
-/// `rotate_x_mq` overhead with no quality benefit — those rotations were
-/// calibrated for Qwen3.5+ training.** Use `--format hfq4` for the plain dense
-/// path; pass `--format mq4` only when the source is a Qwen3.5+ family model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GgufFormat {
-    F16,
-    Bf16,
-    Hfq4,
-    Hfq6,
-    Mq4,
-    Mq6,
-    Mq3,
-    Mq2,
-    Mq2Lloyd,
-    Mq3Lloyd,
-    Mq4Lloyd,
-    Hfp4, // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
-    Mfp4, // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
-}
-
-impl GgufFormat {
-    fn from_flag(flag: &str) -> Option<Self> {
-        match flag {
-            "fp16" | "f16" | "float16" => Some(Self::F16),
-            "bf16" | "bfloat16" => Some(Self::Bf16),
-            "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
-            "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
-            "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
-            "mq6" | "mq6g256" => Some(Self::Mq6),
-            "mq3" | "mq3g256" => Some(Self::Mq3),
-            "mq2" | "mq2g256" => Some(Self::Mq2),
-            "lloyd-mq2" => Some(Self::Mq2Lloyd),
-            "lloyd-mq3" => Some(Self::Mq3Lloyd),
-            "lloyd-mq4" => Some(Self::Mq4Lloyd),
-            "hfp4" | "hfp4g32" | "hf4p" | "fp4" => Some(Self::Hfp4),
-            "mfp4" | "mfp4g32" | "mf4p" => Some(Self::Mfp4),
-            _ => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::F16 => "F16",
-            Self::Bf16 => "BF16",
-            Self::Hfq4 => "HFQ4G256",
-            Self::Hfq6 => "HFQ6G256",
-            Self::Mq4 => "MQ4G256",
-            Self::Mq6 => "MQ6G256",
-            Self::Mq3 => "MQ3G256",
-            Self::Mq2 => "MQ2G256",
-            Self::Mq2Lloyd => "MQ2G256Lloyd",
-            Self::Mq3Lloyd => "MQ3G256Lloyd",
-            Self::Mq4Lloyd => "MQ4G256Lloyd",
-            Self::Hfp4 => "HFP4G32",
-            Self::Mfp4 => "MFP4G32",
-        }
-    }
-}
 
 fn source_precision_tensor_bytes(
     raw_data: &[u8],
@@ -4806,398 +4446,6 @@ fn source_precision_tensor_bytes(
     }
 }
 
-/// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
-/// applies to 2D weight matrices; the embedding table is always Q8F16
-/// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
-/// names are translated GGUF → safetensors style so the engine's existing
-/// `load_weights_hfq` can consume the output.
-fn run_gguf_pipeline(
-    input: &Path,
-    output: &Path,
-    format: GgufFormat,
-    format_label: &str,
-    no_kmap: bool,
-    kmap_dense: bool,
-    kmap_mode: u8,
-) -> std::io::Result<()> {
-    eprintln!("=== GGUF → {} conversion ===", format.label());
-    eprintln!("Input:  {}", input.display());
-    eprintln!("Output: {}", output.display());
-
-    let gguf = gguf_input::GgufFile::open(input)?;
-    eprintln!("GGUF version: {}", gguf.version);
-    eprintln!("Tensors: {}", gguf.tensors.len());
-
-    let arch_str = gguf
-        .meta_str("general.architecture")
-        .unwrap_or("llama")
-        .to_string();
-    let auto_arch_id: u32 = match arch_str.as_str() {
-        "llama" => 0,
-        "qwen3" | "qwen2" => 1,
-        "qwen3moe" => 6,
-        other => {
-            eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
-            0
-        }
-    };
-    // --arch-id <u32> overrides the auto-detected id. Use when the
-    // model's family maps to a different crate than the default
-    // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
-    // instead of the LLaMA-family default 1, which silently drops
-    // Q/K/V bias on the LLaMA loader path). See docs/plans/
-    // dots-ocr-devlog.md §7 (R1) for the bring-up context.
-    let arch_id: u32 = parse_arch_id_override().unwrap_or(auto_arch_id);
-    if arch_id != auto_arch_id {
-        eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
-    } else {
-        eprintln!("Architecture: {arch_str} (id={arch_id})");
-    }
-
-    // Metadata JSON: must populate `config.*` so engine's `config_from_hfq`
-    // can reconstruct LlamaConfig at load time. Also keep the raw GGUF
-    // metadata tree under `gguf_meta` for any consumer that wants original
-    // values (chat template, vocab, scores, merges, etc.).
-    let config_json = config_json_from_gguf(&gguf, &arch_str);
-    let mut metadata = serde_json::json!({
-        "architecture": arch_str,
-        "source": "gguf",
-        "quant_format": format_label,
-        "config": config_json,
-        "gguf_meta": gguf_meta_to_json(&gguf.metadata),
-    });
-
-    // FWHT signs — only used by MQ/MFP formats. Same seed pair as the
-    // safetensors path so the engine's runtime FWHT inverse stays identical.
-    let needs_signs = matches!(
-        format,
-        GgufFormat::Mq4
-            | GgufFormat::Mq6
-            | GgufFormat::Mq3
-            | GgufFormat::Mq2
-            | GgufFormat::Mq2Lloyd
-            | GgufFormat::Mq3Lloyd
-            | GgufFormat::Mq4Lloyd
-            | GgufFormat::Mfp4
-    );
-    let signs1 = if needs_signs {
-        gen_fwht_signs(42, 256)
-    } else {
-        Vec::new()
-    };
-    let signs2 = if needs_signs {
-        gen_fwht_signs(1042, 256)
-    } else {
-        Vec::new()
-    };
-
-    // K-map setup for GGUF path
-    let is_moe = arch_id == 6;
-    let n_layers: usize = config_json
-        .get("num_hidden_layers")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-
-    // Build K-map using translated (safetensors-style) names where available,
-    // falling back to raw GGUF names for untranslated tensors.
-    //
-    // K-map is gated to MoE models only. On dense models the author's own
-    // bench shows a mixed picture (PPL +1.5% to +2.5% at 2K context on 4B
-    // and 27B; PPL -4.8% on 27B at 8K context — crossover at ~3K). The
-    // ship-default is the conservative shape per maintainer directive
-    // (2026-05-08): never silently change dense quantization. Users who
-    // want K-map on dense pass `--kmap-dense` (see flag parsing below).
-    let kmap: HashMap<String, QuantLevel> =
-        if format == GgufFormat::F16 || no_kmap || (!is_moe && !kmap_dense) {
-            HashMap::new()
-        } else {
-            let mut map = HashMap::new();
-            let mut counts = [0u32; 4];
-            for info in &gguf.tensors {
-                let out_name =
-                    gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
-                let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
-                match level {
-                    QuantLevel::F16 => counts[0] += 1,
-                    QuantLevel::Q8 => counts[1] += 1,
-                    QuantLevel::Promote6 => counts[2] += 1,
-                    QuantLevel::Override(_) => counts[3] += 1,
-                    QuantLevel::Base => counts[3] += 1,
-                }
-                map.insert(out_name, level);
-            }
-            if !map.is_empty() {
-                let mode_label = match kmap_mode {
-                    0 => "full",
-                    1 => "alternating",
-                    2 => "typed",
-                    _ => "?",
-                };
-                eprintln!(
-                    "K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
-                    format.label(),
-                    if is_moe { ", MoE" } else { "" }
-                );
-                eprintln!("  F16:       {:>4} tensors", counts[0]);
-                eprintln!("  Q8:        {:>4} tensors", counts[1]);
-                eprintln!("  Promote6:  {:>4} tensors", counts[2]);
-                eprintln!("  Base:      {:>4} tensors", counts[3]);
-            }
-            map
-        };
-
-    let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
-    let mut total_params: u64 = 0;
-    let mut quant_params: u64 = 0;
-    let mut total_bytes_in: u64 = 0;
-    let mut total_bytes_out: u64 = 0;
-
-    for info in &gguf.tensors {
-        let raw = gguf.tensor_data(info);
-        let n_elements = info.numel();
-        total_params += n_elements as u64;
-        total_bytes_in += raw.len() as u64;
-
-        let shape: Vec<u32> = info.shape.iter().map(|&s| s as u32).collect();
-
-        // Tensor classification (uses the original GGUF name).
-        let is_norm = gguf_is_norm_tensor(&info.name);
-        let is_embed = gguf_is_embed_tensor(&info.name);
-        let is_2d = info.shape.len() == 2;
-        let k_dim = if is_2d { info.shape[0] } else { n_elements };
-
-        // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
-        // expects. If we don't have a translation, keep the original name —
-        // the future loader can ignore unknown tensors.
-        let out_name = gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
-
-        let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
-
-        let (data, quant_type, group_size, label) = if format == GgufFormat::F16
-            || is_norm
-            || !is_2d
-        {
-            // Full-F16 artifacts, norms, and 1D tensors use raw half precision.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
-            let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
-            (f16_bytes, QuantType::F16, 0u32, "F16")
-        } else if kmap_level == QuantLevel::Q8 || is_embed {
-            // K-map Q8 or embedding
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
-            let q = quantize_q8f16(&f32_data);
-            quant_params += n_elements as u64;
-            (q, QuantType::Q8F16, 32u32, "Q8_F16")
-        } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
-            // K-map promote to 6-bit
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
-            quant_params += n_elements as u64;
-            match format {
-                GgufFormat::Mq4
-                | GgufFormat::Mq3
-                | GgufFormat::Mq2
-                | GgufFormat::Mq2Lloyd
-                | GgufFormat::Mq3Lloyd
-                | GgufFormat::Mq6 => {
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                }
-                GgufFormat::Hfq4 | GgufFormat::Hfq6 => {
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-                GgufFormat::Hfp4 => {
-                    // No HFP6 variant in v1. Promote6 for HFP4 stays at HFP4G32 (4.25 bpw).
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
-                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                }
-                GgufFormat::Mfp4 => {
-                    // No MFP6 variant. Promote6 for MFP4 stays at MFP4G32 (4.25 bpw).
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
-                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                }
-                GgufFormat::Mq4Lloyd => {
-                    // Promote6 -> MQ6, consistent with default_promote_target
-                    // (Mq4Lloyd -> Mq6) and the Lloyd siblings above.
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                }
-                GgufFormat::F16 | GgufFormat::Bf16 => {
-                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
-                    (f16_bytes, QuantType::F16, 0u32, "F16")
-                }
-            }
-        } else if let (QuantLevel::Override(override_fmt), true) = (kmap_level, k_dim % 256 == 0) {
-            // K-map says override (lm_head when --lm-head-format set).
-            // GGUF pipeline has no AWQ wiring (AWQ is safetensors-only today),
-            // so this is a plain quantize on the carried target format.
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
-            quant_params += n_elements as u64;
-            match override_fmt {
-                GgufFormat::Mq6 => {
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                }
-                GgufFormat::Hfq6 => {
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-                GgufFormat::Mq4 => {
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                }
-                GgufFormat::Hfq4 => {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                }
-                GgufFormat::Mq3 => {
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                }
-                GgufFormat::Mq2 => {
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                }
-                GgufFormat::Mq2Lloyd => {
-                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                }
-                GgufFormat::Mq3Lloyd => {
-                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                }
-                GgufFormat::Mq4Lloyd => {
-                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                }
-                GgufFormat::Hfp4 => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
-                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                }
-                GgufFormat::Mfp4 => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                }
-                GgufFormat::F16 | GgufFormat::Bf16 => {
-                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
-                    (f16_bytes, QuantType::F16, 0u32, "F16")
-                }
-            }
-        } else if k_dim % 256 == 0 {
-            // 256-aligned 2D weight — quantize per the chosen format (Base level).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
-            quant_params += n_elements as u64;
-            match format {
-                GgufFormat::Hfq4 => {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                }
-                GgufFormat::Hfq6 => {
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-                GgufFormat::Mq4 => {
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                }
-                GgufFormat::Mq6 => {
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                }
-                GgufFormat::Mq3 => {
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                }
-                GgufFormat::Mq2 => {
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                }
-                GgufFormat::Mq2Lloyd => {
-                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                }
-                GgufFormat::Mq3Lloyd => {
-                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                }
-                GgufFormat::Mq4Lloyd => {
-                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                }
-                GgufFormat::Hfp4 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
-                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                }
-                GgufFormat::Mfp4 => {
-                    let m = info.shape[0] as usize;
-                    let k = info.shape[1] as usize;
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
-                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                }
-                GgufFormat::F16 | GgufFormat::Bf16 => {
-                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
-                    (f16_bytes, QuantType::F16, 0u32, "F16")
-                }
-            }
-        } else {
-            // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
-            // This branch fires for the rare ragged dim; ignores --format
-            // (no G128 variant of mq4/mq6 exists).
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
-            let q = quantize_hfq4g128(&f32_data);
-            quant_params += n_elements as u64;
-            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-        };
-
-        total_bytes_out += data.len() as u64;
-        eprintln!(
-            "  {label:>9}: {} → {} {:?} ({} src={:?}, {:.1} KB → {:.1} KB)",
-            info.name,
-            out_name,
-            info.shape,
-            n_elements,
-            info.dtype,
-            raw.len() as f64 / 1024.0,
-            data.len() as f64 / 1024.0,
-        );
-
-        hfq_tensors.push(HfqTensor {
-            name: out_name,
-            quant_type,
-            shape,
-            group_size,
-            data,
-            spilled_len: 0,
-        });
-    }
-
-    eprintln!("\n=== GGUF → MQ4 Summary ===");
-    eprintln!("  Tensors:        {}", hfq_tensors.len());
-    eprintln!("  Total params:   {total_params}");
-    eprintln!(
-        "  Quant'd params: {quant_params} ({:.1}%)",
-        100.0 * quant_params as f64 / total_params as f64
-    );
-    eprintln!("  Input size:     {:.1} MB", total_bytes_in as f64 / 1e6);
-    eprintln!(
-        "  Output size:    {:.1} MB ({:.1}% of input)",
-        total_bytes_out as f64 / 1e6,
-        100.0 * total_bytes_out as f64 / total_bytes_in as f64,
-    );
-
-    insert_parameter_counts_metadata(&mut metadata, &hfq_tensors, total_params, quant_params, 0);
-    let metadata_json = metadata_with_quantization_hash(metadata, &hfq_tensors, None)?;
-    write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
-    eprintln!("\nWrote: {}", output.display());
-    Ok(())
-}
 
 /// Full `--help` / `-h` text. Printed to stdout; exits 0 from `main`.
 fn print_help() {
@@ -5213,7 +4461,7 @@ INPUT SOURCES (--input):
     <file.hfq>    an existing .hfq (e.g. a bf16 .hfq) for requantization.
                   The .hfq-source path supports --format
                   bf16 / fp16 / q8f16 / hfq4 / hfq6 / mq4 / mq6 / mq3 / qtip3 /
-                  oq4 (opus; legacy op4 aliases) / oq4+ / oq8 (opus8) / oq8+.
+                  qtip4 / oq4 (opus; legacy op4 aliases) / oq4+ / oq8 (opus8) / oq8+.
                   Other formats (roughquant, lloyd-*, mfp4, …) require a HF/GGUF source.
 
 REQUIRED:
@@ -5237,7 +4485,7 @@ FORMAT (--format <FMT>):
     Legacy Opus-A8     opplus / op4-plus — older W4A8 experimental tag
                        (qt=33), distinct from oq4+.
     MoE / routed       mq4-mq6exp · mq4-routed-lloyd-mq-tiered (needs --imatrix) · antirez-mq · …
-    Research (gated)   mq2 · lloyd-mq2 · lloyd-mq3 · lloyd-mq4 · qtip3 · qtip3-sim ·
+    Research (gated)   mq2 · lloyd-mq2 · lloyd-mq3 · lloyd-mq4 · qtip3 · qtip3-sim · qtip4 ·
                        roughquant (rq) · roughquant{{2,3,4}}-sim · permute5 (rq5)
                        Sub-4-bit and Lloyd formats refuse to run without the matching
                        --allow-* flag / HIPFIRE_ALLOW_* env (see "Research opt-in" below).
@@ -5252,6 +4500,8 @@ OPTIONS:
                                with --awq (smooths activations + rebases the Hessian)
     --chat-template-file <P>   override the embedded chat template (Jinja file)
     --threads <N>              rayon worker threads (default 80% of cores; env HIPFIRE_QUANT_THREADS)
+    --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
+                               much faster encode on big models, slight quality loss (env HIPFIRE_QTIP_BEAM)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
 
   MoE / K-map:
@@ -5347,6 +4597,44 @@ fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
     };
     let hgt = load_h(hg_train)?;
     let hpt = load_h(hp_train)?;
+
+    // Diagnostic: how much did the Fisher weighting actually perturb the Hessian?
+    // Both train Hessians are over the SAME tokens, so diag(Hg)/diag(Hp) per input
+    // channel c = (Σ_n w_n x_n[c]²)/(Σ_n x_n[c]²) is the effective per-channel
+    // weight. A tight ratio (CV≈0) means w is near-uniform ⇒ g=1 is a no-op, not
+    // a "hurt". `‖Hg-Hp‖/‖Hp‖` is the overall relative perturbation.
+    {
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for idx in 0..k * k {
+            let d = (hgt[idx] - hpt[idx]) as f64;
+            num += d * d;
+            den += (hpt[idx] as f64).powi(2);
+        }
+        let (mut rmin, mut rmax, mut rsum, mut rsum2, mut nr) =
+            (f64::MAX, 0.0f64, 0.0f64, 0.0f64, 0usize);
+        for c in 0..k {
+            let dp = hpt[c * k + c] as f64;
+            if dp > 0.0 {
+                let r = hgt[c * k + c] as f64 / dp;
+                rmin = rmin.min(r);
+                rmax = rmax.max(r);
+                rsum += r;
+                rsum2 += r * r;
+                nr += 1;
+            }
+        }
+        let rmean = rsum / nr.max(1) as f64;
+        let rstd = (rsum2 / nr.max(1) as f64 - rmean * rmean).max(0.0).sqrt();
+        eprintln!(
+            "diag: ‖Hg-Hp‖/‖Hp‖ = {:.4}  |  diag(Hg)/diag(Hp): mean {:.3} std {:.3} CV {:.3} range [{:.3}, {:.3}]",
+            (num / den).sqrt(),
+            rmean,
+            rstd,
+            rstd / rmean.max(1e-9),
+            rmin,
+            rmax
+        );
+    }
 
     // LDLQ-quantize with each training Hessian (damp = 1% of mean diagonal).
     let cb = qtip::build_codebook();
@@ -5534,7 +4822,7 @@ fn main() {
     let mq_plus = format_storage.ends_with('+') && !oq_plus_recipe && !is_legacy_opus_plus;
     if mq_plus {
         format_storage.pop();
-        let _ = MQ_CLIPSEARCH.set(true);
+        set_mq_clipsearch(true);
         eprintln!("mq+ modifier: clip-search enabled; AWQ auto-on (needs --hessian/--imatrix)");
     }
     let format = format_storage.as_str();
@@ -5657,10 +4945,13 @@ fn main() {
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
     let use_qtip3_real = format == "qtip3";
+    let use_qtip4_real = format == "qtip4";
     let qtip_bits: u32 = if let Some(b) = qtip_sim_bits {
         b
     } else if use_qtip3_real {
         3
+    } else if use_qtip4_real {
+        4
     } else {
         2
     };
@@ -5670,6 +4961,7 @@ fn main() {
         || format == "bfloat16"
         || use_qtip_sim
         || use_qtip3_real
+        || use_qtip4_real
         || use_roughquant_sim
         || use_roughquant2_sim
         || use_roughquant3_sim
@@ -5679,16 +4971,18 @@ fn main() {
     let use_source_precision = use_fp16 || use_bf16;
     let (qtip_cb, qtip_s1, qtip_s2) = if use_qtip_sim
         || use_qtip3_real
+        || use_qtip4_real
         || use_roughquant2_sim
         || use_roughquant3_sim
         || use_roughquant4_sim
         || use_roughquant_real
         || use_roughquant5
     {
-        if use_qtip3_real {
+        if use_qtip3_real || use_qtip4_real {
+            let bpg = if use_qtip4_real { 132 } else { 100 };
             eprintln!(
-                "qtip3 (real): packing 2D weights as Qtip3G256 \
-                 (FWHT-rotated bitshift trellis beam=128, 100 B/group → gemv_qtip3g256)"
+                "qtip{qtip_bits} (real): packing 2D weights as Qtip{qtip_bits}G256 \
+                 (FWHT-rotated bitshift trellis beam=128, {bpg} B/group)"
             );
         } else {
             eprintln!(
@@ -5697,9 +4991,9 @@ fn main() {
             );
         }
         // HIPFIRE_QTIP_CODEBOOK=3inst selects the QTIP 3INST computed codebook
-        // (closer-to-Gaussian than 1MAD) for the SIM paths only — the real qtip3
+        // (closer-to-Gaussian than 1MAD) for the SIM paths only — the real qtip
         // kernel computes 1MAD on-device, so its codebook must stay 1MAD.
-        let cb = if !use_qtip3_real
+        let cb = if !(use_qtip3_real || use_qtip4_real)
             && std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst")
         {
             eprintln!("qtip: using 3INST computed codebook (sim)");
@@ -6271,6 +5565,23 @@ fn main() {
             frac * 100.0
         );
     }
+
+    // `--beam N` sets the QTIP trellis beam-search width (default 128, near-
+    // Viterbi). Smaller = much faster offline encode on big models, slightly
+    // lower quality. Bridged through HIPFIRE_QTIP_BEAM so both the .hfq-requant
+    // and direct-source pack paths (`qtip_beam_width`) read one value.
+    if let Some(i) = args.iter().position(|a| a == "--beam") {
+        if let Some(b) = args
+            .get(i + 1)
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&b| b > 0)
+        {
+            std::env::set_var("HIPFIRE_QTIP_BEAM", b.to_string());
+            eprintln!("QTIP trellis beam width: {b} (--beam)");
+        } else {
+            eprintln!("--beam requires a positive integer; ignoring");
+        }
+    }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
     // short context, win at long context — see benchmarks/results/
@@ -6426,27 +5737,24 @@ fn main() {
             return;
         }
         if is_gguf_input(raw_input) {
-            let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
-                eprintln!(
-                    "GGUF input: --format '{format}' not recognized. \
-                     Supported: bf16, fp16, hfq4, hfq6, mq4, mq6, mq3, mq2, lloyd-mq*, hfp4, mfp4."
-                );
-                std::process::exit(2);
-            });
-            let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(
-                raw_input,
-                out,
-                gguf_format,
-                format,
-                no_kmap,
-                kmap_dense,
-                kmap_mode,
-            ) {
-                eprintln!("GGUF pipeline failed: {e}");
-                std::process::exit(2);
-            }
-            return;
+            // GGUF import moved out of the inference-adjacent quantize binary.
+            // It is format-conversion tooling and now lives in
+            // hipfire-coexistence (AGENTS.md). The re-quant pipeline itself
+            // still lives in this crate's library (gguf_import), which
+            // coexistence drives; the binary only redirects.
+            eprintln!(
+                "error: GGUF import has moved out of hipfire-quantize.\n\
+                 \n\
+                 Convert with the offline coexistence tool instead:\n\
+                 \n    hipfire-coexistence import gguf --in {input} --out {output} --format {format}\n\
+                 \n\
+                 (GGUF is a format-conversion concern and lives in \
+                 hipfire-coexistence per AGENTS.md; the quantize binary no \
+                 longer parses .gguf.)",
+                input = raw_input.display(),
+                output = output_path,
+            );
+            std::process::exit(2);
         }
     }
 
@@ -6796,6 +6104,32 @@ fn main() {
         all_tensors.len(),
         fp8_scale_for.len()
     );
+
+    // ── SpinQuant R1 deploy pre-pass (`--rotate <M.r1>`) ─────────────────────
+    // Fold RMSNorm scales into readers and rotate residual readers/writers by
+    // FᵀM so the codec FWHT leaves the int4 grid in the learned M. Dense-llama
+    // only. Installs the rotated overrides globally (consumed transparently by
+    // every codec branch) and holds the synthesized untied lm_head for emission
+    // after the main tensor loop.
+    let mut rotate_lm_head: Option<Vec<f32>> = None;
+    if let Some(rotate_path) = arg_value(&args, "--rotate") {
+        if arch_id != 0 && arch_id != 1 {
+            eprintln!("error: --rotate is dense-llama only (arch_id 0/1); got arch_id {arch_id}");
+            std::process::exit(2);
+        }
+        match build_rotation_overrides(rotate_path, &config, n_layers, &st_files, &fp8_scale_for) {
+            Ok((overrides, lm_head)) => {
+                ROTATION_OVERRIDE
+                    .set(overrides)
+                    .expect("ROTATION_OVERRIDE set once");
+                rotate_lm_head = lm_head;
+            }
+            Err(e) => {
+                eprintln!("error: --rotate: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // ── K-map pre-pass ──────────────────────────────────────────────────────
     // Build per-tensor quant level map. Gated to MoE models by default
@@ -8515,7 +7849,16 @@ fn main() {
                     } else if use_q4k_q8embed {
                         name.contains("embed") || name.contains("lm_head") // only embed/output Q8
                     } else if use_mixed || use_fast {
-                        is_q8_tensor(name)
+                        // Arches migrated onto the capability layer (e.g. llama)
+                        // decide high-precision-vs-compressed from their declared
+                        // Ingest quant-policy; unmigrated arches keep is_q8_tensor.
+                        let k = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        high_precision_via_ingest(arch_id, name, k)
+                            .unwrap_or_else(|| is_q8_tensor(name))
                     } else {
                         use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
                     };
@@ -9380,6 +8723,36 @@ fn main() {
                 data,
                 spilled_len: 0,
             });
+        } else if let Some(rot) = ROTATION_OVERRIDE.get().and_then(|m| m.get(*name)) {
+            // --rotate: a non-quantized tensor with a fold+rotate override — most
+            // importantly an RMSNorm folded to ones. The raw source bytes are the
+            // PRE-fold gamma, which the folded readers already absorbed; storing raw
+            // here (as the sibling arm does) would re-apply gamma at runtime (gamma²
+            // → garbage). Encode the OVERRIDE at the source container width instead.
+            let (data, qt, label): (Vec<u8>, QuantType, &str) = match meta.dtype.as_str() {
+                "F32" => (
+                    rot.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+                    QuantType::F32,
+                    "F32",
+                ),
+                "F16" => (f32_slice_to_f16_bytes(rot), QuantType::F16, "F16"),
+                _ => (f32_slice_to_bf16_bytes(rot), QuantType::BF16, "BF16"),
+            };
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!(
+                "  {label:<10} {} {:?} ({} elements) [--rotate override]",
+                name, meta.shape, n_elements
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: qt,
+                shape,
+                group_size: 0,
+                data,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
         } else {
             // Preserve source precision for non-quantized tensors (norms,
             // biases, DeltaNet scalars, etc.). BF16 and F16 have the same byte
@@ -9412,6 +8785,34 @@ fn main() {
         // Release source file page cache after each tensor to prevent
         // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
+    }
+
+    // Emit the synthesized untied lm_head (`--rotate`). Stored F16 [vocab, h]: the
+    // output head is not on the int4 GEMM hot path, and F16 avoids replicating a
+    // per-format weight-codec branch. The runtime prefers an explicit lm_head.weight
+    // over the tied embedding (see hfq.rs loader), so this deploys the rotated head.
+    if let Some(lm) = rotate_lm_head.take() {
+        let h = config
+            .get("hidden_size")
+            .and_then(|v| v.as_u64())
+            .expect("hidden_size (validated in --rotate pre-pass)") as usize;
+        let vocab = lm.len() / h;
+        let bytes = f32_slice_to_f16_bytes(&lm);
+        eprintln!(
+            "  {:>8}: lm_head.weight [{vocab}, {h}] (untied R1 head, F16, {:.1} KB) [--rotate]",
+            "F16-R1",
+            bytes.len() as f64 / 1024.0
+        );
+        total_params += lm.len() as u64;
+        quantized_params += lm.len() as u64;
+        hfq_tensors.push(HfqTensor {
+            name: "lm_head.weight".to_string(),
+            quant_type: QuantType::F16,
+            shape: vec![vocab as u32, h as u32],
+            group_size: 0,
+            data: bytes,
+            spilled_len: 0,
+        });
     }
 
     // Summary
@@ -10677,8 +10078,8 @@ fn main() {
     // weights are stored in the FWHT-rotated frame (NO inverse rotation); the
     // runtime FWHT-rotates x. A self-check re-decodes and reports max abs error
     // vs the effective sim weight so the producer is verified offline.
-    if use_qtip3_real {
-        pack_qtip3_real_tensors(
+    if use_qtip3_real || use_qtip4_real {
+        pack_qtip_real_tensors(
             &mut hfq_tensors,
             &qtip_cb,
             &qtip_s1,
@@ -10687,6 +10088,8 @@ fn main() {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            qtip_bits,
+            qtip_beam_width(),
         );
     }
 
@@ -13246,6 +12649,59 @@ mod tests {
     }
 
     #[test]
+    fn caps_ingest_drives_high_precision_and_falls_back_otherwise() {
+        // llama (arch_id 0) is migrated onto the capability layer: its Ingest keeps
+        // the protected set (embed/lm_head/attn) high-precision and compresses the
+        // MLP bulk — DERIVED from importance/requirements, no is_q8_tensor matching.
+        assert_eq!(
+            high_precision_via_ingest(0, "model.embed_tokens.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            high_precision_via_ingest(0, "model.layers.0.self_attn.q_proj.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            high_precision_via_ingest(0, "lm_head.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            high_precision_via_ingest(0, "model.layers.0.mlp.up_proj.weight", 4096),
+            Some(false)
+        );
+        // Non-256-aligned inner dim → the grouped compressed codec is filtered out,
+        // reproducing the legacy "non-256 → Q8 fallback".
+        assert_eq!(
+            high_precision_via_ingest(0, "model.layers.0.mlp.up_proj.weight", 300),
+            Some(true)
+        );
+        // gemma3 (12) resolves through the same registry — no per-arch quantizer code.
+        assert_eq!(
+            high_precision_via_ingest(12, "model.embed_tokens.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            high_precision_via_ingest(12, "model.layers.0.mlp.up_proj.weight", 4096),
+            Some(false)
+        );
+        // Every family is migrated now: e.g. deepseek4 (9) protects its MLA
+        // compressor (the old is_deepseek4_keep_f16), and a MoE expert (11) compresses.
+        assert_eq!(
+            high_precision_via_ingest(9, "model.layers.0.self_attn.compressor.wkv.weight", 4096),
+            Some(true)
+        );
+        assert_eq!(
+            high_precision_via_ingest(11, "model.layers.0.mlp.experts.2.up_proj.weight", 4096),
+            Some(false)
+        );
+        // A genuinely unregistered arch id → None → caller uses is_q8_tensor.
+        assert_eq!(
+            high_precision_via_ingest(200, "whatever.weight", 4096),
+            None
+        );
+    }
+
+    #[test]
     fn kmap_moe_router_q8() {
         assert_eq!(
             kmap_resolve("model.language_model.layers.5.mlp.gate.weight", 64, true),
@@ -13604,6 +13060,10 @@ mod tests {
 #[cfg(test)]
 mod codec_golden {
     use super::*;
+    // oq3/oq6 live in the `codecs` library module; the parent's private
+    // `use codecs::*` glob isn't re-exported through `use super::*`, so import
+    // the ones this battery characterizes explicitly.
+    use crate::codecs::{dequant_oq3g256, dequant_oq6g256, quantize_oq3g256, quantize_oq6g256};
 
     /// Deterministic f32 stream with a few outliers (LCG; no rng dep).
     fn det_input(n: usize, seed: u32) -> Vec<f32> {
@@ -13657,6 +13117,8 @@ mod codec_golden {
             &quantize_mq8g256_clipsearch(&x, &s1, &s2),
         );
         h("oq4g256", &quantize_oq4g256(&x, &s1, &s2));
+        h("oq3g256", &quantize_oq3g256(&x, &s1, &s2));
+        h("oq6g256", &quantize_oq6g256(&x, &s1, &s2));
         h("mq6g256", &quantize_mq6g256(&x, &s1, &s2));
         h("mq8g256", &quantize_mq8g256(&x, &s1, &s2));
         h("mq3g256", &quantize_mq3g256(&x, &s1, &s2));
@@ -13696,12 +13158,14 @@ mod codec_golden {
         ("q8f16", "43be8c0f93de9cb3"),
         ("q8hfq", "29ca0c52ad9b58dc"),
         ("mq4g256", "6e9d532bbe5d38eb"),
-        ("mq4g256_clipsearch", "7978e3644f11ed99"),
-        ("mq6g256_clipsearch", "f906f337b9bd4df7"),
-        ("mq3g256_clipsearch", "a57eada9ebb78586"),
+        ("mq4g256_clipsearch", "1385e9164d582b48"),
+        ("mq6g256_clipsearch", "2f1924bde478e0de"),
+        ("mq3g256_clipsearch", "0a284feb706411ab"),
         ("mq2g256_clipsearch", "a95cdd8e7672e915"),
         ("mq8g256_clipsearch", "8987f0aa7fdfb487"),
         ("oq4g256", "fceec61d1cb735b3"),
+        ("oq3g256", "2e40f019fba65028"),
+        ("oq6g256", "694673ac9a654c7d"),
         ("mq6g256", "c43cbf518aae87fe"),
         ("mq8g256", "8987f0aa7fdfb487"),
         ("mq3g256", "0c2f928a4236cf57"),
@@ -13801,6 +13265,72 @@ mod codec_golden {
         eprintln!("mq4 SQNR={m:.2} dB  oq4 SQNR={o:.2} dB");
         assert!(o > 8.0, "oq4 SQNR {o:.2} dB too low (broken codec?)");
         assert!(o > m - 3.0, "oq4 {o:.2} dB >3 dB worse than mq4 {m:.2} dB");
+    }
+
+    /// Opus OQ3 (symmetric signed-int3, bit-plane) must round-trip coherently on
+    /// FWHT-rotated weights: well below Oq4 (one fewer bit ≈ −6 dB) but far above
+    /// noise, proving the bit-plane pack + 3-bit two's-complement sext are correct.
+    #[test]
+    fn oq3_roundtrip_below_oq4_above_noise() {
+        let x = det_input(1024, 5);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq3 = dequant_oq3g256(&quantize_oq3g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let sqnr = |rec: &[f32]| -> f64 {
+            let (mut sig, mut noise) = (0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(rec) {
+                sig += (a as f64).powi(2);
+                noise += ((a - b) as f64).powi(2);
+            }
+            10.0 * (sig / noise.max(1e-30)).log10()
+        };
+        let (o3, o4) = (sqnr(&oq3), sqnr(&oq4));
+        eprintln!(
+            "oq3 SQNR={o3:.2} dB  oq4 SQNR={o4:.2} dB  ({:.1} dB)",
+            o3 - o4
+        );
+        assert!(
+            o3 > 4.0,
+            "oq3 SQNR {o3:.2} dB too low (broken bit-plane/sext?)"
+        );
+        assert!(
+            o3 < o4,
+            "oq3 {o3:.2} dB should be below oq4 {o4:.2} dB (one fewer bit)"
+        );
+    }
+
+    /// Oq3 on-disk block is exactly 98 B per 256-group (3.0625 b/w): [f16][8×3 u32].
+    #[test]
+    fn oq3_block_size_is_98_bytes() {
+        let x = det_input(256, 7);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        assert_eq!(quantize_oq3g256(&x, &s1, &s2).len(), 98);
+    }
+
+    /// Opus OQ6 (symmetric signed-int6) is the near-lossless mid-tier: well above Oq4
+    /// (2 extra bits ≈ +12 dB) and below Oq8 — proves the 6-bit pack + sext6 are right.
+    #[test]
+    fn oq6_roundtrip_between_oq4_and_oq8() {
+        let x = det_input(1024, 5);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let oq4 = dequant_oq4g256(&quantize_oq4g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq6 = dequant_oq6g256(&quantize_oq6g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let oq8 = dequant_oq8g256(&quantize_oq8g256(&x, &s1, &s2), x.len(), &s1, &s2);
+        let sqnr = |rec: &[f32]| -> f64 {
+            let (mut sig, mut noise) = (0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(rec) {
+                sig += (a as f64).powi(2);
+                noise += ((a - b) as f64).powi(2);
+            }
+            10.0 * (sig / noise.max(1e-30)).log10()
+        };
+        let (o4, o6, o8) = (sqnr(&oq4), sqnr(&oq6), sqnr(&oq8));
+        eprintln!("oq4 SQNR={o4:.2}  oq6={o6:.2}  oq8={o8:.2} dB");
+        assert!(o6 > o4 + 6.0, "oq6 {o6:.2} dB not >6 dB over oq4 {o4:.2}");
+        assert!(o6 < o8, "oq6 {o6:.2} dB should be below oq8 {o8:.2}");
     }
 
     /// W8A8 weight codec (Oq8G256) is near-lossless and far better than the W4A4

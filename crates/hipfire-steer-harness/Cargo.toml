@@ -23,6 +23,6 @@ hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }
 hip-bridge = { path = "../hip-bridge" }
-anyhow = "1"
+anyhow.workspace = true
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros", "process", "time"] }

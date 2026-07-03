@@ -6,5 +6,5 @@ license.workspace = true
 description = "Pure, GPU-independent KLD scoring core — fp64 log-softmax/top-k reduction, KLD-vs-reference math, reference-block + HFKSEQ formats, and the single KldConfig env contract. Shared by the daemon kld_eval op and any thin client so reference build and candidate scoring cannot drift."
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = "1"

@@ -9,8 +9,8 @@
 //! and optional HIP copy bandwidth when a GPU is available.
 
 use hip_bridge::HipRuntime;
-use hipfire_eval::collect_default_host_profile;
 use hipfire_evidence::HostProfile;
+use hipfire_sysinfo::collect_default_host_profile;
 use rdna_compute::KernelCompiler;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;

@@ -173,6 +173,15 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Username for the /admin console login. The password is set separately with `hipfire admin set-password` (argon2id hash stored in ~/.hipfire/admin.passwd, never in config)."
     ),
     field!(
+        "sdapi_output_root",
+        ConfigType::String,
+        Requirement::Optional,
+        Some("/tmp/hipfire-sdapi"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Root directory for images saved by the SD API compatibility routes (save_images: true). Client-supplied outdir_* override_settings are ignored; every SD API image write stays under this root."
+    ),
+    field!(
         "default_model",
         ConfigType::String,
         Requirement::Optional,

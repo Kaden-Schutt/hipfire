@@ -15,6 +15,30 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Build a `[KernArg; N]` argument list for [`Gpu::launch_kernargs`] with one
+/// entry per kernel parameter, tagged by ABI kind so the packed blob and the
+/// pointer array are always derived from the same declaration (review
+/// 2026-07-03 §3.1). Defined before the op-family submodules so they see it.
+///
+/// ```ignore
+/// self.launch_kernargs(name, grid, block, smem,
+///     &kernargs![ptr x_ptr, ptr w_ptr, ptr out_ptr, i32 n_val, f32 eps_val])?;
+/// ```
+///
+/// Tags: `ptr` (any `*const`/`*mut _`), `i32`, `u32`, `f32`, `u64`.
+macro_rules! kernargs {
+    (@one ptr $v:expr) => {
+        hip_bridge::KernArg::Ptr($v as *const ::std::ffi::c_void)
+    };
+    (@one i32 $v:expr) => { hip_bridge::KernArg::I32($v) };
+    (@one u32 $v:expr) => { hip_bridge::KernArg::U32($v) };
+    (@one f32 $v:expr) => { hip_bridge::KernArg::F32($v) };
+    (@one u64 $v:expr) => { hip_bridge::KernArg::U64($v) };
+    ($($kind:ident $v:expr),* $(,)?) => {
+        [ $( kernargs!(@one $kind $v) ),* ]
+    };
+}
+
 // Op-family submodules split out of this file (dispatch-refactor Phase 1). Each
 // is a child `impl Gpu` block; as a descendant of `dispatch` it reaches Gpu's
 // module-private fields without any visibility change.
@@ -332,6 +356,9 @@ pub enum DType {
     Qtip3G256, // QTIP-3: FWHT-rotated trellis-coded 3-bit (100 bytes/group: f32 scale + 96 B
     // packed symbols). Decoded by gemv_qtip3g256 (computed 1MAD codebook, zero LDS); runtime
     // FWHT-rotates x like MQ3/MQ4. See kernels/src/gemv_qtip3g256.hip / qtip.rs.
+    Qtip4G256, // QTIP-4: FWHT-rotated trellis-coded 4-bit (132 bytes/group: f32 scale + 128 B
+    // nibble-packed symbols). Same 1MAD codebook/12-bit trellis as Qtip3G256, decoded by
+    // gemv_qtip4g256. See kernels/src/gemv_qtip4g256.hip / qtip::pack_qtip4_group.
     MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
     MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
@@ -388,6 +415,7 @@ impl DType {
             | DType::MQ8G256
             | DType::MQ3G256
             | DType::Qtip3G256
+            | DType::Qtip4G256
             | DType::MQ2G256
             | DType::MQ2G256Lloyd
             | DType::MQ3G256Lloyd
@@ -1545,6 +1573,60 @@ impl Gpu {
             unsafe {
                 self.hip
                     .launch_kernel(func, grid, block, shared_mem, stream, params)
+            }
+        }
+    }
+
+    /// Launch a kernel from a single `&[KernArg]` list, deriving BOTH launch
+    /// ABIs from it: the packed [`hip_bridge::KernargBlob`] on the graph-
+    /// capture / `force_blob_path` branch, and the `kernelParams` pointer
+    /// array on the normal branch. This replaces the `launch_maybe_blob`
+    /// pattern where each site hand-maintained two parallel argument lists
+    /// (a `Vec<*mut c_void>` and a blob-building closure) that had to agree
+    /// with each other and the kernel signature, with nothing enforcing it
+    /// (review 2026-07-03 §3.1). One list here cannot disagree with itself.
+    ///
+    /// Safety/lifetime: the `kernelParams` entries borrow into `args`, and
+    /// HIP copies the pointed-to bytes during the launch call, so `args` only
+    /// needs to outlive this call — satisfied by passing `&kernargs![...]` as
+    /// a temporary. Do not stash the derived pointers past the launch.
+    fn launch_kernargs(
+        &mut self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        args: &[hip_bridge::KernArg],
+    ) -> HipResult<()> {
+        if self.capture_mode || self.flags.force_blob_path {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for a in args {
+                blob.push_arg(a);
+            }
+            // Same tail pad as launch_maybe_blob — see its comment.
+            blob.pad_to(16);
+            self.capture_blobs.push(blob.into_vec());
+            let buf = self.capture_blobs.last_mut().unwrap();
+            let func = &self.functions[func_name];
+            let stream = self
+                .active_stream
+                .as_ref()
+                .map(|s| s as &hip_bridge::Stream);
+            unsafe {
+                self.hip
+                    .launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice())
+            }
+        } else {
+            let mut params: Vec<*mut std::ffi::c_void> =
+                args.iter().map(hip_bridge::KernArg::param_ptr).collect();
+            let func = &self.functions[func_name];
+            let stream = self
+                .active_stream
+                .as_ref()
+                .map(|s| s as &hip_bridge::Stream);
+            unsafe {
+                self.hip
+                    .launch_kernel(func, grid, block, shared_mem, stream, &mut params)
             }
         }
     }

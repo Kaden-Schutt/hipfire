@@ -5,7 +5,6 @@
 //! BPE tokenizer loaded from GGUF metadata.
 //! Supports encode (text → token IDs) and decode (token IDs → text).
 
-use crate::gguf::{GgufFile, MetaValue};
 use regex::Regex;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -278,106 +277,6 @@ fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], To
 }
 
 impl Tokenizer {
-    /// Load tokenizer from GGUF metadata.
-    pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
-        // Read vocabulary
-        let tokens_meta =
-            gguf.meta("tokenizer.ggml.tokens")
-                .ok_or(TokenizerError::MetadataMissing {
-                    field: "tokenizer.ggml.tokens",
-                })?;
-        let vocab: Vec<String> = match tokens_meta {
-            MetaValue::Array(arr) => arr
-                .iter()
-                .map(|v| match v {
-                    MetaValue::String(s) => s.clone(),
-                    _ => String::new(),
-                })
-                .collect(),
-            _ => {
-                return Err(TokenizerError::MetadataMissing {
-                    field: "tokenizer.ggml.tokens",
-                })
-            }
-        };
-
-        let mut token_to_id = HashMap::with_capacity(vocab.len());
-        for (i, tok) in vocab.iter().enumerate() {
-            token_to_id.insert(tok.clone(), i as u32);
-        }
-
-        // Read merge rules (raw string pairs; resolved to ids below).
-        let merges_strings: Vec<(String, String)> =
-            if let Some(MetaValue::Array(arr)) = gguf.meta("tokenizer.ggml.merges") {
-                arr.iter()
-                    .filter_map(|v| {
-                        if let MetaValue::String(s) = v {
-                            let parts: Vec<&str> = s.splitn(2, ' ').collect();
-                            if parts.len() == 2 {
-                                Some((parts[0].to_string(), parts[1].to_string()))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
-        let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
-        let endoftext = token_to_id.get("<|endoftext|>").copied();
-        let im_end = token_to_id.get("<|im_end|>").copied();
-        let eot_id = match (endoftext, im_end) {
-            (Some(et), Some(ie)) if et != eos_id && ie == eos_id => Some(et),
-            (Some(et), _) if et != eos_id => Some(et),
-            _ => None,
-        };
-
-        // Detect tokenizer type
-        let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
-        let is_gpt2_bpe = model_type == "gpt2";
-
-        // Build special tokens list: vocab entries matching <|...|> or </...> patterns
-        let mut special_tokens: Vec<(String, u32)> = Vec::new();
-        for (i, tok) in vocab.iter().enumerate() {
-            if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<")
-                    && tok.ends_with(">")
-                    && tok.len() > 3
-                    && !tok.contains(' '))
-            {
-                special_tokens.push((tok.clone(), i as u32));
-            }
-        }
-        // Sort longest-first for greedy matching
-        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-        // Resolve merges to token ids; reject inconsistent vocab/merges (#203).
-        let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
-        // For GPT-2 BPE, every byte 0..=255 must have a vocab entry. SP doesn't need this.
-        let byte_to_id = if is_gpt2_bpe {
-            Some(build_byte_to_id(&token_to_id)?)
-        } else {
-            None
-        };
-
-        Ok(Tokenizer {
-            vocab,
-            token_to_id,
-            merges,
-            merge_pair_rank,
-            byte_to_id,
-            special_tokens,
-            bos_id,
-            eos_id,
-            eot_id,
-            is_gpt2_bpe,
-        })
-    }
 
     /// Load tokenizer from HuggingFace tokenizer.json (embedded in HFQ metadata).
     pub fn from_hf_json(json_str: &str) -> Result<Self, TokenizerError> {

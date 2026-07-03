@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! hipfire-runtime: GGUF model loading and LLaMA inference on RDNA GPUs.
+//! hipfire-runtime: HFQ model loading and inference on RDNA GPUs.
 //!
 //! This crate is arch-agnostic. Architecture implementations live in
 //! sibling crates (`hipfire-arch-qwen35`, `hipfire-arch-qwen35-vl`,
@@ -29,7 +29,6 @@ pub mod dispatch;
 pub mod env_docs;
 pub mod eos_filter;
 pub mod ep;
-pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
 pub mod host_profile;

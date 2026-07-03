@@ -9,6 +9,6 @@ description = "Typed generation request, event, and batch-plan contracts for hip
 hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = "1"
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }

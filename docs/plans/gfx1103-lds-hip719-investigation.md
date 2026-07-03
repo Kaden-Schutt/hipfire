@@ -3602,6 +3602,25 @@ Compare pass/fail boundary for:
 - occupancy/workgroup metadata,
 - any kernel log evidence of GPUVM fault, queue fault, ring timeout, or trap.
 
+## CU Mode (`-mcumode`) — Tested, Does Not Help
+
+A/B on the promoted standalone GEMM probe (`scripts/lds_gemm_standalone_probe.hip`),
+same source built two ways on the gfx1103/780M, run `tile6 full 100 512 3072 3072 0`:
+
+| Build | Workgroup-processor mode | Result |
+|---|---|---|
+| default | WGP (`.amdhsa_workgroup_processor_mode 1`) | FAIL — `sync 17: 719` |
+| `-mcumode` | CU (`.amdhsa_workgroup_processor_mode 0`) | FAIL — `sync 19: 719` |
+
+Both failed at the same point within the documented launch-count state-sensitivity
+(17 vs 19), with the same recoverable MES-reset behavior (a follow-up `tile5` control
+passed after each arm). Confining workgroups to a single CU does **not** avoid the
+fault path. Consistent with the protection-fault hypothesis: CU mode changes LDS
+layout/timing but not the OOB/over-capacity access itself, and it *halves* per-block
+LDS (128→64 KB), so it can only hurt the LDS-heavy kernels at issue. The flag was
+confirmed to flip the mode bit (`workgroup_processor_mode 1→0`) via a standalone
+compile. Conclusion unchanged: keep the no-LDS register-tiled / wave-shuffle path.
+
 ## Working Conclusion
 
 `5546fe12`'s no-LDS register-tiled production choice is currently justified.

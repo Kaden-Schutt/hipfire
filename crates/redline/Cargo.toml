@@ -6,5 +6,5 @@ license.workspace = true
 description = "Direct-KMD GPU compute — bypass HIP, talk to amdgpu driver"
 
 [dependencies]
-libc = "0.2"
-libloading = "0.8"
+libc.workspace = true
+libloading.workspace = true

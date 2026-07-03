@@ -2443,56 +2443,12 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 /// (`DType::Oq4G256`) — only the on-disk parse differs.
 pub const OQ4_ARCH_PACKED_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256ArchPacked.code();
 
-/// Byte length of the OQ4 arch combined device layout for an `[m, k]` matrix:
-/// `[split nibbles m*(k/2)] [split f32 scales m*ng] [interleaved m*ng*132]`.
-pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
-    let ng = k / 256;
-    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
-}
-
-/// Repack canonical on-disk OQ4 (quant_type 34: `[f16 scale][128 nibbles]` per
-/// 256-group, row-contiguous) into the arch combined device layout uploaded by
-/// the loader. This is the SINGLE source of truth for that transform — both the
-/// qt=34 load path and the `oq4_repack` tool call it, so they cannot drift.
-///
-/// Output layout (`[m, k]`, `ng = k/256`):
-///   `[split nibbles m*(k/2)]` — for prefill MMQ/f16 (`sub_offset 0`)
-///   `[split f32 scales m*ng]` — prefill weight-scale region
-///   `[interleaved m*ng*132]`  — decode GEMVs: per group `[f32 scale][128 nibbles]`
-///                               contiguous → one coalesced stream (mq4-style).
-pub fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
-    const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
-    const ILB: usize = 4 + 128; // [f32 scale][128 nibbles]
-    assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let packed_bytes = m * (k / 2);
-    let scales_bytes = m * ng * 4;
-    let il_bytes = m * ng * ILB;
-    let expect = m * ng * BLOCK;
-    assert_eq!(
-        data.len(),
-        expect,
-        "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
-        data.len()
-    );
-    let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
-    let il_base = packed_bytes + scales_bytes;
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let dst = r * (k / 2) + g * (GROUP / 2);
-            combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-            let so = packed_bytes + (r * ng + g) * 4;
-            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-            let io = il_base + (r * ng + g) * ILB;
-            combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
-            combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
-        }
-    }
-    combined
-}
+// The OQ4 arch-combined repack is the SINGLE source of truth in
+// `hipfire_runtime::hfq` (the qt=34 llama/nemotron/qwen35 loaders and the
+// `oq4_repack` tool all call it). Re-exported here to preserve the historical
+// `hipfire_arch_qwen35::qwen35::{oq4_pack_arch_combined, oq4_arch_combined_len}`
+// path (e.g. the oq4_repack example) without keeping a second copy.
+pub use hipfire_runtime::hfq::{oq4_arch_combined_len, oq4_pack_arch_combined};
 
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
 /// in `hipfire-arch-qwen2::qwen2::load_weight_tensor` inlines a subset
@@ -3722,7 +3678,7 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
 
     let f32_data: Vec<f32> = match info.quant_type {
         1 | 2 | 16 => hfq_plain_tensor_as_f32(info, &data, name),
-        3 => hipfire_runtime::quant::dequantize_q8_0(&data, n),
+        3 => hipfire_runtime::quant::dequant_q8f16(&data, n),
         14 => {
             // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
             let group_size: usize = 256;
@@ -4417,7 +4373,10 @@ fn load_gpu_slabs(hfq: &HfqFile, gpu: &mut Gpu) -> HipResult<SlabTensorIndex> {
             .iter()
             .map(|b| {
                 let start = align_down(b.offset, GPU_SLAB_ALIGN);
-                let end = align_up((b.offset + b.len).min(file_len), GPU_SLAB_ALIGN).min(file_len);
+                // NB: do NOT clamp the aligned end back to file_len — O_DIRECT
+                // requires a block-aligned length, and read_direct_allow_eof
+                // absorbs the short read when the last block extends past EOF.
+                let end = align_up((b.offset + b.len).min(file_len), GPU_SLAB_ALIGN);
                 end - start
             })
             .max()
@@ -4432,8 +4391,11 @@ fn load_gpu_slabs(hfq: &HfqFile, gpu: &mut Gpu) -> HipResult<SlabTensorIndex> {
         let t_load = std::time::Instant::now();
         for (bank_idx, bank) in banks.iter().enumerate() {
             let aligned_start = align_down(bank.offset, GPU_SLAB_ALIGN);
-            let aligned_end =
-                align_up((bank.offset + bank.len).min(file_len), GPU_SLAB_ALIGN).min(file_len);
+            // Aligned length must stay a GPU_SLAB_ALIGN multiple for O_DIRECT;
+            // clamping the end to the (unaligned) file_len is what produced the
+            // EINVAL "Invalid argument" on files whose size isn't 4K-aligned.
+            // The tail block reads short at EOF via read_direct_allow_eof.
+            let aligned_end = align_up((bank.offset + bank.len).min(file_len), GPU_SLAB_ALIGN);
             let aligned_len = aligned_end - aligned_start;
             let rel = bank.offset - aligned_start;
             let t_read = std::time::Instant::now();

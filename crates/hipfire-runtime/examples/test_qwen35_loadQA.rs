@@ -4,7 +4,6 @@
 
 //! QA mirror for Qwen3.5 HFQ loading and config validation.
 
-use hipfire_runtime::gguf::GgufFile;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::any::Any;
@@ -12,7 +11,6 @@ use std::path::Path;
 use std::process::ExitCode;
 
 const SKIP_EXIT: u8 = 10;
-const QWEN_GGUF_FALLBACK: &str = "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -153,19 +151,11 @@ fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), Outcome> {
         return Ok((tokenizer, "hfq-metadata".to_string()));
     }
 
-    let fallback = Path::new(QWEN_GGUF_FALLBACK);
-    if !fallback.exists() {
-        return Err(Outcome::Skip(format!(
-            "tokenizer metadata missing and fallback GGUF not found at {}",
-            fallback.display()
-        )));
-    }
-
-    let gguf = GgufFile::open(fallback)
-        .map_err(|e| Outcome::Skip(format!("failed to open fallback GGUF tokenizer: {e}")))?;
-    let tokenizer = Tokenizer::from_gguf(&gguf)
-        .map_err(|e| Outcome::Skip(format!("failed to parse fallback GGUF tokenizer: {e}")))?;
-    Ok((tokenizer, format!("gguf:{}", fallback.display())))
+    // The GGUF tokenizer fallback was removed — GGUF is import-only, in
+    // hipfire-coexistence. A valid HFQ must carry its own tokenizer metadata.
+    Err(Outcome::Skip(
+        "tokenizer metadata missing from HFQ (GGUF fallback removed)".to_string(),
+    ))
 }
 
 fn panic_message(payload: Box<dyn Any + Send>) -> String {

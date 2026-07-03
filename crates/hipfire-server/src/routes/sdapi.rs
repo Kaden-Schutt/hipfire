@@ -217,6 +217,9 @@ pub async fn post_txt2img(
     if let Err(error) = sdapi_validate_supported_scripts(&body) {
         return diffusion_error_response(error);
     }
+    if let Err(error) = sdapi_validate_request_geometry(&body) {
+        return diffusion_error_response(error);
+    }
     execute_sd_generation(state, body, None).await
 }
 
@@ -226,6 +229,9 @@ pub async fn post_img2img(
 ) -> Response {
     let body = sdapi_apply_infotext_defaults(body);
     if let Err(error) = sdapi_validate_supported_scripts(&body) {
+        return diffusion_error_response(error);
+    }
+    if let Err(error) = sdapi_validate_request_geometry(&body) {
         return diffusion_error_response(error);
     }
     let images = body.init_images.clone().filter(|images| !images.is_empty());
@@ -585,9 +591,13 @@ async fn execute_hfq_diffusion_txt2img(
         .and_then(|output| output.images.first().cloned());
     finish_sdapi_progress(&progress_state, output.as_ref().err(), current_image);
     match output {
-        Ok(output) => {
-            finalize_hfq_diffusion_response(body, output, "txt2img", original_send_images)
-        }
+        Ok(output) => finalize_hfq_diffusion_response(
+            body,
+            &state.sdapi_output_root,
+            output,
+            "txt2img",
+            original_send_images,
+        ),
         Err(error) => diffusion_error_response(error),
     }
 }
@@ -728,15 +738,20 @@ async fn execute_hfq_diffusion_img2img(
         .or(current_image);
     finish_sdapi_progress(&progress_state, output.as_ref().err(), current_image);
     match output {
-        Ok(output) => {
-            finalize_hfq_diffusion_response(body, output, "img2img", original_send_images)
-        }
+        Ok(output) => finalize_hfq_diffusion_response(
+            body,
+            &state.sdapi_output_root,
+            output,
+            "img2img",
+            original_send_images,
+        ),
         Err(error) => diffusion_error_response(error),
     }
 }
 
 fn finalize_hfq_diffusion_response(
     body: SdGenerationRequest,
+    output_root: &Path,
     mut output: hipfire_diffusion::DiffusionBatchOutput,
     mode: &str,
     original_send_images: bool,
@@ -771,7 +786,7 @@ fn finalize_hfq_diffusion_response(
     let mut sample_images_saved = false;
     let mut grid_images_saved = false;
     if sdapi_should_save_images(&body) {
-        match save_sdapi_images_with_kind(&body, mode, "sample", &output.images) {
+        match save_sdapi_images_with_kind(output_root, mode, "sample", &output.images) {
             Ok(paths) => {
                 sample_images_saved = !paths.is_empty();
                 saved_paths.extend(paths);
@@ -781,7 +796,8 @@ fn finalize_hfq_diffusion_response(
     }
     if sdapi_should_save_grid(&body, sample_count) {
         if let Some(image) = grid_image.as_ref() {
-            match save_sdapi_images_with_kind(&body, mode, "grid", std::slice::from_ref(image)) {
+            match save_sdapi_images_with_kind(output_root, mode, "grid", std::slice::from_ref(image))
+            {
                 Ok(paths) => {
                     grid_images_saved = !paths.is_empty();
                     saved_paths.extend(paths);
@@ -948,6 +964,104 @@ fn sdapi_validate_supported_scripts(body: &SdGenerationRequest) -> Result<(), Di
     Ok(())
 }
 
+/// Upper bounds for client-supplied SD API geometry.
+///
+/// Request geometry drives `batch × channels × height × width` allocations
+/// before any model-specific validation runs, so unbounded values are a
+/// remote OOM/compute-DoS vector on the network-facing routes. Caps are
+/// portability-safe for the smallest supported GPU class (UMA APUs): a
+/// request above them could not complete there anyway.
+const SDAPI_MAX_DIMENSION: u32 = 4096;
+const SDAPI_MAX_STEPS: u32 = 200;
+const SDAPI_MAX_BATCH_SIZE: u32 = 8;
+const SDAPI_MAX_N_ITER: u32 = 16;
+const SDAPI_MAX_TOTAL_BATCHES: u32 = 32;
+
+/// Boundary gate on raw client fields, called from `post_txt2img` /
+/// `post_img2img` so oversized requests get a clear 400 before any work.
+/// Highres/firstphase fields are capped here too: they become real
+/// width/height in the cloned second-pass request.
+fn sdapi_validate_request_geometry(body: &SdGenerationRequest) -> Result<(), DiffusionError> {
+    for (field, value) in [
+        ("width", body.width),
+        ("height", body.height),
+        ("firstphase_width", body.firstphase_width),
+        ("firstphase_height", body.firstphase_height),
+        ("hr_resize_x", body.hr_resize_x),
+        ("hr_resize_y", body.hr_resize_y),
+    ] {
+        if value.is_some_and(|value| value > SDAPI_MAX_DIMENSION) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "{field} {} exceeds the maximum supported dimension {SDAPI_MAX_DIMENSION}",
+                value.unwrap_or_default()
+            )));
+        }
+    }
+    // Divisibility is deliberately NOT checked here: it is model-specific
+    // (latent_shape_for_request validates against the pipeline's actual
+    // VAE scale factor) and the test fixtures prove scales below 8 exist.
+    for (field, value) in [
+        ("steps", body.steps),
+        ("hr_second_pass_steps", body.hr_second_pass_steps),
+    ] {
+        if value.is_some_and(|value| value > SDAPI_MAX_STEPS) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "{field} {} exceeds the maximum supported step count {SDAPI_MAX_STEPS}",
+                value.unwrap_or_default()
+            )));
+        }
+    }
+    let batch_size = body.batch_size.unwrap_or(1).max(1);
+    if batch_size > SDAPI_MAX_BATCH_SIZE {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batch_size {batch_size} exceeds the maximum supported batch size {SDAPI_MAX_BATCH_SIZE}"
+        )));
+    }
+    let n_iter = body.n_iter.unwrap_or(1).max(1);
+    if n_iter > SDAPI_MAX_N_ITER {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "n_iter {n_iter} exceeds the maximum supported iteration count {SDAPI_MAX_N_ITER}"
+        )));
+    }
+    // Both factors are already capped above, so the product cannot overflow.
+    if batch_size * n_iter > SDAPI_MAX_TOTAL_BATCHES {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batch_size × n_iter = {} exceeds the maximum total batch count {SDAPI_MAX_TOTAL_BATCHES}",
+            batch_size * n_iter
+        )));
+    }
+    Ok(())
+}
+
+/// Funnel gate on RESOLVED geometry, called from
+/// `sd_request_to_diffusion_batch_request` — the one chokepoint every
+/// generation passes through. Covers values that arrive via defaults or via
+/// the cloned highres second-pass request (whose width/height are *derived*,
+/// e.g. from a large `hr_scale`) rather than raw client fields.
+fn sdapi_validate_resolved_geometry(
+    width: u32,
+    height: u32,
+    batch_size: u32,
+    steps: u32,
+) -> Result<(), DiffusionError> {
+    if width > SDAPI_MAX_DIMENSION || height > SDAPI_MAX_DIMENSION {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "resolved dimensions {width}×{height} exceed the maximum supported dimension {SDAPI_MAX_DIMENSION}"
+        )));
+    }
+    if steps > SDAPI_MAX_STEPS {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "resolved steps {steps} exceeds the maximum supported step count {SDAPI_MAX_STEPS}"
+        )));
+    }
+    if batch_size > SDAPI_MAX_BATCH_SIZE {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "resolved batch_size {batch_size} exceeds the maximum supported batch size {SDAPI_MAX_BATCH_SIZE}"
+        )));
+    }
+    Ok(())
+}
+
 fn sdapi_script_value_is_empty(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -1060,38 +1174,12 @@ fn sdapi_apply_stored_generation_defaults(
     if body.save_images.is_none() {
         body.save_images = sd_stored_bool(stored_options, "save_images");
     }
-    for key in [
-        "outdir_samples",
-        "outdir_grids",
-        "outdir_txt2img_samples",
-        "outdir_img2img_samples",
-        "outdir_txt2img_grids",
-        "outdir_img2img_grids",
-    ] {
-        sdapi_apply_stored_override_default(&mut body, stored_options, key);
-    }
+    // Stored `outdir_*` options are deliberately NOT copied into the request:
+    // the save destination is derived solely from the server-owned output
+    // root. `/sdapi/v1/options` is unauthenticated, so honoring persisted
+    // outdir values was a second injection vector for arbitrary directory
+    // creation + write (review 2026-07-03 §6).
     body
-}
-
-fn sdapi_apply_stored_override_default(
-    body: &mut SdGenerationRequest,
-    stored_options: &std::collections::HashMap<String, Value>,
-    key: &str,
-) {
-    let Some(value) = stored_options.get(key).cloned() else {
-        return;
-    };
-    if body.override_settings.is_none() {
-        body.override_settings = Some(json!({}));
-    }
-    let Some(settings) = body
-        .override_settings
-        .as_mut()
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    settings.entry(key.to_string()).or_insert(value);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1482,18 +1570,41 @@ fn build_sdapi_image_grid(images: &[String]) -> Result<RgbImageBatch, DiffusionE
 }
 
 fn save_sdapi_images_with_kind(
-    body: &SdGenerationRequest,
+    output_root: &Path,
     mode: &str,
     kind: &str,
     images: &[String],
 ) -> Result<Vec<String>, DiffusionError> {
-    let output_dir = sdapi_output_dir(body, mode, kind);
+    let output_dir = sdapi_output_dir(output_root, mode, kind);
     fs::create_dir_all(&output_dir).map_err(|error| {
         DiffusionError::Io(format!(
             "failed to create SDAPI output directory {}: {error}",
             output_dir.display()
         ))
     })?;
+    // Belt and suspenders: the subdir names are fixed strings, so escape
+    // requires a pre-planted symlink inside the root — refuse to write
+    // through one.
+    let canonical_root = output_root.canonicalize().map_err(|error| {
+        DiffusionError::Io(format!(
+            "failed to canonicalize SDAPI output root {}: {error}",
+            output_root.display()
+        ))
+    })?;
+    let canonical_dir = output_dir.canonicalize().map_err(|error| {
+        DiffusionError::Io(format!(
+            "failed to canonicalize SDAPI output directory {}: {error}",
+            output_dir.display()
+        ))
+    })?;
+    if !canonical_dir.starts_with(&canonical_root) {
+        return Err(DiffusionError::Io(format!(
+            "SDAPI output directory {} escapes the configured output root {}",
+            canonical_dir.display(),
+            canonical_root.display()
+        )));
+    }
+    let output_dir = canonical_dir;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| DiffusionError::Io(format!("system clock before unix epoch: {error}")))?
@@ -1648,41 +1759,21 @@ fn png_crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn sdapi_output_dir(body: &SdGenerationRequest, mode: &str, kind: &str) -> PathBuf {
-    let (mode_key, kind_key, fallback_dir) = match (mode, kind) {
-        ("img2img", "grid") => (
-            "outdir_img2img_grids",
-            "outdir_grids",
-            "/tmp/hipfire-sdapi/img2img-grids",
-        ),
-        (_, "grid") => (
-            "outdir_txt2img_grids",
-            "outdir_grids",
-            "/tmp/hipfire-sdapi/txt2img-grids",
-        ),
-        ("img2img", _) => (
-            "outdir_img2img_samples",
-            "outdir_samples",
-            "/tmp/hipfire-sdapi/img2img",
-        ),
-        _ => (
-            "outdir_txt2img_samples",
-            "outdir_samples",
-            "/tmp/hipfire-sdapi/txt2img",
-        ),
+/// Map (mode, kind) to a fixed subdirectory of the server-owned output root.
+///
+/// The destination is derived ONLY from server config plus these two
+/// server-chosen strings — never from the request. Client `outdir_*`
+/// override_settings are deliberately ignored (SD-WebUI clients send them
+/// routinely): honoring them meant any unauthenticated request could create
+/// directories and write PNG bytes at an arbitrary filesystem path.
+fn sdapi_output_dir(output_root: &Path, mode: &str, kind: &str) -> PathBuf {
+    let subdir = match (mode, kind) {
+        ("img2img", "grid") => "img2img-grids",
+        (_, "grid") => "txt2img-grids",
+        ("img2img", _) => "img2img",
+        _ => "txt2img",
     };
-    body.override_settings
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|settings| {
-            settings
-                .get(mode_key)
-                .or_else(|| settings.get(kind_key))
-                .or_else(|| settings.get("outdir_samples"))
-                .and_then(Value::as_str)
-        })
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(fallback_dir))
+    output_root.join(subdir)
 }
 
 pub(crate) async fn cached_diffusion_pipeline(
@@ -1740,6 +1831,8 @@ fn sd_request_to_diffusion_batch_request(
         .height
         .or_else(|| default_dimensions.map(|dimensions| dimensions.1))
         .unwrap_or(512);
+    let steps = body.steps.unwrap_or(20);
+    sdapi_validate_resolved_geometry(width, height, batch_size, steps)?;
     let conditioning = sdapi_external_conditioning(body, batch_size as usize)?;
     Ok(DiffusionBatchRequest {
         prompts,
@@ -1760,7 +1853,7 @@ fn sd_request_to_diffusion_batch_request(
             .filter(|value| *value > 0),
         crop_x: body.crop_x.unwrap_or(0),
         crop_y: body.crop_y.unwrap_or(0),
-        steps: body.steps.unwrap_or(20),
+        steps,
         cfg_scale: body.cfg_scale.unwrap_or(7.0) as f32,
         distilled_guidance_scale: body
             .hipfire_distilled_guidance_scale
@@ -3637,25 +3730,33 @@ async fn sdapi_progress_response(state: SharedState, skip_current_image: bool) -
 pub async fn get_options(State(state): State<SharedState>) -> Json<Value> {
     let cfg = state.config.lock().await;
     let options = state.sdapi_options.lock().await;
-    Json(sdapi_options_json(cfg.default_model.clone(), &options))
+    Json(sdapi_options_json(
+        cfg.default_model.clone(),
+        &state.sdapi_output_root,
+        &options,
+    ))
 }
 
 fn sdapi_options_json(
     default_model: Option<String>,
+    output_root: &Path,
     stored_options: &std::collections::HashMap<String, Value>,
 ) -> Value {
+    // Reported for SD-WebUI compatibility. Stored client overrides are echoed
+    // back below, but saves always land under the server-owned root.
+    let outdir = |subdir: &str| output_root.join(subdir).to_string_lossy().into_owned();
     let mut options = json!({
         "sd_model_checkpoint": default_model,
         "samples_format": "png",
         "send_images": true,
         "send_seed": true,
         "save_images": false,
-        "outdir_samples": "/tmp/hipfire-sdapi",
-        "outdir_txt2img_samples": "/tmp/hipfire-sdapi/txt2img",
-        "outdir_img2img_samples": "/tmp/hipfire-sdapi/img2img",
-        "outdir_grids": "/tmp/hipfire-sdapi/grids",
-        "outdir_txt2img_grids": "/tmp/hipfire-sdapi/txt2img-grids",
-        "outdir_img2img_grids": "/tmp/hipfire-sdapi/img2img-grids",
+        "outdir_samples": output_root.to_string_lossy(),
+        "outdir_txt2img_samples": outdir("txt2img"),
+        "outdir_img2img_samples": outdir("img2img"),
+        "outdir_grids": outdir("grids"),
+        "outdir_txt2img_grids": outdir("txt2img-grids"),
+        "outdir_img2img_grids": outdir("img2img-grids"),
         "hipfire_backend": "diffusion-hfq-or-text-fallback",
         "hipfire_rocm_device_id": null,
         "hipfire_sdapi_save_images_supported": true,
@@ -3697,7 +3798,11 @@ pub async fn post_options(
         }
     }
     let options = state.sdapi_options.lock().await;
-    Json(sdapi_options_json(cfg.default_model.clone(), &options))
+    Json(sdapi_options_json(
+        cfg.default_model.clone(),
+        &state.sdapi_output_root,
+        &options,
+    ))
 }
 
 pub async fn get_memory() -> Json<Value> {
@@ -4778,10 +4883,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-grid-save.hfq");
-        let sample_output_dir = dir.join("sample-outputs");
-        let grid_output_dir = dir.join("grid-outputs");
+        let server_root = dir.join("server-root");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
+        let state = crate::AppState::new(cfg);
         let body = SdGenerationRequest {
             prompt: "a grid-save cat".to_string(),
             model: Some(hfq_path.to_string_lossy().into_owned()),
@@ -4793,10 +4899,6 @@ mod tests {
             send_images: Some(false),
             save_images: Some(true),
             do_not_save_samples: Some(true),
-            override_settings: Some(json!({
-                "outdir_txt2img_samples": sample_output_dir,
-                "outdir_txt2img_grids": grid_output_dir,
-            })),
             ..empty_request()
         };
 
@@ -4814,8 +4916,9 @@ mod tests {
         assert_eq!(saved.len(), 1);
         let saved_path = PathBuf::from(saved[0].as_str().unwrap());
         assert!(saved_path.is_file());
-        assert!(saved_path.starts_with(&grid_output_dir));
-        assert!(!sample_output_dir.exists());
+        let canonical_root = server_root.canonicalize().unwrap();
+        assert!(saved_path.starts_with(canonical_root.join("txt2img-grids")));
+        assert!(!canonical_root.join("txt2img").exists());
         assert!(saved_path
             .file_name()
             .unwrap()
@@ -4949,9 +5052,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-highres-save.hfq");
-        let output_dir = dir.join("highres-outputs");
+        let server_root = dir.join("server-root");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
+        let state = crate::AppState::new(cfg);
         let body = SdGenerationRequest {
             prompt: "a highres saved cat".to_string(),
             model: Some(hfq_path.to_string_lossy().into_owned()),
@@ -4966,9 +5071,6 @@ mod tests {
             enable_hr: Some(true),
             hr_scale: Some(2.0),
             hr_second_pass_steps: Some(1),
-            override_settings: Some(json!({
-                "outdir_txt2img_samples": output_dir,
-            })),
             ..empty_request()
         };
 
@@ -4984,7 +5086,7 @@ mod tests {
         assert_eq!(saved.len(), 1);
         let saved_path = PathBuf::from(saved[0].as_str().unwrap());
         assert!(saved_path.is_file());
-        assert!(saved_path.starts_with(output_dir));
+        assert!(saved_path.starts_with(server_root.canonicalize().unwrap().join("txt2img")));
         let bytes = std::fs::read(saved_path).unwrap();
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
@@ -5450,9 +5552,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-save.hfq");
-        let output_dir = dir.join("img2img-outputs");
+        let server_root = dir.join("server-root");
+        let client_outdir = dir.join("img2img-outputs");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
+        let state = crate::AppState::new(cfg);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
             model: Some(hfq_path.to_string_lossy().into_owned()),
@@ -5464,7 +5569,7 @@ mod tests {
             save_images: Some(true),
             init_images: Some(vec![tiny_png_base64()]),
             override_settings: Some(json!({
-                "outdir_img2img_samples": output_dir,
+                "outdir_img2img_samples": client_outdir,
             })),
             denoising_strength: Some(1.0),
             ..empty_request()
@@ -5481,7 +5586,11 @@ mod tests {
         assert_eq!(saved.len(), 1);
         let saved_path = PathBuf::from(saved[0].as_str().unwrap());
         assert!(saved_path.is_file());
-        assert!(saved_path.starts_with(output_dir));
+        assert!(saved_path.starts_with(server_root.canonicalize().unwrap().join("img2img")));
+        assert!(
+            !client_outdir.exists(),
+            "client override outdir must not be honored"
+        );
         let bytes = std::fs::read(saved_path).unwrap();
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6438,26 +6547,15 @@ mod tests {
 
         assert_eq!(body.send_images, Some(false));
         assert_eq!(body.save_images, Some(true));
-        assert_eq!(
-            body.override_settings.as_ref().unwrap()["outdir_txt2img_samples"],
-            "/tmp/stored-txt2img"
-        );
-        assert_eq!(
-            body.override_settings.as_ref().unwrap()["outdir_txt2img_grids"],
-            "/tmp/stored-txt2img-grids"
-        );
-        assert_eq!(
-            body.override_settings.as_ref().unwrap()["outdir_img2img_grids"],
-            "/tmp/stored-img2img-grids"
-        );
+        // Stored outdir_* options must NOT be copied into the request: the
+        // save destination is server-owned (unauthenticated /sdapi/v1/options
+        // was an arbitrary-directory-write vector).
+        assert!(body.override_settings.is_none());
 
         let explicit = sdapi_apply_stored_generation_defaults(
             SdGenerationRequest {
                 send_images: Some(true),
                 save_images: Some(false),
-                override_settings: Some(json!({
-                    "outdir_txt2img_samples": "/tmp/request-txt2img"
-                })),
                 ..empty_request()
             },
             &stored,
@@ -6465,75 +6563,79 @@ mod tests {
 
         assert_eq!(explicit.send_images, Some(true));
         assert_eq!(explicit.save_images, Some(false));
+        assert!(explicit.override_settings.is_none());
+    }
+
+    #[test]
+    fn sdapi_output_dir_derives_only_from_server_root() {
+        let root = PathBuf::from("/srv/hipfire-outputs");
         assert_eq!(
-            explicit.override_settings.unwrap()["outdir_txt2img_samples"],
-            "/tmp/request-txt2img"
+            sdapi_output_dir(&root, "txt2img", "sample"),
+            PathBuf::from("/srv/hipfire-outputs/txt2img")
+        );
+        assert_eq!(
+            sdapi_output_dir(&root, "img2img", "sample"),
+            PathBuf::from("/srv/hipfire-outputs/img2img")
+        );
+        assert_eq!(
+            sdapi_output_dir(&root, "txt2img", "grid"),
+            PathBuf::from("/srv/hipfire-outputs/txt2img-grids")
+        );
+        assert_eq!(
+            sdapi_output_dir(&root, "img2img", "grid"),
+            PathBuf::from("/srv/hipfire-outputs/img2img-grids")
         );
     }
 
     #[test]
-    fn sdapi_output_dir_prefers_mode_specific_grid_directories() {
-        let body = SdGenerationRequest {
-            override_settings: Some(json!({
-                "outdir_samples": "/tmp/samples",
-                "outdir_grids": "/tmp/grids",
-                "outdir_txt2img_samples": "/tmp/txt2img-samples",
-                "outdir_img2img_samples": "/tmp/img2img-samples",
-                "outdir_txt2img_grids": "/tmp/txt2img-grids",
-                "outdir_img2img_grids": "/tmp/img2img-grids",
-            })),
-            ..empty_request()
-        };
+    fn save_sdapi_images_refuses_symlink_escape_from_output_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-sdapi-symlink-escape-test-{}",
+            std::process::id()
+        ));
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // Pre-plant root/txt2img as a symlink pointing outside the root.
+        std::os::unix::fs::symlink(&outside, root.join("txt2img")).unwrap();
 
-        assert_eq!(
-            sdapi_output_dir(&body, "txt2img", "sample"),
-            PathBuf::from("/tmp/txt2img-samples")
+        let png = base64::engine::general_purpose::STANDARD
+            .encode(b"\x89PNG\r\n\x1a\nnot-really-a-png");
+        let result = save_sdapi_images_with_kind(&root, "txt2img", "sample", &[png]);
+        assert!(result.is_err(), "symlinked output dir must be refused");
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing may be written outside the root"
         );
-        assert_eq!(
-            sdapi_output_dir(&body, "img2img", "sample"),
-            PathBuf::from("/tmp/img2img-samples")
-        );
-        assert_eq!(
-            sdapi_output_dir(&body, "txt2img", "grid"),
-            PathBuf::from("/tmp/txt2img-grids")
-        );
-        assert_eq!(
-            sdapi_output_dir(&body, "img2img", "grid"),
-            PathBuf::from("/tmp/img2img-grids")
-        );
-
-        let fallback = SdGenerationRequest {
-            override_settings: Some(json!({
-                "outdir_samples": "/tmp/samples",
-                "outdir_grids": "/tmp/grids",
-            })),
-            ..empty_request()
-        };
-        assert_eq!(
-            sdapi_output_dir(&fallback, "txt2img", "grid"),
-            PathBuf::from("/tmp/grids")
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn txt2img_route_uses_stored_send_save_and_output_directory_defaults() {
+    async fn txt2img_route_uses_stored_send_save_defaults_and_ignores_stored_outdir() {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-sdapi-options-generation-defaults-test-{}",
             std::process::id()
         ));
-        let outdir = dir.join("txt2img-out");
+        let server_root = dir.join("server-root");
+        let client_outdir = dir.join("client-outdir");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-options-defaults-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
+        let state = crate::AppState::new(cfg);
 
+        // Stored outdir_* (set through the unauthenticated options route) and
+        // per-request override_settings outdir_* must both be ignored.
         let Json(updated) = post_options(
             State(state.clone()),
             Json(json!({
                 "send_images": false,
                 "save_images": true,
-                "outdir_txt2img_samples": outdir,
+                "outdir_txt2img_samples": client_outdir,
             })),
         )
         .await;
@@ -6549,6 +6651,9 @@ mod tests {
                 cfg_scale: Some(1.0),
                 width: Some(2),
                 height: Some(2),
+                override_settings: Some(json!({
+                    "outdir_txt2img_samples": dir.join("../request-escape"),
+                })),
                 ..empty_request()
             }),
         )
@@ -6563,8 +6668,14 @@ mod tests {
         let saved = info["saved_images"].as_array().unwrap();
         assert_eq!(saved.len(), 1);
         let saved_path = PathBuf::from(saved[0].as_str().unwrap());
-        assert!(saved_path.starts_with(&outdir));
+        let canonical_root = server_root.canonicalize().unwrap();
+        assert!(
+            saved_path.starts_with(&canonical_root),
+            "saved image must stay under the server root: {}",
+            saved_path.display()
+        );
         assert!(saved_path.exists());
+        assert!(!client_outdir.exists(), "stored outdir must not be honored");
 
         let Json(progress) = sdapi_progress_response(state, false).await;
         assert_eq!(progress["textinfo"], "complete");
@@ -7742,6 +7853,126 @@ mod tests {
         assert_eq!(second.sampler_name.as_deref(), Some("Euler"));
         assert_eq!(second.scheduler.as_deref(), Some("Karras"));
         assert_eq!(request.scheduler, "Euler Karras");
+    }
+
+    #[test]
+    fn request_geometry_gate_rejects_oversized_dimensions() {
+        // The review's DoS payload: a tiny JSON body driving a
+        // batch×channels×height×width allocation in the hundreds of GB.
+        let err = sdapi_validate_request_geometry(&SdGenerationRequest {
+            width: Some(100_000),
+            height: Some(100_000),
+            ..empty_request()
+        })
+        .unwrap_err();
+        assert!(matches!(err, DiffusionError::InvalidRequest(_)));
+
+        for (field_req, _label) in [
+            (
+                SdGenerationRequest {
+                    firstphase_width: Some(SDAPI_MAX_DIMENSION + 8),
+                    ..empty_request()
+                },
+                "firstphase_width",
+            ),
+            (
+                SdGenerationRequest {
+                    hr_resize_x: Some(100_000),
+                    ..empty_request()
+                },
+                "hr_resize_x",
+            ),
+            (
+                SdGenerationRequest {
+                    hr_resize_y: Some(SDAPI_MAX_DIMENSION + 1),
+                    ..empty_request()
+                },
+                "hr_resize_y",
+            ),
+        ] {
+            assert!(sdapi_validate_request_geometry(&field_req).is_err());
+        }
+    }
+
+    #[test]
+    fn request_geometry_gate_accepts_supported_geometry() {
+        for dim in [512, 1024, SDAPI_MAX_DIMENSION] {
+            assert!(
+                sdapi_validate_request_geometry(&SdGenerationRequest {
+                    width: Some(dim),
+                    height: Some(dim),
+                    steps: Some(SDAPI_MAX_STEPS),
+                    batch_size: Some(SDAPI_MAX_BATCH_SIZE),
+                    n_iter: Some(SDAPI_MAX_TOTAL_BATCHES / SDAPI_MAX_BATCH_SIZE),
+                    ..empty_request()
+                })
+                .is_ok(),
+                "dim {dim} should be accepted"
+            );
+        }
+        // Absent fields fall back to safe defaults and must pass.
+        assert!(sdapi_validate_request_geometry(&empty_request()).is_ok());
+    }
+
+    #[test]
+    fn request_geometry_gate_caps_steps_batch_and_iterations() {
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            steps: Some(SDAPI_MAX_STEPS + 1),
+            ..empty_request()
+        })
+        .is_err());
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            hr_second_pass_steps: Some(999),
+            ..empty_request()
+        })
+        .is_err());
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            batch_size: Some(SDAPI_MAX_BATCH_SIZE + 1),
+            ..empty_request()
+        })
+        .is_err());
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            n_iter: Some(SDAPI_MAX_N_ITER + 1),
+            ..empty_request()
+        })
+        .is_err());
+        // Individually legal factors whose product exceeds the total cap.
+        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
+            batch_size: Some(SDAPI_MAX_BATCH_SIZE),
+            n_iter: Some(SDAPI_MAX_TOTAL_BATCHES / SDAPI_MAX_BATCH_SIZE + 1),
+            ..empty_request()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn batch_request_funnel_rejects_oversized_resolved_geometry() {
+        // Direct client geometry.
+        assert!(sd_request_to_diffusion_batch_request(
+            &SdGenerationRequest {
+                width: Some(100_000),
+                height: Some(100_000),
+                ..empty_request()
+            },
+            None,
+            0,
+        )
+        .is_err());
+        // The cloned highres second-pass body carries DERIVED width/height
+        // (e.g. small base × large hr_scale) that never hit the boundary
+        // gate as raw fields — the funnel must stop them.
+        assert!(sd_request_to_diffusion_batch_request(
+            &SdGenerationRequest {
+                width: Some(SDAPI_MAX_DIMENSION * 2),
+                height: Some(512),
+                ..empty_request()
+            },
+            None,
+            0,
+        )
+        .is_err());
+        // Defaults resolve to 512×512 and pass.
+        assert!(sd_request_to_diffusion_batch_request(&empty_request(), None, 0).is_ok());
     }
 
     fn empty_request() -> SdGenerationRequest {

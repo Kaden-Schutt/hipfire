@@ -1,0 +1,24 @@
+[package]
+name = "hipfire-arch-specs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline aggregation: force-links every arch -spec crate so their Ingest registrations are present. The quantizer links THIS (no runtime/kernel deps); adding a migrated family = one dep + one line here."
+
+# The OFFLINE counterpart to hipfire-archs. Every dependency is a lean `-spec`
+# crate (deps only hipfire-arch-api), so this whole bundle is CPU-only and the
+# quantizer can link it without pulling the GPU/serving stack.
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
+hipfire-arch-qwen2-spec = { path = "../hipfire-arch-qwen2-spec" }
+hipfire-arch-qwen35-spec = { path = "../hipfire-arch-qwen35-spec" }
+hipfire-arch-dots-ocr-spec = { path = "../hipfire-arch-dots-ocr-spec" }
+hipfire-arch-deepseek4-spec = { path = "../hipfire-arch-deepseek4-spec" }
+hipfire-arch-minimax-spec = { path = "../hipfire-arch-minimax-spec" }
+hipfire-arch-lfm2moe-spec = { path = "../hipfire-arch-lfm2moe-spec" }
+hipfire-arch-gemma3-spec = { path = "../hipfire-arch-gemma3-spec" }
+hipfire-arch-gemma3-vl-spec = { path = "../hipfire-arch-gemma3-vl-spec" }
+hipfire-arch-nemotron-spec = { path = "../hipfire-arch-nemotron-spec" }
+hipfire-arch-zaya-spec = { path = "../hipfire-arch-zaya-spec" }

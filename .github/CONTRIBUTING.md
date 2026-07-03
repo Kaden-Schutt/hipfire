@@ -218,7 +218,7 @@ crates/
   hipfire-arch-qwen35-vl/  Qwen3.5-VL (vision)
   hipfire-arch-llama/      Llama-family (currently a facade — see
                            PR 14 for physical split)
-  hipfire-arch-toy/        minimal stub arch (reference for porters)
+  hipfire-arch-template/        minimal stub arch (reference for porters)
   hipfire-quantize/        safetensors → .mq4 / .hfq quantizer CLI
 ```
 
@@ -226,7 +226,7 @@ crates/
 
 - **"I want to add a new model architecture"** → new
   `crates/hipfire-arch-<name>/` crate, implement `Architecture` trait.
-  Copy `crates/hipfire-arch-toy/` as a template.
+  Copy `crates/hipfire-arch-template/` as a template.
 - **"I want to fix a kernel bug or add a kernel"** → `kernels/src/*.hip`
   for the kernel + `crates/rdna-compute/src/dispatch.rs` for the
   dispatch wiring. Stays in rdna-compute regardless of which arch
@@ -262,7 +262,7 @@ prompt frame, `<think>` strip, default sampler/loop-guard config).
 
 Field-level docs live on
 `crates/hipfire-runtime/src/arch.rs`; worked examples are in
-`crates/hipfire-arch-toy/src/arch.rs` (one of each, default-bodied).
+`crates/hipfire-arch-template/src/arch.rs` (one of each, default-bodied).
 
 ---
 

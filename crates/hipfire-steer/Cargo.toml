@@ -12,7 +12,7 @@ description = "Refusal-direction steering / abliteration: derive per-block contr
 [dependencies]
 rdna-compute = { path = "../rdna-compute" }
 hip-bridge = { path = "../hip-bridge" }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = "1"
 # Phase 3 will add: hipfire-kld (capability-damage objective), hipfire-eval
 # (refusal-marker / classifier objective + driver).

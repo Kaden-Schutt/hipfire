@@ -8,4 +8,4 @@ license.workspace = true
 description = "AMD XDNA (Ryzen AI NPU) device layer for hipfire: /dev/accel ioctl telemetry and (later) runtime dispatch"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+libc.workspace = true

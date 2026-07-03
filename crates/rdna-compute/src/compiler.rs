@@ -370,19 +370,28 @@ impl KernelCompiler {
         let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
         let hash_path = self.cache_dir.join(format!("{name}.hash"));
 
-        let cache_valid = Self::cache_valid(&obj_path, &hash_path, &src_hash);
-
-        if !cache_valid {
-            Self::hipcc_compile(
-                &self.arch,
-                &src_path,
-                &obj_path,
-                name,
-                source,
-                &self.extra_flags,
-            )?;
-            Self::normalize_hipcc_output(&self.arch, &obj_path, name)?;
-            let _ = std::fs::write(&hash_path, &src_hash);
+        if !Self::cache_valid(&obj_path, &hash_path, &src_hash) {
+            // Serialize runtime compiles process-wide. Distinct KernelCompiler
+            // instances (e.g. one per Gpu across test threads) share `cache_dir`
+            // on disk, so concurrent first-compiles of the same kernel race on
+            // the shared hipcc output and the offload-unbundle temp files
+            // (manifesting as "not ELF" / "failed to replace bundled kernel
+            // object"). The lock is only contended on a cache miss; the second
+            // waiter re-checks the cache and skips the compile.
+            static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = COMPILE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            if !Self::cache_valid(&obj_path, &hash_path, &src_hash) {
+                Self::hipcc_compile(
+                    &self.arch,
+                    &src_path,
+                    &obj_path,
+                    name,
+                    source,
+                    &self.extra_flags,
+                )?;
+                Self::normalize_hipcc_output(&self.arch, &obj_path, name)?;
+                let _ = std::fs::write(&hash_path, &src_hash);
+            }
         }
 
         // Ensure precompiled dir has valid hash + blob (writeback from cache or

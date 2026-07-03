@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-dots-ocr-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the dots.ocr (Qwen2-VL) family (arch_id 8): identity + Ingest quant-policy, no runtime/kernel deps."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

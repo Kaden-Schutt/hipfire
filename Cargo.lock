@@ -1228,6 +1228,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-api"
+version = "0.3.0"
+dependencies = [
+ "inventory",
+]
+
+[[package]]
 name = "hipfire-arch-deepseek4"
 version = "0.3.0"
 dependencies = [
@@ -1237,6 +1244,13 @@ dependencies = [
  "rdna-compute",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-deepseek4-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1253,6 +1267,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-dots-ocr-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-gemma3"
 version = "0.3.0"
 dependencies = [
@@ -1263,6 +1284,13 @@ dependencies = [
  "hipfire-steer",
  "rdna-compute",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-gemma3-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1281,6 +1309,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-gemma3-vl-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-lfm2moe"
 version = "0.1.0"
 dependencies = [
@@ -1293,13 +1328,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-lfm2moe-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-llama"
 version = "0.3.0"
 dependencies = [
- "hip-bridge",
- "hipfire-dispatch",
+ "hipfire-arch-api",
+ "hipfire-arch-llama-spec",
  "hipfire-runtime",
  "rdna-compute",
+]
+
+[[package]]
+name = "hipfire-arch-llama-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1312,6 +1361,13 @@ dependencies = [
  "rdna-compute",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-minimax-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1331,6 +1387,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-nemotron-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-qwen2"
 version = "0.3.0"
 dependencies = [
@@ -1339,6 +1402,13 @@ dependencies = [
  "hipfire-runtime",
  "rdna-compute",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-qwen2-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1362,6 +1432,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen35-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-qwen35-vl"
 version = "0.3.0"
 dependencies = [
@@ -1374,12 +1451,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "hipfire-arch-toy"
+name = "hipfire-arch-specs"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+ "hipfire-arch-deepseek4-spec",
+ "hipfire-arch-dots-ocr-spec",
+ "hipfire-arch-gemma3-spec",
+ "hipfire-arch-gemma3-vl-spec",
+ "hipfire-arch-lfm2moe-spec",
+ "hipfire-arch-llama-spec",
+ "hipfire-arch-minimax-spec",
+ "hipfire-arch-nemotron-spec",
+ "hipfire-arch-qwen2-spec",
+ "hipfire-arch-qwen35-spec",
+ "hipfire-arch-zaya-spec",
+]
+
+[[package]]
+name = "hipfire-arch-template"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-api",
  "hipfire-runtime",
  "rdna-compute",
+]
+
+[[package]]
+name = "hipfire-arch-template-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1395,6 +1498,23 @@ dependencies = [
  "rdna-compute",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-zaya-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
+name = "hipfire-archs"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+ "hipfire-arch-specs",
+ "hipfire-arch-template",
+ "hipfire-arch-template-spec",
 ]
 
 [[package]]
@@ -1452,6 +1572,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-lora-hfq",
+ "hipfire-quantize",
  "hipfire-steer",
  "hipfire-steer-harness",
 ]
@@ -1567,7 +1688,9 @@ dependencies = [
  "anyhow",
  "base64",
  "hip-bridge",
+ "hipfire-model",
  "hipfire-primitives",
+ "hipfire-quantize",
  "hipfire-runtime",
  "image",
  "rayon",
@@ -1608,6 +1731,7 @@ dependencies = [
  "hipfire-generate",
  "hipfire-hash",
  "hipfire-model",
+ "hipfire-sysinfo",
  "libc",
  "serde",
  "serde_json",
@@ -1634,6 +1758,16 @@ dependencies = [
  "serde",
  "serde_json",
  "twox-hash",
+]
+
+[[package]]
+name = "hipfire-gguf"
+version = "0.3.0"
+dependencies = [
+ "byteorder",
+ "hipfire-primitives",
+ "memmap2",
+ "serde_json",
 ]
 
 [[package]]
@@ -1753,11 +1887,16 @@ version = "0.3.0"
 dependencies = [
  "byteorder",
  "faer",
+ "hipfire-arch-api",
+ "hipfire-arch-specs",
+ "hipfire-gguf",
  "hipfire-kvquant",
+ "hipfire-lock",
  "hipfire-primitives",
  "hipfire-quant-format",
  "memmap2",
  "rayon",
+ "rdna-compute",
  "serde",
  "serde_json",
  "tempfile",
@@ -1792,7 +1931,6 @@ dependencies = [
  "hipfire-coherence",
  "hipfire-detect",
  "hipfire-dispatch",
- "hipfire-eval",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-hneurons",
@@ -1804,6 +1942,7 @@ dependencies = [
  "hipfire-prompt",
  "hipfire-quant-format",
  "hipfire-state",
+ "hipfire-sysinfo",
  "libc",
  "memmap2",
  "minijinja",
@@ -1936,7 +2075,9 @@ name = "hipfire-sysinfo"
 version = "0.3.0"
 dependencies = [
  "hipfire-admin-types",
+ "hipfire-evidence",
  "hipfire-xdna",
+ "libc",
 ]
 
 [[package]]
@@ -1944,6 +2085,7 @@ name = "hipfire-train"
 version = "0.3.0"
 dependencies = [
  "crossterm",
+ "faer",
  "glob",
  "half",
  "hipfire-kvquant",
@@ -2286,6 +2428,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]

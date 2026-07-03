@@ -29,7 +29,7 @@ crates/
   hipfire-arch-qwen35/     ← qwen35.rs + speculative.rs + pflash.rs
   hipfire-arch-qwen35-vl/  ← qwen35_vl.rs + image.rs
   hipfire-arch-llama/      ← facade over runtime::llama (real split = PR 14)
-  hipfire-arch-toy/        ← reference template for new-arch contributors
+  hipfire-arch-template/        ← reference template for new-arch contributors
   rdna-compute/            ← unchanged (kernel dispatch + RDNA-arch routing)
   hip-bridge/              ← unchanged (HIP/ROCm FFI)
   hipfire-quantize/        ← unchanged (quantizer CLI)
@@ -73,7 +73,7 @@ suspects:
 | Failure shape | What to do |
 |---|---|
 | `engine::X` import the script missed | Check `scripts/rebase-onto-modular.sh`'s `PATH_MAP` and `REWRITES`. If your branch uses an unusual import path, manually rewrite or extend the script's map. |
-| `arch_id` match-arm in your diff | Daemon's arch dispatch now goes through `<Architecture>::*` for the bring-up triple. If your branch added a new `arch_id => ...` arm in `daemon.rs::generate()`, port it into the new pattern: introduce a new arch crate (use `hipfire-arch-toy/` as template) or wire into an existing arch's dispatch. |
+| `arch_id` match-arm in your diff | Daemon's arch dispatch now goes through `<Architecture>::*` for the bring-up triple. If your branch added a new `arch_id => ...` arm in `daemon.rs::generate()`, port it into the new pattern: introduce a new arch crate (use `hipfire-arch-template/` as template) or wire into an existing arch's dispatch. |
 | Direct `qwen35::*` reach from non-qwen35 code | Most cross-arch helpers (`weight_gemv`, `KvCache`, `dequantize_*`, RoPE) live in `hipfire_runtime::llama` (still — physical split waits for PR 14 transformer extraction). Replace `engine::qwen35::weight_gemv` → `hipfire_runtime::llama::weight_gemv`. |
 | `sampler` / `loop_guard` / `prompt_frame` / `eos_filter` not found | These moved to the runtime crate's top-level modules. `use hipfire_runtime::sampler::*` etc. |
 | Missing `Architecture` trait import | `use hipfire_runtime::arch::Architecture;` |
@@ -138,4 +138,4 @@ instructions, not permission to discard unreviewed work.
 - Migration map: `CHANGELOG.md` 0.1.20 entry
 - Crate topology: `CONTRIBUTING.md` "Crate topology" section
 - Architecture trait: `crates/hipfire-runtime/src/arch.rs`
-- Toy arch template: `crates/hipfire-arch-toy/`
+- Toy arch template: `crates/hipfire-arch-template/`

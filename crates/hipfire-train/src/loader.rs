@@ -133,7 +133,7 @@ fn decode_hfq_tensor(quant_type: u8, data: &[u8], n: usize) -> Result<Vec<f32>, 
             .chunks_exact(2)
             .map(|c| crate::hfq_patch::bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect()),
-        3 => Ok(hipfire_runtime::quant::dequantize_q8_0(data, n)),
+        3 => Ok(hipfire_runtime::quant::dequant_q8f16(data, n)),
         31 => Err(
             "Qtip3G256 .hfq decode not yet implemented in hipfire-train \
                    (use a bf16/qtip2-sim .hfq, or load from the source safetensors)"

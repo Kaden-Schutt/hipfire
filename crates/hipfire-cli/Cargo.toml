@@ -27,19 +27,19 @@ hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-server = { path = "../hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }
-regex = "1"
+regex.workspace = true
 tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = "1"
 toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
-anyhow = "1"
+anyhow.workspace = true
 rpassword = "7"
-uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
+uuid.workspace = true
+base64.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-libc = "0.2"
+libc.workspace = true
 clap-markdown = "0.1.5"
 clap_mangen = "0.3.0"

@@ -30,11 +30,26 @@ members = [
     "crates/hipfire-scheduler",
     "crates/hipfire-state",
     "crates/hipfire-mixer",
+    "crates/hipfire-arch-api",
+    "crates/hipfire-arch-llama-spec",
+    "crates/hipfire-arch-gemma3-spec",
+    "crates/hipfire-arch-qwen2-spec",
+    "crates/hipfire-arch-qwen35-spec",
+    "crates/hipfire-arch-dots-ocr-spec",
+    "crates/hipfire-arch-deepseek4-spec",
+    "crates/hipfire-arch-minimax-spec",
+    "crates/hipfire-arch-lfm2moe-spec",
+    "crates/hipfire-arch-gemma3-vl-spec",
+    "crates/hipfire-arch-nemotron-spec",
+    "crates/hipfire-arch-zaya-spec",
+    "crates/hipfire-arch-template-spec",
+    "crates/hipfire-arch-specs",
+    "crates/hipfire-archs",
     "crates/hipfire-arch-qwen35",
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-deepseek4",
-    "crates/hipfire-arch-toy",
+    "crates/hipfire-arch-template",
     "crates/hipfire-arch-qwen2",
     "crates/hipfire-arch-gemma3",
     "crates/hipfire-arch-gemma3-vl",
@@ -63,6 +78,7 @@ members = [
     "crates/hipfire-lora-hfq",
     "crates/hipfire-steer-harness",
     "crates/hipfire-coexistence",
+    "crates/hipfire-gguf",
     "crates/hipfire-hneurons",
 ]
 # The Leptos browser UIs target wasm32 (leptos CSR + web-sys) and are built
@@ -79,3 +95,21 @@ exclude = [
 version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+
+# Single-sourced versions for deps whose spec is identical in every consumer.
+# Feature-bearing deps with per-crate divergence (serde_json, minijinja, tokio,
+# twox-hash, image) are deliberately NOT here yet; their load-bearing features
+# must be baked into the workspace default first (see the 2026-07-03 review,
+# §3.11).
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+regex = "1"
+base64 = "0.22"
+rayon = "1"
+memmap2 = "0.9"
+libc = "0.2"
+tracing = "0.1"
+libloading = "0.8"
+uuid = { version = "1", features = ["v4"] }
+csv = "1"

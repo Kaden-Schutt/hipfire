@@ -6,4 +6,4 @@ license.workspace = true
 description = "Shared serde types for the hipfire admin console (server + wasm UI)."
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true

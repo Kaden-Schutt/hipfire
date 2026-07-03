@@ -13,7 +13,7 @@ have hit are documented here so you don't repeat them.
 > archs** (gfx1100, gfx1201, gfx94x, etc.) — NOT model archs.
 > If you want to add a new MODEL family (Llama-3, Mixtral, etc.) you
 > implement the `Architecture` trait in your own crate. See
-> `crates/hipfire-arch-toy/` as a reference template and
+> `crates/hipfire-arch-template/` as a reference template and
 > `CONTRIBUTING.md`'s "Crate topology" section. RDNA arch routing
 > stays in `crates/rdna-compute/src/dispatch.rs` regardless of model
 > arch — they're orthogonal.

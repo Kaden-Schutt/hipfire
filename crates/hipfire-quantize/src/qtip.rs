@@ -504,6 +504,8 @@ pub fn beam_encode_group_v2(
 pub const QTIP3_BLOCK_BYTES: usize = 100;
 /// QTIP group size in weights.
 pub const QTIP3_GROUP: usize = 256;
+/// Bytes per packed QTIP-4 group: 4 (f32 scale) + 128 (256×4-bit nibbles).
+pub const QTIP4_BLOCK_BYTES: usize = 132;
 
 /// Pack 8 three-bit symbols into 3 bytes (little-endian bitstream), matching
 /// the MQ3 GEMV kernel's unpack window. Shared by pack/unpack below.
@@ -546,6 +548,34 @@ pub fn pack_qtip3_group(symbols: &[u8], scale: f32) -> Vec<u8> {
         out[bo..bo + 3].copy_from_slice(&packed);
     }
     out
+}
+
+/// Pack one 256-symbol QTIP-4 group (4-bit trellis symbols + scale) into the
+/// 132-byte on-disk record: `[f32 scale][128 B nibble-packed symbols]`. Two
+/// symbols per byte (low nibble = even index), the natural layout a 4-bit decode
+/// GEMV reads — matching the MQ4/HFQ4 nibble convention. No zero-point (the QTIP
+/// codebook is zero-mean by construction).
+pub fn pack_qtip4_group(symbols: &[u8], scale: f32) -> Vec<u8> {
+    assert_eq!(symbols.len(), QTIP3_GROUP, "QTIP-4 group is 256 symbols");
+    let mut out = vec![0u8; QTIP4_BLOCK_BYTES];
+    out[0..4].copy_from_slice(&scale.to_le_bytes());
+    for j in 0..128 {
+        out[4 + j] = (symbols[2 * j] & 0xf) | ((symbols[2 * j + 1] & 0xf) << 4);
+    }
+    out
+}
+
+/// Unpack a 132-byte QTIP-4 record → (256 symbols, scale). Inverse of
+/// [`pack_qtip4_group`].
+pub fn unpack_qtip4_group(bytes: &[u8]) -> (Vec<u8>, f32) {
+    assert_eq!(bytes.len(), QTIP4_BLOCK_BYTES);
+    let scale = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let mut symbols = vec![0u8; QTIP3_GROUP];
+    for j in 0..128 {
+        symbols[2 * j] = bytes[4 + j] & 0xf;
+        symbols[2 * j + 1] = (bytes[4 + j] >> 4) & 0xf;
+    }
+    (symbols, scale)
 }
 
 /// Unpack a 100-byte QTIP-3 record → (256 symbols, scale).
@@ -700,6 +730,36 @@ mod tests {
 
     fn uniform2_roundtrip(group: &[f32]) -> Vec<f32> {
         uniform_nbit_roundtrip(group, 2)
+    }
+
+    #[test]
+    fn qtip4_pack_roundtrip_matches_decode() {
+        // Nibble pack/unpack is an exact identity on arbitrary 4-bit symbols.
+        let mut s = 12_345u32;
+        let symbols: Vec<u8> = (0..256)
+            .map(|_| {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                ((s >> 16) & 0xf) as u8
+            })
+            .collect();
+        let scale = 0.037f32;
+        let packed = pack_qtip4_group(&symbols, scale);
+        assert_eq!(packed.len(), QTIP4_BLOCK_BYTES);
+        let (sym2, sc2) = unpack_qtip4_group(&packed);
+        assert_eq!(symbols, sym2, "4-bit symbols must survive pack/unpack");
+        assert_eq!(scale, sc2);
+
+        // Full pipeline: a 4-bit trellis encode decoded directly must equal the
+        // decode after a pack→unpack round-trip (the on-disk format is lossless).
+        let cb = build_codebook();
+        let mut rng = Lcg(0x9E37_79B9);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let sym = beam_encode_group_bits(&group, group_scale(&group), &cb, 64, 4);
+        let sc = optimal_scale_bits(&group, &sym, &cb, 4);
+        let direct = decode_group_bits(&sym, sc, &cb, 4);
+        let (sym_rt, sc_rt) = unpack_qtip4_group(&pack_qtip4_group(&sym, sc));
+        let via_pack = decode_group_bits(&sym_rt, sc_rt, &cb, 4);
+        assert_eq!(direct, via_pack, "pack round-trip changed the decode");
     }
 
     #[test]

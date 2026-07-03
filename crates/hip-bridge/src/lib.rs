@@ -28,7 +28,7 @@ pub use ffi::launch_counters;
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, HostBuffer, Module, Stream,
 };
-pub use kernarg::KernargBlob;
+pub use kernarg::{KernArg, KernargBlob};
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
 

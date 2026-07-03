@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dedicated offline GGUF codec: parser, dequant, and metadata→config extraction for the import tooling. HIP-independent; kept OFF the inference dependency surface (AGENTS.md: interop/import formats live in a dedicated tooling crate)."
+
+[dependencies]
+hipfire-primitives = { path = "../hipfire-primitives" }
+byteorder = "1"
+memmap2.workspace = true
+serde_json = "1"

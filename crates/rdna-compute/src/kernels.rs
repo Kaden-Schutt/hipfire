@@ -132,6 +132,13 @@ pub const GEMV_MQ3G256_LLOYD_SRC: &str =
 /// QTIP-3: FWHT-rotated trellis-coded 3-bit, fused on-the-fly decode + matvec
 /// (100 B/group, computed 1MAD codebook, zero LDS). Arch-generic (gfx1103/1100).
 pub const GEMV_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip3g256.hip");
+/// QTIP-4: FWHT-rotated trellis-coded 4-bit, fused on-the-fly decode + matvec
+/// (132 B/group, same computed 1MAD codebook, zero LDS). Arch-generic.
+pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip4g256.hip");
+/// QTIP trellis ENCODER (offline): full Viterbi over the 12-bit state space, one
+/// block per 256-group, dp ping-pong in LDS. Replaces the ~1h/1B CPU beam encode.
+pub const QTIP_VITERBI_ENCODE_SRC: &str =
+    include_str!("../../../kernels/src/qtip_viterbi_encode.hip");
 /// MQ4G256Lloyd: 4-bit + per-block 16-entry fp16 codebook (160 B/group).
 pub const GEMV_MQ4G256_LLOYD_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256_lloyd.hip");
@@ -3806,6 +3813,33 @@ pub const NIBBLE_EXPAND_INT4_TO_INT8_SRC: &str =
 /// signed, clamp=false. See `kernels/src/gemm_iu4_i32_wmma.hip` and
 /// `docs/kernels/generic-kernel-library.md`.
 pub const GEMM_IU4_I32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_iu4_i32_wmma.hip");
+
+/// SpinQuant R1 W4A4 working copy of [`GEMM_IU4_I32_WMMA_SRC`] (Phase 1b sandbox,
+/// symbol `gemm_iu4_i32_wmma_r1`). Byte-identical math today; owned by the
+/// learned-rotation experiments so they can fuse the R4 FWHT / dequant epilogue
+/// without disturbing the production kernel. `parity_gemm_iu4_i32_wmma_r1`
+/// asserts they still agree. See `kernels/src/gemm_iu4_i32_wmma_r1.hip`.
+pub const GEMM_IU4_I32_WMMA_R1_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iu4_i32_wmma_r1.hip");
+
+/// Tuned wave64 LDS-staged W4A4 GEMM (`gemm_iu4_i32_wmma_lds`, gfx1151 prefill
+/// path). Same contract/packing as [`GEMM_IU4_I32_WMMA_SRC`] but ~14× faster on
+/// large GEMMs (double-buffered LDS, N-heavy 2×8 tiling, BK64, b128 reads,
+/// `-mwavefrontsize64`). `parity_gemm_iu4_i32_wmma_lds` asserts it matches the
+/// single-chain kernel. See `kernels/src/gemm_iu4_i32_wmma_lds.hip` and memory
+/// `reference_gfx1151_iu4_gemm_tuning`.
+pub const GEMM_IU4_I32_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iu4_i32_wmma_lds.hip");
+
+/// Tuned wave64 LDS-staged **W3A4** GEMM (`gemm_w3a4_i32_wmma_lds`, gfx1151
+/// prefill path). Same tuned iu4·iu4 core as [`GEMM_IU4_I32_WMMA_LDS_SRC`], but
+/// the weight operand is a 3-bit bit-plane (25% less weight traffic) unpacked to
+/// int4 in LDS via a cheap Morton spread — the memory-ceiling lever, ~1.3× in the
+/// weight-bandwidth-bound regime. `parity_gemm_w3a4_i32_wmma_lds` asserts it
+/// matches the exact int reference and the int4 LDS twin on the same values. See
+/// `kernels/src/gemm_w3a4_i32_wmma_lds.hip` and memory `reference_gfx1151_w3a4_gemm`.
+pub const GEMM_W3A4_I32_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_w3a4_i32_wmma_lds.hip");
 
 /// Opus Quant W4A4 core: grouped signed-INT4 × INT4 GEMM with per-group scale
 /// rescale in the f32 epilogue (productionizes the host-tiled E5 recipe).

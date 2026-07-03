@@ -6,4 +6,4 @@ license.workspace = true
 description = "Per-layer token-mixer taxonomy and sequence-state shape for hipfire (the family-seam Mixer model)"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
