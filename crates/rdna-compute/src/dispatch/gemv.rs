@@ -2396,6 +2396,58 @@ impl Gpu {
             },
         )
     }
+    /// QTIP trellis ENCODER (offline): full Viterbi over the 4096 states, one
+    /// block per 256-group. `w` = FWHT-rotated weights [n_groups*256]; writes
+    /// `symbols` [n_groups*256] u8, per-group RMS `scales` [n_groups], and uses
+    /// `backptr` [n_groups*256*4096] u8 as transient predecessor scratch. The
+    /// caller refines each group to the closed-form optimal scale after.
+    pub fn qtip_viterbi_encode(
+        &mut self,
+        w: &GpuTensor,
+        symbols: &GpuTensor,
+        backptr: &GpuTensor,
+        scales: &GpuTensor,
+        n_groups: usize,
+        bits: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qtip_viterbi_encode",
+            kernels::QTIP_VITERBI_ENCODE_SRC,
+            "qtip_viterbi_encode",
+        )?;
+        let w_ptr = w.buf.as_ptr();
+        let sym_ptr = symbols.buf.as_ptr();
+        let bp_ptr = backptr.buf.as_ptr();
+        let sc_ptr = scales.buf.as_ptr();
+        let ng = n_groups as i32;
+        let b = bits as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &sym_ptr as *const _ as *mut c_void,
+            &bp_ptr as *const _ as *mut c_void,
+            &sc_ptr as *const _ as *mut c_void,
+            &ng as *const _ as *mut c_void,
+            &b as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "qtip_viterbi_encode",
+            [n_groups as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(w_ptr);
+                blob.push_ptr(sym_ptr);
+                blob.push_ptr(bp_ptr);
+                blob.push_ptr(sc_ptr);
+                blob.push_i32(ng);
+                blob.push_i32(b);
+                blob
+            },
+        )
+    }
     /// MagnumQuant MQ3-G256 GEMV with fused residual add. The pre-rotation
     /// happens in a separate kernel via fused_silu_mul_mq_rotate or
     /// rotate_x_for_mq; this function just dispatches the underlying

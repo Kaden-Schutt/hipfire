@@ -135,6 +135,10 @@ pub const GEMV_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemv_qti
 /// QTIP-4: FWHT-rotated trellis-coded 4-bit, fused on-the-fly decode + matvec
 /// (132 B/group, same computed 1MAD codebook, zero LDS). Arch-generic.
 pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip4g256.hip");
+/// QTIP trellis ENCODER (offline): full Viterbi over the 12-bit state space, one
+/// block per 256-group, dp ping-pong in LDS. Replaces the ~1h/1B CPU beam encode.
+pub const QTIP_VITERBI_ENCODE_SRC: &str =
+    include_str!("../../../kernels/src/qtip_viterbi_encode.hip");
 /// MQ4G256Lloyd: 4-bit + per-block 16-entry fp16 codebook (160 B/group).
 pub const GEMV_MQ4G256_LLOYD_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256_lloyd.hip");
