@@ -45,6 +45,105 @@ fn is_boundary_ordinal(layer_is_boundary: &[bool], kv_ordinal: usize) -> bool {
 ///                       `physical_cap << max_seq` so the buffer stays bounded
 ///                       even as the absolute position grows past it.
 ///
+/// The KV-cache quantization mode, as a single typed value.
+///
+/// `KvCache` currently stores this as nine parallel `quant_*` booleans (a
+/// historical layout the review flagged, 3.10). This enum is the canonical
+/// mutually-exclusive view of them: [`KvCache::quant_mode`] derives it, and
+/// [`kv_quant_mode_from_flags`] pins the boolean→mode mapping in a pure,
+/// unit-tested function. New code should switch on this rather than reading the
+/// raw booleans; the eventual field-replacement (booleans → this enum + a
+/// `KvCacheSpec` builder) is a hot-path change that must be validated under the
+/// GPU coherence gate.
+///
+/// Superset of the arch-level `KvMode` (qwen35 speculative): it also covers the
+/// `KvCache`-only `Int8`, `Hfq4`, and `Kvarn` modes that never reach that enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvQuantMode {
+    /// Unquantized FP32 K/V (`quantized == false`).
+    Unquantized,
+    /// INT8 co-located K and V (Q8_0).
+    Q8,
+    /// INT8 with separate scales.
+    Int8,
+    /// HFQ4 co-located blocks.
+    Hfq4,
+    /// Givens-rotated 4-bit K + Q8 V.
+    Asym4,
+    /// Givens-rotated 3-bit K + Q8 V.
+    Asym3,
+    /// Givens-rotated 2-bit K + Q8 V.
+    Asym2,
+    /// Signed-FWHT-rotated 4-bit K + Q8 V (byte-identical storage to `Asym4`).
+    Fwht4,
+    /// Signed-FWHT-rotated 3-bit K + Q8 V (byte-identical storage to `Asym3`).
+    Fwht3,
+    /// Signed-FWHT-rotated 2-bit K + Q8 V (byte-identical storage to `Asym2`).
+    Fwht2,
+    /// KVarN variance-normalized 4-bit K blocks + Q8 V.
+    Kvarn,
+}
+
+/// Derive the canonical [`KvQuantMode`] from `KvCache`'s raw quant flags.
+///
+/// Pure and total so it is unit-testable without a GPU. Mirrors the exclusive
+/// flag pattern every `new_gpu*` constructor sets: `quantized` plus exactly one
+/// of `{q8, int8, hfq4, asym{4,3,2}, kvarn}`, with `fwht` selecting the
+/// FWHT-rotated variant of the asym tiers. `quantized == false` is
+/// `Unquantized` regardless of the other flags.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_quant_mode_from_flags(
+    quantized: bool,
+    q8: bool,
+    int8: bool,
+    hfq4: bool,
+    asym4: bool,
+    asym3: bool,
+    asym2: bool,
+    fwht: bool,
+    kvarn: bool,
+) -> KvQuantMode {
+    if !quantized {
+        return KvQuantMode::Unquantized;
+    }
+    if kvarn {
+        return KvQuantMode::Kvarn;
+    }
+    if q8 {
+        return KvQuantMode::Q8;
+    }
+    if int8 {
+        return KvQuantMode::Int8;
+    }
+    if hfq4 {
+        return KvQuantMode::Hfq4;
+    }
+    if asym4 {
+        return if fwht {
+            KvQuantMode::Fwht4
+        } else {
+            KvQuantMode::Asym4
+        };
+    }
+    if asym3 {
+        return if fwht {
+            KvQuantMode::Fwht3
+        } else {
+            KvQuantMode::Asym3
+        };
+    }
+    if asym2 {
+        return if fwht {
+            KvQuantMode::Fwht2
+        } else {
+            KvQuantMode::Asym2
+        };
+    }
+    // `quantized` with no tier flag set is not produced by any constructor;
+    // treat as unquantized rather than panic in the hot path.
+    KvQuantMode::Unquantized
+}
+
 /// Back-compat: constructors that do not take `physical_cap` set it equal to
 /// `max_seq`, preserving existing behaviour.
 pub struct KvCache {
@@ -122,6 +221,23 @@ impl KvCache {
 }
 
 impl KvCache {
+    /// Canonical quantization mode of this cache, derived from the raw
+    /// `quant_*` boolean flags via [`kv_quant_mode_from_flags`]. Prefer this
+    /// over reading the individual booleans in new code.
+    pub fn quant_mode(&self) -> KvQuantMode {
+        kv_quant_mode_from_flags(
+            self.quantized,
+            self.quant_q8,
+            self.quant_int8,
+            self.quant_hfq4,
+            self.quant_asym4,
+            self.quant_asym3,
+            self.quant_asym2,
+            self.quant_fwht,
+            self.quant_kvarn,
+        )
+    }
+
     pub fn new_gpu(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -2616,7 +2732,7 @@ fn replicate_fwht_signs_to_all_devices(gpus: &mut Gpus, n_signs: usize) -> HipRe
 
 #[cfg(test)]
 mod index_math_tests {
-    use super::{is_boundary_ordinal, kv_f32_elems_for_bytes};
+    use super::{is_boundary_ordinal, kv_f32_elems_for_bytes, kv_quant_mode_from_flags};
 
     #[test]
     fn f32_elems_rounds_bytes_up_to_whole_words() {
@@ -2656,5 +2772,46 @@ mod index_math_tests {
         assert!(!is_boundary_ordinal(&flags, 4));
         assert!(!is_boundary_ordinal(&flags, usize::MAX));
         assert!(!is_boundary_ordinal(&[], 0));
+    }
+
+    // 3.10: lock the boolean→KvQuantMode mapping so the eventual field-level
+    // refactor (booleans → enum) has a tested oracle. Flag order:
+    // (quantized, q8, int8, hfq4, asym4, asym3, asym2, fwht, kvarn).
+    #[test]
+    fn kv_quant_mode_derives_each_exclusive_tier() {
+        use super::KvQuantMode::*;
+        let f = kv_quant_mode_from_flags;
+        // Unquantized ignores every other flag.
+        assert_eq!(f(false, true, true, true, true, true, true, true, true), Unquantized);
+        assert_eq!(f(false, false, false, false, false, false, false, false, false), Unquantized);
+        // Each co-located / separate-scale tier.
+        assert_eq!(f(true, true, false, false, false, false, false, false, false), Q8);
+        assert_eq!(f(true, false, true, false, false, false, false, false, false), Int8);
+        assert_eq!(f(true, false, false, true, false, false, false, false, false), Hfq4);
+        assert_eq!(f(true, false, false, false, false, false, false, false, true), Kvarn);
+        // Asym tiers, Givens (fwht=false) vs signed-FWHT (fwht=true).
+        assert_eq!(f(true, false, false, false, true, false, false, false, false), Asym4);
+        assert_eq!(f(true, false, false, false, true, false, false, true, false), Fwht4);
+        assert_eq!(f(true, false, false, false, false, true, false, false, false), Asym3);
+        assert_eq!(f(true, false, false, false, false, true, false, true, false), Fwht3);
+        assert_eq!(f(true, false, false, false, false, false, true, false, false), Asym2);
+        assert_eq!(f(true, false, false, false, false, false, true, true, false), Fwht2);
+    }
+
+    #[test]
+    fn kv_quant_mode_precedence_matches_constructor_priority() {
+        use super::KvQuantMode::*;
+        // kvarn wins over any asym flag (the KVarN constructors leave asym
+        // false, but the precedence must be explicit and stable).
+        assert_eq!(
+            kv_quant_mode_from_flags(true, false, false, false, true, false, false, false, true),
+            Kvarn
+        );
+        // fwht is a modifier, not a standalone tier: fwht=true with no asym tier
+        // set does not fabricate an Fwht* mode.
+        assert_eq!(
+            kv_quant_mode_from_flags(true, true, false, false, false, false, false, true, false),
+            Q8
+        );
     }
 }
