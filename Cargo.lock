@@ -1468,13 +1468,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "hipfire-arch-toy"
+name = "hipfire-arch-template"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-api",
  "hipfire-runtime",
  "rdna-compute",
+]
+
+[[package]]
+name = "hipfire-arch-template-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
 ]
 
 [[package]]
@@ -1505,7 +1512,8 @@ version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
  "hipfire-arch-specs",
- "hipfire-arch-toy",
+ "hipfire-arch-template",
+ "hipfire-arch-template-spec",
 ]
 
 [[package]]

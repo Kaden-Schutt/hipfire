@@ -226,9 +226,9 @@ A pure-CPU test that:
 - a grep-lint failing on any NEW raw `arch_id == <lit>` outside `hipfire-arch-api`
   (freezes the count at today's 72 while migrations drain it).
 
-### 0.6 Reference implementation on `hipfire-arch-toy`
+### 0.6 Reference implementation on `hipfire-arch-template`
 
-Wire the WHOLE mechanism for the toy arch only (`hipfire-arch-toy`, 240 lines):
+Wire the WHOLE mechanism for the toy arch only (`hipfire-arch-template`, 240 lines):
 impl the base trait + `SpecDecodeChain` (stub) + `BatchedPrefill` (stub) + `ToyModel`
 (real — it already has toy_model.rs), `register_arch!`, add to the bundle, and have
 the daemon/scheduler consult `caps.batched_prefill` with the `Some/None` match. Prove

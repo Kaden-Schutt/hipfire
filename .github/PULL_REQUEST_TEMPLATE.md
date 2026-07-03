@@ -11,7 +11,7 @@
 - [ ] `crates/hipfire-arch-qwen35`
 - [ ] `crates/hipfire-arch-qwen35-vl`
 - [ ] `crates/hipfire-arch-llama`
-- [ ] `crates/hipfire-arch-toy` (template — touch only when refining the new-arch reference)
+- [ ] `crates/hipfire-arch-template` (template — touch only when refining the new-arch reference)
 - [ ] `crates/hipfire-quantize`
 - [ ] examples / daemon
 - [ ] docs / CI / scripts

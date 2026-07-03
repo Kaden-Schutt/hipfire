@@ -14,7 +14,7 @@
 //!
 //! # Worked examples
 //!
-//! - `crates/hipfire-arch-toy/` — minimum-viable stub, ~50 lines of
+//! - `crates/hipfire-arch-template/` — minimum-viable stub, ~50 lines of
 //!   trait-impl with explanatory comments. Copy-paste this directory
 //!   as a starting point for a new arch.
 //! - `crates/hipfire-arch-qwen35/src/arch.rs` — full production impl

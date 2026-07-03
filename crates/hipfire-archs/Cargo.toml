@@ -12,6 +12,9 @@ description = "Aggregation crate: depends on every arch crate so their register_
 
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
-hipfire-arch-toy = { path = "../hipfire-arch-toy" }
+# The template's two halves — its serving ToyModel and its offline Ingest register
+# on the same id and demonstrate the spec/serving merge (a self-test reference).
+hipfire-arch-template = { path = "../hipfire-arch-template" }
+hipfire-arch-template-spec = { path = "../hipfire-arch-template-spec" }
 # Every migrated family's offline Ingest spec, via the lean bundle.
 hipfire-arch-specs = { path = "../hipfire-arch-specs" }

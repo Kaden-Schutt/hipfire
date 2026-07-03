@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-template-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Copy-paste template for a new family's OFFLINE spec: arch identity + the Ingest quant-policy, deps only hipfire-arch-api (CPU-only, the quantizer links this). Sibling of hipfire-arch-template."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Qwen2 dense text decoder (GQA + RMSNorm + SwiGLU + 1-D RoPE, attention_bias=true). arch_id=7."
 
-# Bring-up status: skeleton from hipfire-arch-toy template. config_from_hfq
+# Bring-up status: skeleton from hipfire-arch-template template. config_from_hfq
 # and load_weights are stubs at the time of crate creation; the forward
 # path will be ported from hipfire-arch-qwen35::qwen35 with
 # DeltaNet/MoE/q-k-norm-pre-RoPE removed and QKV bias added.

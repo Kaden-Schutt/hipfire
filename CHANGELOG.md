@@ -213,7 +213,7 @@ update to `use hipfire_runtime::...` (runtime symbols) or
   doesn't trigger a recompile of the LLaMA forward path.
 - Clean trait-based bring-up for new arches: implement
   `Architecture` in your own crate, register the `arch_id`, done.
-  See `crates/hipfire-arch-toy/` for a copy-paste template.
+  See `crates/hipfire-arch-template/` for a copy-paste template.
 - Forward-port path for the gemma branch: gemma4 lands as
   `crates/hipfire-arch-gemma4/` without re-touching the qwen35 code.
 - Selective build for downstream library consumers: feature flags
@@ -246,7 +246,7 @@ update to `use hipfire_runtime::...` (runtime symbols) or
 
 ### How to add a new arch
 
-Copy `crates/hipfire-arch-toy/` as a starting template. The toy crate
+Copy `crates/hipfire-arch-template/` as a starting template. The toy crate
 is a minimum-viable `Architecture` trait impl with hardcoded stub
 values and heavy explanatory comments — no real model logic. See
 `CONTRIBUTING.md` "Crate topology" for the full decision tree.

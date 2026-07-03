@@ -28,8 +28,11 @@ mod force_link {
     // nemotron, …), via the lean bundle.
     #[allow(unused_imports)]
     use hipfire_arch_specs as _;
+    // The template's two halves (serving ToyModel + offline Ingest) on one id.
     #[allow(unused_imports)]
-    use hipfire_arch_toy as _;
+    use hipfire_arch_template as _;
+    #[allow(unused_imports)]
+    use hipfire_arch_template_spec as _;
 }
 
 pub use hipfire_arch_api::{self as api, Arch, ArchId, Caps, RegisteredArch};
@@ -46,17 +49,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundle_exposes_toy_registration() {
-        // The toy arch (id 0xFF) must be reachable THROUGH the bundle — proving
-        // force-linking preserved its inventory submission across the crate
-        // boundary (the real daemon path, unlike an in-crate test).
+    fn bundle_merges_template_spec_and_serving() {
+        // The template registers from TWO crates on id 0xFF — its serving crate
+        // (ToyModel) and its offline `-spec` crate (Ingest). Reaching it through the
+        // bundle proves (a) force-linking preserved both inventory submissions
+        // across the crate boundary (the real daemon path), and (b) the registry
+        // MERGED them into one arch carrying both capabilities.
         let reg = registry();
-        let toy = reg
+        let t = reg
             .get(ArchId(0xFF))
-            .expect("toy arch reachable through the bundle");
-        assert_eq!(toy.family, "toy");
-        assert!(toy.caps.toy_model.is_some());
-        assert!(toy.caps.batched_prefill.is_none());
+            .expect("template arch reachable through the bundle");
+        assert_eq!(t.family, "template");
+        assert!(
+            t.caps.toy_model.is_some(),
+            "ToyModel from the serving crate"
+        );
+        assert!(t.caps.ingest.is_some(), "Ingest from the -spec crate");
+        assert!(t.caps.batched_prefill.is_none());
     }
 
     #[test]
@@ -98,7 +107,7 @@ mod tests {
         // it moves over; a mismatch means either a dropped registration or an
         // untracked addition. Ids: 0 llama, 1 qwen2/3, 5 qwen3.5, 6 qwen3.5-moe,
         // 8 dots-ocr, 9 deepseek4, 10 minimax, 11 lfm2, 12 gemma3, 13 gemma3-vl,
-        // 14 nemotron-h, 15 mamba2, 16 zaya, 0xFF toy.
+        // 14 nemotron-h, 15 mamba2, 16 zaya, 0xFF template.
         let expected: BTreeSet<u16> = [0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0xFF]
             .into_iter()
             .collect();

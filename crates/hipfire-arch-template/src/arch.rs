@@ -2,33 +2,33 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! `Architecture` trait impl for the toy arch — minimum-viable reference.
+//! `Architecture` trait impl for the template arch — minimum-viable reference.
 //!
 //! This file is the *shape* a new arch's `arch.rs` should take: a
-//! zero-sized type marker (`Toy`), `impl Architecture for Toy`, and
+//! zero-sized type marker (`Template`), `impl Architecture for Template`, and
 //! every required method delegating into the arch's own model module
-//! (here `toy_model`). Every method is a one-liner with a doc-comment
+//! (here `template_model`). Every method is a one-liner with a doc-comment
 //! explaining what a real arch would do.
 //!
 //! For a fully wired production reference, read
 //! `crates/hipfire-arch-qwen35/src/arch.rs`.
 
-use crate::toy_model::{ToyConfig, ToyState, ToyWeights};
+use crate::template_model::{TemplateConfig, TemplateState, TemplateWeights};
 use hipfire_runtime::arch::{
     Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
 };
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
-/// Type marker for the toy arch. Zero-sized — no per-instance state.
-/// A real arch's marker is exactly this shape (e.g. `Qwen35`, `Llama`).
-/// Trait dispatch uses the type, not a value.
-pub struct Toy;
+/// Type marker for the template arch. Zero-sized — no per-instance state.
+/// A real arch's marker is exactly this shape (e.g. `Qwen35`, `Llama`); rename
+/// `Template` to your family. Trait dispatch uses the type, not a value.
+pub struct Template;
 
-impl Architecture for Toy {
-    type Weights = ToyWeights;
-    type State = ToyState;
-    type Config = ToyConfig;
+impl Architecture for Template {
+    type Weights = TemplateWeights;
+    type State = TemplateState;
+    type Config = TemplateConfig;
 
     /// Pick an unused `arch_id` for a real arch — reserve one in
     /// `docs/architecture-ids.md` if/when it lands. Existing IDs:
@@ -37,20 +37,20 @@ impl Architecture for Toy {
     /// marker for the family; the actual id loaded at runtime lives on
     /// `HfqFile::arch_id` and is dispatched by the daemon.
     fn arch_id() -> u32 {
-        // 0xFF = "toy / reserved for the template". Never ship an HFQ
-        // file with this arch_id; the daemon will not dispatch it.
+        // 0xFF = "reserved for the template". Never ship an HFQ file with this
+        // arch_id; the daemon will not dispatch it.
         0xFF
     }
 
     fn name() -> &'static str {
-        "toy"
+        "template"
     }
 
     /// In a real arch: parse model-shape constants out of
     /// `hfq.metadata_json` and emit a typed `Config`. See
     /// `hipfire_arch_qwen35::qwen35::config_from_hfq` for the pattern.
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
-        ToyConfig::from_hfq(hfq)
+        TemplateConfig::from_hfq(hfq)
     }
 
     /// In a real arch: read every weight tensor out of `hfq`, upload
@@ -64,7 +64,7 @@ impl Architecture for Toy {
         cfg: &Self::Config,
         _gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        ToyWeights::load(hfq, cfg)
+        TemplateWeights::load(hfq, cfg)
     }
 
     /// In a real arch: allocate GPU scratch buffers (KV cache, attention
@@ -72,7 +72,7 @@ impl Architecture for Toy {
     /// See `DeltaNetState::new` in `hipfire-arch-qwen35` (hybrid LA + FA)
     /// and `ForwardScratch::new` in `hipfire-runtime::llama` (dense FA).
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
-        ToyState::new(cfg)
+        TemplateState::new(cfg)
     }
 
     // ── Optional overrides ────────────────────────────────────────────
@@ -129,8 +129,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toy_arch_id_is_reserved() {
-        assert_eq!(Toy::arch_id(), 0xFF);
-        assert_eq!(Toy::name(), "toy");
+    fn template_arch_id_is_reserved() {
+        assert_eq!(Template::arch_id(), 0xFF);
+        assert_eq!(Template::name(), "template");
     }
 }
