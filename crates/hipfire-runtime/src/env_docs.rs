@@ -1053,21 +1053,21 @@ pub const ENV_HIPFIRE_DIAG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_CPU_REFERENCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_CPU_REFERENCE",
     description: "Runtime variable controlling diffusion cpu reference in hipfire",
-    source: "crates/hipfire-diffusion/src/lib.rs:226",
+    source: "crates/hipfire-diffusion/src/lib.rs:224",
 };
 
 /// `HIPFIRE_DIFFUSION_DUMP_DIR` — Runtime variable controlling diffusion dump dir in hipfire
 pub const ENV_HIPFIRE_DIFFUSION_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_DUMP_DIR",
     description: "Runtime variable controlling diffusion dump dir in hipfire",
-    source: "crates/hipfire-diffusion/src/lib.rs:2571",
+    source: "crates/hipfire-diffusion/src/lib.rs:2569",
 };
 
 /// `HIPFIRE_DIFFUSION_LAYER_RUNG` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_LAYER_RUNG",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-diffusion/src/lib.rs:1471",
+    source: "crates/hipfire-diffusion/src/lib.rs:1469",
 };
 
 /// `HIPFIRE_DIR` — Runtime variable controlling dir in hipfire
@@ -2948,14 +2948,14 @@ pub const ENV_HIPFIRE_QUANTIZE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUANT_CALIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_CALIB",
     description: "Runtime variable controlling quant calib in hipfire",
-    source: "crates/hipfire-diffusion/src/tests.rs:6271",
+    source: "crates/hipfire-diffusion/src/tests.rs:6278",
 };
 
 /// `HIPFIRE_QUANT_CANDS` — Runtime variable controlling quant cands in hipfire
 pub const ENV_HIPFIRE_QUANT_CANDS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_CANDS",
     description: "Runtime variable controlling quant cands in hipfire",
-    source: "crates/hipfire-diffusion/src/tests.rs:6295",
+    source: "crates/hipfire-diffusion/src/tests.rs:6302",
 };
 
 /// `HIPFIRE_QUANT_DIAG_PATH` — Runtime variable controlling quant diag path in hipfire
@@ -2969,7 +2969,7 @@ pub const ENV_HIPFIRE_QUANT_DIAG_PATH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUANT_SRC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_SRC",
     description: "Runtime variable controlling quant src in hipfire",
-    source: "crates/hipfire-diffusion/src/tests.rs:6292",
+    source: "crates/hipfire-diffusion/src/tests.rs:6299",
 };
 
 /// `HIPFIRE_QUANT_THREADS` — Runtime variable controlling quant threads in hipfire
