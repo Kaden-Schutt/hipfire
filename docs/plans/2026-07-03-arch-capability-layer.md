@@ -31,6 +31,16 @@ each family has. `SessionServingBackend` becomes the `Sessions` capability;
 
 ## Phase 0 — the capability layer (this plan)
 
+> **STATUS: Phase 0 DONE (2026-07-03).** Commits 919e48a46 (arch-api core:
+> `ArchId`/`Arch`/`Caps`/`BatchedPrefill`/`SpecDecodeChain`/`ToyModel`, declarative
+> `register_arch!`+`__set_cap!`, `inventory` `ArchRegistry`), cb6d02431 (toy arch
+> wired: `Arch`+`ToyModel` impls, seeded `emit_fixture`, `hipfire-archs` force-link
+> bundle + `registry()`), 604be94e1 (migration-ledger gate + purity lint, both in
+> no-gpu-ci). Validated: declared→Some/undeclared→None, over-claim→compile-error,
+> cross-crate force-link preserves registration, purity lint neg-tested. NEXT:
+> migrate the first real family (add its `-spec` crate, `register_arch!`, bump the
+> ledger). Autoref auto-discovery was spiked and rejected (see 0.2) → declarative.
+
 ### 0.1 New leaf crate `hipfire-arch-api`
 
 Minimal deps. Defines the whole surface so arch crates and shared crates depend on
