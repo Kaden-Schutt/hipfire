@@ -7,7 +7,7 @@ description = "Shared CLI/server configuration and local path helpers for hipfir
 
 [dependencies]
 dirs = "5"
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = "1"
 argon2 = "0.5"
 getrandom = "0.2"

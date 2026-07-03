@@ -6,15 +6,15 @@ license.workspace = true
 description = "Async daemon JSONL process adapter for hipfire"
 
 [dependencies]
-anyhow = "1"
+anyhow.workspace = true
 dirs = "5"
 futures = "0.3"
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
-libc = "0.2"
+libc.workspace = true
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+tracing.workspace = true
+uuid.workspace = true

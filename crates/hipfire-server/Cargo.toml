@@ -16,20 +16,20 @@ chat-ui-embed = ["dep:rust-embed"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
-base64 = "0.22"
+base64.workspace = true
 rust-embed = { version = "8", optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-tracing = "0.1"
+uuid.workspace = true
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
 futures = "0.3"
 async-stream = "0.3"
-anyhow = "1"
+anyhow.workspace = true
 hipfire-admin-types = { path = "../hipfire-admin-types" }
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-build-info = { path = "../hipfire-build-info" }

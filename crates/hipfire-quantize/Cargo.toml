@@ -23,11 +23,11 @@ rdna-compute = { path = "../rdna-compute", optional = true }
 # Shared flock(2) GPU resource lock — held automatically while the quantizer uses
 # the GPU, so it cooperates with the daemon/benches (AGENTS.md: one lock primitive).
 hipfire-lock = { path = "../hipfire-lock", optional = true }
-memmap2 = "0.9"
-serde = { version = "1", features = ["derive"] }
+memmap2.workspace = true
+serde.workspace = true
 serde_json = "1"
 byteorder = "1"
-rayon = "1"
+rayon.workspace = true
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 # Linear algebra for QTIP-LDLQ (Phase C1e): damped Cholesky / inverse-Cholesky
 # of per-layer Hessians. The LDLQ algorithm itself is clean-room; faer is just

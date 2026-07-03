@@ -6,4 +6,4 @@ license.workspace = true
 description = "Reusable flock(2) file-lock primitive shared by the daemon singleton lock and the GPU mutex."
 
 [dependencies]
-libc = "0.2"
+libc.workspace = true

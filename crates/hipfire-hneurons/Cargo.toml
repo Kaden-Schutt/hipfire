@@ -6,7 +6,7 @@ license.workspace = true
 description = "Hallucination-associated neuron (H-Neuron) identification, à la arXiv 2512.01797: per-neuron CETT contribution capture + a sparse L1 logistic-regression probe. This crate is the model-independent host core (CETT math + probe); the ffn_hidden forward tap, the daemon capture op, and the collect/label tooling are wired separately. Reference impl vendored at third_party/H-Neurons."
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 
 [dev-dependencies]
 serde_json = "1"

@@ -68,20 +68,20 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
-memmap2 = "0.9"
-serde = { version = "1", features = ["derive"] }
-csv = "1"
+memmap2.workspace = true
+serde.workspace = true
+csv.workspace = true
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
 # default BTreeMap alphabetic sort. Required so request tool-definition key order
 # survives parse → render → `| tojson`, byte-matching the model's trained
 # chat_template (HF apply_chat_template preserves insertion order). Feature-
 # unifies across the workspace build.
 serde_json = { version = "1", features = ["preserve_order"] }
-base64 = "0.22"
-libc = "0.2"
-rayon = "1"
+base64.workspace = true
+libc.workspace = true
+rayon.workspace = true
 twox-hash = { version = "2", default-features = false, features = ["xxhash64", "xxhash3_128"] }
-tracing = "0.1"
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 hipfire-detect = { path = "../hipfire-detect" }
 # Renders the upstream HF chat_template (Jinja) when present in
