@@ -3898,6 +3898,97 @@ fn qtip_beam_width() -> usize {
         .unwrap_or(128)
 }
 
+/// CPU beam-search trellis encode: `symbols` [n_groups*256] from the FWHT-rotated
+/// `rotated` groups, each seeded at its RMS `group_scale` (the closed-form optimal
+/// scale is refit downstream at pack time). The reference path — always available,
+/// byte-preserving vs the historical qtip encode.
+fn cpu_encode_symbols(rotated: &[f32], n_groups: usize, cb: &[f32], beam: usize, bits: u32) -> Vec<u8> {
+    use rayon::prelude::*;
+    let mut symbols = vec![0u8; n_groups * 256];
+    symbols
+        .par_chunks_mut(256)
+        .zip(rotated.par_chunks(256))
+        .for_each(|(srow, grp)| {
+            let scale0 = qtip::group_scale(grp);
+            let sym = qtip::beam_encode_group_bits(grp, scale0, cb, beam, bits);
+            srow.copy_from_slice(&sym);
+        });
+    symbols
+}
+
+/// GPU full-Viterbi trellis encode (exact, ≥ beam quality; ~250× the CPU beam).
+/// Groups are chunked so the per-group Viterbi backpointer scratch (256×4096 B)
+/// stays bounded; the scratch buffer is allocated once and reused across chunks.
+#[cfg(feature = "gpu")]
+fn gpu_encode_symbols(
+    gpu: &mut rdna_compute::Gpu,
+    rotated: &[f32],
+    n_groups: usize,
+    bits: u32,
+) -> Result<Vec<u8>, String> {
+    const CHUNK: usize = 2048; // groups/launch → ~2 GB backpointer scratch, reused
+    let mut symbols = vec![0u8; n_groups * 256];
+    let backptr = gpu
+        .upload_raw(&vec![0u8; CHUNK * 256 * 4096], &[CHUNK * 256 * 4096])
+        .map_err(|e| format!("gpu backptr alloc: {e}"))?;
+    let mut done = 0usize;
+    while done < n_groups {
+        let cn = (n_groups - done).min(CHUNK);
+        let wbytes: Vec<u8> = rotated[done * 256..(done + cn) * 256]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let wd = gpu.upload_raw(&wbytes, &[cn, 256]).map_err(|e| e.to_string())?;
+        let sd = gpu
+            .upload_raw(&vec![0u8; cn * 256], &[cn, 256])
+            .map_err(|e| e.to_string())?;
+        let scd = gpu
+            .upload_raw(&vec![0u8; cn * 4], &[cn])
+            .map_err(|e| e.to_string())?;
+        gpu.qtip_viterbi_encode(&wd, &sd, &backptr, &scd, cn, bits)
+            .map_err(|e| e.to_string())?;
+        gpu.device_synchronize().map_err(|e| e.to_string())?;
+        let s = gpu.download_raw(&sd, cn * 256).map_err(|e| e.to_string())?;
+        symbols[done * 256..(done + cn) * 256].copy_from_slice(&s);
+        done += cn;
+    }
+    Ok(symbols)
+}
+
+/// Acquire the shared GPU flock so the quantizer cooperates with the daemon and
+/// other GPU tools while it runs the trellis encoder — AGENTS.md's one lock
+/// primitive (`hipfire-lock`), acquired automatically rather than by an external
+/// `hipfire lock`. Blocks (with a poll message) until the GPU is free; the guard
+/// is held for the duration of the GPU work via RAII. Returns None only if the
+/// lock file can't be opened, in which case we proceed lock-less rather than fail.
+#[cfg(feature = "gpu")]
+fn acquire_gpu_lock() -> Option<hipfire_lock::FlockGuard> {
+    let path = hipfire_lock::gpu_resource_lock_path();
+    let mut guard = match hipfire_lock::FlockGuard::open(&path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "  qtip: could not open GPU lock {}: {e}; proceeding without it",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let mut waited = 0u64;
+    let acquired = guard
+        .lock_blocking(std::time::Duration::from_secs(2), None, |holder| {
+            waited += 2;
+            let who = if holder.is_empty() { "unknown" } else { holder };
+            eprintln!("  qtip: GPU busy ({who}) — waited {waited}s for the GPU lock…");
+        })
+        .unwrap_or(false);
+    if !acquired {
+        return None;
+    }
+    let _ = guard.write_holder(&format!("{} hipfire-quantize", std::process::id()));
+    Some(guard)
+}
+
 /// Pack the real QTIP format (`bits`-bit trellis) over a set of staged BF16
 /// tensors, in place.
 ///
@@ -3935,6 +4026,33 @@ fn pack_qtip_real_tensors(
     } else {
         QuantType::Qtip3G256
     };
+    // Autodetect a GPU for the trellis encode (exact Viterbi, ~250× the CPU beam).
+    // The CPU beam remains the fallback + reference; nothing here requires a GPU.
+    // When a device is found we self-acquire the shared GPU flock (`_gpu_lock`,
+    // held via RAII until this function returns) so we cooperate with the daemon
+    // and other GPU tools — no external `hipfire lock` needed.
+    #[cfg(feature = "gpu")]
+    let (mut gpu, _gpu_lock) = match rdna_compute::Gpu::init() {
+        Ok(g) => {
+            let lock = acquire_gpu_lock();
+            eprintln!(
+                "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi){}",
+                g.arch,
+                if lock.is_some() {
+                    " — GPU lock held"
+                } else {
+                    " — WARNING: proceeding without GPU lock"
+                }
+            );
+            (Some(g), lock)
+        }
+        Err(_) => {
+            eprintln!("  qtip{bits} (real): no GPU device — CPU beam encoder (beam={beam})");
+            (None, None)
+        }
+    };
+    #[cfg(not(feature = "gpu"))]
+    eprintln!("  qtip{bits} (real): CPU beam encoder (beam={beam}; built --no-default-features)");
     use rayon::prelude::*;
     // The tied embed/lm_head ([vocab × dim]) is gather-accessed (embedding
     // lookup), which the trellis format can't random-access — and it is the
@@ -3997,23 +4115,49 @@ fn pack_qtip_real_tensors(
             .chunks_exact(2)
             .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
-        // Per row → packed records; collect per-row max-error (and, when low-rank
-        // is enabled, the per-row rotated-frame error E_rot) in parallel.
-        let row_out: Vec<(Vec<u8>, f32, Vec<f32>)> = wf
+        // Phase 1 — FWHT-rotate every group into the incoherent frame (CPU,
+        // parallel over rows). `rotated` holds the [m*k] rotated weights.
+        let mut rotated = vec![0.0f32; m * k];
+        rotated
+            .par_chunks_mut(k)
+            .zip(wf.par_chunks(k))
+            .for_each(|(orow, wrow)| {
+                for g in 0..groups {
+                    let mut grp = [0.0f32; 256];
+                    grp.copy_from_slice(&wrow[g * 256..g * 256 + 256]);
+                    cpu_fwht_256(&mut grp, qtip_s1, qtip_s2);
+                    orow[g * 256..g * 256 + 256].copy_from_slice(&grp);
+                }
+            });
+
+        // Phase 2 — trellis-encode the rotated groups → `symbols` [m*k]. GPU exact
+        // Viterbi when a device was autodetected, else CPU beam. The CPU path is
+        // byte-preserving vs the historical encode; the GPU path is optimal (≥ beam)
+        // so its symbols differ (better) — a valid, self-consistent .hfq either way.
+        let ng = m * groups;
+        #[cfg(feature = "gpu")]
+        let symbols: Vec<u8> = match gpu.as_mut() {
+            Some(g) => gpu_encode_symbols(g, &rotated, ng, bits)
+                .unwrap_or_else(|e| panic!("GPU qtip encode failed: {e}")),
+            None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
+        };
+        #[cfg(not(feature = "gpu"))]
+        let symbols: Vec<u8> = cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits);
+
+        // Phase 3 — refit the closed-form optimal scale, self-check (rotated-frame
+        // decode err), and pack (CPU, parallel over rows).
+        let row_out: Vec<(Vec<u8>, f32, Vec<f32>)> = rotated
             .par_chunks(k)
-            .map(|row| {
+            .zip(symbols.par_chunks(k))
+            .map(|(rrow, symrow)| {
                 let mut packed = Vec::with_capacity(groups * block_bytes);
                 let mut rerr = 0.0f32;
                 let mut erow = if want_lr { vec![0.0f32; k] } else { Vec::new() };
                 for g in 0..groups {
-                    let mut grp = [0.0f32; 256];
-                    grp.copy_from_slice(&row[g * 256..g * 256 + 256]);
-                    cpu_fwht_256(&mut grp, qtip_s1, qtip_s2); // rotate
-                    let scale0 = qtip::group_scale(&grp);
-                    let sym = qtip::beam_encode_group_bits(&grp, scale0, qtip_cb, beam, bits);
-                    let scale = qtip::optimal_scale_bits(&grp, &sym, qtip_cb, bits);
-                    // Self-check: decode in the rotated frame vs the encode target.
-                    let deq = qtip::decode_group_bits(&sym, scale, qtip_cb, bits);
+                    let grp = &rrow[g * 256..g * 256 + 256];
+                    let sym = &symrow[g * 256..g * 256 + 256];
+                    let scale = qtip::optimal_scale_bits(grp, sym, qtip_cb, bits);
+                    let deq = qtip::decode_group_bits(sym, scale, qtip_cb, bits);
                     for (idx, (a, b)) in grp.iter().zip(&deq).enumerate() {
                         let d = a - b;
                         rerr = rerr.max(d.abs());
@@ -4022,9 +4166,9 @@ fn pack_qtip_real_tensors(
                         }
                     }
                     let group_bytes = if bits == 4 {
-                        qtip::pack_qtip4_group(&sym, scale)
+                        qtip::pack_qtip4_group(sym, scale)
                     } else {
-                        qtip::pack_qtip3_group(&sym, scale)
+                        qtip::pack_qtip3_group(sym, scale)
                     };
                     packed.extend_from_slice(&group_bytes);
                 }
