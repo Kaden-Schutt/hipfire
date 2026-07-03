@@ -4483,47 +4483,6 @@ fn run_hfq_source_pipeline(
     Ok(())
 }
 
-/// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
-/// names that `hipfire_runtime::hfq::load_weights_hfq` expects. The mapping is
-/// the canonical llama.cpp ↔ HF convention.
-///
-/// Returns None for tensors that don't have a known safetensors equivalent
-/// (we then keep them under their GGUF name; the future loader can decide
-/// what to do, or they're skipped).
-fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
-    // Top-level tensors.
-    match gguf_name {
-        "token_embd.weight" => return Some("model.embed_tokens.weight".to_string()),
-        "output.weight" => return Some("lm_head.weight".to_string()),
-        "output_norm.weight" => return Some("model.norm.weight".to_string()),
-        _ => {}
-    }
-    // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
-    if let Some(rest) = gguf_name.strip_prefix("blk.") {
-        // rest = "{N}.<slot>.weight"
-        let dot = rest.find('.')?;
-        let layer_idx = &rest[..dot];
-        let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
-        let slot = slot_full.strip_suffix(".weight")?;
-        let translated = match slot {
-            "attn_norm" => "input_layernorm".to_string(),
-            "ffn_norm" => "post_attention_layernorm".to_string(),
-            "attn_q" => "self_attn.q_proj".to_string(),
-            "attn_k" => "self_attn.k_proj".to_string(),
-            "attn_v" => "self_attn.v_proj".to_string(),
-            "attn_output" => "self_attn.o_proj".to_string(),
-            "attn_q_norm" => "self_attn.q_norm".to_string(),
-            "attn_k_norm" => "self_attn.k_norm".to_string(),
-            "ffn_gate" => "mlp.gate_proj".to_string(),
-            "ffn_up" => "mlp.up_proj".to_string(),
-            "ffn_down" => "mlp.down_proj".to_string(),
-            other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
-        };
-        return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
-    }
-    None
-}
 
 /// True if the GGUF tensor's name is a 1D norm / RMSNorm scaling vector.
 /// These stay F16 in the .hfq (no benefit from quantization, precision-sensitive).
@@ -5115,140 +5074,8 @@ fn gguf_is_embed_tensor(name: &str) -> bool {
     name == "token_embd.weight"
 }
 
-/// Build the `config` JSON object that `hipfire_runtime::hfq::config_from_hfq`
-/// reads. Mirrors the field names HuggingFace uses in `config.json` for
-/// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
-/// `<arch>.*` metadata keys.
-fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_json::Value {
-    // GGUF prefixes its model hyperparameters with the architecture name —
-    // e.g. for `general.architecture=llama` the keys live under `llama.*`.
-    let prefix = arch_str;
 
-    let read_u = |k: &str| -> Option<u64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::U8(x) => Some(*x as u64),
-            gguf_input::MetaValue::I8(x) => Some(*x as u64),
-            gguf_input::MetaValue::U16(x) => Some(*x as u64),
-            gguf_input::MetaValue::I16(x) => Some(*x as u64),
-            gguf_input::MetaValue::U32(x) => Some(*x as u64),
-            gguf_input::MetaValue::I32(x) => Some(*x as u64),
-            gguf_input::MetaValue::U64(x) => Some(*x),
-            gguf_input::MetaValue::I64(x) => Some(*x as u64),
-            _ => None,
-        })
-    };
-    let read_f = |k: &str| -> Option<f64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::F32(x) => Some(*x as f64),
-            gguf_input::MetaValue::F64(x) => Some(*x),
-            _ => None,
-        })
-    };
 
-    let dim = read_u(&format!("{prefix}.embedding_length"));
-    let n_layers = read_u(&format!("{prefix}.block_count"));
-    let n_heads = read_u(&format!("{prefix}.attention.head_count"));
-    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv")).or(n_heads);
-    let hidden_dim = read_u(&format!("{prefix}.feed_forward_length"));
-    // vocab_size: prefer metadata, fall back to token_embd shape[1].
-    let vocab_size = read_u(&format!("{prefix}.vocab_size")).or_else(|| {
-        gguf.tensors
-            .iter()
-            .find(|t| t.name == "token_embd.weight")
-            .and_then(|t| t.shape.get(1).map(|&s| s as u64))
-    });
-    let max_seq_len = read_u(&format!("{prefix}.context_length"));
-    let rope_theta = read_f(&format!("{prefix}.rope.freq_base"));
-    let rms_eps = read_f(&format!("{prefix}.attention.layer_norm_rms_epsilon"));
-    let head_dim = read_u(&format!("{prefix}.attention.key_length")).or_else(|| {
-        // Fall back: head_dim = dim / n_heads.
-        dim.zip(n_heads).map(|(d, h)| if h > 0 { d / h } else { d })
-    });
-    let bos = read_u("tokenizer.ggml.bos_token_id").unwrap_or(1);
-    let eos = read_u("tokenizer.ggml.eos_token_id").unwrap_or(2);
-
-    let mut cfg = serde_json::Map::new();
-    cfg.insert(
-        "model_type".to_string(),
-        serde_json::Value::from(arch_str.to_string()),
-    );
-    if let Some(v) = dim {
-        cfg.insert("hidden_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = n_layers {
-        cfg.insert("num_hidden_layers".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = n_heads {
-        cfg.insert(
-            "num_attention_heads".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = n_kv_heads {
-        cfg.insert(
-            "num_key_value_heads".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = hidden_dim {
-        cfg.insert("intermediate_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = vocab_size {
-        cfg.insert("vocab_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = max_seq_len {
-        cfg.insert(
-            "max_position_embeddings".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = rope_theta {
-        cfg.insert("rope_theta".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = rms_eps {
-        cfg.insert("rms_norm_eps".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = head_dim {
-        cfg.insert("head_dim".to_string(), serde_json::Value::from(v));
-    }
-    cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
-    cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
-    serde_json::Value::Object(cfg)
-}
-
-/// Translate the GGUF metadata HashMap into a JSON object that ends up in
-/// the `.hfq` header's metadata blob. A future engine-side `from_hfq` for
-/// Llama-style models can read these fields the same way the existing
-/// `from_gguf` reads them today.
-fn gguf_meta_to_json(meta: &HashMap<String, gguf_input::MetaValue>) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    for (k, v) in meta {
-        let json_v = mv_to_json(v);
-        map.insert(k.clone(), json_v);
-    }
-    serde_json::Value::Object(map)
-}
-
-fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
-    use gguf_input::MetaValue as MV;
-    match v {
-        MV::U8(x) => serde_json::Value::from(*x),
-        MV::I8(x) => serde_json::Value::from(*x),
-        MV::U16(x) => serde_json::Value::from(*x),
-        MV::I16(x) => serde_json::Value::from(*x),
-        MV::U32(x) => serde_json::Value::from(*x),
-        MV::I32(x) => serde_json::Value::from(*x),
-        MV::F32(x) => serde_json::Value::from(*x),
-        MV::Bool(x) => serde_json::Value::from(*x),
-        MV::String(s) => serde_json::Value::from(s.clone()),
-        MV::U64(x) => serde_json::Value::from(*x),
-        MV::I64(x) => serde_json::Value::from(*x),
-        MV::F64(x) => serde_json::Value::from(*x),
-        // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
-        // serialize them as JSON arrays so the engine side can re-parse.
-        MV::Array(arr) => serde_json::Value::Array(arr.iter().map(mv_to_json).collect()),
-    }
-}
 
 /// 2D-weight quantization target chosen at the per-tensor level. The choice
 /// per format flag:
@@ -5390,13 +5217,13 @@ fn run_gguf_pipeline(
     // can reconstruct LlamaConfig at load time. Also keep the raw GGUF
     // metadata tree under `gguf_meta` for any consumer that wants original
     // values (chat template, vocab, scores, merges, etc.).
-    let config_json = config_json_from_gguf(&gguf, &arch_str);
+    let config_json = gguf_input::config_json_from_gguf(&gguf, &arch_str);
     let mut metadata = serde_json::json!({
         "architecture": arch_str,
         "source": "gguf",
         "quant_format": format_label,
         "config": config_json,
-        "gguf_meta": gguf_meta_to_json(&gguf.metadata),
+        "gguf_meta": gguf_input::gguf_meta_to_json(&gguf.metadata),
     });
 
     // FWHT signs — only used by MQ/MFP formats. Same seed pair as the
@@ -5447,7 +5274,7 @@ fn run_gguf_pipeline(
             let mut counts = [0u32; 4];
             for info in &gguf.tensors {
                 let out_name =
-                    gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+                    gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
                 let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
                 match level {
                     QuantLevel::F16 => counts[0] += 1,
@@ -5501,7 +5328,7 @@ fn run_gguf_pipeline(
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
-        let out_name = gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+        let out_name = gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
