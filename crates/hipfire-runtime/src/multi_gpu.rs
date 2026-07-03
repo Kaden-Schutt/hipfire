@@ -253,6 +253,17 @@ impl Gpus {
                 if i == j {
                     continue;
                 }
+                // Emulated dual-GPU (HIPFIRE_EMULATE_GPUS): two logical ranks
+                // aliased onto the same physical device_id. A peer query/enable
+                // for device == peer errors on some ROCm versions, which would
+                // abort the load; skip it and leave peer access disabled so
+                // boundary_copy uses the valid same-device d2d fallback
+                // (memcpy_peer with src == dst). Inert on real multi-GPU, where
+                // distinct devices never share a device_id.
+                if self.devices[i].device_id == self.devices[j].device_id {
+                    all_ok = false;
+                    continue;
+                }
                 if !self.devices[i]
                     .hip
                     .can_access_peer(self.devices[i].device_id, self.devices[j].device_id)?
