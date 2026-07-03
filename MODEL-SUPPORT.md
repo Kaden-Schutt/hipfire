@@ -70,6 +70,7 @@ This per-arch chart is the **`family × feature` projection** of the 5-axis capa
 | oq8+ (Opus Quant Plus / OQ8+ (W8A8, calibrated OQ8 weights)) | 8 | 8 | opt-in |
 | mq3 (Magnum / MQ3 (W3A16, mixed-precision only)) | 3 | 16 | experimental |
 | qtip3 (QTIP-3 (W3A16 trellis decode)) | 3 | 16 | opt-in |
+| qtip4 (QTIP-4 (W4A16 trellis decode)) | 4 | 16 | opt-in |
 
 ### Intentional gates (generated)
 
@@ -102,6 +103,7 @@ Projection of the prefill axis over **weight-quant × gfx-class**, computed from
 | oq8+ | 🔒 | 🔒 | 🔒 | 🔒 | 🔒 |
 | mq3 | ❌ | ✅ | ✅ | ✅ | ✅ |
 | qtip3 | 🔒 | 🔒 | 🔒 | 🔒 | 🔒 |
+| qtip4 | 🔒 | 🔒 | 🔒 | 🔒 | 🔒 |
 
 ### Batched prefill: kv-mode (derived)
 

@@ -379,6 +379,7 @@ pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<rdna_compute::DType> {
         Q::MFP4G32 if k % 256 == 0 => DType::MFP4G32,
         Q::MQ4G256Lloyd => DType::MQ4G256Lloyd,
         Q::Qtip3G256 => DType::Qtip3G256,
+        Q::Qtip4G256 => DType::Qtip4G256,
         _ => return None,
     })
 }

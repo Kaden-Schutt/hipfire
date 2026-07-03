@@ -1760,6 +1760,21 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        42 => {
+            // Qtip4G256 — 4-bit bitshift-trellis (132 B/group), served by the
+            // gemv_qtip4g256 kernel. Same plain-llama path as qtip3; the on-disk
+            // bytes are uploaded raw and decoded on-the-fly (nibble unpack).
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Qtip4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         34 => {
             // Oq4G256 — Opus Quant symmetric W4 (int4 per-256-group, FWHT-256
             // rotated). Canonical on-disk form `[f16 scale][128 nibbles]`/group;

@@ -227,6 +227,13 @@ pub const QUANT_TABLE: &[QuantInfo] = &[
         act_bits: 16,
         status: "opt-in",
     },
+    QuantInfo {
+        name: "qtip4",
+        label: "QTIP-4 (W4A16 trellis decode)",
+        weight_bits: 4,
+        act_bits: 16,
+        status: "opt-in",
+    },
 ];
 
 /// An intentional (arch × quant × feature) override of the arch-level

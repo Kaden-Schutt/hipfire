@@ -132,6 +132,9 @@ pub const GEMV_MQ3G256_LLOYD_SRC: &str =
 /// QTIP-3: FWHT-rotated trellis-coded 3-bit, fused on-the-fly decode + matvec
 /// (100 B/group, computed 1MAD codebook, zero LDS). Arch-generic (gfx1103/1100).
 pub const GEMV_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip3g256.hip");
+/// QTIP-4: FWHT-rotated trellis-coded 4-bit, fused on-the-fly decode + matvec
+/// (132 B/group, same computed 1MAD codebook, zero LDS). Arch-generic.
+pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip4g256.hip");
 /// MQ4G256Lloyd: 4-bit + per-block 16-entry fp16 codebook (160 B/group).
 pub const GEMV_MQ4G256_LLOYD_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256_lloyd.hip");

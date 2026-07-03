@@ -2305,6 +2305,97 @@ impl Gpu {
             },
         )
     }
+    /// QTIP-4 GEMV (plain, y = W·x). The 4-bit sibling of `gemv_qtip3g256`:
+    /// same computed 1MAD codebook / 12-bit trellis, 132 B/group nibble packing.
+    /// x must be pre-FWHT-rotated by the caller (rotate_x_mq_for), same contract.
+    pub fn gemv_qtip4g256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_qtip4g256",
+            kernels::GEMV_QTIP4G256_SRC,
+            "gemv_qtip4g256",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_qtip4g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+    /// QTIP-4 GEMV with fused residual add (y += W·x). Same decode as
+    /// `gemv_qtip4g256`; the kernel's final store accumulates.
+    pub fn gemv_qtip4g256_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_qtip4g256",
+            kernels::GEMV_QTIP4G256_SRC,
+            "gemv_qtip4g256_residual",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_qtip4g256_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
     /// MagnumQuant MQ3-G256 GEMV with fused residual add. The pre-rotation
     /// happens in a separate kernel via fused_silu_mul_mq_rotate or
     /// rotate_x_for_mq; this function just dispatches the underlying
