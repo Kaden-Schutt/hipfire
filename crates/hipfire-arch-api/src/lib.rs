@@ -41,8 +41,8 @@
 
 pub mod ingest;
 pub use ingest::{
-    allocate, default_importance, default_requires, target_bits, transformer_role, CapReq,
-    CodecCaps, Ingest, TensorRole,
+    allocate, default_importance, default_precision_class, default_requires, target_bits,
+    transformer_role, CapReq, CodecCaps, Ingest, PrecisionClass, TensorRole,
 };
 
 /// Stable numeric identity of an architecture family (the on-disk/header id).

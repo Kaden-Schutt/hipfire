@@ -2489,26 +2489,10 @@ fn should_quantize(name: &str) -> bool {
     name.contains("weight")
 }
 
-/// antirez ds4 reference keeps three classes at F16 because Q8 measurably
-/// regresses PPL on DeepSeek V4: (1) attn compressor wkv + wgate, (2) indexer wq_b +
-/// weights_proj, (3) indexer compressor wkv + wgate. All small (≤32 MiB
-/// combined across 43 layers).
-///
-/// Router gate.weight (.ffn.gate.weight) is NOT kept at F16: antirez
-/// actually ships it as MQ4G256, and the known-good DeepSeek V4 quant
-/// matches. Falling back to the format's default (Q8F16 in deepseek4-q8-mtp)
-/// is fine — the router is dispatched via `gemv_auto`.
-///
-/// `attn.indexer.compressor.*` is a substring of `attn.compressor.*` only
-/// in the literal-prefix sense, so order doesn't matter — the substring
-/// `.compressor.wkv.weight` matches both `.attn.compressor.wkv.weight` and
-/// `.attn.indexer.compressor.wkv.weight` deliberately.
-fn is_deepseek4_keep_f16(name: &str) -> bool {
-    name.ends_with(".compressor.wkv.weight")
-        || name.ends_with(".compressor.wgate.weight")
-        || name.ends_with(".indexer.wq_b.weight")
-        || name.ends_with(".indexer.weights_proj.weight")
-}
+// DeepSeek-V4 MLA compressor/indexer source-precision protection now lives arch-side
+// as the `SourcePrecision` precision class in `hipfire-arch-deepseek4-spec`
+// (`is_critical_stream`), consulted here via `precision_class_via_ingest`. The old
+// `is_deepseek4_keep_f16` name-matcher was deleted with that migration.
 
 // Force-link the offline specs bundle so every migrated arch's `register_arch!`
 // Ingest registration is present (Rust drops unreferenced rlibs). The bundle and
@@ -2563,6 +2547,27 @@ fn high_precision_via_ingest(arch_id: u32, name: &str, k: usize) -> Option<bool>
     )
 }
 
+/// The arch's declared [`PrecisionClass`](hipfire_arch_api::PrecisionClass) for a
+/// tensor, keyed by `ArchId`. This is the finer, registry-backed model-def the
+/// source-precision and mq4-pinned paths consult instead of arch-name keep-lists
+/// (`is_deepseek4_keep_f16`, `is_nemotron_h_mq4_q8_protected`). Because it is
+/// arch-keyed, a class one family declares can never leak onto another. `None` only
+/// for an unregistered arch (a completeness-gate failure); callers keep their default.
+fn precision_class_via_ingest(
+    arch_id: u32,
+    name: &str,
+) -> Option<hipfire_arch_api::PrecisionClass> {
+    use hipfire_arch_api::ArchId;
+    Some(
+        ARCH_REGISTRY
+            .get_or_init(hipfire_arch_api::ArchRegistry::build)
+            .get(ArchId(arch_id as u16))?
+            .caps
+            .ingest?
+            .precision_class(name),
+    )
+}
+
 /// Structural (not arch-specific) test for a short-conv recurrence filter:
 /// `{prefix}.conv1d.weight`, shape [conv_channels, 1, K]. Small (~32K elem) and
 /// runs every token — Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3)
@@ -2574,28 +2579,11 @@ fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
 }
 
-/// Nemotron-H projections that should stay Q8 in MQ-family artifacts.
-///
-/// Local Nano-4B evidence (native-Mamba Python reference + Hipfire f32/Q8/MQ4
-/// comparison) shows uncalibrated MQ4 flips the close first-token boundary from
-/// `<|im_end|>` to newline when projection-back weights are lossy. Nano-30B
-/// bring-up also marked `mixer.in_proj.weight` as ingress-sensitive: it
-/// generates the SSM gate, x, B/C, and dt streams, and the Q8 candidate moved
-/// the fixed-scale boundary slightly closer to BF16. Keep both classes Q8 for
-/// base MQ-family artifacts until an imatrix/AWQ/Lloyd policy is validated for
-/// this arch.
-fn is_nemotron_h_mq4_q8_protected(name: &str) -> bool {
-    name.starts_with("backbone.layers.")
-        && (name.ends_with(".mixer.in_proj.weight") || is_nemotron_h_residual_writer(name))
-}
-
-/// Nemotron-H projections that write back into the residual stream.
-fn is_nemotron_h_residual_writer(name: &str) -> bool {
-    name.starts_with("backbone.layers.")
-        && (name.ends_with(".mixer.out_proj.weight")
-            || name.ends_with(".mixer.down_proj.weight")
-            || name.ends_with(".mixer.o_proj.weight"))
-}
+// Nemotron-H / Mamba-2 state-critical mixer protection now lives arch-side as the
+// `Pinned` precision class in `hipfire-arch-nemotron-spec` (shared by arch_id 14/15),
+// consulted here via `precision_class_via_ingest`. The old
+// `is_nemotron_h_mq4_q8_protected` / `is_nemotron_h_residual_writer` name-matchers
+// were deleted with that migration.
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -2815,6 +2803,7 @@ fn hfq_source_to_f32(name: &str, qt: u8, raw: &[u8]) -> Result<Vec<f32>, String>
 
 fn quantize_hfq_source_tensor(
     name: &str,
+    arch_id: u32,
     raw: &[u8],
     src_qt: u8,
     shape: &[u32],
@@ -2912,7 +2901,11 @@ fn quantize_hfq_source_tensor(
             )
         }
         HfqInputFormat::Mq4 => {
-            if is_nemotron_h_mq4_q8_protected(name) {
+            if precision_class_via_ingest(arch_id, name)
+                == Some(hipfire_arch_api::PrecisionClass::Pinned)
+            {
+                // Nemotron-H / Mamba-2 state-critical mixer tensors → Q8 even in mq4
+                // (arch-keyed `Pinned` class; was `is_nemotron_h_mq4_q8_protected`).
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
             if k % 256 != 0 {
@@ -3679,7 +3672,7 @@ fn run_hfq_source_pipeline(
         let n_elements = t.shape.iter().map(|&d| d as u64).product::<u64>();
         total_params += n_elements;
         let (data, qt, group_size, label) =
-            quantize_hfq_source_tensor(&t.name, raw, t.quant_type, &t.shape, format)?;
+            quantize_hfq_source_tensor(&t.name, hfq.arch_id, raw, t.quant_type, &t.shape, format)?;
         if qt as u8 != t.quant_type || group_size != t.group_size {
             quantized_params += n_elements;
         }
@@ -6453,7 +6446,7 @@ fn main() {
                 );
                 let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let (q, qt, gs, label) =
-                    quantize_hfq_source_tensor(name, &f32_bytes, 2, &shape, oq_format)
+                    quantize_hfq_source_tensor(name, arch_id, &f32_bytes, 2, &shape, oq_format)
                         .unwrap_or_else(|e| panic!("lfm2 oq quantize {name}: {e}"));
                 eprintln!(
                     "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [LFM2 dense OQ]",
@@ -6770,7 +6763,7 @@ fn main() {
             );
             let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
             let (q, qt, gs, label) =
-                quantize_hfq_source_tensor(name, &f32_bytes, 2, &shape, oq_format)
+                quantize_hfq_source_tensor(name, arch_id, &f32_bytes, 2, &shape, oq_format)
                     .unwrap_or_else(|e| panic!("minimax oq quantize {name}: {e}"));
             eprintln!(
                 "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [MiniMax dense OQ]",
@@ -7434,16 +7427,14 @@ fn main() {
             && name.starts_with("mtp.")
             && !name.contains(".ffn.experts.")
             && should_quantize(name);
-        // SEAM (arch-name matcher not yet drained): `is_deepseek4_keep_f16` is a
-        // NARROW, namespace-scoped keep-list (4 MLA compressor/indexer tensors → f16
-        // source precision). The deepseek4 `-spec` already encodes these as
-        // importance 255 (`is_critical_stream`), but the coarse hi/lo `Ingest` seam
-        // can't isolate them from the rest of the importance-255 protected set
-        // (attn/embed), so routing this through `high_precision_via_ingest` would keep
-        // embeddings at f16 and bloat the artifact. Drains cleanly once per-tensor
-        // model definitions (RON / arch-crate model defs) give the allocator a
-        // format/bits target instead of a bool. Until then this stays name-matched.
-        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
+        // The MLA compressor/indexer streams stay at source precision. deepseek4's
+        // `-spec` declares exactly those tensors as `SourcePrecision` (finer than the
+        // importance-255 protected set, so attn/embed are NOT swept in); we read that
+        // class arch-keyed, replacing the old `is_deepseek4_keep_f16` name-match.
+        if (use_deepseek4_source_precision
+            && precision_class_via_ingest(arch_id, name)
+                == Some(hipfire_arch_api::PrecisionClass::SourcePrecision)
+            || keep_f16_mtp)
             && n_elements >= 32
         {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
@@ -7922,16 +7913,16 @@ fn main() {
                     } else if use_mq4_family && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq4_family && is_nemotron_h_mq4_q8_protected(name) {
-                        // SEAM (arch-name matcher not yet drained): this is scoped to
-                        // nemotron's `backbone.layers.` namespace. Coarsening it to
-                        // `high_precision_via_ingest` would spill Q8 protection onto
-                        // OTHER families' attention in mq4 mode (e.g. Qwen3.5's
-                        // flagship mq4), and the spec's default_importance also
-                        // mis-tiers `mixer.down_proj` (Mlp=128, not the residual-writer
-                        // 255 this needs). Drains cleanly once per-tensor model
-                        // definitions let the arch name its exact protected set without
-                        // over-reaching. Until then this stays name-matched.
+                    } else if use_mq4_family
+                        && precision_class_via_ingest(arch_id, name)
+                            == Some(hipfire_arch_api::PrecisionClass::Pinned)
+                    {
+                        // Nemotron-H / Mamba-2 state-critical mixer tensors stay Q8 even
+                        // under the mq4 budget. Their `-spec` declares them `Pinned`
+                        // (above ordinary `High`), so this is arch-keyed: Qwen3.5's
+                        // attention (only `High`) is untouched — no cross-family spill,
+                        // and `mixer.down_proj` is pinned correctly (the old
+                        // `is_nemotron_h_mq4_q8_protected`, now deleted).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq4_family {
@@ -12324,6 +12315,7 @@ mod tests {
     fn hfq_input_rejects_already_quantized_source_tensors() {
         let result = quantize_hfq_source_tensor(
             "model.layers.0.mlp.down_proj.weight",
+            14, // nemotron-h; irrelevant here (rejected before the precision check)
             &[0; 136],
             QuantType::MQ4G256 as u8,
             &[1, 256],
@@ -12346,6 +12338,7 @@ mod tests {
         ] {
             let (_, qt, group, label) = quantize_hfq_source_tensor(
                 name,
+                14, // NEMOTRON_H_ARCH_ID → mixer ingress/residual declared `Pinned`
                 &raw,
                 QuantType::F16 as u8,
                 &[2, 256],
@@ -12608,17 +12601,24 @@ mod tests {
             "Nemotron MoE router should be Q8-protected via its Ingest policy"
         );
 
+        // State-critical mixer tensors are `Pinned` (arch-keyed via nemotron-h=14),
+        // the drain of the old `is_nemotron_h_mq4_q8_protected` name-match.
         for n in [
             "backbone.layers.0.mixer.in_proj.weight",
             "backbone.layers.0.mixer.out_proj.weight",
             "backbone.layers.1.mixer.down_proj.weight",
             "backbone.layers.12.mixer.o_proj.weight",
         ] {
-            assert!(is_nemotron_h_mq4_q8_protected(n), "{n} should be protected");
+            assert_eq!(
+                precision_class_via_ingest(14, n),
+                Some(hipfire_arch_api::PrecisionClass::Pinned),
+                "{n} should be pinned"
+            );
         }
-        assert!(!is_nemotron_h_mq4_q8_protected(
-            "backbone.layers.0.mixer.up_proj.weight"
-        ));
+        assert_ne!(
+            precision_class_via_ingest(14, "backbone.layers.0.mixer.up_proj.weight"),
+            Some(hipfire_arch_api::PrecisionClass::Pinned)
+        );
     }
 
     #[test]
@@ -12658,7 +12658,7 @@ mod tests {
             Some(false)
         );
         // Every family is migrated now: e.g. deepseek4 (9) protects its MLA
-        // compressor (the old is_deepseek4_keep_f16), and a MoE expert (11) compresses.
+        // compressor, and a MoE expert (11) compresses.
         assert_eq!(
             high_precision_via_ingest(9, "model.layers.0.self_attn.compressor.wkv.weight", 4096),
             Some(true)
@@ -12666,6 +12666,24 @@ mod tests {
         assert_eq!(
             high_precision_via_ingest(11, "model.layers.0.mlp.experts.2.up_proj.weight", 4096),
             Some(false)
+        );
+        // Finer model-def: deepseek4's MLA compressor is SourcePrecision (drains the
+        // old is_deepseek4_keep_f16), while its attention is only High — the split the
+        // bool seam above cannot make. Arch-keyed, so no other family is affected.
+        use hipfire_arch_api::PrecisionClass;
+        assert_eq!(
+            precision_class_via_ingest(9, "model.layers.0.self_attn.compressor.wkv.weight"),
+            Some(PrecisionClass::SourcePrecision)
+        );
+        assert!(
+            precision_class_via_ingest(9, "model.layers.0.self_attn.q_proj.weight")
+                < Some(PrecisionClass::SourcePrecision)
+        );
+        // The same source-precision suffix on a family that does NOT declare it (llama)
+        // stays below SourcePrecision — proving the model-def can't leak across archs.
+        assert!(
+            precision_class_via_ingest(0, "model.layers.0.self_attn.compressor.wkv.weight")
+                < Some(PrecisionClass::SourcePrecision)
         );
         // A genuinely unregistered arch id → None → caller protects (unwrap_or(true)).
         assert_eq!(

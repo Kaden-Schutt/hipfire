@@ -33,6 +33,35 @@ pub enum TensorRole {
     Other,
 }
 
+/// Ordered precision NEED tier for a tensor — a finer, discrete companion to the
+/// scalar [`Ingest::importance`]. It is a *need*, never a format: the deployment
+/// maps a class to a concrete codec (no `f16`/`Q8`/`mq4` token appears here). The
+/// ordering is by fidelity (`Aggressive` cheapest → `SourcePrecision` richest), so
+/// consumers can compare with `>=`.
+///
+/// Where scalar importance collapses distinct needs onto one value (a numerically
+/// critical MLA compressor and ordinary attention both read as ~255), this splits
+/// them: the compressor is [`SourcePrecision`](PrecisionClass::SourcePrecision), the
+/// attention is [`High`](PrecisionClass::High). That is what lets the quantizer drop
+/// the arch-name keep-lists (`is_deepseek4_keep_f16`, `is_nemotron_h_*`) — each arch
+/// declares the class for its special tensors in its own `-spec` crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PrecisionClass {
+    /// Bulk that tolerates the most aggressive (2-bit-class) compression.
+    Aggressive,
+    /// The compressible bulk (4-bit-class) — FFN / experts under a normal budget.
+    Compressed,
+    /// Keep at high precision (Q8-class) — the structurally protected set.
+    High,
+    /// Pinned high precision: do NOT compress below high even under a tight budget
+    /// (e.g. a mq4-family target). SSM ingress / residual writers that corrupt state
+    /// when lossy sit here — above ordinary `High`, which a tight budget may spend down.
+    Pinned,
+    /// Keep at source fidelity — never quantized (the deployment lands it at bf16/f16).
+    /// Numerically critical stream generators (MLA compressor / indexer) sit here.
+    SourcePrecision,
+}
+
 /// Format-AGNOSTIC representability requirements a tensor places on its codec. A
 /// requirement is a *need* ("I must be randomly accessible"), never a solution
 /// ("store me with some specific codec").
@@ -66,6 +95,14 @@ pub trait Ingest: Sync + 'static {
     fn importance(&self, tensor: &str) -> u8;
     /// Hard, format-agnostic representability requirements.
     fn requires(&self, tensor: &str) -> CapReq;
+    /// Discrete precision NEED tier. Defaults to a role-derived class; an arch
+    /// overrides this to pin specific tensors ABOVE the structural default — e.g.
+    /// its MLA compressors to [`PrecisionClass::SourcePrecision`], its SSM ingress to
+    /// [`PrecisionClass::Pinned`]. Because the quantizer consults it keyed by
+    /// `ArchId`, a class an arch does not declare can never leak onto another family.
+    fn precision_class(&self, tensor: &str) -> PrecisionClass {
+        default_precision_class(self.role(tensor))
+    }
 }
 
 /// A codec's self-declared capabilities. NO arch name appears here; `name` is for
@@ -201,6 +238,24 @@ pub fn default_importance(role: TensorRole) -> u8 {
     }
 }
 
+/// Default precision class for a role — the discrete companion to
+/// [`default_importance`], kept consistent with it: the protected set is `High`, the
+/// FFN/expert bulk is `Compressed`. No role defaults to `Pinned`/`SourcePrecision`;
+/// those are only ever reached by an arch's explicit override, so the quantizer's
+/// pinned/source-precision paths fire only for tensors a family deliberately declares.
+pub fn default_precision_class(role: TensorRole) -> PrecisionClass {
+    match role {
+        TensorRole::Embed
+        | TensorRole::LmHead
+        | TensorRole::Norm
+        | TensorRole::AttnProj
+        | TensorRole::ResidualWriter
+        | TensorRole::Router
+        | TensorRole::Conv1d => PrecisionClass::High,
+        TensorRole::Mlp | TensorRole::Expert | TensorRole::Other => PrecisionClass::Compressed,
+    }
+}
+
 /// Default requirements for a role: only the gather-indexed tables need random
 /// access.
 pub fn default_requires(role: TensorRole) -> CapReq {
@@ -213,6 +268,40 @@ pub fn default_requires(role: TensorRole) -> CapReq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precision_class_is_ordered_and_role_default_is_sane() {
+        // Fidelity ordering the quantizer relies on for `>=` comparisons.
+        assert!(PrecisionClass::SourcePrecision > PrecisionClass::Pinned);
+        assert!(PrecisionClass::Pinned > PrecisionClass::High);
+        assert!(PrecisionClass::High > PrecisionClass::Compressed);
+        assert!(PrecisionClass::Compressed > PrecisionClass::Aggressive);
+        // No role defaults into the pinned/source tiers — those need an explicit
+        // per-arch override, so a family can't accidentally pin another's tensors.
+        for role in [
+            TensorRole::Embed,
+            TensorRole::LmHead,
+            TensorRole::Norm,
+            TensorRole::AttnProj,
+            TensorRole::ResidualWriter,
+            TensorRole::Router,
+            TensorRole::Conv1d,
+            TensorRole::Mlp,
+            TensorRole::Expert,
+            TensorRole::Other,
+        ] {
+            assert!(default_precision_class(role) <= PrecisionClass::High);
+        }
+        // Consistent with default_importance: protected set high, bulk compressed.
+        assert_eq!(
+            default_precision_class(TensorRole::AttnProj),
+            PrecisionClass::High
+        );
+        assert_eq!(
+            default_precision_class(TensorRole::Mlp),
+            PrecisionClass::Compressed
+        );
+    }
 
     #[test]
     fn transformer_role_classifies_families() {

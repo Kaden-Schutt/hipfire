@@ -8,9 +8,31 @@
 //! tensors). Deps only `hipfire-arch-api`.
 
 use hipfire_arch_api::{
-    default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
-    Ingest, TensorRole,
+    default_importance, default_precision_class, default_requires, register_arch, transformer_role,
+    Arch, ArchId, CapReq, Ingest, PrecisionClass, TensorRole,
 };
+
+/// Mamba-2 block tensors that corrupt SSM state when lossy: the mixer ingress
+/// (`in_proj`, generating the gate/x/B/C/dt streams) and the residual writers
+/// (`out_proj`/`down_proj`/`o_proj`). Pinned above a tight mq4 budget — this is the
+/// model-definition the quantizer reads instead of the old
+/// `is_nemotron_h_mq4_q8_protected` name-match (shared by Nemotron-H + pure Mamba-2).
+fn is_state_critical(tensor: &str) -> bool {
+    tensor.starts_with("backbone.layers.")
+        && (tensor.ends_with(".mixer.in_proj.weight")
+            || tensor.ends_with(".mixer.out_proj.weight")
+            || tensor.ends_with(".mixer.down_proj.weight")
+            || tensor.ends_with(".mixer.o_proj.weight"))
+}
+
+/// Shared `precision_class`: pin the state-critical mixer tensors, else role default.
+fn state_aware_precision_class(role: TensorRole, tensor: &str) -> PrecisionClass {
+    if is_state_critical(tensor) {
+        PrecisionClass::Pinned
+    } else {
+        default_precision_class(role)
+    }
+}
 
 /// Nemotron-H header id.
 pub const NEMOTRON_H_ARCH_ID: ArchId = ArchId(14);
@@ -37,6 +59,9 @@ impl Ingest for NemotronHSpec {
     fn requires(&self, tensor: &str) -> CapReq {
         default_requires(self.role(tensor))
     }
+    fn precision_class(&self, tensor: &str) -> PrecisionClass {
+        state_aware_precision_class(self.role(tensor), tensor)
+    }
 }
 
 /// Lean identity marker for the pure Mamba-2 offline spec.
@@ -59,6 +84,9 @@ impl Ingest for Mamba2Spec {
     fn requires(&self, tensor: &str) -> CapReq {
         default_requires(self.role(tensor))
     }
+    fn precision_class(&self, tensor: &str) -> PrecisionClass {
+        state_aware_precision_class(self.role(tensor), tensor)
+    }
 }
 
 static NEMOTRON_H_SPEC: NemotronHSpec = NemotronHSpec;
@@ -78,5 +106,33 @@ mod tests {
         assert!(reg.get(NEMOTRON_H_ARCH_ID).unwrap().caps.ingest.is_some());
         assert_eq!(reg.get(MAMBA2_ARCH_ID).unwrap().family, "mamba2");
         assert!(reg.get(MAMBA2_ARCH_ID).unwrap().caps.ingest.is_some());
+    }
+
+    #[test]
+    fn state_critical_mixer_tensors_are_pinned_faithfully() {
+        // Exactly reproduces the old quantizer `is_nemotron_h_mq4_q8_protected`
+        // truth table, now declared arch-side and shared by both Mamba-2 archs.
+        let reg = ArchRegistry::build();
+        for id in [NEMOTRON_H_ARCH_ID, MAMBA2_ARCH_ID] {
+            let ing = reg.get(id).unwrap().caps.ingest.unwrap();
+            for t in [
+                "backbone.layers.0.mixer.in_proj.weight",
+                "backbone.layers.0.mixer.out_proj.weight",
+                "backbone.layers.1.mixer.down_proj.weight",
+                "backbone.layers.12.mixer.o_proj.weight",
+            ] {
+                assert_eq!(ing.precision_class(t), PrecisionClass::Pinned, "{t}");
+            }
+            // up_proj is NOT protected (was `!is_nemotron_h_mq4_q8_protected`).
+            assert!(
+                ing.precision_class("backbone.layers.0.mixer.up_proj.weight")
+                    < PrecisionClass::Pinned
+            );
+            // The router (Q8-protected structurally) is High, not Pinned — so the
+            // mq4 pinned path won't over-reach it.
+            assert!(
+                ing.precision_class("backbone.layers.1.mixer.gate.weight") < PrecisionClass::Pinned
+            );
+        }
     }
 }
