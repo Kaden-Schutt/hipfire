@@ -23,10 +23,14 @@ use hipfire_runtime::arch::{
     decode_loop_with_timing, DecodeLoopTiming, GenerateCtx, ServingBackend, SimpleAr,
 };
 
-use crate::events::{emit_committed_event, emit_error_with_id, emit_stream_event};
+use crate::events::{
+    emit_committed_event, emit_error_with_id, emit_filter_action, emit_stream_event,
+};
 use crate::evidence::write_daemon_runtime_oneshot_evidence;
 use crate::model::{effective_raw, LoadedModel};
+use crate::output_filter::chat_output_filter_from_profile;
 use crate::request::ThinkMode;
+use hipfire_specdecode_dspark::spec::PrefillOutcome;
 
 /// DeepSeek V4 Flash generate path: prefill via the batched scratch, then a
 /// per-token decode loop that parses the model's DSML stream into
@@ -1618,6 +1622,147 @@ pub fn generate_llama(
     };
     if prompt_tokens.is_empty() {
         emit_error_with_id(stdout, id, "empty prompt after framing".to_string());
+        return;
+    }
+
+    // ── DSpark speculative-decode branch (dense LLaMA/Qwen3, arch 0/1) ──────────
+    // When a `.dspark.hfq` sidecar was loaded AND this is a greedy request, drive
+    // the arch-generic `Box<dyn Speculator>` instead of the AR decode loop. temp>0
+    // falls through to AR (greedy-only MVP), so non-greedy + non-DSpark loads stay
+    // byte-unchanged.
+    if temp <= 1e-6 && m.dspark.is_some() {
+        // Borrow split: OWN the speculator (take it out of `m.dspark`) so it and
+        // `&mut m.llama_backend` (the verify target) are held simultaneously; the
+        // speculator is restored into `m.dspark` on every exit path below.
+        let mut ds = m.dspark.take().unwrap();
+        let chat_profile = m.chat_template_profile.clone();
+        // Disjoint field borrows of `m`: tokenizer (shared) + llama_backend (mut).
+        let tok = m.tokenizer.as_ref().unwrap();
+        let backend = m.llama_backend.as_mut().unwrap();
+        let eos = backend.eos_token();
+        let block = ds.speculator.block_size();
+        let ctx_capacity = ds.speculator.ctx_capacity();
+
+        let t0 = Instant::now();
+        let abort = || false;
+        // Prefill the full prompt (cache_hit=false ⇒ cold prefill from pos 0),
+        // returning the target's argmax at the last prompt position (first seed).
+        let prefill = ds.speculator.prefill(
+            gpu,
+            backend,
+            &prompt_tokens,
+            &prompt_tokens,
+            0,
+            false,
+            None,
+            &abort,
+        );
+        let first_token = match prefill {
+            Ok(PrefillOutcome::Ready { first_token }) => first_token,
+            Ok(PrefillOutcome::Aborted) => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"done","id":"{}","tokens":0,"dspark":true}}"#,
+                    id
+                );
+                let _ = stdout.flush();
+                m.dspark = Some(ds);
+                return;
+            }
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("dspark prefill: {e}"));
+                m.dspark = Some(ds);
+                return;
+            }
+        };
+
+        // Reuse the committed-batch emit/stop machinery from `generate_dflash`:
+        // per-token JSONL `token` events (`emit_committed_event`), UTF-8 +
+        // stop-sequence filtering (`chat_output_filter_from_profile` /
+        // `emit_filter_action`), and EOS/terminator + max_tokens stop conditions.
+        let mut emitted: Vec<u32> = Vec::new();
+        let mut streamed: Vec<u32> = Vec::new();
+        let mut filter = chat_output_filter_from_profile(chat_profile.as_ref(), &[]);
+        let mut bytes_fed = 0usize;
+        let mut generated = 0usize;
+        let mut position = prompt_tokens.len();
+        let mut seed = first_token;
+
+        // Emit the seed (first token) immediately (TTFT == prefill).
+        emitted.push(first_token);
+        streamed.push(first_token);
+        emit_committed_event(
+            stdout,
+            id,
+            first_token,
+            streamed.len() - 1,
+            t0.elapsed().as_millis() as u64,
+        );
+        let all = tok.decode_bytes(&streamed);
+        let stop = emit_filter_action(stdout, id, filter.observe(&all[bytes_fed..]));
+        bytes_fed = all.len();
+        generated += 1;
+        let first_is_eos = first_token == eos || tok.is_terminator(first_token);
+
+        while !stop && !first_is_eos && generated < max_tokens {
+            if position + block >= ctx_capacity {
+                break;
+            }
+            let step = match ds
+                .speculator
+                .step(gpu, backend, position, seed, &emitted, None, temp)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("dspark step: {e}"));
+                    break;
+                }
+            };
+            let mut hit_eos = false;
+            for &tk in step.emit.iter() {
+                if generated >= max_tokens {
+                    break;
+                }
+                emitted.push(tk);
+                streamed.push(tk);
+                emit_committed_event(
+                    stdout,
+                    id,
+                    tk,
+                    streamed.len() - 1,
+                    t0.elapsed().as_millis() as u64,
+                );
+                let all = tok.decode_bytes(&streamed);
+                let action = emit_filter_action(stdout, id, filter.observe(&all[bytes_fed..]));
+                bytes_fed = all.len();
+                generated += 1;
+                if action || tk == eos || tok.is_terminator(tk) {
+                    hit_eos = true;
+                    break;
+                }
+            }
+            // SpecStep contract: `position += emit.len()` (chain + MTP drafters);
+            // reseed from the verifier's divergence-point token.
+            position += step.emit.len();
+            seed = step.next_seed;
+            if hit_eos {
+                break;
+            }
+        }
+
+        let total_s = t0.elapsed().as_secs_f64();
+        let tok_s = if total_s > 0.0 {
+            generated as f64 / total_s
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"dspark":true}}"#,
+            id, generated, tok_s
+        );
+        let _ = stdout.flush();
+        m.dspark = Some(ds);
         return;
     }
 

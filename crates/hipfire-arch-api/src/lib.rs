@@ -75,6 +75,12 @@ pub const ARCH_ID_GEMMA3_VL: u32 = 13;
 pub const ARCH_ID_NEMOTRON_H: u32 = 14;
 pub const ARCH_ID_MAMBA2: u32 = 15;
 pub const ARCH_ID_ZAYA: u32 = 16;
+// Speculative-decode drafter sidecar ids (NOT loadable base architectures — a
+// `.hfq` header carries one of these only when the file is a draft sidecar
+// discovered next to a base target). DFlash draft = 20 and the Qwen3.5 MTP head
+// = 21 already exist as local consts in the quantize bins (`dflash_convert.rs`,
+// `mtp_extract.rs`); the DSpark drafter sidecar takes the next free id.
+pub const ARCH_ID_DSPARK_DRAFT: u32 = 22;
 
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

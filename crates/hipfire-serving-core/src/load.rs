@@ -48,7 +48,7 @@ use crate::memory::{hfq_model_memory, unknown_model_memory};
 use crate::model::CaskConfig;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::model::Lfm2DflashState;
-use crate::model::{DdtreeState, DflashState, Eviction, LoadedModel, ResidentSession};
+use crate::model::{DdtreeState, DflashState, DsparkState, Eviction, LoadedModel, ResidentSession};
 use crate::session::{
     next_qwen35_state_allocation_epoch, SessionRegistry, QWEN35_LEGACY_SESSION_ID,
 };
@@ -652,6 +652,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -742,6 +743,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -867,6 +869,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -964,6 +967,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -1065,6 +1069,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -1162,6 +1167,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -1280,6 +1286,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -1404,6 +1411,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -1636,6 +1644,7 @@ pub fn load_model(
                 #[cfg(feature = "arch-lfm2moe")]
                 lfm2_dflash,
                 dflash: None,
+                dspark: None,
                 chat_template,
                 chat_template_profile,
             });
@@ -1988,6 +1997,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash,
+            dspark: None,
             chat_template,
             chat_template_profile,
         })
@@ -2041,8 +2051,14 @@ pub fn load_model(
         // P3.2: assemble the ServingBackend (owns config/weights/scratch/kv); the
         // separate llama_* fields stay None. (HFQ load path — mirrors the
         // safetensors path below.)
-        let llama_backend =
+        let mut llama_backend =
             hipfire_arch_llama::LlamaBackend::new(hfq.arch_id, config, weights, scratch, kv);
+        // DSpark sidecar discovery (dense LLaMA/Qwen3, arch 0/1). Mirrors the
+        // DFlash draft wiring: look for a `<stem>-<quant>.dspark.hfq` next to the
+        // target and, when found, load the drafter + build the greedy speculator.
+        // `None` (no sidecar / disabled / non-0-1 arch) leaves the AR path
+        // byte-unchanged.
+        let dspark = maybe_load_dspark(&mut llama_backend, hfq.arch_id, path, max_seq, gpu);
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
@@ -2107,6 +2123,7 @@ pub fn load_model(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark,
             chat_template,
             chat_template_profile,
         })
@@ -2295,6 +2312,7 @@ pub fn load_model_safetensors(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -2409,6 +2427,7 @@ pub fn load_model_safetensors(
             #[cfg(feature = "arch-lfm2moe")]
             lfm2_dflash: None,
             dflash: None,
+            dspark: None,
             chat_template,
             chat_template_profile,
         });
@@ -2548,6 +2567,7 @@ pub fn load_model_safetensors(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2_dflash: None,
         dflash: None,
+        dspark: None,
         chat_template,
         chat_template_profile,
     })
@@ -2841,6 +2861,7 @@ pub fn load_model_pp(
         #[cfg(feature = "arch-lfm2moe")]
         lfm2_dflash: None,
         dflash: None,
+        dspark: None,
         chat_template,
         chat_template_profile,
     })
@@ -2966,6 +2987,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
         if let Some(ddtree) = df.ddtree {
             ddtree.free_gpu(gpu);
         }
+    }
+    // DSpark speculator: release every GPU buffer the drafter owns (drafter body
+    // weights/scratch + block KV + main-hidden cache). `Speculator::free` is a
+    // required trait method, so a forgotten buffer is a compile error, not a leak.
+    if let Some(ds) = m.dspark {
+        ds.speculator.free(gpu);
     }
     #[cfg(feature = "arch-lfm2moe")]
     if let Some(df) = m.lfm2_dflash {
@@ -3150,6 +3177,128 @@ pub fn load_lfm2_dflash_state(
         ctx_capacity,
         block_size,
     })
+}
+
+/// DSpark analog of the DFlash `draft_path.is_some()` gate: discover a
+/// `<stem>-<quant>.dspark.hfq` sidecar next to a dense LLaMA/Qwen3 target
+/// (arch 0/1) and, when present, load it + build the greedy speculator. Returns
+/// `None` for any non-0/1 arch, when `HIPFIRE_DSPARK=0`, when no sidecar exists,
+/// or when the sidecar fails to load (logged, non-fatal — the model still loads
+/// AR-only). Keeps non-DSpark loads byte-identical.
+fn maybe_load_dspark(
+    backend: &mut hipfire_arch_llama::LlamaBackend,
+    arch_id: u32,
+    target_path: &str,
+    ctx_capacity: usize,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Option<DsparkState> {
+    if !matches!(arch_id, 0 | 1) {
+        return None;
+    }
+    if std::env::var("HIPFIRE_DSPARK").ok().as_deref() == Some("0") {
+        return None;
+    }
+    let sidecar = hipfire_model::discover_dspark_draft_for_model(Path::new(target_path))?;
+    let sidecar = sidecar.to_string_lossy().to_string();
+    eprintln!("  llama: DSpark sidecar discovered: {sidecar}");
+    match load_dspark_state(&sidecar, backend, ctx_capacity, gpu) {
+        Ok(state) => {
+            eprintln!(
+                "  llama DSpark speculator enabled (sidecar, block={})",
+                state.speculator.block_size()
+            );
+            Some(state)
+        }
+        Err(e) => {
+            eprintln!("  llama: WARNING DSpark sidecar load failed: {e}");
+            None
+        }
+    }
+}
+
+/// Load a DSpark drafter sidecar and build the arch-generic greedy speculator.
+///
+/// Mirrors [`load_dflash_state`] for the dense LLaMA/Qwen3 arch: opens the
+/// sidecar HFQ, loads the Qwen3 drafter body + DSpark globals via
+/// `hipfire_arch_llama::dspark_body::load_qwen3_dspark`, arms the target's
+/// extract-layer capture (`set_dflash_extract_layers`), then builds the
+/// `Box<dyn Speculator>` (`build_qwen3_dspark_body` + `build_dspark_speculator`).
+///
+/// `stage_norm` / `lm_head` are NON-OWNING aliases of the drafter's
+/// `output_norm` / `output` tensors: the speculator body owns the primaries and
+/// frees them in `Speculator::free`; `DsparkDrafter::mtp_free` never frees these
+/// aliases, so there is no double-free (this matches the source carrier's
+/// `shallow_clone` contract, expressed here via `GpuTensor::sub_offset`).
+pub fn load_dspark_state(
+    sidecar_path: &str,
+    backend: &mut hipfire_arch_llama::LlamaBackend,
+    ctx_capacity: usize,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Result<DsparkState, String> {
+    let mut hfq =
+        HfqFile::open(Path::new(sidecar_path)).map_err(|e| format!("open dspark sidecar: {e}"))?;
+    // The loader reads via the pread-backed `tensor_data_vec`; drop the mmap
+    // first (mirrors the load-smoke example + the source carrier).
+    hfq.drop_mmap();
+    let (dspark_weights, dspark_assets) =
+        hipfire_arch_llama::dspark_body::load_qwen3_dspark(&hfq, gpu)?
+            .ok_or("dspark sidecar has no dspark_* metadata")?;
+
+    // Stash on the target then take back to build — the LlamaBackend fields are
+    // the canonical home for the discovered sidecar (mirrors the source
+    // carrier's `bundle.dspark_weights = Some(..)` / `.take()` two-phase shape),
+    // and arm the target's extract-layer capture with the drafter's
+    // `target_layer_ids`.
+    let target_layers = dspark_weights.cfg.target_layer_ids.clone();
+    backend.set_dflash_extract_layers(target_layers);
+    backend.dspark_weights = Some(dspark_weights);
+    backend.dspark_assets = Some(dspark_assets);
+    let dspark_weights = backend.dspark_weights.take().unwrap();
+    let dspark_assets = backend.dspark_assets.take().unwrap();
+
+    let block = dspark_weights.cfg.block_size;
+    // conf_threshold ladder: env > 0.1 default (source's sweep-tuned default).
+    let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.1f32);
+    let vocab = dspark_assets.config.vocab_size;
+
+    // Non-owning aliases (body owns/frees the primaries). `stage_norm` keeps the
+    // drafter final-norm dtype/shape; `lm_head` is re-tagged F16/[vocab] because
+    // `output.buf` was uploaded raw but its layout is F16 and `run_heads`
+    // dispatches on `GpuTensor.dtype` + reads `lm_head.shape[0]` as the vocab.
+    let stage_norm = {
+        let n = &dspark_assets.weights.output_norm;
+        n.sub_offset(0, n.numel())
+    };
+    let mut lm_head = {
+        let o = &dspark_assets.weights.output.buf;
+        o.sub_offset(0, o.numel())
+    };
+    lm_head.dtype = hipfire_rdna::DType::F16;
+    lm_head.shape = vec![vocab];
+
+    let body = hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+        dspark_assets,
+        &dspark_weights.cfg,
+        gpu,
+    )
+    .map_err(|e| format!("build dspark body: {e}"))?;
+
+    // Greedy-only MVP: `supports_temp=false` ⇒ the speculator advertises
+    // `requires_greedy()`, and `generate_llama` only drives it when temp≈0.
+    let speculator = hipfire_specdecode_dspark::dspark_core::build_dspark_speculator(
+        body,
+        dspark_weights,
+        stage_norm,
+        lm_head,
+        block,
+        ctx_capacity,
+        conf_threshold,
+        false,
+    );
+    Ok(DsparkState { speculator })
 }
 
 /// Load the optional DFlash speculative-decoding drafter for a model: the draft

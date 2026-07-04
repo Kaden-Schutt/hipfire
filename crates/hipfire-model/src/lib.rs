@@ -1898,6 +1898,55 @@ pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
     out
 }
 
+/// Discover a DSpark drafter sidecar next to a target model artifact.
+///
+/// Mirrors [`discover_dflash_draft_for_model`] exactly but keys off the
+/// `.dspark.hfq` filename role instead of `.dflash.hfq` / `.draft.hfq`. The
+/// DSpark drafter carries its own arch id ([`ARCH_ID_DSPARK_DRAFT`] = 22) in
+/// the sidecar header, but — like DFlash — discovery is filename-driven, not
+/// header-driven, so a dense (arch 0/1) target can find its sidecar without
+/// opening every neighbouring `.hfq`.
+pub fn discover_dspark_draft_for_model(model: &Path) -> Option<PathBuf> {
+    if !model.is_file() {
+        return None;
+    }
+    let dir = model.parent().unwrap_or_else(|| Path::new("."));
+    let filename = model.file_name().and_then(|name| name.to_str())?;
+    dflash_draft_search_dirs(dir)
+        .into_iter()
+        .flat_map(|search_dir| {
+            dspark_draft_candidates(filename)
+                .into_iter()
+                .map(move |candidate| search_dir.join(candidate))
+        })
+        .find(|candidate| candidate.is_file())
+}
+
+/// Return candidate DSpark drafter sidecar filenames for a target filename.
+/// Same stem/quant parse as the DFlash candidates, but only the `dspark` role.
+pub fn dspark_draft_candidates(filename: &str) -> Vec<String> {
+    let Some(target) = parse_dspark_target(filename) else {
+        return Vec::new();
+    };
+    let mut quants = vec![target.quant.clone()];
+    if target.family == "qwen3" && target.quant == "mq3" {
+        quants.push("mq4".to_string());
+    } else if target.family == "qwen3" && target.quant == "mq4" {
+        quants.push("mq3".to_string());
+    }
+    quants
+        .into_iter()
+        .map(|q| target.format_candidate(&q, "dspark"))
+        .collect()
+}
+
+/// Parse a target filename into its stem/quant/separator for DSpark sidecar
+/// naming. The stem+quant grammar is identical to DFlash's, so this delegates
+/// to [`parse_dflash_target`]; only the emitted role (`dspark`) differs.
+fn parse_dspark_target(filename: &str) -> Option<DflashDraftTarget> {
+    parse_dflash_target(filename)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DflashDraftTarget {
     family: &'static str,

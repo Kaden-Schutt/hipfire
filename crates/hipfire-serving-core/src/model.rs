@@ -125,6 +125,18 @@ pub struct DflashState {
     pub ddtree: Option<DdtreeState>,
 }
 
+/// Optional DSpark speculative-decoding state for the dense LLaMA/Qwen3 arch
+/// (arch_id 0/1). Populated when `load_model` discovers a `<stem>-<quant>.dspark.hfq`
+/// sidecar next to the target and loads it via `load_dspark_state`.
+///
+/// The drafter+verifier is built once at load and stored behind the arch-generic
+/// `Box<dyn Speculator>` seam (drafter arch id [`ARCH_ID_DSPARK_DRAFT`] = 22).
+/// `generate_llama` drives it (greedy only for the MVP) when this is `Some`; the
+/// speculator's GPU buffers are released in `unload_model` via `Speculator::free`.
+pub struct DsparkState {
+    pub speculator: Box<dyn hipfire_specdecode_dspark::spec::Speculator>,
+}
+
 /// Optional LFM2 DFlash speculative-decoding state. LFM2 has no DeltaNet
 /// recurrent state, so it carries the generic DFlash draft plus an arch-local
 /// target snapshot and host hidden-history rows.
@@ -435,6 +447,9 @@ pub struct LoadedModel {
     pub memory: ModelArtifactMemory,
     // DFlash speculative decoding state (populated when load supplied a draft).
     pub dflash: Option<DflashState>,
+    // DSpark speculative decoding state for the dense LLaMA/Qwen3 arch (0/1),
+    // populated when a `.dspark.hfq` sidecar is discovered next to the target.
+    pub dspark: Option<DsparkState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
     // model didn't ship one (rare for instruct models). Only consumed when
