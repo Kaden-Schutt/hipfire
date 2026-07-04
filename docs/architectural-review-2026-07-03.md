@@ -31,7 +31,7 @@ None of the confirmed findings is an active correctness bug today (the one candi
 
 ---
 
-## 1a. Status log — updated 2026-07-03 (post-review remediation)
+## 1a. Status log — post-review remediation (updated 2026-07-04)
 
 Progress on the §3 High findings since the review was written. Verified against the current tree (line numbers in §3 are as-reviewed and have drifted). Commits are on `chaingun`.
 
@@ -44,7 +44,7 @@ Progress on the §3 High findings since the review was written. Verified against
 | 3.5 | deepseek4 `forward.rs` 9.2k LOC, 54-field god-state | 🔴 Open | Unchanged. Multi-session. |
 | 3.6 | Cross-arch copy-paste | 🔴 Open | No shared-arch crate; partial folding via the capability layer. |
 | 3.7 | Serving hand-parsed wire protocol / big main() | 🔴 Open | `sdapi.rs` 8,480 LOC; protocol still hand-parsed. Multi-session. |
-| 3.8 | diffusion 10k-line grab-bag + coexistence violation | 🟡 Partial | **Part 1 done**: import/pickle/zip tooling moved to new leaf crate `hipfire-diffusion-coexist`, out of the server dependency graph (verified via `cargo tree`). **Part 2 open**: split the remaining 8,442-line `lib.rs` + 13.5k `tests.rs` into modules. |
+| 3.8 | diffusion 10k-line grab-bag + coexistence violation | 🟡 Partial | **Part 1 done**: import/pickle/zip tooling moved to new leaf crate `hipfire-diffusion-coexist`, out of the server dependency graph (verified via `cargo tree`). **Part 2 in progress** (2026-07-04): `lib.rs` split into cohesive modules — `metadata` / `config` / `batch` / `cpu_ops` extracted (8,442 → 7,251 LOC; 221 tests green at each step), then the pure CPU-reference ops + `CpuTensor` consolidated *out* of the crate into the `hipfire-cpu` backend crate (see below). **Open**: the ~1,900-line `DiffusionPipeline` god-impl + the remaining runtime-context / CLIP / io clusters; `tests.rs` still one 13.5k-line file. |
 | 3.9 | quantize 5.3k-line main(), format geometry, codec copies | 🟡 Partial | **Done**: block geometry single-sourced into `hipfire-quant-format` (WP-3.3, consumed by all arch loaders); GGML/GGUF codec de-duplicated into leaf `hipfire-gguf`; GGUF import pipeline + HFQ writer extracted to the quantize library (11 lib modules); codec round-trip/edge tests added. **Open**: `main()` is still ~5,414 lines (the `parse_args→Recipe`/`run_pipeline` decomposition). |
 | 3.10 | `KvCache` 9 booleans → 49 constructors, 0 tests | 🟡 Partial | **Done**: index-math tests (WP-3.2); typed `KvQuantMode` enum + tested pure flag-derivation + `KvCache::quant_mode()`. **Open**: the boolean-fields → enum + 49-constructor → `KvCacheSpec` builder rewrite (~470 hot-path sites; needs GPU coherence validation — defer to a non-LDS-hazard box). |
 | 3.11 | Layering inversions & workspace hygiene | 🟡 Partial | **(a) done**: runtime no longer deps `hipfire-eval` — `collect_default_host_profile` moved to leaf `hipfire-sysinfo`. **(b) done**: `GpuTensor`+`DType` extracted to leaf `hipfire-gpu-types` (re-exported from hipfire-rdna; all 25 consumers unchanged). **(c) done**: `[workspace.dependencies]` adopted. **(d) done**: members list deduped, no orphans (83 members = 83 crates). |
@@ -52,7 +52,12 @@ Progress on the §3 High findings since the review was written. Verified against
 | 3.13 | Test placement & examples shadow QA suite | 🟡 Partial | **Done**: hsa-bridge 0→5 and hipfire-train 1→16 tests (WP-3.2). **Open**: 130 examples / 5 QA clones / eval-shells-out-to-examples; redline fate. |
 | 3.14 | Dead compute in forward paths | ✅ Resolved | qwen2 double-compute dropped; arch-llama's dead 247-line forward deleted (now a thin facade over `runtime::llama`). |
 
-**Legend:** ✅ resolved · 🟡 partial (scoped remainder noted) · 🔴 open. The remaining fully-open items (3.1, 3.3, 3.4, 3.5, 3.6, 3.7) and the deferred Part-2 splits (3.8, 3.9-main, 3.10-fields) are multi-session refactors and/or require GPU behavioral validation, not single-pass mechanical changes.
+**Legend:** ✅ resolved · 🟡 partial (scoped remainder noted) · 🔴 open. The remaining fully-open items (3.1, 3.3, 3.4, 3.5, 3.6, 3.7) and the deferred remainders (3.9-`main()`, 3.10-fields, and 3.8's `DiffusionPipeline` god-impl) are multi-session refactors and/or require GPU behavioral validation, not single-pass mechanical changes.
+
+**Architectural work beyond the findings (2026-07-04).** Adjacent to the 3.8/3.11 cleanups, three cross-cutting refactors landed:
+- **Backend-crate naming symmetry.** Renamed `rdna-compute` → `hipfire-rdna` (package + `rdna_compute::` → `hipfire_rdna::` ident across 27 manifests and 1,538 refs) so the RDNA/HIP kernel crate matches its `hipfire-*` backend siblings (`hipfire-npu`, `hipfire-xdna`, `hipfire-cpu`, `hipfire-rocm`). Still RDNA-specific / HIP-direct — no generic cross-vendor layer (AGENTS.md).
+- **CPU compute homed in the CPU backend.** The pure CPU-reference tensor ops + `CpuTensor` moved from `hipfire-diffusion` into `hipfire-cpu::tensor_ops` (with a crate-owned `CpuError`; `CpuTensor::from_hfq` → free fn `cpu_tensor_from_hfq`, ~113 call sites). Each backend crate now owns its own compute + tensor type.
+- **CPU-oracle audit.** Swept all `*_cpu`/`*_reference` math: the diffusion ops were the one cohesive misplaced cluster; the rest is correctly arch-coupled (`forward_cpu`), production (`sample_cpu`), or test/example-local. Added a shared `hipfire_cpu::cpu_reference_gemm` and deduped the one real example oracle that used it.
 
 ---
 
