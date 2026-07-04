@@ -19,10 +19,12 @@
 //! arch-agnostic policy/result/stats seam here; the `SpecDecodeTarget` trait and
 //! the generic `ModelSlot<T>` follow in P2.
 
+pub mod math;
 pub mod policy;
 pub mod stats;
 pub mod target;
 
+pub use math::*;
 pub use policy::*;
 pub use stats::*;
 pub use target::*;

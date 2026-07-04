@@ -87,13 +87,25 @@ only in the `impl SpecDecodeTarget for Qwen35` block.
   `load_compatible_tokenizer<T: SpecDecodeTarget>` (behavior-preserving), so the
   boundary is compiler-proven generic, not dead scaffolding. Build + clippy +
   139 qwen tests green.
-- **P2b — Generify the strategy fns + `ModelSlot` state seam.** Thread
-  `SpecDecodeTarget` (and an associated `StateSnapshot` type for the GDN/DeltaNet
-  rollback tape) through the dflash/ddtree/mtp verify+accept fns so they stop
-  naming `Qwen35*`. The ~15 `&Qwen35Weights,&Qwen35Config` fns are mostly
-  DeltaNet/GDN replay machinery → they become the qwen-side *impl* of the
-  snapshot/restore methods, not generic code. Still in-crate, compiler-verified.
-  **GPU gate deferred to P5.**
+- **P2b — Shared primitives to core. (done)** Moved the pure arch-agnostic
+  numeric primitives (`sample_residual`, `softmax_temp_into`, `argmax_u32`,
+  `first_mismatched_f32`, `f32_diff_stats`/`logit_diff_stats` + their POD result
+  structs) into `hipfire-specdecode::math`, `use`-imported back so the (still
+  qwen) drivers resolve unchanged. Pure slice-math only — same low-risk
+  extract-and-re-export pattern as P1. `speculative.rs` 12,730 → 12,326; core
+  now 598 LOC. Build + clippy + 139 qwen tests + workspace examples green.
+  - **Coverage note:** the 47 qwen-*free* fns hold only 1,511 LOC; the qwen
+    coupling (5,647 LOC) is concentrated in a handful of giant hot-path drivers
+    (`spec_step_dflash` **3,312 LOC**, `spec_step_ddtree_batched` 604, …). Those
+    are *not* touched here.
+- **P2c — Generify the giant drivers + `ModelSlot` state seam. (GPU-gated)**
+  Thread `SpecDecodeTarget` + an associated `StateSnapshot` type (the GDN/DeltaNet
+  rollback tape) through `spec_step_dflash` / `spec_step_ddtree*` / the mtp step
+  so they stop naming `Qwen35*`; the ~15 `&Qwen35Weights,&Qwen35Config` GDN-replay
+  fns become the qwen-side *impl* of the snapshot/restore seam. This restructures
+  the spec-decode hot path — a 3,312-line generification must **not** land
+  compile-only. Do it incrementally *against* `coherence-gate-dflash.sh` on a
+  non-LDS-hazard box (halo/medusa), not deferred blindly to P5.
 - **P3 — Move strategies to their crates.** dflash → `-dflash`, ddtree →
   `-ddtree`, `mtp_spec.rs`+`mtp_head.rs` → `-mtp`. Arch crate keeps the
   `impl SpecDecodeTarget for Qwen35` + the DeltaNet snapshot impls + thin
