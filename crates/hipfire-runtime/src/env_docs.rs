@@ -1053,21 +1053,21 @@ pub const ENV_HIPFIRE_DIAG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_CPU_REFERENCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_CPU_REFERENCE",
     description: "Runtime variable controlling diffusion cpu reference in hipfire",
-    source: "crates/hipfire-diffusion/src/lib.rs:119",
+    source: "crates/hipfire-diffusion/src/lib.rs:126",
 };
 
 /// `HIPFIRE_DIFFUSION_DUMP_DIR` — Runtime variable controlling diffusion dump dir in hipfire
 pub const ENV_HIPFIRE_DIFFUSION_DUMP_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_DUMP_DIR",
     description: "Runtime variable controlling diffusion dump dir in hipfire",
-    source: "crates/hipfire-diffusion/src/lib.rs:2083",
+    source: "crates/hipfire-diffusion/src/lib.rs:1865",
 };
 
 /// `HIPFIRE_DIFFUSION_LAYER_RUNG` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_LAYER_RUNG",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-diffusion/src/lib.rs:983",
+    source: "crates/hipfire-diffusion/src/lib.rs:765",
 };
 
 /// `HIPFIRE_DIR` — Runtime variable controlling dir in hipfire
