@@ -17,7 +17,7 @@ dq = Dequant(size=KN, num_aie_columns=ncols, num_channels=nch,
 gm = GEMM(M=M, K=K, N=N, tile_m=64, tile_k=64, tile_n=64, num_aie_columns=ncols, context=ctx)
 runlist = [(dq, "Wp", "Wdeq"), (gm, "A", "Wdeq", "C")]
 fused = FusedMLIROperator("oq4_gemm", runlist, input_args=["A", "Wp"],
-                          output_args=["C"], buffer_sizes={"Wdeq": KN})
+                          output_args=["C"], buffer_sizes={"Wdeq": KN * 2})  # bf16 bytes
 A = np.random.randn(M, K).astype(ml_dtypes.bfloat16)
 Wp = np.zeros(KN // 2 + (KN // gs) * 2, dtype=np.uint8)  # int4 nibbles + scales (dummy for timing)
 C = np.zeros((M, N), dtype=ml_dtypes.bfloat16)

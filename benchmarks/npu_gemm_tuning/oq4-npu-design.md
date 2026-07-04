@@ -35,13 +35,22 @@
 >      functions (gemm has it). Added `func_prefix=""` + prefixed the Kernel
 >      name/object. → gets past fusion into buffer validation. (Submodule edit;
 >      upstream-worthy.)
->   2. **BLOCKER:** `FusedMLIROperator` assumes a UNIFORM input dtype, so it types
->      the int4/uint8 `Wp` buffer as 2-byte (bf16) → size check halves it
->      (expects 133120 B, sees my 133120-elem uint8 as 66560). Oq4 mixes
->      uint8-packed weights + bf16 activations; fusion needs per-input dtype.
->      NEXT: teach the fused op the Wp input is uint8 (buffer_sizes/dtype decl or
->      a small FusedMLIROperator patch), then the fused Oq4 gemm runs → first
->      feed-win number vs 15.7.
+>   2. **Mixed-dtype fusion — PARTIALLY FIXED, one MLIR-op blocker left.**
+>      `fuse_mlir` (iron/common/compilation/fusion.py) was bf16-only: consolidated
+>      buffer, size math, AND the `memref.reinterpret_cast` all hardcode bf16.
+>      FIXED (patched): size check now compares in BYTES using each input's target
+>      element width (`i8`→1, `bf16`→2, `f32`→4) instead of the bf16 itemsize — Wp
+>      (uint8) now validates; identical for the bf16 path so llama unaffected.
+>      Wdeq intermediate sized in bytes (`KN*2`). REMAINING BLOCKER: MLIR
+>      `memref.reinterpret_cast` CANNOT change element type (bf16 subview → ui8
+>      target: "source element type ('bf16') does not match result element type
+>      ('ui8')"). FIX DIRECTION: the fusion carves inputs as a bf16 subview +
+>      reinterpret_cast; for a non-bf16 input it must instead type the consolidated
+>      input buffer as i8 (bytes) and use `memref.view(byte_buf, offset, target_ty)`
+>      — a byte-addressed carve that supports any element type. Deeper IRON change;
+>      test that the all-bf16 llama path still fuses. THEN the fused Oq4 gemm runs
+>      → first feed-win number vs 15.7. Progress: passes ALL Python-side validation,
+>      reaches MLIR codegen, blocked only on that one reinterpret→view rework.
 > FWHT stays an activation-side op. Template: llama_3.2_1b/llama_npu.py.
 > Run env: the py3.14 iron venv recipe above.
 
