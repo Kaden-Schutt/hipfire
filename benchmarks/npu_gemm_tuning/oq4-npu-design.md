@@ -23,10 +23,27 @@
 > - The py3.14 mlir_aie native-binding segfault I hit earlier (conv `test.py`)
 >   does NOT recur with the March wheel + IRON's runtime — it runs clean.
 >
-> **Next (b): compose fused `dequant(group_size=256, int4→bf16)` → `gemm(bf16)`
-> via `FusedMLIROperator`, feed Oq4 weights, measure** — the first real
-> Oq4-on-NPU number. FWHT stays an activation-side op. See llama_3.2_1b/llama_npu.py
-> for the fusion pattern.
+> **(b) IN PROGRESS — fused `dequant(gs=256,int4→bf16)`→`gemm` (drivers in `iron/`):**
+> - `iron/oq4_dequant_run.py`: IRON dequant at **group_size=256 (Oq4)** RUNS +
+>   VERIFIES on NPU (size 262144, 8×2 cores, 159.5µs, errors=False). Oq4
+>   weight-decode confirmed on hardware.
+> - `iron/oq4_fused_gemm.py`: fused runlist `[(dequant,"Wp","Wdeq"),(gemm,"A","Wdeq","C")]`
+>   via `FusedMLIROperator`. Fusion machinery WORKS (compiles, reaches runtime
+>   buffer validation). Two IRON gaps found:
+>   1. **FIXED (local patch to IRON):** dequant `design.py my_dequant_kernel`
+>      lacked the `func_prefix` kwarg that fusion passes to namespace child-op
+>      functions (gemm has it). Added `func_prefix=""` + prefixed the Kernel
+>      name/object. → gets past fusion into buffer validation. (Submodule edit;
+>      upstream-worthy.)
+>   2. **BLOCKER:** `FusedMLIROperator` assumes a UNIFORM input dtype, so it types
+>      the int4/uint8 `Wp` buffer as 2-byte (bf16) → size check halves it
+>      (expects 133120 B, sees my 133120-elem uint8 as 66560). Oq4 mixes
+>      uint8-packed weights + bf16 activations; fusion needs per-input dtype.
+>      NEXT: teach the fused op the Wp input is uint8 (buffer_sizes/dtype decl or
+>      a small FusedMLIROperator patch), then the fused Oq4 gemm runs → first
+>      feed-win number vs 15.7.
+> FWHT stays an activation-side op. Template: llama_3.2_1b/llama_npu.py.
+> Run env: the py3.14 iron venv recipe above.
 
 
 Concrete design for feeding Oq4G256 weights to the Strix Halo NPU (aie2p) as
