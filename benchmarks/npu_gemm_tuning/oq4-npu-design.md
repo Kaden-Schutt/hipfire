@@ -44,13 +44,24 @@
 >      Wdeq intermediate sized in bytes (`KN*2`). REMAINING BLOCKER: MLIR
 >      `memref.reinterpret_cast` CANNOT change element type (bf16 subview → ui8
 >      target: "source element type ('bf16') does not match result element type
->      ('ui8')"). FIX DIRECTION: the fusion carves inputs as a bf16 subview +
->      reinterpret_cast; for a non-bf16 input it must instead type the consolidated
->      input buffer as i8 (bytes) and use `memref.view(byte_buf, offset, target_ty)`
->      — a byte-addressed carve that supports any element type. Deeper IRON change;
->      test that the all-bf16 llama path still fuses. THEN the fused Oq4 gemm runs
->      → first feed-win number vs 15.7. Progress: passes ALL Python-side validation,
->      reaches MLIR codegen, blocked only on that one reinterpret→view rework.
+>      ('ui8')").
+>   3. **memref.view rework — DONE, fusion now dtype-general.** Patched `fuse_mlir`:
+>      consolidated buffers typed **i8 (signless bytes; ui8 fails memref.view's "1D
+>      i8" check)**, and each op arg carved via `memref.view(target_ty,
+>      byte_buf, arith.constant(index, offset), [])` instead of subview+
+>      reinterpret_cast. Byte-equivalent for the bf16 path (llama), and now handles
+>      the uint8 int4-weight input. Result: **the fused Oq4 dequant→gemm MLIR
+>      generates and passes ALL verifiers.** (arith.constant here is
+>      `(result_type, value)`; system build/ must be `rm -rf`'d between runs or a
+>      stale-artifact "No MLIR source" planning error fires.)
+>   4. **REMAINING (compiler bug, not our MLIR):** aiecc CRASHES in
+>      `AIEObjectFifoStatefulTransformPass::unrollForLoops` lowering the fused
+>      dequant→gemm. The MLIR is valid; the mlir-aie backend (March 2026033104)
+>      segfaults on this fused objectFIFO structure. OPTIONS: (a) try tile configs
+>      that avoid the unroll path; (b) newer mlir_aie; (c) report upstream; (d) a
+>      non-fused two-pass dequant→gemm (materializes bf16 weights, loses the feed
+>      win but gives a correctness+baseline number). REGRESSION TODO: confirm the
+>      all-bf16 llama fusion still compiles after the i8/memref.view change.
 > FWHT stays an activation-side op. Template: llama_3.2_1b/llama_npu.py.
 > Run env: the py3.14 iron venv recipe above.
 
