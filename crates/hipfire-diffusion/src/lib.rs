@@ -44,6 +44,13 @@ pub const QT_DIFFUSION_TENSOR_BF16: u8 = 16;
 
 mod metadata;
 pub use metadata::*;
+mod config;
+pub use config::*;
+// Crate-internal config helpers (pub(crate)) also re-exported so sibling
+// modules that used to see them as crate-root-private items keep resolving.
+pub(crate) use config::{
+    TransformerDenoiserFamily, TransformerDenoiserWeightTopology, VaeLatentNorm,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffusionRuntimeKind {
@@ -474,234 +481,9 @@ pub struct DiffusionHfqInspection {
     pub runtime_support: DiffusionRuntimeSupport,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DiffusionBatchRequest {
-    pub prompts: Vec<DiffusionPrompt>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conditioning: Option<DiffusionExternalConditioningBatch>,
-    pub width: u32,
-    pub height: u32,
-    #[serde(default)]
-    pub original_width: Option<u32>,
-    #[serde(default)]
-    pub original_height: Option<u32>,
-    #[serde(default)]
-    pub target_width: Option<u32>,
-    #[serde(default)]
-    pub target_height: Option<u32>,
-    #[serde(default)]
-    pub seed_resize_from_width: Option<u32>,
-    #[serde(default)]
-    pub seed_resize_from_height: Option<u32>,
-    #[serde(default)]
-    pub crop_x: u32,
-    #[serde(default)]
-    pub crop_y: u32,
-    pub steps: u32,
-    pub cfg_scale: f32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub distilled_guidance_scale: Option<f32>,
-    pub scheduler: String,
-    #[serde(default)]
-    pub subseed_strength: f32,
-    pub send_images: bool,
-    pub save_images: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DiffusionExternalConditioningBatch {
-    pub prompt_embeddings: CpuTensor,
-    pub negative_embeddings: CpuTensor,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_attention_mask: Option<CpuTensor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub negative_attention_mask: Option<CpuTensor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_pooled_embeddings: Option<CpuTensor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub negative_pooled_embeddings: Option<CpuTensor>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DiffusionImg2ImgRequest {
-    pub batch: DiffusionBatchRequest,
-    pub init_image: RgbImageBatch,
-    #[serde(default)]
-    pub mask: Option<RgbImageBatch>,
-    #[serde(default)]
-    pub inpainting_fill: Option<u32>,
-    #[serde(default)]
-    pub resize_mode: DiffusionImg2ImgResizeMode,
-    pub denoising_strength: f32,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffusionImg2ImgResizeMode {
-    #[default]
-    Image,
-    Latent,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DiffusionPrompt {
-    pub prompt: String,
-    pub negative_prompt: String,
-    pub seed: i64,
-    #[serde(default)]
-    pub subseed: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DiffusionBatchOutput {
-    pub images: Vec<String>,
-    pub info: Value,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DiffusionProgress {
-    pub completed_steps: usize,
-    pub total_steps: usize,
-    pub timestep: usize,
-    pub preview_latents: Option<LatentBatch>,
-}
-
-pub struct MaskedDenoiseReference<'a> {
-    pub init_latents: &'a LatentBatch,
-    pub noise: &'a [f32],
-    pub mask_weights: &'a [f32],
-    pub source_schedule: &'a DiffusionSchedule,
-    pub start_step: usize,
-}
-
-pub struct InpaintDenoiseConditioning {
-    pub mask_weights: Vec<f32>,
-    pub masked_image_latents: LatentBatch,
-}
-
-pub struct SdxlDenoiseConditioning<'a> {
-    pub text_embeds: &'a CpuTensor,
-    pub time_ids: &'a CpuTensor,
-}
-
-struct DenoiseLatentsOutput {
-    latents: LatentBatch,
-    runtime_kind: DiffusionRuntimeKind,
-}
-
-mod config;
-pub use config::*;
-// Crate-internal config helpers (pub(crate)) also re-exported so sibling
-// modules that used to see them as crate-root-private items keep resolving.
-pub(crate) use config::{
-    TransformerDenoiserFamily, TransformerDenoiserWeightTopology, VaeLatentNorm,
-};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DiffusionConditioningBatch {
-    pub prompt_tokens: Vec<Vec<u32>>,
-    pub negative_tokens: Vec<Vec<u32>>,
-    pub prompt_tokens_2: Option<Vec<Vec<u32>>>,
-    pub negative_tokens_2: Option<Vec<Vec<u32>>>,
-    pub prompt_embeddings: Option<CpuTensor>,
-    pub negative_embeddings: Option<CpuTensor>,
-    pub prompt_embeddings_2: Option<CpuTensor>,
-    pub negative_embeddings_2: Option<CpuTensor>,
-    pub prompt_cross_attention_embeddings: Option<CpuTensor>,
-    pub negative_cross_attention_embeddings: Option<CpuTensor>,
-    pub prompt_attention_mask: Option<CpuTensor>,
-    pub negative_attention_mask: Option<CpuTensor>,
-    pub prompt_pooled_embeddings: Option<CpuTensor>,
-    pub negative_pooled_embeddings: Option<CpuTensor>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffusionLatentShape {
-    pub batch: usize,
-    pub channels: usize,
-    pub height: usize,
-    pub width: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DiffusionRunPlan {
-    pub latent_shape: DiffusionLatentShape,
-    pub latents: LatentBatch,
-    pub schedule: DiffusionSchedule,
-    pub conditioning: DiffusionConditioningBatch,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RgbImageBatch {
-    pub batch: usize,
-    pub width: usize,
-    pub height: usize,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct LatentBatch {
-    pub batch: usize,
-    pub channels: usize,
-    pub height: usize,
-    pub width: usize,
-    pub data: Vec<f32>,
-}
-
-impl LatentBatch {
-    pub fn seeded_normal(
-        batch: usize,
-        channels: usize,
-        height: usize,
-        width: usize,
-        seeds: &[i64],
-    ) -> Self {
-        let mut data = Vec::with_capacity(batch * channels * height * width);
-        for b in 0..batch {
-            let mut rng = SplitMix64::new(seeds.get(b).copied().unwrap_or(-1) as u64);
-            let count = channels * height * width;
-            let mut i = 0;
-            while i < count {
-                let (a, next) = box_muller_pair(&mut rng);
-                data.push(a);
-                i += 1;
-                if i < count {
-                    data.push(next);
-                    i += 1;
-                }
-            }
-        }
-        Self {
-            batch,
-            channels,
-            height,
-            width,
-            data,
-        }
-    }
-
-    pub fn len_per_batch(&self) -> usize {
-        self.channels * self.height * self.width
-    }
-
-    pub fn as_nchw_tensor(&self) -> CpuTensor {
-        CpuTensor {
-            shape: vec![self.batch, self.channels, self.height, self.width],
-            data: self.data.clone(),
-        }
-    }
-
-    pub fn from_nchw_tensor(tensor: CpuTensor) -> DiffusionResult<Self> {
-        let [batch, channels, height, width] = shape4(&tensor)?;
-        Ok(Self {
-            batch,
-            channels,
-            height,
-            width,
-            data: tensor.data,
-        })
-    }
-}
+mod batch;
+pub use batch::*;
+pub(crate) use batch::DenoiseLatentsOutput;
 
 fn seeded_latents_for_request(
     config: &StableDiffusionConfig,
@@ -2037,12 +1819,12 @@ fn f32_slices_close(actual: &[f32], expected: &[f32], tolerance: f32) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct SplitMix64 {
+pub(crate) struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             state: seed ^ 0x9E37_79B9_7F4A_7C15,
         }
@@ -2062,7 +1844,7 @@ impl SplitMix64 {
     }
 }
 
-fn box_muller_pair(rng: &mut SplitMix64) -> (f32, f32) {
+pub(crate) fn box_muller_pair(rng: &mut SplitMix64) -> (f32, f32) {
     let u1 = rng.next_unit().max(f32::MIN_POSITIVE);
     let u2 = rng.next_unit();
     let radius = (-2.0 * u1.ln()).sqrt();
@@ -6565,7 +6347,7 @@ pub fn upsample_nearest2d_nchw(input: &CpuTensor, scale: usize) -> DiffusionResu
     Ok(out)
 }
 
-fn shape4(tensor: &CpuTensor) -> DiffusionResult<[usize; 4]> {
+pub(crate) fn shape4(tensor: &CpuTensor) -> DiffusionResult<[usize; 4]> {
     match tensor.shape.as_slice() {
         [a, b, c, d] => Ok([*a, *b, *c, *d]),
         _ => Err(DiffusionError::InvalidMetadata(format!(
