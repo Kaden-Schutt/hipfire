@@ -29,3 +29,25 @@ The existing NPU dispatch (`hipfire-arch-qwen35/src/xdna1_ffi.rs`) dlopens
 swiglu/rmsnorm/rope/etc. ops, **not on disk here**, and with no gemm/gemv symbol we
 can add. So wiring the W4A8 gemv/gemm needs a **direct XRT-from-Rust** loader
 (xclbin + instr → run), not that dormant blob — tracked as the next integration arc.
+
+## R3b — prefill W4A8 GEMM (`r3b_gemm.cc` + `r3b_run.py`)
+
+Real K accumulation with NACC row-blocks (M = NACC·4): one streamed int4 weight
+tile is macced into NACC named accumulators (R2a recipe), so weight reuse = NACC
+and AI = NACC·8 MACs/byte. Measured single-core, single-N-block:
+
+| NACC (M) | TOPS | MAC/cyc | limiter |
+|---|---|---|---|
+| 4 (M=16) | 0.70 | 195 | feed-bound (W feed ~11 GB/s, matches R1) |
+| 8 (M=32) | 0.26 | 71  | **A-stream-bound** (A super = 4× W bytes) |
+
+The single-N-block probe streams the full activation for one output block, and at
+M=32 that A stream (NACC·MR·K int8) is 4× the weight stream (K·16 int4) — so it
+goes A-bound, not compute-bound. NACC=8 also L1-caps KCHUNK (A super 32 KB at
+KCHUNK=64 overflows), forcing KCHUNK=16 which adds C-fold overhead.
+
+**To reach compute-bound prefill, A must stay resident and be reused across N-blocks
+(or K-tiled through the memtile)** — the standard AIE GEMM dataflow that the
+reference kernels use to approach peak. That is the next step: A-resident, stream W
+across many N-blocks, then scale to the 8×4 array. This is the same ~27%-efficiency
+dataflow wall documented for the `whole_array` reference in ../findings.md.
