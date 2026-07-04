@@ -102,6 +102,52 @@ Against the W4A8 table: one column clears M=4096 (6.8 GB/s) with 2× margin; the
 open question is only how far 8 columns aggregate before the NoC/mem-controller
 knee.
 
+### Aggregate — MEASURED: 8-column feed saturates at ~56 GB/s (the NoC knee)
+
+`r1b_cols_run.py` / `r1b_cols_trace_run.py` run COLS single-column feeds
+concurrently, each pinned to its own column (`Tile(col=i, row=2)` — auto-placement
+otherwise stacks them on column 0 sharing one shim) and traced per-column.
+Aggregate = total bytes / global concurrent span:
+
+| COLS | AGG GB/s | per-col | MEAN_BUSY | vs 1-col linear |
+|---|---|---|---|---|
+| 1 | 13.3 | 13.3 | 0.93 | — |
+| 2 | 26.8 | 13.4 | 0.93 | **2.0× (perfect)** |
+| 4 | 47–49 | 11.8–12.2 | 0.83–0.86 | ~3.6× |
+| 8 | 56–57 | 7.0 | 0.49 | ~4.2× |
+
+The aggregate **saturates at ~56 GB/s**: 1→2 is perfectly linear, then the
+per-column rate falls (13.3→7.0) and the receive DMA busy fraction collapses
+(0.93→0.49) — the shims spend half their time starved. That is the shared
+LPDDR5X/NoC/mem-controller knee predicted by docs/192-193 (aggregate ≠ COLS×).
+
+**Go/no-go for W4A8 prefill** (feed needed = `56e12 / (2·M)` B/s, per the table
+up top, vs the ~56 GB/s ceiling):
+
+- **M ≥ ~512 → compute-bound** (the good case): M=1024 needs 27 GB/s (met by ~3
+  columns), M=4096 needs 6.8 (one column). W4A8 prefill runs at the compute
+  ceiling here.
+- **M ≲ 500 → feed-bound**: M=256 needs 109 GB/s, above the 56 ceiling.
+
+So the crossover is **M ≈ 500**. For realistic prefill batch sizes (M ≥ 512) the
+feed is not the limiter — the earlier "is the feed the wall?" question resolves
+**no** for prefill. Only small-batch/decode-shaped work stays feed-bound.
+
+Caveat: to stay within XRT's ~5 inout-buffer limit, all columns read one **shared**
+input BO (same DDR region). Distinct per-column regions could shift the ceiling
+(bank contention vs locality); the busy-fraction collapse is source-agnostic, but
+a distinct-region rerun (single big BO, per-column offset slices) is the clean
+follow-up. Also COLS=8 + 8 trace flows overruns the router, so trace ≤4 columns
+(`TRACE_COLS`) while all 8 feed — traced columns feel the same contention.
+
+### Next
+
+1. Add the W4A8 `mac_4x16_16x16` compute at M ≥ 512 and confirm sustained TOPS
+   sits at the compute ceiling (feed proven sufficient there).
+2. Distinct-region aggregate rerun to firm up the 56 GB/s ceiling.
+3. (Optional) trace the shim MM2S directly (`shimtile_events`) for the DDR-read
+   view; the core-receive seal already bounds the end-to-end feed.
+
 ### Three-way status (what worked, what the toolchain blocked)
 
 - **M1 host single-shot** (r1b_run.py): dominated by the 16 ms fixed cost —
@@ -111,18 +157,9 @@ knee.
   surface as INSTR events in the trace. Host-side 194 fencing is unreachable too:
   IRON's concrete `run()` bundles BO sync + execute. **The differential slope
   (sweep_r1b.py) is the validated host-side stand-in.**
-- **M3 core-DMA `PORT_RUNNING` trace** (r1b_trace_run.py): **SEALED** — 14.4 GB/s
-  active, busy 0.91, host-sync-free. This is the decisive on-NPU number.
-
-### Next
-
-1. Multi-column aggregate: replicate the feed across 8 columns and trace the knee
-   (NoC/mem-controller, per docs/192-193 — aggregate ≠ 8× linear). ~14 GB/s ×
-   columns is the ceiling to chase against the W4A8 M-table.
-2. Add the W4A8 `mac_4x16_16x16` compute and sweep M for the feed/compute
-   crossover — the go/no-go.
-3. (Optional) trace the shim MM2S directly (`shimtile_events`) for the DDR-read
-   view; the core-receive seal already bounds the end-to-end feed at 14.4 GB/s.
+- **M3 core-DMA `PORT_RUNNING` trace** (r1b_trace_run.py + r1b_cols_trace_run.py):
+  **SEALED** — 14.4 GB/s single-column active (busy 0.91), ~56 GB/s 8-column
+  aggregate, host-sync-free. The decisive on-NPU numbers.
 
 ### Toolchain notes (current, drifted from R1a's pin)
 
