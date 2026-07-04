@@ -55,8 +55,10 @@ use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
 // (hipfire-gguf) — off the inference dependency surface. Alias keeps the
 // import pipeline's `gguf_input::` references source-compatible.
 use hipfire_arch_api::{
-    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE,
-    ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_MOE, ARCH_ID_ZAYA,
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
+    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY,
+    ARCH_ID_ZAYA,
 };
 use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
@@ -5725,32 +5727,32 @@ fn main() {
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
     let auto_arch_id = if is_mamba2_config {
-        15
+        ARCH_ID_MAMBA2
     } else {
         match arch_str {
-            "llama" => 0u32,
-            "qwen3" | "qwen2" => 1,
-            "qwen3_5" | "qwen3_5_text" => 5,
+            "llama" => ARCH_ID_LLAMA_MISTRAL,
+            "qwen3" | "qwen2" => ARCH_ID_QWEN3_QWEN2_LEGACY,
+            "qwen3_5" | "qwen3_5_text" => ARCH_ID_QWEN35_DENSE,
             // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
             // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
             // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
-            "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+            "qwen3_5_moe" | "qwen3_5_moe_text" => ARCH_ID_QWEN35_MOE,
             // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
             // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
             // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
             // dots-ocr-prd.md.
-            "dots_ocr" => 8,
+            "dots_ocr" => ARCH_ID_DOTS_OCR,
             // DeepSeek V4 Flash: 256 routed + 1 shared experts, Hyper-Connections,
             // compressed-KV indexer, FP8 E4M3 + UE8M0 block-scale storage. See
             // crates/hipfire-arch-deepseek4. Phase 1 ingest only — no forward
             // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
             // per-expert) and are translated when the forward bring-up lands.
-            "deepseek_v4" => 9,
+            "deepseek_v4" => ARCH_ID_DEEPSEEK4_FLASH,
             // MiniMax-M2 (Mixtral-style MoE): GQA + per-layer QK-norm + partial
             // rotate_half RoPE; 256 routed experts top-8 sigmoid+e_score_bias, no
             // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
             // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
-            "minimax_m2" => 10,
+            "minimax_m2" => ARCH_ID_MINIMAX_M2,
             // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
             //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
             //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
@@ -5758,7 +5760,7 @@ fn main() {
             //               every layer dense SwiGLU; the ingest Q8s all tensors.
             // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
             // num_dense_layers == num_hidden_layers for the dense variant.
-            "lfm2_moe" | "lfm2" => 11,
+            "lfm2_moe" | "lfm2" => ARCH_ID_LFM2_MOE,
             // Gemma3 (text). `gemma3_text` = Gemma3ForCausalLM (clean
             // model.layers.* names, e.g. medgemma-27b-text-it); `gemma3` =
             // Gemma3ForConditionalGeneration (multimodal wrapper — text fields
@@ -5768,23 +5770,23 @@ fn main() {
             // dim/n_heads, custom attn scale query_pre_attn_scalar^-0.5, dual-theta
             // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
             // See docs/plans/2026-06-19-gemma3-bringup.md.
-            "gemma3_text" | "gemma3" => 12,
+            "gemma3_text" | "gemma3" => ARCH_ID_GEMMA3_TEXT,
             // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
             // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron
             // (arch_id 14). Quantizes the linear projections; keeps conv1d/A_log/D/
             // dt_bias/norms F16 (see should_quantize).
-            "nemotron_h" => 14,
+            "nemotron_h" => ARCH_ID_NEMOTRON_H,
             // state-spaces Mamba-2: pure Mamba-2 mixer stack. Uses the same
             // Mamba block machinery as nemotron_h but remains its own served arch.
-            "mamba2" => 15,
+            "mamba2" => ARCH_ID_MAMBA2,
             // Zyphra ZAYA1 (CCA attention + EDA/MoD-routed MoE). Crate
             // hipfire-arch-zaya (arch_id 16). Native checkpoint stores experts as
             // stacked 3D `mlp.experts.{gate_up,down}_proj`, like Qwen3.5-MoE, so it
             // rides the same is_moe 3D-split path below.
-            "zaya" => 16,
+            "zaya" => ARCH_ID_ZAYA,
             other => {
                 eprintln!("Warning: unknown architecture '{other}', treating as llama");
-                0
+                ARCH_ID_LLAMA_MISTRAL
             }
         }
     };

@@ -17,7 +17,7 @@ use crate::hfq_out::{
     insert_parameter_counts_metadata, metadata_with_quantization_hash, write_hfq, HfqTensor,
 };
 use crate::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
-use hipfire_arch_api::ARCH_ID_QWEN35_MOE;
+use hipfire_arch_api::{ARCH_ID_LLAMA_MISTRAL, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY};
 use hipfire_gguf as gguf_input;
 use hipfire_primitives::conv::f32_slice_to_f16_bytes;
 use hipfire_primitives::fwht::gen_fwht_signs;
@@ -97,12 +97,12 @@ pub fn run_gguf_pipeline(
         .unwrap_or("llama")
         .to_string();
     let auto_arch_id: u32 = match arch_str.as_str() {
-        "llama" => 0,
-        "qwen3" | "qwen2" => 1,
-        "qwen3moe" => 6,
+        "llama" => ARCH_ID_LLAMA_MISTRAL,
+        "qwen3" | "qwen2" => ARCH_ID_QWEN3_QWEN2_LEGACY,
+        "qwen3moe" => ARCH_ID_QWEN35_MOE,
         other => {
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
-            0
+            ARCH_ID_LLAMA_MISTRAL
         }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
