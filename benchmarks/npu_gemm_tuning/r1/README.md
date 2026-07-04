@@ -148,6 +148,34 @@ loop is a DMA `repeat_count`, capped at 255). COLS=8 + 8 trace flows overruns th
 router, so trace ≤4 columns (`TRACE_COLS`) while all 8 feed — traced columns feel
 the same contention.
 
+### What the ~55 GB/s ceiling actually is: the NPU fabric link (not the DRAM)
+
+~55 GB/s is suspiciously low for a ~120-TOPS (W4A8) engine on a 256 GB/s LPDDR5X
+system, so we chased the mechanism. It is **the NPU's link into the SoC data
+fabric**, upstream of the memory controllers — not a per-controller/channel limit
+and not our dataflow. Evidence, all pointing the same way:
+
+- **Address-stride invariant** (`STRIDE` in `r1b_cols_trace_run.py`): spreading the
+  8 columns' regions 256 MB apart across a 2 GB range — forcing distinct memory
+  controllers for any interleave — gives 55.3 / 55.2 / 55.1 GB/s vs. adjacent.
+  Flat. A one-controller bottleneck would scale when spread; it doesn't.
+- **Stream-density invariant** (`r1b_streams_run.py`, ROWS = streams/shim): one
+  interface tile drives its full 128-bit NoC input (1 col × 2 streams = 28.8 GB/s
+  = 128 b × 1.8 GHz), but the *aggregate* is hit by ~2 tiles (2 col × 2 rows =
+  53.6) and adding tiles/streams doesn't exceed ~55 (8×2 = 46.6, worse).
+- **Depth/burst invariant**: FIFO depth 4→32 and tile 4 K→16 K both flat at ~56.
+- **The memory system is not the limit**: a CPU memcpy spreads ~26 M read-beats
+  evenly across all 12 `amd_df/..._read_data_beats_dram_N` channels — the full
+  bandwidth is there; the NPU just has a narrow on-ramp.
+
+So ~55 GB/s is a hard NPU-side ceiling, placement- and parallelism-invariant. It's
+a deliberate design point: XDNA2 is a *reuse* machine (weights/activations live in
+the 8×512 KB memtiles), so its DRAM link is provisioned for CNN / LLM-prefill
+(compute-bound, on-chip-fed), not for decode (M=1, pure weight streaming). Caveat:
+this box's DF PMU does not cleanly attribute XDNA2 DRAM traffic (`upstream_io` /
+`cfi` counters read ~0 during the feed), so the conclusion rests on the behavioral
+invariances above, not a direct counter or datasheet figure.
+
 ### Next
 
 1. Add the W4A8 `mac_4x16_16x16` compute at M ≥ 512 and confirm sustained TOPS

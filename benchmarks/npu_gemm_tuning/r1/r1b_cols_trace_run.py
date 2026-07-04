@@ -43,8 +43,9 @@ DDR_ID = int(os.environ.get("DDR_ID", 4))
 # locality). DISTINCT=0: all columns read the same PER-byte BO (locality-biased).
 DISTINCT = bool(int(os.environ.get("DISTINCT", 1)))
 PER = TILE_N * N_TILES
-TOTAL = PER * COLS
-IN_ELEMS = TOTAL if DISTINCT else PER
+STRIDE = int(os.environ.get("STRIDE", PER))     # address gap between columns' regions
+TOTAL = PER * COLS                              # bytes actually read (aggregate)
+IN_ELEMS = COLS * STRIDE if DISTINCT else PER   # BO size (regions may be spread out)
 TRACE_TXT, TRACE_JSON = "trace_cols.txt", "trace_cols.json"
 
 CORE_EVENTS = [PortEvent(CoreEvent.PORT_RUNNING_0, port=WireBundle.DMA, channel=0, master=True),
@@ -84,13 +85,14 @@ def r1b_cols_trace(A, Out, kf, **_kw):
     with rt.sequence(in_ty, acc_ty) as (a, o):
         for w in workers:
             rt.start(w)
-        # distinct: tile the big BO into COLS PER-sized regions; column i reads its
-        # own tile (offset i*PER). simple_tiler gives the same linear BD structure
-        # as the default fill (sizes [1,1,1,PER]) so it lowers -- a flat [PER],[1]
-        # tap instead becomes an illegal per-element repeat_count.
+        # distinct: column i reads a PER-sized tile at offset i*STRIDE. STRIDE>PER
+        # spreads columns far apart in address space to test whether they land on
+        # different memory controllers (aggregate would rise if we were controller-
+        # bound). simple_tiler gives the linear [1,1,1,PER] BD that lowers.
         region_taps = TensorTiler2D.simple_tiler([IN_ELEMS], [PER]) if DISTINCT else None
+        step = max(1, STRIDE // PER)
         for i in range(COLS):
-            rt.fill(fins[i].prod(), a, tap=(region_taps[i] if DISTINCT else None))
+            rt.fill(fins[i].prod(), a, tap=(region_taps[i * step] if DISTINCT else None))
         for i in range(COLS):
             rt.drain(fouts[i].cons(), o, wait=True)
     return Program(dev, rt).resolve_program()
