@@ -146,20 +146,14 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
             .is_some()
 }
 
-pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
-pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
-pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
-pub const ARCH_ID_QWEN35_MOE: u32 = 6;
-pub const ARCH_ID_QWEN2: u32 = 7;
-pub const ARCH_ID_DOTS_OCR: u32 = 8;
-pub const ARCH_ID_DEEPSEEK4_FLASH: u32 = 9;
-pub const ARCH_ID_MINIMAX_M2: u32 = 10;
-pub const ARCH_ID_LFM2_MOE: u32 = 11;
-pub const ARCH_ID_GEMMA3_TEXT: u32 = 12;
-pub const ARCH_ID_GEMMA3_VL: u32 = 13;
-pub const ARCH_ID_NEMOTRON_H: u32 = 14;
-pub const ARCH_ID_MAMBA2: u32 = 15;
-pub const ARCH_ID_ZAYA: u32 = 16;
+// Canonical arch-family ids now live in the capability layer (`hipfire-arch-api`).
+// Re-exported here so existing `hipfire_model::ARCH_ID_*` callers are unchanged.
+pub use hipfire_arch_api::{
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
+    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
+    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+};
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
 pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[

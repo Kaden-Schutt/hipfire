@@ -54,6 +54,10 @@ use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
 // The GGUF parser/dequant now lives in its own dedicated offline crate
 // (hipfire-gguf) — off the inference dependency surface. Alias keeps the
 // import pipeline's `gguf_input::` references source-compatible.
+use hipfire_arch_api::{
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE,
+    ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_MOE, ARCH_ID_ZAYA,
+};
 use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
 // library (so hipfire-coexistence can drive the import). Re-imported here for
@@ -5788,11 +5792,12 @@ fn main() {
     // → arch_id 13 (gemma3-vl: SigLIP tower + projector + the gemma3 text
     // decoder). Pure-text `gemma3`/`gemma3_text` stay 12. Text tensors are
     // `language_model.*`-prefixed; vision/projector stay F32 (see should_quantize).
-    let auto_arch_id = if auto_arch_id == 12 && config.get("vision_config").is_some() {
-        13
-    } else {
-        auto_arch_id
-    };
+    let auto_arch_id =
+        if auto_arch_id == ARCH_ID_GEMMA3_TEXT && config.get("vision_config").is_some() {
+            ARCH_ID_GEMMA3_VL
+        } else {
+            auto_arch_id
+        };
     // --arch-id <u32> overrides the auto-detected id. Use when the
     // model's family maps to a different crate than the default
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
@@ -5808,7 +5813,7 @@ fn main() {
     // arch_id 6 = Qwen3.5-MoE, 16 = ZAYA1: both store routed experts as stacked 3D
     // `mlp.experts.{gate_up,down}_proj` tensors that the ingest path must split
     // per-expert (see the 3D split gated on `is_moe`).
-    let is_moe = arch_id == 6 || arch_id == 16;
+    let is_moe = arch_id == ARCH_ID_QWEN35_MOE || arch_id == ARCH_ID_ZAYA;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -5816,22 +5821,22 @@ fn main() {
     // ingest handles DeepSeek V4's per-expert tensors individually through
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
-    let is_deepseek4 = arch_id == 9;
+    let is_deepseek4 = arch_id == ARCH_ID_DEEPSEEK4_FLASH;
     // MiniMax-M2 (arch_id=10): MoE like DeepSeek V4, ships per-expert pre-split
     // 2D tensors (`...block_sparse_moe.experts.E.{w1,w2,w3}.weight`). Quantized
     // as HFQ4G256 (the only 4-bit format with a complete indexed-MoE GEMV
     // kernel family). Raw HF tensor names are written verbatim (no rename);
     // the hipfire loader looks them up.
-    let is_minimax = arch_id == 10;
+    let is_minimax = arch_id == ARCH_ID_MINIMAX_M2;
     // LFM2.5-MoE (arch_id 11): per-expert pre-split 2D experts (like minimax),
     // bf16 source. Conv-block + dense-MLP + router + expert_bias get dedicated
     // ingest branches; routed experts → MQ4G256, everything else → Q8.
-    let is_lfm2moe = arch_id == 11;
+    let is_lfm2moe = arch_id == ARCH_ID_LFM2_MOE;
     // Nemotron-H (arch_id 14) is dense for Nano-4B and MoE for Nano-30B. The
     // router-protection rule is harmless for dense 4B because it has no
     // `.mixer.gate.weight` tensors, and necessary for 30B because router noise
     // can flip top-k expert selection.
-    let is_nemotron_h = arch_id == 14;
+    let is_nemotron_h = arch_id == ARCH_ID_NEMOTRON_H;
     // Resolve the AWQ alpha now that the arch is known. The hipfire F2 sweep
     // winner (0.55) suits transformer attention/MLP activations, but
     // nemotron_h's Mamba-2 mixer projections have a far heavier-tailed
@@ -5881,7 +5886,7 @@ fn main() {
             eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, dense projections follow explicit --format when supported, remaining tensors → Q8.");
         }
     }
-    if arch_id == 15 {
+    if arch_id == ARCH_ID_MAMBA2 {
         eprintln!("  Mamba-2 detected — pure Mamba mixer stack; recurrence/norm tensors stay plain precision.");
     }
 
@@ -5986,7 +5991,7 @@ fn main() {
     // rmsnorm kernel — which applies plain `w` — is numerically correct at
     // runtime, with no per-layer special-casing in the gemma3 forward. Record
     // the offset for provenance and to make a re-quantize double-bake detectable.
-    if arch_id == 12 {
+    if arch_id == ARCH_ID_GEMMA3_TEXT {
         if let serde_json::Value::Object(ref mut m) = metadata {
             m.insert("gemma_norm_offset".to_string(), serde_json::json!(1.0_f32));
         }
@@ -6182,7 +6187,8 @@ fn main() {
     // arch_id 13 (gemma3-vl) is multimodal — the SigLIP vision tower is REQUIRED,
     // not optional, so auto-include it (no --include-vision needed). Other arches
     // keep the opt-in default (vision skipped unless the flag is passed).
-    let include_vision = std::env::args().any(|a| a == "--include-vision") || arch_id == 13;
+    let include_vision =
+        std::env::args().any(|a| a == "--include-vision") || arch_id == ARCH_ID_GEMMA3_VL;
     let vision_quant = std::env::args()
         .position(|a| a == "--vision-quant")
         .and_then(|i| std::env::args().nth(i + 1))
@@ -9985,7 +9991,7 @@ fn main() {
     // gemma3 forward. Norms ship at source precision (F32/F16/BF16); convert,
     // offset, convert back to the same dtype. The `gemma_norm_offset=1.0`
     // metadata marker records that this happened.
-    if arch_id == 12 || arch_id == 13 {
+    if arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL {
         let mut n_baked = 0usize;
         for t in hfq_tensors.iter_mut() {
             // Bake the gemma (1+w) RMSNorms (text norms + the projector's

@@ -50,10 +50,30 @@ pub use toy::{Dt, Init, TensorSpec, ToyFixture};
 
 /// Stable numeric identity of an architecture family (the on-disk/header id).
 ///
-/// Named constants for the concrete families live alongside the registry as they
-/// migrate onto this layer; the registry keys on this value.
+/// Named constants for the concrete families live alongside the registry (see the
+/// `ARCH_ID_*` block below); the registry keys on this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArchId(pub u16);
+
+// Canonical numeric arch-family ids (the on-disk/header value). This is the single
+// source of truth; `hipfire-model` re-exports these so existing
+// `hipfire_model::ARCH_ID_*` callers keep working. Ids are stable and gap-tolerant
+// (2..=4 are historically retired). Consumers on the capability layer (quantizer,
+// daemon dispatch) reference these instead of bare `arch_id == N` literals.
+pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
+pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
+pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
+pub const ARCH_ID_QWEN35_MOE: u32 = 6;
+pub const ARCH_ID_QWEN2: u32 = 7;
+pub const ARCH_ID_DOTS_OCR: u32 = 8;
+pub const ARCH_ID_DEEPSEEK4_FLASH: u32 = 9;
+pub const ARCH_ID_MINIMAX_M2: u32 = 10;
+pub const ARCH_ID_LFM2_MOE: u32 = 11;
+pub const ARCH_ID_GEMMA3_TEXT: u32 = 12;
+pub const ARCH_ID_GEMMA3_VL: u32 = 13;
+pub const ARCH_ID_NEMOTRON_H: u32 = 14;
+pub const ARCH_ID_MAMBA2: u32 = 15;
+pub const ARCH_ID_ZAYA: u32 = 16;
 
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

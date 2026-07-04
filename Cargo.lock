@@ -1863,6 +1863,7 @@ name = "hipfire-model"
 version = "0.3.0"
 dependencies = [
  "byteorder",
+ "hipfire-arch-api",
  "hipfire-config",
  "hipfire-hash",
  "hipfire-prompt",

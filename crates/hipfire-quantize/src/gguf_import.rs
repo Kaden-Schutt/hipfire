@@ -17,6 +17,7 @@ use crate::hfq_out::{
     insert_parameter_counts_metadata, metadata_with_quantization_hash, write_hfq, HfqTensor,
 };
 use crate::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
+use hipfire_arch_api::ARCH_ID_QWEN35_MOE;
 use hipfire_gguf as gguf_input;
 use hipfire_primitives::conv::f32_slice_to_f16_bytes;
 use hipfire_primitives::fwht::gen_fwht_signs;
@@ -155,7 +156,7 @@ pub fn run_gguf_pipeline(
     };
 
     // K-map setup for GGUF path
-    let is_moe = arch_id == 6;
+    let is_moe = arch_id == ARCH_ID_QWEN35_MOE;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())

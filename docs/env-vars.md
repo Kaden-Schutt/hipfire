@@ -31,13 +31,13 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_ADAPTIVE_B_UNSAFE` | the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1 | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:923` |
 | `HIPFIRE_ADAPTIVE_B_UP` | HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:1777` |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Runtime variable controlling allow mixed arch in hipfire | `crates/hipfire-runtime/src/config.rs:103` |
-| `HIPFIRE_ALLOW_MQ2` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5546` |
-| `HIPFIRE_ALLOW_MQ2_LLOYD` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5581` |
-| `HIPFIRE_ALLOW_MQ3_LLOYD` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5566` |
-| `HIPFIRE_ALLOW_MQ4_LLOYD` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5616` |
-| `HIPFIRE_ALLOW_UNIT_IMATRIX` | Environment toggle value controls runtime behavior | `crates/hipfire-quantize/src/main.rs:5168` |
+| `HIPFIRE_ALLOW_MQ2` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5550` |
+| `HIPFIRE_ALLOW_MQ2_LLOYD` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5585` |
+| `HIPFIRE_ALLOW_MQ3_LLOYD` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5570` |
+| `HIPFIRE_ALLOW_MQ4_LLOYD` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:5620` |
+| `HIPFIRE_ALLOW_UNIT_IMATRIX` | Environment toggle value controls runtime behavior | `crates/hipfire-quantize/src/main.rs:5172` |
 | `HIPFIRE_ATTN_FLASH` | Honors HIPFIRE_ATTN_FLASH=never\|0\|off as an explicit override | `crates/hipfire-arch-qwen35/src/qwen35.rs:8991` |
-| `HIPFIRE_AWQ_F1_ONLY` | F1-vs-F2 A/B gate. When "HIPFIRE_AWQ_F1_ONLY=1" is set, the F2 | `crates/hipfire-quantize/src/main.rs:4305` |
+| `HIPFIRE_AWQ_F1_ONLY` | F1-vs-F2 A/B gate. When "HIPFIRE_AWQ_F1_ONLY=1" is set, the F2 | `crates/hipfire-quantize/src/main.rs:4309` |
 | `HIPFIRE_BASELINE_ARCH` | Runtime variable controlling baseline arch in hipfire | `crates/hipfire-runtime/examples/coherence_probe.rs:403` |
 | `HIPFIRE_BATCHES_STATE_MAX` | Parses "HIPFIRE_BATCHES_STATE_MAX" with fallback defaults | `crates/hipfire-server/src/routes/batches.rs:687` |
 | `HIPFIRE_BENCH_QWEN35_SPEED_BIN` | Runtime variable controlling bench qwen35 speed bin in hipfire | `crates/hipfire-eval/src/lib.rs:1154` |
@@ -214,7 +214,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_GFX942_GEMV_V3` | Interprets "HIPFIRE_GFX942_GEMV_V3" from environment to select behavior | `crates/hipfire-rdna/src/feature_flags.rs:248` |
 | `HIPFIRE_GFX942_MFMA_PREFILL` | Interprets "HIPFIRE_GFX942_MFMA_PREFILL" from environment to select behavior | `crates/hipfire-rdna/src/feature_flags.rs:251` |
 | `HIPFIRE_GFX942_RMSNORM_SPLIT` | Environment toggle value controls runtime behavior | `crates/hipfire-rdna/src/feature_flags.rs:250` |
-| `HIPFIRE_GPTQ_DAMPING` | Inject env override since the quantizer reads it at fn entry | `crates/hipfire-quantize/src/main.rs:10295` |
+| `HIPFIRE_GPTQ_DAMPING` | Inject env override since the quantizer reads it at fn entry | `crates/hipfire-quantize/src/main.rs:10301` |
 | `HIPFIRE_GPU_SLAB_LOAD` | Runtime variable controlling gpu slab load in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:5284` |
 | `HIPFIRE_GPU_SLAB_MIB` | Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults | `crates/hipfire-arch-qwen35/src/qwen35.rs:4252` |
 | `HIPFIRE_GPU_TOPK` | HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU | `crates/hipfire-runtime/examples/infer_qwen35.rs:232` |
@@ -273,7 +273,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_LFM2_GRAPH` | Interprets "HIPFIRE_LFM2_GRAPH" from environment to select behavior | `crates/hipfire-arch-lfm2moe/src/forward.rs:67` |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | Runtime variable controlling lloyd force baseline in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:309` |
 | `HIPFIRE_LLOYD_GFX12` | Used to configure runtime execution by explicitly setting "HIPFIRE_LLOYD_GFX12" | `crates/hipfire-runtime/examples/prefill_microbench.rs:145` |
-| `HIPFIRE_LLOYD_K3` | Fallback to HFQ2-G128 for non-256-aligned (no rotation) | `crates/hipfire-quantize/src/main.rs:8143` |
+| `HIPFIRE_LLOYD_K3` | Fallback to HFQ2-G128 for non-256-aligned (no rotation) | `crates/hipfire-quantize/src/main.rs:8149` |
 | `HIPFIRE_LLOYD_MB4` | Force MB4=0 to skip the size-gated routing | `crates/hipfire-rdna/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs:274` |
 | `HIPFIRE_LM_DUMP` | Selects behavior from recognized values | `crates/hipfire-arch-gemma3/src/forward.rs:228` |
 | `HIPFIRE_LM_HEAD_F16` | Runtime variable controlling lm head f16 in hipfire | `crates/hipfire-runtime/src/config.rs:108` |
@@ -281,17 +281,17 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_LM_HEAD_WMMA` | Runtime variable controlling lm head wmma in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:220` |
 | `HIPFIRE_LOAD_TRANSPORT` | Selects behavior from recognized values | `crates/hipfire-runtime/src/weight_pager.rs:768` |
 | `HIPFIRE_LOCAL` | Force local-spawn behavior and skip serve HTTP in documented workflows | `README.md:962` |
-| `HIPFIRE_LOWRANK_R` | HIPFIRE_LOWRANK_R=r adds a rank-r correction of the quant error back | `crates/hipfire-quantize/src/main.rs:10050` |
+| `HIPFIRE_LOWRANK_R` | HIPFIRE_LOWRANK_R=r adds a rank-r correction of the quant error back | `crates/hipfire-quantize/src/main.rs:10056` |
 | `HIPFIRE_MAX_GEN` | Runtime variable controlling max gen in hipfire | `crates/hipfire-runtime/examples/infer_qwen35.rs:292` |
 | `HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE` | Interprets "HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE" from environment to select behavior | `crates/hipfire-serving-core/src/load.rs:241` |
 | `HIPFIRE_MEMCPY_DUMP` | Enabled when set to 1 | `crates/hip-bridge/src/ffi.rs:988` |
 | `HIPFIRE_MEMSET_DUMP` | Enabled when set to 1 | `crates/hip-bridge/src/ffi.rs:1040` |
 | `HIPFIRE_MINIMAX_CAPTURE_POSTATTN` | Runtime variable controlling minimax capture postattn in hipfire | `crates/hipfire-arch-minimax/src/forward.rs:206` |
-| `HIPFIRE_MINIMAX_DOWN_FORMAT` | Runtime variable controlling minimax down format in hipfire | `crates/hipfire-quantize/src/main.rs:6967` |
+| `HIPFIRE_MINIMAX_DOWN_FORMAT` | Runtime variable controlling minimax down format in hipfire | `crates/hipfire-quantize/src/main.rs:6973` |
 | `HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ` | down-AWQ harmful (shared s_down bad approx); opt-in | `crates/hipfire-arch-minimax/src/minimax.rs:863` |
-| `HIPFIRE_MINIMAX_EXPERT_MQ2L` | dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model | `crates/hipfire-quantize/src/main.rs:6946` |
-| `HIPFIRE_MINIMAX_EXPERT_MQ3L` | dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model | `crates/hipfire-quantize/src/main.rs:6948` |
-| `HIPFIRE_MINIMAX_EXPERT_MQ6` | _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are | `crates/hipfire-quantize/src/main.rs:6944` |
+| `HIPFIRE_MINIMAX_EXPERT_MQ2L` | dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model | `crates/hipfire-quantize/src/main.rs:6952` |
+| `HIPFIRE_MINIMAX_EXPERT_MQ3L` | dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model | `crates/hipfire-quantize/src/main.rs:6954` |
+| `HIPFIRE_MINIMAX_EXPERT_MQ6` | _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are | `crates/hipfire-quantize/src/main.rs:6950` |
 | `HIPFIRE_MMQ` | Selects behavior from recognized values | `crates/hipfire-rdna/src/feature_flags.rs:194` |
 | `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` | Runtime variable controlling mmq diag quantize only in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:233` |
 | `HIPFIRE_MMQ_SCREEN` | Runtime variable controlling mmq screen in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:225` |
@@ -330,7 +330,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_NGRAM_WINDOW` | Runtime variable controlling ngram window in hipfire | `crates/hipfire-runtime/src/config.rs:98` |
 | `HIPFIRE_NORMALIZE_PROMPT` | Opt-out must skip CRLF/NBSP/trailing-ws too, not just newline collapse | `crates/hipfire-serving-core/src/output_filter.rs:30` |
 | `HIPFIRE_NORM_PLUS1` | qwen3.5 may store RMSNorm weight as (1+γ) (Gemma-style). HIPFIRE_NORM_PLUS1=1 | `crates/hipfire-train/examples/qwen35_mlp_norm_recovery.rs:192` |
-| `HIPFIRE_NO_EXPERT_AWQ` | experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the | `crates/hipfire-quantize/src/main.rs:7247` |
+| `HIPFIRE_NO_EXPERT_AWQ` | experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the | `crates/hipfire-quantize/src/main.rs:7253` |
 | `HIPFIRE_NO_QUANT` | Student weights = OQ+ sim-quant (HIPFIRE_NO_QUANT=1 → identity sanity check) | `crates/hipfire-train/examples/qwen35_mlp_norm_recovery.rs:249` |
 | `HIPFIRE_NPU_ATTN_GATE_CONFIGS` | Runtime variable controlling npu attn gate configs in hipfire | `crates/hipfire-arch-qwen35/build.rs:193` |
 | `HIPFIRE_NPU_DIR` | Defaults to target/npu when unset | `crates/hipfire-arch-qwen35/src/qwen35.rs:2083` |
@@ -414,17 +414,17 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_Q8_WMMA_X64` | Environment toggle value controls runtime behavior | `crates/hipfire-rdna/src/dispatch/gemm_misc.rs:778` |
 | `HIPFIRE_QAT_KVNOISE` | Teacher must run CLEAN — force KV-noise off during its precompute | `crates/hipfire-train/examples/qat_w3_kvarn.rs:89` |
 | `HIPFIRE_QA_KV_MODES` | Defaults to q8,asym4,asym3,asym2 when unset | `crates/hipfire-runtime/examples/test_inferenceQA.rs:750` |
-| `HIPFIRE_QTIP_BBT_ALPHA` | BBT-spectral influence scaling (SpectralLLM): HIPFIRE_QTIP_BBT_ALPHA=α | `crates/hipfire-quantize/src/main.rs:8827` |
-| `HIPFIRE_QTIP_BEAM` | K-map gate: applies to MoE models by default. Dense models opt in | `crates/hipfire-quantize/src/main.rs:5510` |
-| `HIPFIRE_QTIP_CODEBOOK` | Environment toggle value controls runtime behavior | `crates/hipfire-quantize/src/main.rs:4928` |
+| `HIPFIRE_QTIP_BBT_ALPHA` | BBT-spectral influence scaling (SpectralLLM): HIPFIRE_QTIP_BBT_ALPHA=α | `crates/hipfire-quantize/src/main.rs:8833` |
+| `HIPFIRE_QTIP_BEAM` | K-map gate: applies to MoE models by default. Dense models opt in | `crates/hipfire-quantize/src/main.rs:5514` |
+| `HIPFIRE_QTIP_CODEBOOK` | Environment toggle value controls runtime behavior | `crates/hipfire-quantize/src/main.rs:4932` |
 | `HIPFIRE_QTIP_EVAL_ST` | Selects behavior from recognized values | `crates/hipfire-quantize/src/qtip.rs:893` |
-| `HIPFIRE_QTIP_HESSIAN` | Runtime variable controlling qtip hessian in hipfire | `crates/hipfire-quantize/src/main.rs:4950` |
+| `HIPFIRE_QTIP_HESSIAN` | Runtime variable controlling qtip hessian in hipfire | `crates/hipfire-quantize/src/main.rs:4954` |
 | `HIPFIRE_QUANTIZE_BIN` | Runtime variable controlling quantize bin in hipfire | `crates/hipfire-eval/src/executor_tinyquant.rs:126` |
 | `HIPFIRE_QUANT_CALIB` | Runtime variable controlling quant calib in hipfire | `crates/hipfire-diffusion/src/tests.rs:6482` |
 | `HIPFIRE_QUANT_CANDS` | Runtime variable controlling quant cands in hipfire | `crates/hipfire-diffusion/src/tests.rs:6510` |
-| `HIPFIRE_QUANT_DIAG_PATH` | Runtime variable controlling quant diag path in hipfire | `crates/hipfire-quantize/src/main.rs:12020` |
+| `HIPFIRE_QUANT_DIAG_PATH` | Runtime variable controlling quant diag path in hipfire | `crates/hipfire-quantize/src/main.rs:12026` |
 | `HIPFIRE_QUANT_SRC` | Runtime variable controlling quant src in hipfire | `crates/hipfire-diffusion/src/tests.rs:6507` |
-| `HIPFIRE_QUANT_THREADS` | Runtime variable controlling quant threads in hipfire | `crates/hipfire-quantize/src/main.rs:4699` |
+| `HIPFIRE_QUANT_THREADS` | Runtime variable controlling quant threads in hipfire | `crates/hipfire-quantize/src/main.rs:4703` |
 | `HIPFIRE_QWEN35_DECODE_BATCH` | Defaults to auto when unset | `crates/hipfire-serving-core/src/qwen35_decode.rs:360` |
 | `HIPFIRE_QWEN35_DECODE_BATCH_MAX` | Runtime variable controlling qwen35 decode batch max in hipfire | `crates/hipfire-serving-core/src/qwen35_decode.rs:484` |
 | `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` | Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior | `crates/hipfire-serving-core/src/qwen35_decode.rs:506` |
@@ -457,30 +457,30 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_ROCPROF_BIN` | Runtime variable controlling rocprof bin in hipfire | `crates/hipfire-eval/src/rocprof.rs:275` |
 | `HIPFIRE_ROCPROF_CSV` | Runtime variable controlling rocprof csv in hipfire | `crates/hipfire-runtime/examples/bench_qwen35_speed.rs:325` |
 | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | Runtime variable controlling rope interleaved legacy in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:296` |
-| `HIPFIRE_RQ2_BULK_BITS` | Runtime variable controlling rq2 bulk bits in hipfire | `crates/hipfire-quantize/src/main.rs:9033` |
-| `HIPFIRE_RQ2_DAMP` | De-risk B: single shared, foldable residual-stream rotation. With | `crates/hipfire-quantize/src/main.rs:9037` |
-| `HIPFIRE_RQ2_PROTECT_FRAC` | Runtime variable controlling rq2 protect frac in hipfire | `crates/hipfire-quantize/src/main.rs:9029` |
-| `HIPFIRE_RQ2_Q8_EMBED` | Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1, | `crates/hipfire-quantize/src/main.rs:9155` |
-| `HIPFIRE_RQ2_SHARE_RESID` | HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual | `crates/hipfire-quantize/src/main.rs:9051` |
-| `HIPFIRE_RQ3_BULK_BITS` | Runtime variable controlling rq3 bulk bits in hipfire | `crates/hipfire-quantize/src/main.rs:9192` |
-| `HIPFIRE_RQ3_PROTECT_FRAC` | Runtime variable controlling rq3 protect frac in hipfire | `crates/hipfire-quantize/src/main.rs:9188` |
-| `HIPFIRE_RQ3_Q8_EMBED` | Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A) | `crates/hipfire-quantize/src/main.rs:9254` |
-| `HIPFIRE_RQ4_BULK` | Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set | `crates/hipfire-quantize/src/main.rs:9295` |
-| `HIPFIRE_RQ4_BULK_BITS` | Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set | `crates/hipfire-quantize/src/main.rs:9289` |
-| `HIPFIRE_RQ4_DUMP_RANK` | HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking | `crates/hipfire-quantize/src/main.rs:9401` |
-| `HIPFIRE_RQ4_INVERT` | HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the | `crates/hipfire-quantize/src/main.rs:9419` |
-| `HIPFIRE_RQ4_MQ_BITS` | Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0 | `crates/hipfire-quantize/src/main.rs:9305` |
-| `HIPFIRE_RQ4_OBS_DAMP` | Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0 | `crates/hipfire-quantize/src/main.rs:9299` |
-| `HIPFIRE_RQ4_PROTECT_FRAC` | diag(H) residual-channel energy from true residual readers | `crates/hipfire-quantize/src/main.rs:9875` |
-| `HIPFIRE_RQ4_PROTECT_Q8` | on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖² | `crates/hipfire-quantize/src/main.rs:9310` |
-| `HIPFIRE_RQ4_Q8_EMBED` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:9661` |
-| `HIPFIRE_RQ4_RANDOM_SEED` | Runtime variable controlling rQ4 random seed in hipfire | `crates/hipfire-quantize/src/main.rs:9524` |
-| `HIPFIRE_RQ4_SALIENCY` | (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution) | `crates/hipfire-quantize/src/main.rs:9314` |
-| `HIPFIRE_RQ4_VOID_ONLY` | Runtime variable controlling rQ4 void only in hipfire | `crates/hipfire-quantize/src/main.rs:9443` |
-| `HIPFIRE_RQ_BULK_BITS` | Runtime variable controlling rq bulk bits in hipfire | `crates/hipfire-quantize/src/main.rs:8962` |
-| `HIPFIRE_RQ_GROUP` | Runtime variable controlling rq group in hipfire | `crates/hipfire-quantize/src/main.rs:8966` |
+| `HIPFIRE_RQ2_BULK_BITS` | Runtime variable controlling rq2 bulk bits in hipfire | `crates/hipfire-quantize/src/main.rs:9039` |
+| `HIPFIRE_RQ2_DAMP` | De-risk B: single shared, foldable residual-stream rotation. With | `crates/hipfire-quantize/src/main.rs:9043` |
+| `HIPFIRE_RQ2_PROTECT_FRAC` | Runtime variable controlling rq2 protect frac in hipfire | `crates/hipfire-quantize/src/main.rs:9035` |
+| `HIPFIRE_RQ2_Q8_EMBED` | Q8 (~20% of params on a tied-embedding 0.8B). With HIPFIRE_RQ2_Q8_EMBED=1, | `crates/hipfire-quantize/src/main.rs:9161` |
+| `HIPFIRE_RQ2_SHARE_RESID` | HIPFIRE_RQ2_SHARE_RESID=1, every k==1024 weight (the d_model residual | `crates/hipfire-quantize/src/main.rs:9057` |
+| `HIPFIRE_RQ3_BULK_BITS` | Runtime variable controlling rq3 bulk bits in hipfire | `crates/hipfire-quantize/src/main.rs:9198` |
+| `HIPFIRE_RQ3_PROTECT_FRAC` | Runtime variable controlling rq3 protect frac in hipfire | `crates/hipfire-quantize/src/main.rs:9194` |
+| `HIPFIRE_RQ3_Q8_EMBED` | Iso-bit embed for an honest mq4 comparison (same as roughquant2 de-risk A) | `crates/hipfire-quantize/src/main.rs:9260` |
+| `HIPFIRE_RQ4_BULK` | Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set | `crates/hipfire-quantize/src/main.rs:9301` |
+| `HIPFIRE_RQ4_BULK_BITS` | Bulk codec: "mq4" → real mq4 format (fair mq4+protect-vs-mq4 test, set | `crates/hipfire-quantize/src/main.rs:9295` |
+| `HIPFIRE_RQ4_DUMP_RANK` | HIPFIRE_RQ4_DUMP_RANK=1: print the residual-channel saliency ranking | `crates/hipfire-quantize/src/main.rs:9407` |
+| `HIPFIRE_RQ4_INVERT` | HIPFIRE_RQ4_INVERT=1: protect the LOWEST-saliency channels instead of the | `crates/hipfire-quantize/src/main.rs:9425` |
+| `HIPFIRE_RQ4_MQ_BITS` | Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0 | `crates/hipfire-quantize/src/main.rs:9311` |
+| `HIPFIRE_RQ4_OBS_DAMP` | Uniform bulk bit-width for the mq bulk (4=mq4, 5, 6=mq6). protect_frac=0 | `crates/hipfire-quantize/src/main.rs:9305` |
+| `HIPFIRE_RQ4_PROTECT_FRAC` | diag(H) residual-channel energy from true residual readers | `crates/hipfire-quantize/src/main.rs:9881` |
+| `HIPFIRE_RQ4_PROTECT_Q8` | on diag(H) alone). diag = E[x²] (activation energy); wnorm = ‖W[:,c]‖² | `crates/hipfire-quantize/src/main.rs:9316` |
+| `HIPFIRE_RQ4_Q8_EMBED` | Enabled when set to 1 | `crates/hipfire-quantize/src/main.rs:9667` |
+| `HIPFIRE_RQ4_RANDOM_SEED` | Runtime variable controlling rQ4 random seed in hipfire | `crates/hipfire-quantize/src/main.rs:9530` |
+| `HIPFIRE_RQ4_SALIENCY` | (weight energy); product = ‖W[:,c]‖²·E[x²] (output-error contribution) | `crates/hipfire-quantize/src/main.rs:9320` |
+| `HIPFIRE_RQ4_VOID_ONLY` | Runtime variable controlling rQ4 void only in hipfire | `crates/hipfire-quantize/src/main.rs:9449` |
+| `HIPFIRE_RQ_BULK_BITS` | Runtime variable controlling rq bulk bits in hipfire | `crates/hipfire-quantize/src/main.rs:8968` |
+| `HIPFIRE_RQ_GROUP` | Runtime variable controlling rq group in hipfire | `crates/hipfire-quantize/src/main.rs:8972` |
 | `HIPFIRE_RQ_HAND` | Environment toggle value controls runtime behavior | `crates/hipfire-arch-qwen35/src/qwen35.rs:23403` |
-| `HIPFIRE_RQ_PROTECT_FRAC` | Runtime variable controlling rq protect frac in hipfire | `crates/hipfire-quantize/src/main.rs:8958` |
+| `HIPFIRE_RQ_PROTECT_FRAC` | Runtime variable controlling rq protect frac in hipfire | `crates/hipfire-quantize/src/main.rs:8964` |
 | `HIPFIRE_RUN_EXAMPLE_BIN` | Runtime variable controlling run example bin in hipfire | `crates/hipfire-eval/src/lib.rs:1186` |
 | `HIPFIRE_SAMPLE_COMPARE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/infer_qwen35.rs:233` |
 | `HIPFIRE_SCORE_TAIL` | HIPFIRE_SCORE_TAIL=N → score only the last N query positions (leak-free for | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:143` |
@@ -494,7 +494,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_STATE` | Interprets "HIPFIRE_STATE" from environment to select behavior | `crates/hipfire-runtime/examples/greedy_dump_top5.rs:246` |
 | `HIPFIRE_STEER_DUMP` | refusal scorer actually sees — the qualitative companion to the numeric report | `crates/hipfire-steer/src/driver.rs:227` |
 | `HIPFIRE_TARGET_ARCH` | Runtime variable controlling target arch in hipfire | `crates/hipfire-rdna/src/dispatch/mod.rs:722` |
-| `HIPFIRE_TIER_RATIO` | Runtime variable controlling tier ratio in hipfire | `crates/hipfire-quantize/src/main.rs:5211` |
+| `HIPFIRE_TIER_RATIO` | Runtime variable controlling tier ratio in hipfire | `crates/hipfire-quantize/src/main.rs:5215` |
 | `HIPFIRE_TINYQUANT_FAMILIES` | Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES") | `crates/hipfire-eval/src/executor_tinyquant.rs:370` |
 | `HIPFIRE_TINYQUANT_RECORD` | Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES") | `crates/hipfire-eval/src/executor_tinyquant.rs:364` |
 | `HIPFIRE_TINY_QUANT_PROBE_BIN` | Runtime variable controlling tiny quant probe bin in hipfire | `crates/hipfire-eval/src/executor_tinyquant.rs:142` |
