@@ -63,6 +63,10 @@ pub struct Axlf<'a> {
     pub sections: Vec<Section>,
 }
 
+fn rd_u16(b: &[u8], off: usize) -> Option<u16> {
+    b.get(off..off + 2)
+        .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+}
 fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
     b.get(off..off + 4)
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
@@ -114,6 +118,50 @@ impl<'a> Axlf<'a> {
         let s = self.sections.iter().find(|s| s.kind == kind)?;
         self.bytes.get(s.offset..s.offset + s.size)
     }
+
+    /// Parse the AIE_PARTITION section into the column count + start columns + the
+    /// embedded PDI image (the fields CREATE_HWCTX / CONFIG_HWCTX need). Layout per
+    /// `struct aie_partition` (184 B): `info.column_width` u16 @32, `info.start_columns`
+    /// array_offset @40, `aie_pdi` array_offset @120. Each `aie_pdi` entry (96 B) has
+    /// `pdi_image` array_offset @+16. All array offsets are relative to the section.
+    pub fn aie_partition(&self) -> Option<AiePartition<'a>> {
+        let sec = self.section(KIND_AIE_PARTITION)?;
+        let column_width = rd_u16(sec, 32)?;
+
+        let n_cols = rd_u32(sec, 40)? as usize;
+        let cols_off = rd_u32(sec, 44)? as usize;
+        let mut start_columns = Vec::with_capacity(n_cols);
+        for i in 0..n_cols {
+            start_columns.push(rd_u16(sec, cols_off + i * 2)?);
+        }
+
+        let n_pdi = rd_u32(sec, 120)? as usize;
+        let pdi_arr_off = rd_u32(sec, 124)? as usize;
+        if n_pdi == 0 {
+            return None;
+        }
+        // First PDI entry; pdi_image = {size, offset} at entry+16.
+        let pdi_size = rd_u32(sec, pdi_arr_off + 16)? as usize;
+        let pdi_off = rd_u32(sec, pdi_arr_off + 20)? as usize;
+        let pdi = sec.get(pdi_off..pdi_off + pdi_size)?;
+
+        Some(AiePartition {
+            column_width,
+            start_columns,
+            pdi,
+        })
+    }
+}
+
+/// The parsed AIE_PARTITION: partition width, its start columns, and the embedded
+/// PDI image (the compiled tile program the driver loads).
+pub struct AiePartition<'a> {
+    /// Number of AIE columns this partition occupies.
+    pub column_width: u16,
+    /// Start-column identifiers for the partition placement.
+    pub start_columns: Vec<u16>,
+    /// The first PDI image bytes (mlir-aie emits one PDI per xclbin).
+    pub pdi: &'a [u8],
 }
 
 #[cfg(test)]

@@ -43,7 +43,13 @@ fn main() {
             s.size
         );
     }
-    let have_pdi = axlf.section(xclbin::KIND_PDI).is_some();
-    let have_part = axlf.section(xclbin::KIND_AIE_PARTITION).is_some();
-    println!("PDI present: {have_pdi} | AIE_PARTITION present: {have_part}");
+    match axlf.aie_partition() {
+        Some(p) => println!(
+            "AIE_PARTITION: column_width={} start_columns={:?} pdi={} bytes",
+            p.column_width,
+            p.start_columns,
+            p.pdi.len()
+        ),
+        None => println!("no AIE_PARTITION section"),
+    }
 }
