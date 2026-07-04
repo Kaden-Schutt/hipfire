@@ -40,7 +40,7 @@ Progress on the §3 High findings since the review was written. Verified against
 | 3.1 | Dual kernarg lists (~207 sites) | 🔴 Open | Pilot only: `launch_kernargs`/`KernArg` in `dispatch/{mod,norm}.rs`; ~306 launch sites remain. |
 | 3.2 | Kernel-selection cascades, 0 tests, dead duplicate | ✅ Resolved | Dead duplicate selector deleted; `kernels.rs` now has 26 tests. |
 | 3.3 | `Gpu` god object; arch dispatch in generic compute crate | 🔴 Open | 13 hipfire-rdna files still name specific arch families. |
-| 3.4 | `qwen35.rs` 32k-line file, 5.5k-line fn | 🔴 Open | 32,618 LOC; `forward_prefill_chunk` still 5,577 lines. Multi-session. |
+| 3.4 | `qwen35.rs` 32k-line file, 5.5k-line fn | 🔴 Open | 32,618 LOC; `forward_prefill_chunk` still 5,577 lines. Crate is really **58,036 LOC / 5 files** (`speculative.rs` 12,730 was missed) and **~65–70% generic**, not qwen-specific — see the not-in-original-review addendum below. Multi-session. |
 | 3.5 | deepseek4 `forward.rs` 9.2k LOC, 54-field god-state | 🔴 Open | Unchanged. Multi-session. |
 | 3.6 | Cross-arch copy-paste | 🔴 Open | No shared-arch crate; partial folding via the capability layer. |
 | 3.7 | Serving hand-parsed wire protocol / big main() | 🔴 Open | `sdapi.rs` 8,480 LOC; protocol still hand-parsed. Multi-session. |
@@ -58,6 +58,17 @@ Progress on the §3 High findings since the review was written. Verified against
 - **Backend-crate naming symmetry.** Renamed `rdna-compute` → `hipfire-rdna` (package + `rdna_compute::` → `hipfire_rdna::` ident across 27 manifests and 1,538 refs) so the RDNA/HIP kernel crate matches its `hipfire-*` backend siblings (`hipfire-npu`, `hipfire-xdna`, `hipfire-cpu`, `hipfire-rocm`). Still RDNA-specific / HIP-direct — no generic cross-vendor layer (AGENTS.md).
 - **CPU compute homed in the CPU backend.** The pure CPU-reference tensor ops + `CpuTensor` moved from `hipfire-diffusion` into `hipfire-cpu::tensor_ops` (with a crate-owned `CpuError`; `CpuTensor::from_hfq` → free fn `cpu_tensor_from_hfq`, ~113 call sites). Each backend crate now owns its own compute + tensor type.
 - **CPU-oracle audit.** Swept all `*_cpu`/`*_reference` math: the diffusion ops were the one cohesive misplaced cluster; the rest is correctly arch-coupled (`forward_cpu`), production (`sample_cpu`), or test/example-local. Added a shared `hipfire_cpu::cpu_reference_gemm` and deduped the one real example oracle that used it.
+
+**Monoliths beyond the original review (2026-07-04, not-in-original-review addendum).** A repo-wide monolith re-scan surfaced large files the original §3 findings did not name. Recorded here so they are tracked, not lost:
+- **`hipfire-arch-qwen35/src/speculative.rs` — 12,730 LOC, missed entirely.** Finding 3.4 named only `qwen35.rs` (32,618) as the qwen monolith, but the crate is **58,036 LOC across 5 files** (`qwen35.rs` 32,618 + `speculative.rs` 12,730 + `mtp_spec.rs` 3,990 + `mtp_head.rs` 2,683 + `pflash.rs` 2,179). `speculative.rs` is the largest un-reviewed file in the repo.
+- **`hipfire-rdna/src/dispatch/` cluster — ~55,548 LOC.** The dispatch mechanics that finding 3.1 (dual kernarg lists) and 3.3 (`Gpu` god object) touch at the symptom level, but the aggregate size of the dispatch tree itself was never scoped as a decomposition target.
+- **`hipfire-serving-core` — `generate.rs` / `load.rs` / `generate_arch.rs`.** Finding 3.7 named `sdapi.rs` (the wire protocol) but not the serving-core generate/load drivers, which are their own large multi-responsibility files.
+
+**Qwen-crate genericity (finding 3.4/3.6, quantified 2026-07-04).** Investigated whether the 58,036-LOC qwen35 crate is actually qwen-specific. **It is overwhelmingly not.** Evidence:
+- Of 264 top-level fns in `qwen35.rs`, only **15** carry `qwen` in the name; the rest are generic `forward`/`moe`/`load`/`dense`/`gemm`/`ffn`/`prefill` (transformer path), `paro`/`rq`/`mq` (quant-format decode, shared across arches), and `validate`/`kld`/`trace` (eval). The file references generic runtime types (`LlamaConfig`/`WeightTensor`/`KvCache`/`ForwardScratch`) **168×** vs `Qwen35Config` **93×**, and imports its primitives from `hipfire_dispatch::*` and `hipfire_runtime::{hfq,kv,quant,weights,tp_shard,multi_gpu}`.
+- **`speculative.rs` (12,730) + `mtp_spec.rs` (3,990) + `mtp_head.rs` (2,683) ≈ 19,400 LOC is a generic draft-verify speculative-decode engine** (dflash/ddtree, MTP, rollback/replay, verify-graph, seed-oracle), coupled to qwen only through a **32-reference** `Qwen35{Config,Weights,Scratch,Model}` seam — i.e. a thin `ModelSlot` boundary, not qwen logic.
+- **`pflash.rs` (2,179) + the 21-type `DensePrefillSessionBatch*` cluster** in `qwen35.rs` is generic batched-prefill / pointer-table session machinery (0 qwen-named items in `pflash.rs`).
+- The genuinely qwen3.5-specific core is the **DeltaNet hybrid linear-attention** path (`DeltaNet*` weights/state/rule, ~217 mentions), the `LayerType` full-attn/delta interleave schedule, and `Qwen35Config`/`Qwen35Weights` layout — on the order of ~12–18k LOC. **~65–70% of the crate is generic transformer/serving infrastructure misfiled under an arch crate**, confirming the review's premise for 3.6 (no shared-arch crate) and making the spec-decode engine (~19.4k LOC) the single largest extraction candidate.
 
 ---
 
