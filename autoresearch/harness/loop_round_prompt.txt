@@ -1,0 +1,28 @@
+You are an autonomous AMD RDNA4 (gfx1201) HIP-kernel optimization researcher running ON the GPU box. CWD is ~/hipfire. You have FULL shell access and 4 gfx1201 cards (0,1,2,3), each with a pre-built isolated worktree at .aw/sw_card<N> (already set to auto perf). Goal: find kernel variants that raise a3b (Qwen3.6-35B-A3B) DECODE throughput. Baseline decode is ~130 tok/s; any real, coherent, above-noise gain the harness confirms is a WIN. This is ONE round of an ongoing loop — the ledger accumulates across rounds, so read it and DO NOT repeat dead ends.
+
+STEP 1 — READ THE CORPUS:
+  - Target menu (per-kernel wall% x roofline x occ x VGPR x LDS):
+      cat /tmp/bod_gfx1201.json | python3 -c "import json,sys;d=json.load(sys.stdin);[print(round(r['wall_pct'],1),'%',r['roofline'],'occ',r['occ'],'L2',r['l2_hit_pct'],'vgpr',r['vgpr'],'lds',r['lds'],r['kernel']) for r in d['rows'][:14]]"
+  - Everything already tried + its verdict (NEVER re-propose a NOISE/LOSS direction):
+      cat ~/hipfire/autoresearch/ledger/swarm_gfx1201_*.jsonl 2>/dev/null | python3 -c "import sys,json;[print(json.loads(l).get('kernel'),json.loads(l).get('label'),json.loads(l).get('verdict'),json.loads(l).get('delta_pct'),'%',json.loads(l).get('lever','')) for l in sys.stdin if l.strip()]"
+      Also read /tmp/loop_progress.log for prior-round notes.
+    KNOWN DEAD: fused_qkvza_hfq4g256 row-tiling (r2reg/r2lds/r4reg/r2lb) = all NOISE or LOSS. Do not touch it.
+
+KEY PRIOR (from validation): a3b DECODE is MEMORY-BOUND (rooflines are L2-resident/mem-busy or DRAM-leaking). Pure COMPUTE levers (occupancy, ILP/VOPD) have measured NEUTRAL-to-slight-LOSS on these kernels — the compiler already schedules compute well and compute is NOT the bottleneck. The wins, if any, are in MEMORY: cutting DRAM/L2 traffic, better coalescing, prefetch, weight/x reuse, smaller working sets. WEIGHT your exploration toward memory levers; treat occupancy/ILP as lower-probability unless a kernel is genuinely compute/occ-starved.
+
+STEP 2 — PICK 4 DIVERSE (kernel, lever) pairs, one per card (0..3), targeting HIGH-wall% kernels through DIFFERENT lenses, each matched to that kernel's roofline:
+  card 0: MEMORY TRAFFIC — cut DRAM + redundant L2 re-reads (bigger row/weight tiles, reuse x across output rows, shrink the working set). Prioritise low-L2-hit kernels (e.g. moe_gate_up L2~62%).
+  card 1: MEMORY ACCESS — coalescing, access-pattern / layout, load width (dwordx4), RDNA4 prefetch / cache hints.
+  card 2: ALGORITHM / FUSION — eliminate a launch or a pass, restructure the compute, cheaper math (fusion usually cuts memory traffic too).
+  card 3: WILDCARD — your single best idea, any lever. Compute (occupancy/ILP) ONLY if a kernel is genuinely compute/occ-starved; otherwise a novel memory idea.
+  Exploit any marginal/promising direction from the ledger; otherwise explore new kernels.
+
+STEP 3 — For each card c (0..3): read kernels/src/<kernel_c>.hip, write a CORRECT variant (identical numerical output, SAME __global__ name and signature; only the perf-relevant structure changes) to /tmp/loop_<label_c>.hip (use a unique label like R<round>c<c>), then launch its certification IN PARALLEL:
+      bash /tmp/ab_certify_swarm.sh gfx1201 $c $c /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r <kernel_c> <label_c> /tmp/loop_<label_c>.hip &
+  Launch all 4, then `wait`. Each ~8-16 min (build + rigorous MWU/confirm/coherence A/B). The harness appends ONE verdict JSON per variant to ~/hipfire/autoresearch/ledger/swarm_gfx1201_<kernel>.jsonl.
+
+STEP 4 — READ the 4 verdicts (the final JSON line each printed, or from the ledger). Append one line per variant to /tmp/loop_progress.log: label, kernel, lever, verdict, delta_pct, var_coh, mwu_dominance, and what you learned. If any variant is a WIN (verdict WIN, var_coh OK), copy its .hip to /tmp/wins/<label>.hip and note it prominently.
+
+RIGOR: trust ONLY the harness's verdict — never your own perf guess. A var_coh=BAD variant is incoherent = worthless, no matter its speed. Correctness before speed. Do exactly ONE round then stop.
+
+Output a compact JSON summary: {"round_done":true,"variants":[{"label":..,"kernel":..,"lever":..,"verdict":..,"delta_pct":..,"var_coh":..}],"wins":<int>,"note":"<what looks promising vs dead for next round>"}
