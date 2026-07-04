@@ -5726,6 +5726,8 @@ fn main() {
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
+    // Map the HF `model_type` string to a canonical arch_id. Ids and their
+    // `arch_str` detection tokens are documented in `docs/architecture-ids.md`.
     let auto_arch_id = if is_mamba2_config {
         ARCH_ID_MAMBA2
     } else {

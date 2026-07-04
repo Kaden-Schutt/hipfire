@@ -60,6 +60,7 @@ pub struct ArchId(pub u16);
 // `hipfire_model::ARCH_ID_*` callers keep working. Ids are stable and gap-tolerant
 // (2..=4 are historically retired). Consumers on the capability layer (quantizer,
 // daemon dispatch) reference these instead of bare `arch_id == N` literals.
+// See `docs/architecture-ids.md` for the full id table and the add-an-arch checklist.
 pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
 pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
 pub const ARCH_ID_QWEN35_DENSE: u32 = 5;

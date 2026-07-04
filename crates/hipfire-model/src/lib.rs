@@ -148,6 +148,7 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
 
 // Canonical arch-family ids now live in the capability layer (`hipfire-arch-api`).
 // Re-exported here so existing `hipfire_model::ARCH_ID_*` callers are unchanged.
+// See `docs/architecture-ids.md` for the id table and where the constants live.
 pub use hipfire_arch_api::{
     ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
     ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
