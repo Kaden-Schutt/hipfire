@@ -28,3 +28,6 @@
 [submodule "third_party/llvm-aie"]
 	path = third_party/llvm-aie
 	url = https://github.com/Xilinx/llvm-aie.git
+[submodule "third_party/dflash"]
+	path = third_party/dflash
+	url = https://github.com/z-lab/dflash.git
