@@ -421,7 +421,10 @@ impl MtpDrafter for Deepseek4DsparkDrafter {
 ///
 /// `conf_threshold` is the CLI-forwarded confidence-truncation cutoff (`None` =
 /// loader default 0.5). Ladder: env `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD`
-/// wins, else the CLI param, else 0.5.
+/// wins, else the CLI param, else 0.5. Clamped to `[0, 1]` here — it is a
+/// survival-sigmoid cutoff, so the env/JSON paths (which bypass the CLI's TS
+/// validation) can't push it out of range and silently degrade (`>1` ⇒ block
+/// always trims to 1 ≈ AR; `<0` ⇒ truncation never fires).
 pub fn build_deepseek4_dspark_speculator(
     block: usize,
     ctx_capacity: usize,
@@ -431,7 +434,8 @@ pub fn build_deepseek4_dspark_speculator(
         .ok()
         .and_then(|s| s.parse().ok())
         .or(conf_threshold)
-        .unwrap_or(0.5);
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
     Box::new(MtpSpeculator::new(Deepseek4DsparkDrafter::new(
         block,
         ctx_capacity,

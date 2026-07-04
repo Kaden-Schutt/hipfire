@@ -9105,10 +9105,17 @@ pub fn dspark_forward(
             .map_err(|e| format!("dspark htod n_valid: {e:?}"))?;
     }
 
-    // Per-call custom staging buffer [block, head_dim, stage_w].
-    let staged = gpu
-        .alloc_tensor(&[block, head_dim, stage_w], DType::F32)
-        .map_err(|e| format!("dspark alloc staged: {e:?}"))?;
+    // Custom staging buffer [block, head_dim, stage_w] — allocated once and
+    // reused (see DeepseekV4State::dspark_staged). `dspark_stage_kv` rewrites
+    // every column each stage (including the zeroed tail), so reuse is exact;
+    // keeping it off the per-call path means an early `?` can't leak it.
+    if state.dspark_staged.is_none() {
+        state.dspark_staged = Some(
+            gpu.alloc_tensor(&[block, head_dim, stage_w], DType::F32)
+                .map_err(|e| format!("dspark alloc staged: {e:?}"))?,
+        );
+    }
+    let staged = state.dspark_staged.as_ref().unwrap().shallow_clone();
 
     // ── B. 3-stage chain ────────────────────────────────────────────────
     for s in 0..n_stages {
@@ -9317,7 +9324,6 @@ pub fn dspark_forward(
             );
         }
     }
-    let _ = gpu.free_tensor(staged);
 
     // ── C. forward_head (last stage) ────────────────────────────────────
     let last = &dspark.stages[n_stages - 1];

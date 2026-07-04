@@ -1576,6 +1576,23 @@ impl DeepseekV4 {
             None => return Ok(None),
         };
 
+        // Guard: every target layer must index a real trunk layer. An
+        // out-of-range id never matches in the capture hook
+        // (`forward_prefill_batch_chunk`), so its capture slot stays
+        // stale/zero, `main_hidden` degrades, and draft quality silently
+        // collapses (acceptance craters; output stays greedy-correct). Fail
+        // loud at load instead of shipping a lobotomized drafter.
+        if let Some(&bad) = dspark_cfg
+            .target_layer_ids
+            .iter()
+            .find(|&&l| l >= cfg.num_hidden_layers)
+        {
+            return Err(format!(
+                "deepseek4: DSpark target_layer_id {bad} >= num_hidden_layers {} (sidecar/trunk mismatch)",
+                cfg.num_hidden_layers
+            ));
+        }
+
         // Probe stage count: `mtp.{N}.attn_norm.weight` until absent.
         let mut n_stages = 0usize;
         while source

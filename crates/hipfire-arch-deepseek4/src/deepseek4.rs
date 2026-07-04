@@ -1140,6 +1140,13 @@ pub struct DeepseekV4State {
     /// `main_x = main_norm(main_proj(main_hidden))` `[hidden]` — computed
     /// once per `dspark_forward` (forward_embed) and shared by all stages.
     pub dspark_main_x: Option<rdna_compute::GpuTensor>,
+    /// Bidirectional staging buffer `[block, head_dim, stage_w]` for the
+    /// per-stage attention. Constant-sized (block/head_dim/win are model
+    /// constants) and fully overwritten every stage by `dspark_stage_kv`
+    /// (including the zeroed tail), so it is allocated once and reused across
+    /// decode steps rather than per `dspark_forward` call — which leaked it on
+    /// any early `?` before the success-path free.
+    pub dspark_staged: Option<rdna_compute::GpuTensor>,
 
     // ── DSpark target-hidden capture (gated; populated by the batched
     //    trunk forward when `dspark_capture_active` is set). ───────────
@@ -1260,6 +1267,7 @@ impl DeepseekV4State {
             dspark_swa_k: Vec::new(),
             dspark_pbs: None,
             dspark_main_x: None,
+            dspark_staged: None,
             dspark_capture_active: false,
             dspark_target_layers: Vec::new(),
             dspark_caps: None,
@@ -1477,6 +1485,7 @@ impl DeepseekV4State {
             }
         }
         free_opt(gpu, &mut self.dspark_main_x);
+        free_opt(gpu, &mut self.dspark_staged);
         free_opt(gpu, &mut self.dspark_caps);
         free_opt(gpu, &mut self.dspark_cap_ones);
         free_opt(gpu, &mut self.dspark_main_hidden);
