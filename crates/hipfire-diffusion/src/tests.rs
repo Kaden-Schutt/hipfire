@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
