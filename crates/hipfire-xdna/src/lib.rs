@@ -122,6 +122,10 @@ const MAX_SENSORS: usize = 16;
 #[cfg(target_os = "linux")]
 pub mod submit;
 
+// W3a: AXLF (xclbin2) container parser — enumerate sections / extract the AIE
+// partition + PDI. Pure byte parsing, target-independent.
+pub mod xclbin;
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*; // brings the crate-root `submit` module into scope
