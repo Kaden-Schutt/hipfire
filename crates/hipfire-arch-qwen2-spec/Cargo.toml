@@ -7,3 +7,4 @@ description = "Lean offline spec for the Qwen2/Qwen3 dense family (arch_id 1): i
 
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
+serde_json = "1"

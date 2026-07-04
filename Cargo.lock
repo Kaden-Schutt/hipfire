@@ -1291,6 +1291,7 @@ name = "hipfire-arch-gemma3-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1369,6 +1370,7 @@ name = "hipfire-arch-minimax-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1392,6 +1394,7 @@ name = "hipfire-arch-nemotron-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1410,6 +1413,7 @@ name = "hipfire-arch-qwen2-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1437,6 +1441,7 @@ name = "hipfire-arch-qwen35-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]

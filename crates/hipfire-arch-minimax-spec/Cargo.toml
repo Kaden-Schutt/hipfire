@@ -7,3 +7,4 @@ description = "Lean offline spec for the MiniMax-M2 MoE family (arch_id 10): ide
 
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
+serde_json = "1"
