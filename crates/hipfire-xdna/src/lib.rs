@@ -124,7 +124,7 @@ pub mod submit;
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::*;
+    use super::*; // brings the crate-root `submit` module into scope
     use std::os::fd::{IntoRawFd, RawFd};
 
     #[repr(C)]
@@ -327,6 +327,119 @@ mod imp {
                 h_mhz: raw.h_clock.freq_mhz,
             })
         }
+
+        // ── W2: buffer objects (command-submission path) ──────────────────
+        // See docs/npu/wire-in-amdxdna-command-submission.md.
+
+        /// Allocate a buffer object of `size` bytes and mmap it into this process.
+        /// `bo_type` is one of `submit::AMDXDNA_BO_*` (e.g. `AMDXDNA_BO_SHMEM`).
+        pub fn alloc_buffer(&self, size: usize, bo_type: u32) -> Result<DeviceBuffer, XdnaError> {
+            let mut cb = submit::CreateBo {
+                size: size as u64,
+                bo_type,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::CREATE_BO_REQUEST,
+                &mut cb as *mut _ as *mut libc::c_void,
+            )?;
+            let handle = cb.handle;
+
+            let mut info = submit::GetBoInfo {
+                handle,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::GET_BO_INFO_REQUEST,
+                &mut info as *mut _ as *mut libc::c_void,
+            )?;
+
+            // SAFETY: map_offset is the driver's fake mmap offset for this BO; the
+            // fd is our open device; PROT/flags match a shared host mapping.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    self.fd,
+                    info.map_offset as libc::off_t,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(XdnaError::Ioctl(std::io::Error::last_os_error()));
+            }
+            Ok(DeviceBuffer {
+                handle,
+                ptr: ptr as *mut u8,
+                len: size,
+                xdna_addr: info.xdna_addr,
+            })
+        }
+
+        /// Sync a BO's cache to/from the device (`submit::SYNC_DIRECT_*`).
+        pub fn sync_bo(&self, handle: u32, direction: u32, size: usize) -> Result<(), XdnaError> {
+            let mut s = submit::SyncBo {
+                handle,
+                direction,
+                offset: 0,
+                size: size as u64,
+            };
+            self.submit_ioctl(
+                submit::SYNC_BO_REQUEST,
+                &mut s as *mut _ as *mut libc::c_void,
+            )
+        }
+
+        /// Raw ioctl helper for the submission path: Ok(()) on rc==0 else OS error.
+        fn submit_ioctl(&self, request: u64, arg: *mut libc::c_void) -> Result<(), XdnaError> {
+            // SAFETY: request matches arg's struct type; arg is a valid writable ptr.
+            let rc = unsafe { libc::ioctl(self.fd, request as libc::c_ulong, arg) };
+            if rc != 0 {
+                return Err(XdnaError::Ioctl(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+    }
+
+    /// An amdxdna buffer object created via `CREATE_BO` and mmap'd into this
+    /// process. `xdna_addr` is its device virtual address (used in command args).
+    /// The BO handle is released when the owning device fd closes.
+    pub struct DeviceBuffer {
+        handle: u32,
+        ptr: *mut u8,
+        len: usize,
+        xdna_addr: u64,
+    }
+
+    impl DeviceBuffer {
+        /// The BO handle (for EXEC_CMD arg lists / CONFIG_HWCTX).
+        pub fn handle(&self) -> u32 {
+            self.handle
+        }
+        /// Device virtual address of this BO.
+        pub fn xdna_addr(&self) -> u64 {
+            self.xdna_addr
+        }
+        /// Mutable view of the mapped bytes.
+        pub fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: ptr/len come from a successful mmap of this BO.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+        /// Read-only view of the mapped bytes.
+        pub fn as_slice(&self) -> &[u8] {
+            // SAFETY: ptr/len come from a successful mmap of this BO.
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    impl Drop for DeviceBuffer {
+        fn drop(&mut self) {
+            // SAFETY: ptr/len from a successful mmap; unmapped exactly once.
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
+        }
     }
 
     impl Drop for XdnaDevice {
@@ -370,6 +483,8 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use imp::DeviceBuffer;
 pub use imp::XdnaDevice;
 
 #[cfg(test)]
