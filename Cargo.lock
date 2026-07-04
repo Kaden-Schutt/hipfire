@@ -2077,6 +2077,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-specdecode"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+]
+
+[[package]]
+name = "hipfire-specdecode-ddtree"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
+]
+
+[[package]]
+name = "hipfire-specdecode-dflash"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
+]
+
+[[package]]
+name = "hipfire-specdecode-dspark"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
+]
+
+[[package]]
+name = "hipfire-specdecode-mtp"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
+]
+
+[[package]]
 name = "hipfire-state"
 version = "0.3.0"
 dependencies = [

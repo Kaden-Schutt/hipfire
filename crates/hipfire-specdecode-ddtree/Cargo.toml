@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-specdecode-ddtree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ddtree draft-decode-tree speculative-decode strategy (generic over SpecDecodeTarget)"
+
+[dependencies]
+hipfire-specdecode = { path = "../hipfire-specdecode" }
+hip-bridge = { path = "../hip-bridge" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-rdna = { path = "../hipfire-rdna" }

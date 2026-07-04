@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-specdecode-dspark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "dspark speculative-decode strategy — scaffold (future work)"
+
+[dependencies]
+hipfire-specdecode = { path = "../hipfire-specdecode" }
+hip-bridge = { path = "../hip-bridge" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-rdna = { path = "../hipfire-rdna" }
