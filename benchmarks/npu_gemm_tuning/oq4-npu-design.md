@@ -64,6 +64,17 @@
 >      all-bf16 llama fusion still compiles after the i8/memref.view change.
 > FWHT stays an activation-side op. Template: llama_3.2_1b/llama_npu.py.
 > Run env: the py3.14 iron venv recipe above.
+>
+> **(b) TWO-PASS — DONE + VERIFIED (iron/oq4_twopass.py):** non-fused path
+> (dequant int4→bf16 materialized, then bf16 gemm) sidesteps the fusion compiler
+> crash and gives a real end-to-end Oq4-on-NPU number, both passes verified on the
+> NPU (err=False): Oq4 dequant (gs256, 262144 wts) **129.8µs** + bf16 gemm (2048³,
+> accurate) **2.23 TOPS**. Loses the feed win (weights are bf16 at gemm time) — that
+> needs the fused kernel (compiler-blocked). GOTCHAS for a verified gemm: 8-col
+> config is `b_col_maj=True, c_col_maj=False, m128/k32/n32`, and MUST pass
+> `prio_accuracy=True, emulate_bf16_mmul_with_bfp16=False` or bfp16-emulation fails
+> the rel_tol=0.005 verify. So: full Oq4 path proven on NPU; the fused feed-win
+> number is one mlir-aie compiler fix (objectFIFO unrollForLoops) away.
 
 
 Concrete design for feeding Oq4G256 weights to the Strix Halo NPU (aie2p) as
