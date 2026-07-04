@@ -14,6 +14,7 @@
 //! design rationale; PR 11 just adds a second implementation of the
 //! same trait surface for LLaMA-family bring-up.
 
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, Architecture, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
@@ -21,7 +22,6 @@ use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{Gpu, GpuTensor};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
 /// Mistral) and `arch_id = 1` (plain Qwen3 / Qwen2). All members of
@@ -109,6 +109,18 @@ pub struct LlamaBackend {
     pub weights: LlamaWeights,
     pub scratch: ForwardScratch,
     pub kv_cache: KvCache,
+    /// Decoder-layer indices whose residual hidden states a hidden-conditioned
+    /// drafter (DFlash / DSpark / EAGLE) wants captured, ascending order. Empty =
+    /// no capture (the `SpecTarget::dflash_extract_layers` default of `None`).
+    /// The speculator sets the real `target_layer_ids` via
+    /// [`LlamaBackend::set_dflash_extract_layers`].
+    pub dflash_extract_layers: Vec<usize>,
+    /// Loaded DSpark drafter sidecar globals. `None` when no `-dspark` sidecar
+    /// was found or speculation was disabled.
+    pub dspark_weights: Option<hipfire_specdecode_dspark::dspark_core::DsparkWeights>,
+    /// Loaded DSpark drafter body assets (5-layer dense-GQA transformer +
+    /// block-only KvCache/scratch). `None` when `dspark_weights` is `None`.
+    pub dspark_assets: Option<crate::dspark_body::Qwen3DrafterAssets>,
 }
 
 impl LlamaBackend {
@@ -125,7 +137,21 @@ impl LlamaBackend {
             weights,
             scratch,
             kv_cache,
+            dflash_extract_layers: Vec::new(),
+            dspark_weights: None,
+            dspark_assets: None,
         }
+    }
+
+    /// Set the decoder-layer indices whose residual hidden states the
+    /// hidden-conditioned drafter wants captured (ascending order). The
+    /// speculator calls this with the drafter's `target_layer_ids`.
+    pub fn set_dflash_extract_layers(&mut self, layers: Vec<usize>) {
+        debug_assert!(
+            layers.windows(2).all(|w| w[0] < w[1]),
+            "dflash extract layers must be strictly ascending: {layers:?}"
+        );
+        self.dflash_extract_layers = layers;
     }
 }
 
