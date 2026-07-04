@@ -151,9 +151,9 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DFLASH_TRACE_POSITION` | Runtime variable controlling dflash trace position in hipfire | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:133` |
 | `HIPFIRE_DFLASH_TRACE_TOKEN_INDEX` | Runtime variable controlling dflash trace token index in hipfire | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:1806` |
 | `HIPFIRE_DIAG` | Diagnostic: quant-vs-bf16 fidelity per layer (target is the bf16 FFN) | `crates/hipfire-train/examples/qwen35_mlp_norm_recovery.rs:264` |
-| `HIPFIRE_DIFFUSION_CPU_REFERENCE` | Runtime variable controlling diffusion cpu reference in hipfire | `crates/hipfire-diffusion/src/lib.rs:126` |
-| `HIPFIRE_DIFFUSION_DUMP_DIR` | Runtime variable controlling diffusion dump dir in hipfire | `crates/hipfire-diffusion/src/lib.rs:1865` |
-| `HIPFIRE_DIFFUSION_LAYER_RUNG` | Selects behavior from recognized values | `crates/hipfire-diffusion/src/lib.rs:765` |
+| `HIPFIRE_DIFFUSION_CPU_REFERENCE` | Runtime variable controlling diffusion cpu reference in hipfire | `crates/hipfire-diffusion/src/lib.rs:125` |
+| `HIPFIRE_DIFFUSION_DUMP_DIR` | Runtime variable controlling diffusion dump dir in hipfire | `crates/hipfire-diffusion/src/lib.rs:1864` |
+| `HIPFIRE_DIFFUSION_LAYER_RUNG` | Selects behavior from recognized values | `crates/hipfire-diffusion/src/lib.rs:764` |
 | `HIPFIRE_DIR` | Runtime variable controlling dir in hipfire | `crates/hipfire-serving-core/src/generate_vl.rs:1199` |
 | `HIPFIRE_DN_STATE_EF` | Runtime variable controlling dn state ef in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:1432` |
 | `HIPFIRE_DN_STATE_FP32_BELOW` | Used to configure runtime execution by explicitly setting "HIPFIRE_DN_STATE_FP32_BELOW" | `crates/hipfire-arch-qwen35/src/qwen35.rs:30504` |
