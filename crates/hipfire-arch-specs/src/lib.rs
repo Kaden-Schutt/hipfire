@@ -12,6 +12,12 @@
 //!
 //! Adding a migrated family = add its `-spec` crate to this crate's `Cargo.toml`
 //! and one `use … as _;` line below. No quantizer edit.
+//!
+//! One `-spec` per UNIQUE `arch_id`. Variants that reuse a base id do NOT get their
+//! own `-spec` — e.g. `hipfire-arch-qwen35-vl` is "Qwen3.5 dense + ViT" and ships
+//! under `arch_id` 5/6, so it is already covered by `hipfire-arch-qwen35-spec`. A
+//! `qwen35-vl-spec` would register `ArchId(5)` a second time and collide in the
+//! registry (which merges by `ArchId`). Its absence here is intentional, not a gap.
 
 #![allow(unused_imports)]
 

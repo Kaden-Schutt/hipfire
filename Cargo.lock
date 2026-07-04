@@ -1349,6 +1349,7 @@ name = "hipfire-arch-llama-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]

@@ -45,6 +45,9 @@ pub use ingest::{
     transformer_role, CapReq, CodecCaps, Ingest, PrecisionClass, TensorRole,
 };
 
+pub mod toy;
+pub use toy::{Dt, Init, TensorSpec, ToyFixture};
+
 /// Stable numeric identity of an architecture family (the on-disk/header id).
 ///
 /// Named constants for the concrete families live alongside the registry as they
@@ -88,13 +91,15 @@ pub trait SpecDecodeChain: Sync + 'static {
     fn max_draft_len(&self) -> usize;
 }
 
-/// The arch can synthesize a tiny deterministic fixture checkpoint for tests/CI
-/// (the `generate_toy_model_from_seed`-style helpers, co-located with the arch
-/// instead of scattered in test harnesses).
+/// The arch can DESCRIBE a tiny deterministic fixture checkpoint for tests/CI — its
+/// config + tensor manifest, co-located with the arch instead of scattered in a
+/// quantizer `match arch`. The offline tooling owns byte generation + writing (seeded
+/// RNG, safetensors/tokenizer), mirroring the [`Ingest`] declare-vs-do split.
 pub trait ToyModel: Sync + 'static {
-    /// Write a minimal self-consistent `.hfq` (+ any sidecars) under `out_dir`,
-    /// seeded deterministically. Returns the artifact stem on success.
-    fn emit_fixture(&self, out_dir: &std::path::Path, seed: u64) -> Result<String, String>;
+    /// Describe a minimal self-consistent fixture, seeded deterministically. The
+    /// quantizer renders it into a loadable HF model dir (safetensors + config +
+    /// shared tokenizer) and then quantizes it on the normal `--input` path.
+    fn fixture(&self, seed: u64) -> ToyFixture;
 }
 
 /// Per-arch capability table: `Some(&dyn Cap)` iff the arch declared it. Built at
@@ -291,8 +296,11 @@ mod tests {
         }
     }
     impl ToyModel for TestArch {
-        fn emit_fixture(&self, _out_dir: &std::path::Path, _seed: u64) -> Result<String, String> {
-            Ok("test-fixture".to_string())
+        fn fixture(&self, _seed: u64) -> ToyFixture {
+            ToyFixture {
+                config_json: "{}".to_string(),
+                tensors: Vec::new(),
+            }
         }
     }
     impl SpecDecodeChain for TestArch {
@@ -327,14 +335,8 @@ mod tests {
 
         // Dispatch actually works through the capability object.
         assert_eq!(a.caps.spec_decode_chain.unwrap().max_draft_len(), 4);
-        assert_eq!(
-            a.caps
-                .toy_model
-                .unwrap()
-                .emit_fixture(std::path::Path::new("/tmp"), 7)
-                .unwrap(),
-            "test-fixture"
-        );
+        // ToyModel now DESCRIBES a fixture (config + manifest); the stub returns empty.
+        assert!(a.caps.toy_model.unwrap().fixture(7).tensors.is_empty());
     }
 
     // Two crates registering the SAME arch id with DISJOINT capabilities — the
@@ -349,8 +351,11 @@ mod tests {
         }
     }
     impl ToyModel for MergeOffline {
-        fn emit_fixture(&self, _o: &std::path::Path, _s: u64) -> Result<String, String> {
-            Ok("m".into())
+        fn fixture(&self, _s: u64) -> ToyFixture {
+            ToyFixture {
+                config_json: "{}".into(),
+                tensors: Vec::new(),
+            }
         }
     }
     static MERGE_OFFLINE: MergeOffline = MergeOffline;

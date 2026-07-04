@@ -21,6 +21,12 @@ pub use hipfire_kvquant::{kv_compact, kvarn};
 pub use hipfire_primitives::conv::{f16_to_f32, f32_to_f16};
 pub use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 
+// Force-link the offline arch `-spec` bundle so every family's `register_arch!`
+// (Ingest quant-policy + ToyModel fixture) survives rlib pruning. The `fixture` and
+// quant-policy modules build their `ArchRegistry` from these registrations. This
+// MUST live in the lib (not only `main.rs`) so lib tests see the registrations too.
+use hipfire_arch_specs as _;
+
 pub mod codecs;
 pub mod gguf_import;
 pub mod gptq;

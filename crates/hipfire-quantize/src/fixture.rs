@@ -11,6 +11,10 @@
 // ingest path expects; as new archs gain support, add a `tiny_*` builder.
 // See TODO.md "Tiny random-init fixtures + golden-output tripwire".
 
+// The fixture manifest vocabulary (TensorSpec/Init/Dt) lives in hipfire-arch-api so
+// each family's `-spec` crate can DECLARE its ToyModel fixture with only that dep;
+// this crate keeps the writer (seeded RNG → safetensors + shared tokenizer).
+use hipfire_arch_api::{Dt, Init, TensorSpec};
 use hipfire_primitives::conv::f32_to_bf16_bits as bf16_bits;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -31,48 +35,6 @@ impl SplitMix64 {
         let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
         u * 2.0 - 1.0
     }
-}
-
-/// Storage dtype for a fixture tensor. Weight matrices ship BF16 (the model's
-/// source precision); 1D norm/bias vectors ship F16 because the per-arch
-/// loaders (qwen2/gemma3/minimax) reject BF16 for norms/biases — real
-/// checkpoints keep those at F16/F32, never quantized. This lets the new-family
-/// fixtures quantize directly into loadable models. (qwen3.5's preset keeps
-/// everything BF16 so its committed golden hashes stay byte-identical.)
-#[derive(Clone, Copy)]
-enum Dt {
-    Bf16,
-    F16,
-}
-
-impl Dt {
-    fn st_name(self) -> &'static str {
-        match self {
-            Dt::Bf16 => "BF16",
-            Dt::F16 => "F16",
-        }
-    }
-}
-
-/// How a tensor's elements are initialized.
-#[derive(Clone, Copy)]
-enum Init {
-    /// Zero-mean uniform in [-scale, scale] — generic projections.
-    Uniform(f32),
-    /// RMSNorm weights: ~1.0 + small jitter.
-    NormOnes,
-    /// Mamba/DeltaNet A_log: small negative so decay stays well-conditioned.
-    ALog,
-    /// Bias-like: zeros.
-    Zeros,
-}
-
-/// One tensor in the manifest: name, shape, init policy, storage dtype.
-struct TensorSpec {
-    name: String,
-    shape: Vec<usize>,
-    init: Init,
-    dt: Dt,
 }
 
 /// Tiny DFlash draft sidecar fixture. This is not a quality model; it is a
@@ -205,28 +167,6 @@ impl DflashTiny {
             ));
         }
         t
-    }
-}
-
-impl TensorSpec {
-    /// BF16 tensor (default — weight matrices, and every qwen3.5 tensor).
-    fn new(name: impl Into<String>, shape: Vec<usize>, init: Init) -> Self {
-        Self {
-            name: name.into(),
-            shape,
-            init,
-            dt: Dt::Bf16,
-        }
-    }
-
-    /// F16 tensor — used for new-family 1D norm/bias vectors (see [`Dt`]).
-    fn f16(name: impl Into<String>, shape: Vec<usize>, init: Init) -> Self {
-        Self {
-            name: name.into(),
-            shape,
-            init,
-            dt: Dt::F16,
-        }
     }
 }
 
@@ -1119,130 +1059,6 @@ impl Mamba2Tiny {
     }
 }
 
-/// Tiny LLaMA / Mistral (arch 0) dense text config — the simplest supported
-/// family: dense full-attention, RMSNorm + SwiGLU, standard 1-D RoPE, GQA, and
-/// (unlike qwen2) NO Q/K/V bias and NO QK-norm. `model_type:"llama"` auto-detects
-/// to arch_id 0 (the LLaMA-family loader rejects bias tensors, so don't emit
-/// any). Untied `lm_head` to exercise the separate output-projection load.
-struct LlamaTiny {
-    hidden: usize,
-    inter: usize,
-    vocab: usize,
-    layers: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-}
-
-impl LlamaTiny {
-    fn preset() -> Self {
-        Self {
-            hidden: 256,
-            inter: 512,
-            vocab: 4096,
-            layers: 2,
-            n_heads: 2,
-            n_kv_heads: 1,
-            head_dim: 128,
-        }
-    }
-
-    fn config_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "architectures": ["LlamaForCausalLM"],
-            "model_type": "llama",
-            "hidden_size": self.hidden,
-            "intermediate_size": self.inter,
-            "vocab_size": self.vocab,
-            "num_hidden_layers": self.layers,
-            "num_attention_heads": self.n_heads,
-            "num_key_value_heads": self.n_kv_heads,
-            "head_dim": self.head_dim,
-            "hidden_act": "silu",
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 500_000.0,
-            "max_position_embeddings": 4096,
-            "tie_word_embeddings": false,
-            "dtype": "bfloat16",
-            "_comment": "hipfire tiny random-init gating fixture — not a real model",
-        })
-    }
-
-    fn manifest(&self) -> Vec<TensorSpec> {
-        let h = self.hidden;
-        let q_dim = self.n_heads * self.head_dim;
-        let kv_dim = self.n_kv_heads * self.head_dim;
-        let mut t = Vec::new();
-        // Untied: embed + separate lm_head.
-        t.push(TensorSpec::new(
-            "model.embed_tokens.weight",
-            vec![self.vocab, h],
-            Init::Uniform(0.05),
-        ));
-        t.push(TensorSpec::f16(
-            "model.norm.weight",
-            vec![h],
-            Init::NormOnes,
-        ));
-        t.push(TensorSpec::new(
-            "lm_head.weight",
-            vec![self.vocab, h],
-            Init::Uniform(0.05),
-        ));
-        for i in 0..self.layers {
-            let p = format!("model.layers.{i}");
-            let sa = format!("{p}.self_attn");
-            t.push(TensorSpec::f16(
-                format!("{p}.input_layernorm.weight"),
-                vec![h],
-                Init::NormOnes,
-            ));
-            // No bias, no q_norm/k_norm — the LLaMA loader rejects bias tensors.
-            t.push(TensorSpec::new(
-                format!("{sa}.q_proj.weight"),
-                vec![q_dim, h],
-                Init::Uniform(0.05),
-            ));
-            t.push(TensorSpec::new(
-                format!("{sa}.k_proj.weight"),
-                vec![kv_dim, h],
-                Init::Uniform(0.05),
-            ));
-            t.push(TensorSpec::new(
-                format!("{sa}.v_proj.weight"),
-                vec![kv_dim, h],
-                Init::Uniform(0.05),
-            ));
-            t.push(TensorSpec::new(
-                format!("{sa}.o_proj.weight"),
-                vec![h, q_dim],
-                Init::Uniform(0.05),
-            ));
-            t.push(TensorSpec::f16(
-                format!("{p}.post_attention_layernorm.weight"),
-                vec![h],
-                Init::NormOnes,
-            ));
-            t.push(TensorSpec::new(
-                format!("{p}.mlp.gate_proj.weight"),
-                vec![self.inter, h],
-                Init::Uniform(0.05),
-            ));
-            t.push(TensorSpec::new(
-                format!("{p}.mlp.up_proj.weight"),
-                vec![self.inter, h],
-                Init::Uniform(0.05),
-            ));
-            t.push(TensorSpec::new(
-                format!("{p}.mlp.down_proj.weight"),
-                vec![h, self.inter],
-                Init::Uniform(0.05),
-            ));
-        }
-        t
-    }
-}
-
 /// Generate little-endian bytes for one tensor at its declared dtype.
 fn gen_bytes(spec: &TensorSpec, rng: &mut SplitMix64) -> Vec<u8> {
     let n: usize = spec.shape.iter().product();
@@ -1347,6 +1163,26 @@ fn byte_level_tokenizer_json() -> serde_json::Value {
     })
 }
 
+/// Fetch a migrated family's fixture from the offline arch registry (its `-spec`
+/// crate's `ToyModel`). Returns the same `(config, specs)` shape the local `*Tiny`
+/// arms produce, so `emit_fixture` writes it through the identical path. The config
+/// round-trips through a `Value` so the pretty-printed bytes stay byte-identical to
+/// what the old in-crate arm wrote.
+fn toy_fixture_from_registry(
+    arch_id: u16,
+    seed: u64,
+) -> Result<(serde_json::Value, Vec<TensorSpec>), String> {
+    use hipfire_arch_api::{ArchId, ArchRegistry};
+    let f = ArchRegistry::build()
+        .get(ArchId(arch_id))
+        .and_then(|a| a.caps.toy_model)
+        .ok_or_else(|| format!("--emit-fixture: arch_id {arch_id} declares no ToyModel"))?
+        .fixture(seed);
+    let config = serde_json::from_str(&f.config_json)
+        .map_err(|e| format!("parse toy config for arch {arch_id}: {e}"))?;
+    Ok((config, f.tensors))
+}
+
 pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String> {
     let arch_norm = arch.trim().to_ascii_lowercase().replace(['-', '.'], "_");
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {out_dir:?}: {e}"))?;
@@ -1376,10 +1212,8 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             let m = Mamba2Tiny::preset();
             (m.config_json(), m.manifest())
         }
-        "llama" | "mistral" => {
-            let m = LlamaTiny::preset();
-            (m.config_json(), m.manifest())
-        }
+        // llama (arch_id 0) migrated onto its `-spec` crate's ToyModel.
+        "llama" | "mistral" => toy_fixture_from_registry(0, seed)?,
         "dflash" | "dflash_draft" | "tiny_dflash" => {
             let m = DflashTiny::preset();
             (m.config_json(), m.manifest())
@@ -1606,26 +1440,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn llama_manifest_is_bias_free_and_tiny() {
-        let m = LlamaTiny::preset();
-        let specs = m.manifest();
-        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
-        assert!(has("lm_head.weight"), "untied lm_head");
-        assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
-        // The LLaMA loader rejects bias + qk-norm tensors — must emit none.
-        assert!(
-            !specs.iter().any(|s| s.name.ends_with(".bias")),
-            "no biases"
-        );
-        assert!(!specs
-            .iter()
-            .any(|s| s.name.contains("q_norm") || s.name.contains("k_norm")));
-        assert!(
-            n_params(&specs) < 10_000_000,
-            "llama fixture must stay <10M params"
-        );
-    }
+    // llama's fixture invariants moved to hipfire-arch-llama-spec (co-located with the
+    // ToyModel that now owns the manifest).
 
     #[test]
     fn emit_new_families_are_deterministic() {
