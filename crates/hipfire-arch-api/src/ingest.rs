@@ -35,7 +35,7 @@ pub enum TensorRole {
 
 /// Ordered precision NEED tier for a tensor — a finer, discrete companion to the
 /// scalar [`Ingest::importance`]. It is a *need*, never a format: the deployment
-/// maps a class to a concrete codec (no `f16`/`Q8`/`mq4` token appears here). The
+/// maps a class to a concrete codec (no on-disk format token appears here). The
 /// ordering is by fidelity (`Aggressive` cheapest → `SourcePrecision` richest), so
 /// consumers can compare with `>=`.
 ///
@@ -51,10 +51,10 @@ pub enum PrecisionClass {
     Aggressive,
     /// The compressible bulk (4-bit-class) — FFN / experts under a normal budget.
     Compressed,
-    /// Keep at high precision (Q8-class) — the structurally protected set.
+    /// Keep at high precision — the structurally protected set.
     High,
     /// Pinned high precision: do NOT compress below high even under a tight budget
-    /// (e.g. a mq4-family target). SSM ingress / residual writers that corrupt state
+    /// (e.g. an aggressive low-bit target). SSM ingress / residual writers that corrupt state
     /// when lossy sit here — above ordinary `High`, which a tight budget may spend down.
     Pinned,
     /// Keep at source fidelity — never quantized (the deployment lands it at bf16/f16).

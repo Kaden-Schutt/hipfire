@@ -14,7 +14,7 @@ use hipfire_arch_api::{
 
 /// Mamba-2 block tensors that corrupt SSM state when lossy: the mixer ingress
 /// (`in_proj`, generating the gate/x/B/C/dt streams) and the residual writers
-/// (`out_proj`/`down_proj`/`o_proj`). Pinned above a tight mq4 budget — this is the
+/// (`out_proj`/`down_proj`/`o_proj`). Pinned above a tight low-bit budget — this is the
 /// model-definition the quantizer reads instead of the old
 /// `is_nemotron_h_mq4_q8_protected` name-match (shared by Nemotron-H + pure Mamba-2).
 fn is_state_critical(tensor: &str) -> bool {
@@ -128,8 +128,8 @@ mod tests {
                 ing.precision_class("backbone.layers.0.mixer.up_proj.weight")
                     < PrecisionClass::Pinned
             );
-            // The router (Q8-protected structurally) is High, not Pinned — so the
-            // mq4 pinned path won't over-reach it.
+            // The router (structurally protected) is High, not Pinned — so the
+            // low-bit pinned path won't over-reach it.
             assert!(
                 ing.precision_class("backbone.layers.1.mixer.gate.weight") < PrecisionClass::Pinned
             );

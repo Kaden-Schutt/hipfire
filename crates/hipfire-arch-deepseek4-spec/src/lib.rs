@@ -25,7 +25,7 @@ pub struct Deepseek4Spec;
 impl Deepseek4Spec {
     /// MLA compressor / indexer projections — precision-critical stream generators.
     ///
-    /// The antirez DS4 reference keeps these at source precision because Q8 measurably
+    /// The antirez DS4 reference keeps these at source precision because compression measurably
     /// regresses PPL on DeepSeek-V4: (1) attn compressor `wkv`+`wgate`, (2) indexer
     /// `wq_b`+`weights_proj`, (3) indexer compressor `wkv`+`wgate` (matched by the same
     /// `.compressor.wkv.weight` suffix). All small (≤32 MiB combined across 43 layers).
