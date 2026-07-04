@@ -2111,11 +2111,13 @@ name = "hipfire-specdecode-dspark"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-dispatch",
  "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-specdecode",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]

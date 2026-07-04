@@ -5,7 +5,7 @@
 //! LLaMA model implementation using RDNA GPU compute.
 //! Supports loading from GGUF files and running inference.
 
-use crate::kv::KvCache;
+pub use crate::kv::KvCache;
 use crate::transformer::MIN_BATCH;
 use crate::weights::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_for_mq, rotate_x_mq_batched_for, weight_gemm,
@@ -13,6 +13,12 @@ use crate::weights::{
 };
 use hip_bridge::HipResult;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+
+// Re-exports so downstream crates (e.g. hipfire-specdecode-dspark) can reach
+// these helpers through the historical `llama` module path after the
+// runtime refactor relocated their definitions.
+pub use crate::dispatch::gemv_family;
+pub use hipfire_primitives::conv::f16_to_f32;
 
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

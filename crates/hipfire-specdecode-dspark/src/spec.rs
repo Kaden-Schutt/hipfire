@@ -1,0 +1,1056 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Transparent speculative-decode seam.
+//!
+//! The daemon's decode loop drives a `&mut dyn Speculator` and never learns
+//! which drafter/mode (DFlash chain, DDTree tree, DeepSeek4 MTP, future
+//! n-gram / EAGLE) is in use. Adding a drafter is a bounded-context change:
+//! implement [`Speculator`] and register one arm in the loader's
+//! `build_speculator` — no daemon edits.
+//!
+//! This is the arch-generic boundary anticipated by the `hipfire-arch-qwen35`
+//! crate docs ("speculative.rs will become arch-generic"): the trait and the
+//! unified result live here in the arch-agnostic runtime, while the
+//! arch-coupled impls (which need `qwen35::*` / `deepseek4::*` symbols) stay in
+//! their arch crates and `impl` this trait under the orphan rule.
+//!
+//! Status: the trait, the unified [`SpecStep`] result, and the borrowed-target /
+//! erased-grammar interfaces are live. The daemon's DFlash decode loop drives a
+//! `&mut dyn Speculator` (`examples/daemon.rs::generate_dflash`), with the
+//! loader's `DflashSpeculator` as the sole impl. Still future work: a generic
+//! `build_speculator` registry (dispatch on arch/draft kind) and additional
+//! drafters (n-gram, MTP, EAGLE) — the AR one-token path still runs through
+//! `generate()`, not this trait.
+
+use hipfire_rdna::{Gpu, GpuTensor};
+use smallvec::SmallVec;
+
+/// Outcome of one speculative-decode acceptance window, drafter-agnostic.
+///
+/// The daemon advances by `emit.len()` and reseeds from `next_seed` without
+/// knowing which drafter ran. The two arch result types lower onto this:
+/// - qwen35 `SpecStepResult` → `emit = committed[1..]` (the seed re-echo is
+///   dropped), `next_seed = bonus_token`.
+/// - deepseek4 MTP → `emit = accepted_tokens`, `next_seed = accepted_tokens.last()`.
+///
+/// `committed[1..].len()` equals `accepted + 1` for the chain drafters and
+/// `accepted_tokens.len()` equals the MTP position advance, so a single
+/// `position += emit.len()` is correct for both. `proposed`/`accepted` are τ
+/// accounting only; they do NOT drive position math.
+#[derive(Debug, Clone)]
+pub struct SpecStep {
+    /// Tokens to emit this window, in order, with any seed re-echo already
+    /// stripped. `position += emit.len()`. Non-empty on `Ok` (forward progress).
+    ///
+    /// `SmallVec` so a future one-token-per-step drafter (e.g. n-gram) stays
+    /// heap-alloc-free; only large spec windows spill to the heap.
+    pub emit: SmallVec<[u32; 8]>,
+    /// Seed for the next window — the verifier's preferred token at the
+    /// divergence point (qwen35 `bonus_token`; MTP `accepted_tokens.last()`).
+    pub next_seed: u32,
+    /// Drafts offered this window (τ denominator).
+    pub proposed: usize,
+    /// Drafts accepted this window (τ numerator).
+    pub accepted: usize,
+}
+
+impl SpecStep {
+    /// Build a step from an `emit` iterator, hiding the `SmallVec` backing from
+    /// caller crates that don't depend on `smallvec` (the per-arch lowering
+    /// adapters `lower_qwen35` / `lower_mtp` live in the loader / arch crates).
+    pub fn new(
+        emit: impl IntoIterator<Item = u32>,
+        next_seed: u32,
+        proposed: usize,
+        accepted: usize,
+    ) -> Self {
+        Self {
+            emit: emit.into_iter().collect(),
+            next_seed,
+            proposed,
+            accepted,
+        }
+    }
+}
+
+/// Outcome of the shared greedy accept-prefix rule ([`accept_greedy_prefix`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GreedyAccept {
+    /// Accepted drafts in order, followed by the bonus token — UNLESS an
+    /// accepted draft was itself the EOS token (then it stops there, no bonus).
+    /// This is the committed tail the caller emits (callers that track a seed
+    /// prepend it themselves).
+    pub committed: Vec<u32>,
+    /// Number of drafts accepted (excludes the bonus). `0..=drafts.len()`.
+    pub accepted: usize,
+    /// Whether decoding hit EOS inside this window (only possible when `eos`
+    /// was `Some`): either an accepted draft or the bonus was the EOS token.
+    pub hit_eos: bool,
+}
+
+/// The one greedy speculative-accept rule, shared by every drafter (DFlash,
+/// MTP, deepseek4 non-grammar, n-gram). **Precompute-then-match**: the caller
+/// supplies `target_pick[i]` — the verifier's chosen token at slot `i`, computed
+/// however that arch needs (plain argmax, grammar-masked argmax, n-gram /
+/// repeat-penalty-overridden argmax) — and this does ONLY the arch-invariant
+/// part: accept the longest prefix where `target_pick[i] == drafts[i]`, then take
+/// the bonus `target_pick[accepted]`.
+///
+/// `eos = Some(id)` enables EOS-early-stop *inside* the prefix (MTP semantics):
+/// if an accepted draft equals `id`, stop there and emit no bonus. `eos = None`
+/// (DFlash / n-gram) never early-stops and always appends the bonus.
+///
+/// Non-greedy rules (DFlash `temp>0` rejection sampling, MTP residual
+/// acceptance) and stateful per-position grammar masking (deepseek4 tool-call
+/// path, where `target_pick[i+1]` depends on the token accepted at `i`) are NOT
+/// expressible here and stay at their call sites.
+///
+/// Requires `target_pick.len() >= drafts.len() + 1` (one extra slot for the
+/// bonus at full acceptance).
+pub fn accept_greedy_prefix(drafts: &[u32], target_pick: &[u32], eos: Option<u32>) -> GreedyAccept {
+    debug_assert!(
+        target_pick.len() >= drafts.len() + 1,
+        "accept_greedy_prefix: target_pick (len {}) needs drafts+1 (len {})",
+        target_pick.len(),
+        drafts.len() + 1,
+    );
+    let mut committed = Vec::with_capacity(drafts.len() + 1);
+    let mut accepted = 0usize;
+    let mut hit_eos = false;
+    for (i, &d) in drafts.iter().enumerate() {
+        if target_pick[i] == d {
+            committed.push(d);
+            accepted += 1;
+            if eos == Some(d) {
+                hit_eos = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if !hit_eos {
+        let bonus = target_pick[accepted];
+        committed.push(bonus);
+        if eos == Some(bonus) {
+            hit_eos = true;
+        }
+    }
+    GreedyAccept {
+        committed,
+        accepted,
+        hit_eos,
+    }
+}
+
+/// The verifier (target) model's GPU state, borrowed by [`Speculator::step`]
+/// for the duration of one window. A `Speculator` impl recovers its concrete
+/// target via `as_any_mut().downcast_mut::<T>()` (e.g. the qwen35 `ModelSlot`).
+///
+/// The borrowed-not-owned shape lets one decode loop hold the target across all
+/// windows (taken from the model bundle once, via the loader's RAII slot guard)
+/// while the speculator borrows it per step — no per-step ownership transfer.
+pub trait SpecTarget {
+    /// Downcast hook: `target.as_any_mut().downcast_mut::<ModelSlot>()`.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// Zero the target's recurrent (DeltaNet) state and reset the KV eviction
+    /// offset — used by the daemon's mid-generation abort path in place of its
+    /// current inline memset loop.
+    fn reset_recurrent(&mut self, gpu: &mut Gpu);
+
+    // ── Arch-generic speculation primitives ─────────────────────────────────
+    //
+    // These let a *model-free* speculator (n-gram / PLD) drive any arch's target
+    // without knowing its internals: the target owns ALL verify mechanics (the
+    // batched forward, the per-position lm_head, the recurrent snapshot/rewind,
+    // and the arch-specific scratch), while the speculator owns only policy
+    // (drafting + acceptance). The arch-specific verify scratch is created by the
+    // target via [`new_spec_scratch`](Self::new_spec_scratch) and handed back on
+    // every call as an erased `&mut dyn SpecScratch`, so no arch type leaks into
+    // the speculator and the speculator owns the scratch's lifetime.
+
+    /// Allocate arch-specific verify scratch sized to `block_size` (the max
+    /// speculation window). The speculator owns the returned box for its lifetime
+    /// and frees it via [`SpecScratch::free`].
+    fn new_spec_scratch(
+        &mut self,
+        gpu: &mut Gpu,
+        block_size: usize,
+    ) -> Result<Box<dyn SpecScratch>, String>;
+
+    /// Advance the target over `tokens` from absolute `start_pos` (chunked,
+    /// abortable), returning the greedy argmax at the LAST position. `reset`
+    /// zeroes recurrent + KV state first (cache-miss prefill); `false` continues
+    /// from the current state (cache-hit suffix, or the partial-accept replay).
+    ///
+    /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
+    /// the target appends, per processed position, the concat of residual hidden
+    /// at `layers` (`layers.len() × dim` f32/row) to the provided `Vec`. Ignored
+    /// (no-op) when `None` or when `dflash_extract_layers()` returns `None`.
+    fn spec_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        reset: bool,
+        abort: &dyn Fn() -> bool,
+        hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<SpecAdvance, String>;
+
+    /// Run the target over `block` at absolute `position`, returning the greedy
+    /// argmax at each of the `block.len()` positions (`argmax[i]` is the target's
+    /// next-token prediction after consuming `block[0..=i]`). Leaves target state
+    /// advanced by `block.len()`.
+    ///
+    /// CONTRACT: this MUST first snapshot whatever recurrent state
+    /// [`commit_prefix`](Self::commit_prefix) needs to rewind (e.g. the DeltaNet
+    /// S/conv state AND the Q8 error-feedback residual) INTO `scratch`, *before*
+    /// running the forward that advances it. Stateless (pure-attention) arches
+    /// snapshot nothing.
+    ///
+    /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
+    /// the target appends, per processed position, the concat of residual hidden
+    /// at `layers` (`layers.len() × dim` f32/row). Ignored when `None` or when
+    /// `dflash_extract_layers()` returns `None`.
+    fn verify_block(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<u32>, String>;
+
+    /// Like [`verify_block`](Self::verify_block) but returns per-position SAMPLED
+    /// tokens (sample `s_i ~ p_T(top_k,top_p)` from the target logits) instead of
+    /// argmax. For a point-mass n-gram draft this makes the shared
+    /// `accept_greedy_prefix(draft, picks)` flow faithful temp-T speculation:
+    /// "accept the guess iff it equals the target sample" is exactly
+    /// distribution-preserving (the committed token is always the target sample).
+    /// Same snapshot CONTRACT as `verify_block`.
+    ///
+    /// Default: `Err` — a target that has NOT implemented sampled verify must
+    /// never silently fall back to greedy (that would decode temp>0 at argmax).
+    /// The drafter's `requires_greedy()`/`build_speculator` gate is what keeps a
+    /// temp>0 request off this path for such a target; the `Err` is the
+    /// belt-and-suspenders guard if one ever slips through.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        rng_state: &mut u64,
+    ) -> Result<Vec<u32>, String> {
+        let _ = (gpu, block, position, scratch, temp, top_p, top_k, rng_state);
+        Err("verify_block_sampled: this target does not support sampled verify".into())
+    }
+
+    /// Fix target state to reflect exactly the committed prefix
+    /// `block[..accept_len + 1]` (after [`verify_block`](Self::verify_block)
+    /// over-advanced it by `block.len()`). Cases:
+    /// - full accept (`accept_len == block.len() - 1`): no-op — verify already
+    ///   left state at the right position;
+    /// - recurrent + partial: restore the snapshot saved in `scratch` (incl. the
+    ///   s_ef residual) and replay `block[..accept_len + 1]` with the SAME batched
+    ///   forward `verify_block` used (numerics must match the accepted argmax);
+    /// - stateless + partial: no-op — the accepted-prefix KV the verify wrote is
+    ///   already correct, and the rejected tail is overwritten by the next verify.
+    fn commit_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        accept_len: usize,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String>;
+
+    /// The target's EOS token id (for the daemon's decode-loop terminator check).
+    fn eos_token(&self) -> u32;
+
+    /// The target's usable context capacity (decode-loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
+    /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
+    /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation
+    /// (e.g. qwen2's `Qwen2State`) return `None` (the default): they don't support
+    /// eviction, and the daemon's eviction sites are `if let Some(ev)`-gated so
+    /// this is never reached for a non-evicting target. Keeping it `Option` is
+    /// what lets a `Qwen2State`-backed target implement `SpecTarget` at all
+    /// (it has no `llama::KvCache` to hand back).
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        None
+    }
+
+    // ── DFlash drafter primitives (default no-op) ───────────────────────────
+    //
+    // These let a hidden-conditioned drafter (DFlash / EAGLE) be built on top of
+    // ANY dense-attention target without arch-specific coupling. The default
+    // implementations return `None` / `Err` so that `build_speculator`'s DFlash
+    // arm declines gracefully on targets that don't expose hidden states (e.g.
+    // minimax, cohere2moe). A target that DOES expose them (llama, qwen3) overrides
+    // both `dflash_extract_layers` (returning the layer ids) and captures hidden
+    // rows into `hidden_out` inside `spec_advance` / `verify_block` (Task 2b).
+
+    /// The layer indices whose residual hidden states the drafter wants captured,
+    /// in order. When `Some(layers)`, the target should, on each processed
+    /// position, append `layers.len() × dim` f32 values to the `hidden_out` sink
+    /// passed to [`spec_advance`](Self::spec_advance) / [`verify_block`](Self::verify_block).
+    ///
+    /// `None` (default) means this target cannot feed a hidden-conditioned drafter.
+    fn dflash_extract_layers(&self) -> Option<&[usize]> {
+        None
+    }
+
+    /// Apply the target's lm_head to `n` rows of residual hidden states
+    /// (shape `[n, dim]`, stored row-major) on `gpu`, returning `n × vocab`
+    /// host-side logits (not argmax), so the caller has access to the full
+    /// distribution for sampling. Returns `Err` by default.
+    fn lm_head_logits(
+        &mut self,
+        _gpu: &mut Gpu,
+        _hidden_rows: &GpuTensor,
+        _n: usize,
+    ) -> Result<Vec<f32>, String> {
+        Err("target does not expose lm_head over hidden".into())
+    }
+
+    /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
+    /// target logits (`block.len() × vocab`, row-major) instead of the per-position
+    /// argmax. The caller uses the full logits to draw from the target distribution
+    /// (e.g. distribution-exact sampling at temp>0).
+    ///
+    /// Same contract as `verify_block` otherwise: snapshots whatever
+    /// [`commit_prefix`](Self::commit_prefix) needs *before* advancing, leaves
+    /// target state advanced by `block.len()`, and captures per-extract-layer
+    /// residual hidden into `hidden_out` when `Some` and
+    /// [`dflash_extract_layers`](Self::dflash_extract_layers) is `Some`.
+    ///
+    /// Returns `Err` by default.
+    fn verify_block_logits(
+        &mut self,
+        _gpu: &mut Gpu,
+        _block: &[u32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<f32>, String> {
+        Err("target does not expose verify_block_logits".into())
+    }
+
+    /// Like [`verify_block`](Self::verify_block), but captures the per-position
+    /// extract-layer residual hidden into the caller-owned GPU buffer
+    /// `hidden_gpu` (position-major `[n_pos × dflash_extract_layers().len() ×
+    /// dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
+    /// hidden reuse entirely on-device (no D2H+H2D per window; ~free on UMA, a
+    /// real saving on a discrete-VRAM GPU).
+    ///
+    /// Returns `(per-position argmax, captured)`. `captured` is `true` iff all
+    /// `block.len()` positions' hidden were written to `hidden_gpu`; a target
+    /// whose batched capture path can't run for this block (e.g. llama with
+    /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
+    /// the caller re-bootstraps the next window. `hidden_gpu` must be
+    /// `≥ block.len() × dflash_extract_layers().len() × dim` F32.
+    ///
+    /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
+    /// Returns `Err` by default (target has no GPU-resident hidden capture).
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_capture_gpu(
+        &mut self,
+        _gpu: &mut Gpu,
+        _block: &[u32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        Err("target does not expose verify_block_capture_gpu".into())
+    }
+
+    /// Sampled (temp>0) counterpart of
+    /// [`verify_block_capture_gpu`](Self::verify_block_capture_gpu): the target
+    /// SAMPLES `t_i ~ p_T(temp, top_p, top_k)` per position (advancing `rng`)
+    /// instead of taking argmax, still capturing the per-position hidden into
+    /// `hidden_gpu`. Returns `(per-position sampled tokens, captured)`.
+    ///
+    /// For a point-mass drafter, `accept_greedy_prefix(drafts, picks)` on these
+    /// sampled `picks` is exactly distribution-preserving temp-T speculation (the
+    /// committed token is always the target sample). Same contract/`captured`
+    /// semantics as the greedy variant. Returns `Err` by default.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled_capture_gpu(
+        &mut self,
+        _gpu: &mut Gpu,
+        _block: &[u32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _temp: f32,
+        _top_p: f32,
+        _top_k: usize,
+        _rng_state: &mut u64,
+        _hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        Err("target does not expose verify_block_sampled_capture_gpu".into())
+    }
+
+    /// Single-pass TREE-masked verify: run the target over a linearized draft tree
+    /// in ONE batched forward and return the FULL per-node target logits
+    /// (`tokens.len() × vocab`, row-major).
+    ///
+    /// `tokens` is the slot-ordered token sequence (slot 0 = seed). `mask_block`
+    /// is the `[n × n]` additive `0.0`/`-inf` ancestor-visibility bias that encodes
+    /// the tree topology: a node's logits equal a causal verify of that node's
+    /// root-to-node chain. `depth_positions` are the per-slot RoPE positions
+    /// (`position + node.depth`); the target rotates Q/K at these positions so
+    /// parent→child distance is 1, while KV writes and the mask stay on contiguous
+    /// slots. The forward runs at contiguous positions `[position .. position + n)`.
+    ///
+    /// `hidden_out` captures per-extract-layer residual rows (same contract as
+    /// [`verify_block`](Self::verify_block) / [`dflash_extract_layers`](Self::dflash_extract_layers)).
+    ///
+    /// Leaves target state advanced by `n`; for stateless targets
+    /// [`commit_prefix`](Self::commit_prefix) is a no-op. Returns `Err` by default.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_tree_logits(
+        &mut self,
+        _gpu: &mut Gpu,
+        _tokens: &[u32],
+        _mask_block: &[f32],
+        _depth_positions: &[i32],
+        _position: usize,
+        _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<Vec<f32>, String> {
+        Err("target does not expose verify_tree_logits".into())
+    }
+
+    /// Look up the target's embedding row for `token_id`, dequantized to F32
+    /// (length `dim`). Used by hidden-conditioned drafters to obtain the noise
+    /// embedding broadcast across masked block positions. Returns `Err` by default.
+    fn embed_row(&mut self, _gpu: &mut Gpu, _token_id: u32) -> Result<Vec<f32>, String> {
+        Err("target does not expose embed_row".into())
+    }
+
+    /// Configure which residual-hidden layer indices the target captures into
+    /// the `hidden_out` sink of [`spec_advance`](Self::spec_advance) /
+    /// [`verify_block`](Self::verify_block). Called by a hidden-conditioned drafter
+    /// at build time so capture indices match its `fc` expectation. Default no-op
+    /// for targets that do not expose hidden states (their [`dflash_extract_layers`](Self::dflash_extract_layers)
+    /// stays `None`).
+    fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
+
+    /// Capture the target's residual hidden states at `layers` for a freshly-
+    /// committed `seed` token at absolute `position`, returning the concatenated
+    /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).
+    ///
+    /// The generic [`crate::dspark_core::DsparkDrafter`] calls this once per
+    /// window (the "bootstrap" forward) to materialise the seed's hidden before
+    /// the DSpark draft block runs. The target runs a 1-token forward with capture
+    /// armed at `layers`, assembles the concat, and returns it. The generic drafter
+    /// then uploads it to GPU for [`crate::dspark_core::DsparkBody::draft_block`].
+    ///
+    /// Default: returns `Err` (unsupported). Targets that provide a DSpark body
+    /// (deepseek4, qwen3) override this in Tasks 5 / 9.
+    fn capture_seed_main_hidden(
+        &mut self,
+        _gpu: &mut Gpu,
+        _seed: u32,
+        _position: usize,
+        _layers: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        Err("capture_seed_main_hidden: target does not support DSpark capture".to_string())
+    }
+}
+
+/// Erased, arch-specific verify scratch owned by a model-free speculator.
+///
+/// The concrete scratch (qwen35: `VerifyScratch` + `DeltaNetSnapshot` + s_ef
+/// backup + hidden ring; llama: lm_head/argmax buffers) is crate-local to each
+/// arch and this crate depends on none of them — so it is threaded through the
+/// trait erased, mirroring [`SpecGrammar`]. The arch's [`SpecTarget`] impl
+/// recovers it via `scratch.as_any_mut().downcast_mut::<T>()`.
+pub trait SpecScratch {
+    /// Downcast hook for the owning [`SpecTarget`] impl.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// Release all GPU buffers the scratch owns. Explicit because `GpuTensor` /
+    /// `DeviceBuffer` have no `Drop` in this codebase — a bare `drop` of the box
+    /// would orphan device memory. Called from the speculator's `free`.
+    fn free(self: Box<Self>, gpu: &mut Gpu);
+}
+
+/// Outcome of [`SpecTarget::spec_advance`].
+#[derive(Debug, Clone)]
+pub enum SpecAdvance {
+    /// Advanced to the end; `last_argmax` is the greedy token at the final
+    /// position (the first decode seed on prefill; ignored on replay).
+    Ready { last_argmax: u32 },
+    /// Client cancelled mid-advance; the target reset its own state.
+    Aborted,
+}
+
+/// Erased grammar-mask interface for tool-call-constrained spec-decode.
+///
+/// The concrete per-arch grammar `Matcher` types
+/// (`hipfire_arch_qwen35::grammar`, `hipfire_arch_deepseek4::grammar`) are
+/// crate-local and distinct, and this crate depends on neither — so grammar is
+/// threaded through the trait as an erased `&mut dyn SpecGrammar`, not a shared
+/// concrete struct (a shared struct would invert the crate dependency graph; an
+/// associated type would break `Box<dyn Speculator>`). Marker for now; the
+/// mask-fill / accept method set will be defined when a grammar-consuming
+/// drafter (MTP / EAGLE) first needs it. `DflashSpeculator` ignores grammar —
+/// qwen35 enforces tool-call grammar post-hoc in the daemon.
+///
+/// `as_any_mut` lets an in-step grammar consumer (the deepseek4 MTP drafter)
+/// downcast the erased handle back to its concrete arch grammar type
+/// (`hipfire_arch_deepseek4::mtp_speculator::Deepseek4SpecGrammar`) to reach the
+/// `Matcher` + decoded-vocab + mask the fused grammar step needs.
+pub trait SpecGrammar {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// Outcome of [`Speculator::prefill`].
+#[derive(Debug, Clone)]
+pub enum PrefillOutcome {
+    /// Prompt prefilled; `first_token` is the target's argmax at the last prompt
+    /// position (the seed for the first decode window).
+    Ready { first_token: u32 },
+    /// Client cancelled mid-prefill. The caller resets conversation state and
+    /// emits the aborted/done events; the slot guard restores the target bundle.
+    Aborted,
+}
+
+/// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
+/// compact its cached target-hidden rows to match the target KV after a
+/// FlashCASK eviction the daemon already applied to the target.
+#[derive(Debug, Clone)]
+pub struct EvictRetain {
+    /// Per-physical-slot retain mask from the eviction policy.
+    pub retain_mask: Vec<u32>,
+    /// Physical fill before the eviction (rows to compact).
+    pub pre_phys: usize,
+}
+
+/// A speculative-decode drafter+verifier, owned by the loaded model behind a
+/// `Box<dyn Speculator>`. The daemon's decode loop holds `&mut dyn Speculator`
+/// and is agnostic to whether the impl is a DFlash chain, a DDTree tree, an MTP
+/// head, or a future n-gram / EAGLE drafter — chain-vs-tree, K, budget, and
+/// topk are all resolved at build time and stored inside the impl.
+pub trait Speculator {
+    /// Prefill the prompt: seed the target's hidden state (advancing its KV +
+    /// recurrent state) and prime the drafter's cached target-hidden buffer,
+    /// returning the target's first token. `prefill_tokens` is the suffix to
+    /// seed on a cache hit (from `prefill_start`) or the full prompt on a miss;
+    /// `prompt_tokens` is the full rendered prompt (used to size the drafter
+    /// cursor). `resume_from`, when set, drops the drafter projection cursor to a
+    /// divergent-render checkpoint position.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+        resume_from: Option<usize>,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String>;
+
+    /// Whether this speculator's verify is distribution-correct at temp>0 (so the
+    /// daemon may route temp>0 requests through it for the spec speedup). Default
+    /// `false` — greedy-only drafters (n-gram, chain DFlash, MTP) keep temp>0 on
+    /// the AR sampler. The qwen35 DFlash ddtree path overrides this to `true`
+    /// (its SWOR verify samples the target distribution exactly).
+    fn supports_temp_verify(&self) -> bool {
+        false
+    }
+
+    /// Run one acceptance window starting from `seed` at absolute `position`.
+    /// `target` is the borrowed verifier; `emitted` is the prior committed
+    /// tokens (repeat-penalty / n-gram context); `grammar` constrains both the
+    /// draft and verify logits (`None` = unconstrained). `temp` is the request
+    /// sampling temperature — ignored by greedy-only drafters; the ddtree path
+    /// uses it to switch the verify into distribution-preserving SWOR at temp>0.
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        grammar: Option<&mut dyn SpecGrammar>,
+        temp: f32,
+    ) -> Result<SpecStep, String>;
+
+    /// Compact drafter-local cached state after a target KV eviction the daemon
+    /// already applied. Default no-op for drafters with no target-hidden cache.
+    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
+        let _ = (gpu, retain);
+        Ok(())
+    }
+
+    /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
+    /// recurrent state is the daemon's concern (it owns the bundle); this clears
+    /// only the drafter's own scratch + checkpoint ring.
+    fn reset(&mut self, gpu: &mut Gpu);
+
+    /// Snapshot drafter-local recurrent state at `position` for divergent-render
+    /// prompt-cache reuse. Default no-op for stateless drafters (n-gram).
+    fn checkpoint(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<(), String> {
+        let _ = (gpu, target, position);
+        Ok(())
+    }
+
+    /// Restore drafter-local state to the nearest checkpoint `<= position`,
+    /// returning the position actually restored to. Default no-op (returns
+    /// `position`) for stateless drafters.
+    fn rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        let _ = (gpu, target);
+        Ok(position)
+    }
+
+    /// The drafter's speculation window (DFlash block size / MTP K). The daemon
+    /// uses it for capacity checks and the decode-loop overflow guard.
+    fn block_size(&self) -> usize;
+
+    /// The target's usable context capacity (for the loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// Divergent-render checkpoint positions (ascending), for prompt-cache
+    /// resume planning. Default empty for drafters with no checkpoint ring.
+    fn checkpoint_positions(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Release all GPU buffers the drafter owns. Called from `unload_model`,
+    /// so a drafter that forgets to free is a missing-trait-method compile
+    /// error rather than a silent VRAM leak.
+    fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Whether this drafter requires greedy verification (temperature 0).
+    /// A greedy-only drafter (n-gram chain, the MTP-via-`Speculator` wrapper)
+    /// returns `true`; a sampling-capable drafter (DFlash with lossless rejection
+    /// sampling) returns `false`. The daemon dispatch consults this per request:
+    /// a temp>0 request may take the spec path only against a drafter that returns
+    /// `false`; against a `true` drafter it falls through to AR rather than being
+    /// silently decoded greedy.
+    fn requires_greedy(&self) -> bool {
+        true
+    }
+
+    /// Configure per-request sampling for the next acceptance window(s). Called
+    /// by the daemon's spec wrapper (`generate_dflash`) once before the step
+    /// loop, threading the request's resolved temp/top_p/top_k/cactus down to
+    /// the drafter. Default no-op: a greedy-only drafter ignores it and keeps
+    /// decoding at argmax. A sampling-capable drafter (DFlash) stores these and
+    /// applies the IDENTICAL (top_k,top_p) nucleus truncation to draft + target
+    /// inside `step` (lossless == AR-at-(top_k,top_p)). `temp <= 0` ⇒ greedy.
+    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
+}
+
+// ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
+//
+// Every MTP drafter (qwen35 MTP head, deepseek4 MTP layer) shares one shape: a
+// prompt prefill that primes the arch's MTP history + recurrent/KV state and
+// returns a greedy seed, then a per-window draft+verify+accept step returning
+// the committed tail (accepted prefix + bonus, seed excluded). The arches differ
+// only in the fused kernels they run — that difference is [`MtpDrafter`], and
+// [`MtpSpeculator`] adapts any `MtpDrafter` to the generic [`Speculator`]
+// interface (prefill→`PrefillOutcome`, window→`SpecStep`) ONCE, so a new MTP arch
+// implements only `MtpDrafter` (+ `SpecTarget`), never a whole `Speculator`.
+
+/// One acceptance window's committed tokens: the accepted draft prefix plus the
+/// verifier's bonus, EXCLUDING the seed. Identical in meaning to qwen35's
+/// `MtpSpecResult.committed` and deepseek4's `accepted_tokens`.
+#[derive(Debug, Clone)]
+pub struct MtpWindow {
+    /// Tokens committed this window (accepted drafts + bonus, seed excluded).
+    /// `committed.len()` is what drives the daemon's `position += emit.len()`.
+    pub committed: Vec<u32>,
+    /// Drafts accepted, excluding the bonus (τ numerator).
+    pub accepted: usize,
+    /// Drafts offered this window, ≤ `k` (τ denominator).
+    pub drafts_generated: usize,
+}
+
+/// Per-arch MTP draft+verify core. The impl owns its draft scratch (qwen35:
+/// `MtpSpecState` + head; deepseek4: the relocated `PrefillBatchScratch`) and
+/// downcasts `target` (`&mut dyn SpecTarget`) to its concrete model type to run
+/// the fused head-draft + trunk-verify kernels. Everything arch-INvariant
+/// (prefill outcome, window→step lowering, position/seed advance) lives once in
+/// [`MtpSpeculator`].
+pub trait MtpDrafter {
+    /// Prefill `fill_tokens` from absolute `start_pos`: advance the target's
+    /// KV/recurrent state AND the MTP head's position-aligned cache, returning
+    /// the greedy seed (argmax at the last prefilled position). `cache_hit=false`
+    /// ⇒ cold start (reset recurrent + MTP cache first); `true` ⇒ warm suffix
+    /// extension (preserve prior state).
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+    ) -> Result<u32, String>;
+
+    /// One acceptance window: seed at absolute `position`; draft `k`, verify,
+    /// greedily accept the longest matching prefix + bonus. `grammar` is the
+    /// IN-STEP grammar (deepseek4 masks draft+verify logits with it; qwen35
+    /// ignores it and relies on post-hoc grammar in the emission layer).
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        k: usize,
+        eos: u32,
+        grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<MtpWindow, String>;
+
+    /// Reset drafter-local state for a fresh conversation (MTP cache + any
+    /// captured graphs). The target's KV/recurrent reset is the daemon's job.
+    fn mtp_reset(&mut self, gpu: &mut Gpu);
+
+    /// Release all GPU buffers the drafter owns.
+    fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Draft window size (K).
+    fn k(&self) -> usize;
+
+    /// Target context capacity (for the loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// Whether verification is greedy-only (temp≈0). qwen35 MTP → `true`.
+    fn requires_greedy(&self) -> bool;
+
+    /// Stash the request sampling params for the next `mtp_step`. The
+    /// [`MtpSpeculator`] forwards `set_sampling` + the per-step `temp` here so a
+    /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default no-op
+    /// (greedy-only drafters ignore it). `top_p==0` means "disabled" (→ 1.0).
+    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize) {}
+
+    /// Whether this drafter's verify is distribution-correct at temp>0 (so the
+    /// daemon may route temp>0 requests through it). Default `false`.
+    fn supports_temp_verify(&self) -> bool {
+        false
+    }
+}
+
+/// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
+/// interface. One impl serves every MTP arch; the arch-specific work is the
+/// `MtpDrafter` (+ `SpecTarget`) impl in the arch crate.
+pub struct MtpSpeculator<A: MtpDrafter> {
+    arch: A,
+    /// Request sampling (top_p/top_k from `set_sampling`, temp from `step`).
+    /// Forwarded to the drafter via `arch.set_sampling` before each `mtp_step`
+    /// so a temp>0-capable drafter (DSpark) can sample its verify. `top_p==0`
+    /// means disabled; greedy drafters ignore all three.
+    top_p: f32,
+    top_k: usize,
+}
+
+impl<A: MtpDrafter> MtpSpeculator<A> {
+    pub fn new(arch: A) -> Self {
+        Self {
+            arch,
+            top_p: 1.0,
+            top_k: 0,
+        }
+    }
+}
+
+/// Lower an [`MtpWindow`] to the generic [`SpecStep`]. `committed` already
+/// excludes the seed and includes the bonus, so it maps 1:1 to `emit`; the next
+/// window's seed is the last committed token (the daemon's `position +=
+/// emit.len()` / `seed = next_seed` contract). An empty `committed` would stall
+/// the loop (no position/`generated` advance) — surface it as an error so the
+/// loop breaks instead of spinning.
+fn lower_mtp_window(w: MtpWindow) -> Result<SpecStep, String> {
+    let next_seed = *w
+        .committed
+        .last()
+        .ok_or("MtpSpeculator: drafter committed 0 tokens (would stall the decode loop)")?;
+    Ok(SpecStep::new(
+        w.committed.iter().copied(),
+        next_seed,
+        w.drafts_generated,
+        w.accepted,
+    ))
+}
+
+impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+        _resume_from: Option<usize>,
+        _abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String> {
+        // Cache hit ⇒ warm suffix prefill from `prefill_start`; miss ⇒ full
+        // prefill from 0 (the drafter resets recurrent + MTP cache on miss).
+        let (fill_tokens, start_pos): (&[u32], usize) = if cache_hit {
+            (prefill_tokens, prefill_start)
+        } else {
+            (prompt_tokens, 0)
+        };
+        let first_token = self
+            .arch
+            .mtp_prefill(gpu, target, fill_tokens, start_pos, cache_hit)?;
+        Ok(PrefillOutcome::Ready { first_token })
+    }
+
+    fn step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        _emitted: &[u32],
+        grammar: Option<&mut dyn SpecGrammar>,
+        temp: f32,
+    ) -> Result<SpecStep, String> {
+        let k = self.arch.k();
+        let eos = target.eos_token();
+        // Forward the per-step temp + the request top_p/top_k (stashed by
+        // `set_sampling`) to the drafter. Greedy-only drafters ignore it; a
+        // temp>0-capable one (DSpark) uses it to sample its verify.
+        self.arch.set_sampling(temp, self.top_p, self.top_k);
+        let window = self
+            .arch
+            .mtp_step(gpu, target, position, seed, k, eos, grammar)?;
+        lower_mtp_window(window)
+    }
+
+    fn reset(&mut self, gpu: &mut Gpu) {
+        self.arch.mtp_reset(gpu);
+    }
+
+    fn block_size(&self) -> usize {
+        self.arch.k()
+    }
+
+    fn ctx_capacity(&self) -> usize {
+        self.arch.ctx_capacity()
+    }
+
+    fn free(self: Box<Self>, gpu: &mut Gpu) {
+        // Move the drafter out of the box and hand it its own boxed-self free.
+        Box::new(self.arch).mtp_free(gpu);
+    }
+
+    fn requires_greedy(&self) -> bool {
+        self.arch.requires_greedy()
+    }
+
+    fn supports_temp_verify(&self) -> bool {
+        self.arch.supports_temp_verify()
+    }
+
+    fn set_sampling(&mut self, _temp: f32, top_p: f32, top_k: usize, _cactus_delta: f32) {
+        // Stash top_p/top_k; temp arrives per-step via `step`. Forwarded to the
+        // drafter inside `step` (before `mtp_step`).
+        self.top_p = top_p;
+        self.top_k = top_k;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Locks the load-bearing loop contract: the daemon advances `position` by
+    // `emit.len()`, NOT by `accepted`. For a chain window that accepted 2 of 4
+    // drafts, emit is `[d0, d1, bonus]` (len 3 = accepted + 1) and the next
+    // seed is the bonus = `emit.last()`. The adversarial review certified this
+    // equivalence against `speculative.rs:3737-3744`; this test pins it so a
+    // future lowering change can't silently break the position math.
+    #[test]
+    fn emit_len_drives_advance_not_accepted() {
+        let step = SpecStep {
+            emit: SmallVec::from_slice(&[10, 11, 12]),
+            next_seed: 12,
+            proposed: 4,
+            accepted: 2,
+        };
+        assert_eq!(step.emit.len(), step.accepted + 1);
+        assert_eq!(*step.emit.last().unwrap(), step.next_seed);
+    }
+
+    // ── accept_greedy_prefix ────────────────────────────────────────────────
+
+    #[test]
+    fn accept_greedy_none_partial() {
+        // drafts [11,12,13]; target picks [11,12,99,..] → accept 11,12; diverge
+        // at slot 2 (99 != 13); bonus = target_pick[2] = 99.
+        let r = accept_greedy_prefix(&[11, 12, 13], &[11, 12, 99, 0], None);
+        assert_eq!(r.accepted, 2);
+        assert_eq!(r.committed, vec![11, 12, 99]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_none_full() {
+        // all drafts match; bonus = target_pick[3].
+        let r = accept_greedy_prefix(&[11, 12, 13], &[11, 12, 13, 77], None);
+        assert_eq!(r.accepted, 3);
+        assert_eq!(r.committed, vec![11, 12, 13, 77]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_none_zero() {
+        // first draft rejected; accept nothing, bonus = target_pick[0].
+        let r = accept_greedy_prefix(&[11, 12], &[42, 0, 0], None);
+        assert_eq!(r.accepted, 0);
+        assert_eq!(r.committed, vec![42]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_eos_stop_midprefix() {
+        // eos=2; drafts [11,2,13]; accept 11, then 2==eos → stop, NO bonus.
+        let r = accept_greedy_prefix(&[11, 2, 13], &[11, 2, 13, 0], Some(2));
+        assert_eq!(r.accepted, 2);
+        assert_eq!(r.committed, vec![11, 2]);
+        assert!(r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_eos_as_bonus() {
+        // eos=2; drafts [11] accepted; bonus = target_pick[1] = 2 == eos.
+        let r = accept_greedy_prefix(&[11], &[11, 2], Some(2));
+        assert_eq!(r.accepted, 1);
+        assert_eq!(r.committed, vec![11, 2]);
+        assert!(r.hit_eos);
+    }
+
+    // ── lower_mtp_window (MtpWindow → SpecStep) ─────────────────────────────
+
+    #[test]
+    fn lower_mtp_window_maps_committed_and_last_seed() {
+        // 4 drafts offered, 2 accepted + bonus ⇒ committed = [a, b, bonus].
+        let step = lower_mtp_window(MtpWindow {
+            committed: vec![10, 11, 12],
+            accepted: 2,
+            drafts_generated: 4,
+        })
+        .unwrap();
+        assert_eq!(step.emit.as_slice(), &[10, 11, 12]);
+        assert_eq!(step.next_seed, 12); // committed.last() == bonus
+        assert_eq!(step.proposed, 4);
+        assert_eq!(step.accepted, 2);
+        // The load-bearing loop contract still holds for the MTP lowering.
+        assert_eq!(step.emit.len(), step.accepted + 1);
+    }
+
+    #[test]
+    fn lower_mtp_window_single_bonus_only() {
+        // 0 accepted ⇒ committed = [bonus] (still non-empty).
+        let step = lower_mtp_window(MtpWindow {
+            committed: vec![99],
+            accepted: 0,
+            drafts_generated: 4,
+        })
+        .unwrap();
+        assert_eq!(step.emit.as_slice(), &[99]);
+        assert_eq!(step.next_seed, 99);
+        assert_eq!(step.accepted, 0);
+    }
+
+    #[test]
+    fn lower_mtp_window_empty_is_error() {
+        // An empty window would stall the daemon loop — must be an error.
+        assert!(lower_mtp_window(MtpWindow {
+            committed: vec![],
+            accepted: 0,
+            drafts_generated: 4,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn spectarget_hidden_default_is_unsupported() {
+        // A SpecTarget that doesn't override the DFlash hooks reports no extract
+        // layers and refuses capture — so build_speculator's DFlash arm declines
+        // gracefully on arches without hidden capture (e.g. minimax).
+        struct Bare;
+        impl SpecTarget for Bare {
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+            fn reset_recurrent(&mut self, _gpu: &mut hipfire_rdna::Gpu) {}
+            fn new_spec_scratch(
+                &mut self,
+                _gpu: &mut hipfire_rdna::Gpu,
+                _block_size: usize,
+            ) -> Result<Box<dyn SpecScratch>, String> {
+                unimplemented!()
+            }
+            fn spec_advance(
+                &mut self,
+                _gpu: &mut hipfire_rdna::Gpu,
+                _tokens: &[u32],
+                _start_pos: usize,
+                _reset: bool,
+                _abort: &dyn Fn() -> bool,
+                _hidden_out: Option<&mut Vec<f32>>,
+            ) -> Result<SpecAdvance, String> {
+                unimplemented!()
+            }
+            fn verify_block(
+                &mut self,
+                _gpu: &mut hipfire_rdna::Gpu,
+                _block: &[u32],
+                _position: usize,
+                _scratch: &mut dyn SpecScratch,
+                _hidden_out: Option<&mut Vec<f32>>,
+            ) -> Result<Vec<u32>, String> {
+                unimplemented!()
+            }
+            fn commit_prefix(
+                &mut self,
+                _gpu: &mut hipfire_rdna::Gpu,
+                _block: &[u32],
+                _accept_len: usize,
+                _position: usize,
+                _scratch: &mut dyn SpecScratch,
+            ) -> Result<(), String> {
+                unimplemented!()
+            }
+            fn eos_token(&self) -> u32 {
+                0
+            }
+            fn ctx_capacity(&self) -> usize {
+                0
+            }
+        }
+        let b = Bare;
+        assert!(b.dflash_extract_layers().is_none());
+    }
+}

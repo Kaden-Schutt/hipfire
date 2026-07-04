@@ -10,5 +10,7 @@ hipfire-specdecode = { path = "../hipfire-specdecode" }
 hip-bridge = { path = "../hip-bridge" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-rdna = { path = "../hipfire-rdna" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 serde.workspace = true
 serde_json = "1"
+smallvec = "1"
