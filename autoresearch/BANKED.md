@@ -13,3 +13,25 @@ per-arch validation + dispatch-gating required before fleet adoption (variants a
 
 Composed (all 3): base 130.0 → 139.55 tok/s = **+7.35%** decode (f=1.0, coherent).
 Multiturn (serve_harness chain): base 122.9 → 132.9 = **+8.1%**, attractor 2→3 (baseline-level).
+
+## Anti-clobber promotion rule (per-arch gating) — MANDATORY before any kernels/src/ change
+
+Kernel source is SHARED: one `<k>.hip` JIT-compiles per arch. A gfx12-tuned variant dropped
+into a shared-base `<k>.hip` reshapes EVERY RDNA1/2/3 path too. Proven hazard: r2lds was
+coherent on gfx1201 but INCOHERENT on gfx1151. So a gfx12 win is NEVER promoted into a
+shared-base kernel without a cross-arch clobber check.
+
+Mechanism already in tree: 58 `.gfx12`-suffixed kernels + `.gfx1151/.gfx1100/.gfx1030/.gfx1200`
+forks in kernels/src/, resolved by arch at dispatch (`<k>.<arch>.hip` else fall back to `<k>.hip`).
+
+Promotion gate for a gfx12 win on a SHARED-BASE kernel:
+1. Run the variant on the RDNA1/2/3 fleet (hipx: gfx1010/1030/1100/1151) — coherence + perf A/B
+   vs baseline, per arch, model chosen to fit each card's VRAM.
+2a. Coherent AND perf-neutral-or-better on ALL arches → universal win → may replace shared `<k>.hip`.
+2b. Incoherent OR perf-regression on ANY arch → CLOBBER → fork to `kernels/src/<k>.gfx12.hip`
+    + dispatch predicate (gfx12 uses variant, all other arches keep baseline). STRICTLY gated.
+
+Wins on already-suffixed kernels (`<k>.gfx12.hip`) are inherently gated → bank direct, no check.
+
+STATUS: the 3 round-1 wins are ALL shared-base with no gfx12 fork → each REQUIRES the gate above
+before touching kernels/src/. Until checked: archive-only in autoresearch/variants/ (current state).
