@@ -1420,7 +1420,7 @@ pub(crate) fn linear_optional_bias_with_runtime_context(
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
         calib_observe_linear(weight, input);
-        return linear_optional_bias(input, weight, bias);
+        return linear_optional_bias(input, weight, bias).map_err(Into::into);
     };
     {
         runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
@@ -1454,7 +1454,7 @@ fn linear_with_runtime_context(
 ) -> DiffusionResult<CpuTensor> {
     if runtime_context.rocm_device_id().is_none() {
         calib_observe_linear(weight, input);
-        return linear(input, weight, bias);
+        return linear(input, weight, bias).map_err(Into::into);
     }
     linear_optional_bias_with_runtime_context(input, weight, Some(bias), runtime_context)
 }
@@ -1548,7 +1548,7 @@ fn tensor_add_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return tensor_add(a, b);
+        return tensor_add(a, b).map_err(Into::into);
     };
     {
         runtime_context.with_rocm_gpu(|gpu| tensor_add_hip_on_gpu(gpu, a, b))
@@ -1590,7 +1590,7 @@ fn conv2d_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return conv2d_nchw_with_stride(input, weight, bias, padding, stride);
+        return conv2d_nchw_with_stride(input, weight, bias, padding, stride).map_err(Into::into);
     };
     {
         runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
@@ -1608,7 +1608,7 @@ fn group_norm_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return group_norm_nchw(input, weight, bias, groups, eps);
+        return group_norm_nchw(input, weight, bias, groups, eps).map_err(Into::into);
     };
     {
         runtime_context
@@ -1622,7 +1622,7 @@ fn add_channel_bias_nchw_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<()> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return add_channel_bias_nchw(input, bias);
+        return add_channel_bias_nchw(input, bias).map_err(Into::into);
     };
     {
         *input = runtime_context
@@ -1637,7 +1637,7 @@ fn concat_channels_nchw_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return concat_channels_nchw(a, b);
+        return concat_channels_nchw(a, b).map_err(Into::into);
     };
     {
         runtime_context.with_rocm_gpu(|gpu| concat_channels_nchw_hip_on_gpu(gpu, a, b))
@@ -1650,7 +1650,7 @@ fn upsample_nearest2d_nchw_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return upsample_nearest2d_nchw(input, scale);
+        return upsample_nearest2d_nchw(input, scale).map_err(Into::into);
     };
     {
         runtime_context.with_rocm_gpu(|gpu| upsample_nearest2d_nchw_hip_on_gpu(gpu, input, scale))
@@ -1722,7 +1722,7 @@ fn layer_norm_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return layer_norm(input, weight, bias, eps);
+        return layer_norm(input, weight, bias, eps).map_err(Into::into);
     };
     {
         runtime_context.with_rocm_gpu(|gpu| layer_norm_hip_on_gpu(gpu, input, weight, bias, eps))
@@ -1789,7 +1789,7 @@ fn clip_causal_self_attention_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return clip_causal_self_attention(q, k, v, n_heads);
+        return clip_causal_self_attention(q, k, v, n_heads).map_err(Into::into);
     };
     {
         runtime_context
@@ -1802,7 +1802,7 @@ fn geglu_gate_3d_with_runtime_context(
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<CpuTensor> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return geglu_gate_3d(projected);
+        return geglu_gate_3d(projected).map_err(Into::into);
     };
     {
         runtime_context.with_rocm_gpu(|gpu| geglu_gate_3d_hip_on_gpu(gpu, projected))
@@ -1851,11 +1851,10 @@ pub(crate) fn box_muller_pair(rng: &mut SplitMix64) -> (f32, f32) {
     (radius * theta.cos(), radius * theta.sin())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CpuTensor {
-    pub shape: Vec<usize>,
-    pub data: Vec<f32>,
-}
+// CpuTensor now lives in the hipfire-cpu backend crate (re-exported at the top
+// of this file). Its `from_hfq` constructor stays here as a free function since
+// it couples to the HFQ format loader (hipfire-runtime), which the low-level
+// hipfire-cpu crate does not depend on.
 
 /// Parity-debug tensor dump: when `HIPFIRE_DIFFUSION_DUMP_DIR` is set, write
 /// `<dir>/<name>.npy` (numpy v1, `<f4`) so intermediate activations can be diffed
@@ -1894,7 +1893,7 @@ pub(crate) fn dump_debug_tensor(name: &str, tensor: &CpuTensor) {
 }
 
 /// Decode a raw tensor payload (`quant_type` + bytes) into `f32`. Shared by
-/// `CpuTensor::from_hfq` (decode-at-load) and `ResidentWeight` (decode-on-use).
+/// `cpu_tensor_from_hfq` (decode-at-load) and `ResidentWeight` (decode-on-use).
 pub(crate) fn decode_tensor_payload(
     name: &str,
     quant_type: u8,
@@ -1960,7 +1959,7 @@ impl ResidentWeight {
         let data = decode_tensor_payload(&self.name, self.quant_type, &self.bytes, elem_count)?;
         // Register this decode's data pointer for activation calibration so the
         // per-linear Hessian is captured for resident-packed weights too (the
-        // `CpuTensor::from_hfq` calibration hook does not see them). No-op unless
+        // `cpu_tensor_from_hfq` calibration hook does not see them). No-op unless
         // a calibration run is armed.
         if quant_calib::calib_active() {
             quant_calib::calib_register(data.as_ptr() as usize, &self.name);
@@ -1972,54 +1971,38 @@ impl ResidentWeight {
     }
 }
 
-impl CpuTensor {
-    pub fn from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<Self> {
-        let (info, bytes) = hfq.tensor_data_vec(name).ok_or_else(|| {
-            DiffusionError::InvalidMetadata(format!("tensor {name:?} is missing"))
+/// Load a [`CpuTensor`] from an HFQ tensor by name. Free function (not a
+/// `CpuTensor` method) because it couples to the HFQ loader / activation-calib
+/// registry, which the low-level `hipfire-cpu` crate that owns `CpuTensor` does
+/// not depend on. `CpuTensor::{zeros, rows_cols}` live in hipfire-cpu.
+pub(crate) fn cpu_tensor_from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<CpuTensor> {
+    let (info, bytes) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| DiffusionError::InvalidMetadata(format!("tensor {name:?} is missing")))?;
+    let elem_count = info
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim as usize))
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata(format!("tensor {name:?} shape overflows"))
         })?;
-        let elem_count = info
-            .shape
-            .iter()
-            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim as usize))
-            .ok_or_else(|| {
-                DiffusionError::InvalidMetadata(format!("tensor {name:?} shape overflows"))
-            })?;
-        let data = decode_tensor_payload(name, info.quant_type, &bytes, elem_count)?;
-        if data.len() != elem_count {
-            return Err(DiffusionError::InvalidMetadata(format!(
-                "tensor {name:?} decoded {} elements but shape expects {elem_count}",
-                data.len()
-            )));
-        }
-        // Register this weight's data pointer for activation calibration (no-op
-        // unless a calibration run is armed). The Vec buffer is stable across the
-        // move into `Self`, so the pointer matches what the forward sees.
-        if quant_calib::calib_active() {
-            quant_calib::calib_register(data.as_ptr() as usize, name);
-        }
-        Ok(Self {
-            shape: info.shape.iter().map(|&dim| dim as usize).collect(),
-            data,
-        })
+    let data = decode_tensor_payload(name, info.quant_type, &bytes, elem_count)?;
+    if data.len() != elem_count {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "tensor {name:?} decoded {} elements but shape expects {elem_count}",
+            data.len()
+        )));
     }
-
-    pub fn zeros(shape: &[usize]) -> Self {
-        let len = shape.iter().product();
-        Self {
-            shape: shape.to_vec(),
-            data: vec![0.0; len],
-        }
+    // Register this weight's data pointer for activation calibration (no-op
+    // unless a calibration run is armed). The Vec buffer is stable across the
+    // move into the tensor, so the pointer matches what the forward sees.
+    if quant_calib::calib_active() {
+        quant_calib::calib_register(data.as_ptr() as usize, name);
     }
-
-    pub fn rows_cols(&self) -> DiffusionResult<(usize, usize)> {
-        match self.shape.as_slice() {
-            [rows, cols] => Ok((*rows, *cols)),
-            _ => Err(DiffusionError::InvalidMetadata(format!(
-                "expected 2-D tensor, got shape {:?}",
-                self.shape
-            ))),
-        }
-    }
+    Ok(CpuTensor {
+        shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+        data,
+    })
 }
 
 mod quant_decode;
@@ -2063,6 +2046,14 @@ impl std::fmt::Display for DiffusionError {
 }
 
 impl std::error::Error for DiffusionError {}
+
+/// CPU-op errors from hipfire-cpu surface as invalid-metadata (shape/precondition)
+/// failures in the diffusion pipeline, so `?` on a `CpuResult` works everywhere.
+impl From<hipfire_cpu::CpuError> for DiffusionError {
+    fn from(err: hipfire_cpu::CpuError) -> Self {
+        DiffusionError::InvalidMetadata(err.0)
+    }
+}
 
 pub type DiffusionResult<T> = Result<T, DiffusionError>;
 
@@ -5254,7 +5245,7 @@ fn patch_tokens_to_latent_batch(
 
 fn optional_tensor(hfq: &HfqFile, entry: &str) -> DiffusionResult<Option<CpuTensor>> {
     if hfq.find_tensor_info(entry).is_some() {
-        CpuTensor::from_hfq(hfq, entry).map(Some)
+        cpu_tensor_from_hfq(hfq, entry).map(Some)
     } else {
         Ok(None)
     }
@@ -5382,12 +5373,7 @@ fn scaled_dot_product_attention_with_key_mask(
     Ok(out)
 }
 
-pub(crate) fn gelu(value: f32) -> f32 {
-    0.5 * value
-        * (1.0
-            + (std::f32::consts::FRAC_2_SQRT_PI * (value + 0.044_715 * value * value * value))
-                .tanh())
-}
+// gelu now lives in hipfire-cpu::tensor_ops (re-exported at the crate root).
 
 #[derive(Debug, Clone)]
 pub struct ClipTextEncoder {
@@ -5436,11 +5422,11 @@ impl ClipTextEncoder {
         component: &str,
         n_heads: usize,
     ) -> DiffusionResult<Self> {
-        let token_embedding = CpuTensor::from_hfq(
+        let token_embedding = cpu_tensor_from_hfq(
             hfq,
             &format!("{component}/tensors/text_model.embeddings.token_embedding.weight"),
         )?;
-        let position_embedding = CpuTensor::from_hfq(
+        let position_embedding = cpu_tensor_from_hfq(
             hfq,
             &format!("{component}/tensors/text_model.embeddings.position_embedding.weight"),
         )?;
@@ -5461,43 +5447,43 @@ impl ClipTextEncoder {
                 break;
             }
             layers.push(ClipEncoderLayer {
-                q_proj_weight: CpuTensor::from_hfq(
+                q_proj_weight: cpu_tensor_from_hfq(
                     hfq,
                     &format!("{prefix}.self_attn.q_proj.weight"),
                 )?,
-                q_proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.self_attn.q_proj.bias"))?,
-                k_proj_weight: CpuTensor::from_hfq(
+                q_proj_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.self_attn.q_proj.bias"))?,
+                k_proj_weight: cpu_tensor_from_hfq(
                     hfq,
                     &format!("{prefix}.self_attn.k_proj.weight"),
                 )?,
-                k_proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.self_attn.k_proj.bias"))?,
-                v_proj_weight: CpuTensor::from_hfq(
+                k_proj_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.self_attn.k_proj.bias"))?,
+                v_proj_weight: cpu_tensor_from_hfq(
                     hfq,
                     &format!("{prefix}.self_attn.v_proj.weight"),
                 )?,
-                v_proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.self_attn.v_proj.bias"))?,
-                out_proj_weight: CpuTensor::from_hfq(
+                v_proj_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.self_attn.v_proj.bias"))?,
+                out_proj_weight: cpu_tensor_from_hfq(
                     hfq,
                     &format!("{prefix}.self_attn.out_proj.weight"),
                 )?,
-                out_proj_bias: CpuTensor::from_hfq(
+                out_proj_bias: cpu_tensor_from_hfq(
                     hfq,
                     &format!("{prefix}.self_attn.out_proj.bias"),
                 )?,
-                layer_norm1_weight: CpuTensor::from_hfq(
+                layer_norm1_weight: cpu_tensor_from_hfq(
                     hfq,
                     &format!("{prefix}.layer_norm1.weight"),
                 )?,
-                layer_norm1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.layer_norm1.bias"))?,
-                fc1_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.mlp.fc1.weight"))?,
-                fc1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.mlp.fc1.bias"))?,
-                fc2_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.mlp.fc2.weight"))?,
-                fc2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.mlp.fc2.bias"))?,
-                layer_norm2_weight: CpuTensor::from_hfq(
+                layer_norm1_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.layer_norm1.bias"))?,
+                fc1_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.mlp.fc1.weight"))?,
+                fc1_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.mlp.fc1.bias"))?,
+                fc2_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.mlp.fc2.weight"))?,
+                fc2_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.mlp.fc2.bias"))?,
+                layer_norm2_weight: cpu_tensor_from_hfq(
                     hfq,
                     &format!("{prefix}.layer_norm2.weight"),
                 )?,
-                layer_norm2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.layer_norm2.bias"))?,
+                layer_norm2_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.layer_norm2.bias"))?,
             });
         }
         if layers.is_empty() {
@@ -5509,15 +5495,15 @@ impl ClipTextEncoder {
             token_embedding,
             position_embedding,
             layers,
-            final_layer_norm_weight: CpuTensor::from_hfq(
+            final_layer_norm_weight: cpu_tensor_from_hfq(
                 hfq,
                 &format!("{component}/tensors/text_model.final_layer_norm.weight"),
             )?,
-            final_layer_norm_bias: CpuTensor::from_hfq(
+            final_layer_norm_bias: cpu_tensor_from_hfq(
                 hfq,
                 &format!("{component}/tensors/text_model.final_layer_norm.bias"),
             )?,
-            text_projection: CpuTensor::from_hfq(
+            text_projection: cpu_tensor_from_hfq(
                 hfq,
                 &format!("{component}/tensors/text_projection.weight"),
             )
@@ -5877,7 +5863,11 @@ impl ClipEncoderLayer {
 }
 
 mod cpu_ops;
-pub use cpu_ops::*;
+pub(crate) use cpu_ops::*;
+// CpuTensor + the pure CPU-reference tensor ops now live in the hipfire-cpu
+// backend crate; re-export them so this crate's ~1,300 CpuTensor references and
+// the ops' call sites resolve unchanged.
+pub use hipfire_cpu::tensor_ops::*;
 
 mod tokenizer;
 pub use tokenizer::*;

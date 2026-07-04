@@ -970,7 +970,7 @@ pub(crate) fn wan_causal_conv2d(
             }
         }
     }
-    conv2d_nchw(input, &weight2d, bias, (kh - 1) / 2)
+    conv2d_nchw(input, &weight2d, bias, (kh - 1) / 2).map_err(Into::into)
 }
 
 /// SiLU activation over a flat tensor (`x * sigmoid(x)`).
@@ -1020,19 +1020,19 @@ impl WanResnetBlock {
             .is_some()
         {
             Some((
-                CpuTensor::from_hfq(hfq, &format!("{prefix}.conv_shortcut.weight"))?,
-                CpuTensor::from_hfq(hfq, &format!("{prefix}.conv_shortcut.bias"))?,
+                cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_shortcut.weight"))?,
+                cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_shortcut.bias"))?,
             ))
         } else {
             None
         };
         Ok(Self {
-            norm1_gamma: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm1.gamma"))?.data,
-            conv1_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv1.weight"))?,
-            conv1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv1.bias"))?,
-            norm2_gamma: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm2.gamma"))?.data,
-            conv2_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv2.weight"))?,
-            conv2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv2.bias"))?,
+            norm1_gamma: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm1.gamma"))?.data,
+            conv1_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv1.weight"))?,
+            conv1_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv1.bias"))?,
+            norm2_gamma: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm2.gamma"))?.data,
+            conv2_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv2.weight"))?,
+            conv2_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv2.bias"))?,
             conv_shortcut,
         })
     }
@@ -1069,11 +1069,11 @@ impl WanMidAttention {
 
     pub(crate) fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Self> {
         Ok(Self {
-            norm_gamma: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm.gamma"))?.data,
-            qkv_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_qkv.weight"))?,
-            qkv_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_qkv.bias"))?,
-            proj_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.proj.weight"))?,
-            proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.proj.bias"))?,
+            norm_gamma: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm.gamma"))?.data,
+            qkv_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.to_qkv.weight"))?,
+            qkv_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.to_qkv.bias"))?,
+            proj_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.proj.weight"))?,
+            proj_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.proj.bias"))?,
         })
     }
 
@@ -1152,8 +1152,8 @@ impl WanUpsample {
             let weight_entry = format!("{prefix}.resample.{index}.weight");
             if hfq.find_tensor_info(&weight_entry).is_some() {
                 return Ok(Some(Self {
-                    resample_weight: CpuTensor::from_hfq(hfq, &weight_entry)?,
-                    resample_bias: CpuTensor::from_hfq(
+                    resample_weight: cpu_tensor_from_hfq(hfq, &weight_entry)?,
+                    resample_bias: cpu_tensor_from_hfq(
                         hfq,
                         &format!("{prefix}.resample.{index}.bias"),
                     )?,
@@ -1177,6 +1177,7 @@ impl WanUpsample {
             Some(&self.resample_bias),
             padding,
         )
+        .map_err(Into::into)
     }
 }
 
@@ -1251,8 +1252,8 @@ impl WanImageDecoder {
             up_blocks.push(WanUpBlock { resnets, upsampler });
         }
         Ok(Some(Self {
-            conv_in_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv_in.weight"))?,
-            conv_in_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv_in.bias"))?,
+            conv_in_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.weight"))?,
+            conv_in_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.bias"))?,
             mid_resnet0: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.0"))?,
             mid_attention: WanMidAttention::from_hfq(
                 hfq,
@@ -1260,9 +1261,9 @@ impl WanImageDecoder {
             )?,
             mid_resnet1: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.1"))?,
             up_blocks,
-            norm_out_gamma: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm_out.gamma"))?.data,
-            conv_out_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv_out.weight"))?,
-            conv_out_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.conv_out.bias"))?,
+            norm_out_gamma: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm_out.gamma"))?.data,
+            conv_out_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_out.weight"))?,
+            conv_out_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_out.bias"))?,
         }))
     }
 

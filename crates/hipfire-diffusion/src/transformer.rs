@@ -83,8 +83,8 @@ impl NativeTransformerDenoiserIo {
                 )
             })?;
 
-        let img_in_weight = CpuTensor::from_hfq(hfq, "transformer/tensors/img_in.weight")?;
-        let img_in_bias = CpuTensor::from_hfq(hfq, "transformer/tensors/img_in.bias")?;
+        let img_in_weight = cpu_tensor_from_hfq(hfq, "transformer/tensors/img_in.weight")?;
+        let img_in_bias = cpu_tensor_from_hfq(hfq, "transformer/tensors/img_in.bias")?;
         let [hidden_width, input_token_width] = shape2(&img_in_weight)?;
         if input_token_width != input_channels {
             return Err(DiffusionError::InvalidMetadata(format!(
@@ -108,8 +108,8 @@ impl NativeTransformerDenoiserIo {
                 "transformer/tensors/final_layer.linear.bias",
             ),
         };
-        let output_weight = CpuTensor::from_hfq(hfq, output_weight_entry)?;
-        let output_bias = CpuTensor::from_hfq(hfq, output_bias_entry)?;
+        let output_weight = cpu_tensor_from_hfq(hfq, output_weight_entry)?;
+        let output_bias = cpu_tensor_from_hfq(hfq, output_bias_entry)?;
         let [output_token_width, output_hidden_width] = shape2(&output_weight)?;
         if output_hidden_width != hidden_width {
             return Err(DiffusionError::InvalidMetadata(format!(
@@ -142,7 +142,7 @@ impl NativeTransformerDenoiserIo {
         }
         let text_in_weight = optional_tensor(hfq, "transformer/tensors/txt_in.weight")?;
         let text_in_bias = if text_in_weight.is_some() {
-            Some(CpuTensor::from_hfq(hfq, "transformer/tensors/txt_in.bias")?)
+            Some(cpu_tensor_from_hfq(hfq, "transformer/tensors/txt_in.bias")?)
         } else {
             None
         };
@@ -172,7 +172,7 @@ impl NativeTransformerDenoiserIo {
         let output_norm_weight =
             optional_tensor(hfq, "transformer/tensors/norm_out.linear.weight")?;
         let output_norm_bias = if output_norm_weight.is_some() {
-            Some(CpuTensor::from_hfq(
+            Some(cpu_tensor_from_hfq(
                 hfq,
                 "transformer/tensors/norm_out.linear.bias",
             )?)
@@ -485,7 +485,7 @@ impl NativeTransformerTimestepEmbedding {
         };
         let modulation_weight = optional_tensor(hfq, "transformer/tensors/time_mod_proj.weight")?;
         let modulation_bias = if modulation_weight.is_some() {
-            Some(CpuTensor::from_hfq(
+            Some(cpu_tensor_from_hfq(
                 hfq,
                 "transformer/tensors/time_mod_proj.bias",
             )?)
@@ -494,10 +494,10 @@ impl NativeTransformerTimestepEmbedding {
         };
         Ok(Self {
             family,
-            linear_1_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_1.weight"))?,
-            linear_1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_1.bias"))?,
-            linear_2_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_2.weight"))?,
-            linear_2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.linear_2.bias"))?,
+            linear_1_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_1.weight"))?,
+            linear_1_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_1.bias"))?,
+            linear_2_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_2.weight"))?,
+            linear_2_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_2.bias"))?,
             modulation_weight,
             modulation_bias,
         })
@@ -587,7 +587,7 @@ impl NativeTransformerBlockModulation {
         match family {
             TransformerDenoiserFamily::Krea2 => {
                 let scale_shift_table =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.scale_shift_table"))?;
+                    cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.scale_shift_table"))?;
                 let [chunks, hidden_width] = shape2(&scale_shift_table)?;
                 if chunks == 0 || hidden_width == 0 {
                     return Err(DiffusionError::InvalidMetadata(format!(
@@ -608,13 +608,13 @@ impl NativeTransformerBlockModulation {
             }
             TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
                 let img_mod_weight =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.img_mod.1.weight"))?;
+                    cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.img_mod.1.weight"))?;
                 let img_mod_bias =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.img_mod.1.bias"))?;
+                    cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.img_mod.1.bias"))?;
                 let txt_mod_weight =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.weight"))?;
+                    cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.weight"))?;
                 let txt_mod_bias =
-                    CpuTensor::from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.bias"))?;
+                    cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.txt_mod.1.bias"))?;
                 let [img_rows, hidden_width] = shape2(&img_mod_weight)?;
                 let [txt_rows, txt_hidden_width] = shape2(&txt_mod_weight)?;
                 if hidden_width == 0 || img_rows != hidden_width * 6 {
@@ -1446,9 +1446,9 @@ impl TransformerFeedForwardStream {
         prefix: &str,
     ) -> DiffusionResult<Self> {
         let proj_weight = ResidentWeight::from_hfq(hfq, &format!("{prefix}.net.0.proj.weight"))?;
-        let proj_bias = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.0.proj.bias"))?;
+        let proj_bias = cpu_tensor_from_hfq(hfq, &format!("{prefix}.net.0.proj.bias"))?;
         let down_weight = ResidentWeight::from_hfq(hfq, &format!("{prefix}.net.2.weight"))?;
-        let down_bias = CpuTensor::from_hfq(hfq, &format!("{prefix}.net.2.bias"))?;
+        let down_bias = cpu_tensor_from_hfq(hfq, &format!("{prefix}.net.2.bias"))?;
         let [projected_width, hidden_width] = shape2_slice(proj_weight.shape())?;
         if projected_width == 0 || projected_width % 2 != 0 {
             return Err(DiffusionError::InvalidMetadata(format!(
@@ -1710,11 +1710,11 @@ impl NativeTransformerBlock {
         let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
         let (norm1_weight, norm2_weight) = match family {
             TransformerDenoiserFamily::Krea2 => (
-                Some(CpuTensor::from_hfq(
+                Some(cpu_tensor_from_hfq(
                     hfq,
                     &format!("{block_prefix}.norm1.weight"),
                 )?),
-                Some(CpuTensor::from_hfq(
+                Some(cpu_tensor_from_hfq(
                     hfq,
                     &format!("{block_prefix}.norm2.weight"),
                 )?),
@@ -1914,8 +1914,8 @@ impl NativeTextFusionBlock {
         heads: usize,
     ) -> DiffusionResult<Self> {
         Ok(Self {
-            norm1_weight: CpuTensor::from_hfq(hfq, &format!("{block_prefix}.norm1.weight"))?,
-            norm2_weight: CpuTensor::from_hfq(hfq, &format!("{block_prefix}.norm2.weight"))?,
+            norm1_weight: cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.norm1.weight"))?,
+            norm2_weight: cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.norm2.weight"))?,
             attention: NativeTransformerAttentionProjection::single_stream_from_prefix(
                 hfq,
                 &format!("{block_prefix}.attn"),
@@ -3225,14 +3225,14 @@ impl Qwen3EncoderLayer {
 
     pub(crate) fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Self> {
         Ok(Self {
-            input_norm: CpuTensor::from_hfq(hfq, &format!("{prefix}.input_layernorm.weight"))?.data,
+            input_norm: cpu_tensor_from_hfq(hfq, &format!("{prefix}.input_layernorm.weight"))?.data,
             q_proj: ResidentWeight::from_hfq(hfq, &format!("{prefix}.self_attn.q_proj.weight"))?,
             k_proj: ResidentWeight::from_hfq(hfq, &format!("{prefix}.self_attn.k_proj.weight"))?,
             v_proj: ResidentWeight::from_hfq(hfq, &format!("{prefix}.self_attn.v_proj.weight"))?,
-            q_norm: CpuTensor::from_hfq(hfq, &format!("{prefix}.self_attn.q_norm.weight"))?.data,
-            k_norm: CpuTensor::from_hfq(hfq, &format!("{prefix}.self_attn.k_norm.weight"))?.data,
+            q_norm: cpu_tensor_from_hfq(hfq, &format!("{prefix}.self_attn.q_norm.weight"))?.data,
+            k_norm: cpu_tensor_from_hfq(hfq, &format!("{prefix}.self_attn.k_norm.weight"))?.data,
             o_proj: ResidentWeight::from_hfq(hfq, &format!("{prefix}.self_attn.o_proj.weight"))?,
-            post_norm: CpuTensor::from_hfq(
+            post_norm: cpu_tensor_from_hfq(
                 hfq,
                 &format!("{prefix}.post_attention_layernorm.weight"),
             )?
@@ -3385,7 +3385,7 @@ impl NativeQwen3TextEncoder {
         if hfq.find_tensor_info(&embed_entry).is_none() {
             return Ok(None);
         }
-        let embed_tokens = CpuTensor::from_hfq(hfq, &embed_entry)?;
+        let embed_tokens = cpu_tensor_from_hfq(hfq, &embed_entry)?;
         let [_, hidden] = shape2(&embed_tokens)?;
         let mut layers = Vec::new();
         let mut idx = 0;

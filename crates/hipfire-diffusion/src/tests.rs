@@ -2236,8 +2236,8 @@ fn imports_qwen_image_edit_transformer_metadata_and_shards() {
     assert!(entries.contains(&"transformer/tensors/patch_embed.proj.weight".to_string()));
     assert!(entries.contains(&"transformer/tensors/norm_out.weight".to_string()));
     let patch_embed =
-        CpuTensor::from_hfq(&hfq, "transformer/tensors/patch_embed.proj.weight").unwrap();
-    let norm_out = CpuTensor::from_hfq(&hfq, "transformer/tensors/norm_out.weight").unwrap();
+        cpu_tensor_from_hfq(&hfq, "transformer/tensors/patch_embed.proj.weight").unwrap();
+    let norm_out = cpu_tensor_from_hfq(&hfq, "transformer/tensors/norm_out.weight").unwrap();
     assert_eq!(patch_embed.data, vec![1.5]);
     assert_eq!(norm_out.data, vec![2.5]);
     assert!(hfq
@@ -2414,9 +2414,9 @@ fn imports_diffusers_safetensors_as_hfq_tensor_entries() {
         metadata.components["text_encoder"].tensor_roles[0].dtype,
         "BF16"
     );
-    let unet = CpuTensor::from_hfq(&hfq, "unet/tensors/conv_in.weight").unwrap();
-    let vae = CpuTensor::from_hfq(&hfq, "vae/tensors/post_quant_conv.weight").unwrap();
-    let text = CpuTensor::from_hfq(
+    let unet = cpu_tensor_from_hfq(&hfq, "unet/tensors/conv_in.weight").unwrap();
+    let vae = cpu_tensor_from_hfq(&hfq, "vae/tensors/post_quant_conv.weight").unwrap();
+    let text = cpu_tensor_from_hfq(
         &hfq,
         "text_encoder/tensors/text_model.final_layer_norm.weight",
     )
@@ -2475,7 +2475,7 @@ fn importer_prefers_safetensors_over_legacy_bin_when_both_exist() {
         metadata.components["unet"].weight_entries,
         vec!["unet/tensors/conv_in.bias"]
     );
-    let tensor = CpuTensor::from_hfq(&hfq, "unet/tensors/conv_in.bias").unwrap();
+    let tensor = cpu_tensor_from_hfq(&hfq, "unet/tensors/conv_in.bias").unwrap();
     assert_eq!(tensor.data, vec![2.5]);
     assert!(hfq
         .tensor_data_vec("unet/diffusion_pytorch_model.bin")
@@ -2545,8 +2545,8 @@ fn imports_diffusers_sharded_safetensors_index_as_hfq_tensor_entries() {
     assert_eq!(entries.len(), 2);
     assert!(entries.contains(&"unet/tensors/conv_in.weight".to_string()));
     assert!(entries.contains(&"unet/tensors/conv_out.bias".to_string()));
-    let conv_in = CpuTensor::from_hfq(&hfq, "unet/tensors/conv_in.weight").unwrap();
-    let conv_out = CpuTensor::from_hfq(&hfq, "unet/tensors/conv_out.bias").unwrap();
+    let conv_in = cpu_tensor_from_hfq(&hfq, "unet/tensors/conv_in.weight").unwrap();
+    let conv_out = cpu_tensor_from_hfq(&hfq, "unet/tensors/conv_out.bias").unwrap();
     assert_eq!(conv_in.data, vec![1.5]);
     assert_eq!(conv_out.data, vec![2.5]);
     assert!(hfq
@@ -2706,18 +2706,18 @@ fn imports_single_file_safetensors_checkpoint_as_component_tensors() {
             "missing projected native entry {expected}"
         );
     }
-    let checkpoint_tensor = CpuTensor::from_hfq(
+    let checkpoint_tensor = cpu_tensor_from_hfq(
         &hfq,
         "unet/checkpoint_tensors/model.diffusion_model.input_blocks.0.0.weight",
     )
     .unwrap();
-    let native_tensor = CpuTensor::from_hfq(&hfq, "unet/tensors/conv_in.weight").unwrap();
+    let native_tensor = cpu_tensor_from_hfq(&hfq, "unet/tensors/conv_in.weight").unwrap();
     let tokenizer = ClipTokenizer::from_hfq_file(&hfq).unwrap();
     let tokens = tokenizer.encode_padded("a cat");
     let down_resnet =
-        CpuTensor::from_hfq(&hfq, "unet/tensors/down_blocks.0.resnets.0.norm1.weight").unwrap();
+        cpu_tensor_from_hfq(&hfq, "unet/tensors/down_blocks.0.resnets.0.norm1.weight").unwrap();
     let upsample =
-        CpuTensor::from_hfq(&hfq, "unet/tensors/up_blocks.0.upsamplers.0.conv.weight").unwrap();
+        cpu_tensor_from_hfq(&hfq, "unet/tensors/up_blocks.0.upsamplers.0.conv.weight").unwrap();
     assert_eq!(checkpoint_tensor.shape, vec![1, 4, 1, 1]);
     assert_eq!(checkpoint_tensor.data, vec![1.0, 2.0, 3.0, 4.0]);
     assert_eq!(native_tensor.shape, checkpoint_tensor.shape);
@@ -3159,33 +3159,33 @@ fn cpu_tensor_loads_supported_source_and_packed_formats_from_hfq() {
 
     let hfq = HfqFile::open_index_only(&hfq_path).unwrap();
     assert_eq!(
-        CpuTensor::from_hfq(&hfq, "f16").unwrap().data,
+        cpu_tensor_from_hfq(&hfq, "f16").unwrap().data,
         vec![1.5, -2.0]
     );
-    assert_eq!(CpuTensor::from_hfq(&hfq, "bf16").unwrap().data, vec![3.0]);
-    assert_eq!(CpuTensor::from_hfq(&hfq, "f32").unwrap().data, vec![4.25]);
+    assert_eq!(cpu_tensor_from_hfq(&hfq, "bf16").unwrap().data, vec![3.0]);
+    assert_eq!(cpu_tensor_from_hfq(&hfq, "f32").unwrap().data, vec![4.25]);
     assert_eq!(
-        CpuTensor::from_hfq(&hfq, "q8").unwrap().data,
+        cpu_tensor_from_hfq(&hfq, "q8").unwrap().data,
         vec![1.0, -2.0, 3.5]
     );
     assert_eq!(
-        CpuTensor::from_hfq(&hfq, "q4").unwrap().data,
+        cpu_tensor_from_hfq(&hfq, "q4").unwrap().data,
         vec![-1.0, 1.0, 0.0, 1.75]
     );
     assert_eq!(
-        CpuTensor::from_hfq(&hfq, "q4k").unwrap().data,
+        cpu_tensor_from_hfq(&hfq, "q4k").unwrap().data,
         vec![1.0, 2.0, 0.0, 1.75]
     );
     assert_eq!(
-        CpuTensor::from_hfq(&hfq, "hfq4g128").unwrap().data,
+        cpu_tensor_from_hfq(&hfq, "hfq4g128").unwrap().data,
         vec![-1.0, 1.0, 0.0, 1.75]
     );
     assert_eq!(
-        CpuTensor::from_hfq(&hfq, "hfq4g256").unwrap().data,
+        cpu_tensor_from_hfq(&hfq, "hfq4g256").unwrap().data,
         vec![-1.0, 1.0, 0.0, 1.75]
     );
     assert_eq!(
-        CpuTensor::from_hfq(&hfq, "hfq6g256").unwrap().data,
+        cpu_tensor_from_hfq(&hfq, "hfq6g256").unwrap().data,
         vec![-1.0, 1.0, 0.0, 1.75]
     );
     let _ = fs::remove_dir_all(&dir);
@@ -3254,22 +3254,22 @@ fn cpu_tensor_rejects_truncated_packed_payloads() {
     .unwrap();
 
     let hfq = HfqFile::open_index_only(&hfq_path).unwrap();
-    let q4_error = CpuTensor::from_hfq(&hfq, "bad_q4").unwrap_err();
+    let q4_error = cpu_tensor_from_hfq(&hfq, "bad_q4").unwrap_err();
     assert!(q4_error.to_string().contains("Q4F16_G64"));
     assert!(q4_error.to_string().contains("requires at least 36"));
-    let q8_error = CpuTensor::from_hfq(&hfq, "bad_q8").unwrap_err();
+    let q8_error = cpu_tensor_from_hfq(&hfq, "bad_q8").unwrap_err();
     assert!(q8_error.to_string().contains("Q8F16"));
     assert!(q8_error.to_string().contains("requires at least 34"));
-    let q4k_error = CpuTensor::from_hfq(&hfq, "bad_q4k").unwrap_err();
+    let q4k_error = cpu_tensor_from_hfq(&hfq, "bad_q4k").unwrap_err();
     assert!(q4k_error.to_string().contains("Q4_K"));
     assert!(q4k_error.to_string().contains("requires at least 144"));
-    let hfq4g128_error = CpuTensor::from_hfq(&hfq, "bad_hfq4g128").unwrap_err();
+    let hfq4g128_error = cpu_tensor_from_hfq(&hfq, "bad_hfq4g128").unwrap_err();
     assert!(hfq4g128_error.to_string().contains("HFQ4G128"));
     assert!(hfq4g128_error.to_string().contains("requires at least 72"));
-    let hfq4g256_error = CpuTensor::from_hfq(&hfq, "bad_hfq4g256").unwrap_err();
+    let hfq4g256_error = cpu_tensor_from_hfq(&hfq, "bad_hfq4g256").unwrap_err();
     assert!(hfq4g256_error.to_string().contains("HFQ4G256"));
     assert!(hfq4g256_error.to_string().contains("requires at least 136"));
-    let hfq6g256_error = CpuTensor::from_hfq(&hfq, "bad_hfq6g256").unwrap_err();
+    let hfq6g256_error = cpu_tensor_from_hfq(&hfq, "bad_hfq6g256").unwrap_err();
     assert!(hfq6g256_error.to_string().contains("HFQ6G256"));
     assert!(hfq6g256_error.to_string().contains("requires at least 200"));
     let _ = fs::remove_dir_all(&dir);
@@ -6552,8 +6552,8 @@ fn quant_fidelity_report() {
         // (1) weight SQNR vs source, aggregated over all weight tensors.
         let (mut sig, mut noise) = (0.0f64, 0.0f64);
         for name in &weight_names {
-            let a = CpuTensor::from_hfq(&src, name).unwrap().data;
-            let b = CpuTensor::from_hfq(&cand, name).unwrap().data;
+            let a = cpu_tensor_from_hfq(&src, name).unwrap().data;
+            let b = cpu_tensor_from_hfq(&cand, name).unwrap().data;
             for (x, y) in a.iter().zip(b.iter()) {
                 sig += (*x as f64) * (*x as f64);
                 noise += ((*x - *y) as f64) * ((*x - *y) as f64);

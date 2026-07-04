@@ -3,7 +3,7 @@
 
 //! Tensor payload encoders + a post-process quantizer for diffusion `.hfq`
 //! artifacts. Reads a source artifact (whose weights decode to f32 via
-//! [`CpuTensor::from_hfq`]), re-encodes the large 2D+ `.weight` tensors into a
+//! [`cpu_tensor_from_hfq`]), re-encodes the large 2D+ `.weight` tensors into a
 //! packed format, and copies every other entry (biases, norms, configs,
 //! tokenizers) through verbatim. The decode path keys purely off each tensor's
 //! `quant_type`, so the resulting artifact loads with no metadata changes beyond
@@ -415,7 +415,7 @@ pub fn quantize_diffusion_hfq(
             .tensor_data_vec(name)
             .ok_or_else(|| anyhow::anyhow!("tensor {name:?} vanished from source index"))?;
         if is_quantizable_weight(name, &info.shape) {
-            let decoded = CpuTensor::from_hfq(&hfq, name)
+            let decoded = cpu_tensor_from_hfq(&hfq, name)
                 .map_err(|e| anyhow::anyhow!("decode {name:?}: {e}"))?;
             let (quant_type, group_size, data) = if format.is_opus() {
                 let (qt, gs, bytes, ldlq) = encode_opus_tensor(

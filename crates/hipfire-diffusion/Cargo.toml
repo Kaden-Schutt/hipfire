@@ -26,3 +26,4 @@ hipfire-quantize = { path = "../hipfire-quantize" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 hip-bridge = { path = "../hip-bridge" }
+hipfire-cpu = { path = "../hipfire-cpu" }

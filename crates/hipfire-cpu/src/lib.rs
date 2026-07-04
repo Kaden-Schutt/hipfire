@@ -4,6 +4,9 @@
 
 //! Deterministic CPU oracle backends and module evidence contracts.
 
+pub mod tensor_ops;
+pub use tensor_ops::*;
+
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy)]
