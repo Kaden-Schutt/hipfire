@@ -22,6 +22,7 @@ import aie.utils as aie_utils
 from aie.utils.trace import TraceConfig
 from aie.utils.trace.events import get_events_for_device, PortEvent
 from aie.dialects.aie import WireBundle
+from aie.helpers.taplib import TensorTiler2D
 
 DEV = os.environ.get("NPU_DEV", "npu2")
 CoreEvent = get_events_for_device(DEV).CoreEvent
@@ -37,15 +38,20 @@ DEPTH = int(os.environ.get("DEPTH", 4))
 HCLK_MHZ = float(os.environ.get("HCLK_MHZ", 1800))
 TRACE_SIZE = int(os.environ.get("TRACE_SIZE", 262144))
 DDR_ID = int(os.environ.get("DDR_ID", 4))
+# DISTINCT=1: one big input BO of COLS*PER, each column reads its OWN offset slice
+# (distinct DDR regions -> real bank/controller contention, no shared-region
+# locality). DISTINCT=0: all columns read the same PER-byte BO (locality-biased).
+DISTINCT = bool(int(os.environ.get("DISTINCT", 1)))
 PER = TILE_N * N_TILES
 TOTAL = PER * COLS
+IN_ELEMS = TOTAL if DISTINCT else PER
 TRACE_TXT, TRACE_JSON = "trace_cols.txt", "trace_cols.json"
 
 CORE_EVENTS = [PortEvent(CoreEvent.PORT_RUNNING_0, port=WireBundle.DMA, channel=0, master=True),
                PortEvent(CoreEvent.PORT_STALLED_0, port=WireBundle.DMA, channel=0, master=True),
                PortEvent(CoreEvent.PORT_IDLE_0, port=WireBundle.DMA, channel=0, master=True)]
 
-in_ty = np.ndarray[(PER,), np.dtype[np.int8]]
+in_ty = np.ndarray[(IN_ELEMS,), np.dtype[np.int8]]
 tile_ty = np.ndarray[(TILE_N,), np.dtype[np.int8]]
 acc_ty = np.ndarray[(64,), np.dtype[np.int32]]
 
@@ -78,8 +84,13 @@ def r1b_cols_trace(A, Out, kf, **_kw):
     with rt.sequence(in_ty, acc_ty) as (a, o):
         for w in workers:
             rt.start(w)
+        # distinct: tile the big BO into COLS PER-sized regions; column i reads its
+        # own tile (offset i*PER). simple_tiler gives the same linear BD structure
+        # as the default fill (sizes [1,1,1,PER]) so it lowers -- a flat [PER],[1]
+        # tap instead becomes an illegal per-element repeat_count.
+        region_taps = TensorTiler2D.simple_tiler([IN_ELEMS], [PER]) if DISTINCT else None
         for i in range(COLS):
-            rt.fill(fins[i].prod(), a)
+            rt.fill(fins[i].prod(), a, tap=(region_taps[i] if DISTINCT else None))
         for i in range(COLS):
             rt.drain(fouts[i].cons(), o, wait=True)
     return Program(dev, rt).resolve_program()
@@ -103,7 +114,7 @@ def intervals_by_pid(ev, name):
     return out
 
 
-A = randint(-8, 8, (PER,), dtype=np.int8)
+A = randint(-8, 8, (IN_ELEMS,), dtype=np.int8)
 Out = zeros(64, dtype=np.int32)
 tc = TraceConfig(trace_size=TRACE_SIZE, trace_file=TRACE_TXT, ddr_id=DDR_ID)
 t = time.perf_counter()
@@ -138,6 +149,6 @@ overflow = n_pkts >= (TRACE_SIZE // 4) - 2
 agg_gbs = TOTAL / (global_span / (HCLK_MHZ * 1e6)) / 1e9 if global_span else float("nan")
 per_col_gbs = agg_gbs / COLS if COLS else float("nan")
 flag = "  OVERFLOW(prefix)" if overflow else ""
-print(f"COLS {COLS} TRACED {n_traced} TOTALB {TOTAL} PERCOL_B {PER} NTILES {N_TILES} "
+print(f"COLS {COLS} DISTINCT {int(DISTINCT)} TRACED {n_traced} TOTALB {TOTAL} PERCOL_B {PER} NTILES {N_TILES} "
       f"PKTS {n_pkts} GLOBAL_SPAN {global_span} MEAN_BUSY {mean_busy:.3f} "
       f"AGG_GBS {agg_gbs:.4f} PERCOL_GBS {per_col_gbs:.4f}{flag}")

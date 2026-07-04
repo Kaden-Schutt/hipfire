@@ -102,24 +102,24 @@ Against the W4A8 table: one column clears M=4096 (6.8 GB/s) with 2× margin; the
 open question is only how far 8 columns aggregate before the NoC/mem-controller
 knee.
 
-### Aggregate — MEASURED: 8-column feed saturates at ~56 GB/s (the NoC knee)
+### Aggregate — MEASURED: 8-column feed saturates at ~55 GB/s (the NoC knee)
 
 `r1b_cols_run.py` / `r1b_cols_trace_run.py` run COLS single-column feeds
 concurrently, each pinned to its own column (`Tile(col=i, row=2)` — auto-placement
 otherwise stacks them on column 0 sharing one shim) and traced per-column.
-Aggregate = total bytes / global concurrent span:
+Aggregate = total bytes / global concurrent span (distinct per-column regions):
 
 | COLS | AGG GB/s | per-col | MEAN_BUSY | vs 1-col linear |
 |---|---|---|---|---|
-| 1 | 13.3 | 13.3 | 0.93 | — |
-| 2 | 26.8 | 13.4 | 0.93 | **2.0× (perfect)** |
-| 4 | 47–49 | 11.8–12.2 | 0.83–0.86 | ~3.6× |
-| 8 | 56–57 | 7.0 | 0.49 | ~4.2× |
+| 1 | 13.4 | 13.4 | 0.93 | — |
+| 2 | 25.8 | 12.9 | 0.90 | 1.9× |
+| 4 | 44–45 | 11.0–11.3 | 0.77–0.80 | ~3.3× |
+| 8 | 54–56 | 7.0 | 0.47–0.49 | ~4.1× |
 
-The aggregate **saturates at ~56 GB/s**: 1→2 is perfectly linear, then the
-per-column rate falls (13.3→7.0) and the receive DMA busy fraction collapses
-(0.93→0.49) — the shims spend half their time starved. That is the shared
-LPDDR5X/NoC/mem-controller knee predicted by docs/192-193 (aggregate ≠ COLS×).
+The aggregate **saturates at ~55 GB/s**: 1→2 is near-linear, then the per-column
+rate falls (13.4→7.0) and the receive DMA busy fraction collapses (0.93→0.49) —
+the shims spend half their time starved. That is the shared LPDDR5X/NoC/mem-
+controller knee predicted by docs/192-193 (aggregate ≠ COLS×).
 
 **Go/no-go for W4A8 prefill** (feed needed = `56e12 / (2·M)` B/s, per the table
 up top, vs the ~56 GB/s ceiling):
@@ -133,19 +133,26 @@ So the crossover is **M ≈ 500**. For realistic prefill batch sizes (M ≥ 512)
 feed is not the limiter — the earlier "is the feed the wall?" question resolves
 **no** for prefill. Only small-batch/decode-shaped work stays feed-bound.
 
-Caveat: to stay within XRT's ~5 inout-buffer limit, all columns read one **shared**
-input BO (same DDR region). Distinct per-column regions could shift the ceiling
-(bank contention vs locality); the busy-fraction collapse is source-agnostic, but
-a distinct-region rerun (single big BO, per-column offset slices) is the clean
-follow-up. Also COLS=8 + 8 trace flows overruns the router, so trace ≤4 columns
-(`TRACE_COLS`) while all 8 feed — traced columns feel the same contention.
+**Distinct-region firm-up (caveat resolved).** The table above shares one input
+BO (all columns read the same DDR region), which could bias the ceiling via
+locality. Re-run with `DISTINCT=1` — one big BO of `COLS×PER`, each column reading
+its own offset slice via a `simple_tiler` tap (a flat `[PER],[1]` tap illegally
+lowers to a per-element `repeat_count`; the tiler gives the linear `[1,1,1,PER]`
+BD) — lands at **54–56 GB/s at 8 columns** (busy 0.47–0.49), within run-to-run
+jitter (~4%) of the shared number. So locality gave no material bias: the ~55 GB/s
+ceiling is real for distinct per-column regions, i.e. real weight feed.
+
+Notes: XRT's ~5 inout-buffer limit forces the single-BO approach either way
+(2×COLS separate BOs segfaults at COLS≥3). N_TILES ≤ 255 with `DISTINCT` (the tile
+loop is a DMA `repeat_count`, capped at 255). COLS=8 + 8 trace flows overruns the
+router, so trace ≤4 columns (`TRACE_COLS`) while all 8 feed — traced columns feel
+the same contention.
 
 ### Next
 
 1. Add the W4A8 `mac_4x16_16x16` compute at M ≥ 512 and confirm sustained TOPS
    sits at the compute ceiling (feed proven sufficient there).
-2. Distinct-region aggregate rerun to firm up the 56 GB/s ceiling.
-3. (Optional) trace the shim MM2S directly (`shimtile_events`) for the DDR-read
+2. (Optional) trace the shim MM2S directly (`shimtile_events`) for the DDR-read
    view; the core-receive seal already bounds the end-to-end feed.
 
 ### Three-way status (what worked, what the toolchain blocked)
