@@ -45,10 +45,14 @@ __global__ void gated_delta_net_q8_fast(
     __shared__ float S_tile[TILE_ROWS * HD];  // 4 KiB
 
     signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
-    for (int i = tid; i < TILE_ROWS * HD; i += 32) {
-        int r = i / HD;
-        float scale = s_scales[h * HD + row_start + r];
-        S_tile[i] = scale * (float)sq_base[i];
+    for (int r = 0; r < TILE_ROWS; r++) {
+        const float scale = s_scales[h * HD + row_start + r];
+        const signed char* src = sq_base + r * HD;
+        float* dst = S_tile + r * HD;
+        dst[tid]      = scale * (float)src[tid];
+        dst[tid + 32] = scale * (float)src[tid + 32];
+        dst[tid + 64] = scale * (float)src[tid + 64];
+        dst[tid + 96] = scale * (float)src[tid + 96];
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -60,7 +64,9 @@ __global__ void gated_delta_net_q8_fast(
 
         float k0 = k_t[tid], k1 = k_t[tid+32], k2 = k_t[tid+64], k3 = k_t[tid+96];
         float q0 = q_t[tid], q1 = q_t[tid+32], q2 = q_t[tid+64], q3 = q_t[tid+96];
+        const float4 v_rows = *reinterpret_cast<const float4*>(v_t + row_start);
 
+        float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
         for (int r = 0; r < TILE_ROWS; r++) {
             int row = row_start + r;
             float* sr = S_tile + r * HD;
@@ -71,7 +77,11 @@ __global__ void gated_delta_net_q8_fast(
                 kv += __shfl_down(kv, o);
             kv = __shfl(kv, 0);
 
-            float delta = (v_t[row] - alpha * kv) * beta_v;
+            const float v_row =
+                (r == 0) ? v_rows.x :
+                (r == 1) ? v_rows.y :
+                (r == 2) ? v_rows.z : v_rows.w;
+            float delta = (v_row - alpha * kv) * beta_v;
 
             s0 = alpha * s0 + k0 * delta;
             s1 = alpha * s1 + k1 * delta;
@@ -82,8 +92,16 @@ __global__ void gated_delta_net_q8_fast(
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
             for (int o = 16; o > 0; o >>= 1)
                 out_v += __shfl_down(out_v, o);
-            if (tid == 0)
-                output[t * stride + h * HD + row] = out_v;
+            if (tid == 0) {
+                if (r == 0) out0 = out_v;
+                else if (r == 1) out1 = out_v;
+                else if (r == 2) out2 = out_v;
+                else out3 = out_v;
+            }
+        }
+        if (tid == 0) {
+            *reinterpret_cast<float4*>(output + t * stride + h * HD + row_start) =
+                make_float4(out0, out1, out2, out3);
         }
     }
 

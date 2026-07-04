@@ -32,6 +32,31 @@
 //   Byte-exact for normalization + rotation modulo float reordering (the
 //   reduction order for sum-of-squares is identical to rmsnorm_f32, and the
 //   butterfly order matches mq_rotate_x exactly).
+//
+// R2c2: direct-normalize into the FWHT registers. The baseline caches raw x
+// in LDS, writes normalized x back to the same LDS slab, then reads it again
+// for rotation. For decode this kernel is latency/working-set dominated, so
+// this variant keeps only the reduction buffer in LDS and reloads x+weight
+// directly when each FWHT group is formed. That removes the normalized-x LDS
+// write pass, the Phase 1c barrier, and the Phase 2 LDS reads while preserving
+// the exact multiplication order: ((x * weight) * rms) * sign.
+//
+// R3c2_rms_warptail: keep the R2c2 dataflow, then replace only the final
+// intra-warp half of the reduction tree with shuffles. The s=128,64,32
+// shared-memory reductions and their barriers are preserved; lane 0 then
+// performs the same s=16,8,4,2,1 add tree via __shfl_down and publishes
+// reduce[0]. This cuts four block-wide barriers without changing the lane-0
+// reduction order that determines rms.
+//
+// R12c1_rms_s2early_vstore: keep the R9 signs2-early load placement, then
+// write the eight contiguous rotated outputs as two float4 stores. Arithmetic
+// order is unchanged; only the final store access pattern changes.
+//
+// R17c2_rms_one_rsqrt: reduce[0] is uniform, so only lane 0 computes the
+// rsqrt and publishes the rms scalar. All lanes then consume the identical
+// value from LDS instead of issuing the same special-function op 256 times.
+//
+// R5c3_rms_s2f4: extend that vectorization to the final signs2 stream.
 
 __launch_bounds__(256, 1)
 extern "C" __global__ void fused_rmsnorm_mq_rotate(
@@ -44,8 +69,7 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     float eps
 ) {
     extern __shared__ float smem[];
-    float* x_shared = smem;            // [K]
-    float* reduce   = smem + K;        // [256]
+    float* reduce = smem;              // [256]
 
     const int tid = threadIdx.x;
     const int block_size = blockDim.x; // 256
@@ -65,24 +89,28 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     float local_sum = 0.0f;
     for (int i = tid; i < K; i += block_size) {
         float v = x_b[i];
-        x_shared[i] = v;
         local_sum += v * v;
     }
     reduce[tid] = local_sum;
     __syncthreads();
 
-    // Phase 1b: block reduction → RMS.
-    for (int s = block_size >> 1; s > 0; s >>= 1) {
+    // Phase 1b: block reduction -> RMS. Keep the cross-warp tree in LDS,
+    // then finish the warp-local tail with shuffles in the same add order.
+    for (int s = block_size >> 1; s >= 32; s >>= 1) {
         if (tid < s) reduce[tid] += reduce[tid + s];
         __syncthreads();
     }
-    const float rms = rsqrtf(reduce[0] / (float)K + eps);
-
-    // Phase 1c: normalize in place. x_shared now holds rmsnormalized values.
-    for (int i = tid; i < K; i += block_size) {
-        x_shared[i] = x_shared[i] * weight[i] * rms;
+    if (tid < 32) {
+        float warp_sum = reduce[tid];
+        warp_sum += __shfl_down(warp_sum, 16);
+        warp_sum += __shfl_down(warp_sum, 8);
+        warp_sum += __shfl_down(warp_sum, 4);
+        warp_sum += __shfl_down(warp_sum, 2);
+        warp_sum += __shfl_down(warp_sum, 1);
+        if (tid == 0) reduce[0] = rsqrtf(warp_sum / (float)K + eps);
     }
     __syncthreads();
+    const float rms = reduce[0];
 
     // Phase 2: FWHT per group, 256 elements at a time. Each wave owns
     // `groups_per_warp` groups and processes them serially. Register usage per
@@ -98,14 +126,23 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         const int d0 = lane_id * 8;
         const int base = group * 256 + d0;
 
-        float v0 = x_shared[base]     * signs1[d0];
-        float v1 = x_shared[base + 1] * signs1[d0 + 1];
-        float v2 = x_shared[base + 2] * signs1[d0 + 2];
-        float v3 = x_shared[base + 3] * signs1[d0 + 3];
-        float v4 = x_shared[base + 4] * signs1[d0 + 4];
-        float v5 = x_shared[base + 5] * signs1[d0 + 5];
-        float v6 = x_shared[base + 6] * signs1[d0 + 6];
-        float v7 = x_shared[base + 7] * signs1[d0 + 7];
+        const float4 x0 = *reinterpret_cast<const float4*>(x_b + base);
+        const float4 x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
+        const float4 w0 = *reinterpret_cast<const float4*>(weight + base);
+        const float4 w1 = *reinterpret_cast<const float4*>(weight + base + 4);
+        const float4 s10 = *reinterpret_cast<const float4*>(signs1 + d0);
+        const float4 s11 = *reinterpret_cast<const float4*>(signs1 + d0 + 4);
+        const float4 s20 = *reinterpret_cast<const float4*>(signs2 + d0);
+        const float4 s21 = *reinterpret_cast<const float4*>(signs2 + d0 + 4);
+
+        float v0 = x0.x * w0.x * rms * s10.x;
+        float v1 = x0.y * w0.y * rms * s10.y;
+        float v2 = x0.z * w0.z * rms * s10.z;
+        float v3 = x0.w * w0.w * rms * s10.w;
+        float v4 = x1.x * w1.x * rms * s11.x;
+        float v5 = x1.y * w1.y * rms * s11.y;
+        float v6 = x1.z * w1.z * rms * s11.z;
+        float v7 = x1.w * w1.w * rms * s11.w;
 
         // Local butterfly: strides 1, 2, 4 (within each thread's 8 registers).
         float t;
@@ -145,13 +182,17 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         #undef HBFLY
 
         const float s = 0.0625f;
-        x_rot_b[base]     = v0 * s * signs2[d0];
-        x_rot_b[base + 1] = v1 * s * signs2[d0 + 1];
-        x_rot_b[base + 2] = v2 * s * signs2[d0 + 2];
-        x_rot_b[base + 3] = v3 * s * signs2[d0 + 3];
-        x_rot_b[base + 4] = v4 * s * signs2[d0 + 4];
-        x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
-        x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
-        x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
+        float4 out0;
+        float4 out1;
+        out0.x = v0 * s * s20.x;
+        out0.y = v1 * s * s20.y;
+        out0.z = v2 * s * s20.z;
+        out0.w = v3 * s * s20.w;
+        out1.x = v4 * s * s21.x;
+        out1.y = v5 * s * s21.y;
+        out1.z = v6 * s * s21.z;
+        out1.w = v7 * s * s21.w;
+        *reinterpret_cast<float4*>(x_rot_b + base) = out0;
+        *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
     }
 }
