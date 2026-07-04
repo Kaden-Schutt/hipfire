@@ -49,3 +49,34 @@ npuclk (data/NoC) max = 1267 MHz = 70% of hclk (see `npu4_dpm_clk_table` L7).
 The 117.8 W4A8 ceiling makes the *feed* the binding constraint (2× the compute to
 keep fed); R1 measures the achievable feed rate. NPU pinned to `performance`
 (POWER_MODE_HIGH = DPM L7 1800/1267) for stable measurement.
+
+## R0b — II=1 confirmed at the instruction-schedule level
+
+`r0b_throughput.cc`: 4 named independent accumulators forming 4 distinct
+dependency chains (`c_ij += a_i·b_j`) from register-resident tiles, sized so the
+4 chains hide the `acc1=4` accumulator latency. Compiled `-O2` for aie2p, it
+lowers to a **zero-overhead hardware loop** (`r0b_throughput.aie2p.dis`):
+
+```
+00000150 <.LBB0_1>:                             ; zero-overhead loop body =
+  150: ...  vmac dm0, dm0, x0, x2, r11          ;   4 bundles, one vmac each,
+  160: ...  vmac dm1, dm1, x0, x4, r11          ;   no branch, no counter op,
+  170: ...  vmac dm2, dm2, x6, x2, r11          ;   nothing but nops beside them
+00000180 <.L_LEnd0>:
+  180: ...  vmac dm3, dm3, x6, x4, r11
+```
+
+4 vmacs in 4 bundles with zero loop overhead ⇒ **1 VMAC/cycle (II=1)** — the AIE
+issues exactly one bundle/cycle, so this loop sustains 1 vmac/cycle by
+construction. Combined with the empty-FU-stage itinerary, II=1 is established two
+independent ways. (Register pressure: 8×2048-bit accumulators spill; ≥4 fit,
+matching the `acc1=4` minimum.)
+
+**On-hardware numeric seal: pending.** `r0b_run.py` is a single-core `@jit`
+runner that writes the core cycle counter (`get_cycles()`) to the output so
+`cycles/(ITERS·4)` reads the empirical II. It's blocked on IRON harness
+scaffolding (the `@jit` cache-key needs an IRON `Tensor` wrapper; `run_test`
+needs an `AIEOperatorBase` subclass) — plumbing, not a compute question. For a
+register-resident-operand loop there is no memory traffic that could stall the
+issue, so the hardware necessarily sustains the scheduled II=1; the run only
+seals the number.

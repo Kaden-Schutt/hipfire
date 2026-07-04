@@ -1,0 +1,110 @@
+
+r0b.o:	file format elf32-aie
+
+Disassembly of section .text.r0b_i8i8:
+
+00000000 <r0b_i8i8>:
+       0:      	vlda	 wl0, [p0, #0x0];		vldb	 x2, [p1, #0x0];		nopm	
+       a:      	paddxm	 [sp], #0x540
+      10:      	st	 p6, [sp, #-40]
+      14:      	st	 r12, [sp, #-44]
+      18:      	vldb	 x4, [p1, #0x40];		st	 r10, [sp, #-52]
+      1e:      	vldb	 wl6, [p0, #0x20];		st	 r9, [sp, #-56]
+      24:      	mova	r11, #0x308;		st	 r11, [sp, #-48]
+      2a:      	st	 lr, [sp, #-64];		vmul	dm0, x0, x2,r11
+      32:      	st	 r8, [sp, #-60]
+      36:      	vst	 x0, [sp, #-0x540]
+      3a:      	vst	 x2, [sp, #-0x500]
+      3e:      	vst	 x4, [sp, #-0x4c0];		vmul	dm0, x0, x4,r11
+      46:      	vst	 x6, [sp, #-0x480]
+      4a:      	vst	 bmll0, [sp, #-0x440]
+      4e:      	vst	 bmlh0, [sp, #-0x400]
+      52:      	vst	 bmhl0, [sp, #-0x3c0];		vmul	dm0, x6, x2,r11
+      5a:      	vst	 bmhh0, [sp, #-0x380]
+      5e:      	vst	 bmll0, [sp, #-0x340]
+      62:      	vst	 bmlh0, [sp, #-0x300]
+      66:      	vst	 bmhl0, [sp, #-0x2c0];		vmul	dm0, x6, x4,r11
+      6e:      	vst	 bmhh0, [sp, #-0x280]
+      72:      	vst	 bmll0, [sp, #-0x240]
+      76:      	vst	 bmlh0, [sp, #-0x200]
+      7a:      	vst	 bmhl0, [sp, #-0x1c0]
+      7e:      	vst	 bmhh0, [sp, #-0x180]
+      82:      	vst	 bmll0, [sp, #-0x140]
+      86:      	vst	 bmlh0, [sp, #-0x100]
+      8a:      	vst	 bmhl0, [sp, #-0xc0]
+      8e:      	vst	 bmhh0, [sp, #-0x80];		jl	#0x0
+      98:      	nop	
+      9a:      	nop	
+      9c:      	nop	
+      9e:      	movxm	r12, #0x186a0
+      a4:      	mova	r9, #0x100;		movs	p6, p2;		movxm	r10, #0x61a80
+      b0:      	vlda	 x6, [sp, #-0x480];		nopb	;		nopxm	
+      bc:      	vlda	 x4, [sp, #-0x4c0]
+      c0:      	vlda	 bmll3, [sp, #-0x140]
+      c4:      	vlda	 bmlh3, [sp, #-0x100]
+      c8:      	vlda	 bmhl3, [sp, #-0xc0]
+      cc:      	vlda	 bmhh3, [sp, #-0x80]
+      d0:      	vlda	 bmll2, [sp, #-0x240]
+      d4:      	vlda	 bmlh2, [sp, #-0x200]
+      d8:      	vlda	 bmhl2, [sp, #-0x1c0]
+      dc:      	vlda	 bmhh2, [sp, #-0x180]
+      e0:      	vlda	 bmll1, [sp, #-0x340]
+      e4:      	vlda	 bmlh1, [sp, #-0x300]
+      e8:      	vlda	 bmhl1, [sp, #-0x2c0]
+      ec:      	vlda	 x2, [sp, #-0x500]
+      f0:      	vlda	 x0, [sp, #-0x540]
+      f4:      	vlda	 bmll0, [sp, #-0x440]
+      f8:      	vlda	 bmlh0, [sp, #-0x400]
+      fc:      	vlda	 bmhl0, [sp, #-0x3c0]
+     100:      	vlda	 bmhh0, [sp, #-0x380]
+     104:      	vlda	 bmhh1, [sp, #-0x280];		add.nc	lc, r12, #0x0
+     10a:      	movxm	ls, #0x0
+     110:      	nopa	;		nopb	;		nops	;		movxm	le, #0x0;		nopv	
+     120:      	nopa	;		nopb	;		nops	;		nopxm	;		nopv	
+     130:      	nopa	;		nopb	;		nops	;		nopxm	;		nopv	
+     140:      	nopa	;		nopb	;		nops	;		nopx	;		mov	r8, r0;		nopv	
+
+00000150 <.LBB0_1>:
+     150:      	nopa	;		nopb	;		nops	;		nopxm	;		vmac	dm0, dm0, x0, x2,r11
+     160:      	nopa	;		nopb	;		nops	;		nopxm	;		vmac	dm1, dm1, x0, x4,r11
+     170:      	nopa	;		nopb	;		nops	;		nopxm	;		vmac	dm2, dm2, x6, x2,r11
+
+00000180 <.L_LEnd0>:
+     180:      	nopa	;		nopb	;		nops	;		nopxm	;		vmac	dm3, dm3, x6, x4,r11
+     190:      	nopa	;		nopx	
+     196:      	nop	
+     198:      	vst	 bmll0, [sp, #-0x440]
+     19c:      	vst	 bmlh0, [sp, #-0x400]
+     1a0:      	vst	 bmll1, [sp, #-0x340]
+     1a4:      	vst	 bmlh1, [sp, #-0x300];		jl	#0x0
+     1ae:      	vst	 bmll2, [sp, #-0x240]
+     1b2:      	vst	 bmlh2, [sp, #-0x200]
+     1b6:      	vst	 bmll3, [sp, #-0x140]
+     1ba:      	vst	 bmlh3, [sp, #-0x100]
+     1be:      	nop	
+     1c0:      	vlda	 bmll1, [sp, #-0x240];		nopx	
+     1c6:      	vlda	 bmll0, [sp, #-0x140]
+     1ca:      	vlda	 bmlh0, [sp, #-0x100]
+     1ce:      	nop	
+     1d0:      	vlda	 bmlh1, [sp, #-0x200]
+     1d4:      	nop	
+     1d6:      	vlda	 bmll0, [sp, #-0x340]
+     1da:      	vmov	x0, bmll1
+     1de:      	vlda	 bmlh0, [sp, #-0x300];		vmov	x2, bmll0
+     1e4:      	vmov	x4, bmlh0
+     1e8:      	vlda	 bmll0, [sp, #-0x440];		vadd.32	 x0, x0, x2
+     1ee:      	mova	m0, #0x10;		vmov	x2, bmlh1
+     1f4:      	vlda	 bmlh0, [sp, #-0x400];		vadd.32	 x2, x2, x4
+     1fa:      	lda	 lr, [sp, #-64];		vmov	x4, bmll0
+     200:      	lda	 r12, [sp, #-44];		vadd.32	 x0, x0, x4
+     206:      	lda	 r11, [sp, #-48];		vmov	x4, bmlh0
+     20c:      	lda	 r8, [sp, #-60];		vadd.32	 x2, x2, x4
+     212:      	lda	 p6, [sp, #-40];		vmov	x4, bmll0
+     218:      	lda	 r10, [sp, #-52];		vadd.32	 x0, x0, x4
+     21e:      	lda	 r9, [sp, #-56];		movs	p0, p6;		sub	 r0, r0, r8;		vmov	x4, bmlh0
+     22a:      	padda	 [p0], m0;		st	 r0, [p6, #0];		ret	lr;		vadd.32	 x2, x2, x4
+     236:      	mova	m0, #-0x4c;		vst	 x0, [p0], #0x40
+     23c:      	vst	 x2, [p0], m0
+     240:      	st	 r10, [p0, #0]
+     244:      	st	 r9, [p0, #4];		paddxm	 [sp], #-0x540
+     24e:      	nop	
