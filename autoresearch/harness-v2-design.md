@@ -75,15 +75,17 @@ Unchanged in spirit from v1, now git-native:
 
 ## Core change 4 — Self-termination + roofline metric
 
-- **Per-kernel exhaustion:** a kernel is EXHAUSTED when K consecutive diverse
+- **Per-kernel exhaustion (K=5):** a kernel is EXHAUSTED when **5 consecutive** diverse
   adaptive-sampled attempts all resolve DEAD/INCONCLUSIVE. Mark it, drop it from the
   target pool.
 - **Global stop:** when every kernel above a wall%-threshold is EXHAUSTED, the run
   terminates itself — no fixed limit.
-- **Computed roofline ceiling (the "are we there" number):** from the census, sum each
-  kernel's theoretical-min time (traffic ÷ peak BW for mem-bound; else compute roofline)
-  and invert. Report `current / ceiling` each rollover. When measured baseline ≈ ceiling
-  AND all kernels exhausted, we can *claim* near-roofline — not by vibes.
+- **Computed roofline ceiling (the "are we there" number):** built from the **accurate
+  per-kernel L2/DRAM/CU mix in the census/BOD** (GL2C hit/miss + DRAM + occupancy per
+  kernel), NOT a flat traffic÷peak-BW — so a kernel's min-time reflects its actual
+  L2-resident vs DRAM-thrashing behavior. Sum per-kernel min-times, invert, report
+  `current / ceiling` each rollover. When measured baseline ≈ ceiling AND all kernels
+  exhausted, we can *claim* near-roofline — not by vibes.
 
 ## Core change 5 — Tried-levers digest (dedup)
 
@@ -109,9 +111,13 @@ Unchanged in spirit from v1, now git-native:
   - BUT `--reexamine` (or a bumped CAP / lowered floor) lets it re-open kernels under
     tighter sampling — i.e. tune without wiping, exactly like v1's ledger-awareness.
 
-## Open (for reviewer)
+## Resolved decisions (2026-07-04)
 
-- `CAP` value (16?) and exhaustion `K` (3 consecutive?) — tune from v1 variance data.
-- Whether INCONCLUSIVE-at-CAP candidates get one escalated re-visit later (bigger CAP)
-  or are parked.
-- Roofline-ceiling model fidelity (simple traffic÷BW vs per-kernel measured L2/DRAM mix).
+- **Adaptive-sampling CAP = 16.** Reruns allowed anytime, so an INCONCLUSIVE-at-CAP
+  candidate is **parked** (logged as an inconclusive negative), not permanently
+  discarded — a later rerun with a bigger CAP / lowered floor can re-open it. This is
+  the tunable, ledger-persistent re-run semantics.
+- **Exhaustion K = 5** — five consecutive DEAD/INCONCLUSIVE attempts before a kernel is
+  dropped from the target pool.
+- **Roofline-ceiling model = accurate per-kernel L2/DRAM/CU mix from the census/BOD**
+  (not flat traffic÷peak-BW), so the "are we at roofline" number is trustworthy.
