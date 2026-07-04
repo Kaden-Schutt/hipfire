@@ -74,6 +74,7 @@ Notes:
   - --resume is keyed by (seed_id, turn_number) so a partial run at turn 3
     of seed A will skip turns 0-2 on resume but continue from turn 3.
 """
+
 import argparse
 import hashlib
 import json
@@ -107,10 +108,12 @@ def load_seeds_jsonl(path: str) -> list[dict]:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
-        seeds.append({
-            "messages_base": messages,
-            "turns": turns,
-        })
+        seeds.append(
+            {
+                "messages_base": messages,
+                "turns": turns,
+            }
+        )
     return seeds
 
 
@@ -148,10 +151,12 @@ def load_seeds_turns_dir(dir_path: str) -> list[dict]:
         if not turns:
             continue
 
-        seeds.append({
-            "messages_base": [],
-            "turns": turns,
-        })
+        seeds.append(
+            {
+                "messages_base": [],
+                "turns": turns,
+            }
+        )
     return seeds
 
 
@@ -196,7 +201,7 @@ def reconstruct_output(msg: dict) -> str:
     c = msg.get("content")
     if isinstance(c, str) and c.strip():
         parts.append(c)
-    for tc in (msg.get("tool_calls") or []):
+    for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", tc)
         name = fn.get("name")
         args = fn.get("arguments")
@@ -205,8 +210,7 @@ def reconstruct_output(msg: dict) -> str:
     return "\n".join(parts)
 
 
-def call(base_url, model, key, messages, tools, max_tokens, temperature,
-         extra_headers, retries=3):
+def call(base_url, model, key, messages, tools, max_tokens, temperature, extra_headers, retries=3):
     """Send a chat completion request and return the parsed response."""
     url = base_url.rstrip("/") + "/chat/completions"
     body = {
@@ -228,15 +232,13 @@ def call(base_url, model, key, messages, tools, max_tokens, temperature,
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=600) as r:
                 return json.loads(r.read())
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
-                json.JSONDecodeError) as e:
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             last = e
             time.sleep(2 * (attempt + 1))
     raise last
 
 
-def run_multiturn_seed(seed, base_url, model, key, max_tokens, temperature,
-                       extra_headers, done_turns, out_path):
+def run_multiturn_seed(seed, base_url, model, key, max_tokens, temperature, extra_headers, done_turns, out_path):
     """Run all turns for one multi-turn seed. Returns list of (sid, turn, record)."""
     sid = seed_id(seed)
     messages = list(seed["messages_base"])
@@ -266,8 +268,7 @@ def run_multiturn_seed(seed, base_url, model, key, max_tokens, temperature,
 
         messages.append(msg)
         try:
-            resp = call(base_url, model, key, messages, tools,
-                        max_tokens, temperature, extra_headers)
+            resp = call(base_url, model, key, messages, tools, max_tokens, temperature, extra_headers)
             assistant_msg = resp["choices"][0]["message"]
 
             rec = {
@@ -275,8 +276,7 @@ def run_multiturn_seed(seed, base_url, model, key, max_tokens, temperature,
                 "turn": turn_idx,
                 "output": reconstruct_output(assistant_msg),
                 "content": assistant_msg.get("content"),
-                "reasoning_content": (assistant_msg.get("reasoning_content") or
-                                      assistant_msg.get("reasoning")),
+                "reasoning_content": (assistant_msg.get("reasoning_content") or assistant_msg.get("reasoning")),
                 "tool_calls": assistant_msg.get("tool_calls"),
                 "completion_tokens": resp.get("usage", {}).get("completion_tokens"),
             }
@@ -299,31 +299,29 @@ def run_multiturn_seed(seed, base_url, model, key, max_tokens, temperature,
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--base-url", required=True,
-                   help="e.g. http://localhost:8000/v1 or https://openrouter.ai/api/v1")
-    p.add_argument("--model", required=True,
-                   help="model slug (must be Qwen3.6-27B)")
-    p.add_argument("--seeds", default=None,
-                   help="seeds JSONL file (optional, use --turns-dir for plain text)")
-    p.add_argument("--turns-dir", default=None,
-                   help="directory of plain-text turn files separated by '----'")
-    p.add_argument("--output", required=True,
-                   help="output JSONL (append mode)")
-    p.add_argument("--api-key-env", default=None,
-                   help="env var holding the API key (default: try OPENROUTER_API_KEY then OPENAI_API_KEY)")
-    p.add_argument("--max-tokens", type=int, default=4096,
-                   help="max tokens PER TURN (default 4096; reasoning models spend "
-                        "most of a small budget inside <think> and never reach the "
-                        "answer/tool_call, so 512 truncates every turn to reasoning-"
-                        "only — raise to 8192 for long agentic tool loops)")
-    p.add_argument("--temperature", type=float, default=0.7,
-                   help="temperature (default 0.7 for diversity)")
-    p.add_argument("--concurrency", type=int, default=4,
-                   help="parallel seeds (default 4)")
-    p.add_argument("--resume", action="store_true",
-                   help="skip (seed_id, turn) pairs already in --output")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--base-url", required=True, help="e.g. http://localhost:8000/v1 or https://openrouter.ai/api/v1")
+    p.add_argument("--model", required=True, help="model slug (must be Qwen3.6-27B)")
+    p.add_argument("--seeds", default=None, help="seeds JSONL file (optional, use --turns-dir for plain text)")
+    p.add_argument("--turns-dir", default=None, help="directory of plain-text turn files separated by '----'")
+    p.add_argument("--output", required=True, help="output JSONL (append mode)")
+    p.add_argument(
+        "--api-key-env",
+        default=None,
+        help="env var holding the API key (default: try OPENROUTER_API_KEY then OPENAI_API_KEY)",
+    )
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=4096,
+        help="max tokens PER TURN (default 4096; reasoning models spend "
+        "most of a small budget inside <think> and never reach the "
+        "answer/tool_call, so 512 truncates every turn to reasoning-"
+        "only — raise to 8192 for long agentic tool loops)",
+    )
+    p.add_argument("--temperature", type=float, default=0.7, help="temperature (default 0.7 for diversity)")
+    p.add_argument("--concurrency", type=int, default=4, help="parallel seeds (default 4)")
+    p.add_argument("--resume", action="store_true", help="skip (seed_id, turn) pairs already in --output")
     args = p.parse_args()
 
     if not args.seeds and not args.turns_dir:
@@ -365,22 +363,20 @@ def main() -> int:
                 pass
 
     total_turns = sum(len(s["turns"]) for s in seeds)
-    done_count = sum(
-        sum(1 for ti in range(len(s["turns"])) if f"{seed_id(s)}:{ti}" in done_turns)
-        for s in seeds
-    )
+    done_count = sum(sum(1 for ti in range(len(s["turns"])) if f"{seed_id(s)}:{ti}" in done_turns) for s in seeds)
     todo_turns = total_turns - done_count
-    sys.stderr.write(f"seeds: {len(seeds)} total, {total_turns} turns, "
-                     f"{done_count} already done, {todo_turns} to generate\n")
+    sys.stderr.write(
+        f"seeds: {len(seeds)} total, {total_turns} turns, {done_count} already done, {todo_turns} to generate\n"
+    )
 
     lock = threading.Lock()
     fh = open(out_path, "a", encoding="utf-8")
     stats = {"ok": 0, "err": 0, "toks": 0}
 
     def work(seed: dict) -> None:
-        results = run_multiturn_seed(seed, args.base_url, args.model, key,
-                                     args.max_tokens, args.temperature,
-                                     extra_headers, done_turns, out_path)
+        results = run_multiturn_seed(
+            seed, args.base_url, args.model, key, args.max_tokens, args.temperature, extra_headers, done_turns, out_path
+        )
         for item in results:
             sid, turn_idx, resume_key, rec, *err = item
             if rec is None:
@@ -394,14 +390,12 @@ def main() -> int:
                 stats["ok"] += 1
                 stats["toks"] += rec.get("completion_tokens") or 0
                 if stats["ok"] % 20 == 0:
-                    sys.stderr.write(f"  {stats['ok']} ok / {stats['err']} err / "
-                                     f"~{stats['toks']} completion toks\n")
+                    sys.stderr.write(f"  {stats['ok']} ok / {stats['err']} err / ~{stats['toks']} completion toks\n")
 
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
         list(ex.map(work, seeds))
     fh.close()
-    sys.stderr.write(f"done: {stats['ok']} ok, {stats['err']} err, "
-                     f"~{stats['toks']} completion tokens -> {out_path}\n")
+    sys.stderr.write(f"done: {stats['ok']} ok, {stats['err']} err, ~{stats['toks']} completion tokens -> {out_path}\n")
     return 0 if stats["ok"] > 0 or not todo_turns else 1
 
 

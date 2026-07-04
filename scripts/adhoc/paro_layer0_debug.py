@@ -20,6 +20,7 @@ import numpy as np
 # Try torch first, fall back to numpy-only
 try:
     import torch
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
@@ -47,7 +48,7 @@ GROUP_SIZE = 128
 CONV_KERNEL_DIM = 4
 PARTIAL_ROTARY_FACTOR = 0.25
 
-K_DIM = LINEAR_NUM_KEY_HEADS * LINEAR_KEY_HEAD_DIM   # 2048
+K_DIM = LINEAR_NUM_KEY_HEADS * LINEAR_KEY_HEAD_DIM  # 2048
 V_DIM = LINEAR_NUM_VALUE_HEADS * LINEAR_VALUE_HEAD_DIM  # 2048
 QKV_DIM = K_DIM * 2 + V_DIM  # 6144
 
@@ -186,11 +187,11 @@ def awq_dequant_gemv(qweight, qzeros, scales, x, in_dim, out_dim, group_size=128
 
             for g in range(groups_per_row):
                 scale_val = sc[g, m].item()
-                zero_nibble = ((qz[g, col_word].item() >> nibble_shift) & 0xF)
+                zero_nibble = (qz[g, col_word].item() >> nibble_shift) & 0xF
 
                 for i in range(group_size):
                     k = g * group_size + i
-                    q_nibble = ((qw[k, col_word].item() >> nibble_shift) & 0xF)
+                    q_nibble = (qw[k, col_word].item() >> nibble_shift) & 0xF
                     W[k, m] = scale_val * (q_nibble - zero_nibble)
 
         y = x.float() @ W
@@ -261,8 +262,9 @@ def fp16_gemv(weight_bytes, x, out_dim, in_dim):
         return W_f32 @ np.array(x, dtype=np.float32)
 
 
-def paro_rotate_gemv(qw_bytes, qz_bytes, sc_bytes, pairs_bytes, theta_bytes, cs_bytes,
-                     x, in_dim, out_dim, group_size=128, krot=8):
+def paro_rotate_gemv(
+    qw_bytes, qz_bytes, sc_bytes, pairs_bytes, theta_bytes, cs_bytes, x, in_dim, out_dim, group_size=128, krot=8
+):
     """
     ParoQuant: rotate activations + AWQ dequant GEMV.
     1. Apply Givens rotation to x
@@ -355,7 +357,7 @@ def main():
 
     # Also open as raw bytes for rotation metadata
     with open(os.path.join(MODEL_DIR, "model.safetensors"), "rb") as f:
-        header_len = struct.unpack('<Q', f.read(8))[0]
+        header_len = struct.unpack("<Q", f.read(8))[0]
         header_json = json.loads(f.read(header_len))
         data_offset_base = 8 + header_len
 
@@ -405,11 +407,21 @@ def main():
     theta_bytes = load_raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.theta")
     cs_bytes = load_raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.channel_scales")
 
-    print(f"  qweight size = {len(qw_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.qweight']['shape']}")
-    print(f"  scales  size = {len(sc_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.scales']['shape']}")
-    print(f"  pairs   size = {len(pairs_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.pairs']['shape']}")
-    print(f"  theta   size = {len(theta_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.theta']['shape']}")
-    print(f"  cs      size = {len(cs_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.channel_scales']['shape']}")
+    print(
+        f"  qweight size = {len(qw_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.qweight']['shape']}"
+    )
+    print(
+        f"  scales  size = {len(sc_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.scales']['shape']}"
+    )
+    print(
+        f"  pairs   size = {len(pairs_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.pairs']['shape']}"
+    )
+    print(
+        f"  theta   size = {len(theta_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.theta']['shape']}"
+    )
+    print(
+        f"  cs      size = {len(cs_bytes)} bytes, shape = {header_json['model.language_model.layers.0.linear_attn.in_proj_qkv.channel_scales']['shape']}"
+    )
 
     # Show rotation metadata
     pairs_arr = np.frombuffer(pairs_bytes, dtype=np.int16).reshape(KROT, DIM)
@@ -435,15 +447,25 @@ def main():
         x_rot = givens_rotate(x_normed.clone(), pairs_t, theta_t, cs_t, DIM, KROT, GROUP_SIZE)
         print(f"  x_rotated[0:8] = {fmt_arr(x_rot)}")
     else:
-        x_rot = givens_rotate(x_normed_np.copy(), pairs_arr, theta_arr.astype(np.float32), cs_f32, DIM, KROT, GROUP_SIZE)
+        x_rot = givens_rotate(
+            x_normed_np.copy(), pairs_arr, theta_arr.astype(np.float32), cs_f32, DIM, KROT, GROUP_SIZE
+        )
         print(f"  x_rotated[0:8] = {fmt_arr(x_rot)}")
 
     # Full GEMV with rotation
     print("  Computing rotated GEMV (this takes a while for full matrix)...")
     qkv_result = paro_rotate_gemv(
-        qw_bytes, qz_bytes, sc_bytes, pairs_bytes, theta_bytes, cs_bytes,
+        qw_bytes,
+        qz_bytes,
+        sc_bytes,
+        pairs_bytes,
+        theta_bytes,
+        cs_bytes,
         x_normed if HAS_TORCH else x_normed_np,
-        DIM, QKV_DIM, GROUP_SIZE, KROT
+        DIM,
+        QKV_DIM,
+        GROUP_SIZE,
+        KROT,
     )
     if HAS_TORCH:
         qkv_result = torch.from_numpy(qkv_result) if isinstance(qkv_result, np.ndarray) else qkv_result
@@ -463,9 +485,7 @@ def main():
 
     print("  Computing rotated GEMV...")
     z_result = paro_rotate_gemv(
-        z_qw, z_qz, z_sc, z_pairs, z_theta, z_cs,
-        x_normed if HAS_TORCH else x_normed_np,
-        DIM, V_DIM, GROUP_SIZE, KROT
+        z_qw, z_qz, z_sc, z_pairs, z_theta, z_cs, x_normed if HAS_TORCH else x_normed_np, DIM, V_DIM, GROUP_SIZE, KROT
     )
     if HAS_TORCH:
         z_result = torch.from_numpy(z_result) if isinstance(z_result, np.ndarray) else z_result
@@ -561,8 +581,8 @@ def main():
 
     # Split: q_raw[k_dim], k_raw[k_dim], v[v_dim]
     q_raw = silu_np[:K_DIM].copy()
-    k_raw = silu_np[K_DIM:K_DIM * 2].copy()
-    v = silu_np[K_DIM * 2:].copy()
+    k_raw = silu_np[K_DIM : K_DIM * 2].copy()
+    v = silu_np[K_DIM * 2 :].copy()
 
     print(f"  q_raw[0:8] = {fmt_arr(q_raw)}")
     print(f"  k_raw[0:8] = {fmt_arr(k_raw)}")

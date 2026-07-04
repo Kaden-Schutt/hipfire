@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -85,7 +105,7 @@ fn main() {
 }
 
 fn fract_sin(x: f32) -> f32 {
-    (x.sin() * 12345.6789f32).fract() * 2.0f32 - 1.0f32
+    (x.sin() * 12_345.679_f32).fract() * 2.0f32 - 1.0f32
 }
 
 fn compare(_name: &str, a: &[f32], b: &[f32]) -> (bool, f32, f32) {
@@ -105,7 +125,10 @@ fn compare(_name: &str, a: &[f32], b: &[f32]) -> (bool, f32, f32) {
 ///   one fp32 scale + one fp32 zero + 96 B of packed 8x3-bit weights = 104 B/group.
 /// Cross-byte unpack pattern matches kernels/src/gemv_hfq3g256.hip.
 fn quantize_mq3g256(f32_data: &[f32]) -> Vec<u8> {
-    assert!(f32_data.len() % 256 == 0, "must be multiple of 256");
+    assert!(
+        f32_data.len().is_multiple_of(256),
+        "must be multiple of 256"
+    );
     let n_groups = f32_data.len() / 256;
     let mut bytes = Vec::with_capacity(n_groups * 104);
 

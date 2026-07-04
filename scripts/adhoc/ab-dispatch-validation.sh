@@ -50,7 +50,7 @@ DAEMON_EXE="target/release/examples/daemon"
 GRAPH="${HIPFIRE_GRAPH:-0}"
 
 # GPU selection
-read -ra GPUS_TO_TEST <<< "${HIPFIRE_GPUS:-0 1}"
+read -ra GPUS_TO_TEST <<<"${HIPFIRE_GPUS:-0 1}"
 GPU_BIG="${HIPFIRE_GPU_0_BIG:-0}"
 
 # Models for correctness + speed (must fit on all tested GPUs)
@@ -92,11 +92,14 @@ while [ $# -gt 0 ]; do
             MODEL_FILTER="$1"
             ;;
         --long-prefill) PREFILL=512 ;;
-        -h|--help)
+        -h | --help)
             sed -n '3,30p' "$0"
             exit 0
             ;;
-        *) echo "unknown arg: $1" >&2; exit 2 ;;
+        *)
+            echo "unknown arg: $1" >&2
+            exit 2
+            ;;
     esac
     shift
 done
@@ -190,22 +193,22 @@ run_bench() {
     local model_path="$MODELS_DIR/$model"
 
     if [ ! -f "$model_path" ] && [ ! -L "$model_path" ]; then
-        echo "  SKIP (model not found: $model_path)" >> "$log"
+        echo "  SKIP (model not found: $model_path)" >>"$log"
         echo "SKIP"
         return
     fi
 
     ROCR_VISIBLE_DEVICES="$gpu" \
-    HIPFIRE_KV_MODE="$KV_MODE" \
-    HIPFIRE_GRAPH="$GRAPH" \
-    "$bench_bin" "$model_path" \
+        HIPFIRE_KV_MODE="$KV_MODE" \
+        HIPFIRE_GRAPH="$GRAPH" \
+        "$bench_bin" "$model_path" \
         --prefill "$PREFILL" --warmup "$WARMUP" --gen "$GEN" \
-        > "$log.stdout" 2> "$log.stderr"
+        >"$log.stdout" 2>"$log.stderr"
 
     local ec=$?
     if [ $ec -ne 0 ]; then
-        echo "FAIL (exit=$ec)" >> "$log"
-        head -5 "$log.stderr" >> "$log"
+        echo "FAIL (exit=$ec)" >>"$log"
+        head -5 "$log.stderr" >>"$log"
         echo "FAIL"
         return
     fi
@@ -218,13 +221,13 @@ run_bench() {
         | grep -oE 'prefill_tok_s=[0-9.]+' | tail -1 | sed 's/prefill_tok_s=//')
 
     if [ -z "$tok_s" ]; then
-        echo "FAIL (no gen_tok_s)" >> "$log"
+        echo "FAIL (no gen_tok_s)" >>"$log"
         echo "FAIL"
         return
     fi
 
     # Write both metrics to log
-    echo "decode=$tok_s prefill=${prefill_tok_s:-N/A}" >> "$log"
+    echo "decode=$tok_s prefill=${prefill_tok_s:-N/A}" >>"$log"
     echo "decode=$tok_s prefill=${prefill_tok_s:-N/A}"
 }
 
@@ -250,14 +253,14 @@ run_correctness() {
 
     prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$prompt")
 
-    cat > "$in_file" <<JL
+    cat >"$in_file" <<JL
 {"type":"load","model":"$model_path","params":{"max_seq":2048}}
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":${MAX_TOKENS},"repeat_penalty":1.0}
 {"type":"unload"}
 JL
 
     ROCR_VISIBLE_DEVICES="$gpu" \
-    timeout 300 "$daemon_bin" < "$in_file" > "$out_file" 2>"${out_file}.stderr"
+        timeout 300 "$daemon_bin" <"$in_file" >"$out_file" 2>"${out_file}.stderr"
     local ec=$?
 
     rm -f "$in_file"
@@ -268,9 +271,9 @@ JL
 
     if [ "$ec" -ne 0 ] || [ "$n_tokens" -eq 0 ] || [ -n "$panic" ]; then
         echo "  HARD_ERROR (exit=$ec tokens=$n_tokens panic=${panic:+yes})"
-        echo "HARD_ERROR" > "$out_dir/result_${label}"
+        echo "HARD_ERROR" >"$out_dir/result_${label}"
         # Capture last 5 lines of stderr for diagnostics
-        tail -5 "${out_file}.stderr" >> "$out_dir/result_${label}" 2>/dev/null || true
+        tail -5 "${out_file}.stderr" >>"$out_dir/result_${label}" 2>/dev/null || true
         return 1
     fi
 
@@ -285,9 +288,9 @@ for line in sys.stdin:
     t = obj.get('text', '')
     texts.append(t)
 print(''.join(texts))
-" > "$out_dir/tokens_${label}.txt" 2>/dev/null
+" >"$out_dir/tokens_${label}.txt" 2>/dev/null
 
-    echo "$n_tokens tokens" > "$out_dir/result_${label}"
+    echo "$n_tokens tokens" >"$out_dir/result_${label}"
     echo "  OK ($n_tokens tokens)"
     return 0
 }
@@ -328,214 +331,220 @@ trap '
 echo "═══ Phase 1: Build ═══════════════════════════════════════════════════"
 echo
 
-build_ref "$A_REF" "A" || { echo "FATAL: build A failed" >&2; exit 1; }
-build_ref "$B_REF" "B" || { echo "FATAL: build B failed" >&2; exit 1; }
+build_ref "$A_REF" "A" || {
+    echo "FATAL: build A failed" >&2
+    exit 1
+}
+build_ref "$B_REF" "B" || {
+    echo "FATAL: build B failed" >&2
+    exit 1
+}
 
 # Restore working tree
 git checkout -f "$START_BRANCH" >/dev/null 2>&1 || true
-[ $STASHED -eq 0 ] && git stash pop >/dev/null 2>&1 && STASHED=1  # prevent double-pop
+[ $STASHED -eq 0 ] && git stash pop >/dev/null 2>&1 && STASHED=1 # prevent double-pop
 
 # ── Phase 2+3: Correctness + Speed ───────────────────────────────────────
 REPORT="$OUT/report.md"
 HARD_ERRORS=0
 
 {
-echo "# A/B Dispatch Validation Report"
-echo
-echo "| Field | Value |"
-echo "|---|---|"
-echo "| A (baseline) | $A_REF ($A_HASH) |"
-echo "| B (dispatch) | $B_REF ($B_HASH) |"
-echo "| Date | $(date -Iseconds) |"
-echo "| GPUs | ${GPUS_TO_TEST[*]} |"
-echo "| KV mode | $KV_MODE |"
-echo "| Prefill | $PREFILL tokens |"
-echo
-
-# ── Correctness ──────────────────────────────────────────────────────────
-if [ "$DO_CORRECTNESS" -eq 1 ]; then
-    echo "## 1. Correctness (temp=0, byte-parity)"
+    echo "# A/B Dispatch Validation Report"
     echo
-    echo "Each (model × prompt × GPU) is run at temp=0 on both sides."
-    echo "Token output is compared for exact match. Any mismatch is flagged."
+    echo "| Field | Value |"
+    echo "|---|---|"
+    echo "| A (baseline) | $A_REF ($A_HASH) |"
+    echo "| B (dispatch) | $B_REF ($B_HASH) |"
+    echo "| Date | $(date -Iseconds) |"
+    echo "| GPUs | ${GPUS_TO_TEST[*]} |"
+    echo "| KV mode | $KV_MODE |"
+    echo "| Prefill | $PREFILL tokens |"
     echo
-    echo "| GPU | Model | Prompt | A tokens | B tokens | Match |"
-    echo "|-----|-------|--------|----------|----------|-------|"
 
-    for gpu in "${GPUS_TO_TEST[@]}"; do
-        gpu_name="${GPU_NAMES[$gpu]:-gpu$gpu}"
+    # ── Correctness ──────────────────────────────────────────────────────────
+    if [ "$DO_CORRECTNESS" -eq 1 ]; then
+        echo "## 1. Correctness (temp=0, byte-parity)"
+        echo
+        echo "Each (model × prompt × GPU) is run at temp=0 on both sides."
+        echo "Token output is compared for exact match. Any mismatch is flagged."
+        echo
+        echo "| GPU | Model | Prompt | A tokens | B tokens | Match |"
+        echo "|-----|-------|--------|----------|----------|-------|"
 
-        models_this_gpu=("${MODELS[@]}")
-        # Add big models only on GPU 0 if flagged, or if explicitly requested
-        if [ "$gpu" -eq 0 ] && [ "$GPU_BIG" = "1" ]; then
-            models_this_gpu+=("${MODELS_BIG[@]}")
-        fi
+        for gpu in "${GPUS_TO_TEST[@]}"; do
+            gpu_name="${GPU_NAMES[$gpu]:-gpu$gpu}"
 
-        for model in "${models_this_gpu[@]}"; do
-            for prompt_name in "reason" "code"; do
-                case "$prompt_name" in
-                    reason) prompt="$PROMPT_REASON" ;;
-                    code)   prompt="$PROMPT_CODE" ;;
-                esac
+            models_this_gpu=("${MODELS[@]}")
+            # Add big models only on GPU 0 if flagged, or if explicitly requested
+            if [ "$gpu" -eq 0 ] && [ "$GPU_BIG" = "1" ]; then
+                models_this_gpu+=("${MODELS_BIG[@]}")
+            fi
 
-                run_id="${gpu_name}|${model}|${prompt_name}"
-                run_dir="$OUT/correctness/${gpu_name}/${model}/${prompt_name}"
-                mkdir -p "$run_dir"
+            for model in "${models_this_gpu[@]}"; do
+                for prompt_name in "reason" "code"; do
+                    case "$prompt_name" in
+                        reason) prompt="$PROMPT_REASON" ;;
+                        code) prompt="$PROMPT_CODE" ;;
+                    esac
 
-                echo "  [$run_id] Running correctness..."
+                    run_id="${gpu_name}|${model}|${prompt_name}"
+                    run_dir="$OUT/correctness/${gpu_name}/${model}/${prompt_name}"
+                    mkdir -p "$run_dir"
 
-                a_result=$(run_correctness "$gpu" "$model" "$OUT/daemon_A" "$prompt" "A" "$run_dir")
-                b_result=$(run_correctness "$gpu" "$model" "$OUT/daemon_B" "$prompt" "B" "$run_dir")
+                    echo "  [$run_id] Running correctness..."
 
-                a_tok=$(cat "$run_dir/result_A" 2>/dev/null | head -1 || echo "MISSING")
-                b_tok=$(cat "$run_dir/result_B" 2>/dev/null | head -1 || echo "MISSING")
+                    a_result=$(run_correctness "$gpu" "$model" "$OUT/daemon_A" "$prompt" "A" "$run_dir")
+                    b_result=$(run_correctness "$gpu" "$model" "$OUT/daemon_B" "$prompt" "B" "$run_dir")
 
-                if echo "$a_result" | grep -q "HARD_ERROR" || echo "$b_result" | grep -q "HARD_ERROR"; then
-                    match="**HARD_ERROR**"
-                    HARD_ERRORS=$((HARD_ERRORS + 1))
-                elif [ ! -f "$run_dir/tokens_A.txt" ] || [ ! -f "$run_dir/tokens_B.txt" ]; then
-                    match="SKIP"
-                elif diff -q "$run_dir/tokens_A.txt" "$run_dir/tokens_B.txt" >/dev/null 2>&1; then
-                    match="✅ match"
-                else
-                    match="❌ MISMATCH"
-                    HARD_ERRORS=$((HARD_ERRORS + 1))
-                    diff -u "$run_dir/tokens_A.txt" "$run_dir/tokens_B.txt" \
-                        > "$run_dir/diff.txt" 2>/dev/null || true
-                fi
+                    a_tok=$(cat "$run_dir/result_A" 2>/dev/null | head -1 || echo "MISSING")
+                    b_tok=$(cat "$run_dir/result_B" 2>/dev/null | head -1 || echo "MISSING")
 
-                echo "| $gpu_name | $model | $prompt_name | $a_tok | $b_tok | $match |"
+                    if echo "$a_result" | grep -q "HARD_ERROR" || echo "$b_result" | grep -q "HARD_ERROR"; then
+                        match="**HARD_ERROR**"
+                        HARD_ERRORS=$((HARD_ERRORS + 1))
+                    elif [ ! -f "$run_dir/tokens_A.txt" ] || [ ! -f "$run_dir/tokens_B.txt" ]; then
+                        match="SKIP"
+                    elif diff -q "$run_dir/tokens_A.txt" "$run_dir/tokens_B.txt" >/dev/null 2>&1; then
+                        match="✅ match"
+                    else
+                        match="❌ MISMATCH"
+                        HARD_ERRORS=$((HARD_ERRORS + 1))
+                        diff -u "$run_dir/tokens_A.txt" "$run_dir/tokens_B.txt" \
+                            >"$run_dir/diff.txt" 2>/dev/null || true
+                    fi
+
+                    echo "| $gpu_name | $model | $prompt_name | $a_tok | $b_tok | $match |"
+                done
             done
         done
-    done
-    echo
-fi
+        echo
+    fi
 
-# ── Speed ────────────────────────────────────────────────────────────────
-if [ "$DO_SPEED" -eq 1 ]; then
-    echo "## 2. Speed (bench_qwen35_mq4, prefill=$PREFILL)"
-    echo
-    echo "| GPU | Model | A decode | B decode | Δ% | A prefill | B prefill | Δ% | Verdict |"
-    echo "|-----|-------|----------|----------|-----|-----------|-----------|-----|---------|"
+    # ── Speed ────────────────────────────────────────────────────────────────
+    if [ "$DO_SPEED" -eq 1 ]; then
+        echo "## 2. Speed (bench_qwen35_mq4, prefill=$PREFILL)"
+        echo
+        echo "| GPU | Model | A decode | B decode | Δ% | A prefill | B prefill | Δ% | Verdict |"
+        echo "|-----|-------|----------|----------|-----|-----------|-----------|-----|---------|"
 
-    for gpu in "${GPUS_TO_TEST[@]}"; do
-        gpu_name="${GPU_NAMES[$gpu]:-gpu$gpu}"
-        models_this_gpu=("${MODELS[@]}")
-        if [ "$gpu" -eq 0 ] && [ "$GPU_BIG" = "1" ]; then
-            models_this_gpu+=("${MODELS_BIG[@]}")
-        fi
-
-        for model in "${models_this_gpu[@]}"; do
-            run_id="${gpu_name}|${model}"
-            run_dir="$OUT/speed/${gpu_name}/${model}"
-            mkdir -p "$run_dir"
-
-            echo "  [$run_id] Running speed bench..."
-
-            a_result=$(run_bench "$gpu" "$model" "$OUT/bench_A" "$run_dir/a.log")
-            b_result=$(run_bench "$gpu" "$model" "$OUT/bench_B" "$run_dir/b.log")
-
-            if [ "$a_result" = "SKIP" ] || [ "$b_result" = "SKIP" ]; then
-                echo "| $gpu_name | $model | — | — | — | — | — | — | SKIP |"
-                continue
+        for gpu in "${GPUS_TO_TEST[@]}"; do
+            gpu_name="${GPU_NAMES[$gpu]:-gpu$gpu}"
+            models_this_gpu=("${MODELS[@]}")
+            if [ "$gpu" -eq 0 ] && [ "$GPU_BIG" = "1" ]; then
+                models_this_gpu+=("${MODELS_BIG[@]}")
             fi
 
-            if [ "$a_result" = "FAIL" ] || [ "$b_result" = "FAIL" ]; then
-                echo "| $gpu_name | $model | $a_result | $b_result | — | — | — | — | **FAIL** |"
-                HARD_ERRORS=$((HARD_ERRORS + 1))
-                continue
-            fi
+            for model in "${models_this_gpu[@]}"; do
+                run_id="${gpu_name}|${model}"
+                run_dir="$OUT/speed/${gpu_name}/${model}"
+                mkdir -p "$run_dir"
 
-            # Parse results: "decode=X prefill=Y"
-            a_decode=$(echo "$a_result" | grep -oE 'decode=[0-9.]+' | sed 's/decode=//')
-            b_decode=$(echo "$b_result" | grep -oE 'decode=[0-9.]+' | sed 's/decode=//')
-            a_prefill=$(echo "$a_result" | grep -oE 'prefill=[0-9.]+' | sed 's/prefill=//')
-            b_prefill=$(echo "$b_result" | grep -oE 'prefill=[0-9.]+' | sed 's/prefill=//')
+                echo "  [$run_id] Running speed bench..."
 
-            decode_delta=$(delta_pct "$a_decode" "$b_decode")
-            prefill_delta=$(delta_pct "$a_prefill" "$b_prefill")
+                a_result=$(run_bench "$gpu" "$model" "$OUT/bench_A" "$run_dir/a.log")
+                b_result=$(run_bench "$gpu" "$model" "$OUT/bench_B" "$run_dir/b.log")
 
-            # Verdict based on decode delta (±5% mandatory investigation from #397)
-            verdict="OK"
-            if [ "$decode_delta" != "N/A" ]; then
-                if is_above_threshold "$decode_delta" "5.0"; then
-                    verdict="⚠️ INVESTIGATE (>±5%)"
-                    HARD_ERRORS=$((HARD_ERRORS + 1))
-                elif is_above_threshold "$decode_delta" "3.0"; then
-                    verdict="⚠️ MARGINAL (>±3%)"
+                if [ "$a_result" = "SKIP" ] || [ "$b_result" = "SKIP" ]; then
+                    echo "| $gpu_name | $model | — | — | — | — | — | — | SKIP |"
+                    continue
                 fi
-            fi
 
-            a_pf="${a_prefill:--}"
-            b_pf="${b_prefill:--}"
-            pf_delta="${prefill_delta:--}"
+                if [ "$a_result" = "FAIL" ] || [ "$b_result" = "FAIL" ]; then
+                    echo "| $gpu_name | $model | $a_result | $b_result | — | — | — | — | **FAIL** |"
+                    HARD_ERRORS=$((HARD_ERRORS + 1))
+                    continue
+                fi
 
-            echo "| $gpu_name | $model | $a_decode | $b_decode | ${decode_delta}% | $a_pf | $b_pf | ${pf_delta}% | $verdict |"
+                # Parse results: "decode=X prefill=Y"
+                a_decode=$(echo "$a_result" | grep -oE 'decode=[0-9.]+' | sed 's/decode=//')
+                b_decode=$(echo "$b_result" | grep -oE 'decode=[0-9.]+' | sed 's/decode=//')
+                a_prefill=$(echo "$a_result" | grep -oE 'prefill=[0-9.]+' | sed 's/prefill=//')
+                b_prefill=$(echo "$b_result" | grep -oE 'prefill=[0-9.]+' | sed 's/prefill=//')
+
+                decode_delta=$(delta_pct "$a_decode" "$b_decode")
+                prefill_delta=$(delta_pct "$a_prefill" "$b_prefill")
+
+                # Verdict based on decode delta (±5% mandatory investigation from #397)
+                verdict="OK"
+                if [ "$decode_delta" != "N/A" ]; then
+                    if is_above_threshold "$decode_delta" "5.0"; then
+                        verdict="⚠️ INVESTIGATE (>±5%)"
+                        HARD_ERRORS=$((HARD_ERRORS + 1))
+                    elif is_above_threshold "$decode_delta" "3.0"; then
+                        verdict="⚠️ MARGINAL (>±3%)"
+                    fi
+                fi
+
+                a_pf="${a_prefill:--}"
+                b_pf="${b_prefill:--}"
+                pf_delta="${prefill_delta:--}"
+
+                echo "| $gpu_name | $model | $a_decode | $b_decode | ${decode_delta}% | $a_pf | $b_pf | ${pf_delta}% | $verdict |"
+            done
         done
-    done
+        echo
+    fi
+
+    # ── GPU-free coverage tests ─────────────────────────────────────────────
+    echo "## 3. GPU-free dispatch coverage (hipfire-dispatch-tests)"
     echo
-fi
+    echo "Runs on side B only. Catches missing-arm / arch dead-gate defects without a GPU."
+    echo
 
-# ── GPU-free coverage tests ─────────────────────────────────────────────
-echo "## 3. GPU-free dispatch coverage (hipfire-dispatch-tests)"
-echo
-echo "Runs on side B only. Catches missing-arm / arch dead-gate defects without a GPU."
-echo
-
-# Check if hipfire-dispatch-tests exists on side B
-git checkout -f "$B_REF" >/dev/null 2>&1
-if [ -d "crates/hipfire-dispatch-tests" ]; then
-    coverage_out=$(cargo test -p hipfire-dispatch-tests 2>&1)
-    coverage_ec=$?
-    if [ $coverage_ec -eq 0 ]; then
-        echo "| Test | Result |"
-        echo "|------|--------|"
-        echo "| hipfire-dispatch-tests | ✅ pass |"
+    # Check if hipfire-dispatch-tests exists on side B
+    git checkout -f "$B_REF" >/dev/null 2>&1
+    if [ -d "crates/hipfire-dispatch-tests" ]; then
+        coverage_out=$(cargo test -p hipfire-dispatch-tests 2>&1)
+        coverage_ec=$?
+        if [ $coverage_ec -eq 0 ]; then
+            echo "| Test | Result |"
+            echo "|------|--------|"
+            echo "| hipfire-dispatch-tests | ✅ pass |"
+        else
+            echo "| Test | Result |"
+            echo "|------|--------|"
+            echo "| hipfire-dispatch-tests | ❌ FAIL |"
+            echo '```'
+            echo "$coverage_out" | tail -20
+            echo '```'
+            HARD_ERRORS=$((HARD_ERRORS + 1))
+        fi
     else
         echo "| Test | Result |"
         echo "|------|--------|"
-        echo "| hipfire-dispatch-tests | ❌ FAIL |"
-        echo '```'
-        echo "$coverage_out" | tail -20
-        echo '```'
-        HARD_ERRORS=$((HARD_ERRORS + 1))
+        echo "| hipfire-dispatch-tests | SKIP (crate not present on B) |"
     fi
-else
-    echo "| Test | Result |"
-    echo "|------|--------|"
-    echo "| hipfire-dispatch-tests | SKIP (crate not present on B) |"
-fi
 
-# Also run dispatch crate internal tests if present
-if [ -d "crates/hipfire-dispatch" ]; then
-    dispatch_out=$(cargo test -p hipfire-dispatch 2>&1)
-    dispatch_ec=$?
-    if [ $dispatch_ec -eq 0 ]; then
-        echo "| hipfire-dispatch (internal) | ✅ pass |"
-    else
-        echo "| hipfire-dispatch (internal) | ❌ FAIL |"
-        HARD_ERRORS=$((HARD_ERRORS + 1))
+    # Also run dispatch crate internal tests if present
+    if [ -d "crates/hipfire-dispatch" ]; then
+        dispatch_out=$(cargo test -p hipfire-dispatch 2>&1)
+        dispatch_ec=$?
+        if [ $dispatch_ec -eq 0 ]; then
+            echo "| hipfire-dispatch (internal) | ✅ pass |"
+        else
+            echo "| hipfire-dispatch (internal) | ❌ FAIL |"
+            HARD_ERRORS=$((HARD_ERRORS + 1))
+        fi
     fi
-fi
-echo
-
-git checkout -f "$START_BRANCH" >/dev/null 2>&1 || true
-
-# ── Summary ──────────────────────────────────────────────────────────────
-echo "## Summary"
-echo
-if [ "$HARD_ERRORS" -gt 0 ]; then
-    echo "**$HARD_ERRORS hard error(s) found.** See rows marked HARD_ERROR / MISMATCH / FAIL above."
     echo
-    echo "Next steps:"
-    echo "1. Read the report sections above for details"
-    echo "2. Check diff files under $OUT/correctness/"
-    echo "3. Check bench logs under $OUT/speed/"
-else
-    echo "**All checks passed.** No hard errors, no mismatches, no >5% decode regressions."
-fi
-echo
-echo "Full artifacts: \`$OUT\`"
+
+    git checkout -f "$START_BRANCH" >/dev/null 2>&1 || true
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    echo "## Summary"
+    echo
+    if [ "$HARD_ERRORS" -gt 0 ]; then
+        echo "**$HARD_ERRORS hard error(s) found.** See rows marked HARD_ERROR / MISMATCH / FAIL above."
+        echo
+        echo "Next steps:"
+        echo "1. Read the report sections above for details"
+        echo "2. Check diff files under $OUT/correctness/"
+        echo "3. Check bench logs under $OUT/speed/"
+    else
+        echo "**All checks passed.** No hard errors, no mismatches, no >5% decode regressions."
+    fi
+    echo
+    echo "Full artifacts: \`$OUT\`"
 
 } | tee "$REPORT"
 

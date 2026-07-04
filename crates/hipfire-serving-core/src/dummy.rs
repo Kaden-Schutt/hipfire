@@ -42,10 +42,7 @@ impl DummyModelState {
 
     /// Whitespace-word count — the dummy's stand-in for real tokenization.
     fn prompt_token_count(text: &str) -> usize {
-        text.trim()
-            .split_whitespace()
-            .filter(|s| !s.is_empty())
-            .count()
+        text.split_whitespace().filter(|s| !s.is_empty()).count()
     }
 
     /// Advance a session's counter by its prompt/suffix token count (seeding the

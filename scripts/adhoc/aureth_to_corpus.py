@@ -38,8 +38,12 @@ def main() -> int:
     p.add_argument("out", help="Output plain-text corpus")
     p.add_argument("--max-rows", type=int, default=0, help="Cap on rows (0 = all)")
     p.add_argument("--min-quality", type=float, default=0.0, help="Drop rows below this quality_score")
-    p.add_argument("--format", default="prompt_chosen", choices=["prompt_chosen", "chosen_only"],
-                   help="prompt_chosen: 'USER: <prompt>\\nASSISTANT: <chosen>'; chosen_only: just the chosen text")
+    p.add_argument(
+        "--format",
+        default="prompt_chosen",
+        choices=["prompt_chosen", "chosen_only"],
+        help="prompt_chosen: 'USER: <prompt>\\nASSISTANT: <chosen>'; chosen_only: just the chosen text",
+    )
     args = p.parse_args()
 
     src = Path(args.src)

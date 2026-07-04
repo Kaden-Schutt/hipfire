@@ -22,7 +22,7 @@ def interesting(cand):
     with tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False) as t:
         t.writelines(cand); path = t.name
     try:
-        return subprocess.run(["bash", ORACLE, path]).returncode == 0
+        return subprocess.run(["bash", ORACLE, path], check=False).returncode == 0
     finally:
         os.unlink(path)
 

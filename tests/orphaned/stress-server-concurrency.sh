@@ -15,24 +15,24 @@ SERVER_STRESS_LOCK_WAIT="${HIPFIRE_SERVER_STRESS_LOCK_WAIT:-300}"
 
 exec 9>"$SERVER_STRESS_LOCK"
 if ! flock -w "$SERVER_STRESS_LOCK_WAIT" 9; then
-  echo "timed out waiting for server stress lock: $SERVER_STRESS_LOCK" >&2
-  exit 2
+    echo "timed out waiting for server stress lock: $SERVER_STRESS_LOCK" >&2
+    exit 2
 fi
 
 if [[ ! -x "$DAEMON" ]]; then
-  echo "missing daemon binary: $DAEMON" >&2
-  echo "build it with: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
-  exit 2
+    echo "missing daemon binary: $DAEMON" >&2
+    echo "build it with: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
+    exit 2
 fi
 
 if [[ ! -f "$MODEL_A" ]]; then
-  echo "missing MODEL_A: $MODEL_A" >&2
-  exit 2
+    echo "missing MODEL_A: $MODEL_A" >&2
+    exit 2
 fi
 
 if [[ -n "$MODEL_B" && ! -f "$MODEL_B" ]]; then
-  echo "missing MODEL_B: $MODEL_B" >&2
-  exit 2
+    echo "missing MODEL_B: $MODEL_B" >&2
+    exit 2
 fi
 
 python3 - "$ROOT" "$DAEMON" "$MODEL_A" "$MODEL_B" "$REQUESTS" "$CONCURRENCY" "$MAX_TOKENS" "$MAX_SEQ" "$DECODE_BACKEND" <<'PY'

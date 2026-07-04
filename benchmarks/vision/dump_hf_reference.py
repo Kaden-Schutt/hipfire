@@ -29,6 +29,7 @@ Usage:
   dump_hf_reference.py IMAGE... --model google/medgemma-1.5-4b-it
   dump_hf_reference.py IMAGE... --model medgemma-4b          # alias (see ALIASES)
 """
+
 import argparse
 import json
 from dataclasses import dataclass, field
@@ -120,9 +121,7 @@ FAMILIES = [
         final_norm=lambda v: v.post_layernorm,
         projector=lambda m: _getattr_path(m, "model.multi_modal_projector"),
         # SigLIP position embedding is an nn.Embedding inside .embeddings.
-        pos_embed=lambda v: getattr(
-            getattr(v.embeddings, "position_embedding", None), "weight", None
-        ),
+        pos_embed=lambda v: getattr(getattr(v.embeddings, "position_embedding", None), "weight", None),
     ),
 ]
 
@@ -133,8 +132,7 @@ def pick_family(model_type: str) -> VisionFamily:
             return fam
     known = sorted({mt for f in FAMILIES for mt in f.model_types})
     raise SystemExit(
-        f"unsupported model_type {model_type!r}; known: {known}. "
-        f"Add a VisionFamily entry to dump_hf_reference.py."
+        f"unsupported model_type {model_type!r}; known: {known}. Add a VisionFamily entry to dump_hf_reference.py."
     )
 
 
@@ -143,16 +141,21 @@ def dump_one(image_path, out_dir, model, processor, family, device):
     image = Image.open(image_path).convert("RGB")
     print(f"  image: {image.width}x{image.height}")
 
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": "Describe this image."},
-        ],
-    }]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
     inputs = processor.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True,
-        return_dict=True, return_tensors="pt",
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
     ).to(device)
 
     np.save(out_dir / "pixel_values.npy", inputs["pixel_values"].cpu().float().numpy())
@@ -169,6 +172,7 @@ def dump_one(image_path, out_dir, model, processor, family, device):
             t = getattr(t, "last_hidden_state", t)
             if isinstance(t, torch.Tensor):
                 captured[name] = t.detach().cpu().float().numpy()
+
         return _h
 
     handles = [family.patch_embed(visual).register_forward_hook(make_hook("patch_embed"))]
@@ -182,9 +186,9 @@ def dump_one(image_path, out_dir, model, processor, family, device):
 
     # Drive the full image-feature path so the projector/merger hook fires.
     with torch.no_grad():
-        feats = model.get_image_features(**{
-            k: inputs[k] for k in ("pixel_values", *family.extra_inputs) if k in inputs
-        })
+        feats = model.get_image_features(
+            **{k: inputs[k] for k in ("pixel_values", *family.extra_inputs) if k in inputs}
+        )
     feats = _as_tensor(feats)
     feats_shape = list(feats.shape) if feats is not None else None
     if feats is not None:
@@ -231,23 +235,30 @@ def dump_lm(prompt, out_dir, model, processor, device):
     for i, h in enumerate(hs[1:]):
         np.save(out_dir / f"lm_block_{i:02d}.npy", h.detach().cpu().float().numpy())
     np.save(out_dir / "lm_logits.npy", out.logits.detach().cpu().float().numpy())
-    print(f"  prompt M={ids.shape[1]} tokens, {len(hs)-1} layers, hidden={hs[0].shape[-1]}")
+    print(f"  prompt M={ids.shape[1]} tokens, {len(hs) - 1} layers, hidden={hs[0].shape[-1]}")
     print(f"  last-pos top-5 token ids: {out.logits[0, -1].topk(5).indices.tolist()}")
-    (out_dir / "lm_meta.json").write_text(json.dumps({
-        "prompt": prompt, "n_tokens": int(ids.shape[1]),
-        "n_layers": len(hs) - 1, "hidden": int(hs[0].shape[-1]),
-    }, indent=2))
+    (out_dir / "lm_meta.json").write_text(
+        json.dumps(
+            {
+                "prompt": prompt,
+                "n_tokens": int(ids.shape[1]),
+                "n_layers": len(hs) - 1,
+                "hidden": int(hs[0].shape[-1]),
+            },
+            indent=2,
+        )
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("images", nargs="*", help="image paths (vision dump)")
-    ap.add_argument("--model", required=True,
-                    help="HF id, local snapshot path, or alias: " + ", ".join(ALIASES))
+    ap.add_argument("--model", required=True, help="HF id, local snapshot path, or alias: " + ", ".join(ALIASES))
     ap.add_argument("--out", default="hf-ref")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--lm-prompt", default=None,
-                    help="dump the LM forward (hidden states + logits) for this text prompt")
+    ap.add_argument(
+        "--lm-prompt", default=None, help="dump the LM forward (hidden states + logits) for this text prompt"
+    )
     args = ap.parse_args()
 
     model_path = ALIASES.get(args.model, args.model)
@@ -260,12 +271,16 @@ def main():
     if is_text_only:
         processor = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=torch.bfloat16, device_map=args.device,
+            model_path,
+            dtype=torch.bfloat16,
+            device_map=args.device,
         ).eval()
     else:
         processor = AutoProcessor.from_pretrained(model_path)
         model = AutoModelForImageTextToText.from_pretrained(
-            model_path, dtype=torch.bfloat16, device_map=args.device,
+            model_path,
+            dtype=torch.bfloat16,
+            device_map=args.device,
         ).eval()
 
     out_root = Path(args.out)

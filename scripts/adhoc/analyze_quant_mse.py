@@ -9,6 +9,7 @@
 The previous version had a buggy vectorized FWHT (reshape misinterpreted pair indices
 at stride > 1). This uses the slow but correct reference loop.
 """
+
 import argparse
 import json
 import math
@@ -203,9 +204,7 @@ def main():
     targets = args.targets or DEFAULT_TARGETS
     fwht, signs1, signs2 = validate_fwht()
 
-    print(f"{'tensor':<60} {'shape':<14} "
-          f"{'mq4 mse':>11} {'q40 mse':>11} {'q4k mse':>11} "
-          f"{'mq4/q40':>9} {'mq4/q4k':>9}")
+    print(f"{'tensor':<60} {'shape':<14} {'mq4 mse':>11} {'q40 mse':>11} {'q4k mse':>11} {'mq4/q40':>9} {'mq4/q4k':>9}")
     print("-" * 145)
 
     for name in targets:
@@ -250,9 +249,11 @@ def main():
         q4k_mse = q40_mse
 
         shape_str = "x".join(str(dim) for dim in shape)
-        print(f"{name[:60]:<60} {shape_str:<14} "
-              f"{mq4_mse:>11.4e} {q40_mse:>11.4e} {q4k_mse:>11.4e} "
-              f"{mq4_mse/q40_mse:>8.2f}x {mq4_mse/q4k_mse:>8.2f}x")
+        print(
+            f"{name[:60]:<60} {shape_str:<14} "
+            f"{mq4_mse:>11.4e} {q40_mse:>11.4e} {q4k_mse:>11.4e} "
+            f"{mq4_mse / q40_mse:>8.2f}x {mq4_mse / q4k_mse:>8.2f}x"
+        )
 
 
 if __name__ == "__main__":

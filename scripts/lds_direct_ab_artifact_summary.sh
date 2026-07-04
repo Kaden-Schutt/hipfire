@@ -56,10 +56,10 @@ isa_count() {
 isa_ds_store_offset1() {
     local path="$1"
     if [[ -r "$path" ]]; then
-        rg -o 'offset1:[0-9]+' "$path" 2>/dev/null |
-            sed 's/offset1://' |
-            sort -n -u |
-            paste -sd, - || true
+        rg -o 'offset1:[0-9]+' "$path" 2>/dev/null \
+            | sed 's/offset1://' \
+            | sort -n -u \
+            | paste -sd, - || true
     fi
 }
 
@@ -76,8 +76,8 @@ dmesg_delta_count() {
         rg -c "$pattern" "$after" || true
         return
     fi
-    awk 'NR == FNR { seen[$0]++; next } seen[$0] > 0 { seen[$0]--; next } { print }' "$before" "$after" |
-        rg -c "$pattern" || true
+    awk 'NR == FNR { seen[$0]++; next } seen[$0] > 0 { seen[$0]--; next } { print }' "$before" "$after" \
+        | rg -c "$pattern" || true
 }
 
 first_artifact_file() {
@@ -100,8 +100,8 @@ metadata_value_near_name() {
     if [[ -z "$line" ]]; then
         return 0
     fi
-    sed -n "$((line - 30)),$((line + 20))p" "$readobj_txt" |
-        awk -v key="$key" '$1 == "." key ":" { print $2; exit }'
+    sed -n "$((line - 30)),$((line + 20))p" "$readobj_txt" \
+        | awk -v key="$key" '$1 == "." key ":" { print $2; exit }'
 }
 
 devcore_contains() {

@@ -349,10 +349,10 @@ fn lfm2_materialize_prefill_tokens(
         } else if session.state_handle.logical_position != 0
             || session.state_handle.cached_prefix_tokens != 0
         {
-            return Err(format!(
+            Err(format!(
                 "lfm2 generate_batch_prefill prompt session {} must start at logical_position=0 cached_prefix_tokens=0",
                 session.id
-            ));
+            ))
         } else {
             let boundary_checkpoints =
                 lfm2_semantic_boundary_checkpoints(m, session, &full_tokens)?;

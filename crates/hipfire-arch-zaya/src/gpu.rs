@@ -1778,7 +1778,7 @@ mod tests {
     fn oq_repack_dispatch_and_dtype() {
         let mut data = Vec::new();
         data.extend_from_slice(&F16_ONE);
-        data.extend_from_slice(&vec![0u8; 128]);
+        data.extend_from_slice(&[0u8; 128]);
         assert!(matches!(
             oq_repack(34, &data, 1, 256),
             Some((_, DType::Oq4G256))

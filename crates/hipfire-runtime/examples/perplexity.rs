@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -22,6 +42,8 @@
 //! For comparing quants: same model class, same corpus, same offset/ctx/warmup.
 //! 2K tokens is enough to see sub-4-bit deltas (single decimal of ppl);
 //! 8K+ if you want stable second-decimal numbers.
+
+#![allow(clippy::type_complexity)]
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_kld::math::{log_z, score_position, top_k_log_softmax};
@@ -485,7 +507,7 @@ fn main() {
         }
         scored += 1;
 
-        if scored == 1 || scored % 256 == 0 {
+        if scored == 1 || scored.is_multiple_of(256) {
             let avg_nll = total_nll / scored as f64;
             let elapsed = t0.elapsed().as_secs_f64();
             let rate = scored as f64 / elapsed.max(1e-9);

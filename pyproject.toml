@@ -2,65 +2,60 @@
 line-length = 120
 target-version = "py311"
 force-exclude = true
-extend-exclude = [
-    "third_party",
-    "third_party/**",
-]
+extend-exclude = ["third_party", "third_party/**"]
 
 [tool.ruff.lint]
 select = [
-    "E",
-    "F",
-    # Focused Pylint-derived smell checks that are clean enough to gate.
-    "PLC0206",
-    "PLC0207",
-    "PLC3002",
-    "PLR1714",
-    "PLW1510",
-    "PLW2901",
+  "E",
+  "F",
+  # Focused Pylint-derived smell checks that are clean enough to gate.
+  "PLC0206",
+  "PLC0207",
+  "PLC3002",
+  "PLR1714",
+  "PLW1510",
+  "PLW2901",
 ]
 ignore = [
-    "E402",
-    "E501",
-    "E701",
-    "E702",
-    "E731",
-    "E741",
-    "E401",
-    "F401",
-    "F541",
-    "F841",
+  "E402",
+  "E501",
+  "E701",
+  "E702",
+  "E731",
+  "E741",
+  "E401",
+  "F401",
+  "F541",
+  "F841",
 ]
 
 [tool.pytest.ini_options]
 norecursedirs = ["third_party"]
-testpaths = [
-    "tests",
-]
+testpaths = ["tests"]
 
 [tool.mypy]
 ignore_missing_imports = true
 follow_imports = "skip"
 check_untyped_defs = false
 disable_error_code = [
-    "annotation-unchecked",
-    "arg-type",
-    "assignment",
-    "attr-defined",
-    "call-arg",
-    "dict-item",
-    "has-type",
-    "import-not-found",
-    "import-untyped",
-    "index",
-    "list-item",
-    "method-assign",
-    "misc",
-    "no-any-return",
-    "no-untyped-def",
-    "operator",
-    "return-value",
-    "str-bytes-safe",
-    "union-attr",
-    "var-annotated",
+  "annotation-unchecked",
+  "arg-type",
+  "assignment",
+  "attr-defined",
+  "call-arg",
+  "dict-item",
+  "has-type",
+  "import-not-found",
+  "import-untyped",
+  "index",
+  "list-item",
+  "method-assign",
+  "misc",
+  "no-any-return",
+  "no-untyped-def",
+  "operator",
+  "return-value",
+  "str-bytes-safe",
+  "union-attr",
+  "var-annotated",
 ]

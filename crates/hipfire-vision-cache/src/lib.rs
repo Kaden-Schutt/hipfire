@@ -653,7 +653,7 @@ mod tests {
     fn persists_across_reopen() {
         let dir = tempdir().unwrap();
         let key = CacheKey::new("ns", b"persistent");
-        let e = emb(16, 16, 3.14);
+        let e = emb(16, 16, std::f32::consts::PI);
         {
             let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
             cache.insert(&key, &e).unwrap();

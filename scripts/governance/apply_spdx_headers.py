@@ -93,11 +93,11 @@ from typing import Optional
 # inserted AFTER a `#!`-style first line if present, with a blank line
 # separating shebang -> SPDX -> existing content.
 EXTENSIONS = {
-    ".rs":  {"style": "// ", "shebang_aware": False},
+    ".rs": {"style": "// ", "shebang_aware": False},
     ".hip": {"style": "// ", "shebang_aware": False},
     ".cuh": {"style": "// ", "shebang_aware": False},
-    ".py":  {"style": "# ",  "shebang_aware": True},
-    ".sh":  {"style": "# ",  "shebang_aware": True},
+    ".py": {"style": "# ", "shebang_aware": True},
+    ".sh": {"style": "# ", "shebang_aware": True},
 }
 
 # Path components that disqualify any descendant from header sweep.
@@ -211,7 +211,7 @@ class FileReport:
 
     path: Path
     action: str  # "would-add", "added", "skip-existing", "skip-empty",
-                 # "skip-no-blame", "skip-error"
+    # "skip-no-blame", "skip-error"
     authors_added: list[str] = field(default_factory=list)
     note: str = ""
 
@@ -245,9 +245,7 @@ class RewriteStats:
     files_kept_apache: int = 0
     files_kept_mit: int = 0
     files_kept_dual: int = 0
-    multi_author_files: list[tuple[Path, str, list[str]]] = field(
-        default_factory=list
-    )
+    multi_author_files: list[tuple[Path, str, list[str]]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------
@@ -386,9 +384,9 @@ def author_shares(
     current_email: Optional[str] = None
     for line in result.stdout.splitlines():
         if line.startswith("author "):
-            current_name = line[len("author "):].strip()
+            current_name = line[len("author ") :].strip()
         elif line.startswith("author-mail "):
-            email = line[len("author-mail "):].strip()
+            email = line[len("author-mail ") :].strip()
             if email.startswith("<") and email.endswith(">"):
                 email = email[1:-1]
             current_email = email
@@ -465,19 +463,9 @@ def insert_header(
         # Trim leading whitespace from `rest` so we don't end up with
         # blank-line drift if there was already a gap after the shebang.
         rest_stripped = rest.lstrip("\n")
-        new_content = (
-            shebang
-            + "\n"
-            + "\n".join(header_lines)
-            + "\n"
-            + ("\n" + rest_stripped if rest_stripped else "")
-        )
+        new_content = shebang + "\n" + "\n".join(header_lines) + "\n" + ("\n" + rest_stripped if rest_stripped else "")
     else:
-        new_content = (
-            "\n".join(header_lines)
-            + "\n"
-            + ("\n" + original.lstrip("\n") if original else "")
-        )
+        new_content = "\n".join(header_lines) + "\n" + ("\n" + original.lstrip("\n") if original else "")
 
     if apply:
         with file_path.open("w", encoding="utf-8") as f:
@@ -516,9 +504,7 @@ def run_sweep(
             blame = author_shares(path, repo_root)
         except Exception as exc:  # pragma: no cover - defensive
             stats.skipped_error += 1
-            reports.append(
-                FileReport(path=path, action="skip-error", note=str(exc))
-            )
+            reports.append(FileReport(path=path, action="skip-error", note=str(exc)))
             continue
 
         if blame is None:
@@ -541,19 +527,13 @@ def run_sweep(
         authors = select_authors(blame, secondary_threshold, fallback_author)
         rel_str = str(path.relative_to(repo_root))
         license_id = classify_license(authors, rel_str)
-        header_lines = build_header_lines(
-            spec["style"], authors, year, license_id
-        )
+        header_lines = build_header_lines(spec["style"], authors, year, license_id)
 
-        stats.files_by_license[license_id] = (
-            stats.files_by_license.get(license_id, 0) + 1
-        )
+        stats.files_by_license[license_id] = stats.files_by_license.get(license_id, 0) + 1
         if len(authors) > 1:
             stats.multi_author_headers += 1
             for secondary in authors[1:]:
-                stats.files_per_secondary[secondary] = (
-                    stats.files_per_secondary.get(secondary, 0) + 1
-                )
+                stats.files_per_secondary[secondary] = stats.files_per_secondary.get(secondary, 0) + 1
 
         try:
             insert_header(
@@ -564,9 +544,7 @@ def run_sweep(
             )
         except OSError as exc:
             stats.skipped_error += 1
-            reports.append(
-                FileReport(path=path, action="skip-error", note=str(exc))
-            )
+            reports.append(FileReport(path=path, action="skip-error", note=str(exc)))
             continue
 
         stats.would_add_or_added += 1
@@ -612,9 +590,7 @@ def _extract_existing_spdx(file_path: Path) -> Optional[tuple[int, str, str]]:
     return None
 
 
-def _find_pointer_line(
-    file_lines: list[str], spdx_idx: int, search_window: int = 10
-) -> Optional[int]:
+def _find_pointer_line(file_lines: list[str], spdx_idx: int, search_window: int = 10) -> Optional[int]:
     """Find the trailing pointer line (`hipfire — see LICENSE ...`) that
     closes a header block opened by an SPDX line at `spdx_idx`.
 
@@ -662,9 +638,7 @@ def run_rewrite(
                 file_lines = f.readlines()
         except OSError as exc:
             stats.skipped_error += 1
-            reports.append(
-                FileReport(path=path, action="skip-error", note=str(exc))
-            )
+            reports.append(FileReport(path=path, action="skip-error", note=str(exc)))
             continue
 
         existing = _extract_existing_spdx(path)
@@ -710,7 +684,7 @@ def run_rewrite(
 
         new_header = build_header_lines(prefix, authors, year, new_id)
         new_header_block = [line + "\n" for line in new_header]
-        old_header_block = file_lines[spdx_idx:pointer_idx + 1]
+        old_header_block = file_lines[spdx_idx : pointer_idx + 1]
 
         if new_header_block == old_header_block:
             stats.skipped_no_change += 1
@@ -720,26 +694,17 @@ def run_rewrite(
                 stats.files_kept_mit += 1
             elif new_id == LICENSE_DUAL:
                 stats.files_kept_dual += 1
-            reports.append(
-                FileReport(path=path, action="skip-no-change",
-                           authors_added=authors, note=new_id)
-            )
+            reports.append(FileReport(path=path, action="skip-no-change", authors_added=authors, note=new_id))
             continue
 
         if apply:
-            new_file_lines = (
-                file_lines[:spdx_idx]
-                + new_header_block
-                + file_lines[pointer_idx + 1:]
-            )
+            new_file_lines = file_lines[:spdx_idx] + new_header_block + file_lines[pointer_idx + 1 :]
             try:
                 with path.open("w", encoding="utf-8") as f:
                     f.writelines(new_file_lines)
             except OSError as exc:
                 stats.skipped_error += 1
-                reports.append(
-                    FileReport(path=path, action="skip-error", note=str(exc))
-                )
+                reports.append(FileReport(path=path, action="skip-error", note=str(exc)))
                 continue
 
         stats.rewritten += 1
@@ -764,20 +729,15 @@ def run_rewrite(
 
         if verbose:
             verb = "rewrote" if apply else "would-rewrite"
-            print(f"  {verb}: {rel_str}  ({current_id} -> {new_id}; "
-                  f"{', '.join(authors)})")
+            print(f"  {verb}: {rel_str}  ({current_id} -> {new_id}; {', '.join(authors)})")
 
     return stats, reports
 
 
-def write_report(stats: RewriteStats, report_path: Path, apply: bool,
-                 repo_root: Path) -> None:
+def write_report(stats: RewriteStats, report_path: Path, apply: bool, repo_root: Path) -> None:
     """Write the structured SPDX-correction report."""
     lines: list[str] = []
-    lines.append(
-        f"# hipfire SPDX correction report "
-        f"({'APPLIED' if apply else 'DRY RUN'})"
-    )
+    lines.append(f"# hipfire SPDX correction report ({'APPLIED' if apply else 'DRY RUN'})")
     lines.append("")
     lines.append(f"Eligible files in scope:    {stats.eligible}")
     lines.append(f"Skipped (no SPDX header):   {stats.skipped_unheadered}")
@@ -796,15 +756,13 @@ def write_report(stats: RewriteStats, report_path: Path, apply: bool,
             lines.append(f"  {old:<22} -> {new:<22} {count}")
 
     lines.append("")
-    lines.append("## Files reassigned Apache-2.0 -> MIT "
-                 f"({len(stats.files_apache_to_mit)})")
+    lines.append(f"## Files reassigned Apache-2.0 -> MIT ({len(stats.files_apache_to_mit)})")
     lines.append("")
     for p in sorted(stats.files_apache_to_mit):
         lines.append(f"  {p.relative_to(repo_root)}")
 
     lines.append("")
-    lines.append("## Files reassigned Apache-2.0 -> MIT OR Apache-2.0 "
-                 f"({len(stats.files_apache_to_dual)})")
+    lines.append(f"## Files reassigned Apache-2.0 -> MIT OR Apache-2.0 ({len(stats.files_apache_to_dual)})")
     lines.append("")
     for p in sorted(stats.files_apache_to_dual):
         lines.append(f"  {p.relative_to(repo_root)}")
@@ -812,18 +770,13 @@ def write_report(stats: RewriteStats, report_path: Path, apply: bool,
     lines.append("")
     lines.append(f"## Files kept at Apache-2.0:  {stats.files_kept_apache}")
     lines.append(f"## Files kept at MIT:         {stats.files_kept_mit}")
-    lines.append(
-        f"## Files kept at MIT OR Apache-2.0: {stats.files_kept_dual}"
-    )
+    lines.append(f"## Files kept at MIT OR Apache-2.0: {stats.files_kept_dual}")
 
     if stats.multi_author_files:
         lines.append("")
         lines.append("## Multi-author files (corrected SPDX + authors)")
         lines.append("")
-        for path, new_id, authors in sorted(
-            stats.multi_author_files,
-            key=lambda t: str(t[0])
-        ):
+        for path, new_id, authors in sorted(stats.multi_author_files, key=lambda t: str(t[0])):
             rel = path.relative_to(repo_root)
             lines.append(f"  {rel}")
             lines.append(f"    SPDX:    {new_id}")
@@ -880,8 +833,7 @@ def print_summary(stats: SweepStats, apply: bool) -> None:
             print(f"    {license_id:<22} {count}")
     if stats.files_per_secondary:
         print()
-        print("  Files attributing a non-primary author "
-              "(>= secondary threshold):")
+        print("  Files attributing a non-primary author (>= secondary threshold):")
         for name in sorted(
             stats.files_per_secondary,
             key=lambda n: (-stats.files_per_secondary[n], n),
@@ -892,14 +844,12 @@ def print_summary(stats: SweepStats, apply: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Apply Apache-2.0 SPDX + copyright headers to "
-                    "hipfire first-party source files.",
+        description="Apply Apache-2.0 SPDX + copyright headers to hipfire first-party source files.",
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Write changes. Without this flag the script is a dry "
-             "run (default).",
+        help="Write changes. Without this flag the script is a dry run (default).",
     )
     parser.add_argument(
         "--root",
@@ -912,48 +862,47 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.30,
         help="Line-share threshold (0..1) above which a non-primary "
-             "author gets a copyright line on a file. Default 0.30.",
+        "author gets a copyright line on a file. Default 0.30.",
     )
     parser.add_argument(
         "--fallback-author",
         default=DEFAULT_FALLBACK_AUTHOR,
-        help="Author name used when git blame produces no result "
-             f"(default: {DEFAULT_FALLBACK_AUTHOR}).",
+        help=f"Author name used when git blame produces no result (default: {DEFAULT_FALLBACK_AUTHOR}).",
     )
     parser.add_argument(
         "--year",
         type=int,
         default=DEFAULT_COPYRIGHT_YEAR,
         help=f"Copyright year on newly-written lines "
-             f"(default: {DEFAULT_COPYRIGHT_YEAR}). Existing headers "
-             "are never modified.",
+        f"(default: {DEFAULT_COPYRIGHT_YEAR}). Existing headers "
+        "are never modified.",
     )
     parser.add_argument(
         "--rewrite-spdx",
         action="store_true",
         help="Rewrite the SPDX-License-Identifier line on already-"
-             "headered files to match current authorship per the "
-             "dual-license classification rule. Leaves copyright "
-             "lines untouched.",
+        "headered files to match current authorship per the "
+        "dual-license classification rule. Leaves copyright "
+        "lines untouched.",
     )
     parser.add_argument(
         "--report-path",
         type=Path,
         default=None,
         help="If set, write a structured per-file report (transitions "
-             "+ Apache->MIT list + Apache->dual list + multi-author "
-             "headers) to this path. Only used by --rewrite-spdx.",
+        "+ Apache->MIT list + Apache->dual list + multi-author "
+        "headers) to this path. Only used by --rewrite-spdx.",
     )
     parser.add_argument(
         "--blame-rev",
         default=None,
         help="Revision to use for blame in --rewrite-spdx mode. "
-             "Default None = use the working tree (which counts the "
-             "SPDX-administration commit's own added lines toward "
-             "Kaden's share, skewing authorship calc). For the "
-             "course-correction sweep on the relicense-apache2 branch "
-             "use --blame-rev d46f81b6 (the pre-relicense commit) so "
-             "authorship reflects the actual code under license.",
+        "Default None = use the working tree (which counts the "
+        "SPDX-administration commit's own added lines toward "
+        "Kaden's share, skewing authorship calc). For the "
+        "course-correction sweep on the relicense-apache2 branch "
+        "use --blame-rev d46f81b6 (the pre-relicense commit) so "
+        "authorship reflects the actual code under license.",
     )
     parser.add_argument(
         "--verbose",
@@ -983,17 +932,13 @@ def main() -> int:
     args = parse_args()
     repo_root = resolve_repo_root(args.root)
     if not repo_root.is_dir():
-        print(f"error: repo root {repo_root} is not a directory",
-              file=sys.stderr)
+        print(f"error: repo root {repo_root} is not a directory", file=sys.stderr)
         return 2
 
     print(f"hipfire SPDX header sweep")
     print(f"  repo:     {repo_root}")
-    print(f"  mode:     "
-          f"{'REWRITE-SPDX' if args.rewrite_spdx else 'SWEEP'}"
-          f" / {'APPLY' if args.apply else 'DRY RUN'}")
-    print(f"  threshold for secondary author: "
-          f"{args.secondary_threshold:.2f}")
+    print(f"  mode:     {'REWRITE-SPDX' if args.rewrite_spdx else 'SWEEP'} / {'APPLY' if args.apply else 'DRY RUN'}")
+    print(f"  threshold for secondary author: {args.secondary_threshold:.2f}")
 
     if args.rewrite_spdx:
         if args.blame_rev:

@@ -1,9 +1,31 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Qwen3.5-VL inference: image + text question → text answer.
 //! Usage: infer_vl <model.hfq> <image.png> [question...]
+
+#![allow(clippy::same_item_push)]
 
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
@@ -305,7 +327,7 @@ fn main() {
 
         if in_thinking && (think_end_token == Some(next_token) || think_count >= max_think) {
             in_thinking = false;
-            eprint!("</think>\n");
+            eprintln!("</think>");
         } else {
             let text = tokenizer.decode(&[next_token]);
             if in_thinking {

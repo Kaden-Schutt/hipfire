@@ -54,20 +54,63 @@ USAGE
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --model-dir) MODEL_DIR="$2"; shift 2 ;;
-        --model-name) MODEL_NAME="$2"; shift 2 ;;
-        --model-store) MODEL_STORE="$2"; shift 2 ;;
-        --formats) FORMATS="$2"; shift 2 ;;
-        --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
-        --prompt) PROMPT_TEXT="$2"; shift 2 ;;
-        --max-gen) MAX_GEN="$2"; shift 2 ;;
-        --kv-mode) KV_MODE="$2"; shift 2 ;;
-        --prompt-mode) PROMPT_MODE="$2"; shift 2 ;;
-        --out) OUT="$2"; shift 2 ;;
-        --force) FORCE=1; shift ;;
-        --skip-build) SKIP_BUILD=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+        --model-dir)
+            MODEL_DIR="$2"
+            shift 2
+            ;;
+        --model-name)
+            MODEL_NAME="$2"
+            shift 2
+            ;;
+        --model-store)
+            MODEL_STORE="$2"
+            shift 2
+            ;;
+        --formats)
+            FORMATS="$2"
+            shift 2
+            ;;
+        --prompt-file)
+            PROMPT_FILE="$2"
+            shift 2
+            ;;
+        --prompt)
+            PROMPT_TEXT="$2"
+            shift 2
+            ;;
+        --max-gen)
+            MAX_GEN="$2"
+            shift 2
+            ;;
+        --kv-mode)
+            KV_MODE="$2"
+            shift 2
+            ;;
+        --prompt-mode)
+            PROMPT_MODE="$2"
+            shift 2
+            ;;
+        --out)
+            OUT="$2"
+            shift 2
+            ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
+        --skip-build)
+            SKIP_BUILD=1
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "unknown arg: $1" >&2
+            usage >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -89,7 +132,7 @@ else
     exit 2
 fi
 
-IFS=',' read -r -a FORMAT_ARR <<< "$FORMATS"
+IFS=',' read -r -a FORMAT_ARR <<<"$FORMATS"
 if [ "${#FORMAT_ARR[@]}" -lt 2 ]; then
     echo "--formats must contain f32 plus at least one comparison format" >&2
     exit 2
@@ -126,9 +169,9 @@ fi
     echo "- prompt_mode: $PROMPT_MODE"
     echo "- wide_margin: $WIDE_MARGIN"
     echo
-} > "$OUT/report.md"
+} >"$OUT/report.md"
 
-printf '%s' "$PROMPT" > "$OUT/prompts/prompt.txt"
+printf '%s' "$PROMPT" >"$OUT/prompts/prompt.txt"
 
 specs=()
 for format in "${FORMAT_ARR[@]}"; do
@@ -140,10 +183,10 @@ for format in "${FORMAT_ARR[@]}"; do
             --input "$MODEL_DIR" \
             --output "$model" \
             --format "$format" \
-            > "$log" 2>&1
+            >"$log" 2>&1
     else
         echo "== convert $format: using existing $model =="
-        echo "using existing $model" > "$log"
+        echo "using existing $model" >"$log"
     fi
     if [ ! -f "$model" ]; then
         echo "conversion did not produce $model" >&2
@@ -154,24 +197,24 @@ for format in "${FORMAT_ARR[@]}"; do
     echo "== run $format =="
     PROMPT_MODE="$PROMPT_MODE" HIPFIRE_KV_MODE="$KV_MODE" \
         target/release/examples/greedy_dump_top5 \
-            "$model" "$prefix" --max-gen "$MAX_GEN" "$PROMPT" \
-            > "$prefix.stdout" 2> "$prefix.stderr"
+        "$model" "$prefix" --max-gen "$MAX_GEN" "$PROMPT" \
+        >"$prefix.stdout" 2>"$prefix.stderr"
     target/release/examples/decode_tokens "$model" "$prefix.tokens" \
-        > "$prefix.decoded.txt" 2> "$prefix.decode.stderr"
+        >"$prefix.decoded.txt" 2>"$prefix.decode.stderr"
 
     {
         echo "## $format"
         echo
         echo "- model: $model"
         echo "- model_md5: $(md5sum "$model" | awk '{print $1}')"
-        echo "- model_size_bytes: $(stat -c%s "$model" 2>/dev/null || wc -c < "$model")"
-        echo "- tokens: $(wc -l < "$prefix.tokens")"
+        echo "- model_size_bytes: $(stat -c%s "$model" 2>/dev/null || wc -c <"$model")"
+        echo "- tokens: $(wc -l <"$prefix.tokens")"
         echo
         echo '```text'
         sed -n '1,12p' "$prefix.decoded.txt"
         echo '```'
         echo
-    } >> "$OUT/report.md"
+    } >>"$OUT/report.md"
 
     if [ "$format" != "f32" ]; then
         specs+=("$format=$prefix")
@@ -179,7 +222,7 @@ for format in "${FORMAT_ARR[@]}"; do
 done
 
 ./scripts/quant_compare_top5.py "$OUT/logits/f32" "${specs[@]}" --wide-margin "$WIDE_MARGIN" \
-    > "$OUT/compare.json"
+    >"$OUT/compare.json"
 
 {
     echo "## Top-5 Comparison"
@@ -188,6 +231,6 @@ done
     cat "$OUT/compare.json"
     echo '```'
     echo
-} >> "$OUT/report.md"
+} >>"$OUT/report.md"
 
 echo "baseline quant smoke report: $OUT/report.md"

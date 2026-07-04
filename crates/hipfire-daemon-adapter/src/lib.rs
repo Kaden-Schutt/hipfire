@@ -636,21 +636,19 @@ impl DaemonEngine {
         loop {
             match self.recv().await? {
                 DaemonResponse::Token(t) => {
-                    if t.id == request_id {
-                        if on_event(GenerateStreamEvent::Token(t.text))
+                    if t.id == request_id
+                        && on_event(GenerateStreamEvent::Token(t.text))
                             == GenerateStreamControl::Cancel
-                        {
-                            return Ok(None);
-                        }
+                    {
+                        return Ok(None);
                     }
                 }
                 DaemonResponse::ToolCalls(t) => {
-                    if t.id == request_id {
-                        if on_event(GenerateStreamEvent::ToolCalls(t.calls))
+                    if t.id == request_id
+                        && on_event(GenerateStreamEvent::ToolCalls(t.calls))
                             == GenerateStreamControl::Cancel
-                        {
-                            return Ok(None);
-                        }
+                    {
+                        return Ok(None);
                     }
                 }
                 DaemonResponse::Done(d) => {

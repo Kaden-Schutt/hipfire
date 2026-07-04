@@ -32,7 +32,7 @@ if [[ $# -lt 3 ]] || [[ "$2" != "--" ]]; then
 fi
 
 OUTPUT_DIR="$1"
-shift 2  # consume <output-dir> and --
+shift 2 # consume <output-dir> and --
 
 mkdir -p "$OUTPUT_DIR"
 

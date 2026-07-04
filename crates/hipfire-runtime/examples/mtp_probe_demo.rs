@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 //! mtp_probe_demo: target-only Qualcomm-style MTP probe bench harness.
 //!
 //! Loads a Qwen3.5 target (.hfq), prefills the prompt, then loops
@@ -10,6 +30,8 @@
 //!                  (--prompt "Hello" | --prompt-file path) \
 //!                  [--max 64] [--ctx 4096] [--lambda 0.1] [--temp 0.0]
 //!                  [--no-chatml]
+
+#![allow(clippy::field_reassign_with_default)]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {

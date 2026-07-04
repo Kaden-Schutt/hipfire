@@ -34,9 +34,15 @@ echo "tiny-quant-gate: building..."
 cargo build --release \
     -p hipfire-quantize --bin hipfire-quantize \
     -p hipfire-eval --bin hipfire-eval \
-    -p hipfire-serving-core --example tiny_quant_probe >/dev/null || { echo "build failed" >&2; exit 2; }
+    -p hipfire-serving-core --example tiny_quant_probe >/dev/null || {
+    echo "build failed" >&2
+    exit 2
+}
 
-"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "tiny-quant-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "tiny-quant-gate" --watch-pid "$$" || {
+    echo "could not acquire GPU lock" >&2
+    exit 2
+}
 OUT="$(mktemp -d)"
 trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true; rm -rf "$OUT"' EXIT
 
@@ -45,10 +51,16 @@ trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true; rm -rf "$OUT"
 
 # --no-cache: a tripwire must always run fresh.
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm/lib}" \
-    "$EVAL_BIN" --battery tiny_quant --no-cache --out "$OUT" || { echo "eval run failed" >&2; exit 2; }
+    "$EVAL_BIN" --battery tiny_quant --no-cache --out "$OUT" || {
+    echo "eval run failed" >&2
+    exit 2
+}
 
 RES="$OUT/results.jsonl"
-[ -f "$RES" ] || { echo "no results.jsonl produced" >&2; exit 2; }
+[ -f "$RES" ] || {
+    echo "no results.jsonl produced" >&2
+    exit 2
+}
 
 # Summarize each cell; count fails.
 fail=0
@@ -58,8 +70,8 @@ while IFS= read -r line; do
     case_id="$(grep -oE '"case_id":"[^"]+"' <<<"$line" | head -1 | cut -d'"' -f4)"
     reason="$(grep -oE '"reason":"[^"]*"' <<<"$line" | head -1 | cut -d'"' -f4)"
     printf '  %-6s %s%s\n' "$status" "$case_id" "${reason:+  — $reason}"
-    [ "$status" = "fail" ] && fail=$((fail+1))
-    [ "$status" = "skip" ] && skip=$((skip+1))
+    [ "$status" = "fail" ] && fail=$((fail + 1))
+    [ "$status" = "skip" ] && skip=$((skip + 1))
 done <"$RES"
 
 if [ "$RECORD" = 1 ]; then

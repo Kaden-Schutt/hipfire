@@ -9,6 +9,7 @@ one residual channel, all others exact). Reports:
   - tail-gain bound: how much an oracle could improve over diag at the tail
 No scipy dependency (Spearman computed directly).
 """
+
 import sys
 
 rows = []
@@ -43,6 +44,7 @@ def spearman(a, b):
                 rk[order[k]] = avg
             i = j + 1
         return rk
+
     ra, rb = ranks(a), ranks(b)
     ma = sum(ra) / len(ra)
     mb = sum(rb) / len(rb)
@@ -70,7 +72,7 @@ for i in range(n):
         pairs += 1
         if abl_kld[j] > abl_kld[i]:  # j is less important per diag but hurts more
             inv += 1
-print(f"rank inversions: {inv}/{pairs} ({100*inv/pairs:.1f}%)  (0% => diag never mis-orders a sampled pair)")
+print(f"rank inversions: {inv}/{pairs} ({100 * inv / pairs:.1f}%)  (0% => diag never mis-orders a sampled pair)")
 
 # tail-gain bound: among the sampled TAIL (diag_rank in bottom third), is the
 # truly-least-important channel the diag-bottom one? If a higher-rank channel has
@@ -78,11 +80,11 @@ print(f"rank inversions: {inv}/{pairs} ({100*inv/pairs:.1f}%)  (0% => diag never
 tail = [r for r in rows if r[0] >= 0.66 * max(diag_rank)]
 if tail:
     tail.sort(key=lambda r: r[3])  # by true importance ascending
-    print(f"\ntail (diag_rank >= {0.66*max(diag_rank):.0f}), sorted by TRUE importance (least first):")
+    print(f"\ntail (diag_rank >= {0.66 * max(diag_rank):.0f}), sorted by TRUE importance (least first):")
     for r in tail:
         print(f"   diag_rank={r[0]:>4} chan={r[1]:>4} ablation_kld={r[3]:.6f}")
     diagbottom = max(rows, key=lambda r: r[0])
     truebottom = min(tail, key=lambda r: r[3])
     print(f"\n diag would void first: rank {diagbottom[0]} (kld {diagbottom[3]:.6f})")
     print(f" oracle would void first: rank {truebottom[0]} (kld {truebottom[3]:.6f})")
-    print(f" tail-gain (diag - oracle) = {diagbottom[3]-truebottom[3]:+.6f} KLD per channel")
+    print(f" tail-gain (diag - oracle) = {diagbottom[3] - truebottom[3]:+.6f} KLD per channel")

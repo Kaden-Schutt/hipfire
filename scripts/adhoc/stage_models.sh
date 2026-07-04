@@ -29,18 +29,32 @@
 set -uo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 MODELS_DIR="${TRIPWIRE_ROOT}/models"
 INCLUDE_MQ6=1
 QUANT_BIN="${HIPFIRE_QUANTIZE:-${TRIPWIRE_ROOT}/hipfire/target/release/hipfire-quantize}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dir) MODELS_DIR="$2"; shift 2 ;;
-        --no-mq6) INCLUDE_MQ6=0; shift ;;
-        --bin) QUANT_BIN="$2"; shift 2 ;;
-        --help|-h) sed -n '2,26p' "$0"; exit 0 ;;
-        *) echo "unknown flag: $1" >&2; exit 2 ;;
+        --dir)
+            MODELS_DIR="$2"
+            shift 2
+            ;;
+        --no-mq6)
+            INCLUDE_MQ6=0
+            shift
+            ;;
+        --bin)
+            QUANT_BIN="$2"
+            shift 2
+            ;;
+        --help | -h)
+            sed -n '2,26p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown flag: $1" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -84,7 +98,7 @@ log ""
 
 FAILED=()
 for spec in "${MATRIX[@]}"; do
-    IFS=':' read -r hf_id stem fmt <<< "$spec"
+    IFS=':' read -r hf_id stem fmt <<<"$spec"
     out="${MODELS_DIR}/${stem}.${fmt}"
     if [ -f "$out" ]; then
         log "skip  $out (already exists, $(du -h "$out" | cut -f1))"
@@ -94,7 +108,7 @@ for spec in "${MATRIX[@]}"; do
     t0=$(date +%s)
     if "$QUANT_BIN" --input "$hf_id" --output "$out" --format "$fmt" 2>&1 | tail -8; then
         t1=$(date +%s)
-        log "   done in $((t1-t0))s ($(du -h "$out" | cut -f1))"
+        log "   done in $((t1 - t0))s ($(du -h "$out" | cut -f1))"
     else
         rc=$?
         log "   FAILED rc=$rc for $hf_id [$fmt]"

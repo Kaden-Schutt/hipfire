@@ -20,6 +20,7 @@ Forward:
   x       = norm(x)
   logits  = lm_head(x)   # tied with trunk's embed_tokens.weight
 """
+
 import copy
 import torch
 from torch import nn
@@ -72,7 +73,7 @@ class Qwen35MtpBlock(nn.Module):
         stripped = {}
         for k, v in mtp_state_dict.items():
             if k.startswith("mtp."):
-                stripped[k[len("mtp."):]] = v
+                stripped[k[len("mtp.") :]] = v
             else:
                 stripped[k] = v
         missing, unexpected = self.load_state_dict(stripped, strict=False)
@@ -97,7 +98,7 @@ class Qwen35MtpBlock(nn.Module):
         emb_n = self.pre_fc_norm_embedding(prev_token_emb)
         hid_n = self.pre_fc_norm_hidden(trunk_hidden)
         x = torch.cat([emb_n, hid_n], dim=-1)  # [B, T, 2H]
-        x = self.fc(x)                          # [B, T, H]
+        x = self.fc(x)  # [B, T, H]
 
         # Build position embeddings via rotary
         position_embeddings = self.rotary_emb(x, position_ids)
@@ -160,10 +161,13 @@ def smoke_test():
 
     print("1. Load trunk model (HF will skip mtp.* weights)...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, dtype=torch.bfloat16, device_map="cuda:0", trust_remote_code=True,
+        MODEL_ID,
+        dtype=torch.bfloat16,
+        device_map="cuda:0",
+        trust_remote_code=True,
     )
     tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    print(f"   trunk loaded in {time.time()-t0:.1f}s")
+    print(f"   trunk loaded in {time.time() - t0:.1f}s")
     text_cfg = model.config.text_config if hasattr(model.config, "text_config") else model.config
     embed = model.get_input_embeddings()
     print(f"   hidden={text_cfg.hidden_size}, vocab={embed.weight.shape[0]}")
@@ -177,12 +181,14 @@ def smoke_test():
     mtp = Qwen35MtpBlock(text_cfg).to(device="cuda:0", dtype=torch.bfloat16)
     missing, unexpected = mtp.load_pretrained_(mtp_sd)
     print(f"   missing keys (in module, not loaded): {len(missing)}")
-    for k in missing[:5]: print(f"     - {k}")
+    for k in missing[:5]:
+        print(f"     - {k}")
     print(f"   unexpected keys (in sd, not in module): {len(unexpected)}")
-    for k in unexpected[:5]: print(f"     - {k}")
+    for k in unexpected[:5]:
+        print(f"     - {k}")
 
     n_params = sum(p.numel() for p in mtp.parameters())
-    print(f"   MTP block params: {n_params:,} ({n_params/1e6:.1f}M)")
+    print(f"   MTP block params: {n_params:,} ({n_params / 1e6:.1f}M)")
 
     print("\n4. Forward: trunk + MTP, compare argmax to trunk's lm_head...")
     prompt = "def fibonacci(n):\n    if n < 2:\n        return n\n    return"
@@ -192,9 +198,9 @@ def smoke_test():
 
     with torch.no_grad():
         trunk_out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-        trunk_hidden = trunk_out.hidden_states[-1]   # [1, T, H]
-        trunk_logits = trunk_out.logits               # [1, T, V]
-        trunk_argmax = trunk_logits.argmax(-1)        # [1, T]
+        trunk_hidden = trunk_out.hidden_states[-1]  # [1, T, H]
+        trunk_logits = trunk_out.logits  # [1, T, V]
+        trunk_argmax = trunk_logits.argmax(-1)  # [1, T]
 
         # Per hipfire mtp_spec.rs runtime trace (agent #2):
         #   Input to MTP block: embed(last_committed_token) + prev_hidden
@@ -204,25 +210,25 @@ def smoke_test():
         prev_emb = embed(ids)  # [1, T, H] — embed of token AT position t
 
         # Try BOTH conventions and report
-        mtp_hidden = mtp(prev_emb, trunk_hidden)   # [1, T, H]
-        mtp_logits = F.linear(mtp_hidden, embed.weight)    # tied lm_head
-        mtp_argmax = mtp_logits.argmax(-1)                 # [1, T]
+        mtp_hidden = mtp(prev_emb, trunk_hidden)  # [1, T, H]
+        mtp_logits = F.linear(mtp_hidden, embed.weight)  # tied lm_head
+        mtp_argmax = mtp_logits.argmax(-1)  # [1, T]
 
     # Compute agreement: at each position, MTP's argmax should ideally
     # predict the NEXT token, same as trunk's lm_head predicts the next
     # token from the current hidden. Let's compare both.
     print("\n   Trunk argmax (predicts next token at each position):")
-    print(f"     positions 0..10:  {trunk_argmax[0,:11].tolist()}")
-    print(f"     decoded: {tok.decode(trunk_argmax[0,:11].tolist())!r}")
+    print(f"     positions 0..10:  {trunk_argmax[0, :11].tolist()}")
+    print(f"     decoded: {tok.decode(trunk_argmax[0, :11].tolist())!r}")
     print("\n   MTP argmax (predicts ??? from hidden + prev_emb):")
-    print(f"     positions 0..10:  {mtp_argmax[0,:11].tolist()}")
-    print(f"     decoded: {tok.decode(mtp_argmax[0,:11].tolist())!r}")
+    print(f"     positions 0..10:  {mtp_argmax[0, :11].tolist()}")
+    print(f"     decoded: {tok.decode(mtp_argmax[0, :11].tolist())!r}")
 
     # If MTP is meant to predict t+1 from hidden_t + emb_{t-1}, then
     # MTP[t-1] should predict ids[t] (same as trunk[t-1] does).
     # Agreement: count where mtp_argmax[t] == trunk_argmax[t]
     agree = (mtp_argmax == trunk_argmax).float().mean().item()
-    print(f"\n   MTP/trunk argmax agreement: {100*agree:.1f}%")
+    print(f"\n   MTP/trunk argmax agreement: {100 * agree:.1f}%")
     # Also: does MTP predict the actual next-token in the sequence?
     # ids[t+1] should = mtp_argmax[t]? Position t MTP sees emb_{t-1} + hidden_t,
     # so it should predict ids[t+1] (the token AFTER position t)
@@ -233,9 +239,10 @@ def smoke_test():
         mtp_acc = (mtp_pred == labels).float().mean().item()
         trunk_acc = (trunk_pred == labels).float().mean().item()
         print(f"   Next-token accuracy vs actual prompt tokens:")
-        print(f"     trunk: {100*trunk_acc:.1f}%   mtp: {100*mtp_acc:.1f}%")
+        print(f"     trunk: {100 * trunk_acc:.1f}%   mtp: {100 * mtp_acc:.1f}%")
 
-    print(f"\n   total wall: {time.time()-t0:.1f}s")
+    print(f"\n   total wall: {time.time() - t0:.1f}s")
+
 
 if __name__ == "__main__":
     smoke_test()

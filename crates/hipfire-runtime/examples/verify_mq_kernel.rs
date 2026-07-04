@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -14,6 +34,8 @@
 //!
 //! Acceptance (per Q0):
 //!   max_abs_err <= 1e-3  => kernel is correct; close Q0.
+
+#![allow(clippy::needless_range_loop)]
 //!   max_abs_err > 1e-3   => kernel has a bug; investigate.
 
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
@@ -72,7 +94,7 @@ fn main() {
 }
 
 fn fract_sin(x: f32) -> f32 {
-    (x.sin() * 12345.6789f32).fract() * 2.0f32 - 1.0f32
+    (x.sin() * 12_345.679_f32).fract() * 2.0f32 - 1.0f32
 }
 
 fn compare(name: &str, cpu: &[f32], gpu: &[f32]) -> (bool, f32, f32) {
@@ -185,7 +207,7 @@ fn cpu_reference_mq(
 
 fn cpu_rotate_x_mq(x: &[f32]) -> Vec<f32> {
     let k = x.len();
-    assert!(k % 256 == 0, "k must be multiple of 256");
+    assert!(k.is_multiple_of(256), "k must be multiple of 256");
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
     let mut out = vec![0.0f32; k];
@@ -252,7 +274,7 @@ fn quantize_mq3g256(f32_data: &[f32], _k: usize) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 104;
     let n = f32_data.len();
-    let n_blocks = (n + group_size - 1) / group_size;
+    let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
@@ -298,7 +320,7 @@ fn quantize_mq2g256(f32_data: &[f32], _k: usize) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 72;
     let n = f32_data.len();
-    let n_blocks = (n + group_size - 1) / group_size;
+    let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);

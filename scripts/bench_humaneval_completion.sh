@@ -44,7 +44,7 @@ if [ ! -e "$HFQ_PATH" ]; then
     exit 1
 fi
 
-PROMPTS=( $(ls benchmarks/prompts/humaneval_*.txt 2>/dev/null) )
+PROMPTS=($(ls benchmarks/prompts/humaneval_*.txt 2>/dev/null))
 if [ ${#PROMPTS[@]} -eq 0 ]; then
     echo "error: no humaneval prompts in benchmarks/prompts/"
     exit 1
@@ -56,7 +56,7 @@ if ! command -v hipfire >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$OUT")"
-: > "$OUT"
+: >"$OUT"
 
 # Stop any previous daemon, then start fresh.
 hipfire stop 2>&1 | head -1 || true
@@ -70,13 +70,13 @@ HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
 # `tail -1 serve.log | grep "warm-up complete"` check, which broke when
 # serve.log had a stale "warm-up complete" line from the previous session
 # (the file is opened O_APPEND), and the `pgrep -af "examples/daemon"`
-    # fallback that fired falsely because serve no longer spawns a process
-    # named "examples/daemon".
+# fallback that fired falsely because serve no longer spawns a process
+# named "examples/daemon".
 want=$(basename "$HFQ_PATH")
 warmup_start=$(date +%s)
 ready=0
 tmp=$(mktemp)
-while [ $(( $(date +%s) - warmup_start )) -lt 300 ]; do
+while [ $(($(date +%s) - warmup_start)) -lt 300 ]; do
     if curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
         if python3 -c "
 import sys, json
@@ -131,7 +131,7 @@ print(json.dumps({
         -H 'Content-Type: application/json' \
         -d "$body" 2>&1 || echo '{"error":"timeout-or-curl-failure"}')
     t1=$(date +%s%3N)
-    wall_ms=$(( t1 - t0 ))
+    wall_ms=$((t1 - t0))
 
     python3 -c "
 import json
@@ -156,7 +156,7 @@ print(json.dumps({
     'finish_reason': c['finish_reason'],
     'wall_ms': wall_ms,
 }))
-" >> "$OUT"
+" >>"$OUT"
 done
 
 hipfire stop 2>&1 | head -1 || true

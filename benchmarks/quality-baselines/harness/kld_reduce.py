@@ -46,13 +46,13 @@ from kldref_format import read_per_seq_kld  # noqa: E402
 class Row:
     variant: str
     arch: str
-    scoring_mode: str       # "prefill" (canonical hipfire), "per-token" (legacy hipfire),
-                            # "gguf" (eval_gguf anchors). See docs/plans/eval_hipfire_speedup.md
-                            # §"V1 result" for why per-token and prefill are separate
-                            # measurement classes for hipfire variants.
+    scoring_mode: str  # "prefill" (canonical hipfire), "per-token" (legacy hipfire),
+    # "gguf" (eval_gguf anchors). See docs/plans/eval_hipfire_speedup.md
+    # §"V1 result" for why per-token and prefill are separate
+    # measurement classes for hipfire variants.
     n_chunks: int
     mean_kld: float
-    mean_kld_ci_lo: float    # 95% bootstrap lower
+    mean_kld_ci_lo: float  # 95% bootstrap lower
     mean_kld_ci_hi: float
     p99_kld: float
     ppl: float | None = None  # exp(mean NLL) over all scored tokens; None for v1 inputs
@@ -87,9 +87,7 @@ def parse_filename(name: str) -> tuple[str, str, str]:
         variant, arch = parts
         scoring_mode = "gguf" if "gguf" in variant else "per-token"
         return variant, arch, scoring_mode
-    raise ValueError(
-        f"filename {name!r} doesn't match <variant>__<arch>[__<scoring_mode>].kldseq"
-    )
+    raise ValueError(f"filename {name!r} doesn't match <variant>__<arch>[__<scoring_mode>].kldseq")
 
 
 def reduce_one(path: Path) -> Row:
@@ -103,9 +101,15 @@ def reduce_one(path: Path) -> Row:
     finite_nll = nlls_arr[np.isfinite(nlls_arr)]
     ppl: float | None = float(np.exp(finite_nll.mean())) if finite_nll.size else None
     return Row(
-        variant=variant, arch=arch, scoring_mode=scoring_mode, n_chunks=len(means),
-        mean_kld=mean, mean_kld_ci_lo=ci_lo, mean_kld_ci_hi=ci_hi,
-        p99_kld=p99, ppl=ppl,
+        variant=variant,
+        arch=arch,
+        scoring_mode=scoring_mode,
+        n_chunks=len(means),
+        mean_kld=mean,
+        mean_kld_ci_lo=ci_lo,
+        mean_kld_ci_hi=ci_hi,
+        p99_kld=p99,
+        ppl=ppl,
     )
 
 
@@ -144,7 +148,9 @@ def render_markdown_table(rows: list[Row]) -> str:
     for r in sorted(rows, key=lambda r: (mode_order.get(r.scoring_mode, 99), r.variant, r.arch)):
         ci = f"{r.mean_kld:.4f} (CI {r.mean_kld_ci_lo:.4f}–{r.mean_kld_ci_hi:.4f})"
         ppl = f"{r.ppl:.3f}" if r.ppl is not None else "—"
-        out.append(f"| {r.variant} | {r.arch} | {r.scoring_mode} | {r.n_chunks} | {ci} | {r.p99_kld:.3f} | {ppl} | {r.notes} |")
+        out.append(
+            f"| {r.variant} | {r.arch} | {r.scoring_mode} | {r.n_chunks} | {ci} | {r.p99_kld:.3f} | {ppl} | {r.notes} |"
+        )
     return "\n".join(out)
 
 

@@ -14,6 +14,7 @@ hipfire "patches", HF "post_merger" == hipfire "image_embeds").
 Usage:
   diff_dumps.py <image_stem> --hf-dir hf-ref --hipfire-dir hipfire-dump
 """
+
 import argparse
 import json
 import re
@@ -89,9 +90,11 @@ def diff(a, b, name) -> bool:
             return True
     d = np.abs(a - b)
     rel = d.sum() / (np.abs(a).sum() + 1e-9)
-    print(f"  {name:14s} shape={str(tuple(a.shape)):20s} "
-          f"HF(mean={a.mean():+.4f},std={a.std():.4f}) "
-          f"hf-hp: rel-L1={rel:.3e} max|Δ|={d.max():.3e}")
+    print(
+        f"  {name:14s} shape={str(tuple(a.shape)):20s} "
+        f"HF(mean={a.mean():+.4f},std={a.std():.4f}) "
+        f"hf-hp: rel-L1={rel:.3e} max|Δ|={d.max():.3e}"
+    )
     return rel >= 0.1  # >10% relative L1 → genuinely divergent
 
 

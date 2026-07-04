@@ -43,7 +43,8 @@ cargo build --release --features deltanet -p hipfire-runtime --example bench_qwe
 }
 
 run_bench() {
-    local label="$1"; shift
+    local label="$1"
+    shift
     # Capture last "tok/s:" line emitted by the prefill phase.
     local out
     out=$("$@" target/release/examples/bench_qwen35_speed "$MODEL" \

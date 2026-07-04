@@ -70,7 +70,7 @@ print(f"  wrote {len(text):,} bytes ({len(text)/1024/1024:.2f} MB)", file=sys.st
 PYEOF
 
 # md5 tripwire
-md5sum "$OUT" | awk '{print $1}' > slice.md5
+md5sum "$OUT" | awk '{print $1}' >slice.md5
 echo "make_slice.sh: $OUT md5 = $(cat slice.md5)"
 
 echo "make_slice.sh: done."

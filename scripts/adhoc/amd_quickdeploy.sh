@@ -39,7 +39,6 @@
 set -euo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 REPO_URL="${REPO_URL:-https://github.com/Kaden-Schutt/hipfire.git}"
 REPO_DIR="${REPO_DIR:-${TRIPWIRE_ROOT}/hipfire}"
 REPO_BRANCH="${REPO_BRANCH:-dflash}"
@@ -51,14 +50,20 @@ FETCH_CORPUS=0
 
 for arg in "$@"; do
     case "$arg" in
-        --skip-build)   SKIP_BUILD=1 ;;
-        --skip-hf)      SKIP_HF=1 ;;
-        --skip-torch)   SKIP_TORCH=1 ;;
-        --repo=*)       REPO_URL="${arg#--repo=}" ;;
-        --branch=*)     REPO_BRANCH="${arg#--branch=}" ;;
+        --skip-build) SKIP_BUILD=1 ;;
+        --skip-hf) SKIP_HF=1 ;;
+        --skip-torch) SKIP_TORCH=1 ;;
+        --repo=*) REPO_URL="${arg#--repo=}" ;;
+        --branch=*) REPO_BRANCH="${arg#--branch=}" ;;
         --fetch-corpus) FETCH_CORPUS=1 ;;
-        --help|-h)      sed -n '2,35p' "$0"; exit 0 ;;
-        *) echo "unknown flag: $arg" >&2; exit 2 ;;
+        --help | -h)
+            sed -n '2,35p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown flag: $arg" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -186,7 +191,7 @@ fi
 # globally — it only affects the rocBLAS MFMA path.
 log "baking env defaults into ${TRIPWIRE_ROOT}/.bashrc (HIPFIRE_ROCBLAS_OFF=1, ROCm PATH)"
 BASHRC=${TRIPWIRE_ROOT}/.bashrc
-grep -q "HIPFIRE_ROCBLAS_OFF" "$BASHRC" 2>/dev/null || cat >> "$BASHRC" <<'BRC'
+grep -q "HIPFIRE_ROCBLAS_OFF" "$BASHRC" 2>/dev/null || cat >>"$BASHRC" <<'BRC'
 # hipfire deploy defaults
 export HIPFIRE_ROCBLAS_OFF=1
 export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${TRIPWIRE_ROOT}/.cargo/bin:$PATH
@@ -232,15 +237,15 @@ log "  2. Fetch calibration corpus (if not done via --fetch-corpus):"
 log "       bash $REPO_DIR/scripts/fetch_calibration_corpus.sh \\"
 log "            ${TRIPWIRE_ROOT}/calibration_corpus.txt --recipe blended"
 if [ "$N_GPUS" -gt 1 ]; then
-log "  3. Parallel calibrate across all $N_GPUS GPUs:"
-log "       bash $REPO_DIR/scripts/calibrate_multigpu.sh \\"
-log "            --models \$(ls ${TRIPWIRE_ROOT}/models/*.mq[46] | tr '\\n' ',') \\"
-log "            --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt"
+    log "  3. Parallel calibrate across all $N_GPUS GPUs:"
+    log "       bash $REPO_DIR/scripts/calibrate_multigpu.sh \\"
+    log "            --models \$(ls ${TRIPWIRE_ROOT}/models/*.mq[46] | tr '\\n' ',') \\"
+    log "            --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt"
 else
-log "  3. Single-GPU calibration:"
-log "       $REPO_DIR/target/release/examples/triattn_validate \\"
-log "            ${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.hfq \\"
-log "            --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt --max-tokens 1000000 \\"
-log "            --sidecar ${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.triattn.hfq"
+    log "  3. Single-GPU calibration:"
+    log "       $REPO_DIR/target/release/examples/triattn_validate \\"
+    log "            ${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.hfq \\"
+    log "            --corpus ${TRIPWIRE_ROOT}/calibration_corpus.txt --max-tokens 1000000 \\"
+    log "            --sidecar ${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.triattn.hfq"
 fi
 log "────────────────────────────────────────────────────"

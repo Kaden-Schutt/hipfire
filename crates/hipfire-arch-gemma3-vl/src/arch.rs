@@ -316,7 +316,7 @@ fn splice_image_tokens(vl: &Gemma3VlConfig, ids: &[u32], n_images: usize) -> Vec
     let mm = vl.mm_tokens_per_image;
     let push_block = |out: &mut Vec<u32>| {
         out.push(vl.boi_token_index);
-        out.extend(std::iter::repeat(vl.image_token_index).take(mm));
+        out.extend(std::iter::repeat_n(vl.image_token_index, mm));
         out.push(vl.eoi_token_index);
     };
 

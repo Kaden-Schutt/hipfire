@@ -56,9 +56,9 @@ check_coherence() {
 
     # Repetition: most-repeated word (excluding common stopwords)
     local max_rep
-    max_rep=$(echo "$text" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alpha:]' '\n' | \
-        grep -vxE '(the|a|an|is|are|was|were|be|been|of|in|to|and|or|for|it|that|this|with|as|on|at|by|from|not|but|if|no|do|so|up|out|all|has|had|have|will|can|its|they|we|he|she|you|i|my|our|your|their|his|her)' | \
-        sort | uniq -c | sort -rn | head -1 | awk '{print $1}')
+    max_rep=$(echo "$text" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alpha:]' '\n' \
+        | grep -vxE '(the|a|an|is|are|was|were|be|been|of|in|to|and|or|for|it|that|this|with|as|on|at|by|from|not|but|if|no|do|so|up|out|all|has|had|have|will|can|its|they|we|he|she|you|i|my|our|your|their|his|her)' \
+        | sort | uniq -c | sort -rn | head -1 | awk '{print $1}')
     max_rep=${max_rep:-0}
 
     if [ "$max_rep" -gt 15 ]; then
@@ -93,9 +93,9 @@ run_bench() {
     echo "| $label | $tok_s | $ntok | $coherence |"
 
     # Save full output for review
-    echo "--- $label ---" >> "$OUT_DIR/megabench-raw.log"
-    echo "$output" >> "$OUT_DIR/megabench-raw.log"
-    echo "" >> "$OUT_DIR/megabench-raw.log"
+    echo "--- $label ---" >>"$OUT_DIR/megabench-raw.log"
+    echo "$output" >>"$OUT_DIR/megabench-raw.log"
+    echo "" >>"$OUT_DIR/megabench-raw.log"
 }
 
 # ─── Phase 1: All models, default KV (Q8) ─────────────────
@@ -104,12 +104,12 @@ run_bench() {
 VRAM_MB=0
 if command -v rocm-smi &>/dev/null; then
     VRAM_MB=$(rocm-smi --showmeminfo vram 2>/dev/null | grep "Total" | grep -oP '\d+' | head -1 || echo "0")
-    VRAM_MB=$((VRAM_MB / 1048576))  # bytes → MB
+    VRAM_MB=$((VRAM_MB / 1048576)) # bytes → MB
 fi
 if [ "$VRAM_MB" -eq 0 ] 2>/dev/null; then
     # Fallback: parse from kernel log or sysfs
     VRAM_MB=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | head -1 || echo "0")
-    VRAM_MB=$((VRAM_MB / 1048576))  # bytes → MB
+    VRAM_MB=$((VRAM_MB / 1048576)) # bytes → MB
 fi
 echo "Detected VRAM: ${VRAM_MB}MB" >&2
 
@@ -133,10 +133,10 @@ echo "" | tee -a "$RESULTS"
 echo "| Model | tok/s | tokens | coherence |" | tee -a "$RESULTS"
 echo "|-------|-------|--------|-----------|" | tee -a "$RESULTS"
 
-echo "" > "$OUT_DIR/megabench-raw.log"
+echo "" >"$OUT_DIR/megabench-raw.log"
 
 for entry in "${QWEN35_MODELS[@]}"; do
-    IFS=':' read -r file label min_vram <<< "$entry"
+    IFS=':' read -r file label min_vram <<<"$entry"
     model="$MODELS_DIR/$file"
     if [ ! -f "$model" ]; then
         echo "| $label | MISSING | - | - |" | tee -a "$RESULTS"
@@ -223,7 +223,7 @@ fi
 echo "" | tee -a "$LONG_RESULTS"
 
 # Append long context results to main results
-cat "$LONG_RESULTS" >> "$RESULTS"
+cat "$LONG_RESULTS" >>"$RESULTS"
 
 echo "" | tee -a "$RESULTS"
 echo "=== Megabench complete ===" | tee -a "$RESULTS"

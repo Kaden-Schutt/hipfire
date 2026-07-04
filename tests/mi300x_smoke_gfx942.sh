@@ -17,16 +17,21 @@
 set -euo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 WORK="${WORK:-/workspace}"
 HIPFIRE="${HIPFIRE_DIR:-${WORK}/hipfire}"
 HF_HOME="${HF_HOME:-${WORK}/hf-cache}"
 export HF_HOME
 cd "$HIPFIRE"
 
-phase() { echo; echo "─── [$(date +%H:%M:%S)] $* ───"; }
-ok()    { printf "    \033[32m✓\033[0m %s\n" "$*"; }
-die()   { printf "    \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
+phase() {
+    echo
+    echo "─── [$(date +%H:%M:%S)] $* ───"
+}
+ok() { printf "    \033[32m✓\033[0m %s\n" "$*"; }
+die() {
+    printf "    \033[31m✗\033[0m %s\n" "$*" >&2
+    exit 1
+}
 
 # ── 1. Arch detection ──────────────────────────────────────────────────────
 # eval_hipfire was removed; the daemon reports the GPU arch on its stderr at HIP
@@ -75,8 +80,9 @@ echo "    using $test_hfq"
 
 # Quick forward + sample via the daemon generate op (eval_hipfire removed).
 DBIN=$(kld_daemon_bin) || die "hipfire-daemon missing"
-{ printf '{"type":"load","model":"%s","params":{"max_seq":256,"kv_cache":"q8"}}\n' "$test_hfq"
-  printf '{"type":"generate","prompt":"The capital of France is","params":{"max_tokens":16,"temperature":0.0}}\n'
+{
+    printf '{"type":"load","model":"%s","params":{"max_seq":256,"kv_cache":"q8"}}\n' "$test_hfq"
+    printf '{"type":"generate","prompt":"The capital of France is","params":{"max_tokens":16,"temperature":0.0}}\n'
 } | HIPFIRE_RESOURCE_LOCK_WAIT_MS="${HIPFIRE_RESOURCE_LOCK_WAIT_MS:-600000}" "$DBIN" 2>/dev/null \
     | python3 -c 'import json,sys
 print("".join(json.loads(l).get("text","") for l in sys.stdin if l.strip() and json.loads(l).get("type")=="token"))' \

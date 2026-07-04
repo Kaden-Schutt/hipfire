@@ -104,42 +104,68 @@ def parse_args() -> argparse.Namespace:
     # Paper's multi-anchor training (§4.2): concatenate K masked blocks into
     # each training sequence, each block with a random anchor position inside
     # the seq_len window. Each block contributes B-1 supervised predictions.
-    p.add_argument("--masked-blocks-per-seq", type=int, default=4,
-                   help="Number of anchor-masked blocks per training example (paper §4.2 'Random sampling of masked blocks').")
+    p.add_argument(
+        "--masked-blocks-per-seq",
+        type=int,
+        default=4,
+        help="Number of anchor-masked blocks per training example (paper §4.2 'Random sampling of masked blocks').",
+    )
     # Paper's loss weighting (§4.2 'Loss weighting for faster convergence'):
     # w_k = exp(-(k-1)/gamma) where k is position within block (1-indexed).
     # Earlier positions weighted more because errors at k=1 invalidate
     # subsequent accepts. gamma=3 gives meaningful emphasis without nuking
     # the gradient on later positions.
-    p.add_argument("--loss-gamma", type=float, default=3.0,
-                   help="Exponential decay rate for per-position loss weighting (paper eq. 4). <=0 disables weighting.")
-    p.add_argument("--grad-ckpt-target", action="store_true",
-                   help="Enable gradient checkpointing on the frozen target (doesn't affect correctness; saves VRAM on 27B/35B targets).")
+    p.add_argument(
+        "--loss-gamma",
+        type=float,
+        default=3.0,
+        help="Exponential decay rate for per-position loss weighting (paper eq. 4). <=0 disables weighting.",
+    )
+    p.add_argument(
+        "--grad-ckpt-target",
+        action="store_true",
+        help="Enable gradient checkpointing on the frozen target (doesn't affect correctness; saves VRAM on 27B/35B targets).",
+    )
     # Training-time τ probe (Hermes 2026-04-19). Every N steps, take a fixed
     # held-out prompt and run a tiny spec_generate on the current draft. Logs
     # τ alongside loss. If loss drops but τ stays flat → training objective is
     # wrong, don't burn more compute. Would have caught the 4B run's τ=0.09
     # in minutes instead of 5000 steps.
-    p.add_argument("--tau-probe-every", type=int, default=0,
-                   help="Run a small spec_generate τ-probe every N steps (0=disable). Adds ~5s per probe on MI300X.")
-    p.add_argument("--tau-probe-prompt", default=None,
-                   help="Path to a text file with the fixed held-out prompt. If omitted, uses an in-script default.")
-    p.add_argument("--tau-probe-max-new", type=int, default=64,
-                   help="max_new_tokens for probe (small for speed; τ converges fast).")
+    p.add_argument(
+        "--tau-probe-every",
+        type=int,
+        default=0,
+        help="Run a small spec_generate τ-probe every N steps (0=disable). Adds ~5s per probe on MI300X.",
+    )
+    p.add_argument(
+        "--tau-probe-prompt",
+        default=None,
+        help="Path to a text file with the fixed held-out prompt. If omitted, uses an in-script default.",
+    )
+    p.add_argument(
+        "--tau-probe-max-new",
+        type=int,
+        default=64,
+        help="max_new_tokens for probe (small for speed; τ converges fast).",
+    )
     # Architectural A/B knob: Qwen3.5 targets use partial_rotary_factor=0.25
     # (only 64 of 256 head_dim rotated). z-lab's 4B-DFlash draft config has
     # NO partial_rotary_factor → full rotary. If the partial-rotary inheritance
     # is the culprit for our draft's τ=0.09, --full-rotary drops
     # partial_rotary_factor from the draft's rope_parameters.
-    p.add_argument("--full-rotary", action="store_true",
-                   help="Force full (100%) rotary in the draft, matching z-lab's convention.")
+    p.add_argument(
+        "--full-rotary", action="store_true", help="Force full (100%) rotary in the draft, matching z-lab's convention."
+    )
     # Macro flag: replicate z-lab's Qwen3.5-4B-DFlash draft architecture exactly
     # (32 heads × 128 head_dim, no partial rotary, rope_theta=1e7, tied embeds).
     # z-lab's arch produced loss=1.8 on our training task per diag_zlab_loss;
     # ours (16/256 + partial rotary inherited from Qwen3.5) has NO evidence
     # of trainability. Use this to minimize unknowns.
-    p.add_argument("--match-zlab-arch", action="store_true",
-                   help="Override draft arch to match z-lab's Qwen3.5-4B-DFlash (32/128/full-rotary/tied-emb/rope_theta=1e7).")
+    p.add_argument(
+        "--match-zlab-arch",
+        action="store_true",
+        help="Override draft arch to match z-lab's Qwen3.5-4B-DFlash (32/128/full-rotary/tied-emb/rope_theta=1e7).",
+    )
     return p.parse_args()
 
 
@@ -179,8 +205,10 @@ def tau_probe(draft, target, tokenizer, prompt: str, max_new: int, device):
         block_size = draft.block_size
         max_length = num_input + max_new
         output_ids = torch.full(
-            (1, max_length + block_size), draft.mask_token_id,
-            dtype=torch.long, device=device,
+            (1, max_length + block_size),
+            draft.mask_token_id,
+            dtype=torch.long,
+            device=device,
         )
         position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
         # Qwen3.5 target has hybrid linear_attention/full_attention layers;
@@ -190,40 +218,45 @@ def tau_probe(draft, target, tokenizer, prompt: str, max_new: int, device):
         out = target(
             input_ids,
             position_ids=position_ids[:, :num_input],
-            past_key_values=pkv_t, use_cache=True,
-            logits_to_keep=1, output_hidden_states=True,
+            past_key_values=pkv_t,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=True,
         )
         output_ids[:, :num_input] = input_ids
-        output_ids[:, num_input:num_input + 1] = sample(out.logits, 0.0)
+        output_ids[:, num_input : num_input + 1] = sample(out.logits, 0.0)
         target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)
 
         accept_lengths = []
         start = num_input
         while start < max_length:
-            block_out = output_ids[:, start:start + block_size].clone()
-            block_pos = position_ids[:, start:start + block_size]
+            block_out = output_ids[:, start : start + block_size].clone()
+            block_pos = position_ids[:, start : start + block_size]
             noise_emb = target.model.embed_tokens(block_out)
             dh = draft(
                 target_hidden=target_hidden,
                 noise_embedding=noise_emb,
-                position_ids=position_ids[:, pkv_d.get_seq_length():start + block_size],
-                past_key_values=pkv_d, use_cache=True,
+                position_ids=position_ids[:, pkv_d.get_seq_length() : start + block_size],
+                past_key_values=pkv_d,
+                use_cache=True,
             )
-            draft_logits = target.lm_head(dh[:, -block_size + 1:, :])
+            draft_logits = target.lm_head(dh[:, -block_size + 1 :, :])
             pkv_d.crop(start)
             block_out[:, 1:] = sample(draft_logits, 0.0)
             out = target(
-                block_out, position_ids=block_pos,
-                past_key_values=pkv_t, use_cache=True,
+                block_out,
+                position_ids=block_pos,
+                past_key_values=pkv_t,
+                use_cache=True,
                 output_hidden_states=True,
             )
             post = sample(out.logits, 0.0)
             accept = (block_out[:, 1:] == post[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-            output_ids[:, start:start + accept + 1] = block_out[:, :accept + 1]
+            output_ids[:, start : start + accept + 1] = block_out[:, : accept + 1]
             output_ids[:, start + accept + 1] = post[:, accept]
             start += accept + 1
             pkv_t.crop(start)
-            target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)[:, :accept + 1, :]
+            target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)[:, : accept + 1, :]
             accept_lengths.append(accept + 1)
             if stop_ids and any(s in output_ids[:, num_input:] for s in stop_ids):
                 break
@@ -266,8 +299,14 @@ def sample_batch(
     return out
 
 
-def build_draft_config(target_config, draft_layers: int, block_size: int, mask_token_id: int,
-                       full_rotary: bool = False, match_zlab_arch: bool = False):
+def build_draft_config(
+    target_config,
+    draft_layers: int,
+    block_size: int,
+    mask_token_id: int,
+    full_rotary: bool = False,
+    match_zlab_arch: bool = False,
+):
     """Build a flat Qwen3Config for the DFlash draft.
 
     Qwen/Qwen3.5-* returns a composite `Qwen3_5Config` with text_config +
@@ -297,8 +336,7 @@ def build_draft_config(target_config, draft_layers: int, block_size: int, mask_t
     else:
         # Drop MoE-only or VL-only rope keys that confuse Qwen3Config ("default"
         # rope_type doesn't accept mrope_section/mrope_interleaved).
-        rope_params = {k: v for k, v in rope_params.items()
-                       if k not in ("mrope_section", "mrope_interleaved")}
+        rope_params = {k: v for k, v in rope_params.items() if k not in ("mrope_section", "mrope_interleaved")}
     if full_rotary or match_zlab_arch:
         rope_params.pop("partial_rotary_factor", None)
     if match_zlab_arch:
@@ -328,7 +366,7 @@ def build_draft_config(target_config, draft_layers: int, block_size: int, mask_t
         vocab_size=g("vocab_size"),
         hidden_size=g("hidden_size"),
         intermediate_size=ov("intermediate_size"),
-        num_hidden_layers=draft_layers,              # ← 5 for draft, not target's
+        num_hidden_layers=draft_layers,  # ← 5 for draft, not target's
         num_attention_heads=ov("num_attention_heads"),
         num_key_value_heads=ov("num_key_value_heads"),
         hidden_act=g("hidden_act", "silu"),
@@ -395,31 +433,40 @@ def main() -> int:
     target = AutoModelForCausalLM.from_pretrained(
         args.target_repo,
         torch_dtype=dtype,
-        attn_implementation="eager",   # safer on ROCm; swap to sdpa once verified
+        attn_implementation="eager",  # safer on ROCm; swap to sdpa once verified
     ).to(device)
     target.eval()
     for p in target.parameters():
         p.requires_grad_(False)
-    print(f"[target]   {target.config.num_hidden_layers} layers, "
-          f"hidden={target.config.hidden_size}, vocab={target.config.vocab_size}", flush=True)
+    print(
+        f"[target]   {target.config.num_hidden_layers} layers, "
+        f"hidden={target.config.hidden_size}, vocab={target.config.vocab_size}",
+        flush=True,
+    )
 
     # Pick a mask token id that's unlikely to appear in data; reference uses 248070.
     mask_token_id = min(248070, target.config.vocab_size - 1)
 
     # ── build draft ───────────────────────────────────────────────────
     draft_cfg = build_draft_config(
-        target.config, args.draft_layers, args.block_size, mask_token_id,
+        target.config,
+        args.draft_layers,
+        args.block_size,
+        mask_token_id,
         full_rotary=args.full_rotary,
         match_zlab_arch=args.match_zlab_arch,
     )
     draft = DFlashDraftModel(draft_cfg).to(device=device, dtype=dtype)
     if args.resume:
         from safetensors.torch import load_file
+
         sd = load_file(args.resume)
         missing, unexpected = draft.load_state_dict(sd, strict=False)
         print(f"[draft] resumed from {args.resume}; missing={len(missing)} unexpected={len(unexpected)}", flush=True)
     n_draft_params = sum(p.numel() for p in draft.parameters() if p.requires_grad)
-    print(f"[draft]   {args.draft_layers} layers, {n_draft_params / 1e6:.1f}M params, block={args.block_size}", flush=True)
+    print(
+        f"[draft]   {args.draft_layers} layers, {n_draft_params / 1e6:.1f}M params, block={args.block_size}", flush=True
+    )
 
     # ── data ──────────────────────────────────────────────────────────
     ids = read_corpus_tokens(args.corpus, tokenizer)
@@ -430,7 +477,9 @@ def main() -> int:
     # ── optimizer ─────────────────────────────────────────────────────
     optim = torch.optim.AdamW(
         (p for p in draft.parameters() if p.requires_grad),
-        lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01,
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        weight_decay=0.01,
     )
     sched = LambdaLR(optim, lambda s: cosine_schedule(s, args.warmup, args.steps))
 
@@ -443,9 +492,12 @@ def main() -> int:
         pos_weights = pos_weights / pos_weights.sum()  # normalize so expected grad magnitude is comparable to uniform
     else:
         pos_weights = torch.full((B - 1,), 1.0 / (B - 1), device=device)
-    print(f"[train] position weights (γ={args.loss_gamma:.2f}): "
-          + ", ".join(f"{w:.3f}" for w in pos_weights.tolist()[:8])
-          + (" ..." if B - 1 > 8 else ""), flush=True)
+    print(
+        f"[train] position weights (γ={args.loss_gamma:.2f}): "
+        + ", ".join(f"{w:.3f}" for w in pos_weights.tolist()[:8])
+        + (" ..." if B - 1 > 8 else ""),
+        flush=True,
+    )
 
     if args.grad_ckpt_target:
         try:
@@ -455,8 +507,11 @@ def main() -> int:
             print(f"[target] WARN: gradient checkpointing failed to enable: {e}", flush=True)
 
     # ── train ─────────────────────────────────────────────────────────
-    print(f"[train] {args.steps} steps, batch={args.batch_size}, seq={args.seq_len}, "
-          f"blocks_per_seq={args.masked_blocks_per_seq}, lr={args.lr}", flush=True)
+    print(
+        f"[train] {args.steps} steps, batch={args.batch_size}, seq={args.seq_len}, "
+        f"blocks_per_seq={args.masked_blocks_per_seq}, lr={args.lr}",
+        flush=True,
+    )
     loss_ema: Optional[float] = None
     t_start = time.time()
     draft.train()
@@ -467,8 +522,11 @@ def main() -> int:
     max_k = max(1, (args.seq_len - 1) // B)
     anchors_per_seq = min(args.masked_blocks_per_seq, max_k)
     if anchors_per_seq < args.masked_blocks_per_seq:
-        print(f"[train] clamped masked-blocks-per-seq from {args.masked_blocks_per_seq} to {anchors_per_seq} "
-              f"(seq_len={args.seq_len}, B={B}: max non-overlapping anchors = {max_k})", flush=True)
+        print(
+            f"[train] clamped masked-blocks-per-seq from {args.masked_blocks_per_seq} to {anchors_per_seq} "
+            f"(seq_len={args.seq_len}, B={B}: max non-overlapping anchors = {max_k})",
+            flush=True,
+        )
 
     for step in range(args.steps + 1):
         optim.zero_grad(set_to_none=True)
@@ -487,14 +545,16 @@ def main() -> int:
         # equal windows, sample anchor per window) both avoids overlaps and
         # improves coverage across the sequence.
         window_size = (args.seq_len - B) // K
-        anchors = torch.stack([
-            torch.tensor(
-                [w * window_size + 1 + random.randint(0, max(0, window_size - B))
-                 for w in range(K)],
-                dtype=torch.long, device=device
-            )
-            for _ in range(args.batch_size)
-        ])  # [batch, K]
+        anchors = torch.stack(
+            [
+                torch.tensor(
+                    [w * window_size + 1 + random.randint(0, max(0, window_size - B)) for w in range(K)],
+                    dtype=torch.long,
+                    device=device,
+                )
+                for _ in range(args.batch_size)
+            ]
+        )  # [batch, K]
 
         # Single draft forward per example over a CONCATENATED [K×B]-length
         # noise sequence. Paper §4.2 / Figure 4: "all blocks are concatenated
@@ -564,15 +624,15 @@ def main() -> int:
             #         (bidirectional within-block; no cross-block leakage).
             q_len = K * B
             k_len_total = L + q_len
-            q_block = torch.arange(q_len, device=device) // B                   # [q_len] which block
-            q_anchor = anchors[b][q_block]                                      # [q_len] abs anchor of q
+            q_block = torch.arange(q_len, device=device) // B  # [q_len] which block
+            q_anchor = anchors[b][q_block]  # [q_len] abs anchor of q
             # Context visibility: [q_len, L] — j < anchor(q)
-            ctx_idx = torch.arange(L, device=device).unsqueeze(0)               # [1, L]
-            ctx_visible = ctx_idx < q_anchor.unsqueeze(1)                       # [q_len, L]
+            ctx_idx = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+            ctx_visible = ctx_idx < q_anchor.unsqueeze(1)  # [q_len, L]
             # Noise-to-noise: same block only
-            k_block = torch.arange(q_len, device=device) // B                   # [q_len]
-            same_block = q_block.unsqueeze(1) == k_block.unsqueeze(0)           # [q_len, q_len]
-            mask_bool = torch.cat([ctx_visible, same_block], dim=1)             # [q_len, L + q_len]
+            k_block = torch.arange(q_len, device=device) // B  # [q_len]
+            same_block = q_block.unsqueeze(1) == k_block.unsqueeze(0)  # [q_len, q_len]
+            mask_bool = torch.cat([ctx_visible, same_block], dim=1)  # [q_len, L + q_len]
             # Additive mask: 0 where allowed, -inf where blocked. Shape
             # [1, 1, q_len, k_len_total] broadcasts across batch/heads.
             attn_mask = torch.zeros_like(mask_bool, dtype=dtype)
@@ -592,17 +652,19 @@ def main() -> int:
             # Indexing trick: construct a [K*(B-1)] index tensor.
             pred_idx = torch.tensor(
                 [k * B + i for k in range(K) for i in range(1, B)],
-                dtype=torch.long, device=device,
+                dtype=torch.long,
+                device=device,
             )
-            pred_hidden = draft_hidden[:, pred_idx, :]                          # [1, K*(B-1), hidden]
-            logits = target.lm_head(pred_hidden)                                # [1, K*(B-1), vocab]
+            pred_hidden = draft_hidden[:, pred_idx, :]  # [1, K*(B-1), hidden]
+            logits = target.lm_head(pred_hidden)  # [1, K*(B-1), vocab]
 
             # Labels: original token at each predicted position.
             label_abs = torch.tensor(
                 [int(anchors[b, k].item()) + i for k in range(K) for i in range(1, B)],
-                dtype=torch.long, device=device,
+                dtype=torch.long,
+                device=device,
             )
-            labels = clean_seq[:, label_abs]                                    # [1, K*(B-1)]
+            labels = clean_seq[:, label_abs]  # [1, K*(B-1)]
 
             # Reshape to [K, B-1] so the per-position weighting applies
             # uniformly within each block (not across the concatenated stream).
@@ -643,13 +705,16 @@ def main() -> int:
         # so the log shows τ at that checkpoint step.
         if args.tau_probe_every > 0 and step > 0 and step % args.tau_probe_every == 0:
             probe_prompt = (
-                Path(args.tau_probe_prompt).read_text().strip()
-                if args.tau_probe_prompt else DEFAULT_TAU_PROBE_PROMPT
+                Path(args.tau_probe_prompt).read_text().strip() if args.tau_probe_prompt else DEFAULT_TAU_PROBE_PROMPT
             )
             try:
                 tau, n_cycles = tau_probe(
-                    draft, target, tokenizer, probe_prompt,
-                    args.tau_probe_max_new, device,
+                    draft,
+                    target,
+                    tokenizer,
+                    probe_prompt,
+                    args.tau_probe_max_new,
+                    device,
                 )
                 print(f"[probe] step={step} τ={tau:.3f} cycles={n_cycles}", flush=True)
             except Exception as e:
@@ -715,24 +780,28 @@ def main() -> int:
     cfg_path.write_text(json.dumps(hf_cfg, indent=2))
 
     # Training-provenance metadata (not HF-standard; helpful for reproducibility).
-    (final_dir / "training_meta.json").write_text(json.dumps({
-        "steps": args.steps,
-        "loss_ema": loss_ema,
-        "target_repo": args.target_repo,
-        "draft_layers": args.draft_layers,
-        "block_size": args.block_size,
-        "seq_len": args.seq_len,
-        "masked_blocks_per_seq": args.masked_blocks_per_seq,
-        "loss_gamma": args.loss_gamma,
-        "mask_token_id": mask_token_id,
-        "corpus": args.corpus,
-        "lr_peak": args.lr,
-        "batch_size": args.batch_size,
-    }, indent=2))
+    (final_dir / "training_meta.json").write_text(
+        json.dumps(
+            {
+                "steps": args.steps,
+                "loss_ema": loss_ema,
+                "target_repo": args.target_repo,
+                "draft_layers": args.draft_layers,
+                "block_size": args.block_size,
+                "seq_len": args.seq_len,
+                "masked_blocks_per_seq": args.masked_blocks_per_seq,
+                "loss_gamma": args.loss_gamma,
+                "mask_token_id": mask_token_id,
+                "corpus": args.corpus,
+                "lr_peak": args.lr,
+                "batch_size": args.batch_size,
+            },
+            indent=2,
+        )
+    )
     print(f"[done] final HF-format draft at {final_dir}", flush=True)
     print(f"[done] convert to .hfq with:", flush=True)
-    print(f"       target/release/dflash_convert --input {final_dir} "
-          f"--output {final_dir}.hfq --mq4", flush=True)
+    print(f"       target/release/dflash_convert --input {final_dir} --output {final_dir}.hfq --mq4", flush=True)
     return 0
 
 

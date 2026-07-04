@@ -40,8 +40,7 @@ PROMPT_PATH = REPO / "benchmarks" / "prompts" / "qwen2_smoke.txt"
 OUT_PATH = REPO / "benchmarks" / "references" / "qwen2_1p5b_instruct_smoke.json"
 MODEL_ID = "Qwen/Qwen2-1.5B-Instruct"
 SNAPSHOT = (
-    "/data/cache/huggingface/hub/models--Qwen--Qwen2-1.5B-Instruct/"
-    "snapshots/ba1cf1846d7df0a0591d6c00649f57e798519da8"
+    "/data/cache/huggingface/hub/models--Qwen--Qwen2-1.5B-Instruct/snapshots/ba1cf1846d7df0a0591d6c00649f57e798519da8"
 )
 
 
@@ -57,8 +56,7 @@ def main() -> int:
         return 1
     if not Path(SNAPSHOT).is_dir():
         print(
-            f"error: model snapshot not found: {SNAPSHOT}\n"
-            f"  hint: huggingface-cli download {MODEL_ID}",
+            f"error: model snapshot not found: {SNAPSHOT}\n  hint: huggingface-cli download {MODEL_ID}",
             file=sys.stderr,
         )
         return 1
@@ -104,10 +102,7 @@ def main() -> int:
     logit_dump: dict[str, list[dict[str, float]]] = {}
     for p in top_positions:
         vals, ids = torch.topk(logits[p], k=100)
-        logit_dump[f"pos_{p}"] = [
-            {"token_id": int(t), "logit": float(v)}
-            for t, v in zip(ids.tolist(), vals.tolist())
-        ]
+        logit_dump[f"pos_{p}"] = [{"token_id": int(t), "logit": float(v)} for t, v in zip(ids.tolist(), vals.tolist())]
 
     # Greedy decode 32 continuation tokens.
     print("greedy decoding 32 continuation tokens...")

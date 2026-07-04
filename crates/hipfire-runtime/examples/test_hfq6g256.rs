@@ -1,9 +1,31 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Correctness test for HFQ6-G256 quantize → GPU dequant round-trip.
 //! Quantize known F32 values, upload, run GEMV, compare against F32 GEMV.
+
+#![allow(clippy::needless_range_loop)]
 
 fn main() {
     let mut gpu = hipfire_rdna::Gpu::init().unwrap();
@@ -151,7 +173,7 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256;
     let block_bytes = 200;
     let n = f32_data.len();
-    let n_blocks = (n + group_size - 1) / group_size;
+    let n_blocks = n.div_ceil(group_size);
     let mut output = vec![0u8; n_blocks * block_bytes];
 
     for b in 0..n_blocks {

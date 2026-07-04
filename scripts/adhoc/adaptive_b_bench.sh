@@ -24,7 +24,10 @@ fi
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "adaptive-b-bench" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "adaptive-b-bench" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -45,7 +48,8 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
 
 INSTRUCT_PROMPT="Explain, in three or four sentences, why the sky appears blue during the day. Your answer should be accessible to a curious middle-school student."
 
-PARSE_PY=$(cat <<'PY'
+PARSE_PY=$(
+    cat <<'PY'
 import sys, re, statistics
 label = sys.argv[1]
 genre = sys.argv[2]
@@ -101,7 +105,7 @@ for cfg in "fixed-B16|--no-adaptive-b" "adaptive-8-16|" "adaptive-8-20|--adaptiv
     args=${cfg#*|}
     # Split args on spaces but preserve empty.
     read -ra argv <<<"$args"
-    run_one "$label" "code"     "$CODE_PROMPT"     "${argv[@]}"
-    run_one "$label" "prose"    "$PROSE_PROMPT"    "${argv[@]}"
+    run_one "$label" "code" "$CODE_PROMPT" "${argv[@]}"
+    run_one "$label" "prose" "$PROSE_PROMPT" "${argv[@]}"
     run_one "$label" "instruct" "$INSTRUCT_PROMPT" "${argv[@]}"
 done

@@ -31,7 +31,7 @@ GROUP="${HIPFIRE_EVAL_SMOKE_GROUP:-all}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 case "$GROUP" in
-    shape|speed|dflash|all) ;;
+    shape | speed | dflash | all) ;;
     *)
         echo "eval-smoke: unknown HIPFIRE_EVAL_SMOKE_GROUP=$GROUP; expected shape|speed|dflash|all" >&2
         exit 2
@@ -135,11 +135,11 @@ if [ "$GROUP" = "all" ] || [ "$GROUP" = "dflash" ]; then
         exit 0
     fi
     DFLASH_ARGS=(
-        --model "$MODEL" \
-        --battery dflash \
-        --executor examples \
-        --max-tokens "$MAX_TOKENS" \
-        --kv-mode q8 \
+        --model "$MODEL"
+        --battery dflash
+        --executor examples
+        --max-tokens "$MAX_TOKENS"
+        --kv-mode q8
         --dflash auto
     )
     if [ -n "$DRAFT" ]; then

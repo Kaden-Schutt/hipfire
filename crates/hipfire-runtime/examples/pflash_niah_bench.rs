@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -657,9 +677,9 @@ fn main() {
 
             let kept = match decision {
                 PflashDecision::Compressed(cp) => {
-                    score_ms = cp.timings.score_ms as u128;
-                    select_ms = cp.timings.select_ms as u128;
-                    gather_ms = cp.timings.gather_ms as u128;
+                    score_ms = cp.timings.score_ms;
+                    select_ms = cp.timings.select_ms;
+                    gather_ms = cp.timings.gather_ms;
                     eprintln!("compress:    {compress_ms} ms (score={score_ms}ms select={select_ms}ms gather={gather_ms}ms)");
                     eprintln!(
                         "compressed:  {} -> {} tokens (ratio {:.3}, alpha implicit)",

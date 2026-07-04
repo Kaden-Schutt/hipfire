@@ -27,87 +27,116 @@ SKIP=0
 
 # Parse args
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --hermes) HERMES_TEST=true; shift ;;
-    --port) PORT="$2"; BASE="http://localhost:$PORT"; shift 2 ;;
-    --running) ALREADY_RUNNING=true; shift ;;
-    --model) MODEL="$2"; shift 2 ;;
-    *) echo "Unknown arg: $1"; exit 1 ;;
-  esac
+    case "$1" in
+        --hermes)
+            HERMES_TEST=true
+            shift
+            ;;
+        --port)
+            PORT="$2"
+            BASE="http://localhost:$PORT"
+            shift 2
+            ;;
+        --running)
+            ALREADY_RUNNING=true
+            shift
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown arg: $1"
+            exit 1
+            ;;
+    esac
 done
 
 # Colors
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-pass() { PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $1"; }
-fail() { FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $1${2:+ — $2}"; }
-skip() { SKIP=$((SKIP+1)); echo -e "  ${YELLOW}SKIP${NC} $1${2:+ — $2}"; }
+pass() {
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC} $1"
+}
+fail() {
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC} $1${2:+ — $2}"
+}
+skip() {
+    SKIP=$((SKIP + 1))
+    echo -e "  ${YELLOW}SKIP${NC} $1${2:+ — $2}"
+}
 header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
 
 cleanup() {
-  if [[ -n "$SERVE_PID" ]]; then
-    echo -e "\n${CYAN}Stopping hipfire serve (pid $SERVE_PID)...${NC}"
-    kill "$SERVE_PID" 2>/dev/null || true
-    wait "$SERVE_PID" 2>/dev/null || true
-  fi
-  # Restore Hermes config if we modified it
-  if [[ -f ~/.hermes/config.yaml.bak ]]; then
-    mv ~/.hermes/config.yaml.bak ~/.hermes/config.yaml
-  fi
+    if [[ -n "$SERVE_PID" ]]; then
+        echo -e "\n${CYAN}Stopping hipfire serve (pid $SERVE_PID)...${NC}"
+        kill "$SERVE_PID" 2>/dev/null || true
+        wait "$SERVE_PID" 2>/dev/null || true
+    fi
+    # Restore Hermes config if we modified it
+    if [[ -f ~/.hermes/config.yaml.bak ]]; then
+        mv ~/.hermes/config.yaml.bak ~/.hermes/config.yaml
+    fi
 }
 trap cleanup EXIT
 
 # ─── Start hipfire serve ───────────────────────────────────
 if ! $ALREADY_RUNNING; then
-  header "Starting hipfire serve on port $PORT"
-  (cd "$ROOT" && cargo run -q -p hipfire-cli -- serve --host 127.0.0.1 --port "$PORT" --model "$MODEL") &
-  SERVE_PID=$!
-  echo "  PID: $SERVE_PID"
+    header "Starting hipfire serve on port $PORT"
+    (cd "$ROOT" && cargo run -q -p hipfire-cli -- serve --host 127.0.0.1 --port "$PORT" --model "$MODEL") &
+    SERVE_PID=$!
+    echo "  PID: $SERVE_PID"
 
-  # Wait for health (up to 120s for model load + kernel compile)
-  echo "  Waiting for server..."
-  for i in $(seq 1 120); do
-    if curl -sf "$BASE/health" >/dev/null 2>&1; then
-      echo "  Ready after ${i}s"
-      break
-    fi
-    if ! kill -0 "$SERVE_PID" 2>/dev/null; then
-      echo -e "${RED}Server exited prematurely${NC}"
-      exit 1
-    fi
-    sleep 1
-  done
+    # Wait for health (up to 120s for model load + kernel compile)
+    echo "  Waiting for server..."
+    for i in $(seq 1 120); do
+        if curl -sf "$BASE/health" >/dev/null 2>&1; then
+            echo "  Ready after ${i}s"
+            break
+        fi
+        if ! kill -0 "$SERVE_PID" 2>/dev/null; then
+            echo -e "${RED}Server exited prematurely${NC}"
+            exit 1
+        fi
+        sleep 1
+    done
 
-  if ! curl -sf "$BASE/health" >/dev/null 2>&1; then
-    echo -e "${RED}Server failed to start after 120s${NC}"
-    exit 1
-  fi
+    if ! curl -sf "$BASE/health" >/dev/null 2>&1; then
+        echo -e "${RED}Server failed to start after 120s${NC}"
+        exit 1
+    fi
 fi
 
 # ─── Test 1: Health check ──────────────────────────────────
 header "Test 1: Health check"
 HEALTH=$(curl -sf "$BASE/health" 2>/dev/null || echo "FAIL")
 if echo "$HEALTH" | jq -e '.status == "ok"' >/dev/null 2>&1; then
-  pass "GET /health returns {status: ok}"
+    pass "GET /health returns {status: ok}"
 else
-  fail "GET /health" "$HEALTH"
+    fail "GET /health" "$HEALTH"
 fi
 
 # ─── Test 2: Model listing ─────────────────────────────────
 header "Test 2: Model listing"
 MODELS=$(curl -sf "$BASE/v1/models" 2>/dev/null || echo "FAIL")
 if echo "$MODELS" | jq -e '.data | length > 0' >/dev/null 2>&1; then
-  COUNT=$(echo "$MODELS" | jq '.data | length')
-  pass "GET /v1/models returns $COUNT models"
+    COUNT=$(echo "$MODELS" | jq '.data | length')
+    pass "GET /v1/models returns $COUNT models"
 else
-  fail "GET /v1/models" "$MODELS"
+    fail "GET /v1/models" "$MODELS"
 fi
 
 # ─── Test 3: Non-streaming basic chat ──────────────────────
 header "Test 3: Non-streaming basic chat"
 RESP=$(curl -sf -X POST "$BASE/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
+    -H "Content-Type: application/json" \
+    -d '{
     "model": "'"$MODEL"'",
     "messages": [{"role": "user", "content": "Say exactly: hello world"}],
     "stream": false,
@@ -116,16 +145,16 @@ RESP=$(curl -sf -X POST "$BASE/v1/chat/completions" \
   }' 2>/dev/null || echo '{"error":"request failed"}')
 
 if echo "$RESP" | jq -e '.choices[0].message.content' >/dev/null 2>&1; then
-  CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content')
-  FINISH=$(echo "$RESP" | jq -r '.choices[0].finish_reason')
-  if [[ -n "$CONTENT" && "$CONTENT" != "null" ]]; then
-    pass "Non-streaming response received (finish=$FINISH, ${#CONTENT} chars)"
-    echo "       Content: ${CONTENT:0:80}"
-  else
-    fail "Non-streaming: empty content" "$RESP"
-  fi
+    CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content')
+    FINISH=$(echo "$RESP" | jq -r '.choices[0].finish_reason')
+    if [[ -n "$CONTENT" && "$CONTENT" != "null" ]]; then
+        pass "Non-streaming response received (finish=$FINISH, ${#CONTENT} chars)"
+        echo "       Content: ${CONTENT:0:80}"
+    else
+        fail "Non-streaming: empty content" "$RESP"
+    fi
 else
-  fail "Non-streaming: invalid response" "$RESP"
+    fail "Non-streaming: invalid response" "$RESP"
 fi
 
 # ─── Test 4: Streaming basic chat ──────────────────────────
@@ -133,8 +162,8 @@ header "Test 4: Streaming basic chat (SSE open + close)"
 STREAM_OUT=$(mktemp)
 # timeout ensures we don't hang forever — the key regression test
 HTTP_CODE=$(curl -sf -o "$STREAM_OUT" -w "%{http_code}" --max-time 30 -X POST "$BASE/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
+    -H "Content-Type: application/json" \
+    -d '{
     "model": "'"$MODEL"'",
     "messages": [{"role": "user", "content": "Say exactly: streaming test"}],
     "stream": true,
@@ -143,29 +172,29 @@ HTTP_CODE=$(curl -sf -o "$STREAM_OUT" -w "%{http_code}" --max-time 30 -X POST "$
   }' 2>/dev/null || echo "000")
 
 if [[ "$HTTP_CODE" == "200" ]]; then
-  # Check for [DONE] marker — proves stream closed properly
-  if grep -q '\[DONE\]' "$STREAM_OUT"; then
-    # Count content chunks
-    CHUNKS=$(grep -c 'data: {' "$STREAM_OUT" || echo 0)
-    pass "Stream completed with [DONE] ($CHUNKS chunks)"
-  else
-    fail "Stream missing [DONE] — possible hang regression" "$(head -5 "$STREAM_OUT")"
-  fi
+    # Check for [DONE] marker — proves stream closed properly
+    if grep -q '\[DONE\]' "$STREAM_OUT"; then
+        # Count content chunks
+        CHUNKS=$(grep -c 'data: {' "$STREAM_OUT" || echo 0)
+        pass "Stream completed with [DONE] ($CHUNKS chunks)"
+    else
+        fail "Stream missing [DONE] — possible hang regression" "$(head -5 "$STREAM_OUT")"
+    fi
 else
-  if [[ "$HTTP_CODE" == "000" ]]; then
-    fail "Stream timed out (30s) — HANG DETECTED"
-  else
-    fail "Stream HTTP $HTTP_CODE" "$(head -3 "$STREAM_OUT")"
-  fi
+    if [[ "$HTTP_CODE" == "000" ]]; then
+        fail "Stream timed out (30s) — HANG DETECTED"
+    else
+        fail "Stream HTTP $HTTP_CODE" "$(head -3 "$STREAM_OUT")"
+    fi
 fi
 rm -f "$STREAM_OUT"
 
 # ─── Test 5: Non-streaming with tools ──────────────────────
 header "Test 5: Non-streaming tool call"
 TOOL_RESP=$(curl -sf -X POST "$BASE/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  --max-time 60 \
-  -d '{
+    -H "Content-Type: application/json" \
+    --max-time 60 \
+    -d '{
     "model": "'"$MODEL"'",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant. When asked about the weather, always use the get_weather tool."},
@@ -195,28 +224,28 @@ TOOL_FINISH=$(echo "$TOOL_RESP" | jq -r '.choices[0].finish_reason' 2>/dev/null)
 TOOL_CONTENT=$(echo "$TOOL_RESP" | jq -r '.choices[0].message.content // ""' 2>/dev/null)
 
 if [[ -n "$TOOL_CALLS" && "$TOOL_CALLS" != "null" ]]; then
-  TOOL_NAME=$(echo "$TOOL_CALLS" | jq -r '.[0].function.name' 2>/dev/null)
-  pass "Tool call detected: $TOOL_NAME (finish=$TOOL_FINISH)"
+    TOOL_NAME=$(echo "$TOOL_CALLS" | jq -r '.[0].function.name' 2>/dev/null)
+    pass "Tool call detected: $TOOL_NAME (finish=$TOOL_FINISH)"
 elif [[ -n "$TOOL_CONTENT" && "$TOOL_CONTENT" != "null" && "$TOOL_CONTENT" != "" ]]; then
-  # Model responded with text instead of tool call — not a server bug
-  skip "Model chose text over tool call" "${TOOL_CONTENT:0:60}"
+    # Model responded with text instead of tool call — not a server bug
+    skip "Model chose text over tool call" "${TOOL_CONTENT:0:60}"
 else
-  # Empty content = model spent all tokens thinking (common with thinking models).
-  # Server still returned a valid response — not a hang. Mark as skip, not fail.
-  COMP_TOKENS=$(echo "$TOOL_RESP" | jq -r '.usage.completion_tokens // 0' 2>/dev/null)
-  if echo "$TOOL_RESP" | jq -e '.choices[0]' >/dev/null 2>&1; then
-    skip "Model exhausted tokens thinking ($COMP_TOKENS tok, no visible output)"
-  else
-    fail "No valid response" "$TOOL_RESP"
-  fi
+    # Empty content = model spent all tokens thinking (common with thinking models).
+    # Server still returned a valid response — not a hang. Mark as skip, not fail.
+    COMP_TOKENS=$(echo "$TOOL_RESP" | jq -r '.usage.completion_tokens // 0' 2>/dev/null)
+    if echo "$TOOL_RESP" | jq -e '.choices[0]' >/dev/null 2>&1; then
+        skip "Model exhausted tokens thinking ($COMP_TOKENS tok, no visible output)"
+    else
+        fail "No valid response" "$TOOL_RESP"
+    fi
 fi
 
 # ─── Test 6: Streaming with tools ──────────────────────────
 header "Test 6: Streaming tool call"
 STOOL_OUT=$(mktemp)
 HTTP_CODE=$(curl -sf -o "$STOOL_OUT" -w "%{http_code}" --max-time 60 -X POST "$BASE/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
+    -H "Content-Type: application/json" \
+    -d '{
     "model": "'"$MODEL"'",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant. When asked about the weather, always use the get_weather tool."},
@@ -242,24 +271,24 @@ HTTP_CODE=$(curl -sf -o "$STOOL_OUT" -w "%{http_code}" --max-time 60 -X POST "$B
   }' 2>/dev/null || echo "000")
 
 if [[ "$HTTP_CODE" == "200" ]]; then
-  if grep -q '\[DONE\]' "$STOOL_OUT"; then
-    # Check if tool_calls appear in stream deltas
-    if grep -q 'tool_calls' "$STOOL_OUT"; then
-      STREAM_FINISH=$(grep 'finish_reason' "$STOOL_OUT" | tail -1 | grep -o '"tool_calls"\|"stop"' | head -1)
-      pass "Streaming tool call with [DONE] (finish=$STREAM_FINISH)"
+    if grep -q '\[DONE\]' "$STOOL_OUT"; then
+        # Check if tool_calls appear in stream deltas
+        if grep -q 'tool_calls' "$STOOL_OUT"; then
+            STREAM_FINISH=$(grep 'finish_reason' "$STOOL_OUT" | tail -1 | grep -o '"tool_calls"\|"stop"' | head -1)
+            pass "Streaming tool call with [DONE] (finish=$STREAM_FINISH)"
+        else
+            # Stream closed (no hang!) but tools came as content
+            pass "Stream closed properly (tool as content — model-dependent)"
+        fi
     else
-      # Stream closed (no hang!) but tools came as content
-      pass "Stream closed properly (tool as content — model-dependent)"
+        fail "Streaming tool: missing [DONE]"
     fi
-  else
-    fail "Streaming tool: missing [DONE]"
-  fi
 else
-  if [[ "$HTTP_CODE" == "000" ]]; then
-    fail "Streaming tool timed out — HANG DETECTED"
-  else
-    fail "Streaming tool HTTP $HTTP_CODE"
-  fi
+    if [[ "$HTTP_CODE" == "000" ]]; then
+        fail "Streaming tool timed out — HANG DETECTED"
+    else
+        fail "Streaming tool HTTP $HTTP_CODE"
+    fi
 fi
 rm -f "$STOOL_OUT"
 
@@ -269,9 +298,9 @@ header "Test 7: Multi-turn tool-calling (ChatML format test)"
 # Turn 1: user asks question → assistant calls tool
 # Turn 2: tool result → assistant gives final answer
 MULTI_RESP=$(curl -sf -X POST "$BASE/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  --max-time 60 \
-  -d '{
+    -H "Content-Type: application/json" \
+    --max-time 60 \
+    -d '{
     "model": "'"$MODEL"'",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
@@ -306,49 +335,49 @@ MULTI_CONTENT=$(echo "$MULTI_RESP" | jq -r '.choices[0].message.content // ""' 2
 MULTI_FINISH=$(echo "$MULTI_RESP" | jq -r '.choices[0].finish_reason // ""' 2>/dev/null)
 
 if [[ -n "$MULTI_CONTENT" && "$MULTI_CONTENT" != "null" && ${#MULTI_CONTENT} -gt 5 ]]; then
-  # Check if the response references the tool result (18 degrees, cloudy, Paris, etc.)
-  if echo "$MULTI_CONTENT" | grep -qiE '18|cloud|paris|weather|temperature'; then
-    pass "Multi-turn: model used tool result (finish=$MULTI_FINISH, ${#MULTI_CONTENT} chars)"
-    echo "       Content: ${MULTI_CONTENT:0:100}"
-  else
-    # Got content but didn't reference the tool result — ChatML might still be broken
-    pass "Multi-turn: got response but may not reference tool data"
-    echo "       Content: ${MULTI_CONTENT:0:100}"
-  fi
+    # Check if the response references the tool result (18 degrees, cloudy, Paris, etc.)
+    if echo "$MULTI_CONTENT" | grep -qiE '18|cloud|paris|weather|temperature'; then
+        pass "Multi-turn: model used tool result (finish=$MULTI_FINISH, ${#MULTI_CONTENT} chars)"
+        echo "       Content: ${MULTI_CONTENT:0:100}"
+    else
+        # Got content but didn't reference the tool result — ChatML might still be broken
+        pass "Multi-turn: got response but may not reference tool data"
+        echo "       Content: ${MULTI_CONTENT:0:100}"
+    fi
 else
-  fail "Multi-turn: empty or missing response" "$MULTI_RESP"
+    fail "Multi-turn: empty or missing response" "$MULTI_RESP"
 fi
 
 # ─── Test 8: Error handling — bad model ─────────────────────
 header "Test 8: Error handling"
 ERR_RESP=$(curl -sf -X POST "$BASE/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
+    -H "Content-Type: application/json" \
+    -d '{
     "model": "nonexistent-model-xyz",
     "messages": [{"role": "user", "content": "test"}],
     "stream": false
   }' 2>/dev/null || echo '{"error":"request failed"}')
 
 if echo "$ERR_RESP" | jq -e '.error' >/dev/null 2>&1; then
-  pass "Bad model returns error response"
+    pass "Bad model returns error response"
 else
-  fail "Bad model: expected error" "$ERR_RESP"
+    fail "Bad model: expected error" "$ERR_RESP"
 fi
 
 # ─── Test 9 (optional): Hermes agent integration ───────────
 if $HERMES_TEST; then
-  header "Test 9: Hermes agent integration"
+    header "Test 9: Hermes agent integration"
 
-  if ! command -v hermes &>/dev/null; then
-    skip "Hermes CLI not found"
-  else
-    # Backup and modify Hermes config to point at hipfire
-    cp ~/.hermes/config.yaml ~/.hermes/config.yaml.bak
+    if ! command -v hermes &>/dev/null; then
+        skip "Hermes CLI not found"
+    else
+        # Backup and modify Hermes config to point at hipfire
+        cp ~/.hermes/config.yaml ~/.hermes/config.yaml.bak
 
-    # Patch config: use named custom provider (custom:hipfire) — the only
-    # reliable way to bypass hermes' provider auto-detection which would
-    # otherwise route to nous/openrouter despite base_url being set.
-    python3 -c "
+        # Patch config: use named custom provider (custom:hipfire) — the only
+        # reliable way to bypass hermes' provider auto-detection which would
+        # otherwise route to nous/openrouter despite base_url being set.
+        python3 -c "
 import yaml, sys
 with open('$HOME/.hermes/config.yaml') as f:
     cfg = yaml.safe_load(f)
@@ -367,30 +396,30 @@ with open('$HOME/.hermes/config.yaml', 'w') as f:
 print('Hermes config patched to use hipfire serve (custom:hipfire)')
 " 2>/dev/null
 
-    if [[ $? -eq 0 ]]; then
-      # Run a simple one-shot query via hermes chat -q (non-interactive)
-      # Use -t terminal for minimal tools (fewer tokens = model can think + respond)
-      echo "  Running: hermes chat -q 'What is 2+2?' -Q -t terminal --max-turns 1"
-      HERMES_OUT=$(timeout 120 hermes chat -q "What is 2+2? Reply with just the number." -Q -t terminal --max-turns 1 2>&1 || echo "HERMES_TIMEOUT")
-      HERMES_EXIT=$?
+        if [[ $? -eq 0 ]]; then
+            # Run a simple one-shot query via hermes chat -q (non-interactive)
+            # Use -t terminal for minimal tools (fewer tokens = model can think + respond)
+            echo "  Running: hermes chat -q 'What is 2+2?' -Q -t terminal --max-turns 1"
+            HERMES_OUT=$(timeout 120 hermes chat -q "What is 2+2? Reply with just the number." -Q -t terminal --max-turns 1 2>&1 || echo "HERMES_TIMEOUT")
+            HERMES_EXIT=$?
 
-      if [[ "$HERMES_OUT" == *"HERMES_TIMEOUT"* ]]; then
-        fail "Hermes timed out (120s)"
-      elif [[ "$HERMES_OUT" == *"daemon closed"* ]]; then
-        fail "Hermes: daemon crashed" "${HERMES_OUT:0:200}"
-      elif [[ ${#HERMES_OUT} -gt 3 ]]; then
-        pass "Hermes got response (${#HERMES_OUT} chars)"
-        # Show last few meaningful lines (skip banners/spinners)
-        echo "       Output: $(echo "$HERMES_OUT" | tail -5 | head -3)"
-      else
-        fail "Hermes: empty response" "$HERMES_OUT"
-      fi
-    else
-      skip "Hermes config patch failed (missing pyyaml?)"
+            if [[ "$HERMES_OUT" == *"HERMES_TIMEOUT"* ]]; then
+                fail "Hermes timed out (120s)"
+            elif [[ "$HERMES_OUT" == *"daemon closed"* ]]; then
+                fail "Hermes: daemon crashed" "${HERMES_OUT:0:200}"
+            elif [[ ${#HERMES_OUT} -gt 3 ]]; then
+                pass "Hermes got response (${#HERMES_OUT} chars)"
+                # Show last few meaningful lines (skip banners/spinners)
+                echo "       Output: $(echo "$HERMES_OUT" | tail -5 | head -3)"
+            else
+                fail "Hermes: empty response" "$HERMES_OUT"
+            fi
+        else
+            skip "Hermes config patch failed (missing pyyaml?)"
+        fi
+
+        # Config restored by cleanup trap
     fi
-
-    # Config restored by cleanup trap
-  fi
 fi
 
 # ─── Summary ───────────────────────────────────────────────
@@ -398,5 +427,5 @@ header "Results"
 echo -e "  ${GREEN}$PASS passed${NC}  ${RED}$FAIL failed${NC}  ${YELLOW}$SKIP skipped${NC}"
 
 if [[ $FAIL -gt 0 ]]; then
-  exit 1
+    exit 1
 fi

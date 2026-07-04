@@ -15,21 +15,24 @@ md5sum "$PROMPT_FILE" | tee "$OUT/prompt.md5"
 
 # case label -> model file (edit paths to match local model dir)
 declare -A CASES=(
-  [mq4]="qwen3.5-9b-mq4.hfq"
-  [mq6]="qwen3.5-9b-mq6.hfq"
-  [paro]="Qwen3.6-35B-A3B-PARO-mq4.hfq"
-  [q8hfq]="qwen3.5-9b.q8hfq"
-  [ds4_mq2lloyd]="deepseek4-lloyd-mq2.hfq"
+    [mq4]="qwen3.5-9b-mq4.hfq"
+    [mq6]="qwen3.5-9b-mq6.hfq"
+    [paro]="Qwen3.6-35B-A3B-PARO-mq4.hfq"
+    [q8hfq]="qwen3.5-9b.q8hfq"
+    [ds4_mq2lloyd]="deepseek4-lloyd-mq2.hfq"
 )
 
 EXE="./target/release/examples/coherence_probe"
 for label in "${!CASES[@]}"; do
-  model="$MODELS/${CASES[$label]}"
-  if [ ! -e "$model" ]; then echo "SKIP $label ($model missing)"; continue; fi
-  echo "CAPTURE $label"
-  HIPFIRE_EMIT_TOKEN_IDS=1 "$EXE" \
-    --model "$model" --prompt-file "$PROMPT_FILE" \
-    --max-tokens "$MAX_TOKENS" --temperature 0.0 \
-    --emit-committed-jsonl "$OUT/$label.committed.jsonl"
+    model="$MODELS/${CASES[$label]}"
+    if [ ! -e "$model" ]; then
+        echo "SKIP $label ($model missing)"
+        continue
+    fi
+    echo "CAPTURE $label"
+    HIPFIRE_EMIT_TOKEN_IDS=1 "$EXE" \
+        --model "$model" --prompt-file "$PROMPT_FILE" \
+        --max-tokens "$MAX_TOKENS" --temperature 0.0 \
+        --emit-committed-jsonl "$OUT/$label.committed.jsonl"
 done
 echo "done -> $OUT"

@@ -210,7 +210,9 @@ def read_tensor(ref: TensorRef, dtype: torch.dtype) -> torch.Tensor:
     return tensor.to(dtype=dtype)
 
 
-def selected_tensor_names(args: argparse.Namespace, target_refs: dict[str, TensorRef], base_refs: dict[str, TensorRef]) -> list[str]:
+def selected_tensor_names(
+    args: argparse.Namespace, target_refs: dict[str, TensorRef], base_refs: dict[str, TensorRef]
+) -> list[str]:
     include_re = re.compile(args.include) if args.include else None
     exclude_re = re.compile(args.exclude) if args.exclude else None
     default_excludes = []
@@ -239,7 +241,9 @@ def selected_tensor_names(args: argparse.Namespace, target_refs: dict[str, Tenso
     return names[: args.max_tensors] if args.max_tensors else names
 
 
-def randomized_svd(delta: torch.Tensor, rank: int, oversample: int, power_iters: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def randomized_svd(
+    delta: torch.Tensor, rank: int, oversample: int, power_iters: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m, n = delta.shape
     k = min(rank + oversample, m, n)
     if rank > k:
@@ -435,7 +439,9 @@ def main() -> int:
     reports: list[TensorReport] = []
     for index, name in enumerate(selected, start=1):
         print(f"[{index}/{len(selected)}] extracting {name} {list(target_refs[name].shape)}", file=sys.stderr)
-        report, tensors = compute_tensor_report(name, target_refs[name], base_refs[name], args, compute_dtype, write_dtype)
+        report, tensors = compute_tensor_report(
+            name, target_refs[name], base_refs[name], args, compute_dtype, write_dtype
+        )
         reports.append(report)
         adapter_tensors.update(tensors)
         print(
@@ -469,7 +475,9 @@ def main() -> int:
         f"rmse={global_metrics['rmse']:.8g}"
     )
     print(f"Adapter tensors: {len(adapter_tensors)}")
-    print(f"Size: {shutil.disk_usage(out_dir).used if False else sum(p.stat().st_size for p in out_dir.iterdir() if p.is_file()) / (1024 * 1024):.2f} MiB")
+    print(
+        f"Size: {shutil.disk_usage(out_dir).used if False else sum(p.stat().st_size for p in out_dir.iterdir() if p.is_file()) / (1024 * 1024):.2f} MiB"
+    )
     return 0
 
 

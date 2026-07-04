@@ -127,7 +127,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     // load-bearing — do not drop.
     let tools_block: Option<String> = tools
         .filter(|t| !t.is_empty())
-        .map(|t| deepseek4::dsml::tools_prompt_block(t));
+        .map(deepseek4::dsml::tools_prompt_block);
     let effective_system: Option<String> = match (
         system_prompt.filter(|s| !s.is_empty()),
         tools_block.as_deref(),
@@ -844,7 +844,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // codepath stays uniform).
         let mut first_logits = last_logits;
         if grammar_active && !matcher.is_free() {
-            matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+            matcher.token_mask(decoded_vocab, &mut grammar_mask);
             deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut first_logits);
         }
         let mut next_tok: u32 =
@@ -918,7 +918,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             ) {
                 Ok(mut logits) => {
                     if grammar_active && !matcher.is_free() {
-                        matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+                        matcher.token_mask(decoded_vocab, &mut grammar_mask);
                         deepseek4::grammar::Matcher::apply_mask_to_logits(
                             &grammar_mask,
                             &mut logits,

@@ -20,8 +20,15 @@ MAX_TIER=-1
 HIP_ARCH=""
 
 log() { echo "$1" | tee -a "$RESULT_FILE"; }
-pass() { log "  ✅ PASS: $1"; PASS=$((PASS+1)); MAX_TIER=$2; }
-fail() { log "  ❌ FAIL: $1"; FAIL=$((FAIL+1)); }
+pass() {
+    log "  ✅ PASS: $1"
+    PASS=$((PASS + 1))
+    MAX_TIER=$2
+}
+fail() {
+    log "  ❌ FAIL: $1"
+    FAIL=$((FAIL + 1))
+}
 
 log "# Harness Results: ${APPROACH}"
 log "**Timestamp:** ${TIMESTAMP}"
@@ -103,7 +110,8 @@ log "## Tier 2: Compute Runtime Init"
 
 # HIP runtime check
 if command -v hipcc &>/dev/null; then
-    HIP_TEST=$(cat <<'EOF'
+    HIP_TEST=$(
+        cat <<'EOF'
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 int main() {
@@ -119,9 +127,9 @@ int main() {
     return 1;
 }
 EOF
-)
+    )
     TMPDIR=$(mktemp -d)
-    echo "$HIP_TEST" > "$TMPDIR/test.cpp"
+    echo "$HIP_TEST" >"$TMPDIR/test.cpp"
     if hipcc "$TMPDIR/test.cpp" -o "$TMPDIR/test" 2>/dev/null; then
         HIP_OUT=$("$TMPDIR/test" 2>&1 || true)
         if echo "$HIP_OUT" | grep -q "HIP OK"; then
@@ -149,7 +157,8 @@ log ""
 log "## Tier 3: Memory Operations"
 
 if command -v hipcc &>/dev/null; then
-    MEMTEST=$(cat <<'EOF'
+    MEMTEST=$(
+        cat <<'EOF'
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <string.h>
@@ -180,9 +189,9 @@ int main() {
     return correct ? 0 : 1;
 }
 EOF
-)
+    )
     TMPDIR=$(mktemp -d)
-    echo "$MEMTEST" > "$TMPDIR/memtest.cpp"
+    echo "$MEMTEST" >"$TMPDIR/memtest.cpp"
     if hipcc "$TMPDIR/memtest.cpp" -o "$TMPDIR/memtest" 2>/dev/null; then
         MEM_OUT=$("$TMPDIR/memtest" 2>&1 || true)
         if echo "$MEM_OUT" | grep -q "verify=PASS"; then
@@ -206,7 +215,8 @@ log ""
 log "## Tier 4: Compute Kernel Execution"
 
 if command -v hipcc &>/dev/null; then
-    KERNEL_TEST=$(cat <<'EOF'
+    KERNEL_TEST=$(
+        cat <<'EOF'
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <math.h>
@@ -260,9 +270,9 @@ int main() {
     return errors == 0 ? 0 : 1;
 }
 EOF
-)
+    )
     TMPDIR=$(mktemp -d)
-    echo "$KERNEL_TEST" > "$TMPDIR/kernel.cpp"
+    echo "$KERNEL_TEST" >"$TMPDIR/kernel.cpp"
     ARCH_FLAGS=()
     if [ -n "$HIP_ARCH" ]; then
         ARCH_FLAGS=(--offload-arch="$HIP_ARCH")
@@ -301,7 +311,8 @@ log ""
 log "## Tier 5: Matrix Multiply"
 
 if command -v hipcc &>/dev/null && [ "$MAX_TIER" -ge 4 ]; then
-    MATMUL_TEST=$(cat <<'EOF'
+    MATMUL_TEST=$(
+        cat <<'EOF'
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <math.h>
@@ -393,15 +404,15 @@ int main() {
     return errors == 0 ? 0 : 1;
 }
 EOF
-)
+    )
     TMPDIR=$(mktemp -d)
-    echo "$MATMUL_TEST" > "$TMPDIR/matmul.cpp"
+    echo "$MATMUL_TEST" >"$TMPDIR/matmul.cpp"
     ARCH_FLAGS=()
     if [ -n "$HIP_ARCH" ]; then
         ARCH_FLAGS=(--offload-arch="$HIP_ARCH")
     fi
-    if hipcc "$TMPDIR/matmul.cpp" -o "$TMPDIR/matmul" "${ARCH_FLAGS[@]}" 2>/dev/null || \
-       { [ -n "$HIP_ARCH" ] && hipcc "$TMPDIR/matmul.cpp" -o "$TMPDIR/matmul" 2>/dev/null; }; then
+    if hipcc "$TMPDIR/matmul.cpp" -o "$TMPDIR/matmul" "${ARCH_FLAGS[@]}" 2>/dev/null \
+        || { [ -n "$HIP_ARCH" ] && hipcc "$TMPDIR/matmul.cpp" -o "$TMPDIR/matmul" 2>/dev/null; }; then
         MM_OUT=$("$TMPDIR/matmul" 2>&1 || true)
         if echo "$MM_OUT" | grep -q "result=PASS"; then
             pass "Matmul correct${HIP_ARCH:+ (${HIP_ARCH})}: ${MM_OUT}" 5

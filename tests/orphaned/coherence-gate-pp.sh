@@ -44,7 +44,7 @@ OUT="${HIPFIRE_COHERENCE_PP_OUT:-/tmp/coherence-pp-$(date +%Y%m%d-%H%M%S).md}"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 PROMPT="${HIPFIRE_PP_PROMPT:-Write a Python function to compute the sum of an array using a loop.}"
 MAX_TOKENS="${HIPFIRE_PP_MAX_TOKENS:-64}"
-TAU_REGRESSION_THRESHOLD="${HIPFIRE_PP_TAU_REGRESSION:-0.05}"  # fraction; 0.05 = 5%
+TAU_REGRESSION_THRESHOLD="${HIPFIRE_PP_TAU_REGRESSION:-0.05}" # fraction; 0.05 = 5%
 
 # ── Rebuild daemon if relevant source is newer than the binary ────────
 rebuild=0
@@ -52,12 +52,12 @@ if [ ! -x "$EXE" ]; then
     rebuild=1
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs \
-               crates/hipfire-arch-qwen35/src/mtp_spec.rs \
-               crates/hipfire-arch-qwen35/src/mtp_head.rs \
-               crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/multi_gpu.rs \
-               crates/hipfire-runtime/src/mtp_mirror.rs \
-               crates/hipfire-daemon/src/main.rs; do
+        crates/hipfire-arch-qwen35/src/mtp_spec.rs \
+        crates/hipfire-arch-qwen35/src/mtp_head.rs \
+        crates/hipfire-runtime/src/llama.rs \
+        crates/hipfire-runtime/src/multi_gpu.rs \
+        crates/hipfire-runtime/src/mtp_mirror.rs \
+        crates/hipfire-daemon/src/main.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
             break
@@ -87,7 +87,10 @@ fi
 # ── GPU lock ──────────────────────────────────────────────────────────
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coherence-gate-pp" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coherence-gate-pp" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -105,17 +108,17 @@ prompt_md5=$(printf '%s' "$PROMPT" | md5sum | awk '{print $1}')
     echo
     echo "---"
     echo
-} > "$OUT"
+} >"$OUT"
 
 hard_errors=0
-baseline_tau=""  # filled in by test 1
+baseline_tau="" # filled in by test 1
 
 # ── Test runner ───────────────────────────────────────────────────────
 # Args: $1=test_id, $2=pp, $3=use_mtp(0/1), $4..N=extra "key":"val" pairs to splice into load params
 run_test() {
     local test_id="$1" pp="$2" use_mtp="$3"
     shift 3
-    local extra_params="${1:-}"  # already-quoted JSON fragments, comma-prefixed
+    local extra_params="${1:-}" # already-quoted JSON fragments, comma-prefixed
 
     local mtp_param=""
     if [ "$use_mtp" -eq 1 ]; then
@@ -133,7 +136,7 @@ run_test() {
     # a penalty without diverging from the trunk's argmax. With penalty
     # 1.05 (or anything > 1.0), MTP silently falls back to AR — making
     # the test useless for τ regression detection.
-    cat > "$in_file" <<JL
+    cat >"$in_file" <<JL
 {"type":"load","model":"$MODEL","params":{"max_seq":4096,"pp":$pp,"kv_mode":"asym3"$mtp_param$extra_params}}
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":$MAX_TOKENS,"repeat_penalty":1.0}
 {"type":"unload"}
@@ -143,7 +146,7 @@ JL
     local t0 t1 wall ec
     t0=$(date +%s.%N)
     env HIPFIRE_ALLOW_MIXED_ARCH=1 HIPFIRE_PP_LAYERS=48,16 \
-        timeout 360 "$EXE" < "$in_file" > "$out_file" 2>&1
+        timeout 360 "$EXE" <"$in_file" >"$out_file" 2>&1
     ec=$?
     t1=$(date +%s.%N)
     wall=$(python3 -c "print(f'{$t1 - $t0:.1f}')")
@@ -248,7 +251,7 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
         echo
         echo '---'
         echo
-    } >> "$OUT"
+    } >>"$OUT"
 
     rm -f "$in_file" "$out_file"
 }
@@ -269,7 +272,7 @@ run_test "pp2-mtp-load" 2 1
     echo
     echo "- baseline τ (pp=1 + mtp): \`$baseline_tau\`"
     echo "- hard errors: $hard_errors"
-} >> "$OUT"
+} >>"$OUT"
 
 echo
 echo "coherence-pp report: $OUT"

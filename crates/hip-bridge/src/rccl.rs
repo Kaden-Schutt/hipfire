@@ -281,6 +281,7 @@ impl RcclComms {
     /// - `count * sizeof(dtype)` bytes must be valid at both buffers.
     /// - All ranks must call AllReduce with matching `count`, `dtype`, `op`
     ///   between paired `group_start/group_end` calls.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn all_reduce(
         &self,
         rank: usize,

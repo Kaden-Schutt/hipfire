@@ -218,7 +218,7 @@ pub fn load_llama_from_hfq(
 fn bytes_to_f32(dtype: &str, bytes: &[u8]) -> Result<Vec<f32>, String> {
     match dtype {
         "F32" => {
-            if bytes.len() % 4 != 0 {
+            if !bytes.len().is_multiple_of(4) {
                 return Err("F32 byte len not /4".into());
             }
             Ok(bytes

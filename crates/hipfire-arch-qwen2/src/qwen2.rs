@@ -770,7 +770,7 @@ impl Qwen2State {
 
         // Flash-decode partials: chunk_size is 128 for seq_len > 128, so the
         // max chunk count is ceil(max_seq/128); stride is (max, sum, head_dim).
-        let n_chunks_max = (max_seq + 127) / 128;
+        let n_chunks_max = max_seq.div_ceil(128);
         let attn_partials_len = cfg.num_attention_heads * n_chunks_max * (2 + cfg.head_dim);
 
         // x_rot scratch: must fit both attention (dim) and FFN (hidden_dim)

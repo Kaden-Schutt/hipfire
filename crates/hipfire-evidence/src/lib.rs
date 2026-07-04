@@ -1061,6 +1061,7 @@ pub fn classify_hardware_kind(vram_bytes: Option<u64>, gtt_bytes: Option<u64>) -
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn hardware_bucket(
     hardware_kind: &str,
     gfx: Option<&str>,

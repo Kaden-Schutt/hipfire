@@ -12,6 +12,7 @@ Test B: target(prompt, past_kv=DynamicCache(config)), then target(block_out, pas
 
 If Test A = '\n' (198) and Test B = 'user' (846), there's a cache state bug.
 """
+
 import sys, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
@@ -20,7 +21,9 @@ dtype = torch.bfloat16
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
 target = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen3.5-4B", torch_dtype=dtype, attn_implementation="eager",
+    "Qwen/Qwen3.5-4B",
+    torch_dtype=dtype,
+    attn_implementation="eager",
 ).to(device)
 target.eval()
 
@@ -52,39 +55,58 @@ pkv_t = DynamicCache(config=target.config)
 position_ids_full = torch.arange(num_in + 16, device=device).unsqueeze(0)
 with torch.inference_mode():
     out_pre = target(
-        ids, position_ids=position_ids_full[:, :num_in],
-        past_key_values=pkv_t, use_cache=True,
-        logits_to_keep=1, output_hidden_states=True,
+        ids,
+        position_ids=position_ids_full[:, :num_in],
+        past_key_values=pkv_t,
+        use_cache=True,
+        logits_to_keep=1,
+        output_hidden_states=True,
     )
 pre_arg = out_pre.logits[:, -1].argmax(dim=-1)
-print(f"  prefill last logit argmax: {pre_arg.item()} = {tok.decode([pre_arg.item()])!r} (expect '<think>')", flush=True)
+print(
+    f"  prefill last logit argmax: {pre_arg.item()} = {tok.decode([pre_arg.item()])!r} (expect '<think>')", flush=True
+)
 
 block = torch.tensor([[think_tok] + [248070] * 15], device=device)
 with torch.inference_mode():
     out_B = target(
-        block, position_ids=position_ids_full[:, num_in:num_in+16],
-        past_key_values=pkv_t, use_cache=True, output_hidden_states=True,
+        block,
+        position_ids=position_ids_full[:, num_in : num_in + 16],
+        past_key_values=pkv_t,
+        use_cache=True,
+        output_hidden_states=True,
     )
 arg_B = out_B.logits[:, 0].argmax(dim=-1)
 print(f"  cycle logits[:, 0] argmax: {arg_B.item()} = {tok.decode([arg_B.item()])!r} (expect '\\n')", flush=True)
-print(f"  cycle logits[:, 1] argmax: {out_B.logits[:, 1].argmax(dim=-1).item()} = "
-      f"{tok.decode([out_B.logits[:, 1].argmax(dim=-1).item()])!r}", flush=True)
+print(
+    f"  cycle logits[:, 1] argmax: {out_B.logits[:, 1].argmax(dim=-1).item()} = "
+    f"{tok.decode([out_B.logits[:, 1].argmax(dim=-1).item()])!r}",
+    flush=True,
+)
 
 # TEST C: same but WITHOUT logits_to_keep=1 on prefill
 print(f"\n[Test C] prefill WITHOUT logits_to_keep=1:", flush=True)
 pkv_t2 = DynamicCache(config=target.config)
 with torch.inference_mode():
     out_pre2 = target(
-        ids, position_ids=position_ids_full[:, :num_in],
-        past_key_values=pkv_t2, use_cache=True,
+        ids,
+        position_ids=position_ids_full[:, :num_in],
+        past_key_values=pkv_t2,
+        use_cache=True,
         output_hidden_states=True,
     )
     out_C = target(
-        block, position_ids=position_ids_full[:, num_in:num_in+16],
-        past_key_values=pkv_t2, use_cache=True, output_hidden_states=True,
+        block,
+        position_ids=position_ids_full[:, num_in : num_in + 16],
+        past_key_values=pkv_t2,
+        use_cache=True,
+        output_hidden_states=True,
     )
-print(f"  cycle logits[:, 0] argmax: {out_C.logits[:, 0].argmax(dim=-1).item()} = "
-      f"{tok.decode([out_C.logits[:, 0].argmax(dim=-1).item()])!r}", flush=True)
+print(
+    f"  cycle logits[:, 0] argmax: {out_C.logits[:, 0].argmax(dim=-1).item()} = "
+    f"{tok.decode([out_C.logits[:, 0].argmax(dim=-1).item()])!r}",
+    flush=True,
+)
 
 # TEST D: plain DynamicCache (no config)
 print(f"\n[Test D] prefill with plain DynamicCache() (no config=):", flush=True)
@@ -92,15 +114,23 @@ try:
     pkv_t3 = DynamicCache()
     with torch.inference_mode():
         out_pre3 = target(
-            ids, position_ids=position_ids_full[:, :num_in],
-            past_key_values=pkv_t3, use_cache=True,
+            ids,
+            position_ids=position_ids_full[:, :num_in],
+            past_key_values=pkv_t3,
+            use_cache=True,
             output_hidden_states=True,
         )
         out_D = target(
-            block, position_ids=position_ids_full[:, num_in:num_in+16],
-            past_key_values=pkv_t3, use_cache=True, output_hidden_states=True,
+            block,
+            position_ids=position_ids_full[:, num_in : num_in + 16],
+            past_key_values=pkv_t3,
+            use_cache=True,
+            output_hidden_states=True,
         )
-    print(f"  cycle logits[:, 0] argmax: {out_D.logits[:, 0].argmax(dim=-1).item()} = "
-          f"{tok.decode([out_D.logits[:, 0].argmax(dim=-1).item()])!r}", flush=True)
+    print(
+        f"  cycle logits[:, 0] argmax: {out_D.logits[:, 0].argmax(dim=-1).item()} = "
+        f"{tok.decode([out_D.logits[:, 0].argmax(dim=-1).item()])!r}",
+        flush=True,
+    )
 except Exception as e:
     print(f"  FAILED: {e}", flush=True)

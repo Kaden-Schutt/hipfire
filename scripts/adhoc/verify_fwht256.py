@@ -11,16 +11,19 @@ Simulates the 32-thread x 8-element register+shuffle decomposition
 and compares against the scalar triple-loop reference implementation.
 Also validates round-trip (forward then inverse = identity up to scale).
 """
+
 import numpy as np
+
 
 def gen_fwht_signs(seed, n):
     """Match the Rust gen_fwht_signs exactly (LCG, bit 16)."""
-    state = seed & 0x7fffffff
+    state = seed & 0x7FFFFFFF
     signs = []
     for _ in range(n):
-        state = (state * 1103515245 + 12345) & 0x7fffffff
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
         signs.append(1.0 if ((state >> 16) & 1) == 1 else -1.0)
     return np.array(signs, dtype=np.float64)
+
 
 def fwht_scalar_forward_256(x, signs1, signs2):
     """Reference scalar FWHT-256: signs1, butterfly, scale, signs2."""
@@ -30,13 +33,14 @@ def fwht_scalar_forward_256(x, signs1, signs2):
     while stride < n:
         for i in range(0, n, stride * 2):
             for j in range(stride):
-                a, b = x[i+j], x[i+j+stride]
-                x[i+j]        = a + b
-                x[i+j+stride] = a - b
+                a, b = x[i + j], x[i + j + stride]
+                x[i + j] = a + b
+                x[i + j + stride] = a - b
         stride <<= 1
     x *= 1.0 / np.sqrt(256.0)
     x *= signs2
     return x
+
 
 def fwht_scalar_inverse_256(x, signs1, signs2):
     """Reference scalar inverse FWHT-256: signs2, butterfly, scale*signs1."""
@@ -46,12 +50,13 @@ def fwht_scalar_inverse_256(x, signs1, signs2):
     while stride < n:
         for i in range(0, n, stride * 2):
             for j in range(stride):
-                a, b = x[i+j], x[i+j+stride]
-                x[i+j]        = a + b
-                x[i+j+stride] = a - b
+                a, b = x[i + j], x[i + j + stride]
+                x[i + j] = a + b
+                x[i + j + stride] = a - b
         stride <<= 1
     x *= (1.0 / np.sqrt(256.0)) * signs1
     return x
+
 
 def fwht_shfl_forward_256(x, signs1, signs2):
     """
@@ -66,35 +71,35 @@ def fwht_shfl_forward_256(x, signs1, signs2):
     regs = []
     for tid in range(N_THREADS):
         d0 = tid * EPT
-        v = x[d0:d0+EPT].copy()
+        v = x[d0 : d0 + EPT].copy()
         # Apply signs1
-        v *= signs1[d0:d0+EPT]
+        v *= signs1[d0 : d0 + EPT]
         regs.append(v)
 
     # Pass 1: stride 1 (pairs 0-1, 2-3, 4-5, 6-7)
     for tid in range(N_THREADS):
         v = regs[tid]
         for base in range(0, EPT, 2):
-            a, b = v[base], v[base+1]
-            v[base]   = a + b
-            v[base+1] = a - b
+            a, b = v[base], v[base + 1]
+            v[base] = a + b
+            v[base + 1] = a - b
 
     # Pass 2: stride 2 (pairs 0-2, 1-3, 4-6, 5-7)
     for tid in range(N_THREADS):
         v = regs[tid]
         for base in range(0, EPT, 4):
             for j in range(2):
-                a, b = v[base+j], v[base+j+2]
-                v[base+j]   = a + b
-                v[base+j+2] = a - b
+                a, b = v[base + j], v[base + j + 2]
+                v[base + j] = a + b
+                v[base + j + 2] = a - b
 
     # Pass 3: stride 4 (pairs 0-4, 1-5, 2-6, 3-7)
     for tid in range(N_THREADS):
         v = regs[tid]
         for j in range(4):
-            a, b = v[j], v[j+4]
-            v[j]   = a + b
-            v[j+4] = a - b
+            a, b = v[j], v[j + 4]
+            v[j] = a + b
+            v[j + 4] = a - b
 
     # Passes 4-8: warp shuffle (__shfl_xor)
     # Thread strides: 1, 2, 4, 8, 16
@@ -113,14 +118,15 @@ def fwht_shfl_forward_256(x, signs1, signs2):
     s = 1.0 / np.sqrt(256.0)
     for tid in range(N_THREADS):
         d0 = tid * EPT
-        regs[tid] *= s * signs2[d0:d0+EPT]
+        regs[tid] *= s * signs2[d0 : d0 + EPT]
 
     # Reassemble
     result = np.zeros(256, dtype=np.float64)
     for tid in range(N_THREADS):
         d0 = tid * EPT
-        result[d0:d0+EPT] = regs[tid]
+        result[d0 : d0 + EPT] = regs[tid]
     return result
+
 
 def fwht_shfl_inverse_256(x, signs1, signs2):
     """
@@ -133,8 +139,8 @@ def fwht_shfl_inverse_256(x, signs1, signs2):
     regs = []
     for tid in range(N_THREADS):
         d0 = tid * EPT
-        v = x[d0:d0+EPT].copy()
-        v *= signs2[d0:d0+EPT]
+        v = x[d0 : d0 + EPT].copy()
+        v *= signs2[d0 : d0 + EPT]
         regs.append(v)
 
     # Passes 4-8 (shuffle, same as forward)
@@ -153,37 +159,37 @@ def fwht_shfl_inverse_256(x, signs1, signs2):
     for tid in range(N_THREADS):
         v = regs[tid]
         for j in range(4):
-            a, b = v[j], v[j+4]
-            v[j]   = a + b
-            v[j+4] = a - b
+            a, b = v[j], v[j + 4]
+            v[j] = a + b
+            v[j + 4] = a - b
 
     # Pass 2 reverse: stride 2
     for tid in range(N_THREADS):
         v = regs[tid]
         for base in range(0, EPT, 4):
             for j in range(2):
-                a, b = v[base+j], v[base+j+2]
-                v[base+j]   = a + b
-                v[base+j+2] = a - b
+                a, b = v[base + j], v[base + j + 2]
+                v[base + j] = a + b
+                v[base + j + 2] = a - b
 
     # Pass 1 reverse: stride 1
     for tid in range(N_THREADS):
         v = regs[tid]
         for base in range(0, EPT, 2):
-            a, b = v[base], v[base+1]
-            v[base]   = a + b
-            v[base+1] = a - b
+            a, b = v[base], v[base + 1]
+            v[base] = a + b
+            v[base + 1] = a - b
 
     # Scale and apply signs1
     s = 1.0 / np.sqrt(256.0)
     for tid in range(N_THREADS):
         d0 = tid * EPT
-        regs[tid] *= s * signs1[d0:d0+EPT]
+        regs[tid] *= s * signs1[d0 : d0 + EPT]
 
     result = np.zeros(256, dtype=np.float64)
     for tid in range(N_THREADS):
         d0 = tid * EPT
-        result[d0:d0+EPT] = regs[tid]
+        result[d0 : d0 + EPT] = regs[tid]
     return result
 
 
@@ -226,7 +232,8 @@ def main():
 
     # Test 4: Hadamard property - verify WHT of unit vector
     print("Test 4: WHT of e_0 (all elements should be +/- 1/sqrt(256))")
-    e0 = np.zeros(256); e0[0] = 1.0
+    e0 = np.zeros(256)
+    e0[0] = 1.0
     # Use identity signs to check raw WHT
     ones = np.ones(256)
     fwd = fwht_shfl_forward_256(e0, ones, ones)
@@ -251,20 +258,20 @@ def main():
     # Simulate just the local passes (no shuffle) for one thread
     v = np.array([1.0, 0, 0, 0, 0, 0, 0, 0])
     # Pass 1: stride 1
-    v[0], v[1] = v[0]+v[1], v[0]-v[1]
-    v[2], v[3] = v[2]+v[3], v[2]-v[3]
-    v[4], v[5] = v[4]+v[5], v[4]-v[5]
-    v[6], v[7] = v[6]+v[7], v[6]-v[7]
+    v[0], v[1] = v[0] + v[1], v[0] - v[1]
+    v[2], v[3] = v[2] + v[3], v[2] - v[3]
+    v[4], v[5] = v[4] + v[5], v[4] - v[5]
+    v[6], v[7] = v[6] + v[7], v[6] - v[7]
     # Pass 2: stride 2
-    v[0], v[2] = v[0]+v[2], v[0]-v[2]
-    v[1], v[3] = v[1]+v[3], v[1]-v[3]
-    v[4], v[6] = v[4]+v[6], v[4]-v[6]
-    v[5], v[7] = v[5]+v[7], v[5]-v[7]
+    v[0], v[2] = v[0] + v[2], v[0] - v[2]
+    v[1], v[3] = v[1] + v[3], v[1] - v[3]
+    v[4], v[6] = v[4] + v[6], v[4] - v[6]
+    v[5], v[7] = v[5] + v[7], v[5] - v[7]
     # Pass 3: stride 4
-    v[0], v[4] = v[0]+v[4], v[0]-v[4]
-    v[1], v[5] = v[1]+v[5], v[1]-v[5]
-    v[2], v[6] = v[2]+v[6], v[2]-v[6]
-    v[3], v[7] = v[3]+v[7], v[3]-v[7]
+    v[0], v[4] = v[0] + v[4], v[0] - v[4]
+    v[1], v[5] = v[1] + v[5], v[1] - v[5]
+    v[2], v[6] = v[2] + v[6], v[2] - v[6]
+    v[3], v[7] = v[3] + v[7], v[3] - v[7]
     assert np.allclose(v, np.ones(8)), f"8-point local WHT failed: {v}"
     print(f"  PASS (8-point WHT of e0 = all-ones)\n")
 

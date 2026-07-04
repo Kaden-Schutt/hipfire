@@ -55,23 +55,21 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_SRC = SCRIPT_DIR / "rms_norm_weighted_bf16.cc"
 
 # AIE API headers are bundled with mlir_aie
-_mlir_aie_pkg = next(
-    (Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None
-)
+_mlir_aie_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
 AIE_INCLUDE = _mlir_aie_pkg / "mlir_aie" / "include" if _mlir_aie_pkg else None
 
 _NPU_DEVICES = {
-    "npu1": (NPU1, "aie2",  "AIE2"),
+    "npu1": (NPU1, "aie2", "AIE2"),
     "npu2": (NPU2, "aie2p", "AIE2P"),
 }
 
 _NAME_TO_NPU = {
-    "npu1":    "npu1",
+    "npu1": "npu1",
     "Phoenix": "npu1",
-    "npu4":    "npu2",
-    "npu5":    "npu2",
-    "npu6":    "npu2",
-    "Strix":   "npu2",
+    "npu4": "npu2",
+    "npu5": "npu2",
+    "npu6": "npu2",
+    "Strix": "npu2",
     "Krackan": "npu2",
 }
 
@@ -79,6 +77,7 @@ _NAME_TO_NPU = {
 def detect_npu() -> str:
     """Query the installed NPU via pyxrt and return its generation key."""
     import ctypes
+
     _xrt_lib = "/opt/xilinx/xrt/lib"
     ctypes.CDLL(f"{_xrt_lib}/libxrt_coreutil.so.2", mode=ctypes.RTLD_GLOBAL)
     _xrt_py = "/opt/xilinx/xrt/python"
@@ -86,14 +85,14 @@ def detect_npu() -> str:
         sys.path.insert(0, _xrt_py)
 
     import pyxrt
+
     device = pyxrt.device(0)
     name = device.get_info(pyxrt.xrt_info_device.name)
     for substr, key in _NAME_TO_NPU.items():
         if substr in name:
             return key
     raise RuntimeError(
-        f"Cannot map device name {name!r} to a known NPU generation. "
-        f"Pass --npu explicitly (npu1 or npu2)."
+        f"Cannot map device name {name!r} to a known NPU generation. Pass --npu explicitly (npu1 or npu2)."
     )
 
 
@@ -112,11 +111,13 @@ def build(hidden_size: int, out_dir: Path, npu: str = "auto") -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     xclbin_name = f"qwen35-rmsnorm-{hidden_size}.xclbin"
-    instr_name  = f"qwen35-rmsnorm-{hidden_size}-instr.bin"
+    instr_name = f"qwen35-rmsnorm-{hidden_size}-instr.bin"
     xclbin_path = out_dir / xclbin_name
-    instr_path  = out_dir / instr_name
+    instr_path = out_dir / instr_name
 
-    print(f"[build_qwen35_rmsnorm] hidden_size={hidden_size} tile_size={hidden_size} (full-row) npu={npu} arch={target_arch}")
+    print(
+        f"[build_qwen35_rmsnorm] hidden_size={hidden_size} tile_size={hidden_size} (full-row) npu={npu} arch={target_arch}"
+    )
     print(f"  xclbin → {xclbin_path}")
     print(f"  instr  → {instr_path}")
 
@@ -142,7 +143,7 @@ def build(hidden_size: int, out_dir: Path, npu: str = "auto") -> None:
         include_dirs=include_dirs,
     )
 
-    input_buf  = np.zeros(hidden_size, dtype=bfloat16)
+    input_buf = np.zeros(hidden_size, dtype=bfloat16)
     weight_buf = np.zeros(hidden_size, dtype=bfloat16)
     output_buf = np.zeros(hidden_size, dtype=bfloat16)
 
@@ -151,14 +152,12 @@ def build(hidden_size: int, out_dir: Path, npu: str = "auto") -> None:
     # we cannot split the work across columns. With tile_size=hidden_size the
     # core receives all elements at once, computes sum(x²), then applies inv_rms.
     # The framework appends tile_size as the `cols` int32 arg automatically.
-    mlir_module = _transform_gen(
-        kernel, [input_buf, weight_buf], output_buf, tile_size=tile_size
-    )
+    mlir_module = _transform_gen(kernel, [input_buf, weight_buf], output_buf, tile_size=tile_size)
 
     with tempfile.TemporaryDirectory(prefix="hipfire_npu_build_") as tmp:
-        tmp_path   = Path(tmp)
+        tmp_path = Path(tmp)
         tmp_xclbin = tmp_path / "final.xclbin"
-        tmp_instr  = tmp_path / "insts.bin"
+        tmp_instr = tmp_path / "insts.bin"
 
         compile_external_kernel(kernel, tmp_path, target_arch=target_arch)
 
@@ -170,7 +169,7 @@ def build(hidden_size: int, out_dir: Path, npu: str = "auto") -> None:
         )
 
         shutil.copy2(tmp_xclbin, xclbin_path)
-        shutil.copy2(tmp_instr,  instr_path)
+        shutil.copy2(tmp_instr, instr_path)
 
     print(f"[build_qwen35_rmsnorm] done")
     print(f"  xclbin: {xclbin_path.stat().st_size} bytes")
@@ -183,19 +182,21 @@ def build(hidden_size: int, out_dir: Path, npu: str = "auto") -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--hidden-size", type=int, required=True,
-        help="Model hidden size (e.g. 1536 for Qwen3.5-1.5B, 3584 for 7B)"
+        "--hidden-size", type=int, required=True, help="Model hidden size (e.g. 1536 for Qwen3.5-1.5B, 3584 for 7B)"
     )
     parser.add_argument(
-        "--out-dir", type=Path, default=Path("target/npu"),
-        help="Output directory for xclbin and instr.bin (default: target/npu)"
+        "--out-dir",
+        type=Path,
+        default=Path("target/npu"),
+        help="Output directory for xclbin and instr.bin (default: target/npu)",
     )
     parser.add_argument(
-        "--npu", choices=["auto"] + list(_NPU_DEVICES), default="auto",
-        help="Target NPU generation: auto=detect from hardware (default), npu1=AIE2/Phoenix, npu2=AIE2P/Strix"
+        "--npu",
+        choices=["auto"] + list(_NPU_DEVICES),
+        default="auto",
+        help="Target NPU generation: auto=detect from hardware (default), npu1=AIE2/Phoenix, npu2=AIE2P/Strix",
     )
     args = parser.parse_args()
 

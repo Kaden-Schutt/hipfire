@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -58,13 +78,13 @@ struct SafetensorsIndex {
 impl SafetensorsIndex {
     fn open_dir_or_file(path: &Path) -> std::io::Result<Self> {
         let shards: Vec<PathBuf> =
-            if path.is_file() && path.extension().map_or(false, |e| e == "safetensors") {
+            if path.is_file() && path.extension().is_some_and(|e| e == "safetensors") {
                 vec![path.to_path_buf()]
             } else if path.is_dir() {
                 let mut v = Vec::new();
                 for entry in std::fs::read_dir(path)? {
                     let p = entry?.path();
-                    if p.extension().map_or(false, |e| e == "safetensors") {
+                    if p.extension().is_some_and(|e| e == "safetensors") {
                         v.push(p);
                     }
                 }
@@ -420,7 +440,7 @@ fn translate_name(hfq_name: &str) -> Option<&str> {
         // but NOT `mlp.experts.gate.weight` or similar non-numeric paths
         // Heuristic: look for `experts.` followed by a digit
         let after = &hfq_name[hfq_name.find("experts.").unwrap() + 8..];
-        if after.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             return None;
         }
     }

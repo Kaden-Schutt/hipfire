@@ -26,8 +26,7 @@ from pathlib import Path
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--in", dest="inputs", nargs="+", required=True,
-                   help="Two or more sidecar JSONs to merge")
+    p.add_argument("--in", dest="inputs", nargs="+", required=True, help="Two or more sidecar JSONs to merge")
     p.add_argument("--out", required=True, help="Output sidecar JSON path")
     p.add_argument("--top-k", type=int, default=32768)
     p.add_argument("--full-vocab-size", type=int, default=248320)
@@ -38,9 +37,10 @@ def main() -> int:
         data = json.loads(Path(path).read_text())
         sources.append(data)
         n = len(data.get("draft_to_full", []))
-        print(f"  source: {path} ({n} tokens, "
-              f"unique_observed={data.get('stats', {}).get('unique_tokens', 'n/a')})",
-              file=sys.stderr)
+        print(
+            f"  source: {path} ({n} tokens, unique_observed={data.get('stats', {}).get('unique_tokens', 'n/a')})",
+            file=sys.stderr,
+        )
 
     score: dict[int, float] = {}
     for src in sources:

@@ -33,13 +33,14 @@ run_one() {
     logfile=$(mktemp -t "kv-filter-pp${PP}-f${filter}.XXXXXX.log")
     local result
     result=$(
-        (printf '%s\n' \
-            '{"type":"load","model":"'"$MODEL"'","params":{"max_seq":4096,"pp":'"$PP"',"kv_mode":"'"$KV_MODE"'"}}' \
-            '{"type":"generate","id":"r1","prompt":"'"$PROMPT"'","temperature":0.0,"max_tokens":32}' \
-            '{"type":"unload"}'
+        (
+            printf '%s\n' \
+                '{"type":"load","model":"'"$MODEL"'","params":{"max_seq":4096,"pp":'"$PP"',"kv_mode":"'"$KV_MODE"'"}}' \
+                '{"type":"generate","id":"r1","prompt":"'"$PROMPT"'","temperature":0.0,"max_tokens":32}' \
+                '{"type":"unload"}'
         ) | env HIPFIRE_KV_FILTER="$filter" "$EXE" 2>"$logfile" \
-          | grep '"text"' \
-          | python3 -c '
+            | grep '"text"' \
+            | python3 -c '
 import sys, json, hashlib
 toks = []
 for line in sys.stdin:

@@ -31,12 +31,24 @@ HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./t
 # Byte-identical to note 14's split bench (same md5).
 PROMPT="Write a Python function that implements an LRU cache with a configurable capacity, using an OrderedDict. Include get and put methods, and a docstring."
 
-[ -x "$EXE" ] || { echo "daemon binary missing — build first" >&2; exit 2; }
-[ -f "$MODEL" ]    || { echo "model not found: $MODEL" >&2; exit 2; }
-[ -f "$MTP_HEAD" ] || { echo "mtp head not found: $MTP_HEAD" >&2; exit 2; }
+[ -x "$EXE" ] || {
+    echo "daemon binary missing — build first" >&2
+    exit 2
+}
+[ -f "$MODEL" ] || {
+    echo "model not found: $MODEL" >&2
+    exit 2
+}
+[ -f "$MTP_HEAD" ] || {
+    echo "mtp head not found: $MTP_HEAD" >&2
+    exit 2
+}
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-mtp-vs-ar" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-mtp-vs-ar" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -51,7 +63,7 @@ prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$PRO
     echo
     echo "| cell | spec_path | tok/s | decode tok/s | prefill tok/s | τ | cycles | wall(s) |"
     echo "|---|---|---|---|---|---|---|---|"
-} > "$OUT"
+} >"$OUT"
 
 # Args: label  use_mtp(0/1)
 run_cell() {
@@ -60,8 +72,9 @@ run_cell() {
     [ "$use_mtp" -eq 1 ] && mtp_param=",\"mtp_head\":\"$MTP_HEAD\""
 
     local in_file out_file
-    in_file=$(mktemp); out_file=$(mktemp)
-    cat > "$in_file" <<JL
+    in_file=$(mktemp)
+    out_file=$(mktemp)
+    cat >"$in_file" <<JL
 {"type":"load","model":"$MODEL","params":{"max_seq":4096,"kv_mode":"q8"$mtp_param}}
 {"type":"generate","id":"warm","prompt":${prompt_json},"temperature":0.0,"max_tokens":16,"repeat_penalty":1.0}
 {"type":"generate","id":"meas","prompt":${prompt_json},"temperature":0.0,"max_tokens":$MAX,"repeat_penalty":1.0}
@@ -72,7 +85,7 @@ JL
     local t0 t1 wall
     t0=$(date +%s.%N)
     # Pin to gfx906 (HIP idx 0); no PP, no mixed-arch override needed.
-    env HIP_VISIBLE_DEVICES=0 timeout 600 "$EXE" < "$in_file" > "$out_file" 2>&1
+    env HIP_VISIBLE_DEVICES=0 timeout 600 "$EXE" <"$in_file" >"$out_file" 2>&1
     t1=$(date +%s.%N)
     wall=$(python3 -c "print(f'{$t1-$t0:.1f}')")
 
@@ -97,7 +110,7 @@ PY
     rm -f "$in_file" "$out_file"
 }
 
-run_cell "ar"  0
+run_cell "ar" 0
 run_cell "mtp" 1
 
 # Uplift

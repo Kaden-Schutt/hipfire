@@ -15,6 +15,17 @@
 //! bottom-up by dependency; the daemon re-points its `use` paths here as each
 //! lands. No behavior change per move.
 
+#![allow(
+    clippy::drop_non_drop,
+    clippy::explicit_counter_loop,
+    clippy::large_enum_variant,
+    clippy::needless_range_loop,
+    clippy::redundant_locals,
+    clippy::should_implement_trait,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast
+)]
+
 pub mod dummy;
 pub mod events;
 pub mod evidence;

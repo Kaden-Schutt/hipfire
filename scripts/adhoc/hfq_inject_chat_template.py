@@ -6,20 +6,33 @@ The index stores per-tensor *sizes*; the loader computes offsets cumulatively fr
 header's data_offset (hfq.rs:163 `cumulative_offset = data_offset`). So we only grow the
 metadata, bump data_offset by the delta, and copy the index + tensor bytes through verbatim.
 """
+
 import struct, json, sys, shutil
 
+
 def find_json_end(buf: bytes) -> int:
-    depth = 0; in_str = False; esc = False
+    depth = 0
+    in_str = False
+    esc = False
     for i, b in enumerate(buf):
-        if esc: esc = False; continue
-        if b == 0x5c and in_str: esc = True; continue   # backslash inside string
-        if b == 0x22: in_str = not in_str; continue       # quote
+        if esc:
+            esc = False
+            continue
+        if b == 0x5C and in_str:
+            esc = True
+            continue  # backslash inside string
+        if b == 0x22:
+            in_str = not in_str
+            continue  # quote
         if not in_str:
-            if b == 0x7b: depth += 1                       # {
-            elif b == 0x7d:                                # }
+            if b == 0x7B:
+                depth += 1  # {
+            elif b == 0x7D:  # }
                 depth -= 1
-                if depth == 0: return i + 1
+                if depth == 0:
+                    return i + 1
     raise ValueError("no matching close brace for metadata JSON")
+
 
 def inject(src: str, dst: str, jinja_path: str) -> bool:
     with open(src, "rb") as f:
@@ -29,7 +42,7 @@ def inject(src: str, dst: str, jinja_path: str) -> bool:
         metadata_offset = struct.unpack_from("<Q", head, 16)[0]
         data_offset = struct.unpack_from("<Q", head, 24)[0]
         f.seek(0)
-        prefix = bytearray(f.read(metadata_offset))        # header + any pre-metadata gap
+        prefix = bytearray(f.read(metadata_offset))  # header + any pre-metadata gap
         meta_region = f.read(data_offset - metadata_offset)  # [metadata JSON][index][pad]
 
     je = find_json_end(meta_region)
@@ -50,7 +63,7 @@ def inject(src: str, dst: str, jinja_path: str) -> bool:
     new_meta = json.dumps(md, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     new_data_offset = metadata_offset + len(new_meta) + len(index_and_pad)
-    struct.pack_into("<Q", prefix, 24, new_data_offset)    # patch data_offset only
+    struct.pack_into("<Q", prefix, 24, new_data_offset)  # patch data_offset only
 
     with open(dst, "wb") as out:
         out.write(prefix)
@@ -60,9 +73,12 @@ def inject(src: str, dst: str, jinja_path: str) -> bool:
             f.seek(data_offset)
             shutil.copyfileobj(f, out, 64 * 1024 * 1024)
 
-    print(f"  {src} -> {dst}: data_offset {data_offset} -> {new_data_offset} "
-          f"(+{new_data_offset - data_offset}), template {len(tpl)} chars")
+    print(
+        f"  {src} -> {dst}: data_offset {data_offset} -> {new_data_offset} "
+        f"(+{new_data_offset - data_offset}), template {len(tpl)} chars"
+    )
     return True
+
 
 if __name__ == "__main__":
     inject(sys.argv[1], sys.argv[2], sys.argv[3])

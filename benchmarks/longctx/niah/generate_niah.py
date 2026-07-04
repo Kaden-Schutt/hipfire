@@ -37,10 +37,7 @@ WORDS = (
 ).split()
 
 NEEDLE = "The secret pass code is mauve-velociraptor-7741."
-QUESTION = (
-    "Based on the document above, what is the secret pass code? "
-    "Answer in one short sentence."
-)
+QUESTION = "Based on the document above, what is the secret pass code? Answer in one short sentence."
 EXPECTED = "mauve-velociraptor-7741"
 
 # Approximate chars per token for English prose with the Qwen3 tokenizer.
@@ -84,8 +81,7 @@ def main():
         RNG.seed(SEED + ctx)
         filler_text = assemble(ctx)
         # Sanity: the needle must appear exactly once in the assembled text.
-        assert filler_text.count(NEEDLE) == 1, \
-            f"needle appears {filler_text.count(NEEDLE)}x at ctx={ctx}"
+        assert filler_text.count(NEEDLE) == 1, f"needle appears {filler_text.count(NEEDLE)}x at ctx={ctx}"
         record = {
             "context_tokens": ctx,
             "needle": NEEDLE,

@@ -26,7 +26,7 @@ fn decode_1mad(state: u32) -> f32 {
     let x = (state as u64) & 0xFFFF_FFFF;
     let x = x.wrapping_mul(34_038_481).wrapping_add(76_625_530) & 0xFFFF_FFFF;
     let byte_sum = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF);
-    (byte_sum as f32 - 510.0) / 147.800_537_109_375
+    (byte_sum as f32 - 510.0) / 147.800_54
 }
 
 pub fn build_codebook() -> Vec<f32> {
@@ -142,7 +142,7 @@ fn optimal_scale_bits(weights: &[f32], symbols: &[u8], codebook: &[f32], bits: u
 pub fn qtip_quantize_dequant(w: &[f32], bits: u32, beam_width: usize) -> Vec<f32> {
     use rayon::prelude::*;
     assert!(
-        w.len() % GROUP == 0,
+        w.len().is_multiple_of(GROUP),
         "weight len {} not a multiple of 256",
         w.len()
     );

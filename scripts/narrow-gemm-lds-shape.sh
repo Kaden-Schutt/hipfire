@@ -40,14 +40,14 @@ run_case() {
 
     set +e
     ARCH="$ARCH" \
-    VARIANT="$variant" \
-    MODE="$mode" \
-    N_LAUNCH="$launches" \
-    M="$m" \
-    N="$n" \
-    K="$k" \
-    K_LIMIT="$klim" \
-    "$RUNNER" "$case_out"
+        VARIANT="$variant" \
+        MODE="$mode" \
+        N_LAUNCH="$launches" \
+        M="$m" \
+        N="$n" \
+        K="$k" \
+        K_LIMIT="$klim" \
+        "$RUNNER" "$case_out"
     rc=$?
     set -e
 

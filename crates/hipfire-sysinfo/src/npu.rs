@@ -24,6 +24,7 @@ pub fn read_npus() -> Vec<NpuTelemetry> {
 
     if let Ok(s) = dev.sensors() {
         t.power_w = s.power_mw.map(|mw| mw as f64 / 1000.0);
+        t.temp_c = s.temp_c.map(|c| c as f64);
         t.mean_util_pct = s.mean_utilization_pct() as f64;
         t.columns_pct = s.column_utilization_pct;
     }

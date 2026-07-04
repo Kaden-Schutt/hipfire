@@ -30,10 +30,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 
-DEFAULT_MODEL = (
-    "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/"
-    "snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0"
-)
+DEFAULT_MODEL = "/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0"
 DEFAULT_PROMPT = "A farmer has 17 sheep. All but 9 die. State the final number."
 
 
@@ -117,10 +114,7 @@ def top5_row(step: int, logits: torch.Tensor) -> str:
 
 def capture_full_prefix(model, ids: list[int], args: argparse.Namespace) -> tuple[list[int], list[str]]:
     generated: list[int] = []
-    csv_lines = [
-        "step,r1_id,r1_logit,r2_id,r2_logit,r3_id,r3_logit,"
-        "r4_id,r4_logit,r5_id,r5_logit,margin_top12"
-    ]
+    csv_lines = ["step,r1_id,r1_logit,r2_id,r2_logit,r3_id,r3_logit,r4_id,r4_logit,r5_id,r5_logit,margin_top12"]
     cur = torch.tensor([ids], dtype=torch.long, device=args.device)
     with torch.no_grad():
         for step in range(args.max_new_tokens):
@@ -140,10 +134,7 @@ def capture_full_prefix(model, ids: list[int], args: argparse.Namespace) -> tupl
 
 def capture_streaming(model, ids: list[int], args: argparse.Namespace) -> tuple[list[int], list[str]]:
     generated: list[int] = []
-    csv_lines = [
-        "step,r1_id,r1_logit,r2_id,r2_logit,r3_id,r3_logit,"
-        "r4_id,r4_logit,r5_id,r5_logit,margin_top12"
-    ]
+    csv_lines = ["step,r1_id,r1_logit,r2_id,r2_logit,r3_id,r3_logit,r4_id,r4_logit,r5_id,r5_logit,margin_top12"]
     past = None
     logits = None
 
@@ -195,8 +186,7 @@ def main() -> int:
     out_prefix.with_suffix(".prompt_tokens.json").write_text(json.dumps(ids) + "\n")
 
     print(
-        f"loading model dtype={args.dtype} device={args.device} "
-        f"torch={torch.__version__}",
+        f"loading model dtype={args.dtype} device={args.device} torch={torch.__version__}",
         flush=True,
     )
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)

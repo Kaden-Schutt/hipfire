@@ -51,9 +51,7 @@ from aie.utils.compile import compile_mlir_module, compile_external_kernel
 SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_SRC = SCRIPT_DIR / "rope_rotate_bf16.cc"
 
-_mlir_aie_pkg = next(
-    (Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None
-)
+_mlir_aie_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
 AIE_INCLUDE = _mlir_aie_pkg / "mlir_aie" / "include" if _mlir_aie_pkg else None
 
 _NPU_DEVICES = {
@@ -62,53 +60,56 @@ _NPU_DEVICES = {
 }
 
 _NAME_TO_NPU = {
-    "npu1":    "npu1",
+    "npu1": "npu1",
     "Phoenix": "npu1",
-    "npu4":    "npu2",
-    "npu5":    "npu2",
-    "npu6":    "npu2",
-    "Strix":   "npu2",
+    "npu4": "npu2",
+    "npu5": "npu2",
+    "npu6": "npu2",
+    "Strix": "npu2",
     "Krackan": "npu2",
 }
 
 
 def detect_npu() -> str:
     import ctypes
+
     _xrt_lib = "/opt/xilinx/xrt/lib"
     ctypes.CDLL(f"{_xrt_lib}/libxrt_coreutil.so.2", mode=ctypes.RTLD_GLOBAL)
     _xrt_py = "/opt/xilinx/xrt/python"
     if _xrt_py not in sys.path:
         sys.path.insert(0, _xrt_py)
     import pyxrt
+
     device = pyxrt.device(0)
     name = device.get_info(pyxrt.xrt_info_device.name)
     for substr, key in _NAME_TO_NPU.items():
         if substr in name:
             return key
     raise RuntimeError(
-        f"Cannot map device name {name!r} to a known NPU generation. "
-        f"Pass --npu explicitly (npu1 or npu2)."
+        f"Cannot map device name {name!r} to a known NPU generation. Pass --npu explicitly (npu1 or npu2)."
     )
 
 
-def build_one(label: str, n_total: int, n_heads_label: int,
-              head_dim: int, n_rot: int, out_dir: Path,
-              target_arch: str, device_cls) -> None:
+def build_one(
+    label: str, n_total: int, n_heads_label: int, head_dim: int, n_rot: int, out_dir: Path, target_arch: str, device_cls
+) -> None:
     """Compile one RoPE xclbin (Q or K)."""
     xclbin_name = f"qwen35-rope-{label}-{n_heads_label}h{head_dim}d.xclbin"
-    instr_name  = f"qwen35-rope-{label}-{n_heads_label}h{head_dim}d-instr.bin"
+    instr_name = f"qwen35-rope-{label}-{n_heads_label}h{head_dim}d-instr.bin"
     xclbin_path = out_dir / xclbin_name
-    instr_path  = out_dir / instr_name
+    instr_path = out_dir / instr_name
 
-    print(f"[build_qwen35_rope] {label}: n_total={n_total} head_dim={head_dim} "
-          f"n_rot={n_rot} N_div_n={n_total//head_dim} npu={target_arch}")
+    print(
+        f"[build_qwen35_rope] {label}: n_total={n_total} head_dim={head_dim} "
+        f"n_rot={n_rot} N_div_n={n_total // head_dim} npu={target_arch}"
+    )
     print(f"  xclbin → {xclbin_path}")
     print(f"  instr  → {instr_path}")
 
     if n_rot % 32 != 0:
         raise ValueError(f"n_rot={n_rot} must be a multiple of 32 (n_rot/2 must be multiple of 16)")
     if (head_dim - n_rot) % 16 != 0:
-        raise ValueError(f"head_dim-n_rot={head_dim-n_rot} must be a multiple of 16 (pass-through region)")
+        raise ValueError(f"head_dim-n_rot={head_dim - n_rot} must be a multiple of 16 (pass-through region)")
     if n_total % head_dim != 0:
         raise ValueError(f"n_total={n_total} must be divisible by head_dim={head_dim}")
 
@@ -132,21 +133,19 @@ def build_one(label: str, n_total: int, n_heads_label: int,
         include_dirs=include_dirs,
     )
 
-    qk_buf  = np.zeros(n_total, dtype=bfloat16)   # full Q or K tensor
-    out_buf  = np.zeros(n_total, dtype=bfloat16)
-    cs_buf   = np.zeros(n_rot,   dtype=bfloat16)   # tensor param: acquired once per dispatch
+    qk_buf = np.zeros(n_total, dtype=bfloat16)  # full Q or K tensor
+    out_buf = np.zeros(n_total, dtype=bfloat16)
+    cs_buf = np.zeros(n_rot, dtype=bfloat16)  # tensor param: acquired once per dispatch
 
     # _transform_gen: single-core, tile_size=head_dim
     # N_div_n = n_total / head_dim = n_heads (or n_kv_heads)
     # cs_buf → tensor param (held for all head iterations)
-    mlir_module = _transform_gen(
-        kernel, [qk_buf], out_buf, cs_buf, tile_size=head_dim
-    )
+    mlir_module = _transform_gen(kernel, [qk_buf], out_buf, cs_buf, tile_size=head_dim)
 
     with tempfile.TemporaryDirectory(prefix="hipfire_npu_build_") as tmp:
-        tmp_path   = Path(tmp)
+        tmp_path = Path(tmp)
         tmp_xclbin = tmp_path / "final.xclbin"
-        tmp_instr  = tmp_path / "insts.bin"
+        tmp_instr = tmp_path / "insts.bin"
 
         compile_external_kernel(kernel, tmp_path, target_arch=target_arch)
         compile_mlir_module(
@@ -156,14 +155,13 @@ def build_one(label: str, n_total: int, n_heads_label: int,
             work_dir=tmp_path,
         )
         shutil.copy2(tmp_xclbin, xclbin_path)
-        shutil.copy2(tmp_instr,  instr_path)
+        shutil.copy2(tmp_instr, instr_path)
 
     print(f"  xclbin: {xclbin_path.stat().st_size} bytes")
     print(f"  instr:  {instr_path.stat().st_size} bytes")
 
 
-def build(n_heads: int, n_kv_heads: int, head_dim: int, n_rot: int,
-          out_dir: Path, npu: str = "auto") -> None:
+def build(n_heads: int, n_kv_heads: int, head_dim: int, n_rot: int, out_dir: Path, npu: str = "auto") -> None:
     if npu == "auto":
         npu = detect_npu()
         print(f"[build_qwen35_rope] detected NPU: {npu}")
@@ -177,7 +175,7 @@ def build(n_heads: int, n_kv_heads: int, head_dim: int, n_rot: int,
     out_dir.mkdir(parents=True, exist_ok=True)
     set_current_device(device_cls())
 
-    build_one("q", n_heads * head_dim, n_heads,    head_dim, n_rot, out_dir, target_arch, device_cls)
+    build_one("q", n_heads * head_dim, n_heads, head_dim, n_rot, out_dir, target_arch, device_cls)
     build_one("k", n_kv_heads * head_dim, n_kv_heads, head_dim, n_rot, out_dir, target_arch, device_cls)
 
     print(f"\n[build_qwen35_rope] done")
@@ -188,13 +186,12 @@ def build(n_heads: int, n_kv_heads: int, head_dim: int, n_rot: int,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--n-heads",    type=int, required=True, help="Number of Q heads")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--n-heads", type=int, required=True, help="Number of Q heads")
     parser.add_argument("--n-kv-heads", type=int, required=True, help="Number of KV heads")
-    parser.add_argument("--head-dim",   type=int, default=256,   help="Head dimension (default: 256)")
-    parser.add_argument("--n-rot",      type=int, default=64,    help="Number of dims to rotate (default: 64)")
-    parser.add_argument("--out-dir",    type=Path, default=Path("target/npu"))
+    parser.add_argument("--head-dim", type=int, default=256, help="Head dimension (default: 256)")
+    parser.add_argument("--n-rot", type=int, default=64, help="Number of dims to rotate (default: 64)")
+    parser.add_argument("--out-dir", type=Path, default=Path("target/npu"))
     parser.add_argument("--npu", choices=["auto"] + list(_NPU_DEVICES), default="auto")
     args = parser.parse_args()
     build(args.n_heads, args.n_kv_heads, args.head_dim, args.n_rot, args.out_dir, args.npu)

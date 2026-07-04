@@ -433,8 +433,7 @@ pub fn ensure_admin_secret() -> std::io::Result<String> {
 /// Hash a password with argon2id (PHC string) and persist it to
 /// `admin.passwd` (0600). Used by `hipfire admin set-password`.
 pub fn set_admin_password(password: &str) -> std::io::Result<()> {
-    let hash = hash_admin_password(password)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let hash = hash_admin_password(password).map_err(std::io::Error::other)?;
     let path = admin_password_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -880,9 +879,11 @@ mod tests {
 
     #[test]
     fn model_overrides_preserve_typed_merge_policy() {
-        let mut cfg = HipfireConfig::default();
-        cfg.temperature = 0.3;
-        cfg.max_tokens = 512;
+        let mut cfg = HipfireConfig {
+            temperature: 0.3,
+            max_tokens: 512,
+            ..Default::default()
+        };
         cfg.model_overrides.insert(
             "qwen".to_string(),
             serde_json::json!({

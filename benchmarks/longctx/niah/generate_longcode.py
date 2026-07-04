@@ -51,12 +51,18 @@ def main():
     full_code = SOURCE.read_text(encoding="utf-8")
     code = full_code[:TRUNCATE_CHARS]
     if EXPECTED not in code:
-        print(f"FAIL: expected needle {EXPECTED!r} not in first {TRUNCATE_CHARS} chars of {SOURCE}; "
-              f"adjust TRUNCATE_CHARS or move the needle", file=sys.stderr)
+        print(
+            f"FAIL: expected needle {EXPECTED!r} not in first {TRUNCATE_CHARS} chars of {SOURCE}; "
+            f"adjust TRUNCATE_CHARS or move the needle",
+            file=sys.stderr,
+        )
         return 2
     if code.count(EXPECTED) != 1:
-        print(f"FAIL: needle {EXPECTED!r} appears {code.count(EXPECTED)}x in truncated code; "
-              f"need exactly 1 for a clean retrieval test", file=sys.stderr)
+        print(
+            f"FAIL: needle {EXPECTED!r} appears {code.count(EXPECTED)}x in truncated code; "
+            f"need exactly 1 for a clean retrieval test",
+            file=sys.stderr,
+        )
         return 2
 
     record = {
@@ -75,9 +81,11 @@ def main():
         json.dump(record, f, ensure_ascii=False)
         f.write("\n")
     fixture_md5 = hashlib.md5(OUT.read_bytes()).hexdigest()
-    print(f"wrote {OUT.name}: {len(code)} chars (~{len(code) // 4} tokens), "
-          f"truncated_md5={record['source_md5_truncated'][:12]}, "
-          f"fixture_md5={fixture_md5[:12]}")
+    print(
+        f"wrote {OUT.name}: {len(code)} chars (~{len(code) // 4} tokens), "
+        f"truncated_md5={record['source_md5_truncated'][:12]}, "
+        f"fixture_md5={fixture_md5[:12]}"
+    )
 
 
 if __name__ == "__main__":

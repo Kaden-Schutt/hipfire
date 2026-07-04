@@ -49,27 +49,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_SRC = SCRIPT_DIR / "silu_mul_bf16.cc"
 
 # AIE API headers are bundled with mlir_aie
-_mlir_aie_pkg = next(
-    (Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None
-)
+_mlir_aie_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
 AIE_INCLUDE = _mlir_aie_pkg / "mlir_aie" / "include" if _mlir_aie_pkg else None
 AIE_RUNTIME_LIB = _mlir_aie_pkg / "mlir_aie" / "aie_runtime_lib" / "AIE2" if _mlir_aie_pkg else None
 
 
 _NPU_DEVICES = {
-    "npu1": (NPU1, "aie2",  "AIE2"),
+    "npu1": (NPU1, "aie2", "AIE2"),
     "npu2": (NPU2, "aie2p", "AIE2P"),
 }
 
 # Maps substrings of the pyxrt device name to NPU generation keys.
 # Same mapping used by XRTHostRuntime.NPU_MODELS.
 _NAME_TO_NPU = {
-    "npu1":    "npu1",
+    "npu1": "npu1",
     "Phoenix": "npu1",
-    "npu4":    "npu2",
-    "npu5":    "npu2",
-    "npu6":    "npu2",
-    "Strix":   "npu2",
+    "npu4": "npu2",
+    "npu5": "npu2",
+    "npu6": "npu2",
+    "Strix": "npu2",
     "Krackan": "npu2",
 }
 
@@ -81,6 +79,7 @@ def detect_npu() -> str:
     device cannot be detected (no hardware, driver not loaded, etc.).
     """
     import ctypes
+
     # libxrt_coreutil must be loaded before libxrt_core to avoid a missing
     # weak vtable symbol under XRT 2.25.
     _xrt_lib = "/opt/xilinx/xrt/lib"
@@ -90,19 +89,18 @@ def detect_npu() -> str:
         sys.path.insert(0, _xrt_py)
 
     import pyxrt
+
     device = pyxrt.device(0)
     name = device.get_info(pyxrt.xrt_info_device.name)
     for substr, key in _NAME_TO_NPU.items():
         if substr in name:
             return key
     raise RuntimeError(
-        f"Cannot map device name {name!r} to a known NPU generation. "
-        f"Pass --npu explicitly (npu1 or npu2)."
+        f"Cannot map device name {name!r} to a known NPU generation. Pass --npu explicitly (npu1 or npu2)."
     )
 
 
-def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
-          npu: str = "auto") -> None:
+def build(hidden_size: int, out_dir: Path, tile_size: int = 16, npu: str = "auto") -> None:
     """Compile the SwiGLU kernel for `hidden_size` and write artifacts to `out_dir`."""
     if npu == "auto":
         npu = detect_npu()
@@ -114,9 +112,9 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     xclbin_name = f"qwen35-swiglu-{hidden_size}.xclbin"
-    instr_name  = f"qwen35-swiglu-{hidden_size}-instr.bin"
+    instr_name = f"qwen35-swiglu-{hidden_size}-instr.bin"
     xclbin_path = out_dir / xclbin_name
-    instr_path  = out_dir / instr_name
+    instr_path = out_dir / instr_name
 
     print(f"[build_qwen35_swiglu] hidden_size={hidden_size} tile_size={tile_size} npu={npu} arch={target_arch}")
     print(f"  xclbin → {xclbin_path}")
@@ -127,6 +125,7 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
 
     set_current_device(device_cls())
     from aie.utils import get_current_device
+
     dev = get_current_device()
     num_cols = dev.cols
     min_multiple = tile_size * num_cols
@@ -138,10 +137,7 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
         )
 
     # Runtime lib differs per arch (AIE2 has LUT tanh, AIE2P does not)
-    runtime_lib = (
-        _mlir_aie_pkg / "mlir_aie" / "aie_runtime_lib" / runtime_subdir
-        if _mlir_aie_pkg else None
-    )
+    runtime_lib = _mlir_aie_pkg / "mlir_aie" / "aie_runtime_lib" / runtime_subdir if _mlir_aie_pkg else None
 
     tile_ty: Any = np.ndarray[(tile_size,), np.dtype[bfloat16]]
     include_dirs = []
@@ -164,23 +160,20 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
     #     tensors are synthesized internally.
     # Detect which is installed so this builds on both boxes.
     import inspect
+
     if "tensor_ty" in inspect.signature(transform_parallel_binary).parameters:
         tensor_ty: Any = np.ndarray[(hidden_size,), np.dtype[bfloat16]]
-        mlir_module = transform_parallel_binary(
-            kernel, tensor_ty, tile_size=tile_size
-        )
+        mlir_module = transform_parallel_binary(kernel, tensor_ty, tile_size=tile_size)
     else:
         gate_buf = np.zeros(hidden_size, dtype=bfloat16)
-        up_buf   = np.zeros(hidden_size, dtype=bfloat16)
-        out_buf  = np.zeros(hidden_size, dtype=bfloat16)
-        mlir_module = transform_parallel_binary(
-            kernel, gate_buf, up_buf, out_buf, tile_size=tile_size
-        )
+        up_buf = np.zeros(hidden_size, dtype=bfloat16)
+        out_buf = np.zeros(hidden_size, dtype=bfloat16)
+        mlir_module = transform_parallel_binary(kernel, gate_buf, up_buf, out_buf, tile_size=tile_size)
 
     with tempfile.TemporaryDirectory(prefix="hipfire_npu_build_") as tmp:
-        tmp_path   = Path(tmp)
+        tmp_path = Path(tmp)
         tmp_xclbin = tmp_path / "final.xclbin"
-        tmp_instr  = tmp_path / "insts.bin"
+        tmp_instr = tmp_path / "insts.bin"
 
         compile_external_kernel(kernel, tmp_path, target_arch=target_arch)
 
@@ -192,7 +185,7 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
         )
 
         shutil.copy2(tmp_xclbin, xclbin_path)
-        shutil.copy2(tmp_instr,  instr_path)
+        shutil.copy2(tmp_instr, instr_path)
 
     print(f"[build_qwen35_swiglu] done")
     print(f"  xclbin: {xclbin_path.stat().st_size} bytes")
@@ -205,31 +198,34 @@ def build(hidden_size: int, out_dir: Path, tile_size: int = 16,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--hidden-size", type=int, required=True,
-        help="FFN intermediate size (e.g. 8960 for Qwen3.5-1.5B, 18944 for 7B)"
+        "--hidden-size",
+        type=int,
+        required=True,
+        help="FFN intermediate size (e.g. 8960 for Qwen3.5-1.5B, 18944 for 7B)",
     )
     parser.add_argument(
-        "--out-dir", type=Path, default=Path("target/npu"),
-        help="Output directory for xclbin and instr.bin (default: target/npu)"
+        "--out-dir",
+        type=Path,
+        default=Path("target/npu"),
+        help="Output directory for xclbin and instr.bin (default: target/npu)",
     )
     parser.add_argument(
-        "--tile-size", type=int, default=16,
-        help="Elements per objectfifo tile (must be multiple of 16, default: 16)"
+        "--tile-size", type=int, default=16, help="Elements per objectfifo tile (must be multiple of 16, default: 16)"
     )
     parser.add_argument(
-        "--npu", choices=["auto"] + list(_NPU_DEVICES), default="auto",
-        help="Target NPU generation: auto=detect from hardware (default), npu1=AIE2/Phoenix, npu2=AIE2P/Strix"
+        "--npu",
+        choices=["auto"] + list(_NPU_DEVICES),
+        default="auto",
+        help="Target NPU generation: auto=detect from hardware (default), npu1=AIE2/Phoenix, npu2=AIE2P/Strix",
     )
     args = parser.parse_args()
 
     if args.tile_size % 16 != 0:
         parser.error("--tile-size must be a multiple of 16")
 
-    build(hidden_size=args.hidden_size, out_dir=args.out_dir,
-          tile_size=args.tile_size, npu=args.npu)
+    build(hidden_size=args.hidden_size, out_dir=args.out_dir, tile_size=args.tile_size, npu=args.npu)
 
 
 if __name__ == "__main__":

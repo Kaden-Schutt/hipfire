@@ -62,6 +62,8 @@ impl std::error::Error for XdnaError {}
 pub struct NpuSensors {
     /// Total NPU power in milliwatts, if the power sensor was present.
     pub power_mw: Option<u32>,
+    /// NPU temperature in degrees C, if the temperature sensor was present.
+    pub temp_c: Option<u32>,
     /// Per-column utilization percentage `[0, 100]`, one entry per active column.
     pub column_utilization_pct: Vec<u32>,
 }
@@ -110,6 +112,7 @@ const PARAM_RESOURCE_INFO: u32 = 12;
 // enum amdxdna_sensor_type
 const SENSOR_TYPE_POWER: u8 = 0;
 const SENSOR_TYPE_COLUMN_UTILIZATION: u8 = 1;
+const SENSOR_TYPE_TEMPERATURE: u8 = 2;
 
 // Strix Halo has 8 columns + 1 power sensor; allow generous headroom.
 const MAX_SENSORS: usize = 16;
@@ -270,6 +273,7 @@ mod imp {
                 match s.kind {
                     SENSOR_TYPE_POWER => out.power_mw = Some(s.input),
                     SENSOR_TYPE_COLUMN_UTILIZATION => out.column_utilization_pct.push(s.input),
+                    SENSOR_TYPE_TEMPERATURE => out.temp_c = Some(s.input),
                     _ => {}
                 }
             }
@@ -377,6 +381,7 @@ mod tests {
     fn mean_utilization_averages() {
         let s = NpuSensors {
             power_mw: Some(1200),
+            temp_c: None,
             column_utilization_pct: vec![0, 50, 100, 50],
         };
         assert_eq!(s.mean_utilization_pct(), 50.0);

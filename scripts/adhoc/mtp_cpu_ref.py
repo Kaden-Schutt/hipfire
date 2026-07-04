@@ -63,11 +63,7 @@ def main() -> int:
     hidden_dim = int(cfg["intermediate_size"])
     eps = float(cfg.get("rms_norm_eps", 1e-6))
 
-    prompt_tokens = [
-        int(x)
-        for x in (args.dump_prefix.with_suffix(".prompt_tokens.txt")).read_text().split()
-        if x
-    ]
+    prompt_tokens = [int(x) for x in (args.dump_prefix.with_suffix(".prompt_tokens.txt")).read_text().split() if x]
     if len(prompt_tokens) != 1:
         raise SystemExit(
             "mtp_cpu_ref.py currently checks only single-token prompt dumps; "

@@ -95,7 +95,9 @@ def extract_user_prompt(row: dict) -> str | None:
 
 
 def sample_from_dataset(
-    dataset_name: str, n: int, rng: random.Random,
+    dataset_name: str,
+    n: int,
+    rng: random.Random,
 ) -> list[tuple[str, str]]:
     """Return up to n (label, prompt_text) tuples sampled from the dataset."""
     blob = find_dataset_blob(dataset_name)
@@ -103,8 +105,7 @@ def sample_from_dataset(
         print(f"WARNING: dataset '{dataset_name}' not found in HF cache", file=sys.stderr)
         return []
     rows = load_jsonl(blob, max_rows=None)
-    print(f"  {dataset_name}: loaded {len(rows)} rows from {blob.name[:16]}",
-          file=sys.stderr)
+    print(f"  {dataset_name}: loaded {len(rows)} rows from {blob.name[:16]}", file=sys.stderr)
     prompts: list[tuple[str, str]] = []
     for r in rows:
         p = extract_user_prompt(r)
@@ -119,26 +120,26 @@ def sample_from_dataset(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--output-dir", required=True,
-                    help="Directory to write numbered prompt .txt files")
-    ap.add_argument("--n-prompts", type=int, default=400,
-                    help="Total number of prompts to sample (default 400)")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--output-dir", required=True, help="Directory to write numbered prompt .txt files")
+    ap.add_argument("--n-prompts", type=int, default=400, help="Total number of prompts to sample (default 400)")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--mix", default="opus60,reasoning20,filtered20",
-                    help="Comma-sep weights for dataset mix. Each token "
-                         "is `<short>NN` where NN is %% (sums to 100). "
-                         "Defaults to opus60,reasoning20,filtered20.")
+    ap.add_argument(
+        "--mix",
+        default="opus60,reasoning20,filtered20",
+        help="Comma-sep weights for dataset mix. Each token "
+        "is `<short>NN` where NN is %% (sums to 100). "
+        "Defaults to opus60,reasoning20,filtered20.",
+    )
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
 
     DATASET_ALIASES = {
-        "opus":      "Roman1111111/claude-opus-4.6-10000x",
+        "opus": "Roman1111111/claude-opus-4.6-10000x",
         "reasoning": "Jackrong/Qwen3.5-reasoning-700x",
-        "filtered":  "nohurry/Opus-4.6-Reasoning-3000x-filtered",
-        "hermes":    "lambda/hermes-agent-reasoning-traces",
+        "filtered": "nohurry/Opus-4.6-Reasoning-3000x-filtered",
+        "hermes": "lambda/hermes-agent-reasoning-traces",
     }
 
     weights: dict[str, int] = {}
@@ -161,8 +162,7 @@ def main() -> int:
     all_prompts: list[tuple[str, str]] = []
     for short, pct in weights.items():
         if short not in DATASET_ALIASES:
-            print(f"ERROR: unknown dataset alias '{short}'; valid: "
-                  f"{list(DATASET_ALIASES)}", file=sys.stderr)
+            print(f"ERROR: unknown dataset alias '{short}'; valid: {list(DATASET_ALIASES)}", file=sys.stderr)
             return 1
         n = int(args.n_prompts * pct / 100)
         ds_name = DATASET_ALIASES[short]
@@ -178,20 +178,27 @@ def main() -> int:
         digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
         path = out_dir / f"prompt_{i:04d}_{label}_{digest}.txt"
         path.write_text(text)
-        manifest.append({
-            "id": i,
-            "label": label,
-            "md5_8": digest,
-            "path": str(path.relative_to(out_dir)),
-            "char_len": len(text),
-        })
+        manifest.append(
+            {
+                "id": i,
+                "label": label,
+                "md5_8": digest,
+                "path": str(path.relative_to(out_dir)),
+                "char_len": len(text),
+            }
+        )
 
-    (out_dir / "manifest.json").write_text(json.dumps({
-        "seed": args.seed,
-        "mix": args.mix,
-        "n_prompts": len(all_prompts),
-        "prompts": manifest,
-    }, indent=2))
+    (out_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "seed": args.seed,
+                "mix": args.mix,
+                "n_prompts": len(all_prompts),
+                "prompts": manifest,
+            },
+            indent=2,
+        )
+    )
 
     print(f"\nwrote {len(all_prompts)} prompts to {out_dir}", file=sys.stderr)
     print(f"manifest: {out_dir / 'manifest.json'}", file=sys.stderr)

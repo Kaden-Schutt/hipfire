@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -55,7 +75,7 @@ fn render(
         bos_token => bos_token,
         tools => Value::from_serialize(&empty),
         documents => Value::from_serialize(&empty),
-        tool_call_kwargs => Value::from_serialize(&serde_json::Map::new()),
+        tool_call_kwargs => Value::from_serialize(serde_json::Map::new()),
     };
     tmpl.render(ctx).map_err(|e| format!("render: {e}"))
 }

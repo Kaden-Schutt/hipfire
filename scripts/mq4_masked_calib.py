@@ -253,9 +253,8 @@ def compute_awq_scales_autoawq(in_sum2, w_rms, alpha: float):
     if weights.shape != values.shape:
         raise ValueError(f"w_rms length {weights.size} does not match imatrix length {values.size}")
     alpha64 = float(alpha)
-    log_s = (
-        (alpha64 * 0.5) * np.log(np.maximum(values, 1.0e-12))
-        + (1.0 - alpha64) * np.log(np.maximum(weights, 1.0e-12))
+    log_s = (alpha64 * 0.5) * np.log(np.maximum(values, 1.0e-12)) + (1.0 - alpha64) * np.log(
+        np.maximum(weights, 1.0e-12)
     )
     log_s -= np.mean(log_s)
     return np.exp(log_s).astype(np.float32)
@@ -316,9 +315,7 @@ def compute_awq_scale_dict(hessians: dict[str, object], *, alpha: float) -> dict
     return {name: compute_awq_scales_from_hessian(h, alpha) for name, h in hessians.items()}
 
 
-def load_raw_sumsq_dict(
-    npz_path: str, selected: list[dict[str, object]]
-) -> tuple[dict[str, "object"], list[str]]:
+def load_raw_sumsq_dict(npz_path: str, selected: list[dict[str, object]]) -> tuple[dict[str, "object"], list[str]]:
     """Load raw per-channel sum² vectors for the iterate-selected tensors.
 
     Returns (mapping, missing) where ``mapping[hfq_name]`` is a 1D
@@ -904,7 +901,7 @@ def collect_stats(args):
         if len(devices) < 1:
             raise SystemExit("--device-map requires at least one device in --devices for the input device")
         devices = [devices[0]]
-    shard_chunks = [chunks[i:: len(devices)] for i in range(len(devices))]
+    shard_chunks = [chunks[i :: len(devices)] for i in range(len(devices))]
     run_dir = Path(args.out_dir)
     if run_dir.exists() and args.overwrite:
         shutil.rmtree(run_dir)
@@ -958,11 +955,7 @@ def collect_stats(args):
         "actual_chunks": len(chunks),
         "devices": devices,
         "device_map": device_map or "none",
-        "max_memory": (
-            {str(k): v for k, v in parse_max_memory(args.max_memory).items()}
-            if args.max_memory
-            else None
-        ),
+        "max_memory": ({str(k): v for k, v in parse_max_memory(args.max_memory).items()} if args.max_memory else None),
         "target_count": len(targets),
         "stat_count": len(merged),
         "counts": counts,
@@ -1434,9 +1427,7 @@ def quantize_candidate(args):
     for index, item in enumerate(selected, start=1):
         name = item["hfq_name"]
         tensor_started = time.time()
-        if args.progress_every and (
-            index in (1, total) or (index - 1) % args.progress_every == 0
-        ):
+        if args.progress_every and (index in (1, total) or (index - 1) % args.progress_every == 0):
             print(
                 f"[mq4_masked_calib] quantize {index}/{total} {name} "
                 f"shape={item['shape']} bytes={item['base_data_size']}",
@@ -1473,6 +1464,7 @@ def quantize_candidate(args):
                     # raw W and the runtime x/s divide produces per-channel
                     # corruption (KLD ~1.75 vs expected ~0.10–0.13).
                     import numpy as _np
+
                     values = _np.asarray(values, dtype=_np.float32) * scale[_np.newaxis, :]
             if gptq_device is not None:
                 packed, method_stats = quantize_mq4_gptq_torch(
@@ -1508,9 +1500,7 @@ def quantize_candidate(args):
             raise ValueError(f"packed size mismatch for {name}: {len(packed)} vs {tensor_info['data_size']}")
         ASTREA.patch_hfq_tensor(args.output, tensor_info, packed)
         elapsed = time.time() - tensor_started
-        if args.progress_every and (
-            index == total or index % args.progress_every == 0
-        ):
+        if args.progress_every and (index == total or index % args.progress_every == 0):
             rate = index / max(1.0e-9, time.time() - started)
             eta = (total - index) / rate if rate > 0.0 else 0.0
             print(
@@ -1542,9 +1532,9 @@ def quantize_candidate(args):
         "source": source_summary,
         "mask": str(Path(args.mask)),
         "stats_npz": str(Path(args.stats_npz)) if args.stats_npz else None,
-        "stats_json": str(Path(args.stats_json)) if args.stats_json else (
-            str(Path(args.stats_npz).resolve().parent / "stats.json") if args.stats_npz else None
-        ),
+        "stats_json": str(Path(args.stats_json))
+        if args.stats_json
+        else (str(Path(args.stats_npz).resolve().parent / "stats.json") if args.stats_npz else None),
         "selected_count": len(selected),
         "mutated_tensor_count": len(mutations),
         "used_stats_count": sum(1 for m in mutations if m["used_stats"]),
@@ -1751,7 +1741,7 @@ def tensor_sweep(args):
         tasks.append({"index": index, "variant": tensor_variant(index, name), "hfq_name": name})
 
     devices = [int(x) for x in args.devices.split(",") if x.strip()]
-    shards = [tasks[i:: len(devices)] for i in range(len(devices))]
+    shards = [tasks[i :: len(devices)] for i in range(len(devices))]
     workers = [
         {
             "device": device,
@@ -1804,12 +1794,18 @@ def _is_awq_eligible_f1(hfq_name: str) -> bool:
     produces (W·s)·x ≠ W·x corruption (KLD 0.7 → 1.7 measured on path 1).
     """
     F1_SUFFIXES = (
-        "q_proj.weight", "k_proj.weight", "v_proj.weight",
-        "qkv_proj.weight", "wqkv.weight",
-        "gate_proj.weight", "up_proj.weight",
-        "w_gate.weight", "w_up.weight",
+        "q_proj.weight",
+        "k_proj.weight",
+        "v_proj.weight",
+        "qkv_proj.weight",
+        "wqkv.weight",
+        "gate_proj.weight",
+        "up_proj.weight",
+        "w_gate.weight",
+        "w_up.weight",
         "gate_up_proj.weight",
-        "mlp.gate.weight", "router.weight",
+        "mlp.gate.weight",
+        "router.weight",
     )
     if any(hfq_name.endswith(s) for s in F1_SUFFIXES):
         return True
@@ -2045,9 +2041,7 @@ def run_iterative_awq_gptq(args, *, stats_provider=None):
         stats_npz, stats_json = provider(args, round_index, previous_model, round_dir)
         hessians = load_round_hessians(str(stats_npz), selected)
         if raw_sumsq_mapping:
-            raw_scales = compute_awq_scale_dict_with_raw(
-                hessians, raw_sumsq_mapping, alpha=args.awq_alpha
-            )
+            raw_scales = compute_awq_scale_dict_with_raw(hessians, raw_sumsq_mapping, alpha=args.awq_alpha)
         else:
             raw_scales = compute_awq_scale_dict(hessians, alpha=args.awq_alpha)
         damped_scales = damp_awq_scale_dict(previous_scales, raw_scales, damping=args.damping)
@@ -2140,9 +2134,7 @@ def run_iterative_awq_gptq_with_stats_sequence(
         stats_npz = round_dir / "imatrix.npz"
         stats_json = round_dir / "stats.json"
         np.savez_compressed(stats_npz, **payload)
-        stats_json.write_text(
-            json.dumps({"counts": {name: 1 for name in stats}}, indent=2, sort_keys=True) + "\n"
-        )
+        stats_json.write_text(json.dumps({"counts": {name: 1 for name in stats}}, indent=2, sort_keys=True) + "\n")
         return stats_npz, stats_json
 
     args = SimpleNamespace(
@@ -2198,7 +2190,9 @@ def main(argv=None):
     p.add_argument("--chunks", type=int, default=32)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--stats-mode", choices=("diag", "hessian"), default="diag")
-    p.add_argument("--candidate-mq4", help="Collect stats from a quantized MQ4 HFQ candidate via CPU dequantized forward")
+    p.add_argument(
+        "--candidate-mq4", help="Collect stats from a quantized MQ4 HFQ candidate via CPU dequantized forward"
+    )
     p.add_argument("--max-tensors", type=int)
     p.add_argument("--tensor-filter")
     p.add_argument("--overwrite", action="store_true")
@@ -2216,7 +2210,9 @@ def main(argv=None):
     p.add_argument("--ls-iters", type=int, default=5)
     p.add_argument("--method", choices=("wls", "gptq"), default="wls")
     p.add_argument("--gpu", type=int, help="Run GPTQ solve on CUDA device N; omit for CPU numpy path")
-    p.add_argument("--awq-aware-hessian", help="HFQ model containing AWQ .awq_scale.weight sidecars for GPTQ Hessian scaling")
+    p.add_argument(
+        "--awq-aware-hessian", help="HFQ model containing AWQ .awq_scale.weight sidecars for GPTQ Hessian scaling"
+    )
     p.add_argument("--gptq-damp", type=float, default=0.01)
     p.add_argument("--gptq-refit-iters", type=int, default=2)
     p.add_argument("--skip-unsupported", action="store_true")

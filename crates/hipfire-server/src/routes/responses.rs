@@ -432,7 +432,6 @@ async fn stream_responses(state: SharedState, body: ResponsesRequest) -> impl In
                 *state.loaded_model_cache_capable.lock().await = None;
                 *state.loaded_model_max_seq.lock().await = None;
                 drop(engine);
-                return;
             }
             Err(e) => {
                 *engine_guard = Some(engine);

@@ -113,8 +113,8 @@ def split_qkv(qkv_flat: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     """
     n = qkv_flat.shape[0]
     q = qkv_flat[:, 0:HIDDEN].reshape(n, N_HEADS, HEAD_DIM)
-    k = qkv_flat[:, HIDDEN:2 * HIDDEN].reshape(n, N_HEADS, HEAD_DIM)
-    v = qkv_flat[:, 2 * HIDDEN:3 * HIDDEN].reshape(n, N_HEADS, HEAD_DIM)
+    k = qkv_flat[:, HIDDEN : 2 * HIDDEN].reshape(n, N_HEADS, HEAD_DIM)
+    v = qkv_flat[:, 2 * HIDDEN : 3 * HIDDEN].reshape(n, N_HEADS, HEAD_DIM)
     return q.astype(np.float64), k.astype(np.float64), v.astype(np.float64)
 
 
@@ -126,7 +126,7 @@ def attention_numpy(qkv: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.nda
     once. Processing one head at a time peaks at ~3 GB.
     """
     n = qkv.shape[0]
-    q, k, v = split_qkv(qkv)              # [n, n_heads, head_dim]
+    q, k, v = split_qkv(qkv)  # [n, n_heads, head_dim]
     q = apply_rope_halfsplit(q, cos, sin)
     k = apply_rope_halfsplit(k, cos, sin)
     # Use float32 for the big intermediate to keep memory under ~3 GB/head.
@@ -146,7 +146,7 @@ def attention_numpy(qkv: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.nda
         np.divide(scores, s, out=scores)
         # Apply V: [n, n] @ [n, head_dim] → [n, head_dim]
         head_out = scores @ v32[:, h, :]
-        out[:, h * HEAD_DIM:(h + 1) * HEAD_DIM] = head_out.astype(np.float64)
+        out[:, h * HEAD_DIM : (h + 1) * HEAD_DIM] = head_out.astype(np.float64)
         if h % 3 == 0:
             print(f"    [head {h}/{N_HEADS} done]")
     return out
@@ -179,7 +179,7 @@ def main():
     # Build RoPE tables
     print("Building RoPE tables...")
     cos_tbl, sin_tbl = build_rope_tables()
-    print(f"cos[0,0]={cos_tbl[0,0]:.6f}  cos[19519, 64]={cos_tbl[-1, 64]:.6f}")
+    print(f"cos[0,0]={cos_tbl[0, 0]:.6f}  cos[19519, 64]={cos_tbl[-1, 64]:.6f}")
 
     # Compute attention via numpy on both qkv inputs
     print("\nComputing numpy attention with HF qkv (this is slow — F32 19520x19520)...")
@@ -194,7 +194,9 @@ def main():
     print("\nnumpy_out_hf  vs numpy_out_ours  (same algorithm, different qkv inputs):")
     cos_rows = cos_per_row(numpy_out_hf, numpy_out_ours)
     print(f"  mean cos: {cos_rows.mean():.5f}  min cos: {cos_rows.min():.5f}")
-    print(f"  norm ratio (ours/hf): mean={np.linalg.norm(numpy_out_ours, axis=-1).mean() / np.linalg.norm(numpy_out_hf, axis=-1).mean():.4f}")
+    print(
+        f"  norm ratio (ours/hf): mean={np.linalg.norm(numpy_out_ours, axis=-1).mean() / np.linalg.norm(numpy_out_hf, axis=-1).mean():.4f}"
+    )
 
     # Worst-N rows
     order = np.argsort(cos_rows)[:5]

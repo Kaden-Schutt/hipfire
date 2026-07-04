@@ -13,6 +13,8 @@
 //! bidirectional attention, gelu-tanh MLP, **learned** position embeddings (no
 //! RoPE) — so its forward reuses the qwen35-vl vision kernels.
 
+#![allow(clippy::doc_lazy_continuation)]
+
 pub mod arch;
 pub mod config;
 pub mod forward;

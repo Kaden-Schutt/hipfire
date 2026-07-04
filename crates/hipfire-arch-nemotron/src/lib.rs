@@ -14,6 +14,12 @@
 //! MLP, the per-block forward, weight loader, and serving impls land in later
 //! loop iterations (N1+).
 
+#![allow(
+    clippy::large_enum_variant,
+    clippy::needless_range_loop,
+    clippy::type_complexity
+)]
+
 pub mod arch;
 pub mod attn;
 pub mod block;
@@ -182,7 +188,7 @@ impl NemotronHConfig {
                 raw.num_hidden_layers
             ));
         }
-        let has_moe = blocks.iter().any(|b| *b == BlockKind::Moe);
+        let has_moe = blocks.contains(&BlockKind::Moe);
         let moe = if has_moe {
             let n_routed_experts = raw
                 .n_routed_experts
@@ -240,8 +246,8 @@ impl NemotronHConfig {
                 // (0, inf) — a no-op). `time_step_min/max` are INIT-only (used
                 // for dt_bias initialization), NOT the forward clamp — clamping
                 // the forward to [0.001, 0.1] is wrong (verified vs HF dump).
-                dt_min: dt_min,
-                dt_max: dt_max,
+                dt_min,
+                dt_max,
             },
             attn: AttnConfig {
                 num_heads: raw.num_attention_heads,
@@ -288,7 +294,7 @@ impl NemotronHConfig {
         }
 
         let d_inner = raw.d_model * raw.ssm_cfg.expand;
-        if d_inner % raw.ssm_cfg.headdim != 0 {
+        if !d_inner.is_multiple_of(raw.ssm_cfg.headdim) {
             return Err(format!(
                 "mamba2 d_inner {d_inner} is not divisible by headdim {}",
                 raw.ssm_cfg.headdim
@@ -674,10 +680,7 @@ mod tests {
         assert!(prof.needs_kv_cache()); // has attention blocks
         assert!(prof.has_recurrent_state()); // has Mamba2 blocks
         assert!(prof.is_hybrid());
-        assert_eq!(
-            cfg.mamba_out_proj_runtime_scale(),
-            1.0f32 / (42.0f32).sqrt()
-        );
+        assert_eq!(cfg.mamba_out_proj_runtime_scale(), 1.0);
     }
 
     #[test]

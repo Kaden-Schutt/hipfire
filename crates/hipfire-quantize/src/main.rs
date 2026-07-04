@@ -872,9 +872,9 @@ fn qtip_simquant_nbit(
     });
 }
 
-/// QTIP-trellis the bulk after RoughQuant PCA rotation, protecting the leading
-/// `n_prot` columns (PCA-sorted by eigenvalue descending → highest-energy first)
-/// at full precision with PER-COLUMN granularity. The protected columns are
+// QTIP-trellis the bulk after RoughQuant PCA rotation, protecting the leading
+// `n_prot` columns (PCA-sorted by eigenvalue descending -> highest-energy first)
+// at full precision with PER-COLUMN granularity. The protected columns are
 // ── BBT-spectral (SpectralLLM) influence scaling ───────────────────────────
 // Reference: "Influence-Inspired Spectral Rotations for Extreme Low-Bit LLM
 // Quantization" (Pavlov). A math-invariant per-input-channel scale derived from
@@ -2670,7 +2670,7 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|s| s.as_str())
 }
 
-fn required_format_arg<'a>(args: &'a [String]) -> Result<&'a str, &'static str> {
+fn required_format_arg(args: &[String]) -> Result<&str, &'static str> {
     arg_value(args, "--format").ok_or(
         "--format <FMT> is required; hipfire-quantize does not choose a default quant format",
     )
@@ -3078,7 +3078,7 @@ fn quantize_hfq_source_tensor(
                 let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = ldlq::oq4_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
-                if let Some(_) = &out {
+                if out.is_some() {
                     ldlq_record_success();
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));

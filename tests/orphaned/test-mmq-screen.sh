@@ -37,7 +37,7 @@ run_test() {
     shift
     local out_file="/tmp/mmq_screen_test_out_$$.log"
 
-    cat > /tmp/mmq_screen_input_$$.jsonl <<JL
+    cat >/tmp/mmq_screen_input_$$.jsonl <<JL
 {"type":"load","model":"$MODEL","params":{"max_seq":4096}}
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":180,"repeat_penalty":1.05,"system":${system_text}}
 {"type":"unload"}
@@ -45,7 +45,7 @@ JL
 
     echo "=== $label ==="
     echo "  env: $*"
-    env "$@" timeout 120 "$EXE" < /tmp/mmq_screen_input_$$.jsonl > "$out_file" 2>&1
+    env "$@" timeout 120 "$EXE" </tmp/mmq_screen_input_$$.jsonl >"$out_file" 2>&1
     local ec=$?
 
     # Extract generated text

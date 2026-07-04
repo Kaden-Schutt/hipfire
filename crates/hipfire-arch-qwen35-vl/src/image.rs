@@ -210,7 +210,9 @@ pub fn extract_patches(
     let mut patches = vec![0.0f32; n_patches * patch_elems];
 
     assert!(
-        spatial_merge_size >= 1 && ph % spatial_merge_size == 0 && pw % spatial_merge_size == 0,
+        spatial_merge_size >= 1
+            && ph.is_multiple_of(spatial_merge_size)
+            && pw.is_multiple_of(spatial_merge_size),
         "patch grid {ph}x{pw} not divisible by spatial_merge_size={spatial_merge_size} — \
          smart_resize should guarantee this",
     );
@@ -294,7 +296,7 @@ mod tests {
         //   patch_out_idx 1 → out_base = 1 * 24 = 24
         // Per-patch layout (C, T, ph, pw): for c=0, t=0, dy=0, dx=0 the source
         // pixel is at (py*ps+dy, px*ps+dx) = (0, 2) so value = 0*10000 + 0*100 + 2 = 2.
-        let v = patches[24 + 0 * 8 + 0 * 4 + 0 * 2 + 0];
+        let v = patches[24];
         assert_eq!(
             v, 2.0,
             "patch_out_idx=1, c=0,t=0,dy=0,dx=0 should hold (0,2)=2"

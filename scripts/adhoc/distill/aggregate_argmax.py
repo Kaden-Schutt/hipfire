@@ -53,18 +53,25 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--output-dir", required=True,
-                   help="Directory of *.stderr.txt files from run_distill_parallel.sh")
-    p.add_argument("--sidecar-out", required=True,
-                   help="Output sidecar JSON path (drop-in for mtp_extract --vocab-sidecar)")
+    p.add_argument("--output-dir", required=True, help="Directory of *.stderr.txt files from run_distill_parallel.sh")
+    p.add_argument(
+        "--sidecar-out", required=True, help="Output sidecar JSON path (drop-in for mtp_extract --vocab-sidecar)"
+    )
     p.add_argument("--top-k", type=int, default=32768)
-    p.add_argument("--tokenizer", default=None,
-                   help="Path to tokenizer.json directory (for special-token "
-                        "must-include list). Optional; if absent, special "
-                        "tokens are still inferred via counter heuristics.")
-    p.add_argument("--full-vocab-size", type=int, default=248320,
-                   help="Full trunk vocab size (default 248320 for Qwen3.5/3.6). "
-                        "Used for the metadata field; pad-fill if top-k > observed.")
+    p.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Path to tokenizer.json directory (for special-token "
+        "must-include list). Optional; if absent, special "
+        "tokens are still inferred via counter heuristics.",
+    )
+    p.add_argument(
+        "--full-vocab-size",
+        type=int,
+        default=248320,
+        help="Full trunk vocab size (default 248320 for Qwen3.5/3.6). "
+        "Used for the metadata field; pad-fill if top-k > observed.",
+    )
     args = p.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -95,13 +102,11 @@ def main() -> int:
         n_parsed += 1
 
     if n_parsed == 0:
-        print(f"ERROR: no parseable AR tokens in {len(stderr_files)} stderr files",
-              file=sys.stderr)
+        print(f"ERROR: no parseable AR tokens in {len(stderr_files)} stderr files", file=sys.stderr)
         return 1
 
     unique_observed = len(counter)
-    print(f"parsed {n_parsed}/{len(stderr_files)} files "
-          f"({n_failed} failed)", file=sys.stderr)
+    print(f"parsed {n_parsed}/{len(stderr_files)} files ({n_failed} failed)", file=sys.stderr)
     print(f"  total tokens emitted: {total_tokens}", file=sys.stderr)
     print(f"  unique tokens observed: {unique_observed}", file=sys.stderr)
     if per_file_token_counts:
@@ -123,8 +128,7 @@ def main() -> int:
             if hasattr(tok, "all_special_ids"):
                 must_include.extend(int(i) for i in tok.all_special_ids)
         except Exception as e:
-            print(f"  tokenizer load failed: {e}; skipping must-include",
-                  file=sys.stderr)
+            print(f"  tokenizer load failed: {e}; skipping must-include", file=sys.stderr)
     must_include = sorted(set(must_include))
 
     selected = [tid for tid, _ in most_common]
@@ -149,8 +153,7 @@ def main() -> int:
 
     covered = sum(counter[t] for t in selected if t in counter)
     coverage = covered / total_tokens if total_tokens > 0 else 0.0
-    print(f"top-{args.top_k} covers {coverage*100:.2f}% of emitted tokens",
-          file=sys.stderr)
+    print(f"top-{args.top_k} covers {coverage * 100:.2f}% of emitted tokens", file=sys.stderr)
 
     out = {
         "draft_to_full": selected,

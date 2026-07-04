@@ -23,7 +23,6 @@
 set -euo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 export PATH=${TRIPWIRE_ROOT}/.cargo/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
 export HIP_PATH=/opt/rocm
 export ROCM_PATH=/opt/rocm
@@ -31,7 +30,7 @@ export HIPFIRE_FP16=0
 
 log() { printf '[hermes-run] %s\n' "$*"; }
 wait_pid_dead() {
-    while pgrep -f "$1" > /dev/null; do sleep 10; done
+    while pgrep -f "$1" >/dev/null; do sleep 10; done
 }
 
 cd ${TRIPWIRE_ROOT}/hipfire
@@ -62,7 +61,7 @@ if [ ! -f "$CARNICE_SIDECAR" ]; then
         --corpus ${TRIPWIRE_ROOT}/hermes_traces_corpus.txt \
         --max-tokens 1000000 \
         --sidecar "$CARNICE_SIDECAR" \
-        > ${TRIPWIRE_ROOT}/cal_carnice_hermes.log 2>&1
+        >${TRIPWIRE_ROOT}/cal_carnice_hermes.log 2>&1
 else
     log "Carnice-9b agentic sidecar already present"
 fi
@@ -77,7 +76,7 @@ if [ ! -f "$A3B_SIDECAR" ]; then
         --corpus ${TRIPWIRE_ROOT}/hermes_traces_corpus.txt \
         --max-tokens 1000000 \
         --sidecar "$A3B_SIDECAR" \
-        > ${TRIPWIRE_ROOT}/cal_36a3b_hermes.log 2>&1
+        >${TRIPWIRE_ROOT}/cal_36a3b_hermes.log 2>&1
 else
     log "3.6-A3B agentic sidecar already present"
 fi
@@ -87,7 +86,7 @@ tail -6 ${TRIPWIRE_ROOT}/cal_36a3b_hermes.log 2>&1 || true
 log "starting hipfire serve on port 8080..."
 cd ${TRIPWIRE_ROOT}/hipfire
 PORT=8080
-nohup ./target/release/hipfire serve --host 127.0.0.1 --port "$PORT" --model "$CARNICE_MQ4" > ${TRIPWIRE_ROOT}/hipfire_serve.log 2>&1 &
+nohup ./target/release/hipfire serve --host 127.0.0.1 --port "$PORT" --model "$CARNICE_MQ4" >${TRIPWIRE_ROOT}/hipfire_serve.log 2>&1 &
 SERVE_PID=$!
 disown
 log "serve PID=$SERVE_PID"
@@ -106,8 +105,8 @@ for i in $(seq 1 30); do
 done
 
 if ! curl -sf "http://127.0.0.1:$PORT/v1/chat/completions" -X POST \
-     -H "Content-Type: application/json" \
-     -d '{"model":"carnice-9b","messages":[{"role":"user","content":"ping"}]}' > /dev/null 2>&1; then
+    -H "Content-Type: application/json" \
+    -d '{"model":"carnice-9b","messages":[{"role":"user","content":"ping"}]}' >/dev/null 2>&1; then
     log "WARN: serve not responding after 60s — check ${TRIPWIRE_ROOT}/hipfire_serve.log"
     tail -30 ${TRIPWIRE_ROOT}/hipfire_serve.log
 fi
@@ -117,7 +116,7 @@ log "configuring hermes-agent..."
 # hermes-agent config format: TBD, usually ~/.config/hermes or similar
 # Placeholder — the real config may need adjustment once we see hermes CLI:
 mkdir -p ${TRIPWIRE_ROOT}/.config/hermes
-cat > ${TRIPWIRE_ROOT}/.config/hermes/config.json <<EOF
+cat >${TRIPWIRE_ROOT}/.config/hermes/config.json <<EOF
 {
   "provider": "custom",
   "endpoint": "http://127.0.0.1:$PORT/v1/chat/completions",
@@ -134,8 +133,8 @@ mkdir -p ${TRIPWIRE_ROOT}/hermes_validate_results
 log "running first agent task — simple 'list files' to confirm wiring"
 if command -v hermes >/dev/null 2>&1; then
     timeout 120 hermes run "List the files in /root and show their sizes" \
-        > ${TRIPWIRE_ROOT}/hermes_validate_results/task_list_files.log 2>&1 || \
-        log "WARN: first task returned non-zero — see log"
+        >${TRIPWIRE_ROOT}/hermes_validate_results/task_list_files.log 2>&1 \
+        || log "WARN: first task returned non-zero — see log"
     tail -20 ${TRIPWIRE_ROOT}/hermes_validate_results/task_list_files.log
 else
     log "WARN: hermes binary not in PATH — skipping agent task battery"

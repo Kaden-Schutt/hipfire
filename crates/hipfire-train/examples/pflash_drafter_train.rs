@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 //! P3 — train the PFlash drafter to reproduce the target's MID-layer block
 //! ranking, and measure it against the shallow-K baseline PFlash uses today.
 //!
@@ -148,7 +168,7 @@ fn corpus_tokens(tok: &Tokenizer) -> Vec<u32> {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().map_or(false, |x| x == "md" || x == "rs") {
+                } else if p.extension().is_some_and(|x| x == "md" || x == "rs") {
                     if let Ok(t) = std::fs::read_to_string(&p) {
                         text.push_str(&t);
                         text.push('\n');

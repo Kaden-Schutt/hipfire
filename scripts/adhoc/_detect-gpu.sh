@@ -26,8 +26,8 @@
 # ── Arch (gfx1100, gfx1010, ...) ────────────────────────────────
 if [ -z "${HIPFIRE_DETECTED_ARCH:-}" ]; then
     for probe in amdgpu-arch offload-arch \
-                 /opt/rocm/bin/amdgpu-arch /opt/rocm/bin/offload-arch \
-                 /opt/rocm/llvm/bin/amdgpu-arch; do
+        /opt/rocm/bin/amdgpu-arch /opt/rocm/bin/offload-arch \
+        /opt/rocm/llvm/bin/amdgpu-arch; do
         if command -v "$probe" >/dev/null 2>&1 || [ -x "$probe" ]; then
             HIPFIRE_DETECTED_ARCH="$("$probe" 2>/dev/null | head -1)"
             [ -n "$HIPFIRE_DETECTED_ARCH" ] && break
@@ -38,14 +38,38 @@ if [ -z "${HIPFIRE_DETECTED_ARCH:-}" ]; then
             [ -f "$node_props" ] || continue
             ver=$(awk '/gfx_target_version/ {print $2; exit}' "$node_props" 2>/dev/null || true)
             case "$ver" in
-                90006)          HIPFIRE_DETECTED_ARCH="gfx906";  break ;;
-                90008)          HIPFIRE_DETECTED_ARCH="gfx908";  break ;;
-                100100)         HIPFIRE_DETECTED_ARCH="gfx1010"; break ;;
-                100300|100302)  HIPFIRE_DETECTED_ARCH="gfx1030"; break ;;
-                110000|110001)  HIPFIRE_DETECTED_ARCH="gfx1100"; break ;;
-                110501)         HIPFIRE_DETECTED_ARCH="gfx1151"; break ;;
-                120000)         HIPFIRE_DETECTED_ARCH="gfx1200"; break ;;
-                120001)         HIPFIRE_DETECTED_ARCH="gfx1201"; break ;;
+                90006)
+                    HIPFIRE_DETECTED_ARCH="gfx906"
+                    break
+                    ;;
+                90008)
+                    HIPFIRE_DETECTED_ARCH="gfx908"
+                    break
+                    ;;
+                100100)
+                    HIPFIRE_DETECTED_ARCH="gfx1010"
+                    break
+                    ;;
+                100300 | 100302)
+                    HIPFIRE_DETECTED_ARCH="gfx1030"
+                    break
+                    ;;
+                110000 | 110001)
+                    HIPFIRE_DETECTED_ARCH="gfx1100"
+                    break
+                    ;;
+                110501)
+                    HIPFIRE_DETECTED_ARCH="gfx1151"
+                    break
+                    ;;
+                120000)
+                    HIPFIRE_DETECTED_ARCH="gfx1200"
+                    break
+                    ;;
+                120001)
+                    HIPFIRE_DETECTED_ARCH="gfx1201"
+                    break
+                    ;;
             esac
         done
     fi
@@ -53,10 +77,10 @@ if [ -z "${HIPFIRE_DETECTED_ARCH:-}" ]; then
         HIPFIRE_DETECTED_ARCH="$({ rocminfo 2>/dev/null | awk '/^  Name:/ && $2 ~ /^gfx/ {print $2; exit}'; } || true)"
     fi
     case "${HSA_OVERRIDE_GFX_VERSION:-}" in
-        9.0.6|9.0) HIPFIRE_DETECTED_ARCH="gfx906" ;;
-        10.1.0|10.1) HIPFIRE_DETECTED_ARCH="gfx1010" ;;
-        10.3.0|10.3) HIPFIRE_DETECTED_ARCH="gfx1030" ;;
-        11.0.0|11.0) HIPFIRE_DETECTED_ARCH="gfx1100" ;;
+        9.0.6 | 9.0) HIPFIRE_DETECTED_ARCH="gfx906" ;;
+        10.1.0 | 10.1) HIPFIRE_DETECTED_ARCH="gfx1010" ;;
+        10.3.0 | 10.3) HIPFIRE_DETECTED_ARCH="gfx1030" ;;
+        11.0.0 | 11.0) HIPFIRE_DETECTED_ARCH="gfx1100" ;;
     esac
 fi
 

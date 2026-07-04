@@ -51,8 +51,11 @@ from dflash.model import DFlashDraftModel, extract_context_feature  # noqa: E402
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--target-repo", default="Qwen/Qwen3.5-4B")
-    p.add_argument("--zlab-draft-repo", default="z-lab/Qwen3.5-4B-DFlash",
-                   help="HF repo of the z-lab reference draft (or local dir).")
+    p.add_argument(
+        "--zlab-draft-repo",
+        default="z-lab/Qwen3.5-4B-DFlash",
+        help="HF repo of the z-lab reference draft (or local dir).",
+    )
     p.add_argument("--corpus", default=str(TRIPWIRE_ROOT / "calibration_corpus.txt"))
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--masked-blocks-per-seq", type=int, default=4)
@@ -77,7 +80,9 @@ def main():
     print(f"[target] loading {args.target_repo}...")
     tokenizer = AutoTokenizer.from_pretrained(args.target_repo)
     target = AutoModelForCausalLM.from_pretrained(
-        args.target_repo, torch_dtype=dtype, attn_implementation="eager",
+        args.target_repo,
+        torch_dtype=dtype,
+        attn_implementation="eager",
     ).to(device)
     target.eval()
     for p in target.parameters():
@@ -97,6 +102,7 @@ def main():
     try:
         from safetensors.torch import load_file
         from huggingface_hub import hf_hub_download
+
         # Pick up first safetensors file in repo (their drafts are single-file).
         sf = hf_hub_download(repo_id=args.zlab_draft_repo, filename="model.safetensors")
         sd = load_file(sf)
@@ -112,9 +118,11 @@ def main():
     draft.eval()
     for p in draft.parameters():
         p.requires_grad_(False)
-    print(f"[draft] {zlab_cfg.num_hidden_layers} layers, "
-          f"hidden={zlab_cfg.hidden_size}, heads={zlab_cfg.num_attention_heads}, "
-          f"head_dim={getattr(zlab_cfg, 'head_dim', zlab_cfg.hidden_size // zlab_cfg.num_attention_heads)}")
+    print(
+        f"[draft] {zlab_cfg.num_hidden_layers} layers, "
+        f"hidden={zlab_cfg.hidden_size}, heads={zlab_cfg.num_attention_heads}, "
+        f"head_dim={getattr(zlab_cfg, 'head_dim', zlab_cfg.hidden_size // zlab_cfg.num_attention_heads)}"
+    )
 
     # ── Load corpus (SAMPLED — we only need num_batches random slices) ─
     # Full 1GB corpus tokenize is 5+ min; cap at first ~2M chars then
@@ -148,28 +156,28 @@ def main():
     with torch.no_grad():
         for b_idx in range(args.num_batches):
             start = random.randint(0, len(ids) - L - 1)
-            clean = torch.tensor(ids[start:start + L], dtype=torch.long, device=device).unsqueeze(0)
+            clean = torch.tensor(ids[start : start + L], dtype=torch.long, device=device).unsqueeze(0)
 
             # Stratified random anchors
-            anchors = torch.tensor([
-                w * window_size + 1 + random.randint(0, max(0, window_size - B))
-                for w in range(K)
-            ], dtype=torch.long, device=device)
+            anchors = torch.tensor(
+                [w * window_size + 1 + random.randint(0, max(0, window_size - B)) for w in range(K)],
+                dtype=torch.long,
+                device=device,
+            )
 
             # Target forward (clean)
             t_out = target(input_ids=clean, output_hidden_states=True, use_cache=False)
-            tgt_ctx = extract_context_feature(t_out.hidden_states,
-                                              zlab_cfg.dflash_config["target_layer_ids"])
+            tgt_ctx = extract_context_feature(t_out.hidden_states, zlab_cfg.dflash_config["target_layer_ids"])
 
             # Build concatenated noise blocks
             block_tok = torch.empty((1, K * B), dtype=torch.long, device=device)
             noise_positions = torch.empty((K * B,), dtype=torch.long, device=device)
             for k in range(K):
                 s = int(anchors[k].item())
-                blk = clean[:, s:s + B].clone()
+                blk = clean[:, s : s + B].clone()
                 blk[:, 1:] = mask_token_id
-                block_tok[:, k * B:(k + 1) * B] = blk
-                noise_positions[k * B:(k + 1) * B] = torch.arange(s, s + B, device=device)
+                block_tok[:, k * B : (k + 1) * B] = blk
+                noise_positions[k * B : (k + 1) * B] = torch.arange(s, s + B, device=device)
             noise_emb = target.model.embed_tokens(block_tok).to(dtype)
 
             ctx_positions = torch.arange(L, device=device)
@@ -196,13 +204,15 @@ def main():
             )
             pred_idx = torch.tensor(
                 [k * B + i for k in range(K) for i in range(1, B)],
-                dtype=torch.long, device=device,
+                dtype=torch.long,
+                device=device,
             )
             pred_hidden = d_out[:, pred_idx, :]
             logits = target.lm_head(pred_hidden)
             label_abs = torch.tensor(
                 [int(anchors[k].item()) + i for k in range(K) for i in range(1, B)],
-                dtype=torch.long, device=device,
+                dtype=torch.long,
+                device=device,
             )
             labels = clean[:, label_abs]
 
@@ -222,15 +232,17 @@ def main():
             acc_pos1 = (pred_top[:, 0] == labels[:, 0]).float().mean()
             losses.append(weighted.item())
 
-            print(f"  batch {b_idx+1}: weighted_loss={weighted.item():.3f}  "
-                  f"uniform_loss={uniform.item():.3f}  "
-                  f"pos1_top1_acc={acc_pos1.item():.3f}  "
-                  f"anchors={anchors.tolist()}")
+            print(
+                f"  batch {b_idx + 1}: weighted_loss={weighted.item():.3f}  "
+                f"uniform_loss={uniform.item():.3f}  "
+                f"pos1_top1_acc={acc_pos1.item():.3f}  "
+                f"anchors={anchors.tolist()}"
+            )
 
     mean_loss = sum(losses) / len(losses)
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"MEAN WEIGHTED LOSS (z-lab weights, our forward): {mean_loss:.3f}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     if mean_loss < 3.5:
         print("✓ Known-good draft produces low loss on our training task.")
         print("  → Our forward/mask/loss are CORRECT.")

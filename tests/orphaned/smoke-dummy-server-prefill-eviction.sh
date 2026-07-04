@@ -9,8 +9,8 @@ SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
 
 exec 9>"$SERVER_SMOKE_LOCK"
 if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
-  echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
-  exit 2
+    echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
+    exit 2
 fi
 
 python3 - "$ROOT" "$PORT" "$LOG_PATH" <<'PY'

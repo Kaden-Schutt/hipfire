@@ -38,7 +38,10 @@ fi
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ddtree-sweep" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ddtree-sweep" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -67,7 +70,8 @@ CONFIGS=(
     "b22-k4|22|4"
 )
 
-PARSE_PY=$(cat <<'PY'
+PARSE_PY=$(
+    cat <<'PY'
 import sys, re, statistics
 label = sys.argv[1]
 genre = sys.argv[2]
@@ -121,7 +125,7 @@ run_config() {
 }
 
 for entry in "${CONFIGS[@]}"; do
-    IFS='|' read -r label budget topk <<< "$entry"
-    run_config "$label" "$budget" "$topk" "code"  "$CODE_PROMPT"  "$MAX_TOKENS"
+    IFS='|' read -r label budget topk <<<"$entry"
+    run_config "$label" "$budget" "$topk" "code" "$CODE_PROMPT" "$MAX_TOKENS"
     run_config "$label" "$budget" "$topk" "prose" "$PROSE_PROMPT" "$MAX_TOKENS"
 done

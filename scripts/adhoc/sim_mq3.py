@@ -87,6 +87,7 @@ NOT a strict upper bound on its quality cost:
 Usage: ./scripts/sim_mq3.py <input-mq4.hfq> <output-mq4.hfq>   # requires +x bit
        python3 scripts/sim_mq3.py <input-mq4.hfq> <output-mq4.hfq>
 """
+
 import json
 import struct
 import sys
@@ -149,7 +150,7 @@ def parse_header_and_index(buf):
     for _ in range(n_tensors):
         name_len = struct.unpack_from("<H", buf, pos)[0]
         pos += 2
-        name = buf[pos:pos + name_len].decode("utf-8")
+        name = buf[pos : pos + name_len].decode("utf-8")
         pos += name_len
         qt = buf[pos]
         pos += 1
@@ -161,11 +162,16 @@ def parse_header_and_index(buf):
         pos += 4
         data_size = struct.unpack_from("<Q", buf, pos)[0]
         pos += 8
-        tensors.append({
-            "name": name, "qt": qt, "shape": shape,
-            "group_size": group_size,
-            "data_offset": cum, "data_size": data_size,
-        })
+        tensors.append(
+            {
+                "name": name,
+                "qt": qt,
+                "shape": shape,
+                "group_size": group_size,
+                "data_offset": cum,
+                "data_size": data_size,
+            }
+        )
         cum += data_size
 
     return arch_id, n_tensors, metadata_offset, data_offset, json_end, tensors
@@ -198,7 +204,10 @@ def main():
         do = t["data_offset"]
         n_blocks, rem = divmod(ds, BLOCK_BYTES)
         if rem != 0:
-            print(f"  WARN: tensor {t['name']} has data_size {ds} not a multiple of {BLOCK_BYTES} — skipping", file=sys.stderr)
+            print(
+                f"  WARN: tensor {t['name']} has data_size {ds} not a multiple of {BLOCK_BYTES} — skipping",
+                file=sys.stderr,
+            )
             continue
         for b in range(n_blocks):
             nibble_start = do + b * BLOCK_BYTES + 8

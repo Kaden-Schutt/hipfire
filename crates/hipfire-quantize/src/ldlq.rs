@@ -179,9 +179,9 @@ pub fn qtip_ldlq_dequant_bits(
                     *g = residual[rbase + c0 + c] as f32;
                 }
                 let s0 = crate::qtip::group_scale(&grp);
-                let sym = crate::qtip::beam_encode_group_bits(&grp, s0, &cb, beam_width, bits);
-                let s = crate::qtip::optimal_scale_bits(&grp, &sym, &cb, bits);
-                let deq = crate::qtip::decode_group_bits(&sym, s, &cb, bits);
+                let sym = crate::qtip::beam_encode_group_bits(&grp, s0, cb, beam_width, bits);
+                let s = crate::qtip::optimal_scale_bits(&grp, &sym, cb, bits);
+                let deq = crate::qtip::decode_group_bits(&sym, s, cb, bits);
                 let mut err = vec![0.0f64; 256];
                 for c in 0..256 {
                     dr[c0 + c] = deq[c] as f64;

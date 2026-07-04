@@ -88,9 +88,12 @@ def bbox_iou(a: list[int], b: list[int]) -> float:
     """IoU over [x1,y1,x2,y2] boxes."""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
-    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
-    iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
     inter = iw * ih
     aa = (ax2 - ax1) * (ay2 - ay1)
     bb = (bx2 - bx1) * (by2 - by1)
@@ -150,14 +153,14 @@ def greedy_match(ref: list[dict], ours: list[dict]) -> list[tuple[int, int, floa
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--our", required=True, type=Path,
-                    help="path to ocr_e2e stdout (raw decoded text)")
-    ap.add_argument("--ref", required=True, type=Path,
-                    help="path to vLLM reference JSON (eg dots_ocr_smoke_001_vllm.json)")
-    ap.add_argument("--iou-threshold", type=float, default=0.5,
-                    help="IoU threshold for region-detection F1 (default: 0.5)")
-    ap.add_argument("--verbose", action="store_true",
-                    help="print per-region match details")
+    ap.add_argument("--our", required=True, type=Path, help="path to ocr_e2e stdout (raw decoded text)")
+    ap.add_argument(
+        "--ref", required=True, type=Path, help="path to vLLM reference JSON (eg dots_ocr_smoke_001_vllm.json)"
+    )
+    ap.add_argument(
+        "--iou-threshold", type=float, default=0.5, help="IoU threshold for region-detection F1 (default: 0.5)"
+    )
+    ap.add_argument("--verbose", action="store_true", help="print per-region match details")
     args = ap.parse_args()
 
     if not args.our.exists():
@@ -187,21 +190,20 @@ def main() -> int:
 
     # Match.
     pairs = greedy_match(ref_regions, our_regions)
-    matched_at_threshold = sum(1 for (_, oi, iou) in pairs
-                                if oi != -1 and iou >= args.iou_threshold)
+    matched_at_threshold = sum(1 for (_, oi, iou) in pairs if oi != -1 and iou >= args.iou_threshold)
 
     # Reverse-direction: penalise our extras (false positives).
     ref_matched_ours = {oi for (_, oi, iou) in pairs if oi != -1 and iou >= args.iou_threshold}
     n_our_extras = sum(1 for oi in range(len(our_regions)) if oi not in ref_matched_ours)
 
     precision = matched_at_threshold / max(1, len(our_regions))
-    recall    = matched_at_threshold / max(1, len(ref_regions))
+    recall = matched_at_threshold / max(1, len(ref_regions))
     f1 = 2 * precision * recall / max(1e-9, precision + recall)
 
     # Per-region text scores (only on matched pairs).
     text_dists: list[float] = []
     exact_matches = 0
-    for (ri, oi, iou) in pairs:
+    for ri, oi, iou in pairs:
         if oi == -1 or iou < args.iou_threshold:
             continue
         r_text = ref_regions[ri].get("text", "")
@@ -231,7 +233,7 @@ def main() -> int:
 
     if args.verbose:
         print("\nper-region matches:")
-        for (ri, oi, iou) in pairs:
+        for ri, oi, iou in pairs:
             r = ref_regions[ri]
             if oi == -1:
                 print(f"  ref[{ri}] {r['category']:14s} bbox={r['bbox']}  UNMATCHED")
@@ -242,12 +244,14 @@ def main() -> int:
             d = text_distance_ratio(r_text, o_text)
             l1 = bbox_l1(r["bbox"], o["bbox"])
             same_cat = "✓" if r.get("category") == o.get("category") else "✗"
-            print(f"  ref[{ri}] {r['category']:14s} -> ours[{oi}] iou={iou:.3f} bbox_l1={l1:4d}px cat={same_cat} text_dist={d:.3f}")
+            print(
+                f"  ref[{ri}] {r['category']:14s} -> ours[{oi}] iou={iou:.3f} bbox_l1={l1:4d}px cat={same_cat} text_dist={d:.3f}"
+            )
         if n_our_extras > 0:
             print("\nour false-positive regions (no matching ref):")
             for oi, o in enumerate(our_regions):
                 if oi not in ref_matched_ours:
-                    print(f"  ours[{oi}] {o.get('category','?'):14s} bbox={o['bbox']}")
+                    print(f"  ours[{oi}] {o.get('category', '?'):14s} bbox={o['bbox']}")
 
     return 0 if verdict != "FAIL" else 1
 

@@ -44,7 +44,6 @@
 set -euo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 OUT="${1:-}"
 RECIPE="agentic"
 DATASETS=""
@@ -59,26 +58,44 @@ fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --recipe) RECIPE="$2"; shift 2 ;;
-        --dataset) DATASETS="$2"; shift 2 ;;
-        --max-rows) MAX_ROWS="$2"; shift 2 ;;
-        --help|-h) sed -n '1,25p' "$0"; exit 0 ;;
-        *) echo "unknown flag: $1" >&2; exit 2 ;;
+        --recipe)
+            RECIPE="$2"
+            shift 2
+            ;;
+        --dataset)
+            DATASETS="$2"
+            shift 2
+            ;;
+        --max-rows)
+            MAX_ROWS="$2"
+            shift 2
+            ;;
+        --help | -h)
+            sed -n '1,25p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown flag: $1" >&2
+            exit 2
+            ;;
     esac
 done
 
 # Resolve recipe → dataset list if user didn't give --dataset
 if [ -z "$DATASETS" ]; then
     case "$RECIPE" in
-        agentic)     DATASETS="hermes" ;;
-        reasoning)   DATASETS="opus_reason,qwen_reason,claude_opus" ;;
-        chat)        DATASETS="prompts_chat" ;;
-        blended)     DATASETS="hermes,opus_reason,qwen_reason,claude_opus,prompts_chat" ;;
-        all)         DATASETS="hermes,opus_reason,qwen_reason,claude_opus,prompts_chat" ;;
+        agentic) DATASETS="hermes" ;;
+        reasoning) DATASETS="opus_reason,qwen_reason,claude_opus" ;;
+        chat) DATASETS="prompts_chat" ;;
+        blended) DATASETS="hermes,opus_reason,qwen_reason,claude_opus,prompts_chat" ;;
+        all) DATASETS="hermes,opus_reason,qwen_reason,claude_opus,prompts_chat" ;;
         # agentic_xl: 2026-04-19 recipe for 8× cluster. ~90× bigger than
         # plain agentic (Nemotron alone is 335k rows / ~32B tokens).
-        agentic_xl)  DATASETS="hermes,nemotron_agentic,hermes_filtered,tool_calls_mt,xlam" ;;
-        *) echo "unknown recipe: $RECIPE" >&2; exit 2 ;;
+        agentic_xl) DATASETS="hermes,nemotron_agentic,hermes_filtered,tool_calls_mt,xlam" ;;
+        *)
+            echo "unknown recipe: $RECIPE" >&2
+            exit 2
+            ;;
     esac
 fi
 
@@ -329,4 +346,4 @@ with open(out_path, 'w', encoding='utf-8') as fout:
 print(f"[calib-corpus] wrote {total_rows} conversations, {total_bytes/1e6:.1f} MB → {out_path}")
 PY
 
-log "done: $(wc -c < "$OUT" | awk '{printf "%.1f MB\n", $1/1024/1024}') at $OUT"
+log "done: $(wc -c <"$OUT" | awk '{printf "%.1f MB\n", $1/1024/1024}') at $OUT"

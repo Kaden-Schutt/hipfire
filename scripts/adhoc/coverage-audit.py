@@ -32,6 +32,7 @@ from pathlib import Path
 
 # --- rocprof CSV parser ----------------------------------------------------
 
+
 def parse_rocprof_stats_csv(path):
     """
     Parse a rocprofv3 _kernel_stats.csv file.
@@ -54,9 +55,7 @@ def parse_rocprof_stats_csv(path):
 
     header = lines[0].strip().lower()
     if "name" not in header or "calls" not in header:
-        raise SystemExit(
-            f"ERROR: rocprof CSV header does not look like kernel stats: {lines[0]!r}"
-        )
+        raise SystemExit(f"ERROR: rocprof CSV header does not look like kernel stats: {lines[0]!r}")
 
     for lineno, raw in enumerate(lines[1:], start=2):
         line = raw.strip()
@@ -96,6 +95,7 @@ def parse_rocprof_stats_csv(path):
 
 
 # --- Internal profile extractor --------------------------------------------
+
 
 def extract_internal_kernels(atlas_path):
     """
@@ -150,8 +150,7 @@ def extract_internal_kernels(atlas_path):
 
     if not aliases and internal_total_us > 0:
         print(
-            "INFO: no profile_kernels artifact in atlas row -- "
-            "coverage match will use internal_kernel_total_ms only",
+            "INFO: no profile_kernels artifact in atlas row -- coverage match will use internal_kernel_total_ms only",
             file=sys.stderr,
         )
 
@@ -159,6 +158,7 @@ def extract_internal_kernels(atlas_path):
 
 
 # --- Coverage computation --------------------------------------------------
+
 
 def compute_coverage(rocprof_kernels, internal_aliases):
     """
@@ -173,21 +173,14 @@ def compute_coverage(rocprof_kernels, internal_aliases):
     blindspots = []
     for k in rocprof_kernels:
         name_lower = k["name"].lower()
-        is_covered = any(
-            alias == name_lower or alias in name_lower
-            for alias in aliases_lower
-        )
+        is_covered = any(alias == name_lower or alias in name_lower for alias in aliases_lower)
         if is_covered:
             covered.append(k)
         else:
             blindspots.append(k)
 
     blindspot_total_us = sum(k["duration_us"] for k in blindspots)
-    coverage_pct = (
-        (rocprof_total_us - blindspot_total_us) / rocprof_total_us * 100.0
-        if rocprof_total_us > 0
-        else 100.0
-    )
+    coverage_pct = (rocprof_total_us - blindspot_total_us) / rocprof_total_us * 100.0 if rocprof_total_us > 0 else 100.0
     return {
         "rocprof_total_us": rocprof_total_us,
         "blindspot_total_us": blindspot_total_us,
@@ -198,6 +191,7 @@ def compute_coverage(rocprof_kernels, internal_aliases):
 
 
 # --- Report rendering ------------------------------------------------------
+
 
 def render_report(
     atlas_path,
@@ -272,6 +266,7 @@ def render_report(
 
 # --- Main ------------------------------------------------------------------
 
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -317,9 +312,7 @@ def main(argv=None):
 
     cov = compute_coverage(rocprof_kernels, internal_aliases)
     blindspot_pct_of_rocprof = (
-        cov["blindspot_total_us"] / cov["rocprof_total_us"] * 100.0
-        if cov["rocprof_total_us"] > 0
-        else 0.0
+        cov["blindspot_total_us"] / cov["rocprof_total_us"] * 100.0 if cov["rocprof_total_us"] > 0 else 0.0
     )
 
     # One-line summary to stdout.

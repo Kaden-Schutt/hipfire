@@ -13,6 +13,7 @@ Usage:
     compare_layer_positions.py --hf <hf_dump.bin> --hipfire <hipfire_dump.bin> \
                                --layer N
 """
+
 import argparse
 import struct
 import sys

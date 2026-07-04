@@ -37,9 +37,15 @@ EPSILON="${EPSILON:-0.01}"
 mkdir -p "$RUN_DIR"
 cd "$HIPFIRE"
 
-phase() { echo; echo "═══ [$(date +%H:%M:%S)] $* ═══"; }
-ok()    { printf "    \033[32m✓\033[0m %s\n" "$*"; }
-die()   { printf "    \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
+phase() {
+    echo
+    echo "═══ [$(date +%H:%M:%S)] $* ═══"
+}
+ok() { printf "    \033[32m✓\033[0m %s\n" "$*"; }
+die() {
+    printf "    \033[31m✗\033[0m %s\n" "$*" >&2
+    exit 1
+}
 
 # ── 0. Prerequisites ───────────────────────────────────────────────────────
 phase "0  Prerequisites"
@@ -55,8 +61,8 @@ ok "imatrix: $IMATRIX ($(stat -c%s "$IMATRIX") bytes)"
 
 # Tools — KLD scoring drives the daemon kld_eval op (eval_hipfire removed).
 source "$(dirname "$0")/lib/kld_daemon.sh"
-kld_daemon_bin >/dev/null               || die "hipfire-daemon not built"
-[ -x target/release/hipfire-quantize ]  || die "hipfire-quantize not built"
+kld_daemon_bin >/dev/null || die "hipfire-daemon not built"
+[ -x target/release/hipfire-quantize ] || die "hipfire-quantize not built"
 
 # ── 1. GGUF imatrix → raw-sumsq .npz ───────────────────────────────────────
 phase "1  Convert unsloth GGUF imatrix → raw-sumsq npz"
@@ -160,18 +166,21 @@ $PYTHON scripts/mq4_masked_calib.py iterate \
 
 # ── 4. Per-round KLD eval ─────────────────────────────────────────────────
 phase "4  Per-round KLD eval"
-KLDREF="$WORK/kldref/qwen3.5-9b-bf16.kldref"   # hipfire-self HFKREF (built by v3_matrix)
+KLDREF="$WORK/kldref/qwen3.5-9b-bf16.kldref" # hipfire-self HFKREF (built by v3_matrix)
 [ -s "$KLDREF" ] || die "missing kldref at $KLDREF; run v3_matrix first"
 
 for r in "$ITER_OUT"/round_*; do
     [ -d "$r" ] || continue
     model="$r/model.hfq"
-    [ -f "$model" ] || { echo "    $r: no model.hfq"; continue; }
+    [ -f "$model" ] || {
+        echo "    $r: no model.hfq"
+        continue
+    }
     out_json="$r/kld-c512-q8.json"
     if [ ! -s "$out_json" ]; then
         # daemon kld_eval Score: writes .kldseq + returns the metrics JSON (n_ctx=512).
         KLD_DAEMON_LOG="$RUN_DIR/iterate.log" \
-            kld_score "$model" "$KLDREF" "$r/kld-c512-q8.kldseq" "" q8 512 > "$out_json"
+            kld_score "$model" "$KLDREF" "$r/kld-c512-q8.kldseq" "" q8 512 >"$out_json"
     fi
     kld=$(jq -r '.kld_mean' "$out_json" 2>/dev/null || echo "?")
     ppl=$(jq -r '.ppl' "$out_json" 2>/dev/null || echo "?")
@@ -181,7 +190,7 @@ done
 
 # ── 5. Verdict ─────────────────────────────────────────────────────────────
 phase "5  Verdict"
-$PYTHON - "$ITER_OUT" "$RUN_DIR" > "$RUN_DIR/verdict.md" <<'PY'
+$PYTHON - "$ITER_OUT" "$RUN_DIR" >"$RUN_DIR/verdict.md" <<'PY'
 import json, sys
 from pathlib import Path
 iter_dir = Path(sys.argv[1])

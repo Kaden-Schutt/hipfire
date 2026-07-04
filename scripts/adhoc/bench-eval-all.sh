@@ -12,8 +12,11 @@ TIER=${1:-medium}
 REPORT=/tmp/bench-eval-all-$(date +%Y%m%d-%H%M%S).md
 MODELS=~/.hipfire/models
 
-log()     { echo "$(date '+%H:%M:%S') $*" | tee -a "$REPORT"; }
-section() { echo "" | tee -a "$REPORT"; echo "## $*" | tee -a "$REPORT"; }
+log() { echo "$(date '+%H:%M:%S') $*" | tee -a "$REPORT"; }
+section() {
+    echo "" | tee -a "$REPORT"
+    echo "## $*" | tee -a "$REPORT"
+}
 
 log "bench-eval-all start — report: $REPORT"
 echo "REPORT: $REPORT"
@@ -113,26 +116,26 @@ eval_model() {
         || log "  eval FAILED (exit $?) — continuing"
 }
 
-eval_model "qwen3.5-0.8b bf16"  "$MODELS/qwen3.5-0.8b-bf16.hfq"
-eval_model "qwen3.5-0.8b mq4"   "$MODELS/qwen3.5-0.8b-mq4.hfq"
-eval_model "qwen3.5-0.8b mq6"   "$MODELS/qwen3.5-0.8b-mq6.hfq"
+eval_model "qwen3.5-0.8b bf16" "$MODELS/qwen3.5-0.8b-bf16.hfq"
+eval_model "qwen3.5-0.8b mq4" "$MODELS/qwen3.5-0.8b-mq4.hfq"
+eval_model "qwen3.5-0.8b mq6" "$MODELS/qwen3.5-0.8b-mq6.hfq"
 
-eval_model "qwen3.5-2b bf16"    "$MODELS/qwen3.5-2b-bf16.hfq"
-eval_model "qwen3.5-2b mq4"     "$MODELS/qwen3.5-2b-mq4.hfq"
-eval_model "qwen3.5-2b mq6"     "$MODELS/qwen3.5-2b-mq6.hfq"
+eval_model "qwen3.5-2b bf16" "$MODELS/qwen3.5-2b-bf16.hfq"
+eval_model "qwen3.5-2b mq4" "$MODELS/qwen3.5-2b-mq4.hfq"
+eval_model "qwen3.5-2b mq6" "$MODELS/qwen3.5-2b-mq6.hfq"
 
-eval_model "qwen3.5-4b bf16"    "$MODELS/qwen3.5-4b-bf16.hfq"
-eval_model "qwen3.5-4b mq4"     "$MODELS/qwen3.5-4b-mq4.hfq"
-eval_model "qwen3.5-4b mq6"     "$MODELS/qwen3.5-4b-mq6.hfq"
+eval_model "qwen3.5-4b bf16" "$MODELS/qwen3.5-4b-bf16.hfq"
+eval_model "qwen3.5-4b mq4" "$MODELS/qwen3.5-4b-mq4.hfq"
+eval_model "qwen3.5-4b mq6" "$MODELS/qwen3.5-4b-mq6.hfq"
 
-eval_model "qwen3.5-9b bf16"    "$MODELS/qwen3.5-9b-bf16.hfq"
-eval_model "qwen3.5-9b mq4"     "$MODELS/qwen3.5-9b-mq4.hfq"
-eval_model "qwen3.5-9b mq6"     "$MODELS/qwen3.5-9b-mq6.hfq"
-eval_model "qwen3.5-9b mq3"     "$MODELS/qwen3.5-9b-mq3.hfq"
+eval_model "qwen3.5-9b bf16" "$MODELS/qwen3.5-9b-bf16.hfq"
+eval_model "qwen3.5-9b mq4" "$MODELS/qwen3.5-9b-mq4.hfq"
+eval_model "qwen3.5-9b mq6" "$MODELS/qwen3.5-9b-mq6.hfq"
+eval_model "qwen3.5-9b mq3" "$MODELS/qwen3.5-9b-mq3.hfq"
 
-eval_model "qwen3.6-27b mq4"    "$MODELS/qwen3.6-27b-mq4.hfq"
-eval_model "qwen3.6-27b mq6"    "$MODELS/qwen3.6-27b-mq6.hfq"
-eval_model "qwen3.6-27b mq3"    "$MODELS/qwen3.6-27b-mq3.hfq"
+eval_model "qwen3.6-27b mq4" "$MODELS/qwen3.6-27b-mq4.hfq"
+eval_model "qwen3.6-27b mq6" "$MODELS/qwen3.6-27b-mq6.hfq"
+eval_model "qwen3.6-27b mq3" "$MODELS/qwen3.6-27b-mq3.hfq"
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 section "Summary"

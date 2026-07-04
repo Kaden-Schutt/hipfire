@@ -7,32 +7,35 @@ set -uo pipefail
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 cd "$(dirname "$0")/.."
 BIN=./target/release/examples/infer_qwen35
-M=("$@"); [ ${#M[@]} -eq 0 ] && M=(mq4 rq-mq4path rq-protect5bf16)
-OUT=/tmp/rq_coh_battery; mkdir -p "$OUT"
+M=("$@")
+[ ${#M[@]} -eq 0 ] && M=(mq4 rq-mq4path rq-protect5bf16)
+OUT=/tmp/rq_coh_battery
+mkdir -p "$OUT"
 # Byte-identical committed prompts (repo rule: prompt-sensitive evidence must use
 # benchmarks/prompts/*.txt, not heredocs). Mix of factual / reasoning / code so
 # the attractor detector sees the regimes that actually loop. md5s recorded below.
 PROMPT_FILES=(
-  benchmarks/prompts/coherence_capital_france.txt
-  benchmarks/prompts/coherence_sheep_reason.txt
-  benchmarks/prompts/coherence_square_function.txt
-  benchmarks/prompts/trains-meet.txt
-  benchmarks/prompts/merge_sort_thinking_off.txt
-  benchmarks/prompts/humaneval_2_truncate.txt
-  benchmarks/prompts/humaneval_3_below_zero.txt
-  benchmarks/prompts/lru_cache_single_blank.txt
+    benchmarks/prompts/coherence_capital_france.txt
+    benchmarks/prompts/coherence_sheep_reason.txt
+    benchmarks/prompts/coherence_square_function.txt
+    benchmarks/prompts/trains-meet.txt
+    benchmarks/prompts/merge_sort_thinking_off.txt
+    benchmarks/prompts/humaneval_2_truncate.txt
+    benchmarks/prompts/humaneval_3_below_zero.txt
+    benchmarks/prompts/lru_cache_single_blank.txt
 )
-echo "=== prompt provenance (md5) ==="; md5sum "${PROMPT_FILES[@]}"
+echo "=== prompt provenance (md5) ==="
+md5sum "${PROMPT_FILES[@]}"
 for m in "${M[@]}"; do
-  : > "$OUT/$m.txt"
-  for i in "${!PROMPT_FILES[@]}"; do
-    P="$(cat "${PROMPT_FILES[$i]}")"
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coh-$m-$i" --watch-pid "$$" 2>/dev/null || true
-    echo "===PROMPT $i (${PROMPT_FILES[$i]##*/})===" >> "$OUT/$m.txt"
-    FP32_STATE=1 $BIN ~/.hipfire/models/qwen3.5-0.8b-$m.hfq --guards on "$P" 2>/dev/null >> "$OUT/$m.txt"
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
-  done
-  echo "done: $m"
+    : >"$OUT/$m.txt"
+    for i in "${!PROMPT_FILES[@]}"; do
+        P="$(cat "${PROMPT_FILES[$i]}")"
+        "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "coh-$m-$i" --watch-pid "$$" 2>/dev/null || true
+        echo "===PROMPT $i (${PROMPT_FILES[$i]##*/})===" >>"$OUT/$m.txt"
+        FP32_STATE=1 $BIN ~/.hipfire/models/qwen3.5-0.8b-$m.hfq --guards on "$P" 2>/dev/null >>"$OUT/$m.txt"
+        "$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true
+    done
+    echo "done: $m"
 done
 echo "=== detector aggregation ==="
 python3 - "$OUT" "${M[@]}" <<'PY'

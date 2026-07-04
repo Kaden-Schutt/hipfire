@@ -33,7 +33,6 @@
 set -uo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 MODELS=""
 CORPUS=""
 RECIPE=""
@@ -46,17 +45,50 @@ BIN="${HIPFIRE_BIN:-${TRIPWIRE_ROOT}/hipfire/target/release/examples/triattn_val
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --models) MODELS="$2"; shift 2 ;;
-        --corpus) CORPUS="$2"; shift 2 ;;
-        --recipe) RECIPE="$2"; shift 2 ;;
-        --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
-        --chunk-len) CHUNK_LEN="$2"; shift 2 ;;
-        --suffix) SUFFIX="$2"; shift 2 ;;
-        --sidecar-dir) SIDECAR_DIR="$2"; shift 2 ;;
-        --log-dir) LOG_DIR="$2"; shift 2 ;;
-        --bin) BIN="$2"; shift 2 ;;
-        --help|-h) sed -n '1,30p' "$0"; exit 0 ;;
-        *) echo "unknown flag: $1" >&2; exit 2 ;;
+        --models)
+            MODELS="$2"
+            shift 2
+            ;;
+        --corpus)
+            CORPUS="$2"
+            shift 2
+            ;;
+        --recipe)
+            RECIPE="$2"
+            shift 2
+            ;;
+        --max-tokens)
+            MAX_TOKENS="$2"
+            shift 2
+            ;;
+        --chunk-len)
+            CHUNK_LEN="$2"
+            shift 2
+            ;;
+        --suffix)
+            SUFFIX="$2"
+            shift 2
+            ;;
+        --sidecar-dir)
+            SIDECAR_DIR="$2"
+            shift 2
+            ;;
+        --log-dir)
+            LOG_DIR="$2"
+            shift 2
+            ;;
+        --bin)
+            BIN="$2"
+            shift 2
+            ;;
+        --help | -h)
+            sed -n '1,30p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown flag: $1" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -109,10 +141,10 @@ N_GPUS=$((N_GPUS - 1))
 [ "$N_GPUS" -lt 1 ] && N_GPUS=1
 log "GPUs visible: $N_GPUS"
 
-IFS=',' read -ra MODEL_ARR <<< "$MODELS"
+IFS=',' read -ra MODEL_ARR <<<"$MODELS"
 N_MODELS=${#MODEL_ARR[@]}
 log "models queued: $N_MODELS"
-log "corpus:        $CORPUS ($(wc -c < "$CORPUS" | awk '{printf "%.1f MB", $1/1024/1024}'))"
+log "corpus:        $CORPUS ($(wc -c <"$CORPUS" | awk '{printf "%.1f MB", $1/1024/1024}'))"
 log "max-tokens:    $MAX_TOKENS"
 log "chunk-len:     $CHUNK_LEN"
 log "suffix:        $SUFFIX"
@@ -148,11 +180,11 @@ launch() {
     log "launch [#$idx, GPU=$gpu] $name → $sidecar (log: $logf)"
     HIP_VISIBLE_DEVICES=$gpu HIPFIRE_ROCBLAS_OFF=1 \
         "$BIN" "$model" \
-            --corpus "$CORPUS" \
-            --max-tokens "$MAX_TOKENS" \
-            --chunk-len "$CHUNK_LEN" \
-            --sidecar "$sidecar" \
-        > "$logf" 2>&1 &
+        --corpus "$CORPUS" \
+        --max-tokens "$MAX_TOKENS" \
+        --chunk-len "$CHUNK_LEN" \
+        --sidecar "$sidecar" \
+        >"$logf" 2>&1 &
     local pid=$!
     PID_TO_MODEL[$pid]=$name
     RUNNING_PIDS+=($pid)
@@ -169,7 +201,7 @@ done
 while [ ${#RUNNING_PIDS[@]} -gt 0 ]; do
     # wait -n returns as soon as ANY background job finishes.
     if ! wait -n; then
-        :  # swallow; we'll detect per-pid below
+        : # swallow; we'll detect per-pid below
     fi
     # Rebuild RUNNING_PIDS with only still-alive procs; record status of
     # freshly-dead ones.

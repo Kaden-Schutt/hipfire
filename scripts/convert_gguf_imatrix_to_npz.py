@@ -102,14 +102,17 @@ def build_payload(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--in", dest="src", required=True, type=Path,
-                    help="input GGUF imatrix file")
-    ap.add_argument("--out", dest="dst", required=True, type=Path,
-                    help="output .npz path")
-    ap.add_argument("--mask", type=Path, default=None,
-                    help="optional iterate mask JSON; emit only tensors whose hfq_name appears there")
-    ap.add_argument("--stats-json", type=Path, default=None,
-                    help="optional output stats.json path (defaults to <out>.stats.json)")
+    ap.add_argument("--in", dest="src", required=True, type=Path, help="input GGUF imatrix file")
+    ap.add_argument("--out", dest="dst", required=True, type=Path, help="output .npz path")
+    ap.add_argument(
+        "--mask",
+        type=Path,
+        default=None,
+        help="optional iterate mask JSON; emit only tensors whose hfq_name appears there",
+    )
+    ap.add_argument(
+        "--stats-json", type=Path, default=None, help="optional output stats.json path (defaults to <out>.stats.json)"
+    )
     args = ap.parse_args()
 
     if not args.src.exists():
@@ -149,8 +152,10 @@ def main() -> int:
     print(f"[convert-imatrix] wrote {len(payload)} entries to {args.dst}", file=sys.stderr)
     print(f"[convert-imatrix] stats: {stats_json_path}", file=sys.stderr)
     if unmapped:
-        print(f"[convert-imatrix] {len(unmapped)} GGUF tensors did not map to any hfq name; "
-              f"first 5: {unmapped[:5]}", file=sys.stderr)
+        print(
+            f"[convert-imatrix] {len(unmapped)} GGUF tensors did not map to any hfq name; first 5: {unmapped[:5]}",
+            file=sys.stderr,
+        )
     return 0
 
 

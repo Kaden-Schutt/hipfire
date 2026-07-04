@@ -23,6 +23,7 @@ Usage:
   python scripts/traffic_dump_to_corpus.py /tmp/2026-05-25.jsonl \
       --output corpus/agent_2026-05-25.jsonl [--model-filter qwen3.6] [--responses-only]
 """
+
 import argparse
 import glob
 import hashlib
@@ -36,7 +37,7 @@ def _from_blocks(content) -> str:
     if isinstance(content, str):
         return content
     parts = []
-    for b in (content or []):
+    for b in content or []:
         if not isinstance(b, dict):
             continue
         t = b.get("type")
@@ -64,7 +65,7 @@ def _from_openai_msg(msg: dict) -> str:
         blk = _from_blocks(c)
         if blk:
             parts.append(blk)
-    for tc in (msg.get("tool_calls") or []):
+    for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", tc)
         args = fn.get("arguments")
         args = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
@@ -91,14 +92,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="+", help="traffic-dump JSONL file(s) or globs")
     ap.add_argument("--output", required=True, help="output corpus JSONL")
-    ap.add_argument("--model-filter", default=None,
-                    help="case-insensitive substring; drop records whose model doesn't match "
-                         "(use to keep only Qwen3.6 traffic)")
-    ap.add_argument("--responses-only", action="store_true",
-                    help="only harvest response bodies; skip request message-history turns")
-    ap.add_argument("--append", action="store_true",
-                    help="append to existing output file instead of overwriting; "
-                         "pre-loads existing hashes to prevent duplicates")
+    ap.add_argument(
+        "--model-filter",
+        default=None,
+        help="case-insensitive substring; drop records whose model doesn't match (use to keep only Qwen3.6 traffic)",
+    )
+    ap.add_argument(
+        "--responses-only", action="store_true", help="only harvest response bodies; skip request message-history turns"
+    )
+    ap.add_argument(
+        "--append",
+        action="store_true",
+        help="append to existing output file instead of overwriting; pre-loads existing hashes to prevent duplicates",
+    )
     args = ap.parse_args()
 
     paths = []
@@ -153,7 +159,7 @@ def main() -> int:
                             p = json.loads(p)
                         except json.JSONDecodeError:
                             p = {}
-                    for ch in (p.get("choices") or []):
+                    for ch in p.get("choices") or []:
                         m = ch.get("message") or ch.get("delta") or {}
                         outputs.append((_from_openai_msg(m), "resp"))
                 elif direction == "request" and not args.responses_only:
@@ -163,11 +169,10 @@ def main() -> int:
                             p = json.loads(p)
                         except json.JSONDecodeError:
                             p = {}
-                    for m in (p.get("messages") or []):
+                    for m in p.get("messages") or []:
                         if isinstance(m, dict) and m.get("role") == "assistant":
                             outputs.append((_from_openai_msg(m), "req"))
-                elif direction is None and (isinstance(rec.get("response"), str)
-                                            or rec.get("tool_calls")):
+                elif direction is None and (isinstance(rec.get("response"), str) or rec.get("tool_calls")):
                     # completion-dump shape: {messages, response, tool_calls}
                     # (VLM/structured pipelines). `response` is the final assistant
                     # text; image blocks in `messages` are irrelevant to the text
@@ -177,19 +182,16 @@ def main() -> int:
                     resp = rec.get("response")
                     # reasoning may arrive in a separate top-level field; wrap it as
                     # <think> unless it's already inline in `response`.
-                    rc = (rec.get("reasoning_content") or rec.get("reasoning")
-                          or rec.get("thinking"))
-                    if (isinstance(rc, str) and rc.strip()
-                            and "<think>" not in (resp or "")):
+                    rc = rec.get("reasoning_content") or rec.get("reasoning") or rec.get("thinking")
+                    if isinstance(rc, str) and rc.strip() and "<think>" not in (resp or ""):
                         parts.append(f"<think>\n{rc}\n</think>")
                     if isinstance(resp, str) and resp.strip():
                         parts.append(resp)
-                    for tc in (rec.get("tool_calls") or []):
+                    for tc in rec.get("tool_calls") or []:
                         fn = tc.get("function", tc)
                         a = fn.get("arguments")
                         a = a if isinstance(a, str) else json.dumps(a, ensure_ascii=False)
-                        parts.append(f'<tool_call>\n{{"name": "{fn.get("name")}", '
-                                     f'"arguments": {a}}}\n</tool_call>')
+                        parts.append(f'<tool_call>\n{{"name": "{fn.get("name")}", "arguments": {a}}}\n</tool_call>')
                     outputs.append(("\n".join(p for p in parts if p), "resp"))
                 for text, src in outputs:
                     if not text or not text.strip():
@@ -199,15 +201,18 @@ def main() -> int:
                         stats["dup"] += 1
                         continue
                     seen.add(h)
-                    out.write(json.dumps({"output": text, "src": src,
-                                          "model": _model_of(rec)}, ensure_ascii=False) + "\n")
+                    out.write(
+                        json.dumps({"output": text, "src": src, "model": _model_of(rec)}, ensure_ascii=False) + "\n"
+                    )
                     stats["written"] += 1
                     stats["resp" if src == "resp" else "req_turns"] += 1
 
-    print(f"in={stats['lines']} lines | wrote {stats['written']} unique assistant outputs "
-          f"({stats['resp']} from responses, {stats['req_turns']} from request histories) | "
-          f"{stats['dup']} dup, {stats['dropped_model']} dropped-by-model -> {out_path}",
-          file=sys.stderr)
+    print(
+        f"in={stats['lines']} lines | wrote {stats['written']} unique assistant outputs "
+        f"({stats['resp']} from responses, {stats['req_turns']} from request histories) | "
+        f"{stats['dup']} dup, {stats['dropped_model']} dropped-by-model -> {out_path}",
+        file=sys.stderr,
+    )
     return 0 if stats["written"] > 0 else 1
 
 

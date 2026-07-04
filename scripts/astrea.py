@@ -515,10 +515,7 @@ def summarize_gguf(path, *, max_tensors=32):
         "tensor_names_md5": names_md5,
         "imatrix_logical_tensor_count": len(imatrix_logical_names),
         "imatrix_logical_names": sorted(imatrix_logical_names),
-        "imatrix_logical_tensors": {
-            name: imatrix_logical_tensors[name]
-            for name in sorted(imatrix_logical_tensors)
-        },
+        "imatrix_logical_tensors": {name: imatrix_logical_tensors[name] for name in sorted(imatrix_logical_tensors)},
         "imatrix_suffix_counts": dict(sorted(imatrix_suffix_counts.items())),
         "tensors": tensors,
         "tensors_truncated": tensor_count > len(tensors),
@@ -784,11 +781,13 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
             skipped.append({"imatrix_name": logical_name, "reason": "missing_in_sum2"})
             continue
         if in_sum2.get("dtype") != "F32":
-            skipped.append({
-                "imatrix_name": logical_name,
-                "reason": "non_f32_in_sum2",
-                "dtype": in_sum2.get("dtype"),
-            })
+            skipped.append(
+                {
+                    "imatrix_name": logical_name,
+                    "reason": "non_f32_in_sum2",
+                    "dtype": in_sum2.get("dtype"),
+                }
+            )
             continue
 
         imatrix_k, imatrix_columns = imatrix_dims(logical_info)
@@ -800,20 +799,24 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
             for expert_index in range(imatrix_columns):
                 candidates = gguf_expert_to_hfq_candidates(logical_name, expert_index)
                 if not candidates:
-                    skipped.append({
-                        "imatrix_name": logical_name,
-                        "reason": "unsupported_multi_matrix_name",
-                        "shape": in_sum2.get("shape"),
-                    })
+                    skipped.append(
+                        {
+                            "imatrix_name": logical_name,
+                            "reason": "unsupported_multi_matrix_name",
+                            "shape": in_sum2.get("shape"),
+                        }
+                    )
                     break
                 hfq_name = next((name for name in candidates if name in hfq_tensors), None)
                 if hfq_name is None:
                     missing_experts.append(expert_index)
-                    unmatched.append({
-                        "imatrix_name": logical_name,
-                        "expert_index": expert_index,
-                        "candidates": candidates,
-                    })
+                    unmatched.append(
+                        {
+                            "imatrix_name": logical_name,
+                            "expert_index": expert_index,
+                            "candidates": candidates,
+                        }
+                    )
                     continue
                 tensor = hfq_tensors[hfq_name]
                 quant_type_name = tensor["quant_type_name"]
@@ -822,13 +825,15 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
                 tensor_k = hfq_k_dim(tensor)
                 k_dim_match = imatrix_k is None or tensor_k == imatrix_k
                 if not k_dim_match:
-                    k_dim_mismatches.append({
-                        "imatrix_name": logical_name,
-                        "expert_index": expert_index,
-                        "hfq_name": hfq_name,
-                        "imatrix_k": imatrix_k,
-                        "hfq_k": tensor_k,
-                    })
+                    k_dim_mismatches.append(
+                        {
+                            "imatrix_name": logical_name,
+                            "expert_index": expert_index,
+                            "hfq_name": hfq_name,
+                            "imatrix_k": imatrix_k,
+                            "hfq_k": tensor_k,
+                        }
+                    )
                 matched_experts.append(expert_index)
                 matches.append(
                     {
@@ -852,16 +857,18 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
                     }
                 )
             if imatrix_columns > 1:
-                expert_coverage.append({
-                    "imatrix_name": logical_name,
-                    "slot": slot,
-                    "expert_count": imatrix_columns,
-                    "matched_expert_count": len(matched_experts),
-                    "missing_expert_count": len(missing_experts),
-                    "matched_experts": matched_experts[:32],
-                    "missing_experts": missing_experts[:32],
-                    "truncated": len(matched_experts) > 32 or len(missing_experts) > 32,
-                })
+                expert_coverage.append(
+                    {
+                        "imatrix_name": logical_name,
+                        "slot": slot,
+                        "expert_count": imatrix_columns,
+                        "matched_expert_count": len(matched_experts),
+                        "missing_expert_count": len(missing_experts),
+                        "matched_experts": matched_experts[:32],
+                        "missing_experts": missing_experts[:32],
+                        "truncated": len(matched_experts) > 32 or len(missing_experts) > 32,
+                    }
+                )
             continue
 
         candidates = gguf_to_hfq_candidates(logical_name)
@@ -876,12 +883,14 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
         tensor_k = hfq_k_dim(tensor)
         k_dim_match = imatrix_k is None or tensor_k == imatrix_k
         if not k_dim_match:
-            k_dim_mismatches.append({
-                "imatrix_name": logical_name,
-                "hfq_name": hfq_name,
-                "imatrix_k": imatrix_k,
-                "hfq_k": tensor_k,
-            })
+            k_dim_mismatches.append(
+                {
+                    "imatrix_name": logical_name,
+                    "hfq_name": hfq_name,
+                    "imatrix_k": imatrix_k,
+                    "hfq_k": tensor_k,
+                }
+            )
         matches.append(
             {
                 "imatrix_name": logical_name,
@@ -1154,11 +1163,7 @@ def f32_to_f16_bits_numpy(values):
     inf_nan = exp == 0xFF
     if np.any(inf_nan):
         f16_frac = np.where(frac == 0, 0, (frac >> np.uint32(13)) | np.uint32(1))
-        out[inf_nan] = (
-            (sign[inf_nan] << np.uint32(15))
-            | np.uint32(0x1F << 10)
-            | f16_frac[inf_nan]
-        ).astype(np.uint16)
+        out[inf_nan] = ((sign[inf_nan] << np.uint32(15)) | np.uint32(0x1F << 10) | f16_frac[inf_nan]).astype(np.uint16)
 
     finite = ~inf_nan
     new_exp = exp.astype(np.int32) - 127 + 15
@@ -1178,10 +1183,7 @@ def f32_to_f16_bits_numpy(values):
     if np.any(subnormal):
         f = frac[subnormal] | np.uint32(0x800000)
         shifts = (1 - new_exp[subnormal] + 13).astype(np.uint32)
-        out[subnormal] = (
-            (sign[subnormal] << np.uint32(15))
-            | (f >> shifts)
-        ).astype(np.uint16)
+        out[subnormal] = ((sign[subnormal] << np.uint32(15)) | (f >> shifts)).astype(np.uint16)
 
     underflow = finite & (new_exp < -10)
     if np.any(underflow):
@@ -1309,9 +1311,7 @@ def quantize_mq4g256_values_numpy(values, *, clip_ratio=1.0, fit="minmax", ls_it
         raise RuntimeError("numpy is required for MQ4 calibration")
     rows = np.asarray(values, dtype=np.float32)
     m, k = rows.shape
-    q, scale, min_val = mq4_quantized_rotated_blocks_numpy(
-        rows, clip_ratio=clip_ratio, fit=fit, ls_iters=ls_iters
-    )
+    q, scale, min_val = mq4_quantized_rotated_blocks_numpy(rows, clip_ratio=clip_ratio, fit=fit, ls_iters=ls_iters)
     n_blocks = q.shape[0]
     out = np.zeros((n_blocks, 136), dtype=np.uint8)
     out[:, 0:4] = scale.astype("<f4").view(np.uint8).reshape(n_blocks, 4)
@@ -1326,9 +1326,7 @@ def quantize_mq4g256_values_numpy(values, *, clip_ratio=1.0, fit="minmax", ls_it
 def dequantize_mq4g256_from_values_numpy(values, *, clip_ratio=1.0, fit="minmax", ls_iters=3):
     rows = np.asarray(values, dtype=np.float32)
     m, k = rows.shape
-    q, scale, min_val = mq4_quantized_rotated_blocks_numpy(
-        rows, clip_ratio=clip_ratio, fit=fit, ls_iters=ls_iters
-    )
+    q, scale, min_val = mq4_quantized_rotated_blocks_numpy(rows, clip_ratio=clip_ratio, fit=fit, ls_iters=ls_iters)
     rotated = q.astype(np.float32) * scale[:, None] + min_val[:, None]
     return inverse_fwht_256_numpy(rotated.reshape(m, k // 256, 256)).reshape(m, k)
 
@@ -1965,8 +1963,7 @@ def write_policy_promotion_candidate(
 def patch_hfq_tensor(candidate, tensor_info, packed):
     if len(packed) != tensor_info["data_size"]:
         raise ValueError(
-            f"packed tensor size mismatch for {tensor_info['name']}: "
-            f"{len(packed)} vs {tensor_info['data_size']}"
+            f"packed tensor size mismatch for {tensor_info['name']}: {len(packed)} vs {tensor_info['data_size']}"
         )
     with Path(candidate).open("r+b") as f:
         f.seek(tensor_info["data_offset"])
@@ -2176,8 +2173,7 @@ def build_awq_mq4_patch(task):
     packed = quantize_mq4g256_values_numpy(values_array, clip_ratio=clip_ratio)
     if len(packed) != task["tensor_info"]["data_size"]:
         raise ValueError(
-            f"packed MQ4 tensor size mismatch for {hfq_name}: "
-            f"{len(packed)} vs {task['tensor_info']['data_size']}"
+            f"packed MQ4 tensor size mismatch for {hfq_name}: {len(packed)} vs {task['tensor_info']['data_size']}"
         )
     patch_path = Path(task["patch_path"])
     patch_path.write_bytes(packed)
@@ -2218,8 +2214,7 @@ def build_mq4_ls_patch(task):
     )
     if len(packed) != task["tensor_info"]["data_size"]:
         raise ValueError(
-            f"packed MQ4 tensor size mismatch for {hfq_name}: "
-            f"{len(packed)} vs {task['tensor_info']['data_size']}"
+            f"packed MQ4 tensor size mismatch for {hfq_name}: {len(packed)} vs {task['tensor_info']['data_size']}"
         )
     sample = values_array
     if sample.shape[0] > task["sample_rows"]:
@@ -2437,10 +2432,9 @@ def detect_rope_convention(root):
     root = Path(root)
     dispatch_path = root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs"
     text = dispatch_path.read_text(encoding="utf-8", errors="ignore") if dispatch_path.exists() else ""
-    has_halfsplit_source = (
-        (root / "kernels" / "src" / "rope_partial_halfsplit.hip").exists()
-        or (root / "kernels" / "src" / "rope_partial_halfsplit_batched.hip").exists()
-    )
+    has_halfsplit_source = (root / "kernels" / "src" / "rope_partial_halfsplit.hip").exists() or (
+        root / "kernels" / "src" / "rope_partial_halfsplit_batched.hip"
+    ).exists()
     dispatches_halfsplit = "rope_partial_halfsplit" in text
     has_legacy_escape = "HIPFIRE_ROPE_INTERLEAVED_LEGACY" in text
     if has_halfsplit_source and dispatches_halfsplit and has_legacy_escape:
@@ -2531,10 +2525,7 @@ def build_recipe(methods, recipe_stages=None):
         recipe_methods = [item["method"] for item in recipe]
         missing = [method for method in recipe_methods if method not in methods]
         if missing:
-            raise ValueError(
-                "recipe methods must also be listed with --method: "
-                + ", ".join(missing)
-            )
+            raise ValueError("recipe methods must also be listed with --method: " + ", ".join(missing))
         return recipe
     recipe = []
     for i, method in enumerate(methods):
@@ -2643,11 +2634,7 @@ def load_json(path):
 
 
 def write_json(payload, pretty=False, out=None):
-    text = (
-        json.dumps(payload, indent=2, sort_keys=True)
-        if pretty
-        else json.dumps(payload, sort_keys=True)
-    )
+    text = json.dumps(payload, indent=2, sort_keys=True) if pretty else json.dumps(payload, sort_keys=True)
     if out:
         path = Path(out)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2692,9 +2679,7 @@ def calibrate_plan(
             if source_dir:
                 source_summary, source_tensors = read_safetensors_dir_index(source_dir)
                 missing_source = [
-                    item["hfq_name"]
-                    for item in join["matches"]
-                    if item["hfq_name"] not in source_tensors
+                    item["hfq_name"] for item in join["matches"] if item["hfq_name"] not in source_tensors
                 ]
                 source_ready = len(missing_source) == 0 and len(join["matches"]) > 0
                 result["source"] = {
@@ -2708,7 +2693,12 @@ def calibrate_plan(
                 result["missing_source_count"] = len(missing_source)
                 result["missing_source"] = missing_source[:32]
                 result["source_ready"] = source_ready
-                if write_candidate and source_ready and "imatrix-scale" in result["methods"] and "mfp4" in result["formats"]:
+                if (
+                    write_candidate
+                    and source_ready
+                    and "imatrix-scale" in result["methods"]
+                    and "mfp4" in result["formats"]
+                ):
                     mutation = write_imatrix_scale_candidate(
                         plan,
                         join,
@@ -2872,15 +2862,9 @@ def collect_metrics(
     rows = load_quality_rows(quality_json)
     candidate = select_quality_row(rows, candidate_variant, arch=arch, scoring_mode=scoring_mode)
     baseline = (
-        select_quality_row(rows, baseline_variant, arch=arch, scoring_mode=scoring_mode)
-        if baseline_variant
-        else None
+        select_quality_row(rows, baseline_variant, arch=arch, scoring_mode=scoring_mode) if baseline_variant else None
     )
-    floor = (
-        select_quality_row(rows, floor_variant, arch=arch, scoring_mode=scoring_mode)
-        if floor_variant
-        else None
-    )
+    floor = select_quality_row(rows, floor_variant, arch=arch, scoring_mode=scoring_mode) if floor_variant else None
     if floor:
         candidate = attach_above_floor(candidate, floor)
         if baseline:
@@ -2900,9 +2884,7 @@ def collect_metrics(
             recovered = baseline["above_floor_kld"] - candidate["above_floor_kld"]
             quality["kld_recovered"] = recovered
             quality["kld_recovered_pct"] = (
-                recovered / baseline["above_floor_kld"]
-                if baseline["above_floor_kld"] > 0.0
-                else None
+                recovered / baseline["above_floor_kld"] if baseline["above_floor_kld"] > 0.0 else None
             )
 
     verdict = "needs_baseline"
@@ -2990,11 +2972,7 @@ def load_json_sensitivity(path):
         name = row.get("hfq_name") or row.get("name") or row.get("tensor")
         if not name:
             continue
-        score = (
-            row.get("score")
-            if row.get("score") is not None
-            else row.get("sensitivity", row.get("importance"))
-        )
+        score = row.get("score") if row.get("score") is not None else row.get("sensitivity", row.get("importance"))
         if score is None:
             continue
         score = max(float(score), 0.0)
@@ -3251,11 +3229,7 @@ def build_mixed_policy(
             "group_size": 256,
         },
         "formats": formats,
-        "sensitivity": {
-            key: value
-            for key, value in sensitivity.items()
-            if key not in {"by_tensor", "aliases"}
-        },
+        "sensitivity": {key: value for key, value in sensitivity.items() if key not in {"by_tensor", "aliases"}},
         "selection": {
             "method": "ranked_group_terciles",
             "uses_wave_size_as_quality_signal": False,
@@ -3290,13 +3264,7 @@ def build_ingress_summary(hfq_tensors, model_family=None):
             or lowered.endswith(".block_sparse_moe.gate.weight")
         ):
             router_names.append(name)
-    moe_detected = bool(
-        expert_names
-        or router_names
-        or "moe" in family
-        or "a3b" in family
-        or "mixture" in family
-    )
+    moe_detected = bool(expert_names or router_names or "moe" in family or "a3b" in family or "mixture" in family)
     return {
         "model_family": model_family,
         "moe_detected": moe_detected,
@@ -3521,11 +3489,7 @@ def build_policy(
             promotion_format,
             added_runtime_anchors,
         ),
-        "sensitivity": {
-            key: value
-            for key, value in sensitivity.items()
-            if key not in {"scores", "aliases"}
-        },
+        "sensitivity": {key: value for key, value in sensitivity.items() if key not in {"scores", "aliases"}},
         "base_data_bytes": base_data_bytes,
         "max_extra_bytes": int(max_extra_bytes),
         "selected_extra_bytes": selected_extra,
@@ -3631,10 +3595,7 @@ def build_kv_profile(
     validate_values(modes, SUPPORTED_KV_MODES, "KV mode")
     triattn_info = triattn_summary(triattn)
     hfq = summarize_hfq(model) if model and Path(model).is_file() else None
-    mode_map = {
-        mode: describe_kv_mode(mode, triattn=triattn_info)
-        for mode in modes
-    }
+    mode_map = {mode: describe_kv_mode(mode, triattn=triattn_info) for mode in modes}
     if "asym3" not in mode_map:
         mode_map["asym3"] = describe_kv_mode("asym3", triattn=triattn_info)
     model_name = Path(model).name.replace(".", "-").replace("/", "-")
@@ -3651,7 +3612,9 @@ def build_kv_profile(
             "tensor_count": hfq["tensor_count"],
             "quant_type_counts": hfq["quant_type_counts"],
             "tensor_names_md5": hfq["tensor_names_md5"],
-        } if hfq else None,
+        }
+        if hfq
+        else None,
         "baseline_mode": "asym3",
         "modes": mode_map,
         "triattn": triattn_info,
@@ -3821,7 +3784,9 @@ def paro_import_model(model, output, *, local_only=False, max_modules=None, layo
     )
 
 
-def paro_oracle_model(source, hfq, *, module_name=None, local_only=False, samples=2, seed=1234, input_scale=0.125, atol=0.0):
+def paro_oracle_model(
+    source, hfq, *, module_name=None, local_only=False, samples=2, seed=1234, input_scale=0.125, atol=0.0
+):
     module = load_paroquant_oracle_module()
     args = argparse.Namespace(
         source=source,
@@ -3973,10 +3938,14 @@ def build_parser():
     paro_import.add_argument("--pretty", action="store_true")
     paro_import.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
-    paro_oracle = sub.add_parser("paro-oracle", help="Compare PARO4G128 HFQ bytes against a PyTorch Paro decode oracle.")
+    paro_oracle = sub.add_parser(
+        "paro-oracle", help="Compare PARO4G128 HFQ bytes against a PyTorch Paro decode oracle."
+    )
     paro_oracle.add_argument("--source", required=True, help="ParoQuant safetensors directory or HuggingFace repo id.")
     paro_oracle.add_argument("--hfq", required=True, help="HFQ file produced by astrea paro-import.")
-    paro_oracle.add_argument("--module", dest="module_name", help="Paro module base name; defaults to the first complete module.")
+    paro_oracle.add_argument(
+        "--module", dest="module_name", help="Paro module base name; defaults to the first complete module."
+    )
     paro_oracle.add_argument("--local-only", action="store_true")
     paro_oracle.add_argument("--samples", type=int, default=2)
     paro_oracle.add_argument("--seed", type=int, default=1234)

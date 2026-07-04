@@ -252,15 +252,27 @@ fn App() -> impl IntoView {
             let result = if use_stream {
                 let controller = AbortController::new().ok();
                 abort.set_value(controller.clone());
-                stream_completion(url, body, controller, set_messages, assistant_index, set_status, set_usage, set_last_response_id).await
+                stream_completion(
+                    url,
+                    body,
+                    controller,
+                    set_messages,
+                    assistant_index,
+                    set_status,
+                    set_usage,
+                    set_last_response_id,
+                )
+                .await
             } else {
-                fetch_completion(url, body, api, set_usage, set_last_response_id).await.map(|content| {
-                    set_messages.update(|items| {
-                        if let Some(message) = items.get_mut(assistant_index) {
-                            message.content = content;
-                        }
-                    });
-                })
+                fetch_completion(url, body, api, set_usage, set_last_response_id)
+                    .await
+                    .map(|content| {
+                        set_messages.update(|items| {
+                            if let Some(message) = items.get_mut(assistant_index) {
+                                message.content = content;
+                            }
+                        });
+                    })
             };
 
             match result {
@@ -544,7 +556,11 @@ fn SettingsDrawer(
 
 /// Pick the endpoint and build the matching request body for the active API.
 /// `prev_id` (Responses only) chains server-side state via previous_response_id.
-fn build_request(messages: &[UiMessage], cfg: &Settings, prev_id: Option<&str>) -> (&'static str, Value) {
+fn build_request(
+    messages: &[UiMessage],
+    cfg: &Settings,
+    prev_id: Option<&str>,
+) -> (&'static str, Value) {
     let body = match cfg.api {
         ApiKind::Chat => chat_request_body(messages, cfg),
         ApiKind::Responses => responses_request_body(messages, cfg, prev_id),
@@ -656,7 +672,12 @@ fn context_summary(
     usage: Option<Usage>,
 ) -> String {
     if let Some(u) = usage {
-        return format!("Tokens: {} in + {} out = {}", u.prompt, u.completion, u.prompt + u.completion);
+        return format!(
+            "Tokens: {} in + {} out = {}",
+            u.prompt,
+            u.completion,
+            u.prompt + u.completion
+        );
     }
     let input_tokens = estimate_input_tokens(messages, prompt, attachments);
     let output_tokens = cfg.max_tokens.parse::<u32>().unwrap_or(512).max(1);
@@ -674,7 +695,11 @@ fn context_summary(
     }
 }
 
-fn estimate_input_tokens(messages: &[UiMessage], prompt: &str, attachments: &[AttachedImage]) -> u32 {
+fn estimate_input_tokens(
+    messages: &[UiMessage],
+    prompt: &str,
+    attachments: &[AttachedImage],
+) -> u32 {
     let message_chars = messages
         .iter()
         .map(|m| m.content.chars().count() as u32)
@@ -749,11 +774,15 @@ async fn read_attached_image(file: web_sys::File) -> Result<AttachedImage, Strin
 }
 
 fn files_to_vec(files: web_sys::FileList) -> Vec<web_sys::File> {
-    (0..files.length()).filter_map(|idx| files.get(idx)).collect()
+    (0..files.length())
+        .filter_map(|idx| files.get(idx))
+        .collect()
 }
 
 async fn fetch_models() -> Result<Vec<ModelItem>, String> {
-    get_json::<ModelsEnvelope>("/v1/models").await.map(|e| e.data)
+    get_json::<ModelsEnvelope>("/v1/models")
+        .await
+        .map(|e| e.data)
 }
 
 async fn fetch_completion(
@@ -778,7 +807,10 @@ async fn fetch_completion(
     }
     let content = match api {
         // Responses exposes the full text via the `output_text` convenience field.
-        ApiKind::Responses => payload["output_text"].as_str().unwrap_or_default().to_string(),
+        ApiKind::Responses => payload["output_text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         ApiKind::Chat => payload["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or_default()
@@ -800,7 +832,14 @@ async fn stream_completion(
 ) -> Result<(), String> {
     let signal = controller.as_ref().map(|c| c.signal());
     sse_post(url, &body, signal.as_ref(), |data| {
-        handle_sse_data(data, set_messages, assistant_index, set_status, set_usage, set_response_id)
+        handle_sse_data(
+            data,
+            set_messages,
+            assistant_index,
+            set_status,
+            set_usage,
+            set_response_id,
+        )
     })
     .await
 }

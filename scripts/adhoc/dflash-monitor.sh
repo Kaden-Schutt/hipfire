@@ -23,7 +23,10 @@ STATE="/tmp/dflash-monitor-state.json"
 REPO_DIR="${REPO_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire}"
 WORKTREE="${WORKTREE:-$REPO_DIR/.worktrees/dflash}"
 
-cd "$REPO_DIR" 2>/dev/null || { echo "repo dir missing: $REPO_DIR"; exit 10; }
+cd "$REPO_DIR" 2>/dev/null || {
+    echo "repo dir missing: $REPO_DIR"
+    exit 10
+}
 
 # Fetch latest without touching local branches
 git fetch origin dflash 2>&1 | tail -2
@@ -34,7 +37,7 @@ LATEST_COMMIT=$(git log -1 --format='%h %s' origin/dflash 2>/dev/null || echo no
 COMMITS_AHEAD=$(git rev-list --count origin/master..origin/dflash 2>/dev/null || echo 0)
 LAST_COMMIT_TS=$(git log -1 --format='%ct' origin/dflash 2>/dev/null || echo 0)
 NOW=$(date +%s)
-MINUTES_SINCE_COMMIT=$(( (NOW - LAST_COMMIT_TS) / 60 ))
+MINUTES_SINCE_COMMIT=$(((NOW - LAST_COMMIT_TS) / 60))
 
 # Progress file from origin/dflash
 PROGRESS=$(git show origin/dflash:docs/DFLASH_PROGRESS.md 2>/dev/null || echo "")
@@ -56,7 +59,7 @@ fi
 NEW_COMMITS=$(git log "${LAST_SEEN}..origin/dflash" --oneline 2>/dev/null | head -20)
 
 # Write state for next check
-cat > "$STATE" <<EOF
+cat >"$STATE" <<EOF
 {
   "timestamp": $NOW,
   "last_sha": "$LATEST_SHA",

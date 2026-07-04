@@ -256,8 +256,22 @@ mod tests {
         // v1 ⊥ v2 ⇒ summing the two ablate deltas == applying them in sequence.
         let v1 = unit(&[1.0, 0.0, 0.0, 0.0]);
         let v2 = unit(&[0.0, 1.0, 0.0, 0.0]);
-        let a1 = abliteration_adapter("a1", &[v1.clone()], SteerMode::Ablate, 0.6, 0..1).unwrap();
-        let a2 = abliteration_adapter("a2", &[v2.clone()], SteerMode::Ablate, 0.9, 0..1).unwrap();
+        let a1 = abliteration_adapter(
+            "a1",
+            std::slice::from_ref(&v1),
+            SteerMode::Ablate,
+            0.6,
+            0..1,
+        )
+        .unwrap();
+        let a2 = abliteration_adapter(
+            "a2",
+            std::slice::from_ref(&v2),
+            SteerMode::Ablate,
+            0.9,
+            0..1,
+        )
+        .unwrap();
 
         let x0 = vec![2.0, -3.0, 1.0, 0.5];
         let mut x_stack = x0.clone();

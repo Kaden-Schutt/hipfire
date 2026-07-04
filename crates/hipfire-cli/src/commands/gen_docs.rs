@@ -114,7 +114,7 @@ fn trim_trailing_line_ws(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
             .strip_suffix('\n')
             .map(|body| (body, "\n"))
             .unwrap_or((line, ""));
-        out.push_str(body.trim_end_matches(|c| c == ' ' || c == '\t'));
+        out.push_str(body.trim_end_matches([' ', '\t']));
         out.push_str(newline);
     }
     Ok(out.into_bytes())

@@ -33,7 +33,7 @@ run_case() {
     out_file=$(mktemp /tmp/smoke_out_XXXXXX.log)
 
     prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$PROMPT")
-    cat > "$in_file" <<JL
+    cat >"$in_file" <<JL
 {"type":"load","model":"${model_path}","params":{"max_seq":2048}}
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":${MAX_TOKENS},"repeat_penalty":1.05}
 {"type":"unload"}
@@ -41,7 +41,7 @@ JL
 
     local t0 t1 wall ec n_tokens panic status
     t0=$(date +%s.%N)
-    env "${extra_env[@]}" timeout 300 "$EXE" < "$in_file" > "$out_file" 2>&1
+    env "${extra_env[@]}" timeout 300 "$EXE" <"$in_file" >"$out_file" 2>&1
     ec=$?
     t1=$(date +%s.%N)
     wall=$(python3 -c "print(f'{$t1 - $t0:.1f}')")

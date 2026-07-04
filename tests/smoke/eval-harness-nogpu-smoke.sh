@@ -72,12 +72,18 @@ PY
 EVAL_BIN="$(pick_eval_bin)"
 VERSION_REPORT="$("$EVAL_BIN" --version)"
 case "$VERSION_REPORT" in
-    *"hipfire_version "* ) ;;
-    * ) echo "nogpu-smoke: --version missing hipfire_version" >&2; exit 1 ;;
+    *"hipfire_version "*) ;;
+    *)
+        echo "nogpu-smoke: --version missing hipfire_version" >&2
+        exit 1
+        ;;
 esac
 case "$VERSION_REPORT" in
-    *"git_commit "* ) ;;
-    * ) echo "nogpu-smoke: --version missing git_commit" >&2; exit 1 ;;
+    *"git_commit "*) ;;
+    *)
+        echo "nogpu-smoke: --version missing git_commit" >&2
+        exit 1
+        ;;
 esac
 "$EVAL_BIN" \
     --model candidate.hfq \

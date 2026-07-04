@@ -170,7 +170,7 @@ fn clip_byte_encoder() -> Vec<String> {
         }
     }
     let mut out = vec![String::new(); 256];
-    for (byte, codepoint) in bs.into_iter().zip(cs.into_iter()) {
+    for (byte, codepoint) in bs.into_iter().zip(cs) {
         out[byte as usize] = char::from_u32(codepoint).unwrap().to_string();
     }
     out

@@ -68,6 +68,8 @@
 //! - `hipfire-arch-qwen35-vl` — sibling VL arch, closest analog for
 //!   the daemon plumbing (image preprocessing + IMGPAD splicing).
 
+#![allow(clippy::doc_lazy_continuation)]
+
 pub mod arch;
 pub mod dots_ocr;
 pub mod image;

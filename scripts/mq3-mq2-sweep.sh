@@ -51,7 +51,10 @@ fi
 USE_GPU_LOCK=0
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "mq3-mq2-sweep" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "mq3-mq2-sweep" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     USE_GPU_LOCK=1
 fi
 # Single composed EXIT trap so adding the scratch-dir cleanup below doesn't
@@ -108,10 +111,10 @@ mkdir -p "$SCRATCH_DIR"
     echo "### Prompt manifest (md5 of each \`*.txt\` consumed by the run)"
     echo
     for pe in "${PROMPTS[@]}"; do
-        IFS='|' read -r pid _ <<< "$pe"
+        IFS='|' read -r pid _ <<<"$pe"
         pf="$PROMPTS_DIR/${pid}.txt"
         if [ -f "$pf" ]; then
-            echo "- \`${pid}.txt\` md5=\`$(md5sum < "$pf" | cut -d' ' -f1)\` size=$(wc -c < "$pf")B"
+            echo "- \`${pid}.txt\` md5=\`$(md5sum <"$pf" | cut -d' ' -f1)\` size=$(wc -c <"$pf")B"
         else
             echo "- \`${pid}.txt\` MISSING at $pf"
         fi
@@ -120,7 +123,7 @@ mkdir -p "$SCRATCH_DIR"
     echo "Hard fail = panic OR zero tokens OR 240s timeout."
     echo "Soft eyeball = read the **Output** block; flag attractor loops, off-topic, broken language."
     echo
-} > "$OUT"
+} >"$OUT"
 
 hard_errors=0
 
@@ -130,7 +133,7 @@ for model in "${MODELS[@]}"; do
         {
             echo "## $model — SKIPPED (model not present)"
             echo
-        } >> "$OUT"
+        } >>"$OUT"
         continue
     fi
     size=$(du -h "$p" | cut -f1)
@@ -142,10 +145,10 @@ for model in "${MODELS[@]}"; do
         echo "- size: $size"
         echo "- md5:  \`$md5\`"
         echo
-    } >> "$OUT"
+    } >>"$OUT"
 
     for prompt_entry in "${PROMPTS[@]}"; do
-        IFS='|' read -r pid max_tok <<< "$prompt_entry"
+        IFS='|' read -r pid max_tok <<<"$prompt_entry"
         echo "== $model / $pid =="
 
         prompt_file="$PROMPTS_DIR/${pid}.txt"
@@ -154,21 +157,21 @@ for model in "${MODELS[@]}"; do
             continue
         fi
         prompt="$(cat "$prompt_file")"
-        prompt_md5=$(md5sum < "$prompt_file" | cut -d' ' -f1)
+        prompt_md5=$(md5sum <"$prompt_file" | cut -d' ' -f1)
 
         in_file="$SCRATCH_DIR/sweep_in_${model//\//_}_${pid}.jsonl"
         out_file="$SCRATCH_DIR/sweep_out_${model//\//_}_${pid}.log"
         prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$prompt")
 
         # max_seq=8192 to give 27B + 4096 generation budget headroom.
-        cat > "$in_file" <<JL
+        cat >"$in_file" <<JL
 {"type":"load","model":"$p","params":{"max_seq":8192}}
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":$max_tok,"repeat_penalty":1.05}
 {"type":"unload"}
 JL
 
         t0=$(date +%s.%N)
-        timeout 300 "$EXE" < "$in_file" > "$out_file" 2>&1
+        timeout 300 "$EXE" <"$in_file" >"$out_file" 2>&1
         ec=$?
         t1=$(date +%s.%N)
         wall=$(python3 -c "print(f'{$t1 - $t0:.1f}')")
@@ -208,7 +211,7 @@ import sys, json
 print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))' || true
             echo '```'
             echo
-        } >> "$OUT"
+        } >>"$OUT"
 
         # in_file / out_file live under SCRATCH_DIR; cleanup happens via the
         # EXIT trap so failed runs leave evidence behind for diagnosis.
@@ -222,7 +225,7 @@ done
     echo
     echo "- hard errors: $hard_errors"
     echo "- report:      $OUT"
-} >> "$OUT"
+} >>"$OUT"
 
 echo "sweep done — report: $OUT"
 echo "hard errors: $hard_errors"

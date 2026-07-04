@@ -26,22 +26,26 @@ TMPCFG=$(mktemp -d)
 # Only the config file differs — models/bin are SYMLINKED, never copied.
 mkdir -p "$TMPCFG/.hipfire"
 ln -sfn "$HOME/.hipfire/models" "$TMPCFG/.hipfire/models"
-ln -sfn "$HOME/.hipfire/bin"    "$TMPCFG/.hipfire/bin"
+ln -sfn "$HOME/.hipfire/bin" "$TMPCFG/.hipfire/bin"
 # Tight config: tiny max_seq + default max_tokens so a moderate prompt tips
 # over the KV budget and the daemon must reject.
-cat > "$TMPCFG/.hipfire/config.json" <<'JSON'
+cat >"$TMPCFG/.hipfire/config.json" <<'JSON'
 {"max_seq": 1024, "max_tokens": 16, "default_model": "qwen3.5:0.8b"}
 JSON
 
 cargo build -q -p hipfire-cli
-HOME="$TMPCFG" "$PWD/target/debug/hipfire" serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" > "$LOG" 2>&1 &
+HOME="$TMPCFG" "$PWD/target/debug/hipfire" serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" >"$LOG" 2>&1 &
 PID=$!
 trap "kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf $TMPCFG $LOG /tmp/qg_N.json" EXIT
 
 for i in $(seq 1 90); do
-  if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then break; fi
-  if ! kill -0 $PID 2>/dev/null; then echo "serve died"; tail "$LOG"; exit 1; fi
-  sleep 1
+    if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then break; fi
+    if ! kill -0 $PID 2>/dev/null; then
+        echo "serve died"
+        tail "$LOG"
+        exit 1
+    fi
+    sleep 1
 done
 
 fails=0
@@ -54,16 +58,17 @@ fails=0
 # = 2310 > 1524 → daemon emits the KV-budget error.
 HUGE_SYS=$(awk 'BEGIN{for(i=0;i<450;i++)printf "the quick brown fox jumped over the lazy dog. "}')
 PAY_N=$(jq -cn --arg s "$HUGE_SYS" --arg m "$MODEL" \
-  '{model:$m, messages:[{role:"system",content:$s},{role:"user",content:"hi"}], max_tokens:500, temperature:0.0, stream:false}')
+    '{model:$m, messages:[{role:"system",content:$s},{role:"user",content:"hi"}], max_tokens:500, temperature:0.0, stream:false}')
 echo "=== N: non-streaming (expect 400 + error.message) ==="
 HTTP_N=$(curl -s -o /tmp/qg_N.json -w "%{http_code}" --max-time 60 -X POST \
-  "http://localhost:$PORT/v1/chat/completions" -H "Content-Type: application/json" -d "$PAY_N")
+    "http://localhost:$PORT/v1/chat/completions" -H "Content-Type: application/json" -d "$PAY_N")
 echo "HTTP $HTTP_N"
 cat /tmp/qg_N.json | jq '.' 2>/dev/null || cat /tmp/qg_N.json
 if [[ "$HTTP_N" == "400" ]] && jq -e '.error.message | test("KV budget"; "i")' /tmp/qg_N.json >/dev/null 2>&1; then
-  echo "PASS N"
+    echo "PASS N"
 else
-  echo "FAIL N"; fails=$((fails+1))
+    echo "FAIL N"
+    fails=$((fails + 1))
 fi
 rm -f /tmp/qg_N.json
 
@@ -73,13 +78,20 @@ PAY_S=$(echo "$PAY_N" | jq -c '.stream = true')
 echo "=== S: streaming (expect data: {\"error\":...} before [DONE]) ==="
 OUT_S=$(mktemp)
 curl -sN --max-time 60 -X POST "http://localhost:$PORT/v1/chat/completions" \
-  -H "Content-Type: application/json" -d "$PAY_S" > "$OUT_S"
+    -H "Content-Type: application/json" -d "$PAY_S" >"$OUT_S"
 cat "$OUT_S"
 if grep -q '"error"' "$OUT_S" && grep -q 'KV budget' "$OUT_S" && grep -q '\[DONE\]' "$OUT_S"; then
-  echo "PASS S"
+    echo "PASS S"
 else
-  echo "FAIL S"; fails=$((fails+1))
+    echo "FAIL S"
+    fails=$((fails + 1))
 fi
 rm -f "$OUT_S"
 
-if [[ $fails -eq 0 ]]; then echo "ALL PASS"; exit 0; else echo "$fails FAILS"; exit 1; fi
+if [[ $fails -eq 0 ]]; then
+    echo "ALL PASS"
+    exit 0
+else
+    echo "$fails FAILS"
+    exit 1
+fi

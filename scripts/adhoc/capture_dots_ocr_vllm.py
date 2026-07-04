@@ -78,16 +78,17 @@ def md5(path: Path) -> str:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("endpoint", help="vLLM base URL, e.g. http://localhost:8000")
-    p.add_argument("--model", default=None,
-                   help="vLLM model name. If omitted, queries /v1/models and uses the first one.")
-    p.add_argument("--image", default=str(DEFAULT_IMAGE),
-                   help=f"image path (default: {DEFAULT_IMAGE.relative_to(REPO)})")
-    p.add_argument("--out", default=str(DEFAULT_OUT),
-                   help=f"output JSON path (default: {DEFAULT_OUT.relative_to(REPO)})")
-    p.add_argument("--max-tokens", type=int, default=16384,
-                   help="max completion tokens (default: 16384 — full layout)")
-    p.add_argument("--temperature", type=float, default=0.0,
-                   help="sampling temperature (default: 0.0 = greedy)")
+    p.add_argument(
+        "--model", default=None, help="vLLM model name. If omitted, queries /v1/models and uses the first one."
+    )
+    p.add_argument(
+        "--image", default=str(DEFAULT_IMAGE), help=f"image path (default: {DEFAULT_IMAGE.relative_to(REPO)})"
+    )
+    p.add_argument(
+        "--out", default=str(DEFAULT_OUT), help=f"output JSON path (default: {DEFAULT_OUT.relative_to(REPO)})"
+    )
+    p.add_argument("--max-tokens", type=int, default=16384, help="max completion tokens (default: 16384 — full layout)")
+    p.add_argument("--temperature", type=float, default=0.0, help="sampling temperature (default: 0.0 = greedy)")
     args = p.parse_args()
 
     image_path = Path(args.image).resolve()

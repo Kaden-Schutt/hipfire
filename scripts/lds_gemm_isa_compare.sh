@@ -193,8 +193,8 @@ metadata_value_near_name() {
     if [[ -z "$line" ]]; then
         return 0
     fi
-    sed -n "$((line - 30)),$((line + 20))p" "$readobj_txt" |
-        awk -v key="$key" '$1 == "." key ":" { print $2; exit }'
+    sed -n "$((line - 30)),$((line + 20))p" "$readobj_txt" \
+        | awk -v key="$key" '$1 == "." key ":" { print $2; exit }'
 }
 
 extract_section() {

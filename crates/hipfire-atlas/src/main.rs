@@ -174,7 +174,7 @@ fn cmd_eval(task_path: &str, cwd: Option<&str>) -> Result<(), String> {
 fn write_rows_jsonl(rows: &[AtlasRow], path: &str) -> Result<(), String> {
     let lines: Vec<String> = rows
         .iter()
-        .map(|row| serde_json::to_string(row))
+        .map(serde_json::to_string)
         .collect::<Result<_, _>>()
         .map_err(|e| format!("serialize row: {e}"))?;
     let body = lines.join("\n") + "\n";

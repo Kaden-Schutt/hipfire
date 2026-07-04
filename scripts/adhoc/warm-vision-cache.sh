@@ -9,24 +9,32 @@
 #   scripts/warm-vision-cache.sh <model.hfq|name> <dir-or-image>...
 set -euo pipefail
 
-MODEL="${1:?usage: warm-vision-cache.sh <model> <dir-or-image>...}"; shift
-[ $# -gt 0 ] || { echo "warm-vision-cache: no input paths" >&2; exit 1; }
+MODEL="${1:?usage: warm-vision-cache.sh <model> <dir-or-image>...}"
+shift
+[ $# -gt 0 ] || {
+    echo "warm-vision-cache: no input paths" >&2
+    exit 1
+}
 
 DAEMON="${HIPFIRE_DAEMON_BIN:-./target/release/hipfire-daemon}"
-[ -x "$DAEMON" ] || { echo "warm-vision-cache: daemon not found at $DAEMON" >&2; exit 1; }
+[ -x "$DAEMON" ] || {
+    echo "warm-vision-cache: daemon not found at $DAEMON" >&2
+    exit 1
+}
 
 # Collect images (recursively for dirs).
 mapfile -d '' IMGS < <(find "$@" -type f \
-  \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.jfif' \
-     -o -iname '*.avif' -o -iname '*.webp' -o -iname '*.bmp' -o -iname '*.gif' \) -print0)
+    \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.jfif' \
+    -o -iname '*.avif' -o -iname '*.webp' -o -iname '*.bmp' -o -iname '*.gif' \) -print0)
 echo "warm-vision-cache: ${#IMGS[@]} image(s) -> model $MODEL"
-[ "${#IMGS[@]}" -gt 0 ] || { echo "  (no images found)"; exit 0; }
+[ "${#IMGS[@]}" -gt 0 ] || {
+    echo "  (no images found)"
+    exit 0
+}
 
 # Build a JSONL session (python for safe escaping of paths with spaces) and pipe
 # it to the daemon. HIPFIRE_VISION_CACHE must stay enabled (the default).
-python3 - "$MODEL" "${IMGS[@]}" <<'PY' | "$DAEMON" 2>/dev/null \
-  | grep -E '"type":"(done|error)"' \
-  | python3 -c '
+python3 - "$MODEL" "${IMGS[@]}" <<'PY' | "$DAEMON" 2>/dev/null | grep -E '"type":"(done|error)"' | python3 -c '
 import sys, json
 ok=err=hit=0
 for line in sys.stdin:

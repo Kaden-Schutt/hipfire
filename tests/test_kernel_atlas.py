@@ -578,9 +578,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                                 "role": "multirow_gemv",
                                 "phase_hint": "decode",
                             },
-                            "source_files": [
-                                {"path": "kernels/src/gemv_hfq4g256_multirow.hip"}
-                            ],
+                            "source_files": [{"path": "kernels/src/gemv_hfq4g256_multirow.hip"}],
                             "dispatch_refs": [
                                 {
                                     "path": "crates/hipfire-rdna/src/dispatch.rs",
@@ -668,7 +666,10 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         self.assertEqual(task["hot_kernel"]["name"], "gemv_hfq4g256_multirow_r4")
         self.assertEqual(task["hot_kernel"]["op"]["role"], "multirow_gemv")
         self.assertEqual(task["hot_kernel"]["source_files"][0]["path"], "kernels/src/gemv_hfq4g256_multirow.hip")
-        self.assertEqual(task["hot_kernel"]["isa_objects"][0]["path"], "~/.hipfire/kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco")
+        self.assertEqual(
+            task["hot_kernel"]["isa_objects"][0]["path"],
+            "~/.hipfire/kernels/gfx1201/gemv_hfq4g256_multirow_default.hsaco",
+        )
         self.assertEqual(task["constraints"]["allowed_files"], ["kernels/src/gemv_hfq4g256_multirow.hip"])
         self.assertEqual(task["eval"]["metric"], "gen_tok_s")
         self.assertEqual(task["eval"]["goal"], "maximize")
@@ -693,9 +694,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                 }
             },
             "artifacts": {
-                "profile_kernels": kernel_atlas.annotate_profile_kernels(
-                    [{"name": "gemv_hfq4g256", "pct": 36.3}]
-                ),
+                "profile_kernels": kernel_atlas.annotate_profile_kernels([{"name": "gemv_hfq4g256", "pct": 36.3}]),
                 "dispatch": {
                     "entries": [
                         {
@@ -730,9 +729,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             "command": ["bench"],
             "variant": {"env": {}},
             "artifacts": {
-                "profile_kernels": kernel_atlas.annotate_profile_kernels(
-                    [{"name": "gemv_hfq4g256", "pct": 36.3}]
-                ),
+                "profile_kernels": kernel_atlas.annotate_profile_kernels([{"name": "gemv_hfq4g256", "pct": 36.3}]),
                 "dispatch": {
                     "entries": [
                         {
@@ -1301,9 +1298,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                 "command": ["python3", "-c", "print('gen_tok_s=101.0')"],
                 "variant": {"env": {}},
                 "artifacts": {
-                    "profile_kernels": kernel_atlas.annotate_profile_kernels(
-                        [{"name": "gemv_hfq4g256", "pct": 36.3}]
-                    )
+                    "profile_kernels": kernel_atlas.annotate_profile_kernels([{"name": "gemv_hfq4g256", "pct": 36.3}])
                 },
             }
             isa = {"objects": []}
@@ -1364,9 +1359,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                 "command": ["python3", "-c", "print('gen_tok_s=73.0')"],
                 "variant": {"env": {"HIPFIRE_PROFILE_DECODE": "1", "HIPFIRE_GRAPH": "0"}},
                 "artifacts": {
-                    "profile_kernels": kernel_atlas.annotate_profile_kernels(
-                        [{"name": "rmsnorm_f32", "pct": 24.3}]
-                    )
+                    "profile_kernels": kernel_atlas.annotate_profile_kernels([{"name": "rmsnorm_f32", "pct": 24.3}])
                 },
             }
             isa = {

@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Wait for the running F1/F2 comparison eval (daemon-driven KLD) to release the GPU.
-until ! pgrep -f "hipfire-daemon" > /dev/null 2>&1; do
+until ! pgrep -f "hipfire-daemon" >/dev/null 2>&1; do
     sleep 5
 done
 
@@ -16,6 +16,6 @@ done
 sleep 2
 
 MAX_CHUNKS=100 \
-KV_MODE=q8 \
-RESULTS_LABEL=2026-05-14-f2-alpha-sweep-n100-kvq8-9b-gfx906 \
-exec scripts/awq_alpha_sweep.sh 0.35 0.40 0.45 0.50 0.55 0.60 0.65
+    KV_MODE=q8 \
+    RESULTS_LABEL=2026-05-14-f2-alpha-sweep-n100-kvq8-9b-gfx906 \
+    exec scripts/awq_alpha_sweep.sh 0.35 0.40 0.45 0.50 0.55 0.60 0.65

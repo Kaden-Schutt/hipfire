@@ -71,7 +71,7 @@ while [[ $# -gt 0 ]]; do
             compare_right="${3:?missing other ISA summary after --isa-compare}"
             shift 2
             ;;
-        -h|--help)
+        -h | --help)
             usage
             exit 0
             ;;

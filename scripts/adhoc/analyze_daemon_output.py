@@ -5,6 +5,7 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 
 """Parse daemon JSONL output: extract tokens, check for corruption."""
+
 import sys, json
 
 tokens = []

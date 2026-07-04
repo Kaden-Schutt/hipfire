@@ -24,7 +24,6 @@ cd "$ROOT"
 RECORD=0
 [ "${1:-}" = "--record" ] && RECORD=1
 
-
 BASELINES="tests/fixture-golden-baselines.txt"
 ARCHS=(qwen3_5 qwen3_5_moe)
 # Format axis: each runtime quant format has its own dequant kernel path, so a
@@ -41,7 +40,10 @@ cargo build --release -p hipfire-quantize --example fixture_golden -p hipfire-ru
 Q="$ROOT/target/release/hipfire-quantize"
 GOLD="$ROOT/target/release/examples/fixture_golden"
 
-"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "fixture-golden-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "fixture-golden-gate" --watch-pid "$$" || {
+    echo "could not acquire GPU lock" >&2
+    exit 2
+}
 trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 
 TMP="$(mktemp -d)"
@@ -62,9 +64,9 @@ lookup_baseline() { # gpu_arch model_arch format
     awk -v g="$1" -v m="$2" -v f="$3" '$1==g && $2==m && $3==f {print $4}' "$BASELINES" | head -1
 }
 
-fail=0          # drift or nondeterminism — a real regression signal
-matched=0       # runnable cell == its committed baseline for this gpu-arch
-nobaseline=0    # runnable cell, but no committed baseline for this gpu-arch
+fail=0       # drift or nondeterminism — a real regression signal
+matched=0    # runnable cell == its committed baseline for this gpu-arch
+nobaseline=0 # runnable cell, but no committed baseline for this gpu-arch
 declare -a RECORDED=()
 for arch in "${ARCHS[@]}"; do
     echo "== golden: $arch =="
@@ -72,17 +74,22 @@ for arch in "${ARCHS[@]}"; do
     for fmt in "${FORMATS[@]}"; do
         hfq="$TMP/$arch-$fmt.hfq"
         if ! "$Q" --input "$TMP/$arch" --output "$hfq" --format "$fmt" >/dev/null 2>&1; then
-            echo "  SKIP $fmt: quantize unsupported on this build/arch"; continue
+            echo "  SKIP $fmt: quantize unsupported on this build/arch"
+            continue
         fi
 
         read -r gpu_arch h1 <<<"$(run_golden "$hfq")"
-        read -r _        h2 <<<"$(run_golden "$hfq")"
-        if [ "$h1" = "MISSING" ]; then echo "  SKIP $fmt: not runnable here (no logit_hash)"; continue; fi
+        read -r _ h2 <<<"$(run_golden "$hfq")"
+        if [ "$h1" = "MISSING" ]; then
+            echo "  SKIP $fmt: not runnable here (no logit_hash)"
+            continue
+        fi
 
         # 1. Determinism (hard — a runnable cell that flips is a real bug).
         if [ "$h1" != "$h2" ]; then
             echo "  FAIL determinism $fmt: $h1 != $h2 (nondeterministic kernel)"
-            fail=1; continue
+            fail=1
+            continue
         fi
         RECORDED+=("$gpu_arch $arch $fmt $h1")
 

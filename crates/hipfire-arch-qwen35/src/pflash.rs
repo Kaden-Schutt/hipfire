@@ -998,7 +998,7 @@ pub fn compute_scores_batched(
     // 5. Per-block mean K + cosine vs last-position K. Same scoring math
     // as Phase 1.2 compute_scores_cpu, just over the batched-captured
     // K instead of per-token.
-    let n_blocks = (n + block_size - 1) / block_size;
+    let n_blocks = n.div_ceil(block_size);
     let mut scores = vec![0.0f32; n_blocks];
     let last_k = &k_per_pos[(n - 1) * kv_dim..n * kv_dim];
     let last_norm = norm_l2(last_k);
@@ -1084,7 +1084,7 @@ pub fn compute_scores_batched_gpu(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&i| i < n_layers)
         .unwrap_or(auto_layer);
-    let n_blocks = (n + block_size - 1) / block_size;
+    let n_blocks = n.div_ceil(block_size);
 
     let scores_buf = gpu.alloc_owned(&[n_blocks], DType::F32)?;
     // Dispatch on the drafter's KV cache mode. All four kernels emit
@@ -1241,7 +1241,7 @@ pub fn compute_scores_cpu(
         k_per_pos.extend_from_slice(&k_row);
     }
 
-    let n_blocks = (n + block_size - 1) / block_size;
+    let n_blocks = n.div_ceil(block_size);
     let mut scores = vec![0.0f32; n_blocks];
 
     // Last-position K is the proxy for "what the model would attend to next"
@@ -1342,11 +1342,7 @@ pub fn select_spans(
     }
 
     let sink_end = sink_tokens.min(n);
-    let recent_start = if recent_tokens >= n {
-        0
-    } else {
-        n - recent_tokens
-    };
+    let recent_start = n.saturating_sub(recent_tokens);
 
     // Build the mandatory-keep set up-front so it counts against budget.
     // Clamp must_keep entries to [0, n) and drop empty / inverted spans.

@@ -49,7 +49,10 @@ section "gpu_stack"
 if [ -e /dev/kfd ]; then line "/dev/kfd: present"; else line "/dev/kfd: MISSING (install amdgpu-dkms)"; fi
 if [ -e /dev/dri/renderD128 ]; then line "/dev/dri/renderD128: present"; else line "/dev/dri/renderD128: MISSING"; fi
 for p in /opt/rocm/bin/hipcc /opt/rocm-6.*/bin/hipcc /opt/rocm-7.*/bin/hipcc; do
-    if [ -x "$p" ]; then line "hipcc: $p"; break; fi
+    if [ -x "$p" ]; then
+        line "hipcc: $p"
+        break
+    fi
 done
 if exists rocminfo; then
     line "rocminfo: $(rocminfo 2>/dev/null | grep -E 'Name:\s*gfx' | head -1 | sed 's/^\s*//')"
@@ -61,7 +64,7 @@ section "hipfire_install"
 HIPFIRE_DIR="${HIPFIRE_DIR:-$HOME/.hipfire}"
 [ -d "$HIPFIRE_DIR" ] && line "~/.hipfire: present" || line "~/.hipfire: MISSING (not installed)"
 [ -x "$HIPFIRE_DIR/bin/daemon" ] && line "daemon: $(stat -c %y "$HIPFIRE_DIR/bin/daemon" 2>/dev/null | cut -d. -f1)" || line "daemon: MISSING"
-[ -f "$HIPFIRE_DIR/cli/index.ts" ] && line "CLI: $(wc -l < "$HIPFIRE_DIR/cli/index.ts") lines"
+[ -f "$HIPFIRE_DIR/cli/index.ts" ] && line "CLI: $(wc -l <"$HIPFIRE_DIR/cli/index.ts") lines"
 [ -f "$HIPFIRE_DIR/config.json" ] && line "config: $(cat "$HIPFIRE_DIR/config.json" | tr -d '\n' | head -c 200)" || line "config: using defaults"
 KBLOB_COUNT=$(find "$HIPFIRE_DIR/bin/kernels" -name '*.hsaco' 2>/dev/null | wc -l)
 line "pre-compiled kernels: $KBLOB_COUNT blobs"

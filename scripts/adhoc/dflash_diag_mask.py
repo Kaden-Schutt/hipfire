@@ -43,13 +43,13 @@ def build_mask(L: int, K: int, B: int, anchors: list[int], device="cpu"):
     """Replicate dflash_train_poc.py:336-366 (sparse training mask)."""
     q_len = K * B
     anchors_t = torch.tensor(anchors, device=device)
-    q_block = torch.arange(q_len, device=device) // B              # [q_len]
-    q_anchor = anchors_t[q_block]                                  # [q_len]
-    ctx_idx = torch.arange(L, device=device).unsqueeze(0)          # [1, L]
-    ctx_visible = ctx_idx < q_anchor.unsqueeze(1)                  # [q_len, L]
-    k_block = torch.arange(q_len, device=device) // B              # [q_len]
-    same_block = q_block.unsqueeze(1) == k_block.unsqueeze(0)      # [q_len, q_len]
-    mask_bool = torch.cat([ctx_visible, same_block], dim=1)        # [q_len, L+q_len]
+    q_block = torch.arange(q_len, device=device) // B  # [q_len]
+    q_anchor = anchors_t[q_block]  # [q_len]
+    ctx_idx = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+    ctx_visible = ctx_idx < q_anchor.unsqueeze(1)  # [q_len, L]
+    k_block = torch.arange(q_len, device=device) // B  # [q_len]
+    same_block = q_block.unsqueeze(1) == k_block.unsqueeze(0)  # [q_len, q_len]
+    mask_bool = torch.cat([ctx_visible, same_block], dim=1)  # [q_len, L+q_len]
     return mask_bool
 
 
@@ -88,7 +88,7 @@ def pretty_print(mask_bool, L: int, K: int, B: int, anchors: list[int]):
 
     # Axis legend
     print()
-    print(f"  axes: q=[K={K} blocks × B={B} positions]  k=[L={L} ctx] + [K*B={K*B} noise]")
+    print(f"  axes: q=[K={K} blocks × B={B} positions]  k=[L={L} ctx] + [K*B={K * B} noise]")
     print(f"  anchors: {anchors}")
     print(f"  legend: ● = attention allowed, · = masked (-inf)")
 
@@ -105,17 +105,15 @@ def verify(mask_bool, L: int, K: int, B: int, anchors: list[int]):
             want = j < a_ki
             got = bool(mask_bool[i, j].item())
             if want != got:
-                print(f"  FAIL: q[{i}] (blk={blk_i}, a={a_ki}) → ctx[{j}] "
-                      f"want={want} got={got}")
+                print(f"  FAIL: q[{i}] (blk={blk_i}, a={a_ki}) → ctx[{j}] want={want} got={got}")
                 ok = False
         # Noise cells: j = L + noise_idx
         for noise_j in range(q_len):
             blk_j = noise_j // B
-            want = (blk_i == blk_j)
+            want = blk_i == blk_j
             got = bool(mask_bool[i, L + noise_j].item())
             if want != got:
-                print(f"  FAIL: q[{i}] (blk={blk_i}) → noise[{noise_j}] (blk={blk_j}) "
-                      f"want={want} got={got}")
+                print(f"  FAIL: q[{i}] (blk={blk_i}) → noise[{noise_j}] (blk={blk_j}) want={want} got={got}")
                 ok = False
     return ok
 
@@ -136,7 +134,7 @@ def inference_semantics_for_block(a: int, B: int):
       - all B noise positions   (≡ training rule: within-block bidirectional ✓)
     """
     print(f"  block at anchor a={a}, B={B}:")
-    print(f"    ctx visible at inference: positions [0..{a-1}] → training: j < {a} ✓")
+    print(f"    ctx visible at inference: positions [0..{a - 1}] → training: j < {a} ✓")
     print(f"    noise within block: bidirectional (B={B} rows) ✓")
 
 

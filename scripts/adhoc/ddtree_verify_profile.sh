@@ -28,7 +28,10 @@ fi
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ddtree-verify-profile" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ddtree-verify-profile" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -46,9 +49,12 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
 '
 
 run_one() {
-    local tag="$1"; shift
-    local budget="$1"; shift
-    local topk="$1"; shift
+    local tag="$1"
+    shift
+    local budget="$1"
+    shift
+    local topk="$1"
+    shift
     echo "### $tag (b=$budget k=$topk) ###"
     for i in $(seq 1 "$RUNS"); do
         echo "-- run $i --"
@@ -56,8 +62,8 @@ run_one() {
             --target "$TARGET_27B" --draft "$DRAFT_27B" \
             --prompt "$CODE_PROMPT" --max "$MAX_TOKENS" --ctx 2048 \
             --kv-mode q8 --no-chatml \
-            --ddtree-batched --ddtree-budget "$budget" --ddtree-topk "$topk" 2>&1 | \
-            grep -aE '^(emitted:|cycles:|host timing|  launch=|  ssync=|τ=|accept_rate)'
+            --ddtree-batched --ddtree-budget "$budget" --ddtree-topk "$topk" 2>&1 \
+            | grep -aE '^(emitted:|cycles:|host timing|  launch=|  ssync=|τ=|accept_rate)'
     done
     echo
 }

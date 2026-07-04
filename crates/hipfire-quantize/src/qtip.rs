@@ -50,6 +50,7 @@ const NUM_SYMBOLS: usize = 1 << BITS_PER_WEIGHT;
 /// GPU-cheap and stateless — exactly what the C2 decode kernel will compute, so
 /// the offline codebook here matches the on-device decode bit-for-bit.
 #[inline]
+#[allow(clippy::excessive_precision)]
 fn decode_1mad(state: u32) -> f32 {
     let x = (state as u64) & 0xFFFF_FFFF;
     let x = x.wrapping_mul(34_038_481).wrapping_add(76_625_530) & 0xFFFF_FFFF;

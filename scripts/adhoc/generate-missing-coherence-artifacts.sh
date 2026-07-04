@@ -41,18 +41,18 @@ run_quant() {
     start=$(date +%s)
     if [ -n "$extra" ]; then
         # shellcheck disable=SC2086
-        "$QUANT_BIN" --input "$src" --output "$tmp" --format "$fmt" $extra > "$qlog" 2>&1
+        "$QUANT_BIN" --input "$src" --output "$tmp" --format "$fmt" $extra >"$qlog" 2>&1
     else
-        "$QUANT_BIN" --input "$src" --output "$tmp" --format "$fmt" > "$qlog" 2>&1
+        "$QUANT_BIN" --input "$src" --output "$tmp" --format "$fmt" >"$qlog" 2>&1
     fi
     rc=$?
     end=$(date +%s)
 
     if [ "$rc" -eq 0 ] && [ -f "$tmp" ]; then
         mv "$tmp" "$out"
-        echo "[$(date -Iseconds)] DONE  $out ($(du -h "$out" | cut -f1)) elapsed=$((end-start))s"
+        echo "[$(date -Iseconds)] DONE  $out ($(du -h "$out" | cut -f1)) elapsed=$((end - start))s"
     else
-        echo "[$(date -Iseconds)] FAIL  rc=$rc out=$out elapsed=$((end-start))s"
+        echo "[$(date -Iseconds)] FAIL  rc=$rc out=$out elapsed=$((end - start))s"
         rm -f "$tmp"
     fi
 }

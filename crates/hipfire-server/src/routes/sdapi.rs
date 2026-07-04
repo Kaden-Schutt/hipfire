@@ -2660,7 +2660,7 @@ fn sdapi_annotate_img2img_inpainting_info(
 }
 
 fn sdapi_mask_round(body: &SdGenerationRequest) -> bool {
-    body.mask_round.as_ref().map_or(true, sdapi_value_is_truthy)
+    body.mask_round.as_ref().is_none_or(sdapi_value_is_truthy)
 }
 
 fn sdapi_round_mask(mask: RgbImageBatch) -> Result<RgbImageBatch, DiffusionError> {
@@ -2853,7 +2853,7 @@ fn sdapi_inpainting_fill(body: &SdGenerationRequest) -> Result<Option<u32>, Diff
 fn sdapi_inpaint_full_res(body: &SdGenerationRequest) -> bool {
     body.inpaint_full_res
         .as_ref()
-        .map_or(true, sdapi_value_is_truthy)
+        .is_none_or(sdapi_value_is_truthy)
 }
 
 fn sdapi_inpaint_full_res_padding(body: &SdGenerationRequest) -> Result<u32, DiffusionError> {
@@ -8153,10 +8153,10 @@ mod tests {
 
     fn tiny_diffusion_tensors() -> Vec<HfqMemTensor> {
         let identity1 = center_identity_conv(1);
-        let mut vae_encoder_conv_in = vec![0.0; 1 * 3 * 3 * 3];
-        vae_encoder_conv_in[1 * 3 + 1] = 1.0;
-        let mut vae_encoder_conv_out = vec![0.0; 2 * 1 * 3 * 3];
-        vae_encoder_conv_out[1 * 3 + 1] = 1.0;
+        let mut vae_encoder_conv_in = vec![0.0; 3 * 3 * 3];
+        vae_encoder_conv_in[3 + 1] = 1.0;
+        let mut vae_encoder_conv_out = vec![0.0; 2 * 3 * 3];
+        vae_encoder_conv_out[3 + 1] = 1.0;
         let down_prefix = "unet/tensors/down_blocks.0.resnets.0";
         let up_prefix = "unet/tensors/up_blocks.0.resnets.0";
         let vae_resnet_prefix = "vae/tensors/decoder.up_blocks.0.resnets.0";

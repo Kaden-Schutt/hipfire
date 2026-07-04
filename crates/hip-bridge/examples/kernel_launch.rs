@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -74,7 +94,7 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
 
     // Launch kernel
     let block_size = 256u32;
-    let grid_size = ((n as u32) + block_size - 1) / block_size;
+    let grid_size = (n as u32).div_ceil(block_size);
 
     let mut d_a_ptr = d_a.as_ptr();
     let mut d_b_ptr = d_b.as_ptr();
@@ -109,11 +129,11 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
 
     // Verify: a[i] + b[i] = i + (n - i) = n for all i
     let mut errors = 0;
-    for i in 0..n as usize {
-        if (c[i] - n as f32).abs() > 0.001 {
+    for (i, value) in c.iter().enumerate().take(n as usize) {
+        if (value - n as f32).abs() > 0.001 {
             errors += 1;
             if errors <= 5 {
-                eprintln!("  mismatch at {i}: expected {n}, got {}", c[i]);
+                eprintln!("  mismatch at {i}: expected {n}, got {value}");
             }
         }
     }

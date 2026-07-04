@@ -1770,10 +1770,10 @@ fn reject_ffn_bf16_non_hfq_load(source: &str) -> HipResult<()> {
     Ok(())
 }
 
-fn ffn_bf16_selected_shadow<'a>(
+fn ffn_bf16_selected_shadow(
     layer_idx: usize,
-    shadow: &'a Option<Bf16DownShadow>,
-) -> HipResult<Option<&'a Bf16DownShadow>> {
+    shadow: &Option<Bf16DownShadow>,
+) -> HipResult<Option<&Bf16DownShadow>> {
     if !ffn_bf16::enabled() || !ffn_bf16::layer_selected(layer_idx) {
         return Ok(None);
     }
@@ -2649,7 +2649,7 @@ fn load_weight_tensor_raw(
             // stale or externally-quantized file fails at load instead of panicking on
             // first dispatch.
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -2667,7 +2667,7 @@ fn load_weight_tensor_raw(
             // MFP4G32 — HFP4G32 + offline FWHT. Drop-in MQ4 replacement; same byte
             // layout as qtype 21 with format_flags=0x05 stamped in the per-row hdr.
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -2766,7 +2766,7 @@ fn load_weight_tensor_raw(
             );
             let block_bytes = data.len() / n_groups;
             assert!(
-                block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
+                block_bytes >= 132 && (block_bytes - 130).is_multiple_of(2),
                 "OQ+C block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
             );
             let n_out = (block_bytes - 130) / 2;
@@ -3013,7 +3013,7 @@ fn load_weight_tensor_from_slabs(
     let dtype = slab_dtype_for_quant(entry.quant_type, k)?;
     if matches!(dtype, DType::HFP4G32 | DType::MFP4G32) {
         assert!(
-            k % 256 == 0,
+            k.is_multiple_of(256),
             "{entry_name} has K={k} but kernel requires K%256==0"
         );
     }
@@ -3142,7 +3142,7 @@ fn load_weight_tensor(
                 wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
             }
         }
-        return Ok(wt);
+        Ok(wt)
     }
     #[cfg(not(unix))]
     {
@@ -5190,7 +5190,7 @@ pub fn collect_calibration_artifacts(
                         }
                     }
                     let mut pairs: Vec<(u64, u64)> = cooc.into_iter().collect();
-                    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+                    pairs.sort_by_key(|pair| std::cmp::Reverse(pair.1));
                     pairs.truncate(64);
                     let ne = h.num_experts as u64;
                     let cooc_json: Vec<serde_json::Value> = pairs
@@ -8953,11 +8953,11 @@ impl Qwen35Scratch {
             // two preferred (matches FA dispatcher chunking).
             flash_partials: {
                 let tile_size = 128usize;
-                let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
+                let max_tiles = kv_max_seq.div_ceil(tile_size);
                 let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
+                    .filter(|&n| (1..=PREFILL_MAX_BATCH).contains(&n))
                     .unwrap_or(16);
                 gpu.alloc_tensor(
                     &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)],
@@ -9108,7 +9108,7 @@ impl Qwen35Scratch {
             let _ = gpu.free_tensor(t);
         }
         // MoE scratch — only present for MoE configs.
-        for t in [
+        for buf in [
             self.moe_router_logits,
             self.moe_scalar_buf,
             self.moe_x_rot,
@@ -9123,10 +9123,11 @@ impl Qwen35Scratch {
             self.moe_topk_indices,
             self.moe_topk_weights,
             self.moe_down_expanded,
-        ] {
-            if let Some(buf) = t {
-                let _ = gpu.free_tensor(buf);
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(buf);
         }
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
@@ -12729,10 +12730,11 @@ impl PrefillBatchScratch {
             self.moe_y_down_grouped,
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
-        ] {
-            if let Some(t) = t {
-                let _ = gpu.free_tensor(t);
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(t);
         }
     }
 }
@@ -12859,7 +12861,7 @@ fn kld_direct_f16kv_attention_eligible(
         && !kv_cache.quant_asym2
         && !kv_cache.quant_asym3
         && !kv_cache.quant_asym4
-        && config.head_dim % 16 == 0
+        && config.head_dim.is_multiple_of(16)
         && config.head_dim <= 256
         && gpu.arch_caps.has_wmma();
     if enabled && !eligible {
@@ -12992,7 +12994,7 @@ fn kld_fp32_gqa4_attention_eligible(
         && !kv_cache.quant_asym3
         && !kv_cache.quant_asym4
         && config.n_kv_heads > 0
-        && config.n_heads % config.n_kv_heads == 0
+        && config.n_heads.is_multiple_of(config.n_kv_heads)
         && kv_group >= 4
         && kv_group % 4 == 0
         && shared_mem <= 64 * 1024
@@ -14024,8 +14026,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
             let pth_slot = per_token_hidden_out.map(|t| (t, chunk_start));
             // Reborrow the tape for this chunk so we keep the outer mut
             // after the chunk returns.
-            let tape_for_chunk: Option<&mut crate::speculative::GdnTape> =
-                gdn_tape.as_mut().map(|t| &mut **t);
+            let tape_for_chunk: Option<&mut crate::speculative::GdnTape> = gdn_tape.as_deref_mut();
             // Tree-verify was asserted to fit in one chunk above, so passing
             // the whole ctx through unconditionally is safe.
             let tv_for_chunk = tree_verify.as_ref().copied();
@@ -14044,13 +14045,12 @@ pub fn forward_prefill_batch_with_pbs_opts(
             });
             // Sanity: if caller provided an override, it MUST land in some
             // chunk. Detect "fell off the end" at the last chunk boundary.
-            if mask_override.is_some() && chunk_end == n {
-                let landed_anywhere = mask_override.unwrap().slot < n;
+            if let Some(override_) = mask_override.filter(|_| chunk_end == n) {
+                let landed_anywhere = override_.slot < n;
                 assert!(
                     landed_anywhere,
                     "MaskEmbedOverride.slot ({}) is out of range for tokens.len() ({})",
-                    mask_override.unwrap().slot,
-                    n,
+                    override_.slot, n,
                 );
             }
             forward_prefill_chunk(
@@ -17179,11 +17179,6 @@ fn forward_prefill_chunk(
     // call site below selects the right variant via an `arch.starts_with`
     // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
     let q8_wmma_arch = gpu.arch_caps.has_wmma();
-    // MQ3 dispatch arch gate (same predicate, separate name for clarity at
-    // each matcher). Phase 1 gfx10 MQ3 prefill (`docs/plans/gfx10_mq3_prefill.md`)
-    // routes the 8 `is_mq3*` matchers below to scalar HFQ3 kernels on
-    // !arch_has_wmma archs admitted by `is_batchable_la`.
-    let arch_has_wmma = q8_wmma_arch;
     let f16_prefill_wmma = qwen35_f16_prefill_wmma_enabled(gpu);
     let fa_batched_ok = (!kv_cache.quantized
         || kv_cache.quant_q8
@@ -18203,31 +18198,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if wo_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.wo.buf,
+                        layer.wo.gpu_dtype,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
                 } else if wo_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -18710,31 +18691,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if w_down_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.w_down.buf,
+                        layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
                 } else if w_down_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -19076,23 +19043,6 @@ fn forward_prefill_chunk(
                             && matches!(layer.wv.gpu_dtype, DType::F32),
                         "FA qkv F32 dispatch requires all of wq/wk/wv to be F32",
                     );
-                } else if qkv_same_dtype {
-                    run_fused_qkv_key(
-                        gpu,
-                        hipfire_dispatch::types::KernelKey::FusedQkvHfq4G256,
-                        &layer.wq.buf,
-                        &layer.wk.buf,
-                        &layer.wv.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch,
-                        &pbs.fa_k_batch,
-                        &pbs.fa_v_batch,
-                        layer.wq.m,
-                        layer.wk.m,
-                        layer.wv.m,
-                        layer.wq.k,
-                        n,
-                    )?;
                 } else if qkv_is_f16 && qkv_same_dtype {
                     if f16_prefill_wmma {
                         gemm_fp16_or_bf16_x_f32_wmma(
@@ -20116,31 +20066,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_wo_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            fa_wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            fa_wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.wo.buf,
+                        layer.wo.gpu_dtype,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
                 } else if fa_wo_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -20543,31 +20479,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_w_down_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.w_down.buf,
+                        layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
                 } else if fa_w_down_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -24703,7 +24625,7 @@ fn forward_scratch_layers(
                         config.norm_eps,
                     )?;
                     if hipfire_runtime::triattn::tap_enabled() {
-                        triattn_tap(gpu, layer_idx, &s, config)?;
+                        triattn_tap(gpu, layer_idx, s, config)?;
                     }
                     if kv_cache.compact_offset > 0 {
                         let abs = (pos + kv_cache.compact_offset) as i32;
@@ -30534,7 +30456,7 @@ mod tests {
         assert!((layer.weight_sums[2] - 0.65).abs() < 1e-6);
         assert_eq!(layer.dropped_indices, 1);
         assert_eq!(
-            layer.cooccurrence.get(&(1 * hist.num_experts as u64 + 2)),
+            layer.cooccurrence.get(&((hist.num_experts as u64) + 2)),
             Some(&1)
         );
         assert!(take_moe_router_histogram().is_none());
@@ -30920,14 +30842,17 @@ mod tests {
     #[test]
     fn dense_prefill_bf16_is_batchable_in_qwen35() {
         for arch in [
-            "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
-            "gfx942",
+            "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201", "gfx942",
         ] {
             assert!(
                 is_batchable_la(DType::BF16, arch),
                 "BF16 dense prefill must stay on the batched BF16 WMMA-capable path on {arch}"
             );
         }
+        assert!(
+            !is_batchable_la(DType::BF16, "gfx1151"),
+            "BUG-001 keeps BF16 dense prefill off the broken gfx1151 batched projection path"
+        );
     }
 
     #[test]

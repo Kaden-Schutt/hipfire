@@ -78,7 +78,7 @@ for arch in "${ARCHS[@]}"; do
         # WMMA builtins and the dot8 instruction used by MQ8.
         if [ "$arch" = "gfx906" ]; then
             case "$name" in
-                *_wmma*|gemv_mq8g256)
+                *_wmma* | gemv_mq8g256)
                     echo "  - $name SKIP (unsupported ISA on gfx906)"
                     continue
                     ;;
@@ -88,7 +88,7 @@ for arch in "${ARCHS[@]}"; do
         # gfx906-specific kernels (sdot4 dp4a, etc.) only build on gfx906.
         if [ "$arch" != "gfx906" ]; then
             case "$name" in
-                *_gfx906|*_gfx906_*|*_dp4a)
+                *_gfx906 | *_gfx906_* | *_dp4a)
                     echo "  - $name SKIP (gfx906-only)"
                     continue
                     ;;
@@ -96,16 +96,22 @@ for arch in "${ARCHS[@]}"; do
         fi
 
         # Override lookup: arch subdir first, then root tags (backward compat).
-        if   [ -f "$arch_dir/${name}.${arch}.hip" ];          then src="$arch_dir/${name}.${arch}.hip"
-        elif [ -f "$arch_dir/${name}.hip" ];                  then src="$arch_dir/${name}.hip"
-        elif [ -f "$family_dir/${name}.${arch_family}.hip" ]; then src="$family_dir/${name}.${arch_family}.hip"
-        elif [ -f "$family_dir/${name}.hip" ];                then src="$family_dir/${name}.hip"
-        elif [ -f "$SRC_DIR/${name}.${arch}.hip" ];           then src="$SRC_DIR/${name}.${arch}.hip"
-        elif [ -f "$SRC_DIR/${name}.${arch_family}.hip" ];    then src="$SRC_DIR/${name}.${arch_family}.hip"
+        if [ -f "$arch_dir/${name}.${arch}.hip" ]; then
+            src="$arch_dir/${name}.${arch}.hip"
+        elif [ -f "$arch_dir/${name}.hip" ]; then
+            src="$arch_dir/${name}.hip"
+        elif [ -f "$family_dir/${name}.${arch_family}.hip" ]; then
+            src="$family_dir/${name}.${arch_family}.hip"
+        elif [ -f "$family_dir/${name}.hip" ]; then
+            src="$family_dir/${name}.hip"
+        elif [ -f "$SRC_DIR/${name}.${arch}.hip" ]; then
+            src="$SRC_DIR/${name}.${arch}.hip"
+        elif [ -f "$SRC_DIR/${name}.${arch_family}.hip" ]; then
+            src="$SRC_DIR/${name}.${arch_family}.hip"
         fi
 
         out="$out_dir/${name}.hsaco"
-        printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
+        printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >>"$JOB_FILE"
     done
 
     # ── Phase 1b: arch-subdir-only kernels ───────────────────────────────
@@ -136,27 +142,29 @@ for arch in "${ARCHS[@]}"; do
 
             if [ "$arch" = "gfx906" ]; then
                 case "$arch_name" in
-                    *_wmma*|gemv_mq8g256)
+                    *_wmma* | gemv_mq8g256)
                         echo "  - $arch_name SKIP (unsupported ISA on gfx906)"
-                        continue ;;
+                        continue
+                        ;;
                 esac
             fi
             if [ "$arch" != "gfx906" ]; then
                 case "$arch_name" in
-                    *_gfx906|*_gfx906_*|*_dp4a)
+                    *_gfx906 | *_gfx906_* | *_dp4a)
                         echo "  - $arch_name SKIP (gfx906-only)"
-                        continue ;;
+                        continue
+                        ;;
                 esac
             fi
 
             phase1b_seen="${phase1b_seen}|${arch_name}|"
             out="$out_dir/${arch_name}.hsaco"
-            printf '%s|%s|%s|%s\n' "$arch" "$arch_name" "$arch_src" "$out" >> "$JOB_FILE"
+            printf '%s|%s|%s|%s\n' "$arch" "$arch_name" "$arch_src" "$out" >>"$JOB_FILE"
         done
     done
 done
 
-TOTAL=$(wc -l < "$JOB_FILE")
+TOTAL=$(wc -l <"$JOB_FILE")
 echo "=== Compiling $TOTAL jobs across $JOBS workers... ==="
 
 # ── Phase 2: parallel dispatch ───────────────────────────────────────────
@@ -168,13 +176,13 @@ echo "=== Compiling $TOTAL jobs across $JOBS workers... ==="
 worker() {
     local job="$1"
     local arch name src out
-    IFS='|' read -r arch name src out <<< "$job"
+    IFS='|' read -r arch name src out <<<"$job"
 
     if hipcc --genco --offload-arch="$arch" -O3 -I "$SCRIPT_DIR/kernels/src" \
         -o "$out" "$src" 2>/dev/null; then
         local size
         size=$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out" 2>/dev/null)
-        printf 'OK  %-8s %s (%d KB)\n' "$arch" "$name" "$(( size / 1024 ))"
+        printf 'OK  %-8s %s (%d KB)\n' "$arch" "$name" "$((size / 1024))"
     else
         rm -f "$out"
         printf 'FAIL %-8s %s\n' "$arch" "$name"

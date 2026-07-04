@@ -21,9 +21,25 @@ import benchmark  # Triton-XDNA examples/benchmark.py (NPU backend selector)
 
 
 @triton.jit
-def mm(A, B, C, M, N, K, sam, sak, sbk, sbn, scm, scn,
-       BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
-    pm = tl.program_id(0); pn = tl.program_id(1)
+def mm(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    sbk,
+    sbn,
+    scm,
+    scn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
     om = pm * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     on = pn * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     ok = tl.arange(0, BLOCK_SIZE_K)
@@ -56,7 +72,7 @@ def main():
     for _ in range(it):
         mm[grid](*args, BLOCK_SIZE_M=BM, BLOCK_SIZE_N=BN, BLOCK_SIZE_K=K)
     t = (time.perf_counter() - t0) / it
-    print(f"RESULT {dt} M={M} N={N} K={K} BM={BM} BN={BN} time={t*1e3:.3f}ms TOPS={2*M*N*K/t/1e12:.2f}")
+    print(f"RESULT {dt} M={M} N={N} K={K} BM={BM} BN={BN} time={t * 1e3:.3f}ms TOPS={2 * M * N * K / t / 1e12:.2f}")
 
 
 if __name__ == "__main__":

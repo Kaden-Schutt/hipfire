@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -7,6 +27,8 @@
 //! Usage:
 //!   qwen35_hfq_modules probe MODEL.hfq
 //!   qwen35_hfq_modules repack INPUT.hfq OUTPUT.hfq
+
+#![allow(clippy::manual_checked_ops)]
 
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo, HFQM_MAGIC};
 use hipfire_runtime::hfq_modules::{
@@ -135,7 +157,7 @@ fn repack(input: &Path, output: &Path) {
     for _ in 0..16 {
         modules = materialize_modules(&module_specs, data_offset);
         metadata_json = metadata_with_modules(base_meta.clone(), &modules);
-        let unaligned = 32 + metadata_json.as_bytes().len() + index_len;
+        let unaligned = 32 + metadata_json.len() + index_len;
         let next = align_up(unaligned, 4096);
         if next == data_offset {
             break;
@@ -144,13 +166,13 @@ fn repack(input: &Path, output: &Path) {
     }
     modules = materialize_modules(&module_specs, data_offset);
     metadata_json = metadata_with_modules(base_meta, &modules);
-    data_offset = align_up(32 + metadata_json.as_bytes().len() + index_len, 4096);
+    data_offset = align_up(32 + metadata_json.len() + index_len, 4096);
     modules = materialize_modules(&module_specs, data_offset);
     metadata_json = metadata_with_modules(
         serde_json::from_str(&metadata_json).expect("metadata JSON"),
         &modules,
     );
-    data_offset = align_up(32 + metadata_json.as_bytes().len() + index_len, 4096);
+    data_offset = align_up(32 + metadata_json.len() + index_len, 4096);
 
     write_hfqm_v2(
         input,
@@ -514,7 +536,7 @@ fn group_always_resident(
 fn tensor_index_len(tensors: &[OrderedTensor]) -> usize {
     4 + tensors
         .iter()
-        .map(|t| 2 + t.info.name.as_bytes().len() + 1 + 1 + t.info.shape.len() * 4 + 4 + 8)
+        .map(|t| 2 + t.info.name.len() + 1 + 1 + t.info.shape.len() * 4 + 4 + 8)
         .sum::<usize>()
 }
 

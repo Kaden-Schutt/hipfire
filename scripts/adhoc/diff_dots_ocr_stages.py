@@ -31,16 +31,26 @@ import numpy as np
 
 STAGES = [
     "patch_embed",
-    "block_00_attn_out", "block_00",
-    "block_01_attn_out", "block_01",
-    "block_02_attn_out", "block_02",
-    "block_04_attn_out", "block_04",
-    "block_08_attn_out", "block_08",
-    "block_12_attn_out", "block_12",
-    "block_16_attn_out", "block_16",
-    "block_21_attn_out", "block_21",
-    "block_41_attn_out", "block_41",
-    "post_trunk_norm", "merger",
+    "block_00_attn_out",
+    "block_00",
+    "block_01_attn_out",
+    "block_01",
+    "block_02_attn_out",
+    "block_02",
+    "block_04_attn_out",
+    "block_04",
+    "block_08_attn_out",
+    "block_08",
+    "block_12_attn_out",
+    "block_12",
+    "block_16_attn_out",
+    "block_16",
+    "block_21_attn_out",
+    "block_21",
+    "block_41_attn_out",
+    "block_41",
+    "post_trunk_norm",
+    "merger",
 ]
 
 
@@ -76,7 +86,9 @@ def main() -> int:
     print(f"image:        {idx.get('image_path', '?')}")
     print(f"grid_thw:     {idx['image_grid_thw']}")
     print()
-    print(f"{'stage':18s}  {'hf shape':>15s}  {'our shape':>15s}  {'mean cos':>9s}  {'min cos':>9s}  {'max |Δ|':>10s}  {'mean |Δ|':>10s}  status")
+    print(
+        f"{'stage':18s}  {'hf shape':>15s}  {'our shape':>15s}  {'mean cos':>9s}  {'min cos':>9s}  {'max |Δ|':>10s}  {'mean |Δ|':>10s}  status"
+    )
     print("-" * 110)
 
     first_diverge = None
@@ -131,7 +143,9 @@ def main() -> int:
     print()
     d = diverge_details
     print(f"Worst {args.worst_n} rows by cosine (lowest similarity first):")
-    print(f"  {'sample':>6s}  {'row':>5s}  {'cos':>9s}  {'max |Δ|':>10s}  {'hf mean':>10s}  {'our mean':>10s}  {'hf norm':>10s}  {'our norm':>10s}")
+    print(
+        f"  {'sample':>6s}  {'row':>5s}  {'cos':>9s}  {'max |Δ|':>10s}  {'hf mean':>10s}  {'our mean':>10s}  {'hf norm':>10s}  {'our norm':>10s}"
+    )
     for r in d["row_order"][: args.worst_n]:
         gi = int(d["sample_idx"][r])
         cos_r = d["cos"][r]

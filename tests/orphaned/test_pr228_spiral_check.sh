@@ -31,9 +31,9 @@ OUT_DIR="/tmp/pr228-spiral-check-$$"
 mkdir -p "$OUT_DIR"
 
 run_one() {
-    local label="$1"  # filename suffix
-    local rp="$2"     # repeat_penalty
-    local env_pre="$3"  # extra env vars
+    local label="$1"   # filename suffix
+    local rp="$2"      # repeat_penalty
+    local env_pre="$3" # extra env vars
     local in_file="$OUT_DIR/in_${label}.jsonl"
     local out_file="$OUT_DIR/out_${label}.log"
 
@@ -45,14 +45,14 @@ run_one() {
     # daemon, no Jinja env-gate). max_tokens=800 matches the gate's
     # moe36-sheep row (line 126) and the gate-run report on this PR that
     # observed a full reasoning trace + </think> close at that budget.
-    cat > "$in_file" <<JL
+    cat >"$in_file" <<JL
 {"type":"load","model":"$MODEL","params":{"max_seq":4096}}
 {"type":"generate","id":"r1","prompt":$prompt_json,"temperature":0.0,"max_tokens":800,"repeat_penalty":$rp}
 {"type":"unload"}
 JL
 
     echo "=== Run $label: repeat_penalty=$rp $env_pre ==="
-    eval "$env_pre" timeout 360 "$DAEMON" < "$in_file" > "$out_file" 2>&1
+    eval "$env_pre" timeout 360 "$DAEMON" <"$in_file" >"$out_file" 2>&1
     local ec=$?
     local n_tokens
     n_tokens=$(grep -ac '"type":"token"' "$out_file")

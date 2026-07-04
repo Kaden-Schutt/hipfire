@@ -428,7 +428,7 @@ pub fn mtp_probe_step(
     }
     state.last_committed = Some(*committed.last().unwrap());
 
-    let eos_hit = committed.iter().any(|&t| t == eos_token);
+    let eos_hit = committed.contains(&eos_token);
 
     // EOS resets pending_candidate so a downstream caller that ignores the
     // eos_hit signal and keeps stepping won't carry stale speculation across

@@ -204,7 +204,7 @@ mod tests {
             let hpos_expected = want_hpos[i];
             let wpos_expected = want_wpos[i];
 
-            let got_h_cos = cos[i * head_dim + 0];
+            let got_h_cos = cos[i * head_dim];
             let got_w_cos = cos[i * head_dim + quarter];
             let want_h_cos = (hpos_expected as f32).cos();
             let want_w_cos = (wpos_expected as f32).cos();
@@ -337,7 +337,7 @@ mod tests {
         let (cos, _sin) = build_rope_2d_tables(2, 2, 128, 2, 10000.0);
         // Patch 2 has hpos=1 and wpos=0; cos[patch2, 0] = cos(1.0 * inv_freq[0])
         // = cos(1.0 * 1.0) = cos(1) ≈ 0.5403.
-        let got = cos[2 * 128 + 0];
+        let got = cos[2 * 128];
         let want = 1.0_f32.cos();
         assert!(
             (got - want).abs() < 1e-6,

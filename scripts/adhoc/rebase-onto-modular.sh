@@ -157,7 +157,7 @@ else
         for SED_EXPR in "${REWRITES[@]}"; do
             sed -i "$SED_EXPR" "$f" 2>/dev/null || true
         done
-    done <<< "$MODIFIED"
+    done <<<"$MODIFIED"
     echo "    rewrote imports in $(echo "$MODIFIED" | wc -l) files"
 fi
 

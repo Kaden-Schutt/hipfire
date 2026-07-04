@@ -8,6 +8,7 @@ Usage:
   .venv/bin/python3 scripts/count_corpus_tokens.py corpus/qwen36_dump.jsonl
   .venv/bin/python3 scripts/count_corpus_tokens.py corpus/*.jsonl
 """
+
 import argparse
 import json
 import sys
@@ -19,8 +20,7 @@ from transformers import AutoTokenizer
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("files", nargs="+", help="JSONL dump file(s) to count")
-    p.add_argument("--model", default="Qwen/Qwen3.5-27B",
-                   help="tokenizer model (default: Qwen/Qwen3.5-27B)")
+    p.add_argument("--model", default="Qwen/Qwen3.5-27B", help="tokenizer model (default: Qwen/Qwen3.5-27B)")
     args = p.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -70,12 +70,12 @@ def main() -> int:
         }
 
     print(f"{'File':<50} {'Records':>7} {'Tokenized':>10} {'Reported':>10}")
-    print(f"{'-'*50}")
+    print(f"{'-' * 50}")
     for fp, stats in per_file.items():
         name = fp.split("/")[-1] if "/" in fp else fp
         print(f"{name:<50} {stats['records']:>7} {stats['tokenized_tokens']:>10,} {stats['reported_tokens']:>10,}")
 
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
     print(f"{'TOTAL':<50} {total_records:>7} {total_tokens:>10,} {total_reported:>10,}")
     if total_reported > 0:
         ratio = total_tokens / total_reported * 100

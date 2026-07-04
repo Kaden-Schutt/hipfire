@@ -50,8 +50,7 @@ import torch.nn.functional as F
 
 
 DEFAULT_MODEL = (
-    "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/"
-    "snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"
+    "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"
 )
 DEFAULT_TEXT = "The capital of France is"
 
@@ -116,9 +115,7 @@ def _install_mamba_ssm_stub() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Dump a Nemotron-H HF/PyTorch reference for Hipfire comparison."
-    )
+    ap = argparse.ArgumentParser(description="Dump a Nemotron-H HF/PyTorch reference for Hipfire comparison.")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--out", default="/tmp/nemo_hf_ref.npz")
     ap.add_argument("--text", default=DEFAULT_TEXT)
@@ -378,8 +375,7 @@ def main() -> int:
         print(rendered)
 
     print(
-        f"loading model dtype={args.dtype} device={args.device} "
-        f"mamba_reference={args.mamba_reference}",
+        f"loading model dtype={args.dtype} device={args.device} mamba_reference={args.mamba_reference}",
         flush=True,
     )
     t_load = time.time()

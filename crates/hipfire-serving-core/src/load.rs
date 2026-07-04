@@ -1665,7 +1665,7 @@ pub fn load_model(
         let (vision_config, vision_weights) = if let Some(vc) = vision_config {
             if has_vision_tensors {
                 let vw = <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vc, gpu)
-                    .map_err(|e| format!("{e}"))?;
+                    .map_err(|e| e.to_string())?;
                 eprintln!(
                     "  VL model: vision encoder (hidden={}, layers={})",
                     vc.hidden_size, vc.num_layers

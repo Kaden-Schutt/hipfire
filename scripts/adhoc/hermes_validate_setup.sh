@@ -15,7 +15,6 @@
 set -euo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 export PATH=${TRIPWIRE_ROOT}/.cargo/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
 export HIP_PATH=/opt/rocm
 export ROCM_PATH=/opt/rocm

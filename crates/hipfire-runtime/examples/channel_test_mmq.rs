@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -231,8 +251,8 @@ struct SiteStats {
 impl SiteStats {
     fn header() {
         eprintln!(
-            "{:<6}  {:<20}  {:>6}  {:>6}  {:>6}  {:>10}  {:>10}  {:>8}  {}",
-            "layer", "site", "m", "k", "batch", "max_err", "mean_err", "bad", "status"
+            "{:<6}  {:<20}  {:>6}  {:>6}  {:>6}  {:>10}  {:>10}  {:>8}  status",
+            "layer", "site", "m", "k", "batch", "max_err", "mean_err", "bad"
         );
         eprintln!("{}", "-".repeat(90));
     }

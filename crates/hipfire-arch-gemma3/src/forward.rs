@@ -82,7 +82,7 @@ impl Gemma3State {
         // q8_0 KV requires head_dim divisible by the 32-element block; fall back
         // to F32 otherwise. K/V cache slots are q8_0 blocks (32 int8 + fp16
         // scale = 34 bytes each), allocated as an F32 tensor sized by bytes.
-        let kv_quant_q8 = quant_q8 && cfg.head_dim % 32 == 0;
+        let kv_quant_q8 = quant_q8 && cfg.head_dim.is_multiple_of(32);
         let mut k_cache = Vec::with_capacity(cfg.num_hidden_layers);
         let mut v_cache = Vec::with_capacity(cfg.num_hidden_layers);
         let cache_elems = if kv_quant_q8 {

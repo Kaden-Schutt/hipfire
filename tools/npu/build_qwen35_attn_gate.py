@@ -49,34 +49,34 @@ from aie.utils.compile import compile_mlir_module, compile_external_kernel
 SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_SRC = SCRIPT_DIR / "sigmoid_mul_bf16.cc"
 
-_mlir_aie_pkg = next(
-    (Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None
-)
+_mlir_aie_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
 AIE_INCLUDE = _mlir_aie_pkg / "mlir_aie" / "include" if _mlir_aie_pkg else None
 
 _NPU_DEVICES = {
-    "npu1": (NPU1, "aie2",  "AIE2"),
+    "npu1": (NPU1, "aie2", "AIE2"),
     "npu2": (NPU2, "aie2p", "AIE2P"),
 }
 
 _NAME_TO_NPU = {
-    "npu1":    "npu1",
+    "npu1": "npu1",
     "Phoenix": "npu1",
-    "npu4":    "npu2",
-    "npu5":    "npu2",
-    "npu6":    "npu2",
-    "Strix":   "npu2",
+    "npu4": "npu2",
+    "npu5": "npu2",
+    "npu6": "npu2",
+    "Strix": "npu2",
     "Krackan": "npu2",
 }
 
 
 def detect_npu() -> str:
     import ctypes
+
     ctypes.CDLL("/opt/xilinx/xrt/lib/libxrt_coreutil.so.2", mode=ctypes.RTLD_GLOBAL)
     xrt_py = "/opt/xilinx/xrt/python"
     if xrt_py not in sys.path:
         sys.path.insert(0, xrt_py)
     import pyxrt
+
     device = pyxrt.device(0)
     name = device.get_info(pyxrt.xrt_info_device.name)
     for substr, key in _NAME_TO_NPU.items():
@@ -85,8 +85,7 @@ def detect_npu() -> str:
     raise RuntimeError(f"Cannot map device name {name!r}. Pass --npu explicitly.")
 
 
-def build(n_heads: int, head_dim: int, out_dir: Path,
-          tile_size: int = 16, npu: str = "auto") -> None:
+def build(n_heads: int, head_dim: int, out_dir: Path, tile_size: int = 16, npu: str = "auto") -> None:
     if npu == "auto":
         npu = detect_npu()
         print(f"[build_qwen35_attn_gate] detected NPU: {npu}")
@@ -96,12 +95,14 @@ def build(n_heads: int, head_dim: int, out_dir: Path,
 
     q_dim = n_heads * head_dim
     xclbin_name = f"qwen35-attn-gate-{n_heads}h{head_dim}d.xclbin"
-    instr_name  = f"qwen35-attn-gate-{n_heads}h{head_dim}d-instr.bin"
+    instr_name = f"qwen35-attn-gate-{n_heads}h{head_dim}d-instr.bin"
     xclbin_path = out_dir / xclbin_name
-    instr_path  = out_dir / instr_name
+    instr_path = out_dir / instr_name
 
-    print(f"[build_qwen35_attn_gate] n_heads={n_heads} head_dim={head_dim} "
-          f"q_dim={q_dim} tile_size={tile_size} npu={npu} arch={target_arch}")
+    print(
+        f"[build_qwen35_attn_gate] n_heads={n_heads} head_dim={head_dim} "
+        f"q_dim={q_dim} tile_size={tile_size} npu={npu} arch={target_arch}"
+    )
     print(f"  xclbin → {xclbin_path}")
     print(f"  instr  → {instr_path}")
 
@@ -110,6 +111,7 @@ def build(n_heads: int, head_dim: int, out_dir: Path,
 
     set_current_device(device_cls())
     from aie.utils import get_current_device
+
     num_cols = get_current_device().cols
     min_multiple = tile_size * num_cols
     if q_dim % min_multiple != 0:
@@ -120,10 +122,7 @@ def build(n_heads: int, head_dim: int, out_dir: Path,
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    runtime_lib = (
-        _mlir_aie_pkg / "mlir_aie" / "aie_runtime_lib" / runtime_subdir
-        if _mlir_aie_pkg else None
-    )
+    runtime_lib = _mlir_aie_pkg / "mlir_aie" / "aie_runtime_lib" / runtime_subdir if _mlir_aie_pkg else None
 
     tile_ty: Any = np.ndarray[(tile_size,), np.dtype[bfloat16]]
     include_dirs = []
@@ -140,17 +139,15 @@ def build(n_heads: int, head_dim: int, out_dir: Path,
     )
 
     gate_buf = np.zeros(q_dim, dtype=bfloat16)
-    x_buf    = np.zeros(q_dim, dtype=bfloat16)
-    out_buf  = np.zeros(q_dim, dtype=bfloat16)
+    x_buf = np.zeros(q_dim, dtype=bfloat16)
+    out_buf = np.zeros(q_dim, dtype=bfloat16)
 
-    mlir_module = transform_parallel_binary(
-        kernel, gate_buf, x_buf, out_buf, tile_size=tile_size
-    )
+    mlir_module = transform_parallel_binary(kernel, gate_buf, x_buf, out_buf, tile_size=tile_size)
 
     with tempfile.TemporaryDirectory(prefix="hipfire_npu_build_") as tmp:
-        tmp_path   = Path(tmp)
+        tmp_path = Path(tmp)
         tmp_xclbin = tmp_path / "final.xclbin"
-        tmp_instr  = tmp_path / "insts.bin"
+        tmp_instr = tmp_path / "insts.bin"
 
         compile_external_kernel(kernel, tmp_path, target_arch=target_arch)
         compile_mlir_module(
@@ -160,7 +157,7 @@ def build(n_heads: int, head_dim: int, out_dir: Path,
             work_dir=tmp_path,
         )
         shutil.copy2(tmp_xclbin, xclbin_path)
-        shutil.copy2(tmp_instr,  instr_path)
+        shutil.copy2(tmp_instr, instr_path)
 
     print(f"  xclbin: {xclbin_path.stat().st_size} bytes")
     print(f"  instr:  {instr_path.stat().st_size} bytes")
@@ -171,12 +168,11 @@ def build(n_heads: int, head_dim: int, out_dir: Path,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--n-heads",  type=int, required=True, help="Number of Q heads")
-    parser.add_argument("--head-dim", type=int, default=256,   help="Head dimension (default: 256)")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--n-heads", type=int, required=True, help="Number of Q heads")
+    parser.add_argument("--head-dim", type=int, default=256, help="Head dimension (default: 256)")
     parser.add_argument("--tile-size", type=int, default=16)
-    parser.add_argument("--out-dir",  type=Path, default=Path("target/npu"))
+    parser.add_argument("--out-dir", type=Path, default=Path("target/npu"))
     parser.add_argument("--npu", choices=["auto"] + list(_NPU_DEVICES), default="auto")
     args = parser.parse_args()
     if args.tile_size % 16 != 0:

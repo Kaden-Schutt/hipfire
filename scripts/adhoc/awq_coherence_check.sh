@@ -58,7 +58,7 @@ run_one_prompt() {
     # Run REPL: pipe prompt + EOF. --max-seq 4096 gives ~800 token budget after prompt.
     # No --temp → defaults to 0.3 (slight sampling; deterministic-enough for eyeball).
     # 2>&1 captures loading logs + generated text + REPL prompt markers.
-    echo "$prompt" | timeout 180 "$RUN_BIN" "$model" --max-seq 4096 > "$out" 2>&1 \
+    echo "$prompt" | timeout 180 "$RUN_BIN" "$model" --max-seq 4096 >"$out" 2>&1 \
         || echo "  WARN: run exited with $? (may be timeout/normal-EOF)"
     # Show the part after first ">>> " marker (skips load logs, captures actual generation)
     echo "  --- generated text (post-prompt) ---"
@@ -86,7 +86,7 @@ quantize_9b() {
         --format mq4g256 \
         --imatrix "$IMATRIX_9B" \
         --awq-alpha "$alpha" \
-        > "$OUT_DIR/9b-a${alpha//./_}.quantize.log" 2>&1
+        >"$OUT_DIR/9b-a${alpha//./_}.quantize.log" 2>&1
     if ! grep -q "^AWQ pre-scaling: ENABLED" "$OUT_DIR/9b-a${alpha//./_}.quantize.log"; then
         echo "FATAL: AWQ did not enable on 9B α=$alpha quantize" >&2
         exit 1
@@ -104,7 +104,7 @@ quantize_08b() {
             --input "$BF16_08B" \
             --output "$QUANT_SLOT_08B" \
             --format mq4g256 \
-            > "$OUT_DIR/0.8b-a${alpha//./_}.quantize.log" 2>&1
+            >"$OUT_DIR/0.8b-a${alpha//./_}.quantize.log" 2>&1
     else
         "$QUANT_BIN" \
             --input "$BF16_08B" \
@@ -112,7 +112,7 @@ quantize_08b() {
             --format mq4g256 \
             --imatrix "$IMATRIX_08B" \
             --awq-alpha "$alpha" \
-            > "$OUT_DIR/0.8b-a${alpha//./_}.quantize.log" 2>&1
+            >"$OUT_DIR/0.8b-a${alpha//./_}.quantize.log" 2>&1
         if ! grep -q "^AWQ pre-scaling: ENABLED" "$OUT_DIR/0.8b-a${alpha//./_}.quantize.log"; then
             echo "FATAL: AWQ did not enable on 0.8B α=$alpha quantize" >&2
             exit 1

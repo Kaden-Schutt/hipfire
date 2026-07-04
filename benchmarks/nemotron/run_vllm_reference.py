@@ -29,17 +29,14 @@ from vllm import LLM, SamplingParams
 
 
 DEFAULT_MODEL = (
-    "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/"
-    "snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"
+    "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"
 )
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument(
-        "--text", default="Answer in one short sentence: What is 2+2?"
-    )
+    ap.add_argument("--text", default="Answer in one short sentence: What is 2+2?")
     ap.add_argument("--system", default=None)
     ap.add_argument("--thinking", choices=["off", "on"], default="off")
     ap.add_argument("--max-tokens", type=int, default=16)
@@ -75,9 +72,7 @@ def render_prompt(tok: AutoTokenizer, args: argparse.Namespace) -> str:
 def main() -> None:
     args = parse_args()
     model = str(args.model)
-    tok = AutoTokenizer.from_pretrained(
-        model, trust_remote_code=True, local_files_only=True
-    )
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True, local_files_only=True)
     prompt = render_prompt(tok, args)
     prompt_ids = tok.encode(prompt, add_special_tokens=False)
     stop_ids = [tok.convert_tokens_to_ids("<|im_end|>")]

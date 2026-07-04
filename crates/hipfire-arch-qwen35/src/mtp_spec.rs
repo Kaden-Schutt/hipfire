@@ -144,7 +144,7 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
 /// disable); an explicit `set_p_min` call still wins. (Ported from bc5d005d
 /// with the arch gate corrected to gfx110x.)
 fn default_mtp_p_min(arch: &str) -> f32 {
-    if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
+    if let Ok(v) = std::env::var("HIPFIRE_MTP_P_MIN") {
         return v
             .trim()
             .parse::<f32>()
@@ -1085,7 +1085,7 @@ fn greedy_trunk_spine_accept(
     eos_token_id: u32,
 ) -> GreedyTrunkSpineAccept {
     assert!(
-        argmax_per_pos.len() >= candidates.len() + 1,
+        argmax_per_pos.len() > candidates.len(),
         "greedy_trunk_spine_accept: need at least candidates+1 argmax rows \
          (got {}, candidates={})",
         argmax_per_pos.len(),
@@ -3004,15 +3004,13 @@ pub fn spec_step_mtp_compressed_serial(
 
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
-    if cur_pos < 1000 {
-        if std::env::var("HIPFIRE_HETERO_DIFF").is_ok() {
-            // NOTE: argmax_per_pos is now scoped to the host-accept branch
-            // above (#352's GPU greedy-accept path doesn't materialize it),
-            // so it's dropped from this hetero-diff diagnostic.
-            eprintln!(
+    if cur_pos < 1000 && std::env::var("HIPFIRE_HETERO_DIFF").is_ok() {
+        // NOTE: argmax_per_pos is now scoped to the host-accept branch
+        // above (#352's GPU greedy-accept path doesn't materialize it),
+        // so it's dropped from this hetero-diff diagnostic.
+        eprintln!(
                 "[single-diff] cycle@cur_pos={cur_pos} candidates={candidates:?} accept={accept_count} commit={committed:?}"
             );
-        }
     }
 
     // h_idx contract (audited 2026-05-21 vs AtomicBot atomic-llama-cpp-

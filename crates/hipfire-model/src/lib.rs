@@ -1482,7 +1482,7 @@ fn metadata_model_name(metadata: &Value, fallback_path: &Path) -> String {
         .into_iter()
         .filter_map(metadata_string)
         .filter_map(|name| {
-            let trimmed = name.trim().trim_end_matches(|c| c == '/' || c == '\\');
+            let trimmed = name.trim().trim_end_matches(['/', '\\']);
             let leaf = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim();
             (!leaf.is_empty() && leaf != ".").then(|| leaf.to_string())
         })
@@ -1809,9 +1809,7 @@ fn is_feature_group(group: &str) -> bool {
 
 fn parse_model_identity(identity: &str) -> Option<(String, Option<String>, Vec<String>)> {
     let parts = identity.split('-').collect::<Vec<_>>();
-    let Some(size_idx) = parts.iter().position(|part| is_size_token(part)) else {
-        return None;
-    };
+    let size_idx = parts.iter().position(|part| is_size_token(part))?;
     let model = parts[..size_idx].join("-");
     if model.is_empty() {
         return None;

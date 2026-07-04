@@ -16,7 +16,8 @@ hip-bridge = { path = "../hip-bridge" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 serde.workspace = true
 serde_json = { version = "1", features = ["preserve_order"] }
-hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = [
+  "from-hip-error",
+] }
 
 [features]
-

@@ -40,8 +40,7 @@ def main():
     print(f"[bench_oq_gemm] device={design.NPU_DEVICE}  M={M} K={K} groups={K // 256}")
     print(f"  weight bytes (int8 M·K) = {M * K / 1e6:.2f} MB streamed per matmul")
     print()
-    print(f"  {'B':>5} {'tile(m,k,n)':>14} {'npu_us':>9} {'e2e_us':>9} "
-          f"{'GFLOP/s':>8} {'wBW GB/s':>9} {'us/token':>9}")
+    print(f"  {'B':>5} {'tile(m,k,n)':>14} {'npu_us':>9} {'e2e_us':>9} {'GFLOP/s':>8} {'wBW GB/s':>9} {'us/token':>9}")
     rng = np.random.default_rng(0)
     W = rng.integers(-64, 64, size=(M, K), dtype=np.int8)
     for B in Bs:
@@ -51,10 +50,9 @@ def main():
         e2e_us = bench.e2e.avg_us
         flops = 2.0 * M * K * B
         gflops = flops / (npu_us * 1e3)
-        wbw = (M * K) / (npu_us * 1e3)      # bytes/us = GB/s (int8 weight stream)
+        wbw = (M * K) / (npu_us * 1e3)  # bytes/us = GB/s (int8 weight stream)
         us_tok = e2e_us / B
-        print(f"  {B:>5} {str(tile):>14} {npu_us:>9.1f} {e2e_us:>9.1f} "
-              f"{gflops:>8.1f} {wbw:>9.1f} {us_tok:>9.1f}")
+        print(f"  {B:>5} {str(tile):>14} {npu_us:>9.1f} {e2e_us:>9.1f} {gflops:>8.1f} {wbw:>9.1f} {us_tok:>9.1f}")
 
 
 if __name__ == "__main__":

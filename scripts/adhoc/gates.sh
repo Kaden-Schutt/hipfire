@@ -28,23 +28,49 @@
 # BENCH_MODEL, HIPFIRE_KV_MODE, HIPFIRE_PFLASH_*, HIPFIRE_DFLASH_*, …).
 set -uo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)" || { echo "gates.sh: not a git repo" >&2; exit 2; }
+ROOT="$(git rev-parse --show-toplevel)" || {
+    echo "gates.sh: not a git repo" >&2
+    exit 2
+}
 cd "$ROOT"
 G="$ROOT/scripts"
 
-FULL=""; PERF=1; PERF_STRICT=0; PERF_BASE="HEAD~1"; DFLASH="auto"; PERF_THRESH=5.0
+FULL=""
+PERF=1
+PERF_STRICT=0
+PERF_BASE="HEAD~1"
+DFLASH="auto"
+PERF_THRESH=5.0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --full)            FULL="--full" ;;
-        --coherence-only)  PERF=0; DFLASH="off" ;;
-        --no-perf)         PERF=0 ;;
-        --perf)            PERF=1; if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then PERF_BASE="$2"; shift; fi ;;
-        --perf-strict)     PERF=1; PERF_STRICT=1 ;;
-        --dflash)          DFLASH="on" ;;
-        --no-dflash)       DFLASH="off" ;;
-        -h|--help)         sed -n '7,30p' "$0"; exit 0 ;;
-        *) echo "gates.sh: unknown arg: $1" >&2; exit 2 ;;
+        --full) FULL="--full" ;;
+        --coherence-only)
+            PERF=0
+            DFLASH="off"
+            ;;
+        --no-perf) PERF=0 ;;
+        --perf)
+            PERF=1
+            if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then
+                PERF_BASE="$2"
+                shift
+            fi
+            ;;
+        --perf-strict)
+            PERF=1
+            PERF_STRICT=1
+            ;;
+        --dflash) DFLASH="on" ;;
+        --no-dflash) DFLASH="off" ;;
+        -h | --help)
+            sed -n '7,30p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "gates.sh: unknown arg: $1" >&2
+            exit 2
+            ;;
     esac
     shift
 done
@@ -74,11 +100,15 @@ echo "=== hipfire gates.sh ==="
 echo "head=$HEAD_SHORT  perf=$([ $PERF -eq 1 ] && echo "on(base ${PERF_BASE})" || echo off)  dflash=$DFLASH  full=${FULL:-no}  perf_strict=$PERF_STRICT"
 echo
 
-COH_RC=0; DFL_RC="skip"; PERF_NOTE="skipped"; OVERALL=0
+COH_RC=0
+DFL_RC="skip"
+PERF_NOTE="skipped"
+OVERALL=0
 
 # ── [1] Coherence — HARD gate ──────────────────────────────────────────
 echo "── coherence-gate.sh ${FULL} ──"
-"$G/coherence-gate.sh" $FULL; COH_RC=$?
+"$G/coherence-gate.sh" $FULL
+COH_RC=$?
 [ "$COH_RC" -ne 0 ] && OVERALL=1
 echo "coherence: rc=$COH_RC $([ "$COH_RC" -eq 0 ] && echo PASS || echo FAIL)"
 echo
@@ -86,7 +116,8 @@ echo
 # ── [2] DFlash spec-decode — HARD gate (conditional) ───────────────────
 if [ "$DFLASH" = "on" ]; then
     echo "── coherence-gate-dflash.sh ${FULL} ──"
-    "$G/coherence-gate-dflash.sh" $FULL; DFL_RC=$?
+    "$G/coherence-gate-dflash.sh" $FULL
+    DFL_RC=$?
     [ "$DFL_RC" -ne 0 ] && OVERALL=1
     echo "dflash: rc=$DFL_RC $([ "$DFL_RC" -eq 0 ] && echo PASS || echo FAIL)"
     echo
@@ -99,7 +130,8 @@ if [ "$PERF" -eq 1 ]; then
     echo "$PROBE_OUT"
     mapfile -t TOKS < <(echo "$PROBE_OUT" | grep -oE '[0-9.]+ tok/s' | grep -oE '^[0-9.]+')
     if [ "${#TOKS[@]}" -ge 2 ]; then
-        BASE_TOK="${TOKS[0]}"; HEAD_TOK="${TOKS[1]}"
+        BASE_TOK="${TOKS[0]}"
+        HEAD_TOK="${TOKS[1]}"
         DELTA=$(awk -v a="$BASE_TOK" -v b="$HEAD_TOK" 'BEGIN{ if(a>0) printf "%.2f",(b-a)/a*100; else print "nan" }')
         PERF_NOTE="base=${BASE_TOK} head=${HEAD_TOK} Δ=${DELTA}%"
         ABS_GE=$(awk -v d="$DELTA" -v t="$PERF_THRESH" 'BEGIN{ dd=(d<0)?-d:d; print (dd>=t)?1:0 }')

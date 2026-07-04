@@ -80,8 +80,7 @@ IMAGE_PATH = REPO / "benchmarks" / "images" / "dots_ocr_smoke_001.jpg"
 OUT_PATH = REPO / "benchmarks" / "references" / "dots_ocr_smoke_001.json"
 MODEL_ID = "rednote-hilab/dots.ocr"
 SNAPSHOT = (
-    "/data/cache/huggingface/hub/models--rednote-hilab--dots.ocr/"
-    "snapshots/c0111ce6bc07803dbc267932ffef0ae3a51dc951"
+    "/data/cache/huggingface/hub/models--rednote-hilab--dots.ocr/snapshots/c0111ce6bc07803dbc267932ffef0ae3a51dc951"
 )
 
 # Canonical dots.ocr layout-extraction prompt, from
@@ -122,8 +121,7 @@ def main() -> int:
         return 1
     if not Path(SNAPSHOT).is_dir():
         print(
-            f"error: model snapshot not found: {SNAPSHOT}\n"
-            f"  hint: huggingface-cli download {MODEL_ID}",
+            f"error: model snapshot not found: {SNAPSHOT}\n  hint: huggingface-cli download {MODEL_ID}",
             file=sys.stderr,
         )
         return 1
@@ -254,13 +252,12 @@ def main() -> int:
 
     print("applying chat template + processing image...")
     t0 = time.time()
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     # Re-use the dots.ocr github checkout's qwen_vl_utils for image
     # resolution / preprocessing.
     from qwen_vl_utils import process_vision_info
+
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
@@ -297,10 +294,7 @@ def main() -> int:
     logit_dump: dict[str, list[dict[str, float]]] = {}
     for p in top_positions:
         vals, ids = torch.topk(logits[p], k=100)
-        logit_dump[f"pos_{p}"] = [
-            {"token_id": int(t), "logit": float(v)}
-            for t, v in zip(ids.tolist(), vals.tolist())
-        ]
+        logit_dump[f"pos_{p}"] = [{"token_id": int(t), "logit": float(v)} for t, v in zip(ids.tolist(), vals.tolist())]
 
     # ── Greedy decode 200 tokens. dots.ocr's typical layout output runs
     # many thousands of tokens; this cap bounds the one-time reference-
@@ -314,10 +308,7 @@ def main() -> int:
     # Forward accepts it; `generate` (transformers 5.5.1) rejects it
     # via `_validate_model_kwargs`. Filter explicitly.
     GEN_KWARG_DROP = {"mm_token_type_ids"}
-    gen_inputs = {
-        k: v for k, v in inputs.items()
-        if isinstance(v, torch.Tensor) and k not in GEN_KWARG_DROP
-    }
+    gen_inputs = {k: v for k, v in inputs.items() if isinstance(v, torch.Tensor) and k not in GEN_KWARG_DROP}
     with torch.no_grad():
         gen = model.generate(
             **gen_inputs,
@@ -333,9 +324,7 @@ def main() -> int:
     completion_ids = gen[0, n_prompt:].tolist()
     n_completion = len(completion_ids)
 
-    completion_text = processor.tokenizer.decode(
-        completion_ids, skip_special_tokens=False
-    )
+    completion_text = processor.tokenizer.decode(completion_ids, skip_special_tokens=False)
     print(f"completion ({n_completion} tokens): {completion_text[:200]!r}...")
 
     # Best-effort JSON parse. Truncation at 200 tokens almost certainly
@@ -343,9 +332,7 @@ def main() -> int:
     # the parse status so consumers don't conflate the two.
     parsed_json = None
     parse_status = "truncated_at_max_new_tokens"
-    decoded_clean = processor.tokenizer.decode(
-        completion_ids, skip_special_tokens=True
-    )
+    decoded_clean = processor.tokenizer.decode(completion_ids, skip_special_tokens=True)
     try:
         parsed_json = json.loads(decoded_clean)
         parse_status = "ok"
@@ -369,14 +356,8 @@ def main() -> int:
     completion_first10 = completion_ids[:10]
     # Heuristic: if the same token appears in 4+ of the first 10
     # generated tokens, flag the decode as degraded.
-    most_common_count = max(
-        completion_first10.count(t) for t in set(completion_first10)
-    ) if completion_first10 else 0
-    decode_quality = (
-        "degraded_cpu_bf16_collapse"
-        if most_common_count >= 4
-        else "ok_first_10_diverse"
-    )
+    most_common_count = max(completion_first10.count(t) for t in set(completion_first10)) if completion_first10 else 0
+    decode_quality = "degraded_cpu_bf16_collapse" if most_common_count >= 4 else "ok_first_10_diverse"
 
     artifact = {
         "model_id": MODEL_ID,
@@ -393,11 +374,7 @@ def main() -> int:
         "prompt_template_text": PROMPT_LAYOUT_ALL_EN,
         "input_token_ids": input_ids[0].tolist(),
         "n_prompt_tokens": n_prompt,
-        "image_grid_thw": (
-            inputs["image_grid_thw"].tolist()
-            if "image_grid_thw" in inputs
-            else None
-        ),
+        "image_grid_thw": (inputs["image_grid_thw"].tolist() if "image_grid_thw" in inputs else None),
         "completion_token_ids": completion_ids,
         "n_completion_tokens": n_completion,
         "completion_text_partial": completion_text,

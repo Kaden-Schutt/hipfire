@@ -176,8 +176,8 @@ fn erf(x: f32) -> f32 {
     let x = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * x);
     let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
             * t
             * (-x * x).exp();
     sign * y
@@ -363,7 +363,7 @@ fn cca_attention(
     let mut value = vec![0f32; s * nkv * hd];
     for t in 0..s {
         for d in 0..v_half {
-            value[(t * nkv + 0) * hd + d] = v_cur[t * v_half + d];
+            value[(t * nkv) * hd + d] = v_cur[t * v_half + d];
             value[(t * nkv + 1) * hd + d] = if t == 0 {
                 0.0
             } else {

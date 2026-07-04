@@ -38,17 +38,29 @@ PROMPT="Write a Python function that implements an LRU cache with a configurable
 
 # ── build if stale ──
 if [ ! -x "$EXE" ] || [ crates/hipfire-daemon/src/main.rs -nt "$EXE" ] \
-   || [ crates/hipfire-arch-qwen35/src/mtp_spec.rs -nt "$EXE" ] \
-   || [ crates/hipfire-arch-qwen35/src/qwen35.rs -nt "$EXE" ]; then
+    || [ crates/hipfire-arch-qwen35/src/mtp_spec.rs -nt "$EXE" ] \
+    || [ crates/hipfire-arch-qwen35/src/qwen35.rs -nt "$EXE" ]; then
     echo "bench-ppmtp-split: building daemon..." >&2
-    cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2 || { echo "build failed" >&2; exit 2; }
+    cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2 || {
+        echo "build failed" >&2
+        exit 2
+    }
 fi
 
-[ -f "$MODEL" ]    || { echo "model not found: $MODEL" >&2; exit 2; }
-[ -f "$MTP_HEAD" ] || { echo "mtp head not found: $MTP_HEAD" >&2; exit 2; }
+[ -f "$MODEL" ] || {
+    echo "model not found: $MODEL" >&2
+    exit 2
+}
+[ -f "$MTP_HEAD" ] || {
+    echo "mtp head not found: $MTP_HEAD" >&2
+    exit 2
+}
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-ppmtp-split" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-ppmtp-split" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -63,7 +75,7 @@ prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$PRO
     echo
     echo "| cell | pp | split | spec_path | tok/s | decode tok/s | τ | accept | cycles | wall(s) |"
     echo "|---|---|---|---|---|---|---|---|---|---|"
-} > "$OUT"
+} >"$OUT"
 
 # Args: label  pp  use_mtp  split(or "-")
 run_cell() {
@@ -72,9 +84,10 @@ run_cell() {
     [ "$use_mtp" -eq 1 ] && mtp_param=",\"mtp_head\":\"$MTP_HEAD\""
 
     local in_file out_file
-    in_file=$(mktemp); out_file=$(mktemp)
+    in_file=$(mktemp)
+    out_file=$(mktemp)
     # One warmup generate (short) then the measured generate. Fresh load.
-    cat > "$in_file" <<JL
+    cat >"$in_file" <<JL
 {"type":"load","model":"$MODEL","params":{"max_seq":4096,"pp":$pp,"kv_mode":"asym3"$mtp_param}}
 {"type":"generate","id":"warm","prompt":${prompt_json},"temperature":0.0,"max_tokens":16,"repeat_penalty":1.0}
 {"type":"generate","id":"meas","prompt":${prompt_json},"temperature":0.0,"max_tokens":$MAX,"repeat_penalty":1.0}
@@ -88,7 +101,7 @@ JL
     local t0 t1 wall
     t0=$(date +%s.%N)
     env HIPFIRE_ALLOW_MIXED_ARCH=1 $split_env \
-        timeout 600 "$EXE" < "$in_file" > "$out_file" 2>&1
+        timeout 600 "$EXE" <"$in_file" >"$out_file" 2>&1
     t1=$(date +%s.%N)
     wall=$(python3 -c "print(f'{$t1-$t0:.1f}')")
 
@@ -112,15 +125,15 @@ PY
 }
 
 # References
-run_cell "pp1-mtp"   1 1 -
-run_cell "pp2-ar"    2 0 48,16
+run_cell "pp1-mtp" 1 1 -
+run_cell "pp2-ar" 2 0 48,16
 # PpMtp split sweep
 run_cell "ppmtp-48-16" 2 1 48,16
 run_cell "ppmtp-52-12" 2 1 52,12
 run_cell "ppmtp-56-08" 2 1 56,8
 
-echo >> "$OUT"
-echo "Cheapest-step note: byte-identical prompt (md5 $prompt_md5), 1 warmup + 1 measured per cell, fresh process per cell." >> "$OUT"
+echo >>"$OUT"
+echo "Cheapest-step note: byte-identical prompt (md5 $prompt_md5), 1 warmup + 1 measured per cell, fresh process per cell." >>"$OUT"
 echo
 echo "bench report: $OUT"
 cat "$OUT"

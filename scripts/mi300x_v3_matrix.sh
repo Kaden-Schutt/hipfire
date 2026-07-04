@@ -62,10 +62,16 @@ BENCH_MAX="${BENCH_MAX:-120}"
 COHERENCE_MAX_TOKENS="${COHERENCE_MAX_TOKENS:-200}"
 
 # ── Helpers ────────────────────────────────────────────────────────────────
-phase() { echo; echo "═══ [$(date +%H:%M:%S)] $* ═══"; }
-ok()    { printf "    \033[32m✓\033[0m %s\n" "$*"; }
-warn()  { printf "    \033[33m!\033[0m %s\n" "$*"; }
-die()   { printf "    \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
+phase() {
+    echo
+    echo "═══ [$(date +%H:%M:%S)] $* ═══"
+}
+ok() { printf "    \033[32m✓\033[0m %s\n" "$*"; }
+warn() { printf "    \033[33m!\033[0m %s\n" "$*"; }
+die() {
+    printf "    \033[31m✗\033[0m %s\n" "$*" >&2
+    exit 1
+}
 
 # Resolve a pinned HF snapshot to a local path.
 resolve_snapshot() {
@@ -84,7 +90,7 @@ ensure_kldref() {
     local slug="$1" bf16_dir="$2"
     local out_dir="$WORK/kldref"
     mkdir -p "$out_dir"
-    local kldref="$out_dir/${slug}-bf16.kldref"   # hipfire-self HFKREF
+    local kldref="$out_dir/${slug}-bf16.kldref" # hipfire-self HFKREF
     if [ -s "$kldref" ]; then
         ok "kldref cached: $kldref"
         echo "$kldref"
@@ -119,15 +125,15 @@ run_one() {
         bf16_dir=$(resolve_snapshot "$repo" "$rev")
         ok "BF16 source: $bf16_dir"
 
-        local awq_args=( --input "$bf16_dir" --output "$awq_base"
-                         --format mq4 --awq --awq-alpha 0.5
-                         --imatrix "$imatrix" )
+        local awq_args=(--input "$bf16_dir" --output "$awq_base"
+            --format mq4 --awq --awq-alpha 0.5
+            --imatrix "$imatrix")
         # MoE router exclusion for A3B unless explicitly opted in
         if [ "$slug" = "qwen3.6-35b-a3b" ] && [ "$A3B_INCLUDE_ROUTER" != "1" ]; then
-            awq_args+=( --awq-exclude-pattern "router.weight" )
+            awq_args+=(--awq-exclude-pattern "router.weight")
             ok "A3B: excluding router from AWQ (set A3B_INCLUDE_ROUTER=1 to override)"
         fi
-        ( cd "$HIPFIRE" && ./target/release/hipfire-quantize "${awq_args[@]}" ) 2>&1 \
+        (cd "$HIPFIRE" && ./target/release/hipfire-quantize "${awq_args[@]}") 2>&1 \
             | tail -15 | tee "$model_out_dir/stage1_awq.log"
         [ -f "$awq_base" ] || die "stage 1 produced no output"
         local sz=$(stat -c%s "$awq_base")
@@ -166,7 +172,7 @@ run_one() {
     local kld_json="$model_out_dir/kld.json"
     if [ ! -s "$kld_json" ]; then
         KLD_DAEMON_LOG="$model_out_dir/kld.log" \
-            kld_score "$v3_out" "$kldref" "$model_out_dir/kld.kldseq" "" "$EVAL_KV_MODE" "$EVAL_CTX" > "$kld_json"
+            kld_score "$v3_out" "$kldref" "$model_out_dir/kld.kldseq" "" "$EVAL_KV_MODE" "$EVAL_CTX" >"$kld_json"
     fi
     [ -s "$kld_json" ] && ok "KLD eval: $(jq -r '"KLD=" + (.mean_kld|tostring) + " PPL=" + (.ppl|tostring)' "$kld_json")"
 
@@ -186,17 +192,19 @@ run_one() {
     # Stage 6: tok/s — daemon generate `done` event carries decode/prefill tok_s.
     local bench_json="$model_out_dir/bench.json"
     if [ ! -s "$bench_json" ]; then
-        local dbin; dbin=$(kld_daemon_bin) && {
-            { printf '{"type":"load","model":"%s","params":{"max_seq":%d,"kv_cache":"%s"}}\n' "$v3_out" $((BENCH_MAX + 512)) "$EVAL_KV_MODE"
-              printf '{"type":"generate","prompt":"Write a long technical essay.","params":{"max_tokens":%d,"temperature":0.0,"no_chatml":true}}\n' "$BENCH_MAX"
+        local dbin
+        dbin=$(kld_daemon_bin) && {
+            {
+                printf '{"type":"load","model":"%s","params":{"max_seq":%d,"kv_cache":"%s"}}\n' "$v3_out" $((BENCH_MAX + 512)) "$EVAL_KV_MODE"
+                printf '{"type":"generate","prompt":"Write a long technical essay.","params":{"max_tokens":%d,"temperature":0.0,"no_chatml":true}}\n' "$BENCH_MAX"
             } | HIPFIRE_RESOURCE_LOCK_WAIT_MS="${HIPFIRE_RESOURCE_LOCK_WAIT_MS:-600000}" "$dbin" 2>"$model_out_dir/bench.log" \
-                | grep '"type":"done"' | tail -1 > "$bench_json" || true
+                | grep '"type":"done"' | tail -1 >"$bench_json" || true
         }
     fi
     [ -s "$bench_json" ] && ok "bench: $(jq -r '"decode=" + (.decode_tok_s|tostring) + " prefill=" + (.prefill_tok_s|tostring)' "$bench_json" 2>/dev/null || echo unknown)"
 
     # Final summary blob
-    $PYTHON - "$slug" "$kld_json" "$coh_json" "$bench_json" > "$model_out_dir/summary.json" <<'PY'
+    $PYTHON - "$slug" "$kld_json" "$coh_json" "$bench_json" >"$model_out_dir/summary.json" <<'PY'
 import json, sys
 slug, kld_p, coh_p, bench_p = sys.argv[1:5]
 def safe(p):
@@ -220,12 +228,15 @@ phase "v3 matrix start — run dir: $RUN_DIR"
 echo "$MATRIX" | while read -r slug repo rev im_subdir; do
     [ -n "$slug" ] || continue
     run_one "$slug" "$repo" "$rev" "$im_subdir" \
-        || { warn "$slug FAILED — continuing with next model"; continue; }
+        || {
+            warn "$slug FAILED — continuing with next model"
+            continue
+        }
 done
 
 # ── Roll up into table.md ──────────────────────────────────────────────────
 phase "Roll up results"
-$PYTHON - "$RUN_DIR" > "$RUN_DIR/table.md" <<'PY'
+$PYTHON - "$RUN_DIR" >"$RUN_DIR/table.md" <<'PY'
 import json, sys
 from pathlib import Path
 run_dir = Path(sys.argv[1])

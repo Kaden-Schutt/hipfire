@@ -1,7 +1,29 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 hipfire contributors
 // hipfire — see LICENSE and NOTICE in the project root.
 //
+#![allow(clippy::needless_range_loop)]
+
 //! Head-to-head: MQ4 (as shipped) vs MQ+ vs Opus Quant on gfx1103.
 //!
 //! - **MQ4**: affine u4 weights (min+scale·q, range/15), FWHT-256, g256; compute

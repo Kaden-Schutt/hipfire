@@ -13,42 +13,42 @@ OFFSET="${OFFSET:-0}"
 RESULTS="benchmarks/results/ppl_baseline_$(date -u +%Y%m%dT%H%M%SZ).md"
 
 MODELS=(
-  "/home/kaden/.hipfire/models/qwen3.5-0.8b-mq4.hfq"
-  "/home/kaden/.hipfire/models/qwen3.5-0.8b-mq3.hfq"
-  "/home/kaden/.hipfire/models/qwen3.5-4b-mq4.hfq"
-  "/home/kaden/.hipfire/models/qwen3.5-4b-mq3.hfq"
-  "/home/kaden/.hipfire/models/qwen3.5-9b-mq4.hfq"
-  "/home/kaden/.hipfire/models/qwen3.5-9b-mq3.hfq"
+    "/home/kaden/.hipfire/models/qwen3.5-0.8b-mq4.hfq"
+    "/home/kaden/.hipfire/models/qwen3.5-0.8b-mq3.hfq"
+    "/home/kaden/.hipfire/models/qwen3.5-4b-mq4.hfq"
+    "/home/kaden/.hipfire/models/qwen3.5-4b-mq3.hfq"
+    "/home/kaden/.hipfire/models/qwen3.5-9b-mq4.hfq"
+    "/home/kaden/.hipfire/models/qwen3.5-9b-mq3.hfq"
 )
 CORPUS="dev/bench/data/wikitext2-test.txt"
 
 {
-  echo "# PPL baseline ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-  echo
-  echo "ctx=$CTX warmup=$WARMUP offset=$OFFSET corpus=$CORPUS"
-  echo
-  echo "| model | scored | NLL/tok | PPL |"
-  echo "|---|---:|---:|---:|"
-} > "$RESULTS"
+    echo "# PPL baseline ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+    echo
+    echo "ctx=$CTX warmup=$WARMUP offset=$OFFSET corpus=$CORPUS"
+    echo
+    echo "| model | scored | NLL/tok | PPL |"
+    echo "|---|---:|---:|---:|"
+} >"$RESULTS"
 
 for model in "${MODELS[@]}"; do
-  if [[ ! -f "$model" ]]; then
-    echo "(skip) missing: $model"
-    continue
-  fi
-  echo "=== $model ==="
-  "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ppl-$(basename "$model")" --watch-pid "$$"
-  ./target/release/examples/perplexity "$model" "$CORPUS" \
-    --ctx "$CTX" --warmup "$WARMUP" --offset "$OFFSET" 2>&1 | tee "/tmp/_ppl_$(basename "$model").log" || {
-    echo "  ERROR: $model"
+    if [[ ! -f "$model" ]]; then
+        echo "(skip) missing: $model"
+        continue
+    fi
+    echo "=== $model ==="
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ppl-$(basename "$model")" --watch-pid "$$"
+    ./target/release/examples/perplexity "$model" "$CORPUS" \
+        --ctx "$CTX" --warmup "$WARMUP" --offset "$OFFSET" 2>&1 | tee "/tmp/_ppl_$(basename "$model").log" || {
+        echo "  ERROR: $model"
+        "$HIPFIRE_GPULOCK_BIN" gpu-lock release
+        continue
+    }
     "$HIPFIRE_GPULOCK_BIN" gpu-lock release
-    continue
-  }
-  "$HIPFIRE_GPULOCK_BIN" gpu-lock release
-  scored=$(grep -E "^Scored:" "/tmp/_ppl_$(basename "$model").log" | awk '{print $2}')
-  nll=$(grep -E "^NLL/tok:" "/tmp/_ppl_$(basename "$model").log" | awk '{print $2}')
-  ppl=$(grep -E "^PPL:" "/tmp/_ppl_$(basename "$model").log" | awk '{print $2}')
-  echo "| $(basename "$model") | $scored | $nll | $ppl |" >> "$RESULTS"
+    scored=$(grep -E "^Scored:" "/tmp/_ppl_$(basename "$model").log" | awk '{print $2}')
+    nll=$(grep -E "^NLL/tok:" "/tmp/_ppl_$(basename "$model").log" | awk '{print $2}')
+    ppl=$(grep -E "^PPL:" "/tmp/_ppl_$(basename "$model").log" | awk '{print $2}')
+    echo "| $(basename "$model") | $scored | $nll | $ppl |" >>"$RESULTS"
 done
 
 echo "DONE -> $RESULTS"

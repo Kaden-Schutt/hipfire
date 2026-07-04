@@ -340,16 +340,19 @@ pub fn generate_state_kinds_include_required(
     state_kinds: &[String],
     required: SequenceStatePageKind,
 ) -> bool {
-    state_kinds
-        .iter()
-        .any(|kind| match (required, kind.as_str()) {
-            (SequenceStatePageKind::Kv, "attention_kv") => true,
-            (SequenceStatePageKind::DeltaNet, "deltanet_recurrent") => true,
-            (SequenceStatePageKind::MambaSsm, "mamba_ssm") => true,
-            (SequenceStatePageKind::MambaConv, "mamba_conv") => true,
-            (SequenceStatePageKind::BackendPrivate, "architecture_specific") => true,
-            _ => false,
-        })
+    state_kinds.iter().any(|kind| {
+        matches!(
+            (required, kind.as_str()),
+            (SequenceStatePageKind::Kv, "attention_kv")
+                | (SequenceStatePageKind::DeltaNet, "deltanet_recurrent")
+                | (SequenceStatePageKind::MambaSsm, "mamba_ssm")
+                | (SequenceStatePageKind::MambaConv, "mamba_conv")
+                | (
+                    SequenceStatePageKind::BackendPrivate,
+                    "architecture_specific"
+                )
+        )
+    })
 }
 
 pub fn normalize_generate_state_kind_set(state_kinds: &[String]) -> Vec<String> {

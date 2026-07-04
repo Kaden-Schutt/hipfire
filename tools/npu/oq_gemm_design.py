@@ -83,13 +83,13 @@ from aie.utils.benchmark import run_iters  # noqa: E402
 # Set the active NPU device at import — without this, get_current_device() is
 # empty in resolve_program() and the XRT run segfaults (run_design_cli does the
 # equivalent set_current_device() before any run). Detect npu1/npu2 by name.
-_NAME_TO_NPU = {"Phoenix": NPU1, "npu1": NPU1, "Strix": NPU2, "Krackan": NPU2,
-                "npu4": NPU2, "npu5": NPU2, "npu6": NPU2}
+_NAME_TO_NPU = {"Phoenix": NPU1, "npu1": NPU1, "Strix": NPU2, "Krackan": NPU2, "npu4": NPU2, "npu5": NPU2, "npu6": NPU2}
 
 
 def _detect_and_set_device():
     try:
         import pyxrt
+
         name = pyxrt.device(0).get_info(pyxrt.xrt_info_device.name)
         cls = next((c for sub, c in _NAME_TO_NPU.items() if sub in name), NPU1)
     except Exception:
@@ -125,8 +125,11 @@ def int_matmul(
     assert M % m == 0 and K % k == 0 and N % n == 0
 
     matmul_kernel = kernels.mm(
-        dim_m=m, dim_k=k, dim_n=n,
-        input_dtype=dtype_in, output_dtype=dtype_out,
+        dim_m=m,
+        dim_k=k,
+        dim_n=n,
+        input_dtype=dtype_in,
+        output_dtype=dtype_out,
         b_col_maj=bool(b_col_maj),
     )
     zero_kernel = matmul_kernel.zero
@@ -179,18 +182,14 @@ def int_matmul(
     )
 
     rows_per_block = 4
-    A_tiles = TensorTiler2D.group_tiler(
-        (M, K), (m, k), (1, K_div_k), pattern_repeat=N_div_n, prune_step=False
-    )
+    A_tiles = TensorTiler2D.group_tiler((M, K), (m, k), (1, K_div_k), pattern_repeat=N_div_n, prune_step=False)
     if b_col_maj:
         b_tap = TensorTiler2D.group_tiler((N, K), (n, k), (N_div_n, K_div_k), prune_step=False)[0]
     else:
         b_tap = TensorTiler2D.group_tiler(
             (K, N), (k, n), (K_div_k, N_div_n), tile_group_col_major=True, prune_step=False
         )[0]
-    C_tiles = TensorTiler2D.group_tiler(
-        (M, N), (m, n), (rows_per_block // 2, N_div_n), prune_step=False
-    )
+    C_tiles = TensorTiler2D.group_tiler((M, N), (m, n), (rows_per_block // 2, N_div_n), prune_step=False)
     c_index = 0
 
     rt = Runtime()
@@ -248,9 +247,7 @@ def matmul_npu(A_np, B_np, *, b_col_maj=1, tile=None):
     Routes through run_iters (warmup=0, iters=1): calling the @iron.jit design
     object directly segfaults the XRT runtime on this box, but run_iters drives
     the compile+run+device-sync protocol correctly."""
-    C, _bench, tile_used = bench_npu(
-        A_np, B_np, b_col_maj=b_col_maj, tile=tile, warmup=0, iters=1
-    )
+    C, _bench, tile_used = bench_npu(A_np, B_np, b_col_maj=b_col_maj, tile=tile, warmup=0, iters=1)
     return C, tile_used
 
 
@@ -265,10 +262,21 @@ def bench_npu(A_np, B_np, *, b_col_maj=1, tile=None, warmup=5, iters=20):
     B_t = iron.tensor(B_np.reshape(-1).astype(np.int8), dtype=np.int8, device="npu")
     C_t = iron.zeros(M * N, dtype=np.int32, device="npu")
     bench = run_iters(
-        int_matmul, A_t, B_t, C_t,
-        M=M, K=K, N=N, m=m, k=k, n=n,
-        dtype_in_str="i8", dtype_out_str="i32", b_col_maj=b_col_maj,
-        warmup=warmup, iters=iters,
+        int_matmul,
+        A_t,
+        B_t,
+        C_t,
+        M=M,
+        K=K,
+        N=N,
+        m=m,
+        k=k,
+        n=n,
+        dtype_in_str="i8",
+        dtype_out_str="i32",
+        b_col_maj=b_col_maj,
+        warmup=warmup,
+        iters=iters,
     )
     # C_t.numpy() is a VIEW onto the XRT device buffer; it is freed when C_t
     # goes out of scope at return, so the caller would read freed memory

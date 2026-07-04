@@ -26,8 +26,14 @@ DO_BUILD=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --build) DO_BUILD=1 ;;
-        -h|--help) sed -n '3,21p' "$0"; exit 0 ;;
-        *) echo "unknown arg: $1" >&2; exit 2 ;;
+        -h | --help)
+            sed -n '3,21p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown arg: $1" >&2
+            exit 2
+            ;;
     esac
     shift
 done
@@ -51,7 +57,10 @@ for d in \
     "$MODELS_DIR/qwen3.5-9b-mq4.dflash.hfq" \
     "$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq" \
     "$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq"; do
-    if [ -f "$d" ]; then DRAFT="$d"; break; fi
+    if [ -f "$d" ]; then
+        DRAFT="$d"
+        break
+    fi
 done
 if [ -z "$DRAFT" ]; then
     echo "smoke: no DFlash drafter staged in $MODELS_DIR — skipping"
@@ -59,7 +68,7 @@ if [ -z "$DRAFT" ]; then
     exit 0
 fi
 case "$DRAFT" in
-    *qwen3.5-9b-mq4.dflash*)  TARGET="$MODELS_DIR/qwen3.5-9b-mq4.hfq" ;;
+    *qwen3.5-9b-mq4.dflash*) TARGET="$MODELS_DIR/qwen3.5-9b-mq4.hfq" ;;
     *qwen3.5-27b-mq4.dflash*) TARGET="$MODELS_DIR/qwen3.5-27b-mq4.hfq" ;;
     *qwen3.6-27b-mq4.dflash*) TARGET="$MODELS_DIR/qwen3.6-27b-mq4.hfq" ;;
 esac
@@ -75,7 +84,10 @@ echo "smoke: drafter=$DRAFT"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "dflash-bench-resident-smoke" --watch-pid "$$" || { echo "smoke: could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "dflash-bench-resident-smoke" --watch-pid "$$" || {
+        echo "smoke: could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -112,13 +124,13 @@ if ! timeout 240 "$EXE" \
     --target "$TARGET" --draft "$DRAFT" \
     --prompts-file "$MANIFEST" \
     --ctx 1024 --kv-mode q8 --no-chatml \
-    > "$OUT" 2>&1; then
+    >"$OUT" 2>&1; then
     echo "smoke: FAIL — dflash_spec_demo exited non-zero"
     tail -40 "$OUT"
     exit 1
 fi
 t1=$(date +%s)
-echo "smoke: elapsed $((t1-t0))s"
+echo "smoke: elapsed $((t1 - t0))s"
 
 # Assertion 1: both row END markers present
 fail=0

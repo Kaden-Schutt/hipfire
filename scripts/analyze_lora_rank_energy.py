@@ -166,7 +166,9 @@ def read_tensor(ref: TensorRef, dtype: torch.dtype) -> torch.Tensor:
     return tensor.to(dtype=dtype)
 
 
-def selected_tensor_names(args: argparse.Namespace, target_refs: dict[str, TensorRef], base_refs: dict[str, TensorRef]) -> list[str]:
+def selected_tensor_names(
+    args: argparse.Namespace, target_refs: dict[str, TensorRef], base_refs: dict[str, TensorRef]
+) -> list[str]:
     include_re = re.compile(args.include) if args.include else None
     exclude_re = re.compile(args.exclude) if args.exclude else None
     default_excludes = []
@@ -331,17 +333,11 @@ def print_summary(results: list[dict[str, Any]], ranks: list[int], aggregates: d
     print("Global weighted capture:")
     for rank in ranks:
         metric = aggregates["global"]["rank_metrics"][str(rank)]
-        print(
-            f"  r{rank:<4d} captured={metric['captured_energy']:.6f} "
-            f"rel_resid={metric['relative_residual_l2']:.6f}"
-        )
+        print(f"  r{rank:<4d} captured={metric['captured_energy']:.6f} rel_resid={metric['relative_residual_l2']:.6f}")
     print("")
     print("By group:")
     for group, data in aggregates["groups"].items():
-        parts = [
-            f"r{rank}={data['rank_metrics'][str(rank)]['captured_energy']:.4f}"
-            for rank in ranks
-        ]
+        parts = [f"r{rank}={data['rank_metrics'][str(rank)]['captured_energy']:.4f}" for rank in ranks]
         print(f"  {group:16s} tensors={data['tensors']:3d} " + " ".join(parts))
     print("")
     worst = sorted(results, key=lambda r: r["rank_metrics"][str(max(ranks))]["captured_energy"])[:10]

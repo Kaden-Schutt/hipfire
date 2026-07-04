@@ -2,6 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(
+    clippy::collapsible_str_replace,
+    clippy::too_many_arguments,
+    clippy::unnecessary_get_then_check,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_map_or
+)]
+
 //! Shared framework for the `hipfire-eval` runner.
 //!
 //! This module establishes the stable CLI, manifest, JSONL, dataset provenance,

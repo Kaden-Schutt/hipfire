@@ -52,10 +52,10 @@ def parse_args():
     p.add_argument("--target-repo", default="Qwen/Qwen3.5-4B")
     p.add_argument("--draft-layers", type=int, default=5)
     p.add_argument("--block-size", type=int, default=16)
-    p.add_argument("--safetensors", default=None,
-                   help="Path to our trained safetensors to audit.")
-    p.add_argument("--compare-safetensors", default=None,
-                   help="Path to z-lab's (or any reference) safetensors for diff.")
+    p.add_argument("--safetensors", default=None, help="Path to our trained safetensors to audit.")
+    p.add_argument(
+        "--compare-safetensors", default=None, help="Path to z-lab's (or any reference) safetensors for diff."
+    )
     return p.parse_args()
 
 
@@ -66,10 +66,19 @@ def print_config_flat_vs_nested(tc):
     has_vision = hasattr(tc, "vision_config")
     print(f"  composite? text_config={has_text}  vision_config={has_vision}")
     attrs = [
-        "hidden_size", "num_hidden_layers", "num_attention_heads",
-        "num_key_value_heads", "head_dim", "intermediate_size",
-        "vocab_size", "max_position_embeddings", "sliding_window",
-        "rms_norm_eps", "rope_theta", "attention_bias", "attention_dropout",
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "intermediate_size",
+        "vocab_size",
+        "max_position_embeddings",
+        "sliding_window",
+        "rms_norm_eps",
+        "rope_theta",
+        "attention_bias",
+        "attention_dropout",
     ]
     print("\nattribute  → top-level vs text_config")
     for a in attrs:
@@ -80,18 +89,22 @@ def print_config_flat_vs_nested(tc):
     # layer_types deserves extra attention
     lt_top = getattr(tc, "layer_types", None)
     lt_txt = getattr(tc.text_config, "layer_types", None) if has_text else None
-    print(f"\n  layer_types top-level: "
-          f"{'len=%d, %s' % (len(lt_top), list(dict.fromkeys(lt_top))[:3]) if lt_top else 'None'}")
-    print(f"  layer_types text_cfg:  "
-          f"{'len=%d, %s' % (len(lt_txt), list(dict.fromkeys(lt_txt))[:3]) if lt_txt else 'None'}")
+    print(
+        f"\n  layer_types top-level: "
+        f"{'len=%d, %s' % (len(lt_top), list(dict.fromkeys(lt_top))[:3]) if lt_top else 'None'}"
+    )
+    print(
+        f"  layer_types text_cfg:  "
+        f"{'len=%d, %s' % (len(lt_txt), list(dict.fromkeys(lt_txt))[:3]) if lt_txt else 'None'}"
+    )
 
 
 def instantiate_and_dump(args, tc):
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
     import importlib
+
     mod = importlib.import_module("dflash_train_poc")
-    cfg = mod.build_draft_config(tc, args.draft_layers, args.block_size,
-                                 mask_token_id=151935)
+    cfg = mod.build_draft_config(tc, args.draft_layers, args.block_size, mask_token_id=151935)
     print("\n" + "=" * 72)
     print(f"Draft config (from build_draft_config):")
     print(f"  type               = {type(cfg).__name__}")
@@ -174,6 +187,7 @@ def main():
     args = parse_args()
     print(f"Loading target config from {args.target_repo} ...")
     from transformers import AutoConfig
+
     tc = AutoConfig.from_pretrained(args.target_repo)
     print_config_flat_vs_nested(tc)
     ref_shapes = instantiate_and_dump(args, tc)

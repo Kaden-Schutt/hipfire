@@ -168,9 +168,7 @@ def load_source_paro_tensors(index: dict[str, Path], base: str) -> dict[str, tor
     scales = pqi.load_tensor(index, f"{base}.scales").to(torch.float16).contiguous()
     pairs = pqi.load_tensor(index, f"{base}.pairs").to(torch.int16).contiguous()
     theta = pqi.load_tensor(index, f"{base}.theta").to(torch.float16).contiguous()
-    channel_scales = (
-        pqi.load_tensor(index, f"{base}.channel_scales").reshape(-1).to(torch.float16).contiguous()
-    )
+    channel_scales = pqi.load_tensor(index, f"{base}.channel_scales").reshape(-1).to(torch.float16).contiguous()
     pqi.validate_module(base, qweight, qzeros, scales, pairs, theta, channel_scales)
     return {
         "qweight": qweight,
@@ -213,7 +211,9 @@ def unpack_awq_i32(packed: torch.Tensor) -> torch.Tensor:
     return out.reshape(*packed.shape[:-1], packed.shape[-1] * PACK)
 
 
-def rotate_activation(x: torch.Tensor, pairs: torch.Tensor, theta: torch.Tensor, channel_scales: torch.Tensor) -> torch.Tensor:
+def rotate_activation(
+    x: torch.Tensor, pairs: torch.Tensor, theta: torch.Tensor, channel_scales: torch.Tensor
+) -> torch.Tensor:
     k = x.shape[-1]
     groups = k // GROUP_SIZE
     out = x.float().clone() * channel_scales.reshape(1, k).float()

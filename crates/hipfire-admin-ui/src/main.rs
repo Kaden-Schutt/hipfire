@@ -137,8 +137,15 @@ fn Dashboard(
         let cards = gpus
             .into_iter()
             .map(|gpu| {
-                let util = series(&history, |s| s.gpus.iter().find(|c| c.card == gpu.card).map(|c| c.util));
-                let mem = series(&history, |s| s.gpus.iter().find(|c| c.card == gpu.card).map(|c| c.mem_pct));
+                let util = series(&history, |s| {
+                    s.gpus.iter().find(|c| c.card == gpu.card).map(|c| c.util)
+                });
+                let mem = series(&history, |s| {
+                    s.gpus
+                        .iter()
+                        .find(|c| c.card == gpu.card)
+                        .map(|c| c.mem_pct)
+                });
                 view! { <DeviceCard gpu=gpu util_series=util mem_series=mem/> }
             })
             .collect::<Vec<_>>();
@@ -421,7 +428,11 @@ fn HostCard(host: HostMemory, ram_series: Vec<f64>) -> impl IntoView {
 fn MemBar(pool: MemPool, emphasis: &'static str) -> impl IntoView {
     let pct = pool.percent();
     let level = fill_level(pct);
-    let figures = format!("{} / {}", fmt_bytes(pool.used_bytes), fmt_bytes(pool.total_bytes));
+    let figures = format!(
+        "{} / {}",
+        fmt_bytes(pool.used_bytes),
+        fmt_bytes(pool.total_bytes)
+    );
     view! {
         <div class=format!("memrow {emphasis}")>
             <div class="memhead">

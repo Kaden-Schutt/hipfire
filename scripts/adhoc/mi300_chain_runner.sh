@@ -42,7 +42,8 @@ SKIPPING=1
 #   - print [chain-runner] markers for progress
 
 run_if_pending() {
-    local name=$1; shift
+    local name=$1
+    shift
     if [ "$SKIPPING" = "1" ]; then
         if [ "$name" = "$SKIP_UNTIL" ]; then
             SKIPPING=0
@@ -57,15 +58,15 @@ run_if_pending() {
         return 0
     fi
     echo "[chain-runner] starting: $name"
-    date -Is > "$STATUS_DIR/$name.started"
+    date -Is >"$STATUS_DIR/$name.started"
     rm -f "$STATUS_DIR/$name.failed"
-    "$@" > "$LOG_DIR/$name.log" 2>&1
+    "$@" >"$LOG_DIR/$name.log" 2>&1
     local rc=$?
     if [ $rc -eq 0 ]; then
-        date -Is > "$STATUS_DIR/$name.done"
+        date -Is >"$STATUS_DIR/$name.done"
         echo "[chain-runner] finished: $name (rc=0)"
     else
-        date -Is > "$STATUS_DIR/$name.failed"
+        date -Is >"$STATUS_DIR/$name.failed"
         echo "[chain-runner] FAILED:   $name (rc=$rc)"
         echo "[chain-runner] tail of $LOG_DIR/$name.log:"
         tail -20 "$LOG_DIR/$name.log"
@@ -137,13 +138,19 @@ job_4b_sidecar_cal() {
     # the TARGET's attention, not the draft). Produces
     # qwen3.5-4b-mq4.triattn.hfq which pairs with any 4B draft.
     local tgt=${TRIPWIRE_ROOT}/models/qwen3.5-4b-mq4.hfq
-    [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
+    [ -f "$tgt" ] || {
+        echo "no target at $tgt — stage with stage_models.sh first" >&2
+        return 3
+    }
     sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
 }
 
 job_9b_sidecar_cal() {
     local tgt=${TRIPWIRE_ROOT}/models/qwen3.5-9b-mq4.hfq
-    [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
+    [ -f "$tgt" ] || {
+        echo "no target at $tgt — stage with stage_models.sh first" >&2
+        return 3
+    }
     sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
 }
 
@@ -152,9 +159,9 @@ job_9b_sidecar_cal() {
 echo "[chain-runner] starting chain at $(date -Is)"
 echo "[chain-runner] skip_until='${SKIP_UNTIL:-<none>}'"
 
-run_if_pending 9b_scratch_25k           job_9b_scratch_25k           || exit 1
-run_if_pending 9b_scratch_convert       job_9b_scratch_convert       || exit 1
-run_if_pending 9b_sidecar_cal           job_9b_sidecar_cal           || exit 1
+run_if_pending 9b_scratch_25k job_9b_scratch_25k || exit 1
+run_if_pending 9b_scratch_convert job_9b_scratch_convert || exit 1
+run_if_pending 9b_sidecar_cal job_9b_sidecar_cal || exit 1
 
 # PAUSE POINT 2026-04-19: user wants to test 9B draft+sidecar before running
 # 4B. If testing validates the pipeline, the plan is to spin up an 8× cluster

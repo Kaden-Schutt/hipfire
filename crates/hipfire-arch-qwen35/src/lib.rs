@@ -20,6 +20,18 @@
 //! The `arch` module exposes the trait impl for use by the runtime's
 //! daemon and other consumers via `hipfire_arch_qwen35::Qwen35`.
 
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::empty_line_after_doc_comments,
+    clippy::large_enum_variant,
+    clippy::manual_checked_ops,
+    clippy::manual_memcpy,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 // Qwen3.5 is a hybrid DeltaNet + FullAttention architecture; all the
 // runtime infrastructure it touches is `deltanet`-gated. When the parent
 // build doesn't enable the feature, the crate is a no-op stub. This keeps

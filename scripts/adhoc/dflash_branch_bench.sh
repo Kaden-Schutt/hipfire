@@ -23,7 +23,7 @@ REPORT="$OUT_DIR/report.md"
 SHORT_PROMPT="The James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one. Explain in detail how this argument works and whether it still applies today."
 
 LONG_PROMPT_FILE=/tmp/dflash_bench_long_prompt.txt
-head -c 6000 /tmp/wikitext_calib.txt | tr '\n' ' ' | head -c 6000 > "$LONG_PROMPT_FILE"
+head -c 6000 /tmp/wikitext_calib.txt | tr '\n' ' ' | head -c 6000 >"$LONG_PROMPT_FILE"
 
 CODE_PROMPT="def fibonacci(n: int) -> int:
     \"\"\"Compute nth Fibonacci number.\"\"\"
@@ -44,24 +44,29 @@ init_report() {
         echo "Branch: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)"
         echo "Date: $(date -u +%FT%TZ)"
         echo
-    } > "$REPORT"
+    } >"$REPORT"
 }
 
-section() { echo; echo "## $1"; echo; }
-add() { echo "$*" >> "$REPORT"; }
+section() {
+    echo
+    echo "## $1"
+    echo
+}
+add() { echo "$*" >>"$REPORT"; }
 
 # ── Runner ─────────────────────────────────────────────────────────
 run_and_capture() {
-    local label="$1"; shift
+    local label="$1"
+    shift
     local out="$OUT_DIR/${label}.log"
     echo "[bench] $label" >&2
-    "$@" > "$out" 2>&1 || echo "[bench] $label non-zero exit" >&2
+    "$@" >"$out" 2>&1 || echo "[bench] $label non-zero exit" >&2
     echo "$out"
 }
 
 extract_tok_s() { grep -Eo '\([0-9]+\.[0-9]+ tok/s\)' "$1" | tail -1 || echo "?"; }
-extract_tau()   { grep -Eo 'τ=[0-9]+\.[0-9]+' "$1" | tail -1 || echo "?"; }
-extract_accepted()  { grep -Eo 'accepted: [0-9]+' "$1" | tail -1 || echo "?"; }
+extract_tau() { grep -Eo 'τ=[0-9]+\.[0-9]+' "$1" | tail -1 || echo "?"; }
+extract_accepted() { grep -Eo 'accepted: [0-9]+' "$1" | tail -1 || echo "?"; }
 
 # ── Config ─────────────────────────────────────────────────────────
 resolve_model_path() {
@@ -113,7 +118,10 @@ section "1. Sidecar validation (--load-sidecar, Federalist default val-prompt)"
 add '| model | mean r̄ | Mean Resultant Length (R > 0.95) |'
 add '|-------|--------|----------------------------------|'
 for M in 4b 9b 27b; do
-    [ -f "${SIDECARS[$M]}" ] || { add "| $M | — | sidecar not present |"; continue; }
+    [ -f "${SIDECARS[$M]}" ] || {
+        add "| $M | — | sidecar not present |"
+        continue
+    }
     log=$(run_and_capture "sidecar_${M}" \
         ./target/release/examples/triattn_validate "${MODELS[$M]}" --load-sidecar)
     r=$(grep "overall mean r̄" "$log" | tail -1 | grep -Eo '[0-9]+\.[0-9]+' | head -1 || echo "?")
@@ -135,17 +143,20 @@ section "3. DFlash τ + tok/s on 3 prompt types (200-tok decode, ctx=4K, no CASK
 add '| model | prompt | tok/s | τ | accepted |'
 add '|-------|--------|-------|---|----------|'
 for M in 4b 9b 27b; do
-    [ -f "${DRAFTS[$M]}" ] || { add "| $M | — | — | — | no draft |"; continue; }
+    [ -f "${DRAFTS[$M]}" ] || {
+        add "| $M | — | — | — | no draft |"
+        continue
+    }
     for P in short code math; do
         case $P in
-            short) PROMPT="$SHORT_PROMPT";;
-            code)  PROMPT="$CODE_PROMPT";;
-            math)  PROMPT="$MATH_PROMPT";;
+            short) PROMPT="$SHORT_PROMPT" ;;
+            code) PROMPT="$CODE_PROMPT" ;;
+            math) PROMPT="$MATH_PROMPT" ;;
         esac
         log=$(run_and_capture "dflash_${M}_${P}" \
             ./target/release/examples/dflash_spec_demo \
-                --target "${MODELS[$M]}" --draft "${DRAFTS[$M]}" \
-                --prompt "$PROMPT" --max 200 --ctx 4096 --no-chatml)
+            --target "${MODELS[$M]}" --draft "${DRAFTS[$M]}" \
+            --prompt "$PROMPT" --max 200 --ctx 4096 --no-chatml)
         ts=$(extract_tok_s "$log")
         tau=$(extract_tau "$log")
         acc=$(extract_accepted "$log")
@@ -163,16 +174,16 @@ for M in 9b 27b; do
 
     base_log=$(run_and_capture "flashtri_${M}_baseline" \
         ./target/release/examples/dflash_spec_demo \
-            --target "${MODELS[$M]}" --draft "${DRAFTS[$M]}" \
-            --prompt "$LONG_PROMPT" --max 200 --ctx 4096 --no-chatml)
+        --target "${MODELS[$M]}" --draft "${DRAFTS[$M]}" \
+        --prompt "$LONG_PROMPT" --max 200 --ctx 4096 --no-chatml)
     base_ts=$(extract_tok_s "$base_log")
     base_tau=$(extract_tau "$base_log")
 
     flash_log=$(run_and_capture "flashtri_${M}_enabled" \
         ./target/release/examples/dflash_spec_demo \
-            --target "${MODELS[$M]}" --draft "${DRAFTS[$M]}" \
-            --prompt "$LONG_PROMPT" --max 200 --ctx 4096 --no-chatml \
-            --cask-sidecar "${SIDECARS[$M]}" --cask-budget 512 --cask-beta 128)
+        --target "${MODELS[$M]}" --draft "${DRAFTS[$M]}" \
+        --prompt "$LONG_PROMPT" --max 200 --ctx 4096 --no-chatml \
+        --cask-sidecar "${SIDECARS[$M]}" --cask-budget 512 --cask-beta 128)
     flash_ts=$(extract_tok_s "$flash_log")
     flash_tau=$(extract_tau "$flash_log")
 
@@ -194,10 +205,10 @@ ASSISTANT: You mentioned you're working on Rust GPU inference, but you haven't t
 USER: It's a 7900 XTX. Can you remember my name from earlier?"
 log=$(run_and_capture "multiturn_9b" \
     ./target/release/examples/dflash_spec_demo \
-        --target "${MODELS[9b]}" --draft "${DRAFTS[9b]}" \
-        --prompt "$MULTITURN_PROMPT" --max 80 --ctx 2048)
+    --target "${MODELS[9b]}" --draft "${DRAFTS[9b]}" \
+    --prompt "$MULTITURN_PROMPT" --max 80 --ctx 2048)
 add '```'
-tail -30 "$log" >> "$REPORT"
+tail -30 "$log" >>"$REPORT"
 add '```'
 
 section "Summary"

@@ -5,7 +5,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 TARGET_DIR ?= $(REPO_ROOT)/target/release
 # Binaries the installer places in ~/.hipfire/bin (and that `hipfire serve`
 # resolves the daemon from). Override DEV_BINS to link a different set.
-DEV_BINS ?= hipfire hipfire-daemon hipfire-eval hipfire-tui hipfire-host-profile
+DEV_BINS ?= hipfire hipfire-daemon hipfire-eval hipfire-tui hipfire-system-monitor hipfire-host-profile
 
 build:
 	cargo build --release

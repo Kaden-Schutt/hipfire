@@ -21,6 +21,7 @@ Usage:
                           --ref <path-to-kldref.bin> \
                           [--chunk N=0]
 """
+
 import argparse
 import math
 import struct
@@ -81,9 +82,7 @@ def read_kldref_chunk(ref_path: Path, chunk_idx: int):
         for _ in range(scored_per_chunk):
             buf = f.read(block_bytes)
             indices = list(struct.unpack(f"<{top_k}I", buf[: top_k * 4]))
-            log_probs = list(
-                struct.unpack(f"<{top_k}f", buf[top_k * 4 : top_k * 8])
-            )
+            log_probs = list(struct.unpack(f"<{top_k}f", buf[top_k * 4 : top_k * 8]))
             residual = struct.unpack("<f", buf[top_k * 8 : top_k * 8 + 4])[0]
             scored_blocks.append((indices, log_probs, residual))
 
@@ -94,23 +93,18 @@ def main():
     args = parse_args()
 
     print(f"loading reference: {args.ref}", flush=True)
-    n_ctx, n_vocab, top_k, chunk_tokens, scored_blocks = read_kldref_chunk(
-        Path(args.ref), args.chunk
-    )
+    n_ctx, n_vocab, top_k, chunk_tokens, scored_blocks = read_kldref_chunk(Path(args.ref), args.chunk)
     print(
-        f"  n_ctx={n_ctx} n_vocab={n_vocab} top_k={top_k} "
-        f"scored_per_chunk={len(scored_blocks)} chunk={args.chunk}",
+        f"  n_ctx={n_ctx} n_vocab={n_vocab} top_k={top_k} scored_per_chunk={len(scored_blocks)} chunk={args.chunk}",
         flush=True,
     )
 
     print(f"loading HF model BF16 (CPU): {args.model}", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
-    )
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
     model.eval()
     print(
-        f"  config: hidden={model.config.text_config.hidden_size if hasattr(model.config,'text_config') else model.config.hidden_size} "
-        f"layers={model.config.text_config.num_hidden_layers if hasattr(model.config,'text_config') else model.config.num_hidden_layers}",
+        f"  config: hidden={model.config.text_config.hidden_size if hasattr(model.config, 'text_config') else model.config.hidden_size} "
+        f"layers={model.config.text_config.num_hidden_layers if hasattr(model.config, 'text_config') else model.config.num_hidden_layers}",
         flush=True,
     )
 

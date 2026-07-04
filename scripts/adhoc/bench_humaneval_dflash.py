@@ -16,11 +16,13 @@
 
 import argparse, json, os, re, subprocess, sys, time
 
+
 def pct(sorted_arr, p):
     if not sorted_arr:
         return float("nan")
     idx = int(round((len(sorted_arr) - 1) * p / 100))
     return sorted_arr[idx]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -42,12 +44,14 @@ def main():
         print("--kv-mode must be q8, fwht4, fwht3, or fwht2 for DFlash perf runs", file=sys.stderr)
         sys.exit(2)
     if args.ar and (args.ddtree_batched or args.ddtree_budget is not None or args.ddtree_topk is not None):
-        print("--ar is incompatible with --ddtree-* flags", file=sys.stderr); sys.exit(2)
+        print("--ar is incompatible with --ddtree-* flags", file=sys.stderr)
+        sys.exit(2)
 
     with open(args.jsonl) as f:
         tasks = [json.loads(l) for l in f]
     if not tasks:
-        print("empty jsonl", file=sys.stderr); sys.exit(1)
+        print("empty jsonl", file=sys.stderr)
+        sys.exit(1)
 
     stride = max(1, len(tasks) // args.n)
     sampled = tasks[::stride][: args.n]
@@ -64,8 +68,7 @@ def main():
     if args.ddtree_topk is not None:
         extra_args += ["--ddtree-topk", str(args.ddtree_topk)]
     label = args.label or ("ar" if args.ar else "ddtree" if args.ddtree_batched else "linear")
-    print(f"# label={label}  max={args.max} ctx={args.ctx} --no-chatml kv={args.kv_mode}  "
-          f"extra={' '.join(extra_args)}")
+    print(f"# label={label}  max={args.max} ctx={args.ctx} --no-chatml kv={args.kv_mode}  extra={' '.join(extra_args)}")
     print()
     print(f"{'task_id':<16} {'tok/s':>8} {'tau':>7} {'emitted':>8} {'cyc':>5} {'acc':>5} {'run_s':>6}")
     print("-" * 64)
@@ -77,10 +80,26 @@ def main():
         t0 = time.time()
         try:
             proc = subprocess.run(
-                [args.demo, "--target", args.target, "--draft", args.draft,
-                 "--prompt", prompt, "--max", str(args.max), "--ctx", str(args.ctx),
-                 "--no-chatml", *extra_args],
-                capture_output=True, text=True, timeout=240, check=False)
+                [
+                    args.demo,
+                    "--target",
+                    args.target,
+                    "--draft",
+                    args.draft,
+                    "--prompt",
+                    prompt,
+                    "--max",
+                    str(args.max),
+                    "--ctx",
+                    str(args.ctx),
+                    "--no-chatml",
+                    *extra_args,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=240,
+                check=False,
+            )
             out = proc.stdout + proc.stderr
         except subprocess.TimeoutExpired:
             print(f"{tid:<16} TIMEOUT")
@@ -88,9 +107,9 @@ def main():
         dt = time.time() - t0
 
         m_toks = re.search(r"emitted: (\d+) tokens in ([\d.]+)s\s+\(([\d.]+) tok/s\)", out)
-        m_tau  = re.search(r"\xcf\x84=([\d.]+)|τ=([\d.]+)", out)
-        m_cyc  = re.search(r"cycles: (\d+)", out)
-        m_acc  = re.search(r"accepted: (\d+)", out)
+        m_tau = re.search(r"\xcf\x84=([\d.]+)|τ=([\d.]+)", out)
+        m_cyc = re.search(r"cycles: (\d+)", out)
+        m_acc = re.search(r"accepted: (\d+)", out)
 
         # In AR mode there is no τ / cycles / accepted — only emitted+tok_s are required.
         if not m_toks or (not args.ar and not m_tau):
@@ -110,19 +129,25 @@ def main():
     # summary
     valid = [r for r in results if r[1] is not None]
     if not valid:
-        print("\nno valid results"); sys.exit(2)
+        print("\nno valid results")
+        sys.exit(2)
 
     tok_s = sorted([r[1] for r in valid])
     print()
     print(f"=== SUMMARY (n={len(valid)}/{len(sampled)}) ===")
-    print(f"tok/s  mean={sum(tok_s)/len(tok_s):7.2f}  median={pct(tok_s,50):7.2f}  "
-          f"p10={pct(tok_s,10):7.2f}  p90={pct(tok_s,90):7.2f}  "
-          f"min={tok_s[0]:7.2f}  max={tok_s[-1]:7.2f}")
+    print(
+        f"tok/s  mean={sum(tok_s) / len(tok_s):7.2f}  median={pct(tok_s, 50):7.2f}  "
+        f"p10={pct(tok_s, 10):7.2f}  p90={pct(tok_s, 90):7.2f}  "
+        f"min={tok_s[0]:7.2f}  max={tok_s[-1]:7.2f}"
+    )
     if not args.ar:
         taus = sorted([r[2] for r in valid])
-        print(f"tau    mean={sum(taus)/len(taus):7.3f}  median={pct(taus,50):7.3f}  "
-              f"p10={pct(taus,10):7.3f}  p90={pct(taus,90):7.3f}  "
-              f"min={taus[0]:7.3f}  max={taus[-1]:7.3f}")
+        print(
+            f"tau    mean={sum(taus) / len(taus):7.3f}  median={pct(taus, 50):7.3f}  "
+            f"p10={pct(taus, 10):7.3f}  p90={pct(taus, 90):7.3f}  "
+            f"min={taus[0]:7.3f}  max={taus[-1]:7.3f}"
+        )
+
 
 if __name__ == "__main__":
     main()

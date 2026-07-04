@@ -17,7 +17,10 @@ MAX_TOKENS="${HIPFIRE_BENCH_MAX:-192}"
 RUNS="${HIPFIRE_BENCH_RUNS:-3}"
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "dflash-sweep" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "dflash-sweep" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -62,7 +65,8 @@ PROSE_PROMPT="The Roman Empire, at its height, stretched from the windswept moor
 
 INSTRUCT_PROMPT="Explain, in three or four sentences, why the sky appears blue during the day. Your answer should be accessible to a curious middle-school student."
 
-PARSE_PY=$(cat <<'PY'
+PARSE_PY=$(
+    cat <<'PY'
 import sys, re
 label, genre = sys.argv[1], sys.argv[2]
 runs = []
@@ -88,47 +92,53 @@ PY
 #   3.5 drafts trained on raw text → --no-chatml
 #   3.6 draft trained with ChatML → default
 MODELS=(
-  "9b-3.5|$MODELS_DIR/qwen3.5-9b-mq4.hfq|models/qwen3.5-9b-mq4.dflash.hfq|--no-chatml"
-  "27b-3.5|$MODELS_DIR/qwen3.5-27b-mq4.hfq|$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq|--no-chatml"
-  "27b-3.6|$MODELS_DIR/qwen3.6-27b-mq4.hfq|$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq|"
+    "9b-3.5|$MODELS_DIR/qwen3.5-9b-mq4.hfq|models/qwen3.5-9b-mq4.dflash.hfq|--no-chatml"
+    "27b-3.5|$MODELS_DIR/qwen3.5-27b-mq4.hfq|$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq|--no-chatml"
+    "27b-3.6|$MODELS_DIR/qwen3.6-27b-mq4.hfq|$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq|"
 )
 
 MODES=(
-  "dflash|"
-  "ddtree-b12-k2|--ddtree-batched --ddtree-budget 12 --ddtree-topk 2"
+    "dflash|"
+    "ddtree-b12-k2|--ddtree-batched --ddtree-budget 12 --ddtree-topk 2"
 )
 
 GENRES=(
-  "code|$CODE_PROMPT"
-  "prose|$PROSE_PROMPT"
-  "instruct|$INSTRUCT_PROMPT"
+    "code|$CODE_PROMPT"
+    "prose|$PROSE_PROMPT"
+    "instruct|$INSTRUCT_PROMPT"
 )
 
 printf '%-14s %-8s %s\n' "config" "genre" "result"
 printf -- '------------------------------------------------------------------------\n'
 
 for model_entry in "${MODELS[@]}"; do
-  IFS='|' read -r mlabel target draft chatml_flag <<<"$model_entry"
-  [ -r "$target" ] || { echo "$mlabel skip: missing $target"; continue; }
-  [ -r "$draft"  ] || { echo "$mlabel skip: missing $draft";  continue; }
+    IFS='|' read -r mlabel target draft chatml_flag <<<"$model_entry"
+    [ -r "$target" ] || {
+        echo "$mlabel skip: missing $target"
+        continue
+    }
+    [ -r "$draft" ] || {
+        echo "$mlabel skip: missing $draft"
+        continue
+    }
 
-  for mode_entry in "${MODES[@]}"; do
-    IFS='|' read -r mode_label mode_args <<<"$mode_entry"
-    label="${mlabel}-${mode_label}"
+    for mode_entry in "${MODES[@]}"; do
+        IFS='|' read -r mode_label mode_args <<<"$mode_entry"
+        label="${mlabel}-${mode_label}"
 
-    for genre_entry in "${GENRES[@]}"; do
-      IFS='|' read -r genre prompt <<<"$genre_entry"
+        for genre_entry in "${GENRES[@]}"; do
+            IFS='|' read -r genre prompt <<<"$genre_entry"
 
-      blob=""
-      for i in $(seq 1 "$RUNS"); do
-        # shellcheck disable=SC2086
-        out=$("$EXE" \
-          --target "$target" --draft "$draft" \
-          --prompt "$prompt" --max "$MAX_TOKENS" --ctx 2048 \
-          --kv-mode q8 --no-adaptive-b $chatml_flag $mode_args 2>&1)
-        blob+="$out"$'\x1e'
-      done
-      printf '%s' "$blob" | python3 -c "$PARSE_PY" "$label" "$genre"
+            blob=""
+            for i in $(seq 1 "$RUNS"); do
+                # shellcheck disable=SC2086
+                out=$("$EXE" \
+                    --target "$target" --draft "$draft" \
+                    --prompt "$prompt" --max "$MAX_TOKENS" --ctx 2048 \
+                    --kv-mode q8 --no-adaptive-b $chatml_flag $mode_args 2>&1)
+                blob+="$out"$'\x1e'
+            done
+            printf '%s' "$blob" | python3 -c "$PARSE_PY" "$label" "$genre"
+        done
     done
-  done
 done

@@ -20,7 +20,9 @@ npu-kernels = []
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-kld = { path = "../hipfire-kld" }
-hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = [
+  "from-hip-error",
+] }
 hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-primitives = { path = "../hipfire-primitives" }

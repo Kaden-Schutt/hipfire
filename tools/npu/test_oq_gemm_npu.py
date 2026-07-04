@@ -50,7 +50,7 @@ def quantize_group_symmetric(x_f32, bits):
     rows, K = x_f32.shape
     ng = K // GROUP
     xg = x_f32.reshape(rows, ng, GROUP)
-    absmax = np.abs(xg).max(axis=2)                      # [rows, ng]
+    absmax = np.abs(xg).max(axis=2)  # [rows, ng]
     scale = np.where(absmax > 0, absmax / qmax, 1.0).astype(np.float32)
     q = np.round(xg / scale[:, :, None]).clip(-qmax, qmax).astype(np.int8)
     return q.reshape(rows, K), scale
@@ -65,7 +65,7 @@ def oq_reference(qw, sw, qx, sx):
     qwg = qw.astype(np.int64).reshape(M, ng, GROUP)
     qxg = qx.astype(np.int64).reshape(B, ng, GROUP)
     for g in range(ng):
-        P = qxg[:, g, :] @ qwg[:, g, :].T                # [B, M] int64
+        P = qxg[:, g, :] @ qwg[:, g, :].T  # [B, M] int64
         Y += (sx[:, g][:, None] * sw[:, g][None, :]) * P.astype(np.float32)
     return Y
 
@@ -79,9 +79,9 @@ def npu_grouped(qw, qx, run):
     parts = np.empty((ng, M, B), dtype=np.int32)
     tile_used = None
     for g in range(ng):
-        Wg = qw[:, g * GROUP:(g + 1) * GROUP]            # [M, 256] int8
-        Xg = qx[:, g * GROUP:(g + 1) * GROUP]            # [B, 256] int8
-        C, tile_used = run(Wg, Xg)                       # C[M,B] = Wg · Xg^T
+        Wg = qw[:, g * GROUP : (g + 1) * GROUP]  # [M, 256] int8
+        Xg = qx[:, g * GROUP : (g + 1) * GROUP]  # [B, 256] int8
+        C, tile_used = run(Wg, Xg)  # C[M,B] = Wg · Xg^T
         parts[g] = C
     return parts, tile_used
 
@@ -122,12 +122,11 @@ def main():
     qxg = qx.astype(np.int64).reshape(B, ng, GROUP)
     int_ok = True
     for g in range(ng):
-        ref_i = (qwg[:, g, :] @ qxg[:, g, :].T).astype(np.int64)   # [M,B]
+        ref_i = (qwg[:, g, :] @ qxg[:, g, :].T).astype(np.int64)  # [M,B]
         if not np.array_equal(parts[g].astype(np.int64), ref_i):
             int_ok = False
             diff = np.abs(parts[g].astype(np.int64) - ref_i)
-            print(f"  GROUP {g}: int32 MISMATCH  max|Δ|={diff.max()} "
-                  f"({np.count_nonzero(diff)}/{diff.size} elems)")
+            print(f"  GROUP {g}: int32 MISMATCH  max|Δ|={diff.max()} ({np.count_nonzero(diff)}/{diff.size} elems)")
             break
     print(f"  int32 contraction bit-exact: {'PASS' if int_ok else 'FAIL'}")
 
@@ -140,8 +139,10 @@ def main():
     rel = abs_err / (np.abs(Y_ref) + 1e-6)
     atol = 1e-3
     f32_ok = bool((abs_err <= atol + 1e-3 * np.abs(Y_ref)).all())
-    print(f"  f32 rescale: max_abs={abs_err.max():.2e}  mean_abs={abs_err.mean():.2e}  "
-          f"max_rel={rel.max():.2e}  {'PASS' if f32_ok else 'FAIL'} (atol={atol})")
+    print(
+        f"  f32 rescale: max_abs={abs_err.max():.2e}  mean_abs={abs_err.mean():.2e}  "
+        f"max_rel={rel.max():.2e}  {'PASS' if f32_ok else 'FAIL'} (atol={atol})"
+    )
 
     ok = int_ok and f32_ok
     if args.bench:
@@ -150,8 +151,7 @@ def main():
         _, bench, btile = design.bench_npu(Wg, Xg)
         npu_us = getattr(bench, "npu_time_us", None) or getattr(bench, "npu_time", None)
         e2e_us = getattr(bench, "e2e_time_us", None) or getattr(bench, "e2e_time", None)
-        print(f"  bench (one 256-group, M={M} N={B}, tile={btile}): "
-              f"npu={npu_us} e2e={e2e_us} (us)")
+        print(f"  bench (one 256-group, M={M} N={B}, tile={btile}): npu={npu_us} e2e={e2e_us} (us)")
 
     print(f"[test_oq_gemm] {'PASS' if ok else 'FAIL'}")
     sys.exit(0 if ok else 1)

@@ -41,6 +41,7 @@ Notes:
   - --resume skips seeds already present in --output (keyed by a stable seed id),
     so long runs are interruptible. Output is opened in append mode.
 """
+
 import argparse
 import hashlib
 import json
@@ -91,7 +92,7 @@ def reconstruct_output(msg: dict) -> str:
     c = msg.get("content")
     if isinstance(c, str) and c.strip():
         parts.append(c)
-    for tc in (msg.get("tool_calls") or []):
+    for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", tc)
         name = fn.get("name")
         args = fn.get("arguments")
@@ -133,8 +134,11 @@ def main() -> int:
     p.add_argument("--model", required=True, help="model slug (must be Qwen3.6-27B)")
     p.add_argument("--seeds", required=True, help="seed prompts file (see header)")
     p.add_argument("--output", required=True, help="output JSONL (append mode)")
-    p.add_argument("--api-key-env", default=None,
-                   help="env var holding the API key (default: try OPENROUTER_API_KEY then OPENAI_API_KEY)")
+    p.add_argument(
+        "--api-key-env",
+        default=None,
+        help="env var holding the API key (default: try OPENROUTER_API_KEY then OPENAI_API_KEY)",
+    )
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--concurrency", type=int, default=4)
@@ -164,8 +168,7 @@ def main() -> int:
             except json.JSONDecodeError:
                 pass
     todo = [s for s in seeds if seed_id(s) not in done]
-    print(f"seeds: {len(seeds)} total, {len(done)} already done, {len(todo)} to generate",
-          file=sys.stderr)
+    print(f"seeds: {len(seeds)} total, {len(done)} already done, {len(todo)} to generate", file=sys.stderr)
 
     lock = threading.Lock()
     fh = open(out_path, "a", encoding="utf-8")
@@ -174,8 +177,7 @@ def main() -> int:
     def work(seed: dict) -> None:
         sid = seed_id(seed)
         try:
-            resp = call(args.base_url, args.model, key, seed,
-                        args.max_tokens, args.temperature, extra_headers)
+            resp = call(args.base_url, args.model, key, seed, args.max_tokens, args.temperature, extra_headers)
             msg = resp["choices"][0]["message"]
             rec = {
                 "seed_id": sid,
@@ -191,8 +193,9 @@ def main() -> int:
                 stats["ok"] += 1
                 stats["toks"] += rec["completion_tokens"] or 0
                 if stats["ok"] % 20 == 0:
-                    print(f"  {stats['ok']} ok / {stats['err']} err / ~{stats['toks']} completion toks",
-                          file=sys.stderr)
+                    print(
+                        f"  {stats['ok']} ok / {stats['err']} err / ~{stats['toks']} completion toks", file=sys.stderr
+                    )
         except Exception as e:  # noqa: BLE001 — log and continue, don't kill the run
             with lock:
                 stats["err"] += 1
@@ -201,8 +204,9 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
         list(ex.map(work, todo))
     fh.close()
-    print(f"done: {stats['ok']} ok, {stats['err']} err, ~{stats['toks']} completion tokens "
-          f"-> {out_path}", file=sys.stderr)
+    print(
+        f"done: {stats['ok']} ok, {stats['err']} err, ~{stats['toks']} completion tokens -> {out_path}", file=sys.stderr
+    )
     return 0 if stats["ok"] > 0 or not todo else 1
 
 

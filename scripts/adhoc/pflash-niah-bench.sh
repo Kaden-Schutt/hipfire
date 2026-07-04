@@ -63,28 +63,66 @@ LABEL=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --drafter) DRAFTER="$2"; shift 2 ;;
-        --keep-ratio) KEEP_RATIO="$2"; shift 2 ;;
-        --block-size) BLOCK_SIZE="$2"; shift 2 ;;
-        --maxgen) MAXGEN="$2"; shift 2 ;;
-        --asym3|--q8kv) KV_MODE="$1"; shift ;;
-        --pretok) PRETOK=1; shift ;;
-        --runs) RUNS="$2"; shift 2 ;;
-        --label) LABEL="$2"; shift 2 ;;
-        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+        --drafter)
+            DRAFTER="$2"
+            shift 2
+            ;;
+        --keep-ratio)
+            KEEP_RATIO="$2"
+            shift 2
+            ;;
+        --block-size)
+            BLOCK_SIZE="$2"
+            shift 2
+            ;;
+        --maxgen)
+            MAXGEN="$2"
+            shift 2
+            ;;
+        --asym3 | --q8kv)
+            KV_MODE="$1"
+            shift
+            ;;
+        --pretok)
+            PRETOK=1
+            shift
+            ;;
+        --runs)
+            RUNS="$2"
+            shift 2
+            ;;
+        --label)
+            LABEL="$2"
+            shift 2
+            ;;
+        -h | --help)
+            sed -n '2,40p' "$0"
+            exit 0
+            ;;
         *)
-            if [ -z "$TARGET" ]; then TARGET="$1"; shift; continue; fi
-            if [ -z "$FIXTURE" ]; then FIXTURE="$1"; shift; continue; fi
-            echo "unknown arg: $1" >&2; exit 2
+            if [ -z "$TARGET" ]; then
+                TARGET="$1"
+                shift
+                continue
+            fi
+            if [ -z "$FIXTURE" ]; then
+                FIXTURE="$1"
+                shift
+                continue
+            fi
+            echo "unknown arg: $1" >&2
+            exit 2
             ;;
     esac
 done
 
 if [ -z "$TARGET" ] || [ ! -f "$TARGET" ]; then
-    echo "ERR: missing or invalid target path" >&2; exit 2
+    echo "ERR: missing or invalid target path" >&2
+    exit 2
 fi
 if [ -z "$FIXTURE" ] || [ ! -f "$FIXTURE" ]; then
-    echo "ERR: missing or invalid fixture path" >&2; exit 2
+    echo "ERR: missing or invalid fixture path" >&2
+    exit 2
 fi
 if [ ! -x "$EXE" ]; then
     echo "ERR: bench binary missing -- build with:" >&2
@@ -96,7 +134,10 @@ HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./t
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
     "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "pflash-niah-bench${LABEL:+-$LABEL}" --watch-pid "$$" \
-        || { echo "could not acquire GPU lock" >&2; exit 2; }
+        || {
+            echo "could not acquire GPU lock" >&2
+            exit 2
+        }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -121,13 +162,13 @@ run_once() {
     local out
     out=$("$EXE" "$TARGET" "$FIXTURE" --maxgen "$MAXGEN" $KV_MODE $extra 2>&1)
     local pass=0
-    grep -q "^PASS:" <<< "$out" && pass=1
+    grep -q "^PASS:" <<<"$out" && pass=1
     local compress prefill decode ttft total
-    compress=$(grep "^compress:" <<< "$out" | head -1 | grep -oE '[0-9]+ ms' | head -1 | awk '{print $1}')
-    prefill=$(grep "^prefill:" <<< "$out" | head -1 | grep -oE '[0-9]+ ms' | head -1 | awk '{print $1}')
-    decode=$(grep "^decode:" <<< "$out" | head -1 | grep -oE '[0-9]+ ms' | head -1 | awk '{print $1}')
-    ttft=$(grep "^ttft:" <<< "$out" | head -1 | awk '{print $2}')
-    total=$(grep "^total:" <<< "$out" | head -1 | awk '{print $2}')
+    compress=$(grep "^compress:" <<<"$out" | head -1 | grep -oE '[0-9]+ ms' | head -1 | awk '{print $1}')
+    prefill=$(grep "^prefill:" <<<"$out" | head -1 | grep -oE '[0-9]+ ms' | head -1 | awk '{print $1}')
+    decode=$(grep "^decode:" <<<"$out" | head -1 | grep -oE '[0-9]+ ms' | head -1 | awk '{print $1}')
+    ttft=$(grep "^ttft:" <<<"$out" | head -1 | awk '{print $2}')
+    total=$(grep "^total:" <<<"$out" | head -1 | awk '{print $2}')
     echo "${compress:-0} ${prefill:-0} ${decode:-0} ${ttft:-0} ${total:-0} $pass"
 }
 
@@ -137,23 +178,31 @@ mode_label="baseline"
 printf "target=%s  fixture=%s  mode=%s  label=%s  runs=%d\n" \
     "$(basename "$TARGET")" "$(basename "$FIXTURE")" "$mode_label" "$LABEL" "$RUNS"
 
-c_samples=(); p_samples=(); d_samples=(); t_samples=(); tot_samples=()
+c_samples=()
+p_samples=()
+d_samples=()
+t_samples=()
+tot_samples=()
 pass_count=0
 for run in $(seq 1 "$RUNS"); do
     r=$(run_once)
-    read -r c p d t tot pass <<< "$r"
+    read -r c p d t tot pass <<<"$r"
     [ "$pass" = "1" ] && pass_count=$((pass_count + 1))
-    c_samples+=("$c"); p_samples+=("$p")
-    d_samples+=("$d"); t_samples+=("$t"); tot_samples+=("$tot")
+    c_samples+=("$c")
+    p_samples+=("$p")
+    d_samples+=("$d")
+    t_samples+=("$t")
+    tot_samples+=("$tot")
     printf "  run %d: compress=%-5sms prefill=%-5sms decode=%-4sms ttft=%-6sms total=%-6sms %s\n" \
         "$run" "$c" "$p" "$d" "$t" "$tot" "$([ "$pass" = "1" ] && echo PASS || echo FAIL)"
 done
 
 emit_stats() {
-    local name="$1"; shift
+    local name="$1"
+    shift
     local stats
     stats=$(printf '%s\n' "$@" | stat_line)
-    read -r min med max <<< "$stats"
+    read -r min med max <<<"$stats"
     local spread="?"
     if [ "$med" != "0" ] && [ "$med" -gt 0 ] 2>/dev/null; then
         spread=$(awk "BEGIN { printf \"%.1f%%\", ($max - $min) / $med * 100 }")
@@ -162,10 +211,10 @@ emit_stats() {
 }
 
 [ -n "$DRAFTER" ] && emit_stats "compress" "${c_samples[@]}"
-emit_stats "prefill"  "${p_samples[@]}"
-emit_stats "decode"   "${d_samples[@]}"
-emit_stats "ttft"     "${t_samples[@]}"
-emit_stats "total"    "${tot_samples[@]}"
+emit_stats "prefill" "${p_samples[@]}"
+emit_stats "decode" "${d_samples[@]}"
+emit_stats "ttft" "${t_samples[@]}"
+emit_stats "total" "${tot_samples[@]}"
 printf "  passes=%d/%d\n" "$pass_count" "$RUNS"
 
 if [ "$pass_count" -lt "$RUNS" ]; then

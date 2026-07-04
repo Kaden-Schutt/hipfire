@@ -37,7 +37,7 @@ pub struct EncodedMQ4G128 {
 /// quantizes to INT4 affine with scale and min stored per group.
 pub fn encode_mq4g128_from_fp16(weight_fp16: &[u16], rows: usize, cols: usize) -> EncodedMQ4G128 {
     assert!(
-        cols % GROUP_SIZE == 0,
+        cols.is_multiple_of(GROUP_SIZE),
         "encode_mq4g128_from_fp16: cols={cols} not a multiple of {GROUP_SIZE}"
     );
     assert_eq!(
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not a multiple of 128")]
     fn rejects_bad_cols() {
-        encode_mq4g128_from_fp16(&vec![0u16; 100], 1, 100);
+        encode_mq4g128_from_fp16(&[0u16; 100], 1, 100);
     }
 
     #[test]

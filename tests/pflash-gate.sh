@@ -40,10 +40,22 @@ MAXGEN_MULTI=80
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --baseline) BASELINE="$2"; shift 2 ;;
-        --tolerance) TOLERANCE_PCT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
-        *) echo "unknown arg: $1" >&2; exit 2 ;;
+        --baseline)
+            BASELINE="$2"
+            shift 2
+            ;;
+        --tolerance)
+            TOLERANCE_PCT="$2"
+            shift 2
+            ;;
+        -h | --help)
+            sed -n '2,30p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown arg: $1" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -54,7 +66,7 @@ gfx_target_version_to_arch() {
         908000) echo "gfx908" ;;
         1010000) echo "gfx1010" ;;
         1030000) echo "gfx1030" ;;
-        1100000|1100001) echo "gfx1100" ;;
+        1100000 | 1100001) echo "gfx1100" ;;
         1105001) echo "gfx1151" ;;
         1200000) echo "gfx1200" ;;
         1201000) echo "gfx1201" ;;
@@ -69,12 +81,18 @@ detect_gfx_arch() {
     fi
     if command -v hipfire-eval >/dev/null 2>&1; then
         arch="$(hipfire-eval --version 2>/dev/null | awk '/^arch / {print $2; exit}')"
-        [ -n "$arch" ] && { printf '%s\n' "$arch"; return 0; }
+        [ -n "$arch" ] && {
+            printf '%s\n' "$arch"
+            return 0
+        }
     fi
     for exe in ./target/release/hipfire-eval ./target/debug/hipfire-eval; do
         if [ -x "$exe" ]; then
             arch="$("$exe" --version 2>/dev/null | awk '/^arch / {print $2; exit}')"
-            [ -n "$arch" ] && { printf '%s\n' "$arch"; return 0; }
+            [ -n "$arch" ] && {
+                printf '%s\n' "$arch"
+                return 0
+            }
         fi
     done
     for props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
@@ -98,7 +116,7 @@ select_perf_baseline() {
         return 1
     fi
     # shellcheck disable=SC2206
-    matches=( "$BASELINE_ROOT/$arch"-*.json )
+    matches=("$BASELINE_ROOT/$arch"-*.json)
     count=0
     for path in "${matches[@]}"; do
         [ -f "$path" ] || continue
@@ -155,7 +173,7 @@ fi
 
 BASELINE_HEADER=$(printf '%s\n' "$BASELINE_INFO_AND_ROWS" | head -1)
 ROWS_JSON=$(printf '%s\n' "$BASELINE_INFO_AND_ROWS" | sed '1d')
-IFS='|' read -r _baseline_tag baseline_schema baseline_arch baseline_profile <<< "$BASELINE_HEADER"
+IFS='|' read -r _baseline_tag baseline_schema baseline_arch baseline_profile <<<"$BASELINE_HEADER"
 if [ "$_baseline_tag" = "__missing_pflash_suite__" ]; then
     if [ "${HIPFIRE_SKIP_MISSING_PERF_BASELINE:-0}" = "1" ]; then
         echo "pflash-gate: SKIPPED (baseline has no baselines.pflash_niah rows)"
@@ -216,8 +234,7 @@ else
         crates/hip-bridge/src/ffi.rs \
         crates/hip-bridge/src/kernarg.rs \
         crates/hip-bridge/src/error.rs \
-        kernels/src/pflash_score_q8_kv.hip \
-    ; do
+        kernels/src/pflash_score_q8_kv.hip; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
             break
@@ -244,7 +261,10 @@ fi
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "pflash-gate" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "pflash-gate" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -260,8 +280,8 @@ run_fixture() {
     local fixture="$1" mode="$2"
     local maxgen="$MAXGEN_NIAH"
     case "$fixture" in
-        *multi*)     maxgen="$MAXGEN_MULTI" ;;
-        *longcode*|*longprose*) maxgen="$MAXGEN_LONG" ;;
+        *multi*) maxgen="$MAXGEN_MULTI" ;;
+        *longcode* | *longprose*) maxgen="$MAXGEN_LONG" ;;
     esac
     local extra="--pretok"
     if [ "$mode" = "pflash" ]; then
@@ -271,12 +291,12 @@ run_fixture() {
 }
 
 extract_total() {
-    grep '^total:' <<< "$1" | head -1 | awk '{print $2}'
+    grep '^total:' <<<"$1" | head -1 | awk '{print $2}'
 }
 extract_verdict() {
-    if grep -q '^PASS:' <<< "$1"; then
+    if grep -q '^PASS:' <<<"$1"; then
         echo "PASS"
-    elif grep -q '^FAIL:' <<< "$1"; then
+    elif grep -q '^FAIL:' <<<"$1"; then
         echo "FAIL"
     else
         echo "UNKNOWN"
@@ -315,7 +335,7 @@ while IFS='|' read -r label fixture mode baseline_total_ms baseline_verdict; do
             "$label" "$baseline_total_ms" "$baseline_verdict" \
             "$actual_total" "$actual_verdict" "$drift_pct"
     fi
-done <<< "$ROWS_JSON"
+done <<<"$ROWS_JSON"
 
 echo
 echo "pflash-gate: $((total_rows - regressions))/$total_rows rows clean"

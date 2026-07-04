@@ -46,7 +46,7 @@ RESULTS_DIR=benchmarks/quality-baselines/results/$RESULTS_LABEL
 mkdir -p "$RESULTS_DIR/per-variant"
 SUMMARY="$RESULTS_DIR/summary.tsv"
 if [ ! -f "$SUMMARY" ]; then
-    printf "alpha\tquantize_sec\teval_sec\tmean_kld\tppl\tkldseq_path\n" > "$SUMMARY"
+    printf "alpha\tquantize_sec\teval_sec\tmean_kld\tppl\tkldseq_path\n" >"$SUMMARY"
 fi
 
 # ── pre-flight ────────────────────────────────────────────────────────
@@ -59,10 +59,16 @@ done
 
 # Build the hipfire-self KLD reference once (daemon build_ref) if not present.
 if [ ! -f "$KLDREF" ]; then
-    [ -f "$REF_HFQ" ] || { echo "FATAL: need REF_HFQ ($REF_HFQ, a BF16 .hfq) to build the KLD reference, or a pre-built KLDREF ($KLDREF)" >&2; exit 2; }
+    [ -f "$REF_HFQ" ] || {
+        echo "FATAL: need REF_HFQ ($REF_HFQ, a BF16 .hfq) to build the KLD reference, or a pre-built KLDREF ($KLDREF)" >&2
+        exit 2
+    }
     echo "building HFKREF $KLDREF from $REF_HFQ (n=$MAX_CHUNKS, kv=$KV_MODE)"
     kld_build_ref "$REF_HFQ" "$CORPUS" "$KLDREF" "$MAX_CHUNKS" "$KV_MODE" >/dev/null \
-        || { echo "FATAL: daemon build_ref failed" >&2; exit 1; }
+        || {
+            echo "FATAL: daemon build_ref failed" >&2
+            exit 1
+        }
 fi
 
 if [ $# -eq 0 ]; then
@@ -96,8 +102,12 @@ for ALPHA in "$@"; do
         --format mq4g256 \
         --imatrix "$IMATRIX" \
         --awq-alpha "$ALPHA" \
-        > "$QUANT_LOG" 2>&1 \
-    || { echo "  QUANTIZE FAILED — see $QUANT_LOG" >&2; tail -30 "$QUANT_LOG" >&2; exit 1; }
+        >"$QUANT_LOG" 2>&1 \
+        || {
+            echo "  QUANTIZE FAILED — see $QUANT_LOG" >&2
+            tail -30 "$QUANT_LOG" >&2
+            exit 1
+        }
     QSEC=$((SECONDS - QSTART))
     echo "  quantize done in ${QSEC}s; size=$(du -h "$QUANT_SLOT" | cut -f1)"
 
@@ -127,14 +137,18 @@ for ALPHA in "$@"; do
     echo "  eval (n=$MAX_CHUNKS, kv=$KV_MODE, daemon kld_eval)"
     ESTART=$SECONDS
     EVAL_LINE=$(KLD_DAEMON_LOG="$EVAL_LOG" kld_score "$QUANT_SLOT" "$KLDREF" "$KLDSEQ" "$MAX_CHUNKS" "$KV_MODE") \
-        || { echo "  EVAL FAILED — see $EVAL_LOG" >&2; echo "$EVAL_LINE" >&2; exit 1; }
+        || {
+            echo "  EVAL FAILED — see $EVAL_LOG" >&2
+            echo "$EVAL_LINE" >&2
+            exit 1
+        }
     MEAN_KLD=$(kld_field "$EVAL_LINE" mean_kld)
     PPL=$(kld_field "$EVAL_LINE" ppl)
     ESEC=$((SECONDS - ESTART))
     echo "  eval done in ${ESEC}s; mean_kld=$MEAN_KLD ppl=$PPL kldseq=$KLDSEQ"
 
     # 4. Record
-    printf "%s\t%d\t%d\t%s\t%s\t%s\n" "$ALPHA" "$QSEC" "$ESEC" "$MEAN_KLD" "$PPL" "$KLDSEQ" >> "$SUMMARY"
+    printf "%s\t%d\t%d\t%s\t%s\t%s\n" "$ALPHA" "$QSEC" "$ESEC" "$MEAN_KLD" "$PPL" "$KLDSEQ" >>"$SUMMARY"
 
     echo ""
 done

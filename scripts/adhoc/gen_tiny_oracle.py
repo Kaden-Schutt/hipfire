@@ -28,6 +28,7 @@ the pitfall checklist (docs/methodology/arch-port-validation.md):
   • re-split packed→split if the loader/kernels expect split experts
 ──────────────────────────────────────────────────────────────────────────────
 """
+
 import argparse, json, struct, sys
 from pathlib import Path
 import torch
@@ -38,16 +39,27 @@ def build_model_and_config(seed: int):
     """Return (model, hf_config, n_layers, hidden). Tiny, real head_dim/rotary,
     dims divisible by the quant group size, top-k matching the kernel."""
     from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM  # ← arch import
+
     torch.manual_seed(seed)
     n_layers, inter, hidden = 2, 256, 256
     cfg = MiniMaxM2Config(
-        vocab_size=512, hidden_size=hidden, intermediate_size=inter,
-        num_hidden_layers=n_layers, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=128,                       # REAL head_dim (not shrunk)
-        num_local_experts=16, num_experts_per_tok=8,   # top-8 matches the _k8 kernels
-        max_position_embeddings=512, rms_norm_eps=1e-6, tie_word_embeddings=False,
-        rope_parameters={"rope_type": "default", "rope_theta": 5_000_000.0,
-                         "partial_rotary_factor": 0.5},  # rotary_dim = 128*0.5 = 64
+        vocab_size=512,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        num_hidden_layers=n_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,  # REAL head_dim (not shrunk)
+        num_local_experts=16,
+        num_experts_per_tok=8,  # top-8 matches the _k8 kernels
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 5_000_000.0,
+            "partial_rotary_factor": 0.5,
+        },  # rotary_dim = 128*0.5 = 64
     )
     model = MiniMaxM2ForCausalLM(cfg).to(torch.float32).eval()
     # Optional: perturb routing bias so top-k selection is non-trivial.
@@ -79,19 +91,18 @@ def resplit_state_dict(sd, cfg):
     for name, tensor in sd.items():
         t = tensor.detach().to(torch.float32).contiguous()
         if name.endswith("mlp.experts.gate_up_proj"):
-            pre = name[:-len("mlp.experts.gate_up_proj")]
+            pre = name[: -len("mlp.experts.gate_up_proj")]
             for e in range(cfg.num_local_experts):
                 out[f"{pre}block_sparse_moe.experts.{e}.w1.weight"] = t[e][:inter, :].contiguous()
                 out[f"{pre}block_sparse_moe.experts.{e}.w3.weight"] = t[e][inter:, :].contiguous()
         elif name.endswith("mlp.experts.down_proj"):
-            pre = name[:-len("mlp.experts.down_proj")]
+            pre = name[: -len("mlp.experts.down_proj")]
             for e in range(cfg.num_local_experts):
                 out[f"{pre}block_sparse_moe.experts.{e}.w2.weight"] = t[e].contiguous()
         elif name.endswith("mlp.gate.weight"):
             out[name.replace("mlp.gate.weight", "block_sparse_moe.gate.weight")] = t
         elif name.endswith("mlp.e_score_correction_bias"):
-            out[name.replace("mlp.e_score_correction_bias",
-                             "block_sparse_moe.e_score_correction_bias")] = t
+            out[name.replace("mlp.e_score_correction_bias", "block_sparse_moe.e_score_correction_bias")] = t
         else:
             out[name] = t
     return out
@@ -101,15 +112,29 @@ def flat_config_fields(cfg):
     """Flat config fields hipfire's `*Config::from_hfq` parses (the real-ckpt
     convention), in case the HF config nests them differently."""
     return dict(
-        architectures=["MiniMaxM2ForCausalLM"], model_type="minimax_m2",
-        vocab_size=cfg.vocab_size, hidden_size=cfg.hidden_size,
-        intermediate_size=cfg.intermediate_size, num_hidden_layers=cfg.num_hidden_layers,
-        num_attention_heads=cfg.num_attention_heads, num_key_value_heads=cfg.num_key_value_heads,
-        head_dim=128, num_local_experts=cfg.num_local_experts,
-        num_experts_per_tok=cfg.num_experts_per_tok, rotary_dim=64, rope_theta=5_000_000.0,
-        rms_norm_eps=1e-6, use_qk_norm=True, use_routing_bias=True, scoring_func="sigmoid",
-        max_position_embeddings=512, num_mtp_modules=0, tie_word_embeddings=False,
+        architectures=["MiniMaxM2ForCausalLM"],
+        model_type="minimax_m2",
+        vocab_size=cfg.vocab_size,
+        hidden_size=cfg.hidden_size,
+        intermediate_size=cfg.intermediate_size,
+        num_hidden_layers=cfg.num_hidden_layers,
+        num_attention_heads=cfg.num_attention_heads,
+        num_key_value_heads=cfg.num_key_value_heads,
+        head_dim=128,
+        num_local_experts=cfg.num_local_experts,
+        num_experts_per_tok=cfg.num_experts_per_tok,
+        rotary_dim=64,
+        rope_theta=5_000_000.0,
+        rms_norm_eps=1e-6,
+        use_qk_norm=True,
+        use_routing_bias=True,
+        scoring_func="sigmoid",
+        max_position_embeddings=512,
+        num_mtp_modules=0,
+        tie_word_embeddings=False,
     )
+
+
 # =================== END ARCH ADAPTATION ====================================
 
 
@@ -131,15 +156,19 @@ def main():
     args = ap.parse_args()
 
     model, cfg, n_layers, hidden = build_model_and_config(args.seed)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
 
     # Fixed token chunk.
     g = torch.Generator().manual_seed(args.seed + 1)
     tokens = torch.randint(0, cfg.vocab_size, (args.n_ctx,), generator=g).tolist()
     with open(out / "tokens.hfkldr", "wb") as f:
-        f.write(b"HFKLDR\0\0"); hdr = bytearray(24)
-        struct.pack_into("<I", hdr, 4, args.n_ctx); struct.pack_into("<I", hdr, 12, 1)
-        f.write(hdr); f.write(struct.pack(f"<{args.n_ctx}I", *tokens))
+        f.write(b"HFKLDR\0\0")
+        hdr = bytearray(24)
+        struct.pack_into("<I", hdr, 4, args.n_ctx)
+        struct.pack_into("<I", hdr, 12, 1)
+        f.write(hdr)
+        f.write(struct.pack(f"<{args.n_ctx}I", *tokens))
     print(f"tokens: {tokens}", flush=True)
 
     input_ids = torch.tensor([tokens], dtype=torch.long)
@@ -148,8 +177,7 @@ def main():
     with torch.no_grad():
         hs = model(input_ids, output_hidden_states=True).hidden_states
     cap = {}
-    h = final_norm_module(model).register_forward_pre_hook(
-        lambda m, i: cap.__setitem__("x", i[0].detach()))
+    h = final_norm_module(model).register_forward_pre_hook(lambda m, i: cap.__setitem__("x", i[0].detach()))
     with torch.no_grad():
         _ = model(input_ids)
     h.remove()
@@ -162,17 +190,16 @@ def main():
     # Per-layer POST-ATTENTION residual (input to each post_attn norm) for bisection.
     pa, handles = {}, []
     for li, mod in enumerate(post_attn_modules(model)):
-        handles.append(mod.register_forward_pre_hook(
-            lambda m, i, idx=li: pa.__setitem__(idx, i[0].detach())))
+        handles.append(mod.register_forward_pre_hook(lambda m, i, idx=li: pa.__setitem__(idx, i[0].detach())))
     with torch.no_grad():
         _ = model(input_ids)
     for hd in handles:
         hd.remove()
-    write_hfhs(out / "oracle_postattn.hfhs", [pa[k][0] for k in range(n_layers)],
-               n_layers, args.n_ctx, hidden)
+    write_hfhs(out / "oracle_postattn.hfhs", [pa[k][0] for k in range(n_layers)], n_layers, args.n_ctx, hidden)
 
     # Save model.safetensors in the hipfire-ingest layout + flat config.json.
     from safetensors.torch import save_file
+
     save_file(resplit_state_dict(model.state_dict(), cfg), str(out / "model.safetensors"))
     conf = json.loads((out / "config.json").read_text()) if (out / "config.json").exists() else {}
     conf.update(flat_config_fields(cfg))

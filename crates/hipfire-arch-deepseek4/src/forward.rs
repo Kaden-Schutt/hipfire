@@ -267,9 +267,9 @@ fn gemv_auto_batched_wmma(
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
-                        && m % 64 == 0
-                        && k % 32 == 0
-                        && batch_size % 64 == 0;
+                        && m.is_multiple_of(64)
+                        && k.is_multiple_of(32)
+                        && batch_size.is_multiple_of(64);
                     if use_4w {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
@@ -279,7 +279,11 @@ fn gemv_auto_batched_wmma(
                         .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
                         .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
                 }
-            } else if wmma_on && gpu.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
+            } else if wmma_on
+                && gpu.arch_caps.has_wmma()
+                && m.is_multiple_of(64)
+                && k.is_multiple_of(32)
+            {
                 // gfx11 / RDNA3.5 (gfx1151) Q8_0 WMMA prefill. The activation
                 // is pre-converted to F16 in `scratch`; the kernels honor the
                 // F16 dtype (no re-convert). 4-warp 64×64-tile kernel for
@@ -290,7 +294,7 @@ fn gemv_auto_batched_wmma(
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
                     let opt_out_4w = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
-                    if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
+                    if !opt_out_4w && batch_size >= 64 && batch_size.is_multiple_of(64) {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
                             .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
@@ -7057,12 +7061,12 @@ fn attention_block_batched_mixed(
         // score LDS would exceed 64 KB. max_n_total bounds the LDS (n_valid ≤ win).
         let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
             && gpu.arch_caps.has_wmma()
-            && n_heads % 16 == 0
-            && head_dim % 16 == 0;
+            && n_heads.is_multiple_of(16)
+            && head_dim.is_multiple_of(16);
         let _max_n_total = win as i32 + n_active_host.iter().copied().max().unwrap_or(0);
         let mut done = false;
-        if use_dsa_wmma {
-            if gpu
+        if use_dsa_wmma
+            && gpu
                 .deepseek4_attn_swa_topk_direct_batched_f32(
                     &pbs.q_batch,
                     &pbs.swa_staged_batch, // K=V tied
@@ -7081,9 +7085,8 @@ fn attention_block_batched_mixed(
                     batch_size as i32,
                 )
                 .is_ok()
-            {
-                done = true;
-            }
+        {
+            done = true;
         }
         if !done {
             gpu.deepseek4_attn_swa_topk_direct_batched_f32(
@@ -7110,12 +7113,12 @@ fn attention_block_batched_mixed(
         // disable / non-tiling shapes / LDS > 64 KB.
         let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
             && gpu.arch_caps.has_wmma()
-            && n_heads % 16 == 0
-            && head_dim % 16 == 0;
+            && n_heads.is_multiple_of(16)
+            && head_dim.is_multiple_of(16);
         let _max_n_total = win as i32 + n_active_host.iter().copied().max().unwrap_or(0);
         let mut done = false;
-        if use_dsa_wmma {
-            if gpu
+        if use_dsa_wmma
+            && gpu
                 .deepseek4_attn_swa_topk_batched_f32(
                     &pbs.q_batch,
                     &pbs.swa_staged_batch,  // K=V tied
@@ -7133,9 +7136,8 @@ fn attention_block_batched_mixed(
                     batch_size as i32,
                 )
                 .is_ok()
-            {
-                done = true;
-            }
+        {
+            done = true;
         }
         if !done {
             gpu.deepseek4_attn_swa_topk_batched_f32(
@@ -7616,8 +7618,8 @@ fn ffn_batched(
             Ok("0") => false,
             Ok("1") => true,
             _ => gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"),
-        } && (2 * im) % 64 == 0
-            && hidden % 256 == 0;
+        } && (2 * im).is_multiple_of(64)
+            && hidden.is_multiple_of(256);
         // MMQ-style index-pack preload (#356). Reverted to OPT-IN: the preload
         // hoisted only 8 of 16 weight packs, decoding half the MQ2 weights wrong
         // → long-context attractor on DS4 mq2lloyd (root-caused by @nwoolmer on
@@ -7815,8 +7817,8 @@ fn ffn_batched(
             Ok("0") => false,
             Ok("1") => true,
             _ => gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"),
-        } && hidden % 64 == 0
-            && im % 256 == 0;
+        } && hidden.is_multiple_of(64)
+            && im.is_multiple_of(256);
         // Opt-in (see use_mmqload above — same #356 long-context attractor).
         let use_mmqload_down = use_lloyd_4w_down
             && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");

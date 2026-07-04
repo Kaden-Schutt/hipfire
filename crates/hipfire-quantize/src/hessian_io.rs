@@ -32,8 +32,6 @@
 //! imatrix-only routed experts still feed activation-aware quantization even
 //! when LDLQ is unavailable.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use byteorder::{ByteOrder, LittleEndian};
 use hipfire_primitives::conv::bf16_bits_to_f32 as bf16_to_f32;
 use memmap2::{Advice, Mmap};

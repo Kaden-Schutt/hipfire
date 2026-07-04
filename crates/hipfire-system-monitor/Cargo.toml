@@ -1,0 +1,17 @@
+[package]
+name = "hipfire-system-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone terminal system monitor backed by HIP-independent sysfs/proc telemetry."
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+libc = "0.2"
+libdrm_amdgpu_sys = { version = "0.8.16", git = "https://github.com/Umio-Yasuno/libdrm-amdgpu-sys-rs", default-features = false, features = [
+  "link_drm",
+], rev = "46c5aceeef63dbf7045453f69a3ccaf0d376b0fb" }
+ratatui = "0.29"
+hipfire-admin-types = { path = "../hipfire-admin-types" }
+hipfire-sysinfo = { path = "../hipfire-sysinfo" }

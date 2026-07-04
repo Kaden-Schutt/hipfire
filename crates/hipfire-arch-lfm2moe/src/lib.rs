@@ -17,6 +17,13 @@
 //!   * dense MLP   -> Q8 SwiGLU (w1 gate, w3 up, silu_mul, w2 down)
 //!   * LIV conv    -> conv1d_gated_decode_f32 (NEW: K=3, fused B*x / C*conv_out
 //!                    gates + rolling conv-state cache)
+#![allow(
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::large_enum_variant,
+    clippy::too_many_arguments
+)]
+
 pub mod arch;
 pub mod calibration;
 pub mod config;

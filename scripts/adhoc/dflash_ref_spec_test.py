@@ -12,9 +12,11 @@ with our Qwen3.5 target (e.g. cache layout, position_ids, etc).
 
 If this gives τ>1, our tau_probe has a reproducible bug to find.
 """
+
 import sys, torch
 import os
 from pathlib import Path
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRIPWIRE_HIPFIRE_DIR = Path(os.environ.get("TRIPWIRE_HIPFIRE_DIR", str(REPO_ROOT)))
 sys.path.insert(0, str(TRIPWIRE_HIPFIRE_DIR / ".dflash-reference"))
@@ -27,13 +29,17 @@ dtype = torch.bfloat16
 print("[target] loading...", flush=True)
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
 target = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen3.5-4B", torch_dtype=dtype, attn_implementation="eager",
+    "Qwen/Qwen3.5-4B",
+    torch_dtype=dtype,
+    attn_implementation="eager",
 ).to(device)
 target.eval()
 
 print("[draft] loading z-lab 4B DFlash...", flush=True)
 draft = DFlashDraftModel.from_pretrained(
-    "z-lab/Qwen3.5-4B-DFlash", torch_dtype=dtype, trust_remote_code=True,
+    "z-lab/Qwen3.5-4B-DFlash",
+    torch_dtype=dtype,
+    trust_remote_code=True,
 ).to(device)
 draft.eval()
 print(f"[draft]   block_size={draft.block_size}  mask_token_id={draft.mask_token_id}", flush=True)
@@ -57,10 +63,11 @@ try:
         stop_token_ids=[tok.eos_token_id] if tok.eos_token_id is not None else [],
         temperature=0.0,
     )
-    gen_ids = out[0, ids.shape[1]:].cpu().tolist()
+    gen_ids = out[0, ids.shape[1] :].cpu().tolist()
     gen = tok.decode(gen_ids, skip_special_tokens=False)
     print(f"[out] shape={out.shape}  new_len={len(gen_ids)}", flush=True)
     print(f"[gen] {gen[:400]!r}", flush=True)
 except Exception as e:
     import traceback
+
     traceback.print_exc()

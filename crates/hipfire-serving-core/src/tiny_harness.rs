@@ -198,7 +198,7 @@ impl TinyModel {
             TinyArch::Llama => {
                 let config = hipfire_runtime::hfq::config_from_hfq(&hfq)
                     .ok_or("llama: config_from_hfq failed")?;
-                let weights = hipfire_runtime::hfq::load_weights_hfq(&mut hfq, &config, gpu)
+                let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, gpu)
                     .map_err(|e| format!("llama load_weights_hfq: {e:?}"))?;
                 let kv = KvCache::new_gpu_q8(
                     gpu,

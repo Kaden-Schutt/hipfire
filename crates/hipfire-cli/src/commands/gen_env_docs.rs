@@ -19,6 +19,8 @@
 //!     content gate). The `.rs` output is also piped through `rustfmt` so it
 //!     stops fighting `cargo fmt`.
 
+#![allow(clippy::doc_lazy_continuation)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -650,7 +652,7 @@ fn infer_default(
         .collect();
     if !ranked.is_empty() {
         // Highest score wins; ties resolve to first-seen (stable sort).
-        ranked.sort_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         return ranked[0].1.clone();
     }
 

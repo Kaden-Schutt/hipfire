@@ -44,14 +44,14 @@ def build_tiny_config() -> Lfm2MoeConfig:
         vocab_size=512,
         hidden_size=256,
         num_hidden_layers=len(layer_types),
-        num_attention_heads=4,        # 4 * head_dim(64) = 256
-        num_key_value_heads=2,        # GQA 2:1
-        head_dim=64,                  # REAL head_dim
+        num_attention_heads=4,  # 4 * head_dim(64) = 256
+        num_key_value_heads=2,  # GQA 2:1
+        head_dim=64,  # REAL head_dim
         max_position_embeddings=1024,
         norm_eps=1e-5,
         rope_theta=1_000_000.0,
         # conv (LIV short-conv)
-        conv_L_cache=3,               # REAL kernel size
+        conv_L_cache=3,  # REAL kernel size
         conv_bias=False,
         # dense MLP dim -> force 256 (k % 256 == 0); disable auto-adjust
         intermediate_size=256,
@@ -60,9 +60,9 @@ def build_tiny_config() -> Lfm2MoeConfig:
         block_ffn_dim_multiplier=1.0,
         block_auto_adjust_ff_dim=False,
         # MoE
-        moe_intermediate_size=256,    # k % 256 == 0
-        num_experts=8,                # > num_experts_per_tok
-        num_experts_per_tok=4,        # match indexed-MoE K_TOP=4
+        moe_intermediate_size=256,  # k % 256 == 0
+        num_experts=8,  # > num_experts_per_tok
+        num_experts_per_tok=4,  # match indexed-MoE K_TOP=4
         num_dense_layers=2,
         norm_topk_prob=True,
         use_expert_bias=True,
@@ -87,17 +87,23 @@ def main():
 
     torch.manual_seed(args.seed)
     cfg = build_tiny_config()
-    print("tiny config:", json.dumps({
-        "layer_types": cfg.layer_types,
-        "num_dense_layers": cfg.num_dense_layers,
-        "hidden_size": cfg.hidden_size,
-        "head_dim": cfg.head_dim,
-        "num_experts": cfg.num_experts,
-        "num_experts_per_tok": cfg.num_experts_per_tok,
-        "conv_L_cache": cfg.conv_L_cache,
-        "intermediate_size": cfg.intermediate_size,
-        "moe_intermediate_size": cfg.moe_intermediate_size,
-    }, indent=1))
+    print(
+        "tiny config:",
+        json.dumps(
+            {
+                "layer_types": cfg.layer_types,
+                "num_dense_layers": cfg.num_dense_layers,
+                "hidden_size": cfg.hidden_size,
+                "head_dim": cfg.head_dim,
+                "num_experts": cfg.num_experts,
+                "num_experts_per_tok": cfg.num_experts_per_tok,
+                "conv_L_cache": cfg.conv_L_cache,
+                "intermediate_size": cfg.intermediate_size,
+                "moe_intermediate_size": cfg.moe_intermediate_size,
+            },
+            indent=1,
+        ),
+    )
 
     model = Lfm2MoeForCausalLM(cfg)
     model.eval()
@@ -108,8 +114,7 @@ def main():
         for name, p in model.named_parameters():
             if name.endswith("expert_bias"):
                 p.copy_(torch.randn_like(p) * 0.1)
-            elif name.endswith("_norm.weight") or name.endswith("norm.weight") \
-                    or name.endswith("layernorm.weight"):
+            elif name.endswith("_norm.weight") or name.endswith("norm.weight") or name.endswith("layernorm.weight"):
                 # perturb RMSNorm weights away from 1.0 to catch +1/Gemma bugs
                 p.copy_(1.0 + torch.randn_like(p) * 0.05)
 
@@ -135,10 +140,10 @@ def main():
         def hook(_mod, _inp, out):
             hs = out[0] if isinstance(out, tuple) else out
             captures[i] = hs.detach().float()[0].cpu()  # [seq, hidden]
+
         return hook
 
-    handles = [layer.register_forward_hook(mk_hook(i))
-               for i, layer in enumerate(ref.model.layers)]
+    handles = [layer.register_forward_hook(mk_hook(i)) for i, layer in enumerate(ref.model.layers)]
 
     ids = torch.tensor([TOKENS], dtype=torch.long)
     with torch.no_grad():

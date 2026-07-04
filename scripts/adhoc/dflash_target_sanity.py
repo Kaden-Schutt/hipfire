@@ -8,6 +8,7 @@
 output on our agentic prompt? If target outputs 'useruser...' itself, the
 draft failure might just be a reflection of target's weird behavior.
 """
+
 import sys, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -16,7 +17,9 @@ dtype = torch.bfloat16
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
 target = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen3.5-4B", torch_dtype=dtype, attn_implementation="eager",
+    "Qwen/Qwen3.5-4B",
+    torch_dtype=dtype,
+    attn_implementation="eager",
 ).to(device)
 target.eval()
 
@@ -34,8 +37,10 @@ print(f"[prompt] {ids.shape[1]} tokens", flush=True)
 print("[target] greedy generation, 48 new tokens...", flush=True)
 with torch.inference_mode():
     out = target.generate(
-        ids, max_new_tokens=48, do_sample=False,
+        ids,
+        max_new_tokens=48,
+        do_sample=False,
         pad_token_id=tok.pad_token_id or tok.eos_token_id,
     )
-gen = tok.decode(out[0, ids.shape[1]:].cpu().tolist(), skip_special_tokens=False)
+gen = tok.decode(out[0, ids.shape[1] :].cpu().tolist(), skip_special_tokens=False)
 print(f"[out] {gen!r}", flush=True)

@@ -49,9 +49,7 @@ from aie.utils.compile import compile_mlir_module, compile_external_kernel
 SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_SRC = SCRIPT_DIR / "rms_norm_head_bf16.cc"
 
-_mlir_aie_pkg = next(
-    (Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None
-)
+_mlir_aie_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
 AIE_INCLUDE = _mlir_aie_pkg / "mlir_aie" / "include" if _mlir_aie_pkg else None
 
 _NPU_DEVICES = {
@@ -60,23 +58,25 @@ _NPU_DEVICES = {
 }
 
 _NAME_TO_NPU = {
-    "npu1":    "npu1",
+    "npu1": "npu1",
     "Phoenix": "npu1",
-    "npu4":    "npu2",
-    "npu5":    "npu2",
-    "npu6":    "npu2",
-    "Strix":   "npu2",
+    "npu4": "npu2",
+    "npu5": "npu2",
+    "npu6": "npu2",
+    "Strix": "npu2",
     "Krackan": "npu2",
 }
 
 
 def detect_npu() -> str:
     import ctypes
+
     ctypes.CDLL("/opt/xilinx/xrt/lib/libxrt_coreutil.so.2", mode=ctypes.RTLD_GLOBAL)
     xrt_py = "/opt/xilinx/xrt/python"
     if xrt_py not in sys.path:
         sys.path.insert(0, xrt_py)
     import pyxrt
+
     device = pyxrt.device(0)
     name = device.get_info(pyxrt.xrt_info_device.name)
     for substr, key in _NAME_TO_NPU.items():
@@ -85,16 +85,18 @@ def detect_npu() -> str:
     raise RuntimeError(f"Cannot map device name {name!r} to a known NPU. Pass --npu explicitly.")
 
 
-def build_one(label: str, n_total: int, n_heads_label: int,
-              head_dim: int, out_dir: Path,
-              target_arch: str, device_cls) -> None:
+def build_one(
+    label: str, n_total: int, n_heads_label: int, head_dim: int, out_dir: Path, target_arch: str, device_cls
+) -> None:
     xclbin_name = f"qwen35-headnorm-{label}-{n_heads_label}h{head_dim}d.xclbin"
-    instr_name  = f"qwen35-headnorm-{label}-{n_heads_label}h{head_dim}d-instr.bin"
+    instr_name = f"qwen35-headnorm-{label}-{n_heads_label}h{head_dim}d-instr.bin"
     xclbin_path = out_dir / xclbin_name
-    instr_path  = out_dir / instr_name
+    instr_path = out_dir / instr_name
 
-    print(f"[build_qwen35_headnorm] {label}: n_total={n_total} head_dim={head_dim} "
-          f"N_div_n={n_total//head_dim} npu={target_arch}")
+    print(
+        f"[build_qwen35_headnorm] {label}: n_total={n_total} head_dim={head_dim} "
+        f"N_div_n={n_total // head_dim} npu={target_arch}"
+    )
     print(f"  xclbin → {xclbin_path}")
     print(f"  instr  → {instr_path}")
 
@@ -118,18 +120,16 @@ def build_one(label: str, n_total: int, n_heads_label: int,
         include_dirs=include_dirs,
     )
 
-    qk_buf     = np.zeros(n_total,   dtype=bfloat16)
-    out_buf    = np.zeros(n_total,   dtype=bfloat16)
-    weight_buf = np.zeros(head_dim,  dtype=bfloat16)  # tensor param: same weight for all heads
+    qk_buf = np.zeros(n_total, dtype=bfloat16)
+    out_buf = np.zeros(n_total, dtype=bfloat16)
+    weight_buf = np.zeros(head_dim, dtype=bfloat16)  # tensor param: same weight for all heads
 
-    mlir_module = _transform_gen(
-        kernel, [qk_buf], out_buf, weight_buf, tile_size=head_dim
-    )
+    mlir_module = _transform_gen(kernel, [qk_buf], out_buf, weight_buf, tile_size=head_dim)
 
     with tempfile.TemporaryDirectory(prefix="hipfire_npu_build_") as tmp:
-        tmp_path   = Path(tmp)
+        tmp_path = Path(tmp)
         tmp_xclbin = tmp_path / "final.xclbin"
-        tmp_instr  = tmp_path / "insts.bin"
+        tmp_instr = tmp_path / "insts.bin"
 
         compile_external_kernel(kernel, tmp_path, target_arch=target_arch)
         compile_mlir_module(
@@ -139,14 +139,13 @@ def build_one(label: str, n_total: int, n_heads_label: int,
             work_dir=tmp_path,
         )
         shutil.copy2(tmp_xclbin, xclbin_path)
-        shutil.copy2(tmp_instr,  instr_path)
+        shutil.copy2(tmp_instr, instr_path)
 
     print(f"  xclbin: {xclbin_path.stat().st_size} bytes")
     print(f"  instr:  {instr_path.stat().st_size} bytes")
 
 
-def build(n_heads: int, n_kv_heads: int, head_dim: int,
-          out_dir: Path, npu: str = "auto") -> None:
+def build(n_heads: int, n_kv_heads: int, head_dim: int, out_dir: Path, npu: str = "auto") -> None:
     if npu == "auto":
         npu = detect_npu()
         print(f"[build_qwen35_headnorm] detected NPU: {npu}")
@@ -160,23 +159,24 @@ def build(n_heads: int, n_kv_heads: int, head_dim: int,
     out_dir.mkdir(parents=True, exist_ok=True)
     set_current_device(device_cls())
 
-    build_one("q", n_heads    * head_dim, n_heads,    head_dim, out_dir, target_arch, device_cls)
+    build_one("q", n_heads * head_dim, n_heads, head_dim, out_dir, target_arch, device_cls)
     build_one("k", n_kv_heads * head_dim, n_kv_heads, head_dim, out_dir, target_arch, device_cls)
 
     print(f"\n[build_qwen35_headnorm] done")
     print("Set env vars to activate the NPU head-norm path:")
     print(f"  export HIPFIRE_QWEN35_HEADNORM_BF16=xdna1")
     print(f"  export HIPFIRE_QWEN35_XDNA1_HEADNORM_Q_XCLBIN={out_dir}/qwen35-headnorm-q-{n_heads}h{head_dim}d.xclbin")
-    print(f"  export HIPFIRE_QWEN35_XDNA1_HEADNORM_K_XCLBIN={out_dir}/qwen35-headnorm-k-{n_kv_heads}h{head_dim}d.xclbin")
+    print(
+        f"  export HIPFIRE_QWEN35_XDNA1_HEADNORM_K_XCLBIN={out_dir}/qwen35-headnorm-k-{n_kv_heads}h{head_dim}d.xclbin"
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--n-heads",    type=int, required=True, help="Number of Q heads")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--n-heads", type=int, required=True, help="Number of Q heads")
     parser.add_argument("--n-kv-heads", type=int, required=True, help="Number of KV heads")
-    parser.add_argument("--head-dim",   type=int, default=256,   help="Head dimension (default: 256)")
-    parser.add_argument("--out-dir",    type=Path, default=Path("target/npu"))
+    parser.add_argument("--head-dim", type=int, default=256, help="Head dimension (default: 256)")
+    parser.add_argument("--out-dir", type=Path, default=Path("target/npu"))
     parser.add_argument("--npu", choices=["auto"] + list(_NPU_DEVICES), default="auto")
     args = parser.parse_args()
     build(args.n_heads, args.n_kv_heads, args.head_dim, args.out_dir, args.npu)

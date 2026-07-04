@@ -41,13 +41,17 @@ TRIPWIRE_ROOT = Path(os.environ.get("TRIPWIRE_ROOT", str(Path.home())))
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--target-repo", default="Qwen/Qwen3.5-4B")
-    p.add_argument("--corpus", default=str(TRIPWIRE_ROOT / "calibration_corpus.txt"),
-                   help="Path to calibration corpus. Skipped if absent.")
-    p.add_argument("--sample-prompt",
-                   default="Call the get_weather tool for Tokyo and summarize.",
-                   help="Arbitrary prompt used to compare training vs inference token IDs.")
-    p.add_argument("--n-dump", type=int, default=500,
-                   help="Decode the first N token IDs from the corpus.")
+    p.add_argument(
+        "--corpus",
+        default=str(TRIPWIRE_ROOT / "calibration_corpus.txt"),
+        help="Path to calibration corpus. Skipped if absent.",
+    )
+    p.add_argument(
+        "--sample-prompt",
+        default="Call the get_weather tool for Tokyo and summarize.",
+        help="Arbitrary prompt used to compare training vs inference token IDs.",
+    )
+    p.add_argument("--n-dump", type=int, default=500, help="Decode the first N token IDs from the corpus.")
     return p.parse_args()
 
 
@@ -58,14 +62,15 @@ def main():
     print("=" * 72)
     print(f"Tokenizer: {type(tok).__name__} for {args.target_repo}")
     print(f"  vocab_size={tok.vocab_size}  model_max_length={tok.model_max_length}")
-    print(f"  bos={tok.bos_token_id}({tok.bos_token!r})  "
-          f"eos={tok.eos_token_id}({tok.eos_token!r})  "
-          f"pad={tok.pad_token_id}")
+    print(
+        f"  bos={tok.bos_token_id}({tok.bos_token!r})  "
+        f"eos={tok.eos_token_id}({tok.eos_token!r})  "
+        f"pad={tok.pad_token_id}"
+    )
     print(f"  added_tokens_decoder size: {len(tok.added_tokens_decoder)}")
 
     print("\n--- Special token round-trips -----------------------------------")
-    for s in ["<|im_start|>", "<|im_end|>", "<|im_start|>user",
-              "<|im_start|>assistant", "user", "assistant", "\n"]:
+    for s in ["<|im_start|>", "<|im_end|>", "<|im_start|>user", "<|im_start|>assistant", "user", "assistant", "\n"]:
         ids = tok.encode(s, add_special_tokens=False)
         back = tok.decode(ids, skip_special_tokens=False)
         status = "✓ single id" if len(ids) == 1 else f"⚠ {len(ids)} tokens"
@@ -129,7 +134,7 @@ def main():
             ids.extend(tok.encode(d, add_special_tokens=False))
             if len(ids) >= args.n_dump:
                 break
-        ids = ids[:args.n_dump]
+        ids = ids[: args.n_dump]
 
         print(f"\ntoken IDs (first {args.n_dump}):")
         print(ids)
@@ -143,16 +148,21 @@ def main():
         # "added" (special) vs "regular" text tokens.
         added_ids = set(tok.added_tokens_decoder.keys())
         n_special = sum(1 for i in ids if i in added_ids)
-        print(f"\nspecial-token density in first {args.n_dump} corpus tokens: "
-              f"{n_special}/{args.n_dump} = {n_special/len(ids):.1%}")
+        print(
+            f"\nspecial-token density in first {args.n_dump} corpus tokens: "
+            f"{n_special}/{args.n_dump} = {n_special / len(ids):.1%}"
+        )
         if n_special == 0:
             print("⚠ NO special tokens in corpus prefix — ChatML may be tokenizing as literal text.")
         else:
             # Show which special tokens appear (most common first)
             from collections import Counter
+
             c = Counter(i for i in ids if i in added_ids)
-            print(f"special tokens seen (top 5): "
-                  + ", ".join(f"{tok.added_tokens_decoder[i]!r}×{n}" for i, n in c.most_common(5)))
+            print(
+                f"special tokens seen (top 5): "
+                + ", ".join(f"{tok.added_tokens_decoder[i]!r}×{n}" for i, n in c.most_common(5))
+            )
     else:
         print(f"\n(corpus {args.corpus!r} not found — skipping corpus dump)")
 

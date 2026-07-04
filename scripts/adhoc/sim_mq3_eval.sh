@@ -53,12 +53,12 @@ run_one() {
     prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$prompt")
     local in_file="/tmp/mq3eval_in_$$.jsonl"
     local out_file="/tmp/mq3eval_out_$$.log"
-    cat > "$in_file" <<JL
+    cat >"$in_file" <<JL
 {"type":"load","model":"$model_path","params":{"max_seq":4096}}
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":$max_tok,"repeat_penalty":1.05}
 {"type":"unload"}
 JL
-    timeout 180 "$EXE" < "$in_file" > "$out_file" 2>&1
+    timeout 180 "$EXE" <"$in_file" >"$out_file" 2>&1
     local ec=$?
     local text
     text=$(grep -a '"type":"token"' "$out_file" | python3 -c '
@@ -71,7 +71,10 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
     echo "$text"
 }
 
-"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "mq3-sim-eval" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+"$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "mq3-sim-eval" --watch-pid "$$" || {
+    echo "could not acquire GPU lock" >&2
+    exit 2
+}
 trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 
 {
@@ -113,6 +116,6 @@ trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
         echo "---"
         echo
     done
-} > "$OUT"
+} >"$OUT"
 
 echo "wrote $OUT"

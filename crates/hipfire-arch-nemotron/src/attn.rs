@@ -306,7 +306,7 @@ mod tests {
         let q = vec![0.5, -0.3, 1.0, 0.2];
         let k = vec![0.1, 0.4];
         let v = vec![7.0, -2.0];
-        let out = gqa_attention(&q, &[k], &[v.clone()], n_heads, n_kv, hd);
+        let out = gqa_attention(&q, &[k], std::slice::from_ref(&v), n_heads, n_kv, hd);
         // both query heads share kv head 0 → each gets v
         assert!((out[0] - v[0]).abs() < 1e-5 && (out[1] - v[1]).abs() < 1e-5);
         assert!((out[2] - v[0]).abs() < 1e-5 && (out[3] - v[1]).abs() < 1e-5);

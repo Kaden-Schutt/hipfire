@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 //! Parity for the 4-bit-RESIDENT cold-tier read (Phase 2b sub-task 4c): the cold
 //! tier stays as KVarN 4-bit records on GPU and is dequantized on-the-fly each
@@ -12,6 +32,24 @@
 //! basis question for v1; rotation is a later quality lever).
 //!
 //!   cargo run --release -p hipfire-rdna --example parity_cold_4bit_read [n_cold_tok]
+
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::drop_non_drop,
+    clippy::excessive_precision,
+    clippy::identity_op,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::needless_range_loop,
+    clippy::print_literal,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unusual_byte_groupings,
+    clippy::useless_vec,
+    clippy::unnecessary_cast
+)]
 
 use hipfire_kvquant::kv_compact::compact_cold_kv;
 use hipfire_kvquant::kvarn::{kvarn_record_bytes, pack_kvarn_tile};

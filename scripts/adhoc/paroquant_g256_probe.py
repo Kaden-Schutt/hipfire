@@ -293,7 +293,9 @@ def main() -> int:
     if incomplete:
         raise ValueError(f"{len(incomplete)} Paro modules are incomplete")
     bases = args.module if args.module else [m["base"] for m in modules[: args.max_modules]]
-    results = [run_module(index, base, samples=args.samples, seed=args.seed, input_scale=args.input_scale) for base in bases]
+    results = [
+        run_module(index, base, samples=args.samples, seed=args.seed, input_scale=args.input_scale) for base in bases
+    ]
     payload = {
         "schema": "hipfire.astrea.paro_g256_probe.v0",
         "captured_at_utc": utc_now(),

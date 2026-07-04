@@ -43,6 +43,7 @@ impl GenerationSamplingPolicy {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_defaults(
         default_temperature: f64,
         default_top_p: f64,

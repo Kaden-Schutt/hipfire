@@ -100,8 +100,10 @@ impl EosFilter {
         let mut config = config;
         config
             .holdback_prefixes
-            .sort_by(|a, b| b.len().cmp(&a.len()));
-        config.stop_at.sort_by(|a, b| b.len().cmp(&a.len()));
+            .sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
+        config
+            .stop_at
+            .sort_by_key(|stop| std::cmp::Reverse(stop.len()));
         Self {
             config,
             state: EosFilterState::default(),
@@ -160,7 +162,7 @@ impl EosFilter {
     /// 4. Compute the maximal "safe" emit prefix:
     ///    - It must end on a UTF-8 codepoint boundary.
     ///    - Its tail must not match any `holdback_prefix`.
-    ///    Anything after that point stays buffered.
+    ///      Anything after that point stays buffered.
     /// 5. Return `Emit(prefix)` if non-empty, else `Hold`.
     pub fn observe(&mut self, raw_bytes: &[u8]) -> FilterAction {
         if raw_bytes.is_empty() && self.state.buf.is_empty() {

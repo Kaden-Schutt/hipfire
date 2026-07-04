@@ -2,28 +2,55 @@
 # Cleanly stop, free the port, optionally restart `hipfire serve`.
 # Usage: serve-restart.sh [port] [--kill-only] [-- <extra serve args>]
 set -uo pipefail
-PORT=11435; KILL_ONLY=0; EXTRA=()
+PORT=11435
+KILL_ONLY=0
+EXTRA=()
 while [ $# -gt 0 ]; do case "$1" in
-  --kill-only) KILL_ONLY=1; shift;;
-  --) shift; EXTRA=("$@"); break;;
-  *) PORT="$1"; shift;; esac; done
+    --kill-only)
+        KILL_ONLY=1
+        shift
+        ;;
+    --)
+        shift
+        EXTRA=("$@")
+        break
+        ;;
+    *)
+        PORT="$1"
+        shift
+        ;;
+esac done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 echo "[serve-restart] killing serve/daemon, freeing :$PORT"
 for pat in "hipfire serve" "hipfire-cli.*serve" "hipfire-daemon"; do
-  for p in $(pgrep -f "$pat"); do kill -9 "$p" 2>/dev/null; done; done
+    for p in $(pgrep -f "$pat"); do kill -9 "$p" 2>/dev/null; done
+done
 fuser -k "$PORT/tcp" 2>/dev/null
 rm -f ~/.hipfire/daemon.pid ~/.hipfire/serve.pid /tmp/hipfire-gpu.lock
-for i in $(seq 1 10); do ss -ltn 2>/dev/null | grep -q ":$PORT " || break; sleep 1; done
-ss -ltn 2>/dev/null | grep -q ":$PORT " && { echo "[serve-restart] WARN port still busy"; exit 1; }
-echo "[serve-restart] clean"; rocm-smi --showmeminfo vram 2>/dev/null | grep Used | head
+for i in $(seq 1 10); do
+    ss -ltn 2>/dev/null | grep -q ":$PORT " || break
+    sleep 1
+done
+ss -ltn 2>/dev/null | grep -q ":$PORT " && {
+    echo "[serve-restart] WARN port still busy"
+    exit 1
+}
+echo "[serve-restart] clean"
+rocm-smi --showmeminfo vram 2>/dev/null | grep Used | head
 [ "$KILL_ONLY" = 1 ] && exit 0
 echo "[serve-restart] launching"
 rm -f ~/.hipfire/serve.log
 if [ -n "${HIPFIRE_BIN:-}" ]; then
-  SERVE_CMD=("$HIPFIRE_BIN")
+    SERVE_CMD=("$HIPFIRE_BIN")
 else
-  SERVE_CMD=(cargo run -q -p hipfire-cli --)
+    SERVE_CMD=(cargo run -q -p hipfire-cli --)
 fi
-(cd "$ROOT" && setsid "${SERVE_CMD[@]}" serve --host 0.0.0.0 --port "$PORT" "${EXTRA[@]}" >~/.hipfire/serve.log 2>&1 & disown)
-for i in $(seq 1 60); do grep -qiE "listening on|Address already in use|FATAL" ~/.hipfire/serve.log && break; sleep 2; done
+(
+    cd "$ROOT" && setsid "${SERVE_CMD[@]}" serve --host 0.0.0.0 --port "$PORT" "${EXTRA[@]}" >~/.hipfire/serve.log 2>&1 &
+    disown
+)
+for i in $(seq 1 60); do
+    grep -qiE "listening on|Address already in use|FATAL" ~/.hipfire/serve.log && break
+    sleep 2
+done
 tail -3 ~/.hipfire/serve.log

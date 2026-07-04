@@ -315,7 +315,7 @@ impl Matcher {
             return true;
         }
         if self.state_allows_leading_ws() {
-            let trimmed = combined.trim_start_matches(|c: char| c == '\n' || c == ' ');
+            let trimmed = combined.trim_start_matches(['\n', ' ']);
             if Self::check_against_conts(trimmed, &conts) {
                 return true;
             }

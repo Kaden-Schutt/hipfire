@@ -94,9 +94,7 @@ class CandidateResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="CPU-only tensor-wise difference metrics for safetensors models."
-    )
+    parser = argparse.ArgumentParser(description="CPU-only tensor-wise difference metrics for safetensors models.")
     parser.add_argument("target", help="Target/fine-tuned model directory, index file, or safetensors file.")
     parser.add_argument("candidates", nargs="+", help="Candidate parent model directories/indexes/files.")
     parser.add_argument(
@@ -345,8 +343,7 @@ def print_summary(selected: list[str], results: list[CandidateResult], top: int)
             print(f"{result.label} top delta tensors:")
             for item in result.top_tensors[:top]:
                 print(
-                    f"  {item['delta_l2']:12.5g} rel={item['relative_l2']:.8f} "
-                    f"rmse={item['rmse']:.8g} {item['name']}"
+                    f"  {item['delta_l2']:12.5g} rel={item['relative_l2']:.8f} rmse={item['rmse']:.8g} {item['name']}"
                 )
         print("")
 

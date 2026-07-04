@@ -84,6 +84,7 @@ def _mask_broken_torchvision_for_text_only_calibration() -> None:
     """
     try:
         import torchvision  # noqa: F401
+
         return
     except Exception as exc:  # pragma: no cover - host-package dependent.
         print(
@@ -116,15 +117,26 @@ def _mask_broken_torchvision_for_text_only_calibration() -> None:
 # "model.layers.0.self_attn.q_proj"); we match against the last 2-3 components.
 GPTQ_TARGET_SUFFIXES = (
     # Attention input projections
-    "q_proj", "k_proj", "v_proj", "qkv_proj",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "qkv_proj",
     # Attention output (no AWQ but yes GPTQ)
     "o_proj",
     # MLP
-    "gate_proj", "up_proj", "down_proj", "gate_up_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "gate_up_proj",
     # LFM2 dense FFN uses short w1/w2/w3 names instead of gate/up/down_proj.
-    "w1", "w2", "w3",
+    "w1",
+    "w2",
+    "w3",
     # Linear-attention (Gated DeltaNet)
-    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_a",
+    "in_proj_b",
     # LFM2 LIV conv mixer has a plain conv.in_proj module.
     "in_proj",
     "out_proj",
@@ -153,6 +165,7 @@ def _safetensors_keys(model_path: str) -> set[str]:
     safetensors / .hfq naming (`model.language_model.layers.0.q_proj`).
     """
     import json
+
     p = Path(model_path)
     keys: set[str] = set()
     idx = p / "model.safetensors.index.json"
@@ -163,6 +176,7 @@ def _safetensors_keys(model_path: str) -> set[str]:
     else:
         # Single-file safetensors path
         from safetensors import safe_open  # type: ignore[import-not-found]
+
         for st_file in p.glob("*.safetensors"):
             with safe_open(st_file, framework="pt") as f:
                 keys.update(f.keys())
@@ -246,8 +260,7 @@ class HessianAccumulator:
 
     def update(self, x: "torch.Tensor") -> None:
         """x: shape [num_tokens, K], any dtype, on the forward device."""
-        assert x.ndim == 2 and x.shape[1] == self.K, \
-            f"{self.name}: shape mismatch {tuple(x.shape)} vs K={self.K}"
+        assert x.ndim == 2 and x.shape[1] == self.K, f"{self.name}: shape mismatch {tuple(x.shape)} vs K={self.K}"
         if self.accum_device == "gpu":
             xf = x.to(dtype=torch.float32)
             if self.H is None:
@@ -294,9 +307,9 @@ def write_hessian_file(out_path: Path, accs: dict[str, HessianAccumulator]) -> N
     with out_path.open("wb") as f:
         # Header
         f.write(b"HFHS")
-        f.write(struct.pack("<I", 1))                  # version
-        f.write(struct.pack("<Q", len(accs)))          # n_tensors
-        f.write(struct.pack("<Q", 0))                  # reserved
+        f.write(struct.pack("<I", 1))  # version
+        f.write(struct.pack("<Q", len(accs)))  # n_tensors
+        f.write(struct.pack("<Q", 0))  # reserved
 
         for name, acc in accs.items():
             if acc.n_tokens == 0:
@@ -304,16 +317,15 @@ def write_hessian_file(out_path: Path, accs: dict[str, HessianAccumulator]) -> N
                 continue
             H_final = acc.finalize().astype(np.float32, copy=False)
             name_bytes = name.encode("utf-8")
-            f.write(struct.pack("<I", len(name_bytes)))   # name_len
-            f.write(name_bytes)                           # name
-            f.write(struct.pack("<I", 0))                 # expert_idx (default 0)
-            f.write(struct.pack("<I", acc.K))             # K
-            f.write(struct.pack("<I", 1))                 # dtype_flag (1 = F32)
-            f.write(H_final.tobytes(order="C"))           # K*K*4 bytes
+            f.write(struct.pack("<I", len(name_bytes)))  # name_len
+            f.write(name_bytes)  # name
+            f.write(struct.pack("<I", 0))  # expert_idx (default 0)
+            f.write(struct.pack("<I", acc.K))  # K
+            f.write(struct.pack("<I", 1))  # dtype_flag (1 = F32)
+            f.write(H_final.tobytes(order="C"))  # K*K*4 bytes
 
 
-def load_calibration_text(corpus: str, n_sequences: int, ctx_len: int,
-                          tokenizer) -> list[torch.Tensor]:
+def load_calibration_text(corpus: str, n_sequences: int, ctx_len: int, tokenizer) -> list[torch.Tensor]:
     """Returns a list of n_sequences token tensors, each of length ctx_len.
 
     `corpus` is either a HF datasets identifier (e.g. "wikitext") or a
@@ -355,54 +367,66 @@ def load_calibration_text(corpus: str, n_sequences: int, ctx_len: int,
     needed_tokens = n_sequences * ctx_len
     if n_total_tokens < needed_tokens:
         raise SystemExit(
-            f"corpus has only {n_total_tokens} tokens, need {needed_tokens} "
-            f"({n_sequences} seqs × {ctx_len} ctx)"
+            f"corpus has only {n_total_tokens} tokens, need {needed_tokens} ({n_sequences} seqs × {ctx_len} ctx)"
         )
 
-    seqs = [all_tokens[i * ctx_len: (i + 1) * ctx_len] for i in range(n_sequences)]
+    seqs = [all_tokens[i * ctx_len : (i + 1) * ctx_len] for i in range(n_sequences)]
     return seqs
 
 
 def main():
     ap = argparse.ArgumentParser(description="Collect per-tensor Hessians for Stage B GPTQ.")
-    ap.add_argument("--model", required=True,
-                    help="HF model identifier or local path to BF16 model dir.")
-    ap.add_argument("--output", required=True, type=Path,
-                    help="Output Hessian sidecar (.hessian.bin).")
-    ap.add_argument("--n-sequences", type=int, default=128,
-                    help="Calibration sequences (default 128, matches GPTQ paper).")
-    ap.add_argument("--ctx-len", type=int, default=2048,
-                    help="Tokens per calibration sequence (default 2048).")
-    ap.add_argument("--corpus", default="wikitext",
-                    help="HF dataset ID or path to plain-text file "
-                         "(default 'wikitext' = wikitext-2-raw-v1 train).")
-    ap.add_argument("--device", default="cuda",
-                    help="Device for the forward pass (default 'cuda').")
-    ap.add_argument("--dtype", default="bfloat16",
-                    choices=["bfloat16", "float16", "float32"],
-                    help="Model dtype (default bfloat16).")
-    ap.add_argument("--accum", default="gpu", choices=["gpu", "cpu"],
-                    help="Hessian outer-product accumulation device. 'gpu' "
-                         "(default, ~20x faster): on-device addmm_, only the "
-                         "final K×K copied to host (VRAM = Σ K²; fits ≤9B on "
-                         "big-VRAM boxes). 'cpu': transfer [N,K] + numpy gemm "
-                         "(original behavior; use for VRAM-constrained big models).")
-    ap.add_argument("--tensor-filter", default=None,
-                    help="Optional substring over canonical safetensors names "
-                         "(with or without trailing .weight) to collect a small "
-                         "HFHS smoke sidecar.")
+    ap.add_argument("--model", required=True, help="HF model identifier or local path to BF16 model dir.")
+    ap.add_argument("--output", required=True, type=Path, help="Output Hessian sidecar (.hessian.bin).")
+    ap.add_argument(
+        "--n-sequences", type=int, default=128, help="Calibration sequences (default 128, matches GPTQ paper)."
+    )
+    ap.add_argument("--ctx-len", type=int, default=2048, help="Tokens per calibration sequence (default 2048).")
+    ap.add_argument(
+        "--corpus",
+        default="wikitext",
+        help="HF dataset ID or path to plain-text file (default 'wikitext' = wikitext-2-raw-v1 train).",
+    )
+    ap.add_argument("--device", default="cuda", help="Device for the forward pass (default 'cuda').")
+    ap.add_argument(
+        "--dtype",
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Model dtype (default bfloat16).",
+    )
+    ap.add_argument(
+        "--accum",
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="Hessian outer-product accumulation device. 'gpu' "
+        "(default, ~20x faster): on-device addmm_, only the "
+        "final K×K copied to host (VRAM = Σ K²; fits ≤9B on "
+        "big-VRAM boxes). 'cpu': transfer [N,K] + numpy gemm "
+        "(original behavior; use for VRAM-constrained big models).",
+    )
+    ap.add_argument(
+        "--tensor-filter",
+        default=None,
+        help="Optional substring over canonical safetensors names "
+        "(with or without trailing .weight) to collect a small "
+        "HFHS smoke sidecar.",
+    )
     args = ap.parse_args()
 
     print(f"=== Hessian collector — Stage B Phase 1.1 ===")
     print(f"  model:        {args.model}")
     print(f"  output:       {args.output}")
     print(f"  corpus:       {args.corpus}")
-    print(f"  sequences:    {args.n_sequences} × {args.ctx_len} ctx "
-          f"= {args.n_sequences * args.ctx_len} calibration tokens")
+    print(
+        f"  sequences:    {args.n_sequences} × {args.ctx_len} ctx "
+        f"= {args.n_sequences * args.ctx_len} calibration tokens"
+    )
     print(f"  device:       {args.device}")
     print(f"  dtype:        {args.dtype}")
-    print(f"  accum:        {args.accum} "
-          f"({'on-GPU addmm_, K×K host copy at end' if args.accum == 'gpu' else 'host numpy gemm (original)'})")
+    print(
+        f"  accum:        {args.accum} "
+        f"({'on-GPU addmm_, K×K host copy at end' if args.accum == 'gpu' else 'host numpy gemm (original)'})"
+    )
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
@@ -427,9 +451,11 @@ def main():
     model.eval()
     print(f"      loaded in {time.time() - t0:.1f}s")
     if args.device == "cuda" and torch.cuda.is_available():
-        print(f"      VRAM in use: "
-              f"{torch.cuda.memory_allocated() / 1e9:.2f}/"
-              f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        print(
+            f"      VRAM in use: "
+            f"{torch.cuda.memory_allocated() / 1e9:.2f}/"
+            f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB"
+        )
 
     print(f"\n[2/4] Registering Hessian hooks on GPTQ-target Linear modules...")
     # HF's AutoModelForCausalLM flattens multimodal submodules (e.g. Qwen3.5's
@@ -447,8 +473,7 @@ def main():
             K = module.in_features
             stored = _translate_to_stored_name(mod_name, stored_names)
             if stored is None:
-                print(f"  WARN: no safetensors key matches {mod_name!r} — skipping",
-                      file=sys.stderr)
+                print(f"  WARN: no safetensors key matches {mod_name!r} — skipping", file=sys.stderr)
                 continue
             if not _matches_tensor_filter(stored, args.tensor_filter):
                 continue
@@ -456,10 +481,14 @@ def main():
                 name_remap_count += 1
             accs[stored] = HessianAccumulator(stored, K, accum_device=args.accum)
             handles.append(module.register_forward_pre_hook(build_hook(accs[stored])))
-    print(f"      {name_remap_count} of {len(accs)} names remapped from in-memory "
-          f"→ stored (multimodal-flatten translation)")
-    print(f"      registered {len(accs)} hooks "
-          f"({len(set(K_ for K_ in [acc.K for acc in accs.values()]))} distinct K dims)")
+    print(
+        f"      {name_remap_count} of {len(accs)} names remapped from in-memory "
+        f"→ stored (multimodal-flatten translation)"
+    )
+    print(
+        f"      registered {len(accs)} hooks "
+        f"({len(set(K_ for K_ in [acc.K for acc in accs.values()]))} distinct K dims)"
+    )
     if not accs:
         detail = f" matching --tensor-filter {args.tensor_filter!r}" if args.tensor_filter else ""
         raise SystemExit(f"no GPTQ-target Linear modules found{detail}")
@@ -480,12 +509,10 @@ def main():
                 elapsed = time.time() - t0
                 rate = (i + 1) / elapsed
                 eta = (len(seqs) - i - 1) / rate
-                print(f"      seq {i+1}/{len(seqs)} "
-                      f"({elapsed:.1f}s elapsed, {rate:.2f} seq/s, ETA {eta:.0f}s)")
+                print(f"      seq {i + 1}/{len(seqs)} ({elapsed:.1f}s elapsed, {rate:.2f} seq/s, ETA {eta:.0f}s)")
 
     print(f"      forward pass complete: {time.time() - t0:.1f}s")
-    print(f"      total tokens accumulated per tensor (sample): "
-          f"{next(iter(accs.values())).n_tokens}")
+    print(f"      total tokens accumulated per tensor (sample): {next(iter(accs.values())).n_tokens}")
 
     # Detach hooks before writing — they'll keep accumulating otherwise.
     for h in handles:

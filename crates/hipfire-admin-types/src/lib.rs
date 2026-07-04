@@ -132,6 +132,8 @@ pub struct NpuTelemetry {
     pub node: String,
     /// Total NPU power (W).
     pub power_w: Option<f64>,
+    /// NPU temperature (deg C), if the driver/PMF stack exposes it.
+    pub temp_c: Option<f64>,
     /// Mean per-column utilization (%).
     pub mean_util_pct: f64,
     /// Per-column utilization (%), one entry per active column.

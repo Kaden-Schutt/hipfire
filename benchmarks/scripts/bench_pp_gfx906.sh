@@ -47,11 +47,11 @@ for N in 32 64 128 256 512; do
     BEST=$(
         for run in 1 2 3; do
             HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-            HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
+                HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
                 "$EXE" "$MODEL" \
-                    --prefill "$N" --prefill-runs 2 --warmup 0 --gen 1 \
-                    2>&1 | grep -oE 'prefill_tok_s=[0-9.]+' | tail -1 | cut -d= -f2
-        done | sort -n | awk 'NR==2 {print}'  # median of 3
+                --prefill "$N" --prefill-runs 2 --warmup 0 --gen 1 \
+                2>&1 | grep -oE 'prefill_tok_s=[0-9.]+' | tail -1 | cut -d= -f2
+        done | sort -n | awk 'NR==2 {print}' # median of 3
     )
     printf "%-6d %-12s\n" "$N" "$BEST"
 done

@@ -29,6 +29,7 @@ Usage:
     dump_hf_hidden_states.py --model <hf_dir> --ref <kldref> \
                              --chunk N --out <path>
 """
+
 import argparse
 import struct
 import sys
@@ -77,9 +78,7 @@ def main():
         device = "cpu"
 
     print(f"loading HF model BF16 ({device}): {args.model}", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True
-    )
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True)
     if device == "cuda":
         model.to("cuda")
     model.eval()
@@ -121,8 +120,10 @@ def main():
     # Capture pre-final-norm state via a forward-pre-hook on model.model.norm.
     # We replay with the hook attached.
     pre_norm_capture = {}
+
     def _capture(module, inputs):
         pre_norm_capture["x"] = inputs[0].detach()
+
     norm_module = model.model.norm if hasattr(model, "model") and hasattr(model.model, "norm") else None
     if norm_module is None:
         # qwen3_5 wraps in model.language_model.norm
@@ -147,13 +148,13 @@ def main():
             if layer_idx < n_layers - 1:
                 tensor = hs[layer_idx + 1][0]  # post-layer-`layer_idx` output
             else:
-                tensor = post_last_layer       # post-last-layer, pre-norm
+                tensor = post_last_layer  # post-last-layer, pre-norm
             assert tensor.shape == (n_ctx, hidden_dim), f"layer {layer_idx} shape {tensor.shape}"
             arr = tensor.detach().float().cpu().contiguous().numpy()
             f.write(arr.tobytes())
             if layer_idx < 3 or layer_idx == n_layers - 1:
                 norm = arr.reshape(-1).astype("float64")
-                rms = float((norm ** 2).mean() ** 0.5)
+                rms = float((norm**2).mean() ** 0.5)
                 print(
                     f"  layer {layer_idx}: shape={arr.shape} rms={rms:.4f}",
                     flush=True,

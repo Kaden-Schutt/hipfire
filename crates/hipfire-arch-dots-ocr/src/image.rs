@@ -68,7 +68,7 @@ pub const MAX_RATIO: f64 = 200.0;
 pub const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP-style normalisation std (RGB order).
-pub const CLIP_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub const CLIP_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
 /// Vision tower patch size (`config.json:vision_config.patch_size`).
 pub const PATCH_SIZE: usize = 14;

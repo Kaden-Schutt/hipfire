@@ -1,9 +1,31 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // Copyright (c) 2026 Daniil Markevich
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! QA mirror for HFQ4-G256 correctness checks.
+
+#![allow(clippy::needless_range_loop)]
 
 use std::process::ExitCode;
 
@@ -245,7 +267,7 @@ fn supports_mmq_i8_wmma(arch: &str) -> bool {
 fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 256usize;
     let block_bytes = 136usize;
-    let n_blocks = (f32_data.len() + group_size - 1) / group_size;
+    let n_blocks = f32_data.len().div_ceil(group_size);
     let mut out = vec![0u8; n_blocks * block_bytes];
 
     for b in 0..n_blocks {

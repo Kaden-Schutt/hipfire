@@ -1203,7 +1203,7 @@ fn pick_splice_sentinel(tok: &dyn PromptTokenizer) -> Option<String> {
     ];
     let atomic = |s: &str| -> bool {
         tok.special_token_id(s)
-            .map_or(false, |id| tok.encode(s) == vec![id])
+            .is_some_and(|id| tok.encode(s) == vec![id])
     };
     // First pass: obviously-reserved scratch tokens.
     for (s, _id) in tok.special_tokens() {
@@ -1739,7 +1739,7 @@ mod tests {
 
     #[test]
     fn openai_chat_helpers_build_prompt_messages_and_last_user_fallback() {
-        let messages = vec![
+        let messages = [
             ("system", Some(serde_json::json!("be brief"))),
             ("user", Some(serde_json::json!("first"))),
             ("assistant", Some(serde_json::json!("ok"))),

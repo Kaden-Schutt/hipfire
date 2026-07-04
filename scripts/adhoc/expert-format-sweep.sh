@@ -30,9 +30,15 @@ Q=./target/release/hipfire-quantize
 PPL=./target/release/examples/perplexity
 COLLECT=./target/release/examples/collect_artifacts
 for b in "$Q" "$PPL" "$COLLECT"; do
-    [ -x "$b" ] || { echo "missing $b — build: cargo build --release -p hipfire-quantize --bin hipfire-quantize; cargo build --release -p hipfire-runtime --example perplexity --example collect_artifacts" >&2; exit 2; }
+    [ -x "$b" ] || {
+        echo "missing $b — build: cargo build --release -p hipfire-quantize --bin hipfire-quantize; cargo build --release -p hipfire-runtime --example perplexity --example collect_artifacts" >&2
+        exit 2
+    }
 done
-[ -e "$BF16" ] || { echo "bf16 model not found: $BF16" >&2; exit 2; }
+[ -e "$BF16" ] || {
+    echo "bf16 model not found: $BF16" >&2
+    exit 2
+}
 
 # format -> bytes per 256-group (the decode bandwidth proxy). oq4++ needs the
 # Hessian; mq* are RTN (no calib). bf16 is the quality ground truth.
@@ -40,10 +46,13 @@ done
 # mq3 = plain affine 3-bit (the RTN cliff); qtip3 = advanced 3-bit trellis
 # (LDLQ via HIPFIRE_QTIP_HESSIAN) — the fair "good 3-bit" point. mq2/lloyd-*
 # need an HF/GGUF source (not testable from the bf16 hfq).
-declare -A BYTES=( [bf16]=512 [oq8++]=260 [oq4++]=132 [mq4]=136 [mq3]=104 [qtip3]=100 )
-FORMATS=( bf16 oq8++ oq4++ mq4 mq3 qtip3 )
+declare -A BYTES=([bf16]=512 [oq8++]=260 [oq4++]=132 [mq4]=136 [mq3]=104 [qtip3]=100)
+FORMATS=(bf16 oq8++ oq4++ mq4 mq3 qtip3)
 
-"$LOCK" lock acquire "expert-format-sweep" --watch-pid "$$" || { echo "GPU lock busy" >&2; exit 2; }
+"$LOCK" lock acquire "expert-format-sweep" --watch-pid "$$" || {
+    echo "GPU lock busy" >&2
+    exit 2
+}
 trap '"$LOCK" lock release 2>/dev/null || true' EXIT
 
 # Some bf16 hfqs are mis-tagged arch_id=0 but load via the qwen35 backend;
@@ -54,12 +63,12 @@ if [ ! -e "$CALIB" ]; then
     echo "[sweep] calibrating ($CALIB_TOKS tokens${ARCH:+, arch=$ARCH}) → $CALIB"
     LD_LIBRARY_PATH="$LD" "$COLLECT" --model "$BF16" --corpus "$CORPUS" \
         --output "$CALIB" --max-tokens "$CALIB_TOKS" --kldref ${ARCH:+--arch "$ARCH"} \
-        > "$WORK/calib.log" 2>&1 || { echo "  calib FAILED (see $WORK/calib.log)"; }
+        >"$WORK/calib.log" 2>&1 || { echo "  calib FAILED (see $WORK/calib.log)"; }
 fi
 
-run_ppl() {  # model.hfq -> "ppl kld" (parsed from perplexity output)
+run_ppl() { # model.hfq -> "ppl kld" (parsed from perplexity output)
     local m="$1" log="$2"
-    LD_LIBRARY_PATH="$LD" "$PPL" "$m" "$CORPUS" --ctx "$CTX" --warmup 8 > "$log" 2>&1
+    LD_LIBRARY_PATH="$LD" "$PPL" "$m" "$CORPUS" --ctx "$CTX" --warmup 8 >"$log" 2>&1
     local ppl kld
     ppl=$(grep -oiE "ppl[= :]+[0-9.]+" "$log" | grep -oE "[0-9.]+" | tail -1)
     kld=$(grep -oiE "kld[= :]+[0-9.]+" "$log" | grep -oE "[0-9.]+" | tail -1)
@@ -74,19 +83,24 @@ for fmt in "${FORMATS[@]}"; do
         model="$WORK/$STEM.$fmt.hfq"
         if [ ! -e "$model" ]; then
             echo "[sweep] quantize $fmt → $(basename "$model")"
-            extra=(); qenv=()
+            extra=()
+            qenv=()
             case "$fmt" in
-                oq4++|oq8++) [ -e "$CALIB" ] && extra=(--hessian "$CALIB") ;;
+                oq4++ | oq8++) [ -e "$CALIB" ] && extra=(--hessian "$CALIB") ;;
                 qtip3) [ -e "$CALIB" ] && qenv=(env "HIPFIRE_QTIP_HESSIAN=$CALIB") ;;
-                mq2|lloyd-mq2) extra=(--allow-mq2) ;;
+                mq2 | lloyd-mq2) extra=(--allow-mq2) ;;
             esac
             "${qenv[@]}" "$Q" --input "$BF16" --output "$model" --format "$fmt" "${extra[@]}" \
-                > "$WORK/quant.$fmt.log" 2>&1 || { echo "  quant $fmt FAILED (see $WORK/quant.$fmt.log)"; continue; }
+                >"$WORK/quant.$fmt.log" 2>&1 || {
+                echo "  quant $fmt FAILED (see $WORK/quant.$fmt.log)"
+                continue
+            }
         fi
     fi
     echo "[sweep] perplexity $fmt"
     read -r p k <<<"$(run_ppl "$model" "$WORK/ppl.$fmt.log")"
-    RES_PPL[$fmt]="$p"; RES_KLD[$fmt]="$k"
+    RES_PPL[$fmt]="$p"
+    RES_KLD[$fmt]="$k"
     RES_SZ[$fmt]="$(du -h "$model" 2>/dev/null | cut -f1)"
 done
 

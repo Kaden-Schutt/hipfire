@@ -27,8 +27,8 @@ impl ConfigState {
         let mut values = defaults();
         let mut warning = None;
 
-        match fs::read_to_string(&paths.config) {
-            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+        if let Ok(raw) = fs::read_to_string(&paths.config) {
+            match serde_json::from_str::<Value>(&raw) {
                 Ok(Value::Object(map)) => {
                     for (k, v) in map {
                         values.insert(k, value_to_string(&v));
@@ -36,8 +36,7 @@ impl ConfigState {
                 }
                 Ok(_) => warning = Some("config.json is not an object; using defaults".into()),
                 Err(err) => warning = Some(format!("config parse error: {err}")),
-            },
-            Err(_) => {}
+            }
         }
 
         let per_model_count = fs::read_to_string(&paths.per_model_config)

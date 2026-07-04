@@ -337,7 +337,9 @@ def quantize_q8f16_payload(tensor) -> bytes:
     return out.tobytes(order="C")
 
 
-def tensor_to_copy_payload(index: dict[str, Path], name: str, *, copy_floats: str = "f16") -> tuple[bytes, list[int], int, int]:
+def tensor_to_copy_payload(
+    index: dict[str, Path], name: str, *, copy_floats: str = "f16"
+) -> tuple[bytes, list[int], int, int]:
     import torch
 
     tensor = load_tensor(index, name)
@@ -496,12 +498,16 @@ def import_model(
                             "data_size": payload_size,
                         }
                     )
-                    imported_modules.append({"base": base, "hfq_name": f"{base}.weight", "shape": shape, "data_size": payload_size})
+                    imported_modules.append(
+                        {"base": base, "hfq_name": f"{base}.weight", "shape": shape, "data_size": payload_size}
+                    )
                     continue
                 if is_paro_companion(name, all_quant_bases):
                     continue
                 try:
-                    payload, shape, copied_qt, copied_group_size = tensor_to_copy_payload(index, name, copy_floats=copy_floats)
+                    payload, shape, copied_qt, copied_group_size = tensor_to_copy_payload(
+                        index, name, copy_floats=copy_floats
+                    )
                 except ValueError as exc:
                     skipped_tensors.append({"name": name, "reason": str(exc)})
                     continue

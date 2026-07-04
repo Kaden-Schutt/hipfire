@@ -76,9 +76,10 @@ class KldRefHeader:
 @dataclass
 class TokenBlock:
     """Per-token reference distribution (top-K log-probs + residual prob mass)."""
-    top_indices: list[int]      # len == top_k
+
+    top_indices: list[int]  # len == top_k
     top_log_probs: list[float]  # len == top_k, descending log P(i)
-    sum_p_residual: float       # Σ P(i) for i NOT in top-K, in [0, 1]
+    sum_p_residual: float  # Σ P(i) for i NOT in top-K, in [0, 1]
 
 
 def read_header(f) -> KldRefHeader:
@@ -93,8 +94,12 @@ def read_header(f) -> KldRefHeader:
     if version != VERSION:
         raise ValueError(f"unsupported version {version}, this reader supports {VERSION}")
     return KldRefHeader(
-        version=version, n_ctx=n_ctx, n_vocab=n_vocab,
-        n_chunk=n_chunk, top_k=top_k, flags=flags,
+        version=version,
+        n_ctx=n_ctx,
+        n_vocab=n_vocab,
+        n_chunk=n_chunk,
+        top_k=top_k,
+        flags=flags,
     )
 
 
@@ -108,7 +113,7 @@ def read_tokens(f, header: KldRefHeader) -> list[int]:
     n = header.n_ctx * header.n_chunk
     raw = f.read(n * 4)
     if len(raw) != n * 4:
-        raise ValueError(f"short read on tokens: got {len(raw)}, want {n*4}")
+        raise ValueError(f"short read on tokens: got {len(raw)}, want {n * 4}")
     return list(struct.unpack(f"<{n}I", raw))
 
 
@@ -121,10 +126,12 @@ def read_block(f, header: KldRefHeader) -> TokenBlock:
     off += header.top_k * 4
     top_log_probs = list(struct.unpack_from(f"<{header.top_k}f", raw, off))
     off += header.top_k * 4
-    (sum_p_residual,) = struct.unpack_from("<f", raw, off); off += 4
+    (sum_p_residual,) = struct.unpack_from("<f", raw, off)
+    off += 4
     # last 4 bytes are reserved_pad — ignored
     return TokenBlock(
-        top_indices=top_indices, top_log_probs=top_log_probs,
+        top_indices=top_indices,
+        top_log_probs=top_log_probs,
         sum_p_residual=sum_p_residual,
     )
 
@@ -231,6 +238,7 @@ def read_per_seq_kld(
                 nlls.append(n)
         else:  # v1
             import math
+
             for _ in range(n_chunk):
                 m, p = struct.unpack("<dd", f.read(16))
                 means.append(m)

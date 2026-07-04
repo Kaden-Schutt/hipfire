@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -49,6 +69,12 @@
 //! directly, see `benchmarks/prompts/longcode_pflash.jsonl` for an
 //! example of the latter shape). Smoke / correctness tests that
 //! don't compare numbers across sessions can inline prompts safely.
+
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 use hipfire_runtime::kv::KvCache;
 
@@ -1848,7 +1874,7 @@ fn main() {
             }
             if do_profile
                 && profile_armed
-                && stats.cycles >= 1 + profile_cycles_target
+                && stats.cycles > profile_cycles_target
                 && profile_cycle_count == 0
             {
                 profile_cycle_count = stats.cycles - 1;
@@ -2317,7 +2343,7 @@ fn main() {
                     if loop_break_mode == "escalate"
                         && runtime_repeat_penalty > repeat_penalty + 1e-4
                         && loop_break_clean_streak > 0
-                        && loop_break_clean_streak % loop_break_recovery == 0
+                        && loop_break_clean_streak.is_multiple_of(loop_break_recovery)
                     {
                         let prev_rp = runtime_repeat_penalty;
                         runtime_repeat_penalty =

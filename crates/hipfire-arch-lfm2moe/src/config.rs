@@ -190,7 +190,7 @@ impl Lfm2MoeConfig {
                     ff = (m * ff as f32) as usize;
                 }
                 let mo = raw.block_multiple_of.max(1);
-                mo * ((ff + mo - 1) / mo)
+                mo * ff.div_ceil(mo)
             } else {
                 raw.intermediate_size
             }

@@ -226,9 +226,7 @@ def load_inputs(args: argparse.Namespace) -> list[SampleSet]:
 
     for head_dim in parse_csv_ints(args.synthetic or ""):
         values = synthetic_values(head_dim, args.synthetic_samples, args.seed)
-        digest = hashlib.sha256(
-            struct.pack("<" + "f" * len(values), *values)
-        ).hexdigest()
+        digest = hashlib.sha256(struct.pack("<" + "f" * len(values), *values)).hexdigest()
         out.append(SampleSet(head_dim, f"synthetic-normal:{head_dim}", values, digest))
 
     if not out:
@@ -283,10 +281,7 @@ def main() -> int:
             "mean_abs": sum(abs(v) for v in clean) / len(clean),
             "rms": math.sqrt(sum(v * v for v in clean) / len(clean)),
             "tables": tables,
-            "c_snippets": {
-                name: table_to_c(f"TURBO_HD{sample.head_dim}", table)
-                for name, table in tables.items()
-            },
+            "c_snippets": {name: table_to_c(f"TURBO_HD{sample.head_dim}", table) for name, table in tables.items()},
         }
 
     out_path = Path(args.out)

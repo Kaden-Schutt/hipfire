@@ -96,11 +96,26 @@ KV_MODE="asym3"
 SCORING_MODE="prefill"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --kldref)      KLDREF="$2"; shift 2 ;;
-        --max-chunks)  MAX_CHUNKS="$2"; shift 2 ;;
-        --kv-mode)     KV_MODE="$2"; shift 2 ;;
-        --scoring-mode) SCORING_MODE="$2"; shift 2 ;;
-        *) echo "error: unknown flag: $1"; exit 2 ;;
+        --kldref)
+            KLDREF="$2"
+            shift 2
+            ;;
+        --max-chunks)
+            MAX_CHUNKS="$2"
+            shift 2
+            ;;
+        --kv-mode)
+            KV_MODE="$2"
+            shift 2
+            ;;
+        --scoring-mode)
+            SCORING_MODE="$2"
+            shift 2
+            ;;
+        *)
+            echo "error: unknown flag: $1"
+            exit 2
+            ;;
     esac
 done
 
@@ -193,7 +208,7 @@ fi
     echo
     echo "| Variant | Arch | MSE mean (4-bit qts) | KLD mean ± CI | KLD p99 | PPL | HE tokens (sum) | Smoke |"
     echo "|---|---|---:|---|---:|---:|---:|---|"
-} > "$PROGRESS"
+} >"$PROGRESS"
 
 # Spiral-detection prompt (matches existing bench_quant_quality.sh; intentionally
 # byte-identical so prior bench runs are comparable). Embedded here rather than
@@ -209,11 +224,15 @@ PROMPT='A train leaves Station A traveling at 60 km/h. Two hours later, a second
 # `pgrep -af "examples/daemon"` doesn't match anymore — serve no longer uses
 # that example process name.
 wait_for_model_ready() {
-    local hfq_path="$1"; local timeout="${2:-120}"
-    local want; want=$(basename "$hfq_path")
-    local start; start=$(date +%s)
-    local tmp; tmp=$(mktemp)
-    while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+    local hfq_path="$1"
+    local timeout="${2:-120}"
+    local want
+    want=$(basename "$hfq_path")
+    local start
+    start=$(date +%s)
+    local tmp
+    tmp=$(mktemp)
+    while [ $(($(date +%s) - start)) -lt "$timeout" ]; do
         if curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
             if python3 -c "
 import sys, json
@@ -224,12 +243,14 @@ try:
 except Exception:
     sys.exit(1)
 " 2>/dev/null; then
-                rm -f "$tmp"; return 0
+                rm -f "$tmp"
+                return 0
             fi
         fi
         sleep 2
     done
-    rm -f "$tmp"; return 1
+    rm -f "$tmp"
+    return 1
 }
 
 # ─── Per-variant loop ────────────────────────────────────────────────────
@@ -242,7 +263,7 @@ while IFS=$'\t' read -r VARIANT HFQ_PATH ARCH; do
     echo "═══ Variant: ${VARIANT} (${ARCH}) ═══"
     if [ ! -e "$HFQ_PATH" ]; then
         echo "  SKIP: model file not found: $HFQ_PATH"
-        echo "| ${VARIANT} | ${ARCH} | — | — | — | — | — | MODEL_MISSING | — |" >> "$PROGRESS"
+        echo "| ${VARIANT} | ${ARCH} | — | — | — | — | — | MODEL_MISSING | — |" >>"$PROGRESS"
         continue
     fi
 
@@ -250,7 +271,7 @@ while IFS=$'\t' read -r VARIANT HFQ_PATH ARCH; do
 
     # ─── 1. Per-tensor MSE ──────────────────────────────────────────────
     echo "  [1/4] per-tensor MSE..."
-    ./target/release/examples/quant_quality_mse "$ST_DIR" "$HFQ_PATH" 2>&1 > "${PV}.mse.txt" \
+    ./target/release/examples/quant_quality_mse "$ST_DIR" "$HFQ_PATH" 2>&1 >"${PV}.mse.txt" \
         || { echo "    (MSE run failed; output captured anyway)"; }
 
     # Extract the aggregate 4-bit MSE (mean over qts ∈ {13, 21, 24} == MQ4/HFP4/MFP4).
@@ -299,7 +320,7 @@ else:
             EVAL_OK=0
             echo "    daemon kld_eval FAILED (log: ${PV}.eval.log): $EVAL_LINE"
         fi
-        EVAL_WALL=$(( $(date +%s) - EVAL_START ))
+        EVAL_WALL=$(($(date +%s) - EVAL_START))
         echo "    daemon kld_eval wall: ${EVAL_WALL}s"
 
         if [ "$EVAL_OK" = "1" ] && [ -f "${PV}.kldseq" ]; then
@@ -346,7 +367,7 @@ ppl = float(np.exp(finite_nll.mean())) if finite_nll.size else float('nan')
 # Output as TSV for shell consumption.
 print(f'{slice_mean:.4f}\t{ci_lo:.4f}\t{ci_hi:.4f}\t{p99:.3f}\t{ppl:.3f}')
 " 2>"${PV}.reduce.err" || echo "err err err err err")
-            IFS=$'\t' read -r SM CI_LO CI_HI P99 PPL <<< "$REDUCE_OUT"
+            IFS=$'\t' read -r SM CI_LO CI_HI P99 PPL <<<"$REDUCE_OUT"
             if [ "$SM" != "err" ]; then
                 KLD_MEAN="${SM} (CI ${CI_LO}-${CI_HI})"
                 KLD_P99="${P99}"
@@ -363,7 +384,7 @@ print(f'{slice_mean:.4f}\t{ci_lo:.4f}\t{ci_hi:.4f}\t{p99:.3f}\t{ppl:.3f}')
     echo "  [3/4] HumanEval prompts..."
     if command -v hipfire >/dev/null 2>&1; then
         if bash scripts/bench_humaneval_completion.sh "$HFQ_PATH" "${PV}.humaneval.jsonl" \
-                2>&1 | tail -20 > "${PV}.humaneval.log"; then
+            2>&1 | tail -20 >"${PV}.humaneval.log"; then
             HE_TOK_SUM=$(python3 -c "
 import json
 rows = [json.loads(l) for l in open('${PV}.humaneval.jsonl')]
@@ -383,12 +404,13 @@ print(s)
     echo "  [4/4] reasoning smoke..."
     SMOKE="—"
     if command -v hipfire >/dev/null 2>&1; then
-        hipfire stop 2>&1 | head -1 || true; sleep 2
+        hipfire stop 2>&1 | head -1 || true
+        sleep 2
         HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
         if ! wait_for_model_ready "$HFQ_PATH" 300; then
             SMOKE="ERR_DAEMON_NOT_READY"
             hipfire stop 2>&1 | head -1 || true
-            echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE} |" >> "$PROGRESS"
+            echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE} |" >>"$PROGRESS"
             continue
         fi
 
@@ -402,7 +424,7 @@ import json
 print(json.dumps({'model':'$MODEL_ID','messages':[{'role':'user','content':'''$PROMPT'''}],'temperature':0,'max_tokens':400}))
 ")
         timeout 300 curl -sS http://127.0.0.1:8080/v1/chat/completions \
-            -H 'Content-Type: application/json' -d "$body" > "${PV}.smoke.json" 2>&1 || true
+            -H 'Content-Type: application/json' -d "$body" >"${PV}.smoke.json" 2>&1 || true
 
         SMOKE=$(python3 -c "
 import json
@@ -419,9 +441,9 @@ except Exception as e:
         hipfire stop 2>&1 | head -1 || true
     fi
 
-    echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE} |" >> "$PROGRESS"
+    echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE} |" >>"$PROGRESS"
 
-done < "$SPEC"
+done <"$SPEC"
 
 # ─── Finalize ────────────────────────────────────────────────────────────
 {
@@ -434,7 +456,7 @@ done < "$SPEC"
     echo "- **PPL:** exp(mean NLL) across all scored tokens. Wikitext-2-test slice (1175 chunks, n_ctx=2048, slice md5 \`83b0205a\`; or fewer if --max-chunks was used)."
     echo "- **HE tokens (sum):** sum of completion tokens across in-tree humaneval prompts (3 prompts). Sanity signal for 'model produces non-zero output on code prompts'; pass@1 scoring is a follow-up."
     echo "- **Smoke:** train-pursuit reasoning attractor check at temp=0, max_tokens=400. \`SPIRAL\` = empty content after \`<think>\` strip; \`COHERENT_<N>c\` = N chars of reasoning; \`PARTIAL_<N>c\` = N chars but suspiciously short."
-} >> "$PROGRESS"
+} >>"$PROGRESS"
 
 mv "$PROGRESS" "${COHORT_DIR}/result-table.md"
 

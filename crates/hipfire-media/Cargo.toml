@@ -8,4 +8,7 @@ description = "Video/multi-frame decode for the vision path — ffmpeg-subproces
 [dependencies]
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+] }

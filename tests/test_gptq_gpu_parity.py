@@ -65,11 +65,15 @@ def test_awq_hessian_torch_transform_matches_numpy_when_torch_available():
     scales = rng.uniform(0.25, 2.0, size=256).astype(np.float32)
 
     expected = apply_awq_hessian_transform(h, scales)
-    actual = apply_awq_hessian_transform_torch(
-        torch.as_tensor(h, dtype=torch.float32),
-        torch.as_tensor(scales, dtype=torch.float32),
-        device=torch.device("cpu"),
-    ).cpu().numpy()
+    actual = (
+        apply_awq_hessian_transform_torch(
+            torch.as_tensor(h, dtype=torch.float32),
+            torch.as_tensor(scales, dtype=torch.float32),
+            device=torch.device("cpu"),
+        )
+        .cpu()
+        .numpy()
+    )
 
     rel_l2 = float(np.linalg.norm(actual - expected) / max(float(np.linalg.norm(expected)), 1.0e-12))
     assert rel_l2 < 1.0e-5

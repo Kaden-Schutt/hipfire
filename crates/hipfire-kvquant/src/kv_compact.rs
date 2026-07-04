@@ -84,11 +84,7 @@ pub fn compact_cold_kv(
         scratch_owned.sort_unstable();
     }
     let scratch = &scratch_owned[..];
-    let nb = if fold_m > 0 {
-        scratch.len() / fold_m
-    } else {
-        0
-    };
+    let nb = scratch.len().checked_div(fold_m).unwrap_or(0);
 
     let mut slot_members: Vec<Vec<u32>> = Vec::with_capacity(ncore + nb + fold_m);
     for &t in core {
@@ -106,7 +102,7 @@ pub fn compact_cold_kv(
         slot_members.push(vec![t as u32]); // leftover scratch kept singleton
     }
     let n_valid = slot_members.len();
-    let n_slots = if n_valid % 2 == 0 {
+    let n_slots = if n_valid.is_multiple_of(2) {
         n_valid
     } else {
         n_valid + 1

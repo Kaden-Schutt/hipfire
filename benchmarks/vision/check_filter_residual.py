@@ -3,6 +3,7 @@
 2x2-block reorder, then compare to HF reference. If byte-identical, we've
 confirmed (1) the patch reorder is the primary bug, and (2) the Triangle
 resize is the secondary 9% residual."""
+
 import json
 import sys
 from pathlib import Path
@@ -34,7 +35,7 @@ def hipfire_preprocess(image_path, patch_size=16, sms=2, temporal=2, bicubic=Tru
 
     resample = Image.Resampling.BICUBIC if bicubic else Image.Resampling.BILINEAR
     img_r = img.resize((w_bar, h_bar), resample)
-    arr = np.array(img_r, dtype=np.float32) / 127.5 - 1.0   # HWC, [-1, 1]
+    arr = np.array(img_r, dtype=np.float32) / 127.5 - 1.0  # HWC, [-1, 1]
     arr = np.transpose(arr, (2, 0, 1))  # CHW
 
     if channel_order == "RBG":
@@ -49,11 +50,12 @@ def hipfire_preprocess(image_path, patch_size=16, sms=2, temporal=2, bicubic=Tru
     patches = np.zeros((n, elems), dtype=np.float32)
     for py in range(ph):
         for px in range(pw):
-            patch = arr[:, py*patch_size:(py+1)*patch_size,
-                          px*patch_size:(px+1)*patch_size]  # (C, ps, ps)
+            patch = arr[
+                :, py * patch_size : (py + 1) * patch_size, px * patch_size : (px + 1) * patch_size
+            ]  # (C, ps, ps)
             # Duplicate frame for temporal=2
             patch_t = np.stack([patch, patch], axis=0)  # (T, C, ps, ps)
-            patches[py*pw + px] = patch_t.flatten()
+            patches[py * pw + px] = patch_t.flatten()
     return patches, (ph, pw)
 
 
@@ -75,8 +77,7 @@ def main():
             d = np.abs(hf_pixels - reordered)
             rel = d.sum() / (np.abs(hf_pixels).sum() + 1e-9)
             label = f"  filter={filter_label:18s} ch={ch_label:13s}"
-            verdict = "  >>> BYTE-IDENTICAL" if d.max() < 1e-4 else (
-                      "  >>> tiny residual" if rel < 1e-3 else "")
+            verdict = "  >>> BYTE-IDENTICAL" if d.max() < 1e-4 else ("  >>> tiny residual" if rel < 1e-3 else "")
             print(f"{label}  rel-L1={rel:.4e}  max|Δ|={d.max():.4e}{verdict}")
 
 

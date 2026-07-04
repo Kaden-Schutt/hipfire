@@ -71,8 +71,7 @@ REPO = Path(__file__).resolve().parent.parent
 IMAGE_PATH = REPO / "benchmarks" / "images" / "dots_ocr_smoke_001.jpg"
 OUT_DIR = REPO / "benchmarks" / "references" / "dots_ocr_smoke_001_activations"
 SNAPSHOT = (
-    "/data/cache/huggingface/hub/models--rednote-hilab--dots.ocr/"
-    "snapshots/c0111ce6bc07803dbc267932ffef0ae3a51dc951"
+    "/data/cache/huggingface/hub/models--rednote-hilab--dots.ocr/snapshots/c0111ce6bc07803dbc267932ffef0ae3a51dc951"
 )
 
 # Same prompt as the phase-0 item-5 capture — keep byte-identical so
@@ -99,7 +98,7 @@ PROMPT_LAYOUT_ALL_EN = """Please output the layout information from the PDF imag
 # Indices of blocks to capture (out of 42 total). Block 0 establishes
 # the first-block-output reference; mid-stack catches drift accumulation;
 # final block is the pre-merger reference.
-BLOCK_INDICES_TO_CAPTURE = [0, 1, 2, 4, 8, 12, 16, 21, 41]   # bisection of 1..21 to locate per-block divergence
+BLOCK_INDICES_TO_CAPTURE = [0, 1, 2, 4, 8, 12, 16, 21, 41]  # bisection of 1..21 to locate per-block divergence
 
 # Patch-row sampling. The full activation tensors are [N_patches, 1536]
 # (this image: 19520 patches → 120 MB per stage × 5 stages = 600 MB).
@@ -167,6 +166,7 @@ def main() -> int:
             if isinstance(out, tuple):
                 t = out[0]
             captures[name] = t.detach().to(torch.float32).cpu()
+
         return hook
 
     hook_handles.append(vt.patch_embed.register_forward_hook(make_hook("patch_embed")))
@@ -175,19 +175,13 @@ def main() -> int:
         # `vt.blocks[idx].attn` returns the FULL attention output including the
         # `self.proj` projection — i.e. what gets added to the residual on the
         # attention side of the block.
-        hook_handles.append(
-            vt.blocks[idx].register_forward_hook(make_hook(f"block_{idx:02d}"))
-        )
-        hook_handles.append(
-            vt.blocks[idx].attn.register_forward_hook(make_hook(f"block_{idx:02d}_attn_out"))
-        )
+        hook_handles.append(vt.blocks[idx].register_forward_hook(make_hook(f"block_{idx:02d}")))
+        hook_handles.append(vt.blocks[idx].attn.register_forward_hook(make_hook(f"block_{idx:02d}_attn_out")))
         # Hook the qkv linear's OUTPUT (= pre-reshape, pre-permute, pre-RoPE,
         # pre-attention). Shape is [seq, 3*num_heads*head_dim]. Lets us
         # diff our QKV linear output directly vs HF, isolating whether
         # the bug is in QKV linear or downstream (RoPE / attention compute).
-        hook_handles.append(
-            vt.blocks[idx].attn.qkv.register_forward_hook(make_hook(f"block_{idx:02d}_qkv"))
-        )
+        hook_handles.append(vt.blocks[idx].attn.qkv.register_forward_hook(make_hook(f"block_{idx:02d}_qkv")))
     hook_handles.append(vt.post_trunk_norm.register_forward_hook(make_hook("post_trunk_norm")))
     hook_handles.append(vt.merger.register_forward_hook(make_hook("merger")))
     print(f"  registered {len(hook_handles)} hooks")
@@ -206,6 +200,7 @@ def main() -> int:
     t0 = time.time()
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     from qwen_vl_utils import process_vision_info
+
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
@@ -260,20 +255,19 @@ def main() -> int:
         sampled = arr[sample_indices].copy()
         sample_path = OUT_DIR / f"{name}.npy"
         np.save(sample_path, sampled)
-        index_entries.append({
-            "name": name,
-            "file": sample_path.name,
-            "sampled_shape": list(sampled.shape),
-            "full_shape": list(arr.shape),
-            "sample_indices": sample_indices.tolist(),
-            "dtype": str(arr.dtype),
-            "n_sampled_rows": int(sampled.shape[0]),
-            "full_local_path": str(full_path),
-        })
-        print(
-            f"  {name}: full {arr.shape} → /data/cache; "
-            f"sampled [{n_sample}, {arr.shape[1]}] → repo"
+        index_entries.append(
+            {
+                "name": name,
+                "file": sample_path.name,
+                "sampled_shape": list(sampled.shape),
+                "full_shape": list(arr.shape),
+                "sample_indices": sample_indices.tolist(),
+                "dtype": str(arr.dtype),
+                "n_sampled_rows": int(sampled.shape[0]),
+                "full_local_path": str(full_path),
+            }
         )
+        print(f"  {name}: full {arr.shape} → /data/cache; sampled [{n_sample}, {arr.shape[1]}] → repo")
 
     # Sort entries to match forward-order (patch_embed → blocks → post_norm → merger).
     order_rank = {
@@ -281,11 +275,13 @@ def main() -> int:
         "post_trunk_norm": 2,
         "merger": 3,
     }
+
     def rank(e):
         name = e["name"]
         if name.startswith("block_"):
             return (1, int(name.split("_")[1]))
         return (order_rank.get(name, 99), 0)
+
     index_entries.sort(key=rank)
 
     index = {

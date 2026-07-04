@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 //! End-to-end finite-difference gradient check for the FULL model (Phase 0, M2
 //! completion). 2-layer tiny LLaMA, tied embeddings, CE loss with one masked
 //! target. Checks LoRA grads in BOTH layers — exercising the reverse block loop,
@@ -8,6 +28,8 @@
 //!   hipfire gpu-lock acquire "gradcheck-model"
 //!   cargo run -p hipfire-train --release --example gradcheck_model
 //!   hipfire gpu-lock release
+
+#![allow(clippy::needless_range_loop)]
 
 use hipfire_train::block::BlockDims;
 use hipfire_train::model::{model_forward, model_loss_backward};

@@ -234,10 +234,10 @@ impl Lfm2DflashTargetSnapshot {
         for buf in self
             .kv_k
             .into_iter()
-            .chain(self.kv_v.into_iter())
-            .chain(self.kv_k_scales.into_iter())
-            .chain(self.kv_v_scales.into_iter())
-            .chain(self.conv_states.into_iter())
+            .chain(self.kv_v)
+            .chain(self.kv_k_scales)
+            .chain(self.kv_v_scales)
+            .chain(self.conv_states)
             .chain([self.h, self.final_norm_buf, self.logits])
         {
             let _ = gpu.hip.free(buf);

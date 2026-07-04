@@ -22,6 +22,12 @@
 //! "skip" expert being MoD), the SwiGLU experts, the per-block residual rescaling,
 //! the weight loader, and the serving impls land in later loop iterations (Z1+).
 
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::needless_range_loop,
+    clippy::type_complexity
+)]
+
 use serde::Deserialize;
 
 pub mod arch;
@@ -46,7 +52,7 @@ pub enum HalfLayerKind {
 impl HalfLayerKind {
     /// The role of half-layer `idx` in the alternating layout.
     pub fn at(idx: usize) -> Self {
-        if idx % 2 == 0 {
+        if idx.is_multiple_of(2) {
             HalfLayerKind::Attention
         } else {
             HalfLayerKind::Moe
@@ -173,7 +179,10 @@ impl ZayaConfig {
         if raw.hidden_size == 0 || raw.vocab_size == 0 {
             return Err("zaya config: zero hidden_size/vocab_size".to_string());
         }
-        if raw.num_attention_heads % raw.num_key_value_heads != 0 {
+        if !raw
+            .num_attention_heads
+            .is_multiple_of(raw.num_key_value_heads)
+        {
             return Err(format!(
                 "zaya config: num_attention_heads {} not a multiple of num_key_value_heads {}",
                 raw.num_attention_heads, raw.num_key_value_heads
@@ -193,7 +202,7 @@ impl ZayaConfig {
 
         let is_megatron = raw.ffn_hidden_size.is_some();
         let num_blocks = if is_megatron {
-            if raw.num_hidden_layers == 0 || raw.num_hidden_layers % 2 != 0 {
+            if raw.num_hidden_layers == 0 || !raw.num_hidden_layers.is_multiple_of(2) {
                 return Err(format!(
                     "zaya Megatron config: num_hidden_layers must be a positive even (alternating attn/MoE) count, got {}",
                     raw.num_hidden_layers

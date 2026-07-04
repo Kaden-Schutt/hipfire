@@ -52,10 +52,7 @@ class AstreaTests(unittest.TestCase):
         buf += gguf_string("synthetic-imatrix")
         for i, name in enumerate(tensor_names):
             shape = [256] if name.endswith(".in_sum2") else [1]
-            offset = 0 if i == 0 else sum(
-                (256 if prior.endswith(".in_sum2") else 1) * 4
-                for prior in tensor_names[:i]
-            )
+            offset = 0 if i == 0 else sum((256 if prior.endswith(".in_sum2") else 1) * 4 for prior in tensor_names[:i])
             buf += gguf_string(name)
             buf += struct.pack("<I", len(shape))
             for dim in shape:
@@ -988,10 +985,13 @@ class AstreaTests(unittest.TestCase):
         self.assertEqual(policy["sensitivity"]["source"], "imatrix")
         self.assertEqual(policy["candidate_count"], 2)
         selected = policy["selected"][0]
-        self.assertIn(selected["hfq_name"], {
-            "model.language_model.layers.0.mlp.gate_proj.weight",
-            "model.language_model.layers.0.self_attn.q_proj.weight",
-        })
+        self.assertIn(
+            selected["hfq_name"],
+            {
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+            },
+        )
         self.assertTrue(selected["sensitivity_alias"])
         self.assertEqual(selected["extra_bytes"], 136)
 

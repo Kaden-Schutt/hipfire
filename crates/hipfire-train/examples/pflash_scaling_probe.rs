@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 //! PFlash scaling-trend probe (hipfire-native dense-Llama ladder).
 //!
 //! Answers the 405B question honestly: does PFlash's shallow-layer cosine-K
@@ -24,6 +44,8 @@
 //!   hipfire gpu-lock acquire "pflash-scaling"
 //!   cargo run -p hipfire-train --release --example pflash_scaling_probe
 //!   hipfire gpu-lock release
+
+#![allow(clippy::doc_lazy_continuation, clippy::needless_range_loop)]
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::block::BlockActivations;

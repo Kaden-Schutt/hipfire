@@ -47,9 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from kldref_format import read_per_seq_kld  # noqa: E402
 
 
-def bootstrap_mean_ci(
-    values: np.ndarray, n_boot: int = 10_000, seed: int = 0
-) -> tuple[float, float, float]:
+def bootstrap_mean_ci(values: np.ndarray, n_boot: int = 10_000, seed: int = 0) -> tuple[float, float, float]:
     """Return (mean, ci_lo, ci_hi) at 95% bootstrap CI."""
     rng = np.random.default_rng(seed)
     n = len(values)
@@ -76,10 +74,7 @@ def main() -> None:
     b_means, b_p99s, _ = read_per_seq_kld(args.b)
 
     if len(a_means) != len(b_means):
-        sys.exit(
-            f"ERROR: per-seq length mismatch: {args.a.name}={len(a_means)} vs "
-            f"{args.b.name}={len(b_means)}"
-        )
+        sys.exit(f"ERROR: per-seq length mismatch: {args.a.name}={len(a_means)} vs {args.b.name}={len(b_means)}")
 
     label_a = args.label_a or args.a.stem
     label_b = args.label_b or args.b.stem
@@ -122,14 +117,16 @@ def main() -> None:
         ones = max(pos, neg)
         # Binomial CDF: P(X >= ones | n, 0.5). Two-tailed via *2.
         from math import comb
+
         # tail_p = 2 * Σ_{k=ones..n} C(n,k) * 0.5^n
         # For large n this underflows; switch to log-domain for n>200.
         if n <= 200:
-            tail = sum(comb(n, k) for k in range(ones, n + 1)) * (0.5 ** n)
+            tail = sum(comb(n, k) for k in range(ones, n + 1)) * (0.5**n)
             p_value = min(1.0, 2.0 * tail)
         else:
             # Normal approx: under H0, count ~ N(n/2, sqrt(n)/2). Standardise.
             from math import erfc, sqrt
+
             z = (ones - n / 2) / (sqrt(n) / 2)
             p_value = float(erfc(z / sqrt(2.0)))
         one_sided = p_value < 0.001
@@ -154,19 +151,12 @@ def main() -> None:
         )
     print()
     print("# Gates")
-    fmt = lambda ok, name, lhs, op, rhs: (
-        f"  {'PASS' if ok else 'FAIL'}  {name:<30} {lhs}  {op}  {rhs}"
-    )
-    print(fmt(gate_abs, "abs mean delta",
-              f"{abs(mean_delta_abs):.6e}", "<=", f"{args.epsilon_abs:.6e}"))
-    print(fmt(gate_rel, "rel mean delta",
-              f"{abs(mean_delta_rel):.4%}", "<=", f"{args.epsilon_rel:.4%}"))
-    print(fmt(gate_rho, "Pearson rho",
-              f"{rho:.6f}", ">=", f"{args.rho_min:.6f}"))
-    print(fmt(gate_p99, "p99 rel-to-B",
-              f"{p99_rel_b:.4%}", "<=", f"{args.p99_rel:.4%}"))
-    print(fmt(gate_ci, "95% CI overlap",
-              str(ci_overlaps), "==", "True"))
+    fmt = lambda ok, name, lhs, op, rhs: f"  {'PASS' if ok else 'FAIL'}  {name:<30} {lhs}  {op}  {rhs}"
+    print(fmt(gate_abs, "abs mean delta", f"{abs(mean_delta_abs):.6e}", "<=", f"{args.epsilon_abs:.6e}"))
+    print(fmt(gate_rel, "rel mean delta", f"{abs(mean_delta_rel):.4%}", "<=", f"{args.epsilon_rel:.4%}"))
+    print(fmt(gate_rho, "Pearson rho", f"{rho:.6f}", ">=", f"{args.rho_min:.6f}"))
+    print(fmt(gate_p99, "p99 rel-to-B", f"{p99_rel_b:.4%}", "<=", f"{args.p99_rel:.4%}"))
+    print(fmt(gate_ci, "95% CI overlap", str(ci_overlaps), "==", "True"))
 
     print()
     if all_pass:

@@ -159,7 +159,7 @@ fn dequant_qt(qt: u8, bytes: &[u8]) -> Result<Vec<f32>, String> {
     }
 }
 
-fn hfq_tensor<'a>(hfq: &'a HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
+fn hfq_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
     let (info, data) = hfq
         .tensor_data_vec(name)
         .ok_or_else(|| format!("nemotron hfq: missing tensor {name:?}"))?;

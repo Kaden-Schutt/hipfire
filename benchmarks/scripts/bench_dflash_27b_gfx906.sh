@@ -38,10 +38,13 @@ PROMPT_HE0=benchmarks/prompts/humaneval_0_has_close_elements.txt
 # ── Validation ───────────────────────────────────────────────────
 missing=0
 for f in "$TARGET_35" "$DRAFT_35" "$PROMPT_LRU" "$PROMPT_HE0"; do
-    if [ ! -f "$f" ]; then echo "MISSING: $f" >&2; missing=1; fi
+    if [ ! -f "$f" ]; then
+        echo "MISSING: $f" >&2
+        missing=1
+    fi
 done
 [ -f "$TARGET_36" ] || echo "WARN: $TARGET_36 absent (3.6 rows will skip)" >&2
-[ -f "$DRAFT_36" ]  || echo "WARN: $DRAFT_36 absent (3.6 rows will skip)" >&2
+[ -f "$DRAFT_36" ] || echo "WARN: $DRAFT_36 absent (3.6 rows will skip)" >&2
 [ "$missing" -eq 1 ] && exit 2
 
 # ── Reproducibility metadata ─────────────────────────────────────
@@ -49,11 +52,11 @@ echo "## Reproducibility metadata"
 echo "- commit:       $(git rev-parse HEAD)"
 echo "- binary md5:   $(md5sum "$EXE" | awk '{print $1}')"
 echo "- target 3.5:   $(md5sum "$TARGET_35" | awk '{print $1}')  qwen3.5-27b-mq4.hfq"
-echo "- draft 3.5:    $(md5sum "$DRAFT_35"  | awk '{print $1}')  qwen3.5-27b-mq4.dflash"
-[ -f "$TARGET_36" ] && \
-echo "- target 3.6:   $(md5sum "$TARGET_36" | awk '{print $1}')  qwen3.6-27b-mq4.hfq"
-[ -f "$DRAFT_36" ] && \
-echo "- draft 3.6:    $(md5sum "$DRAFT_36"  | awk '{print $1}')  qwen3.6-27b-mq4.dflash"
+echo "- draft 3.5:    $(md5sum "$DRAFT_35" | awk '{print $1}')  qwen3.5-27b-mq4.dflash"
+[ -f "$TARGET_36" ] \
+    && echo "- target 3.6:   $(md5sum "$TARGET_36" | awk '{print $1}')  qwen3.6-27b-mq4.hfq"
+[ -f "$DRAFT_36" ] \
+    && echo "- draft 3.6:    $(md5sum "$DRAFT_36" | awk '{print $1}')  qwen3.6-27b-mq4.dflash"
 echo "- prompt md5:   $(md5sum "$PROMPT_LRU" | awk '{print $1}')  $(basename $PROMPT_LRU)"
 echo "- prompt md5:   $(md5sum "$PROMPT_HE0" | awk '{print $1}')  $(basename $PROMPT_HE0)"
 echo "- arch:         $(rocminfo 2>/dev/null | grep -E '^\s+Name:\s+gfx' | head -1 | awk '{print $2}')"
@@ -70,9 +73,9 @@ run_one() {
     for run in 1 2 3; do
         log=$(HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
             "$EXE" --target "$target" --draft "$draft" \
-                   --prompt "$prompt" --max "$max" --ctx 2048 --no-chatml \
+            --prompt "$prompt" --max "$max" --ctx 2048 --no-chatml \
             2>&1)
-        local toks  # parse "emitted: <T> tokens in <S>s  (<X> tok/s)"
+        local toks # parse "emitted: <T> tokens in <S>s  (<X> tok/s)"
         toks=$(echo "$log" | grep -oE 'emitted: [0-9]+ tokens in [0-9.]+s\s+\([0-9.]+ tok/s\)' | tail -1)
         local tau
         tau=$(echo "$log" | grep -oE 'τ=[0-9]+\.[0-9]+' | tail -1)
@@ -105,7 +108,7 @@ run_battery() {
     echo "| test                       | result (3-run median: emitted / wall / tok/s, τ, mean_B) |"
     echo "|----------------------------|----------------------------------------------------------|"
     for t in "${TESTS[@]}"; do
-        IFS='|' read -r label tgt drf p maxn <<< "$t"
+        IFS='|' read -r label tgt drf p maxn <<<"$t"
         run_one "$(echo "$label" | xargs)" "$tgt" "$drf" "$p" "$maxn"
     done
     echo

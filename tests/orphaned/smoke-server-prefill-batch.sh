@@ -11,19 +11,19 @@ SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
 
 exec 9>"$SERVER_SMOKE_LOCK"
 if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
-  echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
-  exit 2
+    echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
+    exit 2
 fi
 
 if [[ ! -x "$DAEMON" ]]; then
-  echo "missing daemon binary: $DAEMON" >&2
-  echo "build it with: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
-  exit 2
+    echo "missing daemon binary: $DAEMON" >&2
+    echo "build it with: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
+    exit 2
 fi
 
 if [[ ! -f "$MODEL" ]]; then
-  echo "missing model: $MODEL" >&2
-  exit 2
+    echo "missing model: $MODEL" >&2
+    exit 2
 fi
 
 python3 - "$ROOT" "$DAEMON" "$MODEL" "$MAX_SEQ" "$EXPECTED_DAEMON_PREFILL_BACKEND" <<'PY'

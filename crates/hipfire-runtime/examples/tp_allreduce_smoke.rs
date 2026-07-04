@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: MIT
 // hipfire — end-to-end smoke for Gpus::all_reduce_sum_f32 (Stage 2).
 //
@@ -13,6 +33,7 @@
 //   HIP_VISIBLE_DEVICES=0,1,2,3 cargo run -p hipfire-runtime --release \
 //       --example tp_allreduce_smoke
 //   HIP_VISIBLE_DEVICES=0,1 HIPFIRE_TP_BENCH_N=2 cargo run ... (TP=2)
+#![allow(clippy::needless_range_loop)]
 
 use hip_bridge::DeviceBuffer;
 use hipfire_runtime::multi_gpu::Gpus;

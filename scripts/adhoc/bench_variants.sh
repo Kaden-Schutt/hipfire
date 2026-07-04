@@ -95,14 +95,14 @@ for V in 1 2 3 4 5; do
         continue
     fi
 
-    read -r GEN PREFILL <<< "$(parse_tok_s "$OUTPUT")"
+    read -r GEN PREFILL <<<"$(parse_tok_s "$OUTPUT")"
     printf '  decode:  %s tok/s\n' "$GEN"
     printf '  prefill: %s tok/s\n\n' "$PREFILL"
     RESULTS[$V]="gen=${GEN} prefill=${PREFILL}"
 
     # Track best
     if [[ "$GEN" != "NA" ]]; then
-        if (( $(echo "$GEN > $BEST_TOK" | bc -l 2>/dev/null || echo 0) )); then
+        if (($(echo "$GEN > $BEST_TOK" | bc -l 2>/dev/null || echo 0))); then
             BEST_TOK=$GEN
             BEST_V=$V
         fi

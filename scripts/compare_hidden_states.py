@@ -27,6 +27,7 @@ accumulates layer-on-layer) or has a sharp step (one layer is broken).
 Usage:
     compare_hidden_states.py --hf <hf_dump.bin> --hipfire <hipfire_dump.bin>
 """
+
 import argparse
 import struct
 import sys
@@ -52,10 +53,7 @@ def read_hfhs(path: Path):
         body = np.frombuffer(f.read(), dtype=np.float32)
     expected = n_layers * n_pos * hidden_dim
     if body.size != expected:
-        sys.exit(
-            f"{path}: body has {body.size} f32s, expected {expected} "
-            f"({n_layers}*{n_pos}*{hidden_dim})"
-        )
+        sys.exit(f"{path}: body has {body.size} f32s, expected {expected} ({n_layers}*{n_pos}*{hidden_dim})")
     body = body.reshape(n_layers, n_pos, hidden_dim)
     return n_layers, n_pos, hidden_dim, body
 
@@ -65,10 +63,7 @@ def main():
     n_layers_a, n_pos_a, hidden_a, hf = read_hfhs(Path(args.hf))
     n_layers_b, n_pos_b, hidden_b, hip = read_hfhs(Path(args.hipfire))
     if (n_layers_a, n_pos_a, hidden_a) != (n_layers_b, n_pos_b, hidden_b):
-        sys.exit(
-            f"shape mismatch HF {(n_layers_a, n_pos_a, hidden_a)} vs "
-            f"hipfire {(n_layers_b, n_pos_b, hidden_b)}"
-        )
+        sys.exit(f"shape mismatch HF {(n_layers_a, n_pos_a, hidden_a)} vs hipfire {(n_layers_b, n_pos_b, hidden_b)}")
     n_layers, n_pos, hidden = n_layers_a, n_pos_a, hidden_a
     print(
         f"comparing {n_layers} layers x {n_pos} positions x {hidden} hidden",

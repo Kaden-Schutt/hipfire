@@ -47,6 +47,8 @@
 //! `LlamaConfig::from_gguf`, the GGUF-only `load_weights`) can be
 //! physically moved here without breaking arch-qwen35's pflash branch.
 
+#![allow(clippy::too_many_arguments)]
+
 pub mod arch;
 pub mod caps;
 

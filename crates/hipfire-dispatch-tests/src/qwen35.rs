@@ -112,8 +112,8 @@ fn qwen35_default_kv_mode_is_asym3() {
     // This is a policy decision in daemon.rs load_model.
     // The KvCache::new_gpu_asym3_capped sets:
     //   quantized=true, quant_asym3=true, quant_fwht=false (Givens rotation)
-    let caps = vec![false, false, false, false, true, false, false]; // matches asym3 pattern
-    assert_eq!(caps[4], true); // quant_asym3
+    let caps = [false, false, false, false, true, false, false]; // matches asym3 pattern
+    assert!(caps[4]); // quant_asym3
 }
 
 // ─── Qwen3.5 MoE dispatch ─────────────────────────────────────

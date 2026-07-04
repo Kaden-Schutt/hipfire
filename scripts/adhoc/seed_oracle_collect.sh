@@ -34,7 +34,10 @@ fi
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "seed-oracle" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "seed-oracle" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -59,7 +62,8 @@ printf '%-10s %6s %8s %11s %10s %10s %10s %7s\n' \
     "genre" "cycles" "full_acc" "mean_accept" "rej_rate" "tail_rate" "anypos" "tau"
 echo "----------------------------------------------------------------------------------"
 
-PARSE_PY=$(cat <<'PY'
+PARSE_PY=$(
+    cat <<'PY'
 import sys, re
 label = sys.argv[1]
 out = sys.stdin.read()
@@ -88,6 +92,6 @@ run_one() {
     printf '%s\n' "$out" | python3 -c "$PARSE_PY" "$label"
 }
 
-run_one "code"     "$CODE_PROMPT"     "$MAX_TOKENS"
-run_one "prose"    "$PROSE_PROMPT"    "$MAX_TOKENS"
+run_one "code" "$CODE_PROMPT" "$MAX_TOKENS"
+run_one "prose" "$PROSE_PROMPT" "$MAX_TOKENS"
 run_one "instruct" "$INSTRUCT_PROMPT" "$MAX_TOKENS"

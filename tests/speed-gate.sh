@@ -34,8 +34,8 @@ trap cleanup EXIT
 while [ $# -gt 0 ]; do
     case "$1" in
         --fast) FAST=1 ;;
-        --verbose|-v) VERBOSE=1 ;;
-        --update|--update-baselines)
+        --verbose | -v) VERBOSE=1 ;;
+        --update | --update-baselines)
             echo "speed-gate: baseline capture now belongs in hipfire-eval reports; curate benchmarks/perf-baselines/*.json from the report artifact" >&2
             exit 2
             ;;
@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
             echo "speed-gate: tolerance is stored in benchmarks/perf-baselines/*.json" >&2
             shift
             ;;
-        -h|--help)
+        -h | --help)
             sed -n '7,18p' "$0"
             exit 0
             ;;
@@ -58,11 +58,11 @@ done
 color() {
     if [ -t 1 ]; then
         case "$1" in
-            green)  printf '\033[32m%s\033[0m' "$2" ;;
-            red)    printf '\033[31m%s\033[0m' "$2" ;;
+            green) printf '\033[32m%s\033[0m' "$2" ;;
+            red) printf '\033[31m%s\033[0m' "$2" ;;
             yellow) printf '\033[33m%s\033[0m' "$2" ;;
-            bold)   printf '\033[1m%s\033[0m'  "$2" ;;
-            *)      printf '%s' "$2" ;;
+            bold) printf '\033[1m%s\033[0m' "$2" ;;
+            *) printf '%s' "$2" ;;
         esac
     else
         printf '%s' "$2"
@@ -75,7 +75,10 @@ resolve_eval_bin() {
         return 0
     fi
     for cand in ./target/debug/hipfire-eval ./target/release/hipfire-eval; do
-        [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+        [ -x "$cand" ] && {
+            printf '%s\n' "$cand"
+            return 0
+        }
     done
     return 1
 }
@@ -83,8 +86,12 @@ resolve_eval_bin() {
 find_model_file() {
     local name="$1"
     local dir
-    for dir in "$MODELS_DIR"; do
-        [ -f "$dir/$name" ] && { printf '%s\n' "$dir/$name"; return 0; }
+    IFS=: read -r -a model_dirs <<<"$MODELS_DIR"
+    for dir in "${model_dirs[@]}"; do
+        [ -f "$dir/$name" ] && {
+            printf '%s\n' "$dir/$name"
+            return 0
+        }
     done
     # Older staged models used a dotted quant token. Keep the speed gate
     # usable for local legacy artifacts while preserving canonical output names.
@@ -95,7 +102,7 @@ find_model_file() {
             prefix="${name%-"$quant"}"
             prefix="${prefix%-}"
             legacy="${prefix}.${quant}"
-            for dir in "$MODELS_DIR"; do
+            for dir in "${model_dirs[@]}"; do
                 if [ -f "$dir/$legacy" ]; then
                     if [ -z "$MODEL_TMP_DIR" ]; then
                         MODEL_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hipfire-speed-gate-models.XXXXXX")" || return 1
@@ -119,28 +126,58 @@ detect_arch() {
     for probe in amdgpu-arch offload-arch /opt/rocm/bin/amdgpu-arch /opt/rocm/bin/offload-arch /opt/rocm/llvm/bin/amdgpu-arch; do
         if command -v "$probe" >/dev/null 2>&1 || [ -x "$probe" ]; then
             arch="$("$probe" 2>/dev/null | head -1)"
-            [ -n "$arch" ] && { printf '%s\n' "$arch"; return 0; }
+            [ -n "$arch" ] && {
+                printf '%s\n' "$arch"
+                return 0
+            }
         fi
     done
     for node_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
         [ -f "$node_props" ] || continue
         ver=$(awk '/gfx_target_version/ {print $2; exit}' "$node_props" 2>/dev/null || true)
         case "$ver" in
-            90006) printf '%s\n' gfx906; return 0 ;;
-            90008) printf '%s\n' gfx908; return 0 ;;
-            100100) printf '%s\n' gfx1010; return 0 ;;
-            100300|100302) printf '%s\n' gfx1030; return 0 ;;
-            110000|110001) printf '%s\n' gfx1100; return 0 ;;
-            110501) printf '%s\n' gfx1151; return 0 ;;
-            120000) printf '%s\n' gfx1200; return 0 ;;
-            120001) printf '%s\n' gfx1201; return 0 ;;
+            90006)
+                printf '%s\n' gfx906
+                return 0
+                ;;
+            90008)
+                printf '%s\n' gfx908
+                return 0
+                ;;
+            100100)
+                printf '%s\n' gfx1010
+                return 0
+                ;;
+            100300 | 100302)
+                printf '%s\n' gfx1030
+                return 0
+                ;;
+            110000 | 110001)
+                printf '%s\n' gfx1100
+                return 0
+                ;;
+            110501)
+                printf '%s\n' gfx1151
+                return 0
+                ;;
+            120000)
+                printf '%s\n' gfx1200
+                return 0
+                ;;
+            120001)
+                printf '%s\n' gfx1201
+                return 0
+                ;;
         esac
     done
     return 1
 }
 
 select_baseline() {
-    [ -n "${HIPFIRE_PERF_BASELINE:-}" ] && { printf '%s\n' "$HIPFIRE_PERF_BASELINE"; return 0; }
+    [ -n "${HIPFIRE_PERF_BASELINE:-}" ] && {
+        printf '%s\n' "$HIPFIRE_PERF_BASELINE"
+        return 0
+    }
     local arch="$1"
     local matches=()
     shopt -s nullglob
@@ -161,7 +198,10 @@ select_baseline() {
 if ! EVAL_BIN="$(resolve_eval_bin)"; then
     echo "speed-gate: building hipfire-eval..."
     cargo build -p hipfire-eval >/dev/null || exit 2
-    EVAL_BIN="$(resolve_eval_bin)" || { echo "speed-gate: hipfire-eval build did not produce a binary" >&2; exit 2; }
+    EVAL_BIN="$(resolve_eval_bin)" || {
+        echo "speed-gate: hipfire-eval build did not produce a binary" >&2
+        exit 2
+    }
 fi
 
 if [ ! -x ./target/release/examples/bench_qwen35_speed ]; then
@@ -169,7 +209,10 @@ if [ ! -x ./target/release/examples/bench_qwen35_speed ]; then
     cargo build --release -p hipfire-runtime --example bench_qwen35_speed --features deltanet >/dev/null || exit 2
 fi
 
-ARCH="$(detect_arch)" || { echo "speed-gate: cannot detect GPU arch; set HIPFIRE_BASELINE_ARCH" >&2; exit 2; }
+ARCH="$(detect_arch)" || {
+    echo "speed-gate: cannot detect GPU arch; set HIPFIRE_BASELINE_ARCH" >&2
+    exit 2
+}
 BASELINE="$(select_baseline "$ARCH")" || exit 2
 
 if [ "$FAST" -eq 1 ]; then
@@ -179,11 +222,16 @@ else
 fi
 
 if [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; then
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "speed-gate" --watch-pid "$$" || { color red "could not acquire GPU lock"; echo; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "speed-gate" --watch-pid "$$" || {
+        color red "could not acquire GPU lock"
+        echo
+        exit 2
+    }
     GPULOCK_HELD=1
 fi
 
-color bold "=== MQ4 Speed Gate via hipfire-eval ==="; echo
+color bold "=== MQ4 Speed Gate via hipfire-eval ==="
+echo
 echo "baseline: $BASELINE"
 echo
 
@@ -208,7 +256,7 @@ for size in "${SIZES[@]}"; do
             "$EVAL_BIN" --model "$model" --battery speed --executor examples \
             --max-tokens 50 --no-cache --out "$out" >/tmp/hipfire-speed-gate.stdout 2>/tmp/hipfire-speed-gate.stderr; then
             [ "$VERBOSE" -eq 1 ] && cat /tmp/hipfire-speed-gate.stderr
-        elif python3 - "$out/results.jsonl" "$VERBOSE" <<'PY'
+        elif python3 - "$out/results.jsonl" "$VERBOSE" <<'PY'; then
 import json, sys
 path = sys.argv[1]
 verbose = sys.argv[2] == "1"
@@ -227,7 +275,6 @@ for row in rows:
         print(f"      reason: {row['reason']}")
 sys.exit(1 if failed else 0)
 PY
-        then
             model_ok=1
             break
         fi

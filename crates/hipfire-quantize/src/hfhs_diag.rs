@@ -214,7 +214,7 @@ mod tests {
         let m = read_diagonals(tf.path()).unwrap();
         assert_eq!(m.len(), 1, "expert-indexed record should be skipped");
         assert_eq!(m.get("blk.0.attn_q").unwrap(), &vec![1.0, 4.0, 9.0]);
-        assert!(m.get("blk.0.ffn_gate").is_none());
+        assert!(!m.contains_key("blk.0.ffn_gate"));
     }
 
     /// Opt-in: HFHS_REAL=/path/to/qwen3.5-0.8b.hessian.bin cargo test ... -- --nocapture

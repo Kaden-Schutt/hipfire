@@ -20,6 +20,8 @@
 //! deepseek4 `moe_topk_bias_aware` routing, the grouped-MQ4 MoE GEMM +
 //! `moe_scatter/unscatter/down_combine_k8` family.
 
+#![allow(clippy::needless_range_loop)]
+
 pub mod arch;
 pub mod calibration;
 pub mod forward;

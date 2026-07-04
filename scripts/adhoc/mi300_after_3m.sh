@@ -11,7 +11,6 @@
 set -uo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${TRIPWIRE_ROOT}/.cargo/bin:$PATH
 export HIP_PATH=/opt/rocm ROCM_PATH=/opt/rocm HIPFIRE_FP16=0
 export HF_HOME=${TRIPWIRE_ROOT}/hf_cache
@@ -43,7 +42,7 @@ python3 scripts/dflash_train_poc.py \
     --corpus ${TRIPWIRE_ROOT}/wikitext_calib.txt \
     --out ${TRIPWIRE_ROOT}/poc_smoke \
     --ckpt-every 50 --log-every 10 \
-    > ${TRIPWIRE_ROOT}/poc_smoke.log 2>&1
+    >${TRIPWIRE_ROOT}/poc_smoke.log 2>&1
 
 if grep -Eq "^\[done\]" ${TRIPWIRE_ROOT}/poc_smoke.log; then
     log "POC smoke PASS — starting real draft training (10K steps)"
@@ -57,7 +56,7 @@ if grep -Eq "^\[done\]" ${TRIPWIRE_ROOT}/poc_smoke.log; then
         --corpus ${TRIPWIRE_ROOT}/wikitext_calib.txt \
         --out ${TRIPWIRE_ROOT}/draft_b16_4b_10k \
         --ckpt-every 1000 --log-every 50 \
-        > ${TRIPWIRE_ROOT}/draft_b16_4b_10k.log 2>&1 || log "WARN: real training returned non-zero"
+        >${TRIPWIRE_ROOT}/draft_b16_4b_10k.log 2>&1 || log "WARN: real training returned non-zero"
     log "real B=16 training run finished"
 
     # ── B=32 variant to unlock task #121 ──────────────────────────────
@@ -69,7 +68,7 @@ if grep -Eq "^\[done\]" ${TRIPWIRE_ROOT}/poc_smoke.log; then
         --corpus ${TRIPWIRE_ROOT}/wikitext_calib.txt \
         --out ${TRIPWIRE_ROOT}/draft_b32_4b_10k \
         --ckpt-every 1000 --log-every 50 \
-        > ${TRIPWIRE_ROOT}/draft_b32_4b_10k.log 2>&1 || log "WARN: B=32 training returned non-zero"
+        >${TRIPWIRE_ROOT}/draft_b32_4b_10k.log 2>&1 || log "WARN: B=32 training returned non-zero"
     log "real B=32 training run finished"
 else
     log "POC smoke FAILED — see ${TRIPWIRE_ROOT}/poc_smoke.log; skipping long runs"

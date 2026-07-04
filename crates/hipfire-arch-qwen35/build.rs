@@ -430,6 +430,7 @@ fn run_headnorm_build(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rope_build(
     python: &Path,
     script: &Path,

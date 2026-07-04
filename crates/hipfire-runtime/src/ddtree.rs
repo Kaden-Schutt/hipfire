@@ -765,8 +765,8 @@ mod tests {
         assert_eq!(t.nodes[0].depth, 1);
         assert_eq!(t.nodes[0].parent_index, -1);
         // Visibility: root visible to self + node 1 visible to {0,1}.
-        assert_eq!(t.visibility[1][0], true);
-        assert_eq!(t.visibility[1][1], true);
+        assert!(t.visibility[1][0]);
+        assert!(t.visibility[1][1]);
         // child_maps[0] (root's children) should have {7 → 0}.
         assert_eq!(t.child_maps[0].get(&7), Some(&0));
     }

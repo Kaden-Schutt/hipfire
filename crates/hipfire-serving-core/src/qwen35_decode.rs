@@ -1343,8 +1343,6 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
 
     let restore_result = state.restore_into_loaded(m, gpu);
     let save_result = restore_result.and_then(|()| qwen35_save_active_session(m, gpu));
-    if let Err(err) = save_result {
-        return Err(err);
-    }
+    save_result?;
     result
 }

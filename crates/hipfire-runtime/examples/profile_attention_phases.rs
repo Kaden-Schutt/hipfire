@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -238,7 +258,7 @@ fn main() {
 
         // Sum across heads for this repeat (we want average per-head later)
         for h in 0..config.n_heads {
-            p1_ticks_sum += cycles[h * 3 + 0];
+            p1_ticks_sum += cycles[h * 3];
             p2_ticks_sum += cycles[h * 3 + 1];
             p3_ticks_sum += cycles[h * 3 + 2];
         }
@@ -346,7 +366,7 @@ fn main() {
     // ═══ Flash attention comparison ═══
     eprintln!("\n=== Flash attention (tile+reduce) ===");
     const TILE_SIZE: usize = 128;
-    let max_tiles = (kv_seq + TILE_SIZE - 1) / TILE_SIZE;
+    let max_tiles = kv_seq.div_ceil(TILE_SIZE);
     let partials = gpu
         .zeros(
             &[config.n_heads * max_tiles * (2 + config.head_dim)],

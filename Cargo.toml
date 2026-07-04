@@ -72,6 +72,7 @@ members = [
     "crates/hipfire-atlas",
     "crates/hipfire-cli",
     "crates/hipfire-tui",
+    "crates/hipfire-system-monitor",
     "crates/hipfire-sysinfo",
     "crates/hipfire-server",
     "crates/hipfire-serving-core",

@@ -29,7 +29,9 @@ run() {
     local NTOK=$(echo "$R" | grep "=== Done:" | grep -oP '\d+(?= tokens in)')
     local TEXT=$(echo "$R" | sed -n '/^Generating/,/^===/p' | grep -v "^Generating\|^===" | tr '\n' ' ')
     local REPEAT=$(echo "${TEXT:0:200}" | tr ' ' '\n' | sort | uniq -c | sort -rn | head -1 | awk '{print $1}')
-    local COH="ok"; [ -z "$GEN" ] && COH="FAIL"; [ "${REPEAT:-0}" -gt 10 ] && COH="BAD"
+    local COH="ok"
+    [ -z "$GEN" ] && COH="FAIL"
+    [ "${REPEAT:-0}" -gt 10 ] && COH="BAD"
     echo "| $label | ${GEN:-FAIL} | ${NTOK:-0} | $COH |"
 }
 

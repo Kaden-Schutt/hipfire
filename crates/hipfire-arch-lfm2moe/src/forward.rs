@@ -718,9 +718,9 @@ fn prefill_batch_chunk(
     tokens: &[u32],
     start_pos: usize,
     s: &Lfm2MoePrefillScratch,
-    mut capture: Option<&mut Lfm2HiddenCapture>,
-    mut logits_per_pos: Option<&mut Vec<f32>>,
-    mut final_hidden_rows: Option<&mut Vec<f32>>,
+    capture: Option<&mut Lfm2HiddenCapture>,
+    logits_per_pos: Option<&mut Vec<f32>>,
+    final_hidden_rows: Option<&mut Vec<f32>>,
 ) -> Result<(), String> {
     let n = tokens.len();
     debug_assert!(n > 0 && n <= s.max_batch);
@@ -1023,14 +1023,14 @@ fn prefill_batch_chunk(
         }
     }
 
-    if let Some(cap) = capture.as_deref_mut() {
+    if let Some(cap) = capture {
         let layer_rows = captured_layer_rows
             .take()
             .expect("capture rows allocated when capture is present");
         cap.append_interleaved_chunk(&layer_rows, n)?;
     }
 
-    if let Some(out) = final_hidden_rows.as_deref_mut() {
+    if let Some(out) = final_hidden_rows {
         let h_rows = s.h_batch.sub_offset(0, n * hidden);
         let rows = gpu
             .download_f32(&h_rows)
@@ -1038,7 +1038,7 @@ fn prefill_batch_chunk(
         out.extend_from_slice(&rows);
     }
 
-    if let Some(out) = logits_per_pos.as_deref_mut() {
+    if let Some(out) = logits_per_pos {
         let logits_batch = gpu
             .alloc_tensor(&[n * cfg.vocab_size], DType::F32)
             .map_err(|e| format!("lfm2moe prefill: alloc all logits: {e:?}"))?;

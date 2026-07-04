@@ -1,3 +1,9 @@
+#![allow(
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::too_many_arguments
+)]
+
 pub mod admin_ui;
 pub mod auth;
 pub mod model;
@@ -438,6 +444,82 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+async fn prewarm_default_model(state: &SharedState) {
+    let model = {
+        let cfg = state.config.lock().await;
+        cfg.default_model.clone()
+    };
+    let Some(model) = model else {
+        return;
+    };
+
+    tracing::info!("pre-warming {model}");
+    if prewarm_diffusion_model(state, &model).await {
+        return;
+    }
+
+    let required_max_seq = {
+        let cfg = state.config.lock().await;
+        cfg.max_seq
+    };
+    match routes::chat::ensure_model_loaded(state, &model, required_max_seq).await {
+        Ok(loaded) => {
+            let mut engine_guard = state.engine.lock().await;
+            let Some(engine) = engine_guard.as_mut() else {
+                tracing::warn!("pre-warm loaded model but daemon engine is unavailable");
+                return;
+            };
+            let req = GenerateTextRequest::from_prompt(
+                "warmup".to_string(),
+                "Hi",
+                GenerationSamplingPolicy::greedy(1),
+            )
+            .with_worker_key_id(loaded.worker_key_id);
+            if let Err(e) = engine.generate(req).await {
+                tracing::warn!(
+                    "pre-warm generate failed: {e}; first request will continue normally"
+                );
+                return;
+            }
+            if let Err(e) = engine.reset().await {
+                tracing::warn!(
+                    "pre-warm reset failed: {e}; first request will reset before generate"
+                );
+                return;
+            }
+            tracing::info!("warm-up complete");
+        }
+        Err(e) => {
+            tracing::warn!("pre-warm load failed: {e}; will load on first request");
+        }
+    }
+}
+
+async fn prewarm_diffusion_model(state: &SharedState, model: &str) -> bool {
+    let Some(path) = routes::sdapi::resolve_diffusion_hfq_candidate(model) else {
+        return false;
+    };
+
+    match routes::sdapi::cached_diffusion_pipeline(state, path.clone()).await {
+        Ok(pipeline) => {
+            let summary = pipeline.summary();
+            tracing::info!(
+                model = %summary.model_name,
+                pipeline = %summary.pipeline_class,
+                path = %path.display(),
+                "diffusion warm-up complete"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "diffusion pre-warm failed for {}: {e}; first SDAPI request will retry",
+                path.display()
+            );
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,80 +695,4 @@ mod tests {
         )
         .unwrap();
     }
-}
-
-async fn prewarm_default_model(state: &SharedState) {
-    let model = {
-        let cfg = state.config.lock().await;
-        cfg.default_model.clone()
-    };
-    let Some(model) = model else {
-        return;
-    };
-
-    tracing::info!("pre-warming {model}");
-    if prewarm_diffusion_model(state, &model).await {
-        return;
-    }
-
-    let required_max_seq = {
-        let cfg = state.config.lock().await;
-        cfg.max_seq
-    };
-    match routes::chat::ensure_model_loaded(state, &model, required_max_seq).await {
-        Ok(loaded) => {
-            let mut engine_guard = state.engine.lock().await;
-            let Some(engine) = engine_guard.as_mut() else {
-                tracing::warn!("pre-warm loaded model but daemon engine is unavailable");
-                return;
-            };
-            let req = GenerateTextRequest::from_prompt(
-                "warmup".to_string(),
-                "Hi",
-                GenerationSamplingPolicy::greedy(1),
-            )
-            .with_worker_key_id(loaded.worker_key_id);
-            if let Err(e) = engine.generate(req).await {
-                tracing::warn!(
-                    "pre-warm generate failed: {e}; first request will continue normally"
-                );
-                return;
-            }
-            if let Err(e) = engine.reset().await {
-                tracing::warn!(
-                    "pre-warm reset failed: {e}; first request will reset before generate"
-                );
-                return;
-            }
-            tracing::info!("warm-up complete");
-        }
-        Err(e) => {
-            tracing::warn!("pre-warm load failed: {e}; will load on first request");
-        }
-    }
-}
-
-async fn prewarm_diffusion_model(state: &SharedState, model: &str) -> bool {
-    let Some(path) = routes::sdapi::resolve_diffusion_hfq_candidate(model) else {
-        return false;
-    };
-
-    match routes::sdapi::cached_diffusion_pipeline(state, path.clone()).await {
-        Ok(pipeline) => {
-            let summary = pipeline.summary();
-            tracing::info!(
-                model = %summary.model_name,
-                pipeline = %summary.pipeline_class,
-                path = %path.display(),
-                "diffusion warm-up complete"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "diffusion pre-warm failed for {}: {e}; first SDAPI request will retry",
-                path.display()
-            );
-        }
-    }
-    true
 }

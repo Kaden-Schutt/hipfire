@@ -36,15 +36,15 @@ run_case() {
 
     set +e
     ARCH="$ARCH" \
-    BUILD_ONLY="$BUILD_ONLY" \
-    VARIANT="$variant" \
-    MODE=full \
-    N_LAUNCH="$launches" \
-    M="$M" \
-    N="$N" \
-    K="$K" \
-    K_LIMIT="$k_limit" \
-    "$RUNNER" "$case_out"
+        BUILD_ONLY="$BUILD_ONLY" \
+        VARIANT="$variant" \
+        MODE=full \
+        N_LAUNCH="$launches" \
+        M="$M" \
+        N="$N" \
+        K="$K" \
+        K_LIMIT="$k_limit" \
+        "$RUNNER" "$case_out"
     rc=$?
     set -e
 

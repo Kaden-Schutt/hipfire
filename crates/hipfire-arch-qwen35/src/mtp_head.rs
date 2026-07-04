@@ -491,7 +491,7 @@ impl Qwen35MtpHeadScratch {
                 // is single-token. Allocated per scratch instance, lives
                 // for the lifetime of the slot.
                 let tile_size = 128usize;
-                let max_tiles = (config.max_seq + tile_size - 1) / tile_size;
+                let max_tiles = config.max_seq.div_ceil(tile_size);
                 gpu.alloc_tensor(
                     &[config.n_head * max_tiles * (2 + config.head_dim)],
                     DType::F32,
@@ -1144,7 +1144,7 @@ fn weight_tensor_from_raw(
         13 => {
             // MQ4G256 — must be K%256-aligned (kernel requirement).
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 ".mtp tensor '{name}' is MQ4G256 with K={k} not divisible by 256"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -2065,7 +2065,7 @@ pub fn mtp_head_apply_lm_head_batched(
                 .as_deref()
                 != Some("0")
                 && gpu.arch_caps.has_wmma()
-                && lm_head_weights.k % 32 == 0;
+                && lm_head_weights.k.is_multiple_of(32);
             if use_wmma {
                 gpu.gemm_q8_0_wmma(
                     &lm_head_weights.buf,
@@ -2596,7 +2596,7 @@ pub fn mtp_head_forward_block_batched(
     } else {
         let ratio = cfg.n_head / cfg.n_head_kv;
         assert!(
-            cfg.n_head % cfg.n_head_kv == 0,
+            cfg.n_head.is_multiple_of(cfg.n_head_kv),
             "n_head ({}) must be divisible by n_head_kv ({})",
             cfg.n_head,
             cfg.n_head_kv,

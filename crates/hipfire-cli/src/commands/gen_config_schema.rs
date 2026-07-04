@@ -112,7 +112,10 @@ fn render_markdown(fields: &[&ConfigField]) -> String {
 
 fn render_toml(fields: &[&ConfigField]) -> String {
     let mut out = String::new();
-    for field in fields {
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
         out.push_str("[[field]]\n");
         out.push_str(&format!("key = \"{}\"\n", toml_escape(field.key)));
         out.push_str(&format!(
@@ -165,7 +168,6 @@ fn render_toml(fields: &[&ConfigField]) -> String {
             );
             out.push_str("]\n");
         }
-        out.push('\n');
     }
     out
 }

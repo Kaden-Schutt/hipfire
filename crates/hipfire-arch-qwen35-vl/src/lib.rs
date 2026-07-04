@@ -28,6 +28,8 @@
 //! When `deltanet` is off the crate compiles to a no-op stub, matching the
 //! gating `engine::qwen35_vl` had pre-Phase-2.
 
+#![allow(clippy::doc_overindented_list_items)]
+
 #[cfg(feature = "deltanet")]
 pub mod arch;
 #[cfg(feature = "deltanet")]

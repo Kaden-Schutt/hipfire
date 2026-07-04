@@ -35,7 +35,10 @@ if [ ! -f "$TARGET_27B" ] || [ ! -f "$DRAFT_27B" ]; then
 fi
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ddtree-meta-sweep" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "ddtree-meta-sweep" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -56,7 +59,8 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
 
 INSTRUCT_PROMPT="Explain, in three or four sentences, why the sky appears blue during the day. Your answer should be accessible to a curious middle-school student."
 
-PARSE_PY=$(cat <<'PY'
+PARSE_PY=$(
+    cat <<'PY'
 import sys, re
 label = sys.argv[1]
 genre = sys.argv[2]
@@ -111,7 +115,7 @@ run_one() {
 for cfg in "off|" "cutoff-6|6" "cutoff-4|4" "cutoff-3|3" "cutoff-2|2"; do
     label=${cfg%|*}
     cutoff=${cfg#*|}
-    run_one "$label" "$cutoff" "code"     "$CODE_PROMPT"
-    run_one "$label" "$cutoff" "prose"    "$PROSE_PROMPT"
+    run_one "$label" "$cutoff" "code" "$CODE_PROMPT"
+    run_one "$label" "$cutoff" "prose" "$PROSE_PROMPT"
     run_one "$label" "$cutoff" "instruct" "$INSTRUCT_PROMPT"
 done

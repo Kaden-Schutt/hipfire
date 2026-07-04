@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
@@ -14,6 +34,8 @@
 //! Givens inverse, the codebook index math — the CPU and GPU scores
 //! diverge by orders of magnitude. Passing this test means the kernel's
 //! dequant + un-Givens matches exactly.
+
+#![allow(clippy::doc_lazy_continuation, clippy::needless_range_loop)]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -160,7 +182,7 @@ fn main() {
         for pos in 0..seq_len {
             let head_off = pos * k_bytes_per_pos + h_kv * k_bytes_per_head;
             let cnorm = f32::from_le_bytes([
-                k_cache_bytes[head_off + 0],
+                k_cache_bytes[head_off],
                 k_cache_bytes[head_off + 1],
                 k_cache_bytes[head_off + 2],
                 k_cache_bytes[head_off + 3],
@@ -170,7 +192,7 @@ fn main() {
             let mut k_post_recovered = vec![0.0f32; head_dim];
             for tid in 0..32usize {
                 let base_off = head_off + 4 + tid * 3;
-                let b0 = k_cache_bytes[base_off + 0] as u32;
+                let b0 = k_cache_bytes[base_off] as u32;
                 let b1 = k_cache_bytes[base_off + 1] as u32;
                 let b2 = k_cache_bytes[base_off + 2] as u32;
                 let packed = b0 | (b1 << 8) | (b2 << 16);
@@ -186,11 +208,11 @@ fn main() {
                     let f = b0_band + j;
                     let cb = cos_vals[f];
                     let sb = sin_vals[f];
-                    let a_gv = v[j * 2 + 0];
+                    let a_gv = v[j * 2];
                     let b_gv = v[j * 2 + 1];
                     let a = cb * a_gv + sb * b_gv;
                     let b = -sb * a_gv + cb * b_gv;
-                    k_post_recovered[d0 + j * 2 + 0] = a;
+                    k_post_recovered[d0 + j * 2] = a;
                     k_post_recovered[d0 + j * 2 + 1] = b;
                 }
             }

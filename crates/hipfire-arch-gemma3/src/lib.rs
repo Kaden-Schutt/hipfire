@@ -23,6 +23,7 @@
 //!    [`Gemma3Config::is_global_layer`].
 //! 8. **GeGLU `gelu_pytorch_tanh`** (not SwiGLU/silu).
 //! 9. **No logit/attn soft-capping** in Gemma3.
+#![allow(clippy::too_many_arguments)]
 
 pub mod arch;
 pub mod calibration;

@@ -42,8 +42,8 @@ dmesg_delta_count() {
         rg -c "$pattern" "$after" || true
         return
     fi
-    awk 'NR == FNR { seen[$0]++; next } seen[$0] > 0 { seen[$0]--; next } { print }' "$before" "$after" |
-        rg -c "$pattern" || true
+    awk 'NR == FNR { seen[$0]++; next } seen[$0] > 0 { seen[$0]--; next } { print }' "$before" "$after" \
+        | rg -c "$pattern" || true
 }
 
 short_sha256() {
@@ -65,7 +65,7 @@ selected_isa_symbol() {
     local tile suffix
 
     case "$variant" in
-        tile5|tile6|tile16)
+        tile5 | tile6 | tile16)
             tile="${variant#tile}"
             echo "gemm_lds_probeILi${tile}"
             ;;

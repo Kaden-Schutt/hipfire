@@ -942,8 +942,7 @@ mod tests {
 </｜DSML｜>\n\
 </｜DSML｜tool_calls>";
         let calls = parse_tool_calls_body(
-            &body
-                .strip_prefix("<｜DSML｜tool_calls>\n")
+            body.strip_prefix("<｜DSML｜tool_calls>\n")
                 .unwrap()
                 .strip_suffix("</｜DSML｜tool_calls>")
                 .unwrap(),

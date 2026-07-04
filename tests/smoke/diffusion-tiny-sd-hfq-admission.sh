@@ -28,64 +28,64 @@ SKIP_MASKED_IMG2IMG="${HIPFIRE_DIFFUSION_ADMISSION_SKIP_MASKED_IMG2IMG:-0}"
 # for unrelated features.
 HIPFIRE_CLI=(cargo run --release -q -p hipfire-cli)
 if [[ -n "$CARGO_FEATURES" ]]; then
-  HIPFIRE_CLI+=(--features "$CARGO_FEATURES")
+    HIPFIRE_CLI+=(--features "$CARGO_FEATURES")
 fi
 HIPFIRE_CLI+=(--)
 
 find_tiny_sd_source() {
-  if [[ -n "$SOURCE" ]]; then
-    printf '%s\n' "$SOURCE"
-    return 0
-  fi
-  local cache_root="${HIPFIRE_HF_CACHE:-/srv/huggingface}"
-  local snapshots_dir="$cache_root/models--segmind--tiny-sd/snapshots"
-  if [[ ! -d "$snapshots_dir" ]]; then
-    return 1
-  fi
-  find "$snapshots_dir" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1
+    if [[ -n "$SOURCE" ]]; then
+        printf '%s\n' "$SOURCE"
+        return 0
+    fi
+    local cache_root="${HIPFIRE_HF_CACHE:-/srv/huggingface}"
+    local snapshots_dir="$cache_root/models--segmind--tiny-sd/snapshots"
+    if [[ ! -d "$snapshots_dir" ]]; then
+        return 1
+    fi
+    find "$snapshots_dir" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1
 }
 
 if [[ ! -f "$MODEL" ]]; then
-  if [[ "${HIPFIRE_DIFFUSION_ADMISSION_NO_IMPORT:-0}" = "1" ]]; then
-    echo "missing Tiny-SD HFQ model: $MODEL" >&2
-    echo "unset HIPFIRE_DIFFUSION_ADMISSION_NO_IMPORT or set HIPFIRE_TINY_SD_HFQ" >&2
-    exit 2
-  fi
-  if ! SOURCE="$(find_tiny_sd_source)"; then
-    echo "missing Tiny-SD HFQ model: $MODEL" >&2
-    echo "set HIPFIRE_TINY_SD_HFQ or HIPFIRE_TINY_SD_SOURCE to a Diffusers Tiny-SD snapshot" >&2
-    exit 2
-  fi
-  echo "importing Tiny-SD diffusion HFQ from $SOURCE -> $MODEL"
-  timeout "$IMPORT_TIMEOUT" "${HIPFIRE_CLI[@]}" diffusion import \
-    --max-batch "$BATCH_SIZE" \
-    --model-name "$MODEL_NAME" \
-    --output "$MODEL" \
-    "$SOURCE"
+    if [[ "${HIPFIRE_DIFFUSION_ADMISSION_NO_IMPORT:-0}" = "1" ]]; then
+        echo "missing Tiny-SD HFQ model: $MODEL" >&2
+        echo "unset HIPFIRE_DIFFUSION_ADMISSION_NO_IMPORT or set HIPFIRE_TINY_SD_HFQ" >&2
+        exit 2
+    fi
+    if ! SOURCE="$(find_tiny_sd_source)"; then
+        echo "missing Tiny-SD HFQ model: $MODEL" >&2
+        echo "set HIPFIRE_TINY_SD_HFQ or HIPFIRE_TINY_SD_SOURCE to a Diffusers Tiny-SD snapshot" >&2
+        exit 2
+    fi
+    echo "importing Tiny-SD diffusion HFQ from $SOURCE -> $MODEL"
+    timeout "$IMPORT_TIMEOUT" "${HIPFIRE_CLI[@]}" diffusion import \
+        --max-batch "$BATCH_SIZE" \
+        --model-name "$MODEL_NAME" \
+        --output "$MODEL" \
+        "$SOURCE"
 fi
 
 ROCM_ARGS=()
 if [[ -n "$ROCM_DEVICE_ID" ]]; then
-  ROCM_ARGS=(--rocm-device-id "$ROCM_DEVICE_ID")
+    ROCM_ARGS=(--rocm-device-id "$ROCM_DEVICE_ID")
 fi
 SMOKE_MODE_ARGS=()
 if [[ "$TXT2IMG_ONLY" = "1" ]]; then
-  SMOKE_MODE_ARGS+=(--txt2img-only)
+    SMOKE_MODE_ARGS+=(--txt2img-only)
 fi
 if [[ "$SKIP_MASKED_IMG2IMG" = "1" ]]; then
-  SMOKE_MODE_ARGS+=(--skip-masked-img2img)
+    SMOKE_MODE_ARGS+=(--skip-masked-img2img)
 fi
 
 timeout "$SMOKE_TIMEOUT" "${HIPFIRE_CLI[@]}" diffusion smoke \
-  --model "$MODEL" \
-  --output-dir "$OUTPUT_DIR" \
-  --batch-size "$BATCH_SIZE" \
-  --steps "$STEPS" \
-  --width "$WIDTH" \
-  --height "$HEIGHT" \
-  --cfg-scale "$CFG_SCALE" \
-  --scheduler "$SCHEDULER" \
-  --prompt "$PROMPT" \
-  --seed "$SEED" \
-  "${ROCM_ARGS[@]}" \
-  "${SMOKE_MODE_ARGS[@]}"
+    --model "$MODEL" \
+    --output-dir "$OUTPUT_DIR" \
+    --batch-size "$BATCH_SIZE" \
+    --steps "$STEPS" \
+    --width "$WIDTH" \
+    --height "$HEIGHT" \
+    --cfg-scale "$CFG_SCALE" \
+    --scheduler "$SCHEDULER" \
+    --prompt "$PROMPT" \
+    --seed "$SEED" \
+    "${ROCM_ARGS[@]}" \
+    "${SMOKE_MODE_ARGS[@]}"

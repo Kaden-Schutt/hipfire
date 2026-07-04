@@ -613,13 +613,13 @@ pub fn swiglu_down_bf16_cpu(
     }
 
     let mut out = residual.to_vec();
-    for row in 0..shadow.m {
+    for (row, out_value) in out.iter_mut().enumerate().take(shadow.m) {
         let w_row = &shadow.w_down[row * shadow.k..(row + 1) * shadow.k];
         let mut acc = 0.0f32;
         for col in 0..shadow.k {
             acc += w_row[col] * hidden[col];
         }
-        out[row] += acc;
+        *out_value += acc;
     }
     out
 }

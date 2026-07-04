@@ -206,7 +206,9 @@ def model_details(model: Path | None, model_name: str | None) -> dict:
     return out
 
 
-def collect(gate_dir: Path, baseline: str, head_dim: int, excerpt_chars: int, model: Path | None, model_name: str | None) -> dict:
+def collect(
+    gate_dir: Path, baseline: str, head_dim: int, excerpt_chars: int, model: Path | None, model_name: str | None
+) -> dict:
     perf = parse_perf(gate_dir / "perf" / "perf.csv")
     prompt_rows: list[dict] = []
     by_mode: dict[str, list[dict]] = defaultdict(list)
@@ -263,8 +265,7 @@ def collect(gate_dir: Path, baseline: str, head_dim: int, excerpt_chars: int, mo
                         0.0,
                         min(
                             1.0,
-                            int(r.get("first_divergence") or 0)
-                            / max(1, int(r.get("steps_compared") or 1)),
+                            int(r.get("first_divergence") or 0) / max(1, int(r.get("steps_compared") or 1)),
                         ),
                     )
                     for r in rows
@@ -354,14 +355,14 @@ def render_html(data: dict) -> str:
         cls = ' class="baseline"' if row["baseline"] else ""
         rows_html.append(
             f"<tr{cls}><td>{html.escape(row['mode'])}</td>"
-            f"<td data-sort=\"{row['identicality'] if math.isfinite(row['identicality']) else ''}\">{pct(row['identicality'])} {bar(row['identicality'])}</td>"
-            f"<td data-sort=\"{row['top1_agreement'] if math.isfinite(row['top1_agreement']) else ''}\">{pct(row['top1_agreement'])}</td>"
-            f"<td data-sort=\"{row['top5_ratio'] if math.isfinite(row['top5_ratio']) else ''}\">{pct(row['top5_ratio'])}</td>"
-            f"<td data-sort=\"{row['prefix_survival'] if math.isfinite(row['prefix_survival']) else ''}\">{pct(row['prefix_survival'])}</td>"
-            f"<td data-sort=\"{row['bytes_per_head'] or ''}\">{row['bytes_per_head'] or 'n/a'}</td>"
-            f"<td data-sort=\"{row['memory_ratio_vs_fp32'] if math.isfinite(row['memory_ratio_vs_fp32']) else ''}\">{pct(row['memory_ratio_vs_fp32'])}</td>"
-            f"<td data-sort=\"{row['decode_tok_s'] if math.isfinite(row['decode_tok_s']) else ''}\">{num(row['decode_tok_s'])}</td>"
-            f"<td data-sort=\"{row['prefill_tok_s'] if math.isfinite(row['prefill_tok_s']) else ''}\">{num(row['prefill_tok_s'])}</td></tr>"
+            f'<td data-sort="{row["identicality"] if math.isfinite(row["identicality"]) else ""}">{pct(row["identicality"])} {bar(row["identicality"])}</td>'
+            f'<td data-sort="{row["top1_agreement"] if math.isfinite(row["top1_agreement"]) else ""}">{pct(row["top1_agreement"])}</td>'
+            f'<td data-sort="{row["top5_ratio"] if math.isfinite(row["top5_ratio"]) else ""}">{pct(row["top5_ratio"])}</td>'
+            f'<td data-sort="{row["prefix_survival"] if math.isfinite(row["prefix_survival"]) else ""}">{pct(row["prefix_survival"])}</td>'
+            f'<td data-sort="{row["bytes_per_head"] or ""}">{row["bytes_per_head"] or "n/a"}</td>'
+            f'<td data-sort="{row["memory_ratio_vs_fp32"] if math.isfinite(row["memory_ratio_vs_fp32"]) else ""}">{pct(row["memory_ratio_vs_fp32"])}</td>'
+            f'<td data-sort="{row["decode_tok_s"] if math.isfinite(row["decode_tok_s"]) else ""}">{num(row["decode_tok_s"])}</td>'
+            f'<td data-sort="{row["prefill_tok_s"] if math.isfinite(row["prefill_tok_s"]) else ""}">{num(row["prefill_tok_s"])}</td></tr>'
         )
 
     heat_rows = []
@@ -374,16 +375,14 @@ def render_html(data: dict) -> str:
             row = prompt_by_key.get((prompt, mode))
             q = finite_float(row.get("identicality")) if row else math.nan
             shade = 255 - int(max(0.0, min(1.0, q if math.isfinite(q) else 0.0)) * 110)
-            cells.append(
-                f'<td style="background: rgb({shade},255,{shade});">{pct(q)}</td>'
-            )
+            cells.append(f'<td style="background: rgb({shade},255,{shade});">{pct(q)}</td>')
         heat_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     excerpts = []
     prompt_text = data.get("prompt_text", {})
     prompt_inputs = data.get("prompt_inputs", {})
     for prompt in sorted(prompt_text):
-        excerpts.append(f"<h3>{html.escape(prompt)}</h3><div class=\"excerpt-grid\">")
+        excerpts.append(f'<h3>{html.escape(prompt)}</h3><div class="excerpt-grid">')
         inputs = prompt_inputs.get(prompt, {})
         prompt_body = inputs.get("prompt", "")
         system_body = inputs.get("system", "")
@@ -398,9 +397,7 @@ def render_html(data: dict) -> str:
             text = prompt_text[prompt].get(mode)
             if not text:
                 continue
-            excerpts.append(
-                f"<section><h4>{html.escape(mode)}</h4><pre>{html.escape(text)}</pre></section>"
-            )
+            excerpts.append(f"<section><h4>{html.escape(mode)}</h4><pre>{html.escape(text)}</pre></section>")
         excerpts.append("</div>")
 
     return f"""<!doctype html>
@@ -432,8 +429,8 @@ pre {{ white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font-size: 12p
 </head>
 <body>
 <h1>Hipfire KV Quantization Identicality</h1>
-<div class="meta">Baseline: <strong>{html.escape(data['baseline'])}</strong> |
-head_dim={data['head_dim']} | source: {html.escape(data['gate_dir'])}</div>
+<div class="meta">Baseline: <strong>{html.escape(data["baseline"])}</strong> |
+head_dim={data["head_dim"]} | source: {html.escape(data["gate_dir"])}</div>
 <h2>Model</h2>
 <table class="model-table">
 {model_html}
@@ -441,15 +438,15 @@ head_dim={data['head_dim']} | source: {html.escape(data['gate_dir'])}</div>
 <h2>Mode Summary</h2>
 <table id="mode-summary">
 <tr><th class="sortable">Mode</th><th class="sortable">Identicality vs baseline</th><th class="sortable">Top-1</th><th class="sortable">Top-5</th><th class="sortable">Prefix survival</th><th class="sortable">B/head</th><th class="sortable">Memory vs fp32</th><th class="sortable">Decode tok/s</th><th class="sortable">Prefill tok/s</th></tr>
-{''.join(rows_html)}
+{"".join(rows_html)}
 </table>
 <h2>Prompt Heatmap</h2>
 <table>
-<tr><th>Prompt</th>{''.join(f'<th>{html.escape(m)}</th>' for m in modes)}</tr>
-{''.join(heat_rows)}
+<tr><th>Prompt</th>{"".join(f"<th>{html.escape(m)}</th>" for m in modes)}</tr>
+{"".join(heat_rows)}
 </table>
 <h2>Output Excerpts</h2>
-{''.join(excerpts)}
+{"".join(excerpts)}
 <script>
 document.querySelectorAll("#mode-summary th.sortable").forEach((th, idx) => {{
   th.addEventListener("click", () => {{

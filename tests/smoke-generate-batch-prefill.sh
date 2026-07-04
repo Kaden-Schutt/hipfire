@@ -9,14 +9,14 @@ UNSUPPORTED_MODEL="${UNSUPPORTED_MODEL:-$HOME/.hipfire/models/llama-3.2-1b-instr
 MAX_SEQ="${MAX_SEQ:-512}"
 
 if [[ ! -x "$DAEMON" ]]; then
-  echo "missing daemon binary: $DAEMON" >&2
-  echo "build it with: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
-  exit 2
+    echo "missing daemon binary: $DAEMON" >&2
+    echo "build it with: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
+    exit 2
 fi
 
 if [[ ! -f "$MODEL" ]]; then
-  echo "missing model: $MODEL" >&2
-  exit 2
+    echo "missing model: $MODEL" >&2
+    exit 2
 fi
 
 python3 - "$DAEMON" "$MODEL" "$MOE_MODEL" "$UNSUPPORTED_MODEL" "$MAX_SEQ" <<'PY'

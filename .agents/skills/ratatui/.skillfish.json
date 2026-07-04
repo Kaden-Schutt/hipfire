@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "ratatui",
+  "owner": "filipexyz",
+  "repo": "plugins",
+  "path": "plugins/ratatui/skills/ratatui",
+  "branch": "main",
+  "sha": "dac40c7bc200ab261a647e4adaf093db6e8818ca",
+  "source": "manual"
+}

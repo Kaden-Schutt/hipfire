@@ -581,7 +581,7 @@ pub(crate) async fn ensure_model_loaded(
 }
 
 fn loaded_response_cache_capable(loaded: &hipfire_model::ModelLoadedResponse) -> bool {
-    loaded.cache_capable.unwrap_or_else(|| {
+    loaded.cache_capable.unwrap_or({
         matches!(
             loaded.arch.as_deref(),
             Some("qwen3_5" | "qwen3_5_moe" | "deepseek4")

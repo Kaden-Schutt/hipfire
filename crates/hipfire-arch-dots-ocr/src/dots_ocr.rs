@@ -1303,11 +1303,11 @@ pub fn vision_forward(
             )?;
             gpu.free_tensor(k_f16)?;
             gpu.free_tensor(v_f16)?;
-        } else if use_wmma && head_dim % 16 == 0 && head_dim <= 128 && n_patches >= 32 {
+        } else if use_wmma && head_dim.is_multiple_of(16) && head_dim <= 128 && n_patches >= 32 {
             gpu.attention_dflash_wmma_m32_f32(
                 &q_buf, &k_buf, &v_buf, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
-        } else if use_wmma && head_dim % 16 == 0 {
+        } else if use_wmma && head_dim.is_multiple_of(16) {
             gpu.attention_dflash_wmma_f32(
                 &q_buf, &k_buf, &v_buf, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;

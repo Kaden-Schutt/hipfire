@@ -59,9 +59,12 @@ phase() {
     echo
     echo "═══ [$(date +%H:%M:%S)] $* ═══"
 }
-ok()   { printf "    \033[32m✓\033[0m %s\n" "$*"; }
+ok() { printf "    \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "    \033[33m!\033[0m %s\n" "$*"; }
-die()  { printf "    \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
+die() {
+    printf "    \033[31m✗\033[0m %s\n" "$*" >&2
+    exit 1
+}
 
 # ── Phase 0: sanity ─────────────────────────────────────────────────────────
 phase "0/9  Sanity — ROCm + GPU detection"
@@ -90,7 +93,7 @@ if [ ! -f "$WORK/.apt-deps-installed" ]; then
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         pkg-config libssl-dev build-essential git curl jq ca-certificates \
-        > /dev/null
+        >/dev/null
     touch "$WORK/.apt-deps-installed"
 fi
 ok "apt deps installed"
@@ -135,8 +138,8 @@ PYPATCH
     ok "compile-kernels.sh patched to skip WMMA on gfx94*"
 fi
 
-if [ -d "kernels/compiled/$TARGET_ARCH" ] && \
-   [ "$(ls "kernels/compiled/$TARGET_ARCH/"*.hsaco 2>/dev/null | wc -l)" -gt 50 ]; then
+if [ -d "kernels/compiled/$TARGET_ARCH" ] \
+    && [ "$(ls "kernels/compiled/$TARGET_ARCH/"*.hsaco 2>/dev/null | wc -l)" -gt 50 ]; then
     ok "kernels already compiled for $TARGET_ARCH ($(ls kernels/compiled/$TARGET_ARCH/*.hsaco | wc -l) files)"
 else
     JOBS="${JOBS:-$(nproc)}" ./scripts/compile-kernels.sh "$TARGET_ARCH" 2>&1 \
@@ -149,8 +152,8 @@ fi
 # ── Phase 4: cargo build ───────────────────────────────────────────────────
 phase "4/9  cargo build --release"
 RUSTC_WRAPPER="${RUSTC_WRAPPER:-}" \
-HIPFIRE_TARGET_ARCH="$TARGET_ARCH" \
-sh -c '
+    HIPFIRE_TARGET_ARCH="$TARGET_ARCH" \
+    sh -c '
     cargo build --release -p hipfire-quantize &&
     cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon &&
     cargo build --release --features deltanet -p hipfire-runtime \
@@ -159,8 +162,8 @@ sh -c '
 # KLD scoring + arch/generation smoke now drive hipfire-daemon (the eval_hipfire
 # example and the cross-engine `.kldref.bin` format have been removed).
 for b in target/release/hipfire-quantize \
-         target/release/examples/coherence_probe \
-         target/release/hipfire-daemon; do
+    target/release/examples/coherence_probe \
+    target/release/hipfire-daemon; do
     [ -x "$b" ] || die "missing binary: $b"
 done
 ok "binaries built"

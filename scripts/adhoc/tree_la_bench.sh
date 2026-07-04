@@ -19,7 +19,10 @@ MAX_TOKENS="${HIPFIRE_BENCH_MAX:-192}"
 RUNS="${HIPFIRE_BENCH_RUNS:-3}"
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "tree-la-bench" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "tree-la-bench" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -40,7 +43,8 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
 
 INSTRUCT_PROMPT="Explain, in three or four sentences, why the sky appears blue during the day. Your answer should be accessible to a curious middle-school student."
 
-PARSE_PY=$(cat <<'PY'
+PARSE_PY=$(
+    cat <<'PY'
 import sys, re
 label = sys.argv[1]
 genre = sys.argv[2]
@@ -93,7 +97,7 @@ run_one() {
 for cfg in "baseline|" "tree-la|HIPFIRE_DDTREE_TREE_LA"; do
     label=${cfg%|*}
     env_var=${cfg#*|}
-    run_one "$label" "code"     "$CODE_PROMPT"     "$env_var"
-    run_one "$label" "prose"    "$PROSE_PROMPT"    "$env_var"
+    run_one "$label" "code" "$CODE_PROMPT" "$env_var"
+    run_one "$label" "prose" "$PROSE_PROMPT" "$env_var"
     run_one "$label" "instruct" "$INSTRUCT_PROMPT" "$env_var"
 done

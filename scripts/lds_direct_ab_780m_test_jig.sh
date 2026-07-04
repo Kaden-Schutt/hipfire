@@ -67,7 +67,7 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
-        -h|--help)
+        -h | --help)
             usage
             exit 0
             ;;
@@ -157,25 +157,25 @@ run_case() {
 
     set +e
     ARCH="$ARCH" \
-    BUILD_ONLY="$build_only" \
-    CLEAR_COREDUMP="$clear_coredump" \
-    WAIT_DEVCD_MS="${WAIT_DEVCD_MS:-12000}" \
-    ACTIVE_X="$active_x" \
-    ACTIVE_Y="$active_y" \
-    ACTIVE_X_START="$active_x_start" \
-    ACTIVE_Y_START="$active_y_start" \
-    BLOCK_X="$block_x" \
-    BLOCK_Y="$block_y" \
-    LAYOUT_X="$layout_x" \
-    LAYOUT_Y="$layout_y" \
-    READS="$reads" \
-    ITERS="$iters" \
-    FORCE_WRAP_CNDMASK="$force_wrap_cndmask" \
-    CHUNKS="$chunks" \
-    GRID_X="$grid_x" \
-    GRID_Y="$grid_y" \
-    MODE=plain \
-    "$RUNNER" "$OUT" >"$OUT/$case_name.wrapper.log" 2>&1
+        BUILD_ONLY="$build_only" \
+        CLEAR_COREDUMP="$clear_coredump" \
+        WAIT_DEVCD_MS="${WAIT_DEVCD_MS:-12000}" \
+        ACTIVE_X="$active_x" \
+        ACTIVE_Y="$active_y" \
+        ACTIVE_X_START="$active_x_start" \
+        ACTIVE_Y_START="$active_y_start" \
+        BLOCK_X="$block_x" \
+        BLOCK_Y="$block_y" \
+        LAYOUT_X="$layout_x" \
+        LAYOUT_Y="$layout_y" \
+        READS="$reads" \
+        ITERS="$iters" \
+        FORCE_WRAP_CNDMASK="$force_wrap_cndmask" \
+        CHUNKS="$chunks" \
+        GRID_X="$grid_x" \
+        GRID_Y="$grid_y" \
+        MODE=plain \
+        "$RUNNER" "$OUT" >"$OUT/$case_name.wrapper.log" 2>&1
     rc=$?
     set -e
 

@@ -80,23 +80,26 @@ def gather_corpus(prompt_dir: Path, repo_root: Path) -> list[tuple[str, str]]:
         if stdlib_path.exists():
             corpus.append((f"stdlib_{stdlib_name}", stdlib_path.read_text()))
 
-    for rust_name in ("crates/hipfire-runtime/src/lib.rs",
-                      "crates/hipfire-arch-qwen35/src/qwen35.rs"):
+    for rust_name in ("crates/hipfire-runtime/src/lib.rs", "crates/hipfire-arch-qwen35/src/qwen35.rs"):
         rust_path = repo_root / rust_name
         if rust_path.exists():
             text = rust_path.read_text()
             corpus.append((f"rust_{rust_name.split('/')[-1]}", text[:50_000]))
 
     english_samples = [
-        ("english_short_1",
-         "The quick brown fox jumps over the lazy dog. "
-         "Pack my box with five dozen liquor jugs. "
-         "How vexingly quick daft zebras jump."),
-        ("english_explanation",
-         "When you implement a least recently used cache, you typically combine "
-         "a hash table for O(1) lookup with a doubly linked list to track recency. "
-         "Each access promotes the node to the head; eviction removes the tail. "
-         "This gives constant time for both get and put operations."),
+        (
+            "english_short_1",
+            "The quick brown fox jumps over the lazy dog. "
+            "Pack my box with five dozen liquor jugs. "
+            "How vexingly quick daft zebras jump.",
+        ),
+        (
+            "english_explanation",
+            "When you implement a least recently used cache, you typically combine "
+            "a hash table for O(1) lookup with a doubly linked list to track recency. "
+            "Each access promotes the node to the head; eviction removes the tail. "
+            "This gives constant time for both get and put operations.",
+        ),
     ]
     corpus.extend(english_samples)
 
@@ -124,7 +127,7 @@ def _extract_output_text(obj: dict) -> str:
             if isinstance(m, dict) and m.get("role") == "assistant":
                 if isinstance(m.get("content"), str):
                     parts.append(m["content"])
-                for tc in (m.get("tool_calls") or []):
+                for tc in m.get("tool_calls") or []:
                     parts.append(json.dumps(tc, ensure_ascii=False))
     return "\n".join(parts)
 
@@ -134,7 +137,7 @@ def load_custom_corpus(jsonl_globs, corpus_dir) -> list[tuple[str, str]]:
     *.jsonl / *.txt files. JSONL records are reduced to assistant-output text."""
     corpus: list[tuple[str, str]] = []
     jsonl_paths: list[str] = []
-    for pat in (jsonl_globs or []):
+    for pat in jsonl_globs or []:
         jsonl_paths.extend(sorted(glob.glob(pat)))
     txt_paths: list[Path] = []
     if corpus_dir:
@@ -164,33 +167,37 @@ def load_custom_corpus(jsonl_globs, corpus_dir) -> list[tuple[str, str]]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--tokenizer", required=True,
-                   help="Path to tokenizer.json directory (HF format)")
+    p.add_argument("--tokenizer", required=True, help="Path to tokenizer.json directory (HF format)")
     p.add_argument("--output", required=True, help="Output JSON path")
-    p.add_argument("--top-k", type=int, default=32768,
-                   help="Top-K most frequent token IDs to keep (default 32768)")
-    p.add_argument("--prompt-dir", default="benchmarks/prompts",
-                   help="Directory containing canonical bench prompts")
-    p.add_argument("--repo-root", default=".",
-                   help="Repo root (for additional corpus files)")
-    p.add_argument("--corpus-jsonl", nargs="+", default=None,
-                   help="One or more JSONL files (or globs) of dumped assistant "
-                        "outputs (see scripts/dump_corpus_openai.py). Assistant "
-                        "OUTPUT text is counted, not user prompts.")
-    p.add_argument("--corpus-dir", default=None,
-                   help="Directory scanned recursively for *.jsonl (assistant "
-                        "dumps) and *.txt (raw text) corpus files.")
-    p.add_argument("--no-default-corpus", action="store_true",
-                   help="Skip the small built-in seed corpus; use only "
-                        "--corpus-jsonl / --corpus-dir. Use once you have a real "
-                        "workload corpus so the tiny seed set doesn't dilute it.")
+    p.add_argument("--top-k", type=int, default=32768, help="Top-K most frequent token IDs to keep (default 32768)")
+    p.add_argument("--prompt-dir", default="benchmarks/prompts", help="Directory containing canonical bench prompts")
+    p.add_argument("--repo-root", default=".", help="Repo root (for additional corpus files)")
+    p.add_argument(
+        "--corpus-jsonl",
+        nargs="+",
+        default=None,
+        help="One or more JSONL files (or globs) of dumped assistant "
+        "outputs (see scripts/dump_corpus_openai.py). Assistant "
+        "OUTPUT text is counted, not user prompts.",
+    )
+    p.add_argument(
+        "--corpus-dir",
+        default=None,
+        help="Directory scanned recursively for *.jsonl (assistant dumps) and *.txt (raw text) corpus files.",
+    )
+    p.add_argument(
+        "--no-default-corpus",
+        action="store_true",
+        help="Skip the small built-in seed corpus; use only "
+        "--corpus-jsonl / --corpus-dir. Use once you have a real "
+        "workload corpus so the tiny seed set doesn't dilute it.",
+    )
     args = p.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=False)
     full_vocab_size = tokenizer.vocab_size
     if hasattr(tokenizer, "added_tokens_encoder"):
-        full_vocab_size = max(full_vocab_size,
-                              max(tokenizer.added_tokens_encoder.values(), default=0) + 1)
+        full_vocab_size = max(full_vocab_size, max(tokenizer.added_tokens_encoder.values(), default=0) + 1)
     print(f"tokenizer vocab size: {full_vocab_size}", file=sys.stderr)
 
     if args.top_k > full_vocab_size:
@@ -204,8 +211,9 @@ def main() -> int:
         corpus.extend(gather_corpus(prompt_dir, repo_root))
     corpus.extend(load_custom_corpus(args.corpus_jsonl, args.corpus_dir))
     if not corpus:
-        sys.stderr.write("ERROR: no corpus files found (default corpus disabled "
-                         "and no --corpus-jsonl/--corpus-dir matched)\n")
+        sys.stderr.write(
+            "ERROR: no corpus files found (default corpus disabled and no --corpus-jsonl/--corpus-dir matched)\n"
+        )
         return 1
 
     counter: Counter[int] = Counter()
@@ -233,8 +241,9 @@ def main() -> int:
     # etc.) — high-frequency structural tokens in agentic/chat output that must
     # be in the draft K-set or the head can never propose them.
     if hasattr(tokenizer, "added_tokens_encoder"):
-        must_include.extend(int(v) for v in tokenizer.added_tokens_encoder.values()
-                            if isinstance(v, int) and 0 <= v < full_vocab_size)
+        must_include.extend(
+            int(v) for v in tokenizer.added_tokens_encoder.values() if isinstance(v, int) and 0 <= v < full_vocab_size
+        )
     must_include = sorted(set(must_include))
 
     selected_ids = set(tid for tid, _ in most_common)
@@ -248,7 +257,7 @@ def main() -> int:
         for tid in must_include:
             if tid not in ranked_present_set:
                 keep.append(tid)
-        ranked = sorted(set(keep), key=lambda t: (-counter.get(t, 0), t))[:args.top_k]
+        ranked = sorted(set(keep), key=lambda t: (-counter.get(t, 0), t))[: args.top_k]
         for tid in must_include:
             if tid not in ranked:
                 ranked = ranked[:-1] + [tid]
@@ -263,13 +272,11 @@ def main() -> int:
             ranked_full.extend(unused[: args.top_k - len(ranked_full)])
         selected_ids = ranked_full[: args.top_k]
 
-    assert len(selected_ids) == args.top_k, \
-        f"selection size {len(selected_ids)} != top-k {args.top_k}"
+    assert len(selected_ids) == args.top_k, f"selection size {len(selected_ids)} != top-k {args.top_k}"
 
     covered = sum(counter[tid] for tid in selected_ids if tid in counter)
     coverage = covered / total if total > 0 else 0.0
-    print(f"top-{args.top_k} covers {coverage*100:.2f}% of corpus tokens",
-          file=sys.stderr)
+    print(f"top-{args.top_k} covers {coverage * 100:.2f}% of corpus tokens", file=sys.stderr)
 
     out = {
         "draft_to_full": selected_ids,

@@ -111,8 +111,10 @@ def main():
     full = "\n\n\n".join([doc1, doc2, doc3])
 
     if full.count(EXPECTED) != 1:
-        print(f"FAIL: needle {EXPECTED!r} appears {full.count(EXPECTED)}x; "
-              f"need exactly 1 for a clean retrieval test", file=sys.stderr)
+        print(
+            f"FAIL: needle {EXPECTED!r} appears {full.count(EXPECTED)}x; need exactly 1 for a clean retrieval test",
+            file=sys.stderr,
+        )
         return 2
 
     record = {
@@ -130,8 +132,7 @@ def main():
         json.dump(record, f, ensure_ascii=False)
         f.write("\n")
     fixture_md5 = hashlib.md5(OUT.read_bytes()).hexdigest()
-    print(f"wrote {OUT.name}: {len(full)} chars (~{len(full) // 4} tokens), "
-          f"3 docs, fixture_md5={fixture_md5[:12]}")
+    print(f"wrote {OUT.name}: {len(full)} chars (~{len(full) // 4} tokens), 3 docs, fixture_md5={fixture_md5[:12]}")
 
 
 if __name__ == "__main__":

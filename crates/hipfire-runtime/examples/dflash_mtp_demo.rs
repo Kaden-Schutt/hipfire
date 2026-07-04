@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 //! dflash_mtp_demo: DFlash + MTP composition spec-decode bench harness (Task 11).
 //!
 //! Loads a Qwen3.5 trunk (-mq4.hfq / .hfq), a matched DFlash drafter (.hfq), and a
@@ -17,6 +37,8 @@
 //!                   (--prompt "..." | --prompt-file <path>) \
 //!                   [--max 120] [--temp 0] [--dflash-b 16] [--mtp-k 2] \
 //!                   [--ctx 4096] [--no-chatml] [--kv-mode q8]
+
+#![allow(clippy::field_reassign_with_default)]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -145,7 +167,7 @@ fn main() {
         eprintln!("error: dflash_mtp_demo v1 is greedy-only (--temp must be 0.0); got {temp}");
         std::process::exit(2);
     }
-    assert!(mtp_k >= 1 && mtp_k <= 8, "--mtp-k must be in [1,8]");
+    assert!((1..=8).contains(&mtp_k), "--mtp-k must be in [1,8]");
 
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt_raw).into_owned();
     let prompt_hash = prompt_md5(prompt.as_bytes());

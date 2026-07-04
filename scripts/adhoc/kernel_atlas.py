@@ -308,9 +308,7 @@ def build_route_manifest(*, kv_mode, env, output, graph_enabled):
 
 def git_sha():
     try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
-        )
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL)
         return out.strip()
     except Exception:
         return "unknown"
@@ -617,9 +615,7 @@ def collect_isa_manifest(*, arch, files=None, dirs=None, name_filter=None, limit
     paths = discover_isa_paths(files, dirs, name_filter=name_filter, limit=limit)
     objects = [inspect_isa_object(path, arch=arch) for path in paths]
     kernel_count = sum(len(obj.get("kernels", [])) for obj in objects)
-    instruction_count = sum(
-        obj.get("instruction_summary", {}).get("instruction_count", 0) for obj in objects
-    )
+    instruction_count = sum(obj.get("instruction_summary", {}).get("instruction_count", 0) for obj in objects)
     return {
         "schema": "hipfire.kernel_atlas.isa.v0",
         "captured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -702,10 +698,7 @@ def source_file_score(path, root, variants, arch=None):
     if arch and primary and (stem == f"{primary}.{arch}" or stem.startswith(f"{primary}.{arch}.")):
         score += 1200
         reasons.append("target-arch-stem")
-    elif arch and any(
-        stem == f"{variant}.{arch}" or stem.startswith(f"{variant}.{arch}.")
-        for variant in variants[1:]
-    ):
+    elif arch and any(stem == f"{variant}.{arch}" or stem.startswith(f"{variant}.{arch}.") for variant in variants[1:]):
         score += 1050
         reasons.append("variant-target-arch-stem")
     elif primary and stem == primary:
@@ -951,9 +944,7 @@ def profile_names_from_rows(rows):
 
 
 def maybe_build_dispatch_artifact(args, rows):
-    if not getattr(args, "dispatch_provenance", False) and not getattr(
-        args, "dispatch_output", None
-    ):
+    if not getattr(args, "dispatch_provenance", False) and not getattr(args, "dispatch_output", None):
         return None
     manifest = collect_dispatch_manifest(
         root=getattr(args, "dispatch_root", "."),
@@ -1264,9 +1255,7 @@ def render_hot_kernel_lines(row, dispatch_manifest, limit=6):
         env = ""
         if entry.get("env_controls"):
             env = "  env " + ",".join(entry["env_controls"])
-        lines.append(
-            f"{name}  {op['family']}.{op['role']}  src {source}  dispatch {dispatch}{env}"
-        )
+        lines.append(f"{name}  {op['family']}.{op['role']}  src {source}  dispatch {dispatch}{env}")
     return lines
 
 
@@ -1358,9 +1347,7 @@ def render_fit_view(row, manifest):
         unmatched = ", ".join(joined["unmatched_profile_names"][:6])
         lines.append(f"unmatched hot     {unmatched}")
     else:
-        lines.append(
-            f"profile matched   no profile names, using all {joined['inspected_object_count']} objects"
-        )
+        lines.append(f"profile matched   no profile names, using all {joined['inspected_object_count']} objects")
 
     lines.extend(render_hot_kernel_lines(row, dispatch_manifest))
     lines.extend(
@@ -1714,7 +1701,9 @@ def apply_history_to_suggestions(row, suggestions, history_entries):
         rejected = [entry for entry in matches if history_rejects_entry(entry)]
         best_speedup = max(speedups) if speedups else None
         item["history"] = {
-            "status": "rejected" if rejected and (best_speedup is None or best_speedup < HISTORY_REJECT_SPEEDUP) else "seen",
+            "status": "rejected"
+            if rejected and (best_speedup is None or best_speedup < HISTORY_REJECT_SPEEDUP)
+            else "seen",
             "match_count": len(matches),
             "best_speedup": best_speedup,
             "task_ids": sorted(dict.fromkeys(entry.get("task_id") for entry in matches if entry.get("task_id"))),
@@ -1898,7 +1887,9 @@ def build_suggestion_queue(
                     expected_impact="medium",
                     allowed_files=allowed,
                     rationale=[
-                        f"{name} accounts for {pct:.1f}% of the captured profile." if pct else f"{name} is in the hot profile.",
+                        f"{name} accounts for {pct:.1f}% of the captured profile."
+                        if pct
+                        else f"{name} is in the hot profile.",
                         "Use Atlas eval to test one controlled variant at a time.",
                     ],
                     candidate_steps=[
@@ -2389,7 +2380,7 @@ def render_task_markdown(task):
     lines.extend(
         [
             "",
-        "## Allowed Files",
+            "## Allowed Files",
         ]
     )
     if allowed:
@@ -2535,11 +2526,7 @@ def summarize_metric_runs(runs):
     summary = {}
     medians = {}
     for key in keys:
-        values = [
-            run["metrics"][key]
-            for run in runs
-            if isinstance(run.get("metrics", {}).get(key), (int, float))
-        ]
+        values = [run["metrics"][key] for run in runs if isinstance(run.get("metrics", {}).get(key), (int, float))]
         if not values:
             continue
         summary[key] = summarize_values(values)
@@ -2718,9 +2705,7 @@ def evaluate_task_bundle(
         "benchmark_runs": benchmark_results,
         "benchmark": benchmark_results[-1] if benchmark_results else {},
     }
-    (output_path / "result.json").write_text(
-        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    (output_path / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     ledger_entry = {
         "task_id": task.get("task_id"),
         "captured_at_utc": result["captured_at_utc"],
@@ -2975,11 +2960,7 @@ def ar_rows_from_metrics(
             "blindspot_total_ms",
             "blindspot_count",
         )
-        rc_metrics = {
-            f"rocprof_{k}": rocprof_coverage[k]
-            for k in coverage_keys
-            if k in rocprof_coverage
-        }
+        rc_metrics = {f"rocprof_{k}": rocprof_coverage[k] for k in coverage_keys if k in rocprof_coverage}
         if rc_metrics:
             prefill_row.setdefault("metrics", {}).update(rc_metrics)
     annotate_rocprof_coverage(prefill_row)
@@ -3319,9 +3300,7 @@ def task_from_row(args):
         task_id=args.task_id,
         suggestion=suggestion,
     )
-    output_dir = args.output_dir or str(
-        Path(".codeinsight+research") / "kernel-atlas" / "tasks" / task["task_id"]
-    )
+    output_dir = args.output_dir or str(Path(".codeinsight+research") / "kernel-atlas" / "tasks" / task["task_id"])
     paths = write_task_bundle(task, output_dir)
     print(json.dumps(paths, sort_keys=True))
     return 0
@@ -3337,9 +3316,7 @@ def task_from_pytorch(args):
         allowed_files=args.allowed_file,
         task_id=args.task_id,
     )
-    output_dir = args.output_dir or str(
-        Path(".codeinsight+research") / "kernel-atlas" / "tasks" / task["task_id"]
-    )
+    output_dir = args.output_dir or str(Path(".codeinsight+research") / "kernel-atlas" / "tasks" / task["task_id"])
     paths = write_task_bundle(task, output_dir)
     print(json.dumps(paths, sort_keys=True))
     return 0
@@ -3358,7 +3335,11 @@ def eval_task(args):
         refresh_baseline=args.refresh_baseline,
         baseline_path=args.baseline,
     )
-    print(json.dumps({"result_path": str(Path(args.output_dir) / "result.json"), "status": result["status"]}, sort_keys=True))
+    print(
+        json.dumps(
+            {"result_path": str(Path(args.output_dir) / "result.json"), "status": result["status"]}, sort_keys=True
+        )
+    )
     return 0 if result["status"] in ("pass", "unstable") else 1
 
 
@@ -3393,7 +3374,9 @@ def build_parser():
         p.add_argument("--isa-output", help="write ISA manifest here and reference it from each row")
 
     def add_dispatch_args(p):
-        p.add_argument("--dispatch-provenance", action="store_true", help="scan source/dispatch refs for profiled kernels")
+        p.add_argument(
+            "--dispatch-provenance", action="store_true", help="scan source/dispatch refs for profiled kernels"
+        )
         p.add_argument("--dispatch-root", default=".", help="repo root for dispatch provenance scans")
         p.add_argument("--dispatch-ref-limit", type=int, default=8, help="max source/dispatch refs per kernel")
         p.add_argument("--dispatch-output", help="write dispatch manifest here and reference it from each row")
@@ -3422,7 +3405,9 @@ def build_parser():
     suggest.add_argument("--max-suggestions", type=int, default=12)
     suggest.add_argument("--hot-limit", type=int, default=8)
     suggest.add_argument("--history", action="append", default=[], help="add an Atlas history file or directory")
-    suggest.add_argument("--correctness-command", action="append", default=[], help="command string for candidate correctness gate")
+    suggest.add_argument(
+        "--correctness-command", action="append", default=[], help="command string for candidate correctness gate"
+    )
     suggest.add_argument("--format", choices=("json", "markdown"), default="json")
     suggest.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
     suggest.add_argument("--output", help="write suggestions here instead of stdout")
@@ -3437,8 +3422,12 @@ def build_parser():
     task.add_argument("--correctness-command", action="append", default=[], help="command string for correctness gate")
     task.add_argument("--suggestion-rank", type=int, help="build the task from the ranked suggestion N")
     task.add_argument("--suggestion-id", help="build the task from a specific suggestion id")
-    task.add_argument("--max-suggestions", type=int, default=12, help="suggestion queue size when using --suggestion-rank/id")
-    task.add_argument("--hot-limit", type=int, default=8, help="hot profile rows considered when using --suggestion-rank/id")
+    task.add_argument(
+        "--max-suggestions", type=int, default=12, help="suggestion queue size when using --suggestion-rank/id"
+    )
+    task.add_argument(
+        "--hot-limit", type=int, default=8, help="hot profile rows considered when using --suggestion-rank/id"
+    )
     task.add_argument("--history", action="append", default=[], help="add Atlas history when selecting a suggestion")
     task.add_argument("--task-id")
     task.add_argument("--output-dir")
@@ -3462,8 +3451,14 @@ def build_parser():
     ev.add_argument("--cwd")
     ev.add_argument("--runs", type=int, default=1, help="fresh benchmark runs to summarize")
     ev.add_argument("--warmup-runs", type=int, default=0, help="fresh benchmark runs to discard before measurement")
-    ev.add_argument("--max-rel-spread", type=float, default=0.20, help="mark unstable when (max-min)/median exceeds this")
-    ev.add_argument("--refresh-baseline", action="store_true", help="write baseline.json from this run series and compare against it")
+    ev.add_argument(
+        "--max-rel-spread", type=float, default=0.20, help="mark unstable when (max-min)/median exceeds this"
+    )
+    ev.add_argument(
+        "--refresh-baseline",
+        action="store_true",
+        help="write baseline.json from this run series and compare against it",
+    )
     ev.add_argument("--baseline", help="baseline.json to compare against instead of task baseline")
     ev.set_defaults(func=eval_task)
 

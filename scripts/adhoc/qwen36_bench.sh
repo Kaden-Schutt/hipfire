@@ -18,7 +18,10 @@ MAX_TOKENS="${HIPFIRE_BENCH_MAX:-192}"
 RUNS="${HIPFIRE_BENCH_RUNS:-3}"
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "qwen36-bench" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "qwen36-bench" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -39,7 +42,8 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
 
 INSTRUCT_PROMPT="Explain, in three or four sentences, why the sky appears blue during the day. Your answer should be accessible to a curious middle-school student."
 
-PARSE_PY=$(cat <<'PY'
+PARSE_PY=$(
+    cat <<'PY'
 import sys, re
 label = sys.argv[1]; genre = sys.argv[2]
 runs=[]
@@ -59,7 +63,9 @@ printf '%-14s %-8s %s\n' "config" "genre" "result"
 echo "------------------------------------------------------------------------"
 
 run_one() {
-    local label="$1" genre="$2" prompt="$3"; shift 3; local extra=("$@")
+    local label="$1" genre="$2" prompt="$3"
+    shift 3
+    local extra=("$@")
     local blob=""
     for i in $(seq 1 "$RUNS"); do
         out=$("$EXE" \
@@ -72,8 +78,10 @@ run_one() {
 }
 
 for cfg in "3.6-linear|" "3.6-ddtree-b12|--ddtree-batched --ddtree-budget 12 --ddtree-topk 2"; do
-    label=${cfg%|*}; args=${cfg#*|}; read -ra argv <<<"$args"
-    run_one "$label" "code"     "$CODE_PROMPT"     "${argv[@]}"
-    run_one "$label" "prose"    "$PROSE_PROMPT"    "${argv[@]}"
+    label=${cfg%|*}
+    args=${cfg#*|}
+    read -ra argv <<<"$args"
+    run_one "$label" "code" "$CODE_PROMPT" "${argv[@]}"
+    run_one "$label" "prose" "$PROSE_PROMPT" "${argv[@]}"
     run_one "$label" "instruct" "$INSTRUCT_PROMPT" "${argv[@]}"
 done

@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — RoughQuant real-format kernel-level proof.
 //
@@ -164,7 +184,7 @@ fn download(gpu: &hipfire_rdna::Gpu, t: &hipfire_rdna::GpuTensor, n: usize) -> V
 }
 
 fn fract_sin(x: f32) -> f32 {
-    (x.sin() * 12345.6789f32).fract() * 2.0f32 - 1.0f32
+    (x.sin() * 12_345.679_f32).fract() * 2.0f32 - 1.0f32
 }
 
 /// Round an f32 through bf16 (truncate-to-nearest-even-ish: top 16 bits + round).

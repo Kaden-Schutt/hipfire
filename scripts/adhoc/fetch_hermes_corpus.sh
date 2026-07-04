@@ -24,9 +24,8 @@
 set -euo pipefail
 TRIPWIRE_ROOT="${TRIPWIRE_ROOT:-${HOME}}"
 
-
 OUT="${1:-${TRIPWIRE_ROOT}/hermes_corpus.txt}"
-MAX_ROWS="${MAX_ROWS:-0}"   # 0 = all rows
+MAX_ROWS="${MAX_ROWS:-0}" # 0 = all rows
 CONFIGS="${CONFIGS:-kimi,glm-5.1}"
 
 log() { printf '[hermes-corpus] %s\n' "$*"; }
@@ -98,4 +97,4 @@ with open(out_path, 'w', encoding='utf-8') as fout:
 print(f"[hermes-corpus] wrote {total_rows} conversations, {total_bytes/1e6:.1f} MB to {out_path}")
 PY
 
-log "done: $(wc -c < "$OUT" | awk '{printf "%.1f MB\n", $1/1024/1024}') at $OUT"
+log "done: $(wc -c <"$OUT" | awk '{printf "%.1f MB\n", $1/1024/1024}') at $OUT"

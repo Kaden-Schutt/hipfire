@@ -34,9 +34,9 @@ WORDS = (
 ).split()
 
 NEEDLES = [
-    ("courier color",    "indigo-octahedron-9931"),
-    ("vault key",        "fenrir-quartz-2247"),
-    ("safehouse city",   "saint-petersburg-rotunda-5808"),
+    ("courier color", "indigo-octahedron-9931"),
+    ("vault key", "fenrir-quartz-2247"),
+    ("safehouse city", "saint-petersburg-rotunda-5808"),
 ]
 NEEDLE_DEPTHS = [0.25, 0.50, 0.75]
 
@@ -84,14 +84,10 @@ def main():
         RNG.seed(SEED + ctx)
         filler_text = assemble(ctx)
         for sub in EXPECTED_SUBSTRINGS:
-            assert filler_text.count(sub) == 1, \
-                f"needle {sub!r} appears {filler_text.count(sub)}x at ctx={ctx}"
+            assert filler_text.count(sub) == 1, f"needle {sub!r} appears {filler_text.count(sub)}x at ctx={ctx}"
         record = {
             "context_tokens": ctx,
-            "needles": [
-                {"key": k, "value": v, "depth": d}
-                for d, (k, v) in zip(NEEDLE_DEPTHS, NEEDLES)
-            ],
+            "needles": [{"key": k, "value": v, "depth": d} for d, (k, v) in zip(NEEDLE_DEPTHS, NEEDLES)],
             "question": QUESTION,
             "expected_answer_substrings": EXPECTED_SUBSTRINGS,
             "min_recovered": MIN_RECOVERED,
@@ -102,9 +98,11 @@ def main():
             json.dump(record, f, ensure_ascii=False)
             f.write("\n")
         approx_chars = len(filler_text)
-        print(f"wrote {out_path.name}: {approx_chars} chars "
-              f"(~{approx_chars / CHARS_PER_TOKEN:.0f} tokens, "
-              f"3 needles at depths {NEEDLE_DEPTHS})")
+        print(
+            f"wrote {out_path.name}: {approx_chars} chars "
+            f"(~{approx_chars / CHARS_PER_TOKEN:.0f} tokens, "
+            f"3 needles at depths {NEEDLE_DEPTHS})"
+        )
 
 
 if __name__ == "__main__":

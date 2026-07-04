@@ -358,7 +358,7 @@ pub fn fast_pos_embed_interpolate(
     num_grid_per_side: usize,
     merge_size: usize,
 ) -> Vec<f32> {
-    assert!(grid_h % merge_size == 0 && grid_w % merge_size == 0);
+    assert!(grid_h.is_multiple_of(merge_size) && grid_w.is_multiple_of(merge_size));
     assert!(pos_embed.len() == num_grid_per_side * num_grid_per_side * hidden);
 
     // linspace(0, K-1, N) — torch semantics. With N==1 the only output is 0.0.
@@ -478,7 +478,7 @@ pub fn compute_vision_rope_cos_sin(
     theta: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     assert!(
-        head_dim % 4 == 0,
+        head_dim.is_multiple_of(4),
         "head_dim must be divisible by 4 (got {head_dim})"
     );
     let rot_dim = head_dim / 2; // total rotary feature width
@@ -518,187 +518,6 @@ pub fn compute_vision_rope_cos_sin(
         }
     }
     (cos_t, sin_t)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Pure-CPU helper checks. The Python reference values come from
-    // `Qwen3_5VisionModel.fast_pos_embed_interpolate` / `rot_pos_emb` —
-    // see the doc-comments above for the exact formulas.
-
-    #[test]
-    fn pos_embed_interp_identity_when_grid_matches_table() {
-        // grid_h == grid_w == num_grid_per_side: every linspace point lands
-        // exactly on a table entry, so the bilinear weights collapse to
-        // pick a single corner and the interp output is a permutation of
-        // the input table — 2x2-grouped.
-        let k = 4usize;
-        let hidden = 3usize;
-        let merge = 2usize;
-        // Table: pos_embed[r*k+c, d] = (r*k+c)*10 + d
-        let mut table = vec![0.0f32; k * k * hidden];
-        for r in 0..k {
-            for c in 0..k {
-                for d in 0..hidden {
-                    table[(r * k + c) * hidden + d] = (r * k + c) as f32 * 10.0 + d as f32;
-                }
-            }
-        }
-        let out = fast_pos_embed_interpolate(&table, hidden, k, k, k, merge);
-        assert_eq!(out.len(), k * k * hidden);
-        // Walk 2x2-grouped: (gy, gx, sy, sx) → table[(gy*2+sy, gx*2+sx)].
-        let mut idx = 0usize;
-        for gy in 0..(k / merge) {
-            for gx in 0..(k / merge) {
-                for sy in 0..merge {
-                    for sx in 0..merge {
-                        let r = gy * merge + sy;
-                        let c = gx * merge + sx;
-                        for d in 0..hidden {
-                            let want = (r * k + c) as f32 * 10.0 + d as f32;
-                            let got = out[idx * hidden + d];
-                            assert!(
-                                (got - want).abs() < 1e-4,
-                                "idx={idx} d={d} got={got} want={want}"
-                            );
-                        }
-                        idx += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn pos_embed_interp_bilinear_midpoint() {
-        // 2x2 table → request 3x3 grid. The center sample is at the exact
-        // midpoint of all four corners with weight 1/4 each.
-        let k = 2usize;
-        let hidden = 1usize;
-        let merge = 1usize;
-        let table = vec![10.0f32, 20.0f32, 30.0f32, 40.0f32]; // [(0,0)=10, (0,1)=20, (1,0)=30, (1,1)=40]
-        let out = fast_pos_embed_interpolate(&table, hidden, 3, 3, k, merge);
-        // 3x3 in row-major (no merge): center at out[4*hidden+0].
-        assert!((out[0] - 10.0).abs() < 1e-4); // (0,0) → (0,0)
-        assert!((out[2] - 20.0).abs() < 1e-4); // (0,2) → (0,1)
-        assert!((out[6] - 30.0).abs() < 1e-4); // (2,0) → (1,0)
-        assert!((out[8] - 40.0).abs() < 1e-4); // (2,2) → (1,1)
-        assert!((out[4] - 25.0).abs() < 1e-4); // center = mean of all 4
-    }
-
-    #[test]
-    fn rope_table_concat_row_then_col() {
-        // For grid=(2,2), merge=1, head_dim=8 → rot_dim=4, inner=2.
-        // The token at (row=1, col=0) should have cos[:inner] = cos(1*inv_freq)
-        // and cos[inner:] = cos(0*inv_freq) = 1.
-        let head_dim = 8usize;
-        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 2, head_dim, 1, 10000.0);
-        let inner = head_dim / 4;
-        let rot = head_dim / 2;
-        assert_eq!(cos_t.len(), 4 * rot);
-        // Patch (row=1, col=0) is at index gy*2+gx with merge=1 → gy=1, gx=0 → idx 2.
-        let base = 2 * rot;
-        // Col half should be all 1 / 0 since col_idx=0.
-        for i in 0..inner {
-            assert!(
-                (cos_t[base + inner + i] - 1.0).abs() < 1e-6,
-                "cos col half should be 1"
-            );
-            assert!(
-                sin_t[base + inner + i].abs() < 1e-6,
-                "sin col half should be 0"
-            );
-        }
-        // Row half (row_idx=1): cos(inv_freq[0]) = cos(1.0) ≈ 0.5403
-        let inv0 = 1.0f32; // 10000^0 = 1
-        assert!((cos_t[base] - inv0.cos()).abs() < 1e-5);
-        assert!((sin_t[base] - inv0.sin()).abs() < 1e-5);
-    }
-
-    /// Non-square grid (4×6 ≠ 6×6 table): bilinear interpolation across
-    /// rows + h-major outer permutation. Catches an h/w transpose bug in
-    /// the 2x2-group permute that the square cases can't see.
-    #[test]
-    fn pos_embed_interp_identity_non_square() {
-        let k = 6usize;
-        let hidden = 2usize;
-        let merge = 2usize;
-        let mut table = vec![0.0f32; k * k * hidden];
-        for r in 0..k {
-            for c in 0..k {
-                for d in 0..hidden {
-                    table[(r * k + c) * hidden + d] = (r * 100 + c) as f32 + (d as f32) * 0.5;
-                }
-            }
-        }
-        // grid_h=4, grid_w=6 — both ≤ K, both even, distinct so a w/h swap
-        // in the permutation would produce a visibly wrong byte at a known
-        // out_idx.
-        let grid_h = 4usize;
-        let grid_w = 6usize;
-        let out = fast_pos_embed_interpolate(&table, hidden, grid_h, grid_w, k, merge);
-        assert_eq!(out.len(), grid_h * grid_w * hidden);
-
-        // Spot-check: 2x2-grouped patch at (gy=1, gx=2, sy=0, sx=1) is at:
-        //   out_idx = gy * (gw * 4) + gx * 4 + sy * 2 + sx
-        //   gw = grid_w / 2 = 3 → out_idx = 1*12 + 2*4 + 0*2 + 1 = 21
-        // Maps to (py = gy*2+sy, px = gx*2+sx) = (2, 5).
-        // linspace(0, K-1, grid_h)[2] for K=6, N=4 → 2 * 5/3 ≈ 3.333
-        // linspace(0, K-1, grid_w)[5] for K=6, N=6 → 5.0 exact
-        // So we sample a bilinear blend between rows 3 and 4 at column 5.
-        let py_lin = 2.0f32 * 5.0 / 3.0;
-        let r_floor = py_lin as i32 as usize;
-        let r_ceil = (r_floor + 1).min(k - 1);
-        let dh = py_lin - r_floor as f32;
-        let want =
-            (1.0 - dh) * table[(r_floor * k + 5) * hidden] + dh * table[(r_ceil * k + 5) * hidden];
-        let got = out[21 * hidden];
-        assert!(
-            (got - want).abs() < 1e-4,
-            "non-square spot check failed: got={got} want={want}"
-        );
-    }
-
-    /// Rectangular `compute_vision_rope_cos_sin`: a 2×4 grid sanity check
-    /// that distinguishes the row-half vs col-half indexing — col_idx=2
-    /// at head_dim=8 (rot_dim=4, inner=2) yields a deterministic table
-    /// value the row-half cannot match.
-    #[test]
-    fn rope_table_rectangular_grid() {
-        let head_dim = 8usize;
-        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 4, head_dim, 1, 10000.0);
-        let inner = head_dim / 4; // 2
-        let rot = head_dim / 2; // 4
-        assert_eq!(cos_t.len(), 8 * rot);
-        // Patch (row=1, col=2): gy=1, gx=2, sy=0, sx=0 → idx = 1*4 + 2 = 6
-        let base = 6 * rot;
-        // Row half uses row_idx=1: cos[base..base+inner] = cos(1 * inv_freq[0..inner])
-        // inv_freq[0] = 1, inv_freq[1] = 10000^(-2/4) = 0.01
-        let inv = [1.0f32, 0.01f32];
-        for i in 0..inner {
-            assert!((cos_t[base + i] - (1.0 * inv[i]).cos()).abs() < 1e-5);
-            assert!((sin_t[base + i] - (1.0 * inv[i]).sin()).abs() < 1e-5);
-        }
-        // Col half uses col_idx=2:
-        for i in 0..inner {
-            assert!((cos_t[base + inner + i] - (2.0 * inv[i]).cos()).abs() < 1e-5);
-            assert!((sin_t[base + inner + i] - (2.0 * inv[i]).sin()).abs() < 1e-5);
-        }
-    }
-
-    /// `rope_theta` actually changes the table — defends against a future
-    /// accidental hardcode regression in `compute_vision_rope_cos_sin`.
-    #[test]
-    fn rope_table_honors_theta_param() {
-        let (c1, _) = compute_vision_rope_cos_sin(2, 2, 8, 1, 10000.0);
-        let (c2, _) = compute_vision_rope_cos_sin(2, 2, 8, 1, 50000.0);
-        // Some entry must differ — pick a non-row=0, non-col=0 patch so the
-        // angle is non-zero on both halves.
-        let any_diff = c1.iter().zip(&c2).any(|(a, b)| (a - b).abs() > 1e-5);
-        assert!(any_diff, "theta change must shift at least one trig value");
-    }
 }
 
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
@@ -973,4 +792,185 @@ pub fn vision_forward(
         t0.elapsed().as_secs_f32()
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure-CPU helper checks. The Python reference values come from
+    // `Qwen3_5VisionModel.fast_pos_embed_interpolate` / `rot_pos_emb` —
+    // see the doc-comments above for the exact formulas.
+
+    #[test]
+    fn pos_embed_interp_identity_when_grid_matches_table() {
+        // grid_h == grid_w == num_grid_per_side: every linspace point lands
+        // exactly on a table entry, so the bilinear weights collapse to
+        // pick a single corner and the interp output is a permutation of
+        // the input table — 2x2-grouped.
+        let k = 4usize;
+        let hidden = 3usize;
+        let merge = 2usize;
+        // Table: pos_embed[r*k+c, d] = (r*k+c)*10 + d
+        let mut table = vec![0.0f32; k * k * hidden];
+        for r in 0..k {
+            for c in 0..k {
+                for d in 0..hidden {
+                    table[(r * k + c) * hidden + d] = (r * k + c) as f32 * 10.0 + d as f32;
+                }
+            }
+        }
+        let out = fast_pos_embed_interpolate(&table, hidden, k, k, k, merge);
+        assert_eq!(out.len(), k * k * hidden);
+        // Walk 2x2-grouped: (gy, gx, sy, sx) → table[(gy*2+sy, gx*2+sx)].
+        let mut idx = 0usize;
+        for gy in 0..(k / merge) {
+            for gx in 0..(k / merge) {
+                for sy in 0..merge {
+                    for sx in 0..merge {
+                        let r = gy * merge + sy;
+                        let c = gx * merge + sx;
+                        for d in 0..hidden {
+                            let want = (r * k + c) as f32 * 10.0 + d as f32;
+                            let got = out[idx * hidden + d];
+                            assert!(
+                                (got - want).abs() < 1e-4,
+                                "idx={idx} d={d} got={got} want={want}"
+                            );
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pos_embed_interp_bilinear_midpoint() {
+        // 2x2 table → request 3x3 grid. The center sample is at the exact
+        // midpoint of all four corners with weight 1/4 each.
+        let k = 2usize;
+        let hidden = 1usize;
+        let merge = 1usize;
+        let table = vec![10.0f32, 20.0f32, 30.0f32, 40.0f32]; // [(0,0)=10, (0,1)=20, (1,0)=30, (1,1)=40]
+        let out = fast_pos_embed_interpolate(&table, hidden, 3, 3, k, merge);
+        // 3x3 in row-major (no merge): center at out[4*hidden+0].
+        assert!((out[0] - 10.0).abs() < 1e-4); // (0,0) → (0,0)
+        assert!((out[2] - 20.0).abs() < 1e-4); // (0,2) → (0,1)
+        assert!((out[6] - 30.0).abs() < 1e-4); // (2,0) → (1,0)
+        assert!((out[8] - 40.0).abs() < 1e-4); // (2,2) → (1,1)
+        assert!((out[4] - 25.0).abs() < 1e-4); // center = mean of all 4
+    }
+
+    #[test]
+    fn rope_table_concat_row_then_col() {
+        // For grid=(2,2), merge=1, head_dim=8 → rot_dim=4, inner=2.
+        // The token at (row=1, col=0) should have cos[:inner] = cos(1*inv_freq)
+        // and cos[inner:] = cos(0*inv_freq) = 1.
+        let head_dim = 8usize;
+        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 2, head_dim, 1, 10000.0);
+        let inner = head_dim / 4;
+        let rot = head_dim / 2;
+        assert_eq!(cos_t.len(), 4 * rot);
+        // Patch (row=1, col=0) is at index gy*2+gx with merge=1 → gy=1, gx=0 → idx 2.
+        let base = 2 * rot;
+        // Col half should be all 1 / 0 since col_idx=0.
+        for i in 0..inner {
+            assert!(
+                (cos_t[base + inner + i] - 1.0).abs() < 1e-6,
+                "cos col half should be 1"
+            );
+            assert!(
+                sin_t[base + inner + i].abs() < 1e-6,
+                "sin col half should be 0"
+            );
+        }
+        // Row half (row_idx=1): cos(inv_freq[0]) = cos(1.0) ≈ 0.5403
+        let inv0 = 1.0f32; // 10000^0 = 1
+        assert!((cos_t[base] - inv0.cos()).abs() < 1e-5);
+        assert!((sin_t[base] - inv0.sin()).abs() < 1e-5);
+    }
+
+    /// Non-square grid (4×6 ≠ 6×6 table): bilinear interpolation across
+    /// rows + h-major outer permutation. Catches an h/w transpose bug in
+    /// the 2x2-group permute that the square cases can't see.
+    #[test]
+    fn pos_embed_interp_identity_non_square() {
+        let k = 6usize;
+        let hidden = 2usize;
+        let merge = 2usize;
+        let mut table = vec![0.0f32; k * k * hidden];
+        for r in 0..k {
+            for c in 0..k {
+                for d in 0..hidden {
+                    table[(r * k + c) * hidden + d] = (r * 100 + c) as f32 + (d as f32) * 0.5;
+                }
+            }
+        }
+        // grid_h=4, grid_w=6 — both ≤ K, both even, distinct so a w/h swap
+        // in the permutation would produce a visibly wrong byte at a known
+        // out_idx.
+        let grid_h = 4usize;
+        let grid_w = 6usize;
+        let out = fast_pos_embed_interpolate(&table, hidden, grid_h, grid_w, k, merge);
+        assert_eq!(out.len(), grid_h * grid_w * hidden);
+
+        // Spot-check: 2x2-grouped patch at (gy=1, gx=2, sy=0, sx=1) is at:
+        //   out_idx = gy * (gw * 4) + gx * 4 + sy * 2 + sx
+        //   gw = grid_w / 2 = 3 → out_idx = 1*12 + 2*4 + 0*2 + 1 = 21
+        // Maps to (py = gy*2+sy, px = gx*2+sx) = (2, 5).
+        // linspace(0, K-1, grid_h)[2] for K=6, N=4 → 2 * 5/3 ≈ 3.333
+        // linspace(0, K-1, grid_w)[5] for K=6, N=6 → 5.0 exact
+        // So we sample a bilinear blend between rows 3 and 4 at column 5.
+        let py_lin = 2.0f32 * 5.0 / 3.0;
+        let r_floor = py_lin as i32 as usize;
+        let r_ceil = (r_floor + 1).min(k - 1);
+        let dh = py_lin - r_floor as f32;
+        let want =
+            (1.0 - dh) * table[(r_floor * k + 5) * hidden] + dh * table[(r_ceil * k + 5) * hidden];
+        let got = out[21 * hidden];
+        assert!(
+            (got - want).abs() < 1e-4,
+            "non-square spot check failed: got={got} want={want}"
+        );
+    }
+
+    /// Rectangular `compute_vision_rope_cos_sin`: a 2×4 grid sanity check
+    /// that distinguishes the row-half vs col-half indexing — col_idx=2
+    /// at head_dim=8 (rot_dim=4, inner=2) yields a deterministic table
+    /// value the row-half cannot match.
+    #[test]
+    fn rope_table_rectangular_grid() {
+        let head_dim = 8usize;
+        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 4, head_dim, 1, 10000.0);
+        let inner = head_dim / 4; // 2
+        let rot = head_dim / 2; // 4
+        assert_eq!(cos_t.len(), 8 * rot);
+        // Patch (row=1, col=2): gy=1, gx=2, sy=0, sx=0 → idx = 1*4 + 2 = 6
+        let base = 6 * rot;
+        // Row half uses row_idx=1: cos[base..base+inner] = cos(1 * inv_freq[0..inner])
+        // inv_freq[0] = 1, inv_freq[1] = 10000^(-2/4) = 0.01
+        let inv = [1.0f32, 0.01f32];
+        for i in 0..inner {
+            assert!((cos_t[base + i] - (1.0 * inv[i]).cos()).abs() < 1e-5);
+            assert!((sin_t[base + i] - (1.0 * inv[i]).sin()).abs() < 1e-5);
+        }
+        // Col half uses col_idx=2:
+        for i in 0..inner {
+            assert!((cos_t[base + inner + i] - (2.0 * inv[i]).cos()).abs() < 1e-5);
+            assert!((sin_t[base + inner + i] - (2.0 * inv[i]).sin()).abs() < 1e-5);
+        }
+    }
+
+    /// `rope_theta` actually changes the table — defends against a future
+    /// accidental hardcode regression in `compute_vision_rope_cos_sin`.
+    #[test]
+    fn rope_table_honors_theta_param() {
+        let (c1, _) = compute_vision_rope_cos_sin(2, 2, 8, 1, 10000.0);
+        let (c2, _) = compute_vision_rope_cos_sin(2, 2, 8, 1, 50000.0);
+        // Some entry must differ — pick a non-row=0, non-col=0 patch so the
+        // angle is non-zero on both halves.
+        let any_diff = c1.iter().zip(&c2).any(|(a, b)| (a - b).abs() > 1e-5);
+        assert!(any_diff, "theta change must shift at least one trig value");
+    }
 }

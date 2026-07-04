@@ -31,8 +31,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 DEFAULT_MODEL = (
-    "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/"
-    "snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"
+    "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"
 )
 
 
@@ -146,8 +145,7 @@ def main() -> int:
     print("stop_ids", sorted(stop_ids), flush=True)
 
     print(
-        f"loading model dtype={args.dtype} device={args.device} "
-        f"torch={torch.__version__}",
+        f"loading model dtype={args.dtype} device={args.device} torch={torch.__version__}",
         flush=True,
     )
     config = AutoConfig.from_pretrained(
@@ -168,8 +166,7 @@ def main() -> int:
     model.to(args.device)
     first_param = next(model.parameters())
     print(
-        f"model loaded class={type(model).__name__} "
-        f"elapsed={time.time() - t0:.1f}s",
+        f"model loaded class={type(model).__name__} elapsed={time.time() - t0:.1f}s",
         flush=True,
     )
 
@@ -177,9 +174,7 @@ def main() -> int:
     text = tok.decode(generated, skip_special_tokens=False)
     payload = {
         "model": str(model_dir),
-        "config_sha256": sha256_file(model_dir / "config.json")
-        if (model_dir / "config.json").exists()
-        else None,
+        "config_sha256": sha256_file(model_dir / "config.json") if (model_dir / "config.json").exists() else None,
         "tokenizer_sha256": sha256_file(model_dir / "tokenizer.json")
         if (model_dir / "tokenizer.json").exists()
         else None,

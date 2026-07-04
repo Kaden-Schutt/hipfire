@@ -64,8 +64,10 @@ def llamacpp_tokenize(gguf: Path, slice_path: Path, llama_tokenize_bin: str) -> 
     proc = subprocess.run(
         [
             llama_tokenize_bin,
-            "-m", str(gguf),
-            "-f", str(slice_path),
+            "-m",
+            str(gguf),
+            "-f",
+            str(slice_path),
             "--ids",
             "--log-disable",
             "--no-bos",
@@ -83,15 +85,19 @@ def llamacpp_tokenize(gguf: Path, slice_path: Path, llama_tokenize_bin: str) -> 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--hipfire-hfq",   required=True, type=Path, help="path to a hipfire .hfq model")
+    ap.add_argument("--hipfire-hfq", required=True, type=Path, help="path to a hipfire .hfq model")
     ap.add_argument("--llamacpp-gguf", required=True, type=Path, help="path to a llama.cpp .gguf (e.g. BF16 ref)")
-    ap.add_argument("--slice",         required=True, type=Path, help="path to slice text file")
-    ap.add_argument("--llama-tokenize-bin", default="llama-tokenize",
-                    help="path to llama-tokenize binary (default: search PATH)")
-    ap.add_argument("--cargo-target-dir", type=Path, default=Path(__file__).resolve().parents[3] / "target",
-                    help="cargo target dir (default: workspace root /target)")
-    ap.add_argument("--report-only", action="store_true",
-                    help="don't fail on mismatch, just report")
+    ap.add_argument("--slice", required=True, type=Path, help="path to slice text file")
+    ap.add_argument(
+        "--llama-tokenize-bin", default="llama-tokenize", help="path to llama-tokenize binary (default: search PATH)"
+    )
+    ap.add_argument(
+        "--cargo-target-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[3] / "target",
+        help="cargo target dir (default: workspace root /target)",
+    )
+    ap.add_argument("--report-only", action="store_true", help="don't fail on mismatch, just report")
     args = ap.parse_args()
 
     # Sanity checks
@@ -123,8 +129,7 @@ def main() -> int:
     print("[3/3] comparing...", file=sys.stderr)
     if len(hf_ids) != len(gguf_ids):
         print(
-            f"  LENGTH MISMATCH: hipfire={len(hf_ids)} llama.cpp={len(gguf_ids)} "
-            f"(Δ = {len(hf_ids) - len(gguf_ids)})",
+            f"  LENGTH MISMATCH: hipfire={len(hf_ids)} llama.cpp={len(gguf_ids)} (Δ = {len(hf_ids) - len(gguf_ids)})",
             file=sys.stderr,
         )
         return 0 if args.report_only else 1
@@ -157,8 +162,7 @@ def main() -> int:
     if len(diffs) > 10:
         print(f"  ({len(diffs) - 10} more mismatches not shown)", file=sys.stderr)
     print(
-        "  GGUF anchor track requires the bridge OR drop-anchor fallback "
-        "(see plan rev-3.2 §'Tokenizer alignment').",
+        "  GGUF anchor track requires the bridge OR drop-anchor fallback (see plan rev-3.2 §'Tokenizer alignment').",
         file=sys.stderr,
     )
     return 0 if args.report_only else 1

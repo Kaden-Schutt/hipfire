@@ -2061,74 +2061,6 @@ pub fn load_weights_hfq(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "hipfire-hfqm-package-test-{}-{name}",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn writes_and_reads_sidecar_hfqm_package() {
-        let payload_a = temp_path("tokens.bin");
-        let payload_b = temp_path("values.bin");
-        let package_path = temp_path("ref.kldref.hfq");
-        std::fs::write(&payload_a, [1u8, 2, 3, 4]).unwrap();
-        std::fs::write(&payload_b, [5u8, 6, 7, 8, 9, 10, 11, 12]).unwrap();
-
-        let metadata = serde_json::json!({
-            "artifact_kind": "hipfire.kldref",
-            "package_schema": "hipfire.kldref.v1",
-            "arch_id": 5,
-            "n_ctx": 2,
-            "n_chunk": 1,
-            "top_k": 1
-        })
-        .to_string();
-        let entries = vec![
-            HfqPackageWriteEntry {
-                name: "kldref.tokens".to_string(),
-                quant_type: 0,
-                shape: vec![1, 2],
-                group_size: 0,
-                source_path: payload_a.clone(),
-                data_size: 4,
-            },
-            HfqPackageWriteEntry {
-                name: "kldref.top_log_probs".to_string(),
-                quant_type: 0,
-                shape: vec![1, 1, 2],
-                group_size: 0,
-                source_path: payload_b.clone(),
-                data_size: 8,
-            },
-        ];
-        write_hfqm_package_from_files(&package_path, 5, &metadata, &entries).unwrap();
-
-        let package = HfqPackage::open(&package_path).unwrap();
-        assert_eq!(package.version, HFQM_VERSION);
-        assert_eq!(package.arch_id, 5);
-        assert!(package
-            .metadata_json
-            .contains("\"artifact_kind\":\"hipfire.kldref\""));
-        assert_eq!(package.entries().len(), 2);
-        assert_eq!(package.entry("kldref.tokens").unwrap().shape, vec![1, 2]);
-        assert_eq!(package.blob_data("kldref.tokens").unwrap(), &[1, 2, 3, 4]);
-        assert_eq!(
-            package.blob_data("kldref.top_log_probs").unwrap(),
-            &[5, 6, 7, 8, 9, 10, 11, 12]
-        );
-
-        let _ = std::fs::remove_file(payload_a);
-        let _ = std::fs::remove_file(payload_b);
-        let _ = std::fs::remove_file(package_path);
-    }
-}
-
 // ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────
 
 /// Parse a LlamaConfig from a SafetensorsSource's metadata JSON.
@@ -2624,4 +2556,72 @@ pub fn load_weights_paroquant_llama(
         output,
         layers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hipfire-hfqm-package-test-{}-{name}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn writes_and_reads_sidecar_hfqm_package() {
+        let payload_a = temp_path("tokens.bin");
+        let payload_b = temp_path("values.bin");
+        let package_path = temp_path("ref.kldref.hfq");
+        std::fs::write(&payload_a, [1u8, 2, 3, 4]).unwrap();
+        std::fs::write(&payload_b, [5u8, 6, 7, 8, 9, 10, 11, 12]).unwrap();
+
+        let metadata = serde_json::json!({
+            "artifact_kind": "hipfire.kldref",
+            "package_schema": "hipfire.kldref.v1",
+            "arch_id": 5,
+            "n_ctx": 2,
+            "n_chunk": 1,
+            "top_k": 1
+        })
+        .to_string();
+        let entries = vec![
+            HfqPackageWriteEntry {
+                name: "kldref.tokens".to_string(),
+                quant_type: 0,
+                shape: vec![1, 2],
+                group_size: 0,
+                source_path: payload_a.clone(),
+                data_size: 4,
+            },
+            HfqPackageWriteEntry {
+                name: "kldref.top_log_probs".to_string(),
+                quant_type: 0,
+                shape: vec![1, 1, 2],
+                group_size: 0,
+                source_path: payload_b.clone(),
+                data_size: 8,
+            },
+        ];
+        write_hfqm_package_from_files(&package_path, 5, &metadata, &entries).unwrap();
+
+        let package = HfqPackage::open(&package_path).unwrap();
+        assert_eq!(package.version, HFQM_VERSION);
+        assert_eq!(package.arch_id, 5);
+        assert!(package
+            .metadata_json
+            .contains("\"artifact_kind\":\"hipfire.kldref\""));
+        assert_eq!(package.entries().len(), 2);
+        assert_eq!(package.entry("kldref.tokens").unwrap().shape, vec![1, 2]);
+        assert_eq!(package.blob_data("kldref.tokens").unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(
+            package.blob_data("kldref.top_log_probs").unwrap(),
+            &[5, 6, 7, 8, 9, 10, 11, 12]
+        );
+
+        let _ = std::fs::remove_file(payload_a);
+        let _ = std::fs::remove_file(payload_b);
+        let _ = std::fs::remove_file(package_path);
+    }
 }

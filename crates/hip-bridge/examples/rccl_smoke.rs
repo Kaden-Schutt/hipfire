@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 // SPDX-License-Identifier: MIT
 // hipfire — RCCL smoke + microbench in Rust. Mirrors
 // /home/kaden/.claude/jobs/6ea8a1b1/rccl_allreduce_smoke.cpp so we can
@@ -5,6 +25,7 @@
 // gfx1201.
 //
 // Run: HIP_VISIBLE_DEVICES=0,1,2,3 cargo run -p hip-bridge --example rccl_smoke --release
+#![allow(clippy::needless_range_loop)]
 
 use hip_bridge::{HipRuntime, RcclComms};
 use std::time::Instant;
@@ -55,11 +76,9 @@ fn main() {
         // use 1 — the reduced output is whatever sum, content doesn't
         // matter for perf timing. Correctness check below uses a fresh
         // H2D copy with known data.
-        let _ = hip
-            .memset(&send_bufs[r], 1, max_bytes)
+        hip.memset(&send_bufs[r], 1, max_bytes)
             .expect("memset send");
-        let _ = hip
-            .memset(&recv_bufs[r], 0, max_bytes)
+        hip.memset(&recv_bufs[r], 0, max_bytes)
             .expect("memset recv");
     }
 

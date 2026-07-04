@@ -62,11 +62,15 @@ if [ ! -e "$HFQ_PATH" ]; then
 fi
 
 wait_for_model_ready() {
-    local hfq_path="$1"; local timeout="${2:-120}"
-    local want; want=$(basename "$hfq_path")
-    local start; start=$(date +%s)
-    local tmp; tmp=$(mktemp)
-    while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+    local hfq_path="$1"
+    local timeout="${2:-120}"
+    local want
+    want=$(basename "$hfq_path")
+    local start
+    start=$(date +%s)
+    local tmp
+    tmp=$(mktemp)
+    while [ $(($(date +%s) - start)) -lt "$timeout" ]; do
         if curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
             if python3 - "$tmp" "$want" <<'PY' 2>/dev/null; then
 import json
@@ -80,18 +84,22 @@ except Exception:
     sys.exit(1)
 sys.exit(0 if any(m.get("id", "").endswith(want) for m in payload.get("data", [])) else 1)
 PY
-                rm -f "$tmp"; return 0
+                rm -f "$tmp"
+                return 0
             fi
         fi
         sleep 2
     done
-    rm -f "$tmp"; return 1
+    rm -f "$tmp"
+    return 1
 }
 
 model_id_for_path() {
     local hfq_path="$1"
-    local want; want=$(basename "$hfq_path")
-    local tmp; tmp=$(mktemp)
+    local want
+    want=$(basename "$hfq_path")
+    local tmp
+    tmp=$(mktemp)
     if ! curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
         rm -f "$tmp"
         return 0
@@ -135,11 +143,11 @@ PROMPT='A train leaves Station A traveling at 60 km/h. Two hours later, a second
     echo "## Per-tensor MSE vs BF16 reference"
     echo
     echo '```'
-} > "$OUT"
+} >"$OUT"
 
 echo "Running per-tensor MSE..."
 ./target/release/examples/quant_quality_mse "$ST_DIR" "$HFQ_PATH" 2>&1 \
-    | tee -a /tmp/_quant_mse.log >> "$OUT"
+    | tee -a /tmp/_quant_mse.log >>"$OUT"
 
 {
     echo '```'
@@ -147,21 +155,21 @@ echo "Running per-tensor MSE..."
     echo "## Final norm sanity"
     echo
     echo '```'
-} >> "$OUT"
+} >>"$OUT"
 
 ./target/release/examples/dump_norms "$HFQ_PATH" "language_model.norm.weight" 2>&1 \
-    | tail -5 >> "$OUT"
+    | tail -5 >>"$OUT"
 
 {
     echo '```'
     echo
     echo "## Reasoning smoke test (train pursuit, temp=0, max_tokens=400)"
     echo
-} >> "$OUT"
+} >>"$OUT"
 
 # Reasoning smoke test — only run if a daemon can be started
 if ! command -v hipfire >/dev/null 2>&1; then
-    echo "  (skip: hipfire CLI not on PATH)" >> "$OUT"
+    echo "  (skip: hipfire CLI not on PATH)" >>"$OUT"
     echo "Skipping reasoning smoke test (no hipfire CLI)"
 else
     hipfire stop 2>&1 | head -1 || true
@@ -185,7 +193,7 @@ else
         echo "Model: \`$MODEL_ID\`"
         echo
         echo '```'
-    } >> "$OUT"
+    } >>"$OUT"
 
     timeout 240 curl -sS http://127.0.0.1:8080/v1/chat/completions \
         -H 'Content-Type: application/json' \
@@ -197,7 +205,7 @@ print(json.dumps({
   'temperature': 0,
   'max_tokens': 400,
 }))
-")" > /tmp/_smoke_default.json 2>&1 || true
+")" >/tmp/_smoke_default.json 2>&1 || true
 
     python3 -c "
 import json
@@ -218,9 +226,9 @@ try:
     print(c['message']['content'][:400])
 except Exception as e:
     print('ERROR:', e)
-" >> "$OUT"
+" >>"$OUT"
 
-    echo '```' >> "$OUT"
+    echo '```' >>"$OUT"
 
     hipfire stop 2>&1 | head -1 || true
 fi

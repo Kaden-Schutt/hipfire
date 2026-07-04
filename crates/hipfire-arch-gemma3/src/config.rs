@@ -81,7 +81,8 @@ impl Gemma3Config {
     /// every `sliding_window_pattern`-th layer global: HF's
     /// `is_sliding = (layer_idx + 1) % sliding_window_pattern != 0`.
     pub fn is_global_layer(&self, layer_idx: usize) -> bool {
-        self.sliding_window_pattern > 0 && (layer_idx + 1) % self.sliding_window_pattern == 0
+        self.sliding_window_pattern > 0
+            && (layer_idx + 1).is_multiple_of(self.sliding_window_pattern)
     }
 
     /// Per-layer RoPE base, selecting the global vs local theta.

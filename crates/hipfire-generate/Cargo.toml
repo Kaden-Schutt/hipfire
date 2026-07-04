@@ -11,4 +11,6 @@ hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 serde.workspace = true
 serde_json = "1"
-twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"] }
+twox-hash = { version = "2", default-features = false, features = [
+  "xxhash3_128",
+] }

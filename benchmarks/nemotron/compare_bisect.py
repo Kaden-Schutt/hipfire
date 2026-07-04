@@ -35,9 +35,7 @@ def main():
     print(f"comparing at prompt position {pos}")
 
     n = caps.shape[0]  # num_layers+1
-    hf_hidden = [
-        np.array(hf[f"hidden_{i}"][pos], dtype=np.float64, copy=True) for i in range(n)
-    ]
+    hf_hidden = [np.array(hf[f"hidden_{i}"][pos], dtype=np.float64, copy=True) for i in range(n)]
     hf_logits = np.array(hf["logits"][pos], dtype=np.float64, copy=True)
     hp = np.array(hp_logits, dtype=np.float64, copy=True)
     print(f"comparing {n} hidden layers (last position)")
@@ -60,14 +58,16 @@ def main():
     hp_top5 = np.argsort(-hp)[:5].tolist()
     hf_mean_abs = np.abs(hf_logits).mean() + 1e-9
     logit_diff = np.abs(hf_logits - hp)
-    print(f"\nlogits: max|Δ|={logit_diff.max():.4e} rel={logit_diff.mean()/hf_mean_abs:.4f}")
+    print(f"\nlogits: max|Δ|={logit_diff.max():.4e} rel={logit_diff.mean() / hf_mean_abs:.4f}")
     print(f"  HF top5:      {hf_top5}")
     print(f"  hipfire top5: {hp_top5}")
     if first_bad is None:
         print("\nRESULT: no divergence > 5% rel — hipfire matches HF per layer.")
     else:
-        print(f"\nRESULT: first divergence at hidden_{first_bad} "
-              f"(= {'embeddings' if first_bad == 0 else f'after block {first_bad-1}'}).")
+        print(
+            f"\nRESULT: first divergence at hidden_{first_bad} "
+            f"(= {'embeddings' if first_bad == 0 else f'after block {first_bad - 1}'})."
+        )
 
 
 if __name__ == "__main__":

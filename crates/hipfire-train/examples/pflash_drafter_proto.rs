@@ -1,3 +1,23 @@
+#![allow(
+    clippy::duplicated_attributes,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::explicit_counter_loop,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::manual_clamp,
+    clippy::manual_div_ceil,
+    clippy::needless_range_loop,
+    clippy::ptr_arg,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::while_let_loop
+)]
+// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+
 //! PFlash drafter prototype — P1 (label capture) + P2 (arch scaffold).
 //!
 //! P1: run a LOADABLE Llama stand-in target, capture its MID-layer K, compute the
@@ -14,6 +34,8 @@
 //!   hipfire gpu-lock acquire "pflash-drafter"
 //!   cargo run -p hipfire-train --release --example pflash_drafter_proto
 //!   hipfire gpu-lock release
+
+#![allow(clippy::needless_range_loop)]
 
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::drafter::{drafter_forward, Drafter, DrafterConfig};

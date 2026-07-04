@@ -47,15 +47,22 @@ from dflash.model import DFlashDraftModel, extract_context_feature, sample  # no
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--target-repo", default="Qwen/Qwen3.5-4B")
-    p.add_argument("--draft-dir", required=True,
-                   help="Local HF-format draft dir (config.json + model.safetensors).")
-    p.add_argument("--prompt-file", default=None,
-                   help="Path to a txt file with a prompt. Default: a simple tool-call prompt.")
-    p.add_argument("--max-cycles", type=int, default=1,
-                   help="Cap on number of decode cycles. 1 isolates iter-1 τ; set high for aggregate.")
+    p.add_argument("--draft-dir", required=True, help="Local HF-format draft dir (config.json + model.safetensors).")
+    p.add_argument(
+        "--prompt-file", default=None, help="Path to a txt file with a prompt. Default: a simple tool-call prompt."
+    )
+    p.add_argument(
+        "--max-cycles",
+        type=int,
+        default=1,
+        help="Cap on number of decode cycles. 1 isolates iter-1 τ; set high for aggregate.",
+    )
     p.add_argument("--max-new-tokens", type=int, default=128)
-    p.add_argument("--no-chatml", action="store_true",
-                   help="Skip ChatML wrapping. Default: wrap (matches --chatml in dflash_spec_demo).")
+    p.add_argument(
+        "--no-chatml",
+        action="store_true",
+        help="Skip ChatML wrapping. Default: wrap (matches --chatml in dflash_spec_demo).",
+    )
     return p.parse_args()
 
 
@@ -78,7 +85,10 @@ def spec_generate_capped(draft, target, tokenizer, input_ids, max_new, max_cycle
     max_length = num_input + max_new
     B = draft.block_size
     output_ids = torch.full(
-        (1, max_length + B), draft.mask_token_id, dtype=torch.long, device=device,
+        (1, max_length + B),
+        draft.mask_token_id,
+        dtype=torch.long,
+        device=device,
     )
     position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
     # Qwen3.5 target has linear_attention layers — DynamicCache must be
@@ -88,12 +98,15 @@ def spec_generate_capped(draft, target, tokenizer, input_ids, max_new, max_cycle
     pkv_d = DynamicCache()
 
     out = target(
-        input_ids, position_ids=position_ids[:, :num_input],
-        past_key_values=pkv_t, use_cache=True,
-        logits_to_keep=1, output_hidden_states=True,
+        input_ids,
+        position_ids=position_ids[:, :num_input],
+        past_key_values=pkv_t,
+        use_cache=True,
+        logits_to_keep=1,
+        output_hidden_states=True,
     )
     output_ids[:, :num_input] = input_ids
-    output_ids[:, num_input:num_input + 1] = sample(out.logits, 0.0)
+    output_ids[:, num_input : num_input + 1] = sample(out.logits, 0.0)
     target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)
 
     accept_lengths = []
@@ -101,30 +114,33 @@ def spec_generate_capped(draft, target, tokenizer, input_ids, max_new, max_cycle
     cycles = 0
     while start < max_length and cycles < max_cycles:
         cycles += 1
-        block_out = output_ids[:, start:start + B].clone()
-        block_pos = position_ids[:, start:start + B]
+        block_out = output_ids[:, start : start + B].clone()
+        block_pos = position_ids[:, start : start + B]
         noise_emb = target.model.embed_tokens(block_out)
         dh = draft(
             target_hidden=target_hidden,
             noise_embedding=noise_emb,
-            position_ids=position_ids[:, pkv_d.get_seq_length():start + B],
-            past_key_values=pkv_d, use_cache=True,
+            position_ids=position_ids[:, pkv_d.get_seq_length() : start + B],
+            past_key_values=pkv_d,
+            use_cache=True,
         )
-        draft_logits = target.lm_head(dh[:, -B + 1:, :])
+        draft_logits = target.lm_head(dh[:, -B + 1 :, :])
         pkv_d.crop(start)
         block_out[:, 1:] = sample(draft_logits, 0.0)
         out = target(
-            block_out, position_ids=block_pos,
-            past_key_values=pkv_t, use_cache=True,
+            block_out,
+            position_ids=block_pos,
+            past_key_values=pkv_t,
+            use_cache=True,
             output_hidden_states=True,
         )
         post = sample(out.logits, 0.0)
         accept = (block_out[:, 1:] == post[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        output_ids[:, start:start + accept + 1] = block_out[:, :accept + 1]
+        output_ids[:, start : start + accept + 1] = block_out[:, : accept + 1]
         output_ids[:, start + accept + 1] = post[:, accept]
         start += accept + 1
         pkv_t.crop(start)
-        target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)[:, :accept + 1, :]
+        target_hidden = extract_context_feature(out.hidden_states, draft.target_layer_ids)[:, : accept + 1, :]
         accept_lengths.append(accept + 1)
     return output_ids, accept_lengths
 
@@ -140,7 +156,9 @@ def main():
     print(f"[target] loading {args.target_repo}...")
     tokenizer = AutoTokenizer.from_pretrained(args.target_repo)
     target = AutoModelForCausalLM.from_pretrained(
-        args.target_repo, torch_dtype=dtype, attn_implementation="eager",
+        args.target_repo,
+        torch_dtype=dtype,
+        attn_implementation="eager",
     ).to(device)
     target.eval()
     for p in target.parameters():
@@ -153,13 +171,22 @@ def main():
     # config_class is Qwen3Config anyway.
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
     import json as _json
+
     cfg_dict = _json.loads((Path(args.draft_dir) / "config.json").read_text())
     dflash_cfg = cfg_dict.pop("dflash_config", {"mask_token_id": 248070, "target_layer_ids": []})
     block_size = cfg_dict.pop("block_size", 16)
     num_target_layers = cfg_dict.pop("num_target_layers", 32)
     # Strip attrs Qwen3Config doesn't understand
-    for k in ("auto_map", "architectures", "dflash_config", "id2label", "label2id",
-              "problem_type", "num_target_layers", "block_size"):
+    for k in (
+        "auto_map",
+        "architectures",
+        "dflash_config",
+        "id2label",
+        "label2id",
+        "problem_type",
+        "num_target_layers",
+        "block_size",
+    ):
         cfg_dict.pop(k, None)
     draft_cfg = Qwen3Config(**{k: v for k, v in cfg_dict.items() if k not in ("transformers_version",)})
     draft_cfg.dflash_config = dflash_cfg
@@ -197,24 +224,28 @@ def main():
     input_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
     print(f"[prompt] {input_ids.shape[1]} tokens")
 
-    print(f"\n[eval] running spec_generate with max_cycles={args.max_cycles}, "
-          f"max_new_tokens={args.max_new_tokens}...")
+    print(f"\n[eval] running spec_generate with max_cycles={args.max_cycles}, max_new_tokens={args.max_new_tokens}...")
     output_ids, accept_lengths = spec_generate_capped(
-        draft, target, tokenizer, input_ids,
-        args.max_new_tokens, args.max_cycles, device,
+        draft,
+        target,
+        tokenizer,
+        input_ids,
+        args.max_new_tokens,
+        args.max_cycles,
+        device,
     )
 
     tau = sum(accept_lengths) / max(1, len(accept_lengths))
     emitted = sum(accept_lengths)
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"cycles: {len(accept_lengths)}")
     print(f"accept_lengths: {accept_lengths}")
     print(f"τ = {tau:.3f}  (emitted {emitted} tokens in {len(accept_lengths)} cycles)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # Show generated text for sanity
     gen = tokenizer.decode(
-        output_ids[0, input_ids.shape[1]:input_ids.shape[1] + emitted + 1].cpu().tolist(),
+        output_ids[0, input_ids.shape[1] : input_ids.shape[1] + emitted + 1].cpu().tolist(),
         skip_special_tokens=False,
     )
     print(f"\n[gen] {gen!r}")

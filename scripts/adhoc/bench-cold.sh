@@ -64,26 +64,53 @@ RUNS=5
 GEN=50
 LABEL=""
 SLEEP_BETWEEN=2
-WARMUP_RUN=1   # do one untimed warm-up run to stabilize before measuring
+WARMUP_RUN=1 # do one untimed warm-up run to stabilize before measuring
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --pp) PREFILLS="$2"; shift 2 ;;
-        --runs) RUNS="$2"; shift 2 ;;
-        --gen) GEN="$2"; shift 2 ;;
-        --label) LABEL="$2"; shift 2 ;;
-        --no-warmup) WARMUP_RUN=0; shift ;;
-        --sleep) SLEEP_BETWEEN="$2"; shift 2 ;;
-        -h|--help) sed -n '2,55p' "$0"; exit 0 ;;
+        --pp)
+            PREFILLS="$2"
+            shift 2
+            ;;
+        --runs)
+            RUNS="$2"
+            shift 2
+            ;;
+        --gen)
+            GEN="$2"
+            shift 2
+            ;;
+        --label)
+            LABEL="$2"
+            shift 2
+            ;;
+        --no-warmup)
+            WARMUP_RUN=0
+            shift
+            ;;
+        --sleep)
+            SLEEP_BETWEEN="$2"
+            shift 2
+            ;;
+        -h | --help)
+            sed -n '2,55p' "$0"
+            exit 0
+            ;;
         *)
-            if [ -z "$MODEL" ]; then MODEL="$1"; shift; continue; fi
-            echo "unknown arg: $1" >&2; exit 2
+            if [ -z "$MODEL" ]; then
+                MODEL="$1"
+                shift
+                continue
+            fi
+            echo "unknown arg: $1" >&2
+            exit 2
             ;;
     esac
 done
 
 if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
-    echo "ERR: missing or invalid model path" >&2; exit 2
+    echo "ERR: missing or invalid model path" >&2
+    exit 2
 fi
 if [ ! -x "$EXE" ]; then
     echo "ERR: bench binary missing — build with:" >&2
@@ -95,7 +122,10 @@ fi
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-cold" --watch-pid "$$" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "bench-cold" --watch-pid "$$" || {
+        echo "could not acquire GPU lock" >&2
+        exit 2
+    }
     trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
 fi
 
@@ -143,7 +173,7 @@ run_once() {
 printf "model=%s  label=%s  runs=%s  pp=[%s]  gen=%d  start_temp=%s°C\n" \
     "$(basename "$MODEL")" "$LABEL" "$RUNS" "$PREFILLS" "$GEN" "$(read_temp)"
 
-IFS=',' read -ra PP_ARR <<< "$PREFILLS"
+IFS=',' read -ra PP_ARR <<<"$PREFILLS"
 for pp in "${PP_ARR[@]}"; do
     p_samples=()
     d_samples=()
@@ -160,7 +190,7 @@ for pp in "${PP_ARR[@]}"; do
             printf "  pp%-4s run %d: CRASH\n" "$pp" "$run"
             continue
         fi
-        read -r p d <<< "$r"
+        read -r p d <<<"$r"
         p_samples+=("$p")
         d_samples+=("$d")
         printf "  pp%-4s run %d: prefill=%-7s tok/s  decode=%-6s tok/s  temp=%s°C\n" \
@@ -170,8 +200,8 @@ for pp in "${PP_ARR[@]}"; do
     if [ ${#p_samples[@]} -gt 0 ]; then
         p_stats=$(printf '%s\n' "${p_samples[@]}" | stat_line)
         d_stats=$(printf '%s\n' "${d_samples[@]}" | stat_line)
-        read -r p_min p_max p_med p_q1 p_q3 <<< "$p_stats"
-        read -r d_min d_max d_med d_q1 d_q3 <<< "$d_stats"
+        read -r p_min p_max p_med p_q1 p_q3 <<<"$p_stats"
+        read -r d_min d_max d_med d_q1 d_q3 <<<"$d_stats"
         # Spread = (max-min)/median × 100. Anything > ~5 % means the run
         # was contaminated (other GPU users, thermal step, etc.) and the
         # numbers should not be relied on for an A/B comparison.
