@@ -3052,11 +3052,25 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_q8_0_kv",
-            kernels::ATTENTION_Q8_0_KV_SRC,
-            "attention_q8_0_kv",
-        )?;
+        // gfx1103 (Phoenix): no-LDS flash-decode variant (one wave32 per head,
+        // register-resident online softmax). Removes the `scores[seq_len]` LDS
+        // buffer and its context-length ceiling. Needs head_dim % 32 == 0 for
+        // the per-lane block layout; otherwise fall through to the generic path.
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_q8_0_kv_gfx1103",
+                kernels::ATTENTION_Q8_0_KV_GFX1103_SRC,
+                "attention_q8_0_kv_gfx1103",
+            )
+        } else {
+            (
+                "attention_q8_0_kv",
+                kernels::ATTENTION_Q8_0_KV_SRC,
+                "attention_q8_0_kv",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -3097,16 +3111,23 @@ impl Gpu {
         } else {
             seq_len_hint
         };
-        let block_size = (sizing_seq.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        // Extra shared mem for Q head vector preloaded into shared memory
-        let shared_mem = ((sizing_seq + block_size as usize + head_dim) * 4) as u32;
+        // gfx1103 no-LDS variant: one wave32 per head, zero shared memory, and
+        // no seq-len-dependent launch sizing (so it captures at any position).
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (sizing_seq.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            // Extra shared mem for Q head vector preloaded into shared memory
+            let shared_mem = ((sizing_seq + block_size as usize + head_dim) * 4) as u32;
+            (block_size, shared_mem)
+        };
         let bytes =
             crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
         let result = self.launch_maybe_blob(
-            "attention_q8_0_kv",
+            kname,
             [n_heads as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,

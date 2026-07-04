@@ -129,6 +129,13 @@ pub const RMSNORM_AT_SLOT_BUF_GFX1103_SRC: &str =
 pub const ARGMAX_GFX1103_SRC: &str =
     include_str!("../../../kernels/src/gfx1103/argmax.gfx1103.hip");
 
+/// gfx1103 (Phoenix) no-LDS flash-decode attention over a Q8_0 KV cache. Same
+/// ABI as the generic `attention_q8_0_kv` kernel, but a single wave32 per head
+/// runs a register-resident online softmax instead of staging `scores[seq_len]`
+/// in LDS — removing the context-length LDS ceiling. Requires head_dim % 32 == 0.
+pub const ATTENTION_Q8_0_KV_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_q8_0_kv.gfx1103.hip");
+
 /// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
 /// ABI as the generic conv1d split kernel plus a companion state update entry.
 #[cfg(feature = "deltanet")]
