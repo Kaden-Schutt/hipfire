@@ -1,5 +1,38 @@
 # NPU Kernel Results
 
+## Strix Halo NPU (aie2p) — the ceiling is FEEDING, not compute
+
+> **halo** box (RYZEN AI MAX+ 395, NPU Strix Halo **aie2p/npu2**, 4 compute rows
+> × 8 cols = 32 cores). Investigation: 2026-07-04. Full detail + reproducible
+> harness in `benchmarks/npu_gemm_tuning/` (`findings.md`, `tune.sh`).
+
+**The Strix Halo NPU is a real, un-throttled 58 TOPS int8 — but the hard part is
+feeding the cores, not the cores.** Evidence:
+
+- **Hardware peak = 58 TOPS** (`hipfire-xdna` resource_info: `npu_tops_max=58`,
+  `npu_clk_max=1800`). First-principles: 32 cores × 512 int8 MAC/mmul (8×8×8) ×
+  1.8 GHz ≈ 59 TMAC. `crates/hipfire-xdna/examples/npu_info.rs` dumps it live.
+- **NOT power/clock-throttled.** Under GEMM load, `default` pmode already boosts
+  to the full 58-TOPS budget with the AIE compute clock maxed at 1800 MHz.
+  `xrt-smi configure --pmode turbo` is a **confirmed no-op** (15.2 vs 15.7 TOPS).
+- **Real GEMM caps at ~12–27% of peak — it's feed/overhead-bound.** A tuned int8
+  matmul (mlir-aie `whole_array`) tops out at **15.7 TOPS (27%)**; every knob
+  explored (output-tile size is the only lever and it's L1-capped at 64 KB/core;
+  columns maxed; k/fifo_depth/OPT_PERF/pre-tiled-weights all no-op or marginal;
+  the `mm.cc` microkernel is AMD-optimal). Throughput scales with **output-tile
+  size** because it amortizes per-tile feed/sync overhead (DMA setup, C
+  accumulator load/store, objectFIFO acquire/release, software-pipeline
+  fill/drain) — the cores are **starved**, not saturated.
+- **AMD's own shipped kernel confirms it.** Built DynamicDispatch from source and
+  ran the production `mladf` int4 gemm on the NPU: flat **~7 TOPS** across LLM
+  shapes (a memory-bound weight-quant *decode* kernel) — *below* our int8
+  reference. No measured real GEMM — reference or production — approaches 58.
+
+**Takeaway:** treat 58 TOPS as a theoretical ceiling; budget **~15–16 TOPS int8**
+for a real Strix Halo GEMM. The lever for more is a better *dataflow* that keeps
+the cores fed (larger effective tiles / less per-tile overhead), not compute,
+power, columns, or datatype. Bottleneck = feeding the AIE array.
+
 ## Platform
 
 - **Machine**: nix1
