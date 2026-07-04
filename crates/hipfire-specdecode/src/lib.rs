@@ -15,5 +15,12 @@
 //! arch crate (e.g. `hipfire-arch-qwen35`) implements the trait for its own
 //! config/weights/scratch so no strategy crate ever names a concrete arch.
 //!
-//! Extraction is staged (see `docs/specdecode-extraction-plan.md`); this file is
-//! the P0 scaffold — the seam types land in P1 and the trait in P2.
+//! Extraction is staged (see `docs/specdecode-extraction-plan.md`). P1 lands the
+//! arch-agnostic policy/result/stats seam here; the `SpecDecodeTarget` trait and
+//! the generic `ModelSlot<T>` follow in P2.
+
+pub mod policy;
+pub mod stats;
+
+pub use policy::*;
+pub use stats::*;

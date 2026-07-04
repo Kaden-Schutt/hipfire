@@ -1428,6 +1428,7 @@ dependencies = [
  "hipfire-rdna",
  "hipfire-rocm",
  "hipfire-runtime",
+ "hipfire-specdecode",
  "libc",
  "libloading",
  "serde",
