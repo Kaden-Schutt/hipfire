@@ -10,7 +10,7 @@
 
 #![cfg(any())]
 
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GemvFamily, GemvParams, GemvVariant, WeightRef};
 use crate::types::DispatchError;

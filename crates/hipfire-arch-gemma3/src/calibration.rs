@@ -6,7 +6,7 @@ use hipfire_runtime::calibration::{collect_grouped, logsumexp, topk_logits, Cali
 use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weights::WeightTensor;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 pub use hipfire_runtime::calibration::CalibSummary;
 
@@ -127,7 +127,7 @@ fn run_text_forward_for_capture(
     let mut start_pos = 0usize;
     let mut result = Ok(());
     for chunk in tokens.chunks(microbatch) {
-        let x_batch = match gpu.alloc_tensor(&[chunk.len() * dim], rdna_compute::DType::F32) {
+        let x_batch = match gpu.alloc_tensor(&[chunk.len() * dim], hipfire_rdna::DType::F32) {
             Ok(t) => t,
             Err(e) => {
                 result = Err(e);

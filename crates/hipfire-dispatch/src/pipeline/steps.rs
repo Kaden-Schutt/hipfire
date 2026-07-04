@@ -4,7 +4,7 @@
 //! Op-list interpreter. Phase 2a: GEMV + a fused rmsnorm-rotate producer; empty
 //! fusion table (all per-op fallback).
 
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
@@ -590,9 +590,9 @@ pub fn execute_steps(
 fn oq4_gemv_into(
     gpu: &mut Gpu,
     w: &WeightRef,
-    x: &rdna_compute::GpuTensor,
+    x: &hipfire_rdna::GpuTensor,
     already_rotated: bool,
-    out: &rdna_compute::GpuTensor,
+    out: &hipfire_rdna::GpuTensor,
 ) -> Result<(), DispatchError> {
     oq4_gemv_into_impl(gpu, w, x, already_rotated, out, false)
 }
@@ -602,13 +602,13 @@ fn oq4_gemv_into(
 fn oq4_gemv_into_impl(
     gpu: &mut Gpu,
     w: &WeightRef,
-    x: &rdna_compute::GpuTensor,
+    x: &hipfire_rdna::GpuTensor,
     already_rotated: bool,
-    out: &rdna_compute::GpuTensor,
+    out: &hipfire_rdna::GpuTensor,
     residual: bool,
 ) -> Result<(), DispatchError> {
     const GROUP: usize = 256;
-    let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+    let hip = |e: hipfire_rdna::HipError| DispatchError::Hip(e.to_string());
     let (m, k) = (w.m, w.k);
     let ng = k / GROUP;
     gpu.ensure_mq_signs().map_err(hip)?;
@@ -616,7 +616,7 @@ fn oq4_gemv_into_impl(
 
     // Persistent scratch (aliased, no per-call alloc → hipGraph-capture-clean).
     // Stream-ordered reuse across sequential projections is safe (one stream).
-    let alias = |t: &rdna_compute::GpuTensor, n: usize, dt: DType| rdna_compute::GpuTensor {
+    let alias = |t: &hipfire_rdna::GpuTensor, n: usize, dt: DType| hipfire_rdna::GpuTensor {
         buf: unsafe { t.buf.alias() },
         shape: vec![n],
         dtype: dt,
@@ -634,7 +634,7 @@ fn oq4_gemv_into_impl(
         }
         Some(xr)
     };
-    let xr: &rdna_compute::GpuTensor = rotated.as_ref().unwrap_or(x);
+    let xr: &hipfire_rdna::GpuTensor = rotated.as_ref().unwrap_or(x);
 
     // OQ4+ decode (B=1): read the INTERLEAVED weight region ([f32 scale][128
     // nibbles]/group, one coalesced stream) appended after the split region by the
@@ -657,17 +657,17 @@ fn oq4_gemv_into_impl(
 fn oq8_gemv_into(
     gpu: &mut Gpu,
     w: &WeightRef,
-    x: &rdna_compute::GpuTensor,
+    x: &hipfire_rdna::GpuTensor,
     already_rotated: bool,
-    out: &rdna_compute::GpuTensor,
+    out: &hipfire_rdna::GpuTensor,
 ) -> Result<(), DispatchError> {
     const GROUP: usize = 256;
-    let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+    let hip = |e: hipfire_rdna::HipError| DispatchError::Hip(e.to_string());
     let (m, k) = (w.m, w.k);
     let ng = k / GROUP;
     gpu.ensure_mq_signs().map_err(hip)?;
     gpu.ensure_oq4_scratch().map_err(hip)?; // oq4_xr reused as the rotate target
-    let alias = |t: &rdna_compute::GpuTensor, n: usize, dt: DType| rdna_compute::GpuTensor {
+    let alias = |t: &hipfire_rdna::GpuTensor, n: usize, dt: DType| hipfire_rdna::GpuTensor {
         buf: unsafe { t.buf.alias() },
         shape: vec![n],
         dtype: dt,
@@ -683,7 +683,7 @@ fn oq8_gemv_into(
         }
         Some(xr)
     };
-    let xr: &rdna_compute::GpuTensor = rotated.as_ref().unwrap_or(x);
+    let xr: &hipfire_rdna::GpuTensor = rotated.as_ref().unwrap_or(x);
 
     // DECODE (B=1): consume the f32 rotated activation directly — dequant the
     // int8 weight inline (W4A16 decode, mq4-style). No quantize_act_oq8 launch.
@@ -767,7 +767,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 // + add, instead of gemm_oq8 at B=1 (16× wasteful) via WithResidual.
                 gpu.ensure_oq4_scratch()
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                let tmp = rdna_compute::GpuTensor {
+                let tmp = hipfire_rdna::GpuTensor {
                     buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
                     shape: vec![w.m],
                     dtype: DType::F32,
@@ -809,7 +809,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             if w.dtype == DType::Oq8G256 {
                 gpu.ensure_oq4_scratch()
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                let tmp = rdna_compute::GpuTensor {
+                let tmp = hipfire_rdna::GpuTensor {
                     buf: unsafe { gpu.oq4_ytmp.as_ref().unwrap().buf.alias() },
                     shape: vec![w.m],
                     dtype: DType::F32,
@@ -966,7 +966,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
 
 /// Borrow `out` from a `RmsnormAutomatic` step. The guard has already confirmed
 /// step[0] is RmsnormAutomatic; this panics in debug if called incorrectly.
-fn rmsnorm_out<'a>(step: &'a Step<'a>) -> &'a rdna_compute::GpuTensor {
+fn rmsnorm_out<'a>(step: &'a Step<'a>) -> &'a hipfire_rdna::GpuTensor {
     match step {
         Step::RmsnormAutomatic { out, .. } => out,
         _ => panic!("launch_fused: expected RmsnormAutomatic at step[0]"),
@@ -974,7 +974,7 @@ fn rmsnorm_out<'a>(step: &'a Step<'a>) -> &'a rdna_compute::GpuTensor {
 }
 
 /// Borrow `w` and `out` from a `Gemv` step.
-fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
+fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a hipfire_rdna::GpuTensor) {
     match step {
         Step::Gemv { w, out, .. } => (w, out),
         _ => panic!("launch_fused: expected Gemv step"),
@@ -1000,7 +1000,7 @@ fn launch_fused(
         // sub-projection (leaner than the batched WMMA which wastes 15/16 of its
         // N-tile at B=1; the WMMA fused kernel stays for batched prefill).
         KernelKey::FusedQkvzaOq4G256 => {
-            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let hip = |e: hipfire_rdna::HipError| DispatchError::Hip(e.to_string());
             let (wqkv, qkv) = gemv_weight_out(&steps[1]);
             let (wz, z) = gemv_weight_out(&steps[2]);
             let (wb, beta) = gemv_weight_out(&steps[3]);
@@ -1030,7 +1030,7 @@ fn launch_fused(
             Ok(())
         }
         KernelKey::FusedGateUpOq4G256 => {
-            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let hip = |e: hipfire_rdna::HipError| DispatchError::Hip(e.to_string());
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
@@ -1054,7 +1054,7 @@ fn launch_fused(
         // launch (the dominant decode launch cost). Weights are
         // [int8 M*K | f32 scales M*ng]; the kernel derives the scale ptr.
         KernelKey::FusedQkvzaOq8G256 => {
-            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let hip = |e: hipfire_rdna::HipError| DispatchError::Hip(e.to_string());
             let (wqkv, qkv) = gemv_weight_out(&steps[1]);
             let (wz, z) = gemv_weight_out(&steps[2]);
             let (wb, beta) = gemv_weight_out(&steps[3]);
@@ -1068,7 +1068,7 @@ fn launch_fused(
             Ok(())
         }
         KernelKey::FusedGateUpOq8G256 => {
-            let hip = |e: rdna_compute::HipError| DispatchError::Hip(e.to_string());
+            let hip = |e: hipfire_rdna::HipError| DispatchError::Hip(e.to_string());
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up) = gemv_weight_out(&steps[2]);
             let k = wg.k;
@@ -1371,12 +1371,12 @@ mod tests {
         // returns false even for otherwise-matching dtypes. We can't build full
         // Steps with real GPU tensors, so we test the guard logic directly with
         // the flag set.
-        use rdna_compute::feature_flags::FeatureFlags;
+        use hipfire_rdna::feature_flags::FeatureFlags;
         use std::sync::Arc;
         let mut flags = FeatureFlags::from_env_for_test("gfx1100");
         flags.force_unfused = true;
         let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
+            arch: hipfire_rdna::arch_caps::ArchCaps::new(
                 "gfx1100",
                 Arc::new(FeatureFlags::from_env_for_test("gfx1100")),
             ),
@@ -1528,12 +1528,12 @@ mod tests {
     fn q4k_q8_0_guards_reject_force_unfused() {
         // All three new guards must return false when force_unfused is set,
         // even for empty slices (the guard opens with the early-return).
-        use rdna_compute::feature_flags::FeatureFlags;
+        use hipfire_rdna::feature_flags::FeatureFlags;
         use std::sync::Arc;
         let mut flags = FeatureFlags::from_env_for_test("gfx1100");
         flags.force_unfused = true;
         let ctx = DispatchCtx {
-            arch: rdna_compute::arch_caps::ArchCaps::new(
+            arch: hipfire_rdna::arch_caps::ArchCaps::new(
                 "gfx1100",
                 Arc::new(FeatureFlags::from_env_for_test("gfx1100")),
             ),

@@ -11,7 +11,7 @@ use hipfire_runtime::arch::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;
 use crate::forward::{embed_token, forward_prefill_batch, forward_step, Gemma3State};
@@ -110,7 +110,7 @@ impl SimpleAr for Gemma3Backend {
                 .unwrap_or(128);
             for chunk in tokens.chunks(microbatch) {
                 let x_batch = gpu
-                    .alloc_tensor(&[chunk.len() * dim], rdna_compute::DType::F32)
+                    .alloc_tensor(&[chunk.len() * dim], hipfire_rdna::DType::F32)
                     .map_err(|e| format!("gemma3 prefill x_batch alloc: {e:?}"))?;
                 let result = (|| {
                     for (i, &t) in chunk.iter().enumerate() {

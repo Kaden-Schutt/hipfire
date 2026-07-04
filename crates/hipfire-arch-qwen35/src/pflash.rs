@@ -21,7 +21,7 @@ use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::path::Path;
 
 #[cfg(feature = "deltanet")]
@@ -1681,7 +1681,7 @@ fn token_md5(tokens: &[u32]) -> String {
 /// compress (e.g., budget would keep the whole prompt). Caller hands the
 /// `Compressed` variant's `token_ids` to the target prefill path.
 pub fn maybe_compress_prompt(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     state: &mut PflashState,
     cfg: &PflashConfig,
     token_ids: &[u32],

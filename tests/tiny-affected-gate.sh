@@ -183,7 +183,7 @@ while IFS= read -r path; do
             UNCOVERED_REASONS="${UNCOVERED_REASONS}${UNCOVERED_REASONS:+, }$path"
             ;;
 
-        kernels/*|crates/rdna-compute/*|crates/hipfire-runtime/src/weights.rs|\
+        kernels/*|crates/hipfire-rdna/*|crates/hipfire-runtime/src/weights.rs|\
         crates/hipfire-runtime/src/hfq.rs|crates/hipfire-runtime/src/arch.rs|\
         crates/hipfire-runtime/src/calibration.rs|\
         *gemv*|*gemm*|*wmma*|*mq4*|*mq3*|*mq6*|*hfq*|*quant*|*rmsnorm*|*rotate*|*forward*)

@@ -3,7 +3,7 @@
 //! input gradient (rotation by −angle). `x`/`out`: `[rows*d]` with
 //! rows = seq*n_heads; `pos`: `[seq]`.
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 pub fn rope_forward(
     gpu: &mut Gpu,

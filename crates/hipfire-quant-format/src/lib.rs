@@ -16,7 +16,7 @@
 //! depended on by both sides, makes the numbering authoritative in one place.
 //!
 //! This crate is intentionally GPU-agnostic: it owns the *byte identity* only.
-//! The byte → GPU `DType` mapping (which needs `rdna-compute`) lives in
+//! The byte → GPU `DType` mapping (which needs `hipfire-rdna`) lives in
 //! `hipfire_runtime::quant::dtype_for_quant_type`, which matches on the
 //! variants here.
 

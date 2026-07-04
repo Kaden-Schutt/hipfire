@@ -12,7 +12,7 @@ path = "src/main.rs"
 [features]
 default = ["arch-lfm2moe", "deltanet"]
 arch-lfm2moe = ["hipfire-arch-lfm2moe", "hipfire-serving-core/arch-lfm2moe"]
-deltanet = ["rdna-compute/deltanet", "hipfire-serving-core/deltanet"]
+deltanet = ["hipfire-rdna/deltanet", "hipfire-serving-core/deltanet"]
 
 [dependencies]
 hipfire-runtime    = { path = "../hipfire-runtime" }
@@ -41,7 +41,7 @@ hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 hipfire-train = { path = "../hipfire-train" }
 hip-bridge    = { path = "../hip-bridge" }
-rdna-compute  = { path = "../rdna-compute" }
+hipfire-rdna  = { path = "../hipfire-rdna" }
 base64.workspace = true
 serde_json    = "1"
 tracing.workspace = true

@@ -12,7 +12,7 @@
 use crate::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Zero-sized type marker for MiniMax-M2. Trait dispatch uses the type.
 pub struct MiniMaxM2;

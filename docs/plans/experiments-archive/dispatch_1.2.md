@@ -111,13 +111,13 @@ the external reviews:
 
 ### Commit 1 · `gpu.scratch` Paro rotation buffers + `FusedQkvParams` scratch field
 
-**Scope:** `rdna-compute` (scratch + helper) + dispatch crate (`FusedQkvParams`).
+**Scope:** `hipfire-rdna` (scratch + helper) + dispatch crate (`FusedQkvParams`).
 No behavior change yet. **`ResourceManager` is untouched (stays a stub).**
 
-1. **`rdna-compute/src/scratch.rs`:** add `pub paro_fused_scratch:
+1. **`hipfire-rdna/src/scratch.rs`:** add `pub paro_fused_scratch:
    Option<Vec<GpuTensor>>` to `ScratchState` (lazy, `None` by default — keeps
    GPU-free `for_test()`/no-GPU construction working).
-2. **`rdna-compute/src/gemv.rs`:** add `ensure_paro_fused_scratch(&mut self, k:
+2. **`hipfire-rdna/src/gemv.rs`:** add `ensure_paro_fused_scratch(&mut self, k:
    usize) -> HipResult<()>` — allocates 4 `[k]` F32 buffers on first use; on
    subsequent calls, grows any buffer whose `size()/4 < k` (gemini's impl). 4 covers
    QKVZA (4 explicit) and the 3-way `m3=0` synthesis; gate+up uses `buffers[0]` as
@@ -134,7 +134,7 @@ No behavior change yet. **`ResourceManager` is untouched (stays a stub).**
    `Vec`, pass as `rot_scratch`. No borrow held across the kernel launch → no
    `RefCell`, no lifetime conflict.
 
-**Verify:** `cargo test -p hipfire-dispatch -p rdna-compute`; scratch helper unit
+**Verify:** `cargo test -p hipfire-dispatch -p hipfire-rdna`; scratch helper unit
 test (allocates 4, reuses, grows on larger k, buffers distinct & non-aliasing).
 
 **Est:** ~90 lines (scratch field + helper + `FusedQkvParams` field + alias plumbing).

@@ -39,7 +39,7 @@
 //!   builds per-patch cos/sin tables in the
 //!   `[h-quarter, w-quarter, repeat]` layout dots.ocr expects.
 //! - Vision GPU primitives complete (2c-4):
-//!   * `rdna_compute::Gpu::rope_2d_halfsplit_f32` — applies the
+//!   * `hipfire_rdna::Gpu::rope_2d_halfsplit_f32` — applies the
 //!     precomputed tables to Q/K (kernel:
 //!     `kernels/src/rope_2d_halfsplit.hip`).
 //!   * `dots_ocr::linear_f16` / `linear_f16_no_bias` — F16 GEMM +

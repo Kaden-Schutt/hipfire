@@ -146,7 +146,7 @@ fn main() {
         prompt_tokens.len()
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     eprintln!("Loading weights...");
     let weights =
         qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
@@ -241,7 +241,7 @@ fn main() {
                               // Single 8 KB device buffer laid out as [1024 × u32 indices | 1024 × f32 values]
                               // so the whole top-K candidate set downloads in one memcpy_dtoh call.
     let topk_buf = gpu
-        .alloc_tensor(&[2 * TOPK], rdna_compute::DType::F32)
+        .alloc_tensor(&[2 * TOPK], hipfire_rdna::DType::F32)
         .unwrap();
     let mut topk_host = vec![0u8; 2 * TOPK * 4]; // reused across steps
 

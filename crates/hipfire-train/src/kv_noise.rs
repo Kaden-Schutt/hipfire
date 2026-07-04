@@ -22,7 +22,7 @@
 //!   HIPFIRE_KVNOISE_FOLD  cold merge group size (default 4)
 //!   HIPFIRE_KVNOISE_BITS  KVarN quant bits (default 4; 0 = skip quant)
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 #[derive(Clone, Copy)]
 pub struct KvNoiseCfg {

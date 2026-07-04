@@ -34,7 +34,7 @@ fn daemon_runtime_context(model: &LoadedModel) -> serde_json::Value {
 pub fn write_daemon_runtime_oneshot_evidence(
     dir: &str,
     model: &LoadedModel,
-    gpu: &rdna_compute::Gpu,
+    gpu: &hipfire_rdna::Gpu,
     id: &str,
     prompt_tokens: usize,
     emitted_tokens: usize,

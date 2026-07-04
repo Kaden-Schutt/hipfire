@@ -13,7 +13,7 @@
 
 use hipfire_train::ops::linear::{linear_backward_w, linear_forward};
 use hipfire_train::optim::AdamW;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Write;

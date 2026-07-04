@@ -12,7 +12,7 @@ use crate::weights::{
     weight_gemv, weight_gemv_prerotated, EmbeddingFormat, LayerWeights, WeightTensor,
 };
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

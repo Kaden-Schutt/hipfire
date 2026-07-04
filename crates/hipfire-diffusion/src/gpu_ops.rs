@@ -11,7 +11,7 @@
 use super::*;
 
 pub(crate) fn ensure_and_launch_diffusion_kernel(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     module_name: &str,
     source: &str,
     func_name: &str,
@@ -27,7 +27,7 @@ pub(crate) fn ensure_and_launch_diffusion_kernel(
 }
 
 pub(crate) fn rgb_tensor_to_u8_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     tensor: &CpuTensor,
 ) -> DiffusionResult<RgbImageBatch> {
     let [batch, channels, height, width] = shape4(tensor)?;
@@ -94,7 +94,7 @@ pub(crate) fn rgb_tensor_to_u8_hip_on_gpu(
 }
 
 pub(crate) fn rgb_batch_to_vae_tensor_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     batch: &RgbImageBatch,
 ) -> DiffusionResult<CpuTensor> {
     let bytes_per_image = batch
@@ -175,7 +175,7 @@ pub(crate) fn rgb_batch_to_vae_tensor_hip_on_gpu(
 }
 
 pub(crate) fn vae_moments_to_latents_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     moments: &CpuTensor,
     scaling_factor: f32,
 ) -> DiffusionResult<LatentBatch> {
@@ -257,7 +257,7 @@ pub(crate) fn vae_moments_to_latents_hip_on_gpu(
 }
 
 pub(crate) fn latent_mask_weights_from_rgb_batch_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     mask: &RgbImageBatch,
     latents: &LatentBatch,
 ) -> DiffusionResult<Vec<f32>> {
@@ -347,7 +347,7 @@ pub(crate) fn latent_mask_weights_from_rgb_batch_hip_on_gpu(
 }
 
 pub(crate) fn masked_rgb_batch_for_inpaint_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     image: &RgbImageBatch,
     mask: &RgbImageBatch,
 ) -> DiffusionResult<RgbImageBatch> {
@@ -449,7 +449,7 @@ pub(crate) fn masked_rgb_batch_for_inpaint_hip_on_gpu(
 }
 
 pub(crate) fn blend_latents_with_mask_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     generated: &LatentBatch,
     init: &LatentBatch,
     mask_weights: &[f32],
@@ -559,12 +559,12 @@ pub(crate) fn blend_latents_with_mask_hip_on_gpu(
 }
 
 pub(crate) fn launch_diffusion_vector_kernel(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     function_name: &str,
     source: &str,
     output_gpu: &hip_bridge::DeviceBuffer,
-    input_a: &rdna_compute::GpuTensor,
-    input_b: Option<&rdna_compute::GpuTensor>,
+    input_a: &hipfire_rdna::GpuTensor,
+    input_b: Option<&hipfire_rdna::GpuTensor>,
     n: i32,
     scalar: f32,
     synchronize: bool,
@@ -598,7 +598,7 @@ pub(crate) fn launch_diffusion_vector_kernel(
 /// host immediately. Resident ops pass `false` and rely on the single
 /// end-of-chain sync in [`download_resident`], collapsing ~200 per-op syncs per
 /// denoise step into one.
-fn maybe_synchronize(gpu: &mut rdna_compute::Gpu, synchronize: bool) -> DiffusionResult<()> {
+fn maybe_synchronize(gpu: &mut hipfire_rdna::Gpu, synchronize: bool) -> DiffusionResult<()> {
     if synchronize {
         gpu.hip
             .device_synchronize()
@@ -608,7 +608,7 @@ fn maybe_synchronize(gpu: &mut rdna_compute::Gpu, synchronize: bool) -> Diffusio
 }
 
 pub(crate) fn download_f32_buffer(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     buffer: &hip_bridge::DeviceBuffer,
     elements: usize,
 ) -> DiffusionResult<Vec<f32>> {
@@ -627,7 +627,7 @@ pub(crate) fn download_f32_buffer(
 }
 
 pub(crate) fn scale_model_input_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     sample: &[f32],
     scale: f32,
 ) -> DiffusionResult<Vec<f32>> {
@@ -671,7 +671,7 @@ pub(crate) fn scale_model_input_hip_on_gpu(
 }
 
 pub(crate) fn cfg_guidance_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     negative_pred: &[f32],
     positive_pred: &[f32],
     cfg_scale: f32,
@@ -727,7 +727,7 @@ pub(crate) fn cfg_guidance_hip_on_gpu(
 }
 
 pub(crate) fn tensor_add_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     a: &CpuTensor,
     b: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
@@ -784,7 +784,7 @@ pub(crate) fn tensor_add_hip_on_gpu(
 }
 
 pub(crate) fn maybe_center_unet_input_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     sample: &CpuTensor,
     center_input_sample: bool,
 ) -> DiffusionResult<CpuTensor> {
@@ -843,10 +843,10 @@ pub(crate) fn i32_kernel_dim(label: &str, value: usize) -> DiffusionResult<i32> 
 }
 
 pub(crate) fn launch_diffusion_layout_kernel(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     function_name: &str,
-    input_gpu: &rdna_compute::GpuTensor,
-    bias_gpu: Option<&rdna_compute::GpuTensor>,
+    input_gpu: &hipfire_rdna::GpuTensor,
+    bias_gpu: Option<&hipfire_rdna::GpuTensor>,
     output_gpu: &hip_bridge::DeviceBuffer,
     output_elements: usize,
     channels: usize,
@@ -882,7 +882,7 @@ pub(crate) fn launch_diffusion_layout_kernel(
 }
 
 pub(crate) fn add_channel_bias_nchw_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
     bias: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
@@ -937,7 +937,7 @@ pub(crate) fn add_channel_bias_nchw_hip_on_gpu(
 }
 
 pub(crate) fn nchw_to_bsc_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
     let [batch, channels, height, width] = shape4(input)?;
@@ -986,7 +986,7 @@ pub(crate) fn nchw_to_bsc_hip_on_gpu(
 }
 
 pub(crate) fn bsc_to_nchw_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
     batch: usize,
     channels: usize,
@@ -1043,10 +1043,10 @@ pub(crate) fn bsc_to_nchw_hip_on_gpu(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_diffusion_concat_kernel(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     function_name: &str,
-    a_gpu: &rdna_compute::GpuTensor,
-    b_gpu: &rdna_compute::GpuTensor,
+    a_gpu: &hipfire_rdna::GpuTensor,
+    b_gpu: &hipfire_rdna::GpuTensor,
     output_gpu: &hip_bridge::DeviceBuffer,
     kernargs_tail: impl FnOnce(&mut hip_bridge::KernargBlob) -> DiffusionResult<()>,
     output_elements: usize,
@@ -1076,7 +1076,7 @@ pub(crate) fn launch_diffusion_concat_kernel(
 }
 
 pub(crate) fn concat_channels_nchw_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     a: &CpuTensor,
     b: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
@@ -1140,7 +1140,7 @@ pub(crate) fn concat_channels_nchw_hip_on_gpu(
 }
 
 pub(crate) fn concat_last_dim_2d_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     a: &CpuTensor,
     b: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
@@ -1159,7 +1159,7 @@ pub(crate) fn concat_last_dim_2d_hip_on_gpu(
 }
 
 pub(crate) fn concat_last_dim_3d_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     a: &CpuTensor,
     b: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
@@ -1185,7 +1185,7 @@ pub(crate) fn concat_last_dim_3d_hip_on_gpu(
 }
 
 pub(crate) fn concat_last_dim_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     a: &CpuTensor,
     b: &CpuTensor,
     output_shape: &[usize],
@@ -1238,7 +1238,7 @@ pub(crate) fn concat_last_dim_hip_on_gpu(
 }
 
 pub(crate) fn conv2d_nchw_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -1352,7 +1352,7 @@ pub(crate) fn conv2d_nchw_hip_on_gpu(
 }
 
 pub(crate) fn group_norm_nchw_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
     weight: &CpuTensor,
     bias: &CpuTensor,
@@ -1438,7 +1438,7 @@ pub(crate) fn group_norm_nchw_hip_on_gpu(
 }
 
 pub(crate) fn silu_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
     let elements = checked_shape_elements("SiLU input", &input.shape)?;
@@ -1491,7 +1491,7 @@ pub(crate) fn silu_hip_on_gpu(
 }
 
 pub(crate) fn quick_gelu_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
     let elements = checked_shape_elements("QuickGELU input", &input.shape)?;
@@ -1546,7 +1546,7 @@ pub(crate) fn quick_gelu_hip_on_gpu(
 }
 
 pub(crate) fn clip_token_position_embeddings_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     token_embedding: &CpuTensor,
     position_embedding: &CpuTensor,
     tokens: &[u32],
@@ -1646,7 +1646,7 @@ pub(crate) fn clip_token_position_embeddings_hip_on_gpu(
 }
 
 pub(crate) fn upsample_nearest2d_nchw_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
     scale: usize,
 ) -> DiffusionResult<CpuTensor> {
@@ -1720,7 +1720,7 @@ pub(crate) fn upsample_nearest2d_nchw_hip_on_gpu(
 }
 
 pub(crate) fn linear_optional_bias_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -1807,7 +1807,7 @@ pub(crate) fn linear_optional_bias_hip_on_gpu(
 }
 
 pub(crate) fn layer_norm_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
     weight: &CpuTensor,
     bias: &CpuTensor,
@@ -1885,7 +1885,7 @@ pub(crate) fn layer_norm_hip_on_gpu(
 }
 
 pub(crate) fn softmax_rows_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
     let (rows, cols) = input.rows_cols()?;
@@ -1941,7 +1941,7 @@ pub(crate) fn softmax_rows_hip_on_gpu(
 }
 
 pub(crate) fn scaled_dot_product_attention_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     q: &CpuTensor,
     k: &CpuTensor,
     v: &CpuTensor,
@@ -2025,7 +2025,7 @@ pub(crate) fn scaled_dot_product_attention_hip_on_gpu(
 }
 
 pub(crate) fn clip_causal_self_attention_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     q: &CpuTensor,
     k: &CpuTensor,
     v: &CpuTensor,
@@ -2113,7 +2113,7 @@ pub(crate) fn clip_causal_self_attention_hip_on_gpu(
 }
 
 pub(crate) fn geglu_gate_3d_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     projected: &CpuTensor,
 ) -> DiffusionResult<CpuTensor> {
     let [batch, seq, width] = shape3(projected)?;
@@ -2180,7 +2180,7 @@ pub(crate) fn geglu_gate_3d_hip_on_gpu(
 }
 
 pub(crate) fn timestep_embedding_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     timesteps: &[f32],
     dim: usize,
     flip_sin_to_cos: bool,
@@ -2261,7 +2261,7 @@ pub(crate) fn scheduler_prediction_type_id(prediction_type: SchedulerPredictionT
 }
 
 pub(crate) fn euler_step_hip_on_gpu(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     sample: &[f32],
     model_output: &[f32],
     sigma: f32,
@@ -2356,7 +2356,7 @@ pub(crate) fn euler_step_hip_on_gpu(
 // bottom. Weights/bias still come from the resident `RocmWeightCache`.
 //
 // Output buffers are allocated through `Gpu::alloc_tensor`, which is backed by
-// the recycling `GpuPool` (`crates/rdna-compute/src/pool.rs`) — so there is no
+// the recycling `GpuPool` (`crates/hipfire-rdna/src/pool.rs`) — so there is no
 // per-op `hipMalloc`/`hipFree` churn and, because `GpuTensor` has no `Drop`,
 // the caller is responsible for `free_resident`-ing every intermediate it no
 // longer needs (a missed free leaks device memory over a run). A `*_resident`
@@ -2368,18 +2368,18 @@ pub(crate) fn euler_step_hip_on_gpu(
 
 /// Allocate a pooled, device-resident F32 output tensor of `shape`.
 pub(crate) fn alloc_resident_f32(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     shape: &[usize],
-) -> DiffusionResult<rdna_compute::GpuTensor> {
-    gpu.alloc_tensor(shape, rdna_compute::DType::F32)
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    gpu.alloc_tensor(shape, hipfire_rdna::DType::F32)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
 }
 
 /// Return a resident intermediate to the pool. Call this on every `GpuTensor`
 /// the forward chain stops needing — `GpuTensor` has no `Drop`.
 pub(crate) fn free_resident(
-    gpu: &mut rdna_compute::Gpu,
-    tensor: rdna_compute::GpuTensor,
+    gpu: &mut hipfire_rdna::Gpu,
+    tensor: hipfire_rdna::GpuTensor,
 ) -> DiffusionResult<()> {
     gpu.free_tensor(tensor)
         .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
@@ -2389,9 +2389,9 @@ pub(crate) fn free_resident(
 /// for UNet skip snapshots, where the host path clones an activation that is
 /// then mutated further down the chain.
 pub(crate) fn clone_resident(
-    gpu: &mut rdna_compute::Gpu,
-    src: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    src: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let elements = checked_shape_elements("resident clone", &src.shape)?;
     let bytes = elements
         .checked_mul(std::mem::size_of::<f32>())
@@ -2410,8 +2410,8 @@ pub(crate) fn clone_resident(
 /// calls are skipped (the ops run in submission order on one stream), so we sync
 /// once here before reading device memory back to the host.
 pub(crate) fn download_resident(
-    gpu: &mut rdna_compute::Gpu,
-    tensor: &rdna_compute::GpuTensor,
+    gpu: &mut hipfire_rdna::Gpu,
+    tensor: &hipfire_rdna::GpuTensor,
 ) -> DiffusionResult<CpuTensor> {
     let elements = checked_shape_elements("resident download", &tensor.shape)?;
     gpu.hip
@@ -2446,14 +2446,14 @@ fn resident_dims3(shape: &[usize], label: &str) -> DiffusionResult<[usize; 3]> {
 /// (already-resident) activation flows through. Mirrors `conv2d_nchw_hip_on_gpu`
 /// minus the input upload and output download.
 pub(crate) fn conv2d_nchw_resident(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
-    input: &rdna_compute::GpuTensor,
+    input: &hipfire_rdna::GpuTensor,
     weight: &CpuTensor,
     bias: Option<&CpuTensor>,
     padding: usize,
     stride: usize,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     if stride == 0 {
         return Err(DiffusionError::InvalidRequest(
             "conv2d stride must be positive".to_string(),
@@ -2536,14 +2536,14 @@ pub(crate) fn conv2d_nchw_resident(
 /// the F32 reference only to ~F16 tolerance, not 1e-5. This is the standard
 /// SD/DiT inference tradeoff and is gated accordingly.
 pub(crate) fn conv2d_nchw_wmma_resident(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
-    input: &rdna_compute::GpuTensor,
+    input: &hipfire_rdna::GpuTensor,
     weight: &CpuTensor,
     bias: Option<&CpuTensor>,
     padding: usize,
     stride: usize,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     if stride == 0 {
         return Err(DiffusionError::InvalidRequest(
             "conv2d stride must be positive".to_string(),
@@ -2663,14 +2663,14 @@ pub(crate) fn conv2d_nchw_wmma_resident(
 
 /// Device-resident NCHW group-norm. Weight/bias are uploaded once via `cache`.
 pub(crate) fn group_norm_nchw_resident(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
-    input: &rdna_compute::GpuTensor,
+    input: &hipfire_rdna::GpuTensor,
     weight: &CpuTensor,
     bias: &CpuTensor,
     groups: usize,
     eps: f32,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let [batch, channels, height, width] = resident_dims4(&input.shape, "group_norm input")?;
     if groups == 0 || channels % groups != 0 {
         return Err(DiffusionError::InvalidMetadata(format!(
@@ -2753,9 +2753,9 @@ pub(crate) fn group_norm_nchw_resident(
 
 /// Device-resident SiLU.
 pub(crate) fn silu_resident(
-    gpu: &mut rdna_compute::Gpu,
-    input: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let elements = checked_shape_elements("SiLU input", &input.shape)?;
     let n = i32_kernel_dim("SiLU elements", elements)?;
     gpu.bind_thread()
@@ -2782,10 +2782,10 @@ pub(crate) fn silu_resident(
 
 /// Device-resident elementwise add (`a + b`). Shapes must match.
 pub(crate) fn tensor_add_resident(
-    gpu: &mut rdna_compute::Gpu,
-    a: &rdna_compute::GpuTensor,
-    b: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    a: &hipfire_rdna::GpuTensor,
+    b: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     if a.shape != b.shape {
         return Err(DiffusionError::InvalidMetadata(format!(
             "tensor_add shape mismatch {:?} vs {:?}",
@@ -2816,10 +2816,10 @@ pub(crate) fn tensor_add_resident(
 /// step 4); kept here with the rest of the resident op set.
 #[allow(dead_code)]
 pub(crate) fn add_channel_bias_nchw_resident(
-    gpu: &mut rdna_compute::Gpu,
-    input: &rdna_compute::GpuTensor,
-    bias: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    bias: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let [batch, channels, height, width] = resident_dims4(&input.shape, "channel-bias input")?;
     if bias.shape.as_slice() != [batch, channels] {
         return Err(DiffusionError::InvalidMetadata(format!(
@@ -2848,10 +2848,10 @@ pub(crate) fn add_channel_bias_nchw_resident(
 
 /// Device-resident nearest-neighbour 2× (or `scale`×) upsample in NCHW.
 pub(crate) fn upsample_nearest2d_nchw_resident(
-    gpu: &mut rdna_compute::Gpu,
-    input: &rdna_compute::GpuTensor,
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
     scale: usize,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     if scale == 0 {
         return Err(DiffusionError::InvalidRequest(
             "upsample scale must be positive".to_string(),
@@ -2896,9 +2896,9 @@ pub(crate) fn upsample_nearest2d_nchw_resident(
 
 /// Device-resident NCHW→BSC layout change ([b,c,h,w] → [b,h*w,c]).
 pub(crate) fn nchw_to_bsc_resident(
-    gpu: &mut rdna_compute::Gpu,
-    input: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let [batch, channels, height, width] = resident_dims4(&input.shape, "NCHW-to-BSC input")?;
     let seq = height
         .checked_mul(width)
@@ -2925,13 +2925,13 @@ pub(crate) fn nchw_to_bsc_resident(
 
 /// Device-resident BSC→NCHW layout change ([b,h*w,c] → [b,c,h,w]).
 pub(crate) fn bsc_to_nchw_resident(
-    gpu: &mut rdna_compute::Gpu,
-    input: &rdna_compute::GpuTensor,
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
     batch: usize,
     channels: usize,
     height: usize,
     width: usize,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let [input_batch, seq, input_channels] = resident_dims3(&input.shape, "BSC-to-NCHW input")?;
     if input_batch != batch || input_channels != channels || seq != height * width {
         return Err(DiffusionError::InvalidMetadata(format!(
@@ -2963,12 +2963,12 @@ pub(crate) fn bsc_to_nchw_resident(
 /// `[b, seq, in]` resident input; the output preserves the leading dims with the
 /// last dim replaced by `out_features`. Weight/bias are resident via `cache`.
 pub(crate) fn linear_optional_bias_resident(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
-    input: &rdna_compute::GpuTensor,
+    input: &hipfire_rdna::GpuTensor,
     weight: &CpuTensor,
     bias: Option<&CpuTensor>,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let (out_features, in_features) = weight.rows_cols()?;
     let last = input.shape.last().copied().ok_or_else(|| {
         DiffusionError::InvalidMetadata("linear input must have at least one dim".to_string())
@@ -3017,13 +3017,13 @@ pub(crate) fn linear_optional_bias_resident(
     if precision != LinearPrecision::F16 && in_features % 256 == 0 && gpu.arch_caps.has_wmma_w32() {
         let w_ptr = cache.resident_oq4_ptr(gpu, weight, out_features, in_features)?;
         let packed_len = oq4_arch_combined_len(out_features, in_features);
-        let w_view = rdna_compute::GpuTensor {
+        let w_view = hipfire_rdna::GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_ptr, packed_len) },
             shape: vec![packed_len],
-            dtype: rdna_compute::DType::Raw,
+            dtype: hipfire_rdna::DType::Raw,
         };
         let x_rot = gpu
-            .alloc_tensor(&[total], rdna_compute::DType::F32)
+            .alloc_tensor(&[total], hipfire_rdna::DType::F32)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         gpu.rotate_x_mq_batched(input, &x_rot, in_features, rows)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -3087,7 +3087,7 @@ pub(crate) fn linear_optional_bias_resident(
         // and the F32 weight as the X operand (cast lane-side) yields
         // Y[rows, out] directly — the linear's natural layout, no transpose.
         let act_f16 = gpu
-            .alloc_tensor(&[total], rdna_compute::DType::F16)
+            .alloc_tensor(&[total], hipfire_rdna::DType::F16)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         let mut convert_args = hip_bridge::KernargBlob::new();
         convert_args.push_ptr(input.buf.as_ptr());
@@ -3113,10 +3113,10 @@ pub(crate) fn linear_optional_bias_resident(
             .ok_or_else(|| {
                 DiffusionError::InvalidMetadata("linear weight size overflows".to_string())
             })?;
-        let weight_view = rdna_compute::GpuTensor {
+        let weight_view = hipfire_rdna::GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
             shape: vec![out_features, in_features],
-            dtype: rdna_compute::DType::F32,
+            dtype: hipfire_rdna::DType::F32,
         };
         gpu.gemm_f16_wmma(
             &act_f16,
@@ -3183,12 +3183,12 @@ pub(crate) fn linear_optional_bias_resident(
 
 /// Device-resident scaled-dot-product attention over 3D `[b, seq, hidden]` q/k/v.
 pub(crate) fn scaled_dot_product_attention_resident(
-    gpu: &mut rdna_compute::Gpu,
-    q: &rdna_compute::GpuTensor,
-    k: &rdna_compute::GpuTensor,
-    v: &rdna_compute::GpuTensor,
+    gpu: &mut hipfire_rdna::Gpu,
+    q: &hipfire_rdna::GpuTensor,
+    k: &hipfire_rdna::GpuTensor,
+    v: &hipfire_rdna::GpuTensor,
     heads: usize,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let [batch, q_seq, hidden] = resident_dims3(&q.shape, "SDPA query")?;
     let [k_batch, k_seq, k_hidden] = resident_dims3(&k.shape, "SDPA key")?;
     let [v_batch, v_seq, v_hidden] = resident_dims3(&v.shape, "SDPA value")?;
@@ -3283,13 +3283,13 @@ pub(crate) fn scaled_dot_product_attention_resident(
 /// 3D `[b, seq, width]` resident input; the output keeps the same shape.
 /// Weight/bias are resident via `cache`.
 pub(crate) fn layer_norm_resident(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
-    input: &rdna_compute::GpuTensor,
+    input: &hipfire_rdna::GpuTensor,
     weight: &CpuTensor,
     bias: &CpuTensor,
     eps: f32,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let width = input.shape.last().copied().ok_or_else(|| {
         DiffusionError::InvalidMetadata("layer_norm input must have at least one dim".to_string())
     })?;
@@ -3338,9 +3338,9 @@ pub(crate) fn layer_norm_resident(
 /// Device-resident GeGLU gate over a 3D `[b, seq, width]` projection; output is
 /// `[b, seq, width/2]` (`x * gelu(gate)`).
 pub(crate) fn geglu_gate_3d_resident(
-    gpu: &mut rdna_compute::Gpu,
-    projected: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    projected: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let [batch, seq, width] = resident_dims3(&projected.shape, "GeGLU projection")?;
     if width % 2 != 0 {
         return Err(DiffusionError::InvalidMetadata(format!(
@@ -3380,10 +3380,10 @@ pub(crate) fn geglu_gate_3d_resident(
 /// Device-resident NCHW channel concatenation ([n,ca,h,w] ++ [n,cb,h,w] ->
 /// [n,ca+cb,h,w]).
 pub(crate) fn concat_channels_nchw_resident(
-    gpu: &mut rdna_compute::Gpu,
-    a: &rdna_compute::GpuTensor,
-    b: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    a: &hipfire_rdna::GpuTensor,
+    b: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let [batch, a_channels, height, width] = resident_dims4(&a.shape, "channel concat left")?;
     let [b_batch, b_channels, b_height, b_width] =
         resident_dims4(&b.shape, "channel concat right")?;
@@ -3422,9 +3422,9 @@ pub(crate) fn concat_channels_nchw_resident(
 
 /// Device-resident QuickGELU (`x * sigmoid(1.702 * x)`).
 pub(crate) fn quick_gelu_resident(
-    gpu: &mut rdna_compute::Gpu,
-    input: &rdna_compute::GpuTensor,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let elements = checked_shape_elements("QuickGELU input", &input.shape)?;
     let n = i32_kernel_dim("QuickGELU elements", elements)?;
     gpu.bind_thread()
@@ -3451,12 +3451,12 @@ pub(crate) fn quick_gelu_resident(
 
 /// Device-resident CLIP causal self-attention over 2D `[seq, hidden]` q/k/v.
 pub(crate) fn clip_causal_self_attention_resident(
-    gpu: &mut rdna_compute::Gpu,
-    q: &rdna_compute::GpuTensor,
-    k: &rdna_compute::GpuTensor,
-    v: &rdna_compute::GpuTensor,
+    gpu: &mut hipfire_rdna::Gpu,
+    q: &hipfire_rdna::GpuTensor,
+    k: &hipfire_rdna::GpuTensor,
+    v: &hipfire_rdna::GpuTensor,
     n_heads: usize,
-) -> DiffusionResult<rdna_compute::GpuTensor> {
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
     let (seq, hidden) = match q.shape.as_slice() {
         [s, h] => (*s, *h),
         other => {

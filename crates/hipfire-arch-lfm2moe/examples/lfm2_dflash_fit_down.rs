@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let end_block = skip_blocks + eval_blocks;
 
     let pkg = HfqPackage::open(&draft)?;
-    let mut gpu = rdna_compute::Gpu::init()?;
+    let mut gpu = hipfire_rdna::Gpu::init()?;
     eprintln!("gpu: {}", gpu.arch);
 
     let mut target_hfq = HfqFile::open(&model)?;

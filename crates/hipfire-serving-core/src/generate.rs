@@ -62,7 +62,7 @@ use crate::session::{
 #[allow(clippy::too_many_arguments)]
 pub fn generate_mtp(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -479,7 +479,7 @@ pub fn generate_mtp(
 /// chat-completions contract).
 pub fn generate_dflash(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -1150,7 +1150,7 @@ pub fn generate_dflash(
 /// into this path at load time.
 pub fn generate_multi(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
     pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
     stdout: &mut std::io::Stdout,
@@ -1847,8 +1847,8 @@ pub fn generate_multi(
 /// etc.) when the loaded model calls for them.
 pub fn generate(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    drafter_gpu: Option<&mut rdna_compute::Gpu>,
+    gpu: &mut hipfire_rdna::Gpu,
+    drafter_gpu: Option<&mut hipfire_rdna::Gpu>,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2489,7 +2489,7 @@ pub fn generate(
             .map(|s| s.cursor.seq_pos)
             .unwrap_or(m.active.cursor.seq_pos);
         if seq_pos == 0 {
-            let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
+            let compress_gpu: &mut hipfire_rdna::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
             // Sibling-device drafter: bind its device before compress, then
             // restore the target binding for decode. No-op when shared.
             compress_gpu.bind_thread_or_warn();

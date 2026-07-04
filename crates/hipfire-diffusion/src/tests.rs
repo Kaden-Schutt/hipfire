@@ -3313,7 +3313,7 @@ fn cpu_linear_layer_norm_and_softmax_are_stable() {
     assert!((quick_gelu(1.0) - 0.845795).abs() < 1e-5);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for QuickGELU routing test: {error}");
         } else {
             let cpu = tensor_map(&input, quick_gelu);
@@ -4873,7 +4873,7 @@ fn unet_text_time_embedding_projects_pooled_text_and_time_ids() {
     assert!((output.data[1] - silu(-1.0)).abs() < 1e-6);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!(
                 "skip: ROCm GPU unavailable for UNet text-time embedding routing test: {error}"
             );
@@ -4977,7 +4977,7 @@ fn resnet_block_loads_from_hfq_and_preserves_residual_shape() {
     assert_eq!(output.data, input.data);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for VAE ResNet context test: {error}");
         } else {
             let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -5058,7 +5058,7 @@ fn unet_resnet_block_loads_time_projection_from_hfq() {
     assert_ne!(out_a.data, out_b.data);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for UNet ResNet context test: {error}");
         } else {
             let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -5201,7 +5201,7 @@ fn unet_down_block_forward_collects_skips_and_downsamples() {
     assert_eq!(hidden.shape, vec![1, 2, 2, 2]);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for UNet down block context test: {error}");
         } else {
             let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -5326,7 +5326,7 @@ fn unet_up_block_pops_skip_and_upsamples() {
     assert_eq!(&output.data[0..4], &[1.0, 1.0, 2.0, 2.0]);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for UNet up block context test: {error}");
         } else {
             let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -5552,7 +5552,7 @@ fn unet_mid_block_loads_attention_and_resnets_from_hfq() {
     assert!(output.data.iter().all(|value| value.is_finite()));
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for UNet mid block context test: {error}");
         } else {
             let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -5749,7 +5749,7 @@ fn native_unet_forward_runs_synthetic_graph() {
     assert!(output.data.iter().all(|value| value.is_finite()));
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for UNet forward routing test: {error}");
         } else {
             let hip = unet
@@ -6167,7 +6167,7 @@ fn native_unet_resident_path_matches_cpu_reference_with_cross_attention() {
     let cpu_output = unet.forward(&sample, &[0.5], &encoder).unwrap();
     assert!(cpu_output.data.iter().all(|value| value.is_finite()));
 
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for resident UNet cross-attention test: {error}");
     } else {
         let resident = unet
@@ -6196,7 +6196,7 @@ fn native_unet_resident_path_matches_cpu_reference_with_cross_attention() {
 /// post_quant/proj/shortcut shape, K = in_channels).
 #[test]
 fn wmma_conv2d_resident_matches_cpu_reference_to_f16_tolerance() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for WMMA conv test: {error}");
@@ -6276,7 +6276,7 @@ fn wmma_conv2d_resident_matches_cpu_reference_to_f16_tolerance() {
 /// bias. This isolates the op the chain tests exercise only indirectly.
 #[test]
 fn wmma_linear_resident_matches_cpu_reference_to_f16_tolerance() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for WMMA linear test: {error}");
@@ -6356,7 +6356,7 @@ fn wmma_linear_resident_matches_cpu_reference_to_f16_tolerance() {
 /// not a multiple of the wave width, and a single-head VAE-style shape.
 #[test]
 fn flash_attention_resident_matches_cpu_reference() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for flash attention test: {error}");
@@ -6586,7 +6586,7 @@ fn oq4_w4a16_gpu_matches_cpu_reference_when_gpu_is_available() {
     // Phase 4a: validate the W4A16 quantized-compute chain on-device:
     // oq4g256 weight -> pack_oq4_arch_combined -> rotate_x_mq_batched(act)
     // -> gemm_oq4_grouped_f16_wmma, vs the full-precision CPU Y = X @ Wᵀ.
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("skip: ROCm GPU unavailable for oq4 W4A16 parity: {e}");
@@ -6622,11 +6622,11 @@ fn oq4_w4a16_gpu_matches_cpu_reference_when_gpu_is_available() {
     let w_dev = gpu.upload_raw(&packed, &[packed.len()]).unwrap();
     let x_dev = gpu.upload_f32(&x, &[batch * k]).unwrap();
     let x_rot = gpu
-        .alloc_tensor(&[batch * k], rdna_compute::DType::F32)
+        .alloc_tensor(&[batch * k], hipfire_rdna::DType::F32)
         .unwrap();
     gpu.rotate_x_mq_batched(&x_dev, &x_rot, k, batch).unwrap();
     let y_dev = gpu
-        .alloc_tensor(&[batch * m], rdna_compute::DType::F32)
+        .alloc_tensor(&[batch * m], hipfire_rdna::DType::F32)
         .unwrap();
     gpu.gemm_oq4_grouped_f16_wmma(&w_dev, &x_rot, &y_dev, m, k, batch, 256)
         .unwrap();
@@ -6658,12 +6658,12 @@ fn oq4_gpu_parity_fixture(
     k: usize,
     batch: usize,
 ) -> Option<(
-    rdna_compute::Gpu,
-    rdna_compute::GpuTensor,
-    rdna_compute::GpuTensor,
+    hipfire_rdna::Gpu,
+    hipfire_rdna::GpuTensor,
+    hipfire_rdna::GpuTensor,
     Vec<f32>,
 )> {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("skip: ROCm GPU unavailable: {e}");
@@ -6697,7 +6697,7 @@ fn oq4_gpu_parity_fixture(
     let w_dev = gpu.upload_raw(&packed, &[packed.len()]).unwrap();
     let x_dev = gpu.upload_f32(&x, &[batch * k]).unwrap();
     let x_rot = gpu
-        .alloc_tensor(&[batch * k], rdna_compute::DType::F32)
+        .alloc_tensor(&[batch * k], hipfire_rdna::DType::F32)
         .unwrap();
     gpu.rotate_x_mq_batched(&x_dev, &x_rot, k, batch).unwrap();
     Some((gpu, w_dev, x_rot, yref))
@@ -6722,7 +6722,7 @@ fn oq4_w4a8_gpu_matches_cpu_reference_when_gpu_is_available() {
         return;
     };
     let y_dev = gpu
-        .alloc_tensor(&[batch * m], rdna_compute::DType::F32)
+        .alloc_tensor(&[batch * m], hipfire_rdna::DType::F32)
         .unwrap();
     gpu.gemm_oq4_residual_mmq(&w_dev, &x_rot, &y_dev, m, k, batch, false)
         .unwrap();
@@ -6744,7 +6744,7 @@ fn oq4_w4a4_gpu_matches_cpu_reference_when_gpu_is_available() {
         return;
     };
     let y_dev = gpu
-        .alloc_tensor(&[batch * m], rdna_compute::DType::F32)
+        .alloc_tensor(&[batch * m], hipfire_rdna::DType::F32)
         .unwrap();
     gpu.gemm_oq4_grouped_act_batched(&w_dev, &x_rot, &y_dev, m, k, batch)
         .unwrap();
@@ -6935,7 +6935,7 @@ fn rgb_tensor_to_u8_maps_model_range_to_pixels() {
 
 #[test]
 fn hip_rgb_tensor_to_u8_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for RGB kernel parity test: {error}");
@@ -6956,7 +6956,7 @@ fn hip_rgb_tensor_to_u8_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_vae_boundary_transforms_match_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for VAE boundary kernel parity test: {error}");
@@ -7006,7 +7006,7 @@ fn hip_vae_boundary_transforms_match_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_inpaint_mask_ops_match_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for inpaint mask kernel parity test: {error}");
@@ -7085,7 +7085,7 @@ fn hip_inpaint_mask_ops_match_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_euler_step_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for Euler kernel parity test: {error}");
@@ -7131,7 +7131,7 @@ fn hip_euler_step_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_denoise_vector_ops_match_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for denoise vector parity test: {error}");
@@ -7168,7 +7168,7 @@ fn hip_denoise_vector_ops_match_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_denoise_loop_runtime_options_route_vector_stages_when_gpu_is_available() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for denoise loop routing test: {error}");
         return;
     }
@@ -7261,7 +7261,7 @@ fn hip_denoise_loop_runtime_options_route_vector_stages_when_gpu_is_available() 
 
 #[test]
 fn hip_denoise_vector_runtime_context_reuses_single_gpu() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for denoise context reuse test: {error}");
         return;
     }
@@ -7328,7 +7328,7 @@ fn hip_denoise_vector_runtime_context_reuses_single_gpu() {
 
 #[test]
 fn hip_center_unet_input_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for centered UNet input parity test: {error}");
@@ -7353,7 +7353,7 @@ fn hip_center_unet_input_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_timestep_embedding_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for timestep embedding parity test: {error}");
@@ -7384,7 +7384,7 @@ fn hip_timestep_embedding_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_conv2d_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for Conv2D kernel parity test: {error}");
@@ -7432,7 +7432,7 @@ fn hip_conv2d_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_group_norm_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for GroupNorm kernel parity test: {error}");
@@ -7468,7 +7468,7 @@ fn hip_group_norm_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_silu_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for SiLU kernel parity test: {error}");
@@ -7497,7 +7497,7 @@ fn hip_silu_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for tensor-add kernel parity test: {error}");
@@ -7531,7 +7531,7 @@ fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_add_channel_bias_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for channel-bias kernel parity test: {error}");
@@ -7563,7 +7563,7 @@ fn hip_add_channel_bias_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_nchw_bsc_layout_transforms_match_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for layout kernel parity test: {error}");
@@ -7589,7 +7589,7 @@ fn hip_nchw_bsc_layout_transforms_match_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_concat_channels_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for channel-concat kernel parity test: {error}");
@@ -7617,7 +7617,7 @@ fn hip_concat_channels_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_concat_last_dim_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for last-dim concat kernel parity test: {error}");
@@ -7651,7 +7651,7 @@ fn hip_concat_last_dim_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_upsample_nearest2d_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!(
@@ -7678,7 +7678,7 @@ fn hip_upsample_nearest2d_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_linear_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for linear kernel parity test: {error}");
@@ -7725,7 +7725,7 @@ fn hip_linear_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_layer_norm_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for LayerNorm kernel parity test: {error}");
@@ -7761,7 +7761,7 @@ fn hip_layer_norm_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_softmax_rows_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for softmax kernel parity test: {error}");
@@ -7796,7 +7796,7 @@ fn hip_softmax_rows_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_sdpa_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for SDPA kernel parity test: {error}");
@@ -7838,7 +7838,7 @@ fn hip_sdpa_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_geglu_gate_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for GeGLU gate parity test: {error}");
@@ -7866,7 +7866,7 @@ fn hip_geglu_gate_matches_cpu_reference_when_gpu_is_available() {
 
 #[test]
 fn hip_clip_causal_attention_matches_cpu_reference_when_gpu_is_available() {
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for CLIP causal attention parity test: {error}");
@@ -8290,7 +8290,7 @@ fn blend_latents_with_mask_preserves_black_and_uses_generated_white() {
 
 #[test]
 fn hip_img2img_boundary_helpers_reuse_single_runtime_context() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for img2img boundary reuse test: {error}");
         return;
     }
@@ -8531,7 +8531,7 @@ fn runtime_options_default_decode_uses_cpu_rgb_conversion() {
 
 #[test]
 fn runtime_options_rocm_hybrid_decode_matches_cpu_when_gpu_is_available() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for hybrid decode test: {error}");
         return;
     }
@@ -8555,7 +8555,7 @@ fn runtime_options_rocm_hybrid_decode_matches_cpu_when_gpu_is_available() {
 
 #[test]
 fn generate_batch_runtime_options_surface_rocm_hybrid_runtime_when_gpu_is_available() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for hybrid generation test: {error}");
         return;
     }
@@ -9465,7 +9465,7 @@ fn inpainting_fill_latent_nothing_zeros_masked_latents() {
 
 #[test]
 fn generate_img2img_runtime_options_route_vae_mask_boundaries_when_gpu_is_available() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for hybrid img2img generation test: {error}");
         return;
     }
@@ -9653,7 +9653,7 @@ fn diffusion_pipeline_open_hfq_generates_png_with_native_tiny_qwen_transformer()
 
 #[test]
 fn hip_preflight_reports_clip_token_position_embedding_probe() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for diffusion preflight test: {error}");
         return;
     }
@@ -10329,7 +10329,7 @@ fn native_vae_decoder_decodes_synthetic_latents_to_rgb8() {
     assert_eq!(image.data.len(), 12);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for VAE decoder routing test: {error}");
         } else {
             let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -10524,7 +10524,7 @@ fn native_vae_decoder_resident_path_matches_cpu_reference() {
     let cpu_decoded = decoder.decode_latents(&latents).unwrap();
     assert!(cpu_decoded.data.iter().all(|value| value.is_finite()));
 
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for resident VAE decode test: {error}");
     } else {
         let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -10630,7 +10630,7 @@ fn native_vae_encoder_encodes_synthetic_image_to_latents() {
     assert!(latents.data.iter().all(|value| value.is_finite()));
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for VAE encoder routing test: {error}");
         } else {
             let mut runtime_context = DiffusionGenerationRuntimeContext::new(
@@ -10772,7 +10772,7 @@ fn unet_time_embedding_loads_from_hfq() {
     assert!(output.data[0] > 0.73 && output.data[2] == 0.0);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for UNet time embedding routing test: {error}");
         } else {
             let hip = time_embedding
@@ -10834,7 +10834,7 @@ fn attention_layer_runs_biasless_self_and_cross_attention() {
     assert_eq!(cross_out.data, vec![0.25, 0.75, 0.25, 0.75]);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for attention routing test: {error}");
         } else {
             let runtime_options = DiffusionGenerationRuntimeOptions::rocm_hybrid(0);
@@ -10927,7 +10927,7 @@ fn transformer_block_loads_from_hfq_and_preserves_residual_with_zero_weights() {
     assert_eq!(output.data, hidden.data);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for transformer block routing test: {error}");
         } else {
             let hip = block
@@ -11016,7 +11016,7 @@ fn transformer2d_model_loads_from_hfq_and_preserves_residual_with_zero_weights()
     assert_eq!(output.data, input.data);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for transformer2d routing test: {error}");
         } else {
             let hip = model
@@ -11076,7 +11076,7 @@ fn synthetic_clip_text_encoder_forward_is_finite() {
     assert!(encoded.data.iter().any(|value| value.abs() > 0.001));
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for CLIP encoder routing test: {error}");
         } else {
             let hip = encoder
@@ -11093,7 +11093,7 @@ fn synthetic_clip_text_encoder_forward_is_finite() {
 
 #[test]
 fn hip_clip_text_encoder_runtime_context_reuses_single_gpu() {
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for CLIP context reuse test: {error}");
         return;
     }
@@ -11230,7 +11230,7 @@ fn hip_clip_text_encoder_resident_matches_cpu_reference_with_nonzero_weights() {
     // embedding + final-norm, confirming attention/MLP actually contributed.
     assert!(cpu.data.iter().any(|value| value.abs() > 0.01));
 
-    if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+    if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
         eprintln!("skip: ROCm GPU unavailable for resident CLIP encode test: {error}");
     } else {
         let resident = encoder
@@ -11264,7 +11264,7 @@ fn hip_clip_token_position_embeddings_match_cpu_reference() {
     let tokens = [3, 0, 2];
     let cpu =
         clip_token_position_embeddings(&token_embedding, &position_embedding, &tokens).unwrap();
-    let mut gpu = match rdna_compute::Gpu::init_with_device(0) {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
         Err(error) => {
             eprintln!("skip: ROCm GPU unavailable for CLIP embedding routing test: {error}");
@@ -11321,7 +11321,7 @@ fn clip_text_encoder_pools_eos_hidden_state_and_applies_projection() {
     assert!((pooled[1] + 3.0).abs() < 1e-4);
 
     {
-        if let Err(error) = rdna_compute::Gpu::init_with_device(0) {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
             eprintln!("skip: ROCm GPU unavailable for CLIP pooled routing test: {error}");
         } else {
             let (hip_hidden, hip_pooled) = encoder

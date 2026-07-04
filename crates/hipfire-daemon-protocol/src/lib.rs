@@ -583,7 +583,7 @@ mod tests {
             "tokens": 5,
             "tok_s": 10.5,
             "finish_reason": "stop",
-            "backend_path": "hip_rdna_compute"
+            "backend_path": "hip_hipfire_rdna"
         }))
         .unwrap();
 
@@ -591,7 +591,7 @@ mod tests {
             panic!("expected done response");
         };
         assert_eq!(done.id, "req-1");
-        assert_eq!(done.extra["backend_path"], "hip_rdna_compute");
+        assert_eq!(done.extra["backend_path"], "hip_hipfire_rdna");
     }
 
     #[test]

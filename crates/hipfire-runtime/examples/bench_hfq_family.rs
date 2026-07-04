@@ -5,7 +5,7 @@
 //! Benchmark the complete HFQ family: Q2, Q3, Q4, Q6, Q8 at G256.
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     let peak_bw = 448.0f64;
 
     let sizes: &[(usize, usize, &str)] =
@@ -95,9 +95,9 @@ fn main() {
             let total = m * row_bytes;
             let d_a = gpu.upload_raw(&vec![0x55u8; total], &[total]).unwrap();
             let d_x = gpu.upload_f32(&vec![0.01f32; k], &[k]).unwrap();
-            let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+            let d_y = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
-            let run = |gpu: &mut rdna_compute::Gpu| match fmt.id {
+            let run = |gpu: &mut hipfire_rdna::Gpu| match fmt.id {
                 2 => gpu.gemv_hfq2g256(&d_a, &d_x, &d_y, m, k).unwrap(),
                 3 => gpu.gemv_hfq3g256(&d_a, &d_x, &d_y, m, k).unwrap(),
                 4 => gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).unwrap(),

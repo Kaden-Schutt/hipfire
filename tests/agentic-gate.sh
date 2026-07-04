@@ -221,7 +221,7 @@ if [ ! -x "$EXE" ]; then
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
-               crates/rdna-compute/src/dispatch.rs; do
+               crates/hipfire-rdna/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1; break
         fi

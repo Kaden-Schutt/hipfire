@@ -11,7 +11,7 @@
 
 use crate::weight::LinearWeight;
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 #[inline]
 fn relu2(x: f32) -> f32 {

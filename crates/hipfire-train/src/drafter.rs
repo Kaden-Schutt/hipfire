@@ -25,7 +25,7 @@ use crate::ops::linear::{linear_backward_w, linear_backward_x, linear_forward};
 use crate::ops::pflash_score::pflash_score_backward;
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use crate::ops::rope::{rope_backward, rope_forward};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {
     let n: usize = t.shape.iter().product();

@@ -117,7 +117,7 @@ pub struct Qwen35RequestSessionState {
     /// use the `kv_cache()`/`dn_state()` accessors; disjoint-borrow hot-path
     /// sites access `sequence_state.kv` / `sequence_state.recurrent` directly.
     pub sequence_state: SequenceState,
-    pub logits: rdna_compute::GpuTensor,
+    pub logits: hipfire_rdna::GpuTensor,
     pub prefilled_generated_suffix_len: usize,
     pub allocation_epoch: u64,
 }
@@ -154,10 +154,10 @@ impl Qwen35RequestSessionState {
     /// Deep-copy one GPU tensor (fresh device allocation + device-to-device
     /// copy) — used to snapshot session state without aliasing the live buffers.
     pub fn clone_gpu_tensor(
-        gpu: &mut rdna_compute::Gpu,
-        tensor: &rdna_compute::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        tensor: &hipfire_rdna::GpuTensor,
         label: &str,
-    ) -> Result<rdna_compute::GpuTensor, String> {
+    ) -> Result<hipfire_rdna::GpuTensor, String> {
         let buffer_size = tensor.buf.size();
         gpu.bind_thread()
             .map_err(|e| format!("clone qwen35 checkpoint {label} bind gpu: {e:?}"))?;
@@ -168,7 +168,7 @@ impl Qwen35RequestSessionState {
         gpu.hip
             .memcpy_dtod_at(&buf, 0, &tensor.buf, 0, buffer_size)
             .map_err(|e| format!("clone qwen35 checkpoint {label} copy: {e:?}"))?;
-        Ok(rdna_compute::GpuTensor {
+        Ok(hipfire_rdna::GpuTensor {
             buf,
             shape: tensor.shape.clone(),
             dtype: tensor.dtype,
@@ -178,10 +178,10 @@ impl Qwen35RequestSessionState {
     /// [`clone_gpu_tensor`] over a slice of tensors (e.g. the per-layer KV
     /// vectors), returning a freshly-allocated `Vec`.
     pub fn clone_gpu_tensor_vec(
-        gpu: &mut rdna_compute::Gpu,
-        tensors: &[rdna_compute::GpuTensor],
+        gpu: &mut hipfire_rdna::Gpu,
+        tensors: &[hipfire_rdna::GpuTensor],
         label: &str,
-    ) -> Result<Vec<rdna_compute::GpuTensor>, String> {
+    ) -> Result<Vec<hipfire_rdna::GpuTensor>, String> {
         tensors
             .iter()
             .enumerate()
@@ -190,7 +190,7 @@ impl Qwen35RequestSessionState {
     }
 
     pub fn clone_kv_cache(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         kv: &kv::KvCache,
     ) -> Result<kv::KvCache, String> {
         Ok(kv::KvCache {
@@ -234,7 +234,7 @@ impl Qwen35RequestSessionState {
     }
 
     pub fn clone_dn_state(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         dn: &DeltaNetState,
     ) -> Result<DeltaNetState, String> {
         Ok(DeltaNetState {
@@ -250,7 +250,7 @@ impl Qwen35RequestSessionState {
     /// DeltaNet + logits cloned), for branching a conversation without
     /// disturbing the source.
     pub fn fork_from(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         source: &Qwen35RequestSessionState,
     ) -> Result<Self, String> {
         let kv = Self::clone_kv_cache(gpu, source.kv_cache())?;
@@ -274,7 +274,7 @@ impl Qwen35RequestSessionState {
     /// ready to receive another session.
     pub fn take_from_loaded(
         m: &mut LoadedModel,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
     ) -> Result<Self, String> {
         if m.active.sequence_state.is_none() {
             return Err("qwen35 session missing decode state".to_string());
@@ -317,7 +317,7 @@ impl Qwen35RequestSessionState {
     pub fn restore_into_loaded(
         self,
         m: &mut LoadedModel,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
     ) -> Result<(), String> {
         let allocation_epoch = self.allocation_epoch;
         if let Some(scratch) = m.q35_scratch.as_ref() {
@@ -345,7 +345,7 @@ impl Qwen35RequestSessionState {
         Ok(())
     }
 
-    pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+    pub fn reset(&mut self, gpu: &mut hipfire_rdna::Gpu) {
         self.cursor.seq_pos = 0;
         self.cursor.conversation_tokens.clear();
         self.prefix_hash = None;
@@ -376,7 +376,7 @@ pub struct Lfm2RequestSessionState {
 #[cfg(feature = "arch-lfm2moe")]
 impl Lfm2RequestSessionState {
     pub fn new(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         config: &lfm2moe::config::Lfm2MoeConfig,
         max_seq: usize,
         physical_cap: usize,
@@ -433,7 +433,7 @@ impl Lfm2RequestSessionState {
         m.lfm2_registry.allocation_epoch = self.allocation_epoch;
     }
 
-    pub fn reset(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    pub fn reset(&mut self, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
         self.state.reset(gpu)?;
         self.cursor.seq_pos = 0;
         self.cursor.conversation_tokens.clear();
@@ -445,7 +445,7 @@ impl Lfm2RequestSessionState {
     }
 
     fn clone_device_buffer(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         buf: &hip_bridge::DeviceBuffer,
         label: &str,
     ) -> Result<hip_bridge::DeviceBuffer, String> {
@@ -463,7 +463,7 @@ impl Lfm2RequestSessionState {
     }
 
     fn clone_state(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         state: &lfm2moe::lfm2moe::Lfm2MoeState,
     ) -> Result<lfm2moe::lfm2moe::Lfm2MoeState, String> {
         Ok(lfm2moe::lfm2moe::Lfm2MoeState {
@@ -563,7 +563,7 @@ impl Lfm2RequestSessionState {
     }
 
     pub fn fork_from(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         source: &Lfm2RequestSessionState,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -1251,7 +1251,7 @@ pub fn message_worker_id(msg: &serde_json::Value) -> String {
 /// resident-session map so a different worker/session can take the slot.
 pub fn park_active_model(
     model: &mut Option<LoadedModel>,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     active_worker_id: &str,
     resident_models: &mut std::collections::HashMap<String, LoadedModel>,
 ) -> Result<(), String> {
@@ -1321,7 +1321,7 @@ pub fn activate_model_worker(
     worker_id: &str,
     active_worker_id: &mut String,
     model: &mut Option<LoadedModel>,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     resident_models: &mut std::collections::HashMap<String, LoadedModel>,
 ) -> Result<bool, String> {
     if active_worker_id == worker_id {
@@ -1388,7 +1388,7 @@ pub fn resident_worker_status_json(
     })
 }
 
-pub fn daemon_accelerator_inventory(gpu: &mut rdna_compute::Gpu) -> AcceleratorInventory {
+pub fn daemon_accelerator_inventory(gpu: &mut hipfire_rdna::Gpu) -> AcceleratorInventory {
     let hip_runtime = gpu
         .hip
         .runtime_version()
@@ -1497,7 +1497,7 @@ pub fn describe_loaded_sequence_state(
 
 pub fn release_loaded_model_sequence_state_handles(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     handles: &[ParsedSequenceStateHandle],
 ) -> Result<(usize, usize), String> {
     let arena_backend = loaded_model_state_arena_backend(m);
@@ -1535,7 +1535,7 @@ pub fn release_loaded_model_sequence_state_handles(
 pub fn release_loaded_sequence_state_handles(
     model: &mut Option<LoadedModel>,
     resident_models: &mut HashMap<String, LoadedModel>,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     handles: &[ParsedSequenceStateHandle],
 ) -> Result<(usize, usize), String> {
     let mut released = 0usize;
@@ -1557,7 +1557,7 @@ pub fn release_loaded_sequence_state_handles(
 /// were actually resident.
 pub fn qwen35_release_sessions(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session_ids: &[String],
 ) -> Result<usize, String> {
     if !is_qwen35_family_arch_id(m.arch_id) || m.pp != 1 {
@@ -1623,7 +1623,7 @@ pub(crate) fn qwen35_mixer_profile(layer_types: &[LayerType]) -> MixerProfile {
 /// the live one before prefill.
 pub fn qwen35_allocate_session_state(
     m: &LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<Qwen35RequestSessionState, String> {
     let config = m
         .q35_config
@@ -1735,7 +1735,7 @@ pub fn qwen35_allocate_session_state(
         prefix_hash: None,
         sequence_state,
         logits: gpu
-            .alloc_tensor(&[config.vocab_size], rdna_compute::DType::F32)
+            .alloc_tensor(&[config.vocab_size], hipfire_rdna::DType::F32)
             .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?,
         prefilled_generated_suffix_len: 0,
         allocation_epoch: next_qwen35_state_allocation_epoch(),
@@ -1746,7 +1746,7 @@ pub fn qwen35_allocate_session_state(
 /// without giving up the slot (checkpoint without swap).
 pub fn qwen35_save_active_session(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<(), String> {
     if let Some(active_id) = m.q35_registry.active_session_id.take() {
         let session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
@@ -1761,7 +1761,7 @@ pub fn qwen35_save_active_session(
 /// resuming its multi-turn KV/DeltaNet state.
 pub fn qwen35_activate_session(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session_id: &str,
 ) -> Result<bool, String> {
     if m.q35_registry.active_session_id.as_deref() == Some(session_id) {
@@ -1793,7 +1793,7 @@ pub fn lfm2_save_active_session(m: &mut LoadedModel) -> Result<(), String> {
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_allocate_session_state(
     m: &LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<Lfm2RequestSessionState, String> {
     let config = m
         .lfm2moe_config
@@ -1805,7 +1805,7 @@ pub fn lfm2_allocate_session_state(
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_activate_session(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session_id: &str,
 ) -> Result<bool, String> {
     if m.lfm2_registry.active_session_id.as_deref() == Some(session_id) {
@@ -1825,7 +1825,7 @@ pub fn lfm2_activate_session(
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_reset_active_session(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<(), String> {
     let state = m
         .active
@@ -1854,7 +1854,7 @@ pub fn lfm2_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_release_sessions(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session_ids: &[String],
 ) -> Result<usize, String> {
     if m.arch_id != ARCH_ID_LFM2_MOE || m.pp != 1 {
@@ -1905,7 +1905,7 @@ pub fn lfm2_validate_prefix_hash(
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_fork_session_state(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
     lfm2_save_active_session(m)?;
@@ -1934,7 +1934,7 @@ pub fn lfm2_fork_session_state(
 #[cfg(feature = "arch-lfm2moe")]
 pub fn lfm2_checkpoint_session_state(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     request: SequenceStateCheckpointRequest<'_>,
 ) -> Result<(), String> {
     if request.source_session_id == request.dest_session_id {
@@ -1980,7 +1980,7 @@ pub fn lfm2_checkpoint_session_state(
 /// conversation can branch without disturbing the original.
 pub fn qwen35_fork_session_state(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
     if request.source_session_id == request.dest_session_id {
@@ -2023,7 +2023,7 @@ pub fn qwen35_fork_session_state(
 /// mismatched checkpoint requests).
 pub fn qwen35_checkpoint_session_state(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     request: SequenceStateCheckpointRequest<'_>,
 ) -> Result<(), String> {
     if request.source_session_id == request.dest_session_id {
@@ -2088,7 +2088,7 @@ pub fn qwen35_validate_prefix_hash(
 /// freeing the allocation — a cheap O(1) restart for a fresh turn.
 pub fn qwen35_reset_active_session(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<(), String> {
     let mut session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
         .map_err(|e| format!("failed to reset qwen35 session: {e}"))?;
@@ -2171,7 +2171,7 @@ pub fn sequence_state_arena_is_session_resident(
 pub fn sequence_state_arena_release_sessions(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session_ids: &[String],
 ) -> Result<usize, String> {
     #[cfg(feature = "arch-lfm2moe")]
@@ -2191,7 +2191,7 @@ pub fn sequence_state_arena_release_sessions(
 pub fn sequence_state_arena_activate_session(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session_id: &str,
 ) -> Result<bool, String> {
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "activate_session")?;
@@ -2207,7 +2207,7 @@ pub fn sequence_state_arena_activate_session(
 pub fn sequence_state_arena_reset_active_session(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<(), String> {
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "reset_active_session")?;
     match arena_backend {
@@ -2236,7 +2236,7 @@ pub fn sequence_state_arena_active_logical_position(
 pub fn sequence_state_arena_fork_session_state(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
     #[cfg(feature = "arch-lfm2moe")]
@@ -2256,7 +2256,7 @@ pub fn sequence_state_arena_fork_session_state(
 pub fn sequence_state_arena_checkpoint_session_state(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     request: SequenceStateCheckpointRequest<'_>,
 ) -> Result<(), String> {
     #[cfg(feature = "arch-lfm2moe")]
@@ -2281,7 +2281,7 @@ pub fn qwen35_restore_or_error(
     stdout: &mut std::io::Stdout,
     id: &str,
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session: Qwen35RequestSessionState,
 ) {
     if let Err(e) = session.restore_into_loaded(m, gpu) {
@@ -2356,7 +2356,7 @@ impl SessionServingBackend for LoadedModel {
 
     fn activate_session(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         session_id: &str,
     ) -> Result<bool, String> {
         if is_qwen35_family_arch_id(self.arch_id) {
@@ -2369,7 +2369,7 @@ impl SessionServingBackend for LoadedModel {
         Err(session_op_unsupported(self.arch_id, "activate_session"))
     }
 
-    fn save_active_session(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    fn save_active_session(&mut self, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
         if is_qwen35_family_arch_id(self.arch_id) {
             return qwen35_save_active_session(self, gpu);
         }
@@ -2381,7 +2381,7 @@ impl SessionServingBackend for LoadedModel {
         Err(session_op_unsupported(self.arch_id, "save_active_session"))
     }
 
-    fn reset_active_session(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    fn reset_active_session(&mut self, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
         if is_qwen35_family_arch_id(self.arch_id) {
             return qwen35_reset_active_session(self, gpu);
         }
@@ -2394,7 +2394,7 @@ impl SessionServingBackend for LoadedModel {
 
     fn release_sessions(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         session_ids: &[String],
     ) -> Result<usize, String> {
         if is_qwen35_family_arch_id(self.arch_id) {
@@ -2409,7 +2409,7 @@ impl SessionServingBackend for LoadedModel {
 
     fn fork_session_state(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         request: SequenceStateForkRequest<'_>,
     ) -> Result<(), String> {
         if is_qwen35_family_arch_id(self.arch_id) {
@@ -2424,7 +2424,7 @@ impl SessionServingBackend for LoadedModel {
 
     fn checkpoint_session_state(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         request: SequenceStateCheckpointRequest<'_>,
     ) -> Result<(), String> {
         if is_qwen35_family_arch_id(self.arch_id) {

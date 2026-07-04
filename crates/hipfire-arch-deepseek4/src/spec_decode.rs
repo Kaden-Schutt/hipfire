@@ -32,7 +32,7 @@
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{self};
 use crate::grammar;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// One acceptance window of speculative decoding.
 #[derive(Debug, Clone)]
@@ -87,7 +87,7 @@ pub fn speculative_decode_step_with_pbs(
     pbs: &forward::PrefillBatchScratch,
     last_token: u32,
     last_position: u32,
-    last_hidden: Option<&rdna_compute::GpuTensor>,
+    last_hidden: Option<&hipfire_rdna::GpuTensor>,
     k: usize,
 ) -> Result<SpecStepResult, String> {
     speculative_decode_impl(
@@ -113,7 +113,7 @@ pub fn speculative_decode_step_with_pbs_grammar(
     pbs: &forward::PrefillBatchScratch,
     last_token: u32,
     last_position: u32,
-    last_hidden: Option<&rdna_compute::GpuTensor>,
+    last_hidden: Option<&hipfire_rdna::GpuTensor>,
     k: usize,
     matcher: &mut grammar::Matcher,
     decoded_vocab: &[String],
@@ -145,7 +145,7 @@ pub fn speculative_decode_step(
     gpu: &mut Gpu,
     last_token: u32,
     last_position: u32,
-    last_hidden: Option<&rdna_compute::GpuTensor>,
+    last_hidden: Option<&hipfire_rdna::GpuTensor>,
     k: usize,
 ) -> Result<SpecStepResult, String> {
     speculative_decode_impl(
@@ -171,7 +171,7 @@ fn speculative_decode_impl(
     cached_pbs: Option<&forward::PrefillBatchScratch>,
     last_token: u32,
     last_position: u32,
-    last_hidden: Option<&rdna_compute::GpuTensor>,
+    last_hidden: Option<&hipfire_rdna::GpuTensor>,
     k: usize,
     mut grammar: Option<SpecGrammar<'_>>,
 ) -> Result<SpecStepResult, String> {
@@ -197,7 +197,7 @@ fn speculative_decode_impl(
     // duration of this function; mtp_forward writes ONLY to scratch
     // buffers + mtp_last_hidden (which is what step 1+ reads), never
     // to the `last_hidden` caller-passed tensor.
-    let h_n_ptr: *const rdna_compute::GpuTensor = match last_hidden {
+    let h_n_ptr: *const hipfire_rdna::GpuTensor = match last_hidden {
         Some(h) => h as *const _,
         None => {
             let h = state.mtp_last_hidden.as_ref().ok_or_else(|| {
@@ -251,7 +251,7 @@ fn speculative_decode_impl(
         // these GpuTensors live in stable allocations and are only
         // READ by the GEMV chain inside mtp_forward (which writes to
         // distinct scratch + state.mtp_last_hidden each iteration).
-        let hidden_ptr: *const rdna_compute::GpuTensor = if step == 0 {
+        let hidden_ptr: *const hipfire_rdna::GpuTensor = if step == 0 {
             h_n_ptr
         } else {
             state.mtp_last_hidden.as_ref().ok_or_else(|| {
@@ -261,7 +261,7 @@ fn speculative_decode_impl(
                 )
             })? as *const _
         };
-        let hidden: &rdna_compute::GpuTensor = unsafe { &*hidden_ptr };
+        let hidden: &hipfire_rdna::GpuTensor = unsafe { &*hidden_ptr };
         let mut logits =
             forward::mtp_forward(cfg, weights, state, gpu, hidden, next_token, position)?;
         if let (Some(g), Some(matcher)) = (grammar.as_mut(), draft_matcher.as_ref()) {
@@ -382,7 +382,7 @@ fn speculative_decode_impl(
                 .unwrap_or(true);
             if need_realloc {
                 state.mtp_last_hidden = Some(
-                    gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
+                    gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], hipfire_rdna::DType::F32)
                         .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?,
                 );
             }

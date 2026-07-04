@@ -6,7 +6,7 @@
 //! drafter trained against a target's block ranking is drop-in for PFlash's
 //! existing scoring. Backward gives the gradient w.r.t. K for training.
 
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 /// Forward: `k` `[n_pos*kv_dim]` → `scores` `[n_blocks]`. `last_pos` is usually
 /// `n_pos-1`. `n_blocks` defaults to `n_pos/block_size` at the call site.

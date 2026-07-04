@@ -7,7 +7,7 @@
 //! Determines: which acc[j] in which thread corresponds to which C[m][n].
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     let src = r#"
 #include <hip/hip_runtime.h>
@@ -34,7 +34,7 @@ __global__ void probe_wmma(float* __restrict__ out) {
     gpu.ensure_kernel_public("probe_wmma", src, "probe_wmma")
         .unwrap();
 
-    let d_out = gpu.zeros(&[32 * 8], rdna_compute::DType::F32).unwrap();
+    let d_out = gpu.zeros(&[32 * 8], hipfire_rdna::DType::F32).unwrap();
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(d_out.buf.as_ptr());
     gpu.launch_kernel_blob(

@@ -30,12 +30,12 @@ All four Phase A acceptance gates per the plan are cleared:
 
 - `kernels/src/gemm_mq4g256_lloyd_residual_wmma.hip` — the production
   kernel (fp16-LDS, K2 unroll, single `float8_t acc` per lane).
-- `crates/rdna-compute/src/kernels.rs` — `GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC`
+- `crates/hipfire-rdna/src/kernels.rs` — `GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_SRC`
   constant.
-- `crates/rdna-compute/src/dispatch.rs` — `gemm_mq4g256_lloyd_residual_wmma`
+- `crates/hipfire-rdna/src/dispatch.rs` — `gemm_mq4g256_lloyd_residual_wmma`
   Rust binding (gfx1100 family + gfx1151; gfx12 sibling deferred to
   Phase B1).
-- `crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs`
+- `crates/hipfire-rdna/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs`
   — single-variant parity + per-shape timing across 8 canonical shapes.
 
 No `is_batchable_la` change. No matcher updates in `qwen35.rs`. The
@@ -178,7 +178,7 @@ C perf validation.
 
 ```sh
 # Build:
-cargo build --release -p rdna-compute --example test_gemm_mq4g256_lloyd_residual_wmma
+cargo build --release -p hipfire-rdna --example test_gemm_mq4g256_lloyd_residual_wmma
 
 # Run (under GPU lock):
 source scripts/gpu-lock.sh && gpu_acquire "phase-a-mq4-lloyd-wmma" && \

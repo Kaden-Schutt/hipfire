@@ -6,7 +6,7 @@
 //!   hipfire gpu-lock acquire "gemm-bench"
 //!   cargo run -p hipfire-train --release --example gemm_f32_train_bench
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init().expect("Gpu::init failed");

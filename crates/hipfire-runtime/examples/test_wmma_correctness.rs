@@ -41,7 +41,7 @@
 //! errors on the order of the value magnitude itself).
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     eprintln!("GPU: {}", gpu.arch);
 
     let m = 16usize;

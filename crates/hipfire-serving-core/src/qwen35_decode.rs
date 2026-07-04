@@ -346,7 +346,7 @@ pub fn emit_generate_batch_prefill_unsupported(
 /// point the request loop calls.
 pub fn run_generate_batch_decode_step_qwen35(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
@@ -513,8 +513,8 @@ pub fn qwen35_decode_internal_parity_enabled() -> bool {
 /// Compact debug summary of a logits vector (argmax + a few stats) for the
 /// internal-parity diagnostics.
 pub fn qwen35_logits_debug_summary(
-    gpu: &rdna_compute::Gpu,
-    logits: &rdna_compute::GpuTensor,
+    gpu: &hipfire_rdna::Gpu,
+    logits: &hipfire_rdna::GpuTensor,
     token_a: u32,
     token_b: u32,
 ) -> String {
@@ -540,8 +540,8 @@ pub fn qwen35_logits_debug_summary(
 /// package the per-session [`Qwen35DecodeTokenOutcome`] (token + stop state).
 pub fn qwen35_decode_token_outcome(
     m: &LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    logits: &rdna_compute::GpuTensor,
+    gpu: &mut hipfire_rdna::Gpu,
+    logits: &hipfire_rdna::GpuTensor,
     max_tokens_remaining: usize,
     im_end_token: Option<u32>,
 ) -> Result<Qwen35DecodeTokenOutcome, String> {
@@ -578,7 +578,7 @@ pub fn qwen35_decode_token_outcome(
 /// per-session forward — the correctness baseline and the universal fallback.
 pub fn qwen35_decode_step_serial_reference(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
@@ -666,7 +666,7 @@ pub fn qwen35_decode_step_serial_reference(
 
 pub fn qwen35_decode_step_fused_dense_layer_chunked(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     _stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
@@ -680,7 +680,7 @@ pub fn qwen35_decode_step_fused_dense_layer_chunked(
 
 pub fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     _stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
@@ -694,7 +694,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
 
 pub fn qwen35_decode_step_fused_dense_native_chunks(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
     chunk_size: usize,
@@ -727,7 +727,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunks(
 
 pub fn qwen35_decode_step_fused_grouped_moe_native_chunks(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
     chunk_size: usize,
@@ -766,7 +766,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunks(
 
 pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
     chunk: &[GenerateBatchDecodeSession],
     im_end_token: Option<u32>,
@@ -1004,7 +1004,7 @@ pub fn qwen35_decode_native_chunk_ranges(
 
 pub fn qwen35_ensure_decode_prefill_batch_scratch(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     min_rows: usize,
 ) -> Result<(), String> {
     let config = m
@@ -1040,7 +1040,7 @@ pub fn qwen35_ensure_decode_prefill_batch_scratch(
 
 pub fn qwen35_decode_step_fused_dense_native_chunk(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
     chunk: &[GenerateBatchDecodeSession],
     im_end_token: Option<u32>,
@@ -1264,7 +1264,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
 
 pub fn qwen35_decode_step_fused_dense_native_singleton(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     envelope: &GenerateBatchDecodeEnvelope,
     session: &GenerateBatchDecodeSession,
     im_end_token: Option<u32>,

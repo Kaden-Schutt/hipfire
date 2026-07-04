@@ -20,7 +20,7 @@ use crate::deepseek4::{
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
 /// after `8 = Qwen2-VL (dots.ocr)` reserved in `docs/architecture-ids.md`.
@@ -43,7 +43,7 @@ impl DeepseekV4 {
         hfq: &HfqFile,
         gpu: &mut Gpu,
         name: &str,
-    ) -> Result<rdna_compute::GpuTensor, String> {
+    ) -> Result<hipfire_rdna::GpuTensor, String> {
         // pread + fadvise(DONTNEED) keeps page-cache footprint bounded
         // under unified memory (Strix Halo etc.). mmap-based `tensor_data`
         // would hold the read pages until the kernel reclaims them, which
@@ -76,7 +76,7 @@ impl DeepseekV4 {
         hfq: &HfqFile,
         gpu: &mut Gpu,
         name: &str,
-    ) -> Result<rdna_compute::GpuTensor, String> {
+    ) -> Result<hipfire_rdna::GpuTensor, String> {
         // pread-based read (see upload_global_raw note); avoids the
         // mmap-backed page-cache pressure that OOMs on UMA with the
         // 88 GB deepseek4-q8-mtp build.
@@ -99,14 +99,14 @@ impl DeepseekV4 {
             let mut t = gpu
                 .upload_raw(&bytes, &shape)
                 .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
-            t.dtype = rdna_compute::DType::F16;
+            t.dtype = hipfire_rdna::DType::F16;
             return Ok(t);
         }
         let mut t = gpu
             .upload_raw(&bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
         if info.quant_type == 3 {
-            t.dtype = rdna_compute::DType::Q8_0;
+            t.dtype = hipfire_rdna::DType::Q8_0;
         }
         Ok(t)
     }
@@ -119,7 +119,7 @@ impl DeepseekV4 {
         hfq: &HfqFile,
         gpu: &mut Gpu,
         name: &str,
-    ) -> Result<rdna_compute::GpuTensor, String> {
+    ) -> Result<hipfire_rdna::GpuTensor, String> {
         let (info, bytes) = hfq
             .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
@@ -140,7 +140,7 @@ impl DeepseekV4 {
         let mut t = gpu
             .upload_raw(&bytes, &shape)
             .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
-        t.dtype = rdna_compute::DType::F16;
+        t.dtype = hipfire_rdna::DType::F16;
         Ok(t)
     }
 
@@ -241,7 +241,7 @@ impl DeepseekV4 {
                 .collect();
             let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
             let ptr_tensor = gpu
-                .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                .alloc_tensor(&[2 * n_exp], hipfire_rdna::DType::F32)
                 .map_err(|e| format!("deepseek4: alloc ptr table {prefix}.w2: {e:?}"))?;
             gpu.hip
                 .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
@@ -305,7 +305,7 @@ impl DeepseekV4 {
             // sharding with some experts non-owned); else the compact base.
             let dummy_gu = if shard.is_some() && n_owned < n_exp {
                 let z = gpu
-                    .zeros(&[combined_stride / 4], rdna_compute::DType::F32)
+                    .zeros(&[combined_stride / 4], hipfire_rdna::DType::F32)
                     .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?;
                 let p = z.buf.as_ptr() as u64;
                 std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
@@ -324,7 +324,7 @@ impl DeepseekV4 {
                 .collect();
             let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
             let ptr_tensor = gpu
-                .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                .alloc_tensor(&[2 * n_exp], hipfire_rdna::DType::F32)
                 .map_err(|e| format!("deepseek4: alloc gate_up ptr table {prefix}: {e:?}"))?;
             gpu.hip
                 .memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
@@ -344,7 +344,7 @@ impl DeepseekV4 {
         hfq: &HfqFile,
         gpu: &mut Gpu,
         name: &str,
-    ) -> Result<rdna_compute::GpuTensor, String> {
+    ) -> Result<hipfire_rdna::GpuTensor, String> {
         let (info, bytes) = hfq
             .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;

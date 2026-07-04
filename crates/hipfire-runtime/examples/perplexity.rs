@@ -28,7 +28,7 @@ use hipfire_kld::math::{log_z, score_position, top_k_log_softmax};
 use hipfire_kld::refblock::RefBlock;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 use std::time::Instant;
 
@@ -266,7 +266,7 @@ fn main() {
         window.len() - warmup - 1
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init");
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
     eprintln!("Loading weights from {model_path}...");

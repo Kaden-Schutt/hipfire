@@ -153,7 +153,7 @@ fn main() {
     let model_path = model_path.expect("--model <path.hfq> is required");
 
     // ── GPU init ─────────────────────────────────────────────────────────
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
 
@@ -414,7 +414,7 @@ fn sites_for_layer(layer: &hipfire_arch_qwen35::qwen35::LayerWeights) -> &'stati
 /// dispatch paths (suppresses the rocBLAS fast path).
 #[cfg(feature = "deltanet")]
 fn compare_residual(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weight: &hipfire_runtime::weights::WeightTensor,
     x_data: &[f32],
     m: usize,
@@ -433,14 +433,14 @@ fn compare_residual(
 /// Run WMMA then MMQ on identical inputs; return raw output vectors.
 #[cfg(feature = "deltanet")]
 fn compare_residual_raw(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weight: &hipfire_runtime::weights::WeightTensor,
     x_data: &[f32],
     m: usize,
     k: usize,
     batch_size: usize,
 ) -> Result<(Vec<f32>, Vec<f32>), String> {
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     use std::ffi::c_void;
 
     // Upload activations
@@ -556,7 +556,7 @@ fn seed_for_site(site_name: &str) -> u64 {
 
 #[cfg(feature = "deltanet")]
 fn run_site_scan(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
     _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     batch_size: usize,
@@ -578,7 +578,7 @@ fn run_site_scan(
             };
             if !matches!(
                 weight.gpu_dtype,
-                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+                hipfire_rdna::DType::HFQ4G256 | hipfire_rdna::DType::MQ4G256
             ) {
                 continue;
             }
@@ -632,7 +632,7 @@ fn run_site_scan(
 
 #[cfg(feature = "deltanet")]
 fn run_channel_map(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
     _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     batch_size: usize,
@@ -659,7 +659,7 @@ fn run_channel_map(
         };
         if !matches!(
             weight.gpu_dtype,
-            rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+            hipfire_rdna::DType::HFQ4G256 | hipfire_rdna::DType::MQ4G256
         ) {
             eprintln!("  layer={layer_idx}: site '{site_name}' not HFQ4G256 (skipped)");
             continue;
@@ -705,7 +705,7 @@ fn run_channel_map(
 
 #[cfg(feature = "deltanet")]
 fn run_layer_sweep(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
     _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     batch_size: usize,
@@ -725,7 +725,7 @@ fn run_layer_sweep(
         };
         if !matches!(
             weight.gpu_dtype,
-            rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+            hipfire_rdna::DType::HFQ4G256 | hipfire_rdna::DType::MQ4G256
         ) {
             continue;
         }
@@ -782,7 +782,7 @@ fn run_layer_sweep(
 /// model. Reports which weights are safe/unsafe for MMQ.
 #[cfg(feature = "deltanet")]
 fn run_screen(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
     _config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
 ) {
@@ -803,7 +803,7 @@ fn run_screen(
             // (MQ3, MQ2, HFQ6) use different kernels and would OOB. See PR #106.
             if !matches!(
                 weight.gpu_dtype,
-                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+                hipfire_rdna::DType::HFQ4G256 | hipfire_rdna::DType::MQ4G256
             ) {
                 continue;
             }

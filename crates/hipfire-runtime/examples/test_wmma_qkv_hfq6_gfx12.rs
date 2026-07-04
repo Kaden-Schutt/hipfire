@@ -18,7 +18,7 @@
 //! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_qkv_hfq6_gfx12
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");

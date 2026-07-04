@@ -46,7 +46,7 @@ fn main() {
         target_cfg.dim, target_cfg.n_layers, target_cfg.n_heads
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init");
 
     // VRAM estimate. arch_id distinguishes hybrid (5/6) from plain (1).
     let drafter_hfq_peek = HfqFile::open(Path::new(drafter_path)).expect("open drafter HFQ");

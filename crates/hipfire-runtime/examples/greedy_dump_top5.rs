@@ -154,7 +154,7 @@ fn main() {
         .unwrap_or_default();
     eprintln!("prompt: {} tokens", prompt_tokens.len());
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     if prompt_tokens.len() >= kv_seq {

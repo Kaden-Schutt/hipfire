@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/hip-bridge",
     "crates/hsa-bridge",
-    "crates/rdna-compute",
+    "crates/hipfire-rdna",
     "crates/hipfire-admin-types",
     "crates/hipfire-coherence",
     "crates/hipfire-config",

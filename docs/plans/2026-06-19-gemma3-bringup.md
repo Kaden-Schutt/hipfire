@@ -154,7 +154,7 @@ Bring-up target: **`medgemma-27b-text-it`** (`Gemma3ForCausalLM`, clean
 
 **De-risk finding — attention needs NO new kernel for bring-up:**
 The attention kernels (`attention_f32`, `attention_flash_gqa` in
-`rdna-compute/src/dispatch.rs`) hardcode `scale = 1/√head_dim` internally and
+`hipfire-rdna/src/dispatch.rs`) hardcode `scale = 1/√head_dim` internally and
 expose **no scale or sliding-window parameter**. So:
 - **Custom attn scale** (`query_pre_attn_scalar^-0.5`; `1/√168` on 27b): get it
   WITHOUT touching kernels by **pre-scaling Q** by `√(head_dim/query_pre_attn_scalar)`

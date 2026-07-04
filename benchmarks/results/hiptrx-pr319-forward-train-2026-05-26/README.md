@@ -14,7 +14,7 @@ Code under test:
 
 | Area | Command / log | Result | Notes |
 |---|---|---|---|
-| Arch caps | `raw/hiptrx-arch-caps-20260526.log` | PASS | `cargo test -p rdna-compute arch_caps --lib`, 17/17 passed. |
+| Arch caps | `raw/hiptrx-arch-caps-20260526.log` | PASS | `cargo test -p hipfire-rdna arch_caps --lib`, 17/17 passed. |
 | Targeted build | `raw/hiptrx-targeted-build-0bcc6bb8-20260526.log` | PASS | Built rdna direct probes plus Qwen2 and dots OCR examples at `0bcc6bb8`. |
 | gfx12 WMMA/Lloyd kernel smokes | `raw/hiptrx-gfx1201-kernel-smokes-20260526.log` | MIXED, superseded | Initial broad run passed gfx12 QKV/QKVZA/gate/residual/HFQ6/MQ3/MQ4 fused probes, but direct gfx11-only probes failed on gfx1201. |
 | gfx11-only direct probe rerun | `raw/hiptrx-gfx1201-wiring-rerun-20260526.log` | PASS / SKIP | MQ4-Lloyd residual base gfx12 path passed all shapes. `_mb2`/`_mb4` now skip as gfx11-only. Causal WMMA parity now skips on gfx1201 instead of compiling gfx11 WMMA. |

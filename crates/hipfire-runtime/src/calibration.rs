@@ -7,14 +7,14 @@
 //! tensors (`<name>.hessian` [K,K] + `<name>.imatrix` [K]) plus an
 //! internal-consistency metric (`diag(Σxxᵀ)` must equal `Σx²`).
 //!
-//! This is generic (rdna-compute + the HFQ writer only) so it sits in
+//! This is generic (hipfire-rdna + the HFQ writer only) so it sits in
 //! hipfire-runtime without a cycle on the arch crates. Callers (the
 //! `collect_artifacts` CLI, the daemon `Collect` op) own the forward loop +
 //! the model-specific taps (MoE router histogram, KLDREF) and arm this via
 //! `gpu.active_capture = Some(Arc::new(CalibCollector::default()))`.
 
 use crate::hfq::HfqMemTensor;
-use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
+use hipfire_rdna::{ActivationCapture, DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -324,7 +324,7 @@ impl CalibCollector {
         let audit_max = Cell::new(0.0f64);
         let audit_n = Cell::new(0usize);
         let audit_worst = RefCell::new(String::new());
-        let io_err = |e: rdna_compute::HipError| std::io::Error::other(e.to_string());
+        let io_err = |e: hipfire_rdna::HipError| std::io::Error::other(e.to_string());
 
         write_hfqm_package_streaming(path, arch_id, metadata_json, &entries, |i, w| {
             match &plan[i] {

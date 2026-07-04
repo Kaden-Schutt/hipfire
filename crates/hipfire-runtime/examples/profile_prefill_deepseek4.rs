@@ -21,7 +21,7 @@ fn main() {
     use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::hfq::HfqFile;
-    use rdna_compute::profile;
+    use hipfire_rdna::profile;
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Instant;
@@ -89,7 +89,7 @@ fn main() {
         config.num_key_value_heads
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();
@@ -105,7 +105,7 @@ fn main() {
     // Deterministic synthetic prompt.
     let prompt_tokens: Vec<u32> = (0..prefill_len as u32).map(|t| (t % 1000) + 100).collect();
 
-    let run_prefill = |state: &mut DeepseekV4State, gpu: &mut rdna_compute::Gpu| {
+    let run_prefill = |state: &mut DeepseekV4State, gpu: &mut hipfire_rdna::Gpu| {
         state.reset();
         let _ = gpu.hip.device_synchronize();
         let t = Instant::now();

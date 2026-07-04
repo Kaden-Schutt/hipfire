@@ -13,7 +13,7 @@
 //! the platform's native integer matmul.
 //!
 //! Pure CPU, deterministic, no model files. Companion GPU bandwidth probe:
-//! `rdna-compute --example bench_gemv_dtype_bw`.
+//! `hipfire-rdna --example bench_gemv_dtype_bw`.
 //!
 //!   cargo run -p hipfire-quantize --example quant_explore [rows] [k]
 

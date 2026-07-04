@@ -9,14 +9,14 @@ license = "Apache-2.0"
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 hip-bridge = { path = "../hip-bridge" }
 serde.workspace = true
 serde_json = "1"
 
 [features]
-# Mirror minimax: rdna-compute host-readback helpers and hybrid-state plumbing
+# Mirror minimax: hipfire-rdna host-readback helpers and hybrid-state plumbing
 # live behind `deltanet`. The conv/attention/MoE kernels the forward uses are
 # ungated; the new LFM2 short-conv kernel is ungated too.
 default = ["deltanet"]
-deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
+deltanet = ["hipfire-rdna/deltanet", "hipfire-runtime/deltanet"]

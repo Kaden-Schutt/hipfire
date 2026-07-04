@@ -9,7 +9,7 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 # Enable hybrid DeltaNet + speculative decoding paths. Currently always-on
 # because qwen35 is a hybrid arch (DeltaNet + FullAttention layers).
 default = ["deltanet"]
-deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "hipfire-rdna/deltanet"]
 ffn_bf16 = []
 # Build NPU kernel xclbin+instr.bin artifacts for all supported NPU generations
 # via tools/npu/build_qwen35_swiglu.py.  Requires the MLIR-AIE venv at ~/.venv
@@ -27,7 +27,7 @@ hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-npu = { path = "../hipfire-npu" }
 hipfire-rocm = { path = "../hipfire-rocm" }
 hip-bridge = { path = "../hip-bridge" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 serde.workspace = true
 serde_json = "1"
 libc.workspace = true

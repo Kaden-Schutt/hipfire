@@ -15,7 +15,7 @@ use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_runtime::weights::WeightTensor;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// A `[out, in]` linear weight, plain-f32 or quantized.
 pub enum LinearWeight {

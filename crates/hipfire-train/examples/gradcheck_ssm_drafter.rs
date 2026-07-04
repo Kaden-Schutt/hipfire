@@ -11,7 +11,7 @@ use hipfire_train::ops::pflash_score::pflash_score_forward;
 use hipfire_train::ssm_drafter::{
     ssm_drafter_backward, ssm_drafter_forward_train, SsmDrafter, SsmDrafterConfig,
 };
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 const VOCAB: usize = 32;
 const H_T: usize = 8;

@@ -469,7 +469,7 @@ pub fn quantize_diffusion_hfq(
 /// Repack canonical `oq4g256` (`[f16 scale][128 nibbles]` per 256-group,
 /// row-contiguous — the [`quantize_oq4g256`] / `decode_oq4g256_slice` format)
 /// into the arch "combined" device layout consumed by
-/// `rdna_compute::Gpu::gemm_oq4_grouped_f16_wmma` (W4A16). Mirrors
+/// `hipfire_rdna::Gpu::gemm_oq4_grouped_f16_wmma` (W4A16). Mirrors
 /// `hipfire_arch_qwen35::qwen35::oq4_pack_arch_combined` byte-for-byte (replicated
 /// here to avoid a diffusion→arch dependency; both read the same qt-34 bytes).
 ///

@@ -70,7 +70,7 @@ its own `HfqInputFormat` keeps it separate from MQ4 per the directive.
 ### Opus Plus (Opus-A8, id 33) — symmetric W4, int8 activations
 - **Quantizer:** symmetric s4 (no zero-point) + clip + SmoothQuant
   (`quant_sym` from the prototype). New `--format opus-a8`.
-- **Loader:** new `DType::OpusS4G128` (hfq.rs match arm + rdna-compute DType).
+- **Loader:** new `DType::OpusS4G128` (hfq.rs match arm + hipfire-rdna DType).
 - **Forward:** sym-int4 weight → upcast int8 → existing iu8 mmq path, but
   **drop the Q8_1 zero-point correction** (symmetric has none) — simpler than
   MQ4's affine mmq. int8 dynamic per-token activation quant already exists for

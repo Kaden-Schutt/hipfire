@@ -7,7 +7,7 @@ use crate::tables::KernelRegistry;
 use crate::types::*;
 #[allow(unused_imports)]
 use hip_bridge;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 pub(crate) mod steps;
@@ -52,7 +52,7 @@ pub fn execute_pipeline(
     ctx: &DispatchCtx,
     steps: &[PipelineOp],
     params: &PipelineParams,
-    dtype: rdna_compute::DType,
+    dtype: hipfire_rdna::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
     if let PipelineParams::Moe(p) = params {
@@ -76,7 +76,7 @@ pub fn execute_pipeline(
                     GpuTensor {
                         buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
                         shape: vec![params.k],
-                        dtype: rdna_compute::DType::F32,
+                        dtype: hipfire_rdna::DType::F32,
                     }
                 };
                 rot.run(
@@ -131,10 +131,10 @@ pub fn execute_pipeline(
 fn find_fused(
     registry: &KernelRegistry,
     ctx: &DispatchCtx,
-    dtype: rdna_compute::DType,
+    dtype: hipfire_rdna::DType,
     requested: &[PipelineOp],
 ) -> Option<KernelKey> {
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     if dtype == DType::MFP4G32
         && requested.len() == 2
         && requested[0] == PipelineOp::RotateFwht
@@ -1772,7 +1772,7 @@ pub fn dispatch_fused(
                 GpuTensor {
                     buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
                     shape: vec![params.k],
-                    dtype: rdna_compute::DType::F32,
+                    dtype: hipfire_rdna::DType::F32,
                 }
             };
             hip!(gpu.gemv_mfp4g32_with_rotate(

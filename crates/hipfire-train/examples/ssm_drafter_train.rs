@@ -17,7 +17,7 @@
 
 use hipfire_train::ssm_drafter::{SsmDrafter, SsmDrafterConfig};
 use hipfire_train::train_loop::{eval_ssm_drafter, spearman, train_ssm_drafter_loop, TrainCfg};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 const SEQ: usize = 512;
 const BLOCK: usize = 64;

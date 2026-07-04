@@ -5,7 +5,7 @@
 //! Per-kernel profiler for Qwen3.5 MQ4 forward pass.
 //!
 //! Runs the exact same forward_scratch path as bench_qwen35_speed /
-//! greedy_dump, but wraps N generation steps in rdna_compute::profile::{start,stop}
+//! greedy_dump, but wraps N generation steps in hipfire_rdna::profile::{start,stop}
 //! and aggregates the collected ProfileEntries by kernel name. Reports
 //! per-kernel total time, call count, average time per call, total bytes,
 //! and effective bandwidth — sorted by total time descending so the hot
@@ -34,7 +34,7 @@ fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::sampler;
-    use rdna_compute::profile;
+    use hipfire_rdna::profile;
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Instant;
@@ -84,7 +84,7 @@ fn main() {
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();

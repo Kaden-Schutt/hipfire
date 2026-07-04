@@ -44,7 +44,7 @@ Optional wave64 variants later (perf only; correctness path is wave32).
 
 ## Integration
 
-- **dispatch (rdna-compute)**: add `gpu.gemv_oq4g256_moe_*` methods + KernelKey
+- **dispatch (hipfire-rdna)**: add `gpu.gemv_oq4g256_moe_*` methods + KernelKey
   entries; add kernel-source names to the hash/registry list (see
   gen_kernel_hashes). Mirror the hfq4 method signatures exactly.
 - **quantizer (main.rs)**: in the is_minimax expert branch, when an OQ format is

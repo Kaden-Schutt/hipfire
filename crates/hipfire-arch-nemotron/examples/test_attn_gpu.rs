@@ -12,7 +12,7 @@
 
 use hipfire_arch_nemotron::attn::{gqa_attention, NemotronAttnGpu};
 use hipfire_arch_nemotron::AttnConfig;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn matvec(w: &[f32], x: &[f32], out: usize, n_in: usize) -> Vec<f32> {
     (0..out)

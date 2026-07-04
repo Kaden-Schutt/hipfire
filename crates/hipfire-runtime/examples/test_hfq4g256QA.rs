@@ -32,7 +32,7 @@ enum Outcome {
 }
 
 fn run() -> Result<String, Outcome> {
-    let mut gpu = rdna_compute::Gpu::init()
+    let mut gpu = hipfire_rdna::Gpu::init()
         .map_err(|e| Outcome::Skip(format!("GPU init unavailable: {e}")))?;
 
     let m = 4usize;
@@ -61,7 +61,7 @@ fn run() -> Result<String, Outcome> {
         .upload_f32(&x, &[k])
         .map_err(|e| Outcome::Fail(format!("upload x failed: {e}")))?;
     let d_y = gpu
-        .zeros(&[m], rdna_compute::DType::F32)
+        .zeros(&[m], hipfire_rdna::DType::F32)
         .map_err(|e| Outcome::Fail(format!("alloc y failed: {e}")))?;
 
     gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k)
@@ -108,7 +108,7 @@ fn run() -> Result<String, Outcome> {
     }
 
     let d_out = gpu
-        .zeros(&[k], rdna_compute::DType::F32)
+        .zeros(&[k], hipfire_rdna::DType::F32)
         .map_err(|e| Outcome::Fail(format!("alloc embedding out failed: {e}")))?;
     gpu.embedding_lookup_hfq4g256(&d_a, &d_out, 2, k)
         .map_err(|e| Outcome::Fail(format!("embedding lookup failed: {e}")))?;
@@ -185,7 +185,7 @@ fn run() -> Result<String, Outcome> {
             .upload_f32(&mmq_x, &[mmq_n * mmq_k])
             .map_err(|e| Outcome::Fail(format!("upload mmq X failed: {e}")))?;
         let d_mmq_y = gpu
-            .zeros(&[mmq_n * mmq_m], rdna_compute::DType::F32)
+            .zeros(&[mmq_n * mmq_m], hipfire_rdna::DType::F32)
             .map_err(|e| Outcome::Fail(format!("alloc mmq Y failed: {e}")))?;
         gpu.gemm_hfq4g256_residual_mmq(&d_mmq_a, &d_mmq_x, &d_mmq_y, mmq_m, mmq_k, mmq_n)
             .map_err(|e| Outcome::Fail(format!("gemm_hfq4g256_residual_mmq failed: {e}")))?;

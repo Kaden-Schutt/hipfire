@@ -43,7 +43,7 @@ use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
 use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
 

@@ -13,7 +13,7 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 use hip_bridge::DeviceBuffer;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 pub struct AttnParams<'a> {
     pub q: &'a GpuTensor,

@@ -50,7 +50,7 @@ use hipfire_state::{
     SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
     SequenceStatePageDescriptor,
 };
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 use std::time::Instant;
 
 /// Bring-up contract for a hipfire architecture.
@@ -668,10 +668,10 @@ pub fn decode_loop_with_timing(
     // `repeat_buf` (+ `sample_buf`) per generate request the way `alloc_tensor`
     // (no matching `free_tensor`) did.
     let sample_buf = gpu
-        .alloc_owned(&[2], rdna_compute::DType::F32)
+        .alloc_owned(&[2], hipfire_rdna::DType::F32)
         .map_err(|e| format!("decode_loop sample_buf: {e:?}"))?;
     let repeat_buf = gpu
-        .alloc_owned(&[window.max(64)], rdna_compute::DType::F32)
+        .alloc_owned(&[window.max(64)], hipfire_rdna::DType::F32)
         .map_err(|e| format!("decode_loop repeat_buf: {e:?}"))?;
     let cfg = crate::sampler::SamplerConfig {
         temperature: ctx.temperature,

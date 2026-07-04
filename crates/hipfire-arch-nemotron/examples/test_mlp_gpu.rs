@@ -10,7 +10,7 @@
 //!   cargo run -p hipfire-arch-nemotron --example test_mlp_gpu
 
 use hipfire_arch_nemotron::mlp::{mlp_relu2, MlpRelu2Gpu};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");

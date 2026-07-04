@@ -3,7 +3,7 @@ name = "hipfire-gpu-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Leaf GPU value types (GpuTensor, DType) shared across the workspace. Depends only on hip-bridge, so crates that merely name a device tensor / element type need not depend on the whole 63k-LOC rdna-compute crate (review 3.11b)."
+description = "Leaf GPU value types (GpuTensor, DType) shared across the workspace. Depends only on hip-bridge, so crates that merely name a device tensor / element type need not depend on the whole 63k-LOC hipfire-rdna crate (review 3.11b)."
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }

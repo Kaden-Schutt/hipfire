@@ -7,7 +7,7 @@
 ## Change
 
 Add `"gfx1151"` to all 5 MQ3-Lloyd fast-arm matchers in
-`crates/rdna-compute/src/kernels.rs`:
+`crates/hipfire-rdna/src/kernels.rs`:
 
 - `gemv_mq3g256_lloyd_for_arch`
 - `gemv_mq3g256_lloyd_residual_for_arch`

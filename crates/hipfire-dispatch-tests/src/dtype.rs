@@ -1,4 +1,4 @@
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 /// Every DType variant that represents a quantized format (byte-level).
 const QUANTIZED_DTYPES: &[DType] = &[
@@ -130,7 +130,7 @@ fn mq_dtypes_are_magnum_quant_formats() {
 #[test]
 fn rotation_plan_covers_every_dtype() {
     use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     assert_eq!(dtype_rotation_plan(DType::F32), RotationPlan::None);
     assert_eq!(dtype_rotation_plan(DType::HFQ4G256), RotationPlan::None);
     assert_eq!(dtype_rotation_plan(DType::Q8HFQ), RotationPlan::None);
@@ -169,7 +169,7 @@ fn rotation_plan_matches_legacy_needs_fwht() {
 #[test]
 fn post_rotation_variant_paro_is_plain_mq_is_prerotated() {
     use hipfire_dispatch::types::{dtype_post_rotation_variant, GemvVariant};
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     assert_eq!(
         dtype_post_rotation_variant(DType::ParoQ4G128),
         GemvVariant::Plain
@@ -195,7 +195,7 @@ fn post_rotation_variant_paro_is_plain_mq_is_prerotated() {
 #[test]
 fn q8hfq_resolves_to_plain_gemv_key() {
     use hipfire_dispatch::types::{GemvVariant, KernelKey};
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     let key = KernelKey::for_gemv(DType::Q8HFQ, GemvVariant::Plain, false)
         .expect("Q8HFQ Plain must resolve");
     assert_eq!(key, KernelKey::GemvQ8HFQ);

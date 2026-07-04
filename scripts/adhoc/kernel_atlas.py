@@ -1790,7 +1790,7 @@ def build_suggestion_queue(
                 score=96 + min(8, paro_gemv_pct / 16.0),
                 risk="medium/high",
                 expected_impact="high",
-                allowed_files=paro_files or ["kernels/src/gemv_paro4g128.hip", "crates/rdna-compute/src/dispatch.rs"],
+                allowed_files=paro_files or ["kernels/src/gemv_paro4g128.hip", "crates/hipfire-rdna/src/dispatch.rs"],
                 rationale=[
                     f"Paro GEMV kernels account for {paro_gemv_pct:.1f}% of the captured profile.",
                     "The current native kernel rotates each G128 activation group inside every packed-output block.",
@@ -1939,8 +1939,8 @@ def build_suggestion_queue(
 
         if op_role == "residual_gemv" and arch.startswith("gfx12"):
             files = allowed + [
-                "crates/rdna-compute/src/kernels.rs",
-                "crates/rdna-compute/src/dispatch.rs",
+                "crates/hipfire-rdna/src/kernels.rs",
+                "crates/hipfire-rdna/src/dispatch.rs",
             ]
             add_suggestion(
                 suggestions,

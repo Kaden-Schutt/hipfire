@@ -6,7 +6,7 @@
 //! Verifies correctness at batch=1 then measures throughput scaling.
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     // Qwen3-8B dimensions
     let test_cases: &[(usize, usize, &str)] = &[
@@ -42,8 +42,8 @@ fn main() {
         // ─── Correctness: batch=1 GEMM vs GEMV ───
         let x_data: Vec<f32> = (0..k).map(|i| 0.001 * (i % 100) as f32).collect();
         let d_x = gpu.upload_f32(&x_data, &[k]).unwrap();
-        let d_y_gemv = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
-        let d_y_gemm = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+        let d_y_gemv = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
+        let d_y_gemm = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
         gpu.gemv_hfq4g256(&d_a, &d_x, &d_y_gemv, m, k).unwrap();
         gpu.gemm_hfq4g256(&d_a, &d_x, &d_y_gemm, m, k, 1).unwrap();
@@ -74,7 +74,7 @@ fn main() {
 
         // GEMV baseline (repeated single-vector calls)
         let d_x1 = gpu.upload_f32(&vec![0.01f32; k], &[k]).unwrap();
-        let d_y1 = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+        let d_y1 = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
         // Warmup
         for _ in 0..10 {
             gpu.gemv_hfq4g256(&d_a, &d_x1, &d_y1, m, k).unwrap();
@@ -97,7 +97,7 @@ fn main() {
 
         for &bs in &batches {
             let d_xb = gpu.upload_f32(&vec![0.01f32; k * bs], &[bs, k]).unwrap();
-            let d_yb = gpu.zeros(&[bs * m], rdna_compute::DType::F32).unwrap();
+            let d_yb = gpu.zeros(&[bs * m], hipfire_rdna::DType::F32).unwrap();
             // Warmup
             for _ in 0..5 {
                 gpu.gemm_hfq4g256(&d_a, &d_xb, &d_yb, m, k, bs).unwrap();

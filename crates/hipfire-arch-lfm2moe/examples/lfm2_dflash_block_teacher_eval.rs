@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let teacher_dump = teacher_dump.ok_or("--teacher-dump required")?;
     let dump = TeacherDump::load(&teacher_dump)?;
 
-    let mut gpu = rdna_compute::Gpu::init()?;
+    let mut gpu = hipfire_rdna::Gpu::init()?;
     eprintln!("gpu: {}", gpu.arch);
 
     let mut target_hfq = HfqFile::open(&model)?;

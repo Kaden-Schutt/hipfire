@@ -5,7 +5,7 @@
 //! `1/r` per row into `rinv`, which the backward consumes (no recompute). `dw`
 //! is atomic-accumulated, so zero it before calling backward.
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 /// Forward. `x`,`y`: `[rows*h]`; `w`: `[h]`; `rinv`: `[rows]` (output, saved
 /// for backward).

@@ -67,7 +67,7 @@ replicate Rust's `sort_unstable`/`dedup`/`select_nth` semantics.
 ## Integration
 
 - New kernel(s) `qtip_beam_encode_g256` (+ bits param) in `kernels/` +
-  `rdna-compute` dispatch method taking rotated weights → packed groups.
+  `hipfire-rdna` dispatch method taking rotated weights → packed groups.
 - Offline driver (`hipfire-quantize::pack_qtip_real_tensors`) gains a GPU path:
   upload the staged BF16 tensor, encode on GPU, download packed. Gate behind a
   flag (`--gpu-encode`) until proven; keep the CPU path as the reference/oracle.
@@ -97,11 +97,11 @@ replicate Rust's `sort_unstable`/`dedup`/`select_nth` semantics.
    @8192 groups) ≈ 20× vs the 25-core production path → ~1h/1B down to ~3min.
    worst_group_ratio ~1.05 is the expected optimal-scale-refit artifact (encode
    optimizes at the RMS seed; MSE measured at the refit scale), mean is better.
-3. Productionize [NEXT]: hipfire-quantize is CPU-only today; add `rdna-compute` as
+3. Productionize [NEXT]: hipfire-quantize is CPU-only today; add `hipfire-rdna` as
    a dep + a `--gpu-encode` path in pack_qtip_real_tensors (CPU FWHT-rotate → upload
    rotated weights → qtip_viterbi_encode → download symbols → CPU optimal_scale +
    pack). Default stays CPU beam (no GPU requirement unless --gpu-encode). Keep the
-   CPU path as the reference. NOTE: this is the first OFFLINE tool to link rdna-compute.
+   CPU path as the reference. NOTE: this is the first OFFLINE tool to link hipfire-rdna.
 4. Perf [INVESTIGATED — see below].
 
 ## Perf investigation (2026-07-03) — encode is compute-bound, micro-opts flat

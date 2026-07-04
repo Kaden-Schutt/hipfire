@@ -7,7 +7,7 @@
 //! diagonal recurrence — no shared memory (gfx1103 LDS kernels wedge the GPU).
 //! Tensors are time-major `[seq*D]` (index `t*D+c`).
 
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 /// Forward: `g`,`u` `[seq*D]` → `h_out` `[seq*D]` (allocated here).
 pub fn gated_scan_forward(

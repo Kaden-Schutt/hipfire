@@ -33,7 +33,7 @@ fn main() {
     let with_sample = args.iter().any(|a| a == "--sample");
     let with_extract = args.iter().any(|a| a == "--extract");
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     eprintln!("Loading {}...", model_path);
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");

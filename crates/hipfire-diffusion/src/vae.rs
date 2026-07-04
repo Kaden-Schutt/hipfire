@@ -68,10 +68,10 @@ impl VaeAttentionBlock {
     /// `input` (the caller owns it) and returns a resident output.
     pub(crate) fn forward_resident(
         &self,
-        input: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        input: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let (batch, channels, height, width) = match input.shape.as_slice() {
             [b, c, h, w] => (*b, *c, *h, *w),
             other => {
@@ -573,10 +573,10 @@ impl VaeDecoderUpBlock {
     /// `hidden`, freeing each intermediate as the chain advances.
     pub(crate) fn forward_resident(
         &self,
-        mut hidden: rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        mut hidden: hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         for resnet in &self.resnets {
             let next = resnet.forward_resident(&hidden, gpu, cache)?;
             free_resident(gpu, hidden)?;

@@ -62,7 +62,7 @@ list), then `tests/coherence-gate.sh` + `tests/speed-gate.sh` for the real forwa
 
 Rough effort for a real port: bring-up triple (config/weights/state) a few hundred
 lines; forward pass a couple thousand for a dense LLaMA-style model, more for hybrid
-attention or MoE; new ops go in `kernels/src/*.hip` + `crates/rdna-compute`, **not**
+attention or MoE; new ops go in `kernels/src/*.hip` + `crates/hipfire-rdna`, **not**
 your arch crate (see `.github/CONTRIBUTING.md` "Crate topology").
 
 ## Production reference

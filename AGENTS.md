@@ -126,7 +126,7 @@ When a task primarily targets one of these subtrees, read that subtree's
 - `.agents/` owns reusable agent skills and workflow instructions.
 - `benchmarks/` owns prompt corpora, benchmark scripts, baselines, and results.
 - `crates/hipfire-eval/` owns model/runtime evidence batteries and suites.
-- `kernels/` and `crates/rdna-compute/` own HIP kernel and dispatch mechanics.
+- `kernels/` and `crates/hipfire-rdna/` own HIP kernel and dispatch mechanics.
 - `crates/hipfire-runtime/` owns the inference hot path, model execution, and
   runtime examples.
 - `scripts/` owns reusable shell workflows and ad hoc benches outside the formal

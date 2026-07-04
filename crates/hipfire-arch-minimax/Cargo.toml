@@ -11,12 +11,12 @@ description = "MiniMax-M2 architecture (Mixtral-style MoE: GQA + per-layer QK-no
 default = ["deltanet"]
 # partial rotate_half RoPE (rope_partial_interleaved_f32) is deltanet-gated,
 # matching hipfire-arch-qwen35.
-deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "hipfire-rdna/deltanet"]
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 serde.workspace = true
 serde_json = "1"

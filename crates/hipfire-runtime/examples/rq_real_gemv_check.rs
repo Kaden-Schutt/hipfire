@@ -22,10 +22,10 @@
 //! Run: cargo run --release -p hipfire-runtime --example rq_real_gemv_check
 
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     eprintln!("GPU: {}", gpu.arch);
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
@@ -156,7 +156,7 @@ fn cpu_matvec(w: &[f32], x: &[f32], m: usize, k: usize) -> Vec<f32> {
         .collect()
 }
 
-fn download(gpu: &rdna_compute::Gpu, t: &rdna_compute::GpuTensor, n: usize) -> Vec<f32> {
+fn download(gpu: &hipfire_rdna::Gpu, t: &hipfire_rdna::GpuTensor, n: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; n];
     let b = unsafe { std::slice::from_raw_parts_mut(y.as_mut_ptr() as *mut u8, n * 4) };
     gpu.hip.memcpy_dtoh(b, &t.buf).unwrap();

@@ -120,7 +120,7 @@ fn main() {
     );
 
     // Init GPU first (needed for vision weight loading)
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
 
     // Load vision weights (GPU-side for fast inference)
     eprintln!("Loading vision weights...");

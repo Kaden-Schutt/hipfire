@@ -57,7 +57,7 @@ fn main() {
     let n_steps: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(128);
     let use_chatml = std::env::var("HIPFIRE_CHATML").ok().as_deref() == Some("1");
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
 
     // Load both models.
     let t0 = Instant::now();
@@ -114,7 +114,7 @@ fn main() {
     // KV caches sized for prompt + n_steps + headroom.
     let kv_seq = prompt_tokens.len() + n_steps + 16;
     let kv_mode_str = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "asym3".into());
-    let mk_kv = |gpu: &mut rdna_compute::Gpu, cfg: &qwen35::Qwen35Config| -> KvCache {
+    let mk_kv = |gpu: &mut hipfire_rdna::Gpu, cfg: &qwen35::Qwen35Config| -> KvCache {
         match kv_mode_str.as_str() {
             "asym3" => {
                 KvCache::new_gpu_asym3(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq)

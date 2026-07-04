@@ -116,7 +116,7 @@ fn main() {
     eprintln!("max={max_tokens} ctx={ctx_capacity} lambda={lambda} chatml={chatml}");
 
     // ── Init GPU + load target ─────────────────────────────────────────
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
 
     let mut slot_cfg = ModelSlotConfig::default();

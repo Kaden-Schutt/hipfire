@@ -9,7 +9,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::optim::AdamW;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 const N: usize = 16;
 const STEPS: usize = 400;

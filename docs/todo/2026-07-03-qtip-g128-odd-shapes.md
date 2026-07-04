@@ -58,7 +58,7 @@ meaningful quality loss expected; validate).
    for the odd linears (like MQ4 auto-splits G256/G128).
 3. **QuantType bytes** (`hipfire-quant-format`): reserve `Qtip3G128`,
    `Qtip4G128` codes (next free after 42) + `from_code` + stability test.
-4. **DType + rotation** (`rdna-compute` / `hipfire-dispatch`): `DType::Qtip3G128`,
+4. **DType + rotation** (`hipfire-rdna` / `hipfire-dispatch`): `DType::Qtip3G128`,
    `DType::Qtip4G128`; `size()` byte-level arm; `dtype_arch_predicate` → Always;
    `dtype_rotation_plan` → **`FwhtG128`** (already exists); `dtype_post_rotation_variant`
    → Prerotated.

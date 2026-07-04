@@ -17,7 +17,7 @@ use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::weights::weight_gemm;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// LFM2 DFlash is still experimental on the F16 draft GEMM path. Default to the
 /// stable F16-on-disk -> F32-on-GPU lift unless explicitly opted in.

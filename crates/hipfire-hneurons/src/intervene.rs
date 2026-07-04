@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 
 struct Intervention {
     /// `[num_layers * intermediate]` per-neuron gain (H-Neuron → `gain`, else

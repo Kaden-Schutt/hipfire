@@ -25,7 +25,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::{self, KvCache};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::{sampler, weights};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,7 +54,7 @@ fn run_spec_gemm_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_buf: &GpuTensor,
-    w_dtype: rdna_compute::DType,
+    w_dtype: hipfire_rdna::DType,
     x: &GpuTensor,
     y: &GpuTensor,
     m: usize,
@@ -237,15 +237,15 @@ fn dflash_moe_draft_ffn_graph_eligible(
         && dflash_moe_verify_graph_lmhead_enabled_from_env_value(env_value)
 }
 
-fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
+fn dflash_batched_lm_head_supported(dtype: hipfire_rdna::DType) -> bool {
     matches!(
         dtype,
-        rdna_compute::DType::Q8_0
-            | rdna_compute::DType::HFQ4G256
-            | rdna_compute::DType::MQ4G256
-            | rdna_compute::DType::MQ3G256
-            | rdna_compute::DType::HFQ6G256
-            | rdna_compute::DType::MQ6G256
+        hipfire_rdna::DType::Q8_0
+            | hipfire_rdna::DType::HFQ4G256
+            | hipfire_rdna::DType::MQ4G256
+            | hipfire_rdna::DType::MQ3G256
+            | hipfire_rdna::DType::HFQ6G256
+            | hipfire_rdna::DType::MQ6G256
     )
 }
 
@@ -259,10 +259,10 @@ fn dflash_enqueue_verify_lm_head(
 ) -> HipResult<()> {
     let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
     match w_out.gpu_dtype {
-        rdna_compute::DType::Q8_0 => {
+        hipfire_rdna::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, final_hidden, &logits_batch, b)?;
         }
-        rdna_compute::DType::HFQ4G256 => {
+        hipfire_rdna::DType::HFQ4G256 => {
             run_spec_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
@@ -275,7 +275,7 @@ fn dflash_enqueue_verify_lm_head(
                 b,
             )?;
         }
-        rdna_compute::DType::MQ4G256 => {
+        hipfire_rdna::DType::MQ4G256 => {
             assert!(
                 b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
                 "verify_scratch.rot undersized: b*k={} > max_n*hidden_k={}",
@@ -296,7 +296,7 @@ fn dflash_enqueue_verify_lm_head(
                 b,
             )?;
         }
-        rdna_compute::DType::MQ3G256 => {
+        hipfire_rdna::DType::MQ3G256 => {
             assert!(
                 b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
                 "verify_scratch.rot undersized for MQ3 lm_head: b*k={} > max_n*hidden_k={}",
@@ -317,7 +317,7 @@ fn dflash_enqueue_verify_lm_head(
                 b,
             )?;
         }
-        rdna_compute::DType::HFQ6G256 => {
+        hipfire_rdna::DType::HFQ6G256 => {
             run_spec_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq6G256BatchedLmhead,
@@ -330,7 +330,7 @@ fn dflash_enqueue_verify_lm_head(
                 b,
             )?;
         }
-        rdna_compute::DType::MQ6G256 => {
+        hipfire_rdna::DType::MQ6G256 => {
             assert!(
                 b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
                 "verify_scratch.rot undersized for MQ6 lm_head: b*k={} > max_n*hidden_k={}",
@@ -2410,51 +2410,51 @@ impl GdnTape {
         let mut w_down_input_bufs = Vec::with_capacity(n_la_layers);
         let mut layer_out_bufs = Vec::with_capacity(n_la_layers);
         for _ in 0..n_la_layers {
-            x_in_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+            x_in_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_input_bufs
-                .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
-            fa_bridge_x_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
+            fa_bridge_x_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_q_full_bufs
-                .push(gpu.alloc_tensor(&[max_n * fa_q_full_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * fa_q_full_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_q_norm_bufs
-                .push(gpu.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
-            fa_bridge_q_bufs.push(gpu.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
+            fa_bridge_q_bufs.push(gpu.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_k_bufs
-                .push(gpu.alloc_tensor(&[max_n * fa_kv_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * fa_kv_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_v_bufs
-                .push(gpu.alloc_tensor(&[max_n * fa_kv_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * fa_kv_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_attn_raw_bufs
-                .push(gpu.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_attn_out_bufs
-                .push(gpu.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_wo_residual_bufs
-                .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
             fa_bridge_layer_out_bufs
-                .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
-            qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
-            alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-            beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-            alpha_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-            beta_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-            q_raw_bufs.push(gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
-            k_raw_bufs.push(gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
-            v_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-            q_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-            k_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-            attn_out_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-            normed_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-            wo_input_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
+            qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], hipfire_rdna::DType::F32)?);
+            alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
+            beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
+            alpha_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
+            beta_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
+            q_raw_bufs.push(gpu.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?);
+            k_raw_bufs.push(gpu.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?);
+            v_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+            q_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+            k_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+            attn_out_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+            normed_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+            wo_input_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
             wo_residual_in_bufs
-                .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
             attn_residual_bufs
-                .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
-            ffn_input_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
-            ffn_gate_bufs.push(gpu.alloc_tensor(&[max_n * ffn_dim], rdna_compute::DType::F32)?);
-            ffn_up_bufs.push(gpu.alloc_tensor(&[max_n * ffn_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
+            ffn_input_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
+            ffn_gate_bufs.push(gpu.alloc_tensor(&[max_n * ffn_dim], hipfire_rdna::DType::F32)?);
+            ffn_up_bufs.push(gpu.alloc_tensor(&[max_n * ffn_dim], hipfire_rdna::DType::F32)?);
             w_down_residual_in_bufs
-                .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
-            w_down_input_bufs.push(gpu.alloc_tensor(&[max_n * ffn_dim], rdna_compute::DType::F32)?);
-            layer_out_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
+            w_down_input_bufs.push(gpu.alloc_tensor(&[max_n * ffn_dim], hipfire_rdna::DType::F32)?);
+            layer_out_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
         }
 
         Ok(Self {
@@ -2505,14 +2505,14 @@ impl GdnTape {
             w_down_residual_in_bufs,
             w_down_input_bufs,
             layer_out_bufs,
-            q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-            v_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-            alpha_scratch: gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
-            beta_scratch: gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
-            attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?,
+            k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?,
+            v_scratch: gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
+            q_scratch: gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
+            k_scratch: gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
+            alpha_scratch: gpu.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?,
+            beta_scratch: gpu.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?,
+            attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
             q8_requant_frame_base: None,
             q8_requant_frame_layers: n_la_layers,
         })
@@ -2683,60 +2683,60 @@ impl GdnTapeShards {
             let mut layer_out_bufs = Vec::with_capacity(n_la_total);
             for global_la_idx in 0..n_la_total {
                 if shard_owns[band][global_la_idx] {
-                    x_in_bufs.push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                    x_in_bufs.push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_input_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_x_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_q_full_bufs
-                        .push(g.alloc_tensor(&[max_n * fa_q_full_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * fa_q_full_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_q_norm_bufs
-                        .push(g.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_q_bufs
-                        .push(g.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_k_bufs
-                        .push(g.alloc_tensor(&[max_n * fa_kv_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * fa_kv_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_v_bufs
-                        .push(g.alloc_tensor(&[max_n * fa_kv_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * fa_kv_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_attn_raw_bufs
-                        .push(g.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_attn_out_bufs
-                        .push(g.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * fa_q_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_wo_residual_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     fa_bridge_layer_out_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
-                    qkv_bufs.push(g.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
+                    qkv_bufs.push(g.alloc_tensor(&[max_n * qkv_dim], hipfire_rdna::DType::F32)?);
                     alpha_bufs
-                        .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-                    beta_bufs.push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
+                    beta_bufs.push(g.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
                     alpha_raw_bufs
-                        .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
                     beta_raw_bufs
-                        .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
-                    q_raw_bufs.push(g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
-                    k_raw_bufs.push(g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
-                    v_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-                    q_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-                    k_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-                    attn_out_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-                    normed_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
-                    wo_input_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?);
+                    q_raw_bufs.push(g.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?);
+                    k_raw_bufs.push(g.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?);
+                    v_bufs.push(g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+                    q_bufs.push(g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+                    k_bufs.push(g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+                    attn_out_bufs.push(g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+                    normed_bufs.push(g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
+                    wo_input_bufs.push(g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?);
                     wo_residual_in_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     attn_residual_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     ffn_input_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     ffn_gate_bufs
-                        .push(g.alloc_tensor(&[max_n * ffn_dim], rdna_compute::DType::F32)?);
-                    ffn_up_bufs.push(g.alloc_tensor(&[max_n * ffn_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * ffn_dim], hipfire_rdna::DType::F32)?);
+                    ffn_up_bufs.push(g.alloc_tensor(&[max_n * ffn_dim], hipfire_rdna::DType::F32)?);
                     w_down_residual_in_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                     w_down_input_bufs
-                        .push(g.alloc_tensor(&[max_n * ffn_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * ffn_dim], hipfire_rdna::DType::F32)?);
                     layer_out_bufs
-                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], hipfire_rdna::DType::F32)?);
                 } else {
                     // Placeholder: 1 F32 element. Lets the chunk dispatch
                     // index `qkv_bufs[delta_layer_idx]` without bounds-
@@ -2744,40 +2744,40 @@ impl GdnTapeShards {
                     // These entries are never written under correct
                     // dispatch (the chunk loop only iterates layers in
                     // this band).
-                    x_in_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_input_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_x_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_q_full_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_q_norm_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_q_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_k_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_v_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_attn_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_attn_out_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    x_in_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_input_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_x_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_q_full_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_q_norm_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_q_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_k_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_v_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_attn_raw_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_attn_out_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
                     fa_bridge_wo_residual_bufs
-                        .push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    fa_bridge_layer_out_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    qkv_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    alpha_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    beta_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    alpha_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    beta_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    q_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    k_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    v_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    q_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    k_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    attn_out_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    normed_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    wo_input_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    wo_residual_in_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    attn_residual_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    ffn_input_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    ffn_gate_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    ffn_up_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    w_down_residual_in_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    w_down_input_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
-                    layer_out_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                        .push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    fa_bridge_layer_out_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    qkv_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    alpha_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    beta_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    alpha_raw_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    beta_raw_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    q_raw_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    k_raw_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    v_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    q_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    k_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    attn_out_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    normed_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    wo_input_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    wo_residual_in_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    attn_residual_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    ffn_input_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    ffn_gate_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    ffn_up_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    w_down_residual_in_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    w_down_input_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
+                    layer_out_bufs.push(g.alloc_tensor(&[1], hipfire_rdna::DType::F32)?);
                 }
             }
             shards.push(GdnTape {
@@ -2833,14 +2833,14 @@ impl GdnTapeShards {
                 // band-local scratch. PP+MTP consumer's replay runs on
                 // the target tape, not the shards, but allocating these
                 // keeps the GdnTape struct invariant.
-                q_raw_scratch: g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-                k_raw_scratch: g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
-                v_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-                q_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-                k_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
-                alpha_scratch: g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
-                beta_scratch: g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
-                attn_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+                q_raw_scratch: g.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?,
+                k_raw_scratch: g.alloc_tensor(&[max_n * k_dim], hipfire_rdna::DType::F32)?,
+                v_scratch: g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
+                q_scratch: g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
+                k_scratch: g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
+                alpha_scratch: g.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?,
+                beta_scratch: g.alloc_tensor(&[max_n * n_v_heads], hipfire_rdna::DType::F32)?,
+                attn_scratch: g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
                 q8_requant_frame_base: None,
                 q8_requant_frame_layers: n_la_total,
             });
@@ -5483,15 +5483,15 @@ impl DdtreeScratch {
         n_fa_layers: usize,
     ) -> HipResult<Self> {
         let max_n = 1 + max_budget;
-        let attn_bias = gpu.alloc_tensor(&[max_n * max_n], rdna_compute::DType::F32)?;
-        let parent_indices = gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
+        let attn_bias = gpu.alloc_tensor(&[max_n * max_n], hipfire_rdna::DType::F32)?;
+        let parent_indices = gpu.alloc_tensor(&[max_n * 4], hipfire_rdna::DType::Raw)?;
         // Path B per-FA-layer pre-RoPE K capture. Sized once at session
         // init. Empty on n_fa_layers=0 → capture is a no-op even if the
         // env gate is set (slow-path-kill won't have data to consume).
         let mut pre_rope_k: Vec<GpuTensor> = Vec::with_capacity(n_fa_layers);
         for _ in 0..n_fa_layers {
             pre_rope_k.push(
-                gpu.alloc_tensor(&[max_n * n_kv_heads * head_dim], rdna_compute::DType::F32)?,
+                gpu.alloc_tensor(&[max_n * n_kv_heads * head_dim], hipfire_rdna::DType::F32)?,
             );
         }
 
@@ -5504,14 +5504,14 @@ impl DdtreeScratch {
         let widest_k_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp).max(asym2_k_bpp);
         let widest_v_bpp = q8_bpp;
 
-        let kv_gather_indices = gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
+        let kv_gather_indices = gpu.alloc_tensor(&[max_n * 4], hipfire_rdna::DType::Raw)?;
         // Raw byte buffers sized to hold `max_n` full K / V rows.
         let kv_gather_scratch_k =
-            gpu.alloc_tensor(&[(max_n * widest_k_bpp + 3) / 4], rdna_compute::DType::F32)?;
+            gpu.alloc_tensor(&[(max_n * widest_k_bpp + 3) / 4], hipfire_rdna::DType::F32)?;
         let kv_gather_scratch_v =
-            gpu.alloc_tensor(&[(max_n * widest_v_bpp + 3) / 4], rdna_compute::DType::F32)?;
+            gpu.alloc_tensor(&[(max_n * widest_v_bpp + 3) / 4], hipfire_rdna::DType::F32)?;
         // Tape rows are F32 projections, so sized in F32 elements directly.
-        let tape_gather_scratch = gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?;
+        let tape_gather_scratch = gpu.alloc_tensor(&[max_n * qkv_dim], hipfire_rdna::DType::F32)?;
 
         Ok(Self {
             max_n,
@@ -5588,10 +5588,10 @@ impl VerifyScratch {
             dim,
             vocab,
             hidden_k,
-            final_hidden: gpu.alloc_tensor(&[max_n * dim], rdna_compute::DType::F32)?,
-            logits: gpu.alloc_tensor(&[max_n * vocab], rdna_compute::DType::F32)?,
-            rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
-            argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
+            final_hidden: gpu.alloc_tensor(&[max_n * dim], hipfire_rdna::DType::F32)?,
+            logits: gpu.alloc_tensor(&[max_n * vocab], hipfire_rdna::DType::F32)?,
+            rot: gpu.alloc_tensor(&[max_n * hidden_k], hipfire_rdna::DType::F32)?,
+            argmax: gpu.alloc_tensor(&[max_n], hipfire_rdna::DType::F32)?,
             prefill_batch: None,
         })
     }
@@ -5662,9 +5662,9 @@ impl HiddenStateRingBuffer {
         let mut staging_bufs = Vec::with_capacity(num_extract);
         for _ in 0..num_extract {
             layer_bufs
-                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], hipfire_rdna::DType::F32)?);
             staging_bufs
-                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
+                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], hipfire_rdna::DType::F32)?);
         }
         Ok(Self {
             layer_bufs,
@@ -7268,13 +7268,13 @@ pub fn spec_step_dflash(
         let w_out = &target.weights.output;
         let use_batched_gemm = matches!(
             w_out.gpu_dtype,
-            rdna_compute::DType::HFQ4G256
-                | rdna_compute::DType::MQ4G256
-                | rdna_compute::DType::MQ3G256
-                | rdna_compute::DType::HFQ6G256
-                | rdna_compute::DType::MQ6G256,
+            hipfire_rdna::DType::HFQ4G256
+                | hipfire_rdna::DType::MQ4G256
+                | hipfire_rdna::DType::MQ3G256
+                | hipfire_rdna::DType::HFQ6G256
+                | hipfire_rdna::DType::MQ6G256,
         );
-        let use_q8_staged = matches!(w_out.gpu_dtype, rdna_compute::DType::Q8_0);
+        let use_q8_staged = matches!(w_out.gpu_dtype, hipfire_rdna::DType::Q8_0);
         if use_batched_gemm || use_q8_staged {
             // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
             // download just (B-1) × 4 bytes of indices.
@@ -7294,10 +7294,10 @@ pub fn spec_step_dflash(
             let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
 
             match w_out.gpu_dtype {
-                rdna_compute::DType::Q8_0 => {
+                hipfire_rdna::DType::Q8_0 => {
                     dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)?;
                 }
-                rdna_compute::DType::HFQ4G256 => {
+                hipfire_rdna::DType::HFQ4G256 => {
                     run_spec_gemm_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
@@ -7310,7 +7310,7 @@ pub fn spec_step_dflash(
                         batch,
                     )?;
                 }
-                rdna_compute::DType::MQ4G256 => {
+                hipfire_rdna::DType::MQ4G256 => {
                     assert!(
                         batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                         "verify_scratch.rot undersized for draft lm_head"
@@ -7331,7 +7331,7 @@ pub fn spec_step_dflash(
                         batch,
                     )?;
                 }
-                rdna_compute::DType::MQ3G256 => {
+                hipfire_rdna::DType::MQ3G256 => {
                     assert!(
                         batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                         "verify_scratch.rot undersized for MQ3 draft lm_head"
@@ -7350,7 +7350,7 @@ pub fn spec_step_dflash(
                         batch,
                     )?;
                 }
-                rdna_compute::DType::HFQ6G256 => {
+                hipfire_rdna::DType::HFQ6G256 => {
                     run_spec_gemm_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256BatchedLmhead,
@@ -7363,7 +7363,7 @@ pub fn spec_step_dflash(
                         batch,
                     )?;
                 }
-                rdna_compute::DType::MQ6G256 => {
+                hipfire_rdna::DType::MQ6G256 => {
                     assert!(
                         batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                         "verify_scratch.rot undersized for MQ6 draft lm_head"
@@ -10416,14 +10416,14 @@ fn run_dflash_draft_for_logits(
     // the full (B-1) × vocab logits so the tree builder can compute top-K.
     let batch = b - 1;
     let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
-    let logits_batch = gpu.alloc_owned(&[batch * vocab], rdna_compute::DType::F32)?;
+    let logits_batch = gpu.alloc_owned(&[batch * vocab], hipfire_rdna::DType::F32)?;
     let w_out = &target.weights.output;
 
     let gemm_result = match w_out.gpu_dtype {
-        rdna_compute::DType::Q8_0 => {
+        hipfire_rdna::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
         }
-        rdna_compute::DType::HFQ4G256 => {
+        hipfire_rdna::DType::HFQ4G256 => {
             run_spec_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq4G256,
@@ -10436,8 +10436,8 @@ fn run_dflash_draft_for_logits(
                 batch,
             )
         }
-        rdna_compute::DType::MQ4G256 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+        hipfire_rdna::DType::MQ4G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             // AWQ-aware rotation; see the target-verify dispatch above for the
             // rationale (numerically identical when `w_out.awq_scale` is None).
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
@@ -10459,8 +10459,8 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
-        rdna_compute::DType::MQ3G256 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+        hipfire_rdna::DType::MQ3G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
@@ -10484,7 +10484,7 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
-        rdna_compute::DType::HFQ6G256 => {
+        hipfire_rdna::DType::HFQ6G256 => {
             // Phase A.4: HFQ6 lm_head batched via gemm_hfq6g256_batched_lmhead
             // (which zeros Y then dispatches the dp4a residual on gfx906 or
             // WMMA / FP16 fallbacks elsewhere).
@@ -10500,8 +10500,8 @@ fn run_dflash_draft_for_logits(
                 batch,
             )
         }
-        rdna_compute::DType::MQ6G256 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+        hipfire_rdna::DType::MQ6G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
@@ -10614,13 +10614,13 @@ fn run_dflash_draft_for_topk_gpu(
     // Step 4: lm_head → [batch × vocab] logits (GPU-resident).
     let batch = b - 1;
     let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
-    let logits_batch = gpu.alloc_owned(&[batch * vocab], rdna_compute::DType::F32)?;
+    let logits_batch = gpu.alloc_owned(&[batch * vocab], hipfire_rdna::DType::F32)?;
     let w_out = &target.weights.output;
     let gemm_result = match w_out.gpu_dtype {
-        rdna_compute::DType::Q8_0 => {
+        hipfire_rdna::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
         }
-        rdna_compute::DType::HFQ4G256 => {
+        hipfire_rdna::DType::HFQ4G256 => {
             run_spec_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq4G256,
@@ -10633,8 +10633,8 @@ fn run_dflash_draft_for_topk_gpu(
                 batch,
             )
         }
-        rdna_compute::DType::MQ4G256 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+        hipfire_rdna::DType::MQ4G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             // AWQ-aware rotation for the target lm_head when an AWQ
             // sidecar is attached. Sister of the spec-verify dispatch above.
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
@@ -10656,8 +10656,8 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
-        rdna_compute::DType::MQ3G256 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+        hipfire_rdna::DType::MQ3G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
@@ -10677,7 +10677,7 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
-        rdna_compute::DType::HFQ6G256 => {
+        hipfire_rdna::DType::HFQ6G256 => {
             // Phase A.4: HFQ6 lm_head batched.
             run_spec_gemm_key(
                 gpu,
@@ -10691,8 +10691,8 @@ fn run_dflash_draft_for_topk_gpu(
                 batch,
             )
         }
-        rdna_compute::DType::MQ6G256 => {
-            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+        hipfire_rdna::DType::MQ6G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], hipfire_rdna::DType::F32)?;
             let r1 = weights::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
@@ -10720,8 +10720,8 @@ fn run_dflash_draft_for_topk_gpu(
     gemm_result?;
 
     // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
-    let topk_idx_gpu = gpu.alloc_owned(&[batch * k], rdna_compute::DType::F32)?;
-    let topk_val_gpu = gpu.alloc_owned(&[batch * k], rdna_compute::DType::F32)?;
+    let topk_idx_gpu = gpu.alloc_owned(&[batch * k], hipfire_rdna::DType::F32)?;
+    let topk_val_gpu = gpu.alloc_owned(&[batch * k], hipfire_rdna::DType::F32)?;
     let topk_result = gpu.topk_logsumexp_batched_f32(
         &logits_batch,
         &topk_idx_gpu,
@@ -12259,7 +12259,7 @@ pub fn seed_target_hidden_from_prompt(
 /// - `draft_scratch.uploaded_target_hidden_rows = budget` so the next
 ///   draft_forward sees the compacted layout as already-uploaded.
 pub fn apply_eviction_retain_to_draft(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     draft_scratch: &mut dflash::DflashScratch,
     retain_mask: &[u32],
     ne: usize,

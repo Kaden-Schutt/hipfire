@@ -8,7 +8,7 @@
 //!   dW[N,K]          = dYᵀ·X  : trans_a=true
 //! See the mapping table in docs/plans/2026-06-17-hipfire-train-phase0.md §1.
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 /// `y = x · wᵀ`. Shapes: `x:[m*k]`, `w:[n*k]`, `y:[m*n]` (all flat fp32).
 pub fn linear_forward(

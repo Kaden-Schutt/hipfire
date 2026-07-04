@@ -17,7 +17,7 @@ use hipfire_train::model::{model_distill_backward, model_forward, LlamaModel};
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::oqplus_quant::{oq3_simquant, oq8_simquant, oqplus_simquant};
 use hipfire_train::qtip_quant::qtip_quantize_dequant;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 const DEFAULT_DIR: &str =

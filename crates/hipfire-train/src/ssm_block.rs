@@ -14,7 +14,7 @@ use crate::ops::linear::{linear_backward_w, linear_backward_x, linear_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use crate::ops::sigmoid::{sigmoid_backward, sigmoid_forward};
 use crate::ops::swiglu::{swiglu_backward, swiglu_forward};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 #[derive(Clone, Copy)]
 pub struct SsmBlockDims {

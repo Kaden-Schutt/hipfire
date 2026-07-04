@@ -22,7 +22,7 @@
 use crate::block::{Mamba2BlockWeights, Mamba2Dims};
 use crate::weight::LinearWeight;
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 const F32: usize = std::mem::size_of::<f32>();
 

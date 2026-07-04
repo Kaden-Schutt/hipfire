@@ -554,7 +554,7 @@ fn main() {
         "f16"
     };
     // FWHT sign tables for MQ rotation. Seeds 42/1042 match the engine's
-    // `rdna_compute::Gpu::ensure_mq_signs()` so quantized weights here can
+    // `hipfire_rdna::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
     let needs_fwht = use_mq3 || use_mq4 || use_mq6;
     let signs1: Vec<f32> = if needs_fwht {

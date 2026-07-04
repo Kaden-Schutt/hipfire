@@ -97,13 +97,13 @@ Progress: SCOPED 2026-06-22 (manual port, NOT cherry-pick). `git cherry-pick
 -n f7efb940` result: the **9 new kernel .hip files apply clean**
 (gemv_hfq5g256*.hip + gemv_mq5g256.hip), `qwen35.rs` + `families/gemv.rs`
 auto-merge clean; **11 conflicts**. Key STRUCTURAL task: master added 423
-lines of MQ5 gemv launchers to `crates/rdna-compute/src/gemv.rs`, but that
+lines of MQ5 gemv launchers to `crates/hipfire-rdna/src/gemv.rs`, but that
 file is **DELETED in chaingun** (launchers live in `dispatch.rs` now) — so
-relocate those launchers into `rdna-compute/src/dispatch.rs`. Other conflicts
+relocate those launchers into `hipfire-rdna/src/dispatch.rs`. Other conflicts
 are mechanical enum/arm additions: `types.rs` (add `DType::MQ5G256`, qt **31**;
 size + supports_awq_sidecar), `tables/gemv_table.rs`, `families/moe.rs`
 (routed_indexable_mq5 decode arm), `pipeline/mod.rs`, `tests.rs` +
-`coverage_tests.rs`, `rdna-compute/{dispatch,kernels}.rs` (SRC registration),
+`coverage_tests.rs`, `hipfire-rdna/{dispatch,kernels}.rs` (SRC registration),
 `hfq.rs` (loader qt=31), `quantize/src/main.rs` (`--format mq5`,
 `quantize_mq5g256` 8-vals/5-bytes pack, `HIPFIRE_MOE_{EXPERTS,DOWN}_MQ5`).
 Known upstream gaps (non-blocking, mirror them): batched-prefill rejects MQ5
@@ -123,7 +123,7 @@ multi-hour/multi-session, does NOT fit one turn). Findings for whoever resumes:
 - dispatch.rs (DType enum + supports_awq_sidecar) already worked out; the rest
   (types.rs ×10, quantize/main.rs ×9, pipeline ×3, coverage_tests ×3, gemv_table
   ×2, families/moe ×2, tests ×1, hfq ×1) follow the same rule.
-- RELOCATION: f7efb940 adds 8 launchers to `rdna-compute/src/gemv.rs` (DELETED in
+- RELOCATION: f7efb940 adds 8 launchers to `hipfire-rdna/src/gemv.rs` (DELETED in
   chaingun) → paste them into `dispatch.rs`'s `impl Gpu` (helpers ensure_kernel/
   launch_maybe_blob/ensure_fp16_x all present there). Names: gemv_mq5g256_with_rotate,
   _prerotated, gemv_hfq5g256{,_residual,_residual_sigmoid_scaled_gpu_batched,

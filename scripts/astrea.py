@@ -209,8 +209,8 @@ MIXED_G256_BYTES_PER_GROUP = {
 }
 
 ENGINE_HASH_PATHS = [
-    "crates/rdna-compute/src/dispatch.rs",
-    "crates/rdna-compute/src/kernels.rs",
+    "crates/hipfire-rdna/src/dispatch.rs",
+    "crates/hipfire-rdna/src/kernels.rs",
     "crates/hipfire-arch-qwen35/src/qwen35.rs",
     "crates/hipfire-runtime/examples/eval_hipfire.rs",
     "kernels/src/rope_partial_interleaved.hip",
@@ -2435,7 +2435,7 @@ def file_sha256(path):
 
 def detect_rope_convention(root):
     root = Path(root)
-    dispatch_path = root / "crates" / "rdna-compute" / "src" / "dispatch.rs"
+    dispatch_path = root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs"
     text = dispatch_path.read_text(encoding="utf-8", errors="ignore") if dispatch_path.exists() else ""
     has_halfsplit_source = (
         (root / "kernels" / "src" / "rope_partial_halfsplit.hip").exists()

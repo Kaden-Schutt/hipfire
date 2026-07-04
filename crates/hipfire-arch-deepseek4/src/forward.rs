@@ -29,7 +29,7 @@ use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
 };
 use hipfire_dispatch::types::DispatchError;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// OnceLock-cached env-var lookups for the DeepSeek V4 decode hot path. Each
 /// `std::env::var` is a syscall (~1μs) — at 43 layers × ~5 lookups per
@@ -199,7 +199,7 @@ fn gemv_auto_batched(
 /// device-sync. Two same-seed runs with different output dirs can then be
 /// compared with `cmp -l a/x.bin b/x.bin` to find the first byte that
 /// differs — pinpointing which kernel introduces non-determinism.
-fn dump_buf(gpu: &mut Gpu, tag: &str, buf: &rdna_compute::GpuTensor) {
+fn dump_buf(gpu: &mut Gpu, tag: &str, buf: &hipfire_rdna::GpuTensor) {
     let dir = match std::env::var("HIPFIRE_DEEPSEEK4_DUMP_STATE") {
         Ok(d) => d,
         Err(_) => return,
@@ -2426,8 +2426,8 @@ pub fn forward_ep(
                 // systematically-divergent compressor kernel from near-tie
                 // top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable.
                 if r == 0 && std::env::var("HIPFIRE_EP_DUMP_IDX").ok().as_deref() == Some("1") {
-                    let fp = |gpu: &mut rdna_compute::Gpu,
-                              t: &Option<rdna_compute::GpuTensor>|
+                    let fp = |gpu: &mut hipfire_rdna::Gpu,
+                              t: &Option<hipfire_rdna::GpuTensor>|
                      -> String {
                         match t {
                             Some(t) => match gpu.download_f32(t) {
@@ -5350,7 +5350,7 @@ pub(crate) fn pos_slot(
     state: &DeepseekV4State,
     layer_idx: usize,
     slot: usize,
-) -> Result<rdna_compute::GpuTensor, String> {
+) -> Result<hipfire_rdna::GpuTensor, String> {
     let arr = state
         .pos_array_device
         .as_ref()
@@ -6222,10 +6222,10 @@ fn attention_block_batched_swa_only(
         // Lazy-alloc debug scratch on the GPU on first call.
         let n_h = n_heads;
         let debug_max = gpu
-            .alloc_tensor(&[batch_size, n_h], rdna_compute::DType::F32)
+            .alloc_tensor(&[batch_size, n_h], hipfire_rdna::DType::F32)
             .map_err(|e| format!("alloc debug_max: {e:?}"))?;
         let debug_sumexp = gpu
-            .alloc_tensor(&[batch_size, n_h], rdna_compute::DType::F32)
+            .alloc_tensor(&[batch_size, n_h], hipfire_rdna::DType::F32)
             .map_err(|e| format!("alloc debug_sumexp: {e:?}"))?;
         gpu.deepseek4_attn_swa_batched_debug(
             &pbs.q_batch,
@@ -8967,7 +8967,7 @@ pub fn prefill_with_mtp_fill(
     let stream_len = cfg.hc_mult * cfg.hidden_size;
     if state.mtp_last_hidden.is_none() {
         state.mtp_last_hidden = Some(
-            gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
+            gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], hipfire_rdna::DType::F32)
                 .map_err(|e| format!("alloc mtp_last_hidden (spec prefill): {e:?}"))?,
         );
     }
@@ -8990,11 +8990,11 @@ pub fn prefill_with_mtp_fill(
 
         // 2. Capture the last position's stream for the head on the last
         //    chunk, BEFORE mtp_forward_batched overwrites streams_batch.
-        let last_stream_pre_mtp: Option<rdna_compute::OwnedTensor> = if is_last_chunk {
+        let last_stream_pre_mtp: Option<hipfire_rdna::OwnedTensor> = if is_last_chunk {
             let off = (chunk_size - 1) * stream_len;
             let src = pbs.streams_batch.sub_offset(off, stream_len);
             let snap = gpu
-                .alloc_owned(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
+                .alloc_owned(&[cfg.hc_mult, cfg.hidden_size], hipfire_rdna::DType::F32)
                 .map_err(|e| format!("alloc head_input_snap: {e:?}"))?;
             gpu.memcpy_dtod_auto(&snap.buf, &src.buf, stream_len * 4)
                 .map_err(|e| format!("d2d streams[last] → head_input_snap: {e:?}"))?;

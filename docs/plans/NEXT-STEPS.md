@@ -111,7 +111,7 @@ This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
   - **Gate:** full-model PPL via C1d (reconstruction settled: near bound).
 - **C2 — fused QTIP decode GEMV.** Port the reference decode+matvec kernel
   `qtip-kernels/src` + `test_decompress_matvec.py` (CUDA → HIP) into the
-  rdna-compute dispatch; variant of `gemv_mq2g256_lloyd.hip`. Friction is
+  hipfire-rdna dispatch; variant of `gemv_mq2g256_lloyd.hip`. Friction is
   sub-byte bit-window unpack, not serialization (decode is parallel).
 - **C2b — dense QTIP prefill GEMM** (mirror the mq3/mq4 `_residual_wmma`).
 - **C3.** gfx1103 retune (`gfx-kernel-metadata` for occupancy/LDS/spill).

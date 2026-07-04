@@ -53,7 +53,7 @@ if [ ! -x "$EXE" ]; then
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
-               crates/rdna-compute/src/dispatch.rs \
+               crates/hipfire-rdna/src/dispatch.rs \
                crates/hipfire-dispatch/src/families/moe.rs \
                crates/hipfire-dispatch/src/pipeline/mod.rs \
                crates/hipfire-dispatch/src/pipeline/steps.rs \

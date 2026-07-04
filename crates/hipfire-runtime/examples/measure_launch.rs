@@ -4,7 +4,7 @@
 
 //! Measure raw kernel launch overhead by launching a trivial kernel many times.
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init");
 
     // Use add_inplace as a near-zero-work kernel (tiny 1-element tensor)
     let a = gpu.upload_f32(&[1.0], &[1]).unwrap();

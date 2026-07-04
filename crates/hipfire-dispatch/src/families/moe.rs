@@ -17,8 +17,8 @@
 //! end-to-end from the call site through every inner GEMV. Scratch stays model-owned.
 //! Grouped-GEMM prefill is a future arm (gated on `ShapeInfo.batch_size`).
 
-use rdna_compute::DType;
-use rdna_compute::GpuTensor;
+use hipfire_rdna::DType;
+use hipfire_rdna::GpuTensor;
 
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GivensRef, WeightRef};
@@ -389,8 +389,8 @@ impl MoePrefillResolution {
     /// not `std::env` — mid-prefill env mutation is not honored.
     pub fn resolve(
         d: &MoeDtypes,
-        arch: &rdna_compute::arch_caps::ArchCaps,
-        flags: &rdna_compute::feature_flags::FeatureFlags,
+        arch: &hipfire_rdna::arch_caps::ArchCaps,
+        flags: &hipfire_rdna::feature_flags::FeatureFlags,
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
@@ -466,7 +466,7 @@ impl MoeFamily {
     pub fn run(
         &self,
         ctx: &DispatchCtx,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         params: &MoeParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_decode(ctx, gpu, params)
@@ -486,7 +486,7 @@ impl MoeFamily {
     /// be pure waste on the decode hot path.
     pub fn run_bias_aware(
         &self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         params: &MoeBiasAwareParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_decode_bias_aware(gpu, params)
@@ -500,7 +500,7 @@ impl MoeFamily {
     /// the shared expert, and the router GEMV + `sqrt_softplus`.
     pub fn run_bias_aware_prefill(
         &self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         params: &MoeBiasAwarePrefillParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_prefill_bias_aware(gpu, params)
@@ -518,7 +518,7 @@ impl MoeFamily {
     pub fn run_prefill(
         &self,
         ctx: &DispatchCtx,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         params: &MoePrefillParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_prefill(ctx, gpu, params)

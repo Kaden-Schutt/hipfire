@@ -32,7 +32,7 @@ fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::sampler;
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     use std::path::Path;
     use std::time::Instant;
 
@@ -74,7 +74,7 @@ fn main() {
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.head_dim,
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();

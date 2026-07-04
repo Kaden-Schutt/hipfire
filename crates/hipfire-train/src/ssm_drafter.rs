@@ -18,7 +18,7 @@ use crate::ssm_block::{
     free_ssm_block_acts, ssm_block_backward, ssm_block_forward, SsmBlockActivations, SsmBlockDims,
     SsmBlockGrad, SsmBlockWeights,
 };
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 fn clone_tensor(gpu: &mut Gpu, t: &GpuTensor) -> HipResult<GpuTensor> {
     let n: usize = t.shape.iter().product();

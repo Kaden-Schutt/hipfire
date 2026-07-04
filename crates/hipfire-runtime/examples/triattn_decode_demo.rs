@@ -26,7 +26,7 @@ fn main() {
     use hipfire_runtime::sampler;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{self, TriAttnCenters};
-    use rdna_compute::{DType, Gpu};
+    use hipfire_rdna::{DType, Gpu};
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();

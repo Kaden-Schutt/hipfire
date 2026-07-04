@@ -21,7 +21,7 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::triattn::{self, BandCenter, TriAttnCenters};
-    use rdna_compute::{DType, Gpu};
+    use hipfire_rdna::{DType, Gpu};
 
     // ── Config ─────────────────────────────────────────────────────────
     let n_heads = 16usize;

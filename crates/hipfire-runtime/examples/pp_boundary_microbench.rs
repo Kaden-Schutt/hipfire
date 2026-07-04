@@ -33,7 +33,7 @@
 //!      ./target/release/examples/pp_boundary_microbench && hipfire gpu-lock release
 
 use hipfire_runtime::multi_gpu::Gpus;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::time::Instant;
 
 const DIM: usize = 5120; // qwen3.6-27b hidden size

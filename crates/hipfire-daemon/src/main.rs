@@ -2543,7 +2543,7 @@ fn main() {
                     std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
             }
         }
-        let mut gpu = match rdna_compute::Gpu::init() {
+        let mut gpu = match hipfire_rdna::Gpu::init() {
             Ok(g) => g,
             Err(e) => {
                 report_gpu_init_failure(&e);
@@ -2586,7 +2586,7 @@ fn main() {
         llm_registry.templates_dir,
     );
 
-    let mut gpu = match rdna_compute::Gpu::init() {
+    let mut gpu = match hipfire_rdna::Gpu::init() {
         Ok(g) => g,
         Err(e) => {
             report_gpu_init_failure(&e);
@@ -2615,7 +2615,7 @@ fn main() {
     // output is a host-side Vec<u32>, so no peer-copy is needed — generate
     // routes maybe_compress_prompt to this handle, decode stays on target.
     // None means the drafter shares the target gpu (single-card, unchanged).
-    let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
+    let mut pflash_drafter_gpu: Option<hipfire_rdna::Gpu> = None;
     let mut dummy_model: Option<DummyModelState> = None;
 
     let stdin = std::io::stdin();
@@ -3203,7 +3203,7 @@ fn main() {
                         // `HIPFIRE_DPM_WARMUP_SECS` env the in-process bench tools
                         // honor (`bench_qwen35_speed`, `dflash_spec_demo`,
                         // `bench_stream_overlap`); see
-                        // `crates/rdna-compute/src/dispatch.rs::dpm_warmup` and
+                        // `crates/hipfire-rdna/src/dispatch.rs::dpm_warmup` and
                         // `docs/methodology/perf-benchmarking.md`.
                         //
                         // Runs AFTER weight upload but BEFORE the `loaded` ack so
@@ -3297,9 +3297,9 @@ fn main() {
                                     // drafter weights/KV/scratch live on the secondary
                                     // card. Compress output is host-side, so decode stays
                                     // on target. -1 / 0 => share target gpu (unchanged).
-                                    let mut sibling: Option<rdna_compute::Gpu> = None;
+                                    let mut sibling: Option<hipfire_rdna::Gpu> = None;
                                     if pflash_drafter_device > 0 {
-                                        match rdna_compute::Gpu::init_with_device(
+                                        match hipfire_rdna::Gpu::init_with_device(
                                             pflash_drafter_device,
                                         ) {
                                             Ok(g) => sibling = Some(g),
@@ -3313,7 +3313,7 @@ fn main() {
                                             }
                                         }
                                     }
-                                    let dg: &mut rdna_compute::Gpu =
+                                    let dg: &mut hipfire_rdna::Gpu =
                                         sibling.as_mut().unwrap_or(&mut gpu);
                                     dg.bind_thread_or_warn();
                                     match hipfire_arch_qwen35::pflash::load_drafter(
@@ -5848,7 +5848,7 @@ fn main() {
                 // the shared, tapped forward_prefill_batch. Both feed the same
                 // capture session. Helper to finalize identically per backend.
                 use hipfire_runtime::arch::SimpleAr;
-                fn finish(gpu: &mut rdna_compute::Gpu) -> Result<(Vec<Vec<f32>>, usize), String> {
+                fn finish(gpu: &mut hipfire_rdna::Gpu) -> Result<(Vec<Vec<f32>>, usize), String> {
                     hipfire_hneurons::capture::finish_capture(gpu)
                         .map_err(|e| format!("finish: {e:?}"))?
                         .ok_or_else(|| "capture produced no feature".to_string())

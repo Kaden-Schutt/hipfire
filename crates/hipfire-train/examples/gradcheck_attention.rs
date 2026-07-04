@@ -10,7 +10,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::ops::attention::{sdpa_backward, sdpa_forward};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 const SEQ: usize = 5;
 const D: usize = 8;

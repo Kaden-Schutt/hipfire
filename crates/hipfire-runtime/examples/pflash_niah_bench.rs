@@ -484,7 +484,7 @@ fn main() {
     let config = qwen35::config_from_hfq(&hfq).expect("qwen35 config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
-    let mut gpu = rdna_compute::Gpu::init_with_device(target_device).expect("target GPU init");
+    let mut gpu = hipfire_rdna::Gpu::init_with_device(target_device).expect("target GPU init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!(
         "loaded in {:.1}s | dim={} layers={} heads={} kv_heads={}",
@@ -607,8 +607,8 @@ fn main() {
         // to the pre-flag path). When they differ, drafter weights / KV /
         // scratch live entirely on the secondary device; the compression
         // output is just a `Vec<u32>` of kept token IDs returned to host.
-        let mut drafter_gpu_owned: Option<rdna_compute::Gpu> = if drafter_device != target_device {
-            Some(rdna_compute::Gpu::init_with_device(drafter_device).expect("drafter GPU init"))
+        let mut drafter_gpu_owned: Option<hipfire_rdna::Gpu> = if drafter_device != target_device {
+            Some(hipfire_rdna::Gpu::init_with_device(drafter_device).expect("drafter GPU init"))
         } else {
             None
         };
@@ -617,7 +617,7 @@ fn main() {
         // scope keeps the borrow short so the target `gpu` is fully
         // released back to the outer scope after the drafter is unloaded.
         let kept = {
-            let drafter_gpu: &mut rdna_compute::Gpu = match &mut drafter_gpu_owned {
+            let drafter_gpu: &mut hipfire_rdna::Gpu = match &mut drafter_gpu_owned {
                 Some(g) => g,
                 None => &mut gpu,
             };

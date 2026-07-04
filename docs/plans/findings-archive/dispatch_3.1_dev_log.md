@@ -28,7 +28,7 @@
 **Notes:**
 - Refactored `dispatch_attention` signature from `(gpu, params)` to `(gpu, key, params)` now (rather than deferring to B1) because the completeness test needs a way to check "does key X have a dedicated arm?" and keeping the old `params.kind`-reading form would mean changing it twice.
 - The `run()` method now passes `params.kind` explicitly: `dispatch_attention(gpu, params.kind, params)`. B1 will remove `params.kind` entirely when `KvTierPlan` takes over.
-- `AttnQ8_0Kv` maps to `gpu.attention_q8_0_kv(q, k_cache, v_cache, output, pos_buf, seq_len, n_heads, n_kv_heads, head_dim, physical_cap)` — same as `AttnFlashQ8_0` minus `flash_partials`. Parameter mapping verified against `rdna-compute/src/attention.rs:4424`.
+- `AttnQ8_0Kv` maps to `gpu.attention_q8_0_kv(q, k_cache, v_cache, output, pos_buf, seq_len, n_heads, n_kv_heads, head_dim, physical_cap)` — same as `AttnFlashQ8_0` minus `flash_partials`. Parameter mapping verified against `hipfire-rdna/src/attention.rs:4424`.
 - Catch-all error now says `"unhandled key — missing dispatch arm"` instead of empty strings.
 - Added `DISPATCHED_ATTENTION_KEYS` const array (18 entries) + `dispatch_attention_has_arms_for_all_attention_keys` test — cross-checks table registrations vs dispatched arms bidirectionally.
 - Added `attention_keys_resolve_on_fleet_archs` coverage test — all 18 attention keys resolve on their target archs (ALL for Always-gated, WAVE32 for HasWmma-gated).

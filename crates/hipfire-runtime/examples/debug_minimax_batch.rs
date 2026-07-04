@@ -36,7 +36,7 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: debug_minimax_batch <model.hfq>");
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(Path::new(&path)).expect("open model");
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq).expect("config");
     let weights = <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, &mut gpu)

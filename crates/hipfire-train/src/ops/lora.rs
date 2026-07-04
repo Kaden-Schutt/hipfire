@@ -13,7 +13,7 @@
 //!   dx  = dy·W + dh·A      (base contributes to input grad even though frozen)
 
 use super::linear::{linear_backward_w, linear_backward_x, linear_forward};
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 /// Forward. `x:[m*k]`, `w:[n*k]`, `a:[r*k]`, `b:[n*r]`; outputs `y:[m*n]` and
 /// saves `h:[m*r]` for the backward.

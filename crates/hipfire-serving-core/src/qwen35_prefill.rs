@@ -57,7 +57,7 @@ use crate::session::{
 /// prefill kernels call so clients can resume from a cached prefix).
 pub fn emit_qwen35_prefill_checkpoint(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     arena_backend: SequenceStateArenaBackend,
     hook: Qwen35PrefillCheckpointHook<'_>,
 ) -> Result<String, String> {
@@ -85,7 +85,7 @@ pub fn emit_qwen35_prefill_checkpoint(
 /// emitting per-boundary checkpoints. The single-session prefill entry point.
 pub fn qwen35_prefill_active_session(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     tokens: &[u32],
     replay_as_generated_suffix: bool,
 ) -> Result<usize, String> {
@@ -189,7 +189,7 @@ pub fn qwen35_prefill_active_session(
 /// Serial-path prefill of one owned session's token segment (the per-session
 /// unit the serial batch driver loops over).
 pub fn qwen35_prefill_owned_session_serial_segment(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weights: &qwen35::Qwen35Weights,
     config: &qwen35::Qwen35Config,
     scratch: &qwen35::Qwen35Scratch,
@@ -529,7 +529,7 @@ pub fn run_prefix_hash_preflight_qwen35(
 /// the prompt suffix.
 pub fn qwen35_prefill_suffix_batch(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
@@ -667,7 +667,7 @@ pub fn qwen35_prefill_suffix_batch(
 /// [`emit_qwen35_prefill_checkpoint`] for serially-prefilled owned sessions).
 pub fn emit_qwen35_owned_prefill_checkpoint(
     sessions: &mut HashMap<String, Qwen35RequestSessionState>,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     hook: Qwen35PrefillCheckpointHook<'_>,
     source: &mut Qwen35RequestSessionState,
 ) -> Result<String, String> {
@@ -693,7 +693,7 @@ pub fn emit_qwen35_owned_prefill_checkpoint(
 /// expert-grouped FFN.
 pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
@@ -1127,7 +1127,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
 /// (arch_id 5), prefilling the suffix in batched layer passes.
 pub fn qwen35_prefill_suffix_batch_fused_dense(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
@@ -1563,7 +1563,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
 /// and the fallback when no fused kernel applies.
 pub fn qwen35_prefill_suffix_batch_serial_reference(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
@@ -1717,7 +1717,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
 /// batch done events. The non-fused multi-session prefill entry point.
 pub fn run_generate_batch_prefill_serial_qwen35(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
     pflash_active: bool,

@@ -12,7 +12,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::ops::distill::distill_kl;
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 const ROWS: usize = 3;
 const V: usize = 9;

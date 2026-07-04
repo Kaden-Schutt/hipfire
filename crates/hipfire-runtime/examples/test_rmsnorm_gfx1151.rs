@@ -7,7 +7,7 @@
 //! On gfx1151 this exercises `rmsnorm_f32_gfx1151`; on other arches it still
 //! compares the generic route against the same CPU reference.
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn rmsnorm_ref(x: &[f32], weight: &[f32], n: usize, eps: f32) -> Vec<f32> {
     let batch = x.len() / n;

@@ -6,7 +6,7 @@
 //! No model loading required — validates kernels independently.
 //! Usage: cargo run --release --features deltanet --example test_kernels
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::time::Instant;
 
 fn main() {

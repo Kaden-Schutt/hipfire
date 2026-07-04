@@ -12,7 +12,7 @@
 use crate::forward::decode_step;
 use crate::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
 use hipfire_runtime::kld_eval::ChunkScoredForward;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Teacher-force `chunk` through a FRESH per-call state (KV cache + partial-RoPE
 /// attention), feeding one token per position and yielding the just-fed token's

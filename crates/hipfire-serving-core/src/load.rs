@@ -328,7 +328,7 @@ pub fn load_model(
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
     pp: usize,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
@@ -2115,7 +2115,7 @@ pub fn load_model_safetensors(
     path: &str,
     max_seq: usize,
     kv_mode: &str,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
     use hipfire_model::ModelSource;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
@@ -2563,7 +2563,7 @@ pub fn load_model_pp(
     kv_mode_override: Option<&str>,
     state_quant_override: Option<&str>,
     pp: usize,
-    _gpu: &mut rdna_compute::Gpu,
+    _gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
     let mut kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
@@ -2847,7 +2847,7 @@ pub fn load_model_pp(
 /// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
 pub fn screen_weights_qwen35(
     weights: &qwen35::Qwen35Weights,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> (usize, usize) {
     use hipfire_arch_qwen35::qwen35::LayerWeights;
     let mut n_safe = 0usize;
@@ -2895,7 +2895,7 @@ pub fn screen_weights_qwen35(
             // layout mismatch would read past the end. See PR #106.
             if !matches!(
                 wt.gpu_dtype,
-                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+                hipfire_rdna::DType::HFQ4G256 | hipfire_rdna::DType::MQ4G256
             ) {
                 continue;
             }
@@ -2913,7 +2913,7 @@ pub fn screen_weights_qwen35(
 /// Free all GPU resources held by a loaded model (weights, scratch, KV/state,
 /// eviction scratch, DFlash drafter) by consuming it. Per-arch teardown mirrors
 /// whichever Option fields are populated.
-pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
     // can't inherit stale verdicts at recycled device addresses. Order
@@ -3108,7 +3108,7 @@ pub fn load_lfm2_dflash_state(
     ctx_capacity: usize,
     target_config: &lfm2moe::config::Lfm2MoeConfig,
     target_state: &lfm2moe::lfm2moe::Lfm2MoeState,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<Lfm2DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open LFM2 draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse LFM2 DflashConfig")?;
@@ -3157,7 +3157,7 @@ pub fn load_dflash_state(
     ctx_capacity: usize,
     target_config: &qwen35::Qwen35Config,
     target_dn: &DeltaNetState,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;

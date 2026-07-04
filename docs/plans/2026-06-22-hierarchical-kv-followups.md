@@ -26,7 +26,7 @@ Code: `crates/hipfire-kvquant/` (leaf codec + `compact_cold_kv`),
 (`crates/hipfire-arch-qwen35/src/qwen35.rs`), serve hook + guard in
 `crates/hipfire-serving-core/src/qwen35_prefill.rs`.
 
-Parity oracles: `rdna-compute/examples/parity_{attention_cold_slots,
+Parity oracles: `hipfire-rdna/examples/parity_{attention_cold_slots,
 flash_tier_merge,flash_partials_ml,two_tier_e2e,cold_4bit_read}` and
 `hipfire-runtime/examples/parity_kv_hier`. Env knobs registered in `env_docs`.
 

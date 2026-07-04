@@ -10,7 +10,7 @@
 
 use hipfire_arch_nemotron::moe::{moe_relu2, MoeExpertWeights, MoeRelu2Gpu, MoeWeights};
 use hipfire_arch_nemotron::MoeConfig;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init");

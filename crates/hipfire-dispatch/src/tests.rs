@@ -18,7 +18,7 @@ use crate::families::gemv::GemvFamily;
 use crate::pipeline::Pipeline;
 use crate::tables::KernelRegistry;
 use crate::types::*;
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -891,10 +891,10 @@ use crate::families::gemv::WeightRef;
 use crate::pipeline::steps::{match_prefix, GemvInput};
 use crate::pipeline::{FusedPattern, Step};
 
-fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
+fn dummy_wr<'a>(t: &'a hipfire_rdna::GpuTensor) -> WeightRef<'a> {
     WeightRef {
         buf: t,
-        dtype: rdna_compute::DType::F32,
+        dtype: hipfire_rdna::DType::F32,
         m: 1,
         k: 1,
         row_stride: 0,
@@ -903,7 +903,7 @@ fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
     }
 }
 
-fn gemv_step<'a>(t: &'a rdna_compute::GpuTensor, wr: &'a WeightRef<'a>) -> Step<'a> {
+fn gemv_step<'a>(t: &'a hipfire_rdna::GpuTensor, wr: &'a WeightRef<'a>) -> Step<'a> {
     Step::Gemv {
         w: wr,
         input: GemvInput::Raw(t),
@@ -913,7 +913,7 @@ fn gemv_step<'a>(t: &'a rdna_compute::GpuTensor, wr: &'a WeightRef<'a>) -> Step<
 
 #[test]
 fn match_prefix_empty_table_never_fires() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
     let steps = [
         gemv_step(&dummy, &wr),
@@ -925,7 +925,7 @@ fn match_prefix_empty_table_never_fires() {
 
 #[test]
 fn match_prefix_picks_longest() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
     let steps = [
         gemv_step(&dummy, &wr),
@@ -952,7 +952,7 @@ fn match_prefix_picks_longest() {
 
 #[test]
 fn match_prefix_no_pattern_longer_than_steps() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
     let steps = [gemv_step(&dummy, &wr)];
     let table = [FusedPattern {
@@ -965,7 +965,7 @@ fn match_prefix_no_pattern_longer_than_steps() {
 
 #[test]
 fn match_prefix_single_op_consumes_one() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
     let steps = [
         gemv_step(&dummy, &wr),
@@ -986,7 +986,7 @@ fn match_prefix_single_op_consumes_one() {
 
 #[test]
 fn match_prefix_guard_false_blocks_match() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
     let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
     let table = [FusedPattern {
@@ -1000,7 +1000,7 @@ fn match_prefix_guard_false_blocks_match() {
 #[test]
 fn match_prefix_guard_receives_correct_window() {
     // Guard inspects window length — verifies it gets exactly ops.len() steps.
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
     let steps = [
         gemv_step(&dummy, &wr),
@@ -1025,7 +1025,7 @@ use crate::pipeline::steps::{
 };
 
 fn make_qkv3_steps<'a>(
-    dummy: &'a rdna_compute::GpuTensor,
+    dummy: &'a hipfire_rdna::GpuTensor,
     wr: &'a WeightRef<'a>,
     rotation: RotationPlan,
 ) -> Vec<Step<'a>> {
@@ -1059,7 +1059,7 @@ fn make_qkv3_steps<'a>(
 }
 
 fn make_gate_up2_steps<'a>(
-    dummy: &'a rdna_compute::GpuTensor,
+    dummy: &'a hipfire_rdna::GpuTensor,
     wr: &'a WeightRef<'a>,
     rotation: RotationPlan,
 ) -> Vec<Step<'a>> {
@@ -1089,7 +1089,7 @@ fn make_gate_up2_steps<'a>(
 
 #[test]
 fn guard_qkv_mq4g256lloyd_fires() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::MQ4G256Lloyd,
@@ -1105,7 +1105,7 @@ fn guard_qkv_mq4g256lloyd_fires() {
 
 #[test]
 fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::HFQ4G256,
@@ -1121,7 +1121,7 @@ fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
 
 #[test]
 fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::MQ4G256Lloyd,
@@ -1137,7 +1137,7 @@ fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
 
 #[test]
 fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::MQ4G256Lloyd,
@@ -1155,7 +1155,7 @@ fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
 
 #[test]
 fn guard_qkv_hfq4g256_covers_mq4g256() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::MQ4G256,
@@ -1171,7 +1171,7 @@ fn guard_qkv_hfq4g256_covers_mq4g256() {
 
 #[test]
 fn guard_qkv_hfq4g256_covers_hfq4g256() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::HFQ4G256,
@@ -1187,7 +1187,7 @@ fn guard_qkv_hfq4g256_covers_hfq4g256() {
 
 #[test]
 fn guard_qkv_hfq6g256_dp4a_gated() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr_hfq6 = WeightRef {
         buf: &dummy,
         dtype: DType::HFQ6G256,
@@ -1220,7 +1220,7 @@ fn guard_qkv_hfq6g256_dp4a_gated() {
 
 #[test]
 fn guard_qkv_rejects_mixed_gemv_input() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::MQ4G256Lloyd,
@@ -1262,7 +1262,7 @@ fn guard_qkv_rejects_mixed_gemv_input() {
 
 #[test]
 fn guard_gate_up_mq4g256lloyd_fires() {
-    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let dummy = hipfire_rdna::GpuTensor::null_for_test();
     let wr = WeightRef {
         buf: &dummy,
         dtype: DType::MQ4G256Lloyd,
@@ -1311,8 +1311,8 @@ fn moe_dtypes_paro() -> MoeDtypes {
     d
 }
 
-fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
-    rdna_compute::feature_flags::FeatureFlags::from_env_for_test("gfx1100")
+fn flags_default() -> hipfire_rdna::feature_flags::FeatureFlags {
+    hipfire_rdna::feature_flags::FeatureFlags::from_env_for_test("gfx1100")
 }
 
 #[test]
@@ -1390,7 +1390,7 @@ fn moe_prefill_resolution_grouped_gemm_opt_out() {
     let mut flags = flags_default();
     flags.moe_grouped_gemm = false;
     let flags = std::sync::Arc::new(flags);
-    let caps = rdna_compute::arch_caps::ArchCaps::new("gfx1100", flags.clone());
+    let caps = hipfire_rdna::arch_caps::ArchCaps::new("gfx1100", flags.clone());
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &caps, &flags);
     assert!(!r.use_path2, "moe_grouped_gemm=0 should disable Path 2");
 }
@@ -1400,7 +1400,7 @@ fn moe_prefill_resolution_paro_i8_opt_out() {
     let mut flags = flags_default();
     flags.moe_paro_i8 = Some(false);
     let flags = std::sync::Arc::new(flags);
-    let caps = rdna_compute::arch_caps::ArchCaps::new("gfx1151", flags.clone());
+    let caps = hipfire_rdna::arch_caps::ArchCaps::new("gfx1151", flags.clone());
     let r = MoePrefillResolution::resolve(&moe_dtypes_paro(), &caps, &flags);
     assert!(r.use_path2);
     assert!(r.paro_mode);

@@ -6,7 +6,7 @@
 //! Runs each kernel case in an isolated subprocess so hangs, panics, and leaks
 //! do not collapse the rest of the sweep.
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::env;
 use std::process::{Command, ExitCode};
 use std::thread;

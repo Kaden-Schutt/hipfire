@@ -31,7 +31,7 @@
 //! it is a plain `GpuTensor` that never enters the mailbox.
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 
 use crate::config::SigLipConfig;
 use crate::vision::SigLipWeights;

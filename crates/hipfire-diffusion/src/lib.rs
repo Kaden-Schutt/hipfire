@@ -165,14 +165,14 @@ pub enum LinearPrecision {
 
 #[derive(Default)]
 struct RocmWeightCache {
-    entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
     /// F16 copies of weights, for the Phase 3 WMMA-GEMM convolution path. Keyed
     /// the same way as `entries`; populated lazily by converting the resident
     /// F32 weight once.
-    f16_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    f16_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
     /// oq4 arch-combined device buffers, for the W4A* schedule rungs. Keyed the
     /// same way; built once by quantize_oq4g256 → pack_oq4_arch_combined → upload.
-    oq4_entries: std::collections::HashMap<(usize, usize), rdna_compute::GpuTensor>,
+    oq4_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
     /// Active activation precision for the resident linear path this step (the
     /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
     linear_precision: LinearPrecision,
@@ -217,7 +217,7 @@ impl RocmWeightCache {
     /// Return the raw device pointer for `tensor`, uploading it once on first use.
     fn resident_ptr(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         tensor: &CpuTensor,
     ) -> DiffusionResult<*mut std::ffi::c_void> {
         let key = (tensor.data.as_ptr() as usize, tensor.data.len());
@@ -238,10 +238,10 @@ impl RocmWeightCache {
     /// Return the raw device pointer to an F16 copy of `tensor`, converting the
     /// (resident) F32 weight once on first use. The F16 buffer holds the same
     /// element count as `tensor`; the caller wraps it in a non-owning
-    /// [`rdna_compute::GpuTensor`] for the GEMM.
+    /// [`hipfire_rdna::GpuTensor`] for the GEMM.
     fn resident_f16_ptr(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         tensor: &CpuTensor,
     ) -> DiffusionResult<*mut std::ffi::c_void> {
         let key = (tensor.data.as_ptr() as usize, tensor.data.len());
@@ -249,7 +249,7 @@ impl RocmWeightCache {
             let f32_ptr = self.resident_ptr(gpu, tensor)?;
             let n = tensor.data.len();
             let f16 = gpu
-                .alloc_tensor(&[n], rdna_compute::DType::F16)
+                .alloc_tensor(&[n], hipfire_rdna::DType::F16)
                 .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
             let mut kernargs = hip_bridge::KernargBlob::new();
             kernargs.push_ptr(f32_ptr);
@@ -286,7 +286,7 @@ impl RocmWeightCache {
     /// `pack_oq4_arch_combined`-sized.
     fn resident_oq4_ptr(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         tensor: &CpuTensor,
         m: usize,
         k: usize,
@@ -313,7 +313,7 @@ impl RocmWeightCache {
 
 struct DiffusionGenerationRuntimeContext {
     options: DiffusionGenerationRuntimeOptions,
-    rocm_gpu: Option<rdna_compute::Gpu>,
+    rocm_gpu: Option<hipfire_rdna::Gpu>,
     rocm_gpu_init_count: usize,
     rocm_weights: RocmWeightCache,
 }
@@ -339,7 +339,7 @@ impl DiffusionGenerationRuntimeContext {
             ));
         };
         if self.rocm_gpu.is_none() {
-            let gpu = rdna_compute::Gpu::init_with_device(device_id)
+            let gpu = hipfire_rdna::Gpu::init_with_device(device_id)
                 .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
             self.rocm_gpu = Some(gpu);
             self.rocm_gpu_init_count += 1;
@@ -349,7 +349,7 @@ impl DiffusionGenerationRuntimeContext {
 
     fn with_rocm_gpu<T>(
         &mut self,
-        f: impl FnOnce(&mut rdna_compute::Gpu) -> DiffusionResult<T>,
+        f: impl FnOnce(&mut hipfire_rdna::Gpu) -> DiffusionResult<T>,
     ) -> DiffusionResult<T> {
         self.ensure_rocm_gpu()?;
         let gpu = self.rocm_gpu.as_mut().ok_or_else(|| {
@@ -365,7 +365,7 @@ impl DiffusionGenerationRuntimeContext {
     /// re-uploading them on every call.
     fn with_rocm_gpu_weighted<T>(
         &mut self,
-        f: impl FnOnce(&mut rdna_compute::Gpu, &mut RocmWeightCache) -> DiffusionResult<T>,
+        f: impl FnOnce(&mut hipfire_rdna::Gpu, &mut RocmWeightCache) -> DiffusionResult<T>,
     ) -> DiffusionResult<T> {
         self.ensure_rocm_gpu()?;
         let gpu = self.rocm_gpu.as_mut().ok_or_else(|| {
@@ -2169,7 +2169,7 @@ impl DiffusionPipeline {
     ) -> DiffusionResult<DiffusionHipPreflight> {
         validate_batch_request(&self.metadata, request)?;
         let memory_plan = self.hip_memory_plan(request)?;
-        let mut gpu = rdna_compute::Gpu::init_with_device(options.device_id)
+        let mut gpu = hipfire_rdna::Gpu::init_with_device(options.device_id)
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
         gpu.bind_thread()
             .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -5780,11 +5780,11 @@ impl ClipEncoderLayer {
     /// resident `x` and frees it once the residual no longer needs it.
     fn forward_resident(
         &self,
-        x: rdna_compute::GpuTensor,
+        x: hipfire_rdna::GpuTensor,
         n_heads: usize,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let norm1 = layer_norm_resident(
             gpu,
             cache,
@@ -5834,11 +5834,11 @@ impl ClipEncoderLayer {
     /// attention → out projection). `x` is resident (borrowed; caller owns it).
     fn self_attention_resident(
         &self,
-        x: &rdna_compute::GpuTensor,
+        x: &hipfire_rdna::GpuTensor,
         n_heads: usize,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let q = linear_optional_bias_resident(
             gpu,
             cache,

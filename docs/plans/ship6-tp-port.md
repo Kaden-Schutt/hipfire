@@ -157,7 +157,7 @@ token argmax match. Use a dense + DeltaNet model (0.8B-class) that fits 2 cards.
 
 **API drift**
 - `load_weights` signature unchanged `(hfq, config, gpu)`. `WeightTensor`/`awq_scale`/`paro`/`free_tensor` byte-identical → clean.
-- `wo` col-gather is a per-row gather (non-contiguous) for row-major quant blobs — verify the current upload helpers expose a column-gather (or port the proto's slicing util). **Check whether proto added an upload-cols helper to rdna-compute** (the row-slice is contiguous and cheap; the col-gather is the load-bearing one).
+- `wo` col-gather is a per-row gather (non-contiguous) for row-major quant blobs — verify the current upload helpers expose a column-gather (or port the proto's slicing util). **Check whether proto added an upload-cols helper to hipfire-rdna** (the row-slice is contiguous and cheap; the col-gather is the load-bearing one).
 - AWQ sidecar: scale vector is length-K → slices with the **input** dim. For `wq` (row/output shard) the awq_scale (over K=input) is **replicated**, not sliced; for `wo`/`w_down` (input shard) the awq_scale **is** sliced. Confirm the proto handles this asymmetry correctly when porting.
 
 **Validation:** Re-run the Stage 3 gold gate but with **sharded** weights

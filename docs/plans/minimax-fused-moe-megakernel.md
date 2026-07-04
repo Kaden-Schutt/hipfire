@@ -31,7 +31,7 @@ down) shape since that's the resident model.
 
 ## No-clobber architecture
 - New file `kernels/src/minimax_fused_moe_decode.hip`.
-- New `Gpu::minimax_fused_moe_decode(...)` in `rdna-compute` (own module fn,
+- New `Gpu::minimax_fused_moe_decode(...)` in `hipfire-rdna` (own module fn,
   distinct JIT module name — see `reference_kernel_module_cache_collision`).
 - Called ONLY from `minimax_moe_block`, behind `HIPFIRE_MINIMAX_FUSED_MOE`
   (default OFF). When off, the existing indexed-GEMV path runs unchanged.

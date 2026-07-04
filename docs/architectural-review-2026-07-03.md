@@ -13,13 +13,13 @@
 
 ## 1. Executive summary
 
-The macro-architecture of hipfire is in better shape than its file-level statistics suggest. Layering is broadly one-directional (leaf crates → compute → runtime → arch crates → serving → binaries), the arch crates avoid cycles with the runtime via a deliberate dev-dependency pattern, the VL crates (`gemma3-vl`, `dots-ocr`) genuinely reuse their base-arch crates instead of forking them, `hipfire-dispatch` vs `rdna-compute::dispatch` turns out to be deliberate layering rather than a naming accident, and several crates (`hipfire-detect`, `hipfire-eval`, `hipfire-evidence`, `hipfire-sampler`-adjacent code, the tokenizer) show genuinely strong test discipline. Prior dedup passes clearly happened: the runtime's `gguf.rs`/`tokenizer.rs` are thin re-export shims, not copies.
+The macro-architecture of hipfire is in better shape than its file-level statistics suggest. Layering is broadly one-directional (leaf crates → compute → runtime → arch crates → serving → binaries), the arch crates avoid cycles with the runtime via a deliberate dev-dependency pattern, the VL crates (`gemma3-vl`, `dots-ocr`) genuinely reuse their base-arch crates instead of forking them, `hipfire-dispatch` vs `hipfire-rdna::dispatch` turns out to be deliberate layering rather than a naming accident, and several crates (`hipfire-detect`, `hipfire-eval`, `hipfire-evidence`, `hipfire-sampler`-adjacent code, the tokenizer) show genuinely strong test discipline. Prior dedup passes clearly happened: the runtime's `gguf.rs`/`tokenizer.rs` are thin re-export shims, not copies.
 
 The risk is concentrated, not diffuse, in four patterns:
 
 1. **A handful of monster compilation units carry the core product.** `qwen35.rs` (32,648 LOC, containing single functions of 5,571 and 3,006 lines), `hipfire-quantize/src/main.rs` (13,875 LOC with a ~5,300-line `main()`), `hipfire-diffusion/src/lib.rs` (10,349 LOC spanning ~9 responsibilities), `deepseek4/forward.rs` (9,202 LOC), `sdapi.rs` (8,249 LOC), `hipfire-eval/src/lib.rs` (8,117 LOC), and `hipfire-daemon/src/main.rs` (6,434 LOC, bin-only crate, ~3,937-line `main()`). These aren't just style problems: they interleave GPU dispatch, env-var policy, and pure math so that the pure logic can't be unit-tested, and they force serial ownership of the hottest files in the repo.
 
-2. **Dual-maintenance surfaces that must be kept in sync by hand.** The most acute is in `rdna-compute`: every one of ~207 kernel-launch sites maintains *two* hand-written, order-sensitive copies of its kernel argument list with no check they agree — a silent-corruption hazard, not a compile error. The same shape recurs at every level: decode-vs-prefill parallel function pairs in the arch crates, single-vs-multi-GPU copies of the qwen35 layer loop, a wire protocol typed once in `hipfire-daemon-protocol` but hand-parsed from `serde_json::Value` in the daemon that never depends on it, GGML dequant codecs byte-identical across `hipfire-runtime` and `hipfire-quantize`, and quant block geometry (MQ4=136, OQ4=130) re-hardcoded in 10+ sites across 3+ crates instead of living in `hipfire-quant-format`.
+2. **Dual-maintenance surfaces that must be kept in sync by hand.** The most acute is in `hipfire-rdna`: every one of ~207 kernel-launch sites maintains *two* hand-written, order-sensitive copies of its kernel argument list with no check they agree — a silent-corruption hazard, not a compile error. The same shape recurs at every level: decode-vs-prefill parallel function pairs in the arch crates, single-vs-multi-GPU copies of the qwen35 layer loop, a wire protocol typed once in `hipfire-daemon-protocol` but hand-parsed from `serde_json::Value` in the daemon that never depends on it, GGML dequant codecs byte-identical across `hipfire-runtime` and `hipfire-quantize`, and quant block geometry (MQ4=136, OQ4=130) re-hardcoded in 10+ sites across 3+ crates instead of living in `hipfire-quant-format`.
 
 3. **Test coverage is inverted relative to risk.** The best-tested code is leaf/pure utility code; the least-tested is the code most likely to corrupt output silently: quant codec integer math (`codecs.rs`, 2,243 LOC, 0 tests), KV-cache index arithmetic (`kv.rs`, 2,596 LOC, 0 tests), all kernel-selection routing in the dispatch family (0 tests across 7 files), and `hipfire-serving-core` (20,142 LOC, 11 tests). Meanwhile a 42,292-LOC `examples/` tree (148 files) functions as the de-facto QA suite, driven by `hipfire-eval` shelling out to example binaries — and unit tests for `hipfire-generate`'s pure contract logic live, inexplicably, inside `hipfire-daemon`'s binary.
 
@@ -39,7 +39,7 @@ Progress on the §3 High findings since the review was written. Verified against
 |---|---|---|---|
 | 3.1 | Dual kernarg lists (~207 sites) | 🔴 Open | Pilot only: `launch_kernargs`/`KernArg` in `dispatch/{mod,norm}.rs`; ~306 launch sites remain. |
 | 3.2 | Kernel-selection cascades, 0 tests, dead duplicate | ✅ Resolved | Dead duplicate selector deleted; `kernels.rs` now has 26 tests. |
-| 3.3 | `Gpu` god object; arch dispatch in generic compute crate | 🔴 Open | 13 rdna-compute files still name specific arch families. |
+| 3.3 | `Gpu` god object; arch dispatch in generic compute crate | 🔴 Open | 13 hipfire-rdna files still name specific arch families. |
 | 3.4 | `qwen35.rs` 32k-line file, 5.5k-line fn | 🔴 Open | 32,618 LOC; `forward_prefill_chunk` still 5,577 lines. Multi-session. |
 | 3.5 | deepseek4 `forward.rs` 9.2k LOC, 54-field god-state | 🔴 Open | Unchanged. Multi-session. |
 | 3.6 | Cross-arch copy-paste | 🔴 Open | No shared-arch crate; partial folding via the capability layer. |
@@ -47,7 +47,7 @@ Progress on the §3 High findings since the review was written. Verified against
 | 3.8 | diffusion 10k-line grab-bag + coexistence violation | 🟡 Partial | **Part 1 done**: import/pickle/zip tooling moved to new leaf crate `hipfire-diffusion-coexist`, out of the server dependency graph (verified via `cargo tree`). **Part 2 open**: split the remaining 8,442-line `lib.rs` + 13.5k `tests.rs` into modules. |
 | 3.9 | quantize 5.3k-line main(), format geometry, codec copies | 🟡 Partial | **Done**: block geometry single-sourced into `hipfire-quant-format` (WP-3.3, consumed by all arch loaders); GGML/GGUF codec de-duplicated into leaf `hipfire-gguf`; GGUF import pipeline + HFQ writer extracted to the quantize library (11 lib modules); codec round-trip/edge tests added. **Open**: `main()` is still ~5,414 lines (the `parse_args→Recipe`/`run_pipeline` decomposition). |
 | 3.10 | `KvCache` 9 booleans → 49 constructors, 0 tests | 🟡 Partial | **Done**: index-math tests (WP-3.2); typed `KvQuantMode` enum + tested pure flag-derivation + `KvCache::quant_mode()`. **Open**: the boolean-fields → enum + 49-constructor → `KvCacheSpec` builder rewrite (~470 hot-path sites; needs GPU coherence validation — defer to a non-LDS-hazard box). |
-| 3.11 | Layering inversions & workspace hygiene | 🟡 Partial | **(a) done**: runtime no longer deps `hipfire-eval` — `collect_default_host_profile` moved to leaf `hipfire-sysinfo`. **(b) done**: `GpuTensor`+`DType` extracted to leaf `hipfire-gpu-types` (re-exported from rdna-compute; all 25 consumers unchanged). **(c) done**: `[workspace.dependencies]` adopted. **(d) done**: members list deduped, no orphans (83 members = 83 crates). |
+| 3.11 | Layering inversions & workspace hygiene | 🟡 Partial | **(a) done**: runtime no longer deps `hipfire-eval` — `collect_default_host_profile` moved to leaf `hipfire-sysinfo`. **(b) done**: `GpuTensor`+`DType` extracted to leaf `hipfire-gpu-types` (re-exported from hipfire-rdna; all 25 consumers unchanged). **(c) done**: `[workspace.dependencies]` adopted. **(d) done**: members list deduped, no orphans (83 members = 83 crates). |
 | 3.12 | Control-plane arch leakage: scheduler magic-string matching | ✅ Resolved (scheduler) | Scheduler classifies via the canonical `model_arch_family` table (`model_arch_family_from_str` + `ModelArchFamily` match), magic `arch_id` literals removed. The `hipfire-generate` qwen35 saturation (same finding) is still open. |
 | 3.13 | Test placement & examples shadow QA suite | 🟡 Partial | **Done**: hsa-bridge 0→5 and hipfire-train 1→16 tests (WP-3.2). **Open**: 130 examples / 5 QA clones / eval-shells-out-to-examples; redline fate. |
 | 3.14 | Dead compute in forward paths | ✅ Resolved | qwen2 double-compute dropped; arch-llama's dead 247-line forward deleted (now a thin facade over `runtime::llama`). |
@@ -79,14 +79,14 @@ Progress on the §3 High findings since the review was written. Verified against
              └───────────────┬──────────┘    │ scheduler, config, detect    │
                              │               └──────────────────────────────┘
              ┌───────────────▼──────────┐
-             │ rdna-compute (Gpu, ~800  │
+             │ hipfire-rdna (Gpu, ~800  │
              │ dispatch fns, kernels)   │
              └───────────────┬──────────┘
                              │
                   hip-bridge / hsa-bridge (dlopen FFI floor)
 ```
 
-Layering violations found (details in §3): `hipfire-runtime → hipfire-eval → hipfire-daemon-adapter/tokio` (hot path pulls the eval harness for one function); arch-specific dispatch (`deepseek4.rs`, `zaya_cca.rs`, `mamba2.rs`) living inside generic `rdna-compute`; qwen35 batch protocol saturating generic `hipfire-generate` (218 references); offline import tooling inside `hipfire-diffusion`, which `hipfire-server` links.
+Layering violations found (details in §3): `hipfire-runtime → hipfire-eval → hipfire-daemon-adapter/tokio` (hot path pulls the eval harness for one function); arch-specific dispatch (`deepseek4.rs`, `zaya_cca.rs`, `mamba2.rs`) living inside generic `hipfire-rdna`; qwen35 batch protocol saturating generic `hipfire-generate` (218 references); offline import tooling inside `hipfire-diffusion`, which `hipfire-server` links.
 
 ---
 
@@ -94,18 +94,18 @@ Layering violations found (details in §3): `hipfire-runtime → hipfire-eval �
 
 Each item below consolidates all confirmed findings against one artifact; full per-finding text, evidence, and verification notes are in the catalog.
 
-### 3.1 [High] `rdna-compute` dispatch: dual kernarg lists at ~207 launch sites
-`crates/rdna-compute/src/dispatch/gemm_hfq.rs:1891-1935` (representative)
+### 3.1 [High] `hipfire-rdna` dispatch: dual kernarg lists at ~207 launch sites
+`crates/hipfire-rdna/src/dispatch/gemm_hfq.rs:1891-1935` (representative)
 Every kernel launch builds a `Vec<*mut c_void>` **and** a duplicate `KernargBlob` closure that re-pushes the identical arguments. Both must match each other and the HIP kernel signature exactly; nothing enforces it, and a drift produces silent kernarg corruption. ~207 `launch_maybe_blob` sites, 2,454 `as *mut c_void` casts across 7 files; `gemv.rs` alone has 476 `push_*` lines.
 **Fix:** one declaration that emits both representations — a `kernargs![a_ptr, x_ptr, m:i32, k:i32]` macro, or fold blob-building into `launch_maybe_blob(&[KernArg])` and derive the pointer vec internally. Mechanical, ~20 lines saved per dispatch fn, eliminates the hazard class.
 
 ### 3.2 [High] Kernel-selection cascades: zero tests, one dead duplicate selector
-`crates/rdna-compute/src/dispatch/` — 7 files, 0 `#[test]`; `gemm_qkv.rs:844-914`
+`crates/hipfire-rdna/src/dispatch/` — 7 files, 0 `#[test]`; `gemm_qkv.rs:844-914`
 The routing logic ("gfx1103 + batch 32 + hfq4 → which kernel?") is the highest-consequence pure-ish logic in the repo and is untested; the leaf predicates in `arch_caps.rs` are pure and well-tested (19 tests), but the composite cascades call `bind_thread_or_warn()`/`mmq_screen_weight()` mid-decision so they can't run without a GPU. A dead `pub fn gemm_qkvza_hfq4g256_route_label` (zero callers) duplicates one real cascade and must be manually kept in sync.
 **Fix:** extract each cascade into a pure `fn choose_*_kernel(caps, flags, shapes, screen: ScreenOutcome) -> KernelChoice` taking GPU-derived facts as values; table-test the full arch×shape×format matrix on CI (this is also the cheapest way to make the RDNA2/3/4 portability invariant testable). Delete the dead selector.
 
 ### 3.3 [High] `Gpu` god object; model-specific dispatch inside the generic compute crate
-`crates/rdna-compute/src/dispatch/mod.rs:532-769`; `dispatch/deepseek4.rs` (3,536 LOC, 65 methods)
+`crates/hipfire-rdna/src/dispatch/mod.rs:532-769`; `dispatch/deepseek4.rs` (3,536 LOC, 65 methods)
 `Gpu` carries ~50 fields spanning ≥9 responsibilities (runtime+caps, JIT caches, memory pool, calibration hooks, quant scratch, conversion scratch, MMQ screening cache, three hipGraph capture subsystems), with ~800 dispatch methods across 24 `impl Gpu` files. DeepSeek-V4-private concepts (`hc_sinkhorn_4x4`, `indexer_top_k`, NSA compressor), plus `zaya_cca.rs` and `mamba2.rs`, live unconditionally inside the "generic RDNA dispatch" crate despite dedicated arch crates existing.
 **Fix:** split `Gpu` state into owned sub-structs (`JitCache`, `QuantScratch`, `CaptureState`, …) held by a slim `Gpu`; move arch-private dispatch either into the arch crates (via an extension-trait over `Gpu`) or behind feature gates as an interim step.
 
@@ -131,7 +131,7 @@ The protocol is typed once (`hipfire-daemon-protocol`, serde enums, used by adap
 
 ### 3.8 [High] `hipfire-diffusion/src/lib.rs`: 10,349-line grab-bag + coexistence-invariant violation
 `crates/hipfire-diffusion/src/lib.rs` (import block at L8444-10349)
-One file holds HFQ metadata, primitive CPU tensor ops, the CLIP encoder, a 27-method / ~1,890-line pipeline god-impl, JSON/shape helpers, and — the boundary violation — ~1,900 lines of offline import tooling: `import_diffusers_to_hfq`, single-file checkpoint import, safetensors state-dict parsing, a hand-rolled PyTorch **pickle interpreter** and a from-scratch **zip reader**. AGENTS.md mandates conversion tooling live in `hipfire-coexistence` (or a dedicated tooling crate), *not* in a crate the server links — and `hipfire-server` links this one, so untrusted-format parsing ships in the serving binary. Also: a 213-copy error-map closure, ~445 hand-written CPU/GPU dispatch wrappers, and a single 13,491-line `tests.rs`. (Credit where due: the past channels_last/stride loader bug is now pinned by two pure-CPU regression tests, and kernel dispatch correctly reuses `rdna-compute` rather than reinventing it. Note `hipfire-quantize`'s GGUF import is *compliant* — quantize is a dedicated offline tooling crate.)
+One file holds HFQ metadata, primitive CPU tensor ops, the CLIP encoder, a 27-method / ~1,890-line pipeline god-impl, JSON/shape helpers, and — the boundary violation — ~1,900 lines of offline import tooling: `import_diffusers_to_hfq`, single-file checkpoint import, safetensors state-dict parsing, a hand-rolled PyTorch **pickle interpreter** and a from-scratch **zip reader**. AGENTS.md mandates conversion tooling live in `hipfire-coexistence` (or a dedicated tooling crate), *not* in a crate the server links — and `hipfire-server` links this one, so untrusted-format parsing ships in the serving binary. Also: a 213-copy error-map closure, ~445 hand-written CPU/GPU dispatch wrappers, and a single 13,491-line `tests.rs`. (Credit where due: the past channels_last/stride loader bug is now pinned by two pure-CPU regression tests, and kernel dispatch correctly reuses `hipfire-rdna` rather than reinventing it. Note `hipfire-quantize`'s GGUF import is *compliant* — quantize is a dedicated offline tooling crate.)
 **Fix:** move the import/pickle/zip block to `hipfire-coexistence` (it already owns LoRA export/merge — this is its charter); split lib.rs into `metadata / clip / pipeline / cpu_ops / io` modules; generate the dispatch wrappers with a macro; split tests.rs per module.
 
 ### 3.9 [High] Quantization: 5,300-line `main()`, format geometry owned by no one, cross-crate codec copies
@@ -146,7 +146,7 @@ Quant mode is 9 parallel booleans instead of an enum, expanded combinatorially i
 
 ### 3.11 [High] Layering inversions & workspace hygiene
 `hipfire-runtime/Cargo.toml:61`; root `Cargo.toml`
-(a) The inference hot path depends on `hipfire-eval` (21k-LOC evidence harness, pulling tokio-process via daemon-adapter) for exactly one symbol (`collect_default_host_profile`). (b) `GpuTensor`/`HipResult` (1,323/1,527 graph edges) live inside the 63.5k-LOC `rdna-compute`, so ~20 crates depend on the whole compute crate to name a tensor type. (c) No `[workspace.dependencies]`: serde declared in 33 crates, serde_json in 42, with already-diverging feature sets. (d) `crates/hipfire-primitives` appears twice in `members`; one orphan crate dir isn't listed.
+(a) The inference hot path depends on `hipfire-eval` (21k-LOC evidence harness, pulling tokio-process via daemon-adapter) for exactly one symbol (`collect_default_host_profile`). (b) `GpuTensor`/`HipResult` (1,323/1,527 graph edges) live inside the 63.5k-LOC `hipfire-rdna`, so ~20 crates depend on the whole compute crate to name a tensor type. (c) No `[workspace.dependencies]`: serde declared in 33 crates, serde_json in 42, with already-diverging feature sets. (d) `crates/hipfire-primitives` appears twice in `members`; one orphan crate dir isn't listed.
 **Fix:** move `host_profile` collection into `hipfire-sysinfo` (or invert: eval depends on runtime); extract `GpuTensor`/`HipResult`/`DiffusionResult` into a leaf `hipfire-gpu-types` crate (or into the existing zero-dep `hipfire-primitives`); adopt `[workspace.dependencies]`; dedupe the members list.
 
 ### 3.12 [High] Control-plane arch leakage: `hipfire-generate` (218 qwen35 refs) and stringly-typed scheduler
@@ -170,7 +170,7 @@ qwen2's hand forward path computes QKV and FFN gate/up **twice** — Block A's r
 
 | Crate | LOC | `#[cfg(test)]` files | Assessment |
 |---|---|---|---|
-| rdna-compute | 92,859 | 6/176 | Routing cascades 0 tests; arch_caps predicates well-tested (19) |
+| hipfire-rdna | 92,859 | 6/176 | Routing cascades 0 tests; arch_caps predicates well-tested (19) |
 | hipfire-runtime | 73,209 | 18/189 | sampler (17), tool_call (14), eos_filter (12) good; **kv.rs 0, hfq.rs 1** |
 | hipfire-arch-qwen35 | 59,509 | 6/17 | Pure contract logic well-tested; forward paths GPU-bound |
 | hipfire-diffusion | 38,226 | 4/13 | 13.5k-line tests.rs monolith; stride regression pinned ✔ |
@@ -210,7 +210,7 @@ Ordered by leverage-per-risk; each phase is independently shippable.
 10. `hipfire-quantize` `main()` → lib pipeline (§3.9); daemon `main()` → lib handlers (§3.7).
 11. Diffusion lib.rs split + move importer/pickle/zip to `hipfire-coexistence` (§3.8).
 12. `KvCache` mode enum + spec builder (§3.10). `LoadedModel` per-arch residents; finish `SessionServingBackend` adoption, dissolving the model↔session cycle (§3.7).
-13. deepseek4 `forward.rs` split + typed state phases; move deepseek4/zaya/mamba2 dispatch out of `rdna-compute` (§3.3, §3.5).
+13. deepseek4 `forward.rs` split + typed state phases; move deepseek4/zaya/mamba2 dispatch out of `hipfire-rdna` (§3.3, §3.5).
 
 **Phase 3 — consolidation (ongoing)**
 14. Populate the transformer-extraction target; collapse the 16 documented TODO copies (§3.6).
@@ -233,7 +233,7 @@ The completeness critic flagged 19 crates and several lenses the primary round u
 
 **Lock-discipline audit surfaced a stale legacy path, not a live break.** Two shell gates reference `/tmp/hipfire-gpu.lock` (`scripts/serve-restart.sh:15` deletes it; `tests/pp-gate.sh:503` tests its existence as a held/free signal — sentinel semantics). Verification found the current GPU flock lives at `~/.hipfire/locks/hip-gpu-0.lock`; **no Rust code flocks `/tmp/hipfire-gpu.lock`** — it survives only in stale docs (`hipfire-lock/AGENTS.md`, `hipfire-daemon/AGENTS.md`) and these scripts. So no mutual-exclusion break occurs, but `pp-gate.sh`'s parent-lock-detection guard is **effectively dead** (probes a path nothing writes), and the stale references violate AGENTS.md's "remove legacy-name fallback / update stale references" rule. **Fix:** point the gates at `hipfire lock status` (backed by `probe()->LockState`) and purge the `/tmp/hipfire-gpu.lock` references from scripts and docs.
 
-**Accelerator/fallback crates are mostly healthy, with one mislabel.** `hipfire-xdna`, `hipfire-hneurons`, `hipfire-vision-cache` each have a clear single responsibility and good tests; `hipfire-npu` is a clean admission-policy layer delegating device access to xdna. The weak spot: `hipfire-cpu` is described as "deterministic CPU oracle backends" but ~95% of its 894 LOC is a Qwen3.5-specific backend-selection/module-evidence policy DSL (`'qwen35.layers.{}.mlp.swiglu_down'` string-building) — same arch-leakage pattern as §3.12, and its one real CPU compute path is nearly untested. `hipfire-kvquant` is healthier than the runtime KV baseline: it does **not** re-declare `kv.rs`'s 9-boolean mode soup and correctly delegates f16 conversion to `hipfire-primitives`; its issues are Low/Medium (untied FWHT seed literals that must agree across encode/decode, a `KVARN_GROUP=128` const duplicated in `rdna-compute` because the dependency direction blocks sharing, an unchecked pack-loop bound).
+**Accelerator/fallback crates are mostly healthy, with one mislabel.** `hipfire-xdna`, `hipfire-hneurons`, `hipfire-vision-cache` each have a clear single responsibility and good tests; `hipfire-npu` is a clean admission-policy layer delegating device access to xdna. The weak spot: `hipfire-cpu` is described as "deterministic CPU oracle backends" but ~95% of its 894 LOC is a Qwen3.5-specific backend-selection/module-evidence policy DSL (`'qwen35.layers.{}.mlp.swiglu_down'` string-building) — same arch-leakage pattern as §3.12, and its one real CPU compute path is nearly untested. `hipfire-kvquant` is healthier than the runtime KV baseline: it does **not** re-declare `kv.rs`'s 9-boolean mode soup and correctly delegates f16 conversion to `hipfire-primitives`; its issues are Low/Medium (untied FWHT seed literals that must agree across encode/decode, a `KVARN_GROUP=128` const duplicated in `hipfire-rdna` because the dependency direction blocks sharing, an unchecked pack-loop bound).
 
 ---
 

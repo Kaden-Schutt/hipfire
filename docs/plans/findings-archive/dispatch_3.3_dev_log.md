@@ -37,7 +37,7 @@ All existing 3.1/3.2 keys resolve identically (`tile=None` path unchanged).
 Registered WMMA-FA tile variants under `AttnFlashAsym4BatchedMasked` with priority
 ordering: gfx12 → gfx11 → scalar (DO NOT REORDER).
 
-**rdna-compute:**
+**hipfire-rdna:**
 - Added `attention_flash_asym4_wmma_tile_batched` (gfx11) and
   `attention_flash_asym4_wmma_tile_batched_gfx12` (gfx12) public methods
 - Both call `launch_asym_flash_batched` with the WMMA kernel name directly

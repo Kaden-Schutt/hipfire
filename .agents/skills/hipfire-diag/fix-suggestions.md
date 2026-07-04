@@ -47,7 +47,7 @@ Hash sidecar files validate pre-compiled kernels aren't stale.
 Without them, the engine recompiles via hipcc on first run (slow).
 ```bash
 ./scripts/write-kernel-hashes.sh
-# Or: cargo run --release -p rdna-compute --example gen_kernel_hashes
+# Or: cargo run --release -p hipfire-rdna --example gen_kernel_hashes
 ```
 
 ## All "!" output (especially gfx1100)

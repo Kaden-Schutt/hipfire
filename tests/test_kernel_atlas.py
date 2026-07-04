@@ -148,7 +148,7 @@ SUMMARY  gen_tok_s=101.5  bw_gib_s=1512.4  prefill_tok_s=1262.2  avg_ms=9.85  p5
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             kernel_src = root / "kernels" / "src" / "gemv_hfq4g256_multirow.hip"
-            dispatch = root / "crates" / "rdna-compute" / "src" / "dispatch.rs"
+            dispatch = root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs"
             kernel_src.parent.mkdir(parents=True)
             dispatch.parent.mkdir(parents=True)
             kernel_src.write_text(
@@ -169,7 +169,7 @@ SUMMARY  gen_tok_s=101.5  bw_gib_s=1512.4  prefill_tok_s=1262.2  avg_ms=9.85  p5
         self.assertEqual(entry["name"], "gemv_hfq4g256_multirow_r4")
         self.assertEqual(entry["op"]["role"], "multirow_gemv")
         self.assertEqual(entry["source_files"][0]["path"], "kernels/src/gemv_hfq4g256_multirow.hip")
-        self.assertEqual(entry["dispatch_refs"][0]["path"], "crates/rdna-compute/src/dispatch.rs")
+        self.assertEqual(entry["dispatch_refs"][0]["path"], "crates/hipfire-rdna/src/dispatch.rs")
         self.assertEqual(entry["dispatch_refs"][0]["line"], 1)
 
     def test_collect_dispatch_manifest_ranks_exact_kernel_sources_first(self):
@@ -583,7 +583,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                             ],
                             "dispatch_refs": [
                                 {
-                                    "path": "crates/rdna-compute/src/dispatch.rs",
+                                    "path": "crates/hipfire-rdna/src/dispatch.rs",
                                     "line": 42,
                                     "text": "HIPFIRE_GEMV_ROWS == 4",
                                 }
@@ -612,7 +612,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         self.assertIn("HOT KERNELS", view)
         self.assertIn("gemv_hfq4g256_multirow_r4  linear.multirow_gemv", view)
         self.assertIn("src kernels/src/gemv_hfq4g256_multirow.hip", view)
-        self.assertIn("dispatch crates/rdna-compute/src/dispatch.rs:42", view)
+        self.assertIn("dispatch crates/hipfire-rdna/src/dispatch.rs:42", view)
         self.assertIn("env HIPFIRE_GEMV_ROWS", view)
 
     def test_build_task_bundle_from_row_carries_hot_kernel_contract(self):
@@ -637,7 +637,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                         {
                             "name": "gemv_hfq4g256_multirow_r4",
                             "source_files": [{"path": "kernels/src/gemv_hfq4g256_multirow.hip"}],
-                            "dispatch_refs": [{"path": "crates/rdna-compute/src/dispatch.rs", "line": 42}],
+                            "dispatch_refs": [{"path": "crates/hipfire-rdna/src/dispatch.rs", "line": 42}],
                             "env_controls": ["HIPFIRE_GEMV_ROWS"],
                         }
                     ]
@@ -859,7 +859,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                 {
                     "name": "fused_rmsnorm_mq_rotate",
                     "source_files": [{"path": "kernels/src/fused_rmsnorm_mq_rotate.hip"}],
-                    "dispatch_refs": [{"path": "crates/rdna-compute/src/kernels.rs", "line": 269}],
+                    "dispatch_refs": [{"path": "crates/hipfire-rdna/src/kernels.rs", "line": 269}],
                 },
             ]
         }
@@ -924,13 +924,13 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                 {
                     "name": "gemv_hfq4g256_residual",
                     "source_files": [{"path": "kernels/src/gemv_hfq4g256_residual.hip"}],
-                    "dispatch_refs": [{"path": "crates/rdna-compute/src/dispatch.rs", "line": 6231}],
+                    "dispatch_refs": [{"path": "crates/hipfire-rdna/src/dispatch.rs", "line": 6231}],
                     "env_controls": ["HIPFIRE_GEMV_ROWS"],
                 },
                 {
                     "name": "fused_rmsnorm_mq_rotate",
                     "source_files": [{"path": "kernels/src/fused_rmsnorm_mq_rotate.hip"}],
-                    "dispatch_refs": [{"path": "crates/rdna-compute/src/kernels.rs", "line": 269}],
+                    "dispatch_refs": [{"path": "crates/hipfire-rdna/src/kernels.rs", "line": 269}],
                 },
             ]
         }
@@ -972,7 +972,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                     "lever_type": "dispatch",
                     "risk": "medium",
                     "expected_impact": "medium",
-                    "allowed_files": ["crates/rdna-compute/src/dispatch.rs"],
+                    "allowed_files": ["crates/hipfire-rdna/src/dispatch.rs"],
                     "history": {"status": "rejected", "match_count": 1, "best_speedup": 0.97},
                     "rationale": ["hot residual GEMV"],
                     "candidate_steps": ["wire candidate"],
@@ -984,7 +984,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
 
         self.assertIn("# Atlas Suggestions", text)
         self.assertIn("1. Try residual multirow GEMV", text)
-        self.assertIn("crates/rdna-compute/src/dispatch.rs", text)
+        self.assertIn("crates/hipfire-rdna/src/dispatch.rs", text)
         self.assertIn("history: rejected over 1 prior eval(s), best speedup 0.970x", text)
 
     def test_write_task_bundle_creates_json_and_agent_markdown(self):
@@ -1516,13 +1516,13 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
                     {
                         "name": "gemv_hfq4g256_residual",
                         "source_files": [{"path": "kernels/src/gemv_hfq4g256_residual.hip"}],
-                        "dispatch_refs": [{"path": "crates/rdna-compute/src/dispatch.rs", "line": 6231}],
+                        "dispatch_refs": [{"path": "crates/hipfire-rdna/src/dispatch.rs", "line": 6231}],
                         "env_controls": ["HIPFIRE_GEMV_ROWS"],
                     },
                     {
                         "name": "fused_rmsnorm_mq_rotate",
                         "source_files": [{"path": "kernels/src/fused_rmsnorm_mq_rotate.hip"}],
-                        "dispatch_refs": [{"path": "crates/rdna-compute/src/kernels.rs", "line": 269}],
+                        "dispatch_refs": [{"path": "crates/hipfire-rdna/src/kernels.rs", "line": 269}],
                     },
                 ]
             }

@@ -20,7 +20,7 @@ use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_block_activations, LlamaModel};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
 use hipfire_train::optim::AdamW;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -77,7 +77,7 @@ fn load_daemon_labels(
         Vec<Vec<u32>>,
         Vec<Vec<f32>>,
         Vec<Vec<f32>>,
-        rdna_compute::GpuTensor,
+        hipfire_rdna::GpuTensor,
         usize,
         usize,
         f32,
@@ -221,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec<Vec<u32>>,
         Vec<Vec<f32>>,
         Vec<Vec<f32>>,
-        rdna_compute::GpuTensor,
+        hipfire_rdna::GpuTensor,
         usize,
         usize,
         f32,

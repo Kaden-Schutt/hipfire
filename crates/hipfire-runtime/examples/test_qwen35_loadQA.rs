@@ -102,7 +102,7 @@ fn run(path: &str) -> Result<String, Outcome> {
             .filter(|t| matches!(t, hipfire_arch_qwen35::qwen35::LayerType::LinearAttention))
             .count();
         let full_layers = q35_config.n_layers.saturating_sub(linear_layers);
-        let mut gpu = rdna_compute::Gpu::init()
+        let mut gpu = hipfire_rdna::Gpu::init()
             .map_err(|e| Outcome::Skip(format!("GPU init unavailable: {e}")))?;
         let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             hipfire_arch_qwen35::qwen35::load_weights(&mut hfq, &q35_config, &mut gpu)

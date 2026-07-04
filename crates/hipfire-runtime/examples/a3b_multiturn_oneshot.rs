@@ -30,7 +30,7 @@ fn main() {
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load");
 
     let mut kv = KvCache::new_gpu_q8(

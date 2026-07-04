@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let model = model.expect("--model required");
     let draft = draft.expect("--draft required");
-    let mut gpu = rdna_compute::Gpu::init()?;
+    let mut gpu = hipfire_rdna::Gpu::init()?;
     eprintln!("gpu: {}", gpu.arch);
 
     let mut target_hfq = HfqFile::open(&model)?;

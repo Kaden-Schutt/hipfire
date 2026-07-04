@@ -11,7 +11,7 @@ use crate::weights::{EmbeddingFormat, LayerWeights, WeightTensor};
 use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
 use memmap2::Mmap;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};

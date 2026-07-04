@@ -20,7 +20,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use rdna_compute::profile;
+    use hipfire_rdna::profile;
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -37,7 +37,7 @@ fn main() {
     // Reference: spec'd at 960 GB/s (384-bit × 20 Gbps GDDR6).
     const PEAK_BW_GBS: f64 = 960.0;
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     eprintln!("Loading {}...", model_path);
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");

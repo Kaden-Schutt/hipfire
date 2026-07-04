@@ -108,7 +108,7 @@ fn main() {
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer not found in HFQ metadata");
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
 
     // VL: load vision weights + encode image (only if --image given)
     let visual_tokens: Option<Vec<f32>>;
@@ -518,7 +518,7 @@ fn main() {
 // Debug: compare forward() vs forward_scratch() logits on first token
 #[allow(dead_code)]
 fn debug_compare(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     token: u32,

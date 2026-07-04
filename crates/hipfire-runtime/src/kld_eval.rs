@@ -9,7 +9,7 @@
 //! build and candidate scoring share ONE forward path on ONE arch.
 
 use crate::arch::SimpleAr;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Forward a token chunk (teacher-forced, fresh per-chunk state) and yield
 /// per-position logits over the scored window. The one seam every KLD driver

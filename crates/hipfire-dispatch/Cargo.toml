@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 
 [features]
 default = []
@@ -17,4 +17,4 @@ new-fused-qkv = []
 new-attention = []
 new-moe = []
 from-hip-error = []
-deltanet = ["rdna-compute/deltanet"]
+deltanet = ["hipfire-rdna/deltanet"]

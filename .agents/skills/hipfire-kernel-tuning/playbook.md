@@ -167,13 +167,13 @@ manually:
 
 ```bash
 git checkout <baseline-sha>
-cargo clean -p rdna-compute
+cargo clean -p hipfire-rdna
 rm -f target/release/examples/bench_qwen35_mq4
 cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
 ./scripts/speed-gate.sh --fast > before.log
 
 git checkout <candidate-sha>
-cargo clean -p rdna-compute
+cargo clean -p hipfire-rdna
 rm -f target/release/examples/bench_qwen35_mq4
 cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
 ./scripts/speed-gate.sh --fast > after.log
@@ -181,7 +181,7 @@ cargo build --release --features deltanet -p hipfire-runtime --example bench_qwe
 diff before.log after.log
 ```
 
-The `cargo clean -p rdna-compute` + `rm -f .../bench_qwen35_mq4`
+The `cargo clean -p hipfire-rdna` + `rm -f .../bench_qwen35_mq4`
 combo is the load-bearing part. Skipping either gives you a stale
 binary measuring code from a prior run.
 

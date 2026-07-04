@@ -17,7 +17,7 @@ Two things actually need hardware:
 ## Why three "regimes"
 
 `reclaim_pending()` self-gates on `graph_state_live()`
-(`crates/rdna-compute/src/dispatch/mod.rs:2281`; live =
+(`crates/hipfire-rdna/src/dispatch/mod.rs:2281`; live =
 `capture_mode || graph_exec || captured_graph || verify_graph_cache || replay_graph_cache`).
 That yields three behaviors the validation must each hit:
 
@@ -258,7 +258,7 @@ sites are noted in the design doc and were the lowest-value conversions anyway.
 
 ## References
 - Design + what changed: `docs/plans/2026-06-29-owned-tensor-raii-scratch.md`
-- Steering rule: `crates/rdna-compute/AGENTS.md` (GPU Scratch Lifetime)
+- Steering rule: `crates/hipfire-rdna/AGENTS.md` (GPU Scratch Lifetime)
 - Gate sources: `tests/no-gpu-ci.sh`, `tests/coherence-gate-dflash.sh`,
   `tests/coherence-gate-deepseek4-mtp.sh`
 - Lock: `hipfire lock {acquire,release,status}` (`crates/hipfire-lock`,

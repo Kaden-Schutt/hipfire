@@ -4,9 +4,9 @@ Companion to `architectural-review-2026-07-03.md`. One row per source file (larg
 
 # Architectural Source Index — GPU Core Crates
 
-Scope: crates/rdna-compute, crates/hip-bridge, crates/hsa-bridge. Read-only survey.
+Scope: crates/hipfire-rdna, crates/hip-bridge, crates/hsa-bridge. Read-only survey.
 
-## crates/rdna-compute
+## crates/hipfire-rdna
 
 Kernel compilation, caching, and per-architecture dispatch layer for RDNA/GCN/CDNA GPUs.
 
@@ -18,7 +18,7 @@ Kernel compilation, caching, and per-architecture dispatch layer for RDNA/GCN/CD
 | src/arch_caps.rs | 688 | Per-architecture capability defaults (WMMA, wave size, LDS, dtype support). |
 | src/compiler.rs | 714 | Compiles HIP kernel sources to .hsaco code objects via hipcc. |
 | src/kernels.rs | 4751 | Built-in HIP kernel source strings for all inference operations. |
-| src/feature_flags.rs | 481 | Typed immutable env-var resolution for rdna-compute tuning knobs. |
+| src/feature_flags.rs | 481 | Typed immutable env-var resolution for hipfire-rdna tuning knobs. |
 | src/generic_warn.rs | 138 | Runtime coverage map warning when generic fallback kernels are hit. |
 | src/pool.rs | 100 | GPU memory pool eliminating hipMalloc/hipFree overhead in the hot loop. |
 | src/profile.rs | 373 | Per-kernel bandwidth profiling accounting. |

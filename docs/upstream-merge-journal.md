@@ -64,7 +64,7 @@ All other files are additive (new file or non-overlapping edits).
 | `crates/hipfire-dispatch/src/families/gemv.rs` | NEEDS-ADAPTATION | Our `dispatch_residual` for ParoQ4G128 (gemv+add_inplace) becomes dead code once steps.rs uses the upstream `else` branch. See action item #1. |
 | `crates/hipfire-arch-qwen35/src/qwen35.rs` | MERGE-TRIVIAL | Auto-merged. Upstream adds: MQ8 INT8 early-return in `rmsnorm_rotate_dispatch`, MoE CPU fallback calller + `routed_experts`/`gate_up_buf` population. Our commit: QKV Givens path branching. Regions disjoint. Verify post-merge (see action item #2). |
 | `crates/hipfire-runtime/src/llama.rs` | UPSTREAM-APPLIES-CLEAN | Upstream fixes double-rotation (`gemv.run_auto` → `gemv.run(Prerotated)` in `weight_gemv_prerotated`) + gfx12 Q8 prefill gate (`has_wmma_w32()` → `has_wmma()`). Our branch also modified llama.rs (earlier); regions are disjoint, auto-merge correct. |
-| `crates/rdna-compute/src/gemm.rs` | UPSTREAM-APPLIES-CLEAN | Upstream widens 2 WMMA gates for HFQ4G256 and HFQ6G256 batched lmhead on gfx12. Our branch didn't touch these sites. |
+| `crates/hipfire-rdna/src/gemm.rs` | UPSTREAM-APPLIES-CLEAN | Upstream widens 2 WMMA gates for HFQ4G256 and HFQ6G256 batched lmhead on gfx12. Our branch didn't touch these sites. |
 
 ---
 

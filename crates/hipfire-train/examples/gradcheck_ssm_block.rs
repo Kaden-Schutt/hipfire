@@ -10,7 +10,7 @@
 use hipfire_train::ssm_block::{
     ssm_block_backward, ssm_block_forward, SsmBlockDims, SsmBlockWeights,
 };
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 const SEQ: usize = 6;
 const H: usize = 8;

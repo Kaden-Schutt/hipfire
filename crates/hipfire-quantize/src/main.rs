@@ -3287,12 +3287,12 @@ fn cpu_encode_symbols(
 /// stays bounded; the scratch buffer is allocated once and reused across chunks.
 #[cfg(feature = "gpu")]
 fn gpu_encode_symbols(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     rotated: &[f32],
     n_groups: usize,
     bits: u32,
 ) -> Result<Vec<u8>, String> {
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     // Per-chunk packed backpointer scratch = chunk×256×256×2 u32 = chunk×512 KB
     // (uninitialized — the kernel writes it before backtrack, so use a device alloc
     // with NO host zero-copy; on the shared-UMA APU a host zero-vec competes for the
@@ -3414,7 +3414,7 @@ fn pack_qtip_real_tensors(
     // held via RAII until this function returns) so we cooperate with the daemon
     // and other GPU tools — no external `hipfire lock` needed.
     #[cfg(feature = "gpu")]
-    let (mut gpu, _gpu_lock) = match rdna_compute::Gpu::init() {
+    let (mut gpu, _gpu_lock) = match hipfire_rdna::Gpu::init() {
         Ok(g) => {
             let lock = acquire_gpu_lock();
             eprintln!(

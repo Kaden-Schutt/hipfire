@@ -10,7 +10,7 @@
 //! - State quantization (FP32/Q8/Q4) pattern
 //! - MoE routing dispatch
 
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 // ─── Prefill batchability ─────────────────────────────────────
 

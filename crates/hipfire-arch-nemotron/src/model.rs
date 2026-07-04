@@ -27,7 +27,7 @@ use crate::moe::{moe_relu2, MoeRelu2Gpu, MoeWeights};
 use crate::weight::{EmbeddingTable, LinearWeight};
 use crate::{BlockKind, NemotronHConfig};
 use hip_bridge::{HipError, HipResult};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Host-side per-block weights (the loader's target). One per stack layer.
 pub enum HostBlock {

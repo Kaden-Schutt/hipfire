@@ -121,7 +121,7 @@ additions):
    `crates/engine/src/llama.rs` (for HF4-Lloyd variant) — qt=21 wired
    into `load_lm_head`, `load_weight_tensor`, DeltaNet CPU
    `load_any_as_f32`, and `weight_gemv*` arms.
-5. **Dispatch wrappers** — `crates/rdna-compute/src/dispatch.rs`:
+5. **Dispatch wrappers** — `crates/hipfire-rdna/src/dispatch.rs`:
    `gemv_mq4g256_lloyd[_with_rotate]`.
 6. **Research-opt-in guards** — `--allow-mq4-lloyd` /
    `HIPFIRE_ALLOW_MQ4_LLOYD=1` in the quantizer until ship gates clear.
@@ -424,22 +424,22 @@ session. Files touched:
   threads × 1 fp16 cooperative load + barrier + indexed read).
   Tail iterations use a per-group cooperative load (only first 8
   lanes write LDS) routed into `acc[(quads*4 + i) & 3]`.
-- `crates/rdna-compute/src/kernels.rs` — added
+- `crates/hipfire-rdna/src/kernels.rs` — added
   `GEMV_MQ3G256_LLOYD_GFX1100_SRC` const + `gemv_mq3g256_lloyd_for_arch`
   selector. Includes `HIPFIRE_LLOYD_FORCE_BASELINE=1` debug escape
   hatch for logits-Δ comparisons.
-- `crates/rdna-compute/src/dispatch.rs` — `gemv_mq3g256_lloyd` now
+- `crates/hipfire-rdna/src/dispatch.rs` — `gemv_mq3g256_lloyd` now
   uses the arch selector + `launch_maybe_blob` (Step 4b: kernarg
   blob path is graph-capture-safe, mirroring HFQ3 dispatch).
   `gemv_mq2g256_lloyd` migrated to `launch_maybe_blob` for
   consistency (no kernel rewrite — just graph-safety).
-- `crates/rdna-compute/examples/test_gemv_mq3g256_lloyd_tail.rs` (NEW)
+- `crates/hipfire-rdna/examples/test_gemv_mq3g256_lloyd_tail.rs` (NEW)
   — tail K-sweep parity test for groups_per_row ∈ {4, 5, 6, 7, 8}.
 
 #### Step 1 — Build
 
 ```
-cargo check -p rdna-compute -p hipfire-runtime  → clean
+cargo check -p hipfire-rdna -p hipfire-runtime  → clean
 cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed
                                                 → clean
 ```
@@ -492,7 +492,7 @@ spill into VRAM-backed scratch) is met cleanly.
 
 #### Step 2.6 — Tail K-sweep parity (CPU reference)
 
-`crates/rdna-compute/examples/test_gemv_mq3g256_lloyd_tail.rs` builds
+`crates/hipfire-rdna/examples/test_gemv_mq3g256_lloyd_tail.rs` builds
 synthetic Lloyd-MQ3 rows for `groups_per_row ∈ {4, 5, 6, 7, 8}`,
 runs the GPU kernel, and compares against a CPU reference that uses
 the round-tripped fp16→fp32 codebooks (so fp16-quantization noise
@@ -542,7 +542,7 @@ GPU-internal (rocprofv3 counters: spills, L2, LDS).
 ### Decode-loop profile (in-process, gen=50, 9B Lloyd-MQ3, GRAPH=0)
 
 Added `HIPFIRE_PROFILE_DECODE=1` to `bench_qwen35_speed` (wraps the timed
-gen loop in `rdna_compute::profile::start/stop`; distinct from the
+gen loop in `hipfire_rdna::profile::start/stop`; distinct from the
 existing `HIPFIRE_PROFILE=1` which only profiles prefill). Also added
 profile timer wrapping to `gemv_mq3g256_lloyd` dispatch (was previously
 un-instrumented; profile cost is one atomic load when off).
@@ -1332,7 +1332,7 @@ should be unconditional + hoisted out of `if (q+1 < quads)` guards
 
 - `crates/hipfire-runtime/examples/bench_qwen35_speed.rs` — added
   `HIPFIRE_PROFILE_DECODE=1` switch to profile the gen loop.
-- `crates/rdna-compute/src/profile.rs` — added
+- `crates/hipfire-rdna/src/profile.rs` — added
   `gemv_mq3g256_lloyd_bytes()` byte counter.
-- `crates/rdna-compute/src/dispatch.rs` — wrapped `gemv_mq3g256_lloyd`
+- `crates/hipfire-rdna/src/dispatch.rs` — wrapped `gemv_mq3g256_lloyd`
   dispatch with `begin_timer`/`finish` for profile attribution.

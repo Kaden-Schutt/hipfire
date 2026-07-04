@@ -14,7 +14,7 @@
 use hipfire_arch_nemotron::model::NemotronModel;
 use hipfire_arch_nemotron::{BlockKind, NemotronHConfig};
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_DIR: &str = "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/snapshots/cbd3fa9f933d55ef16a84236559f4ee2a0526848";

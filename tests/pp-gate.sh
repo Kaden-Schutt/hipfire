@@ -107,8 +107,8 @@ fi
 # ROCm device-libs. Adding a new APU is a one-line change here.
 #
 # Source of truth for engine-side arch handling:
-#   crates/rdna-compute/src/kernels.rs:80-139 (WMMA family groups)
-#   crates/rdna-compute/src/dispatch.rs       (per-arch dispatch)
+#   crates/hipfire-rdna/src/kernels.rs:80-139 (WMMA family groups)
+#   crates/hipfire-rdna/src/dispatch.rs       (per-arch dispatch)
 #
 # NOT in this list (intentionally):
 #   gfx1150 (Strix Point)  — 16-CU iGPU, plausibly a useful PP partner
@@ -128,9 +128,9 @@ IGPU_ARCHS=(
 
 # ── ISA family table ────────────────────────────────────────────────────
 # Two devices are "heterogeneous" only when their families differ.
-# rdna3/rdna4 groupings mirror crates/rdna-compute/src/kernels.rs:80-139
+# rdna3/rdna4 groupings mirror crates/hipfire-rdna/src/kernels.rs:80-139
 # WMMA matchsets. cdna/rdna1/rdna2 groupings come from the wider per-arch
-# dispatch in crates/rdna-compute/src/dispatch.rs (kernels.rs doesn't
+# dispatch in crates/hipfire-rdna/src/dispatch.rs (kernels.rs doesn't
 # cover those families at line 80-139). The apu_* buckets are unreachable
 # under default flags (stage 2 filters iGPUs first) and only matter when
 # INCLUDE_IGPU=1 forces them into the homogeneity check.
@@ -478,7 +478,7 @@ else
                crates/hipfire-runtime/src/multi_gpu.rs \
                crates/hipfire-daemon/src/main.rs \
                crates/hipfire-runtime/examples/pp_parity_chatml.rs \
-               crates/rdna-compute/src/dispatch.rs; do
+               crates/hipfire-rdna/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then rebuild=1; break; fi
     done
 fi

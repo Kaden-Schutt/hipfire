@@ -12,7 +12,7 @@ edition.workspace = true
 default = ["gpu"]
 # `gpu` pulls the GPU trellis encoder AND the shared flock so the quantizer
 # self-coordinates the GPU it acquires (no external `hipfire lock` needed).
-gpu = ["dep:rdna-compute", "dep:hipfire-lock"]
+gpu = ["dep:hipfire-rdna", "dep:hipfire-lock"]
 
 [dependencies]
 # Capability layer (all LEAF/CPU-only, no GPU/runtime deps): consult a migrated
@@ -25,7 +25,7 @@ hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-gguf = { path = "../hipfire-gguf" }
 hipfire-primitives = { path = "../hipfire-primitives" }
 # GPU QTIP trellis encoder (offline accel). Optional + runtime-autodetected.
-rdna-compute = { path = "../rdna-compute", optional = true }
+hipfire-rdna = { path = "../hipfire-rdna", optional = true }
 # Shared flock(2) GPU resource lock — held automatically while the quantizer uses
 # the GPU, so it cooperates with the daemon/benches (AGENTS.md: one lock primitive).
 hipfire-lock = { path = "../hipfire-lock", optional = true }

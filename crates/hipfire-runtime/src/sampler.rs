@@ -35,7 +35,7 @@
 //! sampler treats them as unconditional `-INF` writes — it does not
 //! reimplement the depth counter.
 
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 pub use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
 

@@ -83,7 +83,7 @@ else
                crates/hipfire-arch-deepseek4/src/deepseek4.rs \
                crates/hipfire-arch-deepseek4/src/forward.rs \
                crates/hipfire-runtime/examples/daemon.rs \
-               crates/rdna-compute/src/dispatch.rs; do
+               crates/hipfire-rdna/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
             break

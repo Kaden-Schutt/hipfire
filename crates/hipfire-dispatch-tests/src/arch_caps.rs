@@ -1,5 +1,5 @@
-use rdna_compute::arch_caps::ArchCaps;
-use rdna_compute::feature_flags::FeatureFlags;
+use hipfire_rdna::arch_caps::ArchCaps;
+use hipfire_rdna::feature_flags::FeatureFlags;
 use std::sync::Arc;
 
 const ALL_ARCHS: &[&str] = &[

@@ -156,7 +156,7 @@ fn main() {
     let target_cfg = hfq::config_from_hfq(&target_hfq).expect("target config");
     let target_tok =
         Tokenizer::from_hfq_metadata(&target_hfq.metadata_json).expect("target tokenizer");
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init");
     let target_weights =
         hfq::load_weights_hfq(&target_hfq, &target_cfg, &mut gpu).expect("target weights");
     let target_scratch = ForwardScratch::new(&mut gpu, &target_cfg).expect("scratch");

@@ -61,7 +61,7 @@ fn main() {
     eprintln!("  layer mix = {n_la} LA + {n_fa} FA");
 
     eprintln!("\nInitializing GPU + loading weights ...");
-    let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("Gpu::init failed");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights failed");
 
     eprintln!("\n=== LOAD SUCCEEDED ===");

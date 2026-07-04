@@ -42,7 +42,7 @@ use std::path::Path;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 #[derive(Default)]
 struct Args {

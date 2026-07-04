@@ -5,7 +5,7 @@
 //! ZAYA1 GPU forward. Loads each big linear from the HFQ in its quant format via
 //! [`LinearWeight`] (f32 / Q8 / MQ4 / MQ6) and runs the forward op-for-op against
 //! `cpu.rs`, reusing `gemv_f32`/the dispatched gemv/`rmsnorm_f32`/`silu_mul_f32`
-//! plus the custom CCA/EDA kernels in `rdna-compute/src/dispatch/zaya_cca.rs`.
+//! plus the custom CCA/EDA kernels in `hipfire-rdna/src/dispatch/zaya_cca.rs`.
 //! Batch 1. `gpu_forward_serve` prefills the whole prompt and primes a
 //! [`ZayaDecodeState`] (KV cache + conv ring + delayed value); `gpu_decode` then
 //! advances one token at a time (O(1) per token). `gpu_forward_prefill` is a
@@ -18,7 +18,7 @@ use hipfire_runtime::calibration::{logsumexp, topk_logits};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::WeightTensor;
-use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 
 /// quant_type byte → quantized linear `DType` (None ⇒ a plain precision handled
 /// by `dequant_qt`). Matches the hipfire-quantize QuantType discriminants.

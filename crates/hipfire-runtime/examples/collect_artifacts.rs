@@ -22,7 +22,7 @@ use hipfire_arch_minimax::{MiniMaxConfig, MiniMaxWeights};
 use hipfire_arch_nemotron::{calibration as nemotron_calib, model::NemotronModel, NemotronHConfig};
 use hipfire_arch_qwen35::qwen35::{self, CalibOpts as QwenCalibOpts};
 use hipfire_arch_zaya::{calibration as zaya_calib, ZayaConfig};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 fn arg(flag: &str, default: Option<String>) -> Option<String> {

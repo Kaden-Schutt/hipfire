@@ -11,7 +11,7 @@
 
 use hipfire_kvquant::kvarn::{dequantize_tile, unpack_kvarn_tile_bits};
 use hipfire_runtime::kv_hier::HierKvState;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 const NH: usize = 8;
 const NKV: usize = 2;

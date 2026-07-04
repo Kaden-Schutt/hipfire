@@ -20,7 +20,7 @@ use hipfire_train::loader::{load_llama_fp32, load_llama_from_hfq};
 use hipfire_train::model::{flatten_norm_grads, model_distill_backward, model_forward, LlamaModel};
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::path::Path;
 

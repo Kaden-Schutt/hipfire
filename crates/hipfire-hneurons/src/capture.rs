@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 
 struct CaptureAcc {
     /// `[num_layers * intermediate]` column norms `‖W_down[:,j]‖`, uploaded once.

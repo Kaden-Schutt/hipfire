@@ -100,7 +100,7 @@ pub fn loop_guard_from_runtime_config() -> LoopGuard {
 /// structure. Currently unused — kept as reference for a future per-token block.
 #[allow(dead_code)]
 pub fn gpu_block_attractor_token(
-    gpu: &rdna_compute::Gpu,
+    gpu: &hipfire_rdna::Gpu,
     logits_buf: &hip_bridge::DeviceBuffer,
     history: &[u32],
     tok_id: u32,

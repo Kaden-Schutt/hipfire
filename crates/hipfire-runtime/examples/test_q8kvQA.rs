@@ -31,7 +31,7 @@ enum Outcome {
 }
 
 fn run() -> Result<String, Outcome> {
-    let mut gpu = rdna_compute::Gpu::init()
+    let mut gpu = hipfire_rdna::Gpu::init()
         .map_err(|e| Outcome::Skip(format!("GPU init unavailable: {e}")))?;
 
     let pos_buf = gpu
@@ -49,7 +49,7 @@ fn run() -> Result<String, Outcome> {
     let cache_bytes = max_seq * total_blocks * 34;
     let cache_elems = (cache_bytes + 3) / 4;
     let d_cache = gpu
-        .zeros(&[cache_elems], rdna_compute::DType::F32)
+        .zeros(&[cache_elems], hipfire_rdna::DType::F32)
         .map_err(|e| Outcome::Fail(format!("alloc cache failed: {e}")))?;
 
     gpu.hip
@@ -84,7 +84,7 @@ fn run() -> Result<String, Outcome> {
         .upload_f32(&vec![1.0f32; head_dim], &[head_dim])
         .map_err(|e| Outcome::Fail(format!("upload q failed: {e}")))?;
     let d_out = gpu
-        .zeros(&[head_dim], rdna_compute::DType::F32)
+        .zeros(&[head_dim], hipfire_rdna::DType::F32)
         .map_err(|e| Outcome::Fail(format!("alloc out failed: {e}")))?;
     gpu.attention_q8_0_kv(
         &d_q, &d_cache, &d_cache, &d_out, &pos_buf, 1, 1, 1, head_dim, max_seq,

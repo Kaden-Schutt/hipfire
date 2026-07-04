@@ -1344,7 +1344,7 @@ pub fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 /// Returns `m * (16 + 17 * (k/32))` bytes — 16-B row header + per-block payloads, repeated per row.
 ///
 /// K%256 — not K%32 — because the v1 GEMV kernel
-/// (`crates/rdna-compute/src/dispatch.rs::gemv_hfp4g32`) iterates 256 elements
+/// (`crates/hipfire-rdna/src/dispatch.rs::gemv_hfp4g32`) iterates 256 elements
 /// per work-item and panics on K%256!=0. The byte format itself is K%32-aligned;
 /// the K%256 limit is a kernel-side constraint that v2 will lift. Refusing here
 /// makes the failure mode "quantize rejects bad input" rather than "runtime

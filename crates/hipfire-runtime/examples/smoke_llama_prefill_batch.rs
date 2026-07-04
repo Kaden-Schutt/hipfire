@@ -45,7 +45,7 @@ fn main() {
         prompt_tokens.len()
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init");
     let weights = hfq::load_weights_hfq(&hfq, &config, &mut gpu).expect("load weights");
     let scratch = ForwardScratch::new(&mut gpu, &config).expect("scratch");
     let kv_seq_len = 2048usize;

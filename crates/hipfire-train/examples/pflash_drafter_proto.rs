@@ -19,7 +19,7 @@ use hipfire_model::tokenizer::Tokenizer;
 use hipfire_train::drafter::{drafter_forward, Drafter, DrafterConfig};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::{Path, PathBuf};
 
 const HF: &str = "/srv/huggingface";
@@ -183,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(acts);
     let embed = std::mem::replace(
         &mut target.embed,
-        gpu.zeros(&[1], rdna_compute::DType::F32)?,
+        gpu.zeros(&[1], hipfire_rdna::DType::F32)?,
     );
 
     // ── P2: untrained drafter ────────────────────────────────────────────────

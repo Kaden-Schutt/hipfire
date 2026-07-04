@@ -7,7 +7,7 @@
 //! those are layer-level concerns handled by the caller). Dispatch is by dtype
 //! only, with WMMA-preferred routing where available.
 
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
@@ -159,7 +159,7 @@ impl GemmFamily {
             K::GemmHfq4G256 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
             // #397 Ship 5.1: plain-GEMM catalog. Each arm maps the registered
-            // KernelKey to the exact rdna-compute method with the canonical
+            // KernelKey to the exact hipfire-rdna method with the canonical
             // `(a, x, y, m, k, batch_size)` signature.
             K::GemmF16 => hip!(gpu.gemm_f16(w.buf, x, y, m, k, batch_size)),
             K::GemmF16Tiled => hip!(gpu.gemm_f16_tiled(w.buf, x, y, m, k, batch_size)),
@@ -206,7 +206,7 @@ impl GemmFamily {
                 hip!(gpu.gemm_mq3g256_lloyd_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
             // #397 Ship 5.3: spec-decode (DFlash) batched lm_head catalog. Each
-            // arm maps the explicit key to the exact rdna-compute method the prior
+            // arm maps the explicit key to the exact hipfire-rdna method the prior
             // direct spec-decode call used. The operand order
             // `(w.buf, x, y, m, k, batch_size)` is byte-identical, and each method
             // keeps its own internal arch routing (WMMA for batch>1 on gfx11/12,

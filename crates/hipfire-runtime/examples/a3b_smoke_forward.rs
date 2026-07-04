@@ -42,7 +42,7 @@ fn main() {
         .unwrap_or(1);
 
     eprintln!("Opening: {}", model_path.display());
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
 
     // Auto-route safetensors directories (ParoQuant / HF native) — mirrors
     // eval_hipfire.rs:165-176 and daemon.rs:1500-1504. HFQ files take the

@@ -3,7 +3,7 @@
 //! arch_id=0/1. Standard dense transformer with GGUF Q4K heritage format
 //! support and basic MQ rotation path. No hybrid LA/FA or MoE complexity.
 
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 // ─── Prefill batchability ─────────────────────────────────────
 

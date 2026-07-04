@@ -130,7 +130,7 @@ gated attention. Nothing exotic per-op; the novelty for hipfire is the
   `quant_calib.rs` (activation capture → `.calib.hfq`), progressive per-step
   precision schedule.
 
-Lift from `rdna-compute` (already in-tree, portable RDNA2/3/4):
+Lift from `hipfire-rdna` (already in-tree, portable RDNA2/3/4):
 
 - RoPE: `dispatch/rope.rs` (`rope_f32`, `rope_batched_f32`,
   `rope_2d_halfsplit_f32`) — extend/compose for the 3-axis `[32,48,48]` split.
@@ -141,7 +141,7 @@ Lift from `rdna-compute` (already in-tree, portable RDNA2/3/4):
 DiT-specific ops to add to `gpu_ops.rs` (+ HIP kernels where needed):
 
 1. **RMSNorm resident** (`rms_norm_resident`) — for `norm1/norm2` and QK-norm.
-   Prefer wiring the existing rdna-compute rmsnorm over a new kernel.
+   Prefer wiring the existing hipfire-rdna rmsnorm over a new kernel.
 2. **3D RoPE** for `axes_dims_rope [32,48,48]` — image tokens carry a
    (frame,h,w) position; compose per-axis rotation over the 128-dim head.
    Reuse the rope dispatch; add the 3-axis position/section handling.

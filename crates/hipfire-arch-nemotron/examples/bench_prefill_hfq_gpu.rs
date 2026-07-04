@@ -18,7 +18,7 @@
 use hipfire_arch_nemotron::model::NemotronModel;
 use hipfire_arch_nemotron::NemotronHConfig;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

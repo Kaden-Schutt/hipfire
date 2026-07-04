@@ -14,8 +14,8 @@
 
 use crate::dispatch::gemv_family;
 use hip_bridge::HipResult;
-use rdna_compute::generic_warn::{warn_generic_once, KernelMode, Quality};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::generic_warn::{warn_generic_once, KernelMode, Quality};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 pub struct ParoRotation {
     pub pairs: GpuTensor, // I16 [krot, in_dim] — pair indices per rotation layer
@@ -1524,7 +1524,7 @@ pub fn weight_gemm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
 
     #[test]
     fn mq6_dense_decode_routes_through_hfq6_family() {

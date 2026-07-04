@@ -3,13 +3,13 @@
 Companion to `architectural-review-2026-07-03.md`. Every finding was produced by a subsystem reviewer and independently re-checked by an adversarial verifier that re-read the cited code. Verdicts: **confirmed** (facts re-checked), **adjusted** (core claim real; location/numbers/severity corrected as noted), **refuted** (dropped, listed at the end).
 
 
-## rdna-compute — GEMM/GEMV dispatch family
+## hipfire-rdna — GEMM/GEMV dispatch family
 
 *Subsystem key: `rdna-dispatch-gemm` — 8 finding(s)*
 
 **Subsystem assessment:** The GEMM/GEMV dispatch family (gemv.rs 6121 LOC, gemm_qkv.rs 5890, gemm_hfq.rs 2916, gemm_gate.rs 2603, fused.rs 4308, plus gemm_base/gemm_misc) is a single god-object: every file is one `impl Gpu` block, contributing to ~803 pub fns across dispatch/. Each dispatch method is a near-verbatim template (bind_thread -> ensure_kernel -> build kernarg list -> launch_maybe_blob -> timer), and critically every one of ~207 launch sites maintains TWO parallel argument lists (a `Vec<*mut c_void>` and a duplicate `KernargBlob` closure) with no compile-time or test check that they agree. Kernel-selection cascades (which quant/tile/arch kernel to run) are the highest-risk logic yet live inline, coupled to GPU state, and are entirely untested: the whole family has zero `#[test]`. Leaf arch predicates in arch_caps.rs are pure and well-tested (19 tests), so the composite routing is the extractable, testable gap. Main risks are silent kernarg drift, routing-cascade drift (including one dead duplicate selector), and truncating `as i32` casts on unvalidated dims.
 
-### [High] duplication — `crates/rdna-compute/src/dispatch/gemm_hfq.rs:1891-1935 (representative of ~207 sites)`
+### [High] duplication — `crates/hipfire-rdna/src/dispatch/gemm_hfq.rs:1891-1935 (representative of ~207 sites)`
 
 **Observation:** Every kernel launch maintains two hand-written, order-sensitive copies of the same argument list: a `params: Vec<*mut c_void>` built with `&mut x as *mut _ as *mut c_void` casts, and a second `KernargBlob` closure that re-pushes the identical args via push_ptr/push_i32. The two must match each other AND the HIP kernel signature exactly, but nothing enforces this — a reorder or a forgotten arg in one list produces silent kernarg corruption, not a compile error. There are ~207 launch_maybe_blob call sites (gemv 81, fused 47, gemm_qkv 24, gemm_misc 20, gemm_hfq 14, gemm_gate 13, gemm_base 8) and gemv.rs alone has 476 push_* lines.
 
@@ -19,7 +19,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [High] missing-tests — `crates/rdna-compute/src/dispatch/{gemv,gemm_qkv,gemm_hfq,gemm_gate,fused,gemm_base,gemm_misc}.rs (0 tests); gemm_qkv.rs:844-914`
+### [High] missing-tests — `crates/hipfire-rdna/src/dispatch/{gemv,gemm_qkv,gemm_hfq,gemm_gate,fused,gemm_base,gemm_misc}.rs (0 tests); gemm_qkv.rs:844-914`
 
 **Observation:** The kernel-selection cascades — the logic most likely to harbor a correctness bug (e.g. 'gfx1103 + batch 32 + M=4096 + hfq4 → which kernel?') — have zero test coverage. All 7 scope files contain 0 `#[test]`; the entire dispatch/ tree has exactly one test (mod.rs:5131, covering gen_fwht_signs, unrelated to routing). The atomic predicates in arch_caps.rs (is_gfx906, should_use_mmq, has_wmma_w32, etc.) ARE pure and have 19 tests, but the composite decision tree that combines them is untested and unpurified: the selector at gemm_qkv.rs:844-914 calls self.bind_thread_or_warn() (845) and self.mmq_screen_weight() (856), which uploads synthetic activations and runs kernels (mod.rs:1952-1991), so it cannot run without a GPU.
 
@@ -29,7 +29,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Medium] coupling — `crates/rdna-compute/src/dispatch/gemm_qkv.rs:832-915 vs 916-1263`
+### [Medium] coupling — `crates/hipfire-rdna/src/dispatch/gemm_qkv.rs:832-915 vs 916-1263`
 
 **Observation:** `gemm_qkvza_hfq4g256_route_label` (832-915) is a `pub fn` that reproduces the exact routing cascade (rocblas eligibility, is_gcn5_wave64, should_use_mmq, has_hfq4_mmq, has_wmma_w32, dot2, fp16 fallback) of the real dispatch fn `gemm_qkvza_hfq4g256` (916-1263), returning the chosen kernel name string. It has ZERO callers anywhere in the crate, so it is dead code that must be manually kept in sync with a 348-line sibling — a guaranteed source of routing drift where the label reports one kernel while dispatch runs another.
 
@@ -39,7 +39,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: adjusted — Verified: route_label (832-915) is pub with ZERO callers crate-wide (only its own definition), and it reproduces the real dispatch cascade (rocblas@939/846, is_gcn5_wave64@998/854, is_gfx906+should_use_mmq@1022/855, should_use_mmq@1092/876, has_hfq4_mmq@1135/889, wmma@1158/902, dot2@1172/905). Duplication and drift risk are real. Downgrading to Medium: with zero callers nothing consumes the label output, so there is no ACTIVE correctness risk (the 'label says X, dispatch runs Y' scenario needs a consumer that does not exist) — it is dead duplicated code, a clear antipattern worth scheduled removal/refactor, not High.*
 
-### [Medium] monolith — `crates/rdna-compute/src/dispatch/gemm_qkv.rs:916-1263 (and siblings)`
+### [Medium] monolith — `crates/hipfire-rdna/src/dispatch/gemm_qkv.rs:916-1263 (and siblings)`
 
 **Observation:** `gemm_qkvza_hfq4g256` is a single 348-line function that mixes four responsibilities: rocBLAS fp16-shadow prefill path (939-992), MMQ screening + gfx906 wave64 split routing (996-1180), WMMA/dot2/fp16 fallback selection, and the actual kernarg build + launch. It uses raw `DeviceBuffer::from_raw` + `std::mem::forget` lifetime juggling (952-986) inline. Peers are similarly oversized: gemm_qkv_hfq4g256 is 252 lines (1961), gemm_qkvza_hfq6g256 142 lines (4670). These are hard to review and impossible to test in pieces.
 
@@ -49,7 +49,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Medium] abstraction — `crates/rdna-compute/src/dispatch/gemv.rs:12 (impl Gpu, 124 pub fns) — family-wide god object`
+### [Medium] abstraction — `crates/hipfire-rdna/src/dispatch/gemv.rs:12 (impl Gpu, 124 pub fns) — family-wide god object`
 
 **Observation:** The entire GEMM/GEMV family is one inherent `impl Gpu` split across 7 files (each opens `impl Gpu {`), contributing to ~803 pub fns on the Gpu struct across dispatch/. gemv.rs alone exposes 124 near-identical methods (gemv_q4lut, gemv_q4wave, gemv_q4as8, gemv_q4k, gemv_hfq4g128, ... 40+ paro variants) that differ only in kernel-name string, kernarg tuple, and grid/block. This is a classic data-in-code smell: what varies is data (kernel name, module const, arg schema, grid formula), but it is encoded as hundreds of hand-written functions.
 
@@ -59,7 +59,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Medium] duplication — `crates/rdna-compute/src/dispatch/gemv.rs:1324-1333, 1347-1356, 1371-1380`
+### [Medium] duplication — `crates/hipfire-rdna/src/dispatch/gemv.rs:1324-1333, 1347-1356, 1371-1380`
 
 **Observation:** The env-var runtime dispatch block reading HIPFIRE_PARO_PACK1/2/4 and branching to the pack1/pack2/pack4 kernel is copy-pasted verbatim in three wrapper functions (gemv_paro4g128t_with_prerotate, _residual_with_prerotate, _swiglu_residual_with_prerotate). Each re-does `std::env::var_os(...).is_some()` three times per call on the hot decode path, and any change to pack selection must be made in three places.
 
@@ -69,7 +69,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Low] coupling — `crates/rdna-compute/src/dispatch/ (family-wide) — e.g. gemm_hfq.rs:1887-1889, gemv.rs:29-30`
+### [Low] coupling — `crates/hipfire-rdna/src/dispatch/ (family-wide) — e.g. gemm_hfq.rs:1887-1889, gemv.rs:29-30`
 
 **Observation:** There are 966 truncating `as i32` casts on usize dimensions (m/k/batch) across the 7 files, with zero `try_into`, `checked_*`, or bounds guards (grep returned none). Dims are passed to kernels as i32; a K or M ≥ 2^31, or a `batch_size * k` product exceeding i32, would silently wrap to a negative/small value and produce wrong-shape launches rather than an error. In practice LLM layer dims are bounded well under 2^31, so this is latent rather than active, but there is no defensive check anywhere on parsed/caller-supplied shapes.
 
@@ -90,13 +90,13 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 *Verification: confirmed*
 
 
-## rdna-compute — attention, dispatch core, kernels
+## hipfire-rdna — attention, dispatch core, kernels
 
 *Subsystem key: `rdna-attn-core` — 11 finding(s)*
 
-**Subsystem assessment:** This subsystem is the HIP/ROCm-direct kernel dispatch core of rdna-compute: a single god struct `Gpu` (dispatch/mod.rs) carries GPU state and ~800 dispatch methods spread across 24 `impl Gpu` files, plus a 258KB embedded-kernel-source blob (kernels.rs), the JIT compiler, memory pool, arch capability tables, and three "profil*" modules. The generic-compute framing is sound in places (pool.rs, arch_caps.rs, and the arch-selection logic in kernels.rs are clean and well-tested), but the crate has absorbed model-family-specific dispatch (deepseek4.rs, zaya_cca.rs, mamba2.rs) even though dedicated arch crates exist for those models, and the `Gpu` struct has become a ~50-field, ~9-responsibility monolith. Main risks: the god object blocks parallel work and makes state lifetimes hard to reason about; attention.rs contains large blocks of byte-identical copy-paste (asym/fwht flash variants) that must be hand-kept in sync; and essentially all dispatch logic plus the pure byte/occupancy/ELF-parsing helpers ship with zero unit tests. The dispatch hot path itself is HIP-correct and portability-conscious (arch atoms), so most issues are maintainability rather than acute correctness, with the ELF parser and truncating as-casts as the notable latent-panic exceptions.
+**Subsystem assessment:** This subsystem is the HIP/ROCm-direct kernel dispatch core of hipfire-rdna: a single god struct `Gpu` (dispatch/mod.rs) carries GPU state and ~800 dispatch methods spread across 24 `impl Gpu` files, plus a 258KB embedded-kernel-source blob (kernels.rs), the JIT compiler, memory pool, arch capability tables, and three "profil*" modules. The generic-compute framing is sound in places (pool.rs, arch_caps.rs, and the arch-selection logic in kernels.rs are clean and well-tested), but the crate has absorbed model-family-specific dispatch (deepseek4.rs, zaya_cca.rs, mamba2.rs) even though dedicated arch crates exist for those models, and the `Gpu` struct has become a ~50-field, ~9-responsibility monolith. Main risks: the god object blocks parallel work and makes state lifetimes hard to reason about; attention.rs contains large blocks of byte-identical copy-paste (asym/fwht flash variants) that must be hand-kept in sync; and essentially all dispatch logic plus the pure byte/occupancy/ELF-parsing helpers ship with zero unit tests. The dispatch hot path itself is HIP-correct and portability-conscious (arch atoms), so most issues are maintainability rather than acute correctness, with the ELF parser and truncating as-casts as the notable latent-panic exceptions.
 
-### [High] monolith — `crates/rdna-compute/src/dispatch/mod.rs:532-769`
+### [High] monolith — `crates/hipfire-rdna/src/dispatch/mod.rs:532-769`
 
 **Observation:** `Gpu` is a god object: ~50 fields spanning at least 9 distinct responsibilities (HIP runtime + arch/caps/flags; JIT compiler + module/function caches; memory pool + free mailbox; calibration capture hooks; MQ/OQ/PARO quant scratch (~20 fields); fp16/bf16/fp8 activation-conversion scratch with src-ptr caches; MMQ per-weight screening cache; three separate hipGraph capture subsystems — AR-forward, verify_graph_cache, replay_graph_cache — plus blobs/exec; rocBLAS + fp16 shadow cache). Its behavior is grafted on via `impl Gpu` blocks in 24 files totaling ~800 methods (mod.rs 134, gemv.rs 125, attention.rs 76, gemm_qkv.rs 67, deepseek4.rs 65, fused.rs 52, ...). Every unrelated feature widens the same struct and shares its `&mut self`, serializing all work through one borrow.
 
@@ -106,17 +106,17 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [High] crate-boundary — `crates/rdna-compute/src/dispatch/deepseek4.rs:12-3273`
+### [High] crate-boundary — `crates/hipfire-rdna/src/dispatch/deepseek4.rs:12-3273`
 
-**Observation:** Model-family-specific dispatch lives inside the generic `rdna-compute` ("Compute kernel dispatch for RDNA GPUs") crate. deepseek4.rs adds 65 DeepSeek-V4-specific `impl Gpu` methods — hyper-connection Sinkhorn (`hc_sinkhorn_4x4`), hash routing (`hash_router_normalize_f32`), NSA indexer/compressor (`indexer_top_k`, `compressor_compress_aligned_batched_f32`), `deepseek4_attn_swa_*`, `deepseek4_gemv_mq2g256_lloyd_moe_*`. zaya_cca.rs and mamba2.rs do the same for ZAYA1 and nemotron_h Mamba-2. Dedicated arch crates already exist (hipfire-arch-deepseek4, hipfire-arch-zaya, hipfire-arch-nemotron), and zaya_cca.rs's own header says it is 'Faithful to crates/hipfire-arch-zaya/src/cpu.rs' — i.e. the model logic is mirrored across two crates. This inverts the intended boundary: the generic compute crate must be edited/recompiled for per-model changes and its god `Gpu` accumulates model-named methods.
+**Observation:** Model-family-specific dispatch lives inside the generic `hipfire-rdna` ("Compute kernel dispatch for RDNA GPUs") crate. deepseek4.rs adds 65 DeepSeek-V4-specific `impl Gpu` methods — hyper-connection Sinkhorn (`hc_sinkhorn_4x4`), hash routing (`hash_router_normalize_f32`), NSA indexer/compressor (`indexer_top_k`, `compressor_compress_aligned_batched_f32`), `deepseek4_attn_swa_*`, `deepseek4_gemv_mq2g256_lloyd_moe_*`. zaya_cca.rs and mamba2.rs do the same for ZAYA1 and nemotron_h Mamba-2. Dedicated arch crates already exist (hipfire-arch-deepseek4, hipfire-arch-zaya, hipfire-arch-nemotron), and zaya_cca.rs's own header says it is 'Faithful to crates/hipfire-arch-zaya/src/cpu.rs' — i.e. the model logic is mirrored across two crates. This inverts the intended boundary: the generic compute crate must be edited/recompiled for per-model changes and its god `Gpu` accumulates model-named methods.
 
-**Recommendation:** Keep rdna-compute holding only generic primitives (gemv/gemm/attention/norm/rope/moe families parameterized by dtype and quant token). Move model-specific orchestration (hyper-connections, hash routing, NSA index/compress, SWA-topk gather) into the matching hipfire-arch-* crate, expressed in terms of the generic dispatch traits from finding #1. Where a genuinely novel kernel is needed, expose it as a generic dispatch method (e.g. `sinkhorn_4x4`, `topk_gather`) without the `deepseek4_`/`zaya_` prefix so it is reusable, and let the arch crate sequence it. This preserves the HIP-direct path while restoring the generic-vs-model separation.
+**Recommendation:** Keep hipfire-rdna holding only generic primitives (gemv/gemm/attention/norm/rope/moe families parameterized by dtype and quant token). Move model-specific orchestration (hyper-connections, hash routing, NSA index/compress, SWA-topk gather) into the matching hipfire-arch-* crate, expressed in terms of the generic dispatch traits from finding #1. Where a genuinely novel kernel is needed, expose it as a generic dispatch method (e.g. `sinkhorn_4x4`, `topk_gather`) without the `deepseek4_`/`zaya_` prefix so it is reusable, and let the arch crate sequence it. This preserves the HIP-direct path while restoring the generic-vs-model separation.
 
-**Evidence:** deepseek4.rs:15-3273 = 65 model-specific `impl Gpu` fns; zaya_cca.rs:5-8 header references hipfire-arch-zaya/src/cpu.rs; `ls crates/` shows hipfire-arch-deepseek4, hipfire-arch-zaya, hipfire-arch-nemotron; rdna-compute/Cargo.toml has no arch-crate dependency (boundary points the wrong way).
+**Evidence:** deepseek4.rs:15-3273 = 65 model-specific `impl Gpu` fns; zaya_cca.rs:5-8 header references hipfire-arch-zaya/src/cpu.rs; `ls crates/` shows hipfire-arch-deepseek4, hipfire-arch-zaya, hipfire-arch-nemotron; hipfire-rdna/Cargo.toml has no arch-crate dependency (boundary points the wrong way).
 
 *Verification: confirmed*
 
-### [High] duplication — `crates/rdna-compute/src/dispatch/attention.rs:2469-2696`
+### [High] duplication — `crates/hipfire-rdna/src/dispatch/attention.rs:2469-2696`
 
 **Observation:** The non-batched flash-attention variants are near-verbatim copy-paste. `attention_flash_asym4` (2583-2696) is byte-identical to `attention_flash_asym3` (2469-2580) except the tile kernel name/SRC string ('asym3'→'asym4'); both hand-roll the same two-phase launch (givens tile kernel + shared `attention_flash_q8_0_reduce`). The code even documents it: line 2697-2698 'Same launch geometry + Q8_0 reduce as asym4 — only the tile kernel differs.' The same body is duplicated for asym2/asym3/asym4/fwht2/fwht3/fwht4 — 11 hand-rolled `ensure_givens4_kernel` launch bodies (~113 lines each). Notably the BATCHED siblings already funnel through one helper `launch_asym_flash_batched` (8+ call sites), so the refactor template exists but was never applied to the non-batched path. Divergence risk: a fix to the reduce/geometry must be applied 11× by hand.
 
@@ -126,7 +126,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Medium] monolith — `crates/rdna-compute/src/kernels.rs:1-4751`
+### [Medium] monolith — `crates/hipfire-rdna/src/kernels.rs:1-4751`
 
 **Observation:** kernels.rs is a 4751-line / 258KB single module mixing three unrelated things: 736 `pub const *_SRC: &str` HIP-source string constants, ~60 `*_for_arch(caps) -> (&str, &str)` arch-selection functions, and a 26-test `dispatch_tests` module. Everything is flat and `pub`, so the compile unit and the public surface are enormous, grep is the only navigation, and adding a kernel means editing the same file as the selection logic and tests.
 
@@ -136,7 +136,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: adjusted — Monolith core confirmed: 4751 lines, 737 pub const *_SRC (749 total pub const), dispatch_tests at 4140 (obs says 4139, off-by-one), mixes source blobs + selectors + tests. But the observation's '~60 *_for_arch selection functions' is wrong: there are only 33 _for_arch fns — the '60' is the TOTAL fn count (33 selectors + 26 tests + 1). kernels/src/*.hip exist (572 files) so include_str! recommendation is viable. Severity Medium stands; number needs correcting to 33.*
 
-### [Medium] missing-tests — `crates/rdna-compute/src/profile.rs:144-373`
+### [Medium] missing-tests — `crates/hipfire-rdna/src/profile.rs:144-373`
 
 **Observation:** The subsystem's pure, GPU-independent logic is almost entirely untested. profile.rs has 15+ analytical byte-count formulas (hfq4g256_weight_bytes, gemv_oq4g256_moe_bytes, attention_q8_0_kv_bytes, etc.) used for bandwidth attribution correctness, with 0 unit tests. profiler.rs occupancy math (decode_vgprs, occupancy_pct, ridge_point_flop_per_byte) and compiler.rs pure helpers (per_kernel_flags tag parsing, cache_valid, hsaco_is_elf) and pool.rs bucket_key are all 0-test. Across the 20+ dispatch files (~800 methods) there is 1 test total. While kernel launches need a GPU, the embedded pure logic — tile/grid math (`(max_seq + TILE-1)/TILE`), chunking, capture-mode branching, byte formulas — is trivially unit-testable and currently unguarded against silent regressions.
 
@@ -146,7 +146,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Medium] missing-tests — `crates/rdna-compute/src/profiler.rs:289-556`
+### [Medium] missing-tests — `crates/hipfire-rdna/src/profiler.rs:289-556`
 
 **Observation:** profile_hsaco parses untrusted-shaped ELF/hsaco binaries using raw indexing helpers `u16_le/u32_le/u64_le` (539-556) that do `d[o+7]` with no bounds check. profile_hsaco guards some offsets (`if base + 40 > elf.len()`) but not all derived reads — e.g. line 332 `u64_le(elf, shoff + shstrndx*shentsize + 24)` and the segment/kd offset reads can index past a truncated or malformed file, panicking the caller. This binary parser has 0 unit tests, so no fixture exercises a short/garbage .hsaco.
 
@@ -156,7 +156,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Medium] module-structure — `crates/rdna-compute/src/profiler.rs:29-112`
+### [Medium] module-structure — `crates/hipfire-rdna/src/profiler.rs:29-112`
 
 **Observation:** The hypothesized 'profiler triplication' is not code triplication — profile.rs (runtime hipEvent timing + byte formulas), profiler.rs (static hsaco ISA/occupancy analysis), and profile_rocprof.rs (rocprofv3 CSV cross-check) are three genuinely distinct concerns. The real issues are (a) discoverability: three top-level `pub mod`s share the `profil*` prefix, so callers cannot tell which does what; and (b) a real data duplication — profiler.rs::arch_spec (41-112) encodes per-arch hardware knowledge (generation string, simds_per_cu, waves, vgprs, lds, caches, bus width) that overlaps the domain of arch_caps.rs, which independently maps the same gfx ids to generations/wave behavior. Two arch tables can drift (e.g. a new gfx1300 must be added in both).
 
@@ -166,7 +166,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Medium] duplication — `crates/rdna-compute/src/kernels.rs:257-838`
+### [Medium] duplication — `crates/hipfire-rdna/src/kernels.rs:257-838`
 
 **Observation:** ~60 `*_for_arch(caps: &ArchCaps) -> (&'static str, &'static str)` selectors repeat an identical shape: `match caps.arch() { gfx12 => (SRC_GFX12, name_rdna4), gfx11/1151 => (SRC, name_rdna3), _ => panic!(...) }`. The bodies differ only in the SRC constant, the module-name string, and the panic text. This is ~60 copies of one dispatch template. (Mitigating: these are pure and well covered by dispatch_tests, and the panic arms are guarded upstream by is_batchable_la.) A portability note: many arms hard-panic for RDNA2 (gfx103x) and some for RDNA4 (gfx120x), so extending is_batchable_la without updating each selector is a latent panic.
 
@@ -176,7 +176,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: adjusted — Read confirms the identical selector template (match caps.arch(){ gfx12 => SRC_GFX12/rdna4; gfx11/1151 => SRC/rdna3; _ => panic! }) at 257-363, repeating for mq3 (588-838) and hfq (2177-2257); the RDNA2/RDNA4 hard-panic portability note is real. But the '~60 selectors' figure is inflated — there are 33 _for_arch selectors total (~27 in the 257-838 range). Macro/table recommendation is sound; severity Medium unchanged, count needs correcting.*
 
-### [Low] utils-sprawl — `crates/rdna-compute/src/dispatch/misc.rs:1-1146`
+### [Low] utils-sprawl — `crates/hipfire-rdna/src/dispatch/misc.rs:1-1146`
 
 **Observation:** misc.rs is a self-declared grab-bag: its module doc lists 'residual-quant, standalone Paro, Givens rotation, deinterleave, cross-entropy, cast, attn-bias, transpose, scatter, scale, l2-norm, qkv-split' — 21 unrelated `impl Gpu` ops bundled because they don't fit another family. gemm_misc.rs (31 fns) is a similar catch-all. This makes the file a magnet for any op without an obvious home and obscures which ops are hot-path vs training-only (cross_entropy_train, transpose_f32).
 
@@ -186,7 +186,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Low] abstraction — `crates/rdna-compute/src/dispatch/deepseek4.rs:20`
+### [Low] abstraction — `crates/hipfire-rdna/src/dispatch/deepseek4.rs:20`
 
 **Observation:** Truncating `as` casts are pervasive and unchecked: attention.rs has 454 and deepseek4.rs 122 `as i32/u32/usize/i8/u8` conversions, including element counts fed to kernels as i32 (`x.numel() as i32` at deepseek4.rs:20, 1668, 2828). For the 122B-class targets this crate serves, most such dims are per-token/per-head and safely small, but numel-as-i32 on a full activation or a large K silently wraps negative past 2^31 with no debug assert, producing a corrupt grid rather than an error.
 
@@ -196,7 +196,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Low] monolith — `crates/rdna-compute/src/dispatch/mod.rs:876-1054`
+### [Low] monolith — `crates/hipfire-rdna/src/dispatch/mod.rs:876-1054`
 
 **Observation:** `Gpu::init_with_device` is a ~178-line constructor that queries the device, builds arch_caps/flags, and initializes the full ~50-field struct (including all the quant-scratch, graph-cache, and screening fields to None/default) in one block. It is a direct consequence of the god-object in finding #1: the struct's breadth forces a wide, hard-to-review init.
 
@@ -207,11 +207,11 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 *Verification: confirmed*
 
 
-## rdna-compute remainder + hip-bridge + hsa-bridge (FFI floor)
+## hipfire-rdna remainder + hip-bridge + hsa-bridge (FFI floor)
 
 *Subsystem key: `rdna-rest-bridges` — 6 finding(s)*
 
-**Subsystem assessment:** This subsystem is the FFI floor of hipfire: hip-bridge (dlopen wrapper over libamdhip64), hsa-bridge (experimental AQL-direct dispatch), the RCCL/rocBLAS wrappers, and the thin rdna-compute glue (pool, generic_warn, sampling dispatch). The wrappers are mostly well-shaped — raw function pointers are held in a Send/Sync *Lib struct, calls go through `check()`-style status translation, and most callers see `Result` rather than raw status codes. However FFI hygiene is uneven: one device-properties call writes a 1472-byte C struct into a 1024-byte buffer (heap overflow on a load-bearing arch-detection path), RAII/Drop coverage is inconsistent across handle types, and hsa-bridge ships ~2988 LOC with zero tests despite containing byte-layout-critical pure logic that is trivially host-testable. The two bridge crates also duplicate four structurally-identical error types, the symbol-loading macro, and the dlopen fallback chain, none of which is factored into a shared low-level FFI-loader abstraction. Main risks: the buffer overflow (correctness/memory safety) and the untested AQL packet-builder (silent dispatch corruption).
+**Subsystem assessment:** This subsystem is the FFI floor of hipfire: hip-bridge (dlopen wrapper over libamdhip64), hsa-bridge (experimental AQL-direct dispatch), the RCCL/rocBLAS wrappers, and the thin hipfire-rdna glue (pool, generic_warn, sampling dispatch). The wrappers are mostly well-shaped — raw function pointers are held in a Send/Sync *Lib struct, calls go through `check()`-style status translation, and most callers see `Result` rather than raw status codes. However FFI hygiene is uneven: one device-properties call writes a 1472-byte C struct into a 1024-byte buffer (heap overflow on a load-bearing arch-detection path), RAII/Drop coverage is inconsistent across handle types, and hsa-bridge ships ~2988 LOC with zero tests despite containing byte-layout-critical pure logic that is trivially host-testable. The two bridge crates also duplicate four structurally-identical error types, the symbol-loading macro, and the dlopen fallback chain, none of which is factored into a shared low-level FFI-loader abstraction. Main risks: the buffer overflow (correctness/memory safety) and the untested AQL packet-builder (silent dispatch corruption).
 
 ### [Medium] missing-tests — `crates/hsa-bridge/src (0 files with #[cfg(test)])`
 
@@ -263,7 +263,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Low] missing-tests — `crates/rdna-compute/src/pool.rs:40-47; crates/hip-bridge/src/lib.rs:58-69`
+### [Low] missing-tests — `crates/hipfire-rdna/src/pool.rs:40-47; crates/hip-bridge/src/lib.rs:58-69`
 
 **Observation:** Two small pure-logic units on hot/allocation paths have no tests. `GpuPool::bucket_key` (pool.rs:40) does power-of-2 rounding with a 256 B floor and is the key that governs free-list reuse correctness, and the alloc/free-list eviction logic (pool.rs:59-90) is pure aside from the `hip.malloc/free` calls. `MemoryType::from_raw` (hip-bridge/src/lib.rs:58) is a hand-written u32->enum map that must stay in sync with `hipMemoryType`. None are covered, though bucket_key and from_raw are trivially testable without a GPU.
 
@@ -292,13 +292,13 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 ### [Medium] crate-boundary — `crates/hipfire-runtime/src/env_docs.rs:1-4259 (527 EnvVarDoc entries, not 1057)`
 
-**Observation:** env_docs.rs is a 4259-line, machine-generated `EnvVarDoc` const table (1057 entries) compiled into the runtime hot-path crate. Its header declares `#![allow(dead_code)]` and 'Generated automatically ... Do not hand-edit'; the entries index env usages across the whole workspace (e.g. rdna-compute/examples). It is produced and consumed only by the CLI tooling command crates/hipfire-cli/src/commands/gen_env_docs.rs (which writes it via fs::write at :129) — no runtime code path references it. This is offline documentation tooling bloating compile time of the crate that AGENTS.md says must stay lean and HIP-direct.
+**Observation:** env_docs.rs is a 4259-line, machine-generated `EnvVarDoc` const table (1057 entries) compiled into the runtime hot-path crate. Its header declares `#![allow(dead_code)]` and 'Generated automatically ... Do not hand-edit'; the entries index env usages across the whole workspace (e.g. hipfire-rdna/examples). It is produced and consumed only by the CLI tooling command crates/hipfire-cli/src/commands/gen_env_docs.rs (which writes it via fs::write at :129) — no runtime code path references it. This is offline documentation tooling bloating compile time of the crate that AGENTS.md says must stay lean and HIP-direct.
 
 **Recommendation:** Move the generated registry out of hipfire-runtime into the tooling crate that owns it (hipfire-cli's gen-env-docs, or a dedicated `hipfire-env-docs` data crate), or emit it as a build artifact / include_str! data file rather than 1057 compiled `pub const` items. Nothing in the inference path needs the `EnvVarDoc` symbols, so the runtime crate should not pay to type-check and codegen them. This mirrors the repo invariant that offline/tooling concerns live outside the inference binaries.
 
 **Evidence:** env_docs.rs first line `#![allow(dead_code)]`; 1057 `EnvVarDoc {` entries; only cross-crate reference is hipfire-cli/src/commands/gen_env_docs.rs which fs::write's it (:129); lib.rs:29 `pub mod env_docs;`
 
-*Verification: adjusted — Core claim fully holds: 4259-LOC file with `#![allow(dead_code)]` and 'Generated automatically... Do not hand-edit' banner, entries source workspace-wide env usages (e.g. rdna-compute/examples), only cross-crate consumer is hipfire-cli/gen_env_docs.rs which fs::write's it at :129; no runtime code path references EnvVarDoc/ENV_* symbols; lib.rs:29 exports it. But the entry count is wrong: `pub const ENV_` = 527 and `= EnvVarDoc {` = 527, not the claimed 1057 (roughly 2x overstated). Severity Medium and recommendation (move to tooling crate) stay valid.*
+*Verification: adjusted — Core claim fully holds: 4259-LOC file with `#![allow(dead_code)]` and 'Generated automatically... Do not hand-edit' banner, entries source workspace-wide env usages (e.g. hipfire-rdna/examples), only cross-crate consumer is hipfire-cli/gen_env_docs.rs which fs::write's it at :129; no runtime code path references EnvVarDoc/ENV_* symbols; lib.rs:29 exports it. But the entry count is wrong: `pub const ENV_` = 527 and `= EnvVarDoc {` = 527, not the claimed 1057 (roughly 2x overstated). Severity Medium and recommendation (move to tooling crate) stay valid.*
 
 ### [Medium] monolith — `crates/hipfire-runtime/src/llama.rs:1-3153`
 
@@ -504,7 +504,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Low] duplication — `bf16_to_f32 dup is in crates/hipfire-arch-lfm2moe/src/lfm2moe.rs:33 (and rdna-compute examples), not hipfire-runtime/src/weight_pager.rs; align_up_usize (L12829) has an extra debug_assert so not byte-identical`
+### [Low] duplication — `bf16_to_f32 dup is in crates/hipfire-arch-lfm2moe/src/lfm2moe.rs:33 (and hipfire-rdna examples), not hipfire-runtime/src/weight_pager.rs; align_up_usize (L12829) has an extra debug_assert so not byte-identical`
 
 **Observation:** align_up (L4511) and align_up_usize (L12829) have byte-identical bodies `(x + align - 1) & !(align - 1)`; the file also carries three near-identical `*_slice_as_bytes` helpers (f32 L7703, u64 L9831, i32 L9835) plus scattered dtype/byte converters (bf16_to_f32 L2071, bf16_bytes_to_f32 L2307, bf16_bytes_to_f16_bytes L2313, gib L4249, load_throughput_gibs L4253). These are grab-bag primitives duplicated within the file and, in a couple cases, across crates (bf16_to_f32 also defined in hipfire-runtime/src/weight_pager.rs).
 
@@ -512,7 +512,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 **Evidence:** sed of L4511 and L12829 shows identical body; grep found f32/u64/i32 `_slice_as_bytes` at L7703/9831/9835; bf16_to_f32 defined in 2 crates
 
-*Verification: adjusted — align_up (L4511) and align_up_usize (L12829) both exist and share the arithmetic `(x + align - 1) & !(align - 1)`, but they are NOT byte-identical: align_up_usize adds a debug_assert!(align.is_power_of_two()) line and uses x vs v. The three *_slice_as_bytes helpers (f32 L7703, u64 L9831, i32 L9835) are confirmed. However bf16_to_f32 is NOT defined in hipfire-runtime/src/weight_pager.rs (not anywhere in hipfire-runtime); the actual cross-crate duplicate is in hipfire-arch-lfm2moe/src/lfm2moe.rs L33 plus rdna-compute/nemotron examples. Core dup/hygiene claim holds; two specific facts corrected. Low severity appropriate.*
+*Verification: adjusted — align_up (L4511) and align_up_usize (L12829) both exist and share the arithmetic `(x + align - 1) & !(align - 1)`, but they are NOT byte-identical: align_up_usize adds a debug_assert!(align.is_power_of_two()) line and uses x vs v. The three *_slice_as_bytes helpers (f32 L7703, u64 L9831, i32 L9835) are confirmed. However bf16_to_f32 is NOT defined in hipfire-runtime/src/weight_pager.rs (not anywhere in hipfire-runtime); the actual cross-crate duplicate is in hipfire-arch-lfm2moe/src/lfm2moe.rs L33 plus hipfire-rdna/nemotron examples. Core dup/hygiene claim holds; two specific facts corrected. Low severity appropriate.*
 
 ### [Low] missing-tests — `crates/hipfire-arch-qwen35/src/mtp_head.rs (2683 LOC, 0 tests); mtp_spec.rs::spec_step_mtp_compressed_serial (L2155, ~1134 LOC)`
 
@@ -529,7 +529,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Subsystem key: `arch-family-a` — 11 finding(s)*
 
-**Subsystem assessment:** This subsystem holds five model-arch crates (deepseek4, lfm2moe, minimax, zaya, nemotron) that each translate a config + weights into a GPU forward pass. The dominant health problem is deepseek4: a 9202-LOC forward.rs and a 3536-LOC arch-specific dispatch module wedged inside the generic rdna-compute crate, both driven by a 54-field lazily-allocated God-state struct read through ~180 as_ref().unwrap() calls. A recurring structural pattern across the family is full duplication of the per-layer math between decode (single-token) and prefill (batched) paths, and copy-paste of per-arch scaffolding (kld.rs adapters, superop constructors, lowered-forward toggles) that a shared trait/macro would collapse. Every arch also carries two live forward implementations (hand-written execute path plus the newer lowered superop path) behind HIPFIRE_FORWARD_LOWERED, doubling maintenance surface. The bright spot is nemotron: 37 files is not fragmentation but proper modularization (focused mlp/attn/moe/ssd/block modules plus example binaries) with co-located unit tests on pure config/shape logic — the pattern the heavier crates should move toward. Main risks: two hand-synced copies of numerically-sensitive kernels, order-dependent state that panics rather than type-errors, and an arch leaking its private concepts into the shared GPU dispatch layer.
+**Subsystem assessment:** This subsystem holds five model-arch crates (deepseek4, lfm2moe, minimax, zaya, nemotron) that each translate a config + weights into a GPU forward pass. The dominant health problem is deepseek4: a 9202-LOC forward.rs and a 3536-LOC arch-specific dispatch module wedged inside the generic hipfire-rdna crate, both driven by a 54-field lazily-allocated God-state struct read through ~180 as_ref().unwrap() calls. A recurring structural pattern across the family is full duplication of the per-layer math between decode (single-token) and prefill (batched) paths, and copy-paste of per-arch scaffolding (kld.rs adapters, superop constructors, lowered-forward toggles) that a shared trait/macro would collapse. Every arch also carries two live forward implementations (hand-written execute path plus the newer lowered superop path) behind HIPFIRE_FORWARD_LOWERED, doubling maintenance surface. The bright spot is nemotron: 37 files is not fragmentation but proper modularization (focused mlp/attn/moe/ssd/block modules plus example binaries) with co-located unit tests on pure config/shape logic — the pattern the heavier crates should move toward. Main risks: two hand-synced copies of numerically-sensitive kernels, order-dependent state that panics rather than type-errors, and an arch leaking its private concepts into the shared GPU dispatch layer.
 
 ### [High] monolith — `crates/hipfire-arch-deepseek4/src/forward.rs:1-9202`
 
@@ -541,11 +541,11 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [High] crate-boundary — `crates/rdna-compute/src/dispatch/deepseek4.rs:1-3536`
+### [High] crate-boundary — `crates/hipfire-rdna/src/dispatch/deepseek4.rs:1-3536`
 
-**Observation:** The generic GPU-dispatch crate rdna-compute contains a 3536-LOC module of 65 pub methods on `impl Gpu` named for DeepSeek-V4-private concepts: compressor_* (MLA), hc_* (hyper-connection 4-stream), indexer_* (sparse top-K), hash_router_*, deepseek4_attn_swa_topk_*. It is declared unconditionally (dispatch/mod.rs:24, not feature-gated), has 0 tests, and grep confirms it is called only from the deepseek4 arch crate. This bolts one architecture's vocabulary onto the shared Gpu type every other arch also uses, inverting the intended dependency direction (arch depends on compute, not compute on arch).
+**Observation:** The generic GPU-dispatch crate hipfire-rdna contains a 3536-LOC module of 65 pub methods on `impl Gpu` named for DeepSeek-V4-private concepts: compressor_* (MLA), hc_* (hyper-connection 4-stream), indexer_* (sparse top-K), hash_router_*, deepseek4_attn_swa_topk_*. It is declared unconditionally (dispatch/mod.rs:24, not feature-gated), has 0 tests, and grep confirms it is called only from the deepseek4 arch crate. This bolts one architecture's vocabulary onto the shared Gpu type every other arch also uses, inverting the intended dependency direction (arch depends on compute, not compute on arch).
 
-**Recommendation:** Move these methods out of rdna-compute. Expose only generic primitives (gather, softmax-pool, top-k, scaled-gemv) on Gpu and implement the deepseek4-specific sequencing in the arch crate as free functions taking `&mut Gpu`, or behind an extension trait defined in the arch crate (`trait Deepseek4Dispatch { ... } impl Deepseek4Dispatch for Gpu`). At minimum feature-gate the module so a build without the deepseek4 arch does not compile 3536 LOC of dead dispatch. The same applies to dispatch/zaya_cca.rs.
+**Recommendation:** Move these methods out of hipfire-rdna. Expose only generic primitives (gather, softmax-pool, top-k, scaled-gemv) on Gpu and implement the deepseek4-specific sequencing in the arch crate as free functions taking `&mut Gpu`, or behind an extension trait defined in the arch crate (`trait Deepseek4Dispatch { ... } impl Deepseek4Dispatch for Gpu`). At minimum feature-gate the module so a build without the deepseek4 arch does not compile 3536 LOC of dead dispatch. The same applies to dispatch/zaya_cca.rs.
 
 **Evidence:** grep -c pub fn = 65; wc -l = 3536; dispatch/mod.rs:24 `mod deepseek4;` unconditional; callers grep resolves only to hipfire-arch-deepseek4/src/{deepseek4,forward}.rs; 0 `#[test]`.
 
@@ -621,7 +621,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Low] missing-tests — `crates/rdna-compute/src/dispatch/{deepseek4.rs,zaya_cca.rs}`
+### [Low] missing-tests — `crates/hipfire-rdna/src/dispatch/{deepseek4.rs,zaya_cca.rs}`
 
 **Observation:** The two arch-specific dispatch modules (3536 + ~490 LOC) have zero unit tests. They contain host-side pure logic that is GPU-independent and testable: the nibble_expand_int4_to_int8 packing (L382), oq4/oq8 repack helpers in zaya gpu.rs (oq4_pack_arch_combined L63, oq4_to_oq8_combined L101), and various index/length computations. These are exactly the truncation/packing paths where an off-by-one silently corrupts weights.
 
@@ -780,7 +780,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Subsystem key: `diffusion` — 7 finding(s)*
 
-**Subsystem assessment:** crates/hipfire-diffusion implements a from-scratch CPU-reference + HIP-boundary diffusion pipeline (SD/SDXL UNet, VAE, CLIP, and a Krea2/QwenImage MMDiT transformer) plus HFQ metadata and diffusers/single-file import. The subsystem is functionally rich and, encouragingly, the past channels_last/stride loader bug is now pinned by two pure-CPU regression tests (tests.rs:6200 pytorch_contiguous_detection_matches_torch_semantics, tests.rs:6218 channels_last_storage_reorders_to_contiguous_oihw), so that specific correctness risk is closed. The main health problems are structural, not behavioral: lib.rs is a 10.3k-line grab-bag mixing metadata, CPU ops, the CLIP encoder, a 1.9k-line pipeline god-impl, and 1.9k lines of untrusted-format import (pickle VM + zip reader) that per AGENTS.md belongs in hipfire-coexistence. Pervasive mechanical duplication (a 213-copy error-map closure and ~445 hand-written CPU/GPU dispatch wrappers) and a single 13.5k-line test module make the crate hard to navigate and evolve. Kernel dispatch correctly reuses rdna-compute's Gpu abstraction rather than reinventing it; the duplication is in the per-op boilerplate wrapping those calls, not in the dispatch layer itself. None of the findings are active correctness bugs, but several are High on the maintainability-at-scale axis.
+**Subsystem assessment:** crates/hipfire-diffusion implements a from-scratch CPU-reference + HIP-boundary diffusion pipeline (SD/SDXL UNet, VAE, CLIP, and a Krea2/QwenImage MMDiT transformer) plus HFQ metadata and diffusers/single-file import. The subsystem is functionally rich and, encouragingly, the past channels_last/stride loader bug is now pinned by two pure-CPU regression tests (tests.rs:6200 pytorch_contiguous_detection_matches_torch_semantics, tests.rs:6218 channels_last_storage_reorders_to_contiguous_oihw), so that specific correctness risk is closed. The main health problems are structural, not behavioral: lib.rs is a 10.3k-line grab-bag mixing metadata, CPU ops, the CLIP encoder, a 1.9k-line pipeline god-impl, and 1.9k lines of untrusted-format import (pickle VM + zip reader) that per AGENTS.md belongs in hipfire-coexistence. Pervasive mechanical duplication (a 213-copy error-map closure and ~445 hand-written CPU/GPU dispatch wrappers) and a single 13.5k-line test module make the crate hard to navigate and evolve. Kernel dispatch correctly reuses hipfire-rdna's Gpu abstraction rather than reinventing it; the duplication is in the per-op boilerplate wrapping those calls, not in the dispatch layer itself. None of the findings are active correctness bugs, but several are High on the maintainability-at-scale axis.
 
 ### [High] monolith — `crates/hipfire-diffusion/src/lib.rs:1-10349`
 
@@ -806,7 +806,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 **Observation:** The exact closure `.map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))` appears 213 times (197 in gpu_ops.rs alone, 16 in lib.rs). Combined with the surrounding per-op boilerplate (40 KernargBlob::new, 45 bind_thread, 43 upload_f32, 24 device_synchronize across gpu_ops.rs's 61 functions), each *_hip_on_gpu function is a near-identical bind/upload/malloc/push-kernargs/launch/sync/copy/free sequence differing only in kernarg layout and grid math. This noise makes real per-op logic hard to see and makes it easy to omit a bounds check or a free in a new op.
 
-**Recommendation:** Add a small extension trait to collapse the error mapping, e.g. `trait BackendResultExt<T> { fn backend(self) -> DiffusionResult<T>; }` implemented for `Result<T, E: Display>`, turning 213 closures into `.backend()?`. Then factor the launch skeleton into one helper that takes input tensors, an output-bytes computation, and a `FnMut(&mut KernargBlob)` kernarg builder + grid function, so each op body shrinks to its unique shape/kernarg logic. rdna-compute::Gpu is already the right dispatch abstraction — this is purely about the diffusion-side wrapper boilerplate.
+**Recommendation:** Add a small extension trait to collapse the error mapping, e.g. `trait BackendResultExt<T> { fn backend(self) -> DiffusionResult<T>; }` implemented for `Result<T, E: Display>`, turning 213 closures into `.backend()?`. Then factor the launch skeleton into one helper that takes input tensors, an output-bytes computation, and a `FnMut(&mut KernargBlob)` kernarg builder + grid function, so each op body shrinks to its unique shape/kernarg logic. hipfire-rdna::Gpu is already the right dispatch abstraction — this is purely about the diffusion-side wrapper boilerplate.
 
 **Evidence:** grep -c 'BackendUnavailable(error.to_string())' gpu_ops.rs = 197, lib.rs = 16; gpu_ops.rs has 61 fns with KernargBlob::new x40, bind_thread x45, upload_f32 x43; representative full skeleton at gpu_ops.rs:29-94 (rgb_tensor_to_u8_hip_on_gpu).
 
@@ -1091,7 +1091,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Subsystem key: `eval-dispatch` — 8 finding(s)*
 
-**Subsystem assessment:** This subsystem spans the evidence-driven eval runner (hipfire-eval), shared provenance helpers (hipfire-evidence), the model-facing kernel-family resolver (hipfire-dispatch) plus its integration-test crate (hipfire-dispatch-tests), and a thin daemon steer adapter (hipfire-steer-harness). Overall discipline is good: production code in hipfire-eval and hipfire-evidence has zero .unwrap() (all 391/35 unwraps live in test regions), test counts are high (eval 104, evidence 38, dispatch 93 inline + a dedicated integration crate), and hipfire-dispatch has a well-documented family contract in families/mod.rs. The layering is clean and one-directional: hipfire-dispatch depends on rdna-compute, whose private dispatch module is the low-level Gpu/GpuTensor/kernel-launch layer, while hipfire-dispatch is the higher-level family/arch/quant resolver — this is deliberate layering, not migration leftover or an accidental collision. The main risks are structural: a few oversized single files (lib.rs at 8117 LOC, evidence lib.rs at 3089 LOC), duplication in the examples executor, tests concentrated away from the units they cover, and a "dispatch" name reused across three layers.
+**Subsystem assessment:** This subsystem spans the evidence-driven eval runner (hipfire-eval), shared provenance helpers (hipfire-evidence), the model-facing kernel-family resolver (hipfire-dispatch) plus its integration-test crate (hipfire-dispatch-tests), and a thin daemon steer adapter (hipfire-steer-harness). Overall discipline is good: production code in hipfire-eval and hipfire-evidence has zero .unwrap() (all 391/35 unwraps live in test regions), test counts are high (eval 104, evidence 38, dispatch 93 inline + a dedicated integration crate), and hipfire-dispatch has a well-documented family contract in families/mod.rs. The layering is clean and one-directional: hipfire-dispatch depends on hipfire-rdna, whose private dispatch module is the low-level Gpu/GpuTensor/kernel-launch layer, while hipfire-dispatch is the higher-level family/arch/quant resolver — this is deliberate layering, not migration leftover or an accidental collision. The main risks are structural: a few oversized single files (lib.rs at 8117 LOC, evidence lib.rs at 3089 LOC), duplication in the examples executor, tests concentrated away from the units they cover, and a "dispatch" name reused across three layers.
 
 ### [High] monolith — `crates/hipfire-eval/src/lib.rs:1-8117`
 
@@ -1133,15 +1133,15 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Verification: confirmed*
 
-### [Low] crate-boundary — `crates/hipfire-dispatch/src/lib.rs:1-23 vs crates/rdna-compute/src/lib.rs:9 (mod dispatch) vs crates/hipfire-runtime/src/lib.rs:28 (pub mod dispatch)`
+### [Low] crate-boundary — `crates/hipfire-dispatch/src/lib.rs:1-23 vs crates/hipfire-rdna/src/lib.rs:9 (mod dispatch) vs crates/hipfire-runtime/src/lib.rs:28 (pub mod dispatch)`
 
-**Observation:** Three distinct layers are all named 'dispatch'. rdna_compute::dispatch is a private module (mod dispatch) documented as 'High-level GPU dispatch interface' that owns Gpu, GpuTensor, DType, and raw kernel launch (launch_maybe_blob, ensure_kernel, alloc_tensor). hipfire-dispatch is a separate crate documented as 'unified kernel dispatch abstraction' that resolves kernels by family x arch x quant. hipfire_runtime also exposes pub mod dispatch (used as hipfire_runtime::dispatch::is_batchable_la). The dependency direction is clean and one-way (hipfire-dispatch depends on rdna-compute via Cargo path), so this is deliberate layering — NOT migration leftover and NOT an accidental namespace collision — but reusing the exact token 'dispatch' for the low-level Gpu launcher, the mid-level family resolver, and a runtime re-export forces every reader to disambiguate by crate path.
+**Observation:** Three distinct layers are all named 'dispatch'. hipfire_rdna::dispatch is a private module (mod dispatch) documented as 'High-level GPU dispatch interface' that owns Gpu, GpuTensor, DType, and raw kernel launch (launch_maybe_blob, ensure_kernel, alloc_tensor). hipfire-dispatch is a separate crate documented as 'unified kernel dispatch abstraction' that resolves kernels by family x arch x quant. hipfire_runtime also exposes pub mod dispatch (used as hipfire_runtime::dispatch::is_batchable_la). The dependency direction is clean and one-way (hipfire-dispatch depends on hipfire-rdna via Cargo path), so this is deliberate layering — NOT migration leftover and NOT an accidental namespace collision — but reusing the exact token 'dispatch' for the low-level Gpu launcher, the mid-level family resolver, and a runtime re-export forces every reader to disambiguate by crate path.
 
-**Recommendation:** Keep the layering (it is correct) but disambiguate the names: rdna_compute::dispatch is really the GPU-handle / kernel-launch layer (consider gpu or launch), while hipfire-dispatch is the family resolver. At minimum, cross-link the two module docs so each states 'this is the low-level launcher, see hipfire-dispatch for the family resolver' and vice versa, so the one-directional relationship is discoverable without tracing Cargo.toml.
+**Recommendation:** Keep the layering (it is correct) but disambiguate the names: hipfire_rdna::dispatch is really the GPU-handle / kernel-launch layer (consider gpu or launch), while hipfire-dispatch is the family resolver. At minimum, cross-link the two module docs so each states 'this is the low-level launcher, see hipfire-dispatch for the family resolver' and vice versa, so the one-directional relationship is discoverable without tracing Cargo.toml.
 
-**Evidence:** rdna-compute/src/lib.rs L9 'mod dispatch;' (private), L19-22 pub use dispatch::{...Gpu, GpuTensor, DType}; dispatch/mod.rs L5 '//! High-level GPU dispatch interface'; hipfire-dispatch/src/lib.rs L4 'unified kernel dispatch abstraction'; hipfire-dispatch/Cargo.toml depends on rdna-compute; hipfire-runtime/src/lib.rs:28 'pub mod dispatch;'.
+**Evidence:** hipfire-rdna/src/lib.rs L9 'mod dispatch;' (private), L19-22 pub use dispatch::{...Gpu, GpuTensor, DType}; dispatch/mod.rs L5 '//! High-level GPU dispatch interface'; hipfire-dispatch/src/lib.rs L4 'unified kernel dispatch abstraction'; hipfire-dispatch/Cargo.toml depends on hipfire-rdna; hipfire-runtime/src/lib.rs:28 'pub mod dispatch;'.
 
-*Verification: adjusted — All facts exact: rdna-compute/lib.rs L9 'mod dispatch;' (private) with pub use of Gpu/GpuTensor/DType L19-22; dispatch/mod.rs L5 '//! High-level GPU dispatch interface'; hipfire-dispatch/lib.rs L4 doc + Cargo dep on rdna-compute L8; hipfire-runtime/Cargo.toml:70 dep on hipfire-dispatch; hipfire-runtime/lib.rs:28 'pub mod dispatch'; is_batchable_la in runtime/src/dispatch.rs. But the finding itself concedes the layering is deliberate and correct (clean one-way deps, not a collision), and the minimum recommendation is cross-linking module docs — that is naming/discoverability hygiene, not a 'clear antipattern worth scheduled refactor', so Low fits better than Medium.*
+*Verification: adjusted — All facts exact: hipfire-rdna/lib.rs L9 'mod dispatch;' (private) with pub use of Gpu/GpuTensor/DType L19-22; dispatch/mod.rs L5 '//! High-level GPU dispatch interface'; hipfire-dispatch/lib.rs L4 doc + Cargo dep on hipfire-rdna L8; hipfire-runtime/Cargo.toml:70 dep on hipfire-dispatch; hipfire-runtime/lib.rs:28 'pub mod dispatch'; is_batchable_la in runtime/src/dispatch.rs. But the finding itself concedes the layering is deliberate and correct (clean one-way deps, not a collision), and the minimum recommendation is cross-linking module docs — that is naming/discoverability hygiene, not a 'clear antipattern worth scheduled refactor', so Low fits better than Medium.*
 
 ### [Low] test-structure — `crates/hipfire-dispatch-tests/src/lib.rs and crates/hipfire-dispatch-tests/Cargo.toml`
 
@@ -1149,7 +1149,7 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 **Recommendation:** Keep the crate — the cycle-break rationale is sound. Optionally note the reason in the crate doc so the src/-with-cfg(test) layout is not mistaken for a mispackaged library. Consider whether hipfire-dispatch/src/coverage_tests.rs and tests.rs could be consolidated to reduce the number of parallel dispatch test locations (inline tests.rs, inline coverage_tests.rs, external crate).
 
-**Evidence:** hipfire-dispatch-tests/Cargo.toml deps: rdna-compute + hipfire-runtime + hipfire-dispatch(test-utils); hipfire-runtime/Cargo.toml:70 depends on hipfire-dispatch (confirms cycle if tests were internal); src/lib.rs declares mod arch_caps/deepseek4/dtype/llama/qwen2/qwen35 all under #[cfg(test)]; deepseek4.rs uses hipfire_runtime::dispatch::is_batchable_la.
+**Evidence:** hipfire-dispatch-tests/Cargo.toml deps: hipfire-rdna + hipfire-runtime + hipfire-dispatch(test-utils); hipfire-runtime/Cargo.toml:70 depends on hipfire-dispatch (confirms cycle if tests were internal); src/lib.rs declares mod arch_caps/deepseek4/dtype/llama/qwen2/qwen35 all under #[cfg(test)]; deepseek4.rs uses hipfire_runtime::dispatch::is_batchable_la.
 
 *Verification: confirmed*
 
@@ -1322,13 +1322,13 @@ Companion to `architectural-review-2026-07-03.md`. Every finding was produced by
 
 *Subsystem key: `workspace-structure` — 10 finding(s)*
 
-**Subsystem assessment:** The hipfire workspace is a 65-member Cargo workspace (66 crate dirs; 3 wasm UI crates correctly excluded) implementing a HIP/ROCm-direct LLM+diffusion inference stack. The overall layering is broadly sound — clean leaf crates (hip-bridge, hipfire-lock, hipfire-hash), a compute layer (rdna-compute, hipfire-dispatch), a runtime hot path, sibling arch-* crates, serving, and binaries — and the arch crates avoid a cycle with runtime via the dev-dependency trick. Health risks are concentrated in three areas: (1) a hot-path layering inversion where hipfire-runtime pulls the entire hipfire-eval evidence harness (and transitively the tokio-process daemon adapter) for a single host-profile function; (2) god-node fanout because GpuTensor lives inside the 63.5k-LOC rdna-compute monolith, forcing 20 crates to depend on the whole compute crate; and (3) zero dependency centralization — no [workspace.dependencies], so 40+ crates repeat and diverge third-party version/feature pins. Within-crate monoliths (qwen35.rs at 32.6k lines, diffusion lib.rs at 10.3k lines, rdna-compute dispatch/) are the main maintainability drags. Manifest hygiene is weak: a duplicated member entry and an orphan crate indicate the members list is hand-maintained without lint.
+**Subsystem assessment:** The hipfire workspace is a 65-member Cargo workspace (66 crate dirs; 3 wasm UI crates correctly excluded) implementing a HIP/ROCm-direct LLM+diffusion inference stack. The overall layering is broadly sound — clean leaf crates (hip-bridge, hipfire-lock, hipfire-hash), a compute layer (hipfire-rdna, hipfire-dispatch), a runtime hot path, sibling arch-* crates, serving, and binaries — and the arch crates avoid a cycle with runtime via the dev-dependency trick. Health risks are concentrated in three areas: (1) a hot-path layering inversion where hipfire-runtime pulls the entire hipfire-eval evidence harness (and transitively the tokio-process daemon adapter) for a single host-profile function; (2) god-node fanout because GpuTensor lives inside the 63.5k-LOC hipfire-rdna monolith, forcing 20 crates to depend on the whole compute crate; and (3) zero dependency centralization — no [workspace.dependencies], so 40+ crates repeat and diverge third-party version/feature pins. Within-crate monoliths (qwen35.rs at 32.6k lines, diffusion lib.rs at 10.3k lines, hipfire-rdna dispatch/) are the main maintainability drags. Manifest hygiene is weak: a duplicated member entry and an orphan crate indicate the members list is hand-maintained without lint.
 
-### [High] crate-boundary — `crates/hipfire-runtime/Cargo.toml:61 + crates/rdna-compute/src/dispatch/mod.rs:124`
+### [High] crate-boundary — `crates/hipfire-runtime/Cargo.toml:61 + crates/hipfire-rdna/src/dispatch/mod.rs:124`
 
-**Observation:** Two dependency-direction problems distort the layering. (a) hipfire-runtime, the inference hot path, has a non-dev dependency on hipfire-eval (a ~21k-LOC evidence/battery harness) used for exactly ONE symbol: host_profile.rs:12 `use hipfire_eval::collect_default_host_profile` (defined hipfire-eval/src/lib.rs:631). hipfire-eval in turn depends on hipfire-daemon-adapter (tokio process-spawning, out-of-process daemon client) and hipfire-daemon-protocol, so the hot path drags the whole eval+daemon-client+tokio-process closure into its build — directly against the AGENTS.md 'inference path stays lean' invariant. (b) GpuTensor, referenced by 130 files across the tree, is defined inside the 63.5k-LOC rdna-compute monolith (dispatch/mod.rs:124), so all 20 crates that need the GPU tensor handle must depend on the entire compute crate (kernels, compiler, profiler, rocblas). HipError/HipResult are already correctly isolated in the hip-bridge leaf (error.rs:14,29), which is the pattern the rest of the primitives should follow.
+**Observation:** Two dependency-direction problems distort the layering. (a) hipfire-runtime, the inference hot path, has a non-dev dependency on hipfire-eval (a ~21k-LOC evidence/battery harness) used for exactly ONE symbol: host_profile.rs:12 `use hipfire_eval::collect_default_host_profile` (defined hipfire-eval/src/lib.rs:631). hipfire-eval in turn depends on hipfire-daemon-adapter (tokio process-spawning, out-of-process daemon client) and hipfire-daemon-protocol, so the hot path drags the whole eval+daemon-client+tokio-process closure into its build — directly against the AGENTS.md 'inference path stays lean' invariant. (b) GpuTensor, referenced by 130 files across the tree, is defined inside the 63.5k-LOC hipfire-rdna monolith (dispatch/mod.rs:124), so all 20 crates that need the GPU tensor handle must depend on the entire compute crate (kernels, compiler, profiler, rocblas). HipError/HipResult are already correctly isolated in the hip-bridge leaf (error.rs:14,29), which is the pattern the rest of the primitives should follow.
 
-**Recommendation:** Extract shared leaf types so hot-path and high-layer crates stop reaching across the stack. Move HostProfile/collect_host_profile into a leaf (hipfire-sysinfo already exists and fits) and have both runtime and eval depend on it; delete the runtime->eval edge. Extract GpuTensor plus the core buffer/handle types into a thin rdna-compute-core (or reuse the mis-named hipfire-primitives) leaf that hip-bridge-only depends on. Target layered diagram (arrows = depends-on, downward):
+**Recommendation:** Extract shared leaf types so hot-path and high-layer crates stop reaching across the stack. Move HostProfile/collect_host_profile into a leaf (hipfire-sysinfo already exists and fits) and have both runtime and eval depend on it; delete the runtime->eval edge. Extract GpuTensor plus the core buffer/handle types into a thin hipfire-rdna-core (or reuse the mis-named hipfire-primitives) leaf that hip-bridge-only depends on. Target layered diagram (arrows = depends-on, downward):
 
 BINARIES  cli / daemon / server / coexistence / tui
    |
@@ -1340,7 +1340,7 @@ RUNTIME   hipfire-runtime   (hot path; MUST NOT depend on eval/daemon-adapter)
    |
 MODEL/IO  model / state / generate / prompt / quantize
    |
-COMPUTE   rdna-compute-core (GpuTensor,pool,ctx) - rdna-compute-{gemm,attn,moe} - hipfire-dispatch
+COMPUTE   hipfire-rdna-core (GpuTensor,pool,ctx) - hipfire-rdna-{gemm,attn,moe} - hipfire-dispatch
    |
 LEAF      hip-bridge(HipError) / hipfire-sysinfo(HostProfile) / hipfire-numeric(conv,fwht) / lock / hash
 
@@ -1348,7 +1348,7 @@ SIDE (offline tooling, never a runtime dep):  eval / daemon-adapter / coherence
 
 This severs runtime->eval, collapses the GpuTensor fanout to a leaf, and quarantines the eval/daemon cluster as offline tooling.
 
-**Evidence:** hipfire-runtime/Cargo.toml:61 `hipfire-eval = { path = ... }`; only user is host_profile.rs:12 (single symbol collect_default_host_profile, eval/lib.rs:631); GpuTensor rdna-compute/src/dispatch/mod.rs:124 referenced by 130 files; 20 crates depend on rdna-compute.
+**Evidence:** hipfire-runtime/Cargo.toml:61 `hipfire-eval = { path = ... }`; only user is host_profile.rs:12 (single symbol collect_default_host_profile, eval/lib.rs:631); GpuTensor hipfire-rdna/src/dispatch/mod.rs:124 referenced by 130 files; 20 crates depend on hipfire-rdna.
 
 *Verification: confirmed*
 
@@ -1372,13 +1372,13 @@ This severs runtime->eval, collapses the GpuTensor fanout to a leaf, and quarant
 
 *Verification: confirmed*
 
-### [Medium] monolith — `crates/rdna-compute/src (63.5k LOC), dispatch/ subdir`
+### [Medium] monolith — `crates/hipfire-rdna/src (63.5k LOC), dispatch/ subdir`
 
-**Observation:** rdna-compute is the largest crate (63.5k src LOC, ~92.9k with tests) and every consumer takes the whole thing. The dispatch/ subdirectory already presents clean split seams: gemv.rs (6,121), gemm_qkv.rs (5,890), attention.rs (5,563), mod.rs (5,153), fused.rs (4,308), deepseek4.rs (3,536), moe.rs, rope.rs, kv.rs. These are largely independent kernel-dispatch wrapper families that share only the core context/pool/GpuTensor types.
+**Observation:** hipfire-rdna is the largest crate (63.5k src LOC, ~92.9k with tests) and every consumer takes the whole thing. The dispatch/ subdirectory already presents clean split seams: gemv.rs (6,121), gemm_qkv.rs (5,890), attention.rs (5,563), mod.rs (5,153), fused.rs (4,308), deepseek4.rs (3,536), moe.rs, rope.rs, kv.rs. These are largely independent kernel-dispatch wrapper families that share only the core context/pool/GpuTensor types.
 
-**Recommendation:** Peel rdna-compute into a small rdna-compute-core (KernelCompiler, pool, arch_caps, feature_flags, GpuTensor, HipResult re-export) plus feature-grouped sub-crates rdna-compute-gemm, rdna-compute-attention, rdna-compute-moe that depend on core. Arch crates then pull only the families they use, shrinking their build closure and letting the pure host-side portions (arch_caps gating, feature_flags, tiling math) be unit-tested without a GPU. Keep the split aligned to the existing dispatch/*.rs file boundaries to minimize churn.
+**Recommendation:** Peel hipfire-rdna into a small hipfire-rdna-core (KernelCompiler, pool, arch_caps, feature_flags, GpuTensor, HipResult re-export) plus feature-grouped sub-crates hipfire-rdna-gemm, hipfire-rdna-attention, hipfire-rdna-moe that depend on core. Arch crates then pull only the families they use, shrinking their build closure and letting the pure host-side portions (arch_caps gating, feature_flags, tiling math) be unit-tested without a GPU. Keep the split aligned to the existing dispatch/*.rs file boundaries to minimize churn.
 
-**Evidence:** find rdna-compute/src: gemv.rs 6121, gemm_qkv.rs 5890, attention.rs 5563, dispatch/mod.rs 5153, fused.rs 4308, deepseek4.rs 3536; 20 crates depend on the whole crate.
+**Evidence:** find hipfire-rdna/src: gemv.rs 6121, gemm_qkv.rs 5890, attention.rs 5563, dispatch/mod.rs 5153, fused.rs 4308, deepseek4.rs 3536; 20 crates depend on the whole crate.
 
 *Verification: confirmed*
 
@@ -1392,15 +1392,15 @@ This severs runtime->eval, collapses the GpuTensor fanout to a leaf, and quarant
 
 *Verification: confirmed*
 
-### [Low] module-structure — `crates/hipfire-dispatch/ vs crates/rdna-compute/src/dispatch/`
+### [Low] module-structure — `crates/hipfire-dispatch/ vs crates/hipfire-rdna/src/dispatch/`
 
-**Observation:** There is a name collision at the busiest layer boundary: the crate hipfire-dispatch (families/, model_ext/, pipeline/, tables/, traits.rs — model-family routing) and the module rdna_compute::dispatch (activation/attention/gemm/moe/rope — raw kernel-launch wrappers) both present as 'dispatch'. hipfire-dispatch depends on rdna-compute, so every arch crate imports both rdna_compute::dispatch::… and hipfire_dispatch::… in the same file, forcing readers to constantly disambiguate two unrelated 'dispatch' concepts at different abstraction levels.
+**Observation:** There is a name collision at the busiest layer boundary: the crate hipfire-dispatch (families/, model_ext/, pipeline/, tables/, traits.rs — model-family routing) and the module hipfire_rdna::dispatch (activation/attention/gemm/moe/rope — raw kernel-launch wrappers) both present as 'dispatch'. hipfire-dispatch depends on hipfire-rdna, so every arch crate imports both hipfire_rdna::dispatch::… and hipfire_dispatch::… in the same file, forcing readers to constantly disambiguate two unrelated 'dispatch' concepts at different abstraction levels.
 
-**Recommendation:** Rename one side to reflect its layer. Cheapest and clearest: rename the low-level module rdna_compute::dispatch -> rdna_compute::launch (or ::kernel), since it is kernel launch/dispatch, freeing 'dispatch' for the higher-level hipfire-dispatch router. Alternatively rename the crate to hipfire-op-router. Do this as a mechanical rename during the rdna-compute split above so it lands once.
+**Recommendation:** Rename one side to reflect its layer. Cheapest and clearest: rename the low-level module hipfire_rdna::dispatch -> hipfire_rdna::launch (or ::kernel), since it is kernel launch/dispatch, freeing 'dispatch' for the higher-level hipfire-dispatch router. Alternatively rename the crate to hipfire-op-router. Do this as a mechanical rename during the hipfire-rdna split above so it lands once.
 
-**Evidence:** rdna-compute/src/dispatch/ contains attention.rs, gemm_*.rs, moe.rs, rope.rs (kernel wrappers); hipfire-dispatch/src has families/, model_ext/, pipeline/, tables/, traits.rs (routing); arch crates depend on both (e.g. hipfire-arch-llama/Cargo.toml deps hipfire-dispatch + rdna-compute).
+**Evidence:** hipfire-rdna/src/dispatch/ contains attention.rs, gemm_*.rs, moe.rs, rope.rs (kernel wrappers); hipfire-dispatch/src has families/, model_ext/, pipeline/, tables/, traits.rs (routing); arch crates depend on both (e.g. hipfire-arch-llama/Cargo.toml deps hipfire-dispatch + hipfire-rdna).
 
-*Verification: adjusted — The directory/name overlap is real (crate hipfire-dispatch has families/model_ext/pipeline/tables/traits.rs; rdna-compute/src/dispatch/ has attention/gemm_*/moe/rope). But the load-bearing claim is false: ZERO occurrences of 'rdna_compute::dispatch::' anywhere in the tree — consumers use root re-exports (e.g. arch.rs:25 'use rdna_compute::{Gpu, GpuTensor}'), so readers never disambiguate two ::dispatch:: imports as claimed. Only the weak dir-name overlap survives; Low severity still fits.*
+*Verification: adjusted — The directory/name overlap is real (crate hipfire-dispatch has families/model_ext/pipeline/tables/traits.rs; hipfire-rdna/src/dispatch/ has attention/gemm_*/moe/rope). But the load-bearing claim is false: ZERO occurrences of 'hipfire_rdna::dispatch::' anywhere in the tree — consumers use root re-exports (e.g. arch.rs:25 'use hipfire_rdna::{Gpu, GpuTensor}'), so readers never disambiguate two ::dispatch:: imports as claimed. Only the weak dir-name overlap survives; Low severity still fits.*
 
 ### [Low] crate-boundary — `Cargo.toml:26 and Cargo.toml:49`
 
@@ -1424,7 +1424,7 @@ This severs runtime->eval, collapses the GpuTensor fanout to a leaf, and quarant
 
 ### [Low] module-structure — `crates/hipfire-arch-nemotron/Cargo.toml:9-16, crates/hipfire-arch-zaya/Cargo.toml:9-11`
 
-**Observation:** The arch-* crates do not share a consistent dependency contract. Most (llama, qwen2, minimax, gemma3, toy) depend on only {hipfire-runtime, hipfire-dispatch, hip-bridge, rdna-compute} and reach shared types through runtime re-exports, but nemotron and zaya additionally depend directly on hipfire-mixer, hipfire-model, hipfire-primitives (nemotron also hipfire-kld). Separately, two arch crates depend on sibling arch crates (hipfire-arch-dots-ocr -> hipfire-arch-qwen2, hipfire-arch-gemma3-vl -> hipfire-arch-gemma3); those laterals are reasonable VL/OCR-on-base compositions, but combined with the direct-dep inconsistency it means arch crates are not clean interchangeable siblings.
+**Observation:** The arch-* crates do not share a consistent dependency contract. Most (llama, qwen2, minimax, gemma3, toy) depend on only {hipfire-runtime, hipfire-dispatch, hip-bridge, hipfire-rdna} and reach shared types through runtime re-exports, but nemotron and zaya additionally depend directly on hipfire-mixer, hipfire-model, hipfire-primitives (nemotron also hipfire-kld). Separately, two arch crates depend on sibling arch crates (hipfire-arch-dots-ocr -> hipfire-arch-qwen2, hipfire-arch-gemma3-vl -> hipfire-arch-gemma3); those laterals are reasonable VL/OCR-on-base compositions, but combined with the direct-dep inconsistency it means arch crates are not clean interchangeable siblings.
 
 **Recommendation:** Define one arch-crate dependency contract and apply it uniformly: either all arch crates depend directly on the shared leaves they use, or all reach them via a single documented hipfire-runtime (or a new hipfire-arch-prelude) re-export. Keep the VL/OCR->base-arch laterals but document them as the one allowed lateral pattern so the sibling model stays predictable.
 
@@ -1555,9 +1555,9 @@ mod pm4_tests {
 
 *Verification: confirmed*
 
-### [Low] missing-tests — `crates/rdna-compute/src/dispatch/{gemv.rs,gemm_qkv.rs,attention.rs,fused.rs}`
+### [Low] missing-tests — `crates/hipfire-rdna/src/dispatch/{gemv.rs,gemm_qkv.rs,attention.rs,fused.rs}`
 
-**Observation:** rdna-compute is 92,859 LOC with 52 #[test] (~1,786 LOC/test). The bulk is legitimately GPU-bound and cannot execute in CI, but the largest dispatch files are entirely test-free: gemv.rs (6121 LOC / 0), gemm_qkv.rs (5890 / 0), attention.rs (5563 / 0), fused.rs (4308 / 0). These files compute launch geometry (grid/block dims, tile counts, workgroup rounding, shared-memory sizing) as pure integer arithmetic that is portability-sensitive across RDNA2/3/4 and could regress silently on a new arch overlay.
+**Observation:** hipfire-rdna is 92,859 LOC with 52 #[test] (~1,786 LOC/test). The bulk is legitimately GPU-bound and cannot execute in CI, but the largest dispatch files are entirely test-free: gemv.rs (6121 LOC / 0), gemm_qkv.rs (5890 / 0), attention.rs (5563 / 0), fused.rs (4308 / 0). These files compute launch geometry (grid/block dims, tile counts, workgroup rounding, shared-memory sizing) as pure integer arithmetic that is portability-sensitive across RDNA2/3/4 and could regress silently on a new arch overlay.
 
 **Recommendation:** Extract the pure launch-parameter math (tiles = ceil_div(n, tile), workgroup/wave rounding, LDS byte budgeting) into free functions and unit-test them with per-arch expected values, so an overlay change for gfx12/gfx1151 that breaks grid sizing fails in CI rather than on hardware. Keep actual kernel numeric correctness in hipfire-eval + coherence-gate-dflash.sh. Do not attempt to unit-test the dispatch calls themselves.
 
@@ -1580,7 +1580,7 @@ mod pm4_tests {
 
 *Subsystem key: `utils-sprawl` — 11 finding(s)*
 
-**Subsystem assessment:** The workspace has no files literally named utils.rs/helpers.rs/common.rs, but the equivalent sprawl is concentrated in a handful of giant crate-root lib.rs files that flatten many unrelated responsibilities into one namespace. The two worst offenders are hipfire-diffusion/src/lib.rs (10,349 LOC of non-test code, tests split out) and hipfire-eval/src/lib.rs (8,117 LOC, ~6,085 of which are inline tests). The diffusion lib.rs is both a monolith and a crate-boundary violation: ~1,900 lines of offline diffusers/safetensors/pickle import and a MiniZip reader live in the runtime crate that hipfire-server links, directly contradicting the AGENTS.md rule that all import/conversion tooling belongs in hipfire-coexistence. Secondary grab-bags: hipfire-model (3,332 LOC spanning 5-6 concerns including misplaced accelerator-inventory hardware types), rdna-compute dispatch/misc.rs (a 21-method "misc" Gpu impl in an otherwise cleanly partitioned dispatch tree), and OpenAI wire-format code scattered across hipfire-prompt + hipfire-generate + hipfire-server with no shared adapter. Health is maintainability-risk rather than correctness-risk, but the diffusion monolith and coexistence boundary breach are structural and worth prioritizing; much of the buried logic (CPU tensor math, artifact-name parsing, resolve_*_bin) is pure and trivially unit-testable if extracted.
+**Subsystem assessment:** The workspace has no files literally named utils.rs/helpers.rs/common.rs, but the equivalent sprawl is concentrated in a handful of giant crate-root lib.rs files that flatten many unrelated responsibilities into one namespace. The two worst offenders are hipfire-diffusion/src/lib.rs (10,349 LOC of non-test code, tests split out) and hipfire-eval/src/lib.rs (8,117 LOC, ~6,085 of which are inline tests). The diffusion lib.rs is both a monolith and a crate-boundary violation: ~1,900 lines of offline diffusers/safetensors/pickle import and a MiniZip reader live in the runtime crate that hipfire-server links, directly contradicting the AGENTS.md rule that all import/conversion tooling belongs in hipfire-coexistence. Secondary grab-bags: hipfire-model (3,332 LOC spanning 5-6 concerns including misplaced accelerator-inventory hardware types), hipfire-rdna dispatch/misc.rs (a 21-method "misc" Gpu impl in an otherwise cleanly partitioned dispatch tree), and OpenAI wire-format code scattered across hipfire-prompt + hipfire-generate + hipfire-server with no shared adapter. Health is maintainability-risk rather than correctness-risk, but the diffusion monolith and coexistence boundary breach are structural and worth prioritizing; much of the buried logic (CPU tensor math, artifact-name parsing, resolve_*_bin) is pure and trivially unit-testable if extracted.
 
 ### [High] utils-sprawl — `crates/hipfire-diffusion/src/lib.rs:1-10349`
 
@@ -1602,7 +1602,7 @@ mod pm4_tests {
 
 *Verification: confirmed*
 
-### [Medium] utils-sprawl — `crates/rdna-compute/src/dispatch/misc.rs:12-1191`
+### [Medium] utils-sprawl — `crates/hipfire-rdna/src/dispatch/misc.rs:12-1191`
 
 **Observation:** misc.rs is a 1,191-line file containing a single `impl Gpu` block (L12) with 21 methods spanning at least five unrelated concerns: rotations (givens_rotate L21, paro4g128_rotate L171, paro4g128_swiglu_rotate L242, paro4g128t_* L318/388), gather/scatter (rq_gather_f32 L464, rq_scatter_add_f32 L506, scatter_session_last_logits_f32 L547), layout shuffles (qkv_split_interleaved_f32 L602, deinterleave_f32 L671/728, transpose_f32 L950), dtype casts (cast_f32_to_bf16 L986, cast_f32_to_f16 L1146), attention padding (attn_split_pad_f16kv L1028, attn_unpad L1100), and losses (cross_entropy_loss L864, cross_entropy_train L905). This is a literal 'misc' grab-bag even though the sibling dispatch files (norm.rs, activation.rs, gemm_base.rs, embedding.rs, quant.rs, conv1d.rs, mamba2.rs) already establish a clean by-concern partition of the same Gpu type.
 
@@ -1682,9 +1682,9 @@ mod pm4_tests {
 
 *Verification: confirmed*
 
-### [Low] utils-sprawl — `crates/hipfire-eval/src/config.rs; crates/hipfire-diffusion/src/lib.rs; crates/hipfire-state/src/lib.rs; crates/rdna-compute/src/dispatch/gemm_misc.rs`
+### [Low] utils-sprawl — `crates/hipfire-eval/src/config.rs; crates/hipfire-diffusion/src/lib.rs; crates/hipfire-state/src/lib.rs; crates/hipfire-rdna/src/dispatch/gemm_misc.rs`
 
-**Observation:** Remaining lower-severity sprawl/hygiene items verified but not warranting separate findings: (1) eval config has a split-brain layout -- the config *types* (EvalConfig, EvalTier, BatteryId, SuiteId enums) are defined in lib.rs L81-630 while their *parsing and defaults* (parse_args_from L16, usage L351, default_batteries L479, default_suites L513) live in config.rs, so one logical concern spans two files by an unclear rule. (2) diffusion re-exports four whole submodules with glob `pub use` (scheduler/layers/unet/vae/tokenizer at L1259/5623/5626/5629/7076), making the public surface incidental. (3) hipfire-state accumulates per-arch hardcoded label lists (qwen35_kv_deltanet_state_kind_labels L380, minimax_state_kind_labels L387, lfm2_state_kind_labels L395, nemotron_h_state_kind_labels L403) that would be better as a data-driven registry keyed by arch. (4) rdna-compute has a second 'misc' file, gemm_misc.rs, alongside dispatch/misc.rs.
+**Observation:** Remaining lower-severity sprawl/hygiene items verified but not warranting separate findings: (1) eval config has a split-brain layout -- the config *types* (EvalConfig, EvalTier, BatteryId, SuiteId enums) are defined in lib.rs L81-630 while their *parsing and defaults* (parse_args_from L16, usage L351, default_batteries L479, default_suites L513) live in config.rs, so one logical concern spans two files by an unclear rule. (2) diffusion re-exports four whole submodules with glob `pub use` (scheduler/layers/unet/vae/tokenizer at L1259/5623/5626/5629/7076), making the public surface incidental. (3) hipfire-state accumulates per-arch hardcoded label lists (qwen35_kv_deltanet_state_kind_labels L380, minimax_state_kind_labels L387, lfm2_state_kind_labels L395, nemotron_h_state_kind_labels L403) that would be better as a data-driven registry keyed by arch. (4) hipfire-rdna has a second 'misc' file, gemm_misc.rs, alongside dispatch/misc.rs.
 
 **Recommendation:** Consolidate eval config types and their parsers into one config module; replace diffusion glob re-exports with explicit named re-exports; drive the state arch-label lists from a table/registry instead of one function per arch; rename gemm_misc.rs to a concern-specific name. All are scheduled-cleanup hygiene, not correctness risks.
 
@@ -1766,7 +1766,7 @@ Four scopes chosen by the completeness critic after round 1. Same reviewer→ver
 
 *Subsystem key: `npu-xdna-cpu` — 7 finding(s)*
 
-**Subsystem assessment:** These five accelerator/fallback crates are small, well-documented, and mostly clean. hipfire-xdna (telemetry-only ioctl device layer), hipfire-hneurons (CETT + L1 probe), and hipfire-vision-cache (content-addressed LRU) each have a single clear responsibility and good tests. hipfire-npu is a pure admission-policy layer that correctly delegates device access to hipfire-xdna. The weakest crate is hipfire-cpu: despite the name/description ("Deterministic CPU oracle backends"), ~95% of its 894 LOC is a Qwen3.5-specific backend-selection/module-evidence policy DSL, and its one actual CPU compute path (the "oracle") is only smoke-tested. Two clarifications on the assignment's premises: (1) CpuTensor is NOT in hipfire-cpu — it is defined in hipfire-diffusion/src/lib.rs:2455; hipfire-cpu's only overlap with hipfire-primitives is three 1:1 conv re-export wrappers. (2) npu/xdna do not duplicate rdna-compute's dispatch surface — there is no NPU kernel dispatch yet (xdna is read-only telemetry; dispatch is documented as "future modules"); the only decision-logic duplication is between hipfire-cpu and hipfire-npu. Lock discipline is otherwise sound across the workspace: daemon singleton (~/.hipfire/daemon.pid), resource leases (hipfire-daemon-adapter), and gpu-lock all go through hipfire_lock::FlockGuard/probe. The only one-lock-primitive violations are two dev scripts that treat /tmp/hipfire-gpu.lock as an unlinkable sentinel rather than a stable-inode flock target — both explicitly forbidden by crates/hipfire-lock/AGENTS.md.
+**Subsystem assessment:** These five accelerator/fallback crates are small, well-documented, and mostly clean. hipfire-xdna (telemetry-only ioctl device layer), hipfire-hneurons (CETT + L1 probe), and hipfire-vision-cache (content-addressed LRU) each have a single clear responsibility and good tests. hipfire-npu is a pure admission-policy layer that correctly delegates device access to hipfire-xdna. The weakest crate is hipfire-cpu: despite the name/description ("Deterministic CPU oracle backends"), ~95% of its 894 LOC is a Qwen3.5-specific backend-selection/module-evidence policy DSL, and its one actual CPU compute path (the "oracle") is only smoke-tested. Two clarifications on the assignment's premises: (1) CpuTensor is NOT in hipfire-cpu — it is defined in hipfire-diffusion/src/lib.rs:2455; hipfire-cpu's only overlap with hipfire-primitives is three 1:1 conv re-export wrappers. (2) npu/xdna do not duplicate hipfire-rdna's dispatch surface — there is no NPU kernel dispatch yet (xdna is read-only telemetry; dispatch is documented as "future modules"); the only decision-logic duplication is between hipfire-cpu and hipfire-npu. Lock discipline is otherwise sound across the workspace: daemon singleton (~/.hipfire/daemon.pid), resource leases (hipfire-daemon-adapter), and gpu-lock all go through hipfire_lock::FlockGuard/probe. The only one-lock-primitive violations are two dev scripts that treat /tmp/hipfire-gpu.lock as an unlinkable sentinel rather than a stable-inode flock target — both explicitly forbidden by crates/hipfire-lock/AGENTS.md.
 
 ### [Medium] module-structure — `crates/hipfire-cpu/src/lib.rs:9-551`
 
@@ -1780,7 +1780,7 @@ Four scopes chosen by the completeness critic after round 1. Same reviewer→ver
 
 ### [Medium] duplication — `crates/hipfire-npu/src/lib.rs:231-247`
 
-**Observation:** xdna_swiglu_admission hand-rolls its own preference+availability -> (DenseFfnBackend, fallback_reason) state machine, parallel to hipfire-cpu's dense_ffn_backend_decision (crates/hipfire-cpu/src/lib.rs:323). Both encode 'if opt-in and available -> NpuXdna, else GpuProduction + a reason string', but with divergent fallback vocabularies (npu uses NPU_ARTIFACTS_MISSING_FALLBACK; cpu uses "npu_backend_unavailable"). This is the only dispatch-decision duplication in the subsystem — npu/xdna do NOT duplicate rdna-compute (no NPU kernel dispatch exists yet; xdna is telemetry-only), but the two backend-selection functions can drift independently.
+**Observation:** xdna_swiglu_admission hand-rolls its own preference+availability -> (DenseFfnBackend, fallback_reason) state machine, parallel to hipfire-cpu's dense_ffn_backend_decision (crates/hipfire-cpu/src/lib.rs:323). Both encode 'if opt-in and available -> NpuXdna, else GpuProduction + a reason string', but with divergent fallback vocabularies (npu uses NPU_ARTIFACTS_MISSING_FALLBACK; cpu uses "npu_backend_unavailable"). This is the only dispatch-decision duplication in the subsystem — npu/xdna do NOT duplicate hipfire-rdna (no NPU kernel dispatch exists yet; xdna is telemetry-only), but the two backend-selection functions can drift independently.
 
 **Recommendation:** Have xdna_swiglu_admission reuse dense_ffn_backend_decision (passing artifacts_available as the availability signal) or hoist a single backend-decision function into one crate so the selected-backend + fallback-reason vocabulary has one source of truth.
 
@@ -1875,13 +1875,13 @@ Four scopes chosen by the completeness critic after round 1. Same reviewer→ver
 
 *Verification: adjusted — Facts all verified: the only byte-exact round-trip test kvarn_tile_record_roundtrips (kvarn.rs:413) goes through pack_kvarn_tile/unpack_kvarn_tile (bits=4, lines 417/419). No workspace test exercises pack_kvarn_tile_bits/unpack_kvarn_tile_bits at bits in {1,2,3} (grep for those symbols in test/assert context is empty; the only non-4-bit caller is the example parity_kv_hier.rs:112/118, not a byte-exact assert test). Production-reachable confirmed: kv_hier.rs:174-179 clamps HIPFIRE_KV_COLD_BITS to (1,4) and kv_hier.rs:341/348-349 feed bits into kvarn_record_bytes_bits/pack_kvarn_tile_bits. Downgrading Medium->Low: (1) missing-tests is hygiene per the rubric, not a code antipattern; (2) the recommended test is largely tautological — pack allocates via kvarn_record_bytes_bits so rec.len() assert is trivially true, and pack/unpack compute cpb+mask identically so pack->unpack recovers q by construction (a symmetric bug survives a round-trip). The genuinely load-bearing coverage gap is host<->device parity, which is exactly finding #3. So the finding is real but its stated payoff is overstated.*
 
-### [Low] duplication — `/home/sadara/hipfire/crates/hipfire-kvquant/src/kv_compact.rs:120 (encode) vs :177 (dequant_head); /home/sadara/hipfire/crates/hipfire-runtime/src/kv.rs:1018 vs /home/sadara/hipfire/crates/rdna-compute/src/dispatch/kv.rs:1669`
+### [Low] duplication — `/home/sadara/hipfire/crates/hipfire-kvquant/src/kv_compact.rs:120 (encode) vs :177 (dequant_head); /home/sadara/hipfire/crates/hipfire-runtime/src/kv.rs:1018 vs /home/sadara/hipfire/crates/hipfire-rdna/src/dispatch/kv.rs:1669`
 
-**Observation:** compact_cold_kv builds its FWHT sign tables with the magic seed pair gen_fwht_signs(42,256)/gen_fwht_signs(1042,256), and dequant_head repeats the identical seeds/width to invert the rotation. The two must agree exactly or every cold round-trip silently corrupts, yet the constants live as untied literals in two functions of the same file. Separately, the KVarN block width is a named const KVARN_GROUP=128 in kv.rs but is re-hard-coded as `const GROUP=128` in the rdna-compute dispatch.
+**Observation:** compact_cold_kv builds its FWHT sign tables with the magic seed pair gen_fwht_signs(42,256)/gen_fwht_signs(1042,256), and dequant_head repeats the identical seeds/width to invert the rotation. The two must agree exactly or every cold round-trip silently corrupts, yet the constants live as untied literals in two functions of the same file. Separately, the KVarN block width is a named const KVARN_GROUP=128 in kv.rs but is re-hard-coded as `const GROUP=128` in the hipfire-rdna dispatch.
 
 **Recommendation:** Hoist the FWHT seed pair and width to a single `const (KVARN_FWHT_SEED_A, KVARN_FWHT_SEED_B, KVARN_FWHT_DIM)` in kvquant used by both encode and decode, and have the dispatch import KVARN_GROUP instead of re-declaring 128.
 
-**Evidence:** kv_compact.rs:120 gen_fwht_signs(42,256)/gen_fwht_signs(1042,256); kv_compact.rs:177 same pair in dequant_head. kv.rs:1018 `pub const KVARN_GROUP: usize = 128`; rdna-compute/src/dispatch/kv.rs:1669 `const GROUP: usize = 128`.
+**Evidence:** kv_compact.rs:120 gen_fwht_signs(42,256)/gen_fwht_signs(1042,256); kv_compact.rs:177 same pair in dequant_head. kv.rs:1018 `pub const KVARN_GROUP: usize = 128`; hipfire-rdna/src/dispatch/kv.rs:1669 `const GROUP: usize = 128`.
 
 *Verification: confirmed*
 

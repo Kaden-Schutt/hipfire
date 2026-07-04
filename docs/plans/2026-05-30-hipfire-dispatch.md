@@ -6,7 +6,7 @@
 
 **Architecture:** Flat `KernelKey` enum + runtime selection table per family. Pipeline-based composition where each kernel record declares its steps (`[RotateFwht, Gemv]`), and a best-fit dispatcher selects the longest-match (fused) kernel. Rotation is automatic — the model never calls it directly. Graph capture is handled by a `GraphMode` flag on `DispatchCtx`.
 
-**Tech Stack:** Rust, `hipfire-runtime`, `rdna-compute`, existing HIP kernel symbols. No proc macros, no new build deps.
+**Tech Stack:** Rust, `hipfire-runtime`, `hipfire-rdna`, existing HIP kernel symbols. No proc macros, no new build deps.
 
 **Decisions (from design exploration):**
 - Q1: Gpu-level `mq_x_rot` persistent across model loads (128 KB isn't worth abstracting)
@@ -87,7 +87,7 @@ edition.workspace = true
 
 [dependencies]
 hipfire-types = { path = "../hipfire-types" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-arch-traits = { path = "../hipfire-arch-traits" }
 
 [features]
@@ -104,8 +104,8 @@ new-moe = []
 
 ```rust
 use hipfire_types::DType;
-use rdna_compute::arch_caps::ArchCaps;
-use rdna_compute::dispatch::GraphMode;
+use hipfire_rdna::arch_caps::ArchCaps;
+use hipfire_rdna::dispatch::GraphMode;
 
 /// A concrete kernel function handle.
 pub type KernelFn = fn(&Gpu, &KernelArgs) -> HipResult<()>;
@@ -344,8 +344,8 @@ pub trait RotationFamily: Send + Sync {
 
 ```rust
 use std::sync::Arc;
-use rdna_compute::arch_caps::ArchCaps;
-use rdna_compute::dispatch::{GraphMode, FeatureFlags};
+use hipfire_rdna::arch_caps::ArchCaps;
+use hipfire_rdna::dispatch::{GraphMode, FeatureFlags};
 use crate::resource::ResourceManager;
 
 pub struct DispatchCtx {
@@ -511,7 +511,7 @@ Into a single `RotationFamily` whose table maps `(DType, RotationVariant, has_aw
 
 ```rust
 use crate::{types::*, tables::*, context::DispatchCtx};
-use rdna_compute::dispatch::Gpu;
+use hipfire_rdna::dispatch::Gpu;
 
 pub struct RotationFamily {
     registry: KernelRegistry,

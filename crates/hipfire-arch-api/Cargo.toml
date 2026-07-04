@@ -10,7 +10,7 @@ description = "Base Arch trait + optional capability traits + declarative regist
 # `ArchRegistry` (Some/None per capability) instead of `arch_id == N` dispatch.
 #
 # INVARIANT: this is a LEAF crate. It must not depend on hipfire-runtime,
-# rdna-compute, or any kernel crate — those are the *consumers*. Capability trait
+# hipfire-rdna, or any kernel crate — those are the *consumers*. Capability trait
 # method signatures use only std / plain data so the offline quantizer can link the
 # trait definitions without pulling the serving stack.
 

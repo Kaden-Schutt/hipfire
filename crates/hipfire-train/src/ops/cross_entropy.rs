@@ -5,7 +5,7 @@
 //! onehot` (both zero for ignored rows). `d_logits` is a SUM-reduction gradient
 //! — divide by the valid-token count for a mean loss (matching `sft.py`).
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 /// `targets` are integer-valued f32 (class id, or `ignore_index`). Writes
 /// `loss` `[rows]` and `d_logits` `[rows*v]`.

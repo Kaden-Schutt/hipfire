@@ -16,7 +16,7 @@ use crate::model::NemotronModel;
 use hip_bridge::HipResult;
 use hipfire_runtime::calibration::{collect, logsumexp, topk_logits, CalibForward, CalibSummary};
 use hipfire_runtime::hfq::HfqMemTensor;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 /// Calibration knobs. `kldref` taps the lm-head logits during the forward and

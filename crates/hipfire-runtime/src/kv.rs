@@ -13,7 +13,7 @@
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
 use hipfire_primitives::fwht;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Number of F32 slots needed to back `bytes` of packed KV data (round up).
 ///

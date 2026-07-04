@@ -25,7 +25,7 @@ Detected GPUs:
 | Surface | GPU | Result | Raw artifact |
 |---|---:|---|---|
 | Release build + static checks | host | PASS: `cargo check`, `bash -n`, release examples | see session notes |
-| Arch capability gating | host | PASS: `cargo test -p rdna-compute arch_caps --lib`, 17/17 | see session notes |
+| Arch capability gating | host | PASS: `cargo test -p hipfire-rdna arch_caps --lib`, 17/17 | see session notes |
 | DFlash coherence, q8 KV | gfx1151 | PASS: no hard errors, sane output | `raw/hipx-pr319-forward-gfx1151-coherence-20260526-213421.md` |
 | DFlash perf, 27B, q8/max256 | gfx1151 | PASS: `decode_tok_s=70.46`, `tau=8.519` | `raw/hipx-pr319-forward-gfx1151-q8-max256-20260526-213611.log` |
 | DFlash smoke, 9B, q8/max256 | gfx1030 | PASS: `decode_tok_s=40.46`, `tau=6.7576` | `raw/hipx-pr319-forward-gfx1030-q8-max256-20260526-213831.log` |

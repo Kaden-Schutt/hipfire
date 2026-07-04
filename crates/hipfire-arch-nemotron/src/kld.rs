@@ -12,7 +12,7 @@
 use crate::model::NemotronModel;
 use hip_bridge::HipResult;
 use hipfire_kld::{KldEvalOutcome, KldRefPayloads, RefArchive};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Run the resident model over `chunk` (per-token decode from fresh SSM/conv/KV
 /// state) and invoke `at_scored(j, full_logits, actual_next)` for each scored

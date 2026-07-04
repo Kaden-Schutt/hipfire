@@ -33,7 +33,7 @@ session that produced this work):
     16-entry codebook lookup as a 16-way ternary chain. No gfx1100
     fast-path / LDS-codebook variant. ~90 LOC, mirrors
     `gemv_mq3g256_lloyd.hip`.
-  - `DType::MQ4G256Lloyd` plumbed through `rdna-compute/src/dispatch.rs`,
+  - `DType::MQ4G256Lloyd` plumbed through `hipfire-rdna/src/dispatch.rs`,
     `kernels.rs`, `profile.rs`. `Gpu::gemv_mq4g256_lloyd` +
     `Gpu::gemv_mq4g256_lloyd_with_rotate` mirror the MQ3-Lloyd Rust
     bindings.

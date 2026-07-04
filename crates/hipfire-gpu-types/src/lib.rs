@@ -5,10 +5,10 @@
 //! Leaf GPU value types shared across the workspace.
 //!
 //! [`GpuTensor`] (a device buffer + shape + [`DType`]) and the [`DType`]
-//! element-type enum. Extracted from `rdna-compute` (review 3.11b) so crates
+//! element-type enum. Extracted from `hipfire-rdna` (review 3.11b) so crates
 //! that only need to *name* a device tensor or element type depend on this
 //! ~200-line leaf (over `hip-bridge`) instead of the whole 63k-LOC compute
-//! crate. `rdna-compute` re-exports both, so `rdna_compute::{GpuTensor, DType}`
+//! crate. `hipfire-rdna` re-exports both, so `hipfire_rdna::{GpuTensor, DType}`
 //! keeps resolving unchanged.
 
 use hip_bridge::DeviceBuffer;
@@ -211,7 +211,7 @@ impl GpuTensor {
     /// so cross-crate tests can borrow a `&GpuTensor` for metadata-only logic.
     ///
     /// Not `#[cfg(test)]`-gated on purpose: `#[cfg(test)]` here would only be active
-    /// when `rdna-compute`'s own tests build, making this invisible to dependent
+    /// when `hipfire-rdna`'s own tests build, making this invisible to dependent
     /// crates' tests (e.g. `hipfire-dispatch`). `#[doc(hidden)]` keeps it out of the
     /// public API surface while remaining reachable cross-crate, matching the
     /// `FeatureFlags::from_env_for_test` precedent.

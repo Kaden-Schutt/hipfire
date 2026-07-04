@@ -38,7 +38,7 @@
 //! stays monomorphized" rule.
 
 use hipfire_mixer::MixerProfile;
-use rdna_compute::{Gpu, HipResult};
+use hipfire_rdna::{Gpu, HipResult};
 
 use crate::kv::KvCache;
 

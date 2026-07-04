@@ -13,7 +13,7 @@ use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 impl SimpleAr for NemotronModel {
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {

@@ -27,12 +27,12 @@ op. This finishes it.
 
 ## Why it's architecturally clean (grounded findings)
 
-- **Same GPU type both sides.** Daemon: `let mut gpu = rdna_compute::Gpu::init()`
-  (main.rs:2332/2365). hipfire-train ops: `gpu: &mut rdna_compute::Gpu`
+- **Same GPU type both sides.** Daemon: `let mut gpu = hipfire_rdna::Gpu::init()`
+  (main.rs:2332/2365). hipfire-train ops: `gpu: &mut hipfire_rdna::Gpu`
   (e.g. `ssm_drafter.rs`). Identical type — the daemon passes its `&mut gpu`
   straight into `ssm_drafter_forward_train` / `_backward`. **No bridging.**
-- **No dependency cycle.** hipfire-train → {rdna-compute, hipfire-runtime,
-  hipfire-model}. Daemon → {rdna-compute, hipfire-runtime, arch crates}.
+- **No dependency cycle.** hipfire-train → {hipfire-rdna, hipfire-runtime,
+  hipfire-model}. Daemon → {hipfire-rdna, hipfire-runtime, arch crates}.
   Adding `hipfire-train` to the daemon's `Cargo.toml` is acyclic (hipfire-train
   does not depend on hipfire-daemon).
 - **Working precedent.** `pflash_labels` op (main.rs:4452) already does in-daemon
@@ -41,7 +41,7 @@ op. This finishes it.
   `qwen35::capture_pflash_block_scores(&mut gpu, weights, config, &toks, block,
   &[shallow, mid])`. The training op is the same shape, one stage further.
 - **Multi-context drafter machinery already exists.** The daemon has
-  `pflash_drafter_gpu: Option<rdna_compute::Gpu>` (main.rs:2391) for hetero PFlash
+  `pflash_drafter_gpu: Option<hipfire_rdna::Gpu>` (main.rs:2391) for hetero PFlash
   (drafter on a sibling device). Training can reuse that pattern to optionally
   train on a sibling GPU while the target serves on the primary.
 
@@ -59,7 +59,7 @@ standalone example):
 // hipfire-train/src/train_loop.rs
 pub struct DrafterTrainReport { pub best_eval: f32, pub best_epoch: usize, pub bar: f32, pub final_eval: f32 }
 pub fn train_drafter_loop(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     drafter: &mut SsmDrafter,            // or an enum over {Ssm, Attention}
     chunks: &[Vec<u32>], label_mid: &[Vec<f32>], base_shallow: &[Vec<f32>],
     cfg: &TrainCfg,
@@ -165,7 +165,7 @@ Reuse `hipfire-train/src/checkpoint.rs` (`save_drafter`), but:
 - **A daemon crash kills the run.** Mitigated by checkpoint/resume (already in
   `checkpoint.rs`); `resume:true` reattaches.
 - **Binary size.** +hipfire-train adds the optim/drafter/checkpoint code; the
-  kernels are already in shared `rdna-compute`. Modest.
+  kernels are already in shared `hipfire-rdna`. Modest.
 
 ## Net
 

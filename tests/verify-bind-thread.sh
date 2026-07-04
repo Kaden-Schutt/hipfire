@@ -18,7 +18,7 @@
 
 set -eu
 
-FILE="${1:-crates/rdna-compute/src/dispatch.rs}"
+FILE="${1:-crates/hipfire-rdna/src/dispatch.rs}"
 
 if [ ! -f "$FILE" ]; then
     echo "verify-bind-thread: $FILE not found" >&2
