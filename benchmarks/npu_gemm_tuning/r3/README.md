@@ -51,3 +51,27 @@ KCHUNK=64 overflows), forcing KCHUNK=16 which adds C-fold overhead.
 reference kernels use to approach peak. That is the next step: A-resident, stream W
 across many N-blocks, then scale to the 8×4 array. This is the same ~27%-efficiency
 dataflow wall documented for the `whole_array` reference in ../findings.md.
+
+## R3c — A-resident GEMM: the single-core register-file wall
+
+Kept A resident (M×K) and streamed only weights across N-blocks (weight reuse =
+M, no A-stream penalty). Still not compute-bound:
+
+| NACC (M) | MAC/cyc | note |
+|---|---|---|
+| 4 (M=16) | ~195 | fits regs but **feed-bound** (AI=32 MACs/B < needed ~58) |
+| 8 (M=32) | ~88  | **accumulator spill** — 8 MMUL accs exceed the aie2p acc file |
+
+The single-core dead-end, quantified: compute-bound W4A8 needs AI ≈ 58 MACs/byte
+⇒ NACC ≈ 8 accumulators, but the register file holds only ~4 MMUL accumulators
+(R2a hit ~460 MAC/cyc at NACC=4 with *fake* reuse; real K-streaming at NACC=4 is
+feed-bound; NACC=8 spills). And true aggregate compute-bound needs M≈264 (feed
+55 GB/s ÷ compute 29 TMAC/s) = ~66 accumulators/core — impossible on one core.
+
+**Resolution = the weight-broadcast ARRAY dataflow (R4).** Broadcast each weight
+tile to all 32 cores; each core holds NACC=4 accumulators for its own M-row-block,
+so aggregate weight reuse = 32×16 = 512 rows while no core exceeds its register
+file. Weight is fed once (broadcast) and reused across the array ⇒ ~53 TOPS
+compute-bound at the ~55 GB/s feed. Spatial reuse across cores, not temporal
+per-core accumulators, is what makes W4A8 GEMM compute-bound. That array kernel
+(cascade/broadcast) is the next major build.
