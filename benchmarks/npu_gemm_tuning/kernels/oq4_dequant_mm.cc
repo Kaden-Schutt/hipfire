@@ -23,11 +23,14 @@
 // Unpack 32 packed bytes (64 signed int4, low-nibble-first) -> 64 int8, in order.
 // byte b = (hi<<4)|lo ; lo_s8 = (int8)(b<<4)>>4 ; hi_s8 = (int8)b>>4  (arith shr
 // sign-extends the 4-bit field).
+// P1 note: aie::downshift is LOGICAL (zero-fill), so this does NOT sign-extend
+// the int4 fields — fine for the P1 feed-win timing (--verify false). P2 must
+// swap to a sign-extending unpack (e.g. mask + bias: ((x & 0xF) ^ 0x8) - 0x8).
 static inline aie::vector<int8, 64> unpack_int4x2(const int8 *__restrict p) {
   aie::vector<int8, 32> packed = aie::load_v<32>(p);
-  aie::vector<int8, 32> lo = aie::sr_reduce((packed << 4), 4); // arith >>4 of (packed<<4)
-  aie::vector<int8, 32> hi = aie::sr_reduce(packed, 4);        // arith >>4
-  return aie::interleave_zip(lo, hi, 1).first_and_second_as<int8, 64>();
+  aie::vector<int8, 32> hi = aie::downshift(packed, 4); // high nibble -> low bits
+  aie::vector<int8, 32> lo = packed;                    // low nibble in low bits
+  return aie::concat(aie::interleave_zip(lo, hi, 1));   // {even,odd} -> 64 in order
 }
 
 template <unsigned rowA, unsigned colA, unsigned colB>
