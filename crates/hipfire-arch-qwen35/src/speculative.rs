@@ -679,6 +679,100 @@ impl ModelSlot {
     }
 }
 
+/// Qwen3.5 is the reference implementation of the arch-agnostic
+/// [`SpecDecodeTarget`](hipfire_specdecode::SpecDecodeTarget) boundary: the
+/// strategy crates (dflash / ddtree / mtp) drive draft→verify→accept through
+/// this trait and never name a concrete arch. Methods that overlap with
+/// `ModelSlot`'s inherent API delegate to it (fully-qualified so existing call
+/// sites — including the demo examples — keep resolving to the inherent method).
+impl hipfire_specdecode::SpecDecodeTarget for ModelSlot {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn num_layers(&self) -> usize {
+        self.config.layer_types.len()
+    }
+
+    fn kv_geometry(&self) -> (usize, usize) {
+        (self.config.n_kv_heads, self.config.head_dim)
+    }
+
+    fn lm_head_weight(&self) -> &weights::WeightTensor {
+        &self.weights.output
+    }
+
+    fn logits(&self) -> &GpuTensor {
+        &self.scratch.logits
+    }
+
+    fn forward(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<()> {
+        ModelSlot::forward(self, gpu, token, pos)
+    }
+
+    fn reset_state(&mut self, gpu: &mut Gpu) {
+        ModelSlot::reset_state(self, gpu)
+    }
+
+    fn load_tokenizer(&self) -> Result<Tokenizer, TokenizerError> {
+        ModelSlot::load_tokenizer(self)
+    }
+}
+
+/// Load + validate that two spec-decode slots expose compatible tokenizers
+/// (identical vocab size and merge rules), returning the shared tokenizer.
+///
+/// Generic over [`SpecDecodeTarget`](hipfire_specdecode::SpecDecodeTarget) — the
+/// check is arch-agnostic, so it works for any arch's slot, not just qwen35's
+/// `ModelSlot`. Speculative decode requires the target and draft to tokenize
+/// identically; a vocab-size match with divergent BPE merges is caught by the
+/// round-trip probe.
+fn load_compatible_tokenizer<T: hipfire_specdecode::SpecDecodeTarget>(
+    target: &T,
+    draft: &T,
+) -> HipResult<Tokenizer> {
+    let target_tok = target.load_tokenizer().map_err(|e| {
+        hip_bridge::HipError::new(0, &format!("target tokenizer load failed: {e}"))
+    })?;
+    let draft_tok = draft.load_tokenizer().map_err(|e| {
+        hip_bridge::HipError::new(0, &format!("draft tokenizer load failed: {e}"))
+    })?;
+
+    if target_tok.vocab_size() != draft_tok.vocab_size() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "tokenizer mismatch: target vocab={}, draft vocab={}. \
+                 Speculative decode requires identical vocabularies.",
+                target_tok.vocab_size(),
+                draft_tok.vocab_size()
+            ),
+        ));
+    }
+
+    // Sanity-check a round-trip on a common string — catches vocab-size match
+    // but token-ID mismatch (different BPE merges producing same vocab count).
+    let probe = "<|im_start|>user\nHello world\n<|im_end|>";
+    let a = target_tok.encode(probe);
+    let b = draft_tok.encode(probe);
+    if a != b {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "tokenizer merge rules diverge: target={:?}, draft={:?}. \
+                 Speculative decode requires identical tokenization.",
+                &a, &b
+            ),
+        ));
+    }
+
+    Ok(target_tok)
+}
+
 /// A pair of target + draft slots sharing one `Gpu` and one tokenizer.
 ///
 /// Phase 1 just carries both slots. Phase 2+ adds the `spec_decode_step`
@@ -702,47 +796,13 @@ impl SpecPair {
     ) -> HipResult<Self> {
         let target = ModelSlot::load(gpu, target_path, "target", target_cfg)?;
         let draft = ModelSlot::load(gpu, draft_path, "draft", draft_cfg)?;
-
-        let target_tok = target.load_tokenizer().map_err(|e| {
-            hip_bridge::HipError::new(0, &format!("target tokenizer load failed: {e}"))
-        })?;
-        let draft_tok = draft.load_tokenizer().map_err(|e| {
-            hip_bridge::HipError::new(0, &format!("draft tokenizer load failed: {e}"))
-        })?;
-
-        if target_tok.vocab_size() != draft_tok.vocab_size() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "tokenizer mismatch: target vocab={}, draft vocab={}. \
-                     Speculative decode requires identical vocabularies.",
-                    target_tok.vocab_size(),
-                    draft_tok.vocab_size()
-                ),
-            ));
-        }
-
-        // Sanity-check a round-trip on a common string — catches vocab-size
-        // match but token-ID mismatch (different BPE merges producing same
-        // vocab count).
-        let probe = "<|im_start|>user\nHello world\n<|im_end|>";
-        let a = target_tok.encode(probe);
-        let b = draft_tok.encode(probe);
-        if a != b {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "tokenizer merge rules diverge: target={:?}, draft={:?}. \
-                     Speculative decode requires identical tokenization.",
-                    &a, &b
-                ),
-            ));
-        }
-
+        // Validated generically over `SpecDecodeTarget` — the compat check is
+        // arch-agnostic and consumes the trait boundary (P2).
+        let tokenizer = load_compatible_tokenizer(&target, &draft)?;
         Ok(Self {
             target,
             draft,
-            tokenizer: target_tok,
+            tokenizer,
         })
     }
 

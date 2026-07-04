@@ -2080,6 +2080,7 @@ name = "hipfire-specdecode"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-model",
  "hipfire-rdna",
  "hipfire-runtime",
 ]

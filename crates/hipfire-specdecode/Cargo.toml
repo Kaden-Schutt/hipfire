@@ -9,3 +9,4 @@ description = "Arch-agnostic speculative-decode core: SpecDecodeTarget trait + s
 hip-bridge = { path = "../hip-bridge" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-rdna = { path = "../hipfire-rdna" }
+hipfire-model = { path = "../hipfire-model" }

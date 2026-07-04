@@ -78,10 +78,22 @@ only in the `impl SpecDecodeTarget for Qwen35` block.
   above (the ones with **no** `Qwen35*`/`DeltaNet*` reference) into
   `hipfire-specdecode`. `speculative.rs`/`mtp_*` re-export from core so nothing
   breaks. Gate: `cargo build`, `no-gpu-ci.sh`, the 2 examples compile.
-- **P2 — Introduce `SpecDecodeTarget`; generify `ModelSlot` + strategy fns.**
-  Define the trait in core, `impl` it for `Qwen35` in the arch crate, make
-  `ModelSlot<T>` + the ~15 fns generic. Still all in the arch crate — pure
-  in-place refactor. Gate: build + `no-gpu-ci.sh`. **GPU gate deferred to P5.**
+- **P2a — Introduce `SpecDecodeTarget` + implement for the qwen slot. (done)**
+  Trait defined in `hipfire-specdecode::target` (geometry accessors, forward,
+  logits, lm_head weight, reset, tokenizer). Implemented for qwen35's
+  `ModelSlot`, delegating to its inherent methods so existing call sites
+  (incl. the demo examples) are untouched. Made load-bearing immediately:
+  `SpecPair::load`'s tokenizer-compat check is now a generic
+  `load_compatible_tokenizer<T: SpecDecodeTarget>` (behavior-preserving), so the
+  boundary is compiler-proven generic, not dead scaffolding. Build + clippy +
+  139 qwen tests green.
+- **P2b — Generify the strategy fns + `ModelSlot` state seam.** Thread
+  `SpecDecodeTarget` (and an associated `StateSnapshot` type for the GDN/DeltaNet
+  rollback tape) through the dflash/ddtree/mtp verify+accept fns so they stop
+  naming `Qwen35*`. The ~15 `&Qwen35Weights,&Qwen35Config` fns are mostly
+  DeltaNet/GDN replay machinery → they become the qwen-side *impl* of the
+  snapshot/restore methods, not generic code. Still in-crate, compiler-verified.
+  **GPU gate deferred to P5.**
 - **P3 — Move strategies to their crates.** dflash → `-dflash`, ddtree →
   `-ddtree`, `mtp_spec.rs`+`mtp_head.rs` → `-mtp`. Arch crate keeps the
   `impl SpecDecodeTarget for Qwen35` + the DeltaNet snapshot impls + thin
