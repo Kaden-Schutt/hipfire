@@ -69,37 +69,60 @@ So the byte-proportional feed cost is **~12 GB/s, not 0.9** — ~14× higher. Ag
 the W4A8 table above a **single** column already clears M=4096 (6.8 GB/s) with
 margin; 8 columns clear M=1024 (27). **The feed is not the wall for prefill.**
 
-### But ~12 GB/s is a lower bound, and it's mostly host BO sync, not the feed
+### Depth-insensitive because bandwidth-bound (not because of host sync)
 
 The slope is nearly **DEPTH-INSENSITIVE** (11.2 / 12.0 / 12.8 GB/s at FIFO depth
-1 / 8 / 4 — within noise, non-monotonic). FIFO depth is an on-NPU DMA knob; its
-irrelevance means the byte cost lives mostly in the **host→device BO sync** (which
-precedes the kernel and depth can't touch), not the on-NPU feed. The `@jit` run
-does sync-then-feed in series, so the measured slope satisfies
-`1/12.8 = 1/sync + 1/feed` ⇒ **the true on-NPU feed is ≥ 12 GB/s** and hidden
-above the sync. Both readings point the same way: feed is fine for prefill.
+1 / 8 / 4 — within noise, non-monotonic). This was first read as "byte cost is
+mostly host BO sync." **M3 (trace) below disproves that**: the depth-insensitivity
+is because the receive DMA is already ~91% busy — **bandwidth-bound, so more
+buffering can't help** — not because the feed is hidden under sync.
+
+### M3 — SEALED: on-NPU feed is ~13 GB/s, bandwidth-bound (trace unit)
+
+The differential slope still can't split feed from host BO sync (both scale with
+bytes). The trace unit can: it timestamps on-NPU events, and host→device sync
+precedes kernel start so it is **not in the trace window**. `r1b_trace_run.py`
+traces the compute tile's S2MM ch0 (the feed-receive port) with
+`PORT_RUNNING/STALLED/IDLE` and reports span (feed duration) + busy fraction.
+
+Measured (single column, `TILE_N=4096`, no trace-buffer overflow), stable across
+128 / 256 / 512-tile feeds:
+
+| metric | value | meaning |
+|---|---|---|
+| **FEED_GBS (active cycles)** | **14.4 GB/s** | exactly 512 cyc/tile = 8 B/cyc @ 1.8 GHz — dead stable |
+| FEED_GBS (span/wall) | ~13 GB/s | includes ~9% inter-tile idle |
+| BUSY_FRAC | 0.89–0.92 | PORT_RUNNING / span |
+| STALL | ~0.2% | negligible → not core-consume-limited |
+
+So the ~12 GB/s host slope **was the real feed** (host BO sync is overlapped /
+negligible in the byte term), and the single-column feed is a genuine on-NPU
+**~13–14 GB/s, ~91% busy = bandwidth-bound**. That is why FIFO depth did nothing.
+Against the W4A8 table: one column clears M=4096 (6.8 GB/s) with 2× margin; the
+open question is only how far 8 columns aggregate before the NoC/mem-controller
+knee.
 
 ### Three-way status (what worked, what the toolchain blocked)
 
 - **M1 host single-shot** (r1b_run.py): dominated by the 16 ms fixed cost —
   reproduces R1a's mistake. Kept as the baseline that exposes the overhead.
 - **M2 on-device core timer**: NOT viable here — `aie::tile::current().cycles()`
-  fails to link (undefined `::get_cycles()`); aie2p kernels timestamp via
-  `event0/event1` + the trace unit. Host-side 194 fencing is also unreachable:
-  IRON's concrete `run()` bundles BO sync + execute. **So the differential slope
-  (sweep_r1b.py) is the validated host-side stand-in for M2.**
-- **M3 shim-DMA `PORT_RUNNING` trace** (r1b_trace_run.py, UNSEALED scaffold): the
-  only way to isolate the feed's own busy-cycle bandwidth from the host sync.
-  Elevated from "refinement" to the **required decisive step** by the
-  depth-insensitive result. Needs an on-hw iteration loop to seal.
+  fails to link (undefined `::get_cycles()`); `event0/event1` markers also did not
+  surface as INSTR events in the trace. Host-side 194 fencing is unreachable too:
+  IRON's concrete `run()` bundles BO sync + execute. **The differential slope
+  (sweep_r1b.py) is the validated host-side stand-in.**
+- **M3 core-DMA `PORT_RUNNING` trace** (r1b_trace_run.py): **SEALED** — 14.4 GB/s
+  active, busy 0.91, host-sync-free. This is the decisive on-NPU number.
 
 ### Next
 
-1. Seal M3 (shim MM2S `PORT_RUNNING`) to get the feed's true busy-cycle rate,
-   separated from host BO sync.
-2. Multi-column aggregate slope (the NoC/mem-controller **saturation knee**, per
-   docs/192-193 — aggregate ≠ 8× linear), then add the W4A8 `mac_4x16_16x16`
-   compute and sweep M for the feed/compute crossover — the go/no-go.
+1. Multi-column aggregate: replicate the feed across 8 columns and trace the knee
+   (NoC/mem-controller, per docs/192-193 — aggregate ≠ 8× linear). ~14 GB/s ×
+   columns is the ceiling to chase against the W4A8 M-table.
+2. Add the W4A8 `mac_4x16_16x16` compute and sweep M for the feed/compute
+   crossover — the go/no-go.
+3. (Optional) trace the shim MM2S directly (`shimtile_events`) for the DDR-read
+   view; the core-receive seal already bounds the end-to-end feed at 14.4 GB/s.
 
 ### Toolchain notes (current, drifted from R1a's pin)
 
