@@ -110,8 +110,19 @@ pub fn sample(
     //   - RNG draw + argmax-on-greedy fallback
     //   - writeback (token_id, new_rng) to `sample_buf`
     //   - 8-byte D2H sync (returned by the wrapper)
-    let (tok, new_rng) = gpu
-        .sample_top_p_pf(
+    //
+    // A GPU sample can fail with a transient kernel launch / readback error
+    // (e.g. an APU MES hiccup / brief device wedge). Panicking here would take
+    // down the whole daemon and every in-flight request, so instead retry a
+    // few times and then fall back to CPU sampling on a host copy of the
+    // logits. The blocked-token `-INF` writes from step 2 are already in the
+    // logits buffer, so they survive the readback; `sample_cpu` re-applies the
+    // repeat/presence/frequency penalties (the GPU kernel applies those
+    // internally without mutating the buffer, so there is no double-penalty).
+    const GPU_SAMPLE_ATTEMPTS: usize = 3;
+    let mut last_err = None;
+    for attempt in 1..=GPU_SAMPLE_ATTEMPTS {
+        match gpu.sample_top_p_pf(
             logits,
             sample_buf,
             repeat_buf,
@@ -123,10 +134,44 @@ pub fn sample(
             cfg.repeat_penalty,
             cfg.presence_penalty,
             cfg.frequency_penalty,
-        )
-        .expect("sample_top_p kernel launch / readback failed");
-    *rng_state = new_rng;
-    tok
+        ) {
+            Ok((tok, new_rng)) => {
+                *rng_state = new_rng;
+                return tok;
+            }
+            Err(e) => {
+                eprintln!(
+                    "sampler: GPU sample_top_p failed (attempt {attempt}/{GPU_SAMPLE_ATTEMPTS}): {e:?}"
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+
+    // GPU sampling did not recover after retries. Degrade to CPU sampling so
+    // the request fails soft (or continues) instead of aborting the process.
+    match gpu.download_f32(logits) {
+        Ok(mut host_logits) => {
+            let n = host_logits.len().min(vocab_size);
+            eprintln!(
+                "sampler: GPU sample failed after {GPU_SAMPLE_ATTEMPTS} attempts ({last_err:?}); \
+                 falling back to CPU sampling"
+            );
+            // `rng_state` is intentionally left unchanged on the fallback path;
+            // exact RNG continuity is best-effort when the GPU sampler is down.
+            sample_cpu(&mut host_logits[..n], history, cfg)
+        }
+        Err(readback_err) => {
+            // The device is unusable (even the logits readback failed). Emit a
+            // deterministic fallback token with a loud log rather than panic;
+            // the decode loop's stop/EOS handling winds the request down.
+            eprintln!(
+                "sampler: GPU sample AND logits readback both failed \
+                 (sample_err={last_err:?}, readback_err={readback_err:?}); emitting fallback token 0"
+            );
+            0
+        }
+    }
 }
 
 /// CPU-only fallback: same math as [`sample`] but operates on a host
