@@ -250,6 +250,54 @@ fn transformer2d_model_loads_from_hfq_and_preserves_residual_with_zero_weights()
 }
 
 #[test]
+fn synthetic_clip_text_encoder_forward_is_finite() {
+    let hidden = 12usize;
+    let encoder = ClipTextEncoder {
+        token_embedding: CpuTensor {
+            shape: vec![3, hidden],
+            data: (0..3 * hidden).map(|idx| idx as f32 * 0.01).collect(),
+        },
+        position_embedding: CpuTensor {
+            shape: vec![2, hidden],
+            data: vec![0.0; 2 * hidden],
+        },
+        layers: vec![zero_clip_layer(hidden)],
+        final_layer_norm_weight: CpuTensor {
+            shape: vec![hidden],
+            data: vec![1.0; hidden],
+        },
+        final_layer_norm_bias: CpuTensor {
+            shape: vec![hidden],
+            data: vec![0.0; hidden],
+        },
+        text_projection: None,
+        hidden_size: hidden,
+        max_length: 2,
+        n_heads: 3,
+    };
+    let encoded = encoder.encode_tokens(&[0, 1]).unwrap();
+
+    assert_eq!(encoded.shape, vec![2, hidden]);
+    assert!(encoded.data.iter().all(|value| value.is_finite()));
+    assert!(encoded.data.iter().any(|value| value.abs() > 0.001));
+
+    {
+        if let Err(error) = hipfire_rdna::Gpu::init_with_device(0) {
+            eprintln!("skip: ROCm GPU unavailable for CLIP encoder routing test: {error}");
+        } else {
+            let hip = encoder
+                .encode_tokens_with_runtime_options(
+                    &[0, 1],
+                    DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+                )
+                .unwrap();
+            assert_eq!(hip.shape, encoded.shape);
+            assert!(f32_slices_close(&hip.data, &encoded.data, 1e-5));
+        }
+    }
+}
+
+#[test]
 fn clip_text_encoder_pools_eos_hidden_state_and_applies_projection() {
     let encoder = ClipTextEncoder {
         token_embedding: CpuTensor {

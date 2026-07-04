@@ -369,6 +369,26 @@ fn latent_mask_weights_downsample_rgb_luma_to_latent_shape() {
 }
 
 #[test]
+fn masked_rgb_batch_for_inpaint_zeroes_white_mask_pixels() {
+    let image = RgbImageBatch {
+        batch: 1,
+        width: 2,
+        height: 1,
+        data: vec![10, 20, 30, 100, 120, 140],
+    };
+    let mask = RgbImageBatch {
+        batch: 1,
+        width: 2,
+        height: 1,
+        data: vec![0, 0, 0, 255, 255, 255],
+    };
+
+    let masked = masked_rgb_batch_for_inpaint(&image, &mask).unwrap();
+
+    assert_eq!(masked.data, vec![10, 20, 30, 0, 0, 0]);
+}
+
+#[test]
 fn blend_latents_with_mask_preserves_black_and_uses_generated_white() {
     let mut generated = LatentBatch {
         batch: 1,
@@ -388,4 +408,62 @@ fn blend_latents_with_mask_preserves_black_and_uses_generated_white() {
     blend_latents_with_mask(&mut generated, &init, &[0.0, 1.0]).unwrap();
 
     assert_eq!(generated.data, vec![1.0, 20.0, 3.0, 40.0]);
+}
+
+#[test]
+fn masked_denoise_reference_reprojects_noised_init_latents_per_step() {
+    let source_schedule = DiffusionSchedule::linear(3).unwrap();
+    let init = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![10.0, 20.0],
+    };
+    let noise = vec![2.0, 4.0];
+    let mut generated = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![100.0, 200.0],
+    };
+    let reference = MaskedDenoiseReference {
+        init_latents: &init,
+        noise: &noise,
+        mask_weights: &[0.0, 1.0],
+        source_schedule: &source_schedule,
+        start_step: 0,
+    };
+
+    apply_masked_denoise_reference(&mut generated, &reference, 0).unwrap();
+
+    assert_eq!(generated.data, vec![11.0, 200.0]);
+}
+
+#[test]
+fn resize_latent_batch_nearest_resizes_spatial_axes_per_channel() {
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 2,
+        height: 2,
+        width: 2,
+        data: vec![
+            1.0, 2.0, //
+            3.0, 4.0, //
+            10.0, 20.0, //
+            30.0, 40.0,
+        ],
+    };
+
+    let resized = resize_latent_batch_nearest(&latents, 1, 4).unwrap();
+
+    assert_eq!(resized.batch, 1);
+    assert_eq!(resized.channels, 2);
+    assert_eq!(resized.height, 1);
+    assert_eq!(resized.width, 4);
+    assert_eq!(
+        resized.data,
+        vec![1.0, 1.0, 2.0, 2.0, 10.0, 10.0, 20.0, 20.0]
+    );
 }

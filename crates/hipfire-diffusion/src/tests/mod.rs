@@ -12,12 +12,14 @@ use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
 
 mod encoder;
+mod hip;
 mod import;
 mod latent;
 mod misc;
 mod model;
+mod native;
+mod pipeline;
 mod quant;
-mod runtime;
 mod scheduler;
 mod unet;
 mod vae;

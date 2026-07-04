@@ -13,6 +13,24 @@ use std::fs;
 use super::*;
 
 #[test]
+fn linear_scheduler_euler_step_moves_toward_next_sigma() {
+    let schedule = DiffusionSchedule::linear(2).unwrap();
+    let mut latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![1.0, -1.0],
+    };
+
+    schedule.euler_step(&mut latents, &[0.25, -0.5], 0).unwrap();
+
+    assert_eq!(schedule.timesteps, vec![1.0, 0.0]);
+    assert_eq!(schedule.sigmas, vec![1.0, 0.0, 0.0]);
+    assert_eq!(latents.data, vec![0.75, -0.5]);
+}
+
+#[test]
 fn scheduler_config_uses_diffusers_beta_sigmas_and_train_timesteps() {
     let config = SchedulerConfig {
         class_name: "EulerDiscreteScheduler".into(),
@@ -106,6 +124,91 @@ fn dpm_solver_config_preserves_dynamic_thresholding_settings() {
             sample_max_value: 2.0,
         }
     );
+}
+
+#[test]
+fn flow_match_euler_scheduler_uses_shifted_sigmas_and_terminal_rescale() {
+    let config = SchedulerConfig {
+        class_name: "FlowMatchEulerDiscreteScheduler".into(),
+        num_train_timesteps: Some(1000),
+        shift: Some(1.0),
+        shift_terminal: Some(0.02),
+        invert_sigmas: Some(false),
+        ..SchedulerConfig::default()
+    };
+
+    let schedule = DiffusionSchedule::from_config(&config, 3).unwrap();
+
+    assert_eq!(schedule.solver, SchedulerSolver::FlowMatchEuler);
+    assert_eq!(schedule.input_scaling, SchedulerInputScaling::None);
+    assert_eq!(schedule.sigmas, vec![1.0, 0.51, 0.02, 0.0]);
+    assert_eq!(schedule.timesteps, vec![1000.0, 510.0, 20.0]);
+    assert_eq!(schedule.initial_noise_sigma(), 1.0);
+}
+
+#[test]
+fn flow_match_euler_step_uses_model_output_as_velocity() {
+    let config = SchedulerConfig {
+        class_name: "FlowMatchEulerDiscreteScheduler".into(),
+        num_train_timesteps: Some(1000),
+        shift: Some(1.0),
+        ..SchedulerConfig::default()
+    };
+    let schedule = DiffusionSchedule::from_config(&config, 2).unwrap();
+    let mut latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![1.0, -1.0],
+    };
+    let mut state = SchedulerStepState::default();
+
+    schedule
+        .step(&mut latents, &[0.25, -0.5], 0, &mut state)
+        .unwrap();
+
+    assert_eq!(schedule.sigmas, vec![1.0, 0.0, 0.0]);
+    assert_eq!(latents.data, vec![0.75, -0.5]);
+}
+
+#[test]
+fn karras_scheduler_uses_power_law_sigmas_and_nearest_train_timesteps() {
+    let mut config = SchedulerConfig {
+        class_name: "DPMSolverMultistepScheduler".into(),
+        beta_start: Some(0.00085),
+        beta_end: Some(0.012),
+        beta_schedule: Some("scaled_linear".into()),
+        num_train_timesteps: Some(1000),
+        prediction_type: Some("epsilon".into()),
+        algorithm_type: Some("dpmsolver++".into()),
+        solver_order: Some(2),
+        solver_type: Some("midpoint".into()),
+        lower_order_final: Some(true),
+        thresholding: Some(false),
+        timestep_spacing: Some("linspace".into()),
+        steps_offset: Some(1),
+        use_karras_sigmas: Some(false),
+        set_alpha_to_one: None,
+        ..SchedulerConfig::default()
+    };
+    let normal = DiffusionSchedule::from_config(&config, 4).unwrap();
+    config.use_karras_sigmas = Some(true);
+
+    let karras = DiffusionSchedule::from_config(&config, 4).unwrap();
+
+    assert_eq!(karras.sigmas.len(), 5);
+    assert!((karras.sigmas[0] - normal.sigmas[0]).abs() / normal.sigmas[0].max(1.0) < 1e-4);
+    assert_eq!(karras.sigmas[4], 0.0);
+    assert!(karras.sigmas[0] > karras.sigmas[1]);
+    assert!(karras.sigmas[1] > karras.sigmas[2]);
+    assert!(karras.sigmas[2] > karras.sigmas[3]);
+    assert_ne!(karras.sigmas, normal.sigmas);
+    assert_eq!(karras.train_timesteps.len(), 4);
+    assert!(karras
+        .train_timesteps
+        .windows(2)
+        .all(|pair| pair[0] >= pair[1]));
 }
 
 #[test]
@@ -212,6 +315,37 @@ fn scheduler_request_alias_changes_run_plan_schedule() {
     );
     assert_ne!(dpm_plan.latents.data, euler_plan.latents.data);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ddim_scheduler_step_matches_deterministic_epsilon_update() {
+    let schedule = DiffusionSchedule {
+        timesteps: vec![2.0, 1.0],
+        sigmas: vec![0.8, 0.6, 0.0],
+        prediction_type: SchedulerPredictionType::Epsilon,
+        input_scaling: SchedulerInputScaling::None,
+        solver: SchedulerSolver::Ddim {
+            set_alpha_to_one: true,
+        },
+        train_timesteps: vec![2, 1],
+        alpha_t: vec![1.0, 0.8, 0.6],
+        sigma_t: vec![0.0, 0.6, 0.8],
+        lambda_t: Vec::new(),
+    };
+    let mut latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 1,
+        data: vec![1.4],
+    };
+    let mut state = SchedulerStepState::default();
+
+    schedule.step(&mut latents, &[0.5], 0, &mut state).unwrap();
+
+    let pred_original = (1.4 - 0.8 * 0.5) / 0.6;
+    let expected = 0.8 * pred_original + 0.6 * 0.5;
+    assert!((latents.data[0] - expected).abs() < 1e-6);
 }
 
 #[test]

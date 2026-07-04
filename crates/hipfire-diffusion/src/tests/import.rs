@@ -858,6 +858,80 @@ fn imports_single_file_sdxl_safetensors_checkpoint_metadata() {
 }
 
 #[test]
+fn ldm_unet_native_tensor_name_maps_standard_sd_blocks() {
+    let cases = [
+        (
+            "input_blocks.0.0.weight",
+            Some("conv_in.weight".to_string()),
+        ),
+        (
+            "input_blocks.2.0.emb_layers.1.bias",
+            Some("down_blocks.0.resnets.1.time_emb_proj.bias".to_string()),
+        ),
+        (
+            "input_blocks.6.0.op.bias",
+            Some("down_blocks.1.downsamplers.0.conv.bias".to_string()),
+        ),
+        (
+            "middle_block.2.skip_connection.weight",
+            Some("mid_block.resnets.1.conv_shortcut.weight".to_string()),
+        ),
+        (
+            "output_blocks.4.0.out_layers.3.weight",
+            Some("up_blocks.1.resnets.1.conv2.weight".to_string()),
+        ),
+        (
+            "output_blocks.5.1.op.bias",
+            Some("up_blocks.1.upsamplers.0.conv.bias".to_string()),
+        ),
+        ("input_blocks.3.1.norm.weight", None),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(ldm_unet_native_tensor_name(input), expected, "{input}");
+    }
+}
+
+#[test]
+fn ldm_vae_native_tensor_name_maps_standard_sd_blocks() {
+    let cases = [
+        (
+            "encoder.down.0.block.1.norm1.weight",
+            Some("encoder.down_blocks.0.resnets.1.norm1.weight".to_string()),
+        ),
+        (
+            "encoder.down.2.downsample.conv.bias",
+            Some("encoder.down_blocks.2.downsamplers.0.conv.bias".to_string()),
+        ),
+        (
+            "encoder.mid.attn_1.proj_out.weight",
+            Some("encoder.mid_block.attentions.0.to_out.0.weight".to_string()),
+        ),
+        (
+            "decoder.mid.block_2.nin_shortcut.bias",
+            Some("decoder.mid_block.resnets.1.conv_shortcut.bias".to_string()),
+        ),
+        (
+            "decoder.up.3.block.0.conv2.weight",
+            Some("decoder.up_blocks.0.resnets.0.conv2.weight".to_string()),
+        ),
+        (
+            "decoder.up.1.upsample.conv.weight",
+            Some("decoder.up_blocks.2.upsamplers.0.conv.weight".to_string()),
+        ),
+        (
+            "decoder.norm_out.bias",
+            Some("decoder.conv_norm_out.bias".to_string()),
+        ),
+        ("decoder.up.4.block.0.norm1.weight", None),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(ldm_vae_native_tensor_name(input), expected, "{input}");
+    }
+}
+
+#[test]
 fn single_file_checkpoint_projection_loads_tiny_native_unet() {
     let dir = std::env::temp_dir().join(format!(
         "hipfire-diffusion-single-file-native-unet-test-{}",

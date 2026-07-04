@@ -389,6 +389,85 @@ fn wmma_linear_resident_matches_cpu_reference_to_f16_tolerance() {
 }
 
 #[test]
+fn quant_fidelity_report() {
+    let Ok(src_path) = std::env::var("HIPFIRE_QUANT_SRC") else {
+        return;
+    };
+    let Ok(cands) = std::env::var("HIPFIRE_QUANT_CANDS") else {
+        return;
+    };
+    let src = HfqFile::open(std::path::Path::new(&src_path)).unwrap();
+    let weight_names: Vec<String> = src
+        .tensors()
+        .iter()
+        .filter(|t| t.name.ends_with(".weight") && t.shape.len() >= 2)
+        .map(|t| t.name.clone())
+        .collect();
+
+    // Deterministic UNet input (matches the diffusers reference harness).
+    let sample = CpuTensor {
+        shape: vec![1, 4, 32, 32],
+        data: (0..4 * 32 * 32)
+            .map(|i| (0.1 * ((i % 97) as f32)).sin())
+            .collect(),
+    };
+    let enc = CpuTensor {
+        shape: vec![1, 77, 768],
+        data: (0..77 * 768)
+            .map(|i| (0.1 * ((i % 89) as f32)).cos())
+            .collect(),
+    };
+    let run_unet = |hfq: &HfqFile| -> Vec<f32> {
+        let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+        let config = StableDiffusionConfig::from_hfq(hfq, &metadata).unwrap();
+        let unet = NativeUnet2DConditionModel::from_hfq(hfq, &config.unet).unwrap();
+        unet.forward_with_runtime_options(
+            &sample,
+            &[999.0],
+            &enc,
+            DiffusionGenerationRuntimeOptions::cpu_reference(),
+        )
+        .unwrap()
+        .data
+    };
+    let src_eps = run_unet(&src);
+
+    for spec in cands.split(',') {
+        let (path, label) = spec.split_once('=').unwrap_or((spec, spec));
+        let cand = HfqFile::open(std::path::Path::new(path)).unwrap();
+        // (1) weight SQNR vs source, aggregated over all weight tensors.
+        let (mut sig, mut noise) = (0.0f64, 0.0f64);
+        for name in &weight_names {
+            let a = cpu_tensor_from_hfq(&src, name).unwrap().data;
+            let b = cpu_tensor_from_hfq(&cand, name).unwrap().data;
+            for (x, y) in a.iter().zip(b.iter()) {
+                sig += (*x as f64) * (*x as f64);
+                noise += ((*x - *y) as f64) * ((*x - *y) as f64);
+            }
+        }
+        let sqnr = if noise > 0.0 {
+            10.0 * (sig / noise).log10()
+        } else {
+            f64::INFINITY
+        };
+        // (2) single-pass eps functional error vs source.
+        let cand_eps = run_unet(&cand);
+        let (mut dot, mut na, mut nb, mut err) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (x, y) in src_eps.iter().zip(cand_eps.iter()) {
+            dot += (*x as f64) * (*y as f64);
+            na += (*x as f64) * (*x as f64);
+            nb += (*y as f64) * (*y as f64);
+            err += ((*x - *y) as f64) * ((*x - *y) as f64);
+        }
+        let corr = dot / (na.sqrt() * nb.sqrt());
+        let rel_l2 = (err / na).sqrt();
+        eprintln!(
+                "[quant-fidelity] {label:12}: weight_SQNR={sqnr:6.2} dB | eps_corr={corr:.5} eps_relL2={rel_l2:.4}"
+            );
+    }
+}
+
+#[test]
 fn oq4_w4a16_gpu_matches_cpu_reference_when_gpu_is_available() {
     // Phase 4a: validate the W4A16 quantized-compute chain on-device:
     // oq4g256 weight -> pack_oq4_arch_combined -> rotate_x_mq_batched(act)
@@ -621,6 +700,27 @@ fn q8f16_encoder_round_trips_through_decoder() {
             .unwrap();
         for (k, &orig) in group.iter().enumerate() {
             assert!((decoded[base + k] - orig).abs() <= step * 0.5 + 1e-4);
+        }
+    }
+}
+
+#[test]
+fn q4f16_g64_encoder_round_trips_through_decoder() {
+    let data: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) * 0.02).collect();
+    let bytes = encode_q4f16_g64(&data);
+    assert_eq!(bytes.len(), data.len().div_ceil(64) * 36);
+    let decoded = decode_q4f16_g64_slice("t", &bytes, data.len()).unwrap();
+    // 4-bit affine over each 64-group: error bounded by half a (range/15) step.
+    for group in data.chunks(64) {
+        let min = group.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let step = ((max - min) / 15.0).max(1e-6);
+        let base = data
+            .iter()
+            .position(|v| (*v - group[0]).abs() < 1e-12)
+            .unwrap();
+        for (k, &orig) in group.iter().enumerate() {
+            assert!((decoded[base + k] - orig).abs() <= step * 0.5 + 1e-2);
         }
     }
 }
