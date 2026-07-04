@@ -75,14 +75,28 @@
 >      has NO assert message and is in a RECURSIVE nested-loop lambda inside
 >      unrollForLoops, so it's the gemm's deeply-nested loop structure (not fifo
 >      depth) — config-fuzzing is low-odds. Upstream repro is the path.
->   7. **UPSTREAM ISSUE FILED: Xilinx/mlir-aie#3281.** Isolated the crash to one
->      pass with a CONCRETE assertion (not a bare segfault):
->      `aie-opt --aie-objectFifo-stateful-transform repro.mlir` →
->      `LockOp::getLockIDValue()` "Lock has no ID value" — the unroll of the fused
->      two-kernel design emits a LockOp with NO lock ID. Reproduces on mlir_aie
->      2026033104 (Mar) AND 886d932 (May); no fix through main d0988194 (Jul-02).
->      Repro gist gist.github.com/xynexus/8a09c8d22c0bcc9bf26be92af272ea66. When
->      fixed, the fused feed-win Oq4 kernel unblocks.
+>   7. **UPSTREAM ISSUE FILED + CORRECTED + MINIMIZED: Xilinx/mlir-aie#3281.**
+>      Genuine bug: `aie-objectFifo-stateful-transform`'s `unrollForLoops` aborts
+>      when it unrolls an `scf.for` nest containing an `aie.objectfifo.acquire` —
+>      it clones the acquire and fabricates a NEW `aie.lock` per copy that never
+>      gets an ID, so a later `getLockID().value()` aborts. CORRECTION: the first
+>      filing used single-pass `--aie-objectFifo-stateful-transform`, whose
+>      "Lock has no ID value" assert was actually the input-artifact of feeding
+>      ID-less INPUT locks. The REAL aiecc order assigns IDs first and STILL
+>      aborts — a MESSAGE-LESS abort (`-fno-exceptions` on the failed
+>      `optional::value`) in `unrollForLoops`: run
+>      `aie-opt --aie-assign-lock-ids --aie-objectFifo-stateful-transform`. So the
+>      pass creates the bad lock on WELL-FORMED input; the input is not malformed.
+>      REDUCED 2503 → **35 lines** (1 device / 1 objectfifo / 1 core / triple-nested
+>      acquire) via config-shrink (M=K=N=256, 1 col) + custom line-`ddmin`; no
+>      dialect-aware `mlir-reduce` exists in the toolchain (mlir_aie ships only
+>      `aie-opt`; ROCm `mlir-reduce` can't parse `aie.*`). KEY oracle fix: the flat
+>      ~90s/run was abort-backtrace SYMBOLIZATION over the ~GB `aie-opt` binary;
+>      `LLVM_DISABLE_SYMBOLIZATION=1` drops it to ~0.2s → `ddmin` viable.
+>      In-tree: `benchmarks/npu_gemm_tuning/repro/` (repro .mlir + faithful oracle +
+>      ddmin). Gist gist.github.com/xynexus/8a09c8d22c0bcc9bf26be92af272ea66 now the
+>      35-line file. Retitled + correction comment posted. When fixed, the fused
+>      feed-win Oq4 kernel unblocks.
 >   6. **.ll INSPECTED (iron/expand_int4_bf16.aie2p.ll):** the Oq4 dequant kernel
 >      (`aie_kernels/generic/expand.cc`, `aie::unpack` on a native `uint4` vector)
 >      lowers to NATIVE aie2p intrinsics, fully 32-lane vectorized:
