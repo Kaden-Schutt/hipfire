@@ -30,7 +30,23 @@ offline** (256-pt Hadamard along K); runtime FWHT-rotates the activation `x`
 B fed as int4 (half bytes across shim+mem DMA), unpacked to int8 in-core, stock
 int8 mmul, **no scale, no FWHT**. Run with `--verify false`; compare TOPS to the
 stock i8/i8 best (15.7). If int4-weight-feed lifts throughput on the feed-bound
-engine, the thesis holds. This is the one buildable next step.
+engine, the thesis holds.
+
+STATUS: **kernel done + verified** — `kernels/oq4_dequant_mm.cc` compiles clean to
+aie2p via Peano (int4 nibble-unpack via `downshift`/`interleave_zip`/`concat` →
+stock 2×2 `aie::mmul<8,8,8,int8>`; 23 vector insns). Remaining = wire an int4-B
+`whole_array` variant. The 4 edits that must move together (B is now K·N/2 bytes):
+1. `whole_array.py` B objectFIFO: `B_l2_ty`/`B_l1_ty` = `(k*n//2,) int8`; keep the
+   8×8 re-tile dims but on half the bytes.
+2. `whole_array.py` `external_func` matmul → `oq4_dequant_mm_i4_i8` (sig
+   `a:int8, b:int8[packed], c:int8`), `link_with` the oq4 `.o`.
+3. Runtime B `npu_dma_memcpy_nd` sizes/strides → half (int4 slab).
+4. **Host `test.cpp` B buffer** (framework-generated, assumes K·N int8) → allocate
+   K·N/2 and skip B verify. This is the real friction: the makefile-common host
+   is shared; needs a `test.cpp` override or a `b_bytes` knob. `--verify false`
+   sidesteps *correctness* but not the *allocation* size.
+Then build via a new design `.py` + kernel `.o` rule and run at `m128 k256 n128`,
+`--verify false`, TOPS vs 15.7.
 
 **P2 — correctness (W4A16-on-NPU).** Add the per-group f16 scale multiply and the
 activation 256-pt FWHT butterfly (once per K-group, shared across N). `--verify`
