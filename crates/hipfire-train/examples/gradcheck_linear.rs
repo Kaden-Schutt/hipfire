@@ -12,7 +12,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::ops::linear::{linear_backward_w, linear_backward_x, linear_forward};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 const M: usize = 4; // tokens
 const K: usize = 6; // in features

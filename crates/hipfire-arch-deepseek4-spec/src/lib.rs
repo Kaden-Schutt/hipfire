@@ -12,8 +12,8 @@
 //! deployment maps max importance to its highest-precision codec.
 
 use hipfire_arch_api::{
-    default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
-    Ingest, TensorRole,
+    default_importance, default_precision_class, default_requires, register_arch, transformer_role,
+    Arch, ArchId, CapReq, Ingest, PrecisionClass, TensorRole,
 };
 
 /// DeepSeek-V4 family header id.
@@ -24,6 +24,13 @@ pub struct Deepseek4Spec;
 
 impl Deepseek4Spec {
     /// MLA compressor / indexer projections — precision-critical stream generators.
+    ///
+    /// The antirez DS4 reference keeps these at source precision because compression measurably
+    /// regresses PPL on DeepSeek-V4: (1) attn compressor `wkv`+`wgate`, (2) indexer
+    /// `wq_b`+`weights_proj`, (3) indexer compressor `wkv`+`wgate` (matched by the same
+    /// `.compressor.wkv.weight` suffix). All small (≤32 MiB combined across 43 layers).
+    /// The router `.ffn.gate.weight` is deliberately NOT here — antirez ships it as a
+    /// 4-bit codec and the known-good quant matches; it takes the role default.
     fn is_critical_stream(name: &str) -> bool {
         name.ends_with(".compressor.wkv.weight")
             || name.ends_with(".compressor.wgate.weight")
@@ -55,6 +62,17 @@ impl Ingest for Deepseek4Spec {
     fn requires(&self, tensor: &str) -> CapReq {
         default_requires(self.role(tensor))
     }
+    fn precision_class(&self, tensor: &str) -> PrecisionClass {
+        // The MLA compressor/indexer streams are kept at source fidelity (the old
+        // `is_deepseek4_keep_f16`); everything else takes the role default. This is
+        // the model-definition the quantizer's deepseek source-precision path reads
+        // instead of a name-match — no format named here.
+        if Self::is_critical_stream(tensor) {
+            PrecisionClass::SourcePrecision
+        } else {
+            default_precision_class(self.role(tensor))
+        }
+    }
 }
 
 static DEEPSEEK4_SPEC: Deepseek4Spec = Deepseek4Spec;
@@ -77,6 +95,24 @@ mod tests {
         assert_eq!(
             ing.importance("model.layers.0.self_attn.compressor.wkv.weight"),
             255
+        );
+        // …and, in the finer model-def, sit at SourcePrecision — distinct from the
+        // rest of the importance-255 protected set (attention is only High). This is
+        // the split the coarse importance scalar could not express.
+        for t in [
+            ".compressor.wkv.weight",
+            ".compressor.wgate.weight",
+            ".indexer.wq_b.weight",
+            ".indexer.weights_proj.weight",
+        ] {
+            assert_eq!(
+                ing.precision_class(&format!("model.layers.0.self_attn{t}")),
+                PrecisionClass::SourcePrecision
+            );
+        }
+        assert!(
+            ing.precision_class("model.layers.0.self_attn.q_proj.weight")
+                < PrecisionClass::SourcePrecision
         );
     }
 }

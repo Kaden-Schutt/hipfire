@@ -10,7 +10,7 @@
 //!   hipfire lock acquire test_gated_norm_seq_gpu --watch-pid $$
 //!   cargo run -p hipfire-arch-nemotron --example test_gated_norm_seq_gpu
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())

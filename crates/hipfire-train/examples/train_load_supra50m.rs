@@ -11,7 +11,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::loader::load_llama_fp32;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 const MODEL_DIR: &str =

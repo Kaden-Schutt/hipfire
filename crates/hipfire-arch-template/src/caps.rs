@@ -26,9 +26,8 @@
 //! [`ToyModel`]: hipfire_arch_api::ToyModel
 
 use crate::arch::Template;
-use crate::template_model::{TemplateConfig, TemplateWeights};
-use hipfire_arch_api::{register_arch, Arch, ArchId, ToyModel};
-use std::path::Path;
+use crate::template_model::TemplateConfig;
+use hipfire_arch_api::{register_arch, Arch, ArchId, Init, TensorSpec, ToyFixture, ToyModel};
 
 /// Reserved template id — never shipped in a real `.hfq`. Kept as a named constant
 /// so the id lives in one place (mirrors `Architecture::arch_id() == 0xFF`). The
@@ -45,21 +44,25 @@ impl Arch for Template {
 }
 
 impl ToyModel for Template {
-    fn emit_fixture(&self, out_dir: &Path, seed: u64) -> Result<String, String> {
+    fn fixture(&self, _seed: u64) -> ToyFixture {
+        // Shape is seed-independent; the quantizer seeds the actual bytes. The
+        // template is a stub, so this is a minimal one-tensor manifest.
         let cfg = TemplateConfig {
             vocab_size: 256,
             dim: 8,
             layers: 1,
         };
-        let w = TemplateWeights::from_seed(&cfg, seed);
-        let stem = format!("template-{seed:016x}");
-        let path = out_dir.join(format!("{stem}.bin"));
-        let mut bytes = Vec::with_capacity(w.embeddings.len() * 4);
-        for v in &w.embeddings {
-            bytes.extend_from_slice(&v.to_le_bytes());
+        ToyFixture {
+            config_json: format!(
+                "{{\"vocab_size\":{},\"hidden_size\":{},\"num_hidden_layers\":{}}}",
+                cfg.vocab_size, cfg.dim, cfg.layers
+            ),
+            tensors: vec![TensorSpec::new(
+                "model.embed_tokens.weight",
+                vec![cfg.vocab_size, cfg.dim],
+                Init::Uniform(0.02),
+            )],
         }
-        std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-        Ok(stem)
     }
 }
 
@@ -83,9 +86,8 @@ mod tests {
 
         // Supported capability → Some → dispatch (the daemon's "do it" branch).
         let tm = a.caps.toy_model.expect("template declares ToyModel");
-        let dir = std::env::temp_dir();
-        let stem = tm.emit_fixture(&dir, 0xABCD).expect("fixture emit");
-        assert!(dir.join(format!("{stem}.bin")).exists());
+        let f = tm.fixture(0xABCD);
+        assert!(!f.tensors.is_empty() && !f.config_json.is_empty());
 
         // Unsupported capability → None → the daemon's safe fallback branch. This is
         // the whole point: the daemon can't call batched prefill on the template.

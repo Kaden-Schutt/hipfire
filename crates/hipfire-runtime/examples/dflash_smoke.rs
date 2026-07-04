@@ -66,7 +66,7 @@ fn main() {
         cfg.num_target_layers,
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
 
     let t0 = Instant::now();

@@ -17,7 +17,7 @@ use hipfire_runtime::arch::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// A loaded ZAYA1 model with GPU-resident weights and per-layer decode state
 /// (KV cache + conv ring + delayed value), so decode is O(1) per token.

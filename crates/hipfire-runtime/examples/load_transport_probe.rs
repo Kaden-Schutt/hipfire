@@ -22,7 +22,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weight_pager::{
     DirectH2DTransport, PinnedH2DTransport, PreadH2DTransport, Transport,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 #[cfg(not(unix))]
 use std::os::unix::fs::FileExt;

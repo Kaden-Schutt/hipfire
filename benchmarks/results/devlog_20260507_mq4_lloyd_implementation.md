@@ -59,7 +59,7 @@ Implemented in commit `7ef567d`:
 - `kernels/src/gemv_mq4g256_lloyd.hip`: chip-agnostic slow generic
   GEMV (16-way ternary lookup, 4-bit nibble unpack). 38 VGPR / 0 LDS /
   0 spills.
-- `DType::MQ4G256Lloyd` (qt=21) plumbed through rdna-compute dispatch
+- `DType::MQ4G256Lloyd` (qt=21) plumbed through hipfire-rdna dispatch
   + bytes accounting + Rust bindings; loaders in `hfq.rs` and
   `qwen35.rs`; basic `weight_gemv` / `weight_gemv_prerotated` /
   `fused_rmsnorm_rotate_for_mq` / `rotate_x_for_mq` arms.
@@ -139,7 +139,7 @@ expected to be higher (calibrated arch + GDDR6 vs LPDDR5x).
 
 ### Standalone parity tests
 
-`crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs` (K-sweep
+`crates/hipfire-rdna/examples/test_gemv_mq4g256_lloyd_tail.rs` (K-sweep
 on basic GEMV) and `test_mq4g256_lloyd_fused_parity.rs` (residual + 3
 fused variants at K=4096) both pass for slow and fast at max-abs
 ≤ 5e-3 fp32-reorder tolerance. Actual measurements: 5e-7 to 2e-6.
@@ -314,8 +314,8 @@ Diagnostic infrastructure (kept for future bisects):
   multi-acc body, exposed via `Gpu::gemv_mq4g256_lloyd_multiacc_diag`
 - `crates/hipfire-runtime/examples/diag_mq4_lloyd_multiacc.rs`
 - `crates/hipfire-runtime/examples/diag_mq3_lloyd_multiacc.rs`
-- `crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs`
-- `crates/rdna-compute/examples/test_mq4g256_lloyd_fused_parity.rs`
+- `crates/hipfire-rdna/examples/test_gemv_mq4g256_lloyd_tail.rs`
+- `crates/hipfire-rdna/examples/test_mq4g256_lloyd_fused_parity.rs`
 
 Findings docs:
 

@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Native diffusion HFQ metadata, import, and batched generation interfaces."
 
+[dev-dependencies]
+# Import tooling moved to the offline coexist crate (out of the server graph);
+# the import tests still live in this crate's tests.rs and call it. A dev-dep
+# cycle (coexist depends on this crate normally) is permitted by cargo.
+hipfire-diffusion-coexist = { path = "../hipfire-diffusion-coexist" }
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
@@ -18,5 +24,6 @@ hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 hipfire-quantize = { path = "../hipfire-quantize" }
 # Qwen2 byte-level BPE tokenizer (tokenizer.json) for the Krea2 Qwen3-VL encoder.
 hipfire-model = { path = "../hipfire-model" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 hip-bridge = { path = "../hip-bridge" }
+hipfire-cpu = { path = "../hipfire-cpu" }

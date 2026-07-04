@@ -31,7 +31,7 @@ use hipfire_runtime::arch::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 /// A loaded LFM2.5-MoE model with GPU-resident weights and per-decode state
 /// (KV cache + short-conv rolling state + logits), so decode is O(1) per token.

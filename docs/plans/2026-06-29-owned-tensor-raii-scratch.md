@@ -20,7 +20,7 @@ band-aid was ~+380 lines).
 
 ## Design: `OwnedTensor` (owning/view split + deferred, graph-gated reclaim)
 
-In `crates/rdna-compute/src/dispatch/mod.rs`. `GpuTensor` is unchanged (still the
+In `crates/hipfire-rdna/src/dispatch/mod.rs`. `GpuTensor` is unchanged (still the
 no-op-drop view / kernel-arg type).
 
 - `OwnedTensor` wraps a uniquely-owned pooled buffer + a clone of a per-`Gpu`

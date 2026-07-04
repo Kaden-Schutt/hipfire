@@ -28,7 +28,7 @@ use hipfire_runtime::arch::{
     Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
 };
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Zero-sized type marker for the dots.ocr arch.
 pub struct DotsOcr;

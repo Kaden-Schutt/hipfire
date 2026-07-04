@@ -1240,8 +1240,8 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
  "serde",
  "serde_json",
 ]
@@ -1260,9 +1260,9 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen2",
  "hipfire-model",
+ "hipfire-rdna",
  "hipfire-runtime",
  "image",
- "rdna-compute",
  "serde_json",
 ]
 
@@ -1280,9 +1280,9 @@ dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
  "hipfire-hneurons",
+ "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-steer",
- "rdna-compute",
  "serde_json",
 ]
 
@@ -1291,6 +1291,7 @@ name = "hipfire-arch-gemma3-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1302,9 +1303,9 @@ dependencies = [
  "hipfire-arch-gemma3",
  "hipfire-dispatch",
  "hipfire-media",
+ "hipfire-rdna",
  "hipfire-runtime",
  "image",
- "rdna-compute",
  "serde_json",
 ]
 
@@ -1321,8 +1322,8 @@ version = "0.1.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
  "serde",
  "serde_json",
 ]
@@ -1340,8 +1341,8 @@ version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
  "hipfire-arch-llama-spec",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
 ]
 
 [[package]]
@@ -1349,6 +1350,7 @@ name = "hipfire-arch-llama-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1357,8 +1359,8 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
  "serde",
  "serde_json",
 ]
@@ -1368,6 +1370,7 @@ name = "hipfire-arch-minimax-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1380,8 +1383,8 @@ dependencies = [
  "hipfire-mixer",
  "hipfire-model",
  "hipfire-primitives",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
  "serde",
  "serde_json",
 ]
@@ -1391,6 +1394,7 @@ name = "hipfire-arch-nemotron-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1399,8 +1403,8 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
  "serde_json",
 ]
 
@@ -1409,6 +1413,7 @@ name = "hipfire-arch-qwen2-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1422,11 +1427,11 @@ dependencies = [
  "hipfire-model",
  "hipfire-npu",
  "hipfire-primitives",
+ "hipfire-rdna",
  "hipfire-rocm",
  "hipfire-runtime",
  "libc",
  "libloading",
- "rdna-compute",
  "serde",
  "serde_json",
 ]
@@ -1436,6 +1441,7 @@ name = "hipfire-arch-qwen35-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1443,9 +1449,9 @@ name = "hipfire-arch-qwen35-vl"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-rdna",
  "hipfire-runtime",
  "image",
- "rdna-compute",
  "serde",
  "serde_json",
 ]
@@ -1474,8 +1480,8 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-api",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
 ]
 
 [[package]]
@@ -1494,8 +1500,8 @@ dependencies = [
  "hipfire-mixer",
  "hipfire-model",
  "hipfire-primitives",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
  "serde",
  "serde_json",
 ]
@@ -1547,6 +1553,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-detect",
  "hipfire-diffusion",
+ "hipfire-diffusion-coexist",
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",
@@ -1602,6 +1609,8 @@ name = "hipfire-cpu"
 version = "0.3.0"
 dependencies = [
  "hipfire-primitives",
+ "rayon",
+ "serde",
  "serde_json",
 ]
 
@@ -1631,12 +1640,12 @@ dependencies = [
  "hipfire-model",
  "hipfire-npu",
  "hipfire-prompt",
+ "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-serving-core",
  "hipfire-state",
  "hipfire-steer",
  "hipfire-train",
- "rdna-compute",
  "serde_json",
  "tracing",
 ]
@@ -1688,15 +1697,27 @@ dependencies = [
  "anyhow",
  "base64",
  "hip-bridge",
+ "hipfire-cpu",
+ "hipfire-diffusion-coexist",
  "hipfire-model",
  "hipfire-primitives",
  "hipfire-quantize",
+ "hipfire-rdna",
  "hipfire-runtime",
  "image",
  "rayon",
- "rdna-compute",
  "regex",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-diffusion-coexist"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "hipfire-diffusion",
+ "hipfire-runtime",
  "serde_json",
 ]
 
@@ -1705,7 +1726,7 @@ name = "hipfire-dispatch"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
- "rdna-compute",
+ "hipfire-rdna",
 ]
 
 [[package]]
@@ -1713,8 +1734,8 @@ name = "hipfire-dispatch-tests"
 version = "0.3.0"
 dependencies = [
  "hipfire-dispatch",
+ "hipfire-rdna",
  "hipfire-runtime",
- "rdna-compute",
 ]
 
 [[package]]
@@ -1771,6 +1792,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-gpu-types"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+]
+
+[[package]]
 name = "hipfire-hash"
 version = "0.3.0"
 
@@ -1779,7 +1807,7 @@ name = "hipfire-hneurons"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
- "rdna-compute",
+ "hipfire-rdna",
  "serde",
  "serde_json",
 ]
@@ -1835,6 +1863,7 @@ name = "hipfire-model"
 version = "0.3.0"
 dependencies = [
  "byteorder",
+ "hipfire-arch-api",
  "hipfire-config",
  "hipfire-hash",
  "hipfire-prompt",
@@ -1895,13 +1924,23 @@ dependencies = [
  "hipfire-model",
  "hipfire-primitives",
  "hipfire-quant-format",
+ "hipfire-rdna",
  "memmap2",
  "rayon",
- "rdna-compute",
  "serde",
  "serde_json",
  "tempfile",
  "twox-hash",
+]
+
+[[package]]
+name = "hipfire-rdna"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-gpu-types",
+ "hipfire-kvquant",
+ "hipfire-primitives",
 ]
 
 [[package]]
@@ -1930,6 +1969,7 @@ dependencies = [
  "hipfire-arch-zaya",
  "hipfire-atlas",
  "hipfire-coherence",
+ "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-evidence",
@@ -1942,6 +1982,7 @@ dependencies = [
  "hipfire-primitives",
  "hipfire-prompt",
  "hipfire-quant-format",
+ "hipfire-rdna",
  "hipfire-state",
  "hipfire-sysinfo",
  "libc",
@@ -1949,7 +1990,6 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "rayon",
- "rdna-compute",
  "serde",
  "serde_json",
  "tracing",
@@ -2028,12 +2068,61 @@ dependencies = [
  "hipfire-model",
  "hipfire-npu",
  "hipfire-prompt",
+ "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-state",
  "hipfire-vision-cache",
- "rdna-compute",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "hipfire-specdecode"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+]
+
+[[package]]
+name = "hipfire-specdecode-ddtree"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
+]
+
+[[package]]
+name = "hipfire-specdecode-dflash"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
+]
+
+[[package]]
+name = "hipfire-specdecode-dspark"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
+]
+
+[[package]]
+name = "hipfire-specdecode-mtp"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "hipfire-specdecode",
 ]
 
 [[package]]
@@ -2050,7 +2139,7 @@ name = "hipfire-steer"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
- "rdna-compute",
+ "hipfire-rdna",
  "serde",
  "serde_json",
 ]
@@ -2092,10 +2181,10 @@ dependencies = [
  "hipfire-kvquant",
  "hipfire-model",
  "hipfire-primitives",
+ "hipfire-rdna",
  "hipfire-runtime",
  "ratatui",
  "rayon",
- "rdna-compute",
  "serde_json",
 ]
 
@@ -3297,15 +3386,6 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
-]
-
-[[package]]
-name = "rdna-compute"
-version = "0.3.0"
-dependencies = [
- "hip-bridge",
- "hipfire-kvquant",
- "hipfire-primitives",
 ]
 
 [[package]]

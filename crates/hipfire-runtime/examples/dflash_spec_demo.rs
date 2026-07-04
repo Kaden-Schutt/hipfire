@@ -78,7 +78,7 @@ fn main() {
     impl CaskPolicy {
         fn maybe_evict(
             &self,
-            gpu: &mut rdna_compute::Gpu,
+            gpu: &mut hipfire_rdna::Gpu,
             kv: &mut KvCache,
             physical: usize,
         ) -> hip_bridge::HipResult<Option<EvictionResult>> {
@@ -322,7 +322,7 @@ fn main() {
     fn write_profile_evidence(
         dir: &Path,
         row_label: &str,
-        entries: &[rdna_compute::profile::ProfileEntry],
+        entries: &[hipfire_rdna::profile::ProfileEntry],
         profile_cycle_count: usize,
     ) -> std::io::Result<()> {
         use serde_json::json;
@@ -842,7 +842,7 @@ fn main() {
     }
 
     // ── Init GPU ──────────────────────────────────────────────────────
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
     let vram_report = |hip: &hip_bridge::HipRuntime, label: &str| {
         if let Ok((free, total)) = hip.get_vram_info() {
@@ -1843,7 +1843,7 @@ fn main() {
             if do_profile && stats.cycles == 1 && !profile_armed {
                 // First cycle was the JIT warm-up. Arm profiling now and drain
                 // after `profile_cycles_target` more cycles.
-                rdna_compute::profile::start();
+                hipfire_rdna::profile::start();
                 profile_armed = true;
             }
             if do_profile
@@ -1852,7 +1852,7 @@ fn main() {
                 && profile_cycle_count == 0
             {
                 profile_cycle_count = stats.cycles - 1;
-                if let Some(entries) = rdna_compute::profile::stop() {
+                if let Some(entries) = hipfire_rdna::profile::stop() {
                     if let Some(dir) = evidence_dir.as_deref() {
                         if let Err(err) = write_profile_evidence(
                             Path::new(dir),

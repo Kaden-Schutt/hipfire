@@ -13,7 +13,9 @@
 //! later against KLD). Anything the deployment cannot otherwise place falls back to
 //! a safe high-precision (bf16) codec, keeping the model coherent in the meantime.
 
-use hipfire_arch_api::{register_arch, Arch, ArchId, CapReq, Ingest, TensorRole};
+use hipfire_arch_api::{
+    register_arch, Arch, ArchId, CapReq, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
+};
 
 /// Llama family header id.
 pub const LLAMA_ARCH_ID: ArchId = ArchId(0);
@@ -79,8 +81,104 @@ impl Ingest for LlamaSpec {
     }
 }
 
+impl ToyModel for LlamaSpec {
+    // Tiny random-init gating fixture, declared arch-side. Ported verbatim from the
+    // quantizer's old `emit_fixture` match arm so the emitted bytes stay identical
+    // (the tiny-quant golden baselines depend on them). The quantizer owns the seeded
+    // RNG + safetensors/tokenizer writing; this only describes shape + config.
+    fn fixture(&self, _seed: u64) -> ToyFixture {
+        let (h, inter, vocab, layers, n_heads, n_kv_heads, head_dim) = (
+            256usize, 512usize, 4096usize, 2usize, 2usize, 1usize, 128usize,
+        );
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": h,
+            "intermediate_size": inter,
+            "vocab_size": vocab,
+            "num_hidden_layers": layers,
+            "num_attention_heads": n_heads,
+            "num_key_value_heads": n_kv_heads,
+            "head_dim": head_dim,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 500_000.0,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": false,
+            "dtype": "bfloat16",
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        });
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let mut tensors = vec![
+            // Untied: embed + separate lm_head.
+            TensorSpec::new(
+                "model.embed_tokens.weight",
+                vec![vocab, h],
+                Init::Uniform(0.05),
+            ),
+            TensorSpec::f16("model.norm.weight", vec![h], Init::NormOnes),
+            TensorSpec::new("lm_head.weight", vec![vocab, h], Init::Uniform(0.05)),
+        ];
+        for i in 0..layers {
+            let p = format!("model.layers.{i}");
+            let sa = format!("{p}.self_attn");
+            tensors.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            // No bias, no q_norm/k_norm — the LLaMA loader rejects bias tensors.
+            tensors.push(TensorSpec::new(
+                format!("{sa}.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            tensors.push(TensorSpec::new(
+                format!("{sa}.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            tensors.push(TensorSpec::new(
+                format!("{sa}.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            tensors.push(TensorSpec::new(
+                format!("{sa}.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            tensors.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            tensors.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![inter, h],
+                Init::Uniform(0.05),
+            ));
+            tensors.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![inter, h],
+                Init::Uniform(0.05),
+            ));
+            tensors.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, inter],
+                Init::Uniform(0.05),
+            ));
+        }
+        ToyFixture {
+            config_json: serde_json::to_string_pretty(&config).expect("serialize llama toy config"),
+            tensors,
+        }
+    }
+}
+
 static LLAMA_SPEC: LlamaSpec = LlamaSpec;
-register_arch!(LLAMA_SPEC, Ingest);
+register_arch!(LLAMA_SPEC, Ingest, ToyModel);
 
 #[cfg(test)]
 mod tests {
@@ -104,7 +202,35 @@ mod tests {
             ing.importance("model.embed_tokens.weight")
                 > ing.importance("model.layers.0.mlp.up_proj.weight")
         );
-        // The lean spec crate on its own carries no serving capability.
+        // The lean spec crate on its own carries no serving capability…
         assert!(a.caps.batched_prefill.is_none());
+        // …but it does now declare the offline ToyModel fixture.
+        assert!(a.caps.toy_model.is_some());
+    }
+
+    #[test]
+    fn toy_fixture_is_bias_free_and_tiny() {
+        // Moved from the quantizer's fixture.rs, now co-located with the manifest.
+        let f = LlamaSpec.fixture(0);
+        let has = |suf: &str| f.tensors.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("lm_head.weight"), "untied lm_head");
+        assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
+        // The LLaMA loader rejects bias + qk-norm tensors — must emit none.
+        assert!(
+            !f.tensors.iter().any(|s| s.name.ends_with(".bias")),
+            "no biases"
+        );
+        assert!(!f
+            .tensors
+            .iter()
+            .any(|s| s.name.contains("q_norm") || s.name.contains("k_norm")));
+        let n_params: usize = f
+            .tensors
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum();
+        assert!(n_params < 10_000_000, "llama fixture must stay <10M params");
+        // config is valid JSON declaring the llama family.
+        assert!(f.config_json.contains("\"model_type\": \"llama\""));
     }
 }

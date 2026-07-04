@@ -7,7 +7,7 @@ reducing bytes/weight actually speed up decode on this UMA part.
 
 Reproduce:
 - `cargo run -p hipfire-quantize --example quant_explore` (CPU, SQNR sweep)
-- `cargo run --release -p rdna-compute --example bench_gemv_dtype_bw` (GPU)
+- `cargo run --release -p hipfire-rdna --example bench_gemv_dtype_bw` (GPU)
 
 ## Platform first principles
 
@@ -167,7 +167,7 @@ recipe **SmoothQuant → rotation → clip-search int4, A=g32**. Reproduce:
 
 ## E5 — End-to-end on-GPU validation of the W4A4 recipe
 
-`validate_w4a4_recipe` (rdna-compute example) runs the full recipe through the
+`validate_w4a4_recipe` (hipfire-rdna example) runs the full recipe through the
 real fused iu4 kernel on gfx1103: SmoothQuant → FWHT-256 → clip-search int4
 (g128), then per-K-group fused `gemm_iu4_i32_wmma` with per-group scale rescale
 accumulated in f32. It checks GPU output against both the f32 reference (SQNR)
@@ -184,7 +184,7 @@ The fused-iu4 path realizes the recipe exactly (GPU == CPU sim) and the ~21 dB
 W4A4 quality holds on real hardware — vs ~9 dB for naive W4A4. Grouped scales
 are handled by K-tiling (one fused iu4 GEMM per K-group); a production kernel
 would fold the per-group rescale into the epilogue instead of per-group launches.
-Reproduce: `cargo run --release -p rdna-compute --example validate_w4a4_recipe`.
+Reproduce: `cargo run --release -p hipfire-rdna --example validate_w4a4_recipe`.
 
 ## E6 — Two named formats: Opus Quant and MQ+
 

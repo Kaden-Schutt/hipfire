@@ -5,7 +5,7 @@
 //! fp32 base) carries no grad; a trainable parameter (LoRA `A`/`B`) and every
 //! activation that sits on a path to a trainable param carries `.grad`.
 
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 pub struct TrainTensor {
     /// Forward value, fp32, row-major, logical shape in `value.shape`.

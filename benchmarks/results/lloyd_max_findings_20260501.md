@@ -55,7 +55,7 @@ informational, not shippable.
 | Lloyd-Max algorithms | `crates/hipfire-quantize/src/main.rs` | +200 (MQ2 + MQ3 + parallel) |
 | Storage formats | qt=19 (MQ2-Lloyd, 72 B/group), qt=20 (MQ3-Lloyd, 112 B/group) | — |
 | GEMV kernels | `kernels/src/gemv_mq{2,3}g256_lloyd.hip` | +120 |
-| DType + dispatch | `crates/rdna-compute/src/dispatch.rs` | +50 |
+| DType + dispatch | `crates/hipfire-rdna/src/dispatch.rs` | +50 |
 | Engine wiring | `crates/engine/src/{hfq,llama,qwen35}.rs` | +60 |
 | Perplexity harness | `crates/engine/examples/perplexity.rs` | +120 |
 | Research-only guards | `--allow-mq2-lloyd`, `--allow-mq3-lloyd` env+flag | +30 |

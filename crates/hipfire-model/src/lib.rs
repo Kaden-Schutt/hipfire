@@ -146,20 +146,15 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
             .is_some()
 }
 
-pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
-pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
-pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
-pub const ARCH_ID_QWEN35_MOE: u32 = 6;
-pub const ARCH_ID_QWEN2: u32 = 7;
-pub const ARCH_ID_DOTS_OCR: u32 = 8;
-pub const ARCH_ID_DEEPSEEK4_FLASH: u32 = 9;
-pub const ARCH_ID_MINIMAX_M2: u32 = 10;
-pub const ARCH_ID_LFM2_MOE: u32 = 11;
-pub const ARCH_ID_GEMMA3_TEXT: u32 = 12;
-pub const ARCH_ID_GEMMA3_VL: u32 = 13;
-pub const ARCH_ID_NEMOTRON_H: u32 = 14;
-pub const ARCH_ID_MAMBA2: u32 = 15;
-pub const ARCH_ID_ZAYA: u32 = 16;
+// Canonical arch-family ids now live in the capability layer (`hipfire-arch-api`).
+// Re-exported here so existing `hipfire_model::ARCH_ID_*` callers are unchanged.
+// See `docs/architecture-ids.md` for the id table and where the constants live.
+pub use hipfire_arch_api::{
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
+    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
+    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+};
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
 pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
@@ -231,6 +226,21 @@ pub fn is_qwen35_family_arch_id(arch_id: u32) -> bool {
         model_arch_family(arch_id),
         ModelArchFamily::Qwen35Dense | ModelArchFamily::Qwen35Moe
     )
+}
+
+/// Resolve an `arch_id` *string* to its canonical [`ModelArchFamily`].
+///
+/// The production form is the numeric arch_id stringified from the HFQ header
+/// (`hfq.arch_id: u32`), so this parses that and defers to [`model_arch_family`]
+/// — the single source of truth. Non-numeric strings (legacy names) return
+/// [`ModelArchFamily::Unknown`]; callers that still accept names should apply
+/// their own fallback. Lets control-plane crates (e.g. the scheduler) classify
+/// arch families through the canonical table instead of magic arch_id literals.
+pub fn model_arch_family_from_str(arch_id: &str) -> ModelArchFamily {
+    match arch_id.trim().parse::<u32>() {
+        Ok(id) => model_arch_family(id),
+        Err(_) => ModelArchFamily::Unknown,
+    }
 }
 
 pub fn normalize_feature_flags(flags: &[String]) -> Vec<String> {
@@ -2461,6 +2471,37 @@ mod tests {
             );
         }
         assert_eq!(model_arch_family(999), ModelArchFamily::Unknown);
+    }
+
+    #[test]
+    fn model_arch_family_from_str_resolves_numeric_arch_ids() {
+        // Production form: the numeric arch_id stringified from the HFQ header.
+        assert_eq!(
+            model_arch_family_from_str("5"),
+            ModelArchFamily::Qwen35Dense
+        );
+        assert_eq!(model_arch_family_from_str("6"), ModelArchFamily::Qwen35Moe);
+        assert_eq!(model_arch_family_from_str("10"), ModelArchFamily::MiniMaxM2);
+        assert_eq!(model_arch_family_from_str("11"), ModelArchFamily::Lfm2Moe);
+        assert_eq!(model_arch_family_from_str("14"), ModelArchFamily::NemotronH);
+        assert_eq!(
+            model_arch_family_from_str(" 6 "),
+            ModelArchFamily::Qwen35Moe
+        );
+        // Every canonical numeric arch_id round-trips through the string form.
+        for &(arch_id, label) in KNOWN_RUNTIME_ARCH_IDS {
+            assert_eq!(
+                model_arch_family_from_str(&arch_id.to_string()),
+                model_arch_family(arch_id),
+                "{label}({arch_id}) string form must match the numeric table"
+            );
+        }
+        // Non-numeric legacy names are not resolved here (callers fall back).
+        assert_eq!(
+            model_arch_family_from_str("nemotron3"),
+            ModelArchFamily::Unknown
+        );
+        assert_eq!(model_arch_family_from_str(""), ModelArchFamily::Unknown);
     }
 
     #[test]

@@ -43,7 +43,7 @@ use std::fs::File;
 use std::path::Path;
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::hfq::HfqFile;
 use crate::hfq_modules::{HfqModuleKind, HfqModuleRecord};
@@ -479,7 +479,7 @@ impl Transport for PreadH2DTransport {
                 &format!("pread {} bytes at offset {}: {}", len, hfq_offset, e),
             )
         })?;
-        // 2. GPU: alloc + memcpy_htod via the existing rdna-compute helper.
+        // 2. GPU: alloc + memcpy_htod via the existing hipfire-rdna helper.
         //    `dtype: Raw` because the pager doesn't care about element layout
         //    — that interpretation belongs to `WeightTensor` at the call site.
         let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
@@ -697,7 +697,7 @@ struct Resident {
     /// callers reinterpret the bytes via their own `WeightTensor` wrapper at
     /// access time. Storing as `GpuTensor` (rather than the lower-level
     /// `DeviceBuffer`) keeps the pager idiomatic with the rest of the
-    /// rdna-compute API and lets us free via `gpu.free_tensor`.
+    /// hipfire-rdna API and lets us free via `gpu.free_tensor`.
     tensor: GpuTensor,
     /// Cached byte length so eviction can update `vram_used_bytes` cheaply.
     bytes: u64,
@@ -1097,7 +1097,7 @@ impl WeightPager {
     /// the residency map and let the caller violate the cap anyway).
     ///
     /// Frees evicted tensors via `gpu.free_tensor` — the underlying VRAM
-    /// returns to the rdna-compute allocator pool, available for the next
+    /// returns to the hipfire-rdna allocator pool, available for the next
     /// `transport.fetch`.
     pub fn evict_lru_until(
         &mut self,

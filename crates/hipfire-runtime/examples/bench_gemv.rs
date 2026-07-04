@@ -5,7 +5,7 @@
 //! Benchmark Q4K GEMV at various sizes matching real inference workloads.
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     let sizes: Vec<(usize, usize, &str)> = vec![
         (2048, 2048, "attn_q (TinyLlama)"),
@@ -40,7 +40,7 @@ fn main() {
         let d_raw = gpu.upload_raw(&fake_data, &[total_bytes]).unwrap();
         let x_data: Vec<f32> = vec![0.01; k];
         let d_x = gpu.upload_f32(&x_data, &[k]).unwrap();
-        let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+        let d_y = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
         // Warmup
         gpu.gemv_q4k(&d_raw, &d_x, &d_y, m, k).unwrap();
@@ -63,7 +63,7 @@ fn main() {
         // Benchmark F32
         let a_f32 = vec![0.01f32; m * k];
         let d_a = gpu.upload_f32(&a_f32, &[m, k]).unwrap();
-        let d_y2 = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+        let d_y2 = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
         gpu.gemv_f32(&d_a, &d_x, &d_y2).unwrap(); // warmup
         gpu.hip.event_record(&start, None).unwrap();
         for _ in 0..n {

@@ -796,8 +796,12 @@ fn finalize_hfq_diffusion_response(
     }
     if sdapi_should_save_grid(&body, sample_count) {
         if let Some(image) = grid_image.as_ref() {
-            match save_sdapi_images_with_kind(output_root, mode, "grid", std::slice::from_ref(image))
-            {
+            match save_sdapi_images_with_kind(
+                output_root,
+                mode,
+                "grid",
+                std::slice::from_ref(image),
+            ) {
                 Ok(paths) => {
                     grid_images_saved = !paths.is_empty();
                     saved_paths.extend(paths);
@@ -6601,8 +6605,8 @@ mod tests {
         // Pre-plant root/txt2img as a symlink pointing outside the root.
         std::os::unix::fs::symlink(&outside, root.join("txt2img")).unwrap();
 
-        let png = base64::engine::general_purpose::STANDARD
-            .encode(b"\x89PNG\r\n\x1a\nnot-really-a-png");
+        let png =
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nnot-really-a-png");
         let result = save_sdapi_images_with_kind(&root, "txt2img", "sample", &[png]);
         assert!(result.is_err(), "symlinked output dir must be refused");
         assert!(

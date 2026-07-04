@@ -204,7 +204,7 @@ fallback would show ~30-50 tok/s at this prompt length).
 ## What this does NOT validate
 
 - **gfx12 (RDNA4) sibling kernels.** No RDNA4 hardware on the bench
-  host. The gfx12 selector arms in `crates/rdna-compute/src/kernels.rs`
+  host. The gfx12 selector arms in `crates/hipfire-rdna/src/kernels.rs`
   and the kernel sources `*.gfx12.hip` are code-complete-but-runtime-
   unvalidated as flagged in B1. **As of the post-review hardening
   commit, Lloyd-MQ3 on gfx12 ships behind an opt-in env gate

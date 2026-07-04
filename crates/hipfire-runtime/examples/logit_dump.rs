@@ -37,7 +37,7 @@ fn main() {
     );
     eprintln!("Prompt: {} tokens", prompt_tokens.len());
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
 

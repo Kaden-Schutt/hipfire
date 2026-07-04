@@ -5,7 +5,7 @@
 //! bias corrections, and applies `Gpu::adamw_step`. Matches `sft.py`'s
 //! AdamW(β1=0.9, β2=0.999, eps=1e-8, wd=0). `set_lr` supports a schedule.
 
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 pub struct AdamW {
     pub lr: f32,

@@ -18,7 +18,7 @@ use hipfire_steer::{
     apply_direction, begin_apply, begin_capture, clear, commit_capture, derive_directions,
     finish_capture, maybe_steer_block, CaptureMeans, SteerMode, SteerSpec,
 };
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 const NUM_LAYERS: usize = 4;
 // Non-power-of-two and > 256 so the gemv tree reduction exercises both the

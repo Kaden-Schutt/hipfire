@@ -221,7 +221,7 @@ impl KvAdaptive {
     /// compare returning an empty Vec. Returns the steps applied this call.
     pub fn maybe_downshift(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         kv: &mut KvCache,
         seq_pos: usize,
     ) -> hip_bridge::HipResult<Vec<Step>> {

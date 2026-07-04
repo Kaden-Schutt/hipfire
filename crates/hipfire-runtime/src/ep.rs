@@ -39,7 +39,7 @@ use hipfire_dispatch::pipeline::superop::{
     dispatch_super_op, ForwardBindings, LayerProgram, SuperOpKind,
 };
 use hipfire_dispatch::types::DispatchError;
-use rdna_compute::GpuTensor;
+use hipfire_rdna::GpuTensor;
 
 fn hip_err(e: HipError) -> DispatchError {
     DispatchError::Hip(e.to_string())

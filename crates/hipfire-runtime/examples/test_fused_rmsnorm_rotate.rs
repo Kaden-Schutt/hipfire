@@ -5,8 +5,8 @@
 //! Correctness check: fused_rmsnorm_rotate vs sequential rmsnorm + rotate.
 
 fn main() {
-    use rdna_compute::DType;
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    use hipfire_rdna::DType;
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     for &k in &[4096usize, 12288] {
         eprintln!("\n=== K = {k} ===");

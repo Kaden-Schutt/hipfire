@@ -38,7 +38,7 @@
 
 use crate::kv::KvCache;
 use crate::llama::LlamaWeights;
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 pub use crate::dispatch::is_batchable_la;
 
@@ -167,7 +167,7 @@ fn quant_repr_dtype(quant: &str) -> Option<DType> {
 /// Whether a quant token's batched-prefill weight GEMM exists on GPU arch `gfx`
 /// (a concrete `gfx*` id, e.g. `"gfx1151"`), GPU-free — the gen-time entry point
 /// for deriving the model-support prefill matrix from the runtime predicates
-/// without the caller depending on `rdna_compute::DType`.
+/// without the caller depending on `hipfire_rdna::DType`.
 ///
 /// Returns `None` for quant tokens whose prefill availability is a quality-gate
 /// decision rather than a kernel predicate (the OQ activation-quant formats); the
@@ -183,7 +183,7 @@ pub fn quant_prefill_batchable(quant: &str, gfx: &str) -> Option<bool> {
 
 /// Whether the dflash / DDTree speculative-decode path is available on GPU arch
 /// `gfx` (a concrete `gfx*` id), GPU-free. dflash requires WMMA matrix units;
-/// [`rdna_compute::arch_caps::gfx_has_wmma`] is the single source of truth (the
+/// [`hipfire_rdna::arch_caps::gfx_has_wmma`] is the single source of truth (the
 /// same predicate behind the runtime's `arch_caps.has_wmma()` gate), so the
 /// model-support matrix's dflash gfx axis can't drift from the runtime.
 ///
@@ -191,5 +191,5 @@ pub fn quant_prefill_batchable(quant: &str, gfx: &str) -> Option<bool> {
 /// half (whether the arch has a draft head / spec path at all) stays in the TOML
 /// `[[arch]].dflash` intent.
 pub fn dflash_gfx_supported(gfx: &str) -> bool {
-    rdna_compute::arch_caps::gfx_has_wmma(gfx)
+    hipfire_rdna::arch_caps::gfx_has_wmma(gfx)
 }

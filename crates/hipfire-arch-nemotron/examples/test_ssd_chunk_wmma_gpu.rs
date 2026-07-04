@@ -14,7 +14,7 @@
 //!   cargo run -p hipfire-arch-nemotron --example test_ssd_chunk_wmma_gpu
 
 use hipfire_arch_nemotron::ssd::{ssd_sequence, SsdParams};
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f64;

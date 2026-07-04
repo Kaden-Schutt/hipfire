@@ -19,7 +19,7 @@
 use crate::weight::LinearWeight;
 use crate::AttnConfig;
 use hip_bridge::{DeviceBuffer, HipResult};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// CPU reference: causal GQA attention (NoPE) for one query against the full
 /// `[seq_len]` k/v history. `q` is `[n_heads*head_dim]`, `k_hist`/`v_hist` are

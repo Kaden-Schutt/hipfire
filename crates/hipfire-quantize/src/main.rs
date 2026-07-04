@@ -40,9 +40,7 @@
 // `crate::…` / `super::…` (test modules) references keep resolving unchanged.
 #[allow(unused_imports)]
 use codecs::*;
-pub use hipfire_quantize::{
-    codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant,
-};
+pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, qtip, roughquant};
 // HFQ writer + provenance/metadata machinery now lives in the library so the
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
@@ -56,14 +54,20 @@ use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
 // The GGUF parser/dequant now lives in its own dedicated offline crate
 // (hipfire-gguf) — off the inference dependency surface. Alias keeps the
 // import pipeline's `gguf_input::` references source-compatible.
+use hipfire_arch_api::{
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
+    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY,
+    ARCH_ID_ZAYA,
+};
 use hipfire_gguf as gguf_input;
 // Quant-format/K-map planning + the GGUF import pipeline now live in the
 // library (so hipfire-coexistence can drive the import). Re-imported here for
 // the native safetensors path + the deprecation shim.
 use hipfire_quantize::gguf_import::{is_gguf_input, parse_arch_id_override};
-use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
 #[cfg(test)]
 use hipfire_quantize::quant_plan::{is_positional_promote, kmap_resolve, parse_layer_idx};
+use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
 // Clip-search toggle now lives in the library too.
 pub use hipfire_quantize::{mq_clipsearch_enabled, set_mq_clipsearch};
 // KVarN codec + deferred KV-compaction live in the leaf `hipfire-kvquant`
@@ -341,7 +345,6 @@ impl SafetensorsFile {
 }
 
 // ─── FP16/BF16 Conversion ───────────────────────────────────────────────────
-
 
 // ─── FP8 E4M3 + UE8M0-scale dequant (DeepSeek V4 Flash) ─────────────────────
 //
@@ -2226,20 +2229,6 @@ fn dequantize_mq2g256_lloyd_to_f32(
 // `t.quant_type as u8` byte emission keep working unchanged.
 pub use hipfire_quant_format::QuantType;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn insert_quant_format_metadata(metadata: &mut serde_json::Value, format: &str) {
     if let serde_json::Value::Object(ref mut map) = metadata {
         map.insert("quant_format".to_string(), serde_json::json!(format));
@@ -2426,27 +2415,12 @@ impl HfqInputFile {
 
 // ─── XXH64 provenance hashing ───────────────────────────────────────────────
 
-
-
 #[cfg(test)]
 fn xxh64_hex(bytes: &[u8]) -> String {
     let mut h = Xxh64::new(0);
     h.update(bytes);
     format!("{:016x}", h.digest())
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
@@ -2468,7 +2442,6 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     let _ = spill.flush();
 }
-
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
@@ -2522,49 +2495,10 @@ fn should_quantize(name: &str) -> bool {
     name.contains("weight")
 }
 
-/// antirez ds4 reference keeps three classes at F16 because Q8 measurably
-/// regresses PPL on DeepSeek V4: (1) attn compressor wkv + wgate, (2) indexer wq_b +
-/// weights_proj, (3) indexer compressor wkv + wgate. All small (≤32 MiB
-/// combined across 43 layers).
-///
-/// Router gate.weight (.ffn.gate.weight) is NOT kept at F16: antirez
-/// actually ships it as MQ4G256, and the known-good DeepSeek V4 quant
-/// matches. Falling back to the format's default (Q8F16 in deepseek4-q8-mtp)
-/// is fine — the router is dispatched via `gemv_auto`.
-///
-/// `attn.indexer.compressor.*` is a substring of `attn.compressor.*` only
-/// in the literal-prefix sense, so order doesn't matter — the substring
-/// `.compressor.wkv.weight` matches both `.attn.compressor.wkv.weight` and
-/// `.attn.indexer.compressor.wkv.weight` deliberately.
-fn is_deepseek4_keep_f16(name: &str) -> bool {
-    name.ends_with(".compressor.wkv.weight")
-        || name.ends_with(".compressor.wgate.weight")
-        || name.ends_with(".indexer.wq_b.weight")
-        || name.ends_with(".indexer.weights_proj.weight")
-}
-
-/// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
-/// Q8: attention weights, embeddings, lm_head (need occupancy)
-/// Q4: FFN weights (bulk of model, benefits from compression)
-fn is_q8_tensor(name: &str) -> bool {
-    name.contains("self_attn") || name.contains("attn_q") || name.contains("attn_k")
-        || name.contains("attn_v") || name.contains("attn_output")
-        || name.contains("q_proj") || name.contains("k_proj")
-        || name.contains("v_proj") || name.contains("o_proj")
-        || name.contains("embed") || name.contains("lm_head")
-        // Qwen3.5 DeltaNet attention
-        || name.contains("linear_attn")
-        // Qwen3.5-MoE: the router (`mlp.gate.weight`, hidden_size × num_experts)
-        // is small but precision-sensitive — flat-routing on a quantized router
-        // shifts which experts a token sees. Same for the per-layer scalar
-        // `mlp.shared_expert_gate.weight` that scales the shared expert. Keep
-        // both at Q8 even in Q4-bulk modes.
-        || name.ends_with("mlp.gate.weight")
-        || name.ends_with("mlp.shared_expert_gate.weight")
-        // Nemotron-H Nano-30B A3B: routed MoE router lives under the flat
-        // block's mixer namespace.
-        || name.ends_with(".mixer.gate.weight")
-}
+// DeepSeek-V4 MLA compressor/indexer source-precision protection now lives arch-side
+// as the `SourcePrecision` precision class in `hipfire-arch-deepseek4-spec`
+// (`is_critical_stream`), consulted here via `precision_class_via_ingest`. The old
+// `is_deepseek4_keep_f16` name-matcher was deleted with that migration.
 
 // Force-link the offline specs bundle so every migrated arch's `register_arch!`
 // Ingest registration is present (Rust drops unreferenced rlibs). The bundle and
@@ -2578,8 +2512,9 @@ static ARCH_REGISTRY: std::sync::OnceLock<hipfire_arch_api::ArchRegistry> =
 /// Should this tensor be kept at HIGH PRECISION (vs. compressed), for arches
 /// migrated onto `hipfire-arch-api`? Returns `Some(true)` = keep high precision,
 /// `Some(false)` = compressible, or `None` when this arch has NOT declared an
-/// `Ingest` policy — the caller then falls back to the legacy `is_q8_tensor`
-/// name-matching.
+/// `Ingest` policy. Every family is migrated, so `None` only means "arch id not in
+/// the registry" (a completeness-gate failure), and callers protect (treat as high
+/// precision) as the safe default rather than name-match.
 ///
 /// Named for the decision it makes, not a format: it does not choose "Q8". The arch
 /// states only needs (importance + requirements); the codec choice is made here by
@@ -2618,36 +2553,43 @@ fn high_precision_via_ingest(arch_id: u32, name: &str, k: usize) -> Option<bool>
     )
 }
 
-/// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
-/// shape [conv_channels, 1, 4]. Small (~32K elem) and runs every token —
-/// Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3) measurably
-/// hurt the gated-delta path.
+/// The arch's declared [`PrecisionClass`](hipfire_arch_api::PrecisionClass) for a
+/// tensor, keyed by `ArchId`. This is the finer, registry-backed model-def the
+/// source-precision and mq4-pinned paths consult instead of arch-name keep-lists
+/// (`is_deepseek4_keep_f16`, `is_nemotron_h_mq4_q8_protected`). Because it is
+/// arch-keyed, a class one family declares can never leak onto another. `None` only
+/// for an unregistered arch (a completeness-gate failure); callers keep their default.
+fn precision_class_via_ingest(
+    arch_id: u32,
+    name: &str,
+) -> Option<hipfire_arch_api::PrecisionClass> {
+    use hipfire_arch_api::ArchId;
+    Some(
+        ARCH_REGISTRY
+            .get_or_init(hipfire_arch_api::ArchRegistry::build)
+            .get(ArchId(arch_id as u16))?
+            .caps
+            .ingest?
+            .precision_class(name),
+    )
+}
+
+/// Structural (not arch-specific) test for a short-conv recurrence filter:
+/// `{prefix}.conv1d.weight`, shape [conv_channels, 1, K]. Small (~32K elem) and
+/// runs every token — Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3)
+/// measurably hurt the gated-delta path. Names no family (any arch with a conv1d
+/// filter matches), so this is arch-GENERIC quant-plan policy that stays in the
+/// quantizer — it is NOT one of the `arch_id ==`/`is_<family>` matchers the
+/// capability layer drains (cf. `is_positional_promote`, LDLQ, FWHT packers).
 fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
 }
 
-/// Nemotron-H projections that should stay Q8 in MQ-family artifacts.
-///
-/// Local Nano-4B evidence (native-Mamba Python reference + Hipfire f32/Q8/MQ4
-/// comparison) shows uncalibrated MQ4 flips the close first-token boundary from
-/// `<|im_end|>` to newline when projection-back weights are lossy. Nano-30B
-/// bring-up also marked `mixer.in_proj.weight` as ingress-sensitive: it
-/// generates the SSM gate, x, B/C, and dt streams, and the Q8 candidate moved
-/// the fixed-scale boundary slightly closer to BF16. Keep both classes Q8 for
-/// base MQ-family artifacts until an imatrix/AWQ/Lloyd policy is validated for
-/// this arch.
-fn is_nemotron_h_mq4_q8_protected(name: &str) -> bool {
-    name.starts_with("backbone.layers.")
-        && (name.ends_with(".mixer.in_proj.weight") || is_nemotron_h_residual_writer(name))
-}
-
-/// Nemotron-H projections that write back into the residual stream.
-fn is_nemotron_h_residual_writer(name: &str) -> bool {
-    name.starts_with("backbone.layers.")
-        && (name.ends_with(".mixer.out_proj.weight")
-            || name.ends_with(".mixer.down_proj.weight")
-            || name.ends_with(".mixer.o_proj.weight"))
-}
+// Nemotron-H / Mamba-2 state-critical mixer protection now lives arch-side as the
+// `Pinned` precision class in `hipfire-arch-nemotron-spec` (shared by arch_id 14/15),
+// consulted here via `precision_class_via_ingest`. The old
+// `is_nemotron_h_mq4_q8_protected` / `is_nemotron_h_residual_writer` name-matchers
+// were deleted with that migration.
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -2792,7 +2734,6 @@ fn tokenizer_config_with_chat_template(
 
 // ─── GGUF input pipeline ────────────────────────────────────────────────────
 
-
 fn is_hfq_input(p: &Path) -> bool {
     p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("hfq")
 }
@@ -2868,6 +2809,7 @@ fn hfq_source_to_f32(name: &str, qt: u8, raw: &[u8]) -> Result<Vec<f32>, String>
 
 fn quantize_hfq_source_tensor(
     name: &str,
+    arch_id: u32,
     raw: &[u8],
     src_qt: u8,
     shape: &[u32],
@@ -2965,7 +2907,11 @@ fn quantize_hfq_source_tensor(
             )
         }
         HfqInputFormat::Mq4 => {
-            if is_nemotron_h_mq4_q8_protected(name) {
+            if precision_class_via_ingest(arch_id, name)
+                == Some(hipfire_arch_api::PrecisionClass::Pinned)
+            {
+                // Nemotron-H / Mamba-2 state-critical mixer tensors → Q8 even in mq4
+                // (arch-keyed `Pinned` class; was `is_nemotron_h_mq4_q8_protected`).
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
             if k % 256 != 0 {
@@ -3347,12 +3293,12 @@ fn cpu_encode_symbols(
 /// stays bounded; the scratch buffer is allocated once and reused across chunks.
 #[cfg(feature = "gpu")]
 fn gpu_encode_symbols(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     rotated: &[f32],
     n_groups: usize,
     bits: u32,
 ) -> Result<Vec<u8>, String> {
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     // Per-chunk packed backpointer scratch = chunk×256×256×2 u32 = chunk×512 KB
     // (uninitialized — the kernel writes it before backtrack, so use a device alloc
     // with NO host zero-copy; on the shared-UMA APU a host zero-vec competes for the
@@ -3474,7 +3420,7 @@ fn pack_qtip_real_tensors(
     // held via RAII until this function returns) so we cooperate with the daemon
     // and other GPU tools — no external `hipfire lock` needed.
     #[cfg(feature = "gpu")]
-    let (mut gpu, _gpu_lock) = match rdna_compute::Gpu::init() {
+    let (mut gpu, _gpu_lock) = match hipfire_rdna::Gpu::init() {
         Ok(g) => {
             let lock = acquire_gpu_lock();
             eprintln!(
@@ -3732,7 +3678,7 @@ fn run_hfq_source_pipeline(
         let n_elements = t.shape.iter().map(|&d| d as u64).product::<u64>();
         total_params += n_elements;
         let (data, qt, group_size, label) =
-            quantize_hfq_source_tensor(&t.name, raw, t.quant_type, &t.shape, format)?;
+            quantize_hfq_source_tensor(&t.name, hfq.arch_id, raw, t.quant_type, &t.shape, format)?;
         if qt as u8 != t.quant_type || group_size != t.group_size {
             quantized_params += n_elements;
         }
@@ -3846,8 +3792,6 @@ fn run_hfq_source_pipeline(
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
     Ok(())
 }
-
-
 
 /// Translate a hipfire safetensors-style tensor name to the ggml-style name
 /// used by llama.cpp's imatrix output (and the rest of llama.cpp's tooling).
@@ -4427,12 +4371,6 @@ fn awq_eligible(name: &str) -> bool {
     f1_match || f2_match
 }
 
-
-
-
-
-
-
 fn source_precision_tensor_bytes(
     raw_data: &[u8],
     dtype: &str,
@@ -4445,7 +4383,6 @@ fn source_precision_tensor_bytes(
         other => panic!("unsupported dtype for source-precision HFQ: {other}"),
     }
 }
-
 
 /// Full `--help` / `-h` text. Printed to stdout; exits 0 from `main`.
 fn print_help() {
@@ -5789,33 +5726,35 @@ fn main() {
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
+    // Map the HF `model_type` string to a canonical arch_id. Ids and their
+    // `arch_str` detection tokens are documented in `docs/architecture-ids.md`.
     let auto_arch_id = if is_mamba2_config {
-        15
+        ARCH_ID_MAMBA2
     } else {
         match arch_str {
-            "llama" => 0u32,
-            "qwen3" | "qwen2" => 1,
-            "qwen3_5" | "qwen3_5_text" => 5,
+            "llama" => ARCH_ID_LLAMA_MISTRAL,
+            "qwen3" | "qwen2" => ARCH_ID_QWEN3_QWEN2_LEGACY,
+            "qwen3_5" | "qwen3_5_text" => ARCH_ID_QWEN35_DENSE,
             // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
             // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
             // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
-            "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+            "qwen3_5_moe" | "qwen3_5_moe_text" => ARCH_ID_QWEN35_MOE,
             // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
             // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
             // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
             // dots-ocr-prd.md.
-            "dots_ocr" => 8,
+            "dots_ocr" => ARCH_ID_DOTS_OCR,
             // DeepSeek V4 Flash: 256 routed + 1 shared experts, Hyper-Connections,
             // compressed-KV indexer, FP8 E4M3 + UE8M0 block-scale storage. See
             // crates/hipfire-arch-deepseek4. Phase 1 ingest only — no forward
             // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
             // per-expert) and are translated when the forward bring-up lands.
-            "deepseek_v4" => 9,
+            "deepseek_v4" => ARCH_ID_DEEPSEEK4_FLASH,
             // MiniMax-M2 (Mixtral-style MoE): GQA + per-layer QK-norm + partial
             // rotate_half RoPE; 256 routed experts top-8 sigmoid+e_score_bias, no
             // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
             // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
-            "minimax_m2" => 10,
+            "minimax_m2" => ARCH_ID_MINIMAX_M2,
             // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
             //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
             //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
@@ -5823,7 +5762,7 @@ fn main() {
             //               every layer dense SwiGLU; the ingest Q8s all tensors.
             // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
             // num_dense_layers == num_hidden_layers for the dense variant.
-            "lfm2_moe" | "lfm2" => 11,
+            "lfm2_moe" | "lfm2" => ARCH_ID_LFM2_MOE,
             // Gemma3 (text). `gemma3_text` = Gemma3ForCausalLM (clean
             // model.layers.* names, e.g. medgemma-27b-text-it); `gemma3` =
             // Gemma3ForConditionalGeneration (multimodal wrapper — text fields
@@ -5833,23 +5772,23 @@ fn main() {
             // dim/n_heads, custom attn scale query_pre_attn_scalar^-0.5, dual-theta
             // sliding-window interleave, GeGLU gelu-tanh. Crate hipfire-arch-gemma3.
             // See docs/plans/2026-06-19-gemma3-bringup.md.
-            "gemma3_text" | "gemma3" => 12,
+            "gemma3_text" | "gemma3" => ARCH_ID_GEMMA3_TEXT,
             // nemotron_h (NVIDIA Nemotron-3): Mamba-2 + GQA-attn + ReLU²-MLP hybrid
             // (Nano-4B dense; Nano-30B adds MoE). Crate hipfire-arch-nemotron
             // (arch_id 14). Quantizes the linear projections; keeps conv1d/A_log/D/
             // dt_bias/norms F16 (see should_quantize).
-            "nemotron_h" => 14,
+            "nemotron_h" => ARCH_ID_NEMOTRON_H,
             // state-spaces Mamba-2: pure Mamba-2 mixer stack. Uses the same
             // Mamba block machinery as nemotron_h but remains its own served arch.
-            "mamba2" => 15,
+            "mamba2" => ARCH_ID_MAMBA2,
             // Zyphra ZAYA1 (CCA attention + EDA/MoD-routed MoE). Crate
             // hipfire-arch-zaya (arch_id 16). Native checkpoint stores experts as
             // stacked 3D `mlp.experts.{gate_up,down}_proj`, like Qwen3.5-MoE, so it
             // rides the same is_moe 3D-split path below.
-            "zaya" => 16,
+            "zaya" => ARCH_ID_ZAYA,
             other => {
                 eprintln!("Warning: unknown architecture '{other}', treating as llama");
-                0
+                ARCH_ID_LLAMA_MISTRAL
             }
         }
     };
@@ -5857,11 +5796,12 @@ fn main() {
     // → arch_id 13 (gemma3-vl: SigLIP tower + projector + the gemma3 text
     // decoder). Pure-text `gemma3`/`gemma3_text` stay 12. Text tensors are
     // `language_model.*`-prefixed; vision/projector stay F32 (see should_quantize).
-    let auto_arch_id = if auto_arch_id == 12 && config.get("vision_config").is_some() {
-        13
-    } else {
-        auto_arch_id
-    };
+    let auto_arch_id =
+        if auto_arch_id == ARCH_ID_GEMMA3_TEXT && config.get("vision_config").is_some() {
+            ARCH_ID_GEMMA3_VL
+        } else {
+            auto_arch_id
+        };
     // --arch-id <u32> overrides the auto-detected id. Use when the
     // model's family maps to a different crate than the default
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
@@ -5877,7 +5817,7 @@ fn main() {
     // arch_id 6 = Qwen3.5-MoE, 16 = ZAYA1: both store routed experts as stacked 3D
     // `mlp.experts.{gate_up,down}_proj` tensors that the ingest path must split
     // per-expert (see the 3D split gated on `is_moe`).
-    let is_moe = arch_id == 6 || arch_id == 16;
+    let is_moe = arch_id == ARCH_ID_QWEN35_MOE || arch_id == ARCH_ID_ZAYA;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -5885,22 +5825,22 @@ fn main() {
     // ingest handles DeepSeek V4's per-expert tensors individually through
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
-    let is_deepseek4 = arch_id == 9;
+    let is_deepseek4 = arch_id == ARCH_ID_DEEPSEEK4_FLASH;
     // MiniMax-M2 (arch_id=10): MoE like DeepSeek V4, ships per-expert pre-split
     // 2D tensors (`...block_sparse_moe.experts.E.{w1,w2,w3}.weight`). Quantized
     // as HFQ4G256 (the only 4-bit format with a complete indexed-MoE GEMV
     // kernel family). Raw HF tensor names are written verbatim (no rename);
     // the hipfire loader looks them up.
-    let is_minimax = arch_id == 10;
+    let is_minimax = arch_id == ARCH_ID_MINIMAX_M2;
     // LFM2.5-MoE (arch_id 11): per-expert pre-split 2D experts (like minimax),
     // bf16 source. Conv-block + dense-MLP + router + expert_bias get dedicated
     // ingest branches; routed experts → MQ4G256, everything else → Q8.
-    let is_lfm2moe = arch_id == 11;
+    let is_lfm2moe = arch_id == ARCH_ID_LFM2_MOE;
     // Nemotron-H (arch_id 14) is dense for Nano-4B and MoE for Nano-30B. The
     // router-protection rule is harmless for dense 4B because it has no
     // `.mixer.gate.weight` tensors, and necessary for 30B because router noise
     // can flip top-k expert selection.
-    let is_nemotron_h = arch_id == 14;
+    let is_nemotron_h = arch_id == ARCH_ID_NEMOTRON_H;
     // Resolve the AWQ alpha now that the arch is known. The hipfire F2 sweep
     // winner (0.55) suits transformer attention/MLP activations, but
     // nemotron_h's Mamba-2 mixer projections have a far heavier-tailed
@@ -5950,7 +5890,7 @@ fn main() {
             eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, dense projections follow explicit --format when supported, remaining tensors → Q8.");
         }
     }
-    if arch_id == 15 {
+    if arch_id == ARCH_ID_MAMBA2 {
         eprintln!("  Mamba-2 detected — pure Mamba mixer stack; recurrence/norm tensors stay plain precision.");
     }
 
@@ -6055,7 +5995,7 @@ fn main() {
     // rmsnorm kernel — which applies plain `w` — is numerically correct at
     // runtime, with no per-layer special-casing in the gemma3 forward. Record
     // the offset for provenance and to make a re-quantize double-bake detectable.
-    if arch_id == 12 {
+    if arch_id == ARCH_ID_GEMMA3_TEXT {
         if let serde_json::Value::Object(ref mut m) = metadata {
             m.insert("gemma_norm_offset".to_string(), serde_json::json!(1.0_f32));
         }
@@ -6251,7 +6191,8 @@ fn main() {
     // arch_id 13 (gemma3-vl) is multimodal — the SigLIP vision tower is REQUIRED,
     // not optional, so auto-include it (no --include-vision needed). Other arches
     // keep the opt-in default (vision skipped unless the flag is passed).
-    let include_vision = std::env::args().any(|a| a == "--include-vision") || arch_id == 13;
+    let include_vision =
+        std::env::args().any(|a| a == "--include-vision") || arch_id == ARCH_ID_GEMMA3_VL;
     let vision_quant = std::env::args()
         .position(|a| a == "--vision-quant")
         .and_then(|i| std::env::args().nth(i + 1))
@@ -6515,7 +6456,7 @@ fn main() {
                 );
                 let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let (q, qt, gs, label) =
-                    quantize_hfq_source_tensor(name, &f32_bytes, 2, &shape, oq_format)
+                    quantize_hfq_source_tensor(name, arch_id, &f32_bytes, 2, &shape, oq_format)
                         .unwrap_or_else(|e| panic!("lfm2 oq quantize {name}: {e}"));
                 eprintln!(
                     "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [LFM2 dense OQ]",
@@ -6832,7 +6773,7 @@ fn main() {
             );
             let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
             let (q, qt, gs, label) =
-                quantize_hfq_source_tensor(name, &f32_bytes, 2, &shape, oq_format)
+                quantize_hfq_source_tensor(name, arch_id, &f32_bytes, 2, &shape, oq_format)
                     .unwrap_or_else(|e| panic!("minimax oq quantize {name}: {e}"));
             eprintln!(
                 "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [MiniMax dense OQ]",
@@ -7496,7 +7437,14 @@ fn main() {
             && name.starts_with("mtp.")
             && !name.contains(".ffn.experts.")
             && should_quantize(name);
-        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
+        // The MLA compressor/indexer streams stay at source precision. deepseek4's
+        // `-spec` declares exactly those tensors as `SourcePrecision` (finer than the
+        // importance-255 protected set, so attn/embed are NOT swept in); we read that
+        // class arch-keyed, replacing the old `is_deepseek4_keep_f16` name-match.
+        if (use_deepseek4_source_precision
+            && precision_class_via_ingest(arch_id, name)
+                == Some(hipfire_arch_api::PrecisionClass::SourcePrecision)
+            || keep_f16_mtp)
             && n_elements >= 32
         {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
@@ -7849,16 +7797,18 @@ fn main() {
                     } else if use_q4k_q8embed {
                         name.contains("embed") || name.contains("lm_head") // only embed/output Q8
                     } else if use_mixed || use_fast {
-                        // Arches migrated onto the capability layer (e.g. llama)
-                        // decide high-precision-vs-compressed from their declared
-                        // Ingest quant-policy; unmigrated arches keep is_q8_tensor.
+                        // Every family is migrated onto the capability layer, so the
+                        // high-precision-vs-compressed decision comes from the arch's
+                        // declared Ingest quant-policy. An unregistered arch is a
+                        // completeness-gate failure, not a runtime path, so we protect
+                        // (keep high precision) as the safe default rather than fall
+                        // back to a name-matcher.
                         let k = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
                             n_elements
                         };
-                        high_precision_via_ingest(arch_id, name, k)
-                            .unwrap_or_else(|| is_q8_tensor(name))
+                        high_precision_via_ingest(arch_id, name, k).unwrap_or(true)
                     } else {
                         use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
                     };
@@ -7932,9 +7882,23 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if q8_router && is_q8_tensor(name) {
-                        // Q8 router for MoE: keep mlp.gate.weight and
-                        // shared_expert_gate.weight at Q8 regardless of --format.
+                    } else if q8_router
+                        && high_precision_via_ingest(
+                            arch_id,
+                            name,
+                            if meta.shape.len() == 2 {
+                                meta.shape[1]
+                            } else {
+                                n_elements
+                            },
+                        ) == Some(true)
+                    {
+                        // Q8 router for MoE: keep the protected set — routers
+                        // (mlp.gate/shared_expert_gate/mixer.gate), attention, and the
+                        // gather tables — at Q8 regardless of --format. The arch's
+                        // Ingest importance is the single source for "protected"; this
+                        // reproduces the old is_q8_tensor set (conv1d/norm never reach
+                        // this 2D-weight selection — should_quantize keeps them f16).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq8g256 && is_embed {
@@ -7959,7 +7923,16 @@ fn main() {
                     } else if use_mq4_family && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq4_family && is_nemotron_h_mq4_q8_protected(name) {
+                    } else if use_mq4_family
+                        && precision_class_via_ingest(arch_id, name)
+                            == Some(hipfire_arch_api::PrecisionClass::Pinned)
+                    {
+                        // Nemotron-H / Mamba-2 state-critical mixer tensors stay Q8 even
+                        // under the mq4 budget. Their `-spec` declares them `Pinned`
+                        // (above ordinary `High`), so this is arch-keyed: Qwen3.5's
+                        // attention (only `High`) is untouched — no cross-family spill,
+                        // and `mixer.down_proj` is pinned correctly (the old
+                        // `is_nemotron_h_mq4_q8_protected`, now deleted).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq4_family {
@@ -10022,7 +9995,7 @@ fn main() {
     // gemma3 forward. Norms ship at source precision (F32/F16/BF16); convert,
     // offset, convert back to the same dtype. The `gemma_norm_offset=1.0`
     // metadata marker records that this happened.
-    if arch_id == 12 || arch_id == 13 {
+    if arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL {
         let mut n_baked = 0usize;
         for t in hfq_tensors.iter_mut() {
             // Bake the gemma (1+w) RMSNorms (text norms + the projector's
@@ -12352,6 +12325,7 @@ mod tests {
     fn hfq_input_rejects_already_quantized_source_tensors() {
         let result = quantize_hfq_source_tensor(
             "model.layers.0.mlp.down_proj.weight",
+            14, // nemotron-h; irrelevant here (rejected before the precision check)
             &[0; 136],
             QuantType::MQ4G256 as u8,
             &[1, 256],
@@ -12374,6 +12348,7 @@ mod tests {
         ] {
             let (_, qt, group, label) = quantize_hfq_source_tensor(
                 name,
+                14, // NEMOTRON_H_ARCH_ID → mixer ingress/residual declared `Pinned`
                 &raw,
                 QuantType::F16 as u8,
                 &[2, 256],
@@ -12630,22 +12605,30 @@ mod tests {
             QuantLevel::Q8
         );
         assert_eq!(kmap_resolve("lm_head.weight", 42, false), QuantLevel::Q8);
-        assert!(
-            is_q8_tensor("backbone.layers.1.mixer.gate.weight"),
-            "Nemotron MoE router should be Q8-protected"
+        assert_eq!(
+            high_precision_via_ingest(14, "backbone.layers.1.mixer.gate.weight", 4096),
+            Some(true),
+            "Nemotron MoE router should be Q8-protected via its Ingest policy"
         );
 
+        // State-critical mixer tensors are `Pinned` (arch-keyed via nemotron-h=14),
+        // the drain of the old `is_nemotron_h_mq4_q8_protected` name-match.
         for n in [
             "backbone.layers.0.mixer.in_proj.weight",
             "backbone.layers.0.mixer.out_proj.weight",
             "backbone.layers.1.mixer.down_proj.weight",
             "backbone.layers.12.mixer.o_proj.weight",
         ] {
-            assert!(is_nemotron_h_mq4_q8_protected(n), "{n} should be protected");
+            assert_eq!(
+                precision_class_via_ingest(14, n),
+                Some(hipfire_arch_api::PrecisionClass::Pinned),
+                "{n} should be pinned"
+            );
         }
-        assert!(!is_nemotron_h_mq4_q8_protected(
-            "backbone.layers.0.mixer.up_proj.weight"
-        ));
+        assert_ne!(
+            precision_class_via_ingest(14, "backbone.layers.0.mixer.up_proj.weight"),
+            Some(hipfire_arch_api::PrecisionClass::Pinned)
+        );
     }
 
     #[test]
@@ -12685,7 +12668,7 @@ mod tests {
             Some(false)
         );
         // Every family is migrated now: e.g. deepseek4 (9) protects its MLA
-        // compressor (the old is_deepseek4_keep_f16), and a MoE expert (11) compresses.
+        // compressor, and a MoE expert (11) compresses.
         assert_eq!(
             high_precision_via_ingest(9, "model.layers.0.self_attn.compressor.wkv.weight", 4096),
             Some(true)
@@ -12694,7 +12677,25 @@ mod tests {
             high_precision_via_ingest(11, "model.layers.0.mlp.experts.2.up_proj.weight", 4096),
             Some(false)
         );
-        // A genuinely unregistered arch id → None → caller uses is_q8_tensor.
+        // Finer model-def: deepseek4's MLA compressor is SourcePrecision (drains the
+        // old is_deepseek4_keep_f16), while its attention is only High — the split the
+        // bool seam above cannot make. Arch-keyed, so no other family is affected.
+        use hipfire_arch_api::PrecisionClass;
+        assert_eq!(
+            precision_class_via_ingest(9, "model.layers.0.self_attn.compressor.wkv.weight"),
+            Some(PrecisionClass::SourcePrecision)
+        );
+        assert!(
+            precision_class_via_ingest(9, "model.layers.0.self_attn.q_proj.weight")
+                < Some(PrecisionClass::SourcePrecision)
+        );
+        // The same source-precision suffix on a family that does NOT declare it (llama)
+        // stays below SourcePrecision — proving the model-def can't leak across archs.
+        assert!(
+            precision_class_via_ingest(0, "model.layers.0.self_attn.compressor.wkv.weight")
+                < Some(PrecisionClass::SourcePrecision)
+        );
+        // A genuinely unregistered arch id → None → caller protects (unwrap_or(true)).
         assert_eq!(
             high_precision_via_ingest(200, "whatever.weight", 4096),
             None

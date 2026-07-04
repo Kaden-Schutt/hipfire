@@ -10,7 +10,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::block::{block_backward, block_forward, BlockDims, BlockLora, BlockWeights};
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 const SEQ: usize = 3;
 const H: usize = 8;

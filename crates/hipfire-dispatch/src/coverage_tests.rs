@@ -29,7 +29,7 @@
 use crate::context::DispatchCtx;
 use crate::families::moe::{MoeDtypes, MoeResolution};
 use crate::types::*;
-use rdna_compute::DType::{self, *};
+use hipfire_rdna::DType::{self, *};
 
 /// The dispatch entry a forward pass reaches for a given weight role.
 #[derive(Clone, Copy, Debug)]

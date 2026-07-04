@@ -8,7 +8,7 @@
 // Design invariant: this crate does NOT differentiate the fused inference
 // kernels (`fused_rmsnorm_rotate_mq`, …). It owns an *un-fused* fp32 forward —
 // one clean op per node, each with a matching backward — built on the dedicated
-// `gemm_f32_train` primitive (general transpose flags) in `rdna-compute`.
+// `gemm_f32_train` primitive (general transpose flags) in `hipfire-rdna`.
 
 pub mod a4_quant;
 pub mod block;

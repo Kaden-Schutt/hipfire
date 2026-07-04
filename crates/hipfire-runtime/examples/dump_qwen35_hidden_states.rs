@@ -143,7 +143,7 @@ fn main() {
     // -------- load model --------
     let mut hfq = HfqFile::open(&model).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!(
         "arch={} dim={} n_layers={}",
         gpu.arch, config.dim, config.n_layers

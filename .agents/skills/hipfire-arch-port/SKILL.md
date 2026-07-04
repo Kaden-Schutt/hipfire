@@ -15,7 +15,7 @@ have hit are documented here so you don't repeat them.
 > implement the `Architecture` trait in your own crate. See
 > `crates/hipfire-arch-template/` as a reference template and
 > `CONTRIBUTING.md`'s "Crate topology" section. RDNA arch routing
-> stays in `crates/rdna-compute/src/dispatch.rs` regardless of model
+> stays in `crates/hipfire-rdna/src/dispatch.rs` regardless of model
 > arch — they're orthogonal.
 
 ## When to use
@@ -81,8 +81,8 @@ have hit are documented here so you don't repeat them.
 - **Canonical gfx12 WMMA pattern:** commit `6924f2a` added
   `kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` as the worked-out
   pattern reference. Current checkouts also contain additional gfx12
-  WMMA sibling kernels and selectors; inspect `crates/rdna-compute/src/kernels.rs`,
-  `crates/rdna-compute/src/dispatch.rs`, and env gates such as
+  WMMA sibling kernels and selectors; inspect `crates/hipfire-rdna/src/kernels.rs`,
+  `crates/hipfire-rdna/src/dispatch.rs`, and env gates such as
   `HIPFIRE_LLOYD_GFX12` before claiming a path is enabled by default.
 - **WMMA correctness fix (gfx11):** commit `b7ac66a` ("wmma
   correctness fix + MQ6 family + cross-arch prefill + gate

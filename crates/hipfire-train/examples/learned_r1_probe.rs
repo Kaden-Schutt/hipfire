@@ -22,7 +22,7 @@ use hipfire_train::learn_rotation::{kurtosis_objective, learn_rotation_kurtosis}
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
 use hipfire_train::rotation::{apply_r1, rotate_rows, Rotation};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 const DEFAULT_DIR: &str =

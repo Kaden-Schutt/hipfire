@@ -14,7 +14,7 @@
 //! codebook span + index histogram so we can spot what triggers the drift.
 
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -157,7 +157,7 @@ fn main() {
     let upload_bytes = &bytes[..m * row_stride];
     let d_a = gpu.upload_raw(upload_bytes, &[upload_bytes.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
-    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+    let d_y = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
     gpu.gemv_mq4g256_lloyd_multiacc_diag(&d_a, &d_x, &d_y, m, k)
         .unwrap();
     let y_gpu = gpu.download_f32(&d_y).unwrap();

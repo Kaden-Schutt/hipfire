@@ -5,7 +5,7 @@ use crate::context::DispatchCtx;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 pub struct FusedQkvParams<'a> {
     pub kind: KernelKey,

@@ -86,19 +86,8 @@ fn cpu_dequant(q: &[u8], m: usize, k: usize) -> Vec<f32> {
     out
 }
 
-fn cpu_gemm(w: &[f32], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut y = vec![0.0f32; n * m];
-    for b in 0..n {
-        for r in 0..m {
-            let mut acc = 0.0f32;
-            for c in 0..k {
-                acc += w[r * k + c] * x[b * k + c];
-            }
-            y[b * m + r] = acc;
-        }
-    }
-    y
-}
+// Shared CPU-reference GEMM oracle (was a local copy of this exact loop).
+use hipfire_cpu::cpu_reference_gemm as cpu_gemm;
 
 fn max_err(a: &[f32], b: &[f32]) -> (f32, usize, usize) {
     let mut maxe = 0.0f32;
@@ -119,7 +108,7 @@ fn max_err(a: &[f32], b: &[f32]) -> (f32, usize, usize) {
 }
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     eprintln!("GPU: {}", gpu.arch);
 
     // Test at sizes realistic for 4B model: k=2560 (hidden dim), n=128 (prefill batch)
@@ -201,8 +190,8 @@ fn main() {
 
         let d_ag = gpu.upload_raw(&qg, &[qg.len()]).unwrap();
         let d_au = gpu.upload_raw(&qu, &[qu.len()]).unwrap();
-        let d_yg = gpu.zeros(&[n * gate_m], rdna_compute::DType::F32).unwrap();
-        let d_yu = gpu.zeros(&[n * up_m], rdna_compute::DType::F32).unwrap();
+        let d_yg = gpu.zeros(&[n * gate_m], hipfire_rdna::DType::F32).unwrap();
+        let d_yu = gpu.zeros(&[n * up_m], hipfire_rdna::DType::F32).unwrap();
 
         std::env::set_var("HIPFIRE_FP16", "0");
         gpu.gemm_gate_up_hfq6g256(&d_ag, &d_au, &d_x, &d_yg, &d_yu, gate_m, up_m, k, n)
@@ -230,8 +219,8 @@ fn main() {
 
         let d_ag = gpu.upload_raw(&qg, &[qg.len()]).unwrap();
         let d_au = gpu.upload_raw(&qu, &[qu.len()]).unwrap();
-        let d_yg = gpu.zeros(&[n * gate_m], rdna_compute::DType::F32).unwrap();
-        let d_yu = gpu.zeros(&[n * up_m], rdna_compute::DType::F32).unwrap();
+        let d_yg = gpu.zeros(&[n * gate_m], hipfire_rdna::DType::F32).unwrap();
+        let d_yu = gpu.zeros(&[n * up_m], hipfire_rdna::DType::F32).unwrap();
 
         gpu.gemm_gate_up_hfq6g256_wmma(&d_ag, &d_au, &d_x, &d_yg, &d_yu, gate_m, up_m, k, n)
             .unwrap();
@@ -263,9 +252,9 @@ fn main() {
         let d_aq = gpu.upload_raw(&qq, &[qq.len()]).unwrap();
         let d_ak = gpu.upload_raw(&qk, &[qk.len()]).unwrap();
         let d_av = gpu.upload_raw(&qv, &[qv.len()]).unwrap();
-        let d_yq = gpu.zeros(&[n * q_m], rdna_compute::DType::F32).unwrap();
-        let d_yk = gpu.zeros(&[n * k_m], rdna_compute::DType::F32).unwrap();
-        let d_yv = gpu.zeros(&[n * v_m], rdna_compute::DType::F32).unwrap();
+        let d_yq = gpu.zeros(&[n * q_m], hipfire_rdna::DType::F32).unwrap();
+        let d_yk = gpu.zeros(&[n * k_m], hipfire_rdna::DType::F32).unwrap();
+        let d_yv = gpu.zeros(&[n * v_m], hipfire_rdna::DType::F32).unwrap();
 
         gpu.gemm_qkv_hfq6g256_wmma(
             &d_aq, &d_ak, &d_av, &d_x, &d_yq, &d_yk, &d_yv, q_m, k_m, v_m, k, n,
@@ -307,10 +296,10 @@ fn main() {
         let d_a2 = gpu.upload_raw(&qz, &[qz.len()]).unwrap();
         let d_a3 = gpu.upload_raw(&qbeta, &[qbeta.len()]).unwrap();
         let d_a4 = gpu.upload_raw(&qalpha, &[qalpha.len()]).unwrap();
-        let d_y1 = gpu.zeros(&[n * qkv_m], rdna_compute::DType::F32).unwrap();
-        let d_y2 = gpu.zeros(&[n * z_m], rdna_compute::DType::F32).unwrap();
-        let d_y3 = gpu.zeros(&[n * beta_m], rdna_compute::DType::F32).unwrap();
-        let d_y4 = gpu.zeros(&[n * alpha_m], rdna_compute::DType::F32).unwrap();
+        let d_y1 = gpu.zeros(&[n * qkv_m], hipfire_rdna::DType::F32).unwrap();
+        let d_y2 = gpu.zeros(&[n * z_m], hipfire_rdna::DType::F32).unwrap();
+        let d_y3 = gpu.zeros(&[n * beta_m], hipfire_rdna::DType::F32).unwrap();
+        let d_y4 = gpu.zeros(&[n * alpha_m], hipfire_rdna::DType::F32).unwrap();
 
         gpu.gemm_qkvza_hfq6g256_wmma(
             &d_a1, &d_a2, &d_a3, &d_a4, &d_x, &d_y1, &d_y2, &d_y3, &d_y4, qkv_m, z_m, beta_m,

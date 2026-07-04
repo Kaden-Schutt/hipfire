@@ -74,7 +74,7 @@ it with rotation+SmoothQuant" tier.
 
 **Exists:**
 - iu8 WMMA core: `kernels/src/gemm_iu8_i32_wmma.hip` + `gemv_iu8_i32.hip`, dispatched
-  in rdna-compute (signed int8, zero-LDS / gfx1103-safe). **Library primitive — not
+  in hipfire-rdna (signed int8, zero-LDS / gfx1103-safe). **Library primitive — not
   yet wired into the qwen35 forward.**
 - iu4 WMMA core + oq4 (W4A4) end-to-end (affine int4 emit, int8 activation quant,
   SmoothQuant sidecar) — reusable front-end for W4A8's A8 side.

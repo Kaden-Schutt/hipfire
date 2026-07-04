@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--max-blocks must be > 0".into());
     }
 
-    let mut gpu = rdna_compute::Gpu::init()?;
+    let mut gpu = hipfire_rdna::Gpu::init()?;
     eprintln!("gpu: {}", gpu.arch);
 
     let mut target_hfq = HfqFile::open(&model)?;

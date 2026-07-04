@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 use crate::resource::ResourceManager;
-use rdna_compute::arch_caps::ArchCaps;
-use rdna_compute::feature_flags::FeatureFlags;
-use rdna_compute::Gpu;
+use hipfire_rdna::arch_caps::ArchCaps;
+use hipfire_rdna::feature_flags::FeatureFlags;
+use hipfire_rdna::Gpu;
 use std::sync::Arc;
 
 /// Per-session context resolved once at Gpu::init().
@@ -34,7 +34,7 @@ impl DispatchCtx {
     /// Only for use in tests.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(arch: &str) -> Self {
-        use rdna_compute::feature_flags::FeatureFlags;
+        use hipfire_rdna::feature_flags::FeatureFlags;
         let flags = Arc::new(FeatureFlags::from_env_for_test(arch));
         let arch_caps = ArchCaps::new(arch, flags.clone());
         Self {

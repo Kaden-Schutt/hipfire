@@ -4,7 +4,7 @@
 //! teacher_p`. `teacher_p` is a probability distribution (e.g. `softmax` of the
 //! teacher's logits). Sum-reduction grad — divide by row count for a mean.
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 pub fn distill_kl(
     gpu: &mut Gpu,

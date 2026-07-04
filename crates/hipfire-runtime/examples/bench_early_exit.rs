@@ -25,7 +25,7 @@ fn main() {
         config.dim, config.n_layers, config.n_heads
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     let weights = hfq::load_weights_hfq(&hfq, &config, &mut gpu).expect("failed to load weights");
 
     let n_gen = 50;

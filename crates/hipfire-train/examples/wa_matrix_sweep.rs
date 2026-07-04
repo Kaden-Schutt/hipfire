@@ -30,7 +30,7 @@ use hipfire_train::model::{model_forward, model_guided_adjoints, LlamaModel};
 use hipfire_train::qtip_quant::{build_codebook, qtip_group_requant};
 use hipfire_train::rotation::{rotate_rows, Rotation};
 use rayon::prelude::*;
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 use std::path::Path;
 
 const DEFAULT_DIR: &str =

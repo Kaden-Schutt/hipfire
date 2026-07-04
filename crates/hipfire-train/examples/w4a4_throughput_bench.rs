@@ -27,7 +27,7 @@
 //!   cargo run -p hipfire-train --release --example w4a4_throughput_bench
 //!   hipfire lock release
 
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::time::Instant;
 
 fn rand_bytes(n: usize, seed: u64) -> Vec<u8> {

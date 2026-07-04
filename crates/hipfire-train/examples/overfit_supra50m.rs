@@ -12,7 +12,7 @@
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{flatten_lora_grads, model_forward, model_loss_backward, LlamaModel};
 use hipfire_train::optim::AdamW;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 const MODEL_DIR: &str =

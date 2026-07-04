@@ -152,7 +152,7 @@ an obvious completeness meaning.
 ### 0.4b Offline vs serving capabilities — respect the dependency direction
 
 CRITICAL constraint: `hipfire-quantize` deps NO arch/runtime crate today (standalone
-offline), but arch crates dep `hipfire-runtime` + `rdna-compute` (GPU). So the OFFLINE
+offline), but arch crates dep `hipfire-runtime` + `hipfire-rdna` (GPU). So the OFFLINE
 capabilities (`Ingest`, `ToyModel`, `Calibration`) must be implementable WITHOUT
 dragging the serving/GPU stack into the quantizer.
 
@@ -204,7 +204,7 @@ Two ways to keep deps clean (decide before migrating `Ingest`):
   (identity, config, `Ingest`, `ToyModel`, `Calibration` — deps only
   `hipfire-arch-api` + `hipfire-quant-format`/`-primitives`) and the serving crate
   `hipfire-arch-<x>` (forward, `Sessions`, `SpecDecode*` — deps the core + runtime +
-  rdna-compute). Quantizer deps the `-spec` bundle; daemon deps the serving crates;
+  hipfire-rdna). Quantizer deps the `-spec` bundle; daemon deps the serving crates;
   the registry collects both tiers. Cleanest boundary; mirrors the existing leaf-crate
   / `hipfire-coexistence` split. More crates.
 - **(b) feature-gate one crate**: offline caps always compiled, serving caps + runtime/

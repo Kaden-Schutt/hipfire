@@ -1,0 +1,11 @@
+[package]
+name = "hipfire-specdecode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Arch-agnostic speculative-decode core: SpecDecodeTarget trait + seam types"
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-rdna = { path = "../hipfire-rdna" }

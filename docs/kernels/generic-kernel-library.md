@@ -107,7 +107,7 @@ follow the same shape.
 ## Dispatch / wiring pattern (per kernel)
 
 1. `kernels/src/<name>.hip` (+ optional `kernels/src/gfx1151/<name>.gfx1151.hip`).
-2. `pub const <NAME>_SRC: &str = include_str!(...)` in `crates/rdna-compute/src/kernels.rs`.
+2. `pub const <NAME>_SRC: &str = include_str!(...)` in `crates/hipfire-rdna/src/kernels.rs`.
 3. `pub fn <name>(&mut self, …)` in `dispatch.rs`: `bind_thread` →
    `ensure_kernel(name, SRC, entry)` → params → `launch_kernel`.
 4. Numeric test vs an f32 CPU reference (small M/K/N), gated to run only on

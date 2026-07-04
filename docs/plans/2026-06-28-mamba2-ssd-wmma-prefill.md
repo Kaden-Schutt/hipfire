@@ -101,7 +101,7 @@ the f32 chunked reference and the gpu-vs-cpu oracle for the WMMA output.
 ## Status / files
 
 - **Phase A (done):** `kernels/src/mamba2_ssd_chunk_f32.hip`,
-  `Gpu::mamba2_ssd_chunk_f32` in `crates/rdna-compute/src/dispatch/mamba2.rs`,
+  `Gpu::mamba2_ssd_chunk_f32` in `crates/hipfire-rdna/src/dispatch/mamba2.rs`,
   `kernels::MAMBA2_SSD_CHUNK_SRC`, test `test_ssd_chunk_gpu.rs`. The GPU oracle.
 - **Phase B kernel (done):** `kernels/src/mamba2_ssd_chunk_wmma.hip` — all 4
   stages, one wave per head, serial chunk loop, state carry in global. bf16

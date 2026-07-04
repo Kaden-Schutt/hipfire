@@ -16,7 +16,7 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hip-bridge = { path = "../hip-bridge" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 serde_json = "1"
 # Used by `image.rs` for PNG/JPEG decode. Matches the version pin in
 # hipfire-arch-qwen35-vl/Cargo.toml; default-features off keeps the

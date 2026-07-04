@@ -19,7 +19,7 @@
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     // Test multiple shapes: 1-group, 2-group, 4-group rows.
     let shapes = [(4usize, 256usize), (4, 512), (8, 1024)];
@@ -42,7 +42,7 @@ fn main() {
         let y_mq3_cpu = cpu_reference_mq(&mq3_bytes, &x, m, k, 104, 3, |scale, zero, q| {
             scale * q as f32 + zero
         });
-        let y_mq3_gpu = gpu_mq_gemv(&mut gpu, &mq3_bytes, &x, m, k, rdna_compute::DType::MQ3G256);
+        let y_mq3_gpu = gpu_mq_gemv(&mut gpu, &mq3_bytes, &x, m, k, hipfire_rdna::DType::MQ3G256);
         let (ok3, _max_err3, _mean_err3) = compare("MQ3", &y_mq3_cpu, &y_mq3_gpu);
         any_fail |= !ok3;
 
@@ -51,7 +51,7 @@ fn main() {
         let y_mq2_cpu = cpu_reference_mq(&mq2_bytes, &x, m, k, 72, 2, |scale, zero, q| {
             scale * q as f32 + zero
         });
-        let y_mq2_gpu = gpu_mq_gemv(&mut gpu, &mq2_bytes, &x, m, k, rdna_compute::DType::MQ2G256);
+        let y_mq2_gpu = gpu_mq_gemv(&mut gpu, &mq2_bytes, &x, m, k, hipfire_rdna::DType::MQ2G256);
         let (ok2, _max_err2, _mean_err2) = compare("MQ2", &y_mq2_cpu, &y_mq2_gpu);
         any_fail |= !ok2;
 
@@ -203,25 +203,25 @@ fn cpu_rotate_x_mq(x: &[f32]) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 
 fn gpu_mq_gemv(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     bytes: &[u8],
     x: &[f32],
     m: usize,
     k: usize,
-    dtype: rdna_compute::DType,
+    dtype: hipfire_rdna::DType,
 ) -> Vec<f32> {
     let d_a = gpu.upload_raw(bytes, &[bytes.len()]).unwrap();
     let d_x = gpu.upload_f32(x, &[k]).unwrap();
-    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+    let d_y = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
     match dtype {
-        rdna_compute::DType::MQ3G256 => {
-            let d_tmp = gpu.zeros(&[k], rdna_compute::DType::F32).unwrap();
+        hipfire_rdna::DType::MQ3G256 => {
+            let d_tmp = gpu.zeros(&[k], hipfire_rdna::DType::F32).unwrap();
             gpu.gemv_mq3g256_with_rotate(&d_a, &d_x, &d_y, &d_tmp, m, k)
                 .unwrap();
         }
-        rdna_compute::DType::MQ2G256 => {
-            let d_tmp = gpu.zeros(&[k], rdna_compute::DType::F32).unwrap();
+        hipfire_rdna::DType::MQ2G256 => {
+            let d_tmp = gpu.zeros(&[k], hipfire_rdna::DType::F32).unwrap();
             gpu.gemv_mq2g256_with_rotate(&d_a, &d_x, &d_y, &d_tmp, m, k)
                 .unwrap();
         }
@@ -234,9 +234,9 @@ fn gpu_mq_gemv(
     y
 }
 
-fn gpu_rotate_x_mq(gpu: &mut rdna_compute::Gpu, x: &[f32], k: usize) -> Vec<f32> {
+fn gpu_rotate_x_mq(gpu: &mut hipfire_rdna::Gpu, x: &[f32], k: usize) -> Vec<f32> {
     let d_x = gpu.upload_f32(x, &[k]).unwrap();
-    let d_xr = gpu.zeros(&[k], rdna_compute::DType::F32).unwrap();
+    let d_xr = gpu.zeros(&[k], hipfire_rdna::DType::F32).unwrap();
     gpu.rotate_x_mq(&d_x, &d_xr, k).unwrap();
     let mut out = vec![0.0f32; k];
     let out_bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, k * 4) };

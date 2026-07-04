@@ -27,7 +27,7 @@ use hipfire_arch_lfm2moe::{Lfm2MoeConfig, Lfm2MoeWeights};
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor, HfqPackage};
 use hipfire_runtime::weights::weight_gemm;
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -242,7 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let mut gpu = rdna_compute::Gpu::init()?;
+    let mut gpu = hipfire_rdna::Gpu::init()?;
     eprintln!("gpu: {}", gpu.arch);
 
     let mut target_hfq = HfqFile::open(&model)?;
@@ -1166,7 +1166,7 @@ fn max_ctx_for_ranges(dump: &TeacherDump, ranges: &[BlockRange]) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_draft_rows(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     target_weights: &Lfm2MoeWeights,
     target_cfg: &Lfm2MoeConfig,
     draft_weights: &DflashWeights,
@@ -1225,7 +1225,7 @@ fn apply_scale(draft_rows: &[f32], scale: &[f64], hidden: usize) -> Vec<f32> {
 }
 
 fn score_corrected_logits(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     target_weights: &Lfm2MoeWeights,
     corrected_rows: &[f32],
     dump: &TeacherDump,
@@ -1256,7 +1256,7 @@ fn score_corrected_logits(
 }
 
 fn logits_for_corrected_rows(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     target_weights: &Lfm2MoeWeights,
     corrected_rows: &[f32],
     rows: usize,

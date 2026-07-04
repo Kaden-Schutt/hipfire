@@ -34,7 +34,7 @@ use crate::request::ThinkMode;
 /// and the optional MTP spec-decode head.
 pub fn generate_deepseek4(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -642,8 +642,8 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         let mut spec_last_position = pos_after_prefill;
         let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
         'outer: while generated_count < max_tokens {
-            let lh: Option<&rdna_compute::GpuTensor> = unsafe {
-                last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
+            let lh: Option<&hipfire_rdna::GpuTensor> = unsafe {
+                last_hidden_ref.and_then(|p| (p as *const hipfire_rdna::GpuTensor).as_ref())
             };
             let r = match if grammar_active {
                 deepseek4::spec_decode::speculative_decode_step_with_pbs_grammar(
@@ -1100,7 +1100,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 /// per-token prefill/decode loop and streaming live inside `Qwen2Backend`.
 pub fn generate_qwen2(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -1171,7 +1171,7 @@ pub fn generate_qwen2(
 #[allow(clippy::too_many_arguments)]
 pub fn generate_nemotron(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -1344,7 +1344,7 @@ pub fn generate_nemotron(
 #[allow(clippy::too_many_arguments)]
 pub fn generate_zaya(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -1517,7 +1517,7 @@ pub fn generate_zaya(
 #[allow(clippy::too_many_arguments)]
 pub fn generate_llama(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -1708,7 +1708,7 @@ pub fn generate_llama(
 /// `minimax::forward::decode_step` (Mixtral-style MoE), streaming events.
 pub fn generate_minimax(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -1979,7 +1979,7 @@ pub fn generate_minimax(
 /// `arch-lfm2moe` feature.
 pub fn generate_lfm2moe(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2355,7 +2355,7 @@ pub fn generate_lfm2moe(
 #[allow(clippy::too_many_arguments)]
 fn generate_lfm2moe_dflash(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2817,7 +2817,7 @@ pub fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma3(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2907,7 +2907,7 @@ pub fn generate_gemma3(
 #[allow(clippy::too_many_arguments)]
 pub fn generate_gemma3_vl_text(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,

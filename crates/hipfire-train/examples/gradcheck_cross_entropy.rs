@@ -11,7 +11,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::ops::cross_entropy::cross_entropy;
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 const ROWS: usize = 4;
 const V: usize = 9;

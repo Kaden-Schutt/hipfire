@@ -34,6 +34,7 @@ if rg -n \
     --glob '!**/*.lock' \
     --glob '!scripts/check-artifact-names.sh' \
     --glob '!benchmarks/results/**' \
+    --glob '!**/findings-archive/**' \
     -- '\.hfq-(?:hf|mq)[1-8]|\.q[1-8]\.hfq|[-.]hfq[1-8]\.hfq' \
     "${EXISTING_SEARCH_PATHS[@]}"; then
     status=1
@@ -45,6 +46,7 @@ if rg -n \
     --glob '!**/*.lock' \
     --glob '!scripts/check-artifact-names.sh' \
     --glob '!benchmarks/results/**' \
+    --glob '!**/findings-archive/**' \
     -- '(?:qwen3[._-]?[56]|qwen3[56])-[A-Za-z0-9_.-]+-dflash-(?:hf|mq)[1-8]|dflash-(?:hf|mq)[1-8]' \
     "${EXISTING_SEARCH_PATHS[@]}"; then
     status=1

@@ -16,7 +16,7 @@ use crate::ops::lora::{lora_backward, lora_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use crate::ops::rope::{rope_backward, rope_forward};
 use crate::ops::swiglu::{swiglu_backward, swiglu_forward};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 #[derive(Clone, Copy)]
 pub struct BlockDims {

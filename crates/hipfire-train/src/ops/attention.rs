@@ -10,7 +10,7 @@
 //!       dQ = dscores·K; dK = dscoresᵀ·Q
 
 use super::softmax::{softmax_backward, softmax_forward};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 /// Forward. `scale` is typically `1/sqrt(d)`. Scratch `scores`,`p`: `[seq*seq]`;
 /// `ctx`: `[seq*d]` out. `p` (softmax output) is saved for the backward.

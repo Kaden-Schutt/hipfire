@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use hipfire_serving_core::tiny_harness::{run_ar_hash, run_collect, run_kld, TinyArch};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()

@@ -380,7 +380,7 @@ fn lfm2_materialize_prefill_tokens(
 
 fn lfm2_prefill_active_session_tokens(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     tokens: &[u32],
 ) -> Result<usize, String> {
     if tokens.is_empty() {
@@ -487,7 +487,7 @@ fn lfm2_prefill_active_session_tokens(
 
 fn lfm2_prefill_with_boundary_checkpoints(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     batch_id: &str,
     session: &GenerateBatchPrefillSession,
     tokens: &[u32],
@@ -548,7 +548,7 @@ fn lfm2_prefill_with_boundary_checkpoints(
 
 pub fn run_generate_batch_prefill_serial_lfm2(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
 ) -> Result<(), String> {
@@ -692,7 +692,7 @@ pub fn run_generate_batch_prefill_serial_lfm2(
 #[allow(dead_code)]
 pub fn release_lfm2_prefill_sessions(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     session_ids: &[String],
 ) -> Result<usize, String> {
     lfm2_release_sessions(m, gpu, session_ids)

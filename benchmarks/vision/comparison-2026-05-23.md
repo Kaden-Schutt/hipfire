@@ -144,7 +144,7 @@ Three of six bench images (scene_1, scene_2, general_qa) trigger `Memory access 
 | scene_2 | ~64×48 | ~3000 | crash |
 | general_qa | ~60×64 | ~3800 | crash |
 
-llama.cpp processes all three correctly. The audit doc only tested ~square ≤600-patch memes, so this bug was previously invisible. **The vision tower (ViT attention / merger / patch_embed kernels in `rdna-compute`) has a fixed-size assumption that doesn't scale beyond the meme dimensions.** Likely candidates: a static LDS allocation, a launch-bounds limit, or a hardcoded `n_patches` buffer in the spliced F16 path.
+llama.cpp processes all three correctly. The audit doc only tested ~square ≤600-patch memes, so this bug was previously invisible. **The vision tower (ViT attention / merger / patch_embed kernels in `hipfire-rdna`) has a fixed-size assumption that doesn't scale beyond the meme dimensions.** Likely candidates: a static LDS allocation, a launch-bounds limit, or a hardcoded `n_patches` buffer in the spliced F16 path.
 
 ### Finding 4 — the OpenAI PR (#312) is NOT the regression
 
@@ -317,8 +317,8 @@ patch totals.
 ### Files touched in this attempt
 
 - `kernels/src/apply_rope_2d_vision.hip` — new HIP kernel
-- `crates/rdna-compute/src/kernels.rs` — `APPLY_ROPE_2D_VISION_SRC` const
-- `crates/rdna-compute/src/dispatch.rs` — `Gpu::apply_rope_2d_vision_f32`
+- `crates/hipfire-rdna/src/kernels.rs` — `APPLY_ROPE_2D_VISION_SRC` const
+- `crates/hipfire-rdna/src/dispatch.rs` — `Gpu::apply_rope_2d_vision_f32`
 - `crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs` — interp + rotary helpers,
   `pos_embed: Vec<f32>` (CPU), rewired `vision_forward`,
   `num_position_embeddings` in `VisionConfig`

@@ -17,7 +17,7 @@
 //!   cargo run -p hipfire-arch-nemotron --example test_ssd_chunk_gpu
 
 use hipfire_arch_nemotron::ssd::{ssd_chunked, ssd_sequence, SsdParams};
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()

@@ -12,6 +12,7 @@
 //! through the same code path the native quantizer uses. See AGENTS.md: import
 //! tooling lives outside the inference-adjacent quantize binary.
 
+use hipfire_arch_api::{transformer_role, TensorRole};
 use hipfire_quant_format::QuantType;
 use std::fs::File;
 use std::hash::Hasher;
@@ -96,17 +97,6 @@ pub fn routed_moe_config(metadata: &serde_json::Value) -> Option<(u64, u64)> {
     }
 }
 
-pub fn is_routed_expert_tensor_name(name: &str) -> bool {
-    if name.contains(".shared_expert") || name.contains(".shared_experts.") {
-        return false;
-    }
-    name.contains(".mlp.experts.")
-        || name.contains(".ffn.experts.")
-        || name.contains(".block_sparse_moe.experts.")
-        || name.contains(".feed_forward.experts.")
-        || name.contains(".mixer.experts.")
-}
-
 pub fn parameter_counts_metadata(
     metadata: &serde_json::Value,
     tensors: &[HfqTensor],
@@ -116,7 +106,7 @@ pub fn parameter_counts_metadata(
 ) -> serde_json::Value {
     let mut routed_expert_params = 0u64;
     for t in tensors {
-        if is_routed_expert_tensor_name(&t.name) {
+        if transformer_role(&t.name) == TensorRole::Expert {
             routed_expert_params = routed_expert_params.saturating_add(tensor_param_count(t));
         }
     }

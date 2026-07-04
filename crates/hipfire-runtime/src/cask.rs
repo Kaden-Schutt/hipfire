@@ -27,7 +27,7 @@ use crate::kv::KvCache;
 use crate::quant::{f16_to_f32, f32_to_f16};
 use crate::triattn::{EvictionCtx, EvictionResult};
 use hip_bridge::HipResult;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Hard cap on per-slot fold factor. The per-slot slot table is a fixed
 /// stack array of size MAX_FOLD_M to avoid per-eviction heap allocation
@@ -156,8 +156,8 @@ impl CaskCtx {
         // GpuTensor has no Drop impl. Capture fallible work in a closure so
         // early `?` exits still free the scratch tensors below.
         let table_len = budget * self.fold_m;
-        let indices_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
-        let weights_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
+        let indices_dev = gpu.alloc_tensor(&[table_len], hipfire_rdna::DType::F32)?;
+        let weights_dev = gpu.alloc_tensor(&[table_len], hipfire_rdna::DType::F32)?;
 
         let inner_result = (|| -> HipResult<()> {
             for (fa_i, &layer_idx) in self.base.fa_layer_ids.iter().enumerate() {

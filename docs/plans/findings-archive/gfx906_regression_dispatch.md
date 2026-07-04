@@ -213,7 +213,7 @@ Dispatch: attention_flash_q8_0_tile_batched   count=120  total= 18.74ms  avg=156
 ```
 
 Both kernels still exist on HEAD — `attention_q8_0_kv_batched_masked`
-(`crates/rdna-compute/src/attention.rs:1437`) and
+(`crates/hipfire-rdna/src/attention.rs:1437`) and
 `attention_flash_q8_0_batched_masked` (`attention.rs:1546`) — so a
 context-length-gated dispatch (Fix B) is implementable without resurrecting
 deleted code.

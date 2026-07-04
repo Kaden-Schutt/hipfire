@@ -12,7 +12,7 @@
 
 use crate::drafter::Drafter;
 use crate::optim::AdamW;
-use rdna_compute::{Gpu, HipResult};
+use hipfire_rdna::{Gpu, HipResult};
 use std::io::{self, Read, Write};
 
 fn wu32(w: &mut impl Write, x: u32) -> io::Result<()> {
@@ -231,8 +231,8 @@ fn read_ckpt<R: Read>(
 fn bytemuck_f32(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
-fn io_err(e: io::Error) -> rdna_compute::HipError {
-    rdna_compute::HipError {
+fn io_err(e: io::Error) -> hipfire_rdna::HipError {
+    hipfire_rdna::HipError {
         code: u32::MAX,
         message: format!("checkpoint io: {e}"),
     }

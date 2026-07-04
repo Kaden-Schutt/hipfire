@@ -35,13 +35,13 @@ use hip_bridge::HipResult;
 // `DType` will be threaded through once the scaffold gains a real load
 // path (Phase 2 — see `load_bf16_model` body TODO). For now, only the
 // types referenced in the function signature + struct fields are imported.
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::path::Path;
 
 /// A single BF16 weight tensor on the device.
 ///
-/// Mirrors the structure of `rdna_compute::GpuTensor` but tagged with
+/// Mirrors the structure of `hipfire_rdna::GpuTensor` but tagged with
 /// the canonical HuggingFace key so the calibration capture hook can
 /// route activations to the right per-tensor accumulator.
 #[allow(dead_code)]
@@ -52,7 +52,7 @@ pub struct Bf16Tensor {
     /// determines which of these get a Hessian collected.
     pub name: String,
     /// Owned device tensor. Always `DType::F16`-tagged for now — the
-    /// rdna-compute layer doesn't have a `BF16` enum arm yet. Phase 2
+    /// hipfire-rdna layer doesn't have a `BF16` enum arm yet. Phase 2
     /// adds `DType::BF16` (a 1-line edit in dispatch.rs::DType once we
     /// have a real BF16 forward path to consume it). For the scaffold,
     /// we mark the tensor with TODO comments so the downstream wiring

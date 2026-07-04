@@ -146,7 +146,7 @@ attention families included. Layer composition is described by `hipfire-mixer`
 ### Training (`hipfire-train`)
 
 - **LoRA SFT** — **shipped** (Phase 0): LoRA adapters on frozen base weights, real
-  fp32 forward + matching backward built on `gemm_f32_train` (rdna-compute).
+  fp32 forward + matching backward built on `gemm_f32_train` (hipfire-rdna).
   `hipfire-train/src/lib.rs`.
 - **Optimizer & loop** — AdamW (decoupled weight decay, bias correction), LR
   scheduling, per-parameter moment buffers; finite-diff gradchecked.
@@ -268,10 +268,10 @@ coherence), `diffusion` (import/inspect diffusion `.hfq`), `admin`,
 - **Kernel compilation & cache** — offline `hipcc` → `.hsaco` ELF with mtime-
   validated cache (`KernelCompiler`); precompiled blobs loaded at runtime; per-model
   caches (`mmq_screen_cache`, `fp16_shadow_cache`) drained on unload. No runtime JIT.
-  `rdna-compute/src/compiler.rs`.
+  `hipfire-rdna/src/compiler.rs`.
 - **OwnedTensor RAII scratch** — RAII transient GPU tensors with a deferred-free
   mailbox for graph-gated reclaim (`alloc_owned`/`zeros_owned`).
-  `rdna-compute/src/dispatch/mod.rs`.
+  `hipfire-rdna/src/dispatch/mod.rs`.
 - **Sequence state management** — `SequenceStateHandle` / page descriptors for KV +
   recurrent-state allocation/reservation. `hipfire-state`.
 - **Resource locking** — single `flock(2)` primitive (`FlockGuard` /

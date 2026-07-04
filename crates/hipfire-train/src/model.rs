@@ -17,7 +17,7 @@ use crate::ops::distill::distill_kl;
 use crate::ops::linear::{linear_backward_x, linear_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use hipfire_runtime::calibration::CalibCollector;
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 /// Owned frozen weights for one layer.
 pub struct LayerWeights {

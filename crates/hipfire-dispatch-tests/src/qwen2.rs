@@ -6,7 +6,7 @@
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::fused_qkv::FusedQkvFamily;
 use hipfire_dispatch::types::KernelKey;
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 #[test]
 fn qwen2_prefill_batchable_formats() {

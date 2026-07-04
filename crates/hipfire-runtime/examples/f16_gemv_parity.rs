@@ -100,7 +100,7 @@ fn errs(y: &[f32], y_ref: &[f32]) -> (f64, f64) {
 }
 
 fn main() {
-    use rdna_compute::{DType, Gpu};
+    use hipfire_rdna::{DType, Gpu};
 
     let bench = std::env::args().any(|a| a == "--bench");
     const PASS_THRESH: f64 = 5e-2;

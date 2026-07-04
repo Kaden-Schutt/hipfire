@@ -43,17 +43,17 @@ pub fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
 }
 
 /// Device-buffer byte size of one GPU tensor.
-pub fn tensor_bytes(tensor: &rdna_compute::GpuTensor) -> usize {
+pub fn tensor_bytes(tensor: &hipfire_rdna::GpuTensor) -> usize {
     tensor.buf.size()
 }
 
 /// [`tensor_bytes`] for an optional tensor; 0 when `None`.
-pub fn opt_tensor_bytes(tensor: Option<&rdna_compute::GpuTensor>) -> usize {
+pub fn opt_tensor_bytes(tensor: Option<&hipfire_rdna::GpuTensor>) -> usize {
     tensor.map(tensor_bytes).unwrap_or(0)
 }
 
 /// Summed [`tensor_bytes`] over a tensor slice (e.g. per-layer KV vectors).
-pub fn tensor_vec_bytes(tensors: &[rdna_compute::GpuTensor]) -> usize {
+pub fn tensor_vec_bytes(tensors: &[hipfire_rdna::GpuTensor]) -> usize {
     tensors.iter().map(tensor_bytes).sum::<usize>()
 }
 

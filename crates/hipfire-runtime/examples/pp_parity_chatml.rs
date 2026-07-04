@@ -22,7 +22,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 const N_DECODE: usize = 50;

@@ -29,7 +29,7 @@
 use crate::hfq::{load_awq_scale, HfqFile};
 use crate::weights::WeightTensor;
 use hip_bridge::{Graph, GraphExec, HipResult};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 
 /// Max rows per call into `gemm_dispatch` for the MQ4/MQ3 (FWHT-rotated)

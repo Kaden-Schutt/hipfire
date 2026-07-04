@@ -8,7 +8,7 @@
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
-use rdna_compute::{DType, Gpu, GpuTensor, OwnedTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor, OwnedTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -825,7 +825,7 @@ pub fn vision_forward(
     // stream (`gpu.stream_ref()`). Correctness depends on submission-order
     // serialization: pool reuse of a reclaimed buffer is fine because the next
     // kernel using that VRAM is queued AFTER the previous one on the same stream.
-    // If anyone ever refactors `rdna_compute` to use multiple streams for the
+    // If anyone ever refactors `hipfire_rdna` to use multiple streams for the
     // vision path (e.g., async memcpy on a side stream), this pattern must be
     // revisited — either add per-layer syncs or attach kernels to the freeing
     // buffer's stream. See review notes in `vision_rev_claude.md`.

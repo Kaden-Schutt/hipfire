@@ -739,7 +739,10 @@ mod aql_tests {
         assert_eq!(dispatch_packet_header(), 0x1502);
         // And it decomposes back to the intended fields.
         let h = dispatch_packet_header();
-        assert_eq!((h >> HSA_PACKET_HEADER_TYPE) & 0xff, HSA_PACKET_TYPE_KERNEL_DISPATCH);
+        assert_eq!(
+            (h >> HSA_PACKET_HEADER_TYPE) & 0xff,
+            HSA_PACKET_TYPE_KERNEL_DISPATCH
+        );
         assert_eq!((h >> HSA_PACKET_HEADER_BARRIER) & 0x1, 1);
         assert_eq!(
             (h >> HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) & 0x3,
@@ -761,15 +764,42 @@ mod aql_tests {
         assert_eq!(std::mem::align_of::<HsaKernelDispatchPacket>(), 64);
         assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, header), 0);
         assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, setup), 2);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, workgroup_size_x), 4);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, workgroup_size_z), 8);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, grid_size_x), 12);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, grid_size_z), 20);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, private_segment_size), 24);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, group_segment_size), 28);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, kernel_object), 32);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, kernarg_address), 40);
-        assert_eq!(std::mem::offset_of!(HsaKernelDispatchPacket, completion_signal), 56);
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, workgroup_size_x),
+            4
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, workgroup_size_z),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, grid_size_x),
+            12
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, grid_size_z),
+            20
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, private_segment_size),
+            24
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, group_segment_size),
+            28
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, kernel_object),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, kernarg_address),
+            40
+        );
+        assert_eq!(
+            std::mem::offset_of!(HsaKernelDispatchPacket, completion_signal),
+            56
+        );
     }
 
     fn test_kernel() -> HsaKernel {
@@ -794,7 +824,10 @@ mod aql_tests {
         }
         // 3-D grid (grid[2] > 1).
         assert_eq!(packet.setup, 3);
-        assert_eq!(packet.header, HSA_PACKET_TYPE_INVALID, "header must stay unpublished");
+        assert_eq!(
+            packet.header, HSA_PACKET_TYPE_INVALID,
+            "header must stay unpublished"
+        );
         assert_eq!(packet.workgroup_size_x, 64);
         assert_eq!(packet.workgroup_size_y, 1);
         assert_eq!(packet.workgroup_size_z, 1);
@@ -815,9 +848,27 @@ mod aql_tests {
     fn build_dispatch_packet_infers_1d_and_2d_dims() {
         let kernel = test_kernel();
         let mut p: HsaKernelDispatchPacket = unsafe { std::mem::zeroed() };
-        unsafe { build_dispatch_packet(&mut p, &kernel, [8, 1, 1], [32, 1, 1], std::ptr::null_mut(), 0) };
+        unsafe {
+            build_dispatch_packet(
+                &mut p,
+                &kernel,
+                [8, 1, 1],
+                [32, 1, 1],
+                std::ptr::null_mut(),
+                0,
+            )
+        };
         assert_eq!(p.setup, 1, "grid [8,1,1] is 1-D");
-        unsafe { build_dispatch_packet(&mut p, &kernel, [8, 4, 1], [32, 2, 1], std::ptr::null_mut(), 0) };
+        unsafe {
+            build_dispatch_packet(
+                &mut p,
+                &kernel,
+                [8, 4, 1],
+                [32, 2, 1],
+                std::ptr::null_mut(),
+                0,
+            )
+        };
         assert_eq!(p.setup, 2, "grid [8,4,1] is 2-D");
     }
 
@@ -826,7 +877,14 @@ mod aql_tests {
         let kernel = test_kernel();
         let mut p: HsaKernelDispatchPacket = unsafe { std::mem::zeroed() };
         unsafe {
-            build_dispatch_packet(&mut p, &kernel, [u32::MAX, 1, 1], [64, 1, 1], std::ptr::null_mut(), 0)
+            build_dispatch_packet(
+                &mut p,
+                &kernel,
+                [u32::MAX, 1, 1],
+                [64, 1, 1],
+                std::ptr::null_mut(),
+                0,
+            )
         };
         // grid_size_x = MAX × 64 saturates to u32::MAX rather than wrapping to a
         // tiny bogus launch size.

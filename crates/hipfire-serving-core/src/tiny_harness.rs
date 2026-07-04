@@ -14,14 +14,14 @@
 //! `hipfire_runtime::weights::weight_gemv` chokepoint now calls
 //! `gpu.maybe_capture_activation` (no-op unless a collector is armed).
 //!
-//! GPU-only: every forward requires `rdna_compute::Gpu`. Used by the
+//! GPU-only: every forward requires `hipfire_rdna::Gpu`. Used by the
 //! `tiny_quant_probe` example and the hipfire-eval `tiny_quant` battery.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 use hipfire_runtime::calibration::CalibCollector;
 use hipfire_runtime::hfq::HfqFile;

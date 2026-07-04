@@ -5,7 +5,7 @@
 **Model:** /local/hipfire/qwen3.5-9b-mq4.hfq (md5 from `bench_qwen35_speed` runs)
 **Prompt:** synthetic 256-token deterministic stream (tokens 0..255)
 **Path:** `forward_prefill_batch` at B=256, kv_mode=asym3, warmup=2 then 1 profiled iter
-**Profiler:** in-process `rdna_compute::profile::{start,stop}` (hipEvent-based;
+**Profiler:** in-process `hipfire_rdna::profile::{start,stop}` (hipEvent-based;
               rocprofv3 segfaults on gfx906 GL2C counter init at this ROCm version)
 **Tool:** `crates/hipfire-runtime/examples/profile_prefill_qwen35.rs` (new)
 
@@ -67,7 +67,7 @@ matching the PR 315 thesis exactly.
 
 ## Notes on the probe methodology
 
-- `rdna_compute::profile` serializes launches (event sync after each), so the
+- `hipfire_rdna::profile` serializes launches (event sync after each), so the
   716 ms profiled wall is ~2× the un-profiled 348 ms. The relative %-of-wall
   numbers are still accurate — async overlap doesn't change per-kernel time,
   only their composition.

@@ -46,7 +46,7 @@ fn main() {
     );
 
     let model_path_buf = Path::new(model_path);
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
     // Auto-route safetensors directories (ParoQuant / AWQ / HF native) —
@@ -140,7 +140,7 @@ fn main() {
         // cross-check internal profile against rocprofv3 _kernel_stats.csv.
         // Stored here so the report is visible in both the logging block and
         // the atlas emission block below.
-        let mut prefill_rocprof_report: Option<rdna_compute::profile_rocprof::ProfileReport> = None;
+        let mut prefill_rocprof_report: Option<hipfire_rdna::profile_rocprof::ProfileReport> = None;
         // When profiling, do an unprofile warm-up prefill first to JIT all kernels,
         // then reset state and profile the second pass.
         if do_profile {
@@ -172,7 +172,7 @@ fn main() {
             )
             .unwrap();
             eprintln!("  JIT complete, profiling next pass...");
-            rdna_compute::profile::start();
+            hipfire_rdna::profile::start();
         }
         eprintln!("\n=== prefill ({prefill_len} tokens) ===");
         let mut prefill_samples_ms = Vec::with_capacity(prefill_runs);
@@ -325,14 +325,14 @@ fn main() {
             let rocprof_csv_env = std::env::var("HIPFIRE_ROCPROF_CSV").ok();
             let report = if let Some(ref csv_path_str) = rocprof_csv_env {
                 let csv_path = std::path::Path::new(csv_path_str.as_str());
-                let r = rdna_compute::profile_rocprof::stop_with_rocprof(csv_path);
+                let r = hipfire_rdna::profile_rocprof::stop_with_rocprof(csv_path);
                 if r.is_none() {
                     eprintln!("WARN: HIPFIRE_ROCPROF_CSV set but internal profiler was not active");
                 }
                 r
             } else {
-                rdna_compute::profile::stop()
-                    .map(|entries| rdna_compute::profile_rocprof::compute_coverage(&entries, &[]))
+                hipfire_rdna::profile::stop()
+                    .map(|entries| hipfire_rdna::profile_rocprof::compute_coverage(&entries, &[]))
             };
             if let Some(ref report) = report {
                 let entries = &report.internal;
@@ -547,7 +547,7 @@ fn main() {
         );
 
         // HIPFIRE_DPM_WARMUP_SECS: optional DPM-stabilization pass before the
-        // timed decode. See crates/rdna-compute/src/dispatch.rs `dpm_warmup`.
+        // timed decode. See crates/hipfire-rdna/src/dispatch.rs `dpm_warmup`.
         maybe_dpm_warmup(&mut gpu, None).expect("dpm warmup");
 
         // === GEN BENCHMARK ===
@@ -560,7 +560,7 @@ fn main() {
         eprintln!("\n=== gen ({gen_len} tokens — timed) ===");
         let mut per_token_ms: Vec<f64> = Vec::with_capacity(gen_len);
         if do_profile_decode {
-            rdna_compute::profile::start();
+            hipfire_rdna::profile::start();
         }
         let t_gen_start = Instant::now();
         for step in 0..gen_len {
@@ -587,7 +587,7 @@ fn main() {
         }
         let gen_total_ms = t_gen_start.elapsed().as_secs_f64() * 1000.0;
         if do_profile_decode {
-            if let Some(entries) = rdna_compute::profile::stop() {
+            if let Some(entries) = hipfire_rdna::profile::stop() {
                 let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> =
                     Default::default();
                 for e in &entries {

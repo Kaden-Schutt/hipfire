@@ -17,7 +17,7 @@ use std::path::Path;
 
 use hipfire_arch_qwen2::qwen2;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();

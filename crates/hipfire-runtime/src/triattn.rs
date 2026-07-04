@@ -46,7 +46,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::kv::KvCache;
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Q-side centers for one (layer, head, band) triple.
 ///
@@ -413,7 +413,7 @@ pub struct TriAttnCalibStateGpu {
 
 impl TriAttnCalibStateGpu {
     pub fn new(
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         n_layers: usize,
         n_heads: usize,
         head_dim: usize,
@@ -448,7 +448,7 @@ impl TriAttnCalibStateGpu {
     /// Download + convert to the same TriAttnCenters format the CPU path
     /// produces. Uses the exact same finalize math as `BandAccumulator::finalize`
     /// to ensure identical output.
-    pub fn finalize(self, gpu: &mut rdna_compute::Gpu) -> hip_bridge::HipResult<TriAttnCenters> {
+    pub fn finalize(self, gpu: &mut hipfire_rdna::Gpu) -> hip_bridge::HipResult<TriAttnCenters> {
         let n_bands = self.head_dim / 2;
         let n_accs = self.n_layers * self.n_heads * n_bands;
 
@@ -544,7 +544,7 @@ pub fn take_tap_gpu() -> Option<TriAttnCalibStateGpu> {
 /// falls back to CPU path). Never errors the whole run; GPU dispatch errors
 /// propagate up as HipResult.
 pub fn record_prerope_q_batch_gpu_if_applicable(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     layer_idx: usize,
     q_batch: &hip_bridge::DeviceBuffer,
     n_tokens: usize,

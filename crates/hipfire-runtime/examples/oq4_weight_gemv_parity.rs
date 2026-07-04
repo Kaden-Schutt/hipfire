@@ -18,7 +18,7 @@
 
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use hipfire_runtime::weights::{weight_gemv, WeightTensor};
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);

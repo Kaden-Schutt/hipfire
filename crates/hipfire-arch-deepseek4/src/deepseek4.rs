@@ -223,44 +223,44 @@ pub struct DeepseekV4LayerWeights {
     pub compress_ratio: u32, // 0 = no indexer; otherwise stride
 
     // Norms (F16 vectors).
-    pub attn_norm: Option<rdna_compute::GpuTensor>,
-    pub ffn_norm: Option<rdna_compute::GpuTensor>,
-    pub q_norm: Option<rdna_compute::GpuTensor>,
-    pub kv_norm: Option<rdna_compute::GpuTensor>,
-    pub attn_sink: Option<rdna_compute::GpuTensor>, // [n_heads]
+    pub attn_norm: Option<hipfire_rdna::GpuTensor>,
+    pub ffn_norm: Option<hipfire_rdna::GpuTensor>,
+    pub q_norm: Option<hipfire_rdna::GpuTensor>,
+    pub kv_norm: Option<hipfire_rdna::GpuTensor>,
+    pub attn_sink: Option<hipfire_rdna::GpuTensor>, // [n_heads]
 
     // Attention LoRA + KV joint (MQ-family quantized).
-    pub wq_a: Option<rdna_compute::GpuTensor>,
-    pub wq_b: Option<rdna_compute::GpuTensor>,
-    pub wkv: Option<rdna_compute::GpuTensor>,
-    pub wo_a: Option<rdna_compute::GpuTensor>,
-    pub wo_b: Option<rdna_compute::GpuTensor>,
+    pub wq_a: Option<hipfire_rdna::GpuTensor>,
+    pub wq_b: Option<hipfire_rdna::GpuTensor>,
+    pub wkv: Option<hipfire_rdna::GpuTensor>,
+    pub wo_a: Option<hipfire_rdna::GpuTensor>,
+    pub wo_b: Option<hipfire_rdna::GpuTensor>,
 
     // Main-attention compressor (compress_ratio > 0). Stores compressed
     // KV at slot pos//ratio for later main-attention gather. Distinct
     // from indexer's own compressor below.
-    pub compressor_wkv: Option<rdna_compute::GpuTensor>,
-    pub compressor_wgate: Option<rdna_compute::GpuTensor>,
-    pub compressor_norm: Option<rdna_compute::GpuTensor>,
-    pub compressor_ape: Option<rdna_compute::GpuTensor>, // [ratio, coff*head_dim]
+    pub compressor_wkv: Option<hipfire_rdna::GpuTensor>,
+    pub compressor_wgate: Option<hipfire_rdna::GpuTensor>,
+    pub compressor_norm: Option<hipfire_rdna::GpuTensor>,
+    pub compressor_ape: Option<hipfire_rdna::GpuTensor>, // [ratio, coff*head_dim]
     /// F16-native copies of the compressor projections for the WMMA
     /// GEMM path. Same data as `compressor_w{kv,gate}` but stored as
     /// F16 bytes directly (no F32 decode). Populated when
     /// `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` is enabled at load time.
-    pub compressor_wkv_f16: Option<rdna_compute::GpuTensor>,
-    pub compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
+    pub compressor_wkv_f16: Option<hipfire_rdna::GpuTensor>,
+    pub compressor_wgate_f16: Option<hipfire_rdna::GpuTensor>,
 
     // Indexer sub-module — only on layers with compress_ratio == 4.
     // Selects top-k positions for sparse attention beyond SWA window.
-    pub indexer_wq_b: Option<rdna_compute::GpuTensor>, // [idx_n_heads * idx_head_dim, q_lora_rank]
-    pub indexer_weights_proj: Option<rdna_compute::GpuTensor>, // [idx_n_heads, hidden]
-    pub indexer_compressor_wkv: Option<rdna_compute::GpuTensor>, // [coff*idx_head_dim, hidden]
-    pub indexer_compressor_wgate: Option<rdna_compute::GpuTensor>,
+    pub indexer_wq_b: Option<hipfire_rdna::GpuTensor>, // [idx_n_heads * idx_head_dim, q_lora_rank]
+    pub indexer_weights_proj: Option<hipfire_rdna::GpuTensor>, // [idx_n_heads, hidden]
+    pub indexer_compressor_wkv: Option<hipfire_rdna::GpuTensor>, // [coff*idx_head_dim, hidden]
+    pub indexer_compressor_wgate: Option<hipfire_rdna::GpuTensor>,
     /// F16-native copies of the indexer compressor projections for WMMA.
-    pub indexer_compressor_wkv_f16: Option<rdna_compute::GpuTensor>,
-    pub indexer_compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
-    pub indexer_compressor_norm: Option<rdna_compute::GpuTensor>, // [idx_head_dim]
-    pub indexer_compressor_ape: Option<rdna_compute::GpuTensor>,  // [ratio, coff*idx_head_dim]
+    pub indexer_compressor_wkv_f16: Option<hipfire_rdna::GpuTensor>,
+    pub indexer_compressor_wgate_f16: Option<hipfire_rdna::GpuTensor>,
+    pub indexer_compressor_norm: Option<hipfire_rdna::GpuTensor>, // [idx_head_dim]
+    pub indexer_compressor_ape: Option<hipfire_rdna::GpuTensor>,  // [ratio, coff*idx_head_dim]
 
     // MTP-specific fields (only populated for the MTP "layer" in
     // `DeepseekV4Weights.mtp_layer`; always None for the normal
@@ -273,11 +273,11 @@ pub struct DeepseekV4LayerWeights {
     // `e_proj`/`h_proj` are FP8-source → Q8F16 on device (under the
     // deepseek4-source-precision quant). `enorm`/`hnorm`/`mtp_final_norm`
     // are BF16-source → F16.
-    pub mtp_enorm: Option<rdna_compute::GpuTensor>, // [hidden]
-    pub mtp_hnorm: Option<rdna_compute::GpuTensor>, // [hidden]
-    pub mtp_e_proj: Option<rdna_compute::GpuTensor>, // [hidden, hidden]
-    pub mtp_h_proj: Option<rdna_compute::GpuTensor>, // [hidden, hidden]
-    pub mtp_final_norm: Option<rdna_compute::GpuTensor>, // [hidden]
+    pub mtp_enorm: Option<hipfire_rdna::GpuTensor>, // [hidden]
+    pub mtp_hnorm: Option<hipfire_rdna::GpuTensor>, // [hidden]
+    pub mtp_e_proj: Option<hipfire_rdna::GpuTensor>, // [hidden, hidden]
+    pub mtp_h_proj: Option<hipfire_rdna::GpuTensor>, // [hidden, hidden]
+    pub mtp_final_norm: Option<hipfire_rdna::GpuTensor>, // [hidden]
     /// MTP-specific head-HC matrices. DeepSeek V4 ships these alongside the per-MTP
     /// HC matrices (hc_attn_*, hc_ffn_*). Their presence in the safetensors
     /// means the MTP layer was trained WITH head-HC mixing on its lm_head
@@ -286,22 +286,22 @@ pub struct DeepseekV4LayerWeights {
     /// for its prediction, measured as ~50% lower acceptance vs head-HC
     /// mixed. Shapes match main globals: hc_head_fn [hc_mult, hc_mult*hidden],
     /// hc_head_base [hc_mult], hc_head_scale [1] (scalar host-side after load).
-    pub mtp_hc_head_fn: Option<rdna_compute::GpuTensor>, // [hc_mult, hc_mult*hidden]
-    pub mtp_hc_head_base: Option<rdna_compute::GpuTensor>, // [hc_mult]
+    pub mtp_hc_head_fn: Option<hipfire_rdna::GpuTensor>, // [hc_mult, hc_mult*hidden]
+    pub mtp_hc_head_base: Option<hipfire_rdna::GpuTensor>, // [hc_mult]
     pub mtp_hc_head_scale: f32,                     // scalar (loaded from [1] F16)
 
     // Hyper-Connections (F16 small matrices).
-    pub hc_attn_base: Option<rdna_compute::GpuTensor>,
-    pub hc_attn_fn: Option<rdna_compute::GpuTensor>,
-    pub hc_attn_scale: Option<rdna_compute::GpuTensor>,
-    pub hc_ffn_base: Option<rdna_compute::GpuTensor>,
-    pub hc_ffn_fn: Option<rdna_compute::GpuTensor>,
-    pub hc_ffn_scale: Option<rdna_compute::GpuTensor>,
+    pub hc_attn_base: Option<hipfire_rdna::GpuTensor>,
+    pub hc_attn_fn: Option<hipfire_rdna::GpuTensor>,
+    pub hc_attn_scale: Option<hipfire_rdna::GpuTensor>,
+    pub hc_ffn_base: Option<hipfire_rdna::GpuTensor>,
+    pub hc_ffn_fn: Option<hipfire_rdna::GpuTensor>,
+    pub hc_ffn_scale: Option<hipfire_rdna::GpuTensor>,
 
     // FFN router. `gate.bias` is None for hash-routed layers (first
     // `num_hash_layers`).
-    pub gate_weight: Option<rdna_compute::GpuTensor>,
-    pub gate_bias: Option<rdna_compute::GpuTensor>,
+    pub gate_weight: Option<hipfire_rdna::GpuTensor>,
+    pub gate_bias: Option<hipfire_rdna::GpuTensor>,
     /// Host-cached gate_bias for CPU-side topk-with-bias logic. DeepSeek V4
     /// adds bias to the routing-selection scores (but not the routing
     /// weights), so we need fast CPU access during ffn_routed. Length
@@ -316,12 +316,12 @@ pub struct DeepseekV4LayerWeights {
     /// path (eliminates per-step d2h+h2d of scores/weights). Allocated
     /// at load time alongside `tid2eid_host`. `None` for non-hash
     /// layers or when the HFQ shipped without the table.
-    pub tid2eid_dev: Option<rdna_compute::GpuTensor>,
+    pub tid2eid_dev: Option<hipfire_rdna::GpuTensor>,
 
     // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
-    pub shared_w1: Option<rdna_compute::GpuTensor>,
-    pub shared_w2: Option<rdna_compute::GpuTensor>,
-    pub shared_w3: Option<rdna_compute::GpuTensor>,
+    pub shared_w1: Option<hipfire_rdna::GpuTensor>,
+    pub shared_w2: Option<hipfire_rdna::GpuTensor>,
+    pub shared_w3: Option<hipfire_rdna::GpuTensor>,
 
     // Routed experts. To avoid 256 × 43 × 3 = 33K separate hipMalloc
     // calls (drives load time to 3+ minutes), all 256 experts for each
@@ -331,12 +331,12 @@ pub struct DeepseekV4LayerWeights {
     // Layout per blob: `[n_routed_experts × bytes_per_expert]` raw bytes.
     // Pointer table: F32 GpuTensor of length `2 * n_routed_experts`
     //   (two F32 slots per u64 pointer, matching qwen35 convention).
-    pub expert_w1_blob: Option<rdna_compute::GpuTensor>,
-    pub expert_w2_blob: Option<rdna_compute::GpuTensor>,
-    pub expert_w3_blob: Option<rdna_compute::GpuTensor>,
-    pub expert_w1_ptrs: Option<rdna_compute::GpuTensor>,
-    pub expert_w2_ptrs: Option<rdna_compute::GpuTensor>,
-    pub expert_w3_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_w1_blob: Option<hipfire_rdna::GpuTensor>,
+    pub expert_w2_blob: Option<hipfire_rdna::GpuTensor>,
+    pub expert_w3_blob: Option<hipfire_rdna::GpuTensor>,
+    pub expert_w1_ptrs: Option<hipfire_rdna::GpuTensor>,
+    pub expert_w2_ptrs: Option<hipfire_rdna::GpuTensor>,
+    pub expert_w3_ptrs: Option<hipfire_rdna::GpuTensor>,
     /// Bytes per expert (uniform across all experts in a layer). Used
     /// for sub_offset math when forward needs a per-expert view (rarely).
     pub expert_w1_stride: usize,
@@ -350,8 +350,8 @@ pub struct DeepseekV4LayerWeights {
     /// up rows. The `_indexed` MQ2-Lloyd MoE kernel reads from this as
     /// a [2*intermediate, hidden] weight and splits the output by row.
     /// `expert_gate_up_ptrs` is the per-expert pointer table.
-    pub expert_gate_up_blob: Option<rdna_compute::GpuTensor>,
-    pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_gate_up_blob: Option<hipfire_rdna::GpuTensor>,
+    pub expert_gate_up_ptrs: Option<hipfire_rdna::GpuTensor>,
     pub expert_gate_up_stride: usize,
 }
 
@@ -423,8 +423,8 @@ impl DeepseekV4LayerWeights {
     /// Release every GPU buffer this layer owns back to the pool.
     /// Used by `DeepseekV4Weights::free_gpu` to walk all 43 main layers
     /// plus the optional MTP layer.
-    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
-        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+    pub fn free_gpu(mut self, gpu: &mut hipfire_rdna::Gpu) {
+        fn free_opt(gpu: &mut hipfire_rdna::Gpu, t: &mut Option<hipfire_rdna::GpuTensor>) {
             if let Some(t) = t.take() {
                 let _ = gpu.free_tensor(t);
             }
@@ -494,17 +494,17 @@ impl DeepseekV4LayerWeights {
 pub struct DeepseekV4Weights {
     /// Token embedding table. Stored as raw Q8F16 bytes on GPU
     /// (matches the `embed.weight` quant_type from Phase 1 ingest).
-    pub token_embd: Option<rdna_compute::GpuTensor>,
+    pub token_embd: Option<hipfire_rdna::GpuTensor>,
     /// Final output norm (RMSNorm scale, F32 — converted from F16 at load time).
-    pub output_norm: Option<rdna_compute::GpuTensor>,
+    pub output_norm: Option<hipfire_rdna::GpuTensor>,
     /// LM head weight (Q8_0 in the canonical build; quant_type follows the
     /// source HFQ — `upload_quant_or_f16` routes by dtype). Shape
     /// `[vocab_size, hidden]`.
-    pub head: Option<rdna_compute::GpuTensor>,
+    pub head: Option<hipfire_rdna::GpuTensor>,
     /// Head HC mix: `hc_head_fn` [hc_mult, hc_mult * hidden] F16 raw on GPU.
-    pub hc_head_fn: Option<rdna_compute::GpuTensor>,
+    pub hc_head_fn: Option<hipfire_rdna::GpuTensor>,
     /// `hc_head_base` [hc_mult] F16 raw on GPU.
-    pub hc_head_base: Option<rdna_compute::GpuTensor>,
+    pub hc_head_base: Option<hipfire_rdna::GpuTensor>,
     /// `hc_head_scale` is shape [1] F16 on disk — cached as host f32 scalar.
     pub hc_head_scale: f32,
     /// One bundle per `num_hidden_layers` (43 on DeepSeek V4).
@@ -530,8 +530,8 @@ impl DeepseekV4Weights {
     /// explicit unload so VRAM is actually returned to the system (not
     /// just released back into the daemon's pool — `drain_pool` calls
     /// `hipFree` after this).
-    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
-        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+    pub fn free_gpu(mut self, gpu: &mut hipfire_rdna::Gpu) {
+        fn free_opt(gpu: &mut hipfire_rdna::Gpu, t: &mut Option<hipfire_rdna::GpuTensor>) {
             if let Some(t) = t.take() {
                 let _ = gpu.free_tensor(t);
             }
@@ -590,42 +590,42 @@ pub struct IndexerLayerState {
     /// Compressed KV cache `[max_compressed_pos, head_dim]` F32. Holds
     /// gated-pooled compressed values at slot pos//ratio. Used by main
     /// attention's gather step to extend SWA window.
-    pub main_kv_cache: Option<rdna_compute::GpuTensor>,
+    pub main_kv_cache: Option<hipfire_rdna::GpuTensor>,
     /// Per-position kv state buffer `[coff*ratio, coff*head_dim]` F32.
     /// Holds raw kv values within the current and (for overlap=true)
     /// previous compress window.
-    pub main_kv_state: Option<rdna_compute::GpuTensor>,
+    pub main_kv_state: Option<hipfire_rdna::GpuTensor>,
     /// Per-position score buffer `[coff*ratio, coff*head_dim]` F32 with
     /// hc_*.ape positional bias added. Pooled via softmax to compress kv.
-    pub main_score_state: Option<rdna_compute::GpuTensor>,
+    pub main_score_state: Option<hipfire_rdna::GpuTensor>,
 
     // ── Indexer state (ratio == 4 only) ────────────────────────────
     /// Indexer-specific compressed KV cache `[max_compressed_pos, idx_head_dim]`
     /// F32. Built by indexer's separate compressor. Used by Q · K_idx
     /// scoring step.
-    pub indexer_kv_cache: Option<rdna_compute::GpuTensor>,
-    pub indexer_kv_state: Option<rdna_compute::GpuTensor>,
-    pub indexer_score_state: Option<rdna_compute::GpuTensor>,
+    pub indexer_kv_cache: Option<hipfire_rdna::GpuTensor>,
+    pub indexer_kv_state: Option<hipfire_rdna::GpuTensor>,
+    pub indexer_score_state: Option<hipfire_rdna::GpuTensor>,
     /// Per-step indexer scratch:
     ///   q_idx [n_idx_heads, idx_head_dim] = [64, 128]
     ///   weights [n_idx_heads] = [64]
     ///   index_score [n_compressed] (per current step)
     ///   topk_indices [index_topk = 512]
-    pub q_idx: Option<rdna_compute::GpuTensor>,
-    pub idx_weights: Option<rdna_compute::GpuTensor>,
-    pub index_score: Option<rdna_compute::GpuTensor>,
-    pub topk_idx_indices: Option<rdna_compute::GpuTensor>,
+    pub q_idx: Option<hipfire_rdna::GpuTensor>,
+    pub idx_weights: Option<hipfire_rdna::GpuTensor>,
+    pub index_score: Option<hipfire_rdna::GpuTensor>,
+    pub topk_idx_indices: Option<hipfire_rdna::GpuTensor>,
 
     // Compressor per-step scratch (re-used main and indexer; sized for
     // the LARGER of the two — main has coff*head_dim = 1024 for ratio=4,
     // indexer has 256). Lazy-alloc by compressor_forward.
     /// Per-step kv = wkv @ x   [proj_dim = coff*head_dim] F32.
-    pub comp_kv_buf: Option<rdna_compute::GpuTensor>,
+    pub comp_kv_buf: Option<hipfire_rdna::GpuTensor>,
     /// Per-step score = wgate @ x + ape   [proj_dim] F32.
-    pub comp_score_buf: Option<rdna_compute::GpuTensor>,
+    pub comp_score_buf: Option<hipfire_rdna::GpuTensor>,
     /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
-    pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
-    pub comp_concat_score: Option<rdna_compute::GpuTensor>,
+    pub comp_concat_kv: Option<hipfire_rdna::GpuTensor>,
+    pub comp_concat_score: Option<hipfire_rdna::GpuTensor>,
 }
 
 /// Per-layer scratch for the main attention path's gathered K/V rows.
@@ -636,9 +636,9 @@ pub struct IndexerLayerState {
 pub struct MainAttentionLayerState {
     /// SWA ring K cache `[n_kv_heads, head_dim, sliding_window]` F32.
     /// `None` until `decode_step` allocates on first call.
-    pub swa_k: Option<rdna_compute::GpuTensor>,
+    pub swa_k: Option<hipfire_rdna::GpuTensor>,
     /// SWA ring V cache. DeepSeek V4 has tied K=V so this is a copy of swa_k.
-    pub swa_v: Option<rdna_compute::GpuTensor>,
+    pub swa_v: Option<hipfire_rdna::GpuTensor>,
 
     /// Full positional K/V cache for indexer-gathered attention. Layout:
     /// `[max_ctx, n_kv_heads * head_dim]` F32. Written at each decode
@@ -648,14 +648,14 @@ pub struct MainAttentionLayerState {
     /// DeepSeek V4 has tied K=V so we keep one buffer; `full_v_cache` is None
     /// in practice and we re-use `full_k_cache` for both. Field kept for
     /// future-proofing models with untied K/V.
-    pub full_k_cache: Option<rdna_compute::GpuTensor>,
-    pub full_v_cache: Option<rdna_compute::GpuTensor>,
+    pub full_k_cache: Option<hipfire_rdna::GpuTensor>,
+    pub full_v_cache: Option<hipfire_rdna::GpuTensor>,
 
     /// Gather scratch — concat of SWA-window K/V + indexer-gathered K/V
     /// for the modified attention pass. `[n_kv_heads, head_dim,
     /// sliding_window + index_topk]` F32, lazy-alloc.
-    pub gathered_k: Option<rdna_compute::GpuTensor>,
-    pub gathered_v: Option<rdna_compute::GpuTensor>,
+    pub gathered_k: Option<hipfire_rdna::GpuTensor>,
+    pub gathered_v: Option<hipfire_rdna::GpuTensor>,
 }
 
 /// DeepSeek V4 per-decode state. Held on the daemon's per-session struct,
@@ -671,34 +671,34 @@ pub struct DeepseekV4State {
     /// (llama / qwen35 use f32 residuals + f32 RMSNorm). Quantized
     /// kernels handle the f32 input directly.
     /// `None` until `decode_step` allocates on first call.
-    pub residual_streams: Option<rdna_compute::GpuTensor>,
+    pub residual_streams: Option<hipfire_rdna::GpuTensor>,
 
     /// Single-row embedding scratch `[hidden]` for the current decode
     /// step's token lookup. F32 to match residual_streams convention.
-    pub embed_scratch: Option<rdna_compute::GpuTensor>,
+    pub embed_scratch: Option<hipfire_rdna::GpuTensor>,
 
     /// Per-step scratch `[hidden]` F32 — used for RMSNorm output,
     /// FWHT-rotated input to first GEMV, etc. Reused across layers.
-    pub tmp: Option<rdna_compute::GpuTensor>,
+    pub tmp: Option<hipfire_rdna::GpuTensor>,
 
     /// Plain RMSNorm'd attention-side input `[hidden]` F32 — no FWHT.
     /// Mirrors `tmp` but skips the rotation step. Consumed by F32 (F16-
     /// source) non-expert GEMVs (`--non-expert-f16` antirez recipe) since
     /// `gemv_f32` expects un-rotated input. Computed once per layer in
     /// `q_lora` alongside `tmp`.
-    pub tmp_plain: Option<rdna_compute::GpuTensor>,
+    pub tmp_plain: Option<hipfire_rdna::GpuTensor>,
 
     /// MTP pre-block scratch — RMSNorm output of the embed input
     /// `[hidden]` F32. Holds `mtp_enorm(embed_lookup(next_token))`
     /// across the two-GEMV `mtp_e_proj @ ... + mtp_h_proj @ ...` fusion.
     /// Only allocated when `mtp_forward` is called.
-    pub mtp_e_norm_scratch: Option<rdna_compute::GpuTensor>,
+    pub mtp_e_norm_scratch: Option<hipfire_rdna::GpuTensor>,
 
     /// MTP pre-block scratch — RMSNorm output of the hidden input
     /// `[hc_mult, hidden]` F32. Holds `mtp_hnorm(h_n)` applied per HC row
     /// (rmsnorm_batched). Same lazy-allocation pattern as
     /// `mtp_e_norm_scratch`. Reallocated if hc_mult ever changes.
-    pub mtp_h_norm_scratch: Option<rdna_compute::GpuTensor>,
+    pub mtp_h_norm_scratch: Option<hipfire_rdna::GpuTensor>,
 
     /// Post-layer-block residual stream `[hc_mult, hidden]` F32 from the
     /// most-recent `decode_step` or `mtp_forward` call. Per antirez/ds4
@@ -708,26 +708,26 @@ pub struct DeepseekV4State {
     /// at ~50%. Populated by both `final_norm_and_head` (decode path) and
     /// `mtp_forward` step 7 so `speculative_decode_step` can chain K MTP
     /// iterations.
-    pub mtp_last_hidden: Option<rdna_compute::GpuTensor>,
+    pub mtp_last_hidden: Option<hipfire_rdna::GpuTensor>,
 
     /// Q-LoRA bottleneck `[q_lora_rank = 1024]` F32. Output of
     /// `wq_a @ x`, input to `wq_b`. Reused across layers.
-    pub q_lat: Option<rdna_compute::GpuTensor>,
+    pub q_lat: Option<hipfire_rdna::GpuTensor>,
 
     /// Q-LoRA bottleneck rotated `[q_lora_rank]` F32. FWHT-rotated
     /// view of q_lat, input to the MQ4 GEMV against wq_b.
-    pub q_lat_rot: Option<rdna_compute::GpuTensor>,
+    pub q_lat_rot: Option<hipfire_rdna::GpuTensor>,
 
     /// Full Q `[n_heads * head_dim = 64 * 512 = 32768]` F32. Output
     /// of `wq_b @ q_lat_rot`. Tail-only RoPE applied in place.
-    pub q: Option<rdna_compute::GpuTensor>,
+    pub q: Option<hipfire_rdna::GpuTensor>,
 
     /// Joint KV stream `[n_kv_heads * head_dim = 1 * 512 = 512]` F32.
     /// Output of `wkv @ x`. DeepSeek V4 uses tied K=V via this single vector
     /// (MQA with V tied to K — see project memory for the layout
     /// open question; revisit during numerical-correctness gate).
     /// Tail-only RoPE applied to last `qk_rope_head_dim = 64` dims.
-    pub kv: Option<rdna_compute::GpuTensor>,
+    pub kv: Option<hipfire_rdna::GpuTensor>,
 
     /// Position counter for RoPE. Stored as a 1-element F32 GpuTensor
     /// where we write the i32 position bits via memcpy_htod (the
@@ -738,7 +738,7 @@ pub struct DeepseekV4State {
     /// ONCE per token at decode_step entry from `pos_array_host`. In the
     /// legacy direct-dispatch path it's a standalone [1] F32 buffer that
     /// gets overwritten per layer.
-    pub pos_buf: Option<rdna_compute::GpuTensor>,
+    pub pos_buf: Option<hipfire_rdna::GpuTensor>,
 
     /// Separate position buffer for the indexer compressor's tail-RoPE
     /// step. Distinct from `pos_buf` because the compressor uses a
@@ -746,7 +746,7 @@ pub struct DeepseekV4State {
     /// attention's inverse-rope (called after the compressor) needs the
     /// current `position`. Sharing one buffer would clobber the value
     /// the main-attn inverse rope reads.
-    pub comp_pos_buf: Option<rdna_compute::GpuTensor>,
+    pub comp_pos_buf: Option<hipfire_rdna::GpuTensor>,
 
     /// HIP-graphs prerequisite: per-layer pre-computed position array
     /// `[(num_hidden_layers + 1) * 3]` i32 (stored as F32 bits — kernels
@@ -755,7 +755,7 @@ pub struct DeepseekV4State {
     /// `pos_array_host`, then sliced for per-layer kernel reads. Lets us
     /// lift the ~130 per-token `memcpy_htod` pos_buf writes out of the
     /// captured region so a single graph replay covers an entire decode.
-    pub pos_array_device: Option<rdna_compute::GpuTensor>,
+    pub pos_array_device: Option<hipfire_rdna::GpuTensor>,
 
     /// Stable-pointer host source for `pos_array_device`. Heap-allocated
     /// `Box<[i32]>` so the underlying address stays valid across graph
@@ -777,7 +777,7 @@ pub struct DeepseekV4State {
     /// Read by `hash_router_normalize_f32_buf` so the captured graph
     /// re-reads it on every replay (mirrors the `pos_array_*` pattern).
     /// Lazy-allocated by the first hash-routed layer that needs it.
-    pub token_id_buf: Option<rdna_compute::GpuTensor>,
+    pub token_id_buf: Option<hipfire_rdna::GpuTensor>,
 
     /// Stable host-side source for `token_id_buf`. The captured htod
     /// node re-reads this pointer on every graph_launch — must be a
@@ -804,7 +804,7 @@ pub struct DeepseekV4State {
     /// pick up new positions on each replay without re-capture. Slots
     /// 7 and 9 store -1 (sentinel) on non-commit positions so the
     /// commit kernels can early-return without writing.
-    pub attn_state_buf: Option<rdna_compute::GpuTensor>,
+    pub attn_state_buf: Option<hipfire_rdna::GpuTensor>,
     /// Stable-pointer host source for `attn_state_buf`. Same rationale
     /// as `pos_array_host`: captured memcpy nodes re-read this pointer
     /// on each graph replay and find the values written for the current
@@ -814,93 +814,93 @@ pub struct DeepseekV4State {
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
     /// view of `q` until real attention + O-LoRA lands.
-    pub attn_out: Option<rdna_compute::GpuTensor>,
+    pub attn_out: Option<hipfire_rdna::GpuTensor>,
 
     /// Per-token FFN output `[hidden]` F32, fed to HC FFN mix as
     /// `transform_out`. Currently = shared expert output (real),
     /// routed experts pending.
-    pub ffn_out: Option<rdna_compute::GpuTensor>,
+    pub ffn_out: Option<hipfire_rdna::GpuTensor>,
 
     /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
     /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
-    pub ffn_x_rot: Option<rdna_compute::GpuTensor>,
+    pub ffn_x_rot: Option<hipfire_rdna::GpuTensor>,
 
     /// Plain RMSNorm'd FFN-side input `[hidden]` F32 — no FWHT. Mirror of
     /// `ffn_x_rot` for F32 (F16-source) non-expert GEMVs (antirez recipe).
-    pub ffn_x_plain: Option<rdna_compute::GpuTensor>,
+    pub ffn_x_plain: Option<hipfire_rdna::GpuTensor>,
 
     /// Shared expert SwiGLU gate scratch `[moe_intermediate=2048]` F32.
-    pub ffn_gate: Option<rdna_compute::GpuTensor>,
+    pub ffn_gate: Option<hipfire_rdna::GpuTensor>,
     /// Shared expert SwiGLU up scratch `[moe_intermediate]` F32.
-    pub ffn_up: Option<rdna_compute::GpuTensor>,
+    pub ffn_up: Option<hipfire_rdna::GpuTensor>,
     /// FWHT-rotated silu(gate)*up for the down GEMV.
-    pub ffn_silu_rot: Option<rdna_compute::GpuTensor>,
+    pub ffn_silu_rot: Option<hipfire_rdna::GpuTensor>,
 
     /// Final pre-lm_head normalized residual `[hidden]` F32. Output
     /// of the global RMSNorm against `output_norm`.
-    pub final_norm: Option<rdna_compute::GpuTensor>,
+    pub final_norm: Option<hipfire_rdna::GpuTensor>,
 
     /// LM head output logits `[vocab_size = 129280]` F32. Output of
     /// `head_weight @ final_norm`.
-    pub logits: Option<rdna_compute::GpuTensor>,
+    pub logits: Option<hipfire_rdna::GpuTensor>,
 
     /// FWHT-rotated `final_norm` for the MQ4 head GEMV. Shape `[hidden]`.
-    pub final_norm_rot: Option<rdna_compute::GpuTensor>,
+    pub final_norm_rot: Option<hipfire_rdna::GpuTensor>,
 
     /// Input-mapping output: `x_in = A · X`. Fed to the transform (attn
     /// or FFN) as its [hidden] input.
-    pub hc_x_in: Option<rdna_compute::GpuTensor>,
+    pub hc_x_in: Option<hipfire_rdna::GpuTensor>,
 
     /// mHC control vector `[24]` F32, set by `hc_compute_control` and
     /// consumed by `hc_mix_4stream`. Allocated once per session.
     /// Layout: c[0..4]=Ã, c[4..20]=B̃, c[20..24]=C̃.
-    pub hc_c: Option<rdna_compute::GpuTensor>,
+    pub hc_c: Option<hipfire_rdna::GpuTensor>,
 
     /// MoE router scores `[n_routed_experts = 256]` F32, set by the
     /// router step (gate.weight @ ffn_input + bias → sqrt_softplus).
-    pub router_scores: Option<rdna_compute::GpuTensor>,
+    pub router_scores: Option<hipfire_rdna::GpuTensor>,
     /// Top-K expert indices, allocated as F32 view but interpreted
     /// as i32. Shape `[num_experts_per_tok = 6]`.
-    pub topk_indices: Option<rdna_compute::GpuTensor>,
+    pub topk_indices: Option<hipfire_rdna::GpuTensor>,
     /// Per-routed-expert output scratch `[hidden]` F32. Reused for
     /// each of the K=6 selected experts; weighted-accumulated into
     /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`. Legacy
     /// fallback-path scratch (no longer reachable from forward.rs).
-    pub routed_expert_out: Option<rdna_compute::GpuTensor>,
+    pub routed_expert_out: Option<hipfire_rdna::GpuTensor>,
 
     /// Phase 1 perf: fused MoE dispatch scratch.
     /// `moe_topk_indices` [k_top] i32, `moe_topk_weights` [k_top] f32
     /// (pre-multiplied by route_scale_override). Filled per-token from
     /// CPU top-K result.
-    pub moe_topk_indices: Option<rdna_compute::GpuTensor>,
-    pub moe_topk_weights: Option<rdna_compute::GpuTensor>,
+    pub moe_topk_indices: Option<hipfire_rdna::GpuTensor>,
+    pub moe_topk_weights: Option<hipfire_rdna::GpuTensor>,
     /// Per-expert SwiGLU intermediate buffers `[k_top × intermediate]`.
-    pub moe_gate_batch: Option<rdna_compute::GpuTensor>,
-    pub moe_up_batch: Option<rdna_compute::GpuTensor>,
-    pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
+    pub moe_gate_batch: Option<hipfire_rdna::GpuTensor>,
+    pub moe_up_batch: Option<hipfire_rdna::GpuTensor>,
+    pub moe_rot_batch: Option<hipfire_rdna::GpuTensor>,
     /// `[k_top × hidden]` per-expert down outputs for the deterministic MoE combine.
-    pub moe_down_expert_outputs: Option<rdna_compute::GpuTensor>,
+    pub moe_down_expert_outputs: Option<hipfire_rdna::GpuTensor>,
 
     /// Buffer of all-ones, length `head_dim`, used as the weight arg
     /// to the per-head Q RMSNorm (upstream DeepSeek V4 has NO learnable scale
     /// on the post-wq_b Q-norm, just rsqrt(mean(sq)+eps)). Allocated
     /// once on first attention layer.
-    pub q_head_ones: Option<rdna_compute::GpuTensor>,
+    pub q_head_ones: Option<hipfire_rdna::GpuTensor>,
 
     /// Raw attention output `[n_heads, head_dim]` F32 = 32768 elems.
     /// Fed into the O-LoRA projection (wo_a + wo_b → state.attn_out).
-    pub attn_out_raw: Option<rdna_compute::GpuTensor>,
+    pub attn_out_raw: Option<hipfire_rdna::GpuTensor>,
     /// FWHT-rotated `attn_out_raw` for wo_a GEMV input.
-    pub attn_out_raw_rot: Option<rdna_compute::GpuTensor>,
+    pub attn_out_raw_rot: Option<hipfire_rdna::GpuTensor>,
     /// wo_a output `[n_groups * o_lora_rank]` F32 = 8192 elems.
-    pub wo_a_out: Option<rdna_compute::GpuTensor>,
+    pub wo_a_out: Option<hipfire_rdna::GpuTensor>,
     /// FWHT-rotated wo_a_out for the wo_b GEMV input.
-    pub wo_a_out_rot: Option<rdna_compute::GpuTensor>,
+    pub wo_a_out_rot: Option<hipfire_rdna::GpuTensor>,
 
     /// Head HC pre-weights `[hc_mult=4]` F32 from hc_head_compute_pre.
-    pub head_hc_pre: Option<rdna_compute::GpuTensor>,
+    pub head_hc_pre: Option<hipfire_rdna::GpuTensor>,
     /// Head HC combined-streams output `[hidden]` F32 → output_norm → lm_head.
-    pub head_hc_out: Option<rdna_compute::GpuTensor>,
+    pub head_hc_out: Option<hipfire_rdna::GpuTensor>,
 
     /// Batched verify lm_head scratch (spec-decode). The lm_head weight is
     /// `[vocab, hidden]` (~565 MB Q8) and the GEMV is pure weight-BW-bound;
@@ -909,9 +909,9 @@ pub struct DeepseekV4State {
     ///   `head_norm_batch`   — per-position pre-lm_head normed acts `[K, hidden]` F32
     ///   `head_x_f16`        — F16-staged GEMM input `[K*hidden]`
     ///   `head_logits_batch` — `[K, vocab]` logits from the single batched GEMV
-    pub head_norm_batch: Option<rdna_compute::GpuTensor>,
-    pub head_x_f16: Option<rdna_compute::GpuTensor>,
-    pub head_logits_batch: Option<rdna_compute::GpuTensor>,
+    pub head_norm_batch: Option<hipfire_rdna::GpuTensor>,
+    pub head_x_f16: Option<hipfire_rdna::GpuTensor>,
+    pub head_logits_batch: Option<hipfire_rdna::GpuTensor>,
 
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
@@ -1090,8 +1090,8 @@ impl DeepseekV4State {
     ///
     /// Must be called where `gpu` is available (the daemon's lcp==0 fresh-
     /// conversation handler), not from `reset()` (no gpu there).
-    pub fn zero_decode_caches(&mut self, gpu: &mut rdna_compute::Gpu) {
-        fn z(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+    pub fn zero_decode_caches(&mut self, gpu: &mut hipfire_rdna::Gpu) {
+        fn z(gpu: &mut hipfire_rdna::Gpu, t: &Option<hipfire_rdna::GpuTensor>) {
             if let Some(t) = t {
                 let _ = gpu.hip.memset(&t.buf, 0, t.byte_size());
             }
@@ -1101,7 +1101,7 @@ impl DeepseekV4State {
         // compressed block has no overlap prev-window, and those unfilled slots
         // must get zero softmax weight in the pooling. Reset to 0 would instead
         // pool the prior turn's stale window (or dilute block 0 with zeros).
-        fn zinf(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+        fn zinf(gpu: &mut hipfire_rdna::Gpu, t: &Option<hipfire_rdna::GpuTensor>) {
             if let Some(t) = t {
                 let _ = gpu.fill_f32(t, f32::NEG_INFINITY);
             }
@@ -1137,8 +1137,8 @@ impl DeepseekV4State {
     /// per-session scratch + per-layer SWA/indexer/compressor caches
     /// until the daemon exits. Idle eviction can't reclaim VRAM in that
     /// regime, defeating its purpose.
-    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
-        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+    pub fn free_gpu(mut self, gpu: &mut hipfire_rdna::Gpu) {
+        fn free_opt(gpu: &mut hipfire_rdna::Gpu, t: &mut Option<hipfire_rdna::GpuTensor>) {
             if let Some(t) = t.take() {
                 let _ = gpu.free_tensor(t);
             }

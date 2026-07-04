@@ -40,7 +40,7 @@ use std::time::Instant;
 
 use hipfire_arch_dots_ocr::{dots_ocr, image as preprocess, rope};
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 // ─── Argument parsing ─────────────────────────────────────────────────
 

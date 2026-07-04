@@ -93,7 +93,7 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
 }
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     eprintln!("GPU: {}", gpu.arch);
 
     // 4B model proj shapes: gate/up = 14336 × 2560, qkv/wo = 2560 × 2560

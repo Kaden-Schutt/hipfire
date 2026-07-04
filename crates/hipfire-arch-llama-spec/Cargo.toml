@@ -12,3 +12,6 @@ description = "Lean offline spec for the Llama family: arch identity + Ingest qu
 
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
+# For the ToyModel fixture's config.json only. Pure/offline; its byte-identical
+# to_string_pretty output keeps the tiny-quant golden baselines stable.
+serde_json = "1"

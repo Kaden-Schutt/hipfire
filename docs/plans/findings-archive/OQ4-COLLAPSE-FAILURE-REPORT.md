@@ -75,10 +75,10 @@ but the whole fails.**
 | Real dims tested | 6144×1024, 1024×3584 (ng=14), 1024×2048, 3584×1024, 256×1024 | all PASS |
 | Decode offset | `sub_offset(0,…)` → pointer at buffer start (offset 0, dtype-size-independent) | Correct |
 | Weight pointers in `forward_prefill` | `&layer.wq.buf` / `&layer.wo.buf` etc. passed at offset 0, no stale sub_offset | Correct |
-| Build freshness | Forced `arch-qwen35` + `rdna-compute` recompile, cleared `~/.hipfire/kernels/gfx1103` | Confirmed fresh |
+| Build freshness | Forced `arch-qwen35` + `hipfire-rdna` recompile, cleared `~/.hipfire/kernels/gfx1103` | Confirmed fresh |
 
 The CPU-reference parity harness (a rewrite of
-`crates/rdna-compute/examples/parity_gemm_oq4_mmq.rs`) builds the interleaved buffer
+`crates/hipfire-rdna/examples/parity_gemm_oq4_mmq.rs`) builds the interleaved buffer
 exactly as the loader does and compares **both** prefill kernels to a CPU dot-product
 reference. Both passed at every real model dimension — proving the kernel ports read
 the interleaved layout correctly.
@@ -99,7 +99,7 @@ correct + pointers correct, yet the end-to-end prefill forward produces NaN.
 - **Stale kernel cache** — `~/.hipfire/kernels/gfx1103` validates by
   `hash(source+arch)` and recompiles via hipcc on mismatch; cleared and reproduced.
 - **Stale binary** — forced recompile of `hipfire-arch-qwen35` (loader) and
-  `rdna-compute` (`include_str!` kernels); reproduced.
+  `hipfire-rdna` (`include_str!` kernels); reproduced.
 - **AWQ / rotation** — plain `oq4.hfq` (no AWQ sidecar) reproduces identically.
 - **Kernel layout/sign bug** — CPU-reference parity PASS across all dims.
 - **Loader byte layout** — instrumented; exact sizes and sane scales.
@@ -111,9 +111,9 @@ correct + pointers correct, yet the end-to-end prefill forward produces NaN.
 ## 8. Gotchas discovered (useful regardless)
 
 1. **`include_str!` kernels need an explicit rebuild trigger.** Editing a `.hip`
-   does not always force the embedding crate (`rdna-compute`) to recompile; the
-   binary can ship stale kernel source. Fix: `touch crates/rdna-compute/src/kernels.rs`
-   and confirm `Compiling rdna-compute` / `Compiling hipfire-arch-qwen35` in the
+   does not always force the embedding crate (`hipfire-rdna`) to recompile; the
+   binary can ship stale kernel source. Fix: `touch crates/hipfire-rdna/src/kernels.rs`
+   and confirm `Compiling hipfire-rdna` / `Compiling hipfire-arch-qwen35` in the
    build output before testing.
 2. **`HIPFIRE_OQ4_BATCHED_PREFILL=0` does NOT fully disable batched prefill** — it
    cannot be used to force a pure decode-only path for isolation.

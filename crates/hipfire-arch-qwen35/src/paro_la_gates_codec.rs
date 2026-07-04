@@ -48,8 +48,8 @@ pub fn encode_mq4g128_from_fp16(weight_fp16: &[u16], rows: usize, cols: usize) -
         rows * cols
     );
 
-    let signs1_vec = rdna_compute::gen_fwht_signs(SIGNS1_SEED, GROUP_SIZE);
-    let signs2_vec = rdna_compute::gen_fwht_signs(SIGNS2_SEED, GROUP_SIZE);
+    let signs1_vec = hipfire_rdna::gen_fwht_signs(SIGNS1_SEED, GROUP_SIZE);
+    let signs2_vec = hipfire_rdna::gen_fwht_signs(SIGNS2_SEED, GROUP_SIZE);
 
     let groups_per_row = cols / GROUP_SIZE;
     let bytes_per_row = groups_per_row * BYTES_PER_GROUP;
@@ -110,7 +110,7 @@ pub fn encode_mq4g128_from_fp16(weight_fp16: &[u16], rows: usize, cols: usize) -
 /// - The arch+env gating allows.
 ///
 /// Env var `HIPFIRE_PARO_LA_GATES_MQ4G128={0|1}` overrides arch default;
-/// unset uses `rdna_compute::arch_caps::paro_la_gates_mq4g128_default(arch)`.
+/// unset uses `hipfire_rdna::arch_caps::paro_la_gates_mq4g128_default(arch)`.
 pub fn should_quantize_la_gate(prefix: &str, arch: &str) -> bool {
     if !(prefix.ends_with("linear_attn.in_proj_a") || prefix.ends_with("linear_attn.in_proj_b")) {
         return false;
@@ -128,7 +128,7 @@ pub fn should_quantize_la_gate(prefix: &str, arch: &str) -> bool {
             );
         }
     }
-    rdna_compute::arch_caps::paro_la_gates_mq4g128_default(arch)
+    hipfire_rdna::arch_caps::paro_la_gates_mq4g128_default(arch)
 }
 
 #[cfg(test)]
@@ -202,8 +202,8 @@ mod tests {
         // Rotate the activation through FWHT-128 using the same sign tables.
         // The two FWHTs cancel orthogonally, so the dot products should match
         // the original-basis reference.
-        let signs1 = rdna_compute::gen_fwht_signs(SIGNS1_SEED, GROUP_SIZE);
-        let signs2 = rdna_compute::gen_fwht_signs(SIGNS2_SEED, GROUP_SIZE);
+        let signs1 = hipfire_rdna::gen_fwht_signs(SIGNS1_SEED, GROUP_SIZE);
+        let signs2 = hipfire_rdna::gen_fwht_signs(SIGNS2_SEED, GROUP_SIZE);
         let mut act_rot = act_f32.clone();
         for g in 0..(cols / GROUP_SIZE) {
             let mut grp: [f32; 128] = act_rot[g * 128..(g + 1) * 128].try_into().unwrap();

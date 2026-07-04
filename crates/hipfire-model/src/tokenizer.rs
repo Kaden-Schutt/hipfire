@@ -277,7 +277,6 @@ fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], To
 }
 
 impl Tokenizer {
-
     /// Load tokenizer from HuggingFace tokenizer.json (embedded in HFQ metadata).
     pub fn from_hf_json(json_str: &str) -> Result<Self, TokenizerError> {
         let tok: serde_json::Value = serde_json::from_str(json_str)?;

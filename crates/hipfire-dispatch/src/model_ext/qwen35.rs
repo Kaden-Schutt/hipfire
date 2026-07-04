@@ -9,7 +9,7 @@
 // don't fit into the standard dispatch families because the state is
 // model-owned and the recurrence is an inherently sequential kernel.
 
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 // ── State quantization ─────────────────────────────────
 

@@ -6,7 +6,7 @@
 //! Compares against a CPU reference dequantizing the same packed HFQ3
 //! bytes via the unpack pattern from gemv_hfq3g256.hip.
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init");

@@ -18,7 +18,7 @@
 //! classification this module enables.
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Allocate a same-shape, same-dtype tensor on `dst_gpu` and peer-copy the
 /// bytes from `src_gpu`'s tensor. Both gpus must already have bidirectional

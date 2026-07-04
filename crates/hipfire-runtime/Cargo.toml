@@ -41,7 +41,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
 default = ["arch-qwen35", "arch-qwen35-vl", "arch-gemma3", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
-deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
+deltanet = ["hipfire-rdna/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-gemma3 = []
@@ -68,7 +68,7 @@ hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 hip-bridge = { path = "../hip-bridge" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-hneurons = { path = "../hipfire-hneurons" }
 hipfire-mixer = { path = "../hipfire-mixer" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
@@ -112,6 +112,7 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # features above and `required-features` on each `[[example]]` block
 # below.
 [dev-dependencies]
+hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }

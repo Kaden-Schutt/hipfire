@@ -16,7 +16,7 @@ savings are **< 8 %**, Path D is paused and rescoped, because the plan's
 60-ms cycle target (20 % savings on a 75-ms baseline) is unreachable on this
 hardware regardless of correct stream wiring.
 
-The bench is `crates/rdna-compute/examples/bench_stream_overlap.rs` (already
+The bench is `crates/hipfire-rdna/examples/bench_stream_overlap.rs` (already
 in the tree, predates this plan). It exercises real
 `gemm_hfq4g256_residual` kernels on synthetic MQ4-layout weights — same
 quantization as production target/draft weights — so contention is realistic
@@ -186,7 +186,7 @@ What this measurement does **not** decide:
 
 ```sh
 # Symmetric + default asymmetric (5v + 5d, same shape):
-cargo build --release -p rdna-compute --example bench_stream_overlap
+cargo build --release -p hipfire-rdna --example bench_stream_overlap
 ./target/release/examples/bench_stream_overlap
 
 # Realistic verify-dominated (the case that fails the threshold):

@@ -54,7 +54,7 @@ fn main() {
     use hipfire_runtime::multi_gpu::Gpus;
     use hipfire_runtime::sampler;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
-    use rdna_compute::{DType, GpuTensor};
+    use hipfire_rdna::{DType, GpuTensor};
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();

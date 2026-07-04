@@ -30,7 +30,7 @@ use hipfire_train::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use hipfire_train::ops::swiglu::{swiglu_backward, swiglu_forward};
 use hipfire_train::optim::AdamW;
 use hipfire_train::oqplus_quant::oqplus_simquant;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::collections::HashMap;
 
 const QT_BF16: u8 = 16;
@@ -222,9 +222,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // FFN forward parameterized by weights: down(swiglu(gate(norm_γ(x_in)),up)).
         let run_fwd = |gpu: &mut Gpu,
-                       wg: &rdna_compute::GpuTensor,
-                       wu: &rdna_compute::GpuTensor,
-                       wd: &rdna_compute::GpuTensor|
+                       wg: &hipfire_rdna::GpuTensor,
+                       wu: &hipfire_rdna::GpuTensor,
+                       wd: &hipfire_rdna::GpuTensor|
          -> Result<Vec<f32>, Box<dyn std::error::Error>> {
             rmsnorm_forward(gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
             linear_forward(gpu, &yn, wg, &g, rows, dim, inter)?;

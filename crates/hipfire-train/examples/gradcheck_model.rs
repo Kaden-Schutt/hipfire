@@ -12,7 +12,7 @@
 use hipfire_train::block::BlockDims;
 use hipfire_train::model::{model_forward, model_loss_backward};
 use hipfire_train::model::{LayerLora, LayerWeights, LlamaModel};
-use rdna_compute::{Gpu, HipResult};
+use hipfire_rdna::{Gpu, HipResult};
 
 const NL: usize = 2;
 const SEQ: usize = 3;

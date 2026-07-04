@@ -84,13 +84,13 @@ Overall Health Score: **6.5 / 10 (Grade C)**
 ## Codebase Profile
 
 - **Language / build**: Rust workspace (Cargo), HIP/ROCm GPU backend
-  (`rdna-compute`, `hip-bridge`), `.hip` kernels under `kernels/`.
+  (`hipfire-rdna`, `hip-bridge`), `.hip` kernels under `kernels/`.
 - **Diff size**: 64 source files, **+8,530 / −3,574** (excluding artifacts);
   plus 611 committed build-artifact files (`target-baseline/`).
 - **New crates**: `hipfire-dispatch` (library), `hipfire-dispatch-tests`
   (test-only).
 - **Touched crates**: `hipfire-arch-{llama,qwen2,qwen35,deepseek4}`,
-  `hipfire-runtime`, `rdna-compute`, `hipfire-quantize`.
+  `hipfire-runtime`, `hipfire-rdna`, `hipfire-quantize`.
 - **Removed**: `paro_la_gates_codec.rs` (321), `test_gemv_paro4g128.rs` (665),
   `fused_rmsnorm_paro4g128t_rotate.hip` (186), and ~12 `HIPFIRE_PARO_*` env-var
   gates.
@@ -159,7 +159,7 @@ silently again. Until then, the branch title oversells what is reachable.
 **What**: A full release build tree was committed: 58 `.rlib`, 58 `.rmeta`,
 example ELF binaries (`bench_qwen35_mq4` 4.95 MB, `profile_qwen35_mq4` 4.55 MB),
 `.d` depfiles, fingerprints, and timestamps. Largest blob:
-`target-baseline/release/deps/librdna_compute-*.rlib` (11 MB). Total **206 MB**.
+`target-baseline/release/deps/libhipfire_rdna-*.rlib` (11 MB). Total **206 MB**.
 
 **Why it matters**: Root `.gitignore:2` ignores only `/target`; the renamed
 `target-baseline/` dodges it. Build artifacts in history can never be cleaned by
@@ -254,7 +254,7 @@ to `.opencode/.gitignore`. The two plan `.md` files are intentional — keep.
 **Effort**: Quick Win.
 
 ### [DEPS-001] / [ARCH-004] `dispatch.rs` remains a 33,172-line god-file
-**Location**: `crates/rdna-compute/src/dispatch.rs`. **What**: verified
+**Location**: `crates/hipfire-rdna/src/dispatch.rs`. **What**: verified
 34,284 → 33,172 lines — the refactor removed only ~1,100 net lines of a 33k-line
 file. Dead `gemv_paro4g128*` / `fused_*_paro4g128t` methods remain after the
 PARO4G128/T dtypes were dropped (`1a02aabe`). **Why**: the stated goal was to
@@ -334,7 +334,7 @@ hipfire-dispatch/
 ├── pipeline/         executor handles 2 of ~10 PipelineOps
 └── resource/         ResourceManager — placeholder, never used
 ```
-Dependency direction is clean and one-way: `hipfire-dispatch → rdna-compute →
+Dependency direction is clean and one-way: `hipfire-dispatch → hipfire-rdna →
 hip-bridge`; arch crates depend on dispatch via an (orphaned) optional feature.
 No circular deps.
 
@@ -442,7 +442,7 @@ deletions reference-clean.
 | S3 | Suggestion | Testing | Arch lists duplicated (no DRY) | `dispatch-tests/src/*.rs` |
 | S3 | Suggestion | Architecture | Family ownership inconsistent (OnceLock vs new()) | `deepseek4/forward.rs:139` vs `llama/arch.rs` |
 | S3 | Suggestion | Architecture | Two parallel new-dispatch integrations | runtime/llama.rs vs arch crates |
-| S3 | Suggestion | Architecture | Dead PARO4G128T Gpu methods linger | `rdna-compute/src/dispatch.rs` |
+| S3 | Suggestion | Architecture | Dead PARO4G128T Gpu methods linger | `hipfire-rdna/src/dispatch.rs` |
 | S3 | Suggestion | Style | ~20 dead-code warnings (feature on) | arch new-dispatch path |
 | S3 | Suggestion | Docs | Public dispatch enums lack rustdoc | `dispatch/src/types.rs` |
 | S3 | Suggestion | Docs | Plan docs overstate shipped scope | `.opencode/plans/` |

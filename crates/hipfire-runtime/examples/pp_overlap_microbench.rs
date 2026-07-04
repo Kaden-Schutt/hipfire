@@ -58,7 +58,7 @@
 //!   ./target/release/examples/pp_overlap_microbench && hipfire gpu-lock release
 
 use hipfire_runtime::multi_gpu::Gpus;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::time::Instant;
 
 const DIM: usize = 5120; // qwen3.6-27b hidden size (M = K)
@@ -103,9 +103,9 @@ fn bytes_of(v: &[f32]) -> &[u8] {
 
 /// Per-band GEMM resources living on one device.
 struct Band {
-    a_raw: rdna_compute::GpuTensor,
-    x: rdna_compute::GpuTensor,
-    y: rdna_compute::GpuTensor,
+    a_raw: hipfire_rdna::GpuTensor,
+    x: hipfire_rdna::GpuTensor,
+    y: hipfire_rdna::GpuTensor,
     iters: usize,
     batch: usize,
 }

@@ -133,7 +133,7 @@ pub fn load_nemotron_weights(
 use crate::weight::{EmbeddingTable, LinearWeight};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weights::WeightTensor;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 /// quant_type byte → quantized linear `DType` (None ⇒ stored as a plain
 /// precision, handle via `dequant_qt`). See `qt_name` in hipfire-quantize.

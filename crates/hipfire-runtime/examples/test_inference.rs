@@ -35,7 +35,7 @@ fn main() {
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.head_dim
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     eprintln!("GPU: {}", gpu.arch);
 
     let weights =

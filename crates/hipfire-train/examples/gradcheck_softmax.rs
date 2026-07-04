@@ -10,7 +10,7 @@
 //!   hipfire gpu-lock release
 
 use hipfire_train::ops::softmax::{softmax_backward, softmax_forward};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 const ROWS: usize = 3;
 const N: usize = 7;

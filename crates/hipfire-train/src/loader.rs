@@ -9,7 +9,7 @@
 use crate::config::LlamaConfig;
 use hipfire_model::ModelSource;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 use std::path::Path;
 
 /// Per-layer frozen weights (HF row-major `[out, in]`, ready for

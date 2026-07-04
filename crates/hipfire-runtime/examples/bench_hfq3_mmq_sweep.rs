@@ -10,7 +10,7 @@
 //!      (set HIPFIRE_HFQ3_MMQ via the dispatcher itself — bench bypasses
 //!       routing by calling _dot2 and _mmq variants directly.)
 
-use rdna_compute::{DType, GpuTensor};
+use hipfire_rdna::{DType, GpuTensor};
 use std::time::Instant;
 
 fn fract_sin(x: f32) -> f32 {
@@ -45,7 +45,7 @@ fn synth_x(n: usize, k: usize, seed: u32) -> Vec<f32> {
 }
 
 fn run_kernel(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     d_w: &GpuTensor,
     d_x: &GpuTensor,
     d_y: &GpuTensor,
@@ -79,7 +79,7 @@ fn run_kernel(
 }
 
 fn time_one(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     d_w: &GpuTensor,
     d_x: &GpuTensor,
     d_y: &GpuTensor,
@@ -103,7 +103,7 @@ fn time_one(
 }
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     eprintln!("=== bench_hfq3_mmq_sweep on {} ===", gpu.arch);
 
     // Qwen3.5 9B FA preamble shape: K=2048, m up to 4096 for q; we use

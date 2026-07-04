@@ -42,13 +42,13 @@
 //! Constraint: this is an inherently per-token-attention feature (it lives in
 //! `kv_cache_attention_dispatch`); the batched session-batch prefill bypasses that
 //! and is guarded against hier. Parity oracle: `ColdTier::two_tier_attend` + the
-//! GPU kernels validated in rdna-compute/examples/parity_{attention_cold_slots,
+//! GPU kernels validated in hipfire-rdna/examples/parity_{attention_cold_slots,
 //! flash_tier_merge,flash_partials_ml,two_tier_e2e,cold_4bit_read} and
 //! hipfire-runtime/examples/parity_kv_hier.
 
 use hipfire_kvquant::kv_compact::compact_cold_kv;
 use hipfire_kvquant::kvarn::{kvarn_record_bytes_bits, pack_kvarn_tile_bits};
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 const HD: usize = 256; // head_dim (kernel CHD)
 

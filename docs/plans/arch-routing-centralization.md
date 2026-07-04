@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Centralize all GPU arch routing in `rdna-compute` into a single `ArchCaps` struct, eliminating 32 `*_for_arch()` panic bombs and ~72 scattered arch checks across `dispatch.rs` and `kernels.rs`.
+**Goal:** Centralize all GPU arch routing in `hipfire-rdna` into a single `ArchCaps` struct, eliminating 32 `*_for_arch()` panic bombs and ~72 scattered arch checks across `dispatch.rs` and `kernels.rs`.
 
 **Architecture:** New `ArchCaps` struct in `arch_caps.rs` holds all arch-family predicates (computed once at construction) and kernel-symbol selection methods (replacing `*_for_arch`). `FeatureFlags` keeps env-var config but delegates arch predicates to `ArchCaps`. `Gpu` holds `arch_caps: ArchCaps` alongside `flags: Arc<FeatureFlags>`.
 
-**Tech Stack:** Rust, `crates/rdna-compute`, no new dependencies.
+**Tech Stack:** Rust, `crates/hipfire-rdna`, no new dependencies.
 
 **Base branch:** `feature/328-feature-flags-v3`
 
@@ -16,12 +16,12 @@
 
 | File | Action | Responsibility |
 |------|--------|---------------|
-| `crates/rdna-compute/src/arch_caps.rs` | Modify (expand from 44 → ~550 lines) | `ArchCaps` struct: all arch-family predicates + kernel symbol selection methods |
-| `crates/rdna-compute/src/dispatch.rs` | Modify (net -~250 lines Phase 1, ~35 changed Phase 2) | Replace all inline arch checks with `self.arch_caps.*` calls; replace `*_for_arch()` calls with `self.arch_caps.*` |
-| `crates/rdna-compute/src/kernels.rs` | Modify (Phase 2: remove 32 `*_for_arch` functions; reorganize const strings) | Pure `pub const` symbol definitions; no routing logic |
-| `crates/rdna-compute/src/feature_flags.rs` | Modify (Phase 1: move arch predicates out) | Keep only env-var config; delegate arch queries to `ArchCaps` |
-| `crates/rdna-compute/src/lib.rs` | Modify (add `mod arch_caps` if not present) | Module declaration |
-| `crates/rdna-compute/src/profiler.rs` | Modify (1 inline arch check) | Replace `arch.starts_with(...)` with `arch_caps.is_rdna_wave32()` |
+| `crates/hipfire-rdna/src/arch_caps.rs` | Modify (expand from 44 → ~550 lines) | `ArchCaps` struct: all arch-family predicates + kernel symbol selection methods |
+| `crates/hipfire-rdna/src/dispatch.rs` | Modify (net -~250 lines Phase 1, ~35 changed Phase 2) | Replace all inline arch checks with `self.arch_caps.*` calls; replace `*_for_arch()` calls with `self.arch_caps.*` |
+| `crates/hipfire-rdna/src/kernels.rs` | Modify (Phase 2: remove 32 `*_for_arch` functions; reorganize const strings) | Pure `pub const` symbol definitions; no routing logic |
+| `crates/hipfire-rdna/src/feature_flags.rs` | Modify (Phase 1: move arch predicates out) | Keep only env-var config; delegate arch queries to `ArchCaps` |
+| `crates/hipfire-rdna/src/lib.rs` | Modify (add `mod arch_caps` if not present) | Module declaration |
+| `crates/hipfire-rdna/src/profiler.rs` | Modify (1 inline arch check) | Replace `arch.starts_with(...)` with `arch_caps.is_rdna_wave32()` |
 
 ---
 
@@ -30,12 +30,12 @@
 ### Task 1: Create `ArchCaps` struct with family predicates
 
 **Files:**
-- Create/modify: `crates/rdna-compute/src/arch_caps.rs`
-- Modify: `crates/rdna-compute/src/lib.rs`
+- Create/modify: `crates/hipfire-rdna/src/arch_caps.rs`
+- Modify: `crates/hipfire-rdna/src/lib.rs`
 
 - [ ] **Step 1: Add `mod arch_caps` to `lib.rs` if not present**
 
-Check if `mod arch_caps;` exists in `crates/rdna-compute/src/lib.rs`. If not, add it. On the feature branch, it should already exist since `arch_caps.rs` is already a file.
+Check if `mod arch_caps;` exists in `crates/hipfire-rdna/src/lib.rs`. If not, add it. On the feature branch, it should already exist since `arch_caps.rs` is already a file.
 
 - [ ] **Step 2: Write the `ArchCaps` struct definition**
 
@@ -260,14 +260,14 @@ Add public accessor methods (one per field):
     pub fn arch(&self) -> &str { &self.arch }
 ```
 
-- [ ] **Step 5: Run `cargo check -p rdna-compute`**
+- [ ] **Step 5: Run `cargo check -p hipfire-rdna`**
 
 Expected: Passes (ArchCaps exists, compile-checks, but not yet wired into Gpu).
 
 - [ ] **Step 6: Commit Phase 1 Task 1**
 
 ```
-feat(rdna-compute): add ArchCaps struct with family predicates
+feat(hipfire-rdna): add ArchCaps struct with family predicates
 ```
 
 ---
@@ -275,8 +275,8 @@ feat(rdna-compute): add ArchCaps struct with family predicates
 ### Task 2: Wire `ArchCaps` into `Gpu` and remove standalone helper functions from dispatch.rs
 
 **Files:**
-- Modify: `crates/rdna-compute/src/dispatch.rs`
-- Modify: `crates/rdna-compute/src/feature_flags.rs` (remove arch predicates that move to ArchCaps)
+- Modify: `crates/hipfire-rdna/src/dispatch.rs`
+- Modify: `crates/hipfire-rdna/src/feature_flags.rs` (remove arch predicates that move to ArchCaps)
 
 - [ ] **Step 1: Add `arch_caps: ArchCaps` field to `Gpu` struct**
 
@@ -355,18 +355,18 @@ Keep env-var fields on FeatureFlags (they're still needed by ArchCaps::new for t
 
 Replace `arch.starts_with("gfx10") || arch.starts_with("gfx11") || arch.starts_with("gfx12")` with `arch_caps.is_rdna_wave32()` once `profiler.rs` has access to ArchCaps (may need to pass `&ArchCaps` as parameter).
 
-- [ ] **Step 7: Run `cargo check -p rdna-compute`**
+- [ ] **Step 7: Run `cargo check -p hipfire-rdna`**
 
 Expected: Passes with zero errors.
 
-- [ ] **Step 8: Run `cargo test -p rdna-compute`**
+- [ ] **Step 8: Run `cargo test -p hipfire-rdna`**
 
 Expected: All existing tests pass.
 
 - [ ] **Step 9: Commit Phase 1 Task 2**
 
 ```
-refactor(rdna-compute): wire ArchCaps into Gpu, remove standalone arch helpers
+refactor(hipfire-rdna): wire ArchCaps into Gpu, remove standalone arch helpers
 
 Replace all inline arch checks and FeatureFlags arch predicates with
 ArchCaps method calls. FeatureFlags retains env-var config only.
@@ -377,7 +377,7 @@ ArchCaps method calls. FeatureFlags retains env-var config only.
 ### Task 3: Add `ArchCaps` unit tests
 
 **Files:**
-- Modify: `crates/rdna-compute/src/arch_caps.rs` (test module)
+- Modify: `crates/hipfire-rdna/src/arch_caps.rs` (test module)
 
 - [ ] **Step 1: Write tests verifying family predicates for all known archs**
 
@@ -484,14 +484,14 @@ mod tests {
 
 Note: `FeatureFlags::from_env_for_test()` may need to be added as a test-only constructor that reads no env vars and uses defaults. If it doesn't exist, create it as `pub fn from_env_for_test(arch: &str) -> Self { Self::from_env(arch) }` or similar, ensuring test isolation.
 
-- [ ] **Step 2: Run `cargo test -p rdna-compute -- arch_caps`**
+- [ ] **Step 2: Run `cargo test -p hipfire-rdna -- arch_caps`**
 
 Expected: All 9 tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```
-test(rdna-compute): add ArchCaps family predicate tests
+test(hipfire-rdna): add ArchCaps family predicate tests
 ```
 
 ---
@@ -500,11 +500,11 @@ test(rdna-compute): add ArchCaps family predicate tests
 
 **Files:** None (validation only)
 
-- [ ] **Step 1: Run `cargo check -p rdna-compute`**
+- [ ] **Step 1: Run `cargo check -p hipfire-rdna`**
 
 Expected: Clean compilation, zero warnings about unused arch predicates.
 
-- [ ] **Step 2: Run `cargo test -p rdna-compute`**
+- [ ] **Step 2: Run `cargo test -p hipfire-rdna`**
 
 Expected: All tests pass.
 
@@ -515,7 +515,7 @@ Expected: All 4 coherence-gate tests pass (per AGENTS.md hard rule #1). This req
 - [ ] **Step 4: Verify no `matches!(self.arch, ...)` or `self.arch.starts_with(...)` remains in dispatch.rs**
 
 ```bash
-rg 'matches!\(self\.arch|self\.arch\.starts_with' crates/rdna-compute/src/dispatch.rs | head
+rg 'matches!\(self\.arch|self\.arch\.starts_with' crates/hipfire-rdna/src/dispatch.rs | head
 ```
 
 Expected: Zero results (all replaced by `self.arch_caps.*()` calls). The only acceptable `self.arch` references left are direct string comparisons that don't map to any named predicate (e.g., `self.arch == "gfx906"` inside method bodies that should become `self.arch_caps.is_gfx906()`).
@@ -527,8 +527,8 @@ Expected: Zero results (all replaced by `self.arch_caps.*()` calls). The only ac
 ### Task 5: Add kernel symbol selection methods to `ArchCaps`
 
 **Files:**
-- Modify: `crates/rdna-compute/src/arch_caps.rs`
-- Modify: `crates/rdna-compute/src/dispatch.rs` (update call sites)
+- Modify: `crates/hipfire-rdna/src/arch_caps.rs`
+- Modify: `crates/hipfire-rdna/src/dispatch.rs` (update call sites)
 
 This is the largest single task. Each of the 32 `*_for_arch()` functions becomes an `ArchCaps` method. They're grouped by family (matching the audit above).
 
@@ -624,14 +624,14 @@ Note: The `is_rdna3_dgpu` predicate here excludes gfx1150/1151 — they fall to 
 
 For `gemv_hfp4g32`, `gemv_hfq4g256_residual`, `gemv_hfq3g256`, and `gemv_hfq3g256_residual` — use the appropriate predicates per the audit.
 
-- [ ] **Step 6: Run `cargo check -p rdna-compute`**
+- [ ] **Step 6: Run `cargo check -p hipfire-rdna`**
 
 Expected: Passes (all ArchCaps methods exist, but `*_for_arch` calls in dispatch.rs not yet replaced).
 
 - [ ] **Step 7: Commit**
 
 ```
-feat(rdna-compute): add kernel symbol selection methods to ArchCaps
+feat(hipfire-rdna): add kernel symbol selection methods to ArchCaps
 
 32 methods replacing *_for_arch() functions in kernels.rs.
 Each uses named predicates instead of raw arch matching.
@@ -642,12 +642,12 @@ Each uses named predicates instead of raw arch matching.
 ### Task 6: Replace all `*_for_arch()` call sites in dispatch.rs
 
 **Files:**
-- Modify: `crates/rdna-compute/src/dispatch.rs`
+- Modify: `crates/hipfire-rdna/src/dispatch.rs`
 
 - [ ] **Step 1: Find all `*_for_arch()` call sites**
 
 ```bash
-rg '_for_arch\(' crates/rdna-compute/src/dispatch.rs
+rg '_for_arch\(' crates/hipfire-rdna/src/dispatch.rs
 ```
 
 Each call site like `kernels::gemm_mq4g256_lloyd_residual_wmma_for_arch(&self.arch)` becomes `self.arch_caps.gemm_mq4g256_lloyd_residual_wmma()`.
@@ -658,14 +658,14 @@ The return type changes from `(&'static str, &'static str)` (what `*_for_arch` r
 
 All ~35 call sites. This is a mechanical find-and-replace, one per line. No logic changes.
 
-- [ ] **Step 3: Run `cargo check -p rdna-compute`**
+- [ ] **Step 3: Run `cargo check -p hipfire-rdna`**
 
 Expected: Passes.
 
 - [ ] **Step 4: Commit**
 
 ```
-refactor(rdna-compute): replace *_for_arch() calls with ArchCaps methods in dispatch
+refactor(hipfire-rdna): replace *_for_arch() calls with ArchCaps methods in dispatch
 
 Mechanical replacement: kernels::X_for_arch(&self.arch) → self.arch_caps.X()
 ```
@@ -675,7 +675,7 @@ Mechanical replacement: kernels::X_for_arch(&self.arch) → self.arch_caps.X()
 ### Task 7: Remove `*_for_arch()` functions from `kernels.rs`
 
 **Files:**
-- Modify: `crates/rdna-compute/src/kernels.rs`
+- Modify: `crates/hipfire-rdna/src/kernels.rs`
 
 - [ ] **Step 1: Delete all 32 `*_for_arch()` function bodies**
 
@@ -684,19 +684,19 @@ Remove the `pub fn *_for_arch(arch: &str) -> ...` functions. Keep all `pub const
 - [ ] **Step 2: Verify no remaining references to `*_for_arch` in the crate**
 
 ```bash
-rg '_for_arch' crates/rdna-compute/src/
+rg '_for_arch' crates/hipfire-rdna/src/
 ```
 
 Expected: Zero results in `kernels.rs`. Any remaining references are in ArchCaps method comments or test code.
 
-- [ ] **Step 3: Run `cargo check -p rdna-compute`**
+- [ ] **Step 3: Run `cargo check -p hipfire-rdna`**
 
 Expected: Passes with zero errors (all references now go through ArchCaps).
 
 - [ ] **Step 4: Commit**
 
 ```
-refactor(rdna-compute): remove *_for_arch() functions from kernels.rs
+refactor(hipfire-rdna): remove *_for_arch() functions from kernels.rs
 
 All kernel symbol selection now lives in ArchCaps. kernels.rs is
 pure data (pub const symbol strings only).
@@ -708,11 +708,11 @@ pure data (pub const symbol strings only).
 
 **Files:** None (validation only)
 
-- [ ] **Step 1: Run `cargo check -p rdna-compute`**
+- [ ] **Step 1: Run `cargo check -p hipfire-rdna`**
 
 Expected: Clean compilation.
 
-- [ ] **Step 2: Run `cargo test -p rdna-compute`**
+- [ ] **Step 2: Run `cargo test -p hipfire-rdna`**
 
 Expected: All tests pass including the new ArchCaps tests.
 
@@ -725,7 +725,7 @@ Expected: All 4 tests pass.
 Run both before and after Phase 2 (or diff against the pre-refactor version):
 
 ```bash
-rg 'pub const.*_SRC' crates/rdna-compute/src/kernels.rs | sort
+rg 'pub const.*_SRC' crates/hipfire-rdna/src/kernels.rs | sort
 ```
 
 Verify that every constant name referenced in the `*_for_arch` match arms is still present as a `pub const` in `kernels.rs`. No typos, no missing symbols.

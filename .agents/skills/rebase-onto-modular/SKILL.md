@@ -30,7 +30,7 @@ crates/
   hipfire-arch-qwen35-vl/  ← qwen35_vl.rs + image.rs
   hipfire-arch-llama/      ← facade over runtime::llama (real split = PR 14)
   hipfire-arch-template/        ← reference template for new-arch contributors
-  rdna-compute/            ← unchanged (kernel dispatch + RDNA-arch routing)
+  hipfire-rdna/            ← unchanged (kernel dispatch + RDNA-arch routing)
   hip-bridge/              ← unchanged (HIP/ROCm FFI)
   hipfire-quantize/        ← unchanged (quantizer CLI)
 ```
@@ -128,7 +128,7 @@ instructions, not permission to discard unreviewed work.
 
 - Brand-new branches authored against post-modular master — they don't
   need rebase.
-- Branches that touch ONLY `kernels/src/` or `crates/rdna-compute/` —
+- Branches that touch ONLY `kernels/src/` or `crates/hipfire-rdna/` —
   those crate paths are unchanged; just `git rebase origin/master`.
 - Branches that touch ONLY `crates/hip-bridge/` — same.
 - Branches touching `crates/hipfire-quantize/` — same.

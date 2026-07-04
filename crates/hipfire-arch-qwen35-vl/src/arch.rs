@@ -40,7 +40,7 @@
 use crate::qwen35_vl::{load_vision_weights, vision_config_from_hfq, VisionConfig, VisionWeights};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Type marker for Qwen3.5-VL (vision-language). Loads the SigLIP-2 ViT
 /// vision tower; pair with `hipfire-arch-qwen35::Qwen35` for the text

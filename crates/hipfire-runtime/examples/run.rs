@@ -301,7 +301,7 @@ fn main() {
     }
 
     // Load model
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
     eprintln!("Loading {}...", model_path);
 
     use hipfire_arch_qwen35::speculative::{KvMode, ModelSlot, ModelSlotConfig};
@@ -497,7 +497,7 @@ fn main() {
             format!("fnv64:{state:016x}")
         }
         fn forward_prompt(
-            gpu: &mut rdna_compute::Gpu,
+            gpu: &mut hipfire_rdna::Gpu,
             slot: &mut hipfire_arch_qwen35::speculative::ModelSlot,
             tokens: &[u32],
             start_pos: usize,

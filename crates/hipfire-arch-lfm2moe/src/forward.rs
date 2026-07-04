@@ -33,7 +33,7 @@ use hipfire_runtime::weights::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemm,
     weight_gemv, weight_gemv_residual,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Decode one token; returns the full logits vector.
 ///
@@ -1498,7 +1498,7 @@ mod tests {
 fn conv_mixer_block(
     gpu: &mut Gpu,
     cfg: &Lfm2MoeConfig,
-    op_norm: &rdna_compute::GpuTensor,
+    op_norm: &hipfire_rdna::GpuTensor,
     c: &ConvWeights,
     state: &Lfm2MoeState,
     l: usize,
@@ -1526,7 +1526,7 @@ fn conv_mixer_block(
 fn attn_mixer_block(
     gpu: &mut Gpu,
     cfg: &Lfm2MoeConfig,
-    op_norm: &rdna_compute::GpuTensor,
+    op_norm: &hipfire_rdna::GpuTensor,
     a: &AttnWeights,
     state: &Lfm2MoeState,
     l: usize,
@@ -1610,7 +1610,7 @@ fn attn_mixer_block(
 fn dense_gate_up_block(
     gpu: &mut Gpu,
     cfg: &Lfm2MoeConfig,
-    ffn_norm: &rdna_compute::GpuTensor,
+    ffn_norm: &hipfire_rdna::GpuTensor,
     d: &DenseFfn,
     state: &Lfm2MoeState,
     l: usize,
@@ -1640,7 +1640,7 @@ fn dense_down_block(
 fn moe_ffn_block(
     gpu: &mut Gpu,
     cfg: &Lfm2MoeConfig,
-    ffn_norm: &rdna_compute::GpuTensor,
+    ffn_norm: &hipfire_rdna::GpuTensor,
     m: &MoeFfn,
     state: &Lfm2MoeState,
     l: usize,

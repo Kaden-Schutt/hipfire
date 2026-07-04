@@ -108,11 +108,11 @@ impl Transformer2DModel {
     /// resident (borrowed; the caller owns them).
     pub(crate) fn forward_resident(
         &self,
-        input: &rdna_compute::GpuTensor,
-        encoder_states: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        input: &hipfire_rdna::GpuTensor,
+        encoder_states: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let normed = self.norm.forward_resident(input, gpu, cache)?;
         let projected = self.proj_in.forward_resident(&normed, gpu, cache)?;
         free_resident(gpu, normed)?;
@@ -126,7 +126,9 @@ impl Transformer2DModel {
         };
         let bsc = nchw_to_bsc_resident(gpu, &projected)?;
         free_resident(gpu, projected)?;
-        let blocked = self.block.forward_resident(&bsc, encoder_states, gpu, cache)?;
+        let blocked = self
+            .block
+            .forward_resident(&bsc, encoder_states, gpu, cache)?;
         free_resident(gpu, bsc)?;
         let nchw = bsc_to_nchw_resident(gpu, &blocked, batch, channels, height, width)?;
         free_resident(gpu, blocked)?;
@@ -272,13 +274,13 @@ impl UnetDownBlock2D {
     /// returns the resident output. The caller owns and must free every skip.
     pub(crate) fn forward_resident(
         &self,
-        mut hidden: rdna_compute::GpuTensor,
-        time_embedding: &rdna_compute::GpuTensor,
-        encoder_states: &rdna_compute::GpuTensor,
-        skips: &mut Vec<rdna_compute::GpuTensor>,
-        gpu: &mut rdna_compute::Gpu,
+        mut hidden: hipfire_rdna::GpuTensor,
+        time_embedding: &hipfire_rdna::GpuTensor,
+        encoder_states: &hipfire_rdna::GpuTensor,
+        skips: &mut Vec<hipfire_rdna::GpuTensor>,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         for (idx, resnet) in self.resnets.iter().enumerate() {
             let next = resnet.forward_resident(&hidden, time_embedding, gpu, cache)?;
             free_resident(gpu, hidden)?;
@@ -419,12 +421,12 @@ impl UnetDownPath {
     /// every returned skip.
     pub(crate) fn forward_resident(
         &self,
-        sample: &rdna_compute::GpuTensor,
-        time_embedding: &rdna_compute::GpuTensor,
-        encoder_states: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        sample: &hipfire_rdna::GpuTensor,
+        time_embedding: &hipfire_rdna::GpuTensor,
+        encoder_states: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<(rdna_compute::GpuTensor, Vec<rdna_compute::GpuTensor>)> {
+    ) -> DiffusionResult<(hipfire_rdna::GpuTensor, Vec<hipfire_rdna::GpuTensor>)> {
         let mut hidden = self.conv_in.forward_resident(sample, gpu, cache)?;
         let mut skips = vec![clone_resident(gpu, &hidden)?];
         for block in &self.blocks {
@@ -575,13 +577,13 @@ impl UnetUpBlock2D {
     /// and returns the resident output.
     pub(crate) fn forward_resident(
         &self,
-        mut hidden: rdna_compute::GpuTensor,
-        skips: &mut Vec<rdna_compute::GpuTensor>,
-        time_embedding: &rdna_compute::GpuTensor,
-        encoder_states: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        mut hidden: hipfire_rdna::GpuTensor,
+        skips: &mut Vec<hipfire_rdna::GpuTensor>,
+        time_embedding: &hipfire_rdna::GpuTensor,
+        encoder_states: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         for (idx, resnet) in self.resnets.iter().enumerate() {
             let skip = skips.pop().ok_or_else(|| {
                 DiffusionError::InvalidMetadata("UNet up block ran out of skip tensors".to_string())
@@ -718,13 +720,13 @@ impl UnetUpPath {
     /// every up block, consuming the resident skips accumulated by the down path.
     pub(crate) fn forward_resident(
         &self,
-        mut hidden: rdna_compute::GpuTensor,
-        skips: &mut Vec<rdna_compute::GpuTensor>,
-        time_embedding: &rdna_compute::GpuTensor,
-        encoder_states: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        mut hidden: hipfire_rdna::GpuTensor,
+        skips: &mut Vec<hipfire_rdna::GpuTensor>,
+        time_embedding: &hipfire_rdna::GpuTensor,
+        encoder_states: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         for block in &self.blocks {
             hidden = block.forward_resident(
                 hidden,
@@ -859,12 +861,12 @@ impl UnetMidBlock2DCrossAttn {
     /// optional resnet). Takes ownership of `hidden`.
     pub(crate) fn forward_resident(
         &self,
-        mut hidden: rdna_compute::GpuTensor,
-        time_embedding: &rdna_compute::GpuTensor,
-        encoder_states: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        mut hidden: hipfire_rdna::GpuTensor,
+        time_embedding: &hipfire_rdna::GpuTensor,
+        encoder_states: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let next = self
             .resnet_0
             .forward_resident(&hidden, time_embedding, gpu, cache)?;
@@ -1120,8 +1122,13 @@ impl NativeUnet2DConditionModel {
             )?;
             free_resident(gpu, sample)?;
             if let Some(mid_block) = &self.mid_block {
-                hidden =
-                    mid_block.forward_resident(hidden, &time_embedding, &encoder_states, gpu, cache)?;
+                hidden = mid_block.forward_resident(
+                    hidden,
+                    &time_embedding,
+                    &encoder_states,
+                    gpu,
+                    cache,
+                )?;
             }
             hidden = self.up_path.forward_resident(
                 hidden,

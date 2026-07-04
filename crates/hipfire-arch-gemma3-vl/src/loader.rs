@@ -7,7 +7,7 @@
 
 use hipfire_arch_gemma3::{config_from_hfq, load_weights_prefixed, Gemma3Config, Gemma3Weights};
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 use crate::config::{vl_config_from_hfq, Gemma3VlConfig};
 use crate::projector::ProjectorWeights;

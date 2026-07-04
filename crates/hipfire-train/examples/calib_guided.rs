@@ -19,7 +19,7 @@ use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::calibration::CalibCollector;
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{free_model_acts, model_calib_down_backward, model_forward, LlamaModel};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

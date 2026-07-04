@@ -16,7 +16,7 @@ use crate::mlp::MlpRelu2Gpu;
 use crate::weight::LinearWeight;
 use crate::MoeConfig;
 use hip_bridge::{HipError, HipResult};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 #[derive(Clone, Debug)]
 pub struct MoeExpertWeights {

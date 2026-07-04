@@ -8,7 +8,7 @@ target arch without breaking anyone else.
 
 ## The dispatch tree
 
-`crates/rdna-compute/src/dispatch.rs` is the kernel-selection hot
+`crates/hipfire-rdna/src/dispatch.rs` is the kernel-selection hot
 path. Every GEMM / GEMV / norm / fused op routes through here:
 
 ```rust
@@ -93,7 +93,7 @@ The minimum-viable workflow:
    `kernels/src/<existing>.<chip>.hip` for chip-specific or
    `<existing>.<family>.hip` for a family.
 2. **Register the source** in
-   `crates/rdna-compute/src/kernels.rs` via `include_str!`.
+   `crates/hipfire-rdna/src/kernels.rs` via `include_str!`.
 3. **Add a method to `Gpu`** that wires the kernel: parameters,
    grid/block dims, kernarg blob.
 4. **Add the dispatch branch** in `dispatch.rs` above the existing

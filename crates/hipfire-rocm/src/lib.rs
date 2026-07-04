@@ -55,7 +55,7 @@ pub enum RocmBackendPath {
 impl RocmBackendPath {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::HipRdnaCompute => "hip_rdna_compute",
+            Self::HipRdnaCompute => "hip_hipfire_rdna",
             Self::CpuOracleBypass => "cpu_oracle_bypass",
             Self::NpuHybridFallback => "npu_hybrid_fallback",
         }

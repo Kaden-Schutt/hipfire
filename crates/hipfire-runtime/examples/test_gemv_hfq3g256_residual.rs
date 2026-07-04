@@ -14,7 +14,7 @@
 //!   cargo run --release --example test_gemv_hfq3g256_residual
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     // Cover: minimal (1 group), 4-group quad, 16-group quad+tail, FFN-shape (43 groups).
     let shapes = [
@@ -48,7 +48,7 @@ fn main() {
         let d_a = gpu.upload_raw(&mq3_bytes, &[mq3_bytes.len()]).unwrap();
         let d_x = gpu.upload_f32(&x_rot, &[k]).unwrap();
         let d_y_ref = gpu.upload_f32(&y_init, &[m]).unwrap();
-        let d_y_tmp = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+        let d_y_tmp = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
         gpu.gemv_hfq3g256(&d_a, &d_x, &d_y_tmp, m, k).unwrap();
         gpu.add_inplace_f32(&d_y_ref, &d_y_tmp).unwrap();

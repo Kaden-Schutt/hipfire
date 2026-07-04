@@ -3,7 +3,7 @@
 //! `d_x = d_out·out·(1-out)` consumes the saved forward output. The GLA-lite
 //! forget gate `g = sigmoid(g_pre)`.
 
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 /// Forward: `x` `[n]` → `out` `[n]` (allocated here).
 pub fn sigmoid_forward(gpu: &mut Gpu, x: &GpuTensor, n: usize) -> HipResult<GpuTensor> {

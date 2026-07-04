@@ -185,7 +185,7 @@ fn main() {
     );
 
     // Init GPU
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init failed");
 
     // Load weights via the trait — same dispatch path as the daemon.
     eprintln!("Loading weights...");

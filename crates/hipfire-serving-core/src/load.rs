@@ -31,6 +31,9 @@ use hipfire_arch_qwen35::speculative::{
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_model::{
     arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport,
+    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
+    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
@@ -328,7 +331,7 @@ pub fn load_model(
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
     pp: usize,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
@@ -409,7 +412,7 @@ pub fn load_model(
     // hfq::load_weights_hfq do at runtime, so the qt we read here is the
     // qt that will end up driving `weights.output.gpu_dtype`.
     if draft_path.is_some() {
-        if hfq.arch_id == 11 {
+        if hfq.arch_id == ARCH_ID_LFM2_MOE {
             #[cfg(not(feature = "arch-lfm2moe"))]
             {
                 return Err(
@@ -557,7 +560,7 @@ pub fn load_model(
         requested.clamp(512.min(max_seq), max_seq)
     };
 
-    if hfq.arch_id == 7 {
+    if hfq.arch_id == ARCH_ID_QWEN2 {
         // Qwen2 dense (hipfire-arch-qwen2). Standalone bring-up — no
         // eviction, no DFlash, no PFlash, no VL. The Architecture
         // trait surface gives us config + weights + state in three
@@ -654,7 +657,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 16 {
+    if hfq.arch_id == ARCH_ID_ZAYA {
         // ZAYA1 (CCA attention + EDA/MoD-routed MoE). Served through the shared
         // ServingBackend seam on ZayaModel (O(1) KV-cache decode).
         if draft_path.is_some() {
@@ -744,7 +747,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 14 || hfq.arch_id == 15 {
+    if hfq.arch_id == ARCH_ID_NEMOTRON_H || hfq.arch_id == ARCH_ID_MAMBA2 {
         // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2
         // from quantized (or bf16) .hfq artifacts, driven through the same
         // Mamba-capable ServingBackend seam.
@@ -752,7 +755,7 @@ pub fn load_model(
             return Err(format!(
                 "DFlash not supported on arch_id={} ({}). Reload without a draft.",
                 hfq.arch_id,
-                if hfq.arch_id == 15 {
+                if hfq.arch_id == ARCH_ID_MAMBA2 {
                     "mamba2"
                 } else {
                     "nemotron_h"
@@ -766,14 +769,14 @@ pub fn load_model(
         let cfg_json = meta
             .get("config")
             .ok_or("nemotron: metadata_json missing 'config'")?;
-        let mut cfg = if hfq.arch_id == 15 {
+        let mut cfg = if hfq.arch_id == ARCH_ID_MAMBA2 {
             hipfire_arch_nemotron::NemotronHConfig::from_mamba2_json(cfg_json)
                 .map_err(|e| format!("mamba2 config: {e}"))?
         } else {
             hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
                 .map_err(|e| format!("nemotron config: {e}"))?
         };
-        if hfq.arch_id == 15 {
+        if hfq.arch_id == ARCH_ID_MAMBA2 {
             if let Some(eot) = tokenizer.special_token_id("<|endoftext|>") {
                 cfg.eos_token_id = eot;
             }
@@ -784,7 +787,7 @@ pub fn load_model(
         }
         eprintln!(
             "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
-            if hfq.arch_id == 15 {
+            if hfq.arch_id == ARCH_ID_MAMBA2 {
                 "mamba2"
             } else {
                 "nemotron_h"
@@ -869,7 +872,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 12 {
+    if hfq.arch_id == ARCH_ID_GEMMA3_TEXT {
         // Gemma3 text (medgemma-*-text). Plain dense-AR: the gemma3 decoder +
         // its own decode state in `Gemma3Backend`, served via the same
         // `ServingBackend::serve` seam (delegates to `run_simple_ar`). No
@@ -966,7 +969,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 13 {
+    if hfq.arch_id == ARCH_ID_GEMMA3_VL {
         // Gemma3-VL (medgemma). Self-contained multimodal backend: the gemma3
         // text decoder (loaded from the `language_model.` prefix) + the SigLIP
         // vision tower + the projector, plus its own decode state — all owned by
@@ -1067,7 +1070,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 8 {
+    if hfq.arch_id == ARCH_ID_DOTS_OCR {
         // dots.ocr (Qwen2-VL family). Text decoder is Qwen2; vision tower
         // is the 42-block DotsVisionTransformer. Both load side-by-side in
         // DotsOcrWeights and stay resident. Single-image, greedy decode at
@@ -1164,7 +1167,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 9 {
+    if hfq.arch_id == ARCH_ID_DEEPSEEK4_FLASH {
         // DeepSeek V4 Flash (hipfire-arch-deepseek4). Standalone bring-up —
         // no eviction, no DFlash drafter, no PFlash, no VL. The
         // Architecture trait gives us config + weights + state in three
@@ -1282,7 +1285,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 10 {
+    if hfq.arch_id == ARCH_ID_MINIMAX_M2 {
         // MiniMax-M2 (hipfire-arch-minimax). Standalone bring-up — no
         // eviction, no DFlash drafter, no PFlash, no VL, no spec-decode.
         // The Architecture trait gives us config + weights + state in three
@@ -1406,7 +1409,7 @@ pub fn load_model(
         });
     }
 
-    if hfq.arch_id == 11 {
+    if hfq.arch_id == ARCH_ID_LFM2_MOE {
         // LFM2.5-8B-A1B (hipfire-arch-lfm2moe). Standalone bring-up — no
         // DFlash drafter, no PFlash, no VL, no spec-decode. CASK/TriAttention
         // is wired through the shared KvCache using attention-ordinal sidecar
@@ -2115,7 +2118,7 @@ pub fn load_model_safetensors(
     path: &str,
     max_seq: usize,
     kv_mode: &str,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
     use hipfire_model::ModelSource;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
@@ -2145,7 +2148,7 @@ pub fn load_model_safetensors(
     // — upstream now defaults to halfsplit, no flag needed
     let chat_template = source.chat_template();
 
-    if arch_id == 0 || arch_id == 1 {
+    if arch_id == ARCH_ID_LLAMA_MISTRAL || arch_id == ARCH_ID_QWEN3_QWEN2_LEGACY {
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         // LLaMA / Qwen3 — standard attention, no DeltaNet
@@ -2297,7 +2300,7 @@ pub fn load_model_safetensors(
         });
     }
 
-    if arch_id == 14 || arch_id == 15 {
+    if arch_id == ARCH_ID_NEMOTRON_H || arch_id == ARCH_ID_MAMBA2 {
         // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2 are
         // routed through the same Mamba-capable ServingBackend seam.
         let (chat_template, chat_template_profile) =
@@ -2308,14 +2311,14 @@ pub fn load_model_safetensors(
         let cfg_json = meta
             .get("config")
             .ok_or("nemotron: metadata_json missing 'config'")?;
-        let mut cfg = if arch_id == 15 {
+        let mut cfg = if arch_id == ARCH_ID_MAMBA2 {
             hipfire_arch_nemotron::NemotronHConfig::from_mamba2_json(cfg_json)
                 .map_err(|e| format!("mamba2 config: {e}"))?
         } else {
             hipfire_arch_nemotron::NemotronHConfig::from_json(cfg_json)
                 .map_err(|e| format!("nemotron config: {e}"))?
         };
-        if arch_id == 15 {
+        if arch_id == ARCH_ID_MAMBA2 {
             if let Some(eot) = tokenizer.special_token_id("<|endoftext|>") {
                 cfg.eos_token_id = eot;
             }
@@ -2327,7 +2330,7 @@ pub fn load_model_safetensors(
         }
         eprintln!(
             "  {}: hidden={}, layers={} ({} M / {} * / {} - / {} E), vocab={}, eos={}",
-            if arch_id == 15 {
+            if arch_id == ARCH_ID_MAMBA2 {
                 "mamba2"
             } else {
                 "nemotron_h"
@@ -2563,7 +2566,7 @@ pub fn load_model_pp(
     kv_mode_override: Option<&str>,
     state_quant_override: Option<&str>,
     pp: usize,
-    _gpu: &mut rdna_compute::Gpu,
+    _gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
     let mut kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
@@ -2847,7 +2850,7 @@ pub fn load_model_pp(
 /// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
 pub fn screen_weights_qwen35(
     weights: &qwen35::Qwen35Weights,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> (usize, usize) {
     use hipfire_arch_qwen35::qwen35::LayerWeights;
     let mut n_safe = 0usize;
@@ -2895,7 +2898,7 @@ pub fn screen_weights_qwen35(
             // layout mismatch would read past the end. See PR #106.
             if !matches!(
                 wt.gpu_dtype,
-                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+                hipfire_rdna::DType::HFQ4G256 | hipfire_rdna::DType::MQ4G256
             ) {
                 continue;
             }
@@ -2913,7 +2916,7 @@ pub fn screen_weights_qwen35(
 /// Free all GPU resources held by a loaded model (weights, scratch, KV/state,
 /// eviction scratch, DFlash drafter) by consuming it. Per-arch teardown mirrors
 /// whichever Option fields are populated.
-pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+pub fn unload_model(mut m: LoadedModel, gpu: &mut hipfire_rdna::Gpu) {
     // Multi-GPU branch (Stage 7 of #58). Frees per-device tensors through the
     // Gpus orchestrator, then invalidates per-device caches so the next load
     // can't inherit stale verdicts at recycled device addresses. Order
@@ -3108,7 +3111,7 @@ pub fn load_lfm2_dflash_state(
     ctx_capacity: usize,
     target_config: &lfm2moe::config::Lfm2MoeConfig,
     target_state: &lfm2moe::lfm2moe::Lfm2MoeState,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<Lfm2DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open LFM2 draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse LFM2 DflashConfig")?;
@@ -3157,7 +3160,7 @@ pub fn load_dflash_state(
     ctx_capacity: usize,
     target_config: &qwen35::Qwen35Config,
     target_dn: &DeltaNetState,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;

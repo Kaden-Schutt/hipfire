@@ -36,7 +36,10 @@ use hipfire_generate::{
     validate_generate_batch_decode, validate_generate_batch_prefill,
     validate_prefix_hash_preflight, GenerateVLParams, ImageSource,
 };
-use hipfire_model::{build_local_llm_registry, is_qwen35_family_arch_id, ARCH_ID_LFM2_MOE};
+use hipfire_model::{
+    build_local_llm_registry, is_qwen35_family_arch_id, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_QWEN2,
+};
 use hipfire_prompt as prompt_frame;
 use hipfire_state::{
     described_sequence_state_json, model_worker_runtime_view_json,
@@ -2543,7 +2546,7 @@ fn main() {
                     std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
             }
         }
-        let mut gpu = match rdna_compute::Gpu::init() {
+        let mut gpu = match hipfire_rdna::Gpu::init() {
             Ok(g) => g,
             Err(e) => {
                 report_gpu_init_failure(&e);
@@ -2586,7 +2589,7 @@ fn main() {
         llm_registry.templates_dir,
     );
 
-    let mut gpu = match rdna_compute::Gpu::init() {
+    let mut gpu = match hipfire_rdna::Gpu::init() {
         Ok(g) => g,
         Err(e) => {
             report_gpu_init_failure(&e);
@@ -2615,7 +2618,7 @@ fn main() {
     // output is a host-side Vec<u32>, so no peer-copy is needed — generate
     // routes maybe_compress_prompt to this handle, decode stays on target.
     // None means the drafter shares the target gpu (single-card, unchanged).
-    let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
+    let mut pflash_drafter_gpu: Option<hipfire_rdna::Gpu> = None;
     let mut dummy_model: Option<DummyModelState> = None;
 
     let stdin = std::io::stdin();
@@ -3150,7 +3153,7 @@ fn main() {
                         // (arch 5/6): a bundled `-mq4+mtp.hfq` trailer or a
                         // sibling `.mtp.hfq` sidecar. Used by mtp_mode to decide
                         // whether to drive the MTP spec-decode path at generate.
-                        let qwen35_mtp_present = (m.arch_id == 5 || m.arch_id == 6) && {
+                        let qwen35_mtp_present = is_qwen35_family_arch_id(m.arch_id) && {
                             let bundled = hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(
                                 std::path::Path::new(&m.model_path),
                             )
@@ -3203,7 +3206,7 @@ fn main() {
                         // `HIPFIRE_DPM_WARMUP_SECS` env the in-process bench tools
                         // honor (`bench_qwen35_speed`, `dflash_spec_demo`,
                         // `bench_stream_overlap`); see
-                        // `crates/rdna-compute/src/dispatch.rs::dpm_warmup` and
+                        // `crates/hipfire-rdna/src/dispatch.rs::dpm_warmup` and
                         // `docs/methodology/perf-benchmarking.md`.
                         //
                         // Runs AFTER weight upload but BEFORE the `loaded` ack so
@@ -3231,7 +3234,8 @@ fn main() {
 
                         let model_worker =
                             model_worker_runtime_view_json(&loaded_model_worker_runtime_view(&m));
-                        let cache_capable = m.arch_id == 9 || is_qwen35_family_arch_id(m.arch_id);
+                        let cache_capable = m.arch_id == ARCH_ID_DEEPSEEK4_FLASH
+                            || is_qwen35_family_arch_id(m.arch_id);
                         let _ = writeln!(
                             stdout,
                             "{}",
@@ -3297,9 +3301,9 @@ fn main() {
                                     // drafter weights/KV/scratch live on the secondary
                                     // card. Compress output is host-side, so decode stays
                                     // on target. -1 / 0 => share target gpu (unchanged).
-                                    let mut sibling: Option<rdna_compute::Gpu> = None;
+                                    let mut sibling: Option<hipfire_rdna::Gpu> = None;
                                     if pflash_drafter_device > 0 {
-                                        match rdna_compute::Gpu::init_with_device(
+                                        match hipfire_rdna::Gpu::init_with_device(
                                             pflash_drafter_device,
                                         ) {
                                             Ok(g) => sibling = Some(g),
@@ -3313,7 +3317,7 @@ fn main() {
                                             }
                                         }
                                     }
-                                    let dg: &mut rdna_compute::Gpu =
+                                    let dg: &mut hipfire_rdna::Gpu =
                                         sibling.as_mut().unwrap_or(&mut gpu);
                                     dg.bind_thread_or_warn();
                                     match hipfire_arch_qwen35::pflash::load_drafter(
@@ -3612,14 +3616,14 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == 11 {
+                let (default_temp, default_top_p) = if m.arch_id == ARCH_ID_LFM2_MOE {
                     // LFM2.5-MoE (11): Liquid's model card recommends specific
                     // sampling — temperature=0.2, top_p=0.80 (+ repetition_penalty
                     // 1.05, set below). Use those exact values, not the generic
                     // MoE-instruct (temp=1.0) default — they're tuned for this
                     // model and keep it on-distribution.
                     (0.2_f64, 0.80_f64)
-                } else if m.arch_id == 9 || m.arch_id == 10 {
+                } else if m.arch_id == ARCH_ID_DEEPSEEK4_FLASH || m.arch_id == ARCH_ID_MINIMAX_M2 {
                     // DeepSeek V4 (9) + MiniMax-M2 (10): quantized instruct
                     // MoE models that fall into block-level attractors under
                     // pure greedy. Default to the HF-recommended sampling
@@ -3665,9 +3669,9 @@ fn main() {
                 // near-identical video slices push bare greedy into a token
                 // attractor, so default to a 1.3 repeat penalty (matches the
                 // bring-up example) unless the client overrides it.
-                let default_repeat_penalty = if m.arch_id == 11 {
+                let default_repeat_penalty = if m.arch_id == ARCH_ID_LFM2_MOE {
                     1.05_f64
-                } else if m.arch_id == 13 {
+                } else if m.arch_id == ARCH_ID_GEMMA3_VL {
                     1.3_f64
                 } else {
                     1.0_f64
@@ -3805,7 +3809,7 @@ fn main() {
                             .collect()
                     })
                     .unwrap_or_default();
-                let is_dots_ocr = m.arch_id == 8;
+                let is_dots_ocr = m.arch_id == ARCH_ID_DOTS_OCR;
                 let is_gemma3_vl = m.gemma3_vl.is_some(); // arch 13 (medgemma)
                 let has_media = has_image || video.is_some() || !images.is_empty();
                 let has_vl = m.vision_config.is_some() || is_dots_ocr || is_gemma3_vl;
@@ -5848,7 +5852,7 @@ fn main() {
                 // the shared, tapped forward_prefill_batch. Both feed the same
                 // capture session. Helper to finalize identically per backend.
                 use hipfire_runtime::arch::SimpleAr;
-                fn finish(gpu: &mut rdna_compute::Gpu) -> Result<(Vec<Vec<f32>>, usize), String> {
+                fn finish(gpu: &mut hipfire_rdna::Gpu) -> Result<(Vec<Vec<f32>>, usize), String> {
                     hipfire_hneurons::capture::finish_capture(gpu)
                         .map_err(|e| format!("finish: {e:?}"))?
                         .ok_or_else(|| "capture produced no feature".to_string())
@@ -6629,7 +6633,7 @@ fn main() {
                         None, None,
                     )
                     .is_ok()
-                } else if m.arch_id == 7 {
+                } else if m.arch_id == ARCH_ID_QWEN2 {
                     // Qwen2 has no batched prefill kernel yet — per-token loop
                     // mirroring the LLaMA fallback path. The loop seeds
                     // position via `state.next_pos` (already reset above to 0).
@@ -6644,7 +6648,7 @@ fn main() {
                         }
                     }
                     ok
-                } else if m.arch_id == 9 {
+                } else if m.arch_id == ARCH_ID_DEEPSEEK4_FLASH {
                     // DeepSeek V4 warm-pass: per-token decode_step. Saturates
                     // the kernel cache (HC, indexer, compressor,
                     // attention, MoE) on a short synthetic prompt
@@ -6666,7 +6670,7 @@ fn main() {
                         }
                     }
                     ok
-                } else if m.arch_id == 10 {
+                } else if m.arch_id == ARCH_ID_MINIMAX_M2 {
                     // MiniMax-M2 warm-pass: per-token decode_step over the
                     // synthetic prompt. Saturates the GQA + QK-norm + RoPE +
                     // MoE kernel set before any user-facing generate. This
@@ -6686,7 +6690,7 @@ fn main() {
                         }
                     }
                     ok
-                } else if cfg!(feature = "arch-lfm2moe") && m.arch_id == 11 {
+                } else if cfg!(feature = "arch-lfm2moe") && m.arch_id == ARCH_ID_LFM2_MOE {
                     // LFM2.5-MoE warm-pass: per-token decode_step over the
                     // synthetic prompt. Saturates the conv + GQA + QK-norm +
                     // RoPE + top-4 MoE kernel set before any user-facing

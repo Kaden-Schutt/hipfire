@@ -85,7 +85,7 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // ── #397 Ship 5.1: plain-GEMM catalog ────────────────
     // All entries below take the canonical plain signature
-    // `(a, x, y, m, k, batch_size)` (verified against rdna-compute/src/gemm.rs)
+    // `(a, x, y, m, k, batch_size)` (verified against hipfire-rdna/src/gemm.rs)
     // and dispatch through GemmFamily::run. Predicates are the narrowest
     // correct ArchPredicate for each kernel's ISA requirements.
 

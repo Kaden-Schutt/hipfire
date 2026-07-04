@@ -66,7 +66,7 @@ impl Eviction {
     /// dispatching to the active policy; `Ok(None)` when nothing was evicted.
     pub fn maybe_evict(
         &self,
-        gpu: &mut rdna_compute::Gpu,
+        gpu: &mut hipfire_rdna::Gpu,
         kv: &mut kv::KvCache,
         physical: usize,
     ) -> HipResult<Option<hipfire_runtime::triattn::EvictionResult>> {
@@ -90,7 +90,7 @@ impl Eviction {
         }
     }
     /// Release the policy's GPU-side scratch on unload.
-    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+    pub fn free_gpu(self, gpu: &mut hipfire_rdna::Gpu) {
         match self {
             Eviction::Plain(c) => c.free_gpu(gpu),
             Eviction::Cask(c) => c.free_gpu(gpu),
@@ -169,7 +169,7 @@ pub struct DdtreeState {
 impl DdtreeState {
     /// Return every GPU-resident snapshot + scratch buffer to the pool.
     /// Consumes self; called from `unload_model`'s DFlash teardown.
-    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+    pub fn free_gpu(self, gpu: &mut hipfire_rdna::Gpu) {
         self.post_seed_snap.free_gpu(gpu);
         self.scratch.free_gpu(gpu);
         self.path_c_parent_pre_snap.free_gpu(gpu);

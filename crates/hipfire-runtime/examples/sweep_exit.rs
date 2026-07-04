@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Instant;
 
 fn run_test(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weights: &hipfire_runtime::llama::LlamaWeights,
     config: &hipfire_runtime::llama::LlamaConfig,
     threshold: f32,
@@ -100,7 +100,7 @@ fn main() {
     });
     let hfq = HfqFile::open(Path::new(&model_path)).expect("parse");
     let config = hfq::config_from_hfq(&hfq).expect("config");
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu");
     let weights = hfq::load_weights_hfq(&hfq, &config, &mut gpu).expect("weights");
     let cp1 = config.n_layers / 3; // layer 12
     let cp2 = config.n_layers * 2 / 3; // layer 24

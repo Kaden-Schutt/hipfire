@@ -6,7 +6,7 @@
 //!   cargo run -p hipfire-train --release --example pflash_score_gradcheck
 
 use hipfire_train::ops::pflash_score::{pflash_score_backward, pflash_score_forward};
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 const N_POS: usize = 8;
 const KV_DIM: usize = 16;

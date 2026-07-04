@@ -265,7 +265,7 @@ def render_report(
         "- Coverage < 90%: at least one significant kernel is un-tracked. Investigate blindspots.",
         "- Coverage < 75%: almost certainly a new kernel was added without a timer. Urgent.",
         "",
-        "Cross-reference: `crates/rdna-compute/src/profile_rocprof.rs` (Rust impl).",
+        "Cross-reference: `crates/hipfire-rdna/src/profile_rocprof.rs` (Rust impl).",
     ]
     return "\n".join(lines) + "\n"
 

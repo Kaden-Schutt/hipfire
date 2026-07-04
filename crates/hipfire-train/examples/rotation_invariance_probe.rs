@@ -16,7 +16,7 @@
 use hipfire_train::block::BlockDims;
 use hipfire_train::model::{model_forward, LayerLora, LayerWeights, LlamaModel};
 use hipfire_train::rotation::{apply_r1, apply_r2, Rotation};
-use rdna_compute::{Gpu, HipResult};
+use hipfire_rdna::{Gpu, HipResult};
 
 const NL: usize = 2;
 const SEQ: usize = 4;
@@ -85,9 +85,9 @@ fn build_model(gpu: &mut Gpu) -> HipResult<LlamaModel> {
         // LoRA B=0 ⇒ zero contribution; A arbitrary. Keeps the base forward pure.
         let ll = LayerLora {
             aq: gpu.upload_f32(&rnd(2 * H, 7, 5, 0.1, -0.2), &[2 * H])?,
-            bq: gpu.zeros(&[QD * 2], rdna_compute::DType::F32)?,
+            bq: gpu.zeros(&[QD * 2], hipfire_rdna::DType::F32)?,
             av: gpu.upload_f32(&rnd(2 * H, 13, 9, 0.1, -0.2), &[2 * H])?,
-            bv: gpu.zeros(&[KVD * 2], rdna_compute::DType::F32)?,
+            bv: gpu.zeros(&[KVD * 2], hipfire_rdna::DType::F32)?,
         };
         layers.push((lw, ll));
     }

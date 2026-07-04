@@ -18,7 +18,7 @@ fn main() {
 fn main() {
     use hipfire_runtime::quant::f16_to_f32;
     use hipfire_runtime::triattn::{self, BandCenter, TriAttnCenters};
-    use rdna_compute::{DType, Gpu};
+    use hipfire_rdna::{DType, Gpu};
 
     // ── Fixed synthetic config ─────────────────────────────────────────
     let n_heads = 16usize;

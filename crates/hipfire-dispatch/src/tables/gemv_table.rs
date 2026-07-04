@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 use crate::tables::KernelRegistry;
 use crate::types::*;
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 /// Register all GEMV kernel variants into the registry.
 ///

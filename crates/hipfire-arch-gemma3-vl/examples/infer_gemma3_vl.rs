@@ -25,7 +25,7 @@ use hipfire_arch_gemma3 as g3;
 use hipfire_arch_gemma3_vl as vl;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn arg(flag: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();

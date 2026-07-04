@@ -4,7 +4,7 @@
 use crate::context::DispatchCtx;
 use crate::tables::KernelRegistry;
 use crate::types::*;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 /// Parameters for a rotation family dispatch call.
 pub struct RotationParams<'a> {

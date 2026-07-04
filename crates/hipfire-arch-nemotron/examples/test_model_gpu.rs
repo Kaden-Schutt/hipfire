@@ -16,7 +16,7 @@ use hipfire_arch_nemotron::model::{
     cpu_state, forward_cpu, HostBlock, NemotronModel, NemotronWeights,
 };
 use hipfire_arch_nemotron::{BlockKind, NemotronHConfig};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");

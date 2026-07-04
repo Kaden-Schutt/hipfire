@@ -109,7 +109,7 @@ struct Context {
     tokenizer_source: String,
     config: qwen35::Qwen35Config,
     tokenizer: Tokenizer,
-    gpu: rdna_compute::Gpu,
+    gpu: hipfire_rdna::Gpu,
     weights: qwen35::Qwen35Weights,
 }
 
@@ -331,7 +331,7 @@ fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
     let config = qwen35::config_from_hfq(&hfq)
         .ok_or_else(|| CaseOutcome::Fail("failed to parse Qwen3.5 config".to_string()))?;
     let (tokenizer, tokenizer_source) = load_tokenizer(&hfq)?;
-    let mut gpu = rdna_compute::Gpu::init()
+    let mut gpu = hipfire_rdna::Gpu::init()
         .map_err(|e| CaseOutcome::Skip(format!("GPU init unavailable: {e}")))?;
     let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         qwen35::load_weights(&mut hfq, &config, &mut gpu)
@@ -451,7 +451,7 @@ Use a sliding window and include a small doctest.";
 
 #[cfg(feature = "deltanet")]
 fn kv_cache_for_mode(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     config: &qwen35::Qwen35Config,
     mode: &str,
     seq_len: usize,

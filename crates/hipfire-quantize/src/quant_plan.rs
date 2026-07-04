@@ -67,6 +67,19 @@ pub const ALTERNATING_STRIDE: usize = 3;
 
 /// llama.cpp-style alternating promotion: edge layers always promoted,
 /// middle layers promoted every `stride` layers.
+///
+/// Arch-GENERIC by design: pure position arithmetic over `(idx, n_layers, stride)`,
+/// selected by the `--kmap-mode` CLI flag, applied identically to every family. No
+/// family specializes it, so it is NOT a per-arch capability and stays in the
+/// quantizer's "arch-generic policy" bucket (alongside FWHT/LDLQ/packers) — do not
+/// migrate it into an `Ingest` trait method.
+///
+/// FUTURE SEAM: genuine per-family *position-dependent* importance (hybrid stacks —
+/// ZAYA's alternating blocks, Mamba/attention interleave, gemma3 sliding/full 5:1)
+/// is a real, config-driven per-arch fact. When a family first needs it, add a
+/// `fn layer_importance(&self, layer_idx, n_layers) -> i16` boost to `Ingest`
+/// (default 0) driven by that arch's block layout — NOT by reusing this universal
+/// stride rule.
 pub fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
     if n_layers == 0 || stride == 0 {
         return false;

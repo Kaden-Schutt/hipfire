@@ -709,7 +709,7 @@ class AstreaTests(unittest.TestCase):
             methods=["imatrix-scale"],
             imatrix="/mnt/nas/imatrix.gguf",
             eval_commands=["python3 crates/hipfire-runtime/examples/eval_hipfire.rs"],
-            atlas_commands=["python3 scripts/kernel_atlas.py collect-ar"],
+            atlas_commands=["python3 scripts/adhoc/kernel_atlas.py collect-ar"],
             output="/tmp/qwen3.5-9b.mfp4.astrea",
             plan_id="astrea-mfp4-smoke",
         )
@@ -1737,7 +1737,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            dispatch = root / "crates" / "rdna-compute" / "src" / "dispatch.rs"
+            dispatch = root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs"
             kernels = root / "kernels" / "src"
             dispatch.parent.mkdir(parents=True)
             kernels.mkdir(parents=True)
@@ -1758,13 +1758,13 @@ class AstreaTests(unittest.TestCase):
 
             halfsplit = astrea.engine_fingerprint(root)
             self.assertEqual(halfsplit["rope_convention_default"], "halfsplit")
-            self.assertIn("crates/rdna-compute/src/dispatch.rs", halfsplit["source_hashes"])
+            self.assertIn("crates/hipfire-rdna/src/dispatch.rs", halfsplit["source_hashes"])
 
     def test_metrics_embeds_engine_fingerprint(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            dispatch = root / "crates" / "rdna-compute" / "src" / "dispatch.rs"
+            dispatch = root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs"
             kernels = root / "kernels" / "src"
             dispatch.parent.mkdir(parents=True)
             kernels.mkdir(parents=True)

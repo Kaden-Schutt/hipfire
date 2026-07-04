@@ -229,7 +229,7 @@ fn main() {
     eprintln!("max={max_tokens} ctx={ctx_capacity} max_n={max_n} chatml={chatml}");
 
     // ── Init GPU + load trunk + load MTP head ──────────────────────────
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
 
     // Hetero mode: second gpu hosts the MTP head + scratch + mirrored
@@ -256,7 +256,7 @@ fn main() {
     eprintln!("trunk loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     // MTP head's max_seq mirrors the trunk's.
-    let head_load_gpu: &mut rdna_compute::Gpu = &mut gpu;
+    let head_load_gpu: &mut hipfire_rdna::Gpu = &mut gpu;
     let t_mtp = Instant::now();
     let head = if let Some(ref mp) = mtp_path {
         // Explicit --mtp-head: standalone .mtp file (legacy path).
@@ -556,12 +556,12 @@ fn main() {
         // Arm per-kernel profiler after cycle 1 (post-JIT warmup), drain after
         // profile_cycles_target additional cycles. Print kernel breakdown.
         if do_profile && cycles == 1 && !profile_armed {
-            rdna_compute::profile::start();
+            hipfire_rdna::profile::start();
             profile_armed = true;
         }
         if do_profile && profile_armed && !profile_done && cycles >= 1 + profile_cycles_target {
             profile_done = true;
-            if let Some(entries) = rdna_compute::profile::stop() {
+            if let Some(entries) = hipfire_rdna::profile::stop() {
                 use std::collections::HashMap;
                 let measured = cycles - 1;
                 let mut by_kernel: HashMap<&str, (f64, usize, usize)> = HashMap::new();

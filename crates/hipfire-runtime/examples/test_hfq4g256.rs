@@ -6,7 +6,7 @@
 //! Quantize known F32 values, upload, run GEMV, compare against F32 GEMV.
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     // Small test: 4 rows × 256 cols (one group per row)
     let m = 4usize;
@@ -80,7 +80,7 @@ fn main() {
     // Upload to GPU
     let d_a = gpu.upload_raw(&quantized, &[quantized.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
-    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+    let d_y = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
     // GPU GEMV
     gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).unwrap();
@@ -133,7 +133,7 @@ fn main() {
     // Now test embedding lookup
     eprintln!("\n=== Embedding lookup test ===");
     let d_embd = gpu.upload_raw(&quantized, &[quantized.len()]).unwrap();
-    let d_out = gpu.zeros(&[k], rdna_compute::DType::F32).unwrap();
+    let d_out = gpu.zeros(&[k], hipfire_rdna::DType::F32).unwrap();
 
     // Lookup row 2
     gpu.embedding_lookup_hfq4g256(&d_embd, &d_out, 2, k)

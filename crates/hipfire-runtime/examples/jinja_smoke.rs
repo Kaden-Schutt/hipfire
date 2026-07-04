@@ -281,7 +281,7 @@ fn main() {
     // daemon's AR path uses; the smoke is bit-equivalent to a daemon
     // chat-completion call where the prompt is pre-rendered.
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("GPU init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     // KV cache sized for prompt + max_gen + headroom. Use asym3 (KV

@@ -8,7 +8,7 @@ description = "Shared model-serving orchestration (load + generate paths, sessio
 [features]
 default = ["arch-lfm2moe", "deltanet"]
 arch-lfm2moe = ["hipfire-arch-lfm2moe"]
-deltanet = ["rdna-compute/deltanet"]
+deltanet = ["hipfire-rdna/deltanet"]
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
@@ -34,7 +34,7 @@ hipfire-media = { path = "../hipfire-media" }
 hipfire-vision-cache = { path = "../hipfire-vision-cache" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe", optional = true }
 hip-bridge = { path = "../hip-bridge" }
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 base64.workspace = true
 serde_json = "1"
 tracing.workspace = true

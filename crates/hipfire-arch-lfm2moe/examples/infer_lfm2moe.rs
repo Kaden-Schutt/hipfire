@@ -58,7 +58,7 @@ fn main() {
     }
     let model = model.expect("--model required");
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(&model).expect("open model");
     let cfg = Lfm2MoeConfig::from_hfq(&hfq).expect("config");
     eprintln!(

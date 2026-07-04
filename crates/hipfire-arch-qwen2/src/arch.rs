@@ -20,7 +20,7 @@ use hipfire_runtime::arch::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 /// Zero-sized type marker for the Qwen2 arch.
 pub struct Qwen2;

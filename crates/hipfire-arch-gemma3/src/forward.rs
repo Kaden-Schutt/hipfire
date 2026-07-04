@@ -27,7 +27,7 @@
 
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;
 use crate::weights::Gemma3Weights;

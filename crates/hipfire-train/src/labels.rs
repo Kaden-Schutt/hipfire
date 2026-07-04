@@ -7,7 +7,7 @@
 //! sidecar (the target's fp32 token embedding). This loads both and (optionally)
 //! shuffles chunks before the train/eval split.
 
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 /// A loaded label set: per-chunk tokens + mid/shallow block scores + the shared
 /// (frozen) target embedding, plus its geometry.

@@ -58,7 +58,7 @@ fn main() {
     }
     let model = model.expect("--model required");
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(&model).expect("open model");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let prompt_ids = tok.encode(&prompt);

@@ -73,7 +73,7 @@ LoRA branch + activations carry grad.
 
 ```
 crates/hipfire-train/
-├── Cargo.toml            # deps: rdna-compute, hipfire-runtime (loaders/types),
+├── Cargo.toml            # deps: hipfire-rdna, hipfire-runtime (loaders/types),
 │                         #       hipfire-model, hipfire-dispatch
 ├── src/
 │   ├── lib.rs
@@ -253,7 +253,7 @@ crate uses **one general fp32 GEMM with transpose flags**, now landed:
   (the `_accum` form does `C = beta*C + op(A)·op(B)` for gradients that land on
   a buffer holding a partial — e.g. residual-merged or LoRA-added `dX`).
 - `Gpu::gemm_f32_train(a,b,c, m,n,k, lda,ldb, trans_a,trans_b)` in
-  `rdna-compute/src/dispatch.rs` (and `…_accum`). Builds clean.
+  `hipfire-rdna/src/dispatch.rs` (and `…_accum`). Builds clean.
 
 Computes `C[M,N] = op(A)·op(B)`, C row-major, `op(A)`=`[M,K]`, `op(B)`=`[K,N]`:
 ```
@@ -273,7 +273,7 @@ This is naive (one wave32 block per output element) — correctness-first;
 tiled/WMMA is a later optimization.
 
 **Correctness VERIFIED 2026-06-17** on gfx1103 via
-`crates/rdna-compute/examples/test_gemm_f32_train_gpu_vs_cpu.rs`: forward, both
+`crates/hipfire-rdna/examples/test_gemm_f32_train_gpu_vs_cpu.rs`: forward, both
 backward matmuls, and the `_accum` variant all match a CPU reference to fp32
 epsilon (max_abs_err ≤ 6e-8). Run it with `/opt/rocm/llvm/bin` on PATH (see
 env note below).

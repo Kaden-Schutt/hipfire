@@ -10,7 +10,7 @@
 //!   hipfire lock acquire
 //!   cargo run --release -p hipfire-arch-nemotron --example bench_ssd_chunk_wmma
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");

@@ -7,7 +7,7 @@ description: Use Kernel Atlas to collect phase-aware hipfire measurements and re
 
 Use this skill when the task is to explain or visualize how a hipfire quant
 format and kernel use an AMD GPU ISA target. The primary tool is
-`scripts/kernel_atlas.py`; this skill is a thin agent wrapper around that CLI.
+`scripts/adhoc/kernel_atlas.py`; this skill is a thin agent wrapper around that CLI.
 
 ## Core Workflow
 
@@ -36,20 +36,20 @@ format and kernel use an AMD GPU ISA target. The primary tool is
    - Report the visual plus a short readout of `likely limit` and `left on table`.
 
 5. **Ask Atlas for candidate experiments**
-   - Use `python3 scripts/kernel_atlas.py suggest --row ... --isa ... --dispatch ...`.
+   - Use `python3 scripts/adhoc/kernel_atlas.py suggest --row ... --isa ... --dispatch ...`.
    - Prefer `--format markdown` for humans and JSON for automation.
    - Let `suggest` auto-load default history from `.codeinsight+research/kernel-atlas/tasks/`; use `--history` only for extra history paths.
    - Treat suggestions as an experiment queue, not as predicted wins.
    - Each suggestion should name the lever type, hot kernel, files, risk, rationale, and eval contract.
 
 6. **Create an optimization task**
-   - Use `python3 scripts/kernel_atlas.py task` to turn a row into `task.json` and `TASK.md`.
+   - Use `python3 scripts/adhoc/kernel_atlas.py task` to turn a row into `task.json` and `TASK.md`.
    - Include `--allowed-file` for every path an agent may edit.
    - Include correctness commands for DFlash or risky runtime changes.
    - Generated tasks strip known profiling/instrumentation env from eval and preserve the original row env as `baseline.row_env`.
 
 7. **Evaluate a candidate**
-   - Use `python3 scripts/kernel_atlas.py eval --task ... --runs 5 --warmup-runs 1 --output-dir ...`.
+   - Use `python3 scripts/adhoc/kernel_atlas.py eval --task ... --runs 5 --warmup-runs 1 --output-dir ...`.
    - Use `--refresh-baseline` first to write `baseline.json`; use `--baseline <baseline.json>` for candidate comparisons.
    - Report `result.json` status, selected metric median, speedup, stability, and any failed command output tail.
    - Treat the local `ledger.jsonl` as experiment lineage, not a public benchmark.
@@ -69,7 +69,7 @@ Render an existing row:
 Collect a small AR smoke with ISA:
 
 ```bash
-python3 scripts/kernel_atlas.py collect-ar \
+python3 scripts/adhoc/kernel_atlas.py collect-ar \
   --model ~/.hipfire/models/qwen3.5-0.8b.mq4 \
   --workload qwen3.5-0.8b \
   --model-size 0.8b \
@@ -90,7 +90,7 @@ python3 scripts/kernel_atlas.py collect-ar \
 Suggest candidate experiments from a profiled row:
 
 ```bash
-python3 scripts/kernel_atlas.py suggest \
+python3 scripts/adhoc/kernel_atlas.py suggest \
   --row .codeinsight+research/kernel-atlas/runs/atlas-gfx1201.jsonl \
   --row-index 1 \
   --isa .codeinsight+research/kernel-atlas/runs/isa-gfx1201.json \
@@ -101,7 +101,7 @@ python3 scripts/kernel_atlas.py suggest \
 Create a bounded task from a profiled row:
 
 ```bash
-python3 scripts/kernel_atlas.py task \
+python3 scripts/adhoc/kernel_atlas.py task \
   --row .codeinsight+research/kernel-atlas/runs/atlas-gfx1201.jsonl \
   --row-index 1 \
   --isa .codeinsight+research/kernel-atlas/runs/isa-gfx1201.json \
@@ -113,7 +113,7 @@ python3 scripts/kernel_atlas.py task \
 Create a PyTorch-shape task for non-Qwen work:
 
 ```bash
-python3 scripts/kernel_atlas.py task-pytorch \
+python3 scripts/adhoc/kernel_atlas.py task-pytorch \
   --name llama-rmsnorm-shape \
   --op rmsnorm \
   --input-shape 1,2048,4096 \
@@ -126,14 +126,14 @@ python3 scripts/kernel_atlas.py task-pytorch \
 Refresh a stable baseline and then evaluate a candidate:
 
 ```bash
-python3 scripts/kernel_atlas.py eval \
+python3 scripts/adhoc/kernel_atlas.py eval \
   --task .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/task.json \
   --runs 5 \
   --warmup-runs 1 \
   --refresh-baseline \
   --output-dir .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/eval-baseline
 
-python3 scripts/kernel_atlas.py eval \
+python3 scripts/adhoc/kernel_atlas.py eval \
   --task .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/task.json \
   --baseline .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/eval-baseline/baseline.json \
   --runs 5 \

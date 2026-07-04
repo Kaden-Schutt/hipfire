@@ -84,7 +84,7 @@ fn main() {
     let model = model.expect("--model required");
     let draft = draft.expect("--draft required");
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
 
     let mut target_hfq = HfqFile::open(&model).expect("open target hfq");
@@ -469,7 +469,7 @@ fn hidden_stats(v: &[f32]) -> (usize, f32, f32, f64) {
 
 #[cfg(feature = "deltanet")]
 fn run_synthetic_dflash_probe(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     hfq: &hipfire_runtime::hfq::HfqFile,
     cfg: &hipfire_runtime::dflash::DflashConfig,
     block_size: usize,

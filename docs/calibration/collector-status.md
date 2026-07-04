@@ -8,8 +8,8 @@ integration + cross-model capture, flagged below.
 
 - **Reduction kernels** (`kernels/src/calib_reduce.hip`): `calib_sumsq_reduce_f32`
   (imatrix Σx²) + `calib_hessian_outer_f32` (Hessian Σxxᵀ, tiled). CPU-verified
-  (`rdna-compute/examples/test_calib_reduce`).
-- **Capture wiring** (`rdna-compute` `ActivationCapture`): `Gpu.active_capture`
+  (`hipfire-rdna/examples/test_calib_reduce`).
+- **Capture wiring** (`hipfire-rdna` `ActivationCapture`): `Gpu.active_capture`
   (Arc) + `capture_names` (weight-ptr→name); fired from the BF16/F16 chokepoints
   the lowered super-op path actually uses (`gemm_bf16_x_bf16_wmma_labeled`,
   `gemm_f16_batched_lmhead`). Gated on `is_none()` ⇒ non-calibration forwards are

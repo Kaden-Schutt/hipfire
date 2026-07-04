@@ -38,7 +38,7 @@ per-lane K-packing differ between archs.**
 
 ### 2. Check `dispatch.rs` for the existing arch-conditional sites
 
-Every arch-aware GEMM dispatch in `crates/rdna-compute/src/dispatch.rs`
+Every arch-aware GEMM dispatch in `crates/hipfire-rdna/src/dispatch.rs`
 has the shape:
 
 ```rust
@@ -128,7 +128,7 @@ working around it:
 1. `rm target/release/examples/<bench>` to force a fresh build of
    the bench binary specifically (the gate's `ensure_build` will
    then rebuild it).
-2. `cargo clean -p rdna-compute && cargo build --release ...` to
+2. `cargo clean -p hipfire-rdna && cargo build --release ...` to
    invalidate the dispatch-crate artifacts.
 3. `cat /sys/class/drm/card*/device/pp_dpm_sclk` to check DPM state.
 4. `dmesg | tail -40` for firmware errors / SMU mismatch.
@@ -175,7 +175,7 @@ and per-lane K-packing differs. Use a separate `.gfx12.hip` file.
 
 ### 5. Wire the include + dispatch
 
-In `crates/rdna-compute/src/kernels.rs`:
+In `crates/hipfire-rdna/src/kernels.rs`:
 
 ```rust
 pub const GEMM_X_WMMA_GFX12_SRC: &str = include_str!(
@@ -183,7 +183,7 @@ pub const GEMM_X_WMMA_GFX12_SRC: &str = include_str!(
 );
 ```
 
-In `crates/rdna-compute/src/dispatch.rs`, add the dispatch branch
+In `crates/hipfire-rdna/src/dispatch.rs`, add the dispatch branch
 ABOVE the existing gfx11 inline check (per step 3).
 
 ### 6. Validate against all three gates (see `validation.md`)

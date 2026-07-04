@@ -8,7 +8,7 @@ use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::calibration::{collect, logsumexp, topk_logits, CalibForward};
 use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::weights::WeightTensor;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::collections::HashMap;
 use std::path::Path;
 

@@ -6,7 +6,7 @@
 //! passed via the `extra` parameter (HIP_LAUNCH_PARAM_BUFFER_POINTER) with
 //! a stable byte buffer, instead of the kernelParams array of stack pointers.
 //!
-//! Background: rdna-compute's existing dispatch path packs kernargs as
+//! Background: hipfire-rdna's existing dispatch path packs kernargs as
 //! `&mut <stack-local>` pointers into a Vec<*mut c_void>. HIP graph capture
 //! apparently stores those pointers (not the values they point to) and
 //! dereferences them at replay time, by which point the stack is gone —

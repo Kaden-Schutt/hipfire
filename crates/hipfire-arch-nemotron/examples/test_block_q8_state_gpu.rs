@@ -14,7 +14,7 @@
 
 use hipfire_arch_nemotron::block::{Mamba2BlockWeights, Mamba2Dims};
 use hipfire_arch_nemotron::block_gpu::{Mamba2BlockGpu, Mamba2StateQuant};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");

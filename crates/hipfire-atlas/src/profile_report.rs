@@ -25,7 +25,7 @@ use crate::schema::AtlasRow;
 use serde_json::{json, Value};
 
 /// Plain-data summary of a rocprofv3 kernel entry, suitable for serialization.
-/// Mirrors `rdna_compute::profile_rocprof::RocprofKernel` but with no GPU deps.
+/// Mirrors `hipfire_rdna::profile_rocprof::RocprofKernel` but with no GPU deps.
 #[derive(Debug, Clone)]
 pub struct AtlasRocprofKernel {
     pub name: String,
@@ -46,7 +46,7 @@ impl AtlasRocprofKernel {
 }
 
 /// Plain-data coverage report for use with [`AtlasRow::set_profile_report`].
-/// Construct from `rdna_compute::profile_rocprof::ProfileReport` by field copy.
+/// Construct from `hipfire_rdna::profile_rocprof::ProfileReport` by field copy.
 #[derive(Debug, Clone)]
 pub struct AtlasProfileReport {
     pub internal_total_us: f64,

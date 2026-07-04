@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 pub struct ResourceManager {
     _priv: (),

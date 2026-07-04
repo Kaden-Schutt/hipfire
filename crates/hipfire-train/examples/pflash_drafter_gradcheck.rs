@@ -8,7 +8,7 @@
 
 use hipfire_train::drafter::{drafter_backward, drafter_forward_train, Drafter, DrafterConfig};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 const VOCAB: usize = 32;
 const H_T: usize = 8;

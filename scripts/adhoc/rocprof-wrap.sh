@@ -5,7 +5,7 @@
 #   scripts/rocprof-wrap.sh <output-dir> -- <command...>
 #
 # Sets HIPFIRE_ROCPROF_CSV=<output-dir>/trace_kernel_stats.csv in the child
-# environment so that a bench binary built with the rdna-compute rocprof
+# environment so that a bench binary built with the hipfire-rdna rocprof
 # integration can pick up the stats file automatically.
 #
 # The output CSV files are:

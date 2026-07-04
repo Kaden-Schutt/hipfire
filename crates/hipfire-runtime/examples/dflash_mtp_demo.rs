@@ -160,7 +160,7 @@ fn main() {
     );
 
     // ── Init GPU + load drafter cfg ────────────────────────────────────
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
 
     let draft_hfq = HfqFile::open(Path::new(&drafter_path)).expect("open drafter");

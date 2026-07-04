@@ -11,7 +11,7 @@
 use hip_bridge::HipRuntime;
 use hipfire_evidence::HostProfile;
 use hipfire_sysinfo::collect_default_host_profile;
-use rdna_compute::KernelCompiler;
+use hipfire_rdna::KernelCompiler;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};

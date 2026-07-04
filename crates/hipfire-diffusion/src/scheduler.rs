@@ -1184,12 +1184,9 @@ mod flow_match_dynamic_tests {
     fn flow_match_dynamic_shift_scales_with_resolution() {
         // At base resolution mu = base_shift = 0.5; the mid sigma (frac = 0.5)
         // under the exponential time shift is exp(mu) / (exp(mu) + 1).
-        let base = DiffusionSchedule::flow_match_euler_with_image_seq_len(
-            &dynamic_config(),
-            3,
-            Some(256),
-        )
-        .unwrap();
+        let base =
+            DiffusionSchedule::flow_match_euler_with_image_seq_len(&dynamic_config(), 3, Some(256))
+                .unwrap();
         let e = 0.5f32.exp();
         let expected_mid = e / (e + 1.0);
         assert!(

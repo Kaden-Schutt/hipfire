@@ -4,7 +4,7 @@
 //! compressed-KV indexer, tail-only RoPE, Q/O-LoRA, FP4 experts,
 //! sliding window attention (SWA), separate MTP spec-decode layer.
 
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 #[test]
 fn deepseek4_prefill_batchable_formats() {

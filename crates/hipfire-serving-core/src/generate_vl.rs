@@ -38,7 +38,7 @@ use crate::output_filter::{block_attractor_unclosed_cpu, loop_guard_from_runtime
 /// loop guard + attractor blocking), emitting `token`/`done` events.
 pub fn generate_vl(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
@@ -666,7 +666,7 @@ pub fn generate_vl(
 /// (`qwen2::forward_step*`).
 pub fn generate_vl_dots_ocr(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
@@ -811,7 +811,7 @@ pub fn generate_vl_dots_ocr(
     state.reset();
     let t_prefill = Instant::now();
     let mut embeds = vec![0f32; prompt_ids.len() * dim];
-    let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
+    let emb_scratch = match gpu.alloc_tensor(&[dim], hipfire_rdna::DType::F32) {
         Ok(t) => t,
         Err(e) => {
             write_error(
@@ -1038,7 +1038,7 @@ pub fn decode_vl_frames(
 /// defaults arch 13 to 1.3), which breaks the near-duplicate-frame attractor.
 pub fn generate_vl_gemma3(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
     frames: &[Vec<u8>],

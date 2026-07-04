@@ -40,7 +40,7 @@ use super::steps::{match_fused_prefix, step_op_kind, Step};
 use crate::context::DispatchCtx;
 use crate::types::DispatchError;
 use crate::types::{KernelKey, PipelineOp};
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_rdna::{Gpu, GpuTensor};
 
 /// Index into the model's per-layer weight table (resolved at lower time, stable
 /// for the model's lifetime). The executor maps this to the live `&GpuTensor`.

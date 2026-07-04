@@ -854,7 +854,7 @@ fn main() {
     eprintln!("  shards : {}", st_files.len());
 
     // FWHT seeds — MUST match engine `Gpu::ensure_mq_signs()` in
-    // rdna_compute (42 / 1042). Reused from dflash_convert.
+    // hipfire_rdna (42 / 1042). Reused from dflash_convert.
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
 

@@ -38,7 +38,7 @@ use crate::qwen35::{
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Type marker for Qwen3.5 architecture (dense Qwen3.5 0.8B/4B/9B/27B,
 /// MoE Qwen3.5-A3B/A10B/A17B, dense Qwen3.6, MoE Qwen3.6-A3B). All share

@@ -18,7 +18,7 @@ use hipfire_runtime::arch::{
     Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
 };
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 
 /// Type marker for the template arch. Zero-sized — no per-instance state.
 /// A real arch's marker is exactly this shape (e.g. `Qwen35`, `Llama`); rename

@@ -51,9 +51,9 @@ preamble) will exceed 16K. **Tiled attention is the proper fix.**
 - **Phase 2:** each output dim `d` (thread-strided) does
   `out[d] = Σ_t scores[t] * V[t][d]` (V same Q8_0 layout).
 
-Dispatch: `crates/rdna-compute/src/dispatch.rs:~25253` (`attention_q8_0_kv`).
+Dispatch: `crates/hipfire-rdna/src/dispatch.rs:~25253` (`attention_q8_0_kv`).
 It already has a `capture_mode` branch and sizes `shared_mem` by `sizing_seq`.
-Kernel registration: `crates/rdna-compute/src/kernels.rs` (`ATTENTION_Q8_0_KV_SRC`).
+Kernel registration: `crates/hipfire-rdna/src/kernels.rs` (`ATTENTION_Q8_0_KV_SRC`).
 
 ## Tiled design (online softmax / flash-attention-decode)
 
@@ -133,7 +133,7 @@ acceptable — measure first.)
 
 **Approach.** The from-scratch tiled kernel above was unnecessary: the existing
 `attention_flash_q8_0` (tile + reduce, `kernels/src/attention_flash_q8_0_tile.hip`
-+ `attention_flash_q8_0_reduce.hip`, dispatch `crates/rdna-compute/src/dispatch.rs`
++ `attention_flash_q8_0_reduce.hip`, dispatch `crates/hipfire-rdna/src/dispatch.rs`
 `attention_flash_q8_0`) is exactly an online-softmax flash path on the same Q8_0
 KV layout, already the default attention for qwen35/llama on gfx11/gfx12. Switched
 minimax onto it.

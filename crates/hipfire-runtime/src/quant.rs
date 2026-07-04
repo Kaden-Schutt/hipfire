@@ -109,9 +109,6 @@ pub fn dequant_q4k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-
-
-
 /// Re-export the canonical on-disk byte-contract so arch loaders can reach it
 /// as `hipfire_runtime::quant::QuantType` without each depending on the leaf
 /// `hipfire-quant-format` crate directly.
@@ -138,9 +135,9 @@ pub use hipfire_quant_format::QuantType;
 ///
 /// Matches on the canonical [`QuantType`] (the shared byte-contract) rather
 /// than raw integers, so the on-disk ids stay authoritative in one crate.
-pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<rdna_compute::DType> {
+pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<hipfire_rdna::DType> {
     use hipfire_quant_format::QuantType as Q;
-    use rdna_compute::DType;
+    use hipfire_rdna::DType;
     Some(match Q::from_code(qt)? {
         Q::F16 => DType::F16,
         Q::Q8F16 => DType::Q8_0,

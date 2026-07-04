@@ -45,7 +45,7 @@ fn main() {
     let model_path = &args[1];
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200);
 
-    let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("Gpu::init");
     eprintln!("Loading {}...", model_path);
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");

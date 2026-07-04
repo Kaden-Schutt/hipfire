@@ -11,7 +11,7 @@ use hipfire_arch_nemotron::loader::load_linear_hfq;
 use hipfire_model::ModelSource;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_DIR: &str = "/srv/huggingface/models--nvidia--NVIDIA-Nemotron-3-Nano-4B-BF16/snapshots/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f";

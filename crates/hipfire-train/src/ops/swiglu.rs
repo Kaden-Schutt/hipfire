@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! SwiGLU: `out = silu(gate) * up`. Elementwise; `n` total elements.
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 pub fn swiglu_forward(
     gpu: &mut Gpu,

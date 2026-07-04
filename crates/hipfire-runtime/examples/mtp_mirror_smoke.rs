@@ -17,7 +17,7 @@
 
 use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
 use hipfire_runtime::mtp_mirror::peer_clone_tensor;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 use std::time::Instant;
 

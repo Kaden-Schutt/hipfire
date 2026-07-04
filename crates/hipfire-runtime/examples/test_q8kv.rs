@@ -4,7 +4,7 @@
 
 //! Minimal roundtrip test for Q8_0 KV cache quantization.
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     let n_kv_heads: usize = 1;
     let head_dim: usize = 32;
@@ -18,7 +18,7 @@ fn main() {
     let total_blocks = n_kv_heads * (head_dim / 32);
     let cache_bytes = max_seq * total_blocks * 34;
     let cache_elems = (cache_bytes + 3) / 4;
-    let d_cache = gpu.zeros(&[cache_elems], rdna_compute::DType::F32).unwrap();
+    let d_cache = gpu.zeros(&[cache_elems], hipfire_rdna::DType::F32).unwrap();
 
     // Write at pos=0
     let pos_buf = gpu.hip.malloc(4).unwrap();
@@ -75,7 +75,7 @@ fn main() {
     let cache_bytes2 = max_seq2 * total_blocks2 * 34;
     let cache_elems2 = (cache_bytes2 + 3) / 4;
     let d_cache2 = gpu
-        .zeros(&[cache_elems2], rdna_compute::DType::F32)
+        .zeros(&[cache_elems2], hipfire_rdna::DType::F32)
         .unwrap();
 
     // Write pos=0: head0=[1.0]*32, head1=[2.0]*32
@@ -138,8 +138,8 @@ fn main() {
     // Allocate K and V caches (2 positions)
     let cache_b = 2 * total_b * 34;
     let cache_e = (cache_b + 3) / 4;
-    let d_kcache = gpu.zeros(&[cache_e], rdna_compute::DType::F32).unwrap();
-    let d_vcache = gpu.zeros(&[cache_e], rdna_compute::DType::F32).unwrap();
+    let d_kcache = gpu.zeros(&[cache_e], hipfire_rdna::DType::F32).unwrap();
+    let d_vcache = gpu.zeros(&[cache_e], hipfire_rdna::DType::F32).unwrap();
 
     // Write K pos0 = [1.0]*32, V pos0 = [1.0]*32
     let ones32 = vec![1.0f32; hd_a];
@@ -164,7 +164,7 @@ fn main() {
 
     // Q = [1.0]*32
     let d_q = gpu.upload_f32(&ones32, &[hd_a]).unwrap();
-    let d_out = gpu.zeros(&[hd_a], rdna_compute::DType::F32).unwrap();
+    let d_out = gpu.zeros(&[hd_a], hipfire_rdna::DType::F32).unwrap();
 
     // Run attention at pos=1 (seq_len=2: see both positions)
     gpu.hip.memcpy_htod(&pos_buf, &1i32.to_ne_bytes()).unwrap();
@@ -200,8 +200,8 @@ fn main() {
     let tb = n_kv * (hd / 32); // 32 blocks per pos
     let cb = 4 * tb * 34;
     let ce = (cb + 3) / 4;
-    let d_kc8 = gpu.zeros(&[ce], rdna_compute::DType::F32).unwrap();
-    let d_vc8 = gpu.zeros(&[ce], rdna_compute::DType::F32).unwrap();
+    let d_kc8 = gpu.zeros(&[ce], hipfire_rdna::DType::F32).unwrap();
+    let d_vc8 = gpu.zeros(&[ce], hipfire_rdna::DType::F32).unwrap();
 
     // Write 2 positions with distinct values
     let k0: Vec<f32> = (0..kv_dim_8b).map(|i| 0.01 * ((i % 128) as f32)).collect();
@@ -228,7 +228,7 @@ fn main() {
     // Q: 32 heads, each [0.01]*128 (aligned with K pos0)
     let q8b: Vec<f32> = vec![0.01f32; n_h * hd];
     let d_q8 = gpu.upload_f32(&q8b, &[n_h * hd]).unwrap();
-    let d_out8 = gpu.zeros(&[n_h * hd], rdna_compute::DType::F32).unwrap();
+    let d_out8 = gpu.zeros(&[n_h * hd], hipfire_rdna::DType::F32).unwrap();
 
     gpu.hip.memcpy_htod(&pos_buf, &1i32.to_ne_bytes()).unwrap();
     gpu.attention_q8_0_kv(
@@ -276,11 +276,11 @@ fn main() {
         let physical_cap = seq;
         let cb = physical_cap * tb5 * 34;
         let ce = (cb + 3) / 4;
-        let d_kc = gpu.zeros(&[ce], rdna_compute::DType::F32).unwrap();
-        let d_vc = gpu.zeros(&[ce], rdna_compute::DType::F32).unwrap();
+        let d_kc = gpu.zeros(&[ce], hipfire_rdna::DType::F32).unwrap();
+        let d_vc = gpu.zeros(&[ce], hipfire_rdna::DType::F32).unwrap();
         // Reuse one upload buffer per kind; overwrite per position.
-        let dk = gpu.zeros(&[kv_dim5], rdna_compute::DType::F32).unwrap();
-        let dv = gpu.zeros(&[kv_dim5], rdna_compute::DType::F32).unwrap();
+        let dk = gpu.zeros(&[kv_dim5], hipfire_rdna::DType::F32).unwrap();
+        let dv = gpu.zeros(&[kv_dim5], hipfire_rdna::DType::F32).unwrap();
         for p in 0..seq {
             let kbuf: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
             let vbuf: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
@@ -296,11 +296,11 @@ fn main() {
         }
         let qbuf: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
         let dq = gpu.upload_f32(&qbuf, &[n_h5 * hd5]).unwrap();
-        let out_base = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
-        let out_flash = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
+        let out_base = gpu.zeros(&[n_h5 * hd5], hipfire_rdna::DType::F32).unwrap();
+        let out_flash = gpu.zeros(&[n_h5 * hd5], hipfire_rdna::DType::F32).unwrap();
         let max_tiles = (physical_cap + 127) / 128;
         let partials = gpu
-            .zeros(&[n_h5 * max_tiles * (2 + hd5)], rdna_compute::DType::F32)
+            .zeros(&[n_h5 * max_tiles * (2 + hd5)], hipfire_rdna::DType::F32)
             .unwrap();
         gpu.hip
             .memcpy_htod(&pos_buf, &((seq - 1) as i32).to_ne_bytes())
@@ -363,8 +363,8 @@ fn main() {
     let big_seq = 20000usize;
     let cb_big = big_seq * tb5 * 34;
     let ce_big = (cb_big + 3) / 4;
-    let d_kc_big = gpu.zeros(&[ce_big], rdna_compute::DType::F32).unwrap();
-    let d_vc_big = gpu.zeros(&[ce_big], rdna_compute::DType::F32).unwrap();
+    let d_kc_big = gpu.zeros(&[ce_big], hipfire_rdna::DType::F32).unwrap();
+    let d_vc_big = gpu.zeros(&[ce_big], hipfire_rdna::DType::F32).unwrap();
     let kfix: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
     let vfix: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
     let dk_big = gpu.upload_f32(&kfix, &[kv_dim5]).unwrap();
@@ -380,12 +380,12 @@ fn main() {
     }
     let q_big: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
     let dq_big = gpu.upload_f32(&q_big, &[n_h5 * hd5]).unwrap();
-    let out_big = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
+    let out_big = gpu.zeros(&[n_h5 * hd5], hipfire_rdna::DType::F32).unwrap();
     let max_tiles_big = (big_seq + 127) / 128;
     let partials_big = gpu
         .zeros(
             &[n_h5 * max_tiles_big * (2 + hd5)],
-            rdna_compute::DType::F32,
+            hipfire_rdna::DType::F32,
         )
         .unwrap();
     gpu.hip

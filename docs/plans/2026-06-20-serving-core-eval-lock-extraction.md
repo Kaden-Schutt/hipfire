@@ -49,7 +49,7 @@ in a new crate to avoid a cycle.
 New library crate `crates/hipfire-serving-core/`. Both `hipfire-daemon` (bin) and
 `hipfire-eval` depend on it. Dep edges: `hipfire-serving-core` → all arch crates
 + `hipfire-runtime` + `hipfire-generate` + `hipfire-model` + `hipfire-prompt` +
-`hipfire-state` + `hipfire-evidence` + `rdna-compute`/`hip-bridge`.
+`hipfire-state` + `hipfire-evidence` + `hipfire-rdna`/`hip-bridge`.
 
 ### What moves (daemon bin → serving-core lib)
 

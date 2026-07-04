@@ -7,3 +7,4 @@ description = "Lean offline spec for the Nemotron-H (arch_id 14) and Mamba-2 (ar
 
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
+serde_json = "1"

@@ -8,7 +8,7 @@
 //! owns the common harness pieces that should not be copied between arches.
 
 use crate::kv::KvCache;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 pub struct SpeedBenchArgs {

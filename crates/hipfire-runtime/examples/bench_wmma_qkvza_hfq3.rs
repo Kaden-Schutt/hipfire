@@ -22,7 +22,7 @@
 //!   qkv_m = 8192, z_m = 4096, beta_m = 32, alpha_m = 32, K = 4096
 //!   N = 128 (typical prefill batch)
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 use std::time::Instant;
 
 fn main() {
@@ -151,15 +151,15 @@ fn run_bench(
 
 fn do_gemv_fallback(
     gpu: &mut Gpu,
-    aq: &rdna_compute::GpuTensor,
-    az: &rdna_compute::GpuTensor,
-    ab: &rdna_compute::GpuTensor,
-    aa: &rdna_compute::GpuTensor,
-    x: &rdna_compute::GpuTensor,
-    yq: &rdna_compute::GpuTensor,
-    yz: &rdna_compute::GpuTensor,
-    yb: &rdna_compute::GpuTensor,
-    ya: &rdna_compute::GpuTensor,
+    aq: &hipfire_rdna::GpuTensor,
+    az: &hipfire_rdna::GpuTensor,
+    ab: &hipfire_rdna::GpuTensor,
+    aa: &hipfire_rdna::GpuTensor,
+    x: &hipfire_rdna::GpuTensor,
+    yq: &hipfire_rdna::GpuTensor,
+    yz: &hipfire_rdna::GpuTensor,
+    yb: &hipfire_rdna::GpuTensor,
+    ya: &hipfire_rdna::GpuTensor,
     qkv_m: usize,
     z_m: usize,
     beta_m: usize,
@@ -183,7 +183,7 @@ fn do_gemv_fallback(
     }
 }
 
-fn upload_random_hfq3(gpu: &mut Gpu, m: usize, k: usize, seed: u8) -> rdna_compute::GpuTensor {
+fn upload_random_hfq3(gpu: &mut Gpu, m: usize, k: usize, seed: u8) -> hipfire_rdna::GpuTensor {
     let groups_per_row = k / 256;
     let bytes_per_row = groups_per_row * 104;
     let mut out = vec![0u8; m * bytes_per_row];

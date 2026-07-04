@@ -15,7 +15,7 @@
 use hipfire_arch_zaya::gpu::{gpu_forward_prefill, ZayaGpuWeights};
 use hipfire_arch_zaya::ZayaConfig;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 fn read_bin(path: &Path) -> (Vec<usize>, Vec<u8>) {

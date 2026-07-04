@@ -187,9 +187,9 @@ Only pursue if we want a ROCm-less dispatch path later.
    - `HsaMemory::alloc_device_memory(agent, size)` — for kernel input/output VAs
 2. Pick a small single-launch kernel (`add_inplace_f32` or `scale_f32`). Build a
    test harness that:
-   - Loads the same `.hsaco` that `rdna-compute` builds today.
+   - Loads the same `.hsaco` that `hipfire-rdna` builds today.
    - Uses the **same input buffers** (just reuse the GpuTensors from
-     `rdna-compute` — we don't need to re-allocate).
+     `hipfire-rdna` — we don't need to re-allocate).
    - Fires the kernel once through HIP (baseline) and once through HSA.
    - Measures latency with `std::time::Instant` inside a 10 000-iter loop.
 3. Target: HSA median < 3 µs, both paths produce identical output. If HSA is
@@ -214,7 +214,7 @@ packets) and try chain-dispatch amortization instead.
       - write AQL packet to ring (header written LAST with release fence)
       - store write index, write doorbell
 - [ ] Implement `signal_wait_scacquire` wrapper
-- [ ] Thread the AQL path through `rdna-compute::dispatch` for ONE kernel
+- [ ] Thread the AQL path through `hipfire-rdna::dispatch` for ONE kernel
       (keep HIP path as fallback; gate on a `use_hsa: bool`)
 - [ ] Run the same in-process hipEvent profiler against HIP and HSA, compare
 - [ ] Document: launch latency, total forward delta, any correctness diff

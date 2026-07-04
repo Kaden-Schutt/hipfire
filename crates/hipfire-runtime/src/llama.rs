@@ -12,7 +12,7 @@ use crate::weights::{
     weight_gemv, weight_gemv_prerotated, EmbeddingFormat, LayerWeights, WeightTensor,
 };
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +40,6 @@ pub struct LlamaConfig {
     pub eos_token: u32,
     pub has_qk_norm: bool, // Qwen3 feature
 }
-
-
 
 /// A weight matrix on GPU — may be quantized or F32.
 /// ParoQuant Givens rotation metadata for a single linear layer.
@@ -1414,7 +1412,6 @@ fn forward_prefill_chunk(
 
     Ok(())
 }
-
 
 /// Pre-allocated scratch buffers for the forward pass.
 /// Allocate once, reuse every token — zero hipMalloc in the hot loop.

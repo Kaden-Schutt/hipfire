@@ -184,7 +184,7 @@ EXE="./target/release/examples/pflash_niah_bench"
 # anywhere in the dispatch path forces a rebuild:
 #   - engine logic (pflash.rs, qwen35.rs, llama.rs, hfq.rs, tokenizer.rs)
 #   - bench harness (pflash_niah_bench.rs)
-#   - rdna-compute layer:
+#   - hipfire-rdna layer:
 #       lib.rs       (Gpu struct, top-level exports)
 #       kernels.rs   (include_str! site for every kernel HIP source)
 #       dispatch.rs  (the `pflash_score_q8_kv` Rust wrapper)
@@ -207,11 +207,11 @@ else
         crates/hipfire-runtime/src/hfq.rs \
         crates/hipfire-runtime/src/tokenizer.rs \
         crates/hipfire-runtime/examples/pflash_niah_bench.rs \
-        crates/rdna-compute/src/lib.rs \
-        crates/rdna-compute/src/kernels.rs \
-        crates/rdna-compute/src/dispatch.rs \
-        crates/rdna-compute/src/compiler.rs \
-        crates/rdna-compute/src/pool.rs \
+        crates/hipfire-rdna/src/lib.rs \
+        crates/hipfire-rdna/src/kernels.rs \
+        crates/hipfire-rdna/src/dispatch.rs \
+        crates/hipfire-rdna/src/compiler.rs \
+        crates/hipfire-rdna/src/pool.rs \
         crates/hip-bridge/src/lib.rs \
         crates/hip-bridge/src/ffi.rs \
         crates/hip-bridge/src/kernarg.rs \

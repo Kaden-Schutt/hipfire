@@ -20,7 +20,7 @@ use hipfire_train::model::{
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
 use hipfire_train::qtip_quant::qtip_quantize_dequant;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 const MODEL_DIR: &str =

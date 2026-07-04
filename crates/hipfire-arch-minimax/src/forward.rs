@@ -37,7 +37,7 @@ use hipfire_runtime::weights::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
     weight_gemv_residual,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Calibration-only: download a small i32 routing tensor to host.
 fn download_i32_tensor(gpu: &mut Gpu, tensor: &GpuTensor, len: usize) -> Result<Vec<i32>, String> {
@@ -1249,7 +1249,7 @@ pub fn forward_batch_supported(weights: &MiniMaxWeights) -> bool {
 /// (`gemm_q8_0_batched` kernel cap); the caller chunks longer prompts.
 ///
 /// Batched twin of `decode_step_body`: every op uses its batched kernel variant
-/// (audited present in rdna-compute), dense Q8 projections go through
+/// (audited present in hipfire-rdna), dense Q8 projections go through
 /// `gemm_q8_0_batched` directly (the `weight_gemm` helper falls back to per-row
 /// GEMV for Q8). Per-row causal masking + the growing KV length are handled
 /// inside `attention_q8_0_kv_batched` via the `positions[B]` array.

@@ -5,7 +5,7 @@
 //! independent softmax rows (e.g. q_heads × seq for attention scores), `n` =
 //! row length (e.g. key length).
 
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 pub fn softmax_forward(
     gpu: &mut Gpu,

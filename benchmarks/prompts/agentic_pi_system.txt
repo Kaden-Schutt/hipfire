@@ -57,7 +57,7 @@ Prefer terse, direct prose in code comments. Comment WHY, not WHAT. Well-named i
 
 ## Hot paths
 
-- `crates/rdna-compute/src/dispatch.rs` (kernel dispatch)
+- `crates/hipfire-rdna/src/dispatch.rs` (kernel dispatch)
 - `crates/hipfire-arch-qwen35/src/qwen35.rs` (forward pass)
 - `crates/hipfire-runtime/examples/daemon.rs` (JSON-line daemon protocol)
 

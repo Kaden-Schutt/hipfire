@@ -20,7 +20,7 @@ use crate::gpu::{build_capture_names, gpu_forward_calib, ZayaGpuWeights};
 use crate::{ZayaConfig, ARCH_ID_ZAYA};
 use hipfire_runtime::calibration::{collect, CalibForward};
 use hipfire_runtime::hfq::HfqMemTensor;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::path::Path;
 
 pub use hipfire_runtime::calibration::CalibSummary;

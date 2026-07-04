@@ -134,7 +134,7 @@ fn main() {
     // -------- load model --------
     let mut hfq = HfqFile::open(&args.model).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!(
         "prefill_microbench: arch={} model={}",
         gpu.arch,
@@ -214,7 +214,7 @@ fn main() {
     );
 
     // -------- timing helpers --------
-    let per_token_path = |gpu: &mut rdna_compute::Gpu,
+    let per_token_path = |gpu: &mut hipfire_rdna::Gpu,
                           kv_cache: &mut KvCache,
                           dn_state: &mut DeltaNetState,
                           tokens: &[u32]|
@@ -242,7 +242,7 @@ fn main() {
         t0.elapsed().as_secs_f64()
     };
 
-    let prefill_path = |gpu: &mut rdna_compute::Gpu,
+    let prefill_path = |gpu: &mut hipfire_rdna::Gpu,
                         kv_cache: &mut KvCache,
                         dn_state: &mut DeltaNetState,
                         tokens: &[u32]|

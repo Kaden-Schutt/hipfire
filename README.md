@@ -312,7 +312,7 @@ They define the methodology and architectural patterns we're following:
 - Their `ane-bridge` crate talks to Apple's Neural Engine through reverse-engineered private APIs
 - We do the same thing but targeting AMD's ROCm/HIP/HSA runtime stack
 - Study their architecture: ane-bridge (FFI layer) → metal-decode (GPU shaders) → engine (orchestrator)
-- Our equivalent: hip-bridge (FFI layer) → rdna-compute (shader dispatch) → engine (orchestrator)
+- Our equivalent: hip-bridge (FFI layer) → hipfire-rdna (shader dispatch) → engine (orchestrator)
 
 ### 3. Also reference
 - Mesa radeonsi/radv source — open AMD GPU driver, has gfx1010 support paths
@@ -443,7 +443,7 @@ hipfire/
 ├── crates/
 │   ├── hip-bridge/      # (or kmd-bridge — whichever HIP path won)
 │   │   └── src/lib.rs   # Safe Rust FFI to AMD compute runtime
-│   ├── rdna-compute/    # Compute shader dispatch, kernel management
+│   ├── hipfire-rdna/    # Compute shader dispatch, kernel management
 │   │   └── src/lib.rs   # Kernel compilation, buffer management, dispatch
 │   └── engine/          # Inference orchestrator
 │       └── src/lib.rs   # Model loading, tensor ops, inference loop

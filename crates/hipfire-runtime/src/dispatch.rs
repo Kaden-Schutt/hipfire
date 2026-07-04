@@ -11,7 +11,7 @@
 //! of the de-llama-ify cleanup. The parameter/plan types are thin re-exports of
 //! the `hipfire_dispatch` crate's own definitions.
 
-use rdna_compute::DType;
+use hipfire_rdna::DType;
 
 pub use hipfire_dispatch::context::DispatchCtx;
 pub use hipfire_dispatch::families::attention::{AttnParams, FullAttnParams};

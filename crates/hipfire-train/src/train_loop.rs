@@ -14,7 +14,7 @@ use crate::ssm_drafter::{
     free_ssm_drafter_acts, free_ssm_drafter_grads, ssm_drafter_backward, ssm_drafter_forward_train,
     SsmDrafter,
 };
-use rdna_compute::{DType, Gpu, HipResult};
+use hipfire_rdna::{DType, Gpu, HipResult};
 
 /// Training hyperparameters. The eval split is the LAST `n_eval` chunks (the
 /// caller is expected to have shuffled, so that tail is a random hold-out).

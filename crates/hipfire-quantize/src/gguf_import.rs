@@ -17,6 +17,7 @@ use crate::hfq_out::{
     insert_parameter_counts_metadata, metadata_with_quantization_hash, write_hfq, HfqTensor,
 };
 use crate::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
+use hipfire_arch_api::{ARCH_ID_LLAMA_MISTRAL, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY};
 use hipfire_gguf as gguf_input;
 use hipfire_primitives::conv::f32_slice_to_f16_bytes;
 use hipfire_primitives::fwht::gen_fwht_signs;
@@ -96,12 +97,12 @@ pub fn run_gguf_pipeline(
         .unwrap_or("llama")
         .to_string();
     let auto_arch_id: u32 = match arch_str.as_str() {
-        "llama" => 0,
-        "qwen3" | "qwen2" => 1,
-        "qwen3moe" => 6,
+        "llama" => ARCH_ID_LLAMA_MISTRAL,
+        "qwen3" | "qwen2" => ARCH_ID_QWEN3_QWEN2_LEGACY,
+        "qwen3moe" => ARCH_ID_QWEN35_MOE,
         other => {
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
-            0
+            ARCH_ID_LLAMA_MISTRAL
         }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
@@ -155,7 +156,7 @@ pub fn run_gguf_pipeline(
     };
 
     // K-map setup for GGUF path
-    let is_moe = arch_id == 6;
+    let is_moe = arch_id == ARCH_ID_QWEN35_MOE;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
@@ -177,8 +178,8 @@ pub fn run_gguf_pipeline(
             let mut map = HashMap::new();
             let mut counts = [0u32; 4];
             for info in &gguf.tensors {
-                let out_name =
-                    gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+                let out_name = gguf_input::gguf_to_safetensors_name(&info.name)
+                    .unwrap_or_else(|| info.name.clone());
                 let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
                 match level {
                     QuantLevel::F16 => counts[0] += 1,
@@ -232,7 +233,8 @@ pub fn run_gguf_pipeline(
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
-        let out_name = gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+        let out_name =
+            gguf_input::gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 

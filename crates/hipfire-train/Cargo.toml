@@ -10,7 +10,7 @@ description = "hipfire training path: un-fused fp32 forward + hand-written backw
 # un-fused fp32 forward so every op has a clean, differentiable backward.
 
 [dependencies]
-rdna-compute = { path = "../rdna-compute" }
+hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-kvquant = { path = "../hipfire-kvquant" }

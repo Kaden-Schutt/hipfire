@@ -36,7 +36,7 @@
 
 use crate::model::LlamaModel;
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
-use rdna_compute::{Gpu, GpuTensor, HipResult};
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
 /// An orthonormal `[h,h]` rotation, row-major (`r[i*h + j]`). Invariant: `R Rᵀ = I`.
 #[derive(Clone)]

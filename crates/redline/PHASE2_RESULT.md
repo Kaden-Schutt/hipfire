@@ -72,7 +72,7 @@ measuring what *the profiler does*, not what production launches cost.
 
 In the actual Hipfire forward pass:
 
-- `crates/rdna-compute/src/dispatch.rs` does NOT call any
+- `crates/hipfire-rdna/src/dispatch.rs` does NOT call any
   `synchronize`. Confirmed by grep — the only `synchronize` calls in the
   whole tree are in `profile.rs` (gated on profiling-active) and in the
   example runners.

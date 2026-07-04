@@ -6,7 +6,7 @@
 //!
 //! Companion to `profile_qwen35_mq4` (which profiles the decode hot path).
 //! This binary wraps a single `forward_prefill_batch` call in
-//! `rdna_compute::profile::{start,stop}` so we get per-kernel wall-time
+//! `hipfire_rdna::profile::{start,stop}` so we get per-kernel wall-time
 //! attribution for the batched prefill path — i.e. the QKVZA / QKV / gate_up
 //! MMQ paths that the gfx906 fused-projection MMQ port targets.
 //!
@@ -33,7 +33,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
-    use rdna_compute::profile;
+    use hipfire_rdna::profile;
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Instant;
@@ -81,7 +81,7 @@ fn main() {
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads
     );
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let mut gpu = hipfire_rdna::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();

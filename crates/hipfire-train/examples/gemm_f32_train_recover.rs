@@ -4,14 +4,14 @@
 //! the 719 kills the process AT the faulting step, so running this N times tallies
 //! which shape is the trigger.
 
-use rdna_compute::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu};
 
 fn step(
     gpu: &mut Gpu,
     label: &str,
-    a: &rdna_compute::GpuTensor,
-    b: &rdna_compute::GpuTensor,
-    c: &rdna_compute::GpuTensor,
+    a: &hipfire_rdna::GpuTensor,
+    b: &hipfire_rdna::GpuTensor,
+    c: &hipfire_rdna::GpuTensor,
     m: usize,
     n: usize,
     k: usize,

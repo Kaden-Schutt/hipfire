@@ -26,7 +26,7 @@ use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
 use hipfire_train::rotation::{apply_r1, Rotation};
-use rdna_compute::{Gpu, HipResult};
+use hipfire_rdna::{Gpu, HipResult};
 use std::path::Path;
 
 const DEFAULT_DIR: &str =

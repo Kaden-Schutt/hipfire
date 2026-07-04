@@ -9,7 +9,7 @@
 //! - **WithResidual**: y += W·x  (HFQ only — MQ-family needs rotation + residual via caller)
 //! - **WithSwiGLUResidual**: y += W·silu(gate·up)  (HFQ only)
 
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
 use crate::families::rotation::{RotationFamily, RotationParams};
@@ -22,7 +22,7 @@ use crate::types::*;
 // ── Lightweight weight descriptor ──────────────────────
 
 /// Givens rotation metadata for ParoQuant weights (mirrors ParoRotation
-/// fields, which are all rdna_compute::GpuTensor — no circular dep).
+/// fields, which are all hipfire_rdna::GpuTensor — no circular dep).
 pub struct GivensRef<'a> {
     pub pairs: &'a GpuTensor,
     pub theta: &'a GpuTensor,

@@ -106,10 +106,10 @@ the three `hfq6` variants).
 
 ### 5. Wire dispatch + add the channel-test case
 
-`crates/rdna-compute/src/kernels.rs`: add `include_str!` for the
+`crates/hipfire-rdna/src/kernels.rs`: add `include_str!` for the
 new kernel.
 
-`crates/rdna-compute/src/dispatch.rs`: add the dispatch branch
+`crates/hipfire-rdna/src/dispatch.rs`: add the dispatch branch
 for the new arch and **simultaneously remove the new arch from
 any older check that now has a more specific match**. Don't leave
 dead `|| starts_with("gfxN")` clauses in master — the dispatch

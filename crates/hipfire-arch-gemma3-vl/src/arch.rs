@@ -21,7 +21,7 @@ use hipfire_runtime::arch::{
     decode_loop, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3VlConfig;
 use crate::loader::Gemma3VlWeights;

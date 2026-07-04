@@ -45,7 +45,7 @@ use crate::qwen35::{self, MaskEmbedOverride, PrefillBatchScratch, Qwen35Config, 
 use crate::speculative::ModelSlot;
 use hip_bridge::HipResult;
 use hipfire_runtime::weights::{self, EmbeddingFormat};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Maximum batch size per MTP probe cycle: 1 last_committed + 1
 /// pending_candidate + 1 mask. v1 never exceeds this.

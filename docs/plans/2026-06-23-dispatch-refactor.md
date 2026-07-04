@@ -1,4 +1,4 @@
-# Refactor `rdna-compute::dispatch` — split the 52k-line monolith
+# Refactor `hipfire-rdna::dispatch` — split the 52k-line monolith
 
 Status: **planned** — 2026-06-23. Owner: chaingun.
 Motivation thread: the kernel test matrix (reference floor vs arch overlays) can only
@@ -11,7 +11,7 @@ it conservatively forces the whole gate. See the
 
 ## The target
 
-`crates/rdna-compute/src/dispatch.rs` is **52,251 lines**: one `pub struct Gpu`
+`crates/hipfire-rdna/src/dispatch.rs` is **52,251 lines**: one `pub struct Gpu`
 (`dispatch.rs:429`) plus essentially one `impl Gpu` block with **848 methods (795
 `pub`)** — the entire GPU dispatch surface (kernel JIT, launch, graph capture, memcpy,
 and every op's kernel selection) in a single file. The 79 `is_gfx*/is_rdna*/is_cdna*`
@@ -61,7 +61,7 @@ From `grep ^pub fn` prefixes in `dispatch.rs`:
 ## Target module layout
 
 ```
-crates/rdna-compute/src/dispatch/
+crates/hipfire-rdna/src/dispatch/
 ├── mod.rs            # `pub struct Gpu` + private fields; init; the kernel-cache /
 │                     #   ensure_kernel JIT; launch_kernel_blob / launch_maybe_blob;
 │                     #   graph capture+replay; memcpy_* ; Drop. The arch-agnostic core.

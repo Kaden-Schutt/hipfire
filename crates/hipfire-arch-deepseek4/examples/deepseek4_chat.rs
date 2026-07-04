@@ -36,7 +36,7 @@ use hipfire_arch_deepseek4::{
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::io::{self, BufRead, Write};
 
 /// Read one prompt "turn" from stdin: accumulate lines into a buffer
@@ -372,8 +372,8 @@ fn main() -> Result<(), String> {
                 if !raw_mode && spec_last_token == eos_tok {
                     break;
                 }
-                let lh: Option<&rdna_compute::GpuTensor> = unsafe {
-                    last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
+                let lh: Option<&hipfire_rdna::GpuTensor> = unsafe {
+                    last_hidden_ref.and_then(|p| (p as *const hipfire_rdna::GpuTensor).as_ref())
                 };
                 let r = speculative_decode_step_with_pbs(
                     &cfg,

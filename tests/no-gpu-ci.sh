@@ -12,7 +12,7 @@ echo "== Eval harness check =="
 RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings" cargo check -p hipfire-eval
 
 echo "== Rust no-GPU unit tests =="
-cargo test -p rdna-compute --lib
+cargo test -p hipfire-rdna --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests

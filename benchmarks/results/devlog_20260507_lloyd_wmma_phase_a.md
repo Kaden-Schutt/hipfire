@@ -25,12 +25,12 @@ All four Phase A acceptance gates per the plan are cleared:
 - `kernels/src/gemm_mq3g256_lloyd_residual_wmma_lds_f32.hip` — sibling
   fp32-LDS variant for the bench A/B; can be retained for future
   contributors to re-validate or removed in Phase B1 cleanup.
-- `crates/rdna-compute/src/kernels.rs` — two new constants, one per
+- `crates/hipfire-rdna/src/kernels.rs` — two new constants, one per
   variant.
-- `crates/rdna-compute/src/dispatch.rs` — `gemm_mq3g256_lloyd_residual_wmma`
+- `crates/hipfire-rdna/src/dispatch.rs` — `gemm_mq3g256_lloyd_residual_wmma`
   + `gemm_mq3g256_lloyd_residual_wmma_lds_f32` dispatch arms (gfx1100
   only; gfx12 sibling deferred to Phase B1).
-- `crates/rdna-compute/examples/test_gemm_mq3g256_lloyd_residual_wmma.rs`
+- `crates/hipfire-rdna/examples/test_gemm_mq3g256_lloyd_residual_wmma.rs`
   — parity test + per-variant timing across 8 canonical shapes.
 
 No `is_batchable_la` change. No matcher updates in `qwen35.rs`. The
@@ -170,7 +170,7 @@ from the plan).
 
 ```sh
 # Build:
-cargo build --release -p rdna-compute --example test_gemm_mq3g256_lloyd_residual_wmma
+cargo build --release -p hipfire-rdna --example test_gemm_mq3g256_lloyd_residual_wmma
 
 # Run (under GPU lock):
 source scripts/gpu-lock.sh && gpu_acquire "phase-a-mq3-lloyd-wmma" && \

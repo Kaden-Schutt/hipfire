@@ -22,9 +22,9 @@ impl Conv2dLayer {
         bias_entry: Option<&str>,
         padding: usize,
     ) -> DiffusionResult<Self> {
-        let weight = CpuTensor::from_hfq(hfq, weight_entry)?;
+        let weight = cpu_tensor_from_hfq(hfq, weight_entry)?;
         let bias = bias_entry
-            .map(|entry| CpuTensor::from_hfq(hfq, entry))
+            .map(|entry| cpu_tensor_from_hfq(hfq, entry))
             .transpose()?;
         Ok(Self {
             weight,
@@ -59,6 +59,7 @@ impl Conv2dLayer {
             self.padding,
             self.stride,
         )
+        .map_err(Into::into)
     }
 
     pub(crate) fn forward_with_runtime_context(
@@ -82,10 +83,10 @@ impl Conv2dLayer {
     /// architectures without wave32 WMMA).
     pub(crate) fn forward_resident(
         &self,
-        input: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        input: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         conv2d_nchw_wmma_resident(
             gpu,
             cache,
@@ -115,15 +116,15 @@ impl GroupNormLayer {
         eps: f32,
     ) -> DiffusionResult<Self> {
         Ok(Self {
-            weight: CpuTensor::from_hfq(hfq, weight_entry)?,
-            bias: CpuTensor::from_hfq(hfq, bias_entry)?,
+            weight: cpu_tensor_from_hfq(hfq, weight_entry)?,
+            bias: cpu_tensor_from_hfq(hfq, bias_entry)?,
             groups,
             eps,
         })
     }
 
     pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
-        group_norm_nchw(input, &self.weight, &self.bias, self.groups, self.eps)
+        group_norm_nchw(input, &self.weight, &self.bias, self.groups, self.eps).map_err(Into::into)
     }
 
     pub(crate) fn forward_with_runtime_context(
@@ -144,10 +145,10 @@ impl GroupNormLayer {
     /// Phase 1b device-resident group-norm. Does not free `input`.
     pub(crate) fn forward_resident(
         &self,
-        input: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        input: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         group_norm_nchw_resident(
             gpu,
             cache,
@@ -263,10 +264,10 @@ impl ResnetBlock2D {
     /// every internal intermediate back to the pool.
     pub(crate) fn forward_resident(
         &self,
-        input: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        input: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let hidden = self.norm1.forward_resident(input, gpu, cache)?;
         let silued = silu_resident(gpu, &hidden)?;
         free_resident(gpu, hidden)?;
@@ -331,11 +332,11 @@ impl UnetResnetBlock2D {
                 Some(&format!("{prefix}.conv1.bias")),
                 1,
             )?,
-            time_emb_proj_weight: CpuTensor::from_hfq(
+            time_emb_proj_weight: cpu_tensor_from_hfq(
                 hfq,
                 &format!("{prefix}.time_emb_proj.weight"),
             )?,
-            time_emb_proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.time_emb_proj.bias"))?,
+            time_emb_proj_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.time_emb_proj.bias"))?,
             norm2: GroupNormLayer::from_hfq(
                 hfq,
                 &format!("{prefix}.norm2.weight"),
@@ -423,11 +424,11 @@ impl UnetResnetBlock2D {
     /// here, mirroring the host path.
     pub(crate) fn forward_resident(
         &self,
-        input: &rdna_compute::GpuTensor,
-        time_embedding: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        input: &hipfire_rdna::GpuTensor,
+        time_embedding: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let normed = self.norm1.forward_resident(input, gpu, cache)?;
         let silued = silu_resident(gpu, &normed)?;
         free_resident(gpu, normed)?;
@@ -476,16 +477,16 @@ pub struct UnetTimeEmbedding {
 impl UnetTimeEmbedding {
     pub fn from_hfq(hfq: &HfqFile) -> DiffusionResult<Self> {
         Ok(Self {
-            linear_1_weight: CpuTensor::from_hfq(
+            linear_1_weight: cpu_tensor_from_hfq(
                 hfq,
                 "unet/tensors/time_embedding.linear_1.weight",
             )?,
-            linear_1_bias: CpuTensor::from_hfq(hfq, "unet/tensors/time_embedding.linear_1.bias")?,
-            linear_2_weight: CpuTensor::from_hfq(
+            linear_1_bias: cpu_tensor_from_hfq(hfq, "unet/tensors/time_embedding.linear_1.bias")?,
+            linear_2_weight: cpu_tensor_from_hfq(
                 hfq,
                 "unet/tensors/time_embedding.linear_2.weight",
             )?,
-            linear_2_bias: CpuTensor::from_hfq(hfq, "unet/tensors/time_embedding.linear_2.bias")?,
+            linear_2_bias: cpu_tensor_from_hfq(hfq, "unet/tensors/time_embedding.linear_2.bias")?,
         })
     }
 
@@ -578,13 +579,13 @@ impl UnetTextTimeEmbedding {
         }
         Ok(Some(Self {
             addition_time_embed_dim,
-            linear_1_weight: CpuTensor::from_hfq(hfq, linear_1)?,
-            linear_1_bias: CpuTensor::from_hfq(hfq, "unet/tensors/add_embedding.linear_1.bias")?,
-            linear_2_weight: CpuTensor::from_hfq(
+            linear_1_weight: cpu_tensor_from_hfq(hfq, linear_1)?,
+            linear_1_bias: cpu_tensor_from_hfq(hfq, "unet/tensors/add_embedding.linear_1.bias")?,
+            linear_2_weight: cpu_tensor_from_hfq(
                 hfq,
                 "unet/tensors/add_embedding.linear_2.weight",
             )?,
-            linear_2_bias: CpuTensor::from_hfq(hfq, "unet/tensors/add_embedding.linear_2.bias")?,
+            linear_2_bias: cpu_tensor_from_hfq(hfq, "unet/tensors/add_embedding.linear_2.bias")?,
         }))
     }
 
@@ -732,13 +733,13 @@ pub struct AttentionLayer {
 impl AttentionLayer {
     pub fn from_hfq(hfq: &HfqFile, prefix: &str, heads: usize) -> DiffusionResult<Self> {
         Ok(Self {
-            to_q_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_q.weight"))?,
+            to_q_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.to_q.weight"))?,
             to_q_bias: optional_tensor(hfq, &format!("{prefix}.to_q.bias"))?,
-            to_k_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_k.weight"))?,
+            to_k_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.to_k.weight"))?,
             to_k_bias: optional_tensor(hfq, &format!("{prefix}.to_k.bias"))?,
-            to_v_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_v.weight"))?,
+            to_v_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.to_v.weight"))?,
             to_v_bias: optional_tensor(hfq, &format!("{prefix}.to_v.bias"))?,
-            to_out_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.to_out.0.weight"))?,
+            to_out_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.to_out.0.weight"))?,
             to_out_bias: optional_tensor(hfq, &format!("{prefix}.to_out.0.bias"))?,
             heads: heads.max(1),
         })
@@ -811,11 +812,11 @@ impl AttentionLayer {
     /// when `encoder` is `None`.
     pub(crate) fn forward_resident(
         &self,
-        hidden_states: &rdna_compute::GpuTensor,
-        encoder_states: Option<&rdna_compute::GpuTensor>,
-        gpu: &mut rdna_compute::Gpu,
+        hidden_states: &hipfire_rdna::GpuTensor,
+        encoder_states: Option<&hipfire_rdna::GpuTensor>,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let context = encoder_states.unwrap_or(hidden_states);
         let q = linear_optional_bias_resident(
             gpu,
@@ -865,10 +866,10 @@ pub struct GeGluFeedForward {
 impl GeGluFeedForward {
     pub fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Self> {
         Ok(Self {
-            proj_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.0.proj.weight"))?,
-            proj_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.0.proj.bias"))?,
-            out_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.2.weight"))?,
-            out_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.ff.net.2.bias"))?,
+            proj_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.ff.net.0.proj.weight"))?,
+            proj_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.ff.net.0.proj.bias"))?,
+            out_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.ff.net.2.weight"))?,
+            out_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.ff.net.2.bias"))?,
         })
     }
 
@@ -912,10 +913,10 @@ impl GeGluFeedForward {
     /// `[b, seq, in]` input (borrowed; caller owns it).
     pub(crate) fn forward_resident(
         &self,
-        hidden_states: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        hidden_states: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
         let projected = linear_optional_bias_resident(
             gpu,
             cache,
@@ -925,8 +926,13 @@ impl GeGluFeedForward {
         )?;
         let gated = geglu_gate_3d_resident(gpu, &projected)?;
         free_resident(gpu, projected)?;
-        let out =
-            linear_optional_bias_resident(gpu, cache, &gated, &self.out_weight, Some(&self.out_bias))?;
+        let out = linear_optional_bias_resident(
+            gpu,
+            cache,
+            &gated,
+            &self.out_weight,
+            Some(&self.out_bias),
+        )?;
         free_resident(gpu, gated)?;
         Ok(out)
     }
@@ -948,14 +954,14 @@ pub struct BasicTransformerBlock {
 impl BasicTransformerBlock {
     pub fn from_hfq(hfq: &HfqFile, prefix: &str, heads: usize) -> DiffusionResult<Self> {
         Ok(Self {
-            norm1_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm1.weight"))?,
-            norm1_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm1.bias"))?,
+            norm1_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm1.weight"))?,
+            norm1_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm1.bias"))?,
             attn1: AttentionLayer::from_hfq(hfq, &format!("{prefix}.attn1"), heads)?,
-            norm2_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm2.weight"))?,
-            norm2_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm2.bias"))?,
+            norm2_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm2.weight"))?,
+            norm2_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm2.bias"))?,
             attn2: AttentionLayer::from_hfq(hfq, &format!("{prefix}.attn2"), heads)?,
-            norm3_weight: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm3.weight"))?,
-            norm3_bias: CpuTensor::from_hfq(hfq, &format!("{prefix}.norm3.bias"))?,
+            norm3_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm3.weight"))?,
+            norm3_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm3.bias"))?,
             feed_forward: GeGluFeedForward::from_hfq(hfq, prefix)?,
         })
     }
@@ -1033,20 +1039,32 @@ impl BasicTransformerBlock {
     /// `encoder_states` are resident (borrowed; the caller owns them).
     pub(crate) fn forward_resident(
         &self,
-        hidden_states: &rdna_compute::GpuTensor,
-        encoder_states: &rdna_compute::GpuTensor,
-        gpu: &mut rdna_compute::Gpu,
+        hidden_states: &hipfire_rdna::GpuTensor,
+        encoder_states: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
         cache: &mut RocmWeightCache,
-    ) -> DiffusionResult<rdna_compute::GpuTensor> {
-        let normed =
-            layer_norm_resident(gpu, cache, hidden_states, &self.norm1_weight, &self.norm1_bias, 1e-5)?;
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        let normed = layer_norm_resident(
+            gpu,
+            cache,
+            hidden_states,
+            &self.norm1_weight,
+            &self.norm1_bias,
+            1e-5,
+        )?;
         let attn = self.attn1.forward_resident(&normed, None, gpu, cache)?;
         free_resident(gpu, normed)?;
         let mut hidden = tensor_add_resident(gpu, hidden_states, &attn)?;
         free_resident(gpu, attn)?;
 
-        let normed =
-            layer_norm_resident(gpu, cache, &hidden, &self.norm2_weight, &self.norm2_bias, 1e-5)?;
+        let normed = layer_norm_resident(
+            gpu,
+            cache,
+            &hidden,
+            &self.norm2_weight,
+            &self.norm2_bias,
+            1e-5,
+        )?;
         let attn = self
             .attn2
             .forward_resident(&normed, Some(encoder_states), gpu, cache)?;
@@ -1056,8 +1074,14 @@ impl BasicTransformerBlock {
         free_resident(gpu, hidden)?;
         hidden = next;
 
-        let normed =
-            layer_norm_resident(gpu, cache, &hidden, &self.norm3_weight, &self.norm3_bias, 1e-5)?;
+        let normed = layer_norm_resident(
+            gpu,
+            cache,
+            &hidden,
+            &self.norm3_weight,
+            &self.norm3_bias,
+            1e-5,
+        )?;
         let ff = self.feed_forward.forward_resident(&normed, gpu, cache)?;
         free_resident(gpu, normed)?;
         let next = tensor_add_resident(gpu, &hidden, &ff)?;
@@ -1066,4 +1090,3 @@ impl BasicTransformerBlock {
         Ok(next)
     }
 }
-

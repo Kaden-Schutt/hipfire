@@ -6,7 +6,7 @@
 //! Quantize known F32 values, upload, run GEMV, compare against F32 GEMV.
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
 
     let m = 4usize;
     let k = 256usize;
@@ -85,7 +85,7 @@ fn main() {
     // Upload to GPU
     let d_a = gpu.upload_raw(&quantized, &[quantized.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
-    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+    let d_y = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
     // GPU GEMV
     gpu.gemv_hfq6g256(&d_a, &d_x, &d_y, m, k).unwrap();

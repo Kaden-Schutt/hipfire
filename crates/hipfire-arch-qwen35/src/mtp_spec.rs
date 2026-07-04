@@ -42,7 +42,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 // Event/Graph/GraphExec/Stream (proposal-graph device-token-chain helpers).
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::weights::{self, EmbeddingFormat};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────

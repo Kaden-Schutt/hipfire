@@ -6,7 +6,7 @@
 //! Tests whether HFQ4-G256's 2x occupancy advantage shows at small matrices.
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     let peak_bw = 448.0f64; // RX 5700 XT theoretical peak GB/s
 
     let sizes: &[(usize, usize, &str)] = &[
@@ -41,7 +41,7 @@ fn main() {
             .unwrap();
 
         let d_x = gpu.upload_f32(&vec![0.01f32; k], &[k]).unwrap();
-        let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+        let d_y = gpu.zeros(&[m], hipfire_rdna::DType::F32).unwrap();
 
         // Warmup
         for _ in 0..10 {

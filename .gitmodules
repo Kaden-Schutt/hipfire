@@ -31,3 +31,6 @@
 [submodule "third_party/dflash"]
 	path = third_party/dflash
 	url = https://github.com/z-lab/dflash.git
+[submodule "third_party/dspark"]
+	path = third_party/dspark
+	url = https://github.com/deepseek-ai/DeepSpec.git

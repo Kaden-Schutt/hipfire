@@ -21,7 +21,7 @@
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
 use hipfire_train::rotation::{apply_r1, bake_for_oq4_recipe, Rotation};
-use rdna_compute::Gpu;
+use hipfire_rdna::Gpu;
 use std::io::Write;
 use std::path::Path;
 
@@ -89,9 +89,9 @@ fn learn_r1(
     let mut wstack = Vec::new();
     let mut rows_wt = 0usize;
     let mut add = |gpu: &mut Gpu,
-                   t: &rdna_compute::GpuTensor,
+                   t: &hipfire_rdna::GpuTensor,
                    stride: usize|
-     -> rdna_compute::HipResult<()> {
+     -> hipfire_rdna::HipResult<()> {
         let m = gpu.download_f32(t)?;
         let mrows = m.len() / h;
         let mut r = 0;

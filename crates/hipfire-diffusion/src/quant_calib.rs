@@ -11,7 +11,7 @@
 //! Hessian) and AWQ-style salience scaling.
 //!
 //! Mechanism (no forward-signature changes): a thread-local registry maps each
-//! weight tensor's `data.as_ptr()` to its name (filled in [`CpuTensor::from_hfq`]
+//! weight tensor's `data.as_ptr()` to its name (filled in [`cpu_tensor_from_hfq`]
 //! while calibration is armed; the `Vec<f32>` backing a `CpuTensor` is stable for
 //! the model's lifetime). The CPU linear/matmul entry points look the weight
 //! pointer up and fold the layer's input activations into that tensor's
@@ -69,13 +69,11 @@ pub fn calib_begin(hessian_max_k: usize) {
     });
 }
 
-/// Register a freshly loaded weight tensor (called from `CpuTensor::from_hfq`).
+/// Register a freshly loaded weight tensor (called from `cpu_tensor_from_hfq`).
 pub(crate) fn calib_register(ptr: usize, name: &str) {
     CALIB.with(|c| {
         if let Some(s) = c.borrow_mut().as_mut() {
-            s.name_by_ptr
-                .entry(ptr)
-                .or_insert_with(|| name.to_string());
+            s.name_by_ptr.entry(ptr).or_insert_with(|| name.to_string());
         }
     });
 }
@@ -95,12 +93,15 @@ pub(crate) fn calib_observe_matrix(weight_ptr: usize, input: &[f32], rows: usize
             return; // not a registered weight (e.g. an activation×activation matmul)
         };
         let want_hessian = k <= state.hessian_max_k && k % 256 == 0;
-        let entry = state.accum.entry(weight_ptr).or_insert_with(|| TensorAccum {
-            name,
-            k,
-            imatrix: vec![0.0; k],
-            hessian: want_hessian.then(|| vec![0.0; k * k]),
-        });
+        let entry = state
+            .accum
+            .entry(weight_ptr)
+            .or_insert_with(|| TensorAccum {
+                name,
+                k,
+                imatrix: vec![0.0; k],
+                hessian: want_hessian.then(|| vec![0.0; k * k]),
+            });
         if entry.k != k {
             return; // shape changed unexpectedly; skip rather than corrupt
         }
@@ -210,7 +211,7 @@ pub fn calibrate_diffusion_hfq(
     hessian_max_k: usize,
 ) -> anyhow::Result<CalibrateSummary> {
     calib_begin(hessian_max_k);
-    // From here on, CpuTensor::from_hfq registers weight pointers.
+    // From here on, cpu_tensor_from_hfq registers weight pointers.
     let pipeline = crate::DiffusionPipeline::open_hfq(model)?;
     let request = crate::DiffusionBatchRequest {
         prompts: prompts

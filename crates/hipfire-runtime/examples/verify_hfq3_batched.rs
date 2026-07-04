@@ -23,7 +23,7 @@
 //!     FP16 mantissa precision (~1% relative over a 512-element accumulation)
 //!     is expected. ~0.1 max_abs_err is normal.
 
-use rdna_compute::{DType, GpuTensor};
+use hipfire_rdna::{DType, GpuTensor};
 
 fn fract_sin(x: f32) -> f32 {
     (x.sin() * 12345.6789f32).fract() * 2.0f32 - 1.0f32
@@ -66,7 +66,7 @@ fn synth_x(n: usize, k: usize, seed: u32) -> Vec<f32> {
 /// Reference: call `gemv_hfq3g256` per row, per batch element.
 /// Output shape: [n × m] row-major.
 fn cpu_reference_via_gemv(
-    gpu: &mut rdna_compute::Gpu,
+    gpu: &mut hipfire_rdna::Gpu,
     weight_bytes: &[u8],
     x: &[f32],
     m: usize,
@@ -111,13 +111,13 @@ fn compare_with_tol(name: &str, ref_out: &[f32], test_out: &[f32], tol: f32) -> 
     ok
 }
 
-fn alloc_zero(gpu: &mut rdna_compute::Gpu, n_elem: usize) -> GpuTensor {
+fn alloc_zero(gpu: &mut hipfire_rdna::Gpu, n_elem: usize) -> GpuTensor {
     let zeros = vec![0.0f32; n_elem];
     gpu.upload_f32(&zeros, &[n_elem]).unwrap()
 }
 
 fn main() {
-    let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let mut gpu = hipfire_rdna::Gpu::init().unwrap();
     eprintln!("=== verify_hfq3_batched on {} ===", gpu.arch);
 
     // Use shapes representative of Qwen3.5 9B FA layer: q_m=4096, kv_m=1024.

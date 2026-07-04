@@ -24,7 +24,7 @@ use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded

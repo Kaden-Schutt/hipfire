@@ -33,7 +33,7 @@ use hipfire_runtime::weights::{
     weight_gemv_prerotated, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
     ParoRotation, WeightTensor,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -4973,7 +4973,7 @@ pub fn dump_embed_fp32(
 ) -> HipResult<(usize, usize)> {
     use std::io::Write;
     if !matches!(weights.embd_format, EmbeddingFormat::F32) {
-        return Err(rdna_compute::HipError {
+        return Err(hipfire_rdna::HipError {
             code: u32::MAX,
             message: format!(
                 "dump_embed_fp32: embedding is {:?}, only F32 supported (load the bf16/unquantized target)",
@@ -4988,7 +4988,7 @@ pub fn dump_embed_fp32(
         vocab * dim,
         "dump_embed_fp32: embed size mismatch"
     );
-    let io_err = |e: std::io::Error| rdna_compute::HipError {
+    let io_err = |e: std::io::Error| hipfire_rdna::HipError {
         code: u32::MAX,
         message: format!("dump_embed_fp32 io: {e}"),
     };
@@ -27094,17 +27094,17 @@ fn kv_cache_attention_dispatch(
         if kv_cache.kvarn_tiles.is_none() {
             let tiles = gpu.alloc_tensor(
                 &[config.n_kv_heads * config.head_dim * 128],
-                rdna_compute::DType::F32,
+                hipfire_rdna::DType::F32,
             )?;
             kv_cache.kvarn_tiles = Some(tiles);
         }
         // The KV-write/flash kernels read positions from a GpuTensor; `s.pos_buf`
         // is a raw 4-byte i32 DeviceBuffer (positions use F32 as a 4-byte i32
         // container, see PrefillBatchScratch). Wrap a non-owning [1] view.
-        let pos_view = rdna_compute::GpuTensor {
+        let pos_view = hipfire_rdna::GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(s.pos_buf.as_ptr(), 4) },
             shape: vec![1],
-            dtype: rdna_compute::DType::F32,
+            dtype: hipfire_rdna::DType::F32,
         };
         return gpu.kvarn_attend(
             &kv_cache.k_gpu[layer_idx],
