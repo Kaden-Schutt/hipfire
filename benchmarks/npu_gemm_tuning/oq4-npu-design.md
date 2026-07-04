@@ -57,11 +57,19 @@
 >   4. **REMAINING (compiler bug, not our MLIR):** aiecc CRASHES in
 >      `AIEObjectFifoStatefulTransformPass::unrollForLoops` lowering the fused
 >      dequant→gemm. The MLIR is valid; the mlir-aie backend (March 2026033104)
->      segfaults on this fused objectFIFO structure. OPTIONS: (a) try tile configs
->      that avoid the unroll path; (b) newer mlir_aie; (c) report upstream; (d) a
->      non-fused two-pass dequant→gemm (materializes bf16 weights, loses the feed
->      win but gives a correctness+baseline number). REGRESSION TODO: confirm the
->      all-bf16 llama fusion still compiles after the i8/memref.view change.
+>      segfaults on this fused objectFIFO structure. UPGRADE RULED OUT: scanned
+>      mlir-aie history from our IRON pin `e4f35d6` (2026-03-31) to newest
+>      origin/main `d098819482` (2026-07-02) — NO commit touches `unrollForLoops`
+>      or mentions "unroll" (only buffer-alloc/license/deadlock #3144/asymmetric-
+>      consumer changes to the pass). So a mlir_aie upgrade will NOT fix it (and
+>      risks IRON API drift). Likely root cause: unroll computes a "common
+>      multiplier as unroll factor" over the fused ops' loops (pass ~L1349; comment
+>      admits "difficult to identify which loop needs to be unrolled") — our
+>      dequant (fifo_depth=1 at large tiles) + gemm have mismatched trip counts.
+>      REMAINING OPTIONS: (a) tile configs that avoid the unroll path; (b) upstream
+>      repro (our fused MLIR is the reproducer); (c) DONE — two-pass (below) for a
+>      verified number now. REGRESSION TODO: confirm all-bf16 llama fusion still
+>      compiles after the i8/memref.view change.
 > FWHT stays an activation-side op. Template: llama_3.2_1b/llama_npu.py.
 > Run env: the py3.14 iron venv recipe above.
 >
