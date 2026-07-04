@@ -70,6 +70,20 @@
 >      repro (our fused MLIR is the reproducer); (c) DONE — two-pass (below) for a
 >      verified number now. REGRESSION TODO: confirm all-bf16 llama fusion still
 >      compiles after the i8/memref.view change.
+>   5. **Tile-dodge ATTEMPTED, failed:** aligned dequant fifo_depth to gemm's
+>      (tile_size≤8192 → depth 2, via K=256/N=512) — STILL crashes. The segfault
+>      has NO assert message and is in a RECURSIVE nested-loop lambda inside
+>      unrollForLoops, so it's the gemm's deeply-nested loop structure (not fifo
+>      depth) — config-fuzzing is low-odds. Upstream repro is the path.
+>   6. **.ll INSPECTED (iron/expand_int4_bf16.aie2p.ll):** the Oq4 dequant kernel
+>      (`aie_kernels/generic/expand.cc`, `aie::unpack` on a native `uint4` vector)
+>      lowers to NATIVE aie2p intrinsics, fully 32-lane vectorized:
+>      **`@llvm.aie2p.unpack.I512.I8.I4`** = a SINGLE hardware int4→int8 unpack
+>      (32 bytes/64 nibbles → 64 int8) — the right primitive vs my hand-kernel's
+>      downshift+interleave; plus `v32bf16.to/from.v32accfloat` + `acc32.v32` for
+>      the bf16 convert + per-group scale-multiply in the accumulator. So Oq4
+>      weight-decode is hardware-efficient; use `aie::unpack`/`uint4` for the fused
+>      kernel too.
 > FWHT stays an activation-side op. Template: llama_3.2_1b/llama_npu.py.
 > Run env: the py3.14 iron venv recipe above.
 >
