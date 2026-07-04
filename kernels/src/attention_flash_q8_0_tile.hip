@@ -163,16 +163,31 @@ __global__ void attention_flash_q8_0_tile(
         const int bj_base = d_base % 32;
         const int v_blk_off = (kv_head_block_start + bi) * 34;
         float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
-        for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
-            int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * row_stride + v_blk_off;
-            float vs = (float)*((const _Float16*)vb);
-            out0 += w * (vs * (float)((signed char)vb[2 + bj_base + 0]));
-            out1 += w * (vs * (float)((signed char)vb[2 + bj_base + 1]));
-            out2 += w * (vs * (float)((signed char)vb[2 + bj_base + 2]));
-            out3 += w * (vs * (float)((signed char)vb[2 + bj_base + 3]));
+        int t_local = 0;
+        #define ACCUM_V(tl) do { \
+            float w = scores[(tl)]; \
+            int t = tile_start + (tl); \
+            const unsigned char* vb = v_cache + (size_t)t * row_stride + v_blk_off; \
+            float vs = (float)*((const _Float16*)vb); \
+            out0 += w * (vs * (float)((signed char)vb[2 + bj_base + 0])); \
+            out1 += w * (vs * (float)((signed char)vb[2 + bj_base + 1])); \
+            out2 += w * (vs * (float)((signed char)vb[2 + bj_base + 2])); \
+            out3 += w * (vs * (float)((signed char)vb[2 + bj_base + 3])); \
+        } while (0)
+        for (; t_local + 7 < tile_len; t_local += 8) {
+            ACCUM_V(t_local + 0);
+            ACCUM_V(t_local + 1);
+            ACCUM_V(t_local + 2);
+            ACCUM_V(t_local + 3);
+            ACCUM_V(t_local + 4);
+            ACCUM_V(t_local + 5);
+            ACCUM_V(t_local + 6);
+            ACCUM_V(t_local + 7);
         }
+        for (; t_local < tile_len; t_local++) {
+            ACCUM_V(t_local);
+        }
+        #undef ACCUM_V
         p[2 + d_base + 0] = out0;
         p[2 + d_base + 1] = out1;
         p[2 + d_base + 2] = out2;
