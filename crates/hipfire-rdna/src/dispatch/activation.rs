@@ -293,7 +293,19 @@ impl Gpu {
     /// In-place softmax over last dimension
     pub fn softmax_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("softmax", kernels::SOFTMAX_SRC, "softmax_f32")?;
+        // gfx1103 (Phoenix) uses a wave-reduced variant that keeps only one
+        // float per wave in LDS instead of a blockDim.x halving ladder.
+        let (module, src, kname, wave_reduced) = if self.arch_caps.is_gfx1103() {
+            (
+                "softmax_gfx1103",
+                kernels::SOFTMAX_GFX1103_SRC,
+                "softmax_f32_gfx1103",
+                true,
+            )
+        } else {
+            ("softmax", kernels::SOFTMAX_SRC, "softmax_f32", false)
+        };
+        self.ensure_kernel(module, src, kname)?;
 
         let rows = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
@@ -307,14 +319,19 @@ impl Gpu {
         ];
 
         let block = 256u32.min(n as u32);
-        let shared_mem = block * 4;
+        let shared_mem = if wave_reduced {
+            // one float per wave32 collector; block ≤ 256 → ≤ 8 waves
+            (block.div_ceil(32)) * 4
+        } else {
+            block * 4
+        };
 
         // Graph-safe launch via launch_maybe_blob. Path B inserts this
         // call into the MoE forward path which gets captured under the
         // verify/HIPFIRE_GRAPH path; raw self.hip.launch_kernel would
         // capture stack-borne kernarg pointers that go dangling on replay.
         self.launch_maybe_blob(
-            "softmax_f32",
+            kname,
             [rows as u32, 1, 1],
             [block, 1, 1],
             shared_mem,
@@ -1055,8 +1072,25 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("layernorm_f32", kernels::LAYERNORM_SRC, "layernorm_f32")?;
-        let func = &self.functions["layernorm_f32"];
+        // gfx1103 (Phoenix) uses a wave-reduced variant: one float per wave in
+        // LDS instead of a blockDim.x halving ladder.
+        let (module, src, kname, wave_reduced) = if self.arch_caps.is_gfx1103() {
+            (
+                "layernorm_f32_gfx1103",
+                kernels::LAYERNORM_GFX1103_SRC,
+                "layernorm_f32_gfx1103",
+                true,
+            )
+        } else {
+            (
+                "layernorm_f32",
+                kernels::LAYERNORM_SRC,
+                "layernorm_f32",
+                false,
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let mut xp = x.buf.as_ptr();
         let mut gp = gamma.buf.as_ptr();
         let mut bp = beta.buf.as_ptr();
@@ -1074,7 +1108,11 @@ impl Gpu {
         let block_size = std::cmp::min(256, n) as u32;
         // Round up to power of 2 for reduction
         let block_size = block_size.next_power_of_two();
-        let shared_mem = block_size * 4;
+        let shared_mem = if wave_reduced {
+            block_size.div_ceil(32) * 4
+        } else {
+            block_size * 4
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,

@@ -94,6 +94,41 @@ pub const FUSED_RMSNORM_MQ_ROTATE_GFX1151_SRC: &str =
 pub const RMSNORM_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/rmsnorm.gfx1151.hip");
 
+/// gfx1103 (Phoenix) RMSNorm with wave-reduced sum-of-squares. Same ABI as the
+/// generic `rmsnorm_f32` kernel and the same wave-shuffle body as the gfx1151
+/// sister, but guarded on `__gfx1103__` with a distinct entry point so the
+/// dispatcher selects it only on Phoenix — keeping the UMA path off heavy LDS.
+pub const RMSNORM_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/rmsnorm.gfx1103.hip");
+
+/// gfx1103 (Phoenix) LayerNorm with wave-reduced mean/variance. Same ABI as
+/// the generic `layernorm_f32` kernel, distinct entry point for Phoenix.
+pub const LAYERNORM_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/layernorm.gfx1103.hip");
+
+/// gfx1103 (Phoenix) in-place row softmax with wave-reduced max/sum. Same ABI
+/// as the generic `softmax_f32` kernel, distinct entry point for Phoenix.
+pub const SOFTMAX_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/softmax.gfx1103.hip");
+
+/// gfx1103 (Phoenix) max softmax probability with wave-reduced max/sum. Same
+/// ABI as the generic `max_prob` kernel, distinct entry point for Phoenix.
+pub const MAX_PROB_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/max_prob.gfx1103.hip");
+
+/// gfx1103 (Phoenix) in-place slot-indexed RMSNorm with wave-reduced sum-of-
+/// squares. Same ABI as the generic `rmsnorm_f32_at_slot_buf`, Phoenix entry.
+pub const RMSNORM_AT_SLOT_BUF_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/rmsnorm_at_slot_buf.gfx1103.hip");
+
+/// gfx1103 (Phoenix) wave-reduced argmax family. One module carries all three
+/// entry points (`argmax_f32_gfx1103`, `argmax_f32_batched_gfx1103`,
+/// `argmax_token_chain_f32_gfx1103`); they share a (value,index) wave reduction
+/// keeping only 2 words per wave in LDS. Same ABIs as the generic argmax,
+/// argmax_batched, and argmax_token_chain kernels.
+pub const ARGMAX_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/argmax.gfx1103.hip");
+
 /// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
 /// ABI as the generic conv1d split kernel plus a companion state update entry.
 #[cfg(feature = "deltanet")]

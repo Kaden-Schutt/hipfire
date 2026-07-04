@@ -18,8 +18,20 @@ impl Gpu {
         vocab_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("max_prob", kernels::MAX_PROB_SRC, "max_prob")?;
-        let func = &self.functions["max_prob"];
+        // gfx1103 (Phoenix) uses a wave-reduced variant: one float per wave in
+        // LDS instead of a blockDim.x halving ladder.
+        let (module, src, kname, wave_reduced) = if self.arch_caps.is_gfx1103() {
+            (
+                "max_prob_gfx1103",
+                kernels::MAX_PROB_GFX1103_SRC,
+                "max_prob_gfx1103",
+                true,
+            )
+        } else {
+            ("max_prob", kernels::MAX_PROB_SRC, "max_prob", false)
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let mut lp = logits.buf.as_ptr();
         let mut rp = result.buf.as_ptr();
         let mut vs = vocab_size as i32;
@@ -29,7 +41,11 @@ impl Gpu {
             &mut vs as *mut _ as *mut c_void,
         ];
         let block = 256u32;
-        let shared = (block * 4) as u32;
+        let shared = if wave_reduced {
+            block.div_ceil(32) * 4
+        } else {
+            block * 4
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -52,11 +68,24 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "argmax_f32_batched",
-            kernels::ARGMAX_BATCHED_SRC,
-            "argmax_f32_batched",
-        )?;
+        // gfx1103 (Phoenix) uses a wave-reduced (value,index) variant: 2 words
+        // per wave in LDS instead of a blockDim.x tournament.
+        let (module, src, kname, wave_reduced) = if self.arch_caps.is_gfx1103() {
+            (
+                "argmax_gfx1103",
+                kernels::ARGMAX_GFX1103_SRC,
+                "argmax_f32_batched_gfx1103",
+                true,
+            )
+        } else {
+            (
+                "argmax_f32_batched",
+                kernels::ARGMAX_BATCHED_SRC,
+                "argmax_f32_batched",
+                false,
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
 
         let mut dp = data.buf.as_ptr();
         let mut rp = result.buf.as_ptr();
@@ -69,9 +98,14 @@ impl Gpu {
         ];
 
         let block_size = 256u32;
-        let shared = block_size * 8; // f32 + i32 per thread
+        // f32 + i32 per thread (generic) vs 2 words per wave (gfx1103)
+        let shared = if wave_reduced {
+            block_size.div_ceil(32) * 8
+        } else {
+            block_size * 8
+        };
         self.launch_maybe_blob(
-            "argmax_f32_batched",
+            kname,
             [batch_size as u32, 1, 1],
             [block_size, 1, 1],
             shared,
@@ -99,11 +133,24 @@ impl Gpu {
         dst_slot: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "argmax_token_chain",
-            kernels::ARGMAX_TOKEN_CHAIN_SRC,
-            "argmax_token_chain_f32",
-        )?;
+        // gfx1103 (Phoenix) uses a wave-reduced (value,index) variant: 2 words
+        // per wave in LDS instead of a blockDim.x tournament.
+        let (module, src, kname, wave_reduced) = if self.arch_caps.is_gfx1103() {
+            (
+                "argmax_gfx1103",
+                kernels::ARGMAX_GFX1103_SRC,
+                "argmax_token_chain_f32_gfx1103",
+                true,
+            )
+        } else {
+            (
+                "argmax_token_chain",
+                kernels::ARGMAX_TOKEN_CHAIN_SRC,
+                "argmax_token_chain_f32",
+                false,
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
 
         let mut dp = data.buf.as_ptr();
         let mut ap = argmax_out.buf.as_ptr();
@@ -126,9 +173,14 @@ impl Gpu {
         ];
 
         let block_size = 256u32;
-        let shared = block_size * 8; // f32 + i32 per thread
+        // f32 + i32 per thread (generic) vs 2 words per wave (gfx1103)
+        let shared = if wave_reduced {
+            block_size.div_ceil(32) * 8
+        } else {
+            block_size * 8
+        };
         self.launch_maybe_blob(
-            "argmax_token_chain_f32",
+            kname,
             [1, 1, 1],
             [block_size, 1, 1],
             shared,
@@ -198,8 +250,20 @@ impl Gpu {
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;
-        self.ensure_kernel("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32")?;
-        let func = &self.functions["argmax_f32"];
+        // gfx1103 (Phoenix) uses a wave-reduced (value,index) variant: 2 words
+        // per wave in LDS instead of a blockDim.x tournament.
+        let (module, src, kname, wave_reduced) = if self.arch_caps.is_gfx1103() {
+            (
+                "argmax_gfx1103",
+                kernels::ARGMAX_GFX1103_SRC,
+                "argmax_f32_gfx1103",
+                true,
+            )
+        } else {
+            ("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32", false)
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
 
         let result_buf = self.hip.malloc(4)?; // single int
         self.hip.memset(&result_buf, 0, 4)?;
@@ -215,7 +279,12 @@ impl Gpu {
         ];
 
         let block_size = 256u32;
-        let shared = block_size * 8; // float + int per thread
+        // f32 + i32 per thread (generic) vs 2 words per wave (gfx1103)
+        let shared = if wave_reduced {
+            block_size.div_ceil(32) * 8
+        } else {
+            block_size * 8
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,

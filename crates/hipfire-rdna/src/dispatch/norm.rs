@@ -19,7 +19,7 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots) =
+        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots, wave_reduced) =
             if self.arch_caps.is_gfx1151() {
                 (
                     "rmsnorm_gfx1151",
@@ -27,6 +27,16 @@ impl Gpu {
                     "rmsnorm_f32_gfx1151",
                     "rmsnorm_f32_gfx1151",
                     8u32,
+                    true,
+                )
+            } else if self.arch_caps.is_gfx1103() {
+                (
+                    "rmsnorm_gfx1103",
+                    kernels::RMSNORM_GFX1103_SRC,
+                    "rmsnorm_f32_gfx1103",
+                    "rmsnorm_f32_gfx1103",
+                    8u32,
+                    true,
                 )
             } else {
                 (
@@ -35,6 +45,7 @@ impl Gpu {
                     "rmsnorm_f32",
                     "rmsnorm_f32",
                     256u32,
+                    false,
                 )
             };
         self.ensure_kernel(module_name, kernel_src, kernel_name)?;
@@ -47,7 +58,7 @@ impl Gpu {
         let out_ptr = out.buf.as_ptr();
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = if self.arch_caps.is_gfx1151() {
+        let shared_mem = if wave_reduced {
             reduce_slots * 4
         } else {
             block_size * 4
@@ -77,7 +88,7 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots) =
+        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots, wave_reduced) =
             if self.arch_caps.is_gfx1151() {
                 (
                     "rmsnorm_gfx1151",
@@ -85,6 +96,16 @@ impl Gpu {
                     "rmsnorm_f32_gfx1151",
                     "rmsnorm_batched_gfx1151",
                     8u32,
+                    true,
+                )
+            } else if self.arch_caps.is_gfx1103() {
+                (
+                    "rmsnorm_gfx1103",
+                    kernels::RMSNORM_GFX1103_SRC,
+                    "rmsnorm_f32_gfx1103",
+                    "rmsnorm_batched_gfx1103",
+                    8u32,
+                    true,
                 )
             } else {
                 (
@@ -93,6 +114,7 @@ impl Gpu {
                     "rmsnorm_f32",
                     "rmsnorm_batched",
                     256u32,
+                    false,
                 )
             };
         self.ensure_kernel(module_name, kernel_src, kernel_name)?;
@@ -103,7 +125,7 @@ impl Gpu {
         let n_val = n as i32;
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = if self.arch_caps.is_gfx1151() {
+        let shared_mem = if wave_reduced {
             reduce_slots * 4
         } else {
             block_size * 4
@@ -230,18 +252,35 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "rmsnorm_f32_at_slot_buf",
-            kernels::RMSNORM_AT_SLOT_BUF_SRC,
-            "rmsnorm_f32_at_slot_buf",
-        )?;
+        // gfx1103 (Phoenix) uses a wave-reduced variant: one float per wave in
+        // LDS instead of a blockDim.x halving ladder.
+        let (module, src, kname, wave_reduced) = if self.arch_caps.is_gfx1103() {
+            (
+                "rmsnorm_f32_at_slot_buf_gfx1103",
+                kernels::RMSNORM_AT_SLOT_BUF_GFX1103_SRC,
+                "rmsnorm_f32_at_slot_buf_gfx1103",
+                true,
+            )
+        } else {
+            (
+                "rmsnorm_f32_at_slot_buf",
+                kernels::RMSNORM_AT_SLOT_BUF_SRC,
+                "rmsnorm_f32_at_slot_buf",
+                false,
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
         let bp = base.buf.as_ptr();
         let wp = weight.buf.as_ptr();
         let sb = slot_buf.buf.as_ptr();
         let block = 256u32.min(n as u32).next_power_of_two().max(32);
-        let shared = block * 4;
+        let shared = if wave_reduced {
+            block.div_ceil(32) * 4
+        } else {
+            block * 4
+        };
         self.launch_kernargs(
-            "rmsnorm_f32_at_slot_buf",
+            kname,
             [1, 1, 1],
             [block, 1, 1],
             shared,
