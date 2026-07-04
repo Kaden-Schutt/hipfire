@@ -36,6 +36,7 @@ pub mod kld_eval;
 pub mod kv;
 pub mod kv_hier;
 pub mod llama;
+pub mod llama_spec;
 pub mod logging;
 pub mod loop_guard;
 pub mod model_source;

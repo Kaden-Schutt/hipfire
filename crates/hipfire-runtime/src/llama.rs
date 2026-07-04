@@ -373,6 +373,56 @@ pub fn prefill_forward(
 /// largest physical_cap any consumer sets up.
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+/// Per-extract-layer residual-hidden capture sink for the batched llama forward
+/// (DFlash / DSpark drafter conditioning).
+///
+/// When threaded through [`forward_prefill_batch_capture`] /
+/// [`forward_prefill_batch_tree`] (or the per-token
+/// [`forward_scratch_compute_capture`]), the forward captures the residual
+/// stream `x` (`[dim]` per position) AFTER each decoder layer whose index
+/// appears in `extract_layers`, laying out — per processed position, across the
+/// extract layers in `extract_layers` order — `extract_layers.len() × dim` f32.
+/// The final buffer is therefore `[n_pos × num_extract × dim]` row-major.
+///
+/// `extract_layers` MUST be ascending. Capture is at the post-FFN residual,
+/// independent of qk-norm (qk-norm acts on Q/K, not the residual).
+pub struct HiddenCaptureSink<'a> {
+    /// Decoder-layer indices to capture, ascending order.
+    pub extract_layers: &'a [usize],
+    /// Host output sink: appended `[n_pos × num_extract × dim]` row-major. Used
+    /// only when `hidden_gpu` is `None`.
+    pub hidden: &'a mut Vec<f32>,
+    /// Optional GPU-resident destination (`[n_pos × num_extract × dim]` F32,
+    /// position-major). When `Some`, captured extract-layer rows are copied
+    /// GPU→GPU straight into this buffer and the host `hidden` Vec is left
+    /// untouched (the accepted-prefix-hidden reuse stays on-device). The buffer
+    /// must be `>= n_pos × extract_layers.len() × dim` F32.
+    pub hidden_gpu: Option<&'a GpuTensor>,
+}
+
+/// Tree-attention mask reference for a single batched tree-verify forward
+/// ([`forward_prefill_batch_tree`]).
+///
+/// When supplied, the batched flash-attention kernels run in tree mode: keys in
+/// the in-block region `[block_start, block_start + block_cols)` are biased by
+/// `bias[row × block_cols + (key_slot − block_start)]` (an additive `0.0`/`-inf`
+/// mask), while prompt keys before `block_start` stay fully visible. The KV WRITE
+/// slot and the FA mask stay CONTIGUOUS (`[block_start .. block_start + n)`), but
+/// Q/K RoPE uses the tree-DEPTH positions (`rope_positions`), so a parent→child
+/// RoPE distance is exactly 1 regardless of linearized slot.
+pub struct TreeMaskRef<'a> {
+    /// `[block_cols × block_cols]` row-major additive bias (0/-inf), on device.
+    pub bias: &'a GpuTensor,
+    /// Absolute decode position where the in-block keys begin (= `position`).
+    pub block_start: usize,
+    /// In-block key count (= linearized tree length `1 + tree.num_nodes()`).
+    pub block_cols: usize,
+    /// Per-slot DEPTH-based RoPE positions (`block_start + node.depth`), on device
+    /// as `[block_cols]` i32-in-F32. Used for the Q/K RoPE rotation ONLY — the KV
+    /// WRITE slot and the FA mask stay CONTIGUOUS.
+    pub rope_positions: &'a GpuTensor,
+}
+
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
 /// buffers reused across the per-layer loop. Sized once per model from
 /// `LlamaConfig` and reused across cycles by callers that retain it.
@@ -565,6 +615,8 @@ pub fn forward_prefill_batch(
                 scratch,
                 pbs,
                 false,
+                None,
+                None,
             )?;
             offset += chunk_n;
         }
@@ -592,6 +644,200 @@ pub fn forward_prefill_batch(
     // decode path. `own_pbs` (a `PrefillBatchScratch`) is not pooled scratch and
     // keeps its own `free_gpu` on all paths above.
     gpu.reclaim_pending();
+    result
+}
+
+/// `forward_prefill_batch` plus an optional per-extract-layer residual-hidden
+/// capture sink (DFlash / DSpark drafter conditioning). The capture sink is only
+/// honored on the eligible batched path; a capture request on an ineligible model
+/// is a usage error (the per-token fallback does not run the capturing layer
+/// loop), so it asserts rather than silently no-op'ing.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_capture(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mut capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    let arch = gpu.arch.as_str();
+    let batched_enabled = crate::config::get().prefill_batched;
+    let eligible =
+        crate::transformer::llama_prefill_batchable(weights, kv_cache, arch, n, batched_enabled);
+
+    if !eligible {
+        assert!(
+            capture.is_none(),
+            "forward_prefill_batch_capture: hidden capture requested but model is \
+             ineligible for the batched path (n={n}); DFlash requires the batched forward"
+        );
+        for (i, &tok) in tokens.iter().enumerate() {
+            forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
+            forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
+        }
+        return Ok(());
+    }
+
+    let mut own_pbs: Option<PrefillBatchScratch> = None;
+    let pbs = if let Some(p) = pbs_in {
+        p
+    } else {
+        let max_batch = PREFILL_MAX_BATCH.min(n.max(MIN_BATCH));
+        own_pbs = Some(PrefillBatchScratch::new(
+            gpu,
+            config,
+            max_batch,
+            kv_cache.physical_cap,
+        )?);
+        own_pbs.as_ref().unwrap()
+    };
+
+    let max_chunk = pbs.max_batch;
+    let result = (|| -> HipResult<()> {
+        let mut offset = 0usize;
+        while offset < n {
+            let chunk_n = (n - offset).min(max_chunk);
+            forward_prefill_chunk(
+                gpu,
+                weights,
+                config,
+                &tokens[offset..offset + chunk_n],
+                start_pos + offset,
+                kv_cache,
+                scratch,
+                pbs,
+                false,
+                capture.as_deref_mut(),
+                None,
+            )?;
+            offset += chunk_n;
+        }
+
+        // Final norm + output projection on the LAST row of x_batch (chunk-local).
+        let dim = config.dim;
+        let last_n = ((n - 1) % max_chunk) + 1;
+        let last_off_bytes = (last_n - 1) * dim * 4;
+        gpu.hip
+            .memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, last_off_bytes, dim * 4)?;
+        gpu.rmsnorm_f32(
+            &scratch.x,
+            &weights.output_norm,
+            &scratch.tmp,
+            config.norm_eps,
+        )?;
+        weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+        Ok(())
+    })();
+
+    if let Some(p) = own_pbs {
+        p.free_gpu(gpu);
+    }
+    gpu.reclaim_pending();
+    result
+}
+
+/// One single-pass TREE-masked verify forward. `tokens` is the linearized tree
+/// (slot 0 = seed), `tree_bias` the `[n × n]` additive (`0.0`/`-inf`) mask, and
+/// `depth_positions` the per-slot DEPTH RoPE positions (`position + node.depth`).
+/// Q/K RoPE rotates at the DEPTH positions (parent→child distance 1) while the KV
+/// write + mask stay on CONTIGUOUS slots `[position .. position + n)`, so a node's
+/// logits equal a causal verify of its root-to-node chain. Every node row's
+/// post-final-layer hidden lands in `pbs.x_batch`. Single chunk only
+/// (`n <= pbs.max_batch`); requires Q8_0 KV (the asym/givens FA re-rotates K by
+/// the write slot, which conflicts with the decoupled depth-RoPE).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_tree(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    position: usize,
+    tree_bias: &GpuTensor,
+    depth_positions: &[i32],
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
+    capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+    assert!(
+        n <= pbs.max_batch,
+        "forward_prefill_batch_tree: tree size {n} exceeds pbs.max_batch {}",
+        pbs.max_batch
+    );
+    assert_eq!(
+        depth_positions.len(),
+        n,
+        "forward_prefill_batch_tree: depth_positions len {} != tree size {n}",
+        depth_positions.len()
+    );
+    assert!(
+        kv_cache.quant_q8
+            && !(kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4),
+        "forward_prefill_batch_tree requires Q8_0 KV (decoupled depth-RoPE is \
+         incompatible with the asym/givens in-kernel re-rotation)"
+    );
+    let arch = gpu.arch.as_str();
+    assert!(
+        crate::config::get().prefill_batched
+            && crate::transformer::llama_weights_batchable(weights, arch),
+        "forward_prefill_batch_tree requires the batched path (prefill_batched, \
+         batchable weights)"
+    );
+
+    // Upload the depth-based RoPE positions into a scratch device buffer (i32 bits
+    // in an F32 tensor, matching pbs.positions' slot-cosmetic dtype).
+    let rope_pos = gpu.alloc_tensor(&[n], DType::F32)?;
+    let rope_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(depth_positions.as_ptr() as *const u8, n * 4) };
+    gpu.hip.memcpy_htod(&rope_pos.buf, rope_bytes)?;
+
+    let tm = TreeMaskRef {
+        bias: tree_bias,
+        block_start: position,
+        block_cols: n,
+        rope_positions: &rope_pos,
+    };
+
+    // Upload tokens + contiguous KV-write/mask positions [position .. position+n)
+    // into pbs, then run one captured chunk with the tree mask applied.
+    let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let tokens_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
+    let positions_host: Vec<i32> = (0..n).map(|i| (position + i) as i32).collect();
+    let positions_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
+
+    let result = (|| -> HipResult<()> {
+        gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+        gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+        forward_prefill_chunk(
+            gpu,
+            weights,
+            config,
+            tokens,
+            position,
+            kv_cache,
+            scratch,
+            pbs,
+            true,
+            capture,
+            Some(&tm),
+        )
+    })();
+    let _ = gpu.free_tensor(rope_pos);
     result
 }
 
@@ -655,10 +901,11 @@ pub fn forward_prefill_batch_chunk_captured(
     );
 
     forward_prefill_chunk(
-        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, true,
+        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, true, None, None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
@@ -670,10 +917,41 @@ fn forward_prefill_chunk(
     s: &ForwardScratch,
     pbs: &PrefillBatchScratch,
     pre_uploaded: bool,
+    // Additive DFlash/DSpark hidden capture. `None` for the plain prefill path
+    // (the normal forward is byte-identical: the capture branches below are dead
+    // when this is `None`).
+    mut capture: Option<&mut HiddenCaptureSink>,
+    // Additive tree-attention mask. `None` for the plain causal prefill path.
+    tree_mask: Option<&TreeMaskRef>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+
+    // Per-extract-layer captured residual rows (host sink). Filled inside the
+    // layer loop, interleaved position-major after it. Unused (empty) when
+    // `capture` is `None` or a GPU-resident sink is supplied.
+    let mut cap_rows: Vec<Vec<f32>> = Vec::new();
+
+    // Tree-verify decoupling: RoPE rotates at DEPTH positions while the KV write
+    // + FA mask stay on the CONTIGUOUS `pbs.positions` slots. Causal path uses
+    // `pbs.positions` for both.
+    let rope_positions: &GpuTensor = match tree_mask {
+        Some(tm) => {
+            debug_assert_eq!(
+                tm.block_cols, n,
+                "tree_mask.block_cols {} must equal chunk size {n}",
+                tm.block_cols
+            );
+            tm.rope_positions
+        }
+        None => &pbs.positions,
+    };
+    let (tree_bias, tree_block_start, tree_block_cols): (Option<&GpuTensor>, usize, usize) =
+        match tree_mask {
+            Some(tm) => (Some(tm.bias), tm.block_start, tm.block_cols),
+            None => (None, 0, 0),
+        };
 
     let dim = config.dim;
     let hidden_dim = config.hidden_dim;
@@ -922,7 +1200,7 @@ fn forward_prefill_chunk(
         gpu.rope_batched_f32(
             &pbs.fa_q_batch,
             &pbs.fa_k_batch,
-            &pbs.positions,
+            rope_positions,
             config.n_heads,
             config.n_kv_heads,
             config.head_dim,
@@ -1015,9 +1293,9 @@ fn forward_prefill_chunk(
                 max_ctx_len,
                 n,
                 &pbs.flash_partials,
-                None,
-                0,
-                0,
+                tree_bias,
+                tree_block_start,
+                tree_block_cols,
             )?;
         } else if kv_cache.quant_asym3 {
             let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -1037,11 +1315,15 @@ fn forward_prefill_chunk(
                 max_ctx_len,
                 n,
                 &pbs.flash_partials,
-                None,
-                0,
-                0,
+                tree_bias,
+                tree_block_start,
+                tree_block_cols,
             )?;
         } else if kv_cache.quant_asym2 {
+            assert!(
+                tree_mask.is_none(),
+                "tree-verify (tree_mask) is unsupported on asym2 KV; requires Q8_0 KV"
+            );
             let ct = kv_cache.givens_cos.as_ref().unwrap();
             let st = kv_cache.givens_sin.as_ref().unwrap();
             gpu.attention_flash_asym2_batched(
@@ -1061,6 +1343,11 @@ fn forward_prefill_chunk(
                 &pbs.flash_partials,
             )?;
         } else if max_ctx_len > LDS_CTX_LIMIT {
+            assert!(
+                tree_mask.is_none(),
+                "tree-verify (tree_mask) is unsupported on the long-context Q8 \
+                 per-position fallback; keep the tree within the LDS context limit"
+            );
             // Long-context Q8 fallback: per-position flash.
             //
             // `pbs.positions` was uploaded as raw i32 bits but the dtype is
@@ -1113,9 +1400,9 @@ fn forward_prefill_chunk(
                 kv_cache.physical_cap,
                 max_ctx_len,
                 n,
-                None,
-                0,
-                0,
+                tree_bias,
+                tree_block_start,
+                tree_block_cols,
             )?;
         }
 
@@ -1413,7 +1700,60 @@ fn forward_prefill_chunk(
             )?;
         }
 
+        // DFlash / DSpark capture: if this layer is an extract layer, collect its
+        // post-FFN residual rows (`pbs.x_batch[..n]`). The residual stream here is
+        // the layer output BEFORE the next layer's attn_norm — exactly the
+        // conditioning the draft model's cross-attention consumes.
+        //
+        // GPU-resident sink (`hidden_gpu` Some): copy each position's row straight
+        // into its position-major slot on-device (`dst[(p·L + l_idx)·dim ..]`) so
+        // the whole capture never leaves VRAM. Host sink (default): download the
+        // rows and interleave after the loop.
+        if let Some(cap) = capture.as_deref() {
+            if let Some(l_idx) = cap.extract_layers.iter().position(|&x| x == layer_idx) {
+                if let Some(dst) = cap.hidden_gpu {
+                    let num_extract = cap.extract_layers.len();
+                    for p in 0..n {
+                        let dst_off = (p * num_extract + l_idx) * dim * 4;
+                        gpu.memcpy_dtod_at_auto(
+                            &dst.buf,
+                            dst_off,
+                            &pbs.x_batch.buf,
+                            p * dim * 4,
+                            dim * 4,
+                        )?;
+                    }
+                } else {
+                    let rows = pbs.x_batch.sub_offset(0, n * dim);
+                    cap_rows.push(gpu.download_f32(&rows)?);
+                }
+            }
+        }
+
         let _ = kv_dim;
+    }
+
+    // Interleave the captured per-extract-layer rows into the HOST sink in
+    // position-major order: for each position p, concat layer 0..L at p. The
+    // GPU-resident sink already wrote position-major slots inline above.
+    if let Some(cap) = capture.as_deref_mut() {
+        if cap.hidden_gpu.is_none() {
+            debug_assert_eq!(
+                cap_rows.len(),
+                cap.extract_layers.len(),
+                "captured {} layers but extract_layers has {}",
+                cap_rows.len(),
+                cap.extract_layers.len()
+            );
+            let num_extract = cap_rows.len();
+            cap.hidden.reserve(n * num_extract * dim);
+            for p in 0..n {
+                for layer_rows in cap_rows.iter() {
+                    cap.hidden
+                        .extend_from_slice(&layer_rows[p * dim..(p + 1) * dim]);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -2364,6 +2704,326 @@ pub fn forward_scratch_compute(
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
         weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+    }
+
+    gpu.rmsnorm_f32(
+        &scratch.x,
+        &weights.output_norm,
+        &scratch.tmp,
+        config.norm_eps,
+    )?;
+    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    Ok(())
+}
+
+/// `forward_scratch_compute` plus an optional per-extract-layer residual-hidden
+/// capture sink. Processes ONE token (decode kernel — bit-identical to the plain
+/// `forward_scratch_compute`), and for each decoder layer whose index appears in
+/// `capture.extract_layers` downloads the post-FFN residual (`scratch.x[..dim]`)
+/// and appends, in `extract_layers` ascending order, `num_extract × dim` f32 to
+/// the host sink. The per-token twin of `forward_prefill_batch_capture`'s
+/// capture; used by the DFlash spec prefill so the speculator conditions on the
+/// EXACT residual stream the per-token decode produces (the batched prefill
+/// kernel is not bitwise-equal to the decode kernel and flips argmax at near-tie
+/// logits).
+///
+/// This is a NEW function alongside `forward_scratch_compute`; the plain forward
+/// is left byte-identical (no capture taps woven into the hot path).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_compute_capture(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    mut capture: Option<&mut HiddenCaptureSink>,
+) -> HipResult<()> {
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let dim = config.dim;
+    // Per-token capture appends rows in extract-layer ASCENDING order, matching
+    // the batched capture's layout for n=1 (one position per call).
+    let mut cap_rows: Vec<Vec<f32>> = Vec::new();
+
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
+
+        if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
+            gpu.fused_qkv_q4k(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                &scratch.tmp,
+                &scratch.q,
+                &scratch.k,
+                &scratch.v,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+            )?;
+        } else {
+            let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
+            weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
+            weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
+        }
+
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(
+                    &scratch.q,
+                    qn,
+                    &scratch.q,
+                    n_heads,
+                    head_dim,
+                    config.norm_eps,
+                )?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(
+                    &scratch.k,
+                    kn,
+                    &scratch.k,
+                    n_kv_heads,
+                    head_dim,
+                    config.norm_eps,
+                )?;
+            }
+        }
+
+        gpu.rope_f32(
+            &scratch.q,
+            &scratch.k,
+            &scratch.pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            config.rope_freq_base,
+        )?;
+
+        if kv_cache.quant_hfq4 {
+            gpu.kv_cache_write_hfq4(
+                &kv_cache.k_gpu[layer_idx],
+                &scratch.k,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.kv_cache_write_hfq4(
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.v,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.attention_hfq4_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out,
+                &scratch.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_cache.physical_cap,
+            )?;
+        } else if kv_cache.quantized
+            && !kv_cache.k_scales.is_empty()
+            && !kv_cache.quant_int8
+            && !kv_cache.quant_q8
+        {
+            // HFQ8 flat layout
+            gpu.kv_cache_write_hfq8(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.k_scales[layer_idx],
+                &scratch.k,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.kv_cache_write_hfq8(
+                &kv_cache.v_gpu[layer_idx],
+                &kv_cache.v_scales[layer_idx],
+                &scratch.v,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.attention_hfq8_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.k_scales[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &kv_cache.v_scales[layer_idx],
+                &scratch.attn_out,
+                &scratch.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_cache.physical_cap,
+            )?;
+        } else if kv_cache.quant_int8 {
+            gpu.kv_cache_write_int8c_f16(
+                &kv_cache.k_gpu[layer_idx],
+                &scratch.k,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.kv_cache_write_int8c_f16(
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.v,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.attention_int8c_f16_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out,
+                &scratch.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_cache.physical_cap,
+            )?;
+        } else if kv_cache.quantized && kv_cache.quant_q8 {
+            gpu.kv_cache_write_q8_0(
+                &kv_cache.k_gpu[layer_idx],
+                &scratch.k,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.kv_cache_write_q8_0(
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.v,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.attention_q8_0_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out,
+                &scratch.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_cache.physical_cap,
+            )?;
+        } else if kv_cache.quantized {
+            gpu.kv_cache_write_q4(
+                &kv_cache.k_gpu[layer_idx],
+                &scratch.k,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.kv_cache_write_q4(
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.v,
+                &scratch.pos_buf,
+                n_kv_heads,
+                head_dim,
+            )?;
+            gpu.attention_q4kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out,
+                &scratch.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_cache.physical_cap,
+            )?;
+        } else {
+            gpu.kv_cache_write(
+                &kv_cache.k_gpu[layer_idx],
+                &scratch.k,
+                &scratch.pos_buf,
+                kv_dim,
+            )?;
+            gpu.kv_cache_write(
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.v,
+                &scratch.pos_buf,
+                kv_dim,
+            )?;
+            gpu.attention_f32(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out,
+                &scratch.pos_buf,
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_cache.physical_cap,
+            )?;
+        }
+
+        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+
+        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
+        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
+            gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &scratch.tmp,
+                &scratch.gate,
+                &scratch.up,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+            )?;
+        } else {
+            let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
+            weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
+            weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
+        }
+
+        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+
+        // DFlash per-token capture: download this layer's post-FFN residual
+        // (`scratch.x[..dim]`) if it is an extract layer. Same tap point as the
+        // batched capture (post-FFN residual, before the next attn_norm).
+        if let Some(cap) = capture.as_deref() {
+            if cap.extract_layers.contains(&layer_idx) {
+                let row = scratch.x.sub_offset(0, dim);
+                cap_rows.push(gpu.download_f32(&row)?);
+            }
+        }
+    }
+
+    if let Some(cap) = capture.as_deref_mut() {
+        debug_assert_eq!(
+            cap_rows.len(),
+            cap.extract_layers.len(),
+            "captured {} layers but extract_layers has {}",
+            cap_rows.len(),
+            cap.extract_layers.len()
+        );
+        for layer_rows in cap_rows.iter() {
+            cap.hidden.extend_from_slice(&layer_rows[..dim]);
+        }
     }
 
     gpu.rmsnorm_f32(
