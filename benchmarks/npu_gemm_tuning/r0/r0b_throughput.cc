@@ -24,19 +24,16 @@ extern "C" void r0b_i8i8(const int8 *__restrict pA, const int8 *__restrict pB,
   MMUL c00, c01, c10, c11;
   c00.mul(a0, b0); c01.mul(a0, b1); c10.mul(a1, b0); c11.mul(a1, b1);
 
-  unsigned t0 = aie::tile::current().cycles();
+  // ITERS*4 vmacs; runtime scales linearly with ITERS (host measures the slope)
   for (int i = 0; i < ITERS; i++) {
     c00.mac(a0, b0);
     c01.mac(a0, b1);
     c10.mac(a1, b0);
     c11.mac(a1, b1);
   }
-  unsigned t1 = aie::tile::current().cycles();
-
   auto s = aie::add(aie::add(c00.template to_vector<int32>(), c01.template to_vector<int32>()),
                     aie::add(c10.template to_vector<int32>(), c11.template to_vector<int32>()));
-  aie::store_v(pOut + 4, s);
-  pOut[0] = (int32)(t1 - t0);        // cycles for ITERS*4 vmacs
-  pOut[1] = ITERS * 4;               // vmac count
-  pOut[2] = MR * MK * MN;            // MACs per vmac
+  aie::store_v(pOut + 4, s);         // DCE guard
+  pOut[0] = ITERS * 4;               // vmac count
+  pOut[1] = MR * MK * MN;            // MACs per vmac
 }

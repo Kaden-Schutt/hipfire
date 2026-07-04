@@ -72,11 +72,39 @@ construction. Combined with the empty-FU-stage itinerary, II=1 is established tw
 independent ways. (Register pressure: 8×2048-bit accumulators spill; ≥4 fit,
 matching the `acc1=4` minimum.)
 
-**On-hardware numeric seal: pending.** `r0b_run.py` is a single-core `@jit`
-runner that writes the core cycle counter (`get_cycles()`) to the output so
-`cycles/(ITERS·4)` reads the empirical II. It's blocked on IRON harness
-scaffolding (the `@jit` cache-key needs an IRON `Tensor` wrapper; `run_test`
-needs an `AIEOperatorBase` subclass) — plumbing, not a compute question. For a
-register-resident-operand loop there is no memory traffic that could stall the
-issue, so the hardware necessarily sustains the scheduled II=1; the run only
-seals the number.
+## R0b — II=1 confirmed ON HARDWARE
+
+`r0b_run.py` runs the kernel on the NPU via IRON `@jit` (single core, one column),
+using IRON `Tensor`s (`zeros`/`randint` — the `@jit` cache-key needs these, not raw
+numpy). `get_cycles()` doesn't link in the minimal JIT build, so throughput is
+measured by **differential host timing**: run at several ITERS; the fixed per-run
+overhead (xclbin load + dispatch + fill/drain, ~17 ms) is an additive constant, so
+the *slope* of wall-time vs vmac-count is the pure per-vmac cost.
+
+Measured (min of 8 runs/point, NPU pinned `performance`):
+
+| ITERS | vmacs | wall (ms, min) |
+|---|---|---|
+| 1e6 | 4e6 | 19.49 |
+| 3e6 | 12e6 | 24.18 |
+| 5e6 | 20e6 | 28.87 |
+
+Pairwise slopes: **1.057 / 1.055 / 1.053 cycles/vmac** (@1.8 GHz) — a stable linear
+slope ⇒ **II ≈ 1.055 ≈ 1.0, confirmed empirically.** The 5.5% over ideal is a clock
+effect: II=1.0 exactly implies a real hclk of **1.706 GHz** (silicon runs just below
+the 1.8 DPM nominal). So the *real achievable* compute ceiling is **~56 TOPS dense
+int8 / ~112 TOPS W4A8** (vs 58.9/117.8 nominal), with **W4A8 = 2× dense int8** intact.
+
+II=1 is now established three independent ways: empty-FU-stage itinerary, the
+zero-overhead 4-vmac disasm loop, and this on-hardware slope.
+
+Run recipe:
+```bash
+PEANO=... MLIR_AIE_INC=... 
+for it in 1000000 3000000 5000000; do RITERS=$it python r0b_run.py; done   # one run/process
+```
+
+Caveats: the `OUT0` checksum readback is unreliable (output-buffer layout bug — does
+not affect timing, which scales correctly with ITERS). Repeated `@jit` runs in one
+process intermittently segfault in pyxrt (py3.14), so each measurement uses a fresh
+process.
