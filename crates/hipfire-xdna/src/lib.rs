@@ -117,6 +117,11 @@ const SENSOR_TYPE_TEMPERATURE: u8 = 2;
 // Strix Halo has 8 columns + 1 power sensor; allow generous headroom.
 const MAX_SENSORS: usize = 16;
 
+// W1: amdxdna command-submission ABI (structs + ioctl numbers), foundation for
+// the W4A8 kernel wire-in. See docs/npu/wire-in-amdxdna-command-submission.md.
+#[cfg(target_os = "linux")]
+pub mod submit;
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*;
