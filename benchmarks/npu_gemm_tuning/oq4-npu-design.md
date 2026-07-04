@@ -75,6 +75,14 @@
 >      has NO assert message and is in a RECURSIVE nested-loop lambda inside
 >      unrollForLoops, so it's the gemm's deeply-nested loop structure (not fifo
 >      depth) — config-fuzzing is low-odds. Upstream repro is the path.
+>   7. **UPSTREAM ISSUE FILED: Xilinx/mlir-aie#3281.** Isolated the crash to one
+>      pass with a CONCRETE assertion (not a bare segfault):
+>      `aie-opt --aie-objectFifo-stateful-transform repro.mlir` →
+>      `LockOp::getLockIDValue()` "Lock has no ID value" — the unroll of the fused
+>      two-kernel design emits a LockOp with NO lock ID. Reproduces on mlir_aie
+>      2026033104 (Mar) AND 886d932 (May); no fix through main d0988194 (Jul-02).
+>      Repro gist gist.github.com/xynexus/8a09c8d22c0bcc9bf26be92af272ea66. When
+>      fixed, the fused feed-win Oq4 kernel unblocks.
 >   6. **.ll INSPECTED (iron/expand_int4_bf16.aie2p.ll):** the Oq4 dequant kernel
 >      (`aie_kernels/generic/expand.cc`, `aie::unpack` on a native `uint4` vector)
 >      lowers to NATIVE aie2p intrinsics, fully 32-lane vectorized:
