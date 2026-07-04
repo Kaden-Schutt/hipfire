@@ -1,0 +1,2 @@
+utc,dtype_in,dtype_out,M,K,N,m,k,n,cols,warmup,iters,avg_us,avg_gflops,tops,pct_peak,status
+20260704T062601Z,i8,i8,4096,4096,4096,128,32,128,8,5,20,9035.80,15210.49,15.21,27.7,PASS

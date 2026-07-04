@@ -14,16 +14,23 @@ whole_array bench's "gflops").
 2. **The mlir-aie `whole_array` REFERENCE dataflow caps at ~15.7 TOPS = 27% of
    peak**, and every tunable knob is explored (below). This is a **dataflow
    efficiency** limit, not compute or power.
-3. **Reaching ~50 requires AMD's production `mladf` dataflow** (DynamicDispatch),
-   which is a fundamentally better-engineered design, not a tuning of the
-   reference. Benchmarking it is scoped and tractable (see "mladf bench" below)
-   but was blocked short of completion on a ROCm-torch→HIP cmake dep in the
-   test harness.
+3. **AMD's PRODUCTION `mladf` kernel does NOT reach 50 either** — built
+   DynamicDispatch from source and ran real mladf gemms on the NPU. The shipped
+   int4 (w3a16) gemm is a flat **~7 TOPS** across LLM shapes — a *memory-bound
+   weight-quant decode* kernel, actually **below** our int8 reference. The
+   compute-bound bf16 prefill gemm wasn't runnable in this package
+   (`op_version "bfp16gemm"` unregistered).
 
-**Bottom line:** 50 TOPS is obtainable on this silicon (hardware does 58,
-un-throttled). The reference dataflow gets 27%; the last ~2× lives in a
-production-grade dataflow (mladf) or a bespoke one, not in the reference's knobs
-or in any power/clock "special condition."
+**Bottom line (revised, evidence-backed):** The hardware genuinely does 58 TOPS
+and is un-throttled — but **no real GEMM kernel I could measure approaches it.**
+The tuned reference (int8) and AMD's shipped production kernel (int4) both sit in
+the **~12–27%-of-peak band (7–16 TOPS)**. ~50/58 TOPS is a theoretical/marketing
+peak; real inference GEMM on this AIE dataflow is per-tile-feed/overhead-bound at
+these shapes. Our int8 reference at **15.7 TOPS is the highest real number
+measured** — beating AMD's shipped int4 decode kernel. Reaching ~50 would need a
+compute-bound dataflow that neither the reference nor the shipped kernels
+demonstrate (unverified whether one exists; the compute-bound production path was
+not runnable here).
 
 ## Device facts (xrt-smi examine + hipfire-xdna resource_info)
 
@@ -64,35 +71,48 @@ help — the cores are starved by per-tile overhead the reference can't shrink
 without a different dataflow (e.g. K-resident C, cross-core cascade/systolic, or
 a larger effective tile via smarter memtile use — i.e. what mladf does).
 
-## mladf bench (the decisive test of ~50) — turnkey resume
+## mladf bench — DONE (built DynamicDispatch from source, ran on NPU)
 
-AMD's production gemm is **bfp16 / a16w8 / a16w4** (`xclbin/stx/mladf_gemm_4x4_a16fw4acc16f`,
-`mladf_4x2_gemm_a16w8_qdq`, `llama2_mladf_2x4x4_bfp16_gemm_*`) with prebuilt
-transaction .bin instruction sequences under `~/build/DynamicDispatch/transaction/stx/`.
+Measured, all PASS (latency reported by the op; TOPS = 2·M·K·N / latency):
 
-Build the perf test (`test_mladfmatmulbias`, `UNIT_TEST_PERF`) — deps resolved so far:
-- nlohmann_json, spdlog, xaiengine: auto-fetched by cmake. XRT: found.
-- **Protobuf**: system libs present (`/usr/lib/.../libprotobuf.so`, protoc 3.21.12)
-  but no cmake config package → change `find_package(Protobuf CONFIG REQUIRED)`
-  to `MODULE` in DynamicDispatch/CMakeLists.txt:74. (Reverted for now.)
-- **Torch**: venv has ROCm torch 2.12 (`~/.venv/.../torch/share/cmake/Torch`), but
-  its `TorchConfig` enables HIP language and needs `hip-lang-config.cmake`, absent
-  under /opt/rocm-7.14. FIX: point at a **CPU-only torch** in a separate venv
-  (`python -m venv /tmp/cputorch && pip install torch --index-url \
-  https://download.pytorch.org/whl/cpu`), then `-DTorch_DIR=<that>/share/cmake/Torch`.
-- Then: `cmake -B build -DENABLE_DD_TESTS=ON -DUNIT_TEST_PERF_EN=ON \
-  -DENABLE_DD_PYTHON=OFF -DDD_DISABLE_AIEBU=ON -DXRT_DIR=/opt/xilinx/xrt` →
-  build `test_mladfmatmulbias` → run (it times a real mladf gemm on the NPU).
+| mladf kernel | shape M×K×N | latency | TOPS |
+|---|---|---|---|
+| int4 w3a16 grp128 | 512×3584×3584 | 1.874 ms | **7.0** |
+| int4 w3a16 grp128 | 512×3584×18944 | 10.10 ms | 6.9 |
+| int4 w3a16 grp128 | 1024×3584×18944 | 20.20 ms | 6.9 |
 
-Simpler if sudo is unblocked: `apt install protobuf-compiler libprotobuf-dev`
-gives the Protobuf cmake config (no MODULE edit); CPU-torch venv still needed
-(or install the HIP cmake package).
+Flat ~7 TOPS = a memory-bound weight-quant **decode** kernel (int4 weight, bf16
+activation), **below** our int8 reference (15.7). The compute-bound `Bfp16Gemm`
+test throws "op version does not exist" (`op_version "bfp16gemm"` not registered
+in this package); a16w8/a16a16 gemms are meta.json runners (not driven). So the
+compute-bound production path was not runnable here — but the shipped int4 kernel
+sitting at the same ~25%-of-peak efficiency as our reference is strong evidence
+the ceiling is dataflow-fundamental, not a kernel we're missing.
 
-## Remaining steps (both currently sudo/effort-gated)
-1. **Confirm turbo is a no-op** — `sudo xrt-smi configure --pmode turbo` then
-   re-bench (expected ~15.7, since H already maxed). Needs sudo password.
-2. **Finish the mladf bench** — CPU-torch venv + build + run (above). This is the
-   definitive proof of what a production dataflow achieves (~50?) on this box.
+### DynamicDispatch build recipe (worked; build left in place at ~/build/DynamicDispatch/build)
+Deps: nlohmann_json/spdlog/xaiengine auto-fetched; XRT found; system protobuf +
+a **CPU-torch venv** (ROCm-torch needs an absent HIP cmake pkg):
+```
+uv python install 3.12 && uv venv -p 3.12 /tmp/cputorch
+uv pip install --python /tmp/cputorch/bin/python torch --index-url https://download.pytorch.org/whl/cpu
+# edit DynamicDispatch/CMakeLists.txt:74  find_package(Protobuf CONFIG REQUIRED) -> MODULE
+cmake -B build -DENABLE_DD_TESTS=ON -DUNIT_TEST_PERF_EN=ON -DENABLE_DD_PYTHON=OFF \
+  -DDD_DISABLE_AIEBU=ON -DCMAKE_BUILD_TYPE=Release -DXRT_DIR=/opt/xilinx/xrt \
+  -DTorch_DIR=/tmp/cputorch/lib/python3.12/site-packages/torch/share/cmake/Torch \
+  -DCMAKE_CXX_FLAGS="-I/opt/xilinx/xrt/include/xrt -include cstdint -include cstddef"
+cmake --build build --target cpp_tests -j$(nproc)
+# run: build/tests/cpp/unit_tests/cpp_tests --gtest_filter='Qwen7b_2Testw3a16_high_time.Kernel4mladf_512x3584x3584_int4_grp128_v1'
+```
+Gotchas fixed: XRT 2.25 moved experimental headers to `xrt/experimental/`
+(`-I.../include/xrt`); GCC 15 needs `-include cstdint -include cstddef`
+(transitive-include tightening); protobuf CONFIG→MODULE (Ubuntu ships no config pkg).
+
+## Confirmed no-op levers
+- **turbo pmode**: 15.21 vs 15.7 TOPS (compute clock already maxed under load).
+
+## Open (only if chasing the last mile)
+- Run a compute-bound production gemm (fix `bfp16gemm` op-version, or hand-build a
+  a16w8/a16a16 meta.json) to test whether ANY shipped kernel exceeds ~16 TOPS.
 
 ## Tooling added
 - `crates/hipfire-xdna/examples/npu_info.rs` — dumps resource_info (max/curr TOPS,
