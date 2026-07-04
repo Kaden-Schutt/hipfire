@@ -25,3 +25,6 @@
 [submodule "third_party/xdna-driver"]
 	path = third_party/xdna-driver
 	url = https://github.com/amd/xdna-driver.git
+[submodule "third_party/llvm-aie"]
+	path = third_party/llvm-aie
+	url = https://github.com/Xilinx/llvm-aie.git
