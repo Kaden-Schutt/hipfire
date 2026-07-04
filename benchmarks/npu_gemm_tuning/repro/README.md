@@ -51,3 +51,25 @@ export AIE_OPT=/path/to/mlir_aie/bin/aie-opt
 - No dialect-aware `mlir-reduce` exists in the toolchain (mlir_aie ships only
   `aie-opt`; the ROCm `mlir-reduce` can't parse the `aie.*` dialect), so this
   homemade ddmin is the reduction path.
+
+## IR-level workaround (no compiler patch)
+
+The crash has a single trigger: a **dynamic (runtime-computed) loop bound**
+around the `acquire`. Isolated against the fast oracle:
+
+| structure | result |
+|---|---|
+| single flat loop, static bound | ok |
+| single loop, infinite (`c9223372036854775807`) bound | ok |
+| double / triple nested, all static bounds | ok |
+| single loop, **dynamic bound** (`memref.load %rtp` → `index_cast`) | **crash** |
+
+`unrollForLoops` can't compute a static unroll factor for a runtime trip count;
+its fallback fabricates the ID-less lock. `workaround_static_bounds.mlir` is the
+exact triple-nested-acquire structure with constant bounds — it not only avoids
+the assert, it **fully lowers** (13 `lock`/`use_lock` ops emitted).
+
+In the real fused Oq4 GEMM the dynamic bounds come only from IRON threading tile
+counts through RTP buffers for size-generality. M/K/N are compile-time constants
+here, so baking them (dropping the RTP loads) compiles the fused feed-win kernel
+today — no `mlir-aie` rebuild, no wait on #3281.

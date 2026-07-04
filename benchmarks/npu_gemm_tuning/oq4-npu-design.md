@@ -95,8 +95,22 @@
 >      `LLVM_DISABLE_SYMBOLIZATION=1` drops it to ~0.2s → `ddmin` viable.
 >      In-tree: `benchmarks/npu_gemm_tuning/repro/` (repro .mlir + faithful oracle +
 >      ddmin). Gist gist.github.com/xynexus/8a09c8d22c0bcc9bf26be92af272ea66 now the
->      35-line file. Retitled + correction comment posted. When fixed, the fused
->      feed-win Oq4 kernel unblocks.
+>      35-line file. Retitled + correction comment posted.
+>      **IR-LEVEL WORKAROUND FOUND (no compiler patch, no rebuild):** trigger
+>      isolated to a single factor — a DYNAMIC (runtime-computed) loop bound around
+>      the `objectfifo.acquire`. Tested against the 0.2s oracle: single flat loop
+>      ok; single loop w/ INFINITE bound ok; double/triple-nested w/ STATIC bounds
+>      ok; single loop w/ DYNAMIC bound (`memref.load %rtp`→`index_cast`) CRASHES.
+>      `unrollForLoops` can't compute a static unroll factor for a runtime trip
+>      count and its fallback fabricates the ID-less lock. The real fused GEMM's
+>      dynamic bounds come ONLY from IRON threading tile counts through RTP buffers
+>      for size-generality; M=K=N are compile-time constants in this design, so the
+>      RTP indirection is unneeded. Proven: the exact triple-nested-acquire
+>      structure with all bounds replaced by constants NOT ONLY avoids the assert
+>      but FULLY LOWERS (13 lock/use_lock ops emitted). NEXT: make IRON's GEMM op
+>      emit constant loop bounds (bake M/K/N, drop RTP loads) → fused feed-win Oq4
+>      compiles today. Falls back to upstream #3281 fix only if IRON can't be
+>      coerced to static bounds.
 >   6. **.ll INSPECTED (iron/expand_int4_bf16.aie2p.ll):** the Oq4 dequant kernel
 >      (`aie_kernels/generic/expand.cc`, `aie::unpack` on a native `uint4` vector)
 >      lowers to NATIVE aie2p intrinsics, fully 32-lane vectorized:
