@@ -2948,14 +2948,14 @@ pub const ENV_HIPFIRE_QUANTIZE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUANT_CALIB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_CALIB",
     description: "Runtime variable controlling quant calib in hipfire",
-    source: "crates/hipfire-diffusion/src/tests/misc.rs:783",
+    source: "crates/hipfire-diffusion/src/tests/misc.rs:267",
 };
 
 /// `HIPFIRE_QUANT_CANDS` — Runtime variable controlling quant cands in hipfire
 pub const ENV_HIPFIRE_QUANT_CANDS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_CANDS",
     description: "Runtime variable controlling quant cands in hipfire",
-    source: "crates/hipfire-diffusion/src/tests/misc.rs:811",
+    source: "crates/hipfire-diffusion/src/tests/quant.rs:396",
 };
 
 /// `HIPFIRE_QUANT_DIAG_PATH` — Runtime variable controlling quant diag path in hipfire
@@ -2969,7 +2969,7 @@ pub const ENV_HIPFIRE_QUANT_DIAG_PATH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QUANT_SRC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QUANT_SRC",
     description: "Runtime variable controlling quant src in hipfire",
-    source: "crates/hipfire-diffusion/src/tests/misc.rs:808",
+    source: "crates/hipfire-diffusion/src/tests/quant.rs:393",
 };
 
 /// `HIPFIRE_QUANT_THREADS` — Runtime variable controlling quant threads in hipfire

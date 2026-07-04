@@ -420,10 +420,10 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_QTIP_EVAL_ST` | Selects behavior from recognized values | `crates/hipfire-quantize/src/qtip.rs:893` |
 | `HIPFIRE_QTIP_HESSIAN` | Runtime variable controlling qtip hessian in hipfire | `crates/hipfire-quantize/src/main.rs:4956` |
 | `HIPFIRE_QUANTIZE_BIN` | Runtime variable controlling quantize bin in hipfire | `crates/hipfire-eval/src/executor_tinyquant.rs:126` |
-| `HIPFIRE_QUANT_CALIB` | Runtime variable controlling quant calib in hipfire | `crates/hipfire-diffusion/src/tests/misc.rs:783` |
-| `HIPFIRE_QUANT_CANDS` | Runtime variable controlling quant cands in hipfire | `crates/hipfire-diffusion/src/tests/misc.rs:811` |
+| `HIPFIRE_QUANT_CALIB` | Runtime variable controlling quant calib in hipfire | `crates/hipfire-diffusion/src/tests/misc.rs:267` |
+| `HIPFIRE_QUANT_CANDS` | Runtime variable controlling quant cands in hipfire | `crates/hipfire-diffusion/src/tests/quant.rs:396` |
 | `HIPFIRE_QUANT_DIAG_PATH` | Runtime variable controlling quant diag path in hipfire | `crates/hipfire-quantize/src/main.rs:12030` |
-| `HIPFIRE_QUANT_SRC` | Runtime variable controlling quant src in hipfire | `crates/hipfire-diffusion/src/tests/misc.rs:808` |
+| `HIPFIRE_QUANT_SRC` | Runtime variable controlling quant src in hipfire | `crates/hipfire-diffusion/src/tests/quant.rs:393` |
 | `HIPFIRE_QUANT_THREADS` | Runtime variable controlling quant threads in hipfire | `crates/hipfire-quantize/src/main.rs:4705` |
 | `HIPFIRE_QWEN35_DECODE_BATCH` | Defaults to auto when unset | `crates/hipfire-serving-core/src/qwen35_decode.rs:360` |
 | `HIPFIRE_QWEN35_DECODE_BATCH_MAX` | Runtime variable controlling qwen35 decode batch max in hipfire | `crates/hipfire-serving-core/src/qwen35_decode.rs:484` |
