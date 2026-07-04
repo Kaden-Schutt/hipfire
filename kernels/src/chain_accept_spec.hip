@@ -54,18 +54,17 @@
 //
 // ── CACTUS ────────────────────────────────────────────────────────────────
 //   When cactus_delta > 0, the acceptance probability is boosted to:
-//     accept_prob = p_t + sqrt(2 * delta * p_t * (1 - p_t))
-//   On rejection the target distribution is replaced with the h-distribution
-//   (speculative.rs:3679-3693):
-//     q_star = min(1, p_t / p_d)   (scalar at the drafted token)
-//     gamma* = 1 - q_star * p_d    (remaining mass for redistribution)
-//     For j != t: h[j] = gamma* / (1 - p_d_at_t) * p_t[j]  (renorm rest)
-//     For j == t: h[t] = 0 (or gamma_star * p_t[t] / (1 - p_d[t]))
-//   In practice this reduces to using the residual sample_residual(p_t, p_d)
-//   on rejection, same as plain RS — the CACTUS boost is only in accept_prob.
-//   The h-distribution sampling (residual of h vs uniform draft) is complex;
-//   we implement the simpler "accept boosted, reject → residual(p_t, p_d)"
-//   approximation used in the host code (speculative.rs:3726-3727).
+//     accept_prob = min(p_t + sqrt(2 * delta * p_t * (1 - p_t)), 1)
+//   On rejection the target row is replaced with the CACTUS h-distribution
+//   BEFORE residual sampling, matching the host fallback exactly
+//   (speculative.rs:3660-3677):
+//     gamma* = accept_prob          (boosted, clamped value at drafted token t)
+//     if p_t >= 1 - 1e-6:  h = one-hot at t
+//     else:                h[t] = gamma*,  h[j!=t] = (1-gamma*)/(1-p_t) * p_t[j]
+//   The bonus is then drawn from residual(h, p_draft), so the committed
+//   rejection token is distribution-identical to the host path. At delta == 0
+//   the rewrite is skipped and this reduces to plain residual(p_t, p_draft)
+//   (Chen & Leviathan 2023). See casp_h_val() below.
 
 #include <hip/hip_runtime.h>
 
@@ -75,6 +74,17 @@
 __device__ __forceinline__ float eff_prob(float p, float tau, float inv_z) {
     if (tau <= 0.0f) return p;  // no truncation
     return (p >= tau) ? (p * inv_z) : 0.0f;
+}
+
+// CACTUS h-distribution value at column j on rejection. `pt_j` is the effective
+// (topp-truncated) target prob at column j; `t` is the drafted token. When
+// use_cx is false this is a no-op (h == raw effective target). Mirrors the host
+// h-distribution rewrite in speculative.rs:3660-3677 term-for-term.
+__device__ __forceinline__ float casp_h_val(
+    int j, int t, float pt_j, bool use_cx, bool onehot, float gamma_star, float scale) {
+    if (!use_cx) return pt_j;
+    if (onehot)  return (j == t) ? 1.0f : 0.0f;
+    return (j == t) ? gamma_star : scale * pt_j;
 }
 
 extern "C" __global__ void chain_accept_spec_f32(
@@ -169,17 +179,32 @@ extern "C" __global__ void chain_accept_spec_f32(
             __syncthreads();
             // Continue to next position.
         } else {
-            // ── Rejection: sample bonus from residual(p_t, p_d) ─────────────
-            // residual[j] = max(p_teff[j] - p_deff[j], 0)
+            // ── Rejection: sample bonus from residual(h, p_d) ───────────────
+            // residual[j] = max(h[j] - p_deff[j], 0), where h is the CACTUS
+            // h-distribution (== raw effective target when cactus_delta == 0).
             // p_deff uses tau_d[i] / z_d[i].
             const float* drow = dft_probs + (size_t)i * vocab;
             const float  tau_di = tau_d[i];
             const float  inv_zd = 1.0f / fmaxf(z_d[i], 1e-30f);
 
+            // CACTUS h-distribution scalars (all threads; p_t and draft_tok are
+            // in scope). Mirrors host speculative.rs:3660-3677: gamma* is the
+            // boosted accept prob at the drafted token, and the rest of the row
+            // is rescaled by (1-gamma*)/(1-p_t). No-op when cactus_delta == 0.
+            const bool  use_cx = (cactus_delta > 0.0f);
+            const float qn = fminf(fmaxf(p_t, 0.0f), 1.0f);
+            const float cx_bump = (p_t > 0.0f && p_t < 1.0f)
+                ? sqrtf(2.0f * cactus_delta * p_t * (1.0f - p_t)) : 0.0f;
+            const float gamma_star = fminf(p_t + cx_bump, 1.0f);
+            const bool  cx_onehot = (qn >= 1.0f - 1e-6f);
+            const float cx_scale =
+                cx_onehot ? 0.0f : (1.0f - gamma_star) / fmaxf(1.0f - qn, 1e-30f);
+
             // Block-parallel residual sum.
             float local_sum = 0.0f;
             for (int j = tid; j < vocab; j += nth) {
-                float pt = eff_prob(trow[j], tau_ti, inv_zt);
+                float pt = casp_h_val(j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
+                                      use_cx, cx_onehot, gamma_star, cx_scale);
                 float pd = eff_prob(drow[j], tau_di, inv_zd);
                 float diff = pt - pd;
                 if (diff > 0.0f) local_sum += diff;
@@ -204,17 +229,20 @@ extern "C" __global__ void chain_accept_spec_f32(
                 }
                 int bonus = vocab - 1;
                 if (resid_sum <= 0.0f) {
-                    // Degenerate: p_draft >= p_target everywhere. Fall back to
-                    // argmax of target row (match host sample_residual fallback).
+                    // Degenerate: p_draft >= h everywhere. Fall back to argmax of
+                    // the h-distribution (match host sample_residual fallback,
+                    // which argmaxes the same rewritten target row).
                     float best = -1.0f;
                     for (int j = 0; j < vocab; ++j) {
-                        float pt = eff_prob(trow[j], tau_ti, inv_zt);
+                        float pt = casp_h_val(j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
+                                              use_cx, cx_onehot, gamma_star, cx_scale);
                         if (pt > best) { best = pt; bonus = j; }
                     }
                 } else {
                     float acc = 0.0f;
                     for (int j = 0; j < vocab; ++j) {
-                        float pt = eff_prob(trow[j], tau_ti, inv_zt);
+                        float pt = casp_h_val(j, draft_tok, eff_prob(trow[j], tau_ti, inv_zt),
+                                              use_cx, cx_onehot, gamma_star, cx_scale);
                         float pd = eff_prob(drow[j], tau_di, inv_zd);
                         float diff = pt - pd;
                         if (diff > 0.0f) {

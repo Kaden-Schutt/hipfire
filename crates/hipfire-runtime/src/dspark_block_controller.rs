@@ -382,6 +382,28 @@ mod tests {
         assert_eq!(c.block(), 3, "block returns to default after reset");
     }
 
+    // Interior argmax: the cost model must settle at a SPECIFIC middle block, not
+    // just a monotone extreme. Deterministic accept_len == 3 gives S(1)=S(2)=S(3)=1,
+    // S(4+)=0, so τ(N) saturates at 4 for N ≥ 3. With t_ar=50, dt=10 (ratio 0.2, i.e.
+    // t_ar > 2·dt) the throughput score τ(N)/(t_ar+(N−1)·dt) peaks at EXACTLY N=3:
+    //   Score(2)=3/60=0.05000, Score(3)=4/70=0.05714, Score(4)=4/80=0.05000.
+    // This locks the selection logic in the interior, which the monotone-extreme
+    // tests above structurally cannot.
+    #[test]
+    fn settles_at_interior_argmax_n3() {
+        let mut c = BlockController::new(2, 1, 7, 0.0);
+        c.set_cost_for_test(10.0, 50.0);
+        for _ in 0..200 {
+            c.observe(3, 7); // accept exactly 3 of 7 drafted, every window
+        }
+        assert_eq!(
+            c.block(),
+            3,
+            "cost-model argmax must settle at the interior optimum N=3, got {}",
+            c.block()
+        );
+    }
+
     // n_proposed == 0 (degenerate window) must not panic, and all-reject settles the
     // block to the minimum without indexing OOB.
     #[test]

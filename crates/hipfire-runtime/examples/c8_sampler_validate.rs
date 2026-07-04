@@ -316,7 +316,28 @@ fn host_chain_accept_lcg(
 
         let u = lcg_step(&mut s);
         if p_d <= 0.0 || u * p_d > accept_prob {
-            // rejection: draw residual
+            // rejection: rewrite the target row into the CACTUS h-distribution
+            // (mirrors kernel casp_h_val + host speculative.rs:3660-3677), then
+            // draw the corrective bonus from residual(h, draft). No-op at δ=0.
+            if cactus_delta > 0.0 {
+                let t = draft_tokens[i] as usize;
+                let qn = p_t.clamp(0.0, 1.0);
+                let bump = if p_t > 0.0 && p_t < 1.0 {
+                    (2.0 * cactus_delta * p_t * (1.0 - p_t)).sqrt()
+                } else {
+                    0.0
+                };
+                let gamma_star = (p_t + bump).min(1.0);
+                if qn >= 1.0 - 1e-6 {
+                    trow.iter_mut().for_each(|v| *v = 0.0);
+                    trow[t] = 1.0;
+                } else {
+                    let scale = (1.0 - gamma_star) / (1.0 - qn);
+                    for (j, v) in trow.iter_mut().enumerate() {
+                        *v = if j == t { gamma_star } else { scale * *v };
+                    }
+                }
+            }
             let u2 = lcg_step(&mut s);
             let resid_sum: f32 = trow
                 .iter()
@@ -547,8 +568,10 @@ fn main() {
     // relu(p_tgt[i] - p_dft[i]) is only nonzero at a few tokens, giving small
     // support and low MC TV noise (O(sqrt(8/40000)) ≈ 0.014; threshold 0.02).
     //
-    // Also verifies the CACTUS delta>0 path: CACTUS only changes accept_prob,
-    // not the residual distribution; both should show the same TV.
+    // The δ=1.0 sub-case here uses p_t=0 at the drafted token, where the CACTUS
+    // h-distribution degenerates to the raw target (scale=1, h[t]=0), so the
+    // residual is unchanged — hence "same TV". Check [3b] exercises the p_t>0
+    // case where the h-distribution genuinely differs from the raw target.
     println!("\n[3] Residual draw MC-TV (forced rejection, small-support residual)");
     {
         // 8 support tokens for the residual distribution.
@@ -650,6 +673,104 @@ fn main() {
             if tv_c >= 0.02 {
                 all_pass = false;
             }
+        }
+    }
+
+    // ── Check 3b: CACTUS h-distribution residual (p_t > 0, h ≠ raw) ────────
+    // The one case the δ=1.0 sub-check above CANNOT catch: when p_t > 0 at the
+    // drafted token, the CACTUS rejection bonus must be drawn from the rewritten
+    // h-distribution (speculative.rs:3660-3677), NOT the raw target. Here the two
+    // give DIFFERENT residual support, so a kernel that skipped the h-rewrite
+    // (the pre-fix behaviour) fails this check. Parameters are chosen so that:
+    //   • rejection is frequent (accept_prob=0.486 < p_d=0.6 ⇒ ~19% reject), and
+    //   • one support token (50) survives the RAW residual but is zeroed by the
+    //     h residual (draft mass 0.35 sits between h[50]=0.325 and p_tgt[50]=0.6).
+    // Expected h residual = {200:1.0}; raw residual = {50:0.45, 200:0.55}.
+    println!("\n[3b] CACTUS h-distribution residual (p_t>0, h differs from raw target)");
+    {
+        let (d_tok, a_tok, b_tok) = (100usize, 50usize, 200usize);
+        let cactus = 2.0f32;
+        let p_d_val = 0.6f32;
+
+        let mut p_tgt = vec![0.0f32; VOCAB];
+        p_tgt[d_tok] = 0.05;
+        p_tgt[a_tok] = 0.60;
+        p_tgt[b_tok] = 0.35;
+        let mut p_dft = vec![0.0f32; VOCAB];
+        p_dft[d_tok] = 0.60;
+        p_dft[a_tok] = 0.35;
+        p_dft[b_tok] = 0.05;
+
+        // Analytic h-distribution + residual theories (same formula as kernel/host).
+        let p_t = p_tgt[d_tok];
+        let bump = (2.0 * cactus * p_t * (1.0 - p_t)).sqrt();
+        let gamma_star = (p_t + bump).min(1.0);
+        let scale = (1.0 - gamma_star) / (1.0 - p_t.clamp(0.0, 1.0));
+        let mut h = p_tgt.clone();
+        for (j, v) in h.iter_mut().enumerate() {
+            *v = if j == d_tok { gamma_star } else { scale * *v };
+        }
+        let normalize_residual = |tgt: &[f32], dft: &[f32]| -> Vec<f32> {
+            let mut r: Vec<f32> = tgt
+                .iter()
+                .zip(dft)
+                .map(|(&t, &d)| (t - d).max(0.0))
+                .collect();
+            let s: f32 = r.iter().sum();
+            if s > 0.0 {
+                r.iter_mut().for_each(|v| *v /= s);
+            }
+            r
+        };
+        let theory_h = normalize_residual(&h, &p_dft);
+        let theory_raw = normalize_residual(&p_tgt, &p_dft);
+
+        let mut tgt_flat = p_tgt.clone();
+        tgt_flat.extend_from_slice(&p_tgt); // bonus row (unused: rejection path)
+
+        let mut hist = vec![0u32; VOCAB];
+        let mut n_reject = 0usize;
+        for s_idx in 0..N_SAMPLES {
+            let seed = 0x9999_0000u32.wrapping_add(s_idx as u32);
+            let result = gpu_chain_accept(
+                &mut gpu,
+                &tgt_flat,
+                &p_dft,
+                &[d_tok as i32],
+                &[p_d_val],
+                &[0.0f32, 0.0],
+                &[1.0f32, 1.0],
+                &[0.0f32],
+                &[1.0f32],
+                1,
+                seed,
+                cactus,
+            );
+            if result[2] == 0 {
+                let tok = result[1] as usize;
+                if tok < VOCAB {
+                    hist[tok] += 1;
+                    n_reject += 1;
+                }
+            }
+        }
+        // Conditional TV (normalize by the number of rejection draws, not N_SAMPLES).
+        let tv_cond = |hist: &[u32], theory: &[f32], total: usize| -> f32 {
+            let n = total.max(1) as f32;
+            0.5 * (0..hist.len().min(theory.len()))
+                .map(|i| (hist[i] as f32 / n - theory[i]).abs())
+                .sum::<f32>()
+        };
+        let tv_h = tv_cond(&hist, &theory_h, n_reject);
+        let tv_raw = tv_cond(&hist, &theory_raw, n_reject);
+        // Must MATCH the h-distribution and be FAR from the raw-target residual.
+        let pass = n_reject > 300 && tv_h < 0.03 && tv_raw > 0.20;
+        let status = if pass { "PASS" } else { "FAIL" };
+        println!(
+            "  {status} n_reject={n_reject}  TV(GPU vs h-dist)={tv_h:.5}  TV(GPU vs raw)={tv_raw:.5}  (want h<0.03, raw>0.20)"
+        );
+        if !pass {
+            all_pass = false;
         }
     }
 
