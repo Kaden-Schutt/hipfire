@@ -551,3 +551,23 @@ pub fn nchw_idx(
 ) -> usize {
     (((batch * channels + channel) * height + y) * width) + x
 }
+
+/// Deterministic CPU-reference GEMM oracle for verifying quant/WMMA GPU kernels.
+///
+/// Computes `y[b*m + r] = Σ_k weight[r*k + k]·x[b*k + k]` — a weight × activation
+/// product with row-major `weight` `[m, k]`, activation `x` `[n, k]`, and output
+/// `y` `[n, m]` (the `[n_batch, m_rows]` layout the kernel benches expect). Shared
+/// so kernel example/bench binaries stop each re-defining their own `cpu_gemm`.
+pub fn cpu_reference_gemm(weight: &[f32], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; n * m];
+    for b in 0..n {
+        for r in 0..m {
+            let mut acc = 0.0f32;
+            for c in 0..k {
+                acc += weight[r * k + c] * x[b * k + c];
+            }
+            y[b * m + r] = acc;
+        }
+    }
+    y
+}

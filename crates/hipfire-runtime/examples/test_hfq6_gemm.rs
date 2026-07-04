@@ -86,19 +86,8 @@ fn cpu_dequant(q: &[u8], m: usize, k: usize) -> Vec<f32> {
     out
 }
 
-fn cpu_gemm(w: &[f32], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut y = vec![0.0f32; n * m];
-    for b in 0..n {
-        for r in 0..m {
-            let mut acc = 0.0f32;
-            for c in 0..k {
-                acc += w[r * k + c] * x[b * k + c];
-            }
-            y[b * m + r] = acc;
-        }
-    }
-    y
-}
+// Shared CPU-reference GEMM oracle (was a local copy of this exact loop).
+use hipfire_cpu::cpu_reference_gemm as cpu_gemm;
 
 fn max_err(a: &[f32], b: &[f32]) -> (f32, usize, usize) {
     let mut maxe = 0.0f32;

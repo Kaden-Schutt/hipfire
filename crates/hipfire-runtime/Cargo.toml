@@ -112,6 +112,7 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # features above and `required-features` on each `[[example]]` block
 # below.
 [dev-dependencies]
+hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }

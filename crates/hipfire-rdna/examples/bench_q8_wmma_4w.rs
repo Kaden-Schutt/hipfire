@@ -70,19 +70,6 @@ fn f32_to_f16_bytes(f: &[f32]) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-fn cpu_gemm(a: &[f32], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut y = vec![0f32; n * m];
-    for ni in 0..n {
-        for mi in 0..m {
-            let mut s = 0.0f32;
-            for ki in 0..k {
-                s += a[mi * k + ki] * x[ni * k + ki];
-            }
-            y[ni * m + mi] = s;
-        }
-    }
-    y
-}
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");

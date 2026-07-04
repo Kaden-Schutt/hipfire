@@ -1969,6 +1969,7 @@ dependencies = [
  "hipfire-arch-zaya",
  "hipfire-atlas",
  "hipfire-coherence",
+ "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-evidence",
