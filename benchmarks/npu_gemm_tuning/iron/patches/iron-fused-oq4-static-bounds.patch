@@ -1,0 +1,178 @@
+diff --git a/iron/common/compilation/fusion.py b/iron/common/compilation/fusion.py
+index fdb6c8a..bff6ee2 100644
+--- a/iron/common/compilation/fusion.py
++++ b/iron/common/compilation/fusion.py
+@@ -12,7 +12,7 @@ import importlib.util
+ from functools import partial
+ from pathlib import Path
+ from aie import ir
+-from aie.dialects import aie, aiex, memref
++from aie.dialects import aie, aiex, memref, arith
+ from aie.extras.context import mlir_mod_ctx
+ import ml_dtypes
+ 
+@@ -127,16 +127,17 @@ def fuse_mlir(artifact: FusedMLIRSource) -> None:
+         # Create the main device -- this contains the runtime sequence calling into the other devices
+         @aie.device(device_ty)
+         def main():
+-            buf_dtype = np.dtype[
+-                ml_dtypes.bfloat16
+-            ]  # TODO: support for other data types
+-            itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
++            # Byte-typed (i8) consolidated buffers so fused ops can carve inputs of
++            # ANY element dtype (int4-packed uint8 weights + bf16 activations, etc.)
++            # via memref.view. Was bf16-only (broke on non-bf16 inputs).
++            buf_dtype = np.dtype[np.int8]  # signless i8 byte buffer (memref.view req)
++            itemsize = 1
+ 
+             # RuntimeSequenceOp
+             @aiex.runtime_sequence(
+-                np.ndarray[(input_buffer_size // itemsize,), buf_dtype],
+-                np.ndarray[(output_buffer_size // itemsize,), buf_dtype],
+-                np.ndarray[(scratch_buffer_size // itemsize,), buf_dtype],
++                np.ndarray[(input_buffer_size,), buf_dtype],
++                np.ndarray[(output_buffer_size,), buf_dtype],
++                np.ndarray[(scratch_buffer_size,), buf_dtype],
+             )
+             def sequence(input_buf, output_buf, scratch_buf):
+                 consolidated_buffers = {
+@@ -182,18 +183,9 @@ def fuse_mlir(artifact: FusedMLIRSource) -> None:
+                                     buf_name
+                                 ]
+ 
+-                            # Subview Op
+                             consolidated_buf = consolidated_buffers[buf_type]
+-                            offset_elements = offset // itemsize
+-                            size_elements = length // itemsize
+-                            subview = memref.subview(
+-                                consolidated_buf,
+-                                [offset_elements],
+-                                [size_elements],
+-                                [1],
+-                            )
+ 
+-                            # Reinterpret_cast Op
++                            # Expected (per-op) memref type + element byte width
+                             target_type = expected_arg_types[idx]
+                             expected_memref = ir.MemRefType(target_type)
+                             target_shape = [
+@@ -201,28 +193,35 @@ def fuse_mlir(artifact: FusedMLIRSource) -> None:
+                                 for i in range(expected_memref.rank)
+                             ]
+                             expected_size = np.prod(target_shape)
++                            # Per-input dtype: the consolidated buffer is bf16, but a
++                            # fused op input may be another dtype (e.g. int4-packed
++                            # uint8 weights for Oq4). Use the target element type's
++                            # byte width and compare in BYTES, not bf16 elements.
++                            target_elem_type = expected_memref.element_type
++                            # byte width from the type's trailing bit count:
++                            # "i8"->1, "bf16"/"f16"->2, "f32"->4
++                            _digits = "".join(
++                                c for c in str(target_elem_type) if c.isdigit()
++                            )
++                            target_itemsize = max(
++                                1, (int(_digits) if _digits else 16) // 8
++                            )
+                             assert (
+-                                expected_size == size_elements
+-                            ), f"Size mismatch for buffer '{buf_name}': MLIR runtime sequence expected {expected_size}, Python fused operator provided {size_elements}"
+-                            strides = []
+-                            stride = 1
+-                            for dim in reversed(target_shape):
+-                                strides.insert(0, stride)
+-                                stride *= dim
++                                expected_size * target_itemsize == length
++                            ), f"Size mismatch for buffer '{buf_name}': MLIR expected {expected_size * target_itemsize} B, layout has {length} B"
++
++                            # Byte-addressed view: carve the op's typed memref out of
++                            # the i8 consolidated buffer at `offset` bytes. Works for
++                            # any element dtype (unlike reinterpret_cast, which cannot
++                            # change element type).
++                            byte_shift = arith.constant(ir.IndexType.get(), offset)
+                             result_type = ir.MemRefType.get(
+-                                target_shape, ir.BF16Type.get()
++                                target_shape, target_elem_type
+                             )
+-                            reinterpreted = memref.reinterpret_cast(
+-                                result=result_type,
+-                                source=subview,
+-                                offsets=[],
+-                                sizes=[],
+-                                strides=[],
+-                                static_offsets=[0],
+-                                static_sizes=target_shape,
+-                                static_strides=strides,
++                            viewed = memref.view(
++                                result_type, consolidated_buf, byte_shift, []
+                             )
+-                            buffer_ssa_values.append(reinterpreted)
++                            buffer_ssa_values.append(viewed)
+ 
+                         # Run Op
+                         sequence_sym_ref_attr = ir.FlatSymbolRefAttr.get("sequence")
+diff --git a/iron/operators/dequant/design.py b/iron/operators/dequant/design.py
+index 65a92ff..eb7eab5 100644
+--- a/iron/operators/dequant/design.py
++++ b/iron/operators/dequant/design.py
+@@ -18,6 +18,7 @@ def my_dequant_kernel(
+     trace_size,
+     tile_size,
+     group_size,
++    func_prefix="",
+ ):
+     per_tile_elements = (
+         16384 if tile_size > 16384 else tile_size
+@@ -62,8 +63,8 @@ def my_dequant_kernel(
+ 
+     # AIE Core Function declaration
+     dequant_kernel = Kernel(
+-        "expand_int4_to_bfloat16",
+-        f"expand_aie2_{tile_size}.o",
++        f"{func_prefix}expand_int4_to_bfloat16",
++        f"{func_prefix}expand_aie2_{tile_size}.o",
+         [in_tile_ty, out_tile_ty],
+     )
+ 
+diff --git a/iron/operators/gemm/design.py b/iron/operators/gemm/design.py
+index b320d35..60fa04b 100644
+--- a/iron/operators/gemm/design.py
++++ b/iron/operators/gemm/design.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import argparse
++import os
+ from pathlib import Path
+ 
+ from ml_dtypes import bfloat16
+@@ -23,6 +24,13 @@ from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
+ from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
+ from aie.iron.controlflow import range_
+ 
++# When set, bake compile-time-constant reduction/tile loop trip counts instead of
++# reading them from RTP buffers. A dynamic (RTP-driven) loop bound around an
++# objectfifo.acquire makes aie-objectFifo-stateful-transform's unrollForLoops
++# abort (Xilinx/mlir-aie#3281); constant bounds lower cleanly. Safe only for a
++# fixed-shape xclbin (loses runtime size-generality).
++_STATIC_LOOP_BOUNDS = os.environ.get("IRON_GEMM_STATIC_BOUNDS", "") not in ("", "0")
++
+ microkernel_mac_dim_map = {
+     "npu1": {
+         "bf16": (4, 8, 4),
+@@ -455,8 +463,14 @@ def my_matmul(
+         elem_out_internal,
+     ):
+         barrier.wait_for_value(1)
+-        rtp_K_div_k = my_rtp[0]
+-        rtp_n_tiles_per_core = my_rtp[1]
++        if _STATIC_LOOP_BOUNDS:
++            # Same values set_rtps() would write, but as compile-time constants so
++            # the acquire's enclosing loops have static bounds (mlir-aie#3281).
++            rtp_K_div_k = K // k
++            rtp_n_tiles_per_core = (M // mem_tile_m_C) * (N // mem_tile_n)
++        else:
++            rtp_K_div_k = my_rtp[0]
++            rtp_n_tiles_per_core = my_rtp[1]
+         loop = range(1)  # Workaround for issue #1547
+         if rtp_n_tiles_per_core > 1:
+             loop = range_(rtp_n_tiles_per_core)

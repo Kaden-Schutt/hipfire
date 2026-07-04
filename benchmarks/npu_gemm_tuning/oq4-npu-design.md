@@ -111,6 +111,24 @@
 >      emit constant loop bounds (bake M/K/N, drop RTP loads) → fused feed-win Oq4
 >      compiles today. Falls back to upstream #3281 fix only if IRON can't be
 >      coerced to static bounds.
+>      **SPIKE DONE — workaround CONFIRMED past #3281; next blocker is IRON fusion
+>      infra, not the compiler:** patched IRON GEMM `core_fn` to bake constant loop
+>      bounds behind `IRON_GEMM_STATIC_BOUNDS=1` (`gemm/design.py`; full patch saved
+>      `iron/patches/iron-fused-oq4-static-bounds.patch`). Re-drove the fused Oq4
+>      compile: the objectFifo unroll crash is GONE — the fused design lowers
+>      through objectFifo transform, L1 bank-alloc (small cfgs), and ALL per-core
+>      Peano ELFs generate (`op0_Dequant`+`op1_GEMM_core_0_2..0_5` "Generated ELF").
+>      Two NEW blockers, both from IRON's generic `FusedMLIROperator` MATERIALIZING
+>      the `Wdeq` intermediate (`buffer_sizes={"Wdeq":KN*2}`): (a) 64KB L1 overflow
+>      at 512³ (bank-aware alloc fails); (b) at small cfgs the NPU shim-DMA lowering
+>      rejects it — `'aie.dma_bd' op Buffer argument must be a constant aie.buffer …
+>      or subview with constant offsets` — the `memref.view` byte-shift
+>      consolidation isn't a valid DMA-BD buffer form. STRATEGIC: the feed-win's
+>      whole point is to NOT materialize Wdeq; IRON's materialize-then-consolidate
+>      fusion is the wrong vehicle — a real feed-win needs a hand-fused streaming
+>      kernel (int4→unpack→matmul in-core, no L1 intermediate). #3281 is no longer
+>      the gate; fusion-infra/kernel-authoring is. Repro:
+>      `iron/oq4_fused_gemm_param.py` (env M/K/N/T/GS/NCH/COLS).
 >   6. **.ll INSPECTED (iron/expand_int4_bf16.aie2p.ll):** the Oq4 dequant kernel
 >      (`aie_kernels/generic/expand.cc`, `aie::unpack` on a native `uint4` vector)
 >      lowers to NATIVE aie2p intrinsics, fully 32-lane vectorized:
