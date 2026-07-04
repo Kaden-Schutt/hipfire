@@ -981,6 +981,9 @@ pub struct DsparkDrafter {
     temp: f32,
     top_p: f32,
     top_k: usize,
+    /// CACTUS acceptance-boost δ (0 = lossless). Applied only in the sampled
+    /// (temp>0) verify via `verify_block_sampled_capture_gpu`.
+    cactus: f32,
     /// RNG for the sampled verify's categorical draw. Fixed seed per drafter
     /// (mirrors the DFlash speculator) so a warm run is reproducible.
     rng_state: u64,
@@ -1207,6 +1210,7 @@ impl MtpDrafter for DsparkDrafter {
                 self.temp,
                 self.top_p,
                 self.top_k,
+                self.cactus,
                 &mut self.rng_state,
                 &capture_buf,
             )?
@@ -1330,10 +1334,11 @@ impl MtpDrafter for DsparkDrafter {
     // ==false; returning true here would mislabel DSpark as SWOR and drop the
     // nucleus controls.
 
-    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize) {
+    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, cactus_delta: f32) {
         self.temp = temp;
         self.top_p = top_p;
         self.top_k = top_k;
+        self.cactus = cactus_delta;
     }
 }
 
@@ -1376,6 +1381,7 @@ pub fn build_dspark_speculator(
         temp: 0.0,
         top_p: 1.0,
         top_k: 0,
+        cactus: 0.0,
         rng_state: 0x13579BDF,
         block,
         ctx_capacity,

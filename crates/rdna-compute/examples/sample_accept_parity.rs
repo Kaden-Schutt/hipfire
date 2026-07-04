@@ -92,6 +92,79 @@ fn upload_u32(gpu: &mut Gpu, data: &[u32]) -> GpuTensor {
     t
 }
 
+/// δ>0 CACTUS distribution check. With `cactus_delta > 0` the fused kernel must
+/// draw the committed token from the BOOSTED distribution — accept the drafted
+/// token with prob `min(p_t + √(2δ·p_t·(1−p_t)), 1)`, else a residual over the
+/// target support with the drafted token removed — NOT the plain target. A kernel
+/// that ignored `cactus_delta` would match the δ=0 target and FAIL the `> 0.30`
+/// leg. Controlled 3-token target (A=draft, p_t=0.3) so the boost is unmissable.
+fn cactus_distribution_check(gpu: &mut Gpu) -> bool {
+    const N_SAMPLES: usize = 10_000;
+    let (a, b, c) = (100usize, 200usize, 300usize);
+    let (pa, pb, pc) = (0.3f32, 0.5f32, 0.2f32); // target probs; drafted token = a
+    let delta = 1.0f32;
+
+    // n=2: pos 0 is the accept row (draft[1]=a); pos 1 is the bonus row. out[0] is
+    // the CACTUS-distributed token either way (accept→a, reject→residual then stop).
+    let mut logits = vec![-1.0e30f32; 2 * VOCAB];
+    for base in [0usize, VOCAB] {
+        logits[base + a] = pa.ln();
+        logits[base + b] = pb.ln();
+        logits[base + c] = pc.ln();
+    }
+    let logits_t = gpu.upload_f32(&logits, &[2, VOCAB]).expect("upload cactus logits");
+    let draft_buf = upload_u32(gpu, &[0u32, a as u32]); // draft[1] = a
+    let out_buf = gpu.zeros(&[3], DType::F32).expect("cactus out_buf");
+
+    // Analytic distributions of out[0].
+    let p_t = pa;
+    let accept_prob = (p_t + (2.0 * delta * p_t * (1.0 - p_t)).sqrt()).min(1.0);
+    let resid = pb + pc; // support minus the drafted token, unnormalized
+    let mut theory_cactus = vec![0.0f32; VOCAB];
+    theory_cactus[a] = accept_prob;
+    theory_cactus[b] = (1.0 - accept_prob) * (pb / resid);
+    theory_cactus[c] = (1.0 - accept_prob) * (pc / resid);
+    let mut theory_delta0 = vec![0.0f32; VOCAB];
+    theory_delta0[a] = pa;
+    theory_delta0[b] = pb;
+    theory_delta0[c] = pc;
+
+    let mut hist = vec![0u32; VOCAB];
+    for s_idx in 0..N_SAMPLES {
+        // Spread seeds across u32 (Knuth multiplicative hash). The kernel's accept
+        // draw u1 is ONE xorshift step from the seed; consecutive seeds through a
+        // single xorshift are poorly decorrelated and would bias the empirical
+        // accept rate (the real path threads a well-mixed RNG across windows).
+        let seed = (s_idx as u32)
+            .wrapping_mul(2654435761)
+            .wrapping_add(0x9E37_79B9);
+        let (ids, _rng) = gpu
+            .sample_accept_lazy_f32(&logits_t, &draft_buf, &out_buf, 2, VOCAB, 1.0, 1.0, None, seed, delta)
+            .expect("sample_accept_lazy_f32 cactus");
+        let t0 = ids[0] as usize;
+        if t0 < VOCAB {
+            hist[t0] += 1;
+        }
+    }
+    let _ = gpu.free_tensor(out_buf);
+    let _ = gpu.free_tensor(draft_buf);
+    let _ = gpu.free_tensor(logits_t);
+
+    let tv = |hist: &[u32], theory: &[f32]| -> f32 {
+        let nn = N_SAMPLES as f32;
+        0.5 * (0..VOCAB).map(|i| (hist[i] as f32 / nn - theory[i]).abs()).sum::<f32>()
+    };
+    let tv_cactus = tv(&hist, &theory_cactus);
+    let tv_delta0 = tv(&hist, &theory_delta0);
+    let pass = tv_cactus < 0.03 && tv_delta0 > 0.30;
+    println!(
+        "[cactus δ={delta}] accept_prob={accept_prob:.4}  TV(GPU vs CACTUS)={tv_cactus:.5}  \
+         TV(GPU vs δ0)={tv_delta0:.5}  (want cactus<0.03, δ0>0.30)  {}",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reference uses the DEFAULT parallel sampler (production path on gfx1151);
     // it is byte-identical to the single-block draw the fused kernel mirrors for
@@ -154,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let draft_buf = upload_u32(&mut gpu, draft);
                 let out_buf = gpu.zeros(&[n + 1], DType::F32)?;
                 let (fused_ids, fused_rng) = gpu.sample_accept_lazy_f32(
-                    &logits, &draft_buf, &out_buf, n, VOCAB, temp, top_p, top_k, seed,
+                    &logits, &draft_buf, &out_buf, n, VOCAB, temp, top_p, top_k, seed, 0.0,
                 )?;
 
                 cases += 1;
@@ -172,11 +245,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("checked {cases} cases, {fails} mismatch(es)");
+    // δ>0 CACTUS distribution check (the feature added on top of the δ=0 kernel).
+    let cactus_ok = cactus_distribution_check(&mut gpu);
+    if !cactus_ok {
+        fails += 1;
+    }
+
+    println!("checked {cases} byte-parity cases + 1 cactus check, {fails} failure(s)");
     if fails > 0 {
-        eprintln!("\nFAIL: fused sample+accept kernel is NOT byte-identical to sample_top_p_pf");
+        eprintln!("\nFAIL: fused sample+accept kernel is NOT byte-identical to sample_top_p_pf (or CACTUS check failed)");
         std::process::exit(1);
     }
-    println!("\nPASS: dspark_sample_accept_lazy_f32 byte-identical to per-position sample_top_p_pf");
+    println!("\nPASS: dspark_sample_accept_lazy_f32 byte-identical at δ=0 AND matches CACTUS at δ>0");
     Ok(())
 }

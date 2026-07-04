@@ -203,6 +203,9 @@ impl SpecTarget for LlamaBundle {
         temp: f32,
         top_p: f32,
         top_k: usize,
+        // llama/qwen3 sampled verify runs the per-position `sample_top_p_pf` path,
+        // which does not implement the CACTUS boost — ignored here (deepseek4-only).
+        _cactus_delta: f32,
         rng_state: &mut u64,
         hidden_gpu: &GpuTensor,
     ) -> Result<(Vec<u32>, bool), String> {

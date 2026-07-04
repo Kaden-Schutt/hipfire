@@ -7935,6 +7935,10 @@ pub fn final_norm_and_sample_all_batched_lazy(
     temp: f32,
     top_p: f32,
     top_k: usize,
+    // CACTUS acceptance-boost δ (0 = lossless/byte-identical). Plumbed from
+    // `Speculator::set_sampling` via the drafter + `verify_block_sampled_capture_gpu`.
+    // Deliberately lossy at δ>0 (trades distribution fidelity for higher τ).
+    cactus_delta: f32,
     rng: &mut u32,
     result_buf: &GpuTensor,
     repeat_buf: &GpuTensor,
@@ -8039,6 +8043,7 @@ pub fn final_norm_and_sample_all_batched_lazy(
             top_p_eff,
             top_k_opt,
             *rng,
+            cactus_delta,
         )
         .map_err(|e| format!("sample_accept_lazy_f32: {e:?}"))?;
     *rng = new_rng;

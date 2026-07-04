@@ -50,7 +50,8 @@ extern "C" __global__ void dspark_sample_accept_lazy_f32(
     float temperature,
     float top_p,
     unsigned int rand_seed,
-    int top_k_req                     // <=0 or >=TOP_K means "no extra cut" (20 → legacy nucleus)
+    int top_k_req,                    // <=0 or >=TOP_K means "no extra cut" (20 → legacy nucleus)
+    float cactus_delta                // >0 → CACTUS acceptance boost (bench-only, deliberately lossy)
 ) {
     const int TOP_K = 64;
     extern __shared__ char smem[];
@@ -178,15 +179,66 @@ extern "C" __global__ void dspark_sample_accept_lazy_f32(
                         trunc_sum += probs[order[i]];
                         if (trunc_sum >= p_thresh) { trunc_k = i + 1; break; }
                     }
-                    float r = (float)rng / 4294967295.0f * trunc_sum;
-                    float cum = 0.0f;
-                    int picked = trunc_k - 1; // FP tail fallback: last top-p entry
-                    for (int i = 0; i < trunc_k; i++) {
-                        cum += probs[order[i]];
-                        if (cum >= r) { picked = i; break; }
+                    if (cactus_delta > 0.0f && pos + 1 < n) {
+                        // ── CACTUS boosted accept vs the point-mass draft d ──────
+                        // The draft is deterministic (a point mass), so the general
+                        // rejection-sampling CACTUS (chain_accept_spec.hip) reduces to:
+                        //   accept d with prob min(p_t + sqrt(2·δ·p_t·(1−p_t)), 1);
+                        //   on reject, draw the bonus from the target support with d
+                        //   removed and renormalized (== the h-distribution residual
+                        //   for a point-mass draft — the residual algebra collapses to
+                        //   "p_target minus the drafted token"). Deliberately lossy: it
+                        //   commits d more often than the true target warrants, trading
+                        //   distribution fidelity for higher acceptance τ.
+                        unsigned int d = draft[pos + 1];
+                        float p_t = 0.0f;
+                        for (int i = 0; i < trunc_k; i++) {
+                            if ((unsigned int)idx[order[i]] == d) {
+                                p_t = probs[order[i]] / trunc_sum;
+                                break;
+                            }
+                        }
+                        float bump = (p_t > 0.0f && p_t < 1.0f)
+                            ? sqrtf(2.0f * cactus_delta * p_t * (1.0f - p_t)) : 0.0f;
+                        float accept_prob = fminf(p_t + bump, 1.0f);
+                        // `rng` was advanced once above (line ~161); reuse as u1.
+                        float u1 = (float)rng / 4294967295.0f;
+                        if (u1 < accept_prob) {
+                            // Accept → commit d. tok_out == draft[pos+1] so the stop
+                            // check below does NOT fire (the prefix continues).
+                            tok_out = d;
+                            rng_out = rng;
+                        } else {
+                            // Reject → residual over the support with d removed,
+                            // renormalized. tok_out != d → the stop check fires.
+                            rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                            float rs = 0.0f;
+                            for (int i = 0; i < trunc_k; i++)
+                                if ((unsigned int)idx[order[i]] != d) rs += probs[order[i]];
+                            float r2 = (float)rng / 4294967295.0f * rs;
+                            float cum = 0.0f;
+                            int picked = -1;
+                            for (int i = 0; i < trunc_k; i++) {
+                                if ((unsigned int)idx[order[i]] == d) continue;
+                                cum += probs[order[i]];
+                                if (cum >= r2) { picked = order[i]; break; }
+                            }
+                            // picked<0 only if the support is {d} alone (rs≈0); then
+                            // there is nothing else to draw — fall back to d.
+                            tok_out = (picked >= 0) ? (unsigned int)idx[picked] : d;
+                            rng_out = rng;
+                        }
+                    } else {
+                        float r = (float)rng / 4294967295.0f * trunc_sum;
+                        float cum = 0.0f;
+                        int picked = trunc_k - 1; // FP tail fallback: last top-p entry
+                        for (int i = 0; i < trunc_k; i++) {
+                            cum += probs[order[i]];
+                            if (cum >= r) { picked = i; break; }
+                        }
+                        tok_out = (unsigned int)idx[order[picked]];
+                        rng_out = rng;
                     }
-                    tok_out = (unsigned int)idx[order[picked]];
-                    rng_out = rng;
                 }
             }
 

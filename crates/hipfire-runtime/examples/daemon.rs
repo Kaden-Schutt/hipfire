@@ -1783,6 +1783,15 @@ fn main() {
                     .get("top_p")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_top_p) as f32;
+                // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
+                // default = lossless/distribution-preserving. >0 is deliberately lossy
+                // (higher acceptance τ, KL-bounded distortion) and applies only to a
+                // CACTUS-capable sampled verify (deepseek4 DSpark / qwen35 DFlash);
+                // other drafters ignore it. Never a default.
+                let cactus_delta = msg
+                    .get("cactus_delta")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -2144,6 +2153,7 @@ fn main() {
                         top_p,
                         top_k,
                         min_p,
+                        cactus_delta,
                         max_tokens,
                         repeat_penalty,
                         repeat_window,
@@ -6560,6 +6570,9 @@ fn generate(
     top_p: f32,
     top_k: Option<u32>,
     min_p: Option<f32>,
+    // CACTUS acceptance-boost δ (0 = lossless). Request opt-in; applies only to a
+    // CACTUS-capable sampled verify (deepseek4 DSpark / qwen35 DFlash).
+    cactus_delta: f32,
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
@@ -6668,7 +6681,7 @@ fn generate(
             temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -6724,7 +6737,16 @@ fn generate(
                       // unified `generate_spec`; the AR sampler path (temp>0) and the
                       // no-speculator fallback stay in the bespoke `generate_deepseek4` (T5
                       // deletes the latter's now-redundant spec loop).
-        let spec_mode = deepseek4_spec_requested(m) && temp <= 1e-6;
+                      // Route to the DSpark/MTP spec loop for greedy OR — now un-gated — for
+                      // temp>0 when the loaded speculator can sample its verify. DSpark
+                      // signals this via `requires_greedy()==false` (its sampled verify is the
+                      // "chain" kind, NOT the ddtree-SWOR flavour that `supports_temp_verify()`
+                      // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
+                      // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
+                      // was hardcoded greedy-only (temp>0 → AR).
+        let spec_temp_ok =
+            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
+        let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(
                 m,
@@ -6734,6 +6756,10 @@ fn generate(
                 prompt,
                 system_prompt,
                 max_tokens,
+                temp,
+                top_p,
+                top_k.map(|k| k as usize).unwrap_or(0),
+                cactus_delta,
                 think_mode,
                 tools,
                 messages_history,
@@ -6785,7 +6811,7 @@ fn generate(
             temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -6850,7 +6876,7 @@ fn generate(
             temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -6913,7 +6939,7 @@ fn generate(
             temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -7239,7 +7265,7 @@ fn generate(
             temp, // request-resolved temp: ddtree mode → SWOR (temp-only); chain mode → lossless rejection-sampling
             top_p, // nucleus cutoff: honored on the chain sampled path (ignored by the ddtree SWOR arm)
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (chain path; recipe → folded into tau)
-            0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume. top_p IS now applied to the spec sampling (nucleus on both
@@ -9797,6 +9823,7 @@ fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
 /// the `Deepseek4Bundle` target (via `spec_target_guard`), and `Deepseek4Emit`.
 /// Greedy-only — the dispatch routes here only at `temp <= 1e-6`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn generate_deepseek4_spec(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -9805,6 +9832,12 @@ fn generate_deepseek4_spec(
     prompt: &str,
     system_prompt: Option<&str>,
     max_tokens: usize,
+    // Sampling: temp<=1e-6 → greedy (argmax-accept, byte-identical to before);
+    // temp>0 → DSpark sampled verify. cactus_delta is the opt-in acceptance boost.
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    cactus_delta: f32,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -9919,6 +9952,13 @@ fn generate_deepseek4_spec(
             None
         };
 
+    // Configure the speculator's sampling before the loop — mirrors generate_dflash's
+    // set_sampling before generate_spec. Greedy (temp<=1e-6) leaves it at argmax-accept
+    // (byte-identical to the prior hardcoded-greedy path); temp>0 drives the DSpark
+    // sampled verify, and cactus_delta>0 applies the opt-in acceptance boost.
+    if let Some(spec) = m.speculator.as_mut() {
+        spec.set_sampling(temp, top_p, top_k, cactus_delta);
+    }
     let prompt_tokens_total = prompt_ids.len();
     let run = match generate_spec(
         m,
@@ -9940,7 +9980,7 @@ fn generate_deepseek4_spec(
             think_mode,
             decoded_vocab,
         },
-        0.0, // ds4 MTP spec is greedy-only (routed at temp<=1e-6); temp ignored
+        temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.

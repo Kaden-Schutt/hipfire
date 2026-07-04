@@ -761,6 +761,7 @@ impl Gpu {
         top_p: f32,
         top_k: Option<u32>,
         rng_state: u32,
+        cactus_delta: f32, // >0 → CACTUS acceptance boost (bench-only, deliberately lossy)
     ) -> HipResult<(Vec<u32>, u32)> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -780,6 +781,7 @@ impl Gpu {
         let mut tp = top_p;
         let mut rng = rng_state;
         let mut tk = top_k_req;
+        let mut cd = cactus_delta;
 
         let mut params: Vec<*mut c_void> = vec![
             &mut lp as *mut _ as *mut c_void,
@@ -791,6 +793,7 @@ impl Gpu {
             &mut tp as *mut _ as *mut c_void,
             &mut rng as *mut _ as *mut c_void,
             &mut tk as *mut _ as *mut c_void,
+            &mut cd as *mut _ as *mut c_void,
         ];
 
         // 1 block × 64 threads; LDS = 64 * 64 * 8 = 32 KiB. The single-block
@@ -819,6 +822,7 @@ impl Gpu {
                 b.push_f32(tp);
                 b.push_u32(rng);
                 b.push_i32(tk);
+                b.push_f32(cd);
                 b
             },
         )?;
@@ -994,7 +998,14 @@ impl Gpu {
         big_n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(big_n >= 1 && big_n <= 4096, "ddtree_build_attn_mask: big_n={big_n} out of range");
+        // The kernel launches blockDim.x = big_n (one thread per tree row); AMD
+        // hardware caps blockDim.x at 1024. In practice big_n = 1 + max_budget ≤ 61,
+        // so 1024 is already generous — a larger value would otherwise fail the
+        // launch with an opaque invalid-configuration error instead of this assert.
+        assert!(
+            big_n >= 1 && big_n <= 1024,
+            "ddtree_build_attn_mask: big_n={big_n} exceeds the 1024 blockDim.x cap (big_n = 1 + max_budget, normally ≤ 61)"
+        );
         self.ensure_kernel(
             "ddtree_build_attn_mask",
             kernels::DDTREE_BUILD_ATTN_MASK_SRC,

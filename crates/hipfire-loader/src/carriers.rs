@@ -633,6 +633,14 @@ impl Carrier for LlamaCarrier {
                         eprintln!("  llama: WARNING cannot open DSpark sidecar {p:?}: {e}");
                     }
                 }
+            } else if ctx.spec.dspark == Some(true) {
+                // Forced `--spec dspark` but the sidecar file is absent → we would
+                // silently run AR. Warn (auto/`None` stays quiet — a missing sidecar
+                // is the expected no-op there).
+                eprintln!(
+                    "  llama: WARNING `--spec dspark` requested but no `-dspark` sidecar found \
+                     (expected `<stem>-dspark.<ext>` next to the model) — falling back to AR/other drafter"
+                );
             }
         }
 
@@ -958,6 +966,15 @@ impl Carrier for Deepseek4Carrier {
         // selector did not pick another mechanism (`ctx.spec.dspark != Some(false)`;
         // `None` = auto keeps the default-on behaviour). The threshold is the
         // CLI-forwarded `--dspark-conf-threshold` (env still wins in the builder).
+        // `--spec dspark` (forced) but the sidecar was absent → we silently ran
+        // AR before. Warn on the forced case only (auto/`None` legitimately falls
+        // back without a sidecar and must stay quiet).
+        if ctx.spec.dspark == Some(true) && weights.dspark.is_none() {
+            eprintln!(
+                "  deepseek4: WARNING `--spec dspark` requested but no `-dspark` sidecar was \
+                 loaded (expected `<stem>-dspark.<ext>` next to the model) — falling back to MTP/AR"
+            );
+        }
         let dspark_enabled = weights.dspark.is_some() && ctx.spec.dspark != Some(false);
         let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if dspark_enabled {
             let block = weights.dspark.as_ref().unwrap().cfg.block_size;
@@ -970,11 +987,13 @@ impl Carrier for Deepseek4Carrier {
                     block,
                     ctx_capacity,
                     ctx.spec.dspark_conf_threshold,
-                    // Serving stays greedy-only: ds4 DSpark temp>0 (sampled verify)
-                    // works but only wins on short/predictable prose — it loses to
-                    // AR on code (greedy ds4 already does). Gate off; temp>0 → AR.
-                    // The bench exercises it via supports_temp=true.
-                    false,
+                    // temp>0 sampled verify ENABLED in serving. The earlier "loses to
+                    // AR → gate off" reasoning was a fixed-block measurement artifact;
+                    // comprehensive temp=1.0 tests with the τ-adaptive block-depth
+                    // controller show ds4 DSpark temp>0 BEATS AR, and the opt-in CACTUS
+                    // acceptance-boost (request `cactus_delta`) adds more on top.
+                    // Distribution-preserving at cactus_delta=0 (the default).
+                    true,
                 )
                 .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
             )

@@ -394,6 +394,7 @@ pub trait SpecTarget {
         _temp: f32,
         _top_p: f32,
         _top_k: usize,
+        _cactus_delta: f32,
         _rng_state: &mut u64,
         _hidden_gpu: &GpuTensor,
     ) -> Result<(Vec<u32>, bool), String> {
@@ -784,7 +785,7 @@ pub trait MtpDrafter {
     /// [`MtpSpeculator`] forwards `set_sampling` + the per-step `temp` here so a
     /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default no-op
     /// (greedy-only drafters ignore it). `top_p==0` means "disabled" (→ 1.0).
-    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize) {}
+    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
 
     /// Whether this drafter's verify is distribution-correct at temp>0 (so the
     /// daemon may route temp>0 requests through it). Default `false`.
@@ -804,6 +805,9 @@ pub struct MtpSpeculator<A: MtpDrafter> {
     /// means disabled; greedy drafters ignore all three.
     top_p: f32,
     top_k: usize,
+    /// CACTUS acceptance-boost δ (0 = lossless). Forwarded to the drafter with
+    /// top_p/top_k; only a CACTUS-capable sampled verify (deepseek4 DSpark) uses it.
+    cactus: f32,
 }
 
 impl<A: MtpDrafter> MtpSpeculator<A> {
@@ -812,6 +816,7 @@ impl<A: MtpDrafter> MtpSpeculator<A> {
             arch,
             top_p: 1.0,
             top_k: 0,
+            cactus: 0.0,
         }
     }
 }
@@ -875,7 +880,8 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         // Forward the per-step temp + the request top_p/top_k (stashed by
         // `set_sampling`) to the drafter. Greedy-only drafters ignore it; a
         // temp>0-capable one (DSpark) uses it to sample its verify.
-        self.arch.set_sampling(temp, self.top_p, self.top_k);
+        self.arch
+            .set_sampling(temp, self.top_p, self.top_k, self.cactus);
         let window = self
             .arch
             .mtp_step(gpu, target, position, seed, k, eos, grammar)?;
@@ -907,11 +913,12 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         self.arch.supports_temp_verify()
     }
 
-    fn set_sampling(&mut self, _temp: f32, top_p: f32, top_k: usize, _cactus_delta: f32) {
-        // Stash top_p/top_k; temp arrives per-step via `step`. Forwarded to the
-        // drafter inside `step` (before `mtp_step`).
+    fn set_sampling(&mut self, _temp: f32, top_p: f32, top_k: usize, cactus_delta: f32) {
+        // Stash top_p/top_k/cactus; temp arrives per-step via `step`. Forwarded to
+        // the drafter inside `step` (before `mtp_step`).
         self.top_p = top_p;
         self.top_k = top_k;
+        self.cactus = cactus_delta;
     }
 }
 

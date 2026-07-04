@@ -155,6 +155,7 @@ impl Deepseek4Bundle {
         temp: f32,
         top_p: f32,
         top_k: usize,
+        cactus_delta: f32,
         rng_state: &mut u64,
     ) -> Result<Vec<u32>, String> {
         let result_buf = gpu
@@ -175,6 +176,7 @@ impl Deepseek4Bundle {
             temp,
             top_p,
             top_k,
+            cactus_delta,
             &mut rng32,
             &result_buf,
             &repeat_buf,
@@ -377,6 +379,7 @@ impl SpecTarget for Deepseek4Bundle {
         temp: f32,
         top_p: f32,
         top_k: usize,
+        cactus_delta: f32,
         rng_state: &mut u64,
         hidden_gpu: &GpuTensor,
     ) -> Result<(Vec<u32>, bool), String> {
@@ -398,7 +401,15 @@ impl SpecTarget for Deepseek4Bundle {
             }
         }
 
-        let picks = self.dspark_verify_sample_lazy(gpu, block, temp, top_p, top_k, rng_state)?;
+        let picks = self.dspark_verify_sample_lazy(
+            gpu,
+            block,
+            temp,
+            top_p,
+            top_k,
+            cactus_delta,
+            rng_state,
+        )?;
         Ok((picks, captured))
     }
 
