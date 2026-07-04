@@ -364,19 +364,19 @@ pub fn run_generate_batch_decode_step_qwen35(
         envelope.session_count,
     )?;
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
-        && m.arch_id == 5
+        && is_qwen35_dense_arch_id(m.arch_id)
         && envelope.session_count >= 2
     {
         qwen35_save_active_session(m, gpu)?;
     }
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
-        && m.arch_id == 6
+        && is_qwen35_moe_arch_id(m.arch_id)
         && qwen35_grouped_moe_decode_auto_latency_gate_passed(envelope.session_count)
     {
         qwen35_save_active_session(m, gpu)?;
     }
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
-        && m.arch_id == 5
+        && is_qwen35_dense_arch_id(m.arch_id)
         && envelope.session_count >= 2
         && validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count).is_ok()
         && validate_qwen35_fused_dense_decode_resident_sessions(m, envelope).is_ok()
@@ -384,7 +384,7 @@ pub fn run_generate_batch_decode_step_qwen35(
         backend = Qwen35DecodeBatchBackend::FusedDenseLayerChunked;
     }
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
-        && m.arch_id == 6
+        && is_qwen35_moe_arch_id(m.arch_id)
         && qwen35_grouped_moe_decode_auto_latency_gate_passed(envelope.session_count)
         && validate_qwen35_grouped_moe_decode_model_capability(
             m,

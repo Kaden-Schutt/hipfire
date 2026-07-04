@@ -23,7 +23,13 @@ use hipfire_arch_qwen35::speculative;
 use hipfire_generate::eos_filter::EosFilter;
 use hipfire_generate::loop_guard::StopReason;
 use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig};
-use hipfire_model::is_qwen35_family_arch_id;
+#[cfg(feature = "arch-lfm2moe")]
+use hipfire_model::ARCH_ID_LFM2_MOE;
+use hipfire_model::{
+    is_qwen35_family_arch_id, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
+    ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2,
+    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+};
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
@@ -1888,7 +1894,7 @@ pub fn generate(
     // Qwen2 model. Route here BEFORE PFlash / DFlash / multi-GPU
     // / ChatML scaffolding since none of those are wired for
     // arch_id=7 yet (R3 bring-up scope).
-    if m.arch_id == 0 || m.arch_id == 1 {
+    if m.arch_id == ARCH_ID_LLAMA_MISTRAL || m.arch_id == ARCH_ID_QWEN3_QWEN2_LEGACY {
         // LLaMA / Mistral / plain-Qwen3 — routed through the ServingBackend seam
         // (P3.2). generate_llama applies the chat-framing then prefill +
         // decode_loop. Fast paths (DFlash/MTP/tools-execution) not on this path.
@@ -1919,7 +1925,7 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 16 {
+    if m.arch_id == ARCH_ID_ZAYA {
         // ZAYA1 — CCA attention + EDA/MoD MoE, routed through the shared
         // ServingBackend seam (same dense-AR path as nemotron). No fast paths.
         let _ = (
@@ -1949,7 +1955,7 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 14 || m.arch_id == 15 {
+    if m.arch_id == ARCH_ID_NEMOTRON_H || m.arch_id == ARCH_ID_MAMBA2 {
         // nemotron_h / mamba2 — routed through the Mamba-capable ServingBackend
         // seam, same dense-AR path as llama. Fast paths are not on this path.
         let _ = (
@@ -1979,7 +1985,7 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 7 {
+    if m.arch_id == ARCH_ID_QWEN2 {
         // Silence the qwen35/llama-only params we deliberately don't
         // honor on this path. See generate_qwen2 doc for the deferral
         // list.
@@ -2009,7 +2015,7 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 12 {
+    if m.arch_id == ARCH_ID_GEMMA3_TEXT {
         // arch_id=12 (gemma3 text, e.g. medgemma-*-text). Plain dense-AR via the
         // `ServingBackend::serve` seam — same short-circuit shape as qwen2 above.
         // PFlash / DFlash / VL / multi-GPU / tools / think-budget all bypass.
@@ -2039,7 +2045,7 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 13 {
+    if m.arch_id == ARCH_ID_GEMMA3_VL {
         // arch_id=13 (gemma3-vl / full MedGemma) with no media payload. Image and
         // video requests are routed in the daemon VL branch before calling this
         // text generate path; plain prompts reuse the VL backend's text-only
@@ -2070,7 +2076,7 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 9 {
+    if m.arch_id == ARCH_ID_DEEPSEEK4_FLASH {
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
         // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
         // / multi-GPU / sampler-budget / ChatML scaffolding all bypass.
@@ -2103,7 +2109,7 @@ pub fn generate(
         );
         return;
     }
-    if m.arch_id == 10 {
+    if m.arch_id == ARCH_ID_MINIMAX_M2 {
         // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
         // qwen2 / deepseek4 short-circuits above. PFlash / DFlash / VL /
         // multi-GPU / sampler-budget / grammar / tools-execution all bypass.
@@ -2137,7 +2143,7 @@ pub fn generate(
         return;
     }
     #[cfg(feature = "arch-lfm2moe")]
-    if m.arch_id == 11 {
+    if m.arch_id == ARCH_ID_LFM2_MOE {
         // arch_id=11 (LFM2.5-MoE). LFM2's arch-local path owns AR, deterministic
         // DFlash, and resident-session decode; VL / multi-GPU / sampler-budget /
         // grammar / tools-execution still bypass here. We honour `system_prompt`,
