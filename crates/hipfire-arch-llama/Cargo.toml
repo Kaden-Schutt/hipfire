@@ -8,5 +8,6 @@ description = "LLaMA / Mistral / plain-Qwen3 architecture for hipfire"
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
+hipfire-specdecode-dspark = { path = "../hipfire-specdecode-dspark" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-rdna = { path = "../hipfire-rdna" }

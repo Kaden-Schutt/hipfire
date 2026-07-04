@@ -1341,6 +1341,7 @@ dependencies = [
  "hipfire-arch-llama-spec",
  "hipfire-rdna",
  "hipfire-runtime",
+ "hipfire-specdecode-dspark",
 ]
 
 [[package]]
@@ -2113,6 +2114,8 @@ dependencies = [
  "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-specdecode",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
