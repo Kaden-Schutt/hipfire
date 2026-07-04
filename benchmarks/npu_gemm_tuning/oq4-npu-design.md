@@ -1,5 +1,34 @@
 # Oq4 → NPU: int4-to-register staging (buildable design)
 
+> **PIVOT (2026-07-04): use AMD IRON, not hand-wired whole_array.** IRON
+> (`third_party/IRON`) has the exact building blocks: an `operators/dequant`
+> that consumes `int4-packed + per-group scale` (= Oq4G256's layout, `group_size`
+> configurable to 256), an `operators/gemm`, operator **fusion**
+> (`FusedMLIROperator`), and Python host-buffer declaration (`AIERuntimeArgSpec`)
+> — which dissolves the `test.cpp` buffer-size friction below. **Both the gemm
+> and the int4 dequant operators RUN on this NPU** (confirmed). The hand-kernel
+> `oq4_dequant_mm.cc` + whole_array route below is now REFERENCE for the in-core
+> mechanics; the buildable path is IRON.
+>
+> **Working IRON setup on halo (hard-won — versions matter):**
+> - venv is **Python 3.14** (system `pyxrt` is cp314-only; py3.12 can't load it).
+> - install IRON's **pinned** `mlir_aie==0.0.1.2026033104+e4f35d6` (has
+>   `aie.iron.placers`; the newer 886d932 REMOVED it → `No module named
+>   'aie.iron.placers'`) + `llvm-aie==...2026062201` via `--find-links` (the
+>   GitHub `expanded_assets` pages are flat wheel lists, NOT pip indexes — using
+>   `--extra-index-url` gives "wrong package metadata" errors) + CPU torch + `-e .`.
+> - run env: activate venv, `PEANO_INSTALL_DIR=<venv>/.../llvm-aie`,
+>   `source /opt/xilinx/xrt/setup.sh`, **`PYTHONPATH=/opt/xilinx/xrt/python`**
+>   (system pyxrt). Then `pytest iron/operators/gemm/test.py -s`.
+> - The py3.14 mlir_aie native-binding segfault I hit earlier (conv `test.py`)
+>   does NOT recur with the March wheel + IRON's runtime — it runs clean.
+>
+> **Next (b): compose fused `dequant(group_size=256, int4→bf16)` → `gemm(bf16)`
+> via `FusedMLIROperator`, feed Oq4 weights, measure** — the first real
+> Oq4-on-NPU number. FWHT stays an activation-side op. See llama_3.2_1b/llama_npu.py
+> for the fusion pattern.
+
+
 Concrete design for feeding Oq4G256 weights to the Strix Halo NPU (aie2p) as
 **int4 all the way to the register file**, dequantizing in-core on the surplus
 compute. Grafts onto the mlir-aie `whole_array` matmul + `aie_kernels/aie2p/mm.cc`
