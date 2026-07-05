@@ -85,13 +85,23 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
        *i-1* back, so the host C read-back overlaps dispatch *i* on the NPU. The
        flattened loop also skips the per-dispatch W memcpy when the slab is unchanged
        (single-K-chunk + one N-block reuses one W across all M-blocks). 6.02 → 3.22 ms.
+     - **Input-sync skip DONE; C-sync is load-bearing.** `submit_synced(args, mask)`
+       flushes only changed inputs (A every dispatch, W only when the slab is re-copied).
+       The output-C `sync_bo` canNOT be skipped — it doubles as the read-back cache
+       reconcile; without it the result is total garbage.
+     - **Pipeline coherence bug found + fixed.** The first pipelined commit was
+       intermittently wrong (~1 run in 3): the host read-back of one `c_buf` overlaps a
+       concurrent DMA write to the other, and the CPU prefetcher can cache stale lines of
+       the in-flight buffer with no invalidate before its later read. Fix: re-`sync_bo`
+       the slot after `wait`, before read-back. `FROM_DEVICE` EINVALs on data BOs, but
+       `TO_DEVICE` clean+invalidates on this driver. Now 0/16 reliable.
      Remaining gap to the 20.7-TOPS compute rate is now **dispatch latency (~78 µs × 24 ≈
-     1.9 ms)** plus the W `sync_bo` that still fires every submit even when the copy is
-     skipped. Levers left: (1) skip the W (and output-C) `sync_bo` when unchanged;
-     (2) fewer dispatches (bigger MT is L1-capped → smarter M×N array tiling); (3)
-     zero-copy C handoff (DMA C straight to the consumer / keep in SHMEM for the next
-     op). At ~1 TOPS this is still below GPU (~50), so the step-4 hot-path hook stays
-     gated until these close more of the gap.
+     1.9 ms)**. Levers left: (1) **fewer dispatches** — MT is L1-capped, so the real win
+     is an **M-parallel, W-broadcast array topology** (R4-style memtile broadcast): all
+     M-blocks share the same W, so broadcasting W to the columns and giving each column a
+     distinct M-block cuts both the W re-feed (24× → ~3×) and the dispatch count (24 →
+     ~3); (2) zero-copy C handoff (DMA C straight to the consumer / keep in SHMEM). At
+     ~1 TOPS this is still below GPU (~50), so the step-4 hot-path hook stays gated.
 
    - **(superseded) 3c-old. Activations + output → the DMA (dynamic, per inference).** A and C are
      computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
