@@ -47,9 +47,14 @@ impl LlamaConfig {
     /// Core parser shared by `from_dir` and `from_hfq_metadata`.
     pub fn from_json_value(v: &serde_json::Value) -> Result<Self, String> {
         let model_type = v["model_type"].as_str().unwrap_or("");
-        if model_type != "llama" {
+        // Dense llama-family decoders share the same block geometry. qwen2/qwen3
+        // add QK-norm, but consumers that only need embed/lm-head + geometry
+        // (e.g. the DSpark drafter trainer, which never runs the target forward)
+        // can load them as llama. Fused-inference correctness for qk-norm is a
+        // separate concern handled by the arch crates, not this fp32 trainer.
+        if !matches!(model_type, "llama" | "qwen2" | "qwen3") {
             return Err(format!(
-                "hipfire-train Phase 0 supports model_type=llama only, got {model_type:?}"
+                "hipfire-train supports dense llama-family model_type (llama/qwen2/qwen3), got {model_type:?}"
             ));
         }
         // Phase 0 is the plain dense path: reject biases we don't model yet.

@@ -338,24 +338,28 @@ fn main() -> HipResult<()> {
         // One capturing prefill over the whole prompt (start_pos=0 overwrites KV
         // slots 0..l; leftover from a prior prompt beyond l is never read).
         let mut hidden: Vec<f32> = Vec::with_capacity(l * row_stride);
-        {
+        // Per-token capturing forward (start_pos=0). The batched prefill path
+        // requires the model be batch-eligible (Q8-KV etc.); a plain dense
+        // Qwen3 target is not, so capture one token at a time — the per-token
+        // capture appends rows in the same extract-layer-ascending layout.
+        for (pos, &tok) in tokens.iter().enumerate() {
+            llama::forward_scratch_embed(&mut gpu, &weights, &config, tok, pos, &scratch)?;
             let mut sink = HiddenCaptureSink {
                 extract_layers: &extract,
                 hidden: &mut hidden,
                 hidden_gpu: None,
             };
-            llama::forward_prefill_batch_capture(
+            llama::forward_scratch_compute_capture(
                 &mut gpu,
                 &weights,
                 &config,
-                tokens,
-                0,
+                pos,
                 &mut kv,
                 &scratch,
-                Some(&pbs),
                 Some(&mut sink),
             )?;
         }
+        let _ = &pbs;
         assert_eq!(hidden.len(), l * row_stride, "capture size mismatch");
 
         // Slide anchor windows.
