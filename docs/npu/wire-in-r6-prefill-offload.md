@@ -70,6 +70,23 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
      This is the concrete next step and should recover the kernel's real throughput
      end-to-end. Still stream the whole GEMM in one dispatch for the ~78 µs latency.
 
+     **DONE + MEASURED (r6_gemm_ts.cc, NpuGemm converged, npu_gemm_e2e).** The R6-TS
+     kernel reads row-major A via a `[mt,k,m]` tensor stream (concat 4 rows → mmul
+     64-vec) and writes row-major C via a `[mt,nt,m]` stream (`vector::extract<16>` per
+     row); W stays pre-packed. Validated 0-mismatch (`r6_ts_verify` MT=8/MT=24;
+     `npu_gemm_verify` single-core + array groups=4). `NpuGemm` now copies A/C row-major
+     (no reshuffle) — `pack_a`→`load_a` block copy, `unpack_c`→per-group block copy.
+     **End-to-end M768·K512·N4096: 0.02 → 0.254 TOPS (64 dispatches, 4 K-chunks) →
+     0.535 TOPS (24 dispatches, KCHUNK=32 = one K-chunk so C is copied once not 4×).**
+     ~27× over the CPU-marshaling floor. **The marshaling wall is cleared.** Remaining
+     gap to the 20.7-TOPS compute rate is now dispatch latency (~78 µs × 24 ≈ 1.9 ms) +
+     the host C copy-back (~12.6 MB ≈ 1.3 ms), NOT the reshuffle. Levers left, in order:
+     (1) pipeline/double-buffer the C read-back against the next dispatches; (2) fewer
+     dispatches (bigger MT is L1-capped, so this needs a smarter M×N array tiling);
+     (3) zero-copy C handoff (DMA C straight to the consumer / keep in SHMEM for the
+     next op) instead of a host copy. At ~0.5 TOPS this is still below GPU (~50), so the
+     step-4 hot-path hook stays gated until (1)–(3) close more of the gap.
+
    - **(superseded) 3c-old. Activations + output → the DMA (dynamic, per inference).** A and C are
      computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
      let the DMA tile it; write C tiled and let the DMA de-tile — the reshuffle in
