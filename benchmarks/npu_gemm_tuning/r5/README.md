@@ -154,10 +154,36 @@ nearly free (42 TOPS ≈ R4b's 40-TOPS fake-reuse ceiling). So the cascade dataf
 the property the memtile dataflow lacks. vs SOTA FastFlowLM's ~5 TOPS and the 15.7
 reference, this is the compute path that was missing.
 
-**Caveat / final step:** 42 TOPS is the *compute ceiling* (fake INNER reuse, weights
-resident). SOTA's ~5 is *real streaming*. The cascade's structural win — C resident,
-stored once, no per-tile reload — should carry into real streaming where R4b's
-independent-core dataflow collapsed to 5.25 (INNER=0). Confirming that needs the
-streaming-cascade kernel (each core streams its K-slice weights, one cascade round
-per output tile); that apples-to-apples INNER=0 measurement vs SOTA's 5 is the last
-step. But the compute capacity (~42 TOPS) is now demonstrably reachable via cascade.
+**7. Real streaming (INNER=0) measured — and the honest verdict: the cascade does
+NOT help real prefill.** Built the streaming-cascade (A resident, W streamed over an
+`NB` inner loop, one cascade round per output tile; `r5_gen.py COLS ROWS NB`). At
+NB=4096, M=16 (4 accumulators × MR=4), bit-exact:
+
+| dataflow, real INNER=0 (M=16) | TOPS |
+|---|---|
+| **R5 streaming cascade** | **3.22** (feed-bound) |
+| R4b independent cores | 5.25 |
+| SOTA FastFlowLM (real) | ~5 |
+
+The cascade is *worse* than the simple independent-core dataflow here (3.22 < 5.25).
+**Why:** real prefill GEMM at feasible M is **feed / arithmetic-intensity-bound**, not
+C-store-overhead-bound. AI = M·1024 / weight-bytes; at M=16, AI≈32 MACs/B → the 16 MB
+weight stream, not compute, sets the rate. The cascade's win (C resident, no per-tile
+reload) only matters in the *overhead* regime (tiny tiles) — it does nothing for the
+feed, and its extra 16-beat transfer + reduced output parallelism (8 columns vs 32
+independent cores) make it slightly *worse* in the feed-bound regime.
+
+**Conclusion — the cascade was the wrong lever for real prefill:**
+- The cascade genuinely unlocks the **compute ceiling** (42 TOPS, fake reuse) —
+  proving the silicon *can* do it, and that the ~5-TOPS "wall" is a dataflow limit.
+- But **real streaming prefill is feed/AI-bound**, and there the lever is **M
+  (weight reuse), not K-depth**. The cascade adds K-depth, which isn't the
+  bottleneck. R4b's plain independent-core dataflow already ≈ **matches SOTA** (5.25
+  vs ~5) at M=16 with *zero* cascade complexity.
+- **Beating SOTA needs higher M** — more weight reuse per streamed byte (more
+  accumulators / bigger MR / A-resident across more output rows), pushing AI past
+  ~58 MACs/B toward the compute ceiling. That, not the cascade, is the real R6.
+
+A clean negative result (per AGENTS.md, it narrows the search): the cascade is a
+validated, working systolic dataflow that reaches full compute capacity, but it does
+not help the actual real-prefill bottleneck. The next lever is M/AI, not K.

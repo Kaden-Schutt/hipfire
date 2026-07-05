@@ -10,6 +10,8 @@ import sys
 
 COLS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 ROWS = int(sys.argv[2]) if len(sys.argv) > 2 else 4  # cascade depth per column (tile rows 2..2+ROWS-1)
+NB = int(sys.argv[3]) if len(sys.argv) > 3 else 1    # N_BTILES: output tiles streamed per dispatch
+                                                     #   (>1 = real streaming: A resident, W streamed)
 AW = 256    # 4 M-tiles * size_A (4*64)
 WW = 128    # one shared int4 weight tile
 CW = 256    # 4 M-tiles * size_C
@@ -26,18 +28,23 @@ def core_body(cid, name, tile, kern, has_c):  # cid = unique core SSA id; name =
             if has_c else
             f"func.call @{kern}(%av, %wv) : (memref<{AW}xi8>, memref<{WW}xi8>) -> ()")
     c_rel = f"\n        aie.objectfifo.release @fc{name}(Produce, 1)" if has_c else ""
+    # A (and C for the tail) are acquired ONCE per outer round and held resident;
+    # W is streamed over the inner NB loop (one cascade round per output tile).
     return f'''    %core_{cid} = aie.core({tile}) {{
       %z = arith.constant 0 : index
       %m = arith.constant {INF} : index
       %o = arith.constant 1 : index
+      %nb = arith.constant {NB} : index
       scf.for %i = %z to %m step %o {{
         %a = aie.objectfifo.acquire @fa{name}(Consume, 1) : !aie.objectfifosubview<memref<{AW}xi8>>
-        %av = aie.objectfifo.subview.access %a[0] : !aie.objectfifosubview<memref<{AW}xi8>> -> memref<{AW}xi8>
-        %w = aie.objectfifo.acquire @fw{name}(Consume, 1) : !aie.objectfifosubview<memref<{WW}xi8>>
-        %wv = aie.objectfifo.subview.access %w[0] : !aie.objectfifosubview<memref<{WW}xi8>> -> memref<{WW}xi8>{c_acq}
-        {call}
-        aie.objectfifo.release @fa{name}(Consume, 1)
-        aie.objectfifo.release @fw{name}(Consume, 1){c_rel}
+        %av = aie.objectfifo.subview.access %a[0] : !aie.objectfifosubview<memref<{AW}xi8>> -> memref<{AW}xi8>{c_acq}
+        scf.for %j = %z to %nb step %o {{
+          %w = aie.objectfifo.acquire @fw{name}(Consume, 1) : !aie.objectfifosubview<memref<{WW}xi8>>
+          %wv = aie.objectfifo.subview.access %w[0] : !aie.objectfifosubview<memref<{WW}xi8>> -> memref<{WW}xi8>
+          {call}
+          aie.objectfifo.release @fw{name}(Consume, 1)
+        }}
+        aie.objectfifo.release @fa{name}(Consume, 1){c_rel}
       }}
       aie.end
     }}'''
@@ -72,7 +79,7 @@ for c in range(COLS):
         else:
             out.append(core_body(f"{c}_{r}", f"{c}", f"%t{c}_{r}", "r5_cascade_mid", False))
 # runtime sequence: A (shared broadcast), W (shared), C (COLS*64 i32)
-args = ", ".join([f"%A: memref<{AW}xi8>", f"%W: memref<{WW}xi8>", f"%C: memref<{COLS*CW}xi32>"])
+args = ", ".join([f"%A: memref<{AW}xi8>", f"%W: memref<{NB*WW}xi8>", f"%C: memref<{COLS*CW}xi32>"])
 out.append(f"    aie.runtime_sequence({args}) {{")
 tid = 0
 for c in range(COLS):
@@ -82,7 +89,7 @@ for c in range(COLS):
       }}
       aiex.dma_start_task(%ta{c})
       %tw{c} = aiex.dma_configure_task_for @fw{c} {{
-        aie.dma_bd(%W : memref<{WW}xi8>, 0, {WW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {WW}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%W : memref<{NB*WW}xi8>, 0, {NB*WW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {NB*WW}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%tw{c})
