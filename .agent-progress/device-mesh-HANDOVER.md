@@ -51,13 +51,22 @@ identical (MQ4G256), GPU-validated**. Loader name map: HF names `model.layers.{i
 via `hfq::load_weights_hfq` (NOT the GGUF `blk.*` path); quant projections upload raw/verbatim (match),
 norms/embed/tied-lm_head do F16→F32 host dequant (scoped out).
 
+**Also DONE (Phase 3 consumption): store→forward.** `WeightStore::take` moves handles out;
+`llama_store_load` now assembles a `LlamaWeights` whose projection `WeightTensor`s wrap the STORE
+buffers and runs a REAL forward — **151936 finite logits, valid argmax, gfx1151**. Byte-identity +
+consumption close the load→forward loop for the quantized projections.
+
 ## The NEXT unit — pick ONE (Phase 3 continuation):
-**Option A (recommended): store→forward CONSUMPTION.** Placement + real-load now proven; the payoff
-is a forward actually *using* the store. Two sub-steps: (1) extend the llama `source` to cover
-norms/embed/tied-lm_head (reproduce the F16→F32 host dequant — return `(f32_bytes, DType::F32)`; see
-`hfq.rs:551 load_f16_tensor`), so the WHOLE model loads via the store; (2) assemble `LlamaWeights`
-from the store (pull each `(name, layer, 0)` → the arch field) and run a forward, asserting logits ==
-bespoke. Then PP-2 (`HIPFIRE_EMULATE_GPUS=2`). This is the ModelParallel/ArchDispatch-hoist track.
+**Option A (recommended): whole-model store load, then PP-2.** (1) Extend the llama `source` to cover
+norms/embed/tied-lm_head — reproduce the F16→F32 host dequant (`llama::f16_to_f32` is public; return
+`(f32_bytes, DType::F32)`; see `hfq.rs:551 load_f16_tensor` + the embed `EmbeddingFormat` branch,
+`hfq.rs:792`), so the WHOLE model loads via the store (drop the projection-only filter in
+`llama_store_load`). Then assemble the FULL `LlamaWeights` from the store (no bespoke fallback) and
+assert a forward logit-matches bespoke. (2) Then `HIPFIRE_EMULATE_GPUS=2` PP-2 fulfill + banded
+forward. This is the ModelParallel/ArchDispatch-hoist track.
+
+**Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study;
+see `qwen35.rs:2876-2945` per-`LayerType` weight sets).
 
 **Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage). Pure-CPU like the ds4/qwen35
 work just done, but needs DeltaNet loader study: per-`LayerType` weight sets (LinearAttention fused

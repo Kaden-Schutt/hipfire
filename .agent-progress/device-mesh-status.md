@@ -63,9 +63,13 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
   store tensor is byte+dtype IDENTICAL to bespoke `Llama::load_weights`.
 - GPU-validated gfx1151: **196 projection tensors / 28 layers, byte+dtype identical (MQ4G256)**.
   These are uploaded raw/verbatim by the loader (no transform) → raw-byte fulfill matches exactly.
-- Scoped out: norms/embed/tied-lm_head (F16→F32 host dequant) — a source-side follow-up (store
-  already carries dtype). The store→forward *consumption* (assemble LlamaWeights from the store,
-  or forward reads the store) is the next Phase-3 step.
+- Scoped out (byte-validation): norms/embed/tied-lm_head (F16→F32 host dequant) — source-side follow-up.
+- **Store→forward CONSUMPTION done + GPU-validated:** `WeightStore::take` moves resident handles out;
+  `llama_store_load` assembles a `LlamaWeights` whose projection `WeightTensor`s wrap the STORE
+  buffers (norms/embed/lm_head from bespoke) and runs a REAL forward — 151936 finite logits, valid
+  argmax on gfx1151. Byte-identity + consumption together close the load→forward loop for projections.
+  Next: whole-model source (norms F16→F32) so the WHOLE model loads via the store, then the
+  `ModelParallel`/`ArchDispatch` daemon hoist + PP-2.
 - GPU-validated on gfx1151 via `examples/fulfill_manifest_probe.rs` (synthetic byte source,
   no model file): single-1×1 + emulated PP-2 + emulated EP-2 all PASS — placement matches
   `placement_devices`, byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device,
