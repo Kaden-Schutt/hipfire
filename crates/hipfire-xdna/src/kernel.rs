@@ -14,6 +14,16 @@ use crate::submit::{self, QosInfo, AMDXDNA_BO_CMD, AMDXDNA_BO_SHMEM};
 use crate::xclbin::Axlf;
 use crate::{DeviceBuffer, XdnaDevice, XdnaError};
 
+/// A prepared ERT command BO for a fixed set of argument buffers. Building it costs
+/// a CREATE_BO + GET_BO_INFO + mmap (~tens of µs); caching it across dispatches with
+/// the same buffers removes that from the per-dispatch path (measured ~100µs → far
+/// less), which matters for the runtime offload seam.
+struct CachedCmd {
+    arg_handles: Vec<u32>,
+    exec_handles: Vec<u32>, // arg_handles + instr_bo
+    cmd_bo: DeviceBuffer,
+}
+
 /// A single compiled NPU kernel with its hwctx and loaded program. Bind argument
 /// buffers with [`Self::alloc_arg`], fill inputs, then [`Self::dispatch`].
 pub struct NpuKernel {
@@ -25,6 +35,8 @@ pub struct NpuKernel {
     instr_bo: u32,
     instr_addr: u64,
     instr_size: usize,
+    // Reused across dispatches with the same argument buffers.
+    cmd_cache: std::cell::RefCell<Option<CachedCmd>>,
 }
 
 impl NpuKernel {
@@ -64,6 +76,7 @@ impl NpuKernel {
             instr_bo,
             instr_addr,
             instr_size: insts.len(),
+            cmd_cache: std::cell::RefCell::new(None),
         })
     }
 
@@ -83,15 +96,29 @@ impl NpuKernel {
                 .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
         }
 
-        let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
-        let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
-        let mut cmd = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
-        cmd.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
+        // Reuse the command BO when the same argument buffers are passed again — the
+        // packet's device addresses are fixed per buffer, so only the first dispatch
+        // of a given arg set pays the CREATE_BO + mmap. Rebuild on a different set.
+        let arg_handles: Vec<u32> = args.iter().map(|b| b.handle()).collect();
+        let mut cache = self.cmd_cache.borrow_mut();
+        if cache.as_ref().is_none_or(|c| c.arg_handles != arg_handles) {
+            let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
+            let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
+            let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
+            cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
+            let mut exec_handles = arg_handles.clone();
+            exec_handles.push(self.instr_bo); // instruction BO is an EXEC arg (residency)
+            *cache = Some(CachedCmd {
+                arg_handles: arg_handles.clone(),
+                exec_handles,
+                cmd_bo,
+            });
+        }
+        let cmd = cache.as_ref().unwrap();
 
-        let mut handles: Vec<u32> = args.iter().map(|b| b.handle()).collect();
-        handles.push(self.instr_bo); // instruction BO is an EXEC arg (residency)
-
-        let seq = self.dev.exec_cmd(self.hwctx, cmd.handle(), &handles)?;
+        let seq = self
+            .dev
+            .exec_cmd(self.hwctx, cmd.cmd_bo.handle(), &cmd.exec_handles)?;
         self.dev.syncobj_wait(self.syncobj, seq)
     }
 }
