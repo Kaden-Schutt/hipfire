@@ -15,6 +15,11 @@ NB = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 AW = int(sys.argv[3]) if len(sys.argv) > 3 else 8192   # A bytes per M-block (resident)
 WW = int(sys.argv[4]) if len(sys.argv) > 4 else 8192   # W bytes per N-slab (broadcast)
 CW = int(sys.argv[5]) if len(sys.argv) > 5 else 2048   # C i32 elements per (M-block,N-slab)
+# ROUNDS = M-blocks streamed per core IN ONE DISPATCH. The cores loop forever, so feeding
+# ROUNDS rounds of A (+ ROUNDS*NB broadcast W slabs, + ROUNDS*NB C blocks) makes one
+# dispatch compute COLS*ROUNDS M-blocks continuously — no inter-dispatch host stall, one
+# exec, one C read-back. ROUNDS=1 is the per-dispatch form.
+ROUNDS = int(sys.argv[6]) if len(sys.argv) > 6 else 1
 INF = 9223372036854775807
 
 out = ["module {", "  aie.device(npu2) {"]
@@ -60,16 +65,20 @@ for c in range(COLS):
       aie.end
     }}''')
 
-# runtime: A = COLS distinct M-blocks; W = ONE region (NB slabs) fed once to the broadcast;
-# C = COLS*NB blocks (each core's M-block × N-slabs).
-ATOT = COLS * AW
-WTOT = NB * WW
-CTOT = COLS * NB * CW
+# runtime: each core streams ROUNDS M-blocks via PURE-LINEAR DMAs — the objectfifo chunks a
+# contiguous stream into fifo-sized pieces with proper acquire/release semaphores (a repeat
+# BD dim does NOT re-check the fifo semaphore, so rounds >0 overrun). So: A is COLS*ROUNDS
+# contiguous blocks (core c at c*ROUNDS*AW, streamed ROUNDS*AW); W is REPLICATED ROUNDS times
+# in DRAM (the broadcast fifo can't replay, and a stride-0 repeat has the same semaphore bug)
+# and streamed ROUNDS*NB*WW; C is COLS*ROUNDS*NB blocks (core c at c*ROUNDS*NB*CW).
+ATOT = COLS * ROUNDS * AW
+WTOT = ROUNDS * NB * WW
+CTOT = COLS * ROUNDS * NB * CW
 args = ", ".join([f"%A: memref<{ATOT}xi8>", f"%W: memref<{WTOT}xi8>", f"%C: memref<{CTOT}xi32>"])
 out.append(f"    aie.runtime_sequence({args}) {{")
 for c in range(COLS):
     out.append(f'''      %ta{c} = aiex.dma_configure_task_for @fa{c} {{
-        aie.dma_bd(%A : memref<{ATOT}xi8>, {c*AW}, {AW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {AW}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%A : memref<{ATOT}xi8>, {c*ROUNDS*AW}, {ROUNDS*AW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {ROUNDS*AW}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%ta{c})''')
@@ -80,7 +89,7 @@ out.append(f'''      %tw = aiex.dma_configure_task_for @fw_in {{
       aiex.dma_start_task(%tw)''')
 for c in range(COLS):
     out.append(f'''      %tc{c} = aiex.dma_configure_task_for @fc{c} {{
-        aie.dma_bd(%C : memref<{CTOT}xi32>, {c*NB*CW}, {NB*CW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {NB*CW}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%C : memref<{CTOT}xi32>, {c*ROUNDS*NB*CW}, {ROUNDS*NB*CW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {ROUNDS*NB*CW}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tc{c})''')

@@ -32,7 +32,9 @@ export PATH="$PEANO/bin:$MA_ROOT/bin:$PATH"
 # (M-parallel W-broadcast: COLS distinct M-blocks share one broadcast W). R6_OUT_TAG names
 # the cache dir. Buffer sizes are identical, so the kernel object is shared.
 SRC="${R6_KERNEL_SRC:-$HERE/r6_gemm.cc}"; TAG="${R6_OUT_TAG:-r6}"; GEN="${R6_GEN:-r6_gen.py}"
-OUT="$HOME/.hipfire/npu/${TAG}_${MT}x${NT}x${KCHUNK}_c${COLS}_nb${NB}"
+ROUNDS="${R6_ROUNDS:-1}"  # r6_gen_mp.py only: M-blocks/core streamed in ONE dispatch
+RSFX=""; [ "$ROUNDS" != 1 ] && RSFX="_r${ROUNDS}"
+OUT="$HOME/.hipfire/npu/${TAG}_${MT}x${NT}x${KCHUNK}_c${COLS}_nb${NB}${RSFX}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 # Tile buffer sizes: A = MT*KCHUNK tiles (MR*MK=64 int8), W = NT*KCHUNK tiles (128 B),
@@ -41,7 +43,7 @@ AW=$((MT * KCHUNK * 64)); WW=$((NT * KCHUNK * 128)); CW=$((MT * NT * 64))
 "$PEANO/bin/clang++" "$SRC" -c -o "$OUT/r6_mac.o" -I"$MA_ROOT/include" \
   -std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -O2 -DNDEBUG --target=aie2p-none-unknown-elf -DMT="$MT" -DNT="$NT" -DKCHUNK="$KCHUNK"
-python3 "$HERE/$GEN" "$COLS" "$NB" "$AW" "$WW" "$CW" > "$OUT/aie.mlir"
+python3 "$HERE/$GEN" "$COLS" "$NB" "$AW" "$WW" "$CW" "$ROUNDS" > "$OUT/aie.mlir"
 
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
