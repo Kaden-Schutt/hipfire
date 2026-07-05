@@ -261,20 +261,20 @@ fn clamp_max_seq_to_model_context(max_seq: usize, metadata_json: &str) -> usize 
     }
 }
 
-/// STOPGAP (pending gemma3 sliding-window attention): `Gemma3State` allocates a
-/// FULL `max_seq` KV cache for **every** layer — it does not yet honor gemma3's
-/// sliding-window (5-of-6 local layers only need a `sliding_window`=1024 span).
-/// At the model's trained 128K context that is ~35 GB (q8) / ~133 GB (f32) of
-/// KV across 62 layers, which OOMs the shared GTT pool on RDNA APUs. Until the
-/// SWA migration lands (KvCache-backed windowed KV), cap gemma3's context to a
-/// budget-safe default. Operators can force the full value with
-/// `HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1`.
+/// Budget cap for gemma3 context on shared-GTT RDNA APUs.
 ///
-/// 8192 is chosen for the RDNA APU shared-GTT case: ~15 GB weights + ~8.3 GB
-/// F32 KV (62 layers × kv_dim × 8192 × 2) ≈ 23 GB, leaving headroom under a
-/// ~32 GB effective budget (the 43 GB GTT is shared with the host OS). The full
-/// context returns once SWA caps local-layer KV at `sliding_window`.
-const GEMMA3_STOPGAP_MAX_SEQ: usize = 8_192;
+/// gemma3 now uses sliding-window attention: the 5-of-6 LOCAL layers keep only a
+/// `sliding_window` (1024) ring, so their KV is fixed and tiny. The remaining
+/// term is the ~10 GLOBAL layers, which still carry a full-context cache. At
+/// medgemma's default F32 KV that is ~1.6 MB/token across the global layers, so
+/// full 128K would be ~21 GB of global KV + ~15 GB weights — still over the
+/// ~32 GB effective budget (the 43 GB GTT is shared with the host OS). q8 global
+/// KV (`kv_mode=q8`) drops that ~4× and reaches full context; until that is the
+/// default, cap F32 gemma3 at a budget-safe context. Operators can force the
+/// full value with `HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1`.
+///
+/// 65536: ~10.7 GB global F32 KV + ~0.9 GB local rings + ~15 GB weights ≈ 27 GB.
+const GEMMA3_STOPGAP_MAX_SEQ: usize = 65_536;
 
 fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32) -> usize {
     let is_gemma3 = arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL;
@@ -283,16 +283,16 @@ fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32) -> usize {
     }
     if std::env::var("HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE").ok().as_deref() == Some("1") {
         eprintln!(
-            "  WARNING: gemma3 max_seq={max_seq} allocates full-context KV for every layer \
-             (no sliding-window yet) and may OOM the GTT pool; \
-             HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 set — proceeding."
+            "  WARNING: gemma3 max_seq={max_seq} — the global-layer F32 KV alone may OOM the \
+             shared GTT pool at this context; HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 set — proceeding \
+             (use kv_mode=q8 for full 128K)."
         );
         max_seq
     } else {
         eprintln!(
-            "  NOTE: gemma3 has no sliding-window KV yet; capping max_seq {max_seq} -> \
-             {GEMMA3_STOPGAP_MAX_SEQ} to fit the GTT pool. Set \
-             HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 to force the full context."
+            "  NOTE: capping gemma3 max_seq {max_seq} -> {GEMMA3_STOPGAP_MAX_SEQ} to fit the GTT \
+             pool (sliding-window KV bounds local layers; global F32 KV still scales with context \
+             — use kv_mode=q8 for full 128K). Override: HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1."
         );
         GEMMA3_STOPGAP_MAX_SEQ
     }

@@ -59,6 +59,27 @@ pub struct Gemma3State {
     /// gemma3: 128 @27b, 256 @4b). Shared with the llama/qwen backends; this is
     /// what unlocks the KVarN/asym quant modes and sliding-window KV sizing.
     pub kv_cache: KvCache,
+    // ── Sliding-window attention (SWA) ────────────────────────────────
+    // gemma3 interleaves 5 local (sliding_window) : 1 global layers. When SWA
+    // is active (`swa_window > 0`), the KvCache above is FILTERED to the global
+    // layers only, and each LOCAL layer keeps a small F32 ring buffer of the
+    // last `swa_window` keys/values here instead of a full-context cache — the
+    // memory win that lets gemma3 load at full context. Local-layer attention
+    // reuses deepseek4's SWA primitives (per kv head): swa_visibility_stage →
+    // attention_swa_gqa_batched → swa_ring_write, at batch size 1 (decode, and
+    // per-token prefill). `swa_window == 0` disables SWA (all layers full — the
+    // pre-SWA path).
+    /// Per-layer F32 ring `[n_kv_heads, head_dim, swa_window]`; `Some` for local
+    /// layers, `None` for global (which use `kv_cache`). Empty when SWA is off.
+    pub swa_k: Vec<Option<GpuTensor>>,
+    pub swa_v: Vec<Option<GpuTensor>>,
+    /// B=1 head-major staging scratch `[n_kv_heads, head_dim, swa_window]` and
+    /// the single `n_valid` (min(pos+1, window)) buffer for the windowed attn.
+    pub swa_staged_k: GpuTensor,
+    pub swa_staged_v: GpuTensor,
+    pub swa_nvalid: GpuTensor,
+    /// Sliding-window span (0 = SWA disabled).
+    pub swa_window: usize,
     /// Next absolute KV write slot; bumped by `forward_step`.
     pub next_pos: usize,
 }
@@ -80,29 +101,61 @@ impl Gemma3State {
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let hidden_dim = cfg.intermediate_size;
 
+        let n_layers = cfg.num_hidden_layers;
+        let n_kv = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+
         // q8_0 KV requires head_dim divisible by the 32-element block; fall back
-        // to F32 otherwise. The system KvCache owns the per-layer buffers and
-        // the byte layout (q8_0 = 34 B/32-weight block, F32 = 4 B/element);
-        // physical_cap == max_seq means every layer carries the full context
-        // (sliding-window sizing lands in a later step).
-        let kv_quant_q8 = quant_q8 && cfg.head_dim.is_multiple_of(32);
-        let kv_cache = if kv_quant_q8 {
-            KvCache::new_gpu_q8(
-                gpu,
-                cfg.num_hidden_layers,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                max_seq,
-            )?
+        // to F32 otherwise.
+        let kv_quant_q8 = quant_q8 && head_dim.is_multiple_of(32);
+
+        // Sliding-window attention: gemma3 interleaves 5 local : 1 global layers.
+        // When SWA applies (window in (0, max_seq) and at least one local layer),
+        // the KvCache carries only the GLOBAL layers (full context) and each
+        // LOCAL layer keeps a small F32 ring of the last `swa_window` positions
+        // — the memory win that lets gemma3 load at full context. Otherwise the
+        // cache carries every layer (pre-SWA path).
+        let has_local = (0..n_layers).any(|l| !cfg.is_global_layer(l));
+        let swa_window = if cfg.sliding_window > 0 && cfg.sliding_window < max_seq && has_local {
+            cfg.sliding_window
         } else {
-            KvCache::new_gpu(
-                gpu,
-                cfg.num_hidden_layers,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                max_seq,
-            )?
+            0
         };
+        let swa = swa_window > 0;
+
+        let kv_cache = if swa {
+            let is_global: Vec<bool> = (0..n_layers).map(|l| cfg.is_global_layer(l)).collect();
+            if kv_quant_q8 {
+                KvCache::new_gpu_q8_filtered(gpu, &is_global, n_kv, head_dim, max_seq)?
+            } else {
+                KvCache::new_gpu_filtered(gpu, &is_global, n_kv, head_dim, max_seq)?
+            }
+        } else if kv_quant_q8 {
+            KvCache::new_gpu_q8(gpu, n_layers, n_kv, head_dim, max_seq)?
+        } else {
+            KvCache::new_gpu(gpu, n_layers, n_kv, head_dim, max_seq)?
+        };
+
+        // Per-local-layer F32 rings + B=1 staging scratch. When SWA is off these
+        // stay empty / 1-element dummies (never read).
+        let ring_elems = n_kv * head_dim * swa_window.max(1);
+        let mut swa_k: Vec<Option<GpuTensor>> = Vec::new();
+        let mut swa_v: Vec<Option<GpuTensor>> = Vec::new();
+        if swa {
+            for l in 0..n_layers {
+                if cfg.is_global_layer(l) {
+                    swa_k.push(None);
+                    swa_v.push(None);
+                } else {
+                    swa_k.push(Some(gpu.zeros(&[ring_elems], DType::F32)?));
+                    swa_v.push(Some(gpu.zeros(&[ring_elems], DType::F32)?));
+                }
+            }
+        }
+        let staged_elems = if swa { ring_elems } else { 1 };
+        let swa_staged_k = gpu.zeros(&[staged_elems], DType::F32)?;
+        let swa_staged_v = gpu.zeros(&[staged_elems], DType::F32)?;
+        let swa_nvalid = gpu.zeros(&[1], DType::F32)?;
 
         Ok(Self {
             x: gpu.alloc_tensor(&[dim], DType::F32)?,
@@ -118,6 +171,12 @@ impl Gemma3State {
             logits: gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
             kv_cache,
+            swa_k,
+            swa_v,
+            swa_staged_k,
+            swa_staged_v,
+            swa_nvalid,
+            swa_window,
             next_pos: 0,
         })
     }
@@ -145,6 +204,15 @@ impl Gemma3State {
             let _ = gpu.free_tensor(t);
         }
         self.kv_cache.free_gpu(gpu);
+        for t in self.swa_k.into_iter().flatten() {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.swa_v.into_iter().flatten() {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in [self.swa_staged_k, self.swa_staged_v, self.swa_nvalid] {
+            let _ = gpu.free_tensor(t);
+        }
         let _ = gpu.hip.free(self.pos_buf);
     }
 }
@@ -295,10 +363,74 @@ fn forward_after_x(
             cfg.rope_base_for_layer(layer_idx),
         )?;
 
-        // GQA attention (full causal; sliding-window mask deferred — only
-        // affects ctx > sliding_window, see the bring-up plan). KV is stored
-        // F32 or q8_0 depending on the state's quant mode.
-        if state.kv_cache.quant_q8 {
+        // Attention. Three routes:
+        //   - SWA local layer: F32 ring + windowed staged attention (batch 1).
+        //   - global layer (or SWA off): full-context KvCache attention.
+        if state.swa_window > 0 && !cfg.is_global_layer(layer_idx) {
+            let win = state.swa_window;
+            let hdw = head_dim * win;
+            let ring_k = state.swa_k[layer_idx].as_ref().unwrap();
+            let ring_v = state.swa_v[layer_idx].as_ref().unwrap();
+            // n_valid = min(pos+1, window) written into the [1] scalar buffer.
+            let nv = ((pos + 1).min(win)) as i32;
+            gpu.hip.memcpy_htod(&state.swa_nvalid.buf, &nv.to_ne_bytes())?;
+            // Stage each kv head's visible window from its ring + this token's KV.
+            for kvh in 0..n_kv_heads {
+                gpu.swa_visibility_stage_batched(
+                    &ring_k.sub_offset(kvh * hdw, hdw),
+                    &state.k.sub_offset(kvh * head_dim, head_dim),
+                    &state.swa_staged_k.sub_offset(kvh * hdw, hdw),
+                    pos as i32,
+                    win as i32,
+                    head_dim as i32,
+                    1,
+                )?;
+                gpu.swa_visibility_stage_batched(
+                    &ring_v.sub_offset(kvh * hdw, hdw),
+                    &state.v.sub_offset(kvh * head_dim, head_dim),
+                    &state.swa_staged_v.sub_offset(kvh * hdw, hdw),
+                    pos as i32,
+                    win as i32,
+                    head_dim as i32,
+                    1,
+                )?;
+            }
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            gpu.attention_swa_gqa_batched(
+                &state.q,
+                &state.swa_staged_k,
+                &state.swa_staged_v,
+                &state.swa_nvalid,
+                &state.attn_out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                win,
+                1,
+                scale,
+            )?;
+            // Advance each kv head's ring with this token's KV (slot pos%window).
+            for kvh in 0..n_kv_heads {
+                gpu.swa_ring_write_batched_f32(
+                    &state.k.sub_offset(kvh * head_dim, head_dim),
+                    &ring_k.sub_offset(kvh * hdw, hdw),
+                    1,
+                    head_dim as i32,
+                    win as i32,
+                    pos as i32,
+                    1,
+                )?;
+                gpu.swa_ring_write_batched_f32(
+                    &state.v.sub_offset(kvh * head_dim, head_dim),
+                    &ring_v.sub_offset(kvh * hdw, hdw),
+                    1,
+                    head_dim as i32,
+                    win as i32,
+                    pos as i32,
+                    1,
+                )?;
+            }
+        } else if state.kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(
                 &state.kv_cache.k_gpu[layer_idx],
                 &state.k,
@@ -458,6 +590,26 @@ pub fn forward_prefill_batch(
     let inter = cfg.intermediate_size;
     let eps = cfg.rms_norm_eps;
     let max_ctx = start_pos + m;
+
+    // SWA safety net: the batched attention below assumes every layer carries a
+    // full-context KvCache, which is false once SWA filters the cache to global
+    // layers (local layers live in per-layer rings, correctly advanced only by
+    // the single-token path). The inference callers already route per-token when
+    // SWA is active; fall back per-token here too so any other caller (e.g.
+    // calibration) stays correct — copy each row's embedding into `state.x`, run
+    // the single-token stack, then emit the last position's logits.
+    if state.swa_window > 0 {
+        for i in 0..m {
+            gpu.memcpy_dtod_at_auto(&state.x.buf, 0, &x_batch.buf, i * dim * 4, dim * 4)?;
+            gpu.hip
+                .memcpy_htod(&state.pos_buf, &((start_pos + i) as i32).to_ne_bytes())?;
+            forward_after_x(gpu, weights, cfg, state, start_pos + i)?;
+        }
+        gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, eps)?;
+        weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+        state.next_pos = start_pos + m;
+        return Ok(());
+    }
 
     // Absolute positions start_pos..start_pos+m as an i32 device table (dtype is
     // cosmetic — the rope/attention/kv kernels read it as `const int*`).
