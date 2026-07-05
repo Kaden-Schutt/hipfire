@@ -30,7 +30,7 @@ Plan: docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md
 Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed for any.
 
 ## REMAINING (GPU-integration / hot-path; multi-session, one PR per phase)
-- Phase 2 cont: fulfill_manifest DENSE-TP slice+upload (whole-tensor + ExpertSharded + transactional-OOM guard DONE, see below); production-arch manifests for qwen35/ds4 hybrids; state_manifest impls.
+- Phase 2 cont: fulfill_manifest DENSE-TP slice+upload (whole-tensor + ExpertSharded + transactional-OOM guard DONE, see below); qwen35 state_manifest DONE (Kv+Recurrent+Conv by layer_type); remaining = qwen35/ds4 WEIGHT_manifest + ds4 state_manifest (hybrid loader study).
 - Phase 1a/1b: wire collective hints + band_xfer into the executor; PP executor loop; PP byte-exact oracle (needs building); 1c llama-PP walking skeleton.
 - Phase 3: WeightStore/StateStore + ModelParallel + ArchDispatch (hoist EpArch/LoadedModel out of daemon example binary → runtime lib). Highest-risk.
 - Phase 4: qwen2 ForwardBindings reach.
