@@ -88,3 +88,61 @@ M-block × 4 N-blocks × one K-tile). This pins the full tile layout — **all r
 
 This is the layout the runtime `NpuGemm` marshaling (wire-in step 2) targets — R6 is a
 proven correct W4A8 GEMM primitive, not only a throughput ceiling.
+
+## End-to-end: from 20.7-TOPS *compute* to a real deliverable rate
+
+20.7 TOPS is the kernel's *compute* rate. The deliverable end-to-end rate (host feeds
+row-major A/W, reads row-major C) was initially **0.02 TOPS** — CPU marshaling
+(row-major ↔ tile-major reshuffle) dwarfed the kernel. Closing that gap drove the arc
+below. All configs are the M768·K512·N4096 prefill GEMM, validated numerically.
+
+| stage | e2e | what changed |
+|---|---|---|
+| CPU marshaling floor | 0.02 | tile-major pack/unpack on the host |
+| **tensor-stream row-major** (`r6_gemm_ts.cc`) | — | kernel reads/writes ROW-MAJOR via `aie::tensor_descriptor`; AGUs tile in-core, zero CPU marshaling, linear DMA |
+| + single-K-chunk (C copied once) | 0.535 | KCHUNK covers all K → no host K-accumulation |
+| + pipelined C read-back | 1.0 | `submit`/`wait` split; overlap read-back with next dispatch |
+| **M-parallel W-broadcast** (`r6_gen_mp.py`) | 1.45 | COLS distinct M-blocks share ONE broadcast W (shim→memtile→all cores); 3 dispatches not 24; *blocking*, no coherence dance |
+| **whole-GEMM in one dispatch** (`r6_gen_mp.py` ROUNDS) | **~1.9** | each core streams ROUNDS M-blocks → the whole GEMM is a *single* dispatch; continuous streaming, one C read-back |
+
+**~95× over the marshaling floor.** Raw single-dispatch ceiling is ~3 TOPS — feed-bound
+on the memtile's 8-way broadcast sync over the N-slabs, not compute. Still below the
+GPU's ~50 TOPS, so *sync* offload stays gated; the aggregate win is a concurrent
+NPU ‖ GPU split.
+
+### Two dataflow lessons (cost real debugging)
+
+1. **Pipelined read-back needs a cache reconcile.** The host read-back of one C buffer
+   overlaps a concurrent DMA write to the double-buffered other; the CPU prefetcher can
+   cache stale lines of the in-flight buffer. `FROM_DEVICE` EINVALs on data BOs, but
+   `TO_DEVICE` clean+invalidates on this driver — re-sync the slot after `wait`, before
+   reading. (Blocking dispatch is immune, which is one reason the blocking M-parallel /
+   whole-GEMM paths are preferred.)
+2. **Stream with pure-linear DMAs, not repeat BD dims.** A repeat dimension does NOT
+   re-check the objectfifo acquire/release semaphore, so rounds > 0 overrun the fifo
+   buffers (round 0 correct, the rest garbage). A contiguous linear stream is chunked by
+   the objectfifo *with* semaphores. W (which the broadcast fifo can't replay) is
+   replicated ROUNDS× in DRAM. Shim BD wrap-dim sizes also cap at [1:64].
+
+## Reproduce
+
+Build (offline; `aiecc`) with `r6_cache.sh`, selecting kernel + generator + tag:
+
+```sh
+R6=benchmarks/npu_gemm_tuning/r6
+# tensor-stream kernel, N-parallel array (single K-chunk peak config)
+R6_KERNEL_SRC=$R6/r6_gemm_ts.cc R6_OUT_TAG=r6ts $R6/r6_cache.sh 8 4 32 8 8
+# M-parallel W-broadcast, whole-GEMM in one dispatch (ROUNDS=3)
+R6_KERNEL_SRC=$R6/r6_gemm_ts.cc R6_GEN=r6_gen_mp.py R6_OUT_TAG=r6mp R6_ROUNDS=3 \
+  $R6/r6_cache.sh 8 4 32 8 64
+```
+
+Verify + measure (examples in `crates/hipfire-xdna/examples/`):
+
+| example | checks |
+|---|---|
+| `ts_a_verify` | in-core tensor-stream A reshuffle == `pack_a` |
+| `r6_ts_verify` | full row-major W4A8 GEMM (TS kernel) vs CPU |
+| `npu_gemm_verify` / `npu_gemm_e2e` | `NpuGemm` correctness / N-parallel pipelined e2e |
+| `r6_mp_verify` / `r6_mp_e2e` | M-parallel array correctness / 3-dispatch e2e |
+| `r6_mp1_e2e` | whole-GEMM one-dispatch correctness + e2e |
