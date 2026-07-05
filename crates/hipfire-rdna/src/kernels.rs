@@ -136,6 +136,37 @@ pub const ARGMAX_GFX1103_SRC: &str =
 pub const ATTENTION_Q8_0_KV_GFX1103_SRC: &str =
     include_str!("../../../kernels/src/gfx1103/attention_q8_0_kv.gfx1103.hip");
 
+/// gfx1103 (Phoenix) no-LDS flash-decode attention, F32 KV. Sibling of the
+/// Q8_0 kernel; same online-softmax structure, no dequant. head_dim % 32 == 0.
+pub const ATTENTION_F32_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_f32.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS flash-decode attention, affine 4-bit KV. One module
+/// serving both `attention_q4kv_gfx1103` and `attention_hfq4_kv_gfx1103` — they
+/// share the [f32 scale][f32 zero][nibbles] block layout. head_dim % 32 == 0.
+pub const ATTENTION_Q4_AFFINE_KV_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_q4_affine_kv.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS flash-decode attention, int8c KV (f32 per-head
+/// scale, [f32 scale][4 pad][int8] block). head_dim % 32 == 0.
+pub const ATTENTION_INT8C_KV_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_int8c_kv.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS flash-decode attention, int8c-f16 KV (f16 per-head
+/// scale, [f16 scale][int8] block). head_dim % 32 == 0.
+pub const ATTENTION_INT8C_F16_KV_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_int8c_f16_kv.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS flash-decode attention, int8 KV with split
+/// value/scale arrays. head_dim % 32 == 0.
+pub const ATTENTION_INT8_KV_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_int8_kv.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS flash-decode attention, HFQ8 KV (affine uint8 with
+/// split scale/zero arrays). head_dim % 32 == 0.
+pub const ATTENTION_HFQ8_KV_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_hfq8_kv.gfx1103.hip");
+
 /// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
 /// ABI as the generic conv1d split kernel plus a companion state update entry.
 #[cfg(feature = "deltanet")]

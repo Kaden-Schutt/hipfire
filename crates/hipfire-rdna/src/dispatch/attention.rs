@@ -104,8 +104,20 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("attention", kernels::ATTENTION_SRC, "attention_f32")?;
-        let func = &self.functions["attention_f32"];
+        // gfx1103 (Phoenix): no-LDS flash-decode variant (one wave32/head,
+        // register online softmax) removes the scores[seq_len] LDS ceiling.
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_f32_gfx1103",
+                kernels::ATTENTION_F32_GFX1103_SRC,
+                "attention_f32_gfx1103",
+            )
+        } else {
+            ("attention", kernels::ATTENTION_SRC, "attention_f32")
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
@@ -134,15 +146,20 @@ impl Gpu {
 
         // When a stream is active (graph capture mode), use max_seq for shared mem
         // so the captured graph works for all sequence lengths.
-        let effective_seq = if self.active_stream.is_some() {
-            max_seq
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
         } else {
-            seq_len_hint
+            let effective_seq = if self.active_stream.is_some() {
+                max_seq
+            } else {
+                seq_len_hint
+            };
+            let block_size = (effective_seq.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            let shared_mem = ((effective_seq + block_size as usize) * 4) as u32;
+            (block_size, shared_mem)
         };
-        let block_size = (effective_seq.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((effective_seq + block_size as usize) * 4) as u32;
 
         unsafe {
             self.hip.launch_kernel(
@@ -463,12 +480,22 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_hfq4_kv",
-            kernels::ATTENTION_HFQ4_KV_SRC,
-            "attention_hfq4_kv",
-        )?;
-        let func = &self.functions["attention_hfq4_kv"];
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_q4_affine_kv_gfx1103",
+                kernels::ATTENTION_Q4_AFFINE_KV_GFX1103_SRC,
+                "attention_hfq4_kv_gfx1103",
+            )
+        } else {
+            (
+                "attention_hfq4_kv",
+                kernels::ATTENTION_HFQ4_KV_SRC,
+                "attention_hfq4_kv",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut qp = q.buf.as_ptr();
         let mut kp = k_cache.buf.as_ptr();
@@ -492,11 +519,18 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        // scores[seq_len] + ws[block_size] + q_shared[head_dim]
-        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (seq_len_hint.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            // scores[seq_len] + ws[block_size] + q_shared[head_dim]
+            (
+                block_size,
+                ((seq_len_hint + block_size as usize + head_dim) * 4) as u32,
+            )
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -522,12 +556,22 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_int8c_f16_kv",
-            kernels::ATTENTION_INT8C_F16_KV_SRC,
-            "attention_int8c_f16_kv",
-        )?;
-        let func = &self.functions["attention_int8c_f16_kv"];
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_int8c_f16_kv_gfx1103",
+                kernels::ATTENTION_INT8C_F16_KV_GFX1103_SRC,
+                "attention_int8c_f16_kv_gfx1103",
+            )
+        } else {
+            (
+                "attention_int8c_f16_kv",
+                kernels::ATTENTION_INT8C_F16_KV_SRC,
+                "attention_int8c_f16_kv",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut qp = q.buf.as_ptr();
         let mut kp = k_cache.buf.as_ptr();
@@ -551,10 +595,14 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (seq_len_hint.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -581,12 +629,22 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_int8c_kv",
-            kernels::ATTENTION_INT8C_KV_SRC,
-            "attention_int8c_kv",
-        )?;
-        let func = &self.functions["attention_int8c_kv"];
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_int8c_kv_gfx1103",
+                kernels::ATTENTION_INT8C_KV_GFX1103_SRC,
+                "attention_int8c_kv_gfx1103",
+            )
+        } else {
+            (
+                "attention_int8c_kv",
+                kernels::ATTENTION_INT8C_KV_SRC,
+                "attention_int8c_kv",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut qp = q.buf.as_ptr();
         let mut kp = k_cache.buf.as_ptr();
@@ -610,10 +668,17 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (seq_len_hint.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            (
+                block_size,
+                ((seq_len_hint + block_size as usize + head_dim) * 4) as u32,
+            )
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -642,12 +707,22 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_hfq8_kv",
-            kernels::ATTENTION_HFQ8_KV_SRC,
-            "attention_hfq8_kv",
-        )?;
-        let func = &self.functions["attention_hfq8_kv"];
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_hfq8_kv_gfx1103",
+                kernels::ATTENTION_HFQ8_KV_GFX1103_SRC,
+                "attention_hfq8_kv_gfx1103",
+            )
+        } else {
+            (
+                "attention_hfq8_kv",
+                kernels::ATTENTION_HFQ8_KV_SRC,
+                "attention_hfq8_kv",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut qp = q.buf.as_ptr();
         let mut kd = k_data.buf.as_ptr();
@@ -675,10 +750,14 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (seq_len_hint.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -707,12 +786,22 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_int8_kv",
-            kernels::ATTENTION_INT8_KV_SRC,
-            "attention_int8_kv",
-        )?;
-        let func = &self.functions["attention_int8_kv"];
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_int8_kv_gfx1103",
+                kernels::ATTENTION_INT8_KV_GFX1103_SRC,
+                "attention_int8_kv_gfx1103",
+            )
+        } else {
+            (
+                "attention_int8_kv",
+                kernels::ATTENTION_INT8_KV_SRC,
+                "attention_int8_kv",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut kv_ptr = k_vals.buf.as_ptr();
@@ -740,10 +829,14 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (seq_len_hint.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -3547,12 +3640,22 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_q4kv",
-            kernels::ATTENTION_Q4KV_SRC,
-            "attention_q4kv",
-        )?;
-        let func = &self.functions["attention_q4kv"];
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_q4_affine_kv_gfx1103",
+                kernels::ATTENTION_Q4_AFFINE_KV_GFX1103_SRC,
+                "attention_q4kv_gfx1103",
+            )
+        } else {
+            (
+                "attention_q4kv",
+                kernels::ATTENTION_Q4KV_SRC,
+                "attention_q4kv",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache_q4.buf.as_ptr();
@@ -3576,10 +3679,14 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (seq_len_hint.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,
