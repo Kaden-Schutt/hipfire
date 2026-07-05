@@ -56,11 +56,19 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
      group) to match the GPU. Design this with 3a (scales travel with the arranged W).
    - **3c. Activations + output → the DMA (dynamic, per inference).** A and C are
      computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
-     let the shim DMA tile it (`dims_to_stream` on the `dma_bd`); write C tiled and let
-     the DMA de-tile — the tile reshuffle happens in hardware, not the CPU. This is how
-     IRON's whole_array gemm avoids CPU marshaling; my R6 MLIR uses plain linear
-     `dma_bd`, which is why marshaling landed on the CPU. Plus stream the whole GEMM in
-     one dispatch to amortize the ~78 µs latency.
+     let the DMA tile it; write C tiled and let the DMA de-tile — the reshuffle in
+     hardware, not the CPU. **Attempted (measured):** a hand-rolled reshuffle on the
+     *shim runtime `dma_bd`* (shim→core direct). It builds — learned the aie2p
+     convention: `len` = product of the **lowest three** dims (the highest/outermost
+     dim is the BD repeat count, excluded from `len`). And the A strides
+     `[(16,1024),(16,16),(4,256),(16,1)]` match IRON's `my_matmul` A pattern exactly.
+     **But it produces wrong data** (A-reshuffle-only: 4093/4096 mismatch). So the
+     shim→core *direct* `dma_bd` reshuffle does not deliver tile-major to the core.
+     **The proven path is IRON's: put the reshuffle on a MEMTILE hop** — shim→memtile
+     (linear) then `objectfifo.cons().split(..., dims_to_stream=…, placement=Tile(col,1))`
+     memtile→core does the tiling. Next: add the memtile hop with `dims_to_stream` for
+     A (and the join for C) instead of the shim-direct `dma_bd`. Plus stream the whole
+     GEMM in one dispatch to amortize the ~78 µs latency.
 
 4. **Runtime offload hook (the hot-path change — smallest possible).** In
    `dispatch/quant.rs`, add an opt-in path: if a prefill W4A8 GEMM is large enough to
