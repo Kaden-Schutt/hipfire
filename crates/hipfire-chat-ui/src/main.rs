@@ -148,9 +148,11 @@ fn App() -> impl IntoView {
     let (status, set_status) = signal("Ready".to_string());
     let (settings_open, set_settings_open) = signal(false);
     let (usage, set_usage) = signal(None::<Usage>);
-    // Model-load progress (current_layer, total_layers) polled from /load-progress
-    // while awaiting the first token; drives the determinate loading bar.
-    let (load_progress, set_load_progress) = signal((0u32, 0u32));
+    // Model-load progress (current_layer, total_layers, phase) polled from
+    // /load-progress while awaiting the first token; drives the determinate
+    // loading bar. `phase` names the current pass ("weights", "experts", …) so
+    // multi-phase loaders (e.g. deepseek4) label the bar meaningfully.
+    let (load_progress, set_load_progress) = signal((0u32, 0u32, String::new()));
     // Responses API server-side conversation state: the last response id, sent
     // as previous_response_id so the server reconstructs prior context.
     let (last_response_id, set_last_response_id) = signal(None::<String>);
@@ -243,7 +245,7 @@ fn App() -> impl IntoView {
         // Poll model-load progress while the assistant bubble is still empty (the
         // pre-first-token window that spans a server-side model load). Stops as
         // soon as a token arrives or the request ends.
-        set_load_progress.set((0, 0));
+        set_load_progress.set((0, 0, String::new()));
         leptos::task::spawn_local(async move {
             loop {
                 let waiting = busy.get_untracked()
@@ -253,13 +255,14 @@ fn App() -> impl IntoView {
                         .map(|m| m.content.is_empty())
                         .unwrap_or(false);
                 if !waiting {
-                    set_load_progress.set((0, 0));
+                    set_load_progress.set((0, 0, String::new()));
                     break;
                 }
                 if let Ok(v) = get_json::<Value>("/load-progress").await {
                     let cur = v["current"].as_u64().unwrap_or(0) as u32;
                     let tot = v["total"].as_u64().unwrap_or(0) as u32;
-                    set_load_progress.set((cur, tot));
+                    let phase = v["phase"].as_str().unwrap_or("").to_string();
+                    set_load_progress.set((cur, tot, phase));
                 }
                 gloo_timers::future::TimeoutFuture::new(400).await;
             }
@@ -439,7 +442,10 @@ fn App() -> impl IntoView {
 
 /// Render one transcript message: role tag, optional reasoning panel, markdown
 /// body (assistant) or plain text (user/error), images, and a copy button.
-fn message_view(message: UiMessage, load_progress: ReadSignal<(u32, u32)>) -> impl IntoView {
+fn message_view(
+    message: UiMessage,
+    load_progress: ReadSignal<(u32, u32, String)>,
+) -> impl IntoView {
     let class = format!("message {}", message.role);
     let is_assistant = message.role == "assistant";
     let role = message.role.clone();
@@ -465,14 +471,14 @@ fn message_view(message: UiMessage, load_progress: ReadSignal<(u32, u32)>) -> im
             // (current < total) show a DETERMINATE bar; otherwise (prefill, or no
             // load) fall back to an INDETERMINATE animation.
             let is_det = move || {
-                let (c, t) = load_progress.get();
+                let (c, t, _) = load_progress.get();
                 t > 0 && c < t
             };
             view! {
                 <div class="loading" role="status" aria-live="polite">
                     <div class="loading-bar" class:determinate=is_det>
                         <div class="loading-fill" style=move || {
-                            let (c, t) = load_progress.get();
+                            let (c, t, _) = load_progress.get();
                             if t > 0 && c < t {
                                 format!("width:{:.1}%", (c as f64 / t as f64) * 100.0)
                             } else {
@@ -481,9 +487,15 @@ fn message_view(message: UiMessage, load_progress: ReadSignal<(u32, u32)>) -> im
                         }></div>
                     </div>
                     <span class="loading-label">{move || {
-                        let (c, t) = load_progress.get();
+                        let (c, t, phase) = load_progress.get();
                         if t > 0 && c < t {
-                            format!("Loading model — layer {c} / {t}")
+                            // Name the pass for multi-phase loaders (deepseek4:
+                            // "weights" then "experts"); default wording for the
+                            // common single-phase "weights" case.
+                            match phase.as_str() {
+                                "" | "weights" => format!("Loading model — layer {c} / {t}"),
+                                other => format!("Loading {other} — {c} / {t}"),
+                            }
                         } else {
                             "Preparing response…".to_string()
                         }

@@ -709,8 +709,12 @@ impl DeepseekV4 {
             weights.hc_head_scale = scale;
         }
 
-        // Per-layer.
+        // Per-layer. Phase 1 of the load bar: attention + norms + shared expert
+        // for every layer (the routed-expert pass below is the separate, much
+        // larger phase 2).
+        let n_layers_prog = weights.layers.len();
         for (l, layer) in weights.layers.iter_mut().enumerate() {
+            hipfire_runtime::load_progress::report(l as u32 + 1, n_layers_prog as u32, "weights");
             // Norms (F16 on disk → F32 on GPU).
             layer.attn_norm = Some(Self::upload_global_f16_as_f32(
                 hfq,
@@ -1221,11 +1225,21 @@ impl DeepseekV4 {
         // stride_w1 × n_exp + stride_w2 × n_exp ≈ 1.2 GB — bounded,
         // well below the pressure threshold.
         if upload_experts {
+            // Phase 2 of the load bar: routed experts (the ~40-80 GB pass that
+            // dominates load time). Only layers `< expert_layer_end` are
+            // uploaded (partial-MoE budget), and those are a prefix, so the
+            // per-layer count stays monotonic against `expert_total`.
+            let expert_total = expert_layer_end.unwrap_or(weights.layers.len());
             for (l, layer) in weights.layers.iter_mut().enumerate() {
                 let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
                 if !upload_this_layer {
                     continue;
                 }
+                hipfire_runtime::load_progress::report(
+                    l as u32 + 1,
+                    expert_total as u32,
+                    "experts",
+                );
                 let n_exp = cfg.n_routed_experts;
                 Self::upload_layer_routed_experts(
                     hfq,

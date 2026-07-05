@@ -17,7 +17,7 @@ use crate::state::SharedState;
 /// weights are in (`current == total`) prefill follows, for which no per-step
 /// progress exists (the UI falls back to an indeterminate bar).
 pub async fn get_load_progress() -> Json<Value> {
-    let (current, total) = hipfire_daemon_adapter::model_load_progress();
+    let (current, total, phase) = hipfire_daemon_adapter::model_load_progress();
     let loading = total > 0 && current < total;
     let fraction = if total > 0 {
         current as f64 / total as f64
@@ -27,6 +27,7 @@ pub async fn get_load_progress() -> Json<Value> {
     Json(json!({
         "current": current,
         "total": total,
+        "phase": phase,
         "loading": loading,
         "fraction": fraction,
     }))

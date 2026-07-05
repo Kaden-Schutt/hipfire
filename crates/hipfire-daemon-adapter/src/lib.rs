@@ -24,7 +24,7 @@ use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
     AcceleratorInventory, LlmModelRegistry, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
@@ -34,25 +34,32 @@ use tracing::debug;
 // its framed stdout channel (see `Daemon::load`), which we store here so the
 // HTTP server can surface a real progress bar to the chat UI during the (often
 // multi-second) load. One daemon loads one model at a time, so a single global
-// suffices. Packed as `(current << 32) | total`.
+// suffices. `phase` is a coarse label (e.g. "weights", "experts") so multi-phase
+// loaders (deepseek4: attn/shared then routed experts) can name the current
+// pass; each phase has its own `current`/`total`, so the bar restarts per phase.
 //
 // This used to be scraped from the daemon's human "loading layer N/M" stderr —
 // fragile (coupled to log wording across arches) and, on a piped stderr,
 // deadlock-prone on non-UTF-8. The stdout frame is structured and UTF-8-safe.
 // `spawn_stderr_progress_reader` still drains + re-emits daemon stderr for
 // operator logs, but no longer parses progress from it.
-static LOAD_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static LOAD_PROGRESS: Mutex<(u32, u32, String)> = Mutex::new((0, 0, String::new()));
 
-/// Current model-load progress as `(current_layer, total_layers)`. `(_, 0)` means
-/// no load in progress / not reported. `current == total` (> 0) means weights are
-/// loaded (state/KV allocation may still follow before the first token).
-pub fn model_load_progress() -> (u32, u32) {
-    let v = LOAD_PROGRESS.load(Ordering::Relaxed);
-    ((v >> 32) as u32, v as u32)
+/// Current model-load progress as `(current, total, phase)`. `(_, 0, _)` means no
+/// load in progress / not reported. `current == total` (> 0) means the current
+/// phase's units are done (for single-phase loaders, weights are in; state/KV
+/// allocation may still follow before the first token).
+pub fn model_load_progress() -> (u32, u32, String) {
+    LOAD_PROGRESS
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or((0, 0, String::new()))
 }
 
-fn set_load_progress(current: u32, total: u32) {
-    LOAD_PROGRESS.store(((current as u64) << 32) | total as u64, Ordering::Relaxed);
+fn set_load_progress(current: u32, total: u32, phase: &str) {
+    if let Ok(mut g) = LOAD_PROGRESS.lock() {
+        *g = (current, total, phase.to_string());
+    }
 }
 
 /// Drain the daemon's piped stderr and re-emit every line to our own stderr so
@@ -256,7 +263,7 @@ impl DaemonEngine {
                 DaemonResponse::LoadProgress(p) => {
                     // Structured per-layer progress from the daemon's framed
                     // stdout channel — the correct source (vs. scraping stderr).
-                    set_load_progress(p.current, p.total);
+                    set_load_progress(p.current, p.total, &p.phase);
                 }
                 DaemonResponse::Error(e) => anyhow::bail!("daemon load error: {}", e.message),
                 DaemonResponse::Unknown => {}
