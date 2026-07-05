@@ -69,8 +69,30 @@ fn parse_load_layer_line(line: &str) -> Option<(u32, u32)> {
 /// is also required — an unread piped stderr would eventually block the daemon.
 fn spawn_stderr_progress_reader(stderr: ChildStderr) {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        // Drain raw bytes, not `.lines()`: `Lines::next_line()` errors on the
+        // first non-UTF-8 byte, and `while let Ok(_)` would treat that as EOF —
+        // silently ending the drain. The daemon's stderr pipe would then fill
+        // (~64 KB) and the daemon would block on its next write (hang). Model
+        // load, hipcc compiles, and HIP errors can all emit non-UTF-8, so we
+        // must keep draining regardless of content via `read_until` + lossy
+        // decode. Only a true EOF (0 bytes) or a hard IO error stops us.
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break, // EOF: daemon closed stderr / exited.
+                Ok(_) => {}
+                Err(_) => break, // Hard IO error on the pipe.
+            }
+            // Trim the trailing newline for parsing / re-emit.
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+            let line = String::from_utf8_lossy(&buf);
             if line.contains("loading layer ") {
                 if let Some((cur, tot)) = parse_load_layer_line(&line) {
                     // `current < total` = actively loading (UI shows a determinate
