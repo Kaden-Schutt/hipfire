@@ -8,6 +8,7 @@
 //! `RuntimeConfig::get()` accessor. Runtime hot paths access config
 //! fields instead of hitting `std::env::var` on every call.
 
+use hipfire_hardware::{DeviceMesh, DimKind};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
@@ -141,12 +142,49 @@ pub fn resolve_parallelism(pp: usize, tp: usize, emulate_gpus: Option<usize>) ->
     (pp, tp)
 }
 
+/// Resolve the `pp`/`tp` load knobs (with `HIPFIRE_EMULATE_GPUS` defaulting) to
+/// a [`DeviceMesh`] — the mesh producer that replaces the flat
+/// `resolve_parallelism` pair as the daemon adopts mesh-driven load/dispatch.
+/// Today `tp` == expert-parallel (`Ep` axis); real row/col TP and composed 2×N
+/// meshes are later phases. Degenerate: neither set → single-device (1×1) mesh.
+pub fn resolve_mesh(pp: usize, tp: usize, emulate_gpus: Option<usize>) -> DeviceMesh {
+    let (pp, tp) = resolve_parallelism(pp, tp, emulate_gpus);
+    if pp > 1 {
+        DeviceMesh::rect(&[(DimKind::Pp, pp)])
+    } else if tp > 1 {
+        DeviceMesh::rect(&[(DimKind::Ep, tp)])
+    } else {
+        DeviceMesh::single()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::RuntimeConfig;
+    use super::{resolve_mesh, RuntimeConfig};
+    use hipfire_hardware::DimKind;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_mesh_maps_knobs_to_axes() {
+        // single-GPU: no axes, one device.
+        assert_eq!(resolve_mesh(1, 1, None).n_devices(), 1);
+        // pp>1 → Pp axis.
+        let pp = resolve_mesh(2, 1, None);
+        assert_eq!(pp.n_devices(), 2);
+        assert!(pp.has_axis(DimKind::Pp));
+        // tp>1 → Ep axis (tp == EP today).
+        let tp = resolve_mesh(1, 4, None);
+        assert_eq!(tp.n_devices(), 4);
+        assert!(tp.has_axis(DimKind::Ep));
+        // emulate defaults to Ep when neither pp nor tp set.
+        let em = resolve_mesh(1, 1, Some(2));
+        assert_eq!(em.n_devices(), 2);
+        assert!(em.has_axis(DimKind::Ep));
+        // explicit pp wins over emulate.
+        assert!(resolve_mesh(2, 1, Some(4)).has_axis(DimKind::Pp));
+    }
 
     #[test]
     fn normalize_prompt_accepts_no_as_false() {
