@@ -630,8 +630,14 @@ Any mismatch = re-pull or report.
 ### Build from source (if you're on a dev branch)
 
 ```bash
-make build
+make            # build everything (all features + embedded browser UIs) and
+                # refresh the ~/.hipfire/bin dev symlinks in place
+make install    # or: full from-scratch cargo-install into ~/.hipfire
 ```
+
+After the first `make`, a plain `make` (or a targeted `make daemon` / `make
+serve` / `make quant`) rebuilds in place and a running `hipfire serve` picks up
+the new binaries on its next daemon spawn. `make help` lists the targets.
 
 ---
 
