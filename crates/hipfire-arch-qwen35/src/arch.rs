@@ -32,11 +32,13 @@
 //!   - a discoverable contract for adding a new arch ("implement this trait
 //!     and register your `arch_id`").
 
-use crate::qwen35::{config_from_hfq as qwen35_config_from_hfq,
-                    load_weights as qwen35_load_weights,
-                    DeltaNetState, Qwen35Config, Qwen35Weights};
+use crate::qwen35::{
+    config_from_hfq as qwen35_config_from_hfq, load_weights as qwen35_load_weights, DeltaNetState,
+    LayerType, Qwen35Config, Qwen35Weights,
+};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::weight_manifest::{StateEntry, StateKind};
 use rdna_compute::Gpu;
 
 /// Type marker for Qwen3.5 architecture (dense Qwen3.5 0.8B/4B/9B/27B,
@@ -78,6 +80,38 @@ impl Architecture for Qwen35 {
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
         DeltaNetState::new(gpu, cfg)
             .map_err(|e| format!("qwen35: DeltaNetState::new failed: {e:?}"))
+    }
+
+    /// State manifest (device-mesh Phase 2): Qwen3.5/3.6 is a hybrid, so the
+    /// per-layer state depends on the layer's [`LayerType`] (the LA-vs-full-attn
+    /// knowledge the plan §4 wants living in manifest construction, so the
+    /// `StateStore` can be keyed by *global* layer index and the DeltaNet
+    /// `la_to_device` sidecar is defined out of existence):
+    /// - `FullAttention` → a KV cache ([`StateKind::Kv`]).
+    /// - `LinearAttention` (DeltaNet) → the recurrent S-matrix
+    ///   ([`StateKind::Recurrent`]) **and** the short-conv1d state
+    ///   ([`StateKind::Conv`]) — a DeltaNet layer holds both (see
+    ///   `DeltaNetState::{recurrent…, conv_states}`).
+    ///
+    /// Keyed by global layer index; the quant mode is a load-time choice
+    /// resolved at fulfillment (empty here).
+    fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
+        let mut m = Vec::with_capacity(cfg.layer_types.len());
+        for (l, lt) in cfg.layer_types.iter().enumerate() {
+            match lt {
+                LayerType::FullAttention => m.push(StateEntry::new(
+                    StateKind::Kv {
+                        quant: String::new(),
+                    },
+                    l,
+                )),
+                LayerType::LinearAttention => {
+                    m.push(StateEntry::new(StateKind::Recurrent, l));
+                    m.push(StateEntry::new(StateKind::Conv, l));
+                }
+            }
+        }
+        m
     }
 
     // Optional overrides default to the trait scaffold's Qwen3.5-flavored
