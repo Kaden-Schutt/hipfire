@@ -42,7 +42,8 @@ pub use hipfire_specdecode::{
     SpecVerifyGraphMode,
 };
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+// (Seed-oracle counters migrated from process-global AtomicU64 statics to a
+// thread-local per-request accumulator; see `SEED_ORACLE` below.)
 
 /// #397 Ship 5.3: route a single spec-decode (DFlash) batched GEMM through
 /// [`GemmFamily::run_key`](hipfire_dispatch::families::gemm::GemmFamily::run_key)
@@ -424,12 +425,18 @@ fn dflash_download_verify_argmax(
 /// draft has no native prediction at position `b`, so REJ_BOUNDARY is
 /// undefined and TAIL/ANYPOS are the only candidates there).
 ///
-static SEED_ORACLE_TOTAL: AtomicU64 = AtomicU64::new(0);
-static SEED_ORACLE_REJ_MATCH: AtomicU64 = AtomicU64::new(0);
-static SEED_ORACLE_TAIL_MATCH: AtomicU64 = AtomicU64::new(0);
-static SEED_ORACLE_ANYPOS_MATCH: AtomicU64 = AtomicU64::new(0);
-static SEED_ORACLE_FULLACCEPT: AtomicU64 = AtomicU64::new(0);
-static SEED_ORACLE_ACCEPT_LEN_SUM: AtomicU64 = AtomicU64::new(0);
+/// Per-request seed-oracle accumulator (P6): previously process-global
+/// `AtomicU64` statics, now a thread-local tuple
+/// `(total, rej, tail, anypos, fullacc, accept_len_sum)`. The daemon spec loop
+/// is synchronous (one request per worker thread), so `reset` at request start
+/// + `read`/`to_json` at the `done` event yields per-request seed-oracle stats,
+/// drained into the unified spec-decode `done` block. `record_seed_oracle`
+/// writes here; the deep DFlash accept site keeps its call unchanged.
+type SeedOracleTuple = (u64, u64, u64, u64, u64, u64);
+thread_local! {
+    static SEED_ORACLE: std::cell::Cell<SeedOracleTuple> =
+        const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SeedOracleStats {
@@ -441,26 +448,71 @@ pub struct SeedOracleStats {
     pub accept_len_sum: u64,
 }
 
-/// Snapshot the process-global seed-oracle counters.
-pub fn read_seed_oracle_stats() -> SeedOracleStats {
-    SeedOracleStats {
-        total: SEED_ORACLE_TOTAL.load(Ordering::Relaxed),
-        rej_match: SEED_ORACLE_REJ_MATCH.load(Ordering::Relaxed),
-        tail_match: SEED_ORACLE_TAIL_MATCH.load(Ordering::Relaxed),
-        anypos_match: SEED_ORACLE_ANYPOS_MATCH.load(Ordering::Relaxed),
-        full_accept: SEED_ORACLE_FULLACCEPT.load(Ordering::Relaxed),
-        accept_len_sum: SEED_ORACLE_ACCEPT_LEN_SUM.load(Ordering::Relaxed),
+impl SeedOracleStats {
+    /// Specialized ext block for the unified spec-decode `done` event. `None`
+    /// when this request observed no seed-oracle cycle (nothing to report).
+    pub fn to_json(&self) -> Option<serde_json::Value> {
+        if self.total == 0 {
+            return None;
+        }
+        let r3 = |x: f32| (x as f64 * 1000.0).round() / 1000.0;
+        let denom = self.total as f32;
+        Some(serde_json::json!({
+            "total": self.total,
+            "rej_match": self.rej_match,
+            "tail_match": self.tail_match,
+            "anypos_match": self.anypos_match,
+            "full_accept": self.full_accept,
+            "accept_len_sum": self.accept_len_sum,
+            "rej_rate": r3(self.rej_match as f32 / denom),
+            "tail_rate": r3(self.tail_match as f32 / denom),
+            "anypos_rate": r3(self.anypos_match as f32 / denom),
+            "mean_accept_len": r3(self.accept_len_sum as f32 / denom),
+        }))
     }
 }
 
-/// Zero all seed-oracle counters. Call before a fresh generation run.
+/// Record one seed-oracle cycle into the current thread's per-request
+/// accumulator. `rej_hit`/`tail_hit`/`anypos_hit` are the position-proxy hits;
+/// `full_accept` is true when the cycle fully accepted the draft.
+fn record_seed_oracle(
+    accept_len: usize,
+    rej_hit: bool,
+    tail_hit: bool,
+    anypos_hit: bool,
+    full_accept: bool,
+) {
+    SEED_ORACLE.with(|c| {
+        let (total, rej, tail, anypos, fullacc, len_sum) = c.get();
+        c.set((
+            total + 1,
+            rej + rej_hit as u64,
+            tail + tail_hit as u64,
+            anypos + anypos_hit as u64,
+            fullacc + full_accept as u64,
+            len_sum + accept_len as u64,
+        ));
+    });
+}
+
+/// Snapshot the current thread's per-request seed-oracle counters.
+pub fn read_seed_oracle_stats() -> SeedOracleStats {
+    let (total, rej_match, tail_match, anypos_match, full_accept, accept_len_sum) =
+        SEED_ORACLE.with(|c| c.get());
+    SeedOracleStats {
+        total,
+        rej_match,
+        tail_match,
+        anypos_match,
+        full_accept,
+        accept_len_sum,
+    }
+}
+
+/// Zero the current thread's seed-oracle counters. Call before a fresh
+/// generation run / at the start of each spec-decode request.
 pub fn reset_seed_oracle_stats() {
-    SEED_ORACLE_TOTAL.store(0, Ordering::Relaxed);
-    SEED_ORACLE_REJ_MATCH.store(0, Ordering::Relaxed);
-    SEED_ORACLE_TAIL_MATCH.store(0, Ordering::Relaxed);
-    SEED_ORACLE_ANYPOS_MATCH.store(0, Ordering::Relaxed);
-    SEED_ORACLE_FULLACCEPT.store(0, Ordering::Relaxed);
-    SEED_ORACLE_ACCEPT_LEN_SUM.store(0, Ordering::Relaxed);
+    SEED_ORACLE.with(|c| c.set((0, 0, 0, 0, 0, 0)));
 }
 
 /// Parse HIPFIRE_DDTREE_LOGW_CUTOFF. Positive value X means "stop tree
@@ -739,12 +791,12 @@ fn load_compatible_tokenizer<T: hipfire_specdecode::SpecDecodeTarget>(
     target: &T,
     draft: &T,
 ) -> HipResult<Tokenizer> {
-    let target_tok = target.load_tokenizer().map_err(|e| {
-        hip_bridge::HipError::new(0, &format!("target tokenizer load failed: {e}"))
-    })?;
-    let draft_tok = draft.load_tokenizer().map_err(|e| {
-        hip_bridge::HipError::new(0, &format!("draft tokenizer load failed: {e}"))
-    })?;
+    let target_tok = target
+        .load_tokenizer()
+        .map_err(|e| hip_bridge::HipError::new(0, &format!("target tokenizer load failed: {e}")))?;
+    let draft_tok = draft
+        .load_tokenizer()
+        .map_err(|e| hip_bridge::HipError::new(0, &format!("draft tokenizer load failed: {e}")))?;
 
     if target_tok.vocab_size() != draft_tok.vocab_size() {
         return Err(hip_bridge::HipError::new(
@@ -7342,33 +7394,17 @@ pub fn spec_step_dflash(
     let anypos_hit: bool = drafted[1..b].iter().any(|&t| t == bonus_token);
     let rej_hit: bool = rej_proxy == Some(bonus_token);
     let tail_hit: bool = tail_proxy == bonus_token;
-    SEED_ORACLE_TOTAL.fetch_add(1, Ordering::Relaxed);
-    SEED_ORACLE_ACCEPT_LEN_SUM.fetch_add(accept_len as u64, Ordering::Relaxed);
-    if rej_hit {
-        SEED_ORACLE_REJ_MATCH.fetch_add(1, Ordering::Relaxed);
-    }
-    if tail_hit {
-        SEED_ORACLE_TAIL_MATCH.fetch_add(1, Ordering::Relaxed);
-    }
-    if anypos_hit {
-        SEED_ORACLE_ANYPOS_MATCH.fetch_add(1, Ordering::Relaxed);
-    }
-    if rej_proxy.is_none() {
-        SEED_ORACLE_FULLACCEPT.fetch_add(1, Ordering::Relaxed);
-    }
-    if std::env::var("HIPFIRE_DFLASH_SEED_ORACLE").ok().as_deref() == Some("1") {
-        let s = read_seed_oracle_stats();
-        let denom = s.total.max(1) as f32;
-        eprintln!(
-            "[seed-oracle] cycle: accept_len={} b={} bonus={} rej={:?}/{} tail={}/{} anypos={} fullacc={} | cum rej={:.3} tail={:.3} anypos={:.3} mean_accept={:.2}",
-            accept_len, b, bonus_token, rej_proxy, rej_hit,
-            tail_proxy, tail_hit, anypos_hit, rej_proxy.is_none(),
-            s.rej_match as f32 / denom,
-            s.tail_match as f32 / denom,
-            s.anypos_match as f32 / denom,
-            s.accept_len_sum as f32 / denom,
-        );
-    }
+    // P6: seed-oracle telemetry now flows structured into the unified
+    // spec-decode `done` ext (`seed_oracle` block) via the per-request
+    // accumulator; the former env-gated per-cycle `eprintln!` stderr surface
+    // (HIPFIRE_DFLASH_SEED_ORACLE) is retired.
+    record_seed_oracle(
+        accept_len,
+        rej_hit,
+        tail_hit,
+        anypos_hit,
+        rej_proxy.is_none(),
+    );
 
     // ── 8. Committed sequence ───────────────────────────────────────────
     // committed[0] is the seed_token (already emitted by prev iter). The

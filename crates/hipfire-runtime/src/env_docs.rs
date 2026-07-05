@@ -115,7 +115,7 @@ pub const ENV_COLORTERM: EnvVarDoc = EnvVarDoc {
 pub const ENV_DDTREE_TIMING: EnvVarDoc = EnvVarDoc {
     name: "DDTREE_TIMING",
     description: "pre_verify / verify. The draft and top-K are fused into one GPU-",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:10762",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:10798",
 };
 
 /// `DEBUG_LAYERS` — Runtime variable controlling debug layers in hipfire
@@ -402,7 +402,7 @@ pub const ENV_HIPFIRE_DDTREE_BUDGET: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_FORCE_SLOW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_FORCE_SLOW",
     description: "HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:10989",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11025",
 };
 
 /// `HIPFIRE_DDTREE_LOGW_CUTOFF` — Adaptive-B usage report — only meaningful when --adaptive-b is on
@@ -416,35 +416,35 @@ pub const ENV_HIPFIRE_DDTREE_LOGW_CUTOFF: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_PATH_B_CAPTURE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_B_CAPTURE",
     description: "Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11028",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11064",
 };
 
 /// `HIPFIRE_DDTREE_PATH_C` — Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The
 pub const ENV_HIPFIRE_DDTREE_PATH_C: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_C",
     description: "Resolve \"HIPFIRE_DDTREE_PATH_C\" ONCE before the decode loop. The",
-    source: "crates/hipfire-serving-core/src/generate.rs:859",
+    source: "crates/hipfire-serving-core/src/generate.rs:864",
 };
 
 /// `HIPFIRE_DDTREE_PATH_C_VERBOSE` — Runtime variable controlling DDTree path c verbose in hipfire
 pub const ENV_HIPFIRE_DDTREE_PATH_C_VERBOSE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_C_VERBOSE",
     description: "Runtime variable controlling DDTree path c verbose in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11553",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11589",
 };
 
 /// `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` — Runtime variable controlling DDTree path c verify graph in hipfire
 pub const ENV_HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH",
     description: "Runtime variable controlling DDTree path c verify graph in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:218",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:219",
 };
 
 /// `HIPFIRE_DDTREE_TAPE_DUMP` — Enabled when set to 1
 pub const ENV_HIPFIRE_DDTREE_TAPE_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TAPE_DUMP",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11008",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11044",
 };
 
 /// `HIPFIRE_DDTREE_TOPK` — Runtime variable controlling DDTree topk in hipfire
@@ -458,7 +458,7 @@ pub const ENV_HIPFIRE_DDTREE_TOPK: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_TREE_LA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TREE_LA",
     description: "Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:10870",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:10906",
 };
 
 /// `HIPFIRE_DEBUG_CHAT` — Enabled when set to 1
@@ -920,14 +920,14 @@ pub const ENV_HIPFIRE_DFLASH_MODE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH",
     description: "Runtime variable controlling dflash moe draft ffn graph in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6719",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6771",
 };
 
 /// `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` — Runtime variable controlling dflash moe verify graph lmhead in hipfire
 pub const ENV_HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD",
     description: "Runtime variable controlling dflash moe verify graph lmhead in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6090",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6142",
 };
 
 /// `HIPFIRE_DFLASH_NGRAM_BLOCK` — Enabled when set to 1
@@ -941,70 +941,63 @@ pub const ENV_HIPFIRE_DFLASH_NGRAM_BLOCK: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DFLASH_Q8_LMHEAD_WMMA: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:129",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:130",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_COMPARE` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_COMPARE"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_COMPARE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_COMPARE",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_COMPARE\"",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12083",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12119",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` — Runtime variable controlling dflash rollback fa raw atol in hipfire
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL",
     description: "Runtime variable controlling dflash rollback fa raw atol in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:917",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:969",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS\"",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12107",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12143",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY\"",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12011",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12047",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY\"",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:11979",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12015",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE\"",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12059",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12095",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES` — Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES"
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES\"",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12035",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:12071",
 };
 
 /// `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` — Parses "HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL" with fallback defaults
 pub const ENV_HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL",
     description: "Parses \"HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL\" with fallback defaults",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:925",
-};
-
-/// `HIPFIRE_DFLASH_SEED_ORACLE` — Enabled when set to 1
-pub const ENV_HIPFIRE_DFLASH_SEED_ORACLE: EnvVarDoc = EnvVarDoc {
-    name: "HIPFIRE_DFLASH_SEED_ORACLE",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:7359",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:977",
 };
 
 /// `HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE` — Runtime variable controlling dflash serial qKVza self compare in hipfire
@@ -2598,7 +2591,7 @@ pub const ENV_HIPFIRE_PFLASH_DAEMON_LABELS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PFLASH_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DEBUG",
     description: "Runtime variable controlling pflash debug in hipfire",
-    source: "crates/hipfire-serving-core/src/generate.rs:2484",
+    source: "crates/hipfire-serving-core/src/generate.rs:2498",
 };
 
 /// `HIPFIRE_PFLASH_DRAFTER_KV` — Selects behavior from recognized values
@@ -3182,7 +3175,7 @@ pub const ENV_HIPFIRE_RECOVER_NOISE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_REPLAY_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_REPLAY_GRAPH",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:4813",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:4865",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK` — HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases
@@ -3499,7 +3492,7 @@ pub const ENV_HIPFIRE_SMOKE_STEPS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SPEC_PHASES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SPEC_PHASES",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6686",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6738",
 };
 
 /// `HIPFIRE_STATE` — Interprets "HIPFIRE_STATE" from environment to select behavior
@@ -3597,21 +3590,21 @@ pub const ENV_HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_VERIFY_GRAPH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VERIFY_GRAPH",
     description: "Runtime variable controlling verify graph in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6148",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6200",
 };
 
 /// `HIPFIRE_VERIFY_GRAPH_TIMING` — (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
 pub const ENV_HIPFIRE_VERIFY_GRAPH_TIMING: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VERIFY_GRAPH_TIMING",
     description: "(HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6163",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6215",
 };
 
 /// `HIPFIRE_VERIFY_GRAPH_TREE` — Enabled when set to 1
 pub const ENV_HIPFIRE_VERIFY_GRAPH_TREE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VERIFY_GRAPH_TREE",
     description: "Enabled when set to 1",
-    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6138",
+    source: "crates/hipfire-arch-qwen35/src/speculative.rs:6190",
 };
 
 /// `HIPFIRE_VISION_CACHE` — Disabled when set to 0
@@ -4003,7 +3996,6 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE,
     ENV_HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES,
     ENV_HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL,
-    ENV_HIPFIRE_DFLASH_SEED_ORACLE,
     ENV_HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE,
     ENV_HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE,
     ENV_HIPFIRE_DFLASH_SPEC_DEMO_BIN,

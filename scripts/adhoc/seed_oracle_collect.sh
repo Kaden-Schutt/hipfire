@@ -6,9 +6,13 @@
 
 # Task #93 Phase B seed-prediction oracle data collection.
 #
-# Runs DFlash spec-decode across three prompt genres (code, prose, instruct)
-# with HIPFIRE_DFLASH_SEED_ORACLE=1 set. Parses the per-run summary line:
-#   seed-oracle: cycles=N match=M full_accept=F predictable=P overall=X among_predictable=Y
+# Runs DFlash spec-decode across three prompt genres (code, prose, instruct).
+# The dflash_spec_demo example prints a per-run seed-oracle summary line
+# unconditionally (when any seed-oracle cycle ran); this parses it:
+#   seed-oracle: cycles=N full_accept=F mean_accept_len=X | rej_match=.. tail_match=.. anypos_match=..
+# (P6: the seed-oracle counters are per-request thread-local, drained into the
+# daemon's unified spec-decode `done` ext; the former HIPFIRE_DFLASH_SEED_ORACLE
+# per-cycle stderr toggle is retired.)
 #
 # The "among_predictable" rate is what matters — it answers "when the draft
 # has a seed guess, how often is it right?" which is the real question for
@@ -34,11 +38,11 @@ fi
 
 if { [ -x "$HIPFIRE_GPULOCK_BIN" ] || command -v "$HIPFIRE_GPULOCK_BIN" >/dev/null 2>&1; }; then
     # shellcheck disable=SC1090
-    "$HIPFIRE_GPULOCK_BIN" gpu-lock acquire "seed-oracle" --watch-pid "$$" || {
+    "$HIPFIRE_GPULOCK_BIN" lock acquire "seed-oracle" --watch-pid "$$" || {
         echo "could not acquire GPU lock" >&2
         exit 2
     }
-    trap '"$HIPFIRE_GPULOCK_BIN" gpu-lock release 2>/dev/null || true' EXIT
+    trap '"$HIPFIRE_GPULOCK_BIN" lock release 2>/dev/null || true' EXIT
 fi
 
 PROSE_PROMPT="The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was"

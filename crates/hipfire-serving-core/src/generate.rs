@@ -784,6 +784,11 @@ pub fn generate_dflash(
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
     let mut spec_metrics = SpecMetrics::new(df.block_size);
+    // Reset the per-request thread-local specialized accumulators (ddtree meta
+    // tree-size + seed-oracle) so this request's `done` ext reflects only its
+    // own cycles. The DFlash step records into these on this same thread.
+    hipfire_arch_qwen35::speculative::reset_ddtree_meta_stats();
+    hipfire_arch_qwen35::speculative::reset_seed_oracle_stats();
     // max_think_tokens enforcement state (mirrors the AR path).
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
@@ -1132,6 +1137,15 @@ pub fn generate_dflash(
     });
     if let (Some(r), Some(a)) = (pflash_bypass_reason, pflash_alpha) {
         ext["pflash"] = serde_json::json!({ "bypass_reason": r, "alpha": a });
+    }
+    // Specialized per-request spec metrics, drained from the qwen35 DFlash
+    // container (migrated off process-global atomics in P6). Each is `None`
+    // when this request drove no such cycle, so absent means "not exercised".
+    if let Some(ddm) = hipfire_arch_qwen35::speculative::read_ddtree_meta_stats().to_json() {
+        ext["ddtree_meta"] = ddm;
+    }
+    if let Some(so) = hipfire_arch_qwen35::speculative::read_seed_oracle_stats().to_json() {
+        ext["seed_oracle"] = so;
     }
     emit_spec_done(
         stdout,
