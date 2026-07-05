@@ -47,8 +47,29 @@ already ≈ saturate; the compute headroom (19.5 shared) is reachable by raising
 i.e. **M/AI, exactly as the R5 verdict predicted — not the cascade.** Everything
 before had a 1D tile stuck at 3–5 TOPS; R6's 2D tile clears the feed wall.
 
-**Next (tuning toward the 15.7 reference):** raise MT (more M-row blocks → more
-weight reuse → higher AI → less feed-bound). MT=16 overran L1 (A + double-buffered W
-+ C > 64 KB) — needs KCHUNK/depth tuning or single-buffered W. Sweep MT/KCHUNK for
-the L1-optimal point, and scale past 8 columns (feed permitting). But the headline is
-settled: **NPU W4A8 prefill offload is a real win — R6 beats SOTA.**
+## MT sweep — peak 20.68 TOPS (beats the 15.7 reference)
+
+The bottleneck is the **weight feed** (~68 GB/s), and effective **AI_W = 8·MT** (each
+weight reused across MT M-row blocks; independent of KCHUNK). So raising MT raises
+throughput until it meets the compute ceiling. KCHUNK only sets L1 fit + C-write
+amortization. 8-core, real independent-W streaming, bit-exact:
+
+| MT | KCHUNK | AI_W | TOPS |
+|---|---|---|---|
+| 8  | 16 | 64  | 9.19 |
+| 16 | 8  | 128 | 13.92 |
+| **24** | **8** | **192** | **20.68** |
+| 32 | 4  | 256 | 18.06 (compute-bound; KCHUNK=4 C-write overhead) |
+
+**Peak MT=24: 20.68 TOPS — 4.1× SOTA FastFlowLM (~5) and above the 15.7 int8
+whole_array reference**, on real weight streaming. MT=32 regresses (past the compute
+ceiling, and KCHUNK=4 pays too much per-block C overhead), so MT=24/KCHUNK=8 is the
+sweet spot. (MT=16 KCHUNK=16 overran the 64 KB L1 — A + double-buffered W + C; MT=24
+KCHUNK=8 fits at ~44 KB.)
+
+The feed caps the aggregate, so 8 cores ≈ saturate it — more columns won't add much.
+**Verdict, settled and on-hardware:** hipfire's R6 W4A8 GEMM does **20.7 TOPS** of
+real prefill on the halo NPU — **4× the SOTA NPU inference stack** and past the
+reference — via the M/AI 2D tile, all through hipfire's own XRT-free dispatch. Next:
+wire R6 into the runtime prefill-offload path (the original goal — now clearly worth
+it; NPU prefill runs concurrently with GPU decode for a real aggregate win).
