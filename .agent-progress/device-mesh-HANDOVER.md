@@ -22,19 +22,30 @@ loops forever). Suggested next goal: `/goal implement device-mesh Phase 2 fulfil
   deterministic compile). `Architecture::{weight_manifest,state_manifest}` implemented for
   llama, qwen2, minimax, toy.
 
-## The NEXT unit (recommended): `fulfill_manifest` (Phase 2 GPU execution)
-`plan_manifest(weights, state, mesh, n_layers) -> ManifestPlan` already computes *where every
-weight/state goes + the collective/band schedule*, validated. `fulfill_manifest` is now just
-the **GPU execution** of that plan:
-  1. `let plan = plan_manifest(&W::weight_manifest(cfg), &W::state_manifest(cfg), &mesh, n_layers)?;`
-  2. for each `WeightPlacement`: read the HFQ tensor, **slice it per `ShardPolicy`**, upload
-     the slice to each device in `placement.devices` (reuse the existing per-device upload
-     primitive — study `qwen35 load_weights_multi` and `deepseek4 load_weights_sharded` +
-     the zeroed-dummy for `ExpertSharded`).
-  3. populate the arch's existing per-device weight/state fields (Tier-1: forward still reads
-     arch fields — do NOT block on the Tier-2 slot-binding).
-Validate: `HIPFIRE_EMULATE_GPUS=2` PP (`+HIPFIRE_PP=2` via the Bun CLI) on qwen3.5-4b + EP
-default on a MoE; compare to the current bespoke `load_model_pp`/`_ep` output (byte-identical).
+## DONE this session: `fulfill_manifest` whole-tensor path (Phase 2 GPU exec)
+`crates/hipfire-runtime/src/weight_store.rs` — `fulfill_manifest(weights, mesh, n_layers, gpus,
+source) -> Result<WeightStore, FulfillError>`. GPU-validated on gfx1151 (`fulfill_manifest_probe`:
+single-1×1 + emulated PP-2, placement + `memcpy_dtoh` byte-oracle; the oracle caught a real
+missing-`layer`-in-key bug). Whole-tensor upload only; `ExpertSharded` + dense-TP slice return
+`Err` (deferred). Takes a `source(entry)->bytes` closure (the arch owns on-disk HFQ naming; the
+engine only does placement). Additive — forward path untouched (Tier-1; store-read is Phase 3).
+
+## The NEXT unit — pick ONE (both build on `fulfill_manifest`):
+**Option A (recommended — self-contained, byte-validatable like this session): `ExpertSharded`
+upload.** Finish Phase-2 EP placement: host-pack owned experts + zeroed-dummy for non-owned,
+reusing the deepseek4 convention (`crates/hipfire-arch-deepseek4/src/arch.rs:163-333`
+`upload_layer_routed_experts` — compact blob via `gpu.upload_raw`, per-expert ptr table,
+`gpu.zeros` dummy for `gate_up`, `ShardConfig::owns_expert`). The `source` closure yields the
+experts tensor bytes; fulfill host-slices owned experts. Validate against `deepseek4
+load_weights_sharded` bytes on a small MoE, or extend the probe with an ExpertSharded entry on Ep-2.
+
+**Option B: wire `WeightStore` into a real load (Phase 3 start).** Give an arch (llama — has
+`weight_manifest`/`state_manifest` but NO multi-loader) a `source` backed by its real HFQ + name
+resolver (study `qwen35_tensor_data`, `qwen35.rs:1155`), fulfill on PP-2, forward reads the store
+not arch fields. Higher risk (forward rewiring); pairs with the ModelParallel/ArchDispatch hoist.
+
+Original PP validation target (for whenever the forward reads the store): `HIPFIRE_EMULATE_GPUS=2`
+PP on qwen3.5-4b; compare to bespoke `load_model_pp`/`_ep` output (byte-identical).
 
 ## GOTCHAS (bit me this session)
 - **GPU lock goes stale** (`/tmp/hipfire-gpu.lock`, noclobber variant). Verify dead (dead pid
