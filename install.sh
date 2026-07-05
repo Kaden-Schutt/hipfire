@@ -238,6 +238,18 @@ fi
 # ─── Build & install ─────────────────────────────────────
 mkdir -p "$BIN_DIR" "$MODELS_DIR"
 
+# Clear any dev symlinks first. `make` / `make dev-install` symlinks
+# ~/.hipfire/bin/<bin> at the repo's target/release build. `cargo install`
+# normally replaces the directory entry via an atomic rename (safe), but on a
+# cross-filesystem copy fallback it would follow the symlink and overwrite the
+# build output. Removing the symlinks guarantees cargo writes real files into a
+# clean bin dir. (Only symlinks are removed; real installed binaries are left
+# for --force to overwrite. Re-run `make` afterward to restore dev symlinks.)
+if find "$BIN_DIR" -maxdepth 1 -type l -print -quit 2>/dev/null | grep -q .; then
+    echo "  clearing dev symlinks in $BIN_DIR (from \`make\`) before install"
+    find "$BIN_DIR" -maxdepth 1 -type l -exec rm -f {} + 2>/dev/null || true
+fi
+
 echo ""
 echo "Building and installing hipfire (release build — this may take several minutes)..."
 cd "$REPO_DIR"
