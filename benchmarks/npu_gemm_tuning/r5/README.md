@@ -64,3 +64,32 @@ cascade kernel. Only then is the cascade GEMM buildable/testable.
 4. Measure real (INNER=0) TOPS through NpuKernel vs the 5-TOPS SOTA / 15.7 reference.
 
 `r5_cascade.cc` holds the compute-core skeleton (head/middle/tail variants).
+
+## Progress — both hard unknowns cleared (2026-07-05)
+
+**1. Low-level build path PROVEN.** Compiled a known-good `aie.mlir` (from a cache
+dir) *directly* via `aiecc` — bypassing IRON entirely — to xclbin+insts, and
+dispatched it through `NpuKernel`: `C[0]=1040`, clean 2× reuse. So I control the MLIR
+end-to-end. Recipe:
+```
+aiecc <dir>/aie.mlir --no-compile-host --no-xchesscc --no-xbridge --peano=$PEANO \
+  --aie-generate-npu-insts --npu-insts-name=<dir>/insts.bin \
+  --aie-generate-xclbin --xclbin-name=<dir>/final.xclbin --tmpdir=<dir>
+```
+Kernel `.o`: `$PEANO/bin/clang++ src.cc -c -o out.o -I$MLIR_AIE_INC -std=c++20 -O2 \
+  -DNDEBUG --target=aie2p-none-unknown-elf [-DROLE=… -DKSLICE=…]` (drop into `<dir>`
+so the MLIR's `link_with` resolves).
+
+**2. Cascade API validated — kernel compiles.** The real API (not the ADF
+`adf/stream.hpp` I first guessed) is the raw aie2p intrinsics from
+`aie_kernels/aie2/cascade_mm.cc`: `put_mcd(v16acc32)` / `get_scd_v16acc32()`, one
+512-bit beat = 16 acc32, so the `mmul<4,16,16>` 64-acc32 partial = 4 beats. `r5_cascade.cc`
+(head/middle/tail) now **compiles for all three roles** to `.o` on the aie2p target,
+using `aie::accum::extract<16>(i).to_native()` → `put_mcd`, and `get_scd_v16acc32()`
+→ `aie::accum::insert`.
+
+**Next:** hand-write the 2-core cascade MLIR (place 2 cores in a column,
+`aie.cascade_flow(core0, core1)`, feed A/W per core, drain C from the tail) using the
+existing `aie.mlir` as a template + the 3 cascade `.o`s; build via the recipe above;
+dispatch via NpuKernel; validate the cascade sum equals the single-core result on
+all-ones. Then 4-core column, 8 columns, and measure real (INNER=0) TOPS vs SOTA ~5.
