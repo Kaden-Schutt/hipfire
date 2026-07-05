@@ -20,7 +20,11 @@ use crate::deepseek4::{
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use hipfire_runtime::tp_shard::ExpertAssign;
+use hipfire_runtime::weight_manifest::{
+    PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+};
+use rdna_compute::{DType, Gpu};
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
 /// after `8 = Qwen2-VL (dots.ocr)` reserved in `docs/architecture-ids.md`.
@@ -171,7 +175,11 @@ impl DeepseekV4 {
         // EP shard: precompute owned set + compact-slot mapping. `shard = None`
         // ⇒ every expert owned, `local_of_global[e] == e`, n_owned == n_exp →
         // identical layout to the unsharded path.
-        let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+        let owns = |e: usize| {
+            shard
+                .map(|(s, rank)| s.owns_expert(rank, e))
+                .unwrap_or(true)
+        };
         let mut local_of_global = vec![usize::MAX; n_exp];
         let mut n_owned = 0usize;
         for e in 0..n_exp {
@@ -550,6 +558,221 @@ impl Architecture for DeepseekV4 {
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
         DeepseekV4State::new(cfg)
     }
+
+    /// Weight manifest (device-mesh Phase 2) for DeepSeek V4 Flash. This is the
+    /// EP-first arch the `ExpertSharded` policy was modelled on, so the sharding
+    /// is exactly: **routed experts → `ExpertSharded`, everything else →
+    /// `Replicate`** (the EP loader threads its `ShardConfig` to *only*
+    /// `upload_layer_routed_experts`; every other tensor is uploaded identically
+    /// on every rank — see `load_weights_inner`). MLA attention is declared
+    /// `Replicate` (not a speculative Column/Row/FusedQKV): the loader replicates
+    /// it across EP ranks and MLA tensor-parallelism is greenfield, so a guessed
+    /// TP policy would be *wrong* — a wrong manifest is worse than none.
+    ///
+    /// **Scope — the always-present, config-exact weights.** Deliberately
+    /// omitted (all `Replicate`, so placement-neutral, and their shapes are
+    /// *read from the file* at load — the `coff` overlap factor is a forward-time
+    /// detail, not config-derivable, so declaring them would mean guessing
+    /// shapes):
+    /// - the per-layer **Hyper-Connections** tensors (`hc_attn_*`/`hc_ffn_*`);
+    /// - the conditional **compressor** (`compress_ratio > 0`) and **indexer**
+    ///   (`compress_ratio == 4`) sub-modules;
+    /// - the **MTP** head layer (optional, env-gated).
+    ///
+    /// These are a follow-up once the store feeds the forward (Phase 3); the
+    /// sharding-relevant structure — every `ExpertSharded` weight and every pin
+    /// — is fully captured here.
+    fn weight_manifest(cfg: &Self::Config) -> Vec<WeightEntry> {
+        use ShardPolicy::*;
+        let d = cfg.hidden_size;
+        let (nh, nkv, hd) = (
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
+        let (qr, or, og) = (cfg.q_lora_rank, cfg.o_lora_rank, cfg.o_groups);
+        let (ne, moe) = (cfg.n_routed_experts, cfg.moe_intermediate_size);
+        let expert = || ExpertSharded {
+            n_experts: ne,
+            assign: ExpertAssign::Stride,
+        };
+        let mut m = Vec::new();
+        m.push(WeightEntry::model(
+            "token_embd",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            Pin(PinTarget::Embed),
+        ));
+        for l in 0..cfg.num_hidden_layers {
+            // Norms (RMSNorm, F32).
+            m.push(WeightEntry::layer(
+                "attn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "q_norm",
+                l,
+                vec![qr],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "kv_norm",
+                l,
+                vec![nkv * hd],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "attn_sink",
+                l,
+                vec![nh],
+                DType::F32,
+                Replicate,
+            ));
+            // MLA: Q-LoRA (wq_a/wq_b), joint MQA wkv, grouped O-LoRA (wo_a/wo_b).
+            m.push(WeightEntry::layer(
+                "wq_a",
+                l,
+                vec![qr, d],
+                DType::F16,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "wq_b",
+                l,
+                vec![nh * hd, qr],
+                DType::F16,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "wkv",
+                l,
+                vec![nkv * hd, d],
+                DType::F16,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "wo_a",
+                l,
+                vec![og * or, (nh / og) * hd],
+                DType::F16,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "wo_b",
+                l,
+                vec![d, og * or],
+                DType::F16,
+                Replicate,
+            ));
+            // MoE router: gate always; gate.bias only on score-routed layers
+            // (l >= num_hash_layers). Hash-routed layers use a tid2eid LUT
+            // instead — a routing table, not a GEMM weight, so it is omitted.
+            m.push(WeightEntry::layer(
+                "router_gate",
+                l,
+                vec![ne, d],
+                DType::F32,
+                Replicate,
+            ));
+            if l >= cfg.num_hash_layers {
+                m.push(WeightEntry::layer(
+                    "router_gate_bias",
+                    l,
+                    vec![ne],
+                    DType::F32,
+                    Replicate,
+                ));
+            }
+            // Shared expert (one per layer): SwiGLU w1/w3/w2, replicated.
+            m.push(WeightEntry::layer(
+                "shared_gate",
+                l,
+                vec![moe, d],
+                DType::F16,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "shared_up",
+                l,
+                vec![moe, d],
+                DType::F16,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "shared_down",
+                l,
+                vec![d, moe],
+                DType::F16,
+                Replicate,
+            ));
+            // Routed experts (n_routed_experts): the ONLY sharded weights (EP).
+            m.push(WeightEntry::layer(
+                "experts_gate",
+                l,
+                vec![ne, moe, d],
+                DType::F16,
+                expert(),
+            ));
+            m.push(WeightEntry::layer(
+                "experts_up",
+                l,
+                vec![ne, moe, d],
+                DType::F16,
+                expert(),
+            ));
+            m.push(WeightEntry::layer(
+                "experts_down",
+                l,
+                vec![ne, d, moe],
+                DType::F16,
+                expert(),
+            ));
+        }
+        m.push(WeightEntry::model(
+            "output_norm",
+            vec![d],
+            DType::F32,
+            Replicate,
+        ));
+        m.push(WeightEntry::model(
+            "head",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            Pin(PinTarget::Output),
+        ));
+        m
+    }
+
+    /// State manifest: DeepSeek V4 is full-attention (MLA/SWA), so per-layer
+    /// state is a KV-family cache — one [`StateKind::Kv`] per layer, keyed by
+    /// global layer index. No DeltaNet recurrent / conv state. (The SWA-ring +
+    /// compressed-indexer machinery is an internal shape detail of the KV state,
+    /// not a distinct `StateKind`.) MTP-layer state is scoped out with its
+    /// weights.
+    fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
+        (0..cfg.num_hidden_layers)
+            .map(|l| {
+                StateEntry::new(
+                    StateKind::Kv {
+                        quant: String::new(),
+                    },
+                    l,
+                )
+            })
+            .collect()
+    }
 }
 
 impl DeepseekV4 {
@@ -588,8 +811,10 @@ impl DeepseekV4 {
         // N). Layers >= N fall back to shared-only FFN. Each layer's
         // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
         // logical shape), so 22 layers ≈ 40 GB.
-        let upload_experts =
-            std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS").ok().as_deref() != Some("0");
+        let upload_experts = std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+            .ok()
+            .as_deref()
+            != Some("0");
         let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -1269,5 +1494,83 @@ mod tests {
     fn deepseek4_arch_id_is_nine() {
         assert_eq!(DeepseekV4::arch_id(), 9);
         assert_eq!(DeepseekV4::name(), "deepseek4");
+    }
+
+    // Minimal valid config: 4 layers, num_hash_layers=2 → layers 0,1 hash-routed
+    // (no gate_bias), layers 2,3 score-routed (gate_bias). Built via serde since
+    // DeepseekV4Config derives Deserialize (cheaper than a 37-field literal).
+    fn tiny_cfg() -> DeepseekV4Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 100, "hidden_size": 64, "num_hidden_layers": 4,
+            "num_attention_heads": 8, "num_key_value_heads": 1, "head_dim": 16,
+            "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
+            "q_lora_rank": 32, "o_lora_rank": 32, "qk_rope_head_dim": 8, "o_groups": 2,
+            "n_routed_experts": 8, "n_shared_experts": 1, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 48, "routed_scaling_factor": 1.0,
+            "topk_method": "noaux_tc", "scoring_func": "sqrtsoftplus",
+            "norm_topk_prob": true, "swiglu_limit": 7.0,
+            "hc_mult": 4, "hc_sinkhorn_iters": 3, "hc_eps": 1e-6,
+            "index_n_heads": 4, "index_head_dim": 16, "index_topk": 8,
+            "compress_ratios": [], "compress_rope_theta": 10000.0,
+            "rope_theta": 10000.0, "rope_scaling_factor": 16.0,
+            "rope_scaling_original_max_position_embeddings": 4096,
+            "rope_scaling_beta_fast": 32, "rope_scaling_beta_slow": 1,
+            "sliding_window": 128, "num_nextn_predict_layers": 1, "num_hash_layers": 2
+        }))
+        .expect("tiny deepseek4 config")
+    }
+
+    #[test]
+    fn deepseek4_weight_manifest_shards_only_experts() {
+        use hipfire_runtime::weight_manifest::{PinTarget, ShardPolicy};
+        let cfg = tiny_cfg();
+        let m = DeepseekV4::weight_manifest(&cfg);
+        // Only routed experts are ExpertSharded — 3 (gate/up/down) × 4 layers.
+        let experts: Vec<_> = m
+            .iter()
+            .filter(|e| matches!(e.policy, ShardPolicy::ExpertSharded { .. }))
+            .collect();
+        assert_eq!(experts.len(), 12);
+        assert!(experts
+            .iter()
+            .all(|e| matches!(e.policy, ShardPolicy::ExpertSharded { n_experts: 8, .. })));
+        // Nothing else shards (all Replicate / Pin).
+        assert!(m.iter().all(|e| !matches!(
+            e.policy,
+            ShardPolicy::RowShard { .. }
+                | ShardPolicy::ColumnShard { .. }
+                | ShardPolicy::FusedQkv { .. }
+                | ShardPolicy::HeadSharded { .. }
+                | ShardPolicy::VocabShard { .. }
+        )));
+        // Pins.
+        assert!(m
+            .iter()
+            .any(|e| e.name == "token_embd"
+                && matches!(e.policy, ShardPolicy::Pin(PinTarget::Embed))));
+        assert!(m
+            .iter()
+            .any(|e| e.name == "head" && matches!(e.policy, ShardPolicy::Pin(PinTarget::Output))));
+        // gate_bias only on score-routed layers (l >= num_hash_layers = 2).
+        let bias_layers: Vec<_> = m
+            .iter()
+            .filter(|e| e.name == "router_gate_bias")
+            .filter_map(|e| e.layer)
+            .collect();
+        assert_eq!(bias_layers, vec![2, 3]);
+        // router_gate on every layer.
+        assert_eq!(m.iter().filter(|e| e.name == "router_gate").count(), 4);
+    }
+
+    #[test]
+    fn deepseek4_state_manifest_is_kv_per_layer() {
+        let cfg = tiny_cfg();
+        let s = DeepseekV4::state_manifest(&cfg);
+        assert_eq!(s.len(), 4);
+        assert!(s.iter().all(|e| matches!(e.kind, StateKind::Kv { .. })));
+        assert_eq!(
+            s.iter().map(|e| e.layer).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 }
