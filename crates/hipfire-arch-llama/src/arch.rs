@@ -195,11 +195,14 @@ impl Architecture for Llama {
                 Replicate,
             ));
         }
+        // Final norm co-locates with lm_head on the last pipeline stage (the
+        // Megatron output convention) — `Pin(Output)`, not `Replicate` (which
+        // would land it on stage 0 and starve the last stage under PP).
         m.push(WeightEntry::model(
             "output_norm",
             vec![d],
             DType::F32,
-            Replicate,
+            Pin(PinTarget::Output),
         ));
         m.push(WeightEntry::model(
             "lm_head",
