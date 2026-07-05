@@ -1,6 +1,10 @@
-//! Wire-in step 2 — `NpuGemm`: a W4A8 GEMM primitive over the R6 kernel. Turns a
-//! standard row-major GEMM into R6 dispatches by marshaling A/W into the kernel's
-//! tile-major SHMEM layout (all tiles row-major; validated 0/256 by `r6_verify`).
+//! Wire-in step 2 — `NpuGemm`: a W4A8 GEMM primitive over the R6-TS kernel
+//! (`r6_gemm_ts.cc`). Turns a standard row-major GEMM into R6 dispatches. A and C move
+//! ROW-MAJOR: the kernel's in-core tensor buffer streams do the tile reshuffle via the
+//! address generators (no CPU marshaling, no strided DMA), so `a_buf`/`c_buf` are plain
+//! row-major blocks. Only W is pre-packed into the kernel's tile-major int4 layout — a
+//! static, once-per-load cost (see [`Self::prepack_weights`]). Validated by
+//! `r6_ts_verify` (0 mismatches at MT=8 and the MT=24 peak).
 //!
 //! `groups` = how many `NT·MN`-wide N-slabs one dispatch computes: 1 for the single
 //! core (`r6_cache.sh` COLS=1), or `COLS·NB` for the array (COLS cores × NB streamed
@@ -118,8 +122,8 @@ impl NpuGemm {
 
     /// One dispatch: `a` row-major `(MT·MR) × (KCHUNK·MK)` int8; `w_int4` row-major
     /// `(KCHUNK·MK) × (groups·NT·MN)` int4 values; `c` gets row-major
-    /// `(MT·MR) × (groups·NT·MN)` int32. Marshals into the tile/group SHMEM layout,
-    /// dispatches, and un-marshals.
+    /// `(MT·MR) × (groups·NT·MN)` int32. A/C are copied row-major (the kernel's tensor
+    /// streams tile them in-core); W is pre-packed tile-major. Dispatches, copies C out.
     pub fn run_slab(&mut self, a: &[i8], w_int4: &[i8], c: &mut [i32]) -> Result<(), XdnaError> {
         let (mt, nt, kc, g) = (self.mt, self.nt, self.kchunk, self.groups);
         let k = kc * MK;
@@ -128,22 +132,9 @@ impl NpuGemm {
         assert_eq!(w_int4.len(), k * n, "W shape");
         assert_eq!(c.len(), mt * MR * n, "C shape");
 
-        // A -> tile-major: a_buf[(mt_i*KCHUNK+ki)*(MR*MK) + m*MK + kk].
-        {
-            let s = self.a_buf.as_mut_slice();
-            for mti in 0..mt {
-                for ki in 0..kc {
-                    for m in 0..MR {
-                        for kk in 0..MK {
-                            s[(mti * kc + ki) * (MR * MK) + m * MK + kk] =
-                                a[(mti * MR + m) * k + ki * MK + kk] as u8;
-                        }
-                    }
-                }
-            }
-        }
-        // W -> per-group tile-major + int4 pack. Group gi owns the N-slab
-        // [gi*NT*MN, (gi+1)*NT*MN); its w_buf region starts at gi*(NT*KCHUNK tiles).
+        self.load_a(a); // row-major A block -> a_buf (kernel tensor-streams the tiling)
+                        // W -> per-group tile-major + int4 pack. Group gi owns the N-slab
+                        // [gi*NT*MN, (gi+1)*NT*MN); its w_buf region starts at gi*(NT*KCHUNK tiles).
         {
             let s = self.w_buf.as_mut_slice();
             s.fill(0);
@@ -201,28 +192,23 @@ impl NpuGemm {
         }
     }
 
-    // Un-marshal c_buf (tile/group-major) into row-major `c` `(MT·MR) × (groups·NT·MN)`.
+    // Copy c_buf into row-major `c` `(MT·MR) × (groups·NT·MN)`. The R6-TS kernel already
+    // writes each group's block ROW-MAJOR (its tensor stream de-tiles in-core), so per
+    // group gi this is a straight block copy — no reshuffle.
     fn unpack_c(&self, c: &mut [i32]) {
         let (mt, nt, g) = (self.mt, self.nt, self.groups);
         let n = g * nt * MN;
+        let bw = nt * MN; // block width (cols per group)
+        let bh = mt * MR; // block height (rows)
         let out: &[i32] = unsafe {
-            std::slice::from_raw_parts(
-                self.c_buf.as_slice().as_ptr() as *const i32,
-                g * mt * nt * MR * MN,
-            )
+            std::slice::from_raw_parts(self.c_buf.as_slice().as_ptr() as *const i32, g * bh * bw)
         };
         for gi in 0..g {
-            let cbase = gi * mt * nt * (MR * MN);
-            let ncol0 = gi * nt * MN;
-            for mti in 0..mt {
-                for nti in 0..nt {
-                    for m in 0..MR {
-                        for nn in 0..MN {
-                            c[(mti * MR + m) * n + ncol0 + nti * MN + nn] =
-                                out[cbase + (mti * nt + nti) * (MR * MN) + m * MN + nn];
-                        }
-                    }
-                }
+            let cbase = gi * bh * bw;
+            let ncol0 = gi * bw;
+            for row in 0..bh {
+                let src = cbase + row * bw;
+                c[row * n + ncol0..row * n + ncol0 + bw].copy_from_slice(&out[src..src + bw]);
             }
         }
     }
@@ -279,7 +265,7 @@ impl NpuGemm {
                         a_sub[i * bk..(i + 1) * bk]
                             .copy_from_slice(&a[(mo + i) * k + ko..(mo + i) * k + ko + bk]);
                     }
-                    self.pack_a(&a_sub);
+                    self.load_a(&a_sub);
                     let off = (ko_i * nns + no_i) * wl;
                     self.w_buf
                         .as_mut_slice()
@@ -300,20 +286,13 @@ impl NpuGemm {
         Ok(())
     }
 
-    // Marshal `a` `(MT·MR) × (KCHUNK·MK)` int8 into a_buf (tile-major).
-    fn pack_a(&mut self, a: &[i8]) {
-        let (mt, kc) = (self.mt, self.kchunk);
-        let k = kc * MK;
+    // Copy `a` `(MT·MR) × (KCHUNK·MK)` int8 row-major into a_buf. The R6-TS kernel's A
+    // tensor stream tiles it in-core, so no CPU reshuffle — just an int8->u8 block copy.
+    fn load_a(&mut self, a: &[i8]) {
         let s = self.a_buf.as_mut_slice();
-        for mti in 0..mt {
-            for ki in 0..kc {
-                for m in 0..MR {
-                    for kk in 0..MK {
-                        s[(mti * kc + ki) * (MR * MK) + m * MK + kk] =
-                            a[(mti * MR + m) * k + ki * MK + kk] as u8;
-                    }
-                }
-            }
+        debug_assert_eq!(s.len(), a.len());
+        for (d, &v) in s.iter_mut().zip(a.iter()) {
+            *d = v as u8;
         }
     }
 }

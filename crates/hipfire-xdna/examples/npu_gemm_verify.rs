@@ -1,7 +1,9 @@
 //! Validate NpuGemm vs a CPU W4A8 reference for any (MT,NT,KCHUNK,groups) config:
 //! one dispatch block, and a tiled 2×(M,N) / 2×K shape (exercises K-accumulation and
-//! multi-block tiling).
+//! multi-block tiling). NpuGemm drives the R6-TS kernel (row-major A/C), so point this at
+//! an xclbin built with R6_KERNEL_SRC=r6_gemm_ts.cc (R6_OUT_TAG=r6ts).
 //!
+//! Build: R6_KERNEL_SRC=<r6>/r6_gemm_ts.cc R6_OUT_TAG=r6ts <r6>/r6_cache.sh MT NT KCHUNK COLS NB
 //! Run: cargo run -p hipfire-xdna --example npu_gemm_verify -- <dir> [MT NT KCHUNK GROUPS]
 fn main() {
     #[cfg(target_os = "linux")]
