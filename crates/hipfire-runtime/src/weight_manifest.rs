@@ -16,7 +16,7 @@
 //! loop exists. See docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md §4.
 
 use crate::tp_shard::ExpertAssign;
-use hipfire_hardware::{CollectiveHint, DimKind};
+use hipfire_hardware::{CollectiveHint, DeviceMesh, DimKind};
 use rdna_compute::DType;
 
 /// Derive the cross-device collective an op's output requires **from its weight
@@ -32,6 +32,37 @@ pub fn collective_for_policy(policy: &ShardPolicy) -> Option<CollectiveHint> {
         ShardPolicy::RowShard { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Tp }),
         ShardPolicy::ExpertSharded { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Ep }),
         _ => None,
+    }
+}
+
+/// The pure "placement = manifest × mesh" computation: the global device ids a
+/// weight entry lands on, before any GPU upload. This is the testable core of
+/// `fulfill_manifest` (the "where"); the "how" (slice/upload the tensor to each
+/// device) is the GPU-integration layer on top. A weight goes to the TP/EP
+/// group of its owning pipeline stage (replicated, sharded, or expert-split);
+/// `Pin`/`Tied` land on one device. Pure `Pp`/`Ep`/single meshes; composed
+/// meshes are Phase 5b.
+pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Vec<usize> {
+    // Owning pipeline stage.
+    let stage = match (&entry.policy, entry.layer) {
+        (ShardPolicy::Pin(PinTarget::Embed), _) => 0,
+        (ShardPolicy::Pin(PinTarget::Output), _) => mesh.size_of(DimKind::Pp).saturating_sub(1),
+        (_, Some(l)) => mesh.stage_for_layer(l, n_layers),
+        (_, None) => 0,
+    };
+    // Coordinate with the Pp axis set to `stage`, others 0.
+    let mut coord = mesh.coord_of(0);
+    if let Some(idx) = mesh.axes().iter().position(|a| a.kind == DimKind::Pp) {
+        coord[idx] = stage;
+    }
+    match &entry.policy {
+        // Pinned/tied non-sharded weights land on exactly one device.
+        ShardPolicy::Pin(_) | ShardPolicy::Tied { .. } => vec![mesh.device_of(&coord)],
+        // Expert-sharded → the Ep group of the stage.
+        ShardPolicy::ExpertSharded { .. } => mesh.group_along(DimKind::Ep, &coord),
+        // Everything else (replicate / column / row / fused-qkv / head / vocab)
+        // spans the stage's Tp group (replica or per-rank shard).
+        _ => mesh.group_along(DimKind::Tp, &coord),
     }
 }
 
@@ -224,6 +255,53 @@ mod tests {
             collective_for_policy(&ShardPolicy::Pin(PinTarget::Embed)),
             None
         );
+    }
+
+    #[test]
+    fn placement_where_by_mesh_and_policy() {
+        let embed = WeightEntry::model(
+            "e",
+            vec![256, 8],
+            DType::F16,
+            ShardPolicy::Pin(PinTarget::Embed),
+        );
+        let out = WeightEntry::model(
+            "lm",
+            vec![256, 8],
+            DType::F16,
+            ShardPolicy::Pin(PinTarget::Output),
+        );
+        let wo = WeightEntry::layer(
+            "wo",
+            3,
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::RowShard { axis: 1 },
+        );
+        let exp = WeightEntry::layer(
+            "experts",
+            3,
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 8,
+                assign: ExpertAssign::Stride,
+            },
+        );
+
+        // Single-GPU: everything on device 0.
+        let single = DeviceMesh::single();
+        assert_eq!(placement_devices(&wo, &single, 4), vec![0]);
+
+        // PP 2×1, 4 layers: layer 3 is on stage 1 → device 1; embed on 0; output on last (1).
+        let pp = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+        assert_eq!(placement_devices(&wo, &pp, 4), vec![1]);
+        assert_eq!(placement_devices(&embed, &pp, 4), vec![0]);
+        assert_eq!(placement_devices(&out, &pp, 4), vec![1]);
+
+        // EP 1×4: experts span the whole Ep group; dense replicated over it too.
+        let ep = DeviceMesh::rect(&[(DimKind::Ep, 4)]);
+        assert_eq!(placement_devices(&exp, &ep, 4), vec![0, 1, 2, 3]);
     }
 
     #[test]
