@@ -9,12 +9,12 @@
 //! forward-usable by gathering them into a single `LlamaWeights` and running a
 //! forward that is **logit-identical** to bespoke.
 //!
-//! This validates the *load half* of pipeline parallelism — "placement = manifest
-//! × mesh" for a real model — reusing the same universal `source` closure as
-//! `llama_store_load`. (The banded *execution* — per-stage layer ranges +
-//! `boundary_copy` of the residual — needs a range-parameterized llama forward
-//! and is the next unit; on this emulated same-device mesh the gathered forward
-//! stands in for it.)
+//! Then the *execution* half: a REAL banded pipeline forward — stage 0 runs
+//! embed + `forward_scratch_band(0..k)` on device 0, hands the residual to
+//! device 1 via `Gpus::boundary_copy`, and stage 1 runs `forward_scratch_band(k..n)`
+//! + `forward_scratch_head` on device 1. Each band touches only its stage's
+//! layers, which live on that stage's device. The result is logit-identical to
+//! bespoke — full pipeline-parallel load + execute on a real model.
 //!
 //! Run: cargo run -p hipfire-runtime --release --example llama_store_pp \
 //!         [~/.hipfire/models/qwen3-0.6b-llama.mq4]
@@ -298,24 +298,105 @@ fn main() {
         layers,
     };
 
+    // (a) Sanity: one gathered forward on device 0 (all layers are physically
+    // co-resident under emulation) — logit-identical to bespoke.
     let asm_logits = forward_logits(&mut gpus.devices[0], &stored_w, &cfg);
-    let max_abs = asm_logits
+    assert_eq!(
+        argmax(&asm_logits),
+        argmax(&ref_logits),
+        "gathered argmax diverged"
+    );
+    assert!(
+        asm_logits.iter().zip(&ref_logits).all(|(a, b)| a == b),
+        "gathered logits differ from bespoke"
+    );
+    println!("llama_store_pp: gathered forward logit-identical to bespoke");
+
+    // (b) REAL banded pipeline forward. Stage 0 runs embed + band(0..k) on device
+    // 0 using its own weights, hands the residual `scratch.x` to device 1 via
+    // `boundary_copy`, and stage 1 runs band(k..n) + head on device 1 — each
+    // band touches only its stage's layers, which live on that stage's device.
+    let k = (0..n_layers)
+        .find(|&l| mesh.stage_for_layer(l, n_layers) == 1)
+        .unwrap_or(n_layers);
+
+    let scratch0 =
+        <Llama as Architecture>::new_state(&mut gpus.devices[0], &cfg).expect("scratch0");
+    let scratch1 =
+        <Llama as Architecture>::new_state(&mut gpus.devices[1], &cfg).expect("scratch1");
+    let mut kv0 = KvCache::new_gpu_q8(
+        &mut gpus.devices[0],
+        n_layers,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        256,
+    )
+    .expect("kv0");
+    let mut kv1 = KvCache::new_gpu_q8(
+        &mut gpus.devices[1],
+        n_layers,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        256,
+    )
+    .expect("kv1");
+    let _ = gpus.enable_peer_all().expect("enable_peer_all");
+
+    llama::forward_scratch_embed(&mut gpus.devices[0], &stored_w, &cfg, 1u32, 0, &scratch0)
+        .expect("embed (stage 0)");
+    llama::forward_scratch_band(
+        &mut gpus.devices[0],
+        &stored_w,
+        &cfg,
+        0..k,
+        0,
+        &mut kv0,
+        &scratch0,
+    )
+    .expect("band (stage 0)");
+    // Residual hand-off, stage 0 → stage 1.
+    let evt = gpus
+        .boundary_copy(0, 1, &scratch0.x.buf, &scratch1.x.buf, cfg.dim * 4)
+        .expect("boundary_copy");
+    gpus.wait_boundary(evt).expect("wait_boundary");
+    llama::forward_scratch_band(
+        &mut gpus.devices[1],
+        &stored_w,
+        &cfg,
+        k..n_layers,
+        0,
+        &mut kv1,
+        &scratch1,
+    )
+    .expect("band (stage 1)");
+    llama::forward_scratch_head(&mut gpus.devices[1], &stored_w, &cfg, &scratch1)
+        .expect("head (stage 1)");
+    let pp_logits = gpus.devices[1]
+        .download_f32(&scratch1.logits)
+        .expect("pp logits");
+
+    let max_abs = pp_logits
         .iter()
         .zip(&ref_logits)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(
-        asm_logits.iter().all(|x| x.is_finite()),
-        "non-finite logits"
+        pp_logits.iter().all(|x| x.is_finite()),
+        "banded PP non-finite logits"
     );
-    assert_eq!(argmax(&asm_logits), argmax(&ref_logits), "argmax diverged");
+    assert_eq!(
+        argmax(&pp_logits),
+        argmax(&ref_logits),
+        "banded PP argmax diverged"
+    );
     assert!(
         max_abs == 0.0,
-        "PP-placed logits differ from bespoke (max |Δ|={max_abs})"
+        "banded PP logits differ from bespoke (max |Δ|={max_abs})"
     );
     println!(
-        "llama_store_pp: gathered PP-placed forward logit-IDENTICAL to bespoke \
-         (max |Δ|=0, argmax token {})",
-        argmax(&asm_logits)
+        "llama_store_pp: REAL banded PP forward OK — stage0 layers 0..{k} on dev0 → boundary_copy \
+         → stage1 layers {k}..{n_layers}+head on dev1, logit-IDENTICAL to bespoke (max |Δ|=0, \
+         argmax token {})",
+        argmax(&pp_logits)
     );
 }
