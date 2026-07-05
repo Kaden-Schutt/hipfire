@@ -107,83 +107,56 @@ the generated **8×4 = 32-core** design builds and dispatches with **all 8 colum
 blocks = 1024** — the cascade dataflow works at full array scale. So the mechanism is
 proven end-to-end from 2 → 4 → 32 cores.
 
-**5. First compute-rate measurement: ~4 TOPS — a per-core stall to diagnose.**
-Added an `INNER` reuse knob to `r5_cascade.cc` (four register-resident K-tiles
-reused INNER times — the II=1 recipe, pure register macs). The 32-core array with
-INNER=16384 is bit-exact (C[0]=4,194,560) but sustains only **~4 TOPS** — ~12× below
-an r4b core. Key clue: **1 accumulator (4.44) ≈ 4 accumulators (4.03)**, so it is
-*not* mac-pipeline/II or accumulator spill; each cascade core is individually slow
-regardless. **Diagnostic run (ROLE=3 standalone, cascade op removed, single core) isolates TWO
-separable slowdowns:**
+## Streaming payoff measurement — DONE, and it's a NO-GO on XDNA1 (2026-07-05)
 
-| kernel | TOPS/core | vs r2a |
-|---|---|---|
-| r2a_mac (r4b reference) | ~1.6 | 1× |
-| r5 standalone, NO cascade | **0.40** | **~4× slow** |
-| r5 in 32-core cascade array | **0.126** | ~13× slow |
+Retargeted the whole R5 line from aie2p/Strix Halo to **aie2 / XDNA1 (gfx1103, the
+nix2 Phoenix NPU)** — build + measure now run locally, no halo round-trip. Arch is
+selected by `R5_ARCH={aie2,aie2p}` across `r5_cascade.cc` (kernel), `r5_build.sh`,
+`r5_gen.py`, and `r5_stream_gen.py`; aie2p stays the default so the Halo repro is
+untouched. XDNA1 deltas: int8×int4 mmul is only `<4,16,8>` (size_C=32, 2 cascade
+beats) vs aie2p's `<4,16,16>`; the cascade read is `get_scd_v16int32` (no
+`get_scd_v16acc32` builtin) so we sum in the int32 domain; device is `npu1`
+(4 cols × 4 compute rows = **16-core max array**). Build needs XRT's `xclbinutil` +
+a user-space boost-1.83 on `LD_LIBRARY_PATH` (both auto-added by `r5_build.sh`).
 
-So (a) the **base kslice_partial is ~4× slower than r2a even without any cascade**,
-and (b) the **cascade adds a further ~3×** on top. Both are tunable:
-- Kernel (4×): r2a keeps 4 A-tiles + **one shared** W-tile in registers; r5 loads 4
-  A **and 4 W** tiles + does an accum-sum at the end → register pressure/spill. Fix:
-  share the weight tile across the 4 accumulators (or reduce live tiles), drop the
-  end-sum onto fewer accumulators.
-- Cascade (3×): the 4 cores in a column aren't overlapping — likely the cascade
-  FIFO depth / the get-then-compute ordering serializing them. Fix: deepen the
-  cascade path, and ensure compute is issued *before* the blocking `get_scd`.
+Re-validated the mechanism on XDNA1 hardware: 2-core `C[0]=512`, full **4×4=16-core**
+`C[0]=1024`, both linear under A=2 — the cascade K-split works on Phoenix too.
 
-The cascade *mechanism* is fully validated (2/4/32 cores, exact sums); reaching a
-SOTA-beating number is now a two-part **perf-tuning** problem on a working dataflow,
-not a correctness one.
+`r5_stream_gen.py` streams `N_BTILES` output tiles per dispatch (persistent cores,
+one tile per objectfifo iteration; A/W fed as real bytes so it's a genuine feed-bound
+measurement; C never reloads — the cascade carries it and the tail stores once).
+`r5_stream.sh` sweeps N_BTILES, building one xclbin each and timing
+`npu_gemm_bench`. Sweep on the 4×4 array (all-ones, `c0=1024` throughout):
 
-**6. KERNEL FIX → 42 TOPS: the cascade reaches full compute capacity.** The ~4× base
-slowdown was register pressure — the kernel now uses R2a's exact recipe: 4 M-block
-accumulators sharing **one** resident weight tile (`compute()` in `r5_cascade.cc`),
-and the cascade carries all four accumulators (16 beats) core→core. Re-measured, all
-bit-exact:
+| N_BTILES | 64 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|
+| per-dispatch | 163 µs | 255 | 382 | 636 | 1114 µs |
+| **TOPS** | 0.10 | 0.26 | 0.35 | 0.42 | **0.48** |
 
-| | TOPS | vs before |
-|---|---|---|
-| 32-core cascade, INNER=16384 | **25.7** | (was 4.03) |
-| 32-core cascade, INNER=65536 | **42.2** | overhead amortized |
+The fixed per-dispatch overhead (~140 µs ERT/hwctx/DMA floor) amortizes as designed,
+but TOPS asymptotes at **~0.56 TOPS** (steady-state slope 0.466 µs/tile over
+NBT 1024→2048) — **~10× below SOTA and ~20× below the array's compute peak.**
 
-The kernel fix alone was a **10×** jump, and it revealed that the earlier "cascade
-adds 3×" was an *artifact of the slow kernel* — with a fast kernel the cascade is
-nearly free (42 TOPS ≈ R4b's 40-TOPS fake-reuse ceiling). So the cascade dataflow
-**accesses the array's full compute capacity while keeping C resident** — exactly
-the property the memtile dataflow lacks. vs SOTA FastFlowLM's ~5 TOPS and the 15.7
-reference, this is the compute path that was missing.
+**Why (two discriminator sweeps, steady-state µs/tile):**
 
-**7. Real streaming (INNER=0) measured — and the honest verdict: the cascade does
-NOT help real prefill.** Built the streaming-cascade (A resident, W streamed over an
-`NB` inner loop, one cascade round per output tile; `r5_gen.py COLS ROWS NB`). At
-NB=4096, M=16 (4 accumulators × MR=4), bit-exact:
+| config | cores | cascade | µs/tile | steady TOPS |
+|---|---|---|---|---|
+| 1×4 | 4 | 4-deep | 0.492 | 0.13 |
+| 4×2 | 8 | 2-deep | 0.346 | 0.38 |
+| 4×4 | 16 | 4-deep | 0.466 | 0.56 |
 
-| dataflow, real INNER=0 (M=16) | TOPS |
-|---|---|
-| **R5 streaming cascade** | **3.22** (feed-bound) |
-| R4b independent cores | 5.25 |
-| SOTA FastFlowLM (real) | ~5 |
+- **1×4 ≈ 4×4 per-tile** despite 4× the columns → columns parallelize for free; the
+  per-tile cost is *per column*, not global shim feed. Column-scaling is ~linear
+  (0.13→0.56 TOPS for 1→4 columns), but XDNA1 caps at 4 columns.
+- **4×2 < 4×4 per-tile** → deeper cascade adds ~0.07 µs/row of chain-sync latency;
+  cascade depth scales *sub-linearly*.
 
-The cascade is *worse* than the simple independent-core dataflow here (3.22 < 5.25).
-**Why:** real prefill GEMM at feasible M is **feed / arithmetic-intensity-bound**, not
-C-store-overhead-bound. AI = M·1024 / weight-bytes; at M=16, AI≈32 MACs/B → the 16 MB
-weight stream, not compute, sets the rate. The cascade's win (C resident, no per-tile
-reload) only matters in the *overhead* regime (tiny tiles) — it does nothing for the
-feed, and its extra 16-beat transfer + reduced output parallelism (8 columns vs 32
-independent cores) make it slightly *worse* in the feed-bound regime.
-
-**Conclusion — the cascade was the wrong lever for real prefill:**
-- The cascade genuinely unlocks the **compute ceiling** (42 TOPS, fake reuse) —
-  proving the silicon *can* do it, and that the ~5-TOPS "wall" is a dataflow limit.
-- But **real streaming prefill is feed/AI-bound**, and there the lever is **M
-  (weight reuse), not K-depth**. The cascade adds K-depth, which isn't the
-  bottleneck. R4b's plain independent-core dataflow already ≈ **matches SOTA** (5.25
-  vs ~5) at M=16 with *zero* cascade complexity.
-- **Beating SOTA needs higher M** — more weight reuse per streamed byte (more
-  accumulators / bigger MR / A-resident across more output rows), pushing AI past
-  ~58 MACs/B toward the compute ceiling. That, not the cascade, is the real R6.
-
-A clean negative result (per AGENTS.md, it narrows the search): the cascade is a
-validated, working systolic dataflow that reaches full compute capacity, but it does
-not help the actual real-prefill bottleneck. The next lever is M/AI, not K.
+So the ceiling is set by **per-tile objectfifo-sync + cascade-beat transfer**, not
+compute: the `<4,16,8>` tile is so small each core does ~8k MACs (~26 ns) wrapped in
+~470 ns of sync. The cascade eliminates the C round-trip, but that never mattered
+here — per-tile sync swamps the compute regardless. **Conclusion: the K-cascade axis
+is the wrong axis on XDNA1 — it multiplies per-tile sync without growing the effective
+output tile.** This extends the aie2p "feeding, not compute" thesis (`../findings.md`)
+to Phoenix. The only levers that could help are the ones that raise compute-per-sync:
+a within-kernel N-loop (many independent output columns per acquired W) or a
+weight-stationary dataflow (W resident, stream only A) — *not* spatial K-splitting.

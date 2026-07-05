@@ -5,10 +5,17 @@
 // tail stores it ONCE — no per-tile C reload (the trap pinning the memtile dataflow
 // and SOTA FastFlowLM to ~5 TOPS).
 //
-// Cascade API (aie_kernels/aie2/cascade_mm.cc + aie2p_streams.h): put_mcd(v16acc32)/
-// get_scd_v16acc32(), one 512-bit beat = 16 acc32, mmul<4,16,16> = 64 acc32 = 4 beats
-// per accumulator, 16 beats for the four. aie.cascade_flow(src,dst) wires the link.
-// Build -DROLE={0 head,1 mid,2 tail,3 solo(no cascade)} -DINNER=<reuse passes>.
+// Cascade API (from aie_kernels/aie2/cascade_mm.cc): the 512-bit cascade moves one
+// v16 per beat via put_mcd / get_scd. The mmul accumulator is size_C acc32 =
+// size_C/16 beats. The graph wires the physical link with aie.cascade_flow(src,dst).
+// Built -DROLE={0 head,1 mid,2 tail}.
+//
+// ARCH: the aie2p (Strix Halo/npu2) int8xint4 mmul is <4,16,16> (size_C=64) and the
+// cascade read is the get_scd_v16acc32 builtin, keeping the sum in the acc32 domain.
+// XDNA1/aie2 (Phoenix/npu1) provides int8xint4 only as <4,16,8> (size_C=32) and has
+// NO get_scd_v16acc32 — its cascade read is get_scd_v16int32, so we sum in the int32
+// domain (partials are exact small ints; acc32->int32 at shift 0 is lossless). Select
+// XDNA1 with -DNPU_AIE2 -DMMUL_N=8; aie2p is the default.
 #include <aie_api/aie.hpp>
 
 #ifndef INNER
@@ -17,79 +24,80 @@
 #ifndef ROLE
 #define ROLE 2             // 0=head, 1=mid, 2=tail (stores C), 3=solo (no cascade)
 #endif
+#ifndef MMUL_N
+#define MMUL_N 16          // aie2p int8xint4 = <4,16,16>; XDNA1/aie2 = <4,16,8> (-DMMUL_N=8)
+#endif
 
-using MMUL = aie::mmul<4, 16, 16, int8, int4>;
-using ACC = aie::accum<acc32, MMUL::size_C>;   // 64 acc32 = one M-block partial
-static constexpr int MB = 4;                    // M-blocks (accumulators) per core
-static constexpr int BEATS = MMUL::size_C / 16; // cascade beats per accumulator (4)
+using MMUL = aie::mmul<4, 16, MMUL_N, int8, int4>;
+using ACC = aie::accum<acc32, MMUL::size_C>;   // 4*MMUL_N acc32 partial C
+static constexpr int CN = MMUL::size_C;
+static constexpr int BEATS = CN / 16;          // cascade beats (16 acc32/int32 each)
 
-struct Partials { ACC c[MB]; };
-
-// Four M-block partials: a0..a3 (4 M rows) x one shared resident weight tile b,
-// reused INNER+1 times in four independent chains -> II=1. (R2a's recipe.)
-static inline Partials compute(const int8 *__restrict pA, const int8 *__restrict wbytes) {
-  aie::vector<int8, MMUL::size_A> a0 = aie::load_v<MMUL::size_A>(pA);
-  aie::vector<int8, MMUL::size_A> a1 = aie::load_v<MMUL::size_A>(pA + MMUL::size_A);
-  aie::vector<int8, MMUL::size_A> a2 = aie::load_v<MMUL::size_A>(pA + 2 * MMUL::size_A);
-  aie::vector<int8, MMUL::size_A> a3 = aie::load_v<MMUL::size_A>(pA + 3 * MMUL::size_A);
-  aie::vector<int4, MMUL::size_B> b = aie::load_v<MMUL::size_B>(reinterpret_cast<const int4 *>(wbytes));
-  MMUL c0, c1, c2, c3;
-  c0.mul(a0, b);
-  c1.mul(a1, b);
-  c2.mul(a2, b);
-  c3.mul(a3, b);
-  for (int r = 0; r < INNER; r++)
+// This core's K-slice partial, in a register accumulator (II=1 recipe). Arch-agnostic.
+static inline ACC kslice_partial(const int8 *__restrict pA, const int8 *__restrict wbytes) {
+  MMUL c;
+  const int4 *w = reinterpret_cast<const int4 *>(wbytes);
+  c.mul(aie::load_v<MMUL::size_A>(pA), aie::load_v<MMUL::size_B>(w));
+  for (int j = 1; j < KSLICE; j++)
       chess_prepare_for_pipelining {
-    c0.mac(a0, b);
-    c1.mac(a1, b);
-    c2.mac(a2, b);
-    c3.mac(a3, b);
+    aie::vector<int8, MMUL::size_A> a = aie::load_v<MMUL::size_A>(pA + j * MMUL::size_A);
+    // Weight stride in BYTES on the int8 buffer, then reinterpret (int4* arithmetic
+    // is byte-addressed — the R3a fix); size_B/2 bytes per 16xN tile.
+    const int4 *bj = reinterpret_cast<const int4 *>(wbytes + j * (MMUL::size_B / 2));
+    c.mac(a, aie::load_v<MMUL::size_B>(bj));
   }
   return {{c0.to_accum(), c1.to_accum(), c2.to_accum(), c3.to_accum()}};
 }
 
-static inline void put_acc(ACC acc) {
+#if defined(NPU_AIE2)
+// XDNA1/aie2: cascade carries v16int32; sum in the int32 domain.
+using CVEC = aie::vector<int32, CN>;
+static inline CVEC to_cvec(ACC a) { return a.template to_vector<int32>(); }
+static inline CVEC csum(CVEC a, CVEC b) { return aie::add(a, b); }
+static inline void store_c(int32 *__restrict pC, CVEC v) { aie::store_v(pC, v); }
+static inline void cascade_put(CVEC v) {
+#pragma unroll
+  for (int i = 0; i < BEATS; i++)
+    put_mcd((v16int32)v.template extract<16>(i));
+}
+static inline CVEC cascade_get() {
+  CVEC v;
+#pragma unroll
+  for (int i = 0; i < BEATS; i++)
+    v.insert(i, aie::vector<int32, 16>(get_scd_v16int32()));
+  return v;
+}
+#else
+// aie2p: keep the accumulator in the acc32 domain end-to-end.
+using CVEC = ACC;
+static inline CVEC to_cvec(ACC a) { return a; }
+static inline CVEC csum(CVEC a, CVEC b) { return add(a, b); }
+static inline void store_c(int32 *__restrict pC, CVEC a) { aie::store_v(pC, a.template to_vector<int32>()); }
+static inline void cascade_put(CVEC acc) {
 #pragma unroll
   for (int i = 0; i < BEATS; i++)
     put_mcd(acc.template extract<16>(i).to_native());
 }
-static inline ACC get_acc() {
+static inline CVEC cascade_get() {
   ACC acc;
 #pragma unroll
   for (int i = 0; i < BEATS; i++)
     acc.insert(i, aie::accum<acc32, 16>(get_scd_v16acc32()));
   return acc;
 }
-static inline void store4(int32 *pC, Partials p) {
-#pragma unroll
-  for (int m = 0; m < MB; m++)
-    aie::store_v(pC + m * MMUL::size_C, p.c[m].to_vector<int32>());
-}
+#endif
 
 #if ROLE == 0   // HEAD: seed the cascade with the four partials.
 extern "C" void r5_cascade_head(const int8 *__restrict pA, const int8 *__restrict wbytes) {
-  Partials p = compute(pA, wbytes);
-#pragma unroll
-  for (int m = 0; m < MB; m++) put_acc(p.c[m]);
+  cascade_put(to_cvec(kslice_partial(pA, wbytes)));
 }
 #elif ROLE == 1 // MIDDLE: add cascade-in + local partials, pass on.
 extern "C" void r5_cascade_mid(const int8 *__restrict pA, const int8 *__restrict wbytes) {
-  Partials p = compute(pA, wbytes);
-#pragma unroll
-  for (int m = 0; m < MB; m++) put_acc(add(get_acc(), p.c[m]));
+  cascade_put(csum(cascade_get(), to_cvec(kslice_partial(pA, wbytes))));
 }
 #elif ROLE == 2 // TAIL: add cascade-in + local partials, STORE C once.
 extern "C" void r5_cascade_tail(const int8 *__restrict pA, const int8 *__restrict wbytes,
                                 int32 *__restrict pC) {
-  Partials p = compute(pA, wbytes);
-  Partials out;
-#pragma unroll
-  for (int m = 0; m < MB; m++) out.c[m] = add(get_acc(), p.c[m]);
-  store4(pC, out);
-}
-#else           // SOLO (diagnostic): compute + store, NO cascade.
-extern "C" void r5_cascade_solo(const int8 *__restrict pA, const int8 *__restrict wbytes,
-                                int32 *__restrict pC) {
-  store4(pC, compute(pA, wbytes));
+  store_c(pC, csum(cascade_get(), to_cvec(kslice_partial(pA, wbytes))));
 }
 #endif

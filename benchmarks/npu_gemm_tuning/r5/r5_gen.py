@@ -6,15 +6,25 @@
 # by the cascade). Columns are independent -> COLS C blocks of 64 i32 each.
 #
 # Usage: r5_gen.py COLS ROWS > r5_array.mlir   (then build with r5_build.sh)
-import sys
+import os, sys
 
-COLS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
+# R5_ARCH: aie2p = Strix Halo/npu2 (default; 8 cols x 4 rows, int8xint4 <4,16,16>);
+# aie2 = XDNA1/Phoenix/npu1 (gfx1103; 4 cols x 4 rows, int8xint4 <4,16,8>). The kernel
+# shape (WW/CW) and device follow the arch, so r5_build.sh must use the same R5_ARCH.
+ARCH = os.environ.get("R5_ARCH", "aie2p")
+if ARCH == "aie2":
+    DEV, MAXCOL, AW, WW, CW = "npu1", 4, 1024, 1024, 32   # <4,16,8>: size_A=64, size_B/2=64B, size_C=32
+elif ARCH == "aie2p":
+    DEV, MAXCOL, AW, WW, CW = "npu2", 8, 1024, 2048, 64   # <4,16,16>: size_A=64, size_B/2=128B, size_C=64
+else:
+    sys.exit(f"unknown R5_ARCH={ARCH} (want aie2 or aie2p)")
+
+COLS = int(sys.argv[1]) if len(sys.argv) > 1 else min(8, MAXCOL)
 ROWS = int(sys.argv[2]) if len(sys.argv) > 2 else 4  # cascade depth per column (tile rows 2..2+ROWS-1)
-NB = int(sys.argv[3]) if len(sys.argv) > 3 else 1    # N_BTILES: output tiles streamed per dispatch
-                                                     #   (>1 = real streaming: A resident, W streamed)
-AW = 256    # 4 M-tiles * size_A (4*64)
-WW = 128    # one shared int4 weight tile
-CW = 256    # 4 M-tiles * size_C
+if COLS > MAXCOL:
+    sys.exit(f"COLS={COLS} exceeds {ARCH} column count {MAXCOL}")
+if ROWS > 4:
+    sys.exit(f"ROWS={ROWS} exceeds 4 compute rows")
 
 rows = list(range(2, 2 + ROWS))          # bottom..top tile rows
 top = rows[-1]                            # head (northernmost)
@@ -49,7 +59,7 @@ def core_body(cid, name, tile, kern, has_c):  # cid = unique core SSA id; name =
       aie.end
     }}'''
 
-out = ["module {", "  aie.device(npu2) {"]
+out = ["module {", f"  aie.device({DEV}) {{"]
 # tiles
 for c in range(COLS):
     out.append(f"    %shim{c} = aie.tile({c}, 0)")
