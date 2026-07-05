@@ -34,15 +34,21 @@ import os, sys
 # aie2p = Strix Halo/npu2 (default; 8x4, int8xint4 <4,16,16>). Build with the same R5_ARCH.
 ARCH = os.environ.get("R5_ARCH", "aie2p")
 if ARCH == "aie2":
-    DEV, MAXCOL, AW, WW, CW = "npu1", 4, 1024, 1024, 32   # <4,16,8>: size_A=64, size_B/2=64B, size_C=32
+    DEV, MAXCOL, MMUL_N = "npu1", 4, 8    # int8xint4 <4,16,8>
 elif ARCH == "aie2p":
-    DEV, MAXCOL, AW, WW, CW = "npu2", 8, 1024, 2048, 64   # <4,16,16>: size_A=64, size_B/2=128B, size_C=64
+    DEV, MAXCOL, MMUL_N = "npu2", 8, 16   # int8xint4 <4,16,16>
 else:
     sys.exit(f"unknown R5_ARCH={ARCH} (want aie2 or aie2p)")
 
 COLS = int(sys.argv[1]) if len(sys.argv) > 1 else min(8, MAXCOL)
 ROWS = int(sys.argv[2]) if len(sys.argv) > 2 else 4   # cascade depth per column
 NBT  = int(sys.argv[3]) if len(sys.argv) > 3 else 32  # output tiles streamed per dispatch
+# KSLICE = mmuls each core contracts per output tile = COMPUTE-PER-SYNC (R6 lever).
+# Buffer sizes derive from it, so the -DKSLICE the kernel is built with MUST match.
+KSLICE = int(sys.argv[4]) if len(sys.argv) > 4 else 16
+AW = KSLICE * 64            # size_A = M*K = 4*16 = 64 int8 bytes / mmul
+WW = KSLICE * (8 * MMUL_N)  # size_B/2 = K*N/2 = 16*MMUL_N/2 = 8*MMUL_N bytes / mmul
+CW = 4 * MMUL_N             # size_C = M*N = 4*MMUL_N i32 (one output tile, K-accumulated)
 if COLS > MAXCOL:
     sys.exit(f"COLS={COLS} exceeds {ARCH} column count {MAXCOL}")
 if ROWS > 4:

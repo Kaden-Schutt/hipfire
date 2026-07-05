@@ -1,200 +1,72 @@
-# R6 — the M/AI lever: 2D-tiled W4A8 GEMM (the real SOTA-beating path)
+# R6 — where is the XDNA1 cascade GEMM actually bound? (compute-per-sync + INNER)
 
-R5 proved the cascade unlocks the compute *ceiling* (42 TOPS) but does NOT help real
-prefill, which is **feed / arithmetic-intensity bound**: to go compute-bound the tile
-must clear AI ≈ 58 MACs/byte, and that needs a tile reusing **both** operands — each
-weight column across MT M-row blocks, each activation row across NT N-col blocks.
-Everything before R6 used a 1D tile (16×16, reuse in one dimension) and stalled at
-~3–5 TOPS. R6 is the 2D tile.
+R5 shipped a working streaming K-cascade W4A8 GEMM on XDNA1 (gfx1103) but it topped
+out at ~0.56 TOPS, and R5's discriminators *read* it as per-objectfifo-sync bound.
+R6 tests that directly and **corrects it**: the wall is neither sync nor feed — it is
+the **mmul MAC chain itself, running ~15× off peak (un-pipelined)**. That is a kernel
+bug, not a hardware ceiling, so there is real headroom.
 
-## Kernel (`r6_gemm.cc`)
+Reuses the R5 rig unchanged (`../r5/`): the kernel is `-DKSLICE`/`-DINNER`
+parametrized and the generator derives buffer sizes from KSLICE. `r6_intensity.sh`
+sweeps KSLICE; the INNER probe is two hand-built points.
 
-One call computes an (MT·4)×(NT·16) output block, K-reduced over KCHUNK 16×16 tiles;
-`A[MT][KCHUNK]` and `W[NT][KCHUNK]` are resident. For each M-row block, the NT=4 N
-accumulators share the loaded activation (A reused NT-wide), and the weight tiles are
-reused across the MT M-blocks; C is stored once (per-tile overhead amortized over
-MT·NT·KCHUNK mmuls). Register accumulators = NT (4), reused across the MT loop, so no
-spill; A/W stay in L1. AI ≈ MT·NT·KCHUNK·1024 / (weight + C bytes) — grows with MT and
-KCHUNK. (L1 is 64 KB/core, so A + double-buffered W + C caps MT·KCHUNK.)
+## 1. Compute-per-sync sweep (`r6_intensity.sh`, 4×4, N_BTILES=1024)
 
-## First measurement — single core (MT=8, NT=4, KCHUNK=16)
+KSLICE = mmuls each core contracts per output tile. Raising it scales BOTH compute
+and feed per objectfifo iteration while the fixed per-iteration sync stays constant.
 
-Streamed (A resident, W streamed, C per block), bit-exact (C[0]=256):
-
-**2.90 TOPS on ONE core** — near a core's ~3.68-TOPS physical max, i.e. the kernel is
-**compute-bound and efficient** (unlike R5's 0.40 solo before its fix). This is the
-first W4A8 kernel here that reaches per-core compute-bound on a *real* (no-fake-reuse)
-tile.
-
-## Array measurement — R6 BEATS SOTA on real prefill
-
-8 **independent** R6 cores (`r6_gen.py COLS NB` — one per column, no cascade; the
-array is the M-parallelism). Real streaming (A resident, W streamed), bit-exact
-(C[0]=256):
-
-| config | W feed | TOPS (8-core aggregate) |
-|---|---|---|
-| MT=8 NT=4 KCHUNK=16, **shared** W region | (compute ceiling) | 19.5 |
-| MT=8 NT=4 KCHUNK=16, **independent** W (16 MB) | feed-bound ~68 GB/s | **9.15** |
-
-**9.15 TOPS on real, independent-weight streaming beats SOTA FastFlowLM's ~5 by
-1.8×** — the first dataflow in this whole investigation (R2a → R4 memtile → R5
-cascade) to beat SOTA on real prefill. The feed cap makes it feed-bound, so 8 cores
-already ≈ saturate; the compute headroom (19.5 shared) is reachable by raising AI
-(more weight reuse per streamed byte).
-
-**The lever, confirmed:** the win came from the **2D tile** (reuse both operands),
-i.e. **M/AI, exactly as the R5 verdict predicted — not the cascade.** Everything
-before had a 1D tile stuck at 3–5 TOPS; R6's 2D tile clears the feed wall.
-
-## MT sweep — peak 20.68 TOPS (beats the 15.7 reference)
-
-The bottleneck is the **weight feed** (~68 GB/s), and effective **AI_W = 8·MT** (each
-weight reused across MT M-row blocks; independent of KCHUNK). So raising MT raises
-throughput until it meets the compute ceiling. KCHUNK only sets L1 fit + C-write
-amortization. 8-core, real independent-W streaming, bit-exact:
-
-| MT | KCHUNK | AI_W | TOPS |
+| KSLICE | per-dispatch | µs/tile | TOPS |
 |---|---|---|---|
-| 8  | 16 | 64  | 9.19 |
-| 16 | 8  | 128 | 13.92 |
-| **24** | **8** | **192** | **20.68** |
-| 32 | 4  | 256 | 18.06 (compute-bound; KCHUNK=4 C-write overhead) |
+| 16  | 645 µs  | 0.630 | 0.42 |
+| 32  | 1256 µs | 1.227 | 0.43 |
+| 64  | 2128 µs | 2.078 | 0.50 |
+| 128 | 4074 µs | 3.979 | 0.53 |
 
-**Peak MT=24: 20.68 TOPS — 4.1× SOTA FastFlowLM (~5) and above the 15.7 int8
-whole_array reference**, on real weight streaming. MT=32 regresses (past the compute
-ceiling, and KCHUNK=4 pays too much per-block C overhead), so MT=24/KCHUNK=8 is the
-sweet spot. (MT=16 KCHUNK=16 overran the 64 KB L1 — A + double-buffered W + C; MT=24
-KCHUNK=8 fits at ~44 KB.)
+TOPS barely moves (0.42→0.53) and per-tile time is ~linear in KSLICE:
+**µs/tile ≈ 0.152 + 0.030·KSLICE**. The fixed sync (0.152 µs) is only ~24% even at
+KSLICE=16 — so R5 was **not** sync-bound. The dominant term is **~30 ns per
+mmul-step**, and it scales with the work. (L1 caps the sweep at KSLICE≤128 on aie2:
+double-buffered A+W = 256·KSLICE B/core → 32 KB at 128.)
 
-The feed caps the aggregate, so 8 cores ≈ saturate it — more columns won't add much.
-**Verdict, settled and on-hardware:** hipfire's R6 W4A8 GEMM does **20.7 TOPS** of
-real prefill on the halo NPU — **4× the SOTA NPU inference stack** and past the
-reference — via the M/AI 2D tile, all through hipfire's own XRT-free dispatch. Next:
-wire R6 into the runtime prefill-offload path (the original goal — now clearly worth
-it; NPU prefill runs concurrently with GPU decode for a real aggregate win).
+## 2. INNER probe — feed-bound or core-bound? (KSLICE=16, N_BTILES=1024, 4×4)
 
-## R6 is a numerically-correct GEMM (real data, not just the ceiling)
+INNER recomputes the K-slice INNER times over the **same resident L1 tiles** — MACs
+scale, feed does not. If feed-bound: time flat, TOPS ×INNER. If core-bound: time ×INNER.
 
-`crates/hipfire-xdna/examples/r6_verify` runs the kernel on random int8×int4 data and
-compares to a CPU reference: **0/256 mismatches** (build MT=1 NT=4 KCHUNK=1, one
-M-block × 4 N-blocks × one K-tile). This pins the full tile layout — **all row-major**:
+| INNER | per-dispatch | MACs/disp | TOPS | c0 |
+|---|---|---|---|---|
+| 1 | 630 µs  | 1.34e8 | 0.43 | 1024 |
+| 8 | 2956 µs | 1.07e9 | 0.73 | 8192 |
 
-- A tile = 4×16 int8, `a[m*16 + k]`.
-- W tile = 16×16 int4, `w[k*16 + n]`, packed two int4 per byte (low nibble first).
-- C tile = 4×16 int32, `c[m*16 + n]`.
-- `r6_mac` tile ordering: `A[MT][KCHUNK]` at `(mt*KCHUNK+k)*64`, `W[NT][KCHUNK]` at
-  `(nt*KCHUNK+k)*128` bytes, `C[MT][NT]` at `(mt*NT+nt)*64`.
+8× the compute over fixed feed → time grew **4.7×**, not flat. So it is **core-bound**,
+not feed-bound. The marginal cost of the extra (feed-free) passes is
+(2956−630)/7/1024 = **0.324 µs/tile = ~20 ns/mmul of pure compute**. Combined with the
+KSLICE slope (~30 ns/mmul incl. feed) the decomposition is **~20 ns compute + ~10 ns
+feed per mmul-step**, plus ~0.15 µs/tile fixed sync that amortizes.
 
-This is the layout the runtime `NpuGemm` marshaling (wire-in step 2) targets — R6 is a
-proven correct W4A8 GEMM primitive, not only a throughput ceiling.
+## Verdict — un-pipelined MAC chain, ~15× off peak (fixable)
 
-## End-to-end: from 20.7-TOPS *compute* to a real deliverable rate
+~20 ns/mmul @ 1.8 GHz = **~36 cycles per `mmul<4,16,8>`**. Per-core INT8 peak is
+~2–3 cycles/mmul, so the core runs **~15× slow**. The kernel accumulates a whole
+K-slice into a single `MMUL c` — a serial dependency chain that never reaches II≈1,
+so the mmul latency is fully exposed. Feed is a real but secondary term (~1/3).
 
-20.7 TOPS is the kernel's *compute* rate. The deliverable end-to-end rate (host feeds
-row-major A/W, reads row-major C) was initially **0.02 TOPS** — CPU marshaling
-(row-major ↔ tile-major reshuffle) dwarfed the kernel. Closing that gap drove the arc
-below. All configs are the M768·K512·N4096 prefill GEMM, validated numerically.
+This overturns the R5 "sync-bound, K-cascade is the wrong axis" read: the cascade and
+the array geometry are fine; the **microkernel** is the wall. Corollaries:
+- R5's cascade C-residency and R6's bigger K-tiles can't help while each mmul is 15×
+  slow — the compute term dominates everything.
+- There is ~10–15× of headroom if the MAC chain pipelines.
 
-| stage | e2e | what changed |
-|---|---|---|
-| CPU marshaling floor | 0.02 | tile-major pack/unpack on the host |
-| **tensor-stream row-major** (`r6_gemm_ts.cc`) | — | kernel reads/writes ROW-MAJOR via `aie::tensor_descriptor`; AGUs tile in-core, zero CPU marshaling, linear DMA |
-| + single-K-chunk (C copied once) | 0.535 | KCHUNK covers all K → no host K-accumulation |
-| + pipelined C read-back | 1.0 | `submit`/`wait` split; overlap read-back with next dispatch |
-| **M-parallel W-broadcast** (`r6_gen_mp.py`) | 1.45 | COLS distinct M-blocks share ONE broadcast W (shim→memtile→all cores); 3 dispatches not 24; *blocking*, no coherence dance |
-| **whole-GEMM in one dispatch** (`r6_gen_mp.py` ROUNDS) | **~1.9** | each core streams ROUNDS M-blocks → the whole GEMM is a *single* dispatch; continuous streaming, one C read-back |
+## R7 (the real lever)
 
-**~95× over the marshaling floor.** Raw single-dispatch ceiling is ~3 TOPS — feed-bound
-on the memtile's 8-way broadcast sync over the N-slabs, not compute. Still below the
-GPU's ~50 TOPS, so *sync* offload stays gated; the aggregate win is a concurrent
-NPU ‖ GPU split.
+Rewrite the K-slice inner loop for **II≈1: multiple independent accumulators**
+(interleave 2–4 output tiles / partial-sum banks so successive `mmul`s don't depend on
+the immediately-prior accumulator), the standard AIE matmul recipe. Also confirm
+whether aie2 int8×int4 `<4,16,8>` is native or emulated (aie2p ships
+`emulated_mmul_intrinsics.hpp`; if aie2 emulates int4, part of the 36 cycles is
+inherent and int8×int8 `<4,16,8>`/`<8,16,8>` may pipeline better). Target: close the
+~15× compute gap; feed (~10 ns/mmul, ~3× current TOPS) becomes the next wall, and only
+*then* do weight-stationary / A-reuse dataflows matter.
 
-### Batch prefill — throughput is flat in M (weight-bandwidth-bound)
-
-Sweeping M (= total prefill tokens = batch × seq) at K=512, N=4096, all validated:
-
-| M (tokens) | multi-dispatch (`r6_mp_e2e`, any M) | whole-GEMM 1-dispatch (`r6_mp1_e2e`) |
-|---|---|---|
-| 256  | 1.37 | — |
-| 768  | 1.46 | ~1.9 |
-| 2048 | 1.40 | 1.83 |
-| 4096 | 1.47 | 1.75 |
-| 8192 | 1.42 | — |
-
-**Throughput does not scale with batch** — it's weight-bandwidth-bound. L1 caps weight
-reuse at MT=8 M-rows per weight load, so W is re-read ≈ M/32 times *regardless of batch*;
-total weight traffic scales with M, so the compute rate stays constant. This is the
-opposite of the GPU (bigger batch → bigger WMMA tiles → more weight reuse → higher
-throughput). The NPU array is already feed-saturated at small M, so batching buys
-nothing here. The whole-GEMM one-dispatch stays ~0.3–0.4 TOPS ahead at every size (no
-inter-dispatch host stalls) but needs a per-M xclbin; multi-dispatch handles any M with
-one xclbin.
-
-### The ceiling: objectfifo per-slab streaming overhead
-
-Pure-dispatch (all-ones, no host copy) rates pin *why* e2e tops out ~1.9 TOPS:
-
-| config | pure dispatch | effective W feed |
-|---|---|---|
-| M-parallel whole-GEMM, K=512 KCHUNK=32 | 941 µs → 3.42 TOPS | ~3.2 GB/s |
-| N-parallel whole-GEMM, K=128 KCHUNK=8 | 490 µs → 1.64 TOPS | ~4.1 GB/s |
-
-Both are feed-bound at only ~3–4 GB/s (DRAM does ~68), i.e. **objectfifo per-slab
-streaming overhead (~5 µs/slab) dominates, not the broadcast** — the 16×16 mmul tiles are
-too small, so each N-slab acquire/release costs ~8× its own compute. The one lever is
-**KCHUNK** (k-tiles amortized per slab-acquire): K=512/KCHUNK=32 does 4× the compute per
-acquire of K=128/KCHUNK=8, which is why it's 2× faster per slab. But KCHUNK=32 needs MT≤8
-to fit L1 — so the high-MT N-parallel tile (20.7-TOPS *compute* ceiling at K=128) can't be
-used at K=512, and **raising MT doesn't help**: it forces KCHUNK down and worsens the
-amortization. Net: for K=512, **MT=8 KCHUNK=32 (M-parallel whole-GEMM) is near the
-practical ceiling — ~3.4 TOPS raw, ~1.9 TOPS e2e.** The generators carry a `ROUNDS`
-whole-GEMM knob for both topologies (`r6_gen.py` / `r6_gen_mp.py`), exercised by
-`r6_np1_e2e` / `r6_mp1_e2e`.
-
-**NT=8 tried — dead end (`r6_gemm_ts8.cc`).** Doubling the accumulators to NT=8 makes each
-N-slab cover 128 cols, halving the slab count — the obvious attack on the per-slab
-overhead. But (a) the doubled W-slab overruns L1 at KCHUNK=32, so it can't do K=512 at all;
-and (b) even where it fits (K=256), it's *slower*: raw dispatch NT=8/32-slabs = 1.40 TOPS
-vs NT=4/64-slabs = 2.07 TOPS at identical work — the 8 live accumulators lose II=1 to
-register pressure, which outweighs the fewer acquires. So bigger effective tiles don't help
-here; NT=4 is optimal. What's left is a fundamentally different feed (cascade K-resident —
-R5 showed it's feed-bound for real prefill anyway) or the strategic move: a concurrent
-NPU ‖ GPU split, most valuable at low batch where the GPU also can't amortize.
-
-### Two dataflow lessons (cost real debugging)
-
-1. **Pipelined read-back needs a cache reconcile.** The host read-back of one C buffer
-   overlaps a concurrent DMA write to the double-buffered other; the CPU prefetcher can
-   cache stale lines of the in-flight buffer. `FROM_DEVICE` EINVALs on data BOs, but
-   `TO_DEVICE` clean+invalidates on this driver — re-sync the slot after `wait`, before
-   reading. (Blocking dispatch is immune, which is one reason the blocking M-parallel /
-   whole-GEMM paths are preferred.)
-2. **Stream with pure-linear DMAs, not repeat BD dims.** A repeat dimension does NOT
-   re-check the objectfifo acquire/release semaphore, so rounds > 0 overrun the fifo
-   buffers (round 0 correct, the rest garbage). A contiguous linear stream is chunked by
-   the objectfifo *with* semaphores. W (which the broadcast fifo can't replay) is
-   replicated ROUNDS× in DRAM. Shim BD wrap-dim sizes also cap at [1:64].
-
-## Reproduce
-
-Build (offline; `aiecc`) with `r6_cache.sh`, selecting kernel + generator + tag:
-
-```sh
-R6=benchmarks/npu_gemm_tuning/r6
-# tensor-stream kernel, N-parallel array (single K-chunk peak config)
-R6_KERNEL_SRC=$R6/r6_gemm_ts.cc R6_OUT_TAG=r6ts $R6/r6_cache.sh 8 4 32 8 8
-# M-parallel W-broadcast, whole-GEMM in one dispatch (ROUNDS=3)
-R6_KERNEL_SRC=$R6/r6_gemm_ts.cc R6_GEN=r6_gen_mp.py R6_OUT_TAG=r6mp R6_ROUNDS=3 \
-  $R6/r6_cache.sh 8 4 32 8 64
-```
-
-Verify + measure (examples in `crates/hipfire-xdna/examples/`):
-
-| example | checks |
-|---|---|
-| `ts_a_verify` | in-core tensor-stream A reshuffle == `pack_a` |
-| `r6_ts_verify` | full row-major W4A8 GEMM (TS kernel) vs CPU |
-| `npu_gemm_verify` / `npu_gemm_e2e` | `NpuGemm` correctness / N-parallel pipelined e2e |
-| `r6_mp_verify` / `r6_mp_e2e` | M-parallel array correctness / 3-dispatch e2e |
-| `r6_mp1_e2e` | whole-GEMM one-dispatch correctness + e2e |
+Repro: `R5_ARCH=aie2 ./r6_intensity.sh 4 4 1024 300 16 32 64 128`; INNER via
+`R5_INNER=8 ../r5/r5_build.sh <mlir> <wd> 16`.

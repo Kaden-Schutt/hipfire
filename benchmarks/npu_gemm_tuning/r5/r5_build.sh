@@ -38,8 +38,9 @@ INC="$MA_ROOT/include"
 for BOOSTDIR in "$HOME/.cache/hipfire-npu-deps/lib" "$HOME/.cache/hipfire-npu-deps/extract/usr/lib/x86_64-linux-gnu"; do
   [ -e "$BOOSTDIR/libboost_program_options.so.1.83.0" ] && export LD_LIBRARY_PATH="$BOOSTDIR:${LD_LIBRARY_PATH:-}" && break
 done
+: "${R5_INNER:=1}"   # R6 probe: >1 recomputes the K-slice over resident tiles (no extra feed)
 CF=(-std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body
-    -O2 -DNDEBUG --target="$TGT" "${ARCHDEF[@]}" "-DKSLICE=$KSLICE")
+    -O2 -DNDEBUG --target="$TGT" "${ARCHDEF[@]}" "-DKSLICE=$KSLICE" "-DINNER=$R5_INNER")
 
 rm -rf "$W"; mkdir -p "$W"
 # One object per cascade role (the .mlir's link_with picks which each core needs).

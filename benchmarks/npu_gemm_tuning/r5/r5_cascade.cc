@@ -27,6 +27,9 @@
 #ifndef MMUL_N
 #define MMUL_N 16          // aie2p int8xint4 = <4,16,16>; XDNA1/aie2 = <4,16,8> (-DMMUL_N=8)
 #endif
+#ifndef INNER
+#define INNER 1            // R6 probe: recompute the K-slice INNER times over the SAME
+#endif                     // resident L1 tiles (no extra feed) to isolate feed- vs core-bound.
 
 using MMUL = aie::mmul<4, 16, MMUL_N, int8, int4>;
 using ACC = aie::accum<acc32, MMUL::size_C>;   // 4*MMUL_N acc32 partial C
@@ -46,7 +49,17 @@ static inline ACC kslice_partial(const int8 *__restrict pA, const int8 *__restri
     const int4 *bj = reinterpret_cast<const int4 *>(wbytes + j * (MMUL::size_B / 2));
     c.mac(a, aie::load_v<MMUL::size_B>(bj));
   }
-  return {{c0.to_accum(), c1.to_accum(), c2.to_accum(), c3.to_accum()}};
+#if INNER > 1
+  // Extra MAC passes over the already-resident tiles: MACs scale, feed does not.
+  for (int r = 1; r < INNER; r++)
+    for (int j = 0; j < KSLICE; j++)
+        chess_prepare_for_pipelining {
+      aie::vector<int8, MMUL::size_A> a = aie::load_v<MMUL::size_A>(pA + j * MMUL::size_A);
+      const int4 *bj = reinterpret_cast<const int4 *>(wbytes + j * (MMUL::size_B / 2));
+      c.mac(a, aie::load_v<MMUL::size_B>(bj));
+    }
+#endif
+  return c.to_accum();
 }
 
 #if defined(NPU_AIE2)
