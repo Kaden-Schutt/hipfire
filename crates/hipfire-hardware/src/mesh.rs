@@ -34,6 +34,22 @@ pub enum DimKind {
     Ep,
 }
 
+/// A cross-device sync the executor injects for an op, derived (not
+/// hand-written) from the op's weight [`ShardPolicy`] — the "single source of
+/// truth" partitioner: a row-sharded / expert-sharded weight *mechanically
+/// implies* an all-reduce over its axis group; a pipeline-band boundary implies
+/// a residual copy. See docs/…/device-mesh §1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CollectiveHint {
+    /// All-reduce the op's output over the device group along `kind`
+    /// (`Tp` for row-sharded dense, `Ep` for MoE experts). The reduce
+    /// element count is applied at execution (`n_rows * dim`).
+    AllReduce { kind: DimKind },
+    /// Copy the residual stream across a pipeline-stage boundary (PP), from
+    /// global device `src` to `dst`.
+    BandXfer { src: usize, dst: usize },
+}
+
 /// One rectangular axis of the mesh.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Axis {

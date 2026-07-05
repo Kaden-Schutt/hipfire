@@ -21,7 +21,7 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 pub mod mesh;
-pub use mesh::{Axis, DeviceMesh, DimKind};
+pub use mesh::{Axis, CollectiveHint, DeviceMesh, DimKind};
 
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,

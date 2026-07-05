@@ -16,7 +16,24 @@
 //! loop exists. See docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md §4.
 
 use crate::tp_shard::ExpertAssign;
+use hipfire_hardware::{CollectiveHint, DimKind};
 use rdna_compute::DType;
+
+/// Derive the cross-device collective an op's output requires **from its weight
+/// [`ShardPolicy`]** — the mini-partitioner that makes sharding a *single*
+/// source of truth (declared once in the manifest) instead of a policy in the
+/// manifest AND a hand-written hint at lowering (which risks a silent
+/// forgotten-reduce). Row-parallel dense → all-reduce over `Tp`; expert-sharded
+/// MoE → all-reduce over `Ep`. Column/replicate/pin/etc. need no output reduce.
+/// (PP `BandXfer` is a per-layer-boundary concern, not per-op — handled by the
+/// pipeline driver, not this map.)
+pub fn collective_for_policy(policy: &ShardPolicy) -> Option<CollectiveHint> {
+    match policy {
+        ShardPolicy::RowShard { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Tp }),
+        ShardPolicy::ExpertSharded { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Ep }),
+        _ => None,
+    }
+}
 
 /// Non-layer placement targets (resolved against the mesh, not hardcoded).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -150,6 +167,32 @@ mod tests {
         );
         assert_eq!(l.layer, Some(3));
         assert!(matches!(l.policy, ShardPolicy::RowShard { axis: 1 }));
+    }
+
+    #[test]
+    fn collective_derived_from_policy() {
+        // Row-parallel → Tp all-reduce; expert → Ep all-reduce.
+        assert_eq!(
+            collective_for_policy(&ShardPolicy::RowShard { axis: 1 }),
+            Some(CollectiveHint::AllReduce { kind: DimKind::Tp })
+        );
+        assert_eq!(
+            collective_for_policy(&ShardPolicy::ExpertSharded {
+                n_experts: 8,
+                assign: ExpertAssign::Stride
+            }),
+            Some(CollectiveHint::AllReduce { kind: DimKind::Ep })
+        );
+        // Column-parallel / replicate / pin produce no output reduce.
+        assert_eq!(
+            collective_for_policy(&ShardPolicy::ColumnShard { axis: 0 }),
+            None
+        );
+        assert_eq!(collective_for_policy(&ShardPolicy::Replicate), None);
+        assert_eq!(
+            collective_for_policy(&ShardPolicy::Pin(PinTarget::Embed)),
+            None
+        );
     }
 
     #[test]
