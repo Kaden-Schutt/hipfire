@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod drafter;
 pub mod dspark_drafter;
+pub mod dspark_loss;
 pub mod hfq_patch;
 pub mod kv_noise;
 pub mod labels;
