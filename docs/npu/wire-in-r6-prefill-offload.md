@@ -76,16 +76,22 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
      row); W stays pre-packed. Validated 0-mismatch (`r6_ts_verify` MT=8/MT=24;
      `npu_gemm_verify` single-core + array groups=4). `NpuGemm` now copies A/C row-major
      (no reshuffle) — `pack_a`→`load_a` block copy, `unpack_c`→per-group block copy.
-     **End-to-end M768·K512·N4096: 0.02 → 0.254 TOPS (64 dispatches, 4 K-chunks) →
-     0.535 TOPS (24 dispatches, KCHUNK=32 = one K-chunk so C is copied once not 4×).**
-     ~27× over the CPU-marshaling floor. **The marshaling wall is cleared.** Remaining
-     gap to the 20.7-TOPS compute rate is now dispatch latency (~78 µs × 24 ≈ 1.9 ms) +
-     the host C copy-back (~12.6 MB ≈ 1.3 ms), NOT the reshuffle. Levers left, in order:
-     (1) pipeline/double-buffer the C read-back against the next dispatches; (2) fewer
-     dispatches (bigger MT is L1-capped, so this needs a smarter M×N array tiling);
-     (3) zero-copy C handoff (DMA C straight to the consumer / keep in SHMEM for the
-     next op) instead of a host copy. At ~0.5 TOPS this is still below GPU (~50), so the
-     step-4 hot-path hook stays gated until (1)–(3) close more of the gap.
+     **End-to-end M768·K512·N4096: 0.02 → 0.254 (64 dispatches, 4 K-chunks) → 0.535
+     (24 dispatches, KCHUNK=32 = one K-chunk so C is copied once not 4×) → 1.00 TOPS
+     (software-pipelined + redundant-W-copy skip).** ~50× over the CPU-marshaling floor.
+     **The marshaling wall is cleared.**
+     - **Pipelining DONE.** `NpuKernel` split into `submit()`/`wait()` + a multi-slot cmd
+       cache; `NpuGemm` double-buffers `c_buf` and submits dispatch *i* before reading
+       *i-1* back, so the host C read-back overlaps dispatch *i* on the NPU. The
+       flattened loop also skips the per-dispatch W memcpy when the slab is unchanged
+       (single-K-chunk + one N-block reuses one W across all M-blocks). 6.02 → 3.22 ms.
+     Remaining gap to the 20.7-TOPS compute rate is now **dispatch latency (~78 µs × 24 ≈
+     1.9 ms)** plus the W `sync_bo` that still fires every submit even when the copy is
+     skipped. Levers left: (1) skip the W (and output-C) `sync_bo` when unchanged;
+     (2) fewer dispatches (bigger MT is L1-capped → smarter M×N array tiling); (3)
+     zero-copy C handoff (DMA C straight to the consumer / keep in SHMEM for the next
+     op). At ~1 TOPS this is still below GPU (~50), so the step-4 hot-path hook stays
+     gated until these close more of the gap.
 
    - **(superseded) 3c-old. Activations + output → the DMA (dynamic, per inference).** A and C are
      computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
