@@ -26,10 +26,12 @@ loops forever). Suggested next goal: `/goal implement device-mesh Phase 2 fulfil
 `crates/hipfire-runtime/src/weight_store.rs` — `fulfill_manifest(weights, mesh, n_layers, gpus,
 source) -> Result<WeightStore, FulfillError>`. GPU-validated on gfx1151 (`fulfill_manifest_probe`:
 single-1×1 + emulated PP-2 + emulated EP-2; placement + `memcpy_dtoh` byte-oracle; the oracle
-caught a real missing-`layer`-in-key bug). Implemented: whole-tensor upload (single/PP/Replicate/
-Pin/Tied→Alias) + **`ExpertSharded`** (each rank = compact blob of its owned experts, generic
-expert-outermost gather via `expert_compact_blob` + `ShardConfig`). **Dense-TP slice returns `Err`**
-(Phase 5). `source(entry)->bytes` closure keeps arch on-disk HFQ naming out of the engine. Additive
+caught a real missing-`layer`-in-key bug + a rollback smoke). Implemented: whole-tensor upload
+(single/PP/Replicate/Pin/Tied→Alias) + **`ExpertSharded`** (each rank = compact blob of its owned
+experts, generic expert-outermost gather via `expert_compact_blob` + `ShardConfig`) + **§6
+transactional guard** (mid-load failure → `free_all` the partial uploads, return `Err`; no VRAM
+leak). **Dense-TP slice returns `Err`** (Phase 5). `source(entry)->bytes` closure keeps arch
+on-disk HFQ naming out of the engine. Additive
 — forward untouched (Tier-1; store-read is Phase 3). NOTE: the EP path produces the placed *bytes*;
 the per-expert pointer-table + zeroed-dummy the deepseek4 kernel indexes through
 (`crates/hipfire-arch-deepseek4/src/arch.rs:163-333`) is forward-consumption, wired in Phase 3.

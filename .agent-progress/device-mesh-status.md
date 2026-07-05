@@ -30,7 +30,7 @@ Plan: docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md
 Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed for any.
 
 ## REMAINING (GPU-integration / hot-path; multi-session, one PR per phase)
-- Phase 2 cont: fulfill_manifest DENSE-TP slice+upload (whole-tensor + ExpertSharded DONE, see below); production-arch manifests for qwen2/qwen35/ds4/minimax; state_manifest impls; transactional-OOM guard.
+- Phase 2 cont: fulfill_manifest DENSE-TP slice+upload (whole-tensor + ExpertSharded + transactional-OOM guard DONE, see below); production-arch manifests for qwen35/ds4 hybrids; state_manifest impls.
 - Phase 1a/1b: wire collective hints + band_xfer into the executor; PP executor loop; PP byte-exact oracle (needs building); 1c llama-PP walking skeleton.
 - Phase 3: WeightStore/StateStore + ModelParallel + ArchDispatch (hoist EpArch/LoadedModel out of daemon example binary → runtime lib). Highest-risk.
 - Phase 4: qwen2 ForwardBindings reach.
@@ -47,6 +47,10 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
   owned experts (generic expert-outermost host gather; `expert_compact_blob` + `ShardConfig`;
   the arch's forward owns the per-expert ptr-table + zeroed-dummy — that's forward-indexing, not
   placement); **dense TP slice (Column/Row/FusedQkv/Head/Vocab @ Tp>1) returns `Err`** (Phase 5).
+- **Transactional (§6):** outer/inner split — on any mid-load failure (source-read/shard-math/
+  upload), `WeightStore::free_all` frees every already-uploaded buffer on its own device (best-
+  effort via `Gpu::hip.free`) and returns `Err`. Never a half-loaded VRAM-leaking mesh (unlike the
+  bespoke loaders). `Alias` cells hold no buffer.
 - DECISION: takes a `source(entry) -> raw bytes` closure, NOT `&HfqFile` — manifest names are
   *logical* ("wq"), on-disk HFQ names are arch-specific; the closure keeps the engine free of
   on-disk naming (pulls complexity to the arch; Tier-1). Same shape as the plan's
@@ -54,7 +58,8 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
 - GPU-validated on gfx1151 via `examples/fulfill_manifest_probe.rs` (synthetic byte source,
   no model file): single-1×1 + emulated PP-2 + emulated EP-2 all PASS — placement matches
   `placement_devices`, byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device,
-  Tied→Alias, dense-TP refusal, EP compact-blob per rank (rank0 experts [0,2,4,6], rank1 [1,3,5,7]).
+  Tied→Alias, dense-TP refusal, EP compact-blob per rank (rank0 experts [0,2,4,6], rank1 [1,3,5,7]),
+  transactional rollback (source-fail mid-load → Err + partial uploads freed).
   **The byte-oracle caught a real bug**: `(name, device)` key aliased all layers' `wq` onto one
   cell → fixed by adding `layer` to the key.
 - 4 no-GPU unit tests (classifier + expert_compact_blob + store keying + refusal decision).
