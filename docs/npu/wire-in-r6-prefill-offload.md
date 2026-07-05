@@ -70,6 +70,24 @@ Until (1)+(2) land, the offload is a net loss vs the GPU (which needs no marshal
 The 20.7 TOPS is a real *compute* rate; the deliverable end-to-end rate depends
 entirely on beating this overhead — that, not the kernel, is now the open question.
 
+### Measured: pre-packing W helps 2×, but CPU marshaling is still a dead end
+
+`prepack_weights` (once, 23 ms) + `run_packed` (per inference, weight cost = memcpy):
+**351 → 177 ms/run (0.01 → 0.02 TOPS)** on the same shape, still correct. So the W
+re-pack was ~half — but the residual 177 ms is the **C tile→row-major reshuffle** (M·N
+= 3.1 M scalar index ops per inference) plus per-dispatch A-pack. Even a perfect CPU
+version floors around ~20 ms (0.16 TOPS) — still below the GPU.
+
+**The real fix is DMA-side reshuffle, not CPU.** The shim DMA supports strided access
+(`dims_to_stream` on the objectfifo `dma_bd`), so A/W/C can be fed **row-major** and
+the DMA does the tile-major reshuffle *for free* during transfer — which is exactly
+how IRON's whole_array gemm avoids CPU marshaling. My hand-written R6 MLIR uses plain
+linear `dma_bd` (hence the CPU marshaling). Porting the tile-major stride pattern into
+the `dma_bd` eliminates CPU marshaling entirely; that is the substantive next step and
+the true gate on offload viability (alongside the ~78 µs/dispatch latency, which still
+argues for streaming the whole GEMM in one dispatch). `prepack_weights`/`run_packed`
+stay useful (weights still pre-arranged once), but the reshuffle must move to the DMA.
+
 ## The one architectural decision (needs a call)
 
 **Concurrency model.** The win is *concurrent* NPU-prefill ‖ GPU-work. Options:
