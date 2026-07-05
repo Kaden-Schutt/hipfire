@@ -862,12 +862,24 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_causal_batched",
-            kernels::ATTENTION_CAUSAL_BATCHED_SRC,
-            "attention_causal_batched",
-        )?;
-        let func = &self.functions["attention_causal_batched"];
+        // gfx1103 (Phoenix): no-LDS variant (one wave32 per (head, query),
+        // register online softmax) removes the scores[qpos+1] LDS ceiling.
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_causal_batched_gfx1103",
+                kernels::ATTENTION_CAUSAL_BATCHED_GFX1103_SRC,
+                "attention_causal_batched_gfx1103",
+            )
+        } else {
+            (
+                "attention_causal_batched",
+                kernels::ATTENTION_CAUSAL_BATCHED_SRC,
+                "attention_causal_batched",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
+        let func = &self.functions[kname];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
@@ -892,9 +904,13 @@ impl Gpu {
             &mut causal as *mut _ as *mut c_void,
         ];
         // Block size: enough threads to cover head_dim and seq_len
-        let block_size = 128u32.min((seq_len.max(head_dim) as u32).next_power_of_two());
-        // Shared: scores[seq_len] + workspace[block_size]
-        let shared_mem = ((seq_len + block_size as usize) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = 128u32.min((seq_len.max(head_dim) as u32).next_power_of_two());
+            // Shared: scores[seq_len] + workspace[block_size]
+            (block_size, ((seq_len + block_size as usize) * 4) as u32)
+        };
         unsafe {
             self.hip.launch_kernel(
                 func,

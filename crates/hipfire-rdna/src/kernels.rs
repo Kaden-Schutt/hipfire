@@ -167,6 +167,12 @@ pub const ATTENTION_INT8_KV_GFX1103_SRC: &str =
 pub const ATTENTION_HFQ8_KV_GFX1103_SRC: &str =
     include_str!("../../../kernels/src/gfx1103/attention_hfq8_kv.gfx1103.hip");
 
+/// gfx1103 (Phoenix) no-LDS batched causal attention (F32 KV, prefill). One
+/// wave32 per (head, query position); register online softmax over the causal
+/// window removes the scores[qpos+1] LDS. head_dim % 32 == 0.
+pub const ATTENTION_CAUSAL_BATCHED_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_causal_batched.gfx1103.hip");
+
 /// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
 /// ABI as the generic conv1d split kernel plus a companion state update entry.
 #[cfg(feature = "deltanet")]
