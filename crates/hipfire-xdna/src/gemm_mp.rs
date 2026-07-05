@@ -87,6 +87,42 @@ impl NpuGemmMp {
         })
     }
 
+    /// Load from a standard `r6_cache.sh` cache dir, parsing (COLS, MT, KCHUNK, NB) from its
+    /// name (`..._{MT}x{NT}x{KCHUNK}_c{COLS}_nb{NB}`) so the config can't silently mismatch
+    /// the xclbin. Rejects whole-GEMM `_r{ROUNDS}` builds (different layout) and any NT≠4.
+    pub fn load_cached(dir: &str) -> Result<Self, XdnaError> {
+        let xclbin = std::fs::read(format!("{dir}/final.xclbin")).map_err(XdnaError::Open)?;
+        let insts = std::fs::read(format!("{dir}/insts.bin")).map_err(XdnaError::Open)?;
+        let base = std::path::Path::new(dir)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let toks: Vec<&str> = base.split('_').collect();
+        let bad = || XdnaError::BadCacheName(base.to_string());
+        // A `_r{N}` token means a whole-GEMM (ROUNDS) build — not this per-dispatch primitive.
+        if toks.iter().any(|t| {
+            t.strip_prefix('r')
+                .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+        }) {
+            return Err(bad());
+        }
+        let pfx = |p: &str| {
+            toks.iter()
+                .find_map(|t| t.strip_prefix(p).and_then(|r| r.parse().ok()))
+        };
+        let nb: usize = pfx("nb").ok_or_else(bad)?;
+        let cols: usize = pfx("c").ok_or_else(bad)?;
+        let dims = toks
+            .iter()
+            .find(|t| t.split('x').count() == 3)
+            .ok_or_else(bad)?;
+        let d: Vec<usize> = dims.split('x').filter_map(|s| s.parse().ok()).collect();
+        if d.len() != 3 || d[1] != NT {
+            return Err(bad());
+        }
+        Self::load(&xclbin, &insts, cols, d[0], d[2], nb)
+    }
+
     /// Pack a full `K×N` int4 weight matrix (`-8..=7`, one value per byte, row-major) into
     /// the broadcast slab layout — the slow bit-packing that must NOT happen per inference
     /// (weights are static). Returns `NB·ww` bytes for [`Self::load_weights`].

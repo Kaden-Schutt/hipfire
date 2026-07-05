@@ -3,7 +3,7 @@
 //! it at an M-parallel xclbin (r6_gen_mp.py, ROUNDS=1) built for (COLS, MT, KCHUNK, NB).
 //!
 //! Build: R6_KERNEL_SRC=<r6>/r6_gemm_ts.cc R6_GEN=r6_gen_mp.py R6_OUT_TAG=r6mp <r6>/r6_cache.sh MT 4 KCHUNK COLS NB
-//! Run:   cargo run -p hipfire-xdna --example npu_gemm_mp_verify -- <dir> COLS MT KCHUNK NB
+//! Run:   cargo run -p hipfire-xdna --example npu_gemm_mp_verify -- <dir>  (config from dir name)
 
 fn main() {
     #[cfg(target_os = "linux")]
@@ -11,11 +11,8 @@ fn main() {
         use hipfire_xdna::NpuGemmMp;
         let a: Vec<String> = std::env::args().collect();
         let dir = &a[1];
-        let p = |i: usize, d: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
-        let (cols, mt, kc, nb) = (p(2, 8), p(3, 8), p(4, 32), p(5, 64));
-        let x = std::fs::read(format!("{dir}/final.xclbin")).unwrap();
-        let i = std::fs::read(format!("{dir}/insts.bin")).unwrap();
-        let mut g = NpuGemmMp::load(&x, &i, cols, mt, kc, nb).unwrap();
+        // Self-describing: config (COLS/MT/KCHUNK/NB) is parsed from the cache dir name.
+        let mut g = NpuGemmMp::load_cached(dir).unwrap();
         let (k, n, rows_per) = (g.k(), g.n(), g.rows_per_dispatch());
 
         let rnd = |i: usize| -> i8 {

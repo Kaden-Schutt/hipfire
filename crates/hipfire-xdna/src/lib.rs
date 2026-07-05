@@ -47,6 +47,9 @@ pub enum XdnaError {
     Xclbin(xclbin::XclbinError),
     /// The xclbin has no AIE_PARTITION section (no PDI to load).
     NoAiePartition,
+    /// A cache directory name did not match the expected `..._{MT}x{NT}x{KCHUNK}_c{COLS}_nb{NB}`
+    /// shape (or was a whole-GEMM `_r{ROUNDS}` build the primitive can't consume).
+    BadCacheName(String),
 }
 
 impl From<xclbin::XclbinError> for XdnaError {
@@ -66,6 +69,12 @@ impl fmt::Display for XdnaError {
             XdnaError::DevBoOutsideHeap => write!(f, "DEV BO device address outside heap mapping"),
             XdnaError::Xclbin(e) => write!(f, "xclbin parse: {e}"),
             XdnaError::NoAiePartition => write!(f, "xclbin has no AIE_PARTITION section"),
+            XdnaError::BadCacheName(n) => {
+                write!(
+                    f,
+                    "cache dir '{n}' not a NpuGemmMp config (want ..._MTxNTxKCHUNK_cCOLS_nbNB)"
+                )
+            }
         }
     }
 }
