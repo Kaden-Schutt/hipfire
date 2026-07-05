@@ -13,3 +13,8 @@ Branch: feature/device-mesh (off feature/parallel-expansion, has HIPFIRE_EMULATE
 mesh-driven run_layer_program(mesh,…) in hipfire-dispatch (dispatch→hardware dep).
 This is where DeviceMesh gets its first real consumer. Needs the byte-exact
 HIPFIRE_FORWARD_LOWERED oracle (single-GPU) + EP-decode byte-identity → GPU.
+
+## Phase 0b — executor unification (in progress)
+- [x] crate edge dispatch->hardware + relocate ep.rs into hipfire-dispatch (runtime re-exports). 33731539. Byte-identical, daemon builds 10 crates.
+- [x] DeviceMesh (rectangular named-axis core: DimKind{Pp,Tp,Ep}, Axis, rect()/single()/coord_of/device_of/group_along). In hipfire-hardware::mesh. 8 unit tests pass (1x1, Nx1, 1xN, 2x2 coords+groups), no GPU. Tree/raggedness = Phase 5b extension (documented, not built).
+- [ ] Unify single-GPU run_layer_program + EP-decode run_layer_program_ep into ONE run_layer_program(mesh, gpus, program, bindings: &mut [B]) consuming DeviceMesh (single = 1x1). BEHAVIOR-RELEVANT hot-path change → needs byte-exact HIPFIRE_FORWARD_LOWERED oracle (single-GPU) + EP-decode byte-identity on GPU. NEXT.

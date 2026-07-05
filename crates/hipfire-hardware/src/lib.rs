@@ -20,6 +20,9 @@
 //! 2. Run debug builds to catch silent mis-binds via the bind_thread invariant.
 //! 3. Pass the multi-GPU coherence gate.
 
+pub mod mesh;
+pub use mesh::{Axis, DeviceMesh, DimKind};
+
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms,
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,

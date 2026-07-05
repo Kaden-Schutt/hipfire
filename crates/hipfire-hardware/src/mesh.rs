@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: MIT
+//! `DeviceMesh` — the single abstraction that describes how logical devices are
+//! arranged for pipeline / tensor / expert parallelism, consumed identically by
+//! the forward executor (compute placement) and the loader (weight/state
+//! placement). See docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md.
+//!
+//! **Named-axis semantics are primary.** A mesh is an ordered set of typed axes
+//! `{Pp, Tp, Ep}`; a device's *coordinate* is an index tuple over the axes, and
+//! its *collective group along an axis* is every device sharing the other
+//! coordinates. This already expresses coexisting TP and EP at different group
+//! sizes (a MoE model reduces its expert op over the `Ep` group and attention
+//! over the `Tp` group) — exactly how Megatron/JAX meshes work.
+//!
+//! The common **rectangular** case (uniform size per axis) is implemented here
+//! and built via [`DeviceMesh::rect`]. Degenerate cases: single-GPU = no axes
+//! (`rect(&[])`, one device); PP-only = `[{Pp, N}]`; EP-only = `[{Ep, N}]`.
+//!
+//! **Raggedness (a `Dimension` tree — different Tp/Ep size per Pp stage, for
+//! heterogeneous/mixed-arch fleets) is a Phase-5b extension**, not built here.
+//! The rectangular mesh is the "all sub-trees identical" special case, so the
+//! tree is a future superset, not a rewrite.
+
+/// The parallelism axes a device coordinate can range over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum DimKind {
+    /// Pipeline-parallel: layers are banded across stages; the residual is
+    /// handed stage→stage (`BandXfer`). Point-to-point, never all-reduced.
+    Pp,
+    /// Tensor-parallel: dense GEMMs (attention/MLP) sharded within a group,
+    /// all-reduced after the row-sharded op.
+    Tp,
+    /// Expert-parallel: MoE experts sharded within a group, all-reduced after
+    /// the expert op.
+    Ep,
+}
+
+/// One rectangular axis of the mesh.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Axis {
+    pub kind: DimKind,
+    pub size: usize,
+}
+
+/// A rectangular device mesh: an ordered list of typed axes. A global device id
+/// is the row-major flattening of a coordinate tuple over the axes (last axis
+/// varies fastest). An empty axis list is the single-device (1×1) mesh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceMesh {
+    axes: Vec<Axis>,
+}
+
+impl DeviceMesh {
+    /// Build a rectangular mesh from `(kind, size)` pairs. Sizes must be ≥ 1;
+    /// size-1 axes are kept (so `group_along` over them is a singleton) — call
+    /// [`DeviceMesh::squeezed`] to drop them if you want a minimal shape.
+    pub fn rect(axes: &[(DimKind, usize)]) -> Self {
+        let axes = axes
+            .iter()
+            .map(|&(kind, size)| Axis {
+                kind,
+                size: size.max(1),
+            })
+            .collect();
+        Self { axes }
+    }
+
+    /// The single-device (1×1) mesh — no axes, exactly one device. This is what
+    /// the unified `run_layer_program` runs the single-GPU path as.
+    pub fn single() -> Self {
+        Self { axes: Vec::new() }
+    }
+
+    pub fn axes(&self) -> &[Axis] {
+        &self.axes
+    }
+
+    /// Total number of logical devices = product of axis sizes (1 for a mesh
+    /// with no axes).
+    pub fn n_devices(&self) -> usize {
+        self.axes.iter().map(|a| a.size).product::<usize>().max(1)
+    }
+
+    /// The size of the first axis of the given kind (1 if absent).
+    pub fn size_of(&self, kind: DimKind) -> usize {
+        self.axes
+            .iter()
+            .find(|a| a.kind == kind)
+            .map_or(1, |a| a.size)
+    }
+
+    /// Whether this mesh has more than one device along `kind`.
+    pub fn has_axis(&self, kind: DimKind) -> bool {
+        self.axes.iter().any(|a| a.kind == kind && a.size > 1)
+    }
+
+    /// Coordinate tuple (one index per axis) for a global device id.
+    pub fn coord_of(&self, dev: usize) -> Vec<usize> {
+        let mut rem = dev;
+        let mut coord = vec![0usize; self.axes.len()];
+        // Row-major: last axis varies fastest.
+        for i in (0..self.axes.len()).rev() {
+            let sz = self.axes[i].size;
+            coord[i] = rem % sz;
+            rem /= sz;
+        }
+        coord
+    }
+
+    /// Global device id for a coordinate tuple (inverse of [`coord_of`]).
+    pub fn device_of(&self, coord: &[usize]) -> usize {
+        debug_assert_eq!(coord.len(), self.axes.len());
+        let mut id = 0usize;
+        for (i, a) in self.axes.iter().enumerate() {
+            id = id * a.size + coord[i].min(a.size - 1);
+        }
+        id
+    }
+
+    /// The collective group along `kind` for the device at `coord`: every device
+    /// sharing all *other* coordinates, ordered by their index along `kind`.
+    /// Returns the ids as a `Vec<usize>` suitable for
+    /// `Gpus::all_reduce_sum_f32[_peer](&group, …)`. If the mesh has no axis of
+    /// `kind`, the group is just this device (singleton) — the all-reduce is
+    /// then the identity, matching the single-GPU / no-op case.
+    pub fn group_along(&self, kind: DimKind, coord: &[usize]) -> Vec<usize> {
+        let Some(axis_idx) = self.axes.iter().position(|a| a.kind == kind) else {
+            return vec![self.device_of(coord)];
+        };
+        let size = self.axes[axis_idx].size;
+        (0..size)
+            .map(|k| {
+                let mut c = coord.to_vec();
+                c[axis_idx] = k;
+                self.device_of(&c)
+            })
+            .collect()
+    }
+
+    /// Drop size-1 axes, yielding the minimal equivalent shape.
+    pub fn squeezed(&self) -> Self {
+        Self {
+            axes: self.axes.iter().copied().filter(|a| a.size > 1).collect(),
+        }
+    }
+}
+
+impl Default for DeviceMesh {
+    fn default() -> Self {
+        Self::single()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_is_one_device_no_axes() {
+        let m = DeviceMesh::single();
+        assert_eq!(m.n_devices(), 1);
+        assert_eq!(m.coord_of(0), Vec::<usize>::new());
+        // No Tp axis → all-reduce group is the singleton {0} (identity).
+        assert_eq!(m.group_along(DimKind::Tp, &[]), vec![0]);
+    }
+
+    #[test]
+    fn pp_only_n_by_1() {
+        let m = DeviceMesh::rect(&[(DimKind::Pp, 4)]);
+        assert_eq!(m.n_devices(), 4);
+        assert_eq!(m.coord_of(2), vec![2]);
+        assert_eq!(m.device_of(&[3]), 3);
+        // No Tp/Ep axis → singleton groups (PP never all-reduces).
+        assert_eq!(m.group_along(DimKind::Tp, &[2]), vec![2]);
+    }
+
+    #[test]
+    fn ep_only_1_by_n_group_is_all_devices() {
+        let m = DeviceMesh::rect(&[(DimKind::Ep, 4)]);
+        assert_eq!(m.n_devices(), 4);
+        // Ep group for any device = all 4 (they share the empty "other" coords).
+        assert_eq!(m.group_along(DimKind::Ep, &[1]), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn stacked_2x2_pp_tp_coords_and_groups() {
+        // axes = [Pp:2, Tp:2]; row-major, Tp varies fastest.
+        let m = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)]);
+        assert_eq!(m.n_devices(), 4);
+        // device 0=(0,0) 1=(0,1) 2=(1,0) 3=(1,1)
+        assert_eq!(m.coord_of(0), vec![0, 0]);
+        assert_eq!(m.coord_of(1), vec![0, 1]);
+        assert_eq!(m.coord_of(3), vec![1, 1]);
+        assert_eq!(m.device_of(&[1, 0]), 2);
+        // Tp group of device 2=(1,0): share Pp=1, vary Tp → devices 2,3.
+        assert_eq!(m.group_along(DimKind::Tp, &[1, 0]), vec![2, 3]);
+        // Tp group of device 1=(0,1): share Pp=0 → devices 0,1.
+        assert_eq!(m.group_along(DimKind::Tp, &[0, 1]), vec![0, 1]);
+        // Pp "group" (not all-reduced, but the accessor is symmetric) of
+        // device 1=(0,1): share Tp=1, vary Pp → devices 1,3.
+        assert_eq!(m.group_along(DimKind::Pp, &[0, 1]), vec![1, 3]);
+    }
+
+    #[test]
+    fn coord_roundtrip_all_devices() {
+        let m = DeviceMesh::rect(&[(DimKind::Pp, 3), (DimKind::Ep, 2)]);
+        for d in 0..m.n_devices() {
+            assert_eq!(m.device_of(&m.coord_of(d)), d);
+        }
+    }
+}
