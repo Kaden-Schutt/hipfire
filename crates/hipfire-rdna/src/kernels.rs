@@ -173,6 +173,17 @@ pub const ATTENTION_HFQ8_KV_GFX1103_SRC: &str =
 pub const ATTENTION_CAUSAL_BATCHED_GFX1103_SRC: &str =
     include_str!("../../../kernels/src/gfx1103/attention_causal_batched.gfx1103.hip");
 
+/// gfx1103 (Phoenix) no-LDS batched Q8_0 causal/tree attention (prefill +
+/// dflash/ddtree verify). One wave32 per (head, batch row); register online
+/// softmax over positions[b]+1 (or the tree block), no scores[seq_len] LDS.
+pub const ATTENTION_Q8_0_KV_BATCHED_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_q8_0_kv_batched.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS batched F32 causal/tree attention (prefill/KLD +
+/// verify). One wave32 per (head, batch row); register online softmax.
+pub const ATTENTION_F32_BATCHED_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_f32_batched.gfx1103.hip");
+
 /// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
 /// ABI as the generic conv1d split kernel plus a companion state update entry.
 #[cfg(feature = "deltanet")]

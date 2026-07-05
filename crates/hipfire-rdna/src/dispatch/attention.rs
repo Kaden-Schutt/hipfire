@@ -1023,11 +1023,23 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_f32_batched",
-            kernels::ATTENTION_F32_BATCHED_SRC,
-            "attention_f32_batched",
-        )?;
+        // gfx1103 (Phoenix): no-LDS batched variant (one wave32 per (head,row),
+        // register online softmax) removes the scores[max_ctx_len] LDS ceiling.
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_f32_batched_gfx1103",
+                kernels::ATTENTION_F32_BATCHED_GFX1103_SRC,
+                "attention_f32_batched_gfx1103",
+            )
+        } else {
+            (
+                "attention_f32_batched",
+                kernels::ATTENTION_F32_BATCHED_SRC,
+                "attention_f32_batched",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let q_ptr = q.buf.as_ptr();
         let k_ptr = k_cache.buf.as_ptr();
@@ -1060,17 +1072,24 @@ impl Gpu {
             &bs as *const _ as *mut c_void,
             &bc as *const _ as *mut c_void,
         ];
-        let block_size = (max_ctx_len.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (max_ctx_len.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            (
+                block_size,
+                ((max_ctx_len + block_size as usize + head_dim) * 4) as u32,
+            )
+        };
         let bytes =
             crate::profile::attention_f32_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
                 * batch_size;
         let timer =
             crate::profile::begin_timer(&self.hip, "attention", "attention_f32_batched", bytes);
         let result = self.launch_maybe_blob(
-            "attention_f32_batched",
+            kname,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -1520,11 +1539,23 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_q8_0_kv_batched",
-            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
-            "attention_q8_0_kv_batched",
-        )?;
+        // gfx1103 (Phoenix): no-LDS batched variant (one wave32 per (head,row),
+        // register online softmax) removes the scores[max_ctx_len] LDS ceiling.
+        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_gfx1103 {
+            (
+                "attention_q8_0_kv_batched_gfx1103",
+                kernels::ATTENTION_Q8_0_KV_BATCHED_GFX1103_SRC,
+                "attention_q8_0_kv_batched_gfx1103",
+            )
+        } else {
+            (
+                "attention_q8_0_kv_batched",
+                kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+                "attention_q8_0_kv_batched",
+            )
+        };
+        self.ensure_kernel(module, src, kname)?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -1558,12 +1589,19 @@ impl Gpu {
             &mut bs as *mut _ as *mut c_void,
             &mut bc as *mut _ as *mut c_void,
         ];
-        let block_size = (max_ctx_len.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        // Shared memory must accommodate the LARGEST batch row's seq_len for
-        // scores[], plus nthreads workspace and head_dim q_shared.
-        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        let (block_size, shared_mem) = if use_gfx1103 {
+            (32u32, 0u32)
+        } else {
+            let block_size = (max_ctx_len.max(head_dim) as u32)
+                .next_power_of_two()
+                .min(256);
+            // Shared memory must accommodate the LARGEST batch row's seq_len for
+            // scores[], plus nthreads workspace and head_dim q_shared.
+            (
+                block_size,
+                ((max_ctx_len + block_size as usize + head_dim) * 4) as u32,
+            )
+        };
         let bytes =
             crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
                 * batch_size;
@@ -1571,7 +1609,7 @@ impl Gpu {
             crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_batched", bytes);
         let bias_raw = bias_ptr; // alias for move into closure
         let result = self.launch_maybe_blob(
-            "attention_q8_0_kv_batched",
+            kname,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
