@@ -61,6 +61,11 @@ cp "$VARIANT" "$KSRC"
 if ! build; then git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null; echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"VARIANT_BUILD_FAIL\"}"; exit 0; fi
 cp "$DB" /tmp/v2_var_$ID
 git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null; git clean -fdq kernels/src/ 2>/dev/null
+# ---- GPU RUN-QUEUE: serialize measure+profile across parallel certifies (flock) so concurrent A/Bs don't
+#      thrash the GPU and produce garbage tok/s (the builds above ran UNLOCKED = parallel/CPU, the bottleneck).
+#      Reentrant within a process tree + kernel auto-releases on death. This is what makes a build-parallel /
+#      measure-serial swarm safe to fan out onto one card.
+GPULK="$MAIN/scripts/gpu-lock.sh"; [ -f "$GPULK" ] && { . "$GPULK"; gpu_acquire "cert_${ARCH}_c${CARD}_${LABEL}" >/dev/null 2>&1; }
 # ---- ADAPTIVE SAMPLING ----
 BASE=();VAR=();BK=();VK=();BC=OK;VC=OK
 sample(){ local n=$1 r d c k; for r in $(seq 1 "$n"); do
@@ -108,6 +113,7 @@ if [ "$VERDICT" != "BASELINE_BUILD_FAIL" ] && [ "$VERDICT" != "VARIANT_BUILD_FAI
   [ -s "$BPC" ] || rp /tmp/v2_base_$ID > "$BPC"
   BP=$(cat "$BPC"); VP=$(rp /tmp/v2_var_$ID)
 fi
+[ -f "$GPULK" ] && gpu_release >/dev/null 2>&1   # GPU phase done -> release the run-queue for the next queued certify
 rm -f /tmp/v2_base_$ID /tmp/v2_var_$ID
 mkdir -p "$(dirname "$LEDGER")"
 python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUNDS" "$F" "$DELTA" "$BM" "$VM" "$BC" "$VC" "$COMMITTED" "$LEDGER" "${BASE[*]}" "${VAR[*]}" "$BP" "$VP" <<'PY'
