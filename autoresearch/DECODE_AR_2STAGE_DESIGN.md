@@ -26,9 +26,19 @@ two modes, one shared certify.
 - **`.hip`-only surface** (kernel bodies). No Rust / launch-config editing (that
   surface — `EXPANDED_SURFACE.md` — is parked; free codex editing of the Rust
   dispatch produced only build-fails).
-- **Mechanical control, not self-report.** The dry-streak counter and the ledger
-  live in the **loop driver** wrapping codex, so "no new WIN in N" and "what was
-  tried" are *measured*, not reported by codex (which breaks discipline).
+- **Mechanical control, not self-report.** The dry-streak counter, the ledger,
+  **and the loop branch lifecycle** live in the **loop driver** wrapping codex,
+  so "no new WIN in N", "what was tried", and "where the accumulated wins live"
+  are *driver-owned*, not codex-owned (which breaks discipline).
+- **Driver owns the branch — codex NEVER `checkout -B`.** The driver creates the
+  loop branch once (**create-or-resume**: `git checkout loop/cardN 2>/dev/null ||
+  git checkout -B loop/cardN <baseline>`) and codex only commits onto the current
+  HEAD. A `git checkout -B loop/cardN <baseline>` in codex's own prompt
+  **force-resets the branch to baseline on every (re)start**, silently dropping
+  every accumulated win — this actually happened: a keep-alive re-fire wiped a
+  banked 3-win stack (recovered only via reflog). The driver must also keep a
+  `loop/cardN_recovered` safety branch at each new WIN so a stack can never be
+  gc'd.
 
 ## Architecture
 
@@ -62,6 +72,12 @@ Stage 1 exhausted ──► Claude workflow reads stage1_ledger.jsonl (+ final B
 - Replaces the ad-hoc `fire_moe.sh` (which hard-coded moe kernels).
 
 ### 2. Stage-1 driver (wraps codex, owns the mechanical state)
+- **Owns the loop branch** — before spawning codex, `git checkout loop/cardN
+  2>/dev/null || git checkout -B loop/cardN <baseline>` (create-or-resume, never
+  force-reset). Codex's prompt must NOT contain any `checkout -B` — it commits
+  onto HEAD only.
+- On each parity-clean WIN, fast-forwards `loop/cardN_recovered` to the new tip
+  (gc-proof safety branch).
 - Spawns codex with the BOD prompt; codex proposes candidate `.hip` + calls
   `ab_certify_v2p`.
 - After each certify: parse the verdict JSON, append a `stage1_ledger.jsonl` row
@@ -109,6 +125,10 @@ stage1_exhausted + final BOD → Claude brainstorm → certify_queue.json →
   candidates before the A/B.
 - **Empty queue at Stage 2**: `--mode queue` refuses to start without a
   `certify_queue.json` (fail fast, not a silent no-op).
+- **Re-fire mid-run** (keep-alive restarts a dead codex): the driver's
+  create-or-**resume** branch handling means a restart continues the accumulated
+  stack instead of resetting it; the `loop/cardN_recovered` safety branch is the
+  backstop if anything still force-resets `loop/cardN`.
 
 ## Testing
 
