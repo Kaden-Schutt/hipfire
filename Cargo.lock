@@ -277,6 +277,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-hardware"
+version = "0.2.1"
+dependencies = [
+ "hip-bridge",
+ "rdna-compute",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.2.1"
 dependencies = [
@@ -305,6 +313,7 @@ dependencies = [
  "hipfire-atlas",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "libc",
  "memmap2",
  "minijinja",

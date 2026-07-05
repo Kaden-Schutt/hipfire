@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-hardware"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+
+[features]
+default = []
+deltanet = ["rdna-compute/deltanet"]

@@ -41,7 +41,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
 default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "deltanet"]
-deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet", "hipfire-hardware/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
@@ -51,6 +51,7 @@ arch-dots-ocr = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
 byteorder = "1"
