@@ -1942,7 +1942,6 @@ dependencies = [
  "hipfire-kvquant",
  "hipfire-primitives",
  "hipfire-xdna",
- "libc",
 ]
 
 [[package]]
