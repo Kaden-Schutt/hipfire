@@ -148,11 +148,19 @@ acquire of K=128/KCHUNK=8, which is why it's 2× faster per slab. But KCHUNK=32 
 to fit L1 — so the high-MT N-parallel tile (20.7-TOPS *compute* ceiling at K=128) can't be
 used at K=512, and **raising MT doesn't help**: it forces KCHUNK down and worsens the
 amortization. Net: for K=512, **MT=8 KCHUNK=32 (M-parallel whole-GEMM) is near the
-practical ceiling — ~3.4 TOPS raw, ~1.9 TOPS e2e.** Beyond this needs bigger effective
-tiles (an NT=8 kernel — register-spill risk) or a fundamentally different feed (cascade
-K-resident, which R5 showed is feed-bound for real prefill anyway). The generators carry a
-`ROUNDS` whole-GEMM knob for both topologies (`r6_gen.py` / `r6_gen_mp.py`), exercised by
+practical ceiling — ~3.4 TOPS raw, ~1.9 TOPS e2e.** The generators carry a `ROUNDS`
+whole-GEMM knob for both topologies (`r6_gen.py` / `r6_gen_mp.py`), exercised by
 `r6_np1_e2e` / `r6_mp1_e2e`.
+
+**NT=8 tried — dead end (`r6_gemm_ts8.cc`).** Doubling the accumulators to NT=8 makes each
+N-slab cover 128 cols, halving the slab count — the obvious attack on the per-slab
+overhead. But (a) the doubled W-slab overruns L1 at KCHUNK=32, so it can't do K=512 at all;
+and (b) even where it fits (K=256), it's *slower*: raw dispatch NT=8/32-slabs = 1.40 TOPS
+vs NT=4/64-slabs = 2.07 TOPS at identical work — the 8 live accumulators lose II=1 to
+register pressure, which outweighs the fewer acquires. So bigger effective tiles don't help
+here; NT=4 is optimal. What's left is a fundamentally different feed (cascade K-resident —
+R5 showed it's feed-bound for real prefill anyway) or the strategic move: a concurrent
+NPU ‖ GPU split, most valuable at low batch where the GPU also can't amortize.
 
 ### Two dataflow lessons (cost real debugging)
 

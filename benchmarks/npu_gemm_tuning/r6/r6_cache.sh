@@ -15,7 +15,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MT="${1:-16}"; NT="${2:-4}"; KCHUNK="${3:-16}"; COLS="${4:-1}"; NB="${5:-1}"
-[ "$NT" = 4 ] || { echo "NT must be 4 (r6_mac accumulator count)"; exit 1; }
+{ [ "$NT" = 4 ] || [ "$NT" = 8 ]; } || { echo "NT must be 4 (r6_gemm*.cc) or 8 (r6_gemm_ts8.cc)"; exit 1; }
 
 : "${HIPFIRE_NPU_VENV:=$HOME/.venv}"
 source "$HIPFIRE_NPU_VENV/bin/activate"
