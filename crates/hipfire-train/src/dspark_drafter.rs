@@ -1189,11 +1189,12 @@ impl DsparkHeadsGrads {
 /// index reused by the scatter in backward (so `prev_tokens` need not be
 /// threaded into `dspark_heads_backward`).
 pub struct DsparkHeadsActs {
-    pub draft_logits: GpuTensor,     // [block, vocab]  — head output
-    pub markov_latent: GpuTensor,    // [block, rank]   — markov_w1[prev]
-    pub confidence_logit: GpuTensor, // [block]         — pre-sigmoid
-    pub confidence_pred: GpuTensor,  // [block]         — sigmoid(logit)
-    pub markov_idx: GpuTensor,       // [block*rank] i32 (Raw) — gather/scatter index
+    pub draft_logits: GpuTensor,      // [block, vocab]  — head output
+    pub markov_latent: GpuTensor,     // [block, rank]   — markov_w1[prev]
+    pub confidence_logit: GpuTensor,  // [block]         — pre-sigmoid
+    pub confidence_pred: GpuTensor,   // [block]         — sigmoid(logit)
+    pub markov_idx: GpuTensor,        // [block*rank] i32 (Raw) — gather/scatter index
+    pub markov_onehot_idx: GpuTensor, // [block] i32 (Raw) — dest `b*vocab + prev[b]`
 }
 
 /// Return head activations to the pool (GpuTensor has no Drop).
@@ -1204,6 +1205,7 @@ pub fn free_dspark_heads_acts(gpu: &mut Gpu, a: DsparkHeadsActs) -> HipResult<()
         confidence_logit,
         confidence_pred,
         markov_idx,
+        markov_onehot_idx,
     } = a;
     for t in [
         draft_logits,
@@ -1211,6 +1213,7 @@ pub fn free_dspark_heads_acts(gpu: &mut Gpu, a: DsparkHeadsActs) -> HipResult<()
         confidence_logit,
         confidence_pred,
         markov_idx,
+        markov_onehot_idx,
     ] {
         gpu.free_tensor(t)?;
     }
@@ -1288,15 +1291,20 @@ pub fn dspark_heads_forward(
     let block = x_head.shape.iter().product::<usize>() / h;
     debug_assert_eq!(prev_tokens.len(), block);
 
-    // Flattened row index for markov_w1 gather/scatter: idx[b*r+j] = prev[b]*r + j.
+    // Flattened row index for markov_w1 gather: idx[b*r+j] = prev[b]*r + j.
     let mut idx_host = vec![0i32; block * r];
+    // Per-block one-hot destination for the race-free backward: distinct index
+    // `b*vocab + prev[b]` (used to build onehot[block, vocab] in dspark_heads_backward).
+    let mut onehot_idx_host = vec![0i32; block];
     for b in 0..block {
         let base = prev_tokens[b] as i32 * r as i32;
         for j in 0..r {
             idx_host[b * r + j] = base + j as i32;
         }
+        onehot_idx_host[b] = (b * v) as i32 + prev_tokens[b] as i32;
     }
     let markov_idx = upload_idx_i32(gpu, &idx_host, block * r)?;
+    let markov_onehot_idx = upload_idx_i32(gpu, &onehot_idx_host, block)?;
 
     // markov_latent = markov_w1[prev]  (row gather of rank-wide rows).
     let markov_latent = gpu.zeros(&[block * r], DType::F32)?;
@@ -1345,6 +1353,7 @@ pub fn dspark_heads_forward(
         confidence_logit,
         confidence_pred,
         markov_idx,
+        markov_onehot_idx,
     })
 }
 
@@ -1452,9 +1461,29 @@ pub fn dspark_heads_backward(
     gpu.add_inplace_f32(&d_x_head, &d_xh_conf)?;
     gpu.add_inplace_f32(&d_markov_latent, &d_ml_conf)?;
 
-    // ── markov_w1: scatter-add d_markov_latent rows by prev_token (zero-init).
+    // ── markov_w1: forward is a row gather markov_latent[b,:] = markov_w1[prev[b],:],
+    // so d_markov_w1[i,:] = Σ_{b: prev[b]=i} d_markov_latent[b,:] = onehotᵀ @ d_markov_latent.
+    // A non-atomic scatter-add races when two blocks share prev_token, dropping a
+    // contribution; the GEMM sums duplicates correctly. Build onehot[block, vocab]
+    // via a scatter into DISTINCT destinations (b*vocab + prev[b]) — race-free —
+    // then dw = onehotᵀ·d_markov_latent through the training GEMM (dyᵀ·x).
+    let onehot = gpu.zeros(&[block * v], DType::F32)?;
+    let onehot_ones = gpu.full_f32(&[block], 1.0)?;
+    gpu.rq_scatter_add_f32(&onehot, &acts.markov_onehot_idx, &onehot_ones, block)?;
     let d_markov_w1 = gpu.zeros(&[v, r], DType::F32)?;
-    gpu.rq_scatter_add_f32(&d_markov_w1, &acts.markov_idx, &d_markov_latent, block * r)?;
+    linear_backward_w(
+        gpu,
+        &onehot,
+        &d_markov_latent,
+        &d_markov_w1,
+        block,
+        r,
+        v,
+        false,
+    )?;
+    for t in [onehot, onehot_ones] {
+        gpu.free_tensor(t)?;
+    }
 
     for t in [
         d_logit,
