@@ -121,7 +121,7 @@ def prow(p):
   return None
 b=prow(bp); v=prow(vp)
 roof={"target_base":b,"target_var":v} if (b or v) else None
-# ANNOTATE per the instrument->lever map (autoresearch/GPU_ISA_LEVERS.md): tell the agent WHY + what to try next
+# ANNOTATE per the instrument->lever map (autoresearch/levers/): tell the agent WHY + what to try next
 fb=[]
 if b and v:
   bo,vo=b.get("occ"),v.get("occ"); bg,vg=b.get("vgpr"),v.get("vgpr"); vl=v.get("l2_hit_pct"); vmb=v.get("mem_busy")
