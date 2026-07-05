@@ -2085,6 +2085,7 @@ dependencies = [
  "hipfire-model",
  "hipfire-rdna",
  "hipfire-runtime",
+ "serde_json",
 ]
 
 [[package]]
