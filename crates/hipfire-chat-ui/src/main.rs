@@ -430,7 +430,21 @@ fn message_view(message: UiMessage) -> impl IntoView {
     };
 
     let body_view = if content.is_empty() {
-        ().into_any()
+        if is_assistant {
+            // Empty assistant bubble = awaiting the first token. That wait spans
+            // any server-side model (re)load — which can take tens of seconds for
+            // a large model — plus prefill. Show an indeterminate loading bar so
+            // the user knows the model is spinning up rather than hung.
+            view! {
+                <div class="loading" role="status" aria-live="polite">
+                    <div class="loading-bar"><div class="loading-fill"></div></div>
+                    <span class="loading-label">"Loading model / preparing response…"</span>
+                </div>
+            }
+            .into_any()
+        } else {
+            ().into_any()
+        }
     } else if is_assistant {
         view! { <div class="md" inner_html=render_markdown(&content)></div> }.into_any()
     } else {
