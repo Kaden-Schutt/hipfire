@@ -281,7 +281,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_LLOYD_GFX12` | Used to configure runtime execution by explicitly setting "HIPFIRE_LLOYD_GFX12" | `crates/hipfire-runtime/examples/prefill_microbench.rs:167` |
 | `HIPFIRE_LLOYD_K3` | Fallback to HFQ2-G128 for non-256-aligned (no rotation) | `crates/hipfire-quantize/src/main.rs:8153` |
 | `HIPFIRE_LLOYD_MB4` | Force MB4=0 to skip the size-gated routing | `crates/hipfire-rdna/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs:274` |
-| `HIPFIRE_LM_DUMP` | Selects behavior from recognized values | `crates/hipfire-arch-gemma3/src/forward.rs:228` |
+| `HIPFIRE_LM_DUMP` | Selects behavior from recognized values | `crates/hipfire-arch-gemma3/src/forward.rs:296` |
 | `HIPFIRE_LM_HEAD_F16` | Runtime variable controlling lm head f16 in hipfire | `crates/hipfire-runtime/src/config.rs:108` |
 | `HIPFIRE_LM_HEAD_OVERWRITE` | Environment toggle value controls runtime behavior | `crates/hipfire-rdna/src/feature_flags.rs:222` |
 | `HIPFIRE_LM_HEAD_WMMA` | Runtime variable controlling lm head wmma in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:220` |

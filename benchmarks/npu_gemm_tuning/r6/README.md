@@ -73,3 +73,18 @@ real prefill on the halo NPU — **4× the SOTA NPU inference stack** and past t
 reference — via the M/AI 2D tile, all through hipfire's own XRT-free dispatch. Next:
 wire R6 into the runtime prefill-offload path (the original goal — now clearly worth
 it; NPU prefill runs concurrently with GPU decode for a real aggregate win).
+
+## R6 is a numerically-correct GEMM (real data, not just the ceiling)
+
+`crates/hipfire-xdna/examples/r6_verify` runs the kernel on random int8×int4 data and
+compares to a CPU reference: **0/256 mismatches** (build MT=1 NT=4 KCHUNK=1, one
+M-block × 4 N-blocks × one K-tile). This pins the full tile layout — **all row-major**:
+
+- A tile = 4×16 int8, `a[m*16 + k]`.
+- W tile = 16×16 int4, `w[k*16 + n]`, packed two int4 per byte (low nibble first).
+- C tile = 4×16 int32, `c[m*16 + n]`.
+- `r6_mac` tile ordering: `A[MT][KCHUNK]` at `(mt*KCHUNK+k)*64`, `W[NT][KCHUNK]` at
+  `(nt*KCHUNK+k)*128` bytes, `C[MT][NT]` at `(mt*NT+nt)*64`.
+
+This is the layout the runtime `NpuGemm` marshaling (wire-in step 2) targets — R6 is a
+proven correct W4A8 GEMM primitive, not only a throughput ceiling.

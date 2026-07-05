@@ -1967,7 +1967,7 @@ pub const ENV_HIPFIRE_LLOYD_MB4: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_LM_DUMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LM_DUMP",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-arch-gemma3/src/forward.rs:228",
+    source: "crates/hipfire-arch-gemma3/src/forward.rs:296",
 };
 
 /// `HIPFIRE_LM_HEAD_F16` — Runtime variable controlling lm head f16 in hipfire
