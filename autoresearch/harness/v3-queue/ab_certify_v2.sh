@@ -99,35 +99,46 @@ if [ "$VERDICT" = WIN ]; then
     commit -q -m "WIN $LABEL $KERNEL f=$F d=${DELTA}% rounds=$ROUNDS" 2>/dev/null && COMMITTED=$(git rev-parse --short HEAD)
   git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null; git clean -fdq kernels/src/ 2>/dev/null
 fi
-# ---- roofline WHY on a WIN (reuse oracle_profile) ----
-ROOF="null"
-if [ "$VERDICT" = WIN ]; then
+# ---- per-variant PROFILE on EVERY verdict (so the agent sees WHY it won/lost + what to try next,
+#      not a bare scalar — this is what stops it flying blind under the 5-run permutation budget) ----
+BP="null"; VP="null"
+if [ "$VERDICT" != "BASELINE_BUILD_FAIL" ] && [ "$VERDICT" != "VARIANT_BUILD_FAIL" ]; then
   rp(){ cp "$1" "$DB"; HIPFIRE_REPO="$WT" bash /tmp/oracle_profile.sh "$ARCH" "$DEV" "$CARD" "$MODEL" 24 2>/dev/null | tail -1; }
-  BP=$(rp /tmp/v2_base_$ID); VP=$(rp /tmp/v2_var_$ID)
-  ROOF=$(python3 - "$KERNEL" "$BP" "$VP" <<'PY'
-import json,sys
-k=sys.argv[1]
-def row(p):
-  try:d=json.loads(p)
-  except:return None
-  for r in d.get("rows",[]):
-    if r["kernel"].startswith(k):return {x:r.get(x) for x in("wall_pct","occ","l2_hit_pct","mem_busy","vgpr","lds","roofline")}
-print(json.dumps({"target_base":row(sys.argv[2]),"target_var":row(sys.argv[3])}))
-PY
-)
+  BPC="/tmp/baseprof_${ARCH}_$(echo "$KERNEL" | tr / _)"   # base profiled ONCE per kernel, cached + reused across its variants
+  [ -s "$BPC" ] || rp /tmp/v2_base_$ID > "$BPC"
+  BP=$(cat "$BPC"); VP=$(rp /tmp/v2_var_$ID)
 fi
 rm -f /tmp/v2_base_$ID /tmp/v2_var_$ID
 mkdir -p "$(dirname "$LEDGER")"
-python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUNDS" "$F" "$DELTA" "$BM" "$VM" "$BC" "$VC" "$COMMITTED" "$ROOF" "$LEDGER" "${BASE[*]}" "${VAR[*]}" <<'PY'
+python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUNDS" "$F" "$DELTA" "$BM" "$VM" "$BC" "$VC" "$COMMITTED" "$LEDGER" "${BASE[*]}" "${VAR[*]}" "$BP" "$VP" <<'PY'
 import sys,json
-(arch,kern,label,variant,verdict,rounds,f,delta,bm,vm,bc,vc,committed,roof,ledger,bs,vs)=sys.argv[1:18]
-try: rf=json.loads(roof) if roof!="null" else None
-except: rf=None
+(arch,kern,label,variant,verdict,rounds,f,delta,bm,vm,bc,vc,committed,ledger,bs,vs,bp,vp)=sys.argv[1:19]
+def prow(p):
+  try: d=json.loads(p)
+  except: return None
+  for r in d.get("rows",[]):
+    if r["kernel"].startswith(kern): return {x:r.get(x) for x in ("wall_pct","occ","l2_hit_pct","mem_busy","vgpr","lds")}
+  return None
+b=prow(bp); v=prow(vp)
+roof={"target_base":b,"target_var":v} if (b or v) else None
+# ANNOTATE per the instrument->lever map (autoresearch/GPU_ISA_LEVERS.md): tell the agent WHY + what to try next
+fb=[]
+if b and v:
+  bo,vo=b.get("occ"),v.get("occ"); bg,vg=b.get("vgpr"),v.get("vgpr"); vl=v.get("l2_hit_pct"); vmb=v.get("mem_busy")
+  if bg is not None and vg is not None and vg>bg+2: fb.append(f"VGPR {bg}->{vg}")
+  if bo and vo and vo<bo*0.85: fb.append(f"occ {bo}->{vo}% DROPPED-WAVES(you overloaded=the row-reuse regression mode; cut registers/use global_load_lds)")
+  if vo is not None and vo<5: fb.append(f"occ {vo}% CATASTROPHIC-UNDEROCC(per-wave MLP ring is the lever here)")
+  elif vmb is not None and vo is not None and vmb<70 and vo>=20: fb.append(f"mem_busy {vmb}%+occ {vo}%=TLP already hides latency, NOT MLP-limited")
+  if vl is not None and vl<30: fb.append(f"L2-hit {vl}% CACHE-NOT-FIXED(DRAM-thrash; SLC/stream the write-once weights, keep x/KV resident)")
+  if vo is not None and vmb is not None and vo>85 and vmb>85: fb.append("SATURATED at roofline-leave it")
+feedback="; ".join(fb) if fb else ("no profile" if not v else "no clear lever signal")
 rec={"arch":arch,"kernel":kern,"label":label,"variant":variant,"verdict":verdict,
  "WIN":verdict=="WIN","mwu_dominance":round(float(f),3),"rounds":int(rounds),
  "base_decode":round(float(bm),2),"var_decode":round(float(vm),2),"delta_pct":round(float(delta),2),
- "base_coh":bc,"var_coh":vc,"win_commit":committed or None,"roofline":rf,
+ "base_coh":bc,"var_coh":vc,"win_commit":committed or None,"roofline":roof,"profile_feedback":feedback,
  "base_runs":[float(x) for x in bs.split()],"var_runs":[float(x) for x in vs.split()]}
 open(ledger,"a").write(json.dumps(rec)+"\n")
-print(json.dumps({k:rec[k] for k in ("label","verdict","mwu_dominance","delta_pct","rounds","var_coh","win_commit")}))
+out={k:rec[k] for k in ("label","verdict","mwu_dominance","delta_pct","rounds","var_coh","win_commit")}
+out["profile_feedback"]=feedback; out["target_var"]=v
+print(json.dumps(out))
 PY

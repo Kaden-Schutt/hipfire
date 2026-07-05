@@ -5,6 +5,7 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 ARCH="${ARCH:?}"; CARDS="${CARDS:?}"; BASELINE_REF="${BASELINE_REF:?}"; MODEL="${MODEL:?}"; MAXR="${MAXR:-30}"
 [ -f /tmp/loop_progress.log ] || : > /tmp/loop_progress.log   # RESUME: keep prior verdicts, skip done items
 : > /tmp/loop_driver.log
+rm -f /tmp/baseprof_* 2>/dev/null   # fresh baseline profiles for the per-variant profile_feedback (baseline may have advanced)
 NC=$(echo $CARDS | wc -w); FIRST=${CARDS%% *}
 for c in $CARDS; do git -C "$HOME/hipfire/.aw/sw_card$c" checkout -- kernels/src/ 2>/dev/null; git -C "$HOME/hipfire/.aw/sw_card$c" clean -fdq kernels/src/ 2>/dev/null; git -C "$HOME/hipfire/.aw/sw_card$c" checkout -q -B "loop/card$c" "$BASELINE_REF" 2>/dev/null; done
 HDR="BOX: arch=$ARCH cards=[$CARDS] ncards=$NC model=$MODEL baseline_ref=$BASELINE_REF. The queue is PRE-VETTED -- IMPLEMENT, do not brainstorm. Skip any Q<order> already in the progress log. Certify each variant (card=dev=card; up to $NC parallel with & then wait): BASELINE_REF=$BASELINE_REF bash /tmp/ab_certify_v2.sh $ARCH <card> <card> $MODEL <kernel> <Qlabel> <variant.hip>"

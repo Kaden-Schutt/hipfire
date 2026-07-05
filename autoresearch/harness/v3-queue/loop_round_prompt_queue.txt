@@ -16,7 +16,13 @@ STEP 4 — CERTIFY the verbatim implementation (arch/dev/card/model/baseline are
   ab_certify_v2.sh <arch> <dev> <card> <model> <kernel> Q<order>v0_<slug> /tmp/loop_Q<order>.hip
   ab_certify_v2 adaptively resamples (beats the DPM clock VOIDs), hard-gates coherence, commits WINs to the card branch. Trust ONLY its verdict.
 
-STEP 4b — PERMUTATION SWEEP (the levers are MECHANISM-vetted, so a verbatim miss is a TUNING problem, not a dead lever — explore the parameter space before abandoning):
+STEP 4b — PERMUTATION SWEEP (the levers are MECHANISM-vetted, so a verbatim miss is a TUNING problem, not a dead lever — explore the parameter space before abandoning). DO NOT TUNE BLIND: the certify returns `profile_feedback` + `target_var` (YOUR variant's measured occ / VGPR / L2-hit / mem_busy vs baseline_v0, annotated with the lever). READ it first — it tells you WHY v0 landed where it did and what to change:
+  - "occ DROPPED-WAVES" = you overloaded registers (the row-reuse regression) -> cut VGPR / use global_load_lds, do NOT add more.
+  - "L2-hit CACHE-NOT-FIXED" = still DRAM-thrashing -> SLC/stream the write-once weights, keep x/KV resident (this is the arch's real bottleneck).
+  - "TLP already hides latency, NOT MLP-limited" = more prefetch/MLP will no-op -> attack cache/traffic instead.
+  - "CATASTROPHIC-UNDEROCC" = the register-ring MLP lever IS the fix here.
+  - "SATURATED at roofline" = leave it.
+  Tune the next permutation FROM that measured signal, not from a guess. Then, on a miss:
   - verbatim is a WIN  -> bank it, move on.
   - verbatim is DEAD-with-small-positive / INCONCLUSIVE / a near-miss / a COHERENCE_FAIL a reformulation could fix -> the mechanism is sound, so try UP TO 3 permutations varying the ONE key tunable of THIS lever, e.g.:
       * prefetch / pipeline / gather depth: 2-stage vs 3-stage vs 4-stage window
