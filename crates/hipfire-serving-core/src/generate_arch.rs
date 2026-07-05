@@ -1687,6 +1687,11 @@ pub fn generate_llama(
         let mut generated = 0usize;
         let mut position = prompt_tokens.len();
         let mut seed = first_token;
+        // Spec-decode telemetry: per-window drafts proposed (after confidence
+        // truncation) and accepted, aggregated for τ + draft-size reporting.
+        let mut spec_proposed = 0usize;
+        let mut spec_accepted = 0usize;
+        let mut spec_windows = 0usize;
 
         // Emit the seed (first token) immediately (TTFT == prefill).
         emitted.push(first_token);
@@ -1718,6 +1723,9 @@ pub fn generate_llama(
                     break;
                 }
             };
+            spec_proposed += step.proposed;
+            spec_accepted += step.accepted;
+            spec_windows += 1;
             let mut hit_eos = false;
             for &tk in step.emit.iter() {
                 if generated >= max_tokens {
@@ -1756,10 +1764,35 @@ pub fn generate_llama(
         } else {
             0.0
         };
+        // τ = mean accepted-block length = (accepted + 1 bonus) per window.
+        let accept_pct = if spec_proposed > 0 {
+            spec_accepted as f64 / spec_proposed as f64 * 100.0
+        } else {
+            0.0
+        };
+        let mean_draft = if spec_windows > 0 {
+            spec_proposed as f64 / spec_windows as f64
+        } else {
+            0.0
+        };
+        let tau = if spec_windows > 0 {
+            spec_accepted as f64 / spec_windows as f64 + 1.0
+        } else {
+            0.0
+        };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"dspark":true}}"#,
-            id, generated, tok_s
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"dspark":true,"spec_windows":{},"spec_proposed":{},"spec_accepted":{},"spec_accept_pct":{:.1},"mean_draft_len":{:.2},"tau":{:.2},"block_size":{}}}"#,
+            id,
+            generated,
+            tok_s,
+            spec_windows,
+            spec_proposed,
+            spec_accepted,
+            accept_pct,
+            mean_draft,
+            tau,
+            block
         );
         let _ = stdout.flush();
         m.dspark = Some(ds);
