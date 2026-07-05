@@ -23,7 +23,7 @@ for c in range(COLS):
     out.append(f"    %shim{c} = aie.tile({c}, 0)")
     out.append(f"    %t{c} = aie.tile({c}, 2)")
 for c in range(COLS):
-    out.append(f"    aie.objectfifo @fa{c}(%shim{c}, {{%t{c}}}, 2 : i32) : !aie.objectfifo<memref<{AW}xi8>>")
+    out.append(f"    aie.objectfifo @fa{c}(%shim{c}, {{%t{c}}}, 1 : i32) : !aie.objectfifo<memref<{AW}xi8>>")  # A resident (single-buffer)
     out.append(f"    aie.objectfifo @fw{c}(%shim{c}, {{%t{c}}}, 2 : i32) : !aie.objectfifo<memref<{WW}xi8>>")
     out.append(f"    aie.objectfifo @fc{c}(%t{c}, {{%shim{c}}}, 1 : i32) : !aie.objectfifo<memref<{CW}xi32>>")
 out.append(f'    func.func private @r6_mac(memref<{AW}xi8>, memref<{WW}xi8>, memref<{CW}xi32>) attributes {{link_with = "r6_mac.o"}}')
