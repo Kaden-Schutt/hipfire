@@ -41,6 +41,8 @@ pub enum XdnaError {
     Ioctl(std::io::Error),
     /// The kernel returned fewer bytes than one record.
     ShortResponse,
+    /// A DEV BO's device address fell outside the backing heap mapping.
+    DevBoOutsideHeap,
 }
 
 impl fmt::Display for XdnaError {
@@ -51,6 +53,7 @@ impl fmt::Display for XdnaError {
             XdnaError::Open(e) => write!(f, "open NPU device: {e}"),
             XdnaError::Ioctl(e) => write!(f, "amdxdna ioctl: {e}"),
             XdnaError::ShortResponse => write!(f, "kernel returned a short telemetry buffer"),
+            XdnaError::DevBoOutsideHeap => write!(f, "DEV BO device address outside heap mapping"),
         }
     }
 }
@@ -375,6 +378,71 @@ mod imp {
             )
         }
 
+        /// Configure the hwctx's CU (loads the compiled tile program): CONFIG_HWCTX
+        /// with `DRM_AMDXDNA_HWCTX_CONFIG_CU` and one `cu_config{ cu_bo, cu_func=0 }`.
+        /// `cu_bo` is a BO holding the PDI (from the xclbin AIE_PARTITION).
+        pub fn config_hwctx_cu(&self, hwctx: u32, cu_bo: u32) -> Result<(), XdnaError> {
+            // struct hwctx_param_config_cu { u16 num_cus; u16 pad[3];
+            //   cu_config { u32 cu_bo; u8 cu_func; u8 pad[3]; } } = 16 bytes.
+            let mut cfg = [0u8; 16];
+            cfg[0..2].copy_from_slice(&1u16.to_le_bytes()); // num_cus = 1
+            cfg[8..12].copy_from_slice(&cu_bo.to_le_bytes()); // cu_config[0].cu_bo
+            cfg[12] = 0; // cu_func
+            let mut c = submit::ConfigHwctx {
+                handle: hwctx,
+                param_type: submit::DRM_AMDXDNA_HWCTX_CONFIG_CU,
+                param_val: cfg.as_ptr() as u64,
+                param_val_size: cfg.len() as u32,
+                pad: 0,
+            };
+            self.submit_ioctl(
+                submit::CONFIG_HWCTX_REQUEST,
+                &mut c as *mut _ as *mut libc::c_void,
+            )
+        }
+
+        /// Allocate a DEV buffer object (for the PDI / instruction stream, which
+        /// live in device memory) and fill it with `data`. DEV BOs are carved out
+        /// of `heap` by the driver and are *not* directly mmap-able (GET_BO_INFO
+        /// returns `map_offset = INVALID`); userspace fills them by writing into the
+        /// heap's own mapping at the BO's offset (`bo.xdna_addr - heap.xdna_addr`),
+        /// then SYNC_BO flushes those heap pages. Returns `(handle, xdna_addr)` —
+        /// the device address goes in the command packet.
+        pub fn alloc_dev_bo(
+            &self,
+            heap: &mut DeviceBuffer,
+            data: &[u8],
+        ) -> Result<(u32, u64), XdnaError> {
+            let mut cb = submit::CreateBo {
+                size: data.len() as u64,
+                bo_type: submit::AMDXDNA_BO_DEV,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::CREATE_BO_REQUEST,
+                &mut cb as *mut _ as *mut libc::c_void,
+            )?;
+            let handle = cb.handle;
+            let mut info = submit::GetBoInfo {
+                handle,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::GET_BO_INFO_REQUEST,
+                &mut info as *mut _ as *mut libc::c_void,
+            )?;
+            // Write through the heap mapping at the BO's offset within the heap.
+            let off = info
+                .xdna_addr
+                .checked_sub(heap.xdna_addr())
+                .and_then(|o| usize::try_from(o).ok())
+                .filter(|&o| o + data.len() <= heap.len())
+                .ok_or(XdnaError::DevBoOutsideHeap)?;
+            heap.as_mut_slice()[off..off + data.len()].copy_from_slice(data);
+            self.sync_bo(handle, submit::SYNC_DIRECT_TO_DEVICE, data.len())?;
+            Ok((handle, info.xdna_addr))
+        }
+
         // ── W2: buffer objects (command-submission path) ──────────────────
         // See docs/npu/wire-in-amdxdna-command-submission.md.
 
@@ -545,6 +613,14 @@ mod imp {
         /// Device virtual address of this BO.
         pub fn xdna_addr(&self) -> u64 {
             self.xdna_addr
+        }
+        /// Length in bytes of the mapped region.
+        pub fn len(&self) -> usize {
+            self.len
+        }
+        /// Whether the mapped region is empty.
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
         }
         /// Mutable view of the mapped bytes.
         pub fn as_mut_slice(&mut self) -> &mut [u8] {
