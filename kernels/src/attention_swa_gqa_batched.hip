@@ -6,8 +6,11 @@
 //
 // Adapted from deepseek4_attn_swa_batched for the GQA arches (gemma3): each
 // query head h reads the K/V of its group's kv head `kv_h = h / (n_heads /
-// n_kv_heads)`, so the staged cache is per-kv-head ([batch, n_kv, head_dim,
+// n_kv_heads)`. The staged cache is HEAD-MAJOR ([n_kv_heads, batch, head_dim,
 // window]) rather than deepseek4's MLA shared-KV ([batch, head_dim, window]).
+// Head-major matches how the staging is built: swa_visibility_stage_batched is
+// n_kv=1 (deepseek MLA), so gemma3 calls it per kv head, and each per-head call
+// writes a contiguous [batch, head_dim, window] block — i.e. head-major.
 // No attention sink (gemma3 has none). Softmax scale is passed in (gemma3 bakes
 // its query_pre_attn_scalar into q_norm, so the caller passes 1/sqrt(head_dim)).
 //
@@ -33,8 +36,8 @@
 extern "C" __launch_bounds__(512, 1)
 __global__ void attention_swa_gqa_batched(
     const float* __restrict__ q,        // [batch, n_heads, head_dim]
-    const float* __restrict__ k_cache,  // [batch, n_kv_heads, head_dim, window]
-    const float* __restrict__ v_cache,  // [batch, n_kv_heads, head_dim, window]
+    const float* __restrict__ k_cache,  // [n_kv_heads, batch, head_dim, window]
+    const float* __restrict__ v_cache,  // [n_kv_heads, batch, head_dim, window]
     const int*   __restrict__ n_valid_arr, // [batch]
     float*       __restrict__ attn_out, // [batch, n_heads, head_dim]
     int n_heads,
@@ -57,8 +60,8 @@ __global__ void attention_swa_gqa_batched(
     __shared__ float warp_scratch[HIPFIRE_SWA_MAX_WARPS];
 
     const size_t q_base = (size_t)(b * n_heads + h) * head_dim;
-    // Per-(batch, kv-head) staged window base.
-    const size_t kv_base = (size_t)((b * n_kv_heads) + kv_h) * head_dim * window;
+    // Head-major staged window base: [kv_h][b][head_dim][window].
+    const size_t kv_base = (size_t)((kv_h * batch_size) + b) * head_dim * window;
     const size_t out_base = (size_t)(b * n_heads + h) * head_dim;
 
     const float* k_b = k_cache + kv_base;

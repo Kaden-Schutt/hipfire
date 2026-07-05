@@ -48,12 +48,12 @@ fn main() {
     gpu.hip.device_synchronize().unwrap();
     let got = gpu.download_f32(&dout).unwrap();
 
-    // CPU reference. staged idx (bb, kvh, d, p) = ((bb*nkv+kvh)*hd + d)*win + p.
+    // CPU reference. Head-major staged idx (kvh, bb, d, p) = ((kvh*b+bb)*hd + d)*win + p.
     let kget = |bb: usize, kvh: usize, d: usize, p: usize| -> f64 {
-        kst[((bb * nkv + kvh) * hd + d) * win + p] as f64
+        kst[((kvh * b + bb) * hd + d) * win + p] as f64
     };
     let vget = |bb: usize, kvh: usize, d: usize, p: usize| -> f64 {
-        vst[((bb * nkv + kvh) * hd + d) * win + p] as f64
+        vst[((kvh * b + bb) * hd + d) * win + p] as f64
     };
     let mut refv = vec![0f32; b * nh * hd];
     for bb in 0..b {
