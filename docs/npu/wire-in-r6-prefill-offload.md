@@ -54,7 +54,23 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
      the `0/256` validation used *unscaled* int4. oq4 carries per-group f32 scales, so
      the NPU path must accumulate int32 then apply the group scale (at the tail, per
      group) to match the GPU. Design this with 3a (scales travel with the arranged W).
-   - **3c. Activations + output → the DMA (dynamic, per inference).** A and C are
+   - **3c (REVISED — the real fix). Reshuffle in-core via tensor buffer streams.**
+     aie2p (AIE-ML/XDNA) has **multidimensional addressing**: `aie::tensor_descriptor`
+     + `aie::make_tensor_buffer_stream(ptr, desc)` let the *kernel* read/write **row-major**
+     memory in tile order — the address generators walk the 4D pattern in parallel with
+     the vector MACs (free, and exactly the scalar/AGU-alongside-fixed-point point). The
+     reference bf16 GEMM (`aie_api/detail/mmul.hpp` `group_mmul_page_multidim_gemm`) feeds
+     **row-major `matA`/`matB`/`matC`**: `a_desc`/`b_desc`/`c_desc` 4D descriptors,
+     `tsA >> Xbuff` / `tsC << C.to_vector()`, no marshaling. My R6 kernel used plain
+     `load_v`/`store_v` (which *demand* pre-tiled memory) — that self-inflicted the whole
+     marshaling problem. **Rewrite R6 to use tensor buffer streams for A/W/C.** Then: DMA
+     stays linear; `NpuGemm` passes row-major A/W/C with **zero** marshaling (no CPU
+     reshuffle, no memtile hop, no `prepack`); the shim-`dma_bd`/memtile experiments (3c
+     above) become moot; the loader only needs the **scales** (3b), not a layout repack.
+     This is the concrete next step and should recover the kernel's real throughput
+     end-to-end. Still stream the whole GEMM in one dispatch for the ~78 µs latency.
+
+   - **(superseded) 3c-old. Activations + output → the DMA (dynamic, per inference).** A and C are
      computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
      let the DMA tile it; write C tiled and let the DMA de-tile — the reshuffle in
      hardware, not the CPU. **Attempted (measured):** a hand-rolled reshuffle on the
