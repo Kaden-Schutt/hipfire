@@ -1060,6 +1060,135 @@ fn scaled_add_resident_matches_cpu_reference_when_gpu_is_available() {
     }
 }
 
+/// Build a 3x3 Conv2dLayer with deterministic small weights for RDB tests.
+fn rdb_test_conv(out_channels: usize, in_channels: usize, seed: f32) -> Conv2dLayer {
+    let fill = |n: usize, seed: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 13.0) - 6.0) / 12.0)
+            .collect()
+    };
+    let weight = CpuTensor {
+        shape: vec![out_channels, in_channels, 3, 3],
+        data: fill(out_channels * in_channels * 9, seed),
+    };
+    let bias = CpuTensor {
+        shape: vec![out_channels],
+        data: fill(out_channels, seed + 100.0),
+    };
+    Conv2dLayer {
+        weight,
+        bias: Some(bias),
+        padding: 1,
+        stride: 1,
+    }
+}
+
+#[test]
+fn superres_residual_dense_block_resident_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for RDB parity test: {error}");
+            return;
+        }
+    };
+    // num_feat = 4, num_grow_ch = 2: conv{k} in = num_feat + (k-1)*grow.
+    let block = SuperResResidualDenseBlock {
+        conv1: rdb_test_conv(2, 4, 1.0),
+        conv2: rdb_test_conv(2, 6, 2.0),
+        conv3: rdb_test_conv(2, 8, 3.0),
+        conv4: rdb_test_conv(2, 10, 4.0),
+        conv5: rdb_test_conv(4, 12, 5.0),
+    };
+    let input = CpuTensor {
+        shape: vec![1, 4, 4, 4],
+        data: (0..64).map(|v| ((v as f32) % 9.0 - 4.0) / 4.0).collect(),
+    };
+
+    let cpu = block.forward(&input).unwrap();
+
+    let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+    let mut cache = RocmWeightCache::default();
+    let out_gpu = block
+        .forward_resident(&input_gpu, &mut gpu, &mut cache)
+        .unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, input_gpu).unwrap();
+
+    assert_eq!(hip.shape, cpu.shape);
+    assert_eq!(hip.shape, vec![1, 4, 4, 4]);
+    let max_diff = hip
+        .data
+        .iter()
+        .zip(&cpu.data)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff <= 2e-2,
+        "RDB resident vs cpu max_diff {max_diff} too large; hip={:?} cpu={:?}",
+        &hip.data[..hip.data.len().min(8)],
+        &cpu.data[..cpu.data.len().min(8)]
+    );
+}
+
+fn rdb_test_block(feat_seed: f32) -> SuperResResidualDenseBlock {
+    // num_feat = 4, num_grow_ch = 2.
+    SuperResResidualDenseBlock {
+        conv1: rdb_test_conv(2, 4, feat_seed + 1.0),
+        conv2: rdb_test_conv(2, 6, feat_seed + 2.0),
+        conv3: rdb_test_conv(2, 8, feat_seed + 3.0),
+        conv4: rdb_test_conv(2, 10, feat_seed + 4.0),
+        conv5: rdb_test_conv(4, 12, feat_seed + 5.0),
+    }
+}
+
+#[test]
+fn superres_rrdb_resident_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for RRDB parity test: {error}");
+            return;
+        }
+    };
+    let block = SuperResRrdb {
+        rdb1: rdb_test_block(10.0),
+        rdb2: rdb_test_block(20.0),
+        rdb3: rdb_test_block(30.0),
+    };
+    let input = CpuTensor {
+        shape: vec![1, 4, 4, 4],
+        data: (0..64).map(|v| ((v as f32) % 7.0 - 3.0) / 4.0).collect(),
+    };
+
+    let cpu = block.forward(&input).unwrap();
+
+    let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+    let mut cache = RocmWeightCache::default();
+    let out_gpu = block
+        .forward_resident(&input_gpu, &mut gpu, &mut cache)
+        .unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, input_gpu).unwrap();
+
+    assert_eq!(hip.shape, cpu.shape);
+    let max_diff = hip
+        .data
+        .iter()
+        .zip(&cpu.data)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    // Three chained RDBs (15 convs) accumulate a bit more WMMA f16 error.
+    assert!(
+        max_diff <= 3e-2,
+        "RRDB resident vs cpu max_diff {max_diff} too large; hip={:?} cpu={:?}",
+        &hip.data[..hip.data.len().min(8)],
+        &cpu.data[..cpu.data.len().min(8)]
+    );
+}
+
 #[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {

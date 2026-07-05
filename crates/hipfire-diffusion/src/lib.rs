@@ -1791,6 +1791,10 @@ pub use unet::*;
 mod vae;
 pub use vae::*;
 
+mod superres;
+#[allow(unused_imports)]
+use superres::*;
+
 /// Domain-separation salts so VAE-encode Gaussian noise does not alias the
 /// initial-latent noise stream (which seeds the request seed directly) or other
 /// encode sites. The values are arbitrary fixed constants. Consumed by the
