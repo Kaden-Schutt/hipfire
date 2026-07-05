@@ -23,13 +23,18 @@ PEANO="$(pip show llvm-aie 2>/dev/null | awk '/^Location:/{print $2}')/llvm-aie"
 MA_ROOT="$(python -c 'import mlir_aie;print(list(mlir_aie.__path__)[0])')"
 export PATH="$PEANO/bin:$MA_ROOT/bin:$PATH"
 
-OUT="$HOME/.hipfire/npu/r6_${MT}x${NT}x${KCHUNK}_c${COLS}_nb${NB}"
+# Kernel source: default r6_gemm.cc (pre-tiled load_v/store_v). Set R6_KERNEL_SRC to
+# r6_gemm_ts.cc for the tensor-buffer-stream variant (row-major A/C, no CPU marshaling);
+# R6_OUT_TAG names its cache dir (default r6). Buffer sizes are identical either way, so
+# the MLIR is unchanged.
+SRC="${R6_KERNEL_SRC:-$HERE/r6_gemm.cc}"; TAG="${R6_OUT_TAG:-r6}"
+OUT="$HOME/.hipfire/npu/${TAG}_${MT}x${NT}x${KCHUNK}_c${COLS}_nb${NB}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 # Tile buffer sizes: A = MT*KCHUNK tiles (MR*MK=64 int8), W = NT*KCHUNK tiles (128 B),
 # C = MT*NT tiles (MR*MN=64 int32). groups = COLS*NB N-slabs/dispatch.
 AW=$((MT * KCHUNK * 64)); WW=$((NT * KCHUNK * 128)); CW=$((MT * NT * 64))
-"$PEANO/bin/clang++" "$HERE/r6_gemm.cc" -c -o "$OUT/r6_mac.o" -I"$MA_ROOT/include" \
+"$PEANO/bin/clang++" "$SRC" -c -o "$OUT/r6_mac.o" -I"$MA_ROOT/include" \
   -std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -O2 -DNDEBUG --target=aie2p-none-unknown-elf -DMT="$MT" -DNT="$NT" -DKCHUNK="$KCHUNK"
 python3 "$HERE/r6_gen.py" "$COLS" "$NB" "$AW" "$WW" "$CW" > "$OUT/aie.mlir"

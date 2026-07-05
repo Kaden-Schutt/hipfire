@@ -55,7 +55,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_COLLECT_ARTIFACTS_BIN` | Runtime variable controlling collect artifacts bin in hipfire | `crates/hipfire-eval/src/lib.rs:1209` |
 | `HIPFIRE_COMP_DUMP` | Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each | `crates/hipfire-arch-deepseek4/src/forward.rs:647` |
 | `HIPFIRE_CONV1D_TREE_GFX1151` | Environment toggle value controls runtime behavior | `crates/hipfire-rdna/examples/bench_conv1d_tree_gfx1151.rs:59` |
-| `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:1222` |
+| `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:1229` |
 | `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1444` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `crates/hipfire-serving-core/src/load.rs:3409` |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:11025` |
@@ -91,7 +91,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DEEPSEEK4_GRAPH` | Selects behavior from recognized values | `crates/hipfire-arch-deepseek4/src/forward.rs:1568` |
 | `HIPFIRE_DEEPSEEK4_HFQ4_WMMA` | HFQ4G256/Raw. WMMA route requires F16 input staging | `crates/hipfire-arch-deepseek4/src/forward.rs:332` |
 | `HIPFIRE_DEEPSEEK4_INDEXER_WMMA` | Runtime variable controlling deepseek4 indexer wmma in hipfire | `crates/hipfire-arch-deepseek4/src/forward.rs:6932` |
-| `HIPFIRE_DEEPSEEK4_LOAD_MTP` | Runtime variable controlling deepseek4 load MTP in hipfire | `crates/hipfire-arch-deepseek4/src/arch.rs:998` |
+| `HIPFIRE_DEEPSEEK4_LOAD_MTP` | Runtime variable controlling deepseek4 load MTP in hipfire | `crates/hipfire-arch-deepseek4/src/arch.rs:1002` |
 | `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` | ratio == 128: identity gather, no indexer. Per-batch n_compressed | `crates/hipfire-arch-deepseek4/src/forward.rs:7014` |
 | `HIPFIRE_DEEPSEEK4_MODEL` | Runtime variable controlling deepseek4 model in hipfire | `crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:176` |
 | `HIPFIRE_DEEPSEEK4_MOE` | Layers 0..num_hash_layers use STATIC tid2eid routing per upstream DeepSeek V4 | `crates/hipfire-arch-deepseek4/src/forward.rs:7456` |
@@ -453,11 +453,11 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_RECOVER_MODE` | HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity) | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:158` |
 | `HIPFIRE_RECOVER_NOISE` | KVarN+CASK: tail queries read merged cold keys strictly in their past). 0 = | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:157` |
 | `HIPFIRE_REPLAY_GRAPH` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:4865` |
-| `HIPFIRE_RESOURCE_LOCK` | HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases | `crates/hipfire-daemon-adapter/src/lib.rs:1075` |
-| `HIPFIRE_RESOURCE_LOCK_CPU_CORES` | HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores | `crates/hipfire-daemon-adapter/src/lib.rs:960` |
+| `HIPFIRE_RESOURCE_LOCK` | HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases | `crates/hipfire-daemon-adapter/src/lib.rs:1082` |
+| `HIPFIRE_RESOURCE_LOCK_CPU_CORES` | HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores | `crates/hipfire-daemon-adapter/src/lib.rs:967` |
 | `HIPFIRE_RESOURCE_LOCK_DIR` | HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory | `crates/hipfire-lock/src/lib.rs:213` |
-| `HIPFIRE_RESOURCE_LOCK_NPUS` | HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs | `crates/hipfire-daemon-adapter/src/lib.rs:925` |
-| `HIPFIRE_RESOURCE_LOCK_WAIT_MS` | HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup | `crates/hipfire-daemon-adapter/src/lib.rs:1093` |
+| `HIPFIRE_RESOURCE_LOCK_NPUS` | HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs | `crates/hipfire-daemon-adapter/src/lib.rs:932` |
+| `HIPFIRE_RESOURCE_LOCK_WAIT_MS` | HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup | `crates/hipfire-daemon-adapter/src/lib.rs:1100` |
 | `HIPFIRE_RESPONSES_STATE_MAX` | Runtime variable controlling responses state max in hipfire | `crates/hipfire-server/src/routes/responses.rs:713` |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | Runtime variable controlling rocblas all archs in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:303` |
 | `HIPFIRE_ROCBLAS_OFF` | Enabled when set to 1 | `crates/hipfire-rdna/src/feature_flags.rs:305` |
@@ -528,7 +528,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_WO_WMMA_VARIANT` | Runtime variable controlling wo wmma variant in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:300` |
 | `HIPFIRE_XDNA1_LIB` | Runtime variable controlling xdna1 lib in hipfire | `crates/hipfire-npu/src/lib.rs:69` |
 | `HIP_PATH` | fails with "file not found". Add well-known candidates as -I flags; | `crates/hipfire-rdna/src/compiler.rs:518` |
-| `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1504` |
+| `HIP_VISIBLE_DEVICES` | Used to configure runtime execution by explicitly setting "HIP_VISIBLE_DEVICES" | `crates/hipfire-daemon-adapter/src/lib.rs:1511` |
 | `HOME` | Runtime variable controlling home in hipfire | `crates/hipfire-tui/src/hipfire/mod.rs:40` |
 | `HOSTNAME` | Runtime variable controlling hostname in hipfire | `crates/hipfire-tui/src/hipfire/status.rs:130` |
 | `HUGGINGFACE_HUB_CACHE` | Runtime variable controlling huggingface hub cache in hipfire | `crates/hipfire-server/src/routes/sdapi.rs:4236` |
@@ -544,7 +544,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `QWEN35_TEST_MODEL` | Runtime variable controlling qwen35 test model in hipfire | `crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:40` |
 | `ROCM_DEVICE_LIB_PATH` | Runtime variable controlling rocm device lib path in hipfire | `crates/hipfire-rdna/src/compiler.rs:506` |
 | `ROCM_PATH` | Runtime variable controlling rocm path in hipfire | `crates/hipfire-rdna/src/compiler.rs:503` |
-| `ROCR_VISIBLE_DEVICES` | Runtime variable controlling rocr visible devices in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:884` |
+| `ROCR_VISIBLE_DEVICES` | Runtime variable controlling rocr visible devices in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:891` |
 | `TERM` | Runtime variable controlling term in hipfire | `crates/hipfire-system-monitor/src/lib.rs:317` |
 | `TRIALS` | Runtime variable controlling trials in hipfire | `crates/hipfire-rdna/examples/bench_gfx1151_hfq4_s4_mmq.rs:188` |
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/hipfire-rdna/src/compiler.rs:228` |
