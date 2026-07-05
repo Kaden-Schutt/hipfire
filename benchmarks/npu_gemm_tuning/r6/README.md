@@ -131,6 +131,29 @@ nothing here. The whole-GEMM one-dispatch stays ~0.3–0.4 TOPS ahead at every s
 inter-dispatch host stalls) but needs a per-M xclbin; multi-dispatch handles any M with
 one xclbin.
 
+### The ceiling: objectfifo per-slab streaming overhead
+
+Pure-dispatch (all-ones, no host copy) rates pin *why* e2e tops out ~1.9 TOPS:
+
+| config | pure dispatch | effective W feed |
+|---|---|---|
+| M-parallel whole-GEMM, K=512 KCHUNK=32 | 941 µs → 3.42 TOPS | ~3.2 GB/s |
+| N-parallel whole-GEMM, K=128 KCHUNK=8 | 490 µs → 1.64 TOPS | ~4.1 GB/s |
+
+Both are feed-bound at only ~3–4 GB/s (DRAM does ~68), i.e. **objectfifo per-slab
+streaming overhead (~5 µs/slab) dominates, not the broadcast** — the 16×16 mmul tiles are
+too small, so each N-slab acquire/release costs ~8× its own compute. The one lever is
+**KCHUNK** (k-tiles amortized per slab-acquire): K=512/KCHUNK=32 does 4× the compute per
+acquire of K=128/KCHUNK=8, which is why it's 2× faster per slab. But KCHUNK=32 needs MT≤8
+to fit L1 — so the high-MT N-parallel tile (20.7-TOPS *compute* ceiling at K=128) can't be
+used at K=512, and **raising MT doesn't help**: it forces KCHUNK down and worsens the
+amortization. Net: for K=512, **MT=8 KCHUNK=32 (M-parallel whole-GEMM) is near the
+practical ceiling — ~3.4 TOPS raw, ~1.9 TOPS e2e.** Beyond this needs bigger effective
+tiles (an NT=8 kernel — register-spill risk) or a fundamentally different feed (cascade
+K-resident, which R5 showed is feed-bound for real prefill anyway). The generators carry a
+`ROUNDS` whole-GEMM knob for both topologies (`r6_gen.py` / `r6_gen_mp.py`), exercised by
+`r6_np1_e2e` / `r6_mp1_e2e`.
+
 ### Two dataflow lessons (cost real debugging)
 
 1. **Pipelined read-back needs a cache reconcile.** The host read-back of one C buffer
