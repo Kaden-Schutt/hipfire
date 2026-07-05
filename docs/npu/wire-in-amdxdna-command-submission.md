@@ -99,3 +99,34 @@ bound; prefill GEMM needs the weight-broadcast array dataflow (R3c → R4) to be
 compute-bound. Wire-in: this plan; W1 (ABI layer) is the next concrete code step.
 Both remaining halves (R4 array kernel, W1–W5 submission subsystem) are multi-day
 builds — this doc makes the wire-in half fully scoped and actionable.
+
+## W3c findings (hwctx creation frontier)
+
+Implemented `create_hwctx`/`destroy_hwctx` + the BO heap. On-hardware probing of
+`/dev/accel/accel0` pinned the exact prerequisites and the current frontier:
+
+1. **DEV_HEAP required first.** A bare CREATE_HWCTX returns `-ENOENT` ("dev heap
+   object not exist"): `aie2_hwctx_init` needs `client->dev_heap`. Allocating a
+   `AMDXDNA_BO_DEV_HEAP` BO first clears it. (W2's `alloc_buffer` does this.)
+2. **Then EINVAL at the resource solver.** With the heap present, CREATE_HWCTX
+   reaches `aie2_alloc_resource` → `xrs_allocate_resource` (or, if the device is
+   `AIE2_TEMPORAL_ONLY`, `aie2_create_context`, a firmware call) and returns
+   `-EINVAL` for every `num_tiles`/QoS tried. So it needs more of what XRT sets up
+   before context creation — almost certainly a **registered AIE partition / PDI**
+   (the driver must know the partition to reserve columns) and/or the temporal-only
+   firmware create path with the right config.
+
+**This is the firmware frontier.** Everything past here — the partition/PDI
+registration, CONFIG_HWCTX firmware load, and the W4 ERT command packet + EXEC_CMD
+— is a deep reverse-engineering effort against the amdxdna firmware protocol
+(reimplementing XRT's aie2 submission core), and EXEC_CMD runs a real program on
+the NPU where a malformed packet can hang the device. The right next move is the
+documented **capture-based de-risking**: run a working mlir-aie kernel through XRT
+under instrumentation (strace + BO dumps), snapshot the exact CREATE_HWCTX args,
+the partition-registration path, and the CMD BO bytes, and match the Rust path to
+them — not further blind ioctl guessing. This warrants a human call on approach
+(from-scratch capture-based build vs. reviving the dormant libhipfire_xdna1.so).
+
+Landed so far (all tested): W1 ABI, W2 BO alloc/mmap/sync (hardware-validated),
+W3a AXLF parse, W3b AIE_PARTITION/PDI extract, W3c create/destroy_hwctx + dev_heap
+(reaches the resource-solver frontier).

@@ -49,7 +49,7 @@ impl fmt::Display for XdnaError {
             XdnaError::Unsupported => write!(f, "XDNA ioctl ABI is Linux-only"),
             XdnaError::NotFound => write!(f, "no /dev/accel/accelN NPU device found"),
             XdnaError::Open(e) => write!(f, "open NPU device: {e}"),
-            XdnaError::Ioctl(e) => write!(f, "GET_INFO ioctl: {e}"),
+            XdnaError::Ioctl(e) => write!(f, "amdxdna ioctl: {e}"),
             XdnaError::ShortResponse => write!(f, "kernel returned a short telemetry buffer"),
         }
     }
@@ -330,6 +330,44 @@ mod imp {
                 mp_npu_mhz: raw.mp_npu_clock.freq_mhz,
                 h_mhz: raw.h_clock.freq_mhz,
             })
+        }
+
+        // ── W3c: hardware contexts ────────────────────────────────────────
+        // A hwctx reserves `num_tiles / row_count` AIE columns (no program runs
+        // until CONFIG_HWCTX loads a PDI + EXEC_CMD). `num_tiles` = num_col *
+        // core row_count (aie2p Strix Halo: 4 rows, so 8 cols => 32 tiles).
+
+        /// Create a hardware context reserving `num_tiles` AIE tiles. Returns
+        /// `(handle, syncobj_handle)`. QoS is passed by pointer as the driver
+        /// requires; zeros are accepted.
+        pub fn create_hwctx(
+            &self,
+            num_tiles: u32,
+            mem_size: u32,
+            max_opc: u32,
+            qos: &submit::QosInfo,
+        ) -> Result<(u32, u32), XdnaError> {
+            let mut c = submit::CreateHwctx {
+                qos_p: qos as *const submit::QosInfo as u64,
+                num_tiles,
+                mem_size,
+                max_opc,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::CREATE_HWCTX_REQUEST,
+                &mut c as *mut _ as *mut libc::c_void,
+            )?;
+            Ok((c.handle, c.syncobj_handle))
+        }
+
+        /// Destroy a hardware context created by [`Self::create_hwctx`].
+        pub fn destroy_hwctx(&self, handle: u32) -> Result<(), XdnaError> {
+            let mut d = submit::DestroyHwctx { handle, pad: 0 };
+            self.submit_ioctl(
+                submit::DESTROY_HWCTX_REQUEST,
+                &mut d as *mut _ as *mut libc::c_void,
+            )
         }
 
         // ── W2: buffer objects (command-submission path) ──────────────────

@@ -66,6 +66,18 @@ pub const AMDXDNA_CMD_SUBMIT_SIGNAL: u32 = 2;
 // enum amdxdna_drm_config_hwctx_param
 pub const DRM_AMDXDNA_HWCTX_CONFIG_CU: u32 = 0;
 
+/// struct amdxdna_qos_info — pointed to by `CreateHwctx::qos_p`.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QosInfo {
+    pub gops: u32,
+    pub fps: u32,
+    pub dma_bandwidth: u32,
+    pub latency: u32,
+    pub frame_exec_time: u32,
+    pub priority: u32,
+}
+
 /// struct amdxdna_drm_create_hwctx
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -161,6 +173,7 @@ pub struct ExecCmd {
 }
 
 // ABI guards: any drift vs the kernel header is a compile error.
+const _: () = assert!(core::mem::size_of::<QosInfo>() == 24);
 const _: () = assert!(core::mem::size_of::<CreateHwctx>() == 56);
 const _: () = assert!(core::mem::size_of::<DestroyHwctx>() == 8);
 const _: () = assert!(core::mem::size_of::<CuConfig>() == 8);
