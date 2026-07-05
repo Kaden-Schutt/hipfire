@@ -1925,19 +1925,29 @@ pub fn discover_dspark_draft_for_model(model: &Path) -> Option<PathBuf> {
 /// Return candidate DSpark drafter sidecar filenames for a target filename.
 /// Same stem/quant parse as the DFlash candidates, but only the `dspark` role.
 pub fn dspark_draft_candidates(filename: &str) -> Vec<String> {
-    let Some(target) = parse_dspark_target(filename) else {
-        return Vec::new();
-    };
-    let mut quants = vec![target.quant.clone()];
-    if target.family == "qwen3" && target.quant == "mq3" {
-        quants.push("mq4".to_string());
-    } else if target.family == "qwen3" && target.quant == "mq4" {
-        quants.push("mq3".to_string());
+    let mut out = Vec::new();
+    // Direct sibling `<target-stem>.dspark.hfq` — the natural name emitted by
+    // dspark_export / dspark_convert. Works for ANY target, including the dense
+    // llama/qwen3 (arch 0/1) DSpark path, which the qwen3.5-family stem/quant
+    // grammar below does not parse.
+    if let Some(stem) = filename.strip_suffix(".hfq") {
+        out.push(format!("{stem}.dspark.hfq"));
     }
-    quants
-        .into_iter()
-        .map(|q| target.format_candidate(&q, "dspark"))
-        .collect()
+    // Family-specific cross-quant fallbacks (e.g. qwen3.5 mq3↔mq4).
+    if let Some(target) = parse_dspark_target(filename) {
+        let mut quants = vec![target.quant.clone()];
+        if target.family == "qwen3" && target.quant == "mq3" {
+            quants.push("mq4".to_string());
+        } else if target.family == "qwen3" && target.quant == "mq4" {
+            quants.push("mq3".to_string());
+        }
+        out.extend(
+            quants
+                .into_iter()
+                .map(|q| target.format_candidate(&q, "dspark")),
+        );
+    }
+    out
 }
 
 /// Parse a target filename into its stem/quant/separator for DSpark sidecar
