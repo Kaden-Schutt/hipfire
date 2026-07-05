@@ -153,6 +153,13 @@ pub mod gemm;
 #[cfg(target_os = "linux")]
 pub use gemm::NpuGemm;
 
+// NpuGemmMp — the productionized best path: M-parallel W-broadcast, row-major A/C via
+// tensor streams, weights broadcast once. One xclbin, any M. ~1.45 TOPS e2e on halo.
+#[cfg(target_os = "linux")]
+pub mod gemm_mp;
+#[cfg(target_os = "linux")]
+pub use gemm_mp::NpuGemmMp;
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*; // brings the crate-root `submit` module into scope
