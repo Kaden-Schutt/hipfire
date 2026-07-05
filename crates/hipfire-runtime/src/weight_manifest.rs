@@ -79,6 +79,70 @@ pub fn layer_collectives(manifest: &[WeightEntry]) -> Vec<(usize, CollectiveHint
         .collect()
 }
 
+/// A fully-resolved placement for one weight: the device ids it occupies.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WeightPlacement {
+    pub name: String,
+    pub layer: Option<usize>,
+    pub devices: Vec<usize>,
+}
+
+/// The complete, deterministic compilation of a (weight manifest, state
+/// manifest, mesh) into everything the GPU-side `fulfill_manifest` + executor
+/// need: where each weight/state lands, the per-layer all-reduce schedule, and
+/// the PP band-transfer boundaries. This is the pure, unit-testable "compile"
+/// step; `fulfill_manifest` is just the GPU execution of this plan.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ManifestPlan {
+    pub weights: Vec<WeightPlacement>,
+    /// (state entry, device ids it occupies).
+    pub state: Vec<(StateEntry, Vec<usize>)>,
+    /// (layer, all-reduce hint) implied by that layer's sharded weights.
+    pub layer_collectives: Vec<(usize, CollectiveHint)>,
+    /// (after-layer, band-transfer hint) at PP stage boundaries.
+    pub band_xfers: Vec<(usize, CollectiveHint)>,
+}
+
+/// Compile a manifest + mesh into a [`ManifestPlan`] (validates first). Pure —
+/// no GPU. State co-resides with its layer's owning stage (replicated across
+/// the stage's Tp group).
+pub fn plan_manifest(
+    weights: &[WeightEntry],
+    state: &[StateEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+) -> Result<ManifestPlan, String> {
+    validate_manifest(weights, mesh)?;
+    let w = weights
+        .iter()
+        .map(|e| WeightPlacement {
+            name: e.name.clone(),
+            layer: e.layer,
+            devices: placement_devices(e, mesh, n_layers),
+        })
+        .collect();
+    let s = state
+        .iter()
+        .map(|e| {
+            let stage = mesh.stage_for_layer(e.layer, n_layers);
+            let mut coord = mesh.coord_of(0);
+            if let Some(idx) = mesh.axes().iter().position(|a| a.kind == DimKind::Pp) {
+                coord[idx] = stage;
+            }
+            (e.clone(), mesh.group_along(DimKind::Tp, &coord))
+        })
+        .collect();
+    let band_xfers = (0..n_layers)
+        .filter_map(|l| mesh.band_xfer_after(l, n_layers).map(|h| (l, h)))
+        .collect();
+    Ok(ManifestPlan {
+        weights: w,
+        state: s,
+        layer_collectives: layer_collectives(weights),
+        band_xfers,
+    })
+}
+
 /// Validate a manifest against a mesh at **load time** (the plan's shape-only
 /// safety, §6): every dim/head count a policy shards must divide evenly by its
 /// group size, and every `Tied` source must name a real entry. Catches TP
@@ -295,6 +359,64 @@ mod tests {
         );
         assert_eq!(l.layer, Some(3));
         assert!(matches!(l.policy, ShardPolicy::RowShard { axis: 1 }));
+    }
+
+    #[test]
+    fn plan_manifest_ties_placement_collectives_and_bands() {
+        // 2-layer MoE-ish manifest: attention (wo row) + experts, KV state.
+        let mut w = Vec::new();
+        let mut st = Vec::new();
+        for l in 0..2 {
+            w.push(WeightEntry::layer(
+                "wo",
+                l,
+                vec![8, 8],
+                DType::F16,
+                ShardPolicy::RowShard { axis: 1 },
+            ));
+            w.push(WeightEntry::layer(
+                "experts",
+                l,
+                vec![4, 8, 8],
+                DType::F16,
+                ShardPolicy::ExpertSharded {
+                    n_experts: 4,
+                    assign: ExpertAssign::Stride,
+                },
+            ));
+            st.push(StateEntry::new(
+                StateKind::Kv {
+                    quant: String::new(),
+                },
+                l,
+            ));
+        }
+        // PP 2-stage mesh, 2 layers → one band boundary after layer 0.
+        let pp = DeviceMesh::rect(&[(DimKind::Pp, 2)]);
+        let plan = plan_manifest(&w, &st, &pp, 2).unwrap();
+        // 4 weight placements, 2 state placements.
+        assert_eq!(plan.weights.len(), 4);
+        assert_eq!(plan.state.len(), 2);
+        // layer-0 weights on stage 0 (device 0), layer-1 on stage 1 (device 1).
+        let wo0 = plan
+            .weights
+            .iter()
+            .find(|p| p.name == "wo" && p.layer == Some(0))
+            .unwrap();
+        assert_eq!(wo0.devices, vec![0]);
+        let wo1 = plan
+            .weights
+            .iter()
+            .find(|p| p.name == "wo" && p.layer == Some(1))
+            .unwrap();
+        assert_eq!(wo1.devices, vec![1]);
+        // collectives: wo → Tp, experts → Ep, per layer (4 total).
+        assert_eq!(plan.layer_collectives.len(), 4);
+        // one band transfer after layer 0.
+        assert_eq!(
+            plan.band_xfers,
+            vec![(0, CollectiveHint::BandXfer { src: 0, dst: 1 })]
+        );
     }
 
     #[test]
