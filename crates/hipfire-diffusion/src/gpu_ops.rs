@@ -1777,6 +1777,84 @@ pub(crate) fn upsample_nearest2d_nchw_hip_on_gpu(
     })
 }
 
+/// Space-to-depth by `scale` (inverse of pixel-shuffle), NCHW:
+/// `[N, C, H, W] -> [N, C*scale*scale, H/scale, W/scale]`. Matches
+/// PyTorch/basicsr `pixel_unshuffle`. Used by the RealESRGAN x2 (RRDBNet) input
+/// stage in the MrFlow super-resolution model.
+#[allow(dead_code)]
+pub(crate) fn pixel_unshuffle_nchw_hip_on_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &CpuTensor,
+    scale: usize,
+) -> DiffusionResult<CpuTensor> {
+    if scale == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "pixel_unshuffle scale must be positive".to_string(),
+        ));
+    }
+    let [batch, channels, in_h, in_w] = shape4(input)?;
+    if in_h % scale != 0 || in_w % scale != 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "pixel_unshuffle input [{in_h}, {in_w}] not divisible by scale {scale}"
+        )));
+    }
+    let out_h = in_h / scale;
+    let out_w = in_w / scale;
+    let out_channels = channels.checked_mul(scale * scale).ok_or_else(|| {
+        DiffusionError::InvalidRequest("pixel_unshuffle output channels overflows".to_string())
+    })?;
+    let output_shape = [batch, out_channels, out_h, out_w];
+    let output_elements = checked_shape_elements("pixel_unshuffle output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("pixel_unshuffle output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output channels", out_channels)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output height", out_h)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output width", out_w)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle scale", scale)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_pixel_unshuffle_nchw_f32",
+        DIFFUSION_PIXEL_UNSHUFFLE_HIP_SRC,
+        "diffusion_pixel_unshuffle_nchw_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, output_elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
 pub(crate) fn linear_optional_bias_hip_on_gpu(
     gpu: &mut hipfire_rdna::Gpu,
     cache: &mut RocmWeightCache,
@@ -2903,6 +2981,41 @@ pub(crate) fn tensor_add_resident(
     Ok(output)
 }
 
+/// Device-resident scaled add (`a + scale * b`). Shapes must match. RRDBNet
+/// scales each residual-dense and RRDB residual by 0.2 before adding; this is
+/// that fused op for the MrFlow super-resolution forward chain.
+#[allow(dead_code)]
+pub(crate) fn scaled_add_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    a: &hipfire_rdna::GpuTensor,
+    b: &hipfire_rdna::GpuTensor,
+    scale: f32,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    if a.shape != b.shape {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "scaled_add shape mismatch {:?} vs {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let elements = checked_shape_elements("scaled_add output", &a.shape)?;
+    let n = i32_kernel_dim("scaled_add elements", elements)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &a.shape)?;
+    launch_diffusion_vector_kernel(
+        gpu,
+        "diffusion_scaled_add_f32",
+        DIFFUSION_DENOISE_VECTOR_HIP_SRC,
+        &output.buf,
+        a,
+        Some(b),
+        n,
+        scale,
+        false,
+    )?;
+    Ok(output)
+}
+
 /// Device-resident channel-bias add (`input[n,c,h,w] += bias[n,c]`), returning a
 /// new resident tensor. Used by the UNet resnet time-embedding path (Phase 1b
 /// step 4); kept here with the rest of the resident op set.
@@ -2978,6 +3091,59 @@ pub(crate) fn upsample_nearest2d_nchw_resident(
         "diffusion_upsample_nearest2d_nchw_f32",
         DIFFUSION_UPSAMPLE_NEAREST2D_HIP_SRC,
         "diffusion_upsample_nearest2d_nchw_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
+/// Device-resident space-to-depth by `scale` (inverse of pixel-shuffle), NCHW:
+/// `[N, C, H, W] -> [N, C*scale*scale, H/scale, W/scale]`. The resident sibling
+/// of [`pixel_unshuffle_nchw_hip_on_gpu`], for the RRDBNet input stage.
+#[allow(dead_code)]
+pub(crate) fn pixel_unshuffle_nchw_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    scale: usize,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    if scale == 0 {
+        return Err(DiffusionError::InvalidRequest(
+            "pixel_unshuffle scale must be positive".to_string(),
+        ));
+    }
+    let [batch, channels, in_h, in_w] = resident_dims4(&input.shape, "pixel_unshuffle input")?;
+    if in_h % scale != 0 || in_w % scale != 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "pixel_unshuffle input [{in_h}, {in_w}] not divisible by scale {scale}"
+        )));
+    }
+    let out_h = in_h / scale;
+    let out_w = in_w / scale;
+    let out_channels = channels.checked_mul(scale * scale).ok_or_else(|| {
+        DiffusionError::InvalidRequest("pixel_unshuffle output channels overflows".to_string())
+    })?;
+    let output_shape = [batch, out_channels, out_h, out_w];
+    let output_elements = checked_shape_elements("pixel_unshuffle output", &output_shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output elements", output_elements)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output channels", out_channels)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output height", out_h)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle output width", out_w)?);
+    kernargs.push_i32(i32_kernel_dim("pixel_unshuffle scale", scale)?);
+    kernargs.pad_to(16);
+    let grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_pixel_unshuffle_nchw_f32",
+        DIFFUSION_PIXEL_UNSHUFFLE_HIP_SRC,
+        "diffusion_pixel_unshuffle_nchw_f32",
         grid,
         [256, 1, 1],
         0,

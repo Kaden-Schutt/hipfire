@@ -241,6 +241,20 @@ extern "C" __global__ void diffusion_tensor_add_f32(
     output[idx] = a[idx] + b[idx];
 }
 
+extern "C" __global__ void diffusion_scaled_add_f32(
+    const float* a,
+    const float* b,
+    float* output,
+    int n,
+    float scale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    output[idx] = a[idx] + scale * b[idx];
+}
+
 extern "C" __global__ void diffusion_center_unet_input_f32(
     const float* sample,
     float* output,
@@ -755,6 +769,49 @@ extern "C" __global__ void diffusion_upsample_nearest2d_nchw_f32(
     int iy = oy / scale;
     int ix = ox / scale;
     int input_idx = ((b * channels + c) * in_h + iy) * in_w + ix;
+    output[idx] = input[input_idx];
+}
+"#;
+
+pub(crate) const DIFFUSION_PIXEL_UNSHUFFLE_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Space-to-depth by `scale` (inverse of pixel-shuffle), NCHW. Matches
+// PyTorch/basicsr pixel_unshuffle: for an r=scale block, output channel
+// c_out = c * r*r + dy * r + dx gathers input[n, c, oh*r + dy, ow*r + dx].
+// Used by the RealESRGAN x2 (RRDBNet) input stage.
+extern "C" __global__ void diffusion_pixel_unshuffle_nchw_f32(
+    const float* input,
+    float* output,
+    int total_outputs,
+    int out_channels,
+    int out_h,
+    int out_w,
+    int scale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_outputs) {
+        return;
+    }
+    int ow = idx % out_w;
+    int t = idx / out_w;
+    int oh = t % out_h;
+    t /= out_h;
+    int c_out = t % out_channels;
+    int b = t / out_channels;
+
+    int rr = scale * scale;
+    int in_channels = out_channels / rr;
+    int c = c_out / rr;
+    int rem = c_out - c * rr;
+    int dy = rem / scale;
+    int dx = rem - dy * scale;
+
+    int in_h = out_h * scale;
+    int in_w = out_w * scale;
+    int ih = oh * scale + dy;
+    int iw = ow * scale + dx;
+    int input_idx = ((b * in_channels + c) * in_h + ih) * in_w + iw;
     output[idx] = input[input_idx];
 }
 "#;

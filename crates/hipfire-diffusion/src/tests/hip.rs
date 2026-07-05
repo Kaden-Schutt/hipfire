@@ -955,6 +955,111 @@ fn hip_leaky_relu_matches_cpu_reference_when_gpu_is_available() {
     }
 }
 
+/// CPU reference for space-to-depth (inverse of pixel-shuffle), matching
+/// PyTorch/basicsr pixel_unshuffle channel ordering.
+fn pixel_unshuffle_cpu_reference(input: &CpuTensor, scale: usize) -> CpuTensor {
+    let (n, c, h, w) = (
+        input.shape[0],
+        input.shape[1],
+        input.shape[2],
+        input.shape[3],
+    );
+    let (oh, ow) = (h / scale, w / scale);
+    let oc = c * scale * scale;
+    let mut out = vec![0.0f32; n * oc * oh * ow];
+    for nn in 0..n {
+        for cc in 0..c {
+            for y in 0..h {
+                for x in 0..w {
+                    let (dy, dx) = (y % scale, x % scale);
+                    let (by, bx) = (y / scale, x / scale);
+                    let c_out = cc * scale * scale + dy * scale + dx;
+                    let in_idx = ((nn * c + cc) * h + y) * w + x;
+                    let out_idx = ((nn * oc + c_out) * oh + by) * ow + bx;
+                    out[out_idx] = input.data[in_idx];
+                }
+            }
+        }
+    }
+    CpuTensor {
+        shape: vec![n, oc, oh, ow],
+        data: out,
+    }
+}
+
+#[test]
+fn hip_pixel_unshuffle_matches_cpu_reference_when_gpu_is_available() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for pixel_unshuffle kernel parity test: {error}");
+            return;
+        }
+    };
+    // N=1, C=2, H=4, W=4, scale=2 -> [1, 8, 2, 2]. Sequential fill so any
+    // channel-ordering or index error is obvious.
+    let input = CpuTensor {
+        shape: vec![1, 2, 4, 4],
+        data: (0..32).map(|v| v as f32).collect(),
+    };
+    let scale = 2;
+
+    let cpu = pixel_unshuffle_cpu_reference(&input, scale);
+    let hip = pixel_unshuffle_nchw_hip_on_gpu(&mut gpu, &input, scale).unwrap();
+
+    assert_eq!(hip.shape, cpu.shape);
+    assert_eq!(hip.shape, vec![1, 8, 2, 2]);
+    for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 1e-6,
+            "pixel_unshuffle mismatch at {index}: hip={actual} cpu={expected}"
+        );
+    }
+}
+
+#[test]
+fn scaled_add_resident_matches_cpu_reference_when_gpu_is_available() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for scaled_add kernel parity test: {error}");
+            return;
+        }
+    };
+    let a = CpuTensor {
+        shape: vec![2, 2, 2, 2],
+        data: (0..16).map(|v| v as f32 - 8.0).collect(),
+    };
+    let b = CpuTensor {
+        shape: vec![2, 2, 2, 2],
+        data: (0..16).map(|v| (v as f32) * 0.5).collect(),
+    };
+    // RRDBNet residual scaling.
+    let scale = 0.2_f32;
+    let cpu: Vec<f32> = a
+        .data
+        .iter()
+        .zip(&b.data)
+        .map(|(av, bv)| av + scale * bv)
+        .collect();
+
+    let a_gpu = gpu.upload_f32(&a.data, &a.shape).unwrap();
+    let b_gpu = gpu.upload_f32(&b.data, &b.shape).unwrap();
+    let out_gpu = scaled_add_resident(&mut gpu, &a_gpu, &b_gpu, scale).unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, a_gpu).unwrap();
+    free_resident(&mut gpu, b_gpu).unwrap();
+
+    assert_eq!(hip.shape, a.shape);
+    for (index, (actual, expected)) in hip.data.iter().zip(&cpu).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 1e-6,
+            "scaled_add mismatch at {index}: hip={actual} cpu={expected}"
+        );
+    }
+}
+
 #[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
