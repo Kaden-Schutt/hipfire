@@ -30,10 +30,10 @@ done
 # --- AUTONOMOUS FOLD: compound the drained queue's wins into the baseline + re-census the BOD ---
 # (this is what I hand-drove last time; the loop now folds itself — rollover_v2 composes the
 #  branch wins, A/B-gates the composed fold, advances loop_baseline_$ARCH, and re-censuses bod_$ARCH.json)
-echo "===== AUTONOMOUS FOLD (rollover_v2) $(date -u +%T) =====" >> /tmp/loop_driver.log
-# rollover_v2 advances by DEFAULT now (dry-run ripped out). The lineage manifest is PERSISTENT so
-# baseline versions CONTINUE (v2->v3->v4...); the anti-thrash gap is bypassed via MIN_ROUNDS_GAP=0 + round 999.
-BOD="/tmp/bod_${ARCH}.json" SKIP_HOMOGUARD="${SKIP_HOMOGUARD:-0}" MANIFEST="/tmp/baseline_manifest_${ARCH}.txt" \
-  FOLDED="/tmp/queue_folded_${ARCH}.txt" MIN_ROUNDS_GAP=0 MIN_NAIVE_SUM="${MIN_NAIVE_SUM:-2.0}" MIN_COMPOSED="${MIN_COMPOSED:-2.0}" \
-  timeout 2600 bash /tmp/rollover_v2.sh 999 >> /tmp/loop_driver.log 2>&1 || echo "  [fold] rollover_v2 rc=$?" >> /tmp/loop_driver.log
+echo "===== AUTONOMOUS FOLD (promote wins to arch-forks, A/B, advance) $(date -u +%T) =====" >> /tmp/loop_driver.log
+# fold_with_forks: codex promotes each branch win to <k>.<arch>.hip (anti-clobber — writes the fork const +
+# dispatch arm, REVERTS the shared <k>.hip), then A/Bs the combined fork state vs baseline (isolate-decode-
+# window) and advances loop_baseline_$ARCH + re-censuses the BOD if it holds. Lineage manifest is persistent.
+ARCH="$ARCH" CARDS="$CARDS" BASELINE_REF="$BASELINE_REF" MODEL="$MODEL" \
+  timeout 3400 bash /tmp/fold_with_forks.sh >> /tmp/loop_driver.log 2>&1 || echo "  [fold] fold_with_forks rc=$?" >> /tmp/loop_driver.log
 echo "QUEUE LOOP COMPLETE r$r $(date -u +%T)" >> /tmp/loop_driver.log

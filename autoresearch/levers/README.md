@@ -33,7 +33,8 @@ levers that won/died, why). Treat it like the kernel forks — form-fitting per 
 | occ ~0.5% + mem_busy moderate | pathologically under-occupied, NO TLP, latency fully exposed | **per-wave MLP**: register-ring prefetch + deferred reduction (v3 attention win). ONLY wins here. |
 | occ 30-50% + mem_busy moderate + L2-hit low | TLP already hides latency; NOT MLP-limited | **cache-residency**, NOT more MLP (v4 proved per-wave MLP no-ops here). |
 | mem_busy ~90% + occ ~90% | at the memory roofline | leave it, saturated. |
-| high VALU + low mem | compute-bound | **cheaper instructions**: fp8/fp4 WMMA (RDNA4), dp4a/sdot4 (int8), VOPD dual-issue (RDNA3), packed math. |
+| high VALU + low mem, **prefill/GEMM (batch>1)** | compute-bound matrix×matrix | **matrix cores**: fp8/fp4 WMMA (RDNA4), WMMA fp16/int8. PREFILL ONLY — decode is batch-1 GEMV, wastes ~15/16 of a matrix core. |
+| high VALU + low mem, **decode/GEMV (batch-1)** | compute-bound matrix×vector | **cheaper scalar/vector**: dp4a/sdot4 (int8), fdot2 (fp16), VOPD dual-issue (RDNA3), packed math — NOT WMMA. |
 | VGPR at the occupancy cliff | a wave dropped = regression (the row-reuse failure mode) | `global_load_lds` (frees VGPR + prefetches), fewer temporaries, scalarize wave-uniform values. |
 
 **Look up exact mnemonics** in the emitted ISA (`llvm-objdump -d` on the `.hsaco`) and the LLVM AMDGPU
