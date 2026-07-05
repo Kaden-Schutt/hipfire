@@ -11,6 +11,27 @@ use std::env;
 use crate::scheduler::server_accelerator_inventory;
 use crate::state::SharedState;
 
+/// Model-load progress for the chat UI's loading bar. Reflects the daemon's
+/// per-layer weight-load stream (parsed from its stderr by the daemon adapter).
+/// `loading` is true only while actively loading (`current < total`); once
+/// weights are in (`current == total`) prefill follows, for which no per-step
+/// progress exists (the UI falls back to an indeterminate bar).
+pub async fn get_load_progress() -> Json<Value> {
+    let (current, total) = hipfire_daemon_adapter::model_load_progress();
+    let loading = total > 0 && current < total;
+    let fraction = if total > 0 {
+        current as f64 / total as f64
+    } else {
+        0.0
+    };
+    Json(json!({
+        "current": current,
+        "total": total,
+        "loading": loading,
+        "fraction": fraction,
+    }))
+}
+
 pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let loaded = {
         let loaded = state.loaded_model_path.lock().await;

@@ -93,6 +93,7 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         .route("/chat/", get(routes::chat_ui::get_chat_index))
         .route("/chat/{*path}", get(routes::chat_ui::get_chat_asset))
         .route("/health", get(routes::health::get_health))
+        .route("/load-progress", get(routes::health::get_load_progress))
         .route("/admin", get(routes::admin::get_admin_index))
         .route("/admin/", get(routes::admin::get_admin_index))
         .route("/admin/login", post(auth::login))

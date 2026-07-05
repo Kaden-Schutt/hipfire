@@ -24,9 +24,67 @@ use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
     AcceleratorInventory, LlmModelRegistry, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
+
+// ── Model-load progress ──────────────────────────────────────────────────────
+// The daemon prints per-layer load progress (`<arch>: loading layer N/M...`) to
+// stderr as it loads a model. We pipe + parse that stream (see `StdioTransport::
+// spawn`) into this global so the HTTP server can surface a real progress bar to
+// the chat UI during the (often multi-second) load. One daemon loads one model
+// at a time, so a single global suffices. Packed as `(current << 32) | total`.
+static LOAD_PROGRESS: AtomicU64 = AtomicU64::new(0);
+
+/// Current model-load progress as `(current_layer, total_layers)`. `(_, 0)` means
+/// no load in progress / not reported. `current == total` (> 0) means weights are
+/// loaded (state/KV allocation may still follow before the first token).
+pub fn model_load_progress() -> (u32, u32) {
+    let v = LOAD_PROGRESS.load(Ordering::Relaxed);
+    ((v >> 32) as u32, v as u32)
+}
+
+fn set_load_progress(current: u32, total: u32) {
+    LOAD_PROGRESS.store(((current as u64) << 32) | total as u64, Ordering::Relaxed);
+}
+
+/// Parse `current`/`total` from a `... loading layer N/M ...` stderr line.
+fn parse_load_layer_line(line: &str) -> Option<(u32, u32)> {
+    let rest = line.split("loading layer ").nth(1)?;
+    let (n, m) = rest.split_once('/')?;
+    let n: u32 = n.trim().parse().ok()?;
+    // `M` is followed by `...` / ` (` / ` on dev` across arches — take the digits.
+    let m: u32 = m
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((n, m))
+}
+
+/// Drain the daemon's stderr: parse load progress into `LOAD_PROGRESS`, and
+/// re-emit every line to our own stderr so operator logs are unchanged. Draining
+/// is also required — an unread piped stderr would eventually block the daemon.
+fn spawn_stderr_progress_reader(stderr: ChildStderr) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains("loading layer ") {
+                if let Some((cur, tot)) = parse_load_layer_line(&line) {
+                    // `current < total` = actively loading (UI shows a determinate
+                    // bar); `current == total` = weights done, prefill next (UI
+                    // falls back to indeterminate). A new load resets `current`
+                    // back to 1, so no explicit clear is needed.
+                    set_load_progress(cur, tot);
+                }
+            }
+            // Re-emit to our real stderr so operator logs are unchanged.
+            eprintln!("{line}");
+        }
+    });
+}
 
 trait DaemonTransport: Send {
     #[cfg(test)]
@@ -46,13 +104,19 @@ impl StdioTransport {
         let mut child = Command::new(bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // Piped (not inherited) so we can parse per-layer load progress; the
+            // reader task below re-emits every line to our stderr, so operator
+            // logs are unchanged.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to spawn daemon at {}: {e}", bin.display()))?;
 
         let stdin = BufWriter::new(child.stdin.take().expect("piped stdin"));
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        if let Some(stderr) = child.stderr.take() {
+            spawn_stderr_progress_reader(stderr);
+        }
 
         Ok(Self {
             _child: child,

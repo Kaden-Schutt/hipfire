@@ -148,6 +148,9 @@ fn App() -> impl IntoView {
     let (status, set_status) = signal("Ready".to_string());
     let (settings_open, set_settings_open) = signal(false);
     let (usage, set_usage) = signal(None::<Usage>);
+    // Model-load progress (current_layer, total_layers) polled from /load-progress
+    // while awaiting the first token; drives the determinate loading bar.
+    let (load_progress, set_load_progress) = signal((0u32, 0u32));
     // Responses API server-side conversation state: the last response id, sent
     // as previous_response_id so the server reconstructs prior context.
     let (last_response_id, set_last_response_id) = signal(None::<String>);
@@ -236,6 +239,31 @@ fn App() -> impl IntoView {
         set_usage.set(None);
         set_busy.set(true);
         set_status.set("Generating".to_string());
+
+        // Poll model-load progress while the assistant bubble is still empty (the
+        // pre-first-token window that spans a server-side model load). Stops as
+        // soon as a token arrives or the request ends.
+        set_load_progress.set((0, 0));
+        leptos::task::spawn_local(async move {
+            loop {
+                let waiting = busy.get_untracked()
+                    && messages
+                        .get_untracked()
+                        .get(assistant_index)
+                        .map(|m| m.content.is_empty())
+                        .unwrap_or(false);
+                if !waiting {
+                    set_load_progress.set((0, 0));
+                    break;
+                }
+                if let Ok(v) = get_json::<Value>("/load-progress").await {
+                    let cur = v["current"].as_u64().unwrap_or(0) as u32;
+                    let tot = v["total"].as_u64().unwrap_or(0) as u32;
+                    set_load_progress.set((cur, tot));
+                }
+                gloo_timers::future::TimeoutFuture::new(400).await;
+            }
+        });
 
         let cfg = settings.get_untracked();
         // Responses API chains via previous_response_id; chat replays history.
@@ -364,7 +392,7 @@ fn App() -> impl IntoView {
                 open=settings_open set_open=set_settings_open version=server_version/>
 
             <main class="messages" node_ref=messages_ref aria-live="polite">
-                {move || messages.get().into_iter().map(message_view).collect_view()}
+                {move || messages.get().into_iter().map(move |m| message_view(m, load_progress)).collect_view()}
             </main>
 
             <form class="composer" on:submit=move |ev: SubmitEvent| { ev.prevent_default(); submit_action(); }>
@@ -411,7 +439,7 @@ fn App() -> impl IntoView {
 
 /// Render one transcript message: role tag, optional reasoning panel, markdown
 /// body (assistant) or plain text (user/error), images, and a copy button.
-fn message_view(message: UiMessage) -> impl IntoView {
+fn message_view(message: UiMessage, load_progress: ReadSignal<(u32, u32)>) -> impl IntoView {
     let class = format!("message {}", message.role);
     let is_assistant = message.role == "assistant";
     let role = message.role.clone();
@@ -432,13 +460,34 @@ fn message_view(message: UiMessage) -> impl IntoView {
     let body_view = if content.is_empty() {
         if is_assistant {
             // Empty assistant bubble = awaiting the first token. That wait spans
-            // any server-side model (re)load — which can take tens of seconds for
-            // a large model — plus prefill. Show an indeterminate loading bar so
-            // the user knows the model is spinning up rather than hung.
+            // any server-side model (re)load — tens of seconds for a large model
+            // — plus prefill. While the daemon reports per-layer load progress
+            // (current < total) show a DETERMINATE bar; otherwise (prefill, or no
+            // load) fall back to an INDETERMINATE animation.
+            let is_det = move || {
+                let (c, t) = load_progress.get();
+                t > 0 && c < t
+            };
             view! {
                 <div class="loading" role="status" aria-live="polite">
-                    <div class="loading-bar"><div class="loading-fill"></div></div>
-                    <span class="loading-label">"Loading model / preparing response…"</span>
+                    <div class="loading-bar" class:determinate=is_det>
+                        <div class="loading-fill" style=move || {
+                            let (c, t) = load_progress.get();
+                            if t > 0 && c < t {
+                                format!("width:{:.1}%", (c as f64 / t as f64) * 100.0)
+                            } else {
+                                String::new()
+                            }
+                        }></div>
+                    </div>
+                    <span class="loading-label">{move || {
+                        let (c, t) = load_progress.get();
+                        if t > 0 && c < t {
+                            format!("Loading model — layer {c} / {t}")
+                        } else {
+                            "Preparing response…".to_string()
+                        }
+                    }}</span>
                 </div>
             }
             .into_any()

@@ -65,8 +65,10 @@
     .loading { display: flex; flex-direction: column; gap: 8px; padding: 2px 0; }
     .loading-bar { position: relative; height: 4px; border-radius: 999px; overflow: hidden;
       background: color-mix(in srgb, var(--accent), transparent 82%); }
-    .loading-fill { position: absolute; top: 0; height: 100%; width: 40%; border-radius: 999px;
+    .loading-fill { position: absolute; top: 0; left: 0; height: 100%; width: 40%; border-radius: 999px;
       background: var(--accent); animation: loading-slide 1.15s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
+    /* Determinate: width driven by inline style, no sliding animation. */
+    .loading-bar.determinate .loading-fill { left: 0; animation: none; transition: width 280ms ease; }
     .loading-label { color: var(--muted); font-size: 13px; }
     @keyframes loading-slide { 0% { left: -42%; } 100% { left: 100%; } }
     @media (prefers-reduced-motion: reduce) { .loading-fill { animation-duration: 2.6s; } }
