@@ -185,6 +185,27 @@ the true gate on offload viability (alongside the ~78 µs/dispatch latency, whic
 argues for streaming the whole GEMM in one dispatch). `prepack_weights`/`run_packed`
 stay useful (weights still pre-arranged once), but the reshuffle must move to the DMA.
 
+## Concurrency premise — PROVEN (`npu_concurrency_demo`)
+
+The whole offload thesis rests on one assumption: an async NPU dispatch overlaps with
+concurrent host/GPU work, so the NPU GEMM is *hidden* rather than added to the critical
+path. Measured on the whole-GEMM xclbin with a CPU workload proxy for GPU-dispatch-issuing
+host work (`submit` → host work → `wait`):
+
+| schedule | ms |
+|---|---|
+| T_npu (dispatch alone) | 0.855 |
+| T_host (host work alone) | 1.530 |
+| T_serial (submit; wait; host) | 2.929 |
+| **T_overlap (submit; host; wait)** | **1.678** |
+
+T_overlap ≈ T_host — the **entire 0.855 ms NPU GEMM is hidden** behind concurrent host
+work (saves ~1.25 ms/iter). So the `submit`/`wait` split does deliver true async
+concurrency; when there is GPU work to run alongside, NPU prefill offload is a net win, not
+a loss. This de-risks the concurrent split below: the mechanism is validated; what remains
+is wiring a *real* GPU GEMM (hipfire-rdna) as the concurrent partner instead of the CPU
+proxy, plus the work-splitting policy.
+
 ## The one architectural decision (needs a call)
 
 **Concurrency model.** The win is *concurrent* NPU-prefill ‖ GPU-work. Options:
