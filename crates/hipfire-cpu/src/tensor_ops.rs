@@ -510,6 +510,43 @@ pub fn upsample_nearest2d_nchw(input: &CpuTensor, scale: usize) -> CpuResult<Cpu
     Ok(out)
 }
 
+/// Space-to-depth by `scale` (inverse of pixel-shuffle), NCHW:
+/// `[N, C, H, W] -> [N, C*scale*scale, H/scale, W/scale]`. Output channel
+/// `c*scale*scale + dy*scale + dx` gathers `input[n, c, oh*scale+dy, ow*scale+dx]`,
+/// matching PyTorch/basicsr `pixel_unshuffle`. Used by the RealESRGAN x2 input
+/// stage.
+pub fn pixel_unshuffle_nchw(input: &CpuTensor, scale: usize) -> CpuResult<CpuTensor> {
+    if scale == 0 {
+        return Err(CpuError("pixel_unshuffle scale must be positive".to_string()));
+    }
+    let [batch, channels, height, width] = shape4(input)?;
+    if height % scale != 0 || width % scale != 0 {
+        return Err(CpuError(format!(
+            "pixel_unshuffle input [{height}, {width}] not divisible by scale {scale}"
+        )));
+    }
+    let out_h = height / scale;
+    let out_w = width / scale;
+    let out_channels = channels * scale * scale;
+    let mut out = CpuTensor::zeros(&[batch, out_channels, out_h, out_w]);
+    for b in 0..batch {
+        for c in 0..channels {
+            for y in 0..height {
+                let dy = y % scale;
+                let by = y / scale;
+                for x in 0..width {
+                    let dx = x % scale;
+                    let bx = x / scale;
+                    let c_out = c * scale * scale + dy * scale + dx;
+                    out.data[nchw_idx(b, c_out, by, bx, out_channels, out_h, out_w)] =
+                        input.data[nchw_idx(b, c, y, x, channels, height, width)];
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn shape4(tensor: &CpuTensor) -> CpuResult<[usize; 4]> {
     match tensor.shape.as_slice() {
         [a, b, c, d] => Ok([*a, *b, *c, *d]),

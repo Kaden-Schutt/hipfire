@@ -1190,6 +1190,65 @@ fn superres_rrdb_resident_matches_cpu_reference() {
 }
 
 #[test]
+fn superres_rrdbnet_x2_resident_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for RRDBNet parity test: {error}");
+            return;
+        }
+    };
+    // Tiny x2 RRDBNet: in=3, num_feat=4, num_grow_ch=2, num_block=1, scale=2.
+    // Input [1,3,4,4] -> unshuffle2 -> [1,12,2,2] -> conv_first -> [1,4,2,2]
+    // -> body -> conv_body(+res) -> up x2 x2 -> [1,4,8,8] -> hr -> last -> [1,3,8,8].
+    let net = SuperResRrdbNet {
+        scale: 2,
+        conv_first: rdb_test_conv(4, 12, 1.0),
+        body: vec![SuperResRrdb {
+            rdb1: rdb_test_block(40.0),
+            rdb2: rdb_test_block(50.0),
+            rdb3: rdb_test_block(60.0),
+        }],
+        conv_body: rdb_test_conv(4, 4, 7.0),
+        conv_up1: rdb_test_conv(4, 4, 8.0),
+        conv_up2: rdb_test_conv(4, 4, 9.0),
+        conv_hr: rdb_test_conv(4, 4, 11.0),
+        conv_last: rdb_test_conv(3, 4, 12.0),
+    };
+    let input = CpuTensor {
+        shape: vec![1, 3, 4, 4],
+        data: (0..48).map(|v| ((v as f32) % 11.0 - 5.0) / 6.0).collect(),
+    };
+
+    let cpu = net.forward(&input).unwrap();
+    assert_eq!(cpu.shape, vec![1, 3, 8, 8], "x2 output should double spatial");
+
+    let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+    let mut cache = RocmWeightCache::default();
+    let out_gpu = net
+        .forward_resident(&input_gpu, &mut gpu, &mut cache)
+        .unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, input_gpu).unwrap();
+
+    assert_eq!(hip.shape, cpu.shape);
+    let max_diff = hip
+        .data
+        .iter()
+        .zip(&cpu.data)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    // Full net (~20 convs deep) over the WMMA f16 resident conv path.
+    assert!(
+        max_diff <= 5e-2,
+        "RRDBNet resident vs cpu max_diff {max_diff} too large; hip={:?} cpu={:?}",
+        &hip.data[..hip.data.len().min(8)],
+        &cpu.data[..cpu.data.len().min(8)]
+    );
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,

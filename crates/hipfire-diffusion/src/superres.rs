@@ -207,3 +207,152 @@ impl SuperResRrdb {
         Ok(out)
     }
 }
+
+fn tensor_add_cpu(a: &CpuTensor, b: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    if a.data.len() != b.data.len() {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "add shape mismatch {:?} vs {:?}",
+            a.shape, b.shape
+        )));
+    }
+    Ok(CpuTensor {
+        shape: a.shape.clone(),
+        data: a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect(),
+    })
+}
+
+fn conv3x3_from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<Conv2dLayer> {
+    Conv2dLayer::from_hfq(
+        hfq,
+        &format!("{name}.weight"),
+        Some(&format!("{name}.bias")),
+        1,
+    )
+}
+
+/// RealESRGAN RRDBNet: pixel-unshuffle input stage (for scale 1/2), a
+/// conv_first, `num_block` RRDBs with a conv_body and a plain global residual,
+/// two nearest-upsample + conv + LeakyReLU stages, and a conv_hr / conv_last
+/// head. The two fixed upsample stages give x4; scale 2 pre-unshuffles by 2 and
+/// scale 1 by 4, so the net output ratio is `4 / input_unshuffle_scale`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SuperResRrdbNet {
+    pub scale: usize,
+    pub conv_first: Conv2dLayer,
+    pub body: Vec<SuperResRrdb>,
+    pub conv_body: Conv2dLayer,
+    pub conv_up1: Conv2dLayer,
+    pub conv_up2: Conv2dLayer,
+    pub conv_hr: Conv2dLayer,
+    pub conv_last: Conv2dLayer,
+}
+
+impl SuperResRrdbNet {
+    /// Pre-body space-to-depth factor: scale 2 -> 2, scale 1 -> 4, otherwise 1
+    /// (no unshuffle). Matches basicsr's RRDBNet.
+    fn input_unshuffle_scale(&self) -> usize {
+        match self.scale {
+            2 => 2,
+            1 => 4,
+            _ => 1,
+        }
+    }
+
+    pub fn from_hfq(hfq: &HfqFile, num_block: usize, scale: usize) -> DiffusionResult<Self> {
+        let body = (0..num_block)
+            .map(|i| SuperResRrdb::from_hfq(hfq, &format!("body.{i}")))
+            .collect::<DiffusionResult<Vec<_>>>()?;
+        Ok(Self {
+            scale,
+            conv_first: conv3x3_from_hfq(hfq, "conv_first")?,
+            body,
+            conv_body: conv3x3_from_hfq(hfq, "conv_body")?,
+            conv_up1: conv3x3_from_hfq(hfq, "conv_up1")?,
+            conv_up2: conv3x3_from_hfq(hfq, "conv_up2")?,
+            conv_hr: conv3x3_from_hfq(hfq, "conv_hr")?,
+            conv_last: conv3x3_from_hfq(hfq, "conv_last")?,
+        })
+    }
+
+    /// CPU reference forward. `input` is NCHW RGB in model range.
+    pub fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let unshuffle = self.input_unshuffle_scale();
+        let feat = if unshuffle > 1 {
+            pixel_unshuffle_nchw(input, unshuffle)?
+        } else {
+            input.clone()
+        };
+        let feat = self.conv_first.forward(&feat)?;
+        let mut body = feat.clone();
+        for rrdb in &self.body {
+            body = rrdb.forward(&body)?;
+        }
+        let body = self.conv_body.forward(&body)?;
+        // Global residual is a plain add (no 0.2 scaling here).
+        let mut feat = tensor_add_cpu(&feat, &body)?;
+        feat = leaky_relu_cpu(&self.conv_up1.forward(&upsample_nearest2d_nchw(&feat, 2)?)?);
+        feat = leaky_relu_cpu(&self.conv_up2.forward(&upsample_nearest2d_nchw(&feat, 2)?)?);
+        let hr = leaky_relu_cpu(&self.conv_hr.forward(&feat)?);
+        self.conv_last.forward(&hr)
+    }
+
+    /// Device-resident forward.
+    pub(crate) fn forward_resident(
+        &self,
+        input: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        let unshuffle = self.input_unshuffle_scale();
+        let unshuffled = if unshuffle > 1 {
+            Some(pixel_unshuffle_nchw_resident(gpu, input, unshuffle)?)
+        } else {
+            None
+        };
+        let feat = self.conv_first.forward_resident(
+            unshuffled.as_ref().unwrap_or(input),
+            gpu,
+            cache,
+        )?;
+        if let Some(unshuffled) = unshuffled {
+            free_resident(gpu, unshuffled)?;
+        }
+
+        // The body chain produces a fresh tensor; `forward_resident` never frees
+        // its input, so running the first block (or conv_body) on `feat`
+        // directly keeps `feat` alive for the global residual add.
+        let body_conv = if self.body.is_empty() {
+            self.conv_body.forward_resident(&feat, gpu, cache)?
+        } else {
+            let mut body = self.body[0].forward_resident(&feat, gpu, cache)?;
+            for rrdb in self.body.iter().skip(1) {
+                let next = rrdb.forward_resident(&body, gpu, cache)?;
+                free_resident(gpu, body)?;
+                body = next;
+            }
+            let conv = self.conv_body.forward_resident(&body, gpu, cache)?;
+            free_resident(gpu, body)?;
+            conv
+        };
+        let mut feat_res = tensor_add_resident(gpu, &feat, &body_conv)?;
+        free_resident(gpu, feat)?;
+        free_resident(gpu, body_conv)?;
+
+        for conv in [&self.conv_up1, &self.conv_up2] {
+            let up = upsample_nearest2d_nchw_resident(gpu, &feat_res, 2)?;
+            free_resident(gpu, feat_res)?;
+            let conv_out = conv.forward_resident(&up, gpu, cache)?;
+            free_resident(gpu, up)?;
+            feat_res = leaky_relu_resident(gpu, &conv_out, RRDB_LEAKY_SLOPE)?;
+            free_resident(gpu, conv_out)?;
+        }
+
+        let hr_conv = self.conv_hr.forward_resident(&feat_res, gpu, cache)?;
+        free_resident(gpu, feat_res)?;
+        let hr = leaky_relu_resident(gpu, &hr_conv, RRDB_LEAKY_SLOPE)?;
+        free_resident(gpu, hr_conv)?;
+        let out = self.conv_last.forward_resident(&hr, gpu, cache)?;
+        free_resident(gpu, hr)?;
+        Ok(out)
+    }
+}
