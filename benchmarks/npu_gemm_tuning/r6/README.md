@@ -55,18 +55,42 @@ This overturns the R5 "sync-bound, K-cascade is the wrong axis" read: the cascad
 the array geometry are fine; the **microkernel** is the wall. Corollaries:
 - R5's cascade C-residency and R6's bigger K-tiles can't help while each mmul is 15×
   slow — the compute term dominates everything.
-- There is ~10–15× of headroom if the MAC chain pipelines.
+- **R6's guess:** ~10–15× of headroom if the MAC chain pipelines. **(R7 disproves this.)**
 
-## R7 (the real lever)
+## R7 — multi-accumulator: hypothesis DISPROVEN, ~1.35× consolation win
 
-Rewrite the K-slice inner loop for **II≈1: multiple independent accumulators**
-(interleave 2–4 output tiles / partial-sum banks so successive `mmul`s don't depend on
-the immediately-prior accumulator), the standard AIE matmul recipe. Also confirm
-whether aie2 int8×int4 `<4,16,8>` is native or emulated (aie2p ships
-`emulated_mmul_intrinsics.hpp`; if aie2 emulates int4, part of the 36 cycles is
-inherent and int8×int8 `<4,16,8>`/`<8,16,8>` may pipeline better). Target: close the
-~15× compute gap; feed (~10 ns/mmul, ~3× current TOPS) becomes the next wall, and only
-*then* do weight-stationary / A-reuse dataflows matter.
+R6 hypothesized the ~36 cyc/mmul was a single-accumulator dependency stall. R7 split
+the K contraction across NACC independent accumulators (`-DNACC`, tree-summed;
+`../r5/r5_cascade.cc`) and swept it. First confirmed the shape is **native, not
+emulated**: aie2 int8×int4 `<4,16,8>` lowers to `::mac_4x16_16x8_conf` (a real
+intrinsic; `emulated_mmul_intrinsics.hpp` is unused for it).
 
-Repro: `R5_ARCH=aie2 ./r6_intensity.sh 4 4 1024 300 16 32 64 128`; INNER via
-`R5_INNER=8 ../r5/r5_build.sh <mlir> <wd> 16`.
+Throughput (4×4, feed + MACs held fixed; NACC = internal pipelining only):
+
+| NACC | KSLICE=16 TOPS | KSLICE=128 TOPS |
+|---|---|---|
+| 1 | 0.42 | 0.46 |
+| 2 | 0.44 | 0.53 |
+| 4 | **0.49** | **0.62** |
+| 8 | 0.56* | 0.40 (spills) |
+
+The decisive test is the **feed-free marginal rate** (INNER probe, isolates pure
+compute): NACC=1 → **20.3 ns/mmul**, NACC=8 → **18.0 ns/mmul**. Essentially unchanged.
+So the mmul is **not** accumulator-latency-stalled — `mac_4x16_16x8_conf` simply runs
+**~32 cycles/mmul on AIE-ML gen1 (Phoenix)**, and that op throughput *is* the wall.
+Multi-accumulator helps only by overlapping the loads/sync around the MACs (~1.35×),
+and NACC=8 spills the accumulator register file (KSLICE=128 regresses to 0.40).
+
+*The KSLICE=16 NACC=8 "0.56" is inflated by fill/drain at a tiny K; the compute-heavy
+KSLICE=128 column is the honest read, where NACC=4 (0.62) is the peak and 8 spills.
+
+**Verdict.** NACC=4 is the new default — a real, correctness-preserving ~1.35× (best
+~0.62 TOPS). But the ~0.6-TOPS ceiling is the int8×int4 mmul-op throughput on Phoenix,
+**not** a dataflow, sync, feed, or pipelining bug — consistent with the ~12%-of-peak
+XDNA1 int8 GEMM seen before. Closing the rest is not an mlir-aie kernel-structure
+problem: it needs a faster op (does int8×int8 `<4,16,8>`/`<8,16,8>` clock fewer cycles?
+does aie2p/Strix run the same op faster?), which is the only remaining probe worth
+running before declaring XDNA1 W4A8 GEMM a hard ~0.6-TOPS floor.
+
+Repro: `R5_ARCH=aie2 ./r6_intensity.sh 4 4 1024 300 16 32 64 128`; NACC/INNER via
+`R5_NACC=4 R5_INNER=1 ../r5/r5_build.sh <mlir> <wd> <KSLICE>`.

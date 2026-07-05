@@ -39,8 +39,9 @@ for BOOSTDIR in "$HOME/.cache/hipfire-npu-deps/lib" "$HOME/.cache/hipfire-npu-de
   [ -e "$BOOSTDIR/libboost_program_options.so.1.83.0" ] && export LD_LIBRARY_PATH="$BOOSTDIR:${LD_LIBRARY_PATH:-}" && break
 done
 : "${R5_INNER:=1}"   # R6 probe: >1 recomputes the K-slice over resident tiles (no extra feed)
+: "${R5_NACC:=4}"    # R7: independent K-partial accumulators (II~1). 1 = old single-accumulator chain.
 CF=(-std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body
-    -O2 -DNDEBUG --target="$TGT" "${ARCHDEF[@]}" "-DKSLICE=$KSLICE" "-DINNER=$R5_INNER")
+    -O2 -DNDEBUG --target="$TGT" "${ARCHDEF[@]}" "-DKSLICE=$KSLICE" "-DINNER=$R5_INNER" "-DNACC=$R5_NACC")
 
 rm -rf "$W"; mkdir -p "$W"
 # One object per cascade role (the .mlir's link_with picks which each core needs).

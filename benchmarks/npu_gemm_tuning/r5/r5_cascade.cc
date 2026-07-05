@@ -30,36 +30,60 @@
 #ifndef INNER
 #define INNER 1            // R6 probe: recompute the K-slice INNER times over the SAME
 #endif                     // resident L1 tiles (no extra feed) to isolate feed- vs core-bound.
+#ifndef NACC
+#define NACC 4             // R7: independent K-partial accumulators to hide mmul latency
+#endif                     // (II~1). NACC=1 = the R5/R6 single-accumulator chain. KSLICE%NACC==0.
 
 using MMUL = aie::mmul<4, 16, MMUL_N, int8, int4>;
 using ACC = aie::accum<acc32, MMUL::size_C>;   // 4*MMUL_N acc32 partial C
 static constexpr int CN = MMUL::size_C;
 static constexpr int BEATS = CN / 16;          // cascade beats (16 acc32/int32 each)
 
-// This core's K-slice partial, in a register accumulator (II=1 recipe). Arch-agnostic.
+// Load this core's A / W tile for K-step j. Weight stride is in BYTES on the int8
+// buffer, then reinterpret (int4* arithmetic is byte-addressed — the R3a fix);
+// size_B/2 bytes per 16xN tile.
+static inline aie::vector<int8, MMUL::size_A> ldA(const int8 *__restrict pA, int j) {
+  return aie::load_v<MMUL::size_A>(pA + j * MMUL::size_A);
+}
+static inline aie::vector<int4, MMUL::size_B> ldW(const int8 *__restrict wbytes, int j) {
+  return aie::load_v<MMUL::size_B>(reinterpret_cast<const int4 *>(wbytes + j * (MMUL::size_B / 2)));
+}
+
+// This core's K-slice partial. R5/R6 used ONE accumulator (every mac chained on the
+// prior). R7 splits the K contraction across NACC independent accumulators (interleaved
+// over the K loop, tree-summed at the end — exact int32). This gives a real but MODEST
+// ~1.35x (NACC=4 optimal; NACC=8 spills the accumulator regs). The R7 measurement
+// showed the feed-free rate is ~18ns/mmul at NACC=8 vs ~20ns at NACC=1 — i.e. the mmul
+// was NOT accumulator-latency-stalled; mac_4x16_16x8_conf just runs ~32 cyc/mmul on
+// AIE-ML gen1 (Phoenix). NACC helps by overlapping loads/sync, not by unstalling MACs.
+static_assert(KSLICE % NACC == 0, "KSLICE must be a multiple of NACC");
 static inline ACC kslice_partial(const int8 *__restrict pA, const int8 *__restrict wbytes) {
-  MMUL c;
-  const int4 *w = reinterpret_cast<const int4 *>(wbytes);
-  c.mul(aie::load_v<MMUL::size_A>(pA), aie::load_v<MMUL::size_B>(w));
-  for (int j = 1; j < KSLICE; j++)
-      chess_prepare_for_pipelining {
-    aie::vector<int8, MMUL::size_A> a = aie::load_v<MMUL::size_A>(pA + j * MMUL::size_A);
-    // Weight stride in BYTES on the int8 buffer, then reinterpret (int4* arithmetic
-    // is byte-addressed — the R3a fix); size_B/2 bytes per 16xN tile.
-    const int4 *bj = reinterpret_cast<const int4 *>(wbytes + j * (MMUL::size_B / 2));
-    c.mac(a, aie::load_v<MMUL::size_B>(bj));
-  }
+  MMUL c[NACC];
+  // Seed each independent chain with a mul (zeroes its accumulator).
+#pragma unroll
+  for (int p = 0; p < NACC; p++)
+    c[p].mul(ldA(pA, p), ldW(wbytes, p));
+  // Remaining K steps, NACC independent macs per iteration.
+  for (int j = NACC; j < KSLICE; j += NACC)
+      chess_prepare_for_pipelining
+#pragma unroll
+    for (int p = 0; p < NACC; p++)
+      c[p].mac(ldA(pA, j + p), ldW(wbytes, j + p));
 #if INNER > 1
-  // Extra MAC passes over the already-resident tiles: MACs scale, feed does not.
+  // R6 probe: extra feed-free MAC passes over the resident tiles (MACs scale, feed does not).
   for (int r = 1; r < INNER; r++)
-    for (int j = 0; j < KSLICE; j++)
-        chess_prepare_for_pipelining {
-      aie::vector<int8, MMUL::size_A> a = aie::load_v<MMUL::size_A>(pA + j * MMUL::size_A);
-      const int4 *bj = reinterpret_cast<const int4 *>(wbytes + j * (MMUL::size_B / 2));
-      c.mac(a, aie::load_v<MMUL::size_B>(bj));
-    }
+    for (int j = 0; j < KSLICE; j += NACC)
+        chess_prepare_for_pipelining
+#pragma unroll
+      for (int p = 0; p < NACC; p++)
+        c[p].mac(ldA(pA, j + p), ldW(wbytes, j + p));
 #endif
-  return c.to_accum();
+  // Tree-sum the NACC partials into one accumulator.
+  ACC acc = c[0].to_accum();
+#pragma unroll
+  for (int p = 1; p < NACC; p++)
+    acc = add(acc, c[p].to_accum());
+  return acc;
 }
 
 #if defined(NPU_AIE2)
