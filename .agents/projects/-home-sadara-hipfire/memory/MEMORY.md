@@ -1,0 +1,16 @@
+- [Spec-decode metrics system](project-specdecode-metrics-system.md) — unified SpecMetrics + drain_extra_metrics (P1-P6 DONE, chaingun); only DSpark/MTP has a Speculator, qwen35/deepseek4 use thread-local per-request accumulators
+- [Eval tooling refactor](project-eval-tooling-refactor.md) — daemon-resident unified KLD eval; hipfire-kld crate landed; daemon op next
+- [halo fleet box](reference-halo-fleet-box.md) — gfx1151 validation host + model/ref/hessian repo at ~/.hipfire
+- [Two W8A8 paths on chaingun](project-two-w8a8-paths-chaingun.md) — Oq8G256 (grouped, near-lossless 1.6e-3 KLD) vs W8A8Ref (per-token reference) coexist; keep both arms
+- [Tiny-quant matrix](project-tiny-quant-matrix.md) — tokenizer-free emit→quantize→collect→KLD test across qwen2/gemma3/minimax/qwen35; per-family loader/format constraints; ./tests/tiny-quant-gate.sh
+- [NPU toolchain on this box](project-npu-toolchain-this-box.md) — XDNA1 build quirks: IRON transform API drift + user-space boost-1.83 LD_LIBRARY_PATH workaround; swiglu smoke validated
+- [OQ→NPU spike NO-GO](project-oq-npu-spike-nogo.md) — OQ8/OQ+ int8 GEMM runs bit-exact on XDNA1 but ~2 TFLOP/s (12% peak), loses to GPU on synchronous dispatch + shared memory; correctness proven, perf no-go
+- [ZAYA1 port](project-zaya1-port.md) — Zyphra ZAYA1-8B → hipfire on branch arch-zaya; arch_id 16; alternating→40 hybrid blocks, CCA+EDA/MoD, ref vendored at third_party/transformers@zaya1; full port DONE (bit-exact CPU/GPU, daemon serve, O(1) decode, mq4 5.96GB)
+- [ZAYA LDLQ quant](project-zaya-ldlq-quant.md) — LDLQ Hessian generation DONE+validated (361 dense Hessians CONSISTENT → oq4++ LDLQ success=132/132); running oq4++ needs halo+linear_dtype wiring; experts imatrix-only is follow-up
+- [OwnedTensor RAII scratch](project-owned-tensor-raii-scratch.md) — RAII GPU scratch (graph-gated reclaim) landed in rdna-compute; transient forwards migrated off manual free_tensor; uncommitted; halo coherence+VRAM validation pending
+- [H-Neurons repro](project-hneurons-repro.md) — CETT capture (daemon cett_* ops + llama prefill_forward tap) + L1 probe; Llama-8B test acc 0.675 cross-model demo; committed 3447b57d
+- [Steer/abliteration](project-steer-abliteration.md) — hipfire-steer pivoted onto the daemon (5 steer ops, DaemonHarness); abliteration coherent only at low strength (~0.2), gibberish by 1.0; KLD-guard-reads-0 bug ROOT-CAUSED+FIXED (n_ctx=2048 vs tiny corpus → 0 chunks; daemon now clamps n_ctx to corpus len so any corpus works); GGUF gemma3 quant broken use safetensors
+- [q8 deprecation](project-q8-deprecation.md) — Q8_0/q8f16 format being retired; prefer oq8/oq4/mq4; surviving formats already WMMA on RDNA3 so the gemma3 Q8 prefill fix is deprecation-window-only
+- [Model variants share arch_id](project-model-variants-share-arch-id.md) — VL/MTP layer on a base arch_id; never mint new ids or duplicate -spec crates (qwen35-vl shares 5/6)
+- [DSpark port source](project-dspark-port-source.md) — port hipfire-specdecode-dspark from fivetide PRs #492/#493 (Kaden-Schutt fork); built on #477 SpecTarget seam chaingun lacks
+- [DSpark native trainer](project-dspark-native-trainer.md) — build DSpark drafter training in hipfire-train (ROCm, no Python); T1 masked SDPA → T6 validate on halo
