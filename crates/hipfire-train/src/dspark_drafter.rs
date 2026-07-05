@@ -48,6 +48,7 @@ use crate::ops::attention::{gqa_backward_masked, gqa_forward_masked};
 use crate::ops::linear::{linear_backward_w, linear_backward_x, linear_forward};
 use crate::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use crate::ops::rope::{rope_backward, rope_forward};
+use crate::ops::sigmoid::{sigmoid_backward, sigmoid_forward};
 use crate::ops::swiglu::{swiglu_backward, swiglu_forward};
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
@@ -1082,4 +1083,534 @@ pub fn dspark_drafter_backward(
         d_out_norm,
         d_main_hidden,
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DSpark drafter HEADS (T2b) — lm-head + VanillaMarkov + AcceptRatePredictor.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Consumes the body's `x_head` `[block, h]` and produces:
+//   * `draft_logits [block, vocab]` = `x_head @ lm_headᵀ + markov_bias`
+//   * `confidence_pred [block]`     = `sigmoid(proj(concat(x_head, markov_latent)))`
+//
+// References:
+//   * `third_party/dspark/deepspec/modeling/dspark/markov_head.py` (`VanillaMarkov`):
+//       `markov_w1 = Embedding(vocab, rank)`, `markov_w2 = Linear(rank, vocab, bias=False)`.
+//       `markov_bias = markov_w2(markov_w1[prev_token])`, added per block position with
+//       that position's `prev_token`.
+//   * `third_party/dspark/deepspec/modeling/dspark/common.py` (`AcceptRatePredictor`):
+//       `proj = Linear(input_dim, 1)`; with `confidence_head_with_markov=True`,
+//       `input_dim = h + markov_rank` and `features = concat(x_head, markov_latent)`;
+//       `confidence_pred = sigmoid(logit)`. Inference side
+//       `crates/hipfire-arch-llama/src/dspark_body.rs` confirms
+//       `confidence_proj:[1, h+rank]`, `confidence_bias:[1]`.
+//
+// The lm-head weight is TARGET-SHARED / external (borrowed, frozen — no grad).
+// `markov_w1` gather/scatter reuses the RoughQuant `rq_gather_f32` /
+// `rq_scatter_add_f32` element movers with a flattened row index
+// (`idx[b*rank + j] = prev[b]*rank + j`), so gather and scatter share one index
+// and are exact inverses.
+
+/// Head hyperparameters (kept separate from `DsparkDrafterConfig` so the body
+/// forward/backward and their gradchecks are untouched). `markov_rank` is the
+/// low-rank width of the VanillaMarkov head.
+#[derive(Clone, Copy)]
+pub struct DsparkHeadsConfig {
+    pub h: usize,
+    pub vocab: usize,
+    pub markov_rank: usize,
+}
+
+impl DsparkHeadsConfig {
+    /// Derive the head config from the body config plus the markov rank.
+    pub fn from_drafter(cfg: &DsparkDrafterConfig, markov_rank: usize) -> Self {
+        Self {
+            h: cfg.h,
+            vocab: cfg.vocab,
+            markov_rank,
+        }
+    }
+    /// Confidence proj input width = `h + markov_rank`.
+    pub fn conf_in(&self) -> usize {
+        self.h + self.markov_rank
+    }
+}
+
+// ── Head weights / grads ────────────────────────────────────────────────────
+
+/// Trainable head weights. The lm-head is NOT here (target-shared, borrowed).
+pub struct DsparkHeadsWeights {
+    pub markov_w1: GpuTensor,       // [vocab, rank]  — Embedding(vocab, rank)
+    pub markov_w2: GpuTensor,       // [vocab, rank]  — Linear(rank→vocab), HF [out, in]
+    pub confidence_proj: GpuTensor, // [1, h+rank]    — AcceptRatePredictor proj
+    pub confidence_bias: GpuTensor, // [1]            — AcceptRatePredictor bias
+}
+
+impl DsparkHeadsWeights {
+    /// Head params in a fixed order (matches `DsparkHeadsGrads::flat`):
+    /// `[markov_w1, markov_w2, confidence_proj, confidence_bias]`.
+    pub fn params(&self) -> Vec<&GpuTensor> {
+        vec![
+            &self.markov_w1,
+            &self.markov_w2,
+            &self.confidence_proj,
+            &self.confidence_bias,
+        ]
+    }
+    pub fn param_sizes(&self) -> Vec<usize> {
+        self.params()
+            .iter()
+            .map(|t| t.shape.iter().product())
+            .collect()
+    }
+}
+
+/// Head weight grads (same field set / order as `DsparkHeadsWeights`).
+pub struct DsparkHeadsGrads {
+    pub d_markov_w1: GpuTensor,       // [vocab, rank]
+    pub d_markov_w2: GpuTensor,       // [vocab, rank]
+    pub d_confidence_proj: GpuTensor, // [1, h+rank]
+    pub d_confidence_bias: GpuTensor, // [1]
+}
+
+impl DsparkHeadsGrads {
+    /// Flatten in the SAME fixed order as `DsparkHeadsWeights::params()`.
+    pub fn flat(&self) -> Vec<&GpuTensor> {
+        vec![
+            &self.d_markov_w1,
+            &self.d_markov_w2,
+            &self.d_confidence_proj,
+            &self.d_confidence_bias,
+        ]
+    }
+}
+
+/// Backward-needed head activations. `markov_idx` is the flattened i32 gather
+/// index reused by the scatter in backward (so `prev_tokens` need not be
+/// threaded into `dspark_heads_backward`).
+pub struct DsparkHeadsActs {
+    pub draft_logits: GpuTensor,     // [block, vocab]  — head output
+    pub markov_latent: GpuTensor,    // [block, rank]   — markov_w1[prev]
+    pub confidence_logit: GpuTensor, // [block]         — pre-sigmoid
+    pub confidence_pred: GpuTensor,  // [block]         — sigmoid(logit)
+    pub markov_idx: GpuTensor,       // [block*rank] i32 (Raw) — gather/scatter index
+}
+
+/// Return head activations to the pool (GpuTensor has no Drop).
+pub fn free_dspark_heads_acts(gpu: &mut Gpu, a: DsparkHeadsActs) -> HipResult<()> {
+    let DsparkHeadsActs {
+        draft_logits,
+        markov_latent,
+        confidence_logit,
+        confidence_pred,
+        markov_idx,
+    } = a;
+    for t in [
+        draft_logits,
+        markov_latent,
+        confidence_logit,
+        confidence_pred,
+        markov_idx,
+    ] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
+}
+
+/// Return head grads to the pool after the optimizer step.
+pub fn free_dspark_heads_grads(gpu: &mut Gpu, g: DsparkHeadsGrads) -> HipResult<()> {
+    let DsparkHeadsGrads {
+        d_markov_w1,
+        d_markov_w2,
+        d_confidence_proj,
+        d_confidence_bias,
+    } = g;
+    for t in [
+        d_markov_w1,
+        d_markov_w2,
+        d_confidence_proj,
+        d_confidence_bias,
+    ] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
+}
+
+/// Upload a host i32 index as a Raw device tensor (rq gather/scatter read the
+/// buffer as `i32*`; the dtype tag is unused by those kernels).
+fn upload_idx_i32(gpu: &Gpu, data: &[i32], n: usize) -> HipResult<GpuTensor> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
+    gpu.upload_raw(bytes, &[n])
+}
+
+/// Row-concat `[x_head[b] ++ markov_latent[b]]` → `feat [block, h+rank]`.
+fn concat_feat(
+    gpu: &mut Gpu,
+    x_head: &GpuTensor,
+    markov_latent: &GpuTensor,
+    block: usize,
+    h: usize,
+    r: usize,
+) -> HipResult<GpuTensor> {
+    let feat = gpu.zeros(&[block * (h + r)], DType::F32)?;
+    for b in 0..block {
+        gpu.memcpy_dtod_at_auto(&feat.buf, b * (h + r) * 4, &x_head.buf, b * h * 4, h * 4)?;
+        gpu.memcpy_dtod_at_auto(
+            &feat.buf,
+            (b * (h + r) + h) * 4,
+            &markov_latent.buf,
+            b * r * 4,
+            r * 4,
+        )?;
+    }
+    Ok(feat)
+}
+
+// ── Heads forward ───────────────────────────────────────────────────────────
+
+/// Head forward. `x_head` `[block*h]` (body output); `prev_tokens` `[block]` are
+/// the previous-token ids per block position (VanillaMarkov step token); `lm_head`
+/// `[vocab*h]` is the frozen target-shared lm-head weight (HF `[out, in]`).
+///
+/// Produces `draft_logits [block*vocab]`, `markov_latent [block*rank]`,
+/// `confidence_logit`/`confidence_pred [block]` (saved for backward).
+pub fn dspark_heads_forward(
+    gpu: &mut Gpu,
+    x_head: &GpuTensor,
+    prev_tokens: &[u32],
+    lm_head: &GpuTensor,
+    w: &DsparkHeadsWeights,
+    cfg: &DsparkHeadsConfig,
+) -> HipResult<DsparkHeadsActs> {
+    let (h, v, r) = (cfg.h, cfg.vocab, cfg.markov_rank);
+    let block = x_head.shape.iter().product::<usize>() / h;
+    debug_assert_eq!(prev_tokens.len(), block);
+
+    // Flattened row index for markov_w1 gather/scatter: idx[b*r+j] = prev[b]*r + j.
+    let mut idx_host = vec![0i32; block * r];
+    for b in 0..block {
+        let base = prev_tokens[b] as i32 * r as i32;
+        for j in 0..r {
+            idx_host[b * r + j] = base + j as i32;
+        }
+    }
+    let markov_idx = upload_idx_i32(gpu, &idx_host, block * r)?;
+
+    // markov_latent = markov_w1[prev]  (row gather of rank-wide rows).
+    let markov_latent = gpu.zeros(&[block * r], DType::F32)?;
+    gpu.rq_gather_f32(
+        &w.markov_w1,
+        &markov_idx,
+        &markov_latent,
+        block * r,
+        block * r,
+    )?;
+
+    // markov_bias = markov_latent @ markov_w2ᵀ  [block, vocab].
+    let markov_bias = gpu.zeros(&[block * v], DType::F32)?;
+    linear_forward(gpu, &markov_latent, &w.markov_w2, &markov_bias, block, r, v)?;
+
+    // base_logits = x_head @ lm_headᵀ  [block, vocab]  (lm_head frozen).
+    let base_logits = gpu.zeros(&[block * v], DType::F32)?;
+    linear_forward(gpu, x_head, lm_head, &base_logits, block, h, v)?;
+
+    // draft_logits = base_logits + markov_bias.
+    let draft_logits = gpu.zeros(&[block * v], DType::F32)?;
+    gpu.add_f32(&base_logits, &markov_bias, &draft_logits)?;
+
+    // confidence: features = concat(x_head, markov_latent) → proj + bias → sigmoid.
+    let feat = concat_feat(gpu, x_head, &markov_latent, block, h, r)?;
+    let confidence_logit = gpu.zeros(&[block], DType::F32)?;
+    linear_forward(
+        gpu,
+        &feat,
+        &w.confidence_proj,
+        &confidence_logit,
+        block,
+        h + r,
+        1,
+    )?;
+    gpu.bias_add_f32(&confidence_logit, &w.confidence_bias, block, 1)?;
+    let confidence_pred = sigmoid_forward(gpu, &confidence_logit, block)?;
+
+    for t in [markov_bias, base_logits, feat] {
+        gpu.free_tensor(t)?;
+    }
+
+    Ok(DsparkHeadsActs {
+        draft_logits,
+        markov_latent,
+        confidence_logit,
+        confidence_pred,
+        markov_idx,
+    })
+}
+
+// ── Heads backward ──────────────────────────────────────────────────────────
+
+/// Head backward. `d_draft_logits` `[block*vocab]` and `d_confidence_pred`
+/// `[block]` are the two upstream seeds (either may be all-zero). Returns
+/// `(d_x_head [block*h], DsparkHeadsGrads)`. `d_x_head` sums the lm-head path
+/// and the confidence-feature path; `x_head`/`lm_head`/`w` are the same tensors
+/// passed to the forward.
+#[allow(clippy::too_many_arguments)]
+pub fn dspark_heads_backward(
+    gpu: &mut Gpu,
+    d_draft_logits: &GpuTensor,
+    d_confidence_pred: &GpuTensor,
+    acts: &DsparkHeadsActs,
+    x_head: &GpuTensor,
+    lm_head: &GpuTensor,
+    w: &DsparkHeadsWeights,
+    cfg: &DsparkHeadsConfig,
+) -> HipResult<(GpuTensor, DsparkHeadsGrads)> {
+    let (h, v, r) = (cfg.h, cfg.vocab, cfg.markov_rank);
+    let block = x_head.shape.iter().product::<usize>() / h;
+
+    // d_x_head and d_markov_latent accumulate contributions from both heads.
+    let d_x_head = gpu.zeros(&[block * h], DType::F32)?;
+    let d_markov_latent = gpu.zeros(&[block * r], DType::F32)?;
+
+    // ── draft_logits path: draft = base + markov_bias.
+    //   base = x_head @ lm_headᵀ ⇒ d_x_head = d_draft @ lm_head (lm_head frozen).
+    linear_backward_x(gpu, d_draft_logits, lm_head, &d_x_head, block, h, v, false)?; // first writer
+                                                                                     //   markov_bias = markov_latent @ markov_w2ᵀ.
+    let d_markov_w2 = gpu.zeros(&[v, r], DType::F32)?;
+    linear_backward_w(
+        gpu,
+        d_draft_logits,
+        &acts.markov_latent,
+        &d_markov_w2,
+        block,
+        r,
+        v,
+        false,
+    )?;
+    linear_backward_x(
+        gpu,
+        d_draft_logits,
+        &w.markov_w2,
+        &d_markov_latent,
+        block,
+        r,
+        v,
+        false,
+    )?; // first writer
+
+    // ── confidence path: pred = sigmoid(proj(feat) + bias), feat=concat(x_head, markov_latent).
+    let d_logit = sigmoid_backward(gpu, d_confidence_pred, &acts.confidence_pred, block)?;
+    let feat = concat_feat(gpu, x_head, &acts.markov_latent, block, h, r)?;
+    let d_confidence_proj = gpu.zeros(&[1, h + r], DType::F32)?;
+    linear_backward_w(
+        gpu,
+        &d_logit,
+        &feat,
+        &d_confidence_proj,
+        block,
+        h + r,
+        1,
+        false,
+    )?;
+    let d_feat = gpu.zeros(&[block * (h + r)], DType::F32)?;
+    linear_backward_x(
+        gpu,
+        &d_logit,
+        &w.confidence_proj,
+        &d_feat,
+        block,
+        h + r,
+        1,
+        false,
+    )?;
+    // bias grad = Σ_b d_logit[b]  (via dyᵀ·ones).
+    let ones = gpu.full_f32(&[block], 1.0)?;
+    let d_confidence_bias = gpu.zeros(&[1], DType::F32)?;
+    linear_backward_w(gpu, &d_logit, &ones, &d_confidence_bias, block, 1, 1, false)?;
+
+    // Split d_feat rows → d_x_head (cols 0..h) and d_markov_latent (cols h..h+r),
+    // accumulating onto the draft-path contributions.
+    let d_xh_conf = gpu.zeros(&[block * h], DType::F32)?;
+    let d_ml_conf = gpu.zeros(&[block * r], DType::F32)?;
+    for b in 0..block {
+        gpu.memcpy_dtod_at_auto(
+            &d_xh_conf.buf,
+            b * h * 4,
+            &d_feat.buf,
+            b * (h + r) * 4,
+            h * 4,
+        )?;
+        gpu.memcpy_dtod_at_auto(
+            &d_ml_conf.buf,
+            b * r * 4,
+            &d_feat.buf,
+            (b * (h + r) + h) * 4,
+            r * 4,
+        )?;
+    }
+    gpu.add_inplace_f32(&d_x_head, &d_xh_conf)?;
+    gpu.add_inplace_f32(&d_markov_latent, &d_ml_conf)?;
+
+    // ── markov_w1: scatter-add d_markov_latent rows by prev_token (zero-init).
+    let d_markov_w1 = gpu.zeros(&[v, r], DType::F32)?;
+    gpu.rq_scatter_add_f32(&d_markov_w1, &acts.markov_idx, &d_markov_latent, block * r)?;
+
+    for t in [
+        d_logit,
+        feat,
+        d_feat,
+        ones,
+        d_xh_conf,
+        d_ml_conf,
+        d_markov_latent,
+    ] {
+        gpu.free_tensor(t)?;
+    }
+
+    Ok((
+        d_x_head,
+        DsparkHeadsGrads {
+            d_markov_w1,
+            d_markov_w2,
+            d_confidence_proj,
+            d_confidence_bias,
+        },
+    ))
+}
+
+// ── Full drafter (body → heads) ─────────────────────────────────────────────
+
+/// Combined body + head weights. `params()` appends the head params AFTER the
+/// body params, preserving the body's fixed order (so an AdamW state built for
+/// the body remains a prefix of the full state).
+pub struct DsparkFullWeights {
+    pub body: DsparkDrafterWeights,
+    pub heads: DsparkHeadsWeights,
+}
+
+impl DsparkFullWeights {
+    /// Body params (in `DsparkDrafterWeights::params()` order) then head params
+    /// (in `DsparkHeadsWeights::params()` order).
+    pub fn params(&self) -> Vec<&GpuTensor> {
+        let mut v = self.body.params();
+        v.extend(self.heads.params());
+        v
+    }
+    pub fn param_sizes(&self) -> Vec<usize> {
+        self.params()
+            .iter()
+            .map(|t| t.shape.iter().product())
+            .collect()
+    }
+}
+
+/// Combined grads; `flat()` mirrors `DsparkFullWeights::params()` (body then heads).
+pub struct DsparkFullGrads {
+    pub body: DsparkDrafterGrads,
+    pub heads: DsparkHeadsGrads,
+}
+
+impl DsparkFullGrads {
+    pub fn flat(&self) -> Vec<&GpuTensor> {
+        let mut v = self.body.flat();
+        v.extend(self.heads.flat());
+        v
+    }
+}
+
+/// Saved activations for the full body → heads forward.
+pub struct DsparkFullActs {
+    pub body: DsparkDrafterActs,
+    pub heads: DsparkHeadsActs,
+}
+
+/// Borrowed view of the head outputs a train loop consumes.
+pub struct DsparkForwardOutput<'a> {
+    pub draft_logits: &'a GpuTensor,    // [block, vocab]
+    pub confidence_pred: &'a GpuTensor, // [block]
+    pub markov_latent: &'a GpuTensor,   // [block, rank]
+}
+
+impl DsparkFullActs {
+    pub fn output(&self) -> DsparkForwardOutput<'_> {
+        DsparkForwardOutput {
+            draft_logits: &self.heads.draft_logits,
+            confidence_pred: &self.heads.confidence_pred,
+            markov_latent: &self.heads.markov_latent,
+        }
+    }
+}
+
+/// Return a full forward's activations to the pool.
+pub fn free_dspark_full_acts(gpu: &mut Gpu, a: DsparkFullActs) -> HipResult<()> {
+    free_dspark_drafter_acts(gpu, a.body)?;
+    free_dspark_heads_acts(gpu, a.heads)?;
+    Ok(())
+}
+
+/// Full training forward: body (`dspark_drafter_forward_train`) → heads.
+#[allow(clippy::too_many_arguments)]
+pub fn dspark_drafter_forward_full(
+    gpu: &mut Gpu,
+    weights: &DsparkFullWeights,
+    cfg: &DsparkDrafterConfig,
+    heads_cfg: &DsparkHeadsConfig,
+    main_hidden: &GpuTensor,
+    block_embeds: &GpuTensor,
+    prev_tokens: &[u32],
+    lm_head: &GpuTensor,
+    ctx_positions: &[f32],
+    block_positions: &[f32],
+    bias: Option<&GpuTensor>,
+) -> HipResult<DsparkFullActs> {
+    let body = dspark_drafter_forward_train(
+        gpu,
+        &weights.body,
+        cfg,
+        main_hidden,
+        block_embeds,
+        ctx_positions,
+        block_positions,
+        bias,
+    )?;
+    let heads = dspark_heads_forward(
+        gpu,
+        body.x_head(),
+        prev_tokens,
+        lm_head,
+        &weights.heads,
+        heads_cfg,
+    )?;
+    Ok(DsparkFullActs { body, heads })
+}
+
+/// Full training backward: heads (from `d_draft_logits` + `d_confidence_pred`)
+/// → body (from the summed `d_x_head`). `d_main_hidden` rides inside `body`.
+#[allow(clippy::too_many_arguments)]
+pub fn dspark_drafter_backward_full(
+    gpu: &mut Gpu,
+    weights: &DsparkFullWeights,
+    cfg: &DsparkDrafterConfig,
+    heads_cfg: &DsparkHeadsConfig,
+    main_hidden: &GpuTensor,
+    lm_head: &GpuTensor,
+    acts: &DsparkFullActs,
+    d_draft_logits: &GpuTensor,
+    d_confidence_pred: &GpuTensor,
+) -> HipResult<DsparkFullGrads> {
+    let (d_x_head, heads) = dspark_heads_backward(
+        gpu,
+        d_draft_logits,
+        d_confidence_pred,
+        &acts.heads,
+        acts.body.x_head(),
+        lm_head,
+        &weights.heads,
+        heads_cfg,
+    )?;
+    let body =
+        dspark_drafter_backward(gpu, &weights.body, cfg, main_hidden, &acts.body, &d_x_head)?;
+    gpu.free_tensor(d_x_head)?;
+    Ok(DsparkFullGrads { body, heads })
 }
