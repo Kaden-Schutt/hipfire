@@ -41,3 +41,12 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
 - coherence-gate.sh CLEAN on qwen35 matrix (Phase 0). 
 - ep_decode_parity tp=1 ANCHOR PASS (mesh-driven EP == production, 35B-A3B).
 - All commits build; per-file rustfmt only (never qwen35/ds4/minimax/daemon fmt-debt files).
+
+## Capstone regression validation (HEAD 49aef4df, 23 commits)
+- `cargo build --workspace --features hipfire-runtime/deltanet`: 0 errors (whole engine).
+- No-GPU lib tests across hipfire-hardware/runtime/toy/llama/qwen2/minimax: 0 failures
+  (217 in hipfire-runtime alone + arch crates). No regression from the foundation.
+- GPU-validated: coherence-gate (Phase 0) + ep_decode_parity anchor (mesh EP).
+=> Foundation is production-safe + landable as one "Phase 0 + 0b-foundation + Phase-1a/2
+   pure-logic + §6 validate" PR. GPU-integration phases (fulfill upload, executor wiring,
+   ModelParallel hoist, TP kernels, ragged) are the mapped multi-session remainder.
