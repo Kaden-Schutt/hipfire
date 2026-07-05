@@ -95,13 +95,21 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
        the in-flight buffer with no invalidate before its later read. Fix: re-`sync_bo`
        the slot after `wait`, before read-back. `FROM_DEVICE` EINVALs on data BOs, but
        `TO_DEVICE` clean+invalidates on this driver. Now 0/16 reliable.
-     Remaining gap to the 20.7-TOPS compute rate is now **dispatch latency (~78 µs × 24 ≈
-     1.9 ms)**. Levers left: (1) **fewer dispatches** — MT is L1-capped, so the real win
-     is an **M-parallel, W-broadcast array topology** (R4-style memtile broadcast): all
-     M-blocks share the same W, so broadcasting W to the columns and giving each column a
-     distinct M-block cuts both the W re-feed (24× → ~3×) and the dispatch count (24 →
-     ~3); (2) zero-copy C handoff (DMA C straight to the consumer / keep in SHMEM). At
-     ~1 TOPS this is still below GPU (~50), so the step-4 hot-path hook stays gated.
+     - **M-parallel W-broadcast DONE + wins (`r6_gen_mp.py`).** Each of COLS cores
+       computes a distinct M-block over full N, sharing ONE broadcast W (shim → memtile →
+       all cores). W is read from DRAM once and one dispatch covers COLS M-blocks, so
+       M768·K512·N4096 is **3 dispatches, not 24**. End-to-end **~1.45 TOPS** (2.0–2.5 ms,
+       0/5 fail) vs 1.12 N-parallel — and it's *blocking*, so no pipelined-readback
+       coherence dance. Raw single dispatch = 3.07 TOPS: feed-bound on the memtile's 8-way
+       broadcast sync over 64 N-slabs, not compute. Standalone array + benches
+       (`r6_mp_verify`, `r6_mp_e2e`); wiring an M-parallel mode into `NpuGemm` is the
+       follow-up.
+     Levers left: (1) pipeline the 3 C read-backs / reduce broadcast-sync overhead
+       (bigger MT, fewer larger N-slabs); (2) the endgame — encode the **whole GEMM in one
+       instruction stream** (loop the `runtime_sequence` DMAs over all M/N/K blocks) so a
+       single dispatch computes the entire GEMM: one exec, one wait, one C read-back, no
+       per-block latency and no read-back coherence issue; (3) zero-copy C handoff. At
+       ~1.45 TOPS this is still below GPU (~50), so the step-4 hot-path hook stays gated.
 
    - **(superseded) 3c-old. Activations + output → the DMA (dynamic, per inference).** A and C are
      computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
