@@ -18,16 +18,20 @@
 //!   3. **Tied → Alias** — a tied lm_head records an alias, not an upload.
 //!   4. **Deferred refusal** — a dense TP shard on a Tp>1 mesh returns `Err`
 //!      (Phase-5 slicing not silently mis-placed).
+//!   5. **Expert-parallel** — on an Ep-2 mesh, each rank's resident tensor is the
+//!      compact blob of exactly its owned experts (byte-exact vs a `ShardConfig`
+//!      gather).
 //!
-//! Runs the 1×1 mesh always; additionally runs an emulated PP-2 mesh when a
-//! 2-rank `Gpus` can be brought up (`HIPFIRE_EMULATE_GPUS=2`), else reports it
-//! as skipped rather than failing.
+//! Runs the 1×1 mesh always; additionally runs emulated PP-2 + EP-2 meshes when
+//! a 2-rank `Gpus` can be brought up (`HIPFIRE_EMULATE_GPUS=2`), else reports
+//! them as skipped rather than failing.
 //!
 //! Run: cargo run -p hipfire-runtime --release --example fulfill_manifest_probe
 
 use hipfire_hardware::{DeviceMesh, DimKind};
 use hipfire_runtime::config::resolve_mesh;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use hipfire_runtime::weight_manifest::{
     placement_devices, FusedQkvLayout, PinTarget, ShardPolicy, WeightEntry,
 };
@@ -103,6 +107,62 @@ fn test_manifest() -> Vec<WeightEntry> {
         },
     ));
     m
+}
+
+/// Validate expert-parallel placement: each rank gets a compact blob of only
+/// its owned experts, byte-exact. Experts are the outermost dim so per-expert
+/// byte ranges are contiguous; we build the expected compaction with the same
+/// `ShardConfig` fulfill_manifest uses and byte-compare the readback.
+fn check_ep(label: &str, gpus: &Gpus) {
+    const N_EXPERTS: usize = 8;
+    const PER: usize = 16; // bytes per expert
+    let entry = WeightEntry::layer(
+        "experts",
+        0,
+        vec![N_EXPERTS, 4, 4],
+        DType::F16,
+        ShardPolicy::ExpertSharded {
+            n_experts: N_EXPERTS,
+            assign: ExpertAssign::Stride,
+        },
+    );
+    // Expert e occupies bytes [e*PER, (e+1)*PER); byte j of expert e = e*PER+j.
+    let bytes: Vec<u8> = (0..(N_EXPERTS * PER) as u32).map(|x| x as u8).collect();
+    let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+    let store = fulfill_manifest(&[entry.clone()], &mesh, N_LAYERS, gpus, |_| {
+        Ok(bytes.clone())
+    })
+    .unwrap_or_else(|e| panic!("[{label}] fulfill_manifest(EP) failed: {e}"));
+
+    let shard = ShardConfig::new(2, false, N_EXPERTS, ExpertAssign::Stride).unwrap();
+    let devs = placement_devices(&entry, &mesh, N_LAYERS);
+    assert_eq!(devs.len(), 2, "[{label}] expected Ep-2 placement");
+    for (rank, &dev) in devs.iter().enumerate() {
+        let owned = shard.experts_on_rank(rank);
+        let mut expected = Vec::new();
+        for &e in &owned {
+            expected.extend_from_slice(&bytes[e * PER..(e + 1) * PER]);
+        }
+        match store
+            .get("experts", Some(0), dev)
+            .unwrap_or_else(|| panic!("[{label}] experts missing on device {dev}"))
+        {
+            WeightHandle::Resident(t) => {
+                let got = readback(gpus, dev, t);
+                assert_eq!(
+                    got, expected,
+                    "[{label}] rank {rank} (dev {dev}) owns {owned:?} — compact blob mismatch"
+                );
+            }
+            _ => panic!("[{label}] experts should be Resident, not Alias"),
+        }
+    }
+    println!(
+        "[{label}] OK — EP compact expert blobs byte-verified on {} ranks (rank0 {:?}, rank1 {:?})",
+        devs.len(),
+        shard.experts_on_rank(0),
+        shard.experts_on_rank(1)
+    );
 }
 
 /// Read a resident tensor's bytes back off its device.
@@ -201,6 +261,8 @@ fn main() {
             let mesh = resolve_mesh(2, 1, Some(2));
             assert!(mesh.has_axis(DimKind::Pp), "expected a Pp mesh");
             check("pp-2-emulated", &mesh, &gpus2);
+            // Same 2 ranks, Ep axis: expert-parallel compact-blob placement.
+            check_ep("ep-2-emulated", &gpus2);
         }
         Err(e) => {
             println!("pp-2-emulated: SKIPPED (could not bring up 2-rank Gpus: {e})");

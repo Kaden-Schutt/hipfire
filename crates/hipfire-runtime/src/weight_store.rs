@@ -14,18 +14,14 @@
 //! value is a [`WeightHandle`] (`Resident` GPU tensor or `Alias` of another
 //! entry). See docs/…/2026-07-05-device-mesh-transparent-parallelism.md §4.
 //!
-//! **Scope of this landing (deliberately minimal — "Simplicity First").** The
-//! only placement a `Pp`/single mesh ever needs is *whole-tensor upload*:
-//! pipeline parallelism bands whole layers across stages and never slices a
-//! tensor; only tensor-parallel (`Column`/`Row`/`FusedQkv`/`Head`/`Vocab` at
-//! `Tp>1`) and expert-parallel (`ExpertSharded`) actually cut a tensor, and the
-//! plan defers live TP to Phase 5 and the arch-specific MoE packed-blob
-//! convention to its own unit. So this driver handles the whole-tensor path
-//! (which covers single-GPU + all of PP + every `Replicate`/`Pin`/`Tied`, and
-//! any sharding policy that degenerates to a size-1 group) and returns a clear
-//! [`FulfillError`] for the still-unimplemented slicing policies, rather than
-//! speculatively re-encoding the quant-blob host-gather the bespoke loaders
-//! already do.
+//! **Scope of this landing.** Two placements are implemented: *whole-tensor
+//! upload* (single-GPU + all of PP + every `Replicate`/`Pin`/`Tied`, and any
+//! sharding policy that degenerates to a size-1 group) and *expert-parallel
+//! `ExpertSharded`* on an `Ep>1` mesh (each rank gets a compact blob of its
+//! owned experts — a generic expert-outermost host gather). **Dense tensor-
+//! parallel slicing** (`Column`/`Row`/`FusedQkv`/`Head`/`Vocab` at `Tp>1`)
+//! returns a clear [`FulfillError`]: it needs the quant-blob row-gather that is
+//! Phase-5 work, and refusing beats speculatively re-encoding it.
 //!
 //! **Why a `source` closure, not `&HfqFile`.** A [`WeightEntry`] names tensors
 //! *logically* (`"wq"`, `"ffn_down"`); the on-disk HFQ names are arch-specific
@@ -37,6 +33,7 @@
 //! tensor. (The plan sketches `fulfill_manifest(manifest, hfq, mesh)`; the
 //! source closure is the same shape with the name-resolution seam made explicit.)
 
+use crate::tp_shard::ShardConfig;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry};
 use hipfire_hardware::DeviceMesh;
 use rdna_compute::GpuTensor;
@@ -128,10 +125,13 @@ impl std::fmt::Display for FulfillError {
 
 impl std::error::Error for FulfillError {}
 
-/// True for a policy that cuts the tensor across a group of size ≥ 2 — the
-/// slicing this landing defers. A group of size 1 (single-GPU / PP stage) never
-/// slices, so a sharding policy there degenerates to a whole-tensor upload.
-fn is_slicing_policy(policy: &ShardPolicy) -> bool {
+/// True for a **dense** TP policy that cuts a single matrix across a group of
+/// size ≥ 2 — the row/column/head slicing this landing defers to Phase 5. A
+/// group of size 1 (single-GPU / PP stage) never slices, so such a policy there
+/// degenerates to a whole-tensor upload. `ExpertSharded` is *not* here: it is
+/// handled directly (expert-outermost slicing is generic, unlike the quant-blob
+/// row-gather the dense TP shards need).
+fn is_dense_tp_slice(policy: &ShardPolicy) -> bool {
     matches!(
         policy,
         ShardPolicy::ColumnShard { .. }
@@ -139,8 +139,29 @@ fn is_slicing_policy(policy: &ShardPolicy) -> bool {
             | ShardPolicy::FusedQkv { .. }
             | ShardPolicy::HeadSharded { .. }
             | ShardPolicy::VocabShard { .. }
-            | ShardPolicy::ExpertSharded { .. }
     )
+}
+
+/// Pack the bytes of a rank's *owned* experts into one compact blob. Experts are
+/// the **outermost** dim of a routed-expert tensor (each expert is a
+/// self-contained quant matrix), so per-expert byte ranges are contiguous and
+/// the compaction is a generic host gather — no arch-specific quant knowledge.
+/// (This is the *placement* the deepseek4 EP loader produces; the per-expert
+/// pointer table + zeroed-dummy for non-owned experts is a forward-indexing
+/// concern the arch owns, not part of where the bytes land.)
+fn expert_compact_blob(bytes: &[u8], n_experts: usize, owned: &[usize]) -> Result<Vec<u8>, String> {
+    if n_experts == 0 || bytes.len() % n_experts != 0 {
+        return Err(format!(
+            "experts blob {} not divisible by n_experts {n_experts}",
+            bytes.len()
+        ));
+    }
+    let per = bytes.len() / n_experts;
+    let mut out = Vec::with_capacity(per * owned.len());
+    for &e in owned {
+        out.extend_from_slice(&bytes[e * per..(e + 1) * per]);
+    }
+    Ok(out)
 }
 
 /// Execute a weight manifest against a mesh: for each entry, compute its
@@ -155,11 +176,13 @@ fn is_slicing_policy(policy: &ShardPolicy) -> bool {
 /// yet a forward-consumable operand (Phase 3 re-derives dtype from the manifest
 /// when it wires the store into the forward).
 ///
-/// **Deferred policies return `Err`, not silent wrong placement:**
-/// `ExpertSharded` (arch-specific MoE packed-blob + zeroed-dummy) and any dense
-/// TP slice at `Tp>1` (`Column`/`Row`/`FusedQkv`/`Head`/`Vocab`) are Phase-5 /
-/// EP-unit work; hitting one is a hard error so a caller can't mistake a
-/// half-supported mesh for a full one.
+/// `ExpertSharded` on an `Ep>1` mesh is handled directly: each rank receives a
+/// compact blob of only its owned experts (the generic expert-outermost gather;
+/// the arch's forward owns the per-expert pointer table + zeroed-dummy for
+/// non-owned experts). **Dense TP slices at `Tp>1`** (`Column`/`Row`/`FusedQkv`/
+/// `Head`/`Vocab`) still return `Err` — they need the quant-blob row-gather that
+/// is Phase-5 work; refusing keeps a caller from mistaking a half-supported mesh
+/// for a full one.
 ///
 /// Not transactional on mid-load OOM yet (matches the existing bespoke loaders,
 /// which `hipMalloc` + leak): the §6 free-and-`Err`-all guard is a documented
@@ -191,21 +214,78 @@ where
             continue;
         }
 
-        // Slicing policies across a real (≥2) group are not implemented in this
+        // Expert-parallel: each rank (device in the Ep group) gets a compact
+        // blob of only its OWNED experts. Generic — expert-outermost slicing is
+        // contiguous, no arch-specific quant handling. (Size-1 group falls
+        // through to whole-tensor: all experts on the one device.)
+        if let ShardPolicy::ExpertSharded { n_experts, assign } = &entry.policy {
+            if devices.len() > 1 {
+                let tp_size = devices.len();
+                let shard = ShardConfig::new(tp_size, false, *n_experts, *assign).map_err(|e| {
+                    FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: *devices.first().unwrap_or(&0),
+                        reason: format!("ExpertSharded: {e}"),
+                    }
+                })?;
+                let bytes = source(entry).map_err(|e| FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: *devices.first().unwrap_or(&0),
+                    reason: format!("source read failed: {e}"),
+                })?;
+                for (rank, &dev) in devices.iter().enumerate() {
+                    let owned = shard.experts_on_rank(rank);
+                    let compact = expert_compact_blob(&bytes, *n_experts, &owned).map_err(|e| {
+                        FulfillError {
+                            name: entry.name.clone(),
+                            layer: entry.layer,
+                            device: dev,
+                            reason: e,
+                        }
+                    })?;
+                    // Compact shape: owned-expert count on the outermost dim.
+                    let mut shape = entry.logical_shape.clone();
+                    if let Some(first) = shape.first_mut() {
+                        *first = owned.len();
+                    }
+                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                    })?;
+                    let tensor = gpu.upload_raw(&compact, &shape).map_err(|e| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("upload_raw failed: {e}"),
+                    })?;
+                    store.insert(
+                        &entry.name,
+                        entry.layer,
+                        dev,
+                        WeightHandle::Resident(tensor),
+                    );
+                }
+                continue;
+            }
+        }
+
+        // Dense TP slicing across a real (≥2) group is not implemented in this
         // landing — refuse rather than mis-place. A size-1 group degenerates to
         // a whole-tensor upload and is fine.
-        if is_slicing_policy(&entry.policy) && devices.len() > 1 {
-            let kind = match &entry.policy {
-                ShardPolicy::ExpertSharded { .. } => {
-                    "ExpertSharded (MoE packed-blob) upload is a separate EP unit"
-                }
-                _ => "dense TP slicing (Column/Row/FusedQkv/Head/Vocab) is Phase 5",
-            };
+        if is_dense_tp_slice(&entry.policy) && devices.len() > 1 {
             return Err(FulfillError {
                 name: entry.name.clone(),
                 layer: entry.layer,
                 device: *devices.first().unwrap_or(&0),
-                reason: format!("{kind}; group size {} > 1", devices.len()),
+                reason: format!(
+                    "dense TP slicing (Column/Row/FusedQkv/Head/Vocab) is Phase 5; \
+                     group size {} > 1",
+                    devices.len()
+                ),
             });
         }
 
@@ -259,20 +339,38 @@ mod tests {
     // The upload path is covered by the GPU example fulfill_manifest_probe.
 
     #[test]
-    fn slicing_policy_classification() {
-        assert!(is_slicing_policy(&ShardPolicy::RowShard { axis: 1 }));
-        assert!(is_slicing_policy(&ShardPolicy::ColumnShard { axis: 0 }));
-        assert!(is_slicing_policy(&ShardPolicy::ExpertSharded {
+    fn dense_tp_slice_classification() {
+        assert!(is_dense_tp_slice(&ShardPolicy::RowShard { axis: 1 }));
+        assert!(is_dense_tp_slice(&ShardPolicy::ColumnShard { axis: 0 }));
+        assert!(is_dense_tp_slice(&ShardPolicy::VocabShard { axis: 0 }));
+        // ExpertSharded is NOT a dense TP slice — it has its own generic path.
+        assert!(!is_dense_tp_slice(&ShardPolicy::ExpertSharded {
             n_experts: 8,
             assign: ExpertAssign::Stride
         }));
-        assert!(is_slicing_policy(&ShardPolicy::VocabShard { axis: 0 }));
         // Whole-tensor policies never slice.
-        assert!(!is_slicing_policy(&ShardPolicy::Replicate));
-        assert!(!is_slicing_policy(&ShardPolicy::Pin(PinTarget::Embed)));
-        assert!(!is_slicing_policy(&ShardPolicy::Tied {
+        assert!(!is_dense_tp_slice(&ShardPolicy::Replicate));
+        assert!(!is_dense_tp_slice(&ShardPolicy::Pin(PinTarget::Embed)));
+        assert!(!is_dense_tp_slice(&ShardPolicy::Tied {
             source: "x".into()
         }));
+    }
+
+    #[test]
+    fn expert_compact_blob_gathers_owned() {
+        // 4 experts, 3 bytes each; rank owns experts [1, 3] (stride tp=2, rank 1).
+        let bytes: Vec<u8> = (0..12).collect(); // e0=0..3 e1=3..6 e2=6..9 e3=9..12
+        let owned = vec![1, 3];
+        let out = expert_compact_blob(&bytes, 4, &owned).unwrap();
+        assert_eq!(out, vec![3, 4, 5, 9, 10, 11]);
+        // Non-divisible blob → error (shape/quant mismatch caught at load).
+        assert!(expert_compact_blob(&bytes, 5, &owned).is_err());
+        // Empty owned → empty blob (a rank owning no experts is caught upstream
+        // by ShardConfig::new, but the gather itself is well-defined).
+        assert_eq!(
+            expert_compact_blob(&bytes, 4, &[]).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -295,20 +393,21 @@ mod tests {
         assert!(s.get("wo", Some(2), 0).is_none());
     }
 
-    // The refusal path is checkable without a GPU: a row-shard on a 2-device
-    // Ep/Tp mesh must Err before any upload. We can't build a real `Gpus`
+    // The dense-TP refusal path is checkable without a GPU: a row-shard on a
+    // 2-device Tp mesh must Err before any upload. We can't build a real `Gpus`
     // without a GPU, so we assert the *decision* via placement + classifier
     // (the same predicates fulfill_manifest branches on).
     #[test]
-    fn deferred_slicing_would_refuse_on_multi_device() {
+    fn dense_tp_slice_would_refuse_on_multi_device() {
         // RowShard maps to the Tp group, so a Tp-2 mesh gives a 2-device split
         // → refusal. (On an Ep-only mesh it degenerates to a Tp singleton.)
         let tp2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
         let e = wl("wo", 0, ShardPolicy::RowShard { axis: 1 });
         let devs = placement_devices(&e, &tp2, 4);
         assert_eq!(devs.len(), 2);
-        assert!(is_slicing_policy(&e.policy) && devs.len() > 1);
-        // ExpertSharded refuses on a 2-device Ep mesh (its own axis).
+        assert!(is_dense_tp_slice(&e.policy) && devs.len() > 1);
+        // ExpertSharded on a 2-device Ep mesh is NOT refused — it has its own
+        // path — but it does place across the whole Ep group.
         let ep2 = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
         let exp = wl(
             "experts",
@@ -320,11 +419,11 @@ mod tests {
         );
         let edevs = placement_devices(&exp, &ep2, 4);
         assert_eq!(edevs.len(), 2);
-        assert!(is_slicing_policy(&exp.policy) && edevs.len() > 1);
-        // Same entry on a single mesh degenerates to whole-tensor (no refusal).
+        assert!(!is_dense_tp_slice(&exp.policy));
+        // Same dense entry on a single mesh degenerates to whole-tensor (no refusal).
         let single = DeviceMesh::single();
         let devs1 = placement_devices(&e, &single, 4);
         assert_eq!(devs1, vec![0]);
-        assert!(!(is_slicing_policy(&e.policy) && devs1.len() > 1));
+        assert!(!(is_dense_tp_slice(&e.policy) && devs1.len() > 1));
     }
 }
