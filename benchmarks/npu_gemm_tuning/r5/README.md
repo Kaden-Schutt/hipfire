@@ -100,8 +100,18 @@ systolic dataflow no shipped kernel uses is validated end-to-end.**
 `r5_build.sh <mlir> <workdir> [KSLICE]` builds any R5 cascade design (compiles the
 head/mid/tail objects, runs aiecc) → `final.xclbin` + `insts.bin`, reproducibly.
 
-**Next:** scale to a **4-core column** (head + 2 middle + tail, full K-split down the
-column via `r5_cascade_mid`) — validate the sum still holds — then broadcast across
-**8 columns = 32 cores** and measure the real (INNER=0) TOPS through NpuKernel against
-SOTA's ~5. If the cascade keeps C resident and kills the per-tile reload, this is
-where it should break past ~15.7 toward the ~40 capacity.
+**4. 4-core column + FULL 32-core array validated on hardware.** `r5_4core.mlir`
+(head + 2 `mid` + tail down column 0) → `C[0]=1024` (4×256, summed through the two
+middle get+add+put cores). `r5_gen.py COLS ROWS` emits an arbitrary cascade array;
+the generated **8×4 = 32-core** design builds and dispatches with **all 8 column C
+blocks = 1024** — the cascade dataflow works at full array scale. So the mechanism is
+proven end-to-end from 2 → 4 → 32 cores.
+
+**Next — the payoff measurement.** The current design does one cascade round per
+dispatch (overhead-dominated for throughput). To measure whether keeping C resident
+beats the ~5-TOPS real-GEMM wall, the cores need to stream many output tiles per
+dispatch (an `N_BTILES` loop, streaming each core's K-slice weights, tail storing
+C[n]) so the per-output-tile cost (one cascade transfer + fifo acquire, *no* C
+reload) is amortized and measurable. That streaming-cascade kernel + a
+`r5_gen.py`-style array is the next build; then measure real (INNER=0) TOPS through
+NpuKernel vs SOTA's ~5 and the 15.7 reference.
