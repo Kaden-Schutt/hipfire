@@ -37,3 +37,15 @@ HIPFIRE_FORWARD_LOWERED oracle (single-GPU) + EP-decode byte-identity → GPU.
 - Phase 4: qwen2 ForwardBindings reach.
 - Phase 5/5a/5b: live head-axis TP + DeltaNet head-shard + emulation heterogeneity + ragged/mixed-arch.
 - Phase 6: Tier-2 slot-binding (optional). Phase 7: initiate follow-ups (spec-decode/VL/TP tracks).
+
+## DECISION: literal single-GPU+EP one-signature merge NOT pursued (0b)
+The plan's "ONE run_layer_program(mesh,...)" is served at the module level (both
+executors in dispatch, mesh-driven, sharing dispatch_super_op/ForwardBindings/
+LayerProgram). A literal single-signature merge would need a union params struct
+(single needs DispatchCtx; EP needs partials/residual_dim; single-GPU MoE uses
+run_moe while EP uses run_moe_ep+partial+all-reduce) threaded through every
+arch's per-token hot-path call site — high ripple, hot-path risk, cosmetic gain.
+The plan's OWN history (memory: N1 "unified step contract") REJECTED exactly this
+shape as overcomplicated (3 review rounds). Engineering call: keep the two
+mesh-aware executors; the mesh is the unification. Revisit only if a concrete
+consumer needs the single entry.
