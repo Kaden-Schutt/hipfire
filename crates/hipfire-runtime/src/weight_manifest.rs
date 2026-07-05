@@ -143,6 +143,37 @@ impl WeightEntry {
     }
 }
 
+/// The kind of per-layer state an arch holds — placed by the same mesh
+/// projection as weights (co-resident with its layer's stage under PP,
+/// replicated or head-sharded under TP). Collapses the ~15 format-exploded
+/// `KvCache::*_multi` ctors + the DeltaNet `la_to_device` sidecar into one
+/// keyed store (device-mesh plan §4).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StateKind {
+    /// KV cache in a given quant mode (the quant string, e.g. "q8"/"fwht2").
+    Kv { quant: String },
+    /// Recurrent state (DeltaNet S-matrix) — head-sharded under TP.
+    Recurrent,
+    /// Conv state (lfm2moe short conv) — kernel_size-1 elems per conv layer.
+    Conv,
+}
+
+/// One entry in an arch's *state* manifest. `layer` is the **global** layer
+/// index (the store keys by global index, which is what defines the DeltaNet
+/// LA-compact `la_to_device` sidecar out of existence — the LA-vs-full-attn
+/// knowledge lives in manifest construction via `config.layer_types`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StateEntry {
+    pub kind: StateKind,
+    pub layer: usize,
+}
+
+impl StateEntry {
+    pub fn new(kind: StateKind, layer: usize) -> Self {
+        Self { kind, layer }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +224,15 @@ mod tests {
             collective_for_policy(&ShardPolicy::Pin(PinTarget::Embed)),
             None
         );
+    }
+
+    #[test]
+    fn state_entry_keyed_by_global_layer() {
+        let s = StateEntry::new(StateKind::Kv { quant: "q8".into() }, 7);
+        assert_eq!(s.layer, 7);
+        assert!(matches!(s.kind, StateKind::Kv { .. }));
+        let r = StateEntry::new(StateKind::Recurrent, 3);
+        assert!(matches!(r.kind, StateKind::Recurrent));
     }
 
     #[test]

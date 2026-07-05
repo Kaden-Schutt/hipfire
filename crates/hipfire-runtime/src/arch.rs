@@ -164,6 +164,13 @@ pub trait Architecture: Send + 'static {
         unimplemented!("weight_manifest not yet implemented for this arch")
     }
 
+    /// Declarative per-layer state manifest (KV/recurrent/conv) — sibling of
+    /// [`Architecture::weight_manifest`], placed by the same mesh projection.
+    /// Default empty (arches opt in). See device-mesh plan §4.
+    fn state_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::StateEntry> {
+        Vec::new()
+    }
+
     // Forward pass shapes are arch-specific; declare the surface but
     // don't constrain types in this trait — concrete arch crates
     // expose their own typed forward methods. The runtime's generic
