@@ -423,7 +423,7 @@ pub const ENV_HIPFIRE_DDTREE_PATH_B_CAPTURE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_PATH_C: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_PATH_C",
     description: "Resolve \"HIPFIRE_DDTREE_PATH_C\" ONCE before the decode loop. The",
-    source: "crates/hipfire-serving-core/src/generate.rs:849",
+    source: "crates/hipfire-serving-core/src/generate.rs:859",
 };
 
 /// `HIPFIRE_DDTREE_PATH_C_VERBOSE` — Runtime variable controlling DDTree path c verbose in hipfire
@@ -528,7 +528,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_BATCH_HEAD: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_CACHE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_CACHE_TRACE",
     description: "Runtime variable controlling deepseek4 cache trace in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_arch.rs:981",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:979",
 };
 
 /// `HIPFIRE_DEEPSEEK4_CHAT_RAW` — Enabled when set to 1
@@ -563,7 +563,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_DSA_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_DUMP_PROMPT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_DUMP_PROMPT",
     description: "Runtime variable controlling deepseek4 dump prompt in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_arch.rs:324",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:326",
 };
 
 /// `HIPFIRE_DEEPSEEK4_DUMP_STATE` — Selects behavior from recognized values
@@ -787,14 +787,14 @@ pub const ENV_HIPFIRE_DEEPSEEK4_SEED: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_SPEC_DECODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_SPEC_DECODE",
     description: "Priority: 1. legacy env var → 2. generic env var → 3. stored config → default",
-    source: "crates/hipfire-serving-core/src/generate_arch.rs:346",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:348",
 };
 
 /// `HIPFIRE_DEEPSEEK4_SPEC_K` — Runtime variable controlling deepseek4 spec k in hipfire
 pub const ENV_HIPFIRE_DEEPSEEK4_SPEC_K: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_SPEC_K",
     description: "Runtime variable controlling deepseek4 spec k in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_arch.rs:354",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:356",
 };
 
 /// `HIPFIRE_DEEPSEEK4_TEMP` — Runtime variable controlling deepseek4 temp in hipfire
@@ -2248,14 +2248,14 @@ pub const ENV_HIPFIRE_MTP_HEAD_LMHEAD_WMMA: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_MTP_K: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_K",
     description: "Runtime variable controlling MTP k in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_arch.rs:358",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:360",
 };
 
 /// `HIPFIRE_MTP_MODE` — Defaults to auto when unset
 pub const ENV_HIPFIRE_MTP_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_MTP_MODE",
     description: "Defaults to auto when unset",
-    source: "crates/hipfire-serving-core/src/generate_arch.rs:349",
+    source: "crates/hipfire-serving-core/src/generate_arch.rs:351",
 };
 
 /// `HIPFIRE_MTP_PHASE_TIMERS` — Env-gated phase timers (HIPFIRE_MTP_PHASE_TIMERS=1). The existing
@@ -2598,7 +2598,7 @@ pub const ENV_HIPFIRE_PFLASH_DAEMON_LABELS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PFLASH_DEBUG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DEBUG",
     description: "Runtime variable controlling pflash debug in hipfire",
-    source: "crates/hipfire-serving-core/src/generate.rs:2480",
+    source: "crates/hipfire-serving-core/src/generate.rs:2484",
 };
 
 /// `HIPFIRE_PFLASH_DRAFTER_KV` — Selects behavior from recognized values

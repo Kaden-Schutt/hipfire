@@ -61,7 +61,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:10989` |
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:2545` |
 | `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `crates/hipfire-arch-qwen35/src/speculative.rs:11028` |
-| `HIPFIRE_DDTREE_PATH_C` | Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The | `crates/hipfire-serving-core/src/generate.rs:849` |
+| `HIPFIRE_DDTREE_PATH_C` | Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The | `crates/hipfire-serving-core/src/generate.rs:859` |
 | `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:11553` |
 | `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` | Runtime variable controlling DDTree path c verify graph in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:218` |
 | `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:11008` |
@@ -76,12 +76,12 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT` | Runtime variable controlling deepseek4 attn topk direct in hipfire | `crates/hipfire-arch-deepseek4/src/forward.rs:6506` |
 | `HIPFIRE_DEEPSEEK4_ATTN_TWIN` | DEBUG: same-process twin-call test (HIPFIRE_DEEPSEEK4_ATTN_TWIN=1) | `crates/hipfire-arch-deepseek4/src/forward.rs:6202` |
 | `HIPFIRE_DEEPSEEK4_BATCH_HEAD` | Opt-out: HIPFIRE_DEEPSEEK4_BATCH_HEAD=0 forces the legacy per-position | `crates/hipfire-arch-deepseek4/src/forward.rs:8164` |
-| `HIPFIRE_DEEPSEEK4_CACHE_TRACE` | Runtime variable controlling deepseek4 cache trace in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:981` |
+| `HIPFIRE_DEEPSEEK4_CACHE_TRACE` | Runtime variable controlling deepseek4 cache trace in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:979` |
 | `HIPFIRE_DEEPSEEK4_CHAT_RAW` | Enabled when set to 1 | `crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:183` |
 | `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` | Opt out via HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=0 | `crates/hipfire-arch-deepseek4/src/forward.rs:6577` |
 | `HIPFIRE_DEEPSEEK4_COMP_ROPE_POS` | Runtime variable controlling deepseek4 comp rope pos in hipfire | `crates/hipfire-arch-deepseek4/src/forward.rs:5238` |
 | `HIPFIRE_DEEPSEEK4_DSA_WMMA` | Head-batched f16-WMMA gathered DSA attention; f32 fallback on | `crates/hipfire-arch-deepseek4/src/forward.rs:7114` |
-| `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | Runtime variable controlling deepseek4 dump prompt in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:324` |
+| `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | Runtime variable controlling deepseek4 dump prompt in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:326` |
 | `HIPFIRE_DEEPSEEK4_DUMP_STATE` | Selects behavior from recognized values | `crates/hipfire-arch-deepseek4/src/forward.rs:203` |
 | `HIPFIRE_DEEPSEEK4_DUMP_TOPK` | Gate 1 validation (2026-05-22): dump per-layer topk_indices to a | `crates/hipfire-dispatch/src/pipeline/mod.rs:1072` |
 | `HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END` | Runtime variable controlling deepseek4 expert layer end in hipfire | `crates/hipfire-arch-deepseek4/src/arch.rs:599` |
@@ -113,8 +113,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | bench_q8_wmma_variants. Opt-out via HIPFIRE_DEEPSEEK4_Q8_WMMA=0 | `crates/hipfire-arch-deepseek4/src/forward.rs:246` |
 | `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` | Runtime variable controlling deepseek4 route scale in hipfire | `crates/hipfire-arch-deepseek4/src/forward.rs:7476` |
 | `HIPFIRE_DEEPSEEK4_SEED` | Runtime variable controlling deepseek4 seed in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:554` |
-| `HIPFIRE_DEEPSEEK4_SPEC_DECODE` | Priority: 1. legacy env var → 2. generic env var → 3. stored config → default | `crates/hipfire-serving-core/src/generate_arch.rs:346` |
-| `HIPFIRE_DEEPSEEK4_SPEC_K` | Runtime variable controlling deepseek4 spec k in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:354` |
+| `HIPFIRE_DEEPSEEK4_SPEC_DECODE` | Priority: 1. legacy env var → 2. generic env var → 3. stored config → default | `crates/hipfire-serving-core/src/generate_arch.rs:348` |
+| `HIPFIRE_DEEPSEEK4_SPEC_K` | Runtime variable controlling deepseek4 spec k in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:356` |
 | `HIPFIRE_DEEPSEEK4_TEMP` | Runtime variable controlling deepseek4 temp in hipfire | `crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:184` |
 | `HIPFIRE_DEEPSEEK4_TOP_K` | for local deployment; we honor that as the default. Pure greedy | `crates/hipfire-serving-core/src/generate_arch.rs:550` |
 | `HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS` | without them). Opt out with "HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS=0" | `crates/hipfire-arch-deepseek4/src/arch.rs:595` |
@@ -321,8 +321,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_MTP_DEVICE_TOKEN_CHAIN` | Default on: this path is token-identical in greedy mode and removes the | `crates/hipfire-arch-qwen35/src/mtp_spec.rs:82` |
 | `HIPFIRE_MTP_GPU_ACCEPT` | Default on for greedy device-token-chain MTP: candidates and verify | `crates/hipfire-arch-qwen35/src/mtp_spec.rs:107` |
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | HIPFIRE_MTP_HEAD_LMHEAD_WMMA=0. (Ported from origin/master 5ac96a8f.) | `crates/hipfire-arch-qwen35/src/mtp_head.rs:2063` |
-| `HIPFIRE_MTP_K` | Runtime variable controlling MTP k in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:358` |
-| `HIPFIRE_MTP_MODE` | Defaults to auto when unset | `crates/hipfire-serving-core/src/generate_arch.rs:349` |
+| `HIPFIRE_MTP_K` | Runtime variable controlling MTP k in hipfire | `crates/hipfire-serving-core/src/generate_arch.rs:360` |
+| `HIPFIRE_MTP_MODE` | Defaults to auto when unset | `crates/hipfire-serving-core/src/generate_arch.rs:351` |
 | `HIPFIRE_MTP_PHASE_TIMERS` | Env-gated phase timers (HIPFIRE_MTP_PHASE_TIMERS=1). The existing | `crates/hipfire-arch-qwen35/src/mtp_spec.rs:1348` |
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | Runtime variable controlling MTP proposal graph in hipfire | `crates/hipfire-arch-qwen35/src/mtp_spec.rs:187` |
 | `HIPFIRE_MTP_P_MIN` | Runtime variable controlling MTP p min in hipfire | `crates/hipfire-arch-qwen35/src/mtp_spec.rs:147` |
@@ -371,7 +371,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_PERF_BASELINE_DIR` | Runtime variable controlling perf baseline dir in hipfire | `crates/hipfire-eval/src/executor_examples.rs:1338` |
 | `HIPFIRE_PERPLEXITY_BIN` | Runtime variable controlling perplexity bin in hipfire | `crates/hipfire-eval/src/lib.rs:1224` |
 | `HIPFIRE_PFLASH_DAEMON_LABELS` | Runtime variable controlling pflash daemon labels in hipfire | `crates/hipfire-train/examples/ssm_drafter_train.rs:66` |
-| `HIPFIRE_PFLASH_DEBUG` | Runtime variable controlling pflash debug in hipfire | `crates/hipfire-serving-core/src/generate.rs:2480` |
+| `HIPFIRE_PFLASH_DEBUG` | Runtime variable controlling pflash debug in hipfire | `crates/hipfire-serving-core/src/generate.rs:2484` |
 | `HIPFIRE_PFLASH_DRAFTER_KV` | Selects behavior from recognized values | `crates/hipfire-arch-qwen35/src/pflash.rs:534` |
 | `HIPFIRE_PFLASH_DRAFTER_STATE` | Hybrid drafter only stores K (and V for chat-path) at | `crates/hipfire-arch-qwen35/src/pflash.rs:621` |
 | `HIPFIRE_PFLASH_FRESH` | resume: reload weights + AdamW state from the checkpoint unless FRESH=1 | `crates/hipfire-train/examples/pflash_drafter_train.rs:366` |

@@ -665,6 +665,18 @@ pub trait Speculator {
     /// applies the IDENTICAL (top_k,top_p) nucleus truncation to draft + target
     /// inside `step` (lossless == AR-at-(top_k,top_p)). `temp <= 0` ⇒ greedy.
     fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
+
+    /// Drain any strategy-SPECIALIZED metrics accumulated over the request, to be
+    /// merged into the `done` event alongside the arch-agnostic `SpecMetrics`
+    /// block. Default `None`: a strategy contributes nothing beyond the canonical
+    /// primitives. A specialized drafter (dspark confidence histogram, ddtree tree
+    /// size, seed-oracle, ...) overrides this to return its own JSON object — the
+    /// serving layer merges it without ever naming the strategy. Called once at the
+    /// `done` site after the decode loop; `&mut` so the impl may reset its
+    /// per-request accumulators.
+    fn drain_extra_metrics(&mut self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────

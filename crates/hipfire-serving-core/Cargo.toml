@@ -24,6 +24,7 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-specdecode = { path = "../hipfire-specdecode" }
 hipfire-specdecode-dspark = { path = "../hipfire-specdecode-dspark" }
 hipfire-arch-nemotron = { path = "../hipfire-arch-nemotron" }
 hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }

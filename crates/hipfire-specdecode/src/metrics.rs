@@ -107,7 +107,7 @@ impl SpecMetrics {
     /// (`tau`, `accept_rate`, `windows`, ...) so every strategy reports uniformly.
     /// Rates rounded to 3 dp for stable JSON.
     pub fn to_json(&self) -> Value {
-        let r3 = |x: f32| ((x * 1000.0).round() / 1000.0) as f64;
+        let r3 = |x: f32| (x as f64 * 1000.0).round() / 1000.0;
         json!({
             "windows": self.windows,
             "proposed": self.proposed_total,

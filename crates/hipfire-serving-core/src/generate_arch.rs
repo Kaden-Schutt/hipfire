@@ -30,6 +30,8 @@ use crate::evidence::write_daemon_runtime_oneshot_evidence;
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter_from_profile;
 use crate::request::ThinkMode;
+use crate::spec_metrics::emit_spec_done;
+use hipfire_specdecode::SpecMetrics;
 use hipfire_specdecode_dspark::spec::PrefillOutcome;
 
 /// DeepSeek V4 Flash generate path: prefill via the batched scratch, then a
@@ -539,9 +541,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let pos_after_prefill = state.n_tokens as u32;
-    let mut spec_windows: u64 = 0;
-    let mut spec_drafts_offered: u64 = 0;
-    let mut spec_drafts_accepted: u64 = 0;
+    let mut spec_metrics = SpecMetrics::new(spec_k);
 
     // Sampler. HF DeepSeek-V4-Flash card recommends temp=1.0, top_p=1.0
     // for local deployment; we honor that as the default. Pure greedy
@@ -684,9 +684,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     return;
                 }
             };
-            spec_windows += 1;
-            spec_drafts_offered += spec_k as u64;
-            spec_drafts_accepted += r.n_accepted as u64;
+            spec_metrics.record_window(spec_k, r.n_accepted as usize, r.accepted_tokens.len());
 
             for &t in &r.accepted_tokens {
                 if generated_count >= max_tokens || t == eos_tok {
@@ -1048,17 +1046,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     } else {
         "stop"
     };
-    let done_envelope = if spec_mode {
-        let accept_pct = if spec_drafts_offered > 0 {
-            spec_drafts_accepted as f64 / spec_drafts_offered as f64 * 100.0
-        } else {
-            0.0
-        };
-        serde_json::json!({
-            "type": "done",
-            "id": id,
-            "tokens": generated_count,
-            "tok_s": tok_s,
+    if spec_mode {
+        // Non-metric done fields + legacy `spec_k` (block size). The canonical
+        // metric block (windows/accepted/accept_rate/...) comes from `spec_metrics`.
+        let ext = serde_json::json!({
             "prompt_tokens": prompt_tokens_total,
             "prefill_tokens": prefill_tokens_actual,
             "cached_tokens": cached_tokens,
@@ -1066,11 +1057,18 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             "total_ms": total_ms,
             "finish_reason": finish_reason,
             "spec_k": spec_k,
-            "spec_windows": spec_windows,
-            "spec_accept_pct": accept_pct,
-        })
+        });
+        emit_spec_done(
+            stdout,
+            id,
+            generated_count,
+            tok_s,
+            "mtp",
+            &spec_metrics,
+            Some(ext),
+        );
     } else {
-        serde_json::json!({
+        let done_envelope = serde_json::json!({
             "type": "done",
             "id": id,
             "tokens": generated_count,
@@ -1081,10 +1079,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             "prefill_ms": prefill_ms,
             "total_ms": total_ms,
             "finish_reason": finish_reason,
-        })
-    };
-    let _ = writeln!(stdout, "{}", done_envelope);
-    let _ = stdout.flush();
+        });
+        let _ = writeln!(stdout, "{}", done_envelope);
+        let _ = stdout.flush();
+    }
 }
 
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
@@ -1688,10 +1686,9 @@ pub fn generate_llama(
         let mut position = prompt_tokens.len();
         let mut seed = first_token;
         // Spec-decode telemetry: per-window drafts proposed (after confidence
-        // truncation) and accepted, aggregated for τ + draft-size reporting.
-        let mut spec_proposed = 0usize;
-        let mut spec_accepted = 0usize;
-        let mut spec_windows = 0usize;
+        // truncation), accepted, and committed, aggregated for the canonical
+        // `done` block (τ + draft-size reporting).
+        let mut spec_metrics = SpecMetrics::new(block);
 
         // Emit the seed (first token) immediately (TTFT == prefill).
         emitted.push(first_token);
@@ -1723,9 +1720,7 @@ pub fn generate_llama(
                     break;
                 }
             };
-            spec_proposed += step.proposed;
-            spec_accepted += step.accepted;
-            spec_windows += 1;
+            spec_metrics.record_window(step.proposed, step.accepted, step.emit.len());
             let mut hit_eos = false;
             for &tk in step.emit.iter() {
                 if generated >= max_tokens {
@@ -1764,37 +1759,24 @@ pub fn generate_llama(
         } else {
             0.0
         };
-        // τ = mean accepted-block length = (accepted + 1 bonus) per window.
-        let accept_pct = if spec_proposed > 0 {
-            spec_accepted as f64 / spec_proposed as f64 * 100.0
-        } else {
-            0.0
-        };
-        let mean_draft = if spec_windows > 0 {
-            spec_proposed as f64 / spec_windows as f64
-        } else {
-            0.0
-        };
-        let tau = if spec_windows > 0 {
-            spec_accepted as f64 / spec_windows as f64 + 1.0
-        } else {
-            0.0
-        };
-        let _ = writeln!(
+        // Site-specific `ext`: keep `block_size` (non-metric) and merge any
+        // strategy-specialized metrics the speculator contributes.
+        let mut ext = serde_json::Map::new();
+        ext.insert("block_size".to_string(), serde_json::json!(block));
+        if let Some(serde_json::Value::Object(extra)) = ds.speculator.drain_extra_metrics() {
+            for (k, v) in extra {
+                ext.insert(k, v);
+            }
+        }
+        emit_spec_done(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"dspark":true,"spec_windows":{},"spec_proposed":{},"spec_accepted":{},"spec_accept_pct":{:.1},"mean_draft_len":{:.2},"tau":{:.2},"block_size":{}}}"#,
             id,
             generated,
             tok_s,
-            spec_windows,
-            spec_proposed,
-            spec_accepted,
-            accept_pct,
-            mean_draft,
-            tau,
-            block
+            "dspark",
+            &spec_metrics,
+            Some(serde_json::Value::Object(ext)),
         );
-        let _ = stdout.flush();
         m.dspark = Some(ds);
         return;
     }
@@ -2861,9 +2843,7 @@ fn generate_lfm2moe_dflash(
     let mut generated_count = 1usize;
     let mut position = starting_position;
     let mut seed_token = first_token;
-    let mut cycles = 0usize;
-    let mut accepted_total = 0usize;
-    let mut drafted_total = 0usize;
+    let mut spec_metrics = SpecMetrics::new(block_size);
 
     while generated_count < max_tokens {
         if position.saturating_add(block_size) > usable_capacity {
@@ -2897,9 +2877,13 @@ fn generate_lfm2moe_dflash(
                 break;
             }
         };
-        cycles += 1;
-        accepted_total += step.accepted;
-        drafted_total += step.drafted.len().saturating_sub(1);
+        // `drafted` includes the seed as `drafted[0]`, so the proposed-draft
+        // count is `len - 1`; `committed` includes the seed (length accept+2).
+        spec_metrics.record_window(
+            step.drafted.len().saturating_sub(1),
+            step.accepted,
+            step.committed.len(),
+        );
 
         let mut hit_eos = false;
         for &tok in step.committed.iter().skip(1) {
@@ -2944,17 +2928,21 @@ fn generate_lfm2moe_dflash(
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = (generated_count as f64 * 1000.0) / decode_ms as f64;
-    let accept_rate = if drafted_total > 0 {
-        accepted_total as f64 / drafted_total as f64
-    } else {
-        0.0
-    };
-    let _ = writeln!(
+    // Non-metric done fields + legacy `cycles` alias (== windows).
+    let ext = serde_json::json!({
+        "prefill_ms": prefill_ms,
+        "total_ms": total_ms,
+        "cycles": spec_metrics.windows,
+    });
+    emit_spec_done(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"dflash":true,"cycles":{},"accepted":{},"accept_rate":{:.3}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms, cycles, accepted_total, accept_rate,
+        id,
+        generated_count,
+        tok_s,
+        "dflash",
+        &spec_metrics,
+        Some(ext),
     );
-    let _ = stdout.flush();
 }
 
 #[cfg(feature = "arch-lfm2moe")]

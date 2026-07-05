@@ -54,6 +54,8 @@ use crate::session::{
     put_qwen35_state_into_model, qwen35_restore_or_error, take_qwen35_state_from_model,
     Qwen35RequestSessionState,
 };
+use crate::spec_metrics::emit_spec_done;
+use hipfire_specdecode::SpecMetrics;
 
 /// MTP (Multi-Token Prediction) spec-decode generate path for Qwen3.5/3.6.
 ///
@@ -272,7 +274,7 @@ pub fn generate_mtp(
 
     // Run prefill + spec-decode loop; centralize cleanup after.
     // Returns (hit_eos, generated, cycles, accepted_total, decode_secs).
-    let run: Result<(bool, usize, usize, usize, f64), String> = (|| {
+    let run: Result<(bool, usize, SpecMetrics, f64), String> = (|| {
         // Prefill the prompt through the batched WMMA path.
         qwen35::forward_prefill_batch(
             gpu,
@@ -387,8 +389,7 @@ pub fn generate_mtp(
 
         let mut last_committed = seed_token;
         let mut cur_pos = prompt_tokens.len();
-        let mut cycles = 0usize;
-        let mut accepted_total = 0usize;
+        let mut spec_metrics = SpecMetrics::new(max_n);
         let t_decode = Instant::now();
 
         while !hit_eos && !think_cap_hit && generated < max_tokens {
@@ -405,8 +406,13 @@ pub fn generate_mtp(
                 eos_token,
             )
             .map_err(|e| format!("spec_step_mtp: {e:?}"))?;
-            cycles += 1;
-            accepted_total += result.accept_count;
+            // `committed` EXCLUDES the seed (unlike DFlash); `drafts_generated`
+            // is the proposed count this window.
+            spec_metrics.record_window(
+                result.drafts_generated,
+                result.accept_count,
+                result.committed.len(),
+            );
 
             // result.committed already EXCLUDES the seed (unlike DFlash).
             for &tok in &result.committed {
@@ -443,8 +449,7 @@ pub fn generate_mtp(
         Ok((
             hit_eos,
             generated,
-            cycles,
-            accepted_total,
+            spec_metrics,
             t_decode.elapsed().as_secs_f64(),
         ))
     })();
@@ -455,20 +460,25 @@ pub fn generate_mtp(
     putback!(target);
 
     match run {
-        Ok((_hit_eos, generated, cycles, accepted_total, decode_secs)) => {
+        Ok((_hit_eos, generated, spec_metrics, decode_secs)) => {
             let tok_s = generated as f64 / decode_secs.max(1e-9);
-            // τ = committed tokens per spec cycle (excludes the prefill seed).
-            let tau = if cycles > 0 {
-                generated.saturating_sub(1) as f64 / cycles as f64
-            } else {
-                0.0
-            };
-            let _ = writeln!(
+            // Non-metric + legacy fields: decode_tok_s (== tok_s here), the
+            // `cycles` alias (== windows), and `max_n` (block size). Canonical
+            // `tau`/`accepted`/`windows` come from `spec_metrics`.
+            let ext = serde_json::json!({
+                "decode_tok_s": (tok_s * 10.0).round() / 10.0,
+                "cycles": spec_metrics.windows,
+                "max_n": max_n,
+            });
+            emit_spec_done(
                 stdout,
-                r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"decode_tok_s":{:.1},"mtp":true,"tau":{:.2},"cycles":{},"accepted":{},"max_n":{}}}"#,
-                id, generated, tok_s, tok_s, tau, cycles, accepted_total, max_n,
+                id,
+                generated,
+                tok_s,
+                "mtp",
+                &spec_metrics,
+                Some(ext),
             );
-            let _ = stdout.flush();
         }
         Err(e) => {
             write_error(stdout, id, &e);
@@ -501,7 +511,7 @@ pub fn generate_dflash(
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
-        ModelSlotConfig, Phase2Snapshots, SpecStats,
+        ModelSlotConfig, Phase2Snapshots,
     };
 
     // Prompt build: same two-path branch as the AR-path generate() — when
@@ -773,7 +783,7 @@ pub fn generate_dflash(
         chat_output_filter_from_profile(chat_template_profile.as_ref(), request_stop_sequences);
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
-    let mut stats = SpecStats::new(df.block_size);
+    let mut spec_metrics = SpecMetrics::new(df.block_size);
     // max_think_tokens enforcement state (mirrors the AR path).
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
@@ -964,7 +974,10 @@ pub fn generate_dflash(
                 break;
             }
         };
-        stats.record(&step);
+        // Per the metrics-unification plan: proposed = drafted.len(), accepted,
+        // committed = committed.len(). (`committed` includes the seed, length
+        // accept+2.)
+        spec_metrics.record_window(step.drafted.len(), step.accepted, step.committed.len());
         let committed_tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
 
         let mut hit_eos = false;
@@ -1105,39 +1118,30 @@ pub fn generate_dflash(
     } else {
         0.0
     };
-    let tau = if stats.cycles > 0 {
-        stats.accepted_tokens as f64 / stats.cycles as f64
-    } else {
-        0.0
-    };
-    // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
-    // this branch) the `done` object must surface the bypass reason and
-    // alpha alongside the dflash perf metrics. Build a small fragment
-    // when both are available; otherwise empty for back-compat.
-    let pflash_done_field = match (pflash_bypass_reason, pflash_alpha) {
-        (Some(r), Some(a)) => format!(
-            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
-            r.replace('"', "'"),
-            a,
-        ),
-        _ => String::new(),
-    };
-    let _ = writeln!(
+    // Non-metric done fields (prefill/decode timings) + legacy `cycles` alias
+    // (== windows). Per PRD §3.1, when PFlash is bypassed (e.g.
+    // dflash_decode_active for this branch) the `done` object must also surface
+    // the bypass reason and alpha alongside the dflash perf metrics.
+    let mut ext = serde_json::json!({
+        "prefill_tokens": prompt_tokens.len(),
+        "prefill_ms": prefill_s * 1000.0,
+        "prefill_tok_s": prefill_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "ttft_ms": prefill_s * 1000.0,
+        "cycles": spec_metrics.windows,
+    });
+    if let (Some(r), Some(a)) = (pflash_bypass_reason, pflash_alpha) {
+        ext["pflash"] = serde_json::json!({ "bypass_reason": r, "alpha": a });
+    }
+    emit_spec_done(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}}}"#,
         id,
         generated,
         tok_s,
-        prompt_tokens.len(),
-        prefill_s * 1000.0,
-        prefill_tok_s,
-        decode_tok_s,
-        prefill_s * 1000.0,
-        tau,
-        stats.cycles,
-        pflash_done_field,
+        "dflash",
+        &spec_metrics,
+        Some(ext),
     );
-    let _ = stdout.flush();
 }
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
