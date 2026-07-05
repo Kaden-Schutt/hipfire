@@ -132,7 +132,7 @@ fn check_ep(label: &str, gpus: &Gpus) {
     let bytes: Vec<u8> = (0..(N_EXPERTS * PER) as u32).map(|x| x as u8).collect();
     let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
     let store = fulfill_manifest(&[entry.clone()], &mesh, N_LAYERS, gpus, |_| {
-        Ok(bytes.clone())
+        Ok((bytes.clone(), DType::F16))
     })
     .unwrap_or_else(|e| panic!("[{label}] fulfill_manifest(EP) failed: {e}"));
 
@@ -181,7 +181,7 @@ fn check_rollback(label: &str, gpus: &Gpus) {
         if e.name == fail_name && e.layer == fail_layer {
             Err("synthetic source failure".to_string())
         } else {
-            Ok(synth_bytes(e))
+            Ok((synth_bytes(e), DType::Raw))
         }
     });
     match r {
@@ -210,9 +210,10 @@ fn readback(gpus: &Gpus, device: usize, tensor: &rdna_compute::GpuTensor) -> Vec
 /// Validate placement + byte-oracle + tied-alias for one (mesh, gpus) pair.
 fn check(label: &str, mesh: &DeviceMesh, gpus: &Gpus) {
     let manifest = test_manifest();
-    let store: WeightStore =
-        fulfill_manifest(&manifest, mesh, N_LAYERS, gpus, |e| Ok(synth_bytes(e)))
-            .unwrap_or_else(|e| panic!("[{label}] fulfill_manifest failed: {e}"));
+    let store: WeightStore = fulfill_manifest(&manifest, mesh, N_LAYERS, gpus, |e| {
+        Ok((synth_bytes(e), DType::Raw))
+    })
+    .unwrap_or_else(|e| panic!("[{label}] fulfill_manifest failed: {e}"));
 
     let mut resident = 0usize;
     let mut aliased = 0usize;
@@ -277,7 +278,9 @@ fn main() {
             DType::F16,
             ShardPolicy::RowShard { axis: 1 },
         )];
-        let r = fulfill_manifest(&m, &tp2, N_LAYERS, &gpus, |e| Ok(synth_bytes(e)));
+        let r = fulfill_manifest(&m, &tp2, N_LAYERS, &gpus, |e| {
+            Ok((synth_bytes(e), DType::Raw))
+        });
         assert!(r.is_err(), "dense TP shard on Tp-2 must be refused");
         println!(
             "refusal: dense TP shard on Tp-2 → Err ({})",

@@ -26,17 +26,20 @@
 //! **Why a `source` closure, not `&HfqFile`.** A [`WeightEntry`] names tensors
 //! *logically* (`"wq"`, `"ffn_down"`); the on-disk HFQ names are arch-specific
 //! (prefix variants, GGUF `blk.N.*`). Reading them is the arch's knowledge, not
-//! the engine's — so the caller passes a `source(entry) -> raw bytes` closure
-//! (backed by its HFQ + name resolver), keeping the engine free of on-disk
-//! naming. This *pulls complexity to the arch* and preserves the Tier-1 rule
-//! that the engine drives placement without naming a device or an on-disk
-//! tensor. (The plan sketches `fulfill_manifest(manifest, hfq, mesh)`; the
-//! source closure is the same shape with the name-resolution seam made explicit.)
+//! the engine's — so the caller passes a `source(entry) -> (raw bytes, dtype)`
+//! closure (backed by its HFQ + name resolver), keeping the engine free of
+//! on-disk naming. The dtype is the tensor's **real** on-disk quant type
+//! (`Q4F16G64`/`MQ4`/`Q8_0`/`F16`/`F32`), so the placed tensor is forward-ready
+//! (the right kernel dispatches), not an opaque `Raw` blob. This *pulls
+//! complexity to the arch* and preserves the Tier-1 rule that the engine drives
+//! placement without naming a device or an on-disk tensor. (The plan sketches
+//! `fulfill_manifest(manifest, hfq, mesh)`; the source closure is the same shape
+//! with the name-resolution seam made explicit.)
 
 use crate::tp_shard::ShardConfig;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry};
 use hipfire_hardware::DeviceMesh;
-use rdna_compute::GpuTensor;
+use rdna_compute::{DType, GpuTensor};
 use std::collections::HashMap;
 
 /// A placed weight: either a GPU-resident tensor or an alias to another entry
@@ -183,11 +186,11 @@ fn expert_compact_blob(bytes: &[u8], n_experts: usize, owned: &[usize]) -> Resul
 /// [`WeightStore`]. This is the GPU counterpart of
 /// [`crate::weight_manifest::plan_manifest`]'s weight-placement half.
 ///
-/// `source(entry)` returns the **whole logical tensor's** raw bytes (the caller
-/// resolves the on-disk name and reads its HFQ). The tensor is uploaded as a
-/// `DType::Raw` blob under `entry.logical_shape` — a *placement* container, not
-/// yet a forward-consumable operand (Phase 3 re-derives dtype from the manifest
-/// when it wires the store into the forward).
+/// `source(entry)` returns the **whole logical tensor's** raw bytes **and its
+/// real on-disk dtype** (the caller resolves the on-disk name and reads its
+/// HFQ). The tensor is uploaded under `entry.logical_shape` with that dtype, so
+/// the placed tensor is forward-consumable (the correct kernel dispatches on the
+/// quant type) — not an opaque `Raw` blob.
 ///
 /// `ExpertSharded` on an `Ep>1` mesh is handled directly: each rank receives a
 /// compact blob of only its owned experts (the generic expert-outermost gather;
@@ -210,7 +213,7 @@ pub fn fulfill_manifest<F>(
     source: F,
 ) -> Result<WeightStore, FulfillError>
 where
-    F: Fn(&WeightEntry) -> Result<Vec<u8>, String>,
+    F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
     let mut store = WeightStore::new();
     match fulfill_into(&mut store, weights, mesh, n_layers, gpus, &source) {
@@ -234,7 +237,7 @@ fn fulfill_into<F>(
     source: &F,
 ) -> Result<(), FulfillError>
 where
-    F: Fn(&WeightEntry) -> Result<Vec<u8>, String>,
+    F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
     for entry in weights {
         let devices = placement_devices(entry, mesh, n_layers);
@@ -266,7 +269,7 @@ where
                         reason: format!("ExpertSharded: {e}"),
                     }
                 })?;
-                let bytes = source(entry).map_err(|e| FulfillError {
+                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
                     name: entry.name.clone(),
                     layer: entry.layer,
                     device: *devices.first().unwrap_or(&0),
@@ -293,12 +296,14 @@ where
                         device: dev,
                         reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
                     })?;
-                    let tensor = gpu.upload_raw(&compact, &shape).map_err(|e| FulfillError {
-                        name: entry.name.clone(),
-                        layer: entry.layer,
-                        device: dev,
-                        reason: format!("upload_raw failed: {e}"),
-                    })?;
+                    let mut tensor =
+                        gpu.upload_raw(&compact, &shape).map_err(|e| FulfillError {
+                            name: entry.name.clone(),
+                            layer: entry.layer,
+                            device: dev,
+                            reason: format!("upload_raw failed: {e}"),
+                        })?;
+                    tensor.dtype = dtype;
                     store.insert(
                         &entry.name,
                         entry.layer,
@@ -327,7 +332,7 @@ where
         }
 
         // Whole-tensor path: read once, upload the same bytes to each device.
-        let bytes = source(entry).map_err(|e| FulfillError {
+        let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
             name: entry.name.clone(),
             layer: entry.layer,
             device: *devices.first().unwrap_or(&0),
@@ -340,7 +345,7 @@ where
                 device: dev,
                 reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
             })?;
-            let tensor =
+            let mut tensor =
                 gpu.upload_raw(&bytes, &entry.logical_shape)
                     .map_err(|e| FulfillError {
                         name: entry.name.clone(),
@@ -348,6 +353,7 @@ where
                         device: dev,
                         reason: format!("upload_raw failed: {e}"),
                     })?;
+            tensor.dtype = dtype;
             store.insert(
                 &entry.name,
                 entry.layer,
