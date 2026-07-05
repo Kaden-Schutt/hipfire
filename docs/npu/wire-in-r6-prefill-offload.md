@@ -34,10 +34,33 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
    on real (non-all-ones) data — the current benches only prove the all-ones ceiling.
    This is the unit the runtime calls; it carries no hot-path risk.
 
-3. **Weight marshaling.** oq4 weights are already 4-bit packed; confirm the packing
-   matches R6's `int4` tile layout (the R3a byte-stride lesson) or add a one-time
-   repack at load into the NPU-resident tile-major form. Belongs with the loader, not
-   per-dispatch.
+3. **Marshaling splits by static vs dynamic — and the layouts do NOT match the GPU.**
+   Measured (`prepack_weights`/`run_packed`): CPU marshaling dominates end-to-end
+   (0.02 TOPS). Verified against the GPU iu4 kernel (`fused_qkvza_oq4_wmma.hip`): it
+   stores W as `[N_out, K/2]` nibbles + per-group f32 scales, loaded through the WMMA
+   lane-distributed fragment; R6 wants `[K, N]` 16×16 aie2p tile-major raw int4. So
+   **the buffer cannot be shared** — different orientation (transposed), different
+   tiling (WMMA fragment vs aie2p mmul tile), and R6 applies **no scales**. Transposing
+   either kernel to match orientation doesn't help: it only moves the transpose onto
+   the *dynamic* activation, and the tiling still differs. Split:
+
+   - **3a. Weights → the loader (static, once).** Produce an NPU-specific weight buffer
+     at load: read GPU `W[n][k]` → write NPU `[k][n]` 16×16 tile-major + int4 pack. The
+     `[N][K]→[K][N]` transpose is *absorbed for free* into the re-tile index mapping (no
+     separate pass). Store it alongside the GPU copy for offloaded layers (4-bit, small).
+     The hot path then DMAs it linearly — zero per-inference weight work. `prepack_weights`
+     is the reference impl; move it into the loader / NPU-quantize path.
+   - **3b. R6 scale handling (a real correctness item).** R6 is a raw int4×int8 GEMM;
+     the `0/256` validation used *unscaled* int4. oq4 carries per-group f32 scales, so
+     the NPU path must accumulate int32 then apply the group scale (at the tail, per
+     group) to match the GPU. Design this with 3a (scales travel with the arranged W).
+   - **3c. Activations + output → the DMA (dynamic, per inference).** A and C are
+     computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
+     let the shim DMA tile it (`dims_to_stream` on the `dma_bd`); write C tiled and let
+     the DMA de-tile — the tile reshuffle happens in hardware, not the CPU. This is how
+     IRON's whole_array gemm avoids CPU marshaling; my R6 MLIR uses plain linear
+     `dma_bd`, which is why marshaling landed on the CPU. Plus stream the whole GEMM in
+     one dispatch to amortize the ~78 µs latency.
 
 4. **Runtime offload hook (the hot-path change — smallest possible).** In
    `dispatch/quant.rs`, add an opt-in path: if a prefill W4A8 GEMM is large enough to
