@@ -87,3 +87,22 @@ column — the R4 weight-stationary dataflow:
   overhead (cross-core cascade / K-resident C) — the unbuilt dataflow. Next step to
   chase it: R4b with a larger mmul tile (m/k/n = 64) and measure the real (INNER=0)
   rate against the 15.7 reference.
+
+### Hardware constraint that pins this (aie2p int8×int4 mmul)
+
+The only int8×int4 matmul shape aie2p provides is **`mmul<4,16,16>`** — verified: it
+is the sole `mmul_8_4<M,K,N>` specialization in `aie_api/detail/aie2p/mmul_8_4.hpp`
+(`mmul<4,16,64>` fails to instantiate). So a register-accumulator kernel like R2a/R4b
+is *structurally* capped at the tiny 16×16 output tile, and bigger tiles cannot come
+from a wider mmul. Amortizing the per-tile overhead therefore requires **L1-resident C
+accumulation** across a K-loop of many 16×16 mmuls (not register accumulators — those
+hit the R3c wall at ~4) — which is exactly IRON's reference kernel structure, already
+measured at the **15.7-TOPS** ceiling.
+
+**R4 conclusion (firm):** real streaming W4A8 on this NPU tops out at ~15.7 TOPS via
+all known dataflows; the array has ~40-TOPS compute *capacity* but the per-tile
+overhead wall + the fixed 16×16 mmul shape prevent reaching it for real GEMM. Beating
+15.7 would need a cross-core cascade / K-resident-C systolic dataflow that keeps C in
+place and never re-loads per tile — undemonstrated on this hardware (findings.md), a
+genuine research kernel. vs GPU ~50-TOPS real W4A8, NPU prefill offload is a modest
+concurrent add (~+30% best case), not parity.
