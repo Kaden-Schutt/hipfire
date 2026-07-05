@@ -401,6 +401,48 @@ mod imp {
             )
         }
 
+        /// Submit one ERT command BO to a hwctx (`AMDXDNA_CMD_SUBMIT_EXEC_BUF`).
+        /// `arg_bos` are the data + instruction BO handles the command references
+        /// (for residency/pin); the PDI/cu_bo is configured separately and is not
+        /// listed here. Returns the submission sequence number to wait on.
+        pub fn exec_cmd(&self, hwctx: u32, cmd_bo: u32, arg_bos: &[u32]) -> Result<u64, XdnaError> {
+            let mut e = submit::ExecCmd {
+                hwctx,
+                cmd_type: submit::AMDXDNA_CMD_SUBMIT_EXEC_BUF,
+                // For cmd_count==1 this field is the BO handle itself, not a pointer.
+                cmd_handles: cmd_bo as u64,
+                args: arg_bos.as_ptr() as u64,
+                cmd_count: 1,
+                arg_count: arg_bos.len() as u32,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::EXEC_CMD_REQUEST,
+                &mut e as *mut _ as *mut libc::c_void,
+            )?;
+            Ok(e.seq)
+        }
+
+        /// Block until a submitted command's timeline `point` signals on the hwctx
+        /// `syncobj` (from [`Self::create_hwctx`]). Mirrors XRT: `WAIT_FOR_SUBMIT`,
+        /// `timeout_nsec = i64::MAX`.
+        pub fn syncobj_wait(&self, syncobj: u32, point: u64) -> Result<(), XdnaError> {
+            let handles = [syncobj];
+            let points = [point];
+            let mut w = submit::SyncobjTimelineWait {
+                handles: handles.as_ptr() as u64,
+                points: points.as_ptr() as u64,
+                timeout_nsec: i64::MAX,
+                count_handles: 1,
+                flags: submit::SYNCOBJ_WAIT_FOR_SUBMIT,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::SYNCOBJ_TIMELINE_WAIT_REQUEST,
+                &mut w as *mut _ as *mut libc::c_void,
+            )
+        }
+
         /// Allocate a DEV buffer object (for the PDI / instruction stream, which
         /// live in device memory) and fill it with `data`. DEV BOs are carved out
         /// of `heap` by the driver and are *not* directly mmap-able (GET_BO_INFO
@@ -613,6 +655,12 @@ mod imp {
         /// Device virtual address of this BO.
         pub fn xdna_addr(&self) -> u64 {
             self.xdna_addr
+        }
+        /// Host virtual address of the mapping. For SHMEM / CMD BOs this is the
+        /// device-accessible address to place in a command regmap (the NPU reaches
+        /// host memory at the same VA via PASID); DEV BOs use [`Self::xdna_addr`].
+        pub fn host_addr(&self) -> u64 {
+            self.ptr as u64
         }
         /// Length in bytes of the mapped region.
         pub fn len(&self) -> usize {

@@ -94,11 +94,41 @@ firmware-ABI unknown into a diff.
 
 ## Status
 
+**W1–W4 DONE — first hipfire-driven NPU dispatch runs end-to-end.** The
+`run_smoke` example takes an mlir-aie cache dir (`final.xclbin` + `insts.bin`),
+parses the PDI, loads it via `CONFIG_HWCTX(CONFIG_CU)`, stages the instruction
+stream + A/W/C data BOs, builds the ERT DPU command, submits it (`EXEC_CMD`),
+waits on the hwctx timeline, and reads back C. Verified on halo running the R2a
+single-core W4A8 GEMM: A=all-1s int8 × W=all-1s int4 yields the exact expected
+`16 × (INNER+1) = 1040` per lane. The whole submission ABI is captured byte-exact
+from XRT (see recipe below) and locked with a unit test.
+
 Kernels (benchmarks/npu_gemm_tuning): decode GEMV (R3a) works and is bandwidth-
 bound; prefill GEMM needs the weight-broadcast array dataflow (R3c → R4) to be
-compute-bound. Wire-in: this plan; W1 (ABI layer) is the next concrete code step.
-Both remaining halves (R4 array kernel, W1–W5 submission subsystem) are multi-day
-builds — this doc makes the wire-in half fully scoped and actionable.
+compute-bound. Remaining wire-in: W5 — hoist the `run_smoke` flow into a reusable
+`NpuGemm` dispatch entry (shape → cached xclbin/instr, bind tensors) and call it
+from the runtime.
+
+### How W4 was de-risked
+
+The command-packet layout was the risky part, so it was captured byte-exact from a
+working pyxrt run under an `LD_PRELOAD` ioctl tracer rather than guessed:
+
+- **Data BOs** (A/W/C) are `SHMEM`; their regmap address is the **host mmap VA**
+  (the NPU reaches host memory at the same VA via PASID). `xdna_addr` is invalid
+  for SHMEM.
+- **Instruction BO** is `DEV` (heap); regmap address is its `xdna_addr`, and
+  `ninstr` is the instruction-stream **byte size**.
+- DEV BOs are not mmap-able (`GET_BO_INFO` map_offset = INVALID); fill them by
+  writing through the heap mapping at `bo.xdna_addr - heap.xdna_addr`, then
+  `SYNC_BO` flushes those heap pages.
+- `EXEC_CMD` args = `[A, W, C, instr]` handles (residency); the PDI/cu_bo is *not*
+  listed (it's loaded via CONFIG_CU). For `cmd_count==1`, `cmd_handles` is the BO
+  handle directly, not a pointer.
+- Wait via `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` on the hwctx syncobj at
+  `point = EXEC seq`, `flags = WAIT_FOR_SUBMIT`, `timeout = i64::MAX`.
+- Output readback needs **no** sync: SHMEM is coherent once the timeline signals.
+  `SYNC_DIRECT_FROM_DEVICE` is reserved for debug BOs and EINVALs on data BOs.
 
 ## W3c findings (hwctx creation frontier)
 
