@@ -152,6 +152,46 @@ impl DeviceMesh {
             .collect()
     }
 
+    /// Which pipeline stage (`Pp` coordinate) owns layer `layer` of `n_layers`,
+    /// using a uniform band split (max−min ≤ 1 layer per stage, earlier stages
+    /// take the remainder). No `Pp` axis → stage 0.
+    pub fn stage_for_layer(&self, layer: usize, n_layers: usize) -> usize {
+        let p = self.size_of(DimKind::Pp);
+        if p <= 1 || n_layers == 0 {
+            return 0;
+        }
+        let base = n_layers / p;
+        let rem = n_layers % p;
+        let mut start = 0usize;
+        for s in 0..p {
+            let cnt = base + if s < rem { 1 } else { 0 };
+            if layer < start + cnt {
+                return s;
+            }
+            start += cnt;
+        }
+        p - 1
+    }
+
+    /// The residual-stream `BandXfer` to inject *after* `layer`, if the next
+    /// layer lives on a different pipeline stage. `None` at the last layer or
+    /// when there is no `Pp` axis. NOTE: for a pure `Pp` (P×1) mesh the device
+    /// id equals the stage; composed meshes (per-stage tp-rank mapping) are
+    /// Phase 5b — asserted single-axis here.
+    pub fn band_xfer_after(&self, layer: usize, n_layers: usize) -> Option<CollectiveHint> {
+        if !self.has_axis(DimKind::Pp) || layer + 1 >= n_layers {
+            return None;
+        }
+        debug_assert_eq!(
+            self.axes.len(),
+            1,
+            "band_xfer_after: pure Pp mesh only; composed meshes are Phase 5b",
+        );
+        let s = self.stage_for_layer(layer, n_layers);
+        let s1 = self.stage_for_layer(layer + 1, n_layers);
+        (s != s1).then_some(CollectiveHint::BandXfer { src: s, dst: s1 })
+    }
+
     /// Drop size-1 axes, yielding the minimal equivalent shape.
     pub fn squeezed(&self) -> Self {
         Self {
@@ -214,6 +254,30 @@ mod tests {
         // Pp "group" (not all-reduced, but the accessor is symmetric) of
         // device 1=(0,1): share Tp=1, vary Pp → devices 1,3.
         assert_eq!(m.group_along(DimKind::Pp, &[0, 1]), vec![1, 3]);
+    }
+
+    #[test]
+    fn stage_for_layer_uniform_band_split() {
+        // 4 stages, 10 layers → counts 3,3,2,2 (earlier stages take remainder).
+        let m = DeviceMesh::rect(&[(DimKind::Pp, 4)]);
+        let stages: Vec<usize> = (0..10).map(|l| m.stage_for_layer(l, 10)).collect();
+        assert_eq!(stages, vec![0, 0, 0, 1, 1, 1, 2, 2, 3, 3]);
+        // No Pp axis → always stage 0.
+        let ep = DeviceMesh::rect(&[(DimKind::Ep, 4)]);
+        assert_eq!(ep.stage_for_layer(5, 10), 0);
+    }
+
+    #[test]
+    fn band_xfer_at_stage_boundaries_only() {
+        let m = DeviceMesh::rect(&[(DimKind::Pp, 2)]); // 2 stages, 4 layers → 2,2
+                                                       // boundary between layer 1 (stage 0) and layer 2 (stage 1).
+        assert_eq!(m.band_xfer_after(0, 4), None);
+        assert_eq!(
+            m.band_xfer_after(1, 4),
+            Some(CollectiveHint::BandXfer { src: 0, dst: 1 })
+        );
+        assert_eq!(m.band_xfer_after(2, 4), None);
+        assert_eq!(m.band_xfer_after(3, 4), None); // last layer
     }
 
     #[test]
