@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
 use hipfire_diffusion_coexist::{
-    import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
-    parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
-    DiffusersImportOptions,
+    import_diffusers_to_hfq, import_realesrgan_to_hfq, ldm_unet_native_tensor_name,
+    ldm_vae_native_tensor_name, parse_pytorch_state_dict, pytorch_tensor_is_contiguous,
+    reorder_pytorch_storage_to_contiguous, DiffusersImportOptions, RealesrganImportOptions,
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
@@ -1246,6 +1246,68 @@ fn superres_rrdbnet_x2_resident_matches_cpu_reference() {
         &hip.data[..hip.data.len().min(8)],
         &cpu.data[..cpu.data.len().min(8)]
     );
+}
+
+/// End-to-end step-4 validation: import a real RealESRGAN RRDBNet checkpoint to
+/// .hfq, load it via the metadata, and run the model forward on gfx1103.
+/// Skips when the checkpoint is not present on this host.
+#[test]
+fn realesrgan_import_loads_and_runs_x4_anime_6b() {
+    let checkpoint = std::path::Path::new("/home/sadara/RealESRGAN_x4plus_anime_6B.pth");
+    if !checkpoint.exists() {
+        eprintln!("skip: RealESRGAN_x4plus_anime_6B.pth not present on this host");
+        return;
+    }
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for RealESRGAN import/run test: {error}");
+            return;
+        }
+    };
+
+    let out_hfq = std::env::temp_dir().join("hipfire_test_realesrgan_x4_anime_6b.hfq");
+    let summary = import_realesrgan_to_hfq(RealesrganImportOptions {
+        source: checkpoint.to_path_buf(),
+        output: out_hfq.clone(),
+        model_name: Some("RealESRGAN-x4plus-anime-6B".to_string()),
+    })
+    .unwrap();
+    // anime_6B: x4, 6 RRDBs, feat 64, grow 32, RGB — no input pixel-unshuffle.
+    assert_eq!(summary.scale, 4, "anime_6B is an x4 model");
+    assert_eq!(summary.num_block, 6);
+    assert_eq!(summary.num_feat, 64);
+    assert_eq!(summary.num_grow_ch, 32);
+    assert_eq!(summary.num_in_ch, 3);
+    assert_eq!(summary.num_out_ch, 3);
+
+    let net = SuperResRrdbNet::open_hfq(&out_hfq).unwrap();
+    assert_eq!(net.scale, 4);
+    assert_eq!(net.body.len(), 6);
+
+    // 16x16 RGB -> x4 -> 64x64.
+    let input = CpuTensor {
+        shape: vec![1, 3, 16, 16],
+        data: (0..(3 * 16 * 16))
+            .map(|v| ((v % 23) as f32 - 11.0) / 12.0)
+            .collect(),
+    };
+    let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+    let mut cache = RocmWeightCache::default();
+    let out_gpu = net
+        .forward_resident(&input_gpu, &mut gpu, &mut cache)
+        .unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, input_gpu).unwrap();
+
+    assert_eq!(hip.shape, vec![1, 3, 64, 64], "x4 upscale of 16x16");
+    assert!(
+        hip.data.iter().all(|v| v.is_finite()),
+        "super-res output has non-finite values"
+    );
+
+    let _ = std::fs::remove_file(&out_hfq);
 }
 
 #[test]

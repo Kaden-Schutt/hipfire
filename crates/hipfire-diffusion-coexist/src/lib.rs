@@ -38,6 +38,148 @@ pub struct DiffusersImportOptions {
     pub metadata_only: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RealesrganImportOptions {
+    pub source: PathBuf,
+    pub output: PathBuf,
+    pub model_name: Option<String>,
+}
+
+/// RRDBNet topology inferred from a RealESRGAN checkpoint, written into the
+/// output `.hfq` metadata and returned to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealesrganImportSummary {
+    pub scale: u32,
+    pub num_block: u32,
+    pub num_feat: u32,
+    pub num_grow_ch: u32,
+    pub num_in_ch: u32,
+    pub num_out_ch: u32,
+}
+
+/// Import a RealESRGAN / basicsr **RRDBNet** super-resolution checkpoint
+/// (`.pth`) to a hipfire `.hfq` sidecar for the MrFlow staged-sampling
+/// super-resolution stage. The basicsr key names (`conv_first`,
+/// `body.{i}.rdb{1,2,3}.conv{1..5}`, `conv_body`, `conv_up1/2`, `conv_hr`,
+/// `conv_last`) are already what `SuperResRrdbNet::from_hfq` consumes, so tensors
+/// pass through under their own names; only the topology metadata is inferred.
+///
+/// The output scale is `4 / r`, where `r` is the input pixel-unshuffle factor
+/// recovered from `conv_first`'s input channels (`num_in_ch * r*r`): the two
+/// fixed upsample stages give x4, and scale-2/scale-1 nets pre-unshuffle by 2/4.
+pub fn import_realesrgan_to_hfq(
+    options: RealesrganImportOptions,
+) -> anyhow::Result<RealesrganImportSummary> {
+    let source = options.source.canonicalize()?;
+    let tensors = parse_pytorch_state_dict(&source)?;
+    if tensors.is_empty() {
+        anyhow::bail!("RealESRGAN checkpoint {source:?} has no tensors");
+    }
+
+    let find = |name: &str| {
+        tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint missing {name:?}; not a RRDBNet checkpoint"))
+    };
+    let conv_first = find("conv_first.weight")?;
+    let conv_last = find("conv_last.weight")?;
+    let rdb_conv1 = find("body.0.rdb1.conv1.weight")?;
+    if conv_first.shape.len() != 4 || conv_last.shape.len() != 4 {
+        anyhow::bail!("RRDBNet conv weights must be 4-D NCHW");
+    }
+    let num_feat = conv_first.shape[0];
+    let conv_first_in = conv_first.shape[1];
+    let num_out_ch = conv_last.shape[0];
+    // RealESRGAN is symmetric RGB; use out channels as the pre-unshuffle input
+    // channel count to recover the unshuffle factor.
+    let num_in_ch = num_out_ch;
+    if num_in_ch == 0 || conv_first_in % num_in_ch != 0 {
+        anyhow::bail!(
+            "conv_first input channels {conv_first_in} not a multiple of num_in_ch {num_in_ch}"
+        );
+    }
+    let r_squared = conv_first_in / num_in_ch;
+    let r = (r_squared as f64).sqrt().round() as u32;
+    if r == 0 || r * r != r_squared || !matches!(r, 1 | 2 | 4) {
+        anyhow::bail!(
+            "conv_first input channels {conv_first_in} imply an unsupported unshuffle factor"
+        );
+    }
+    let scale = 4 / r; // r=2 -> scale 2, r=4 -> scale 1, r=1 -> scale 4
+    let num_grow_ch = rdb_conv1.shape[0];
+    let num_block = tensors
+        .iter()
+        .filter_map(|t| {
+            t.name
+                .strip_prefix("body.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|idx| idx.parse::<u32>().ok())
+        })
+        .max()
+        .map(|max_idx| max_idx + 1)
+        .ok_or_else(|| anyhow::anyhow!("checkpoint has no body.N RRDB blocks"))?;
+
+    let summary = RealesrganImportSummary {
+        scale,
+        num_block,
+        num_feat,
+        num_grow_ch,
+        num_in_ch,
+        num_out_ch,
+    };
+
+    let model_name = options.model_name.clone().unwrap_or_else(|| {
+        source
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("RealESRGAN")
+            .to_string()
+    });
+    let metadata = json!({
+        "kind": "realesrgan_rrdbnet",
+        "model_name": model_name,
+        "scale": scale,
+        "num_block": num_block,
+        "num_feat": num_feat,
+        "num_grow_ch": num_grow_ch,
+        "num_in_ch": num_in_ch,
+        "num_out_ch": num_out_ch,
+        "tensor_count": tensors.len(),
+    });
+
+    let mut entries = Vec::with_capacity(tensors.len());
+    for tensor in &tensors {
+        let source_entry = if pytorch_tensor_is_contiguous(&tensor.shape, &tensor.stride) {
+            DiffusionImportSource::ZipMember {
+                archive_path: source.clone(),
+                member_name: tensor.member_name.clone(),
+            }
+        } else {
+            let archive = MiniZipArchive::open(&source)?;
+            let storage = archive.read_entry(&tensor.member_name)?;
+            let data = reorder_pytorch_storage_to_contiguous(
+                &storage,
+                &tensor.shape,
+                &tensor.stride,
+                tensor.storage_offset,
+                pytorch_dtype_elem_size(&tensor.dtype),
+            )?;
+            DiffusionImportSource::Inline(data)
+        };
+        entries.push(DiffusionImportEntry {
+            name: tensor.name.clone(),
+            quant_type: tensor.quant_type,
+            shape: tensor.shape.clone(),
+            group_size: 0,
+            source: source_entry,
+        });
+    }
+
+    write_import_entries_to_hfq(&options.output, &metadata.to_string(), &entries)?;
+    Ok(summary)
+}
+
 pub fn import_diffusers_to_hfq(
     options: DiffusersImportOptions,
 ) -> anyhow::Result<DiffusionModelSummary> {

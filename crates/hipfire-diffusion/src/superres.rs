@@ -258,6 +258,25 @@ impl SuperResRrdbNet {
         }
     }
 
+    /// Open a RealESRGAN RRDBNet `.hfq` produced by
+    /// `hipfire_diffusion_coexist::import_realesrgan_to_hfq`, reading `scale` and
+    /// `num_block` from the package metadata.
+    pub(crate) fn open_hfq(path: &std::path::Path) -> DiffusionResult<Self> {
+        let hfq =
+            HfqFile::open_index_only(path).map_err(|err| DiffusionError::Io(err.to_string()))?;
+        let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).map_err(|err| {
+            DiffusionError::InvalidMetadata(format!("super-res metadata parse failed: {err}"))
+        })?;
+        let scale = meta.get("scale").and_then(serde_json::Value::as_u64).ok_or_else(|| {
+            DiffusionError::InvalidMetadata("super-res metadata missing scale".to_string())
+        })? as usize;
+        let num_block =
+            meta.get("num_block").and_then(serde_json::Value::as_u64).ok_or_else(|| {
+                DiffusionError::InvalidMetadata("super-res metadata missing num_block".to_string())
+            })? as usize;
+        Self::from_hfq(&hfq, num_block, scale)
+    }
+
     pub fn from_hfq(hfq: &HfqFile, num_block: usize, scale: usize) -> DiffusionResult<Self> {
         let body = (0..num_block)
             .map(|i| SuperResRrdb::from_hfq(hfq, &format!("body.{i}")))
