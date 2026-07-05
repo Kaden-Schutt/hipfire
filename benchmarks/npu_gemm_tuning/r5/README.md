@@ -52,7 +52,12 @@ cascade kernel. Only then is the cascade GEMM buildable/testable.
 ## Plan (incremental, correctness-gated)
 
 1. **Establish the low-level build**: minimal explicit `aie.dialects` design (1 core,
-   trivial kernel) → xclbin+insts → dispatch via NpuKernel, all-ones validated. *(blocker)*
+   trivial kernel) → xclbin+insts → dispatch via NpuKernel, all-ones validated.
+   *Build path confirmed*: construct the module with `aie.dialects.aie`/`aiex`, then
+   compile with `aie.utils.compile.compile(module, …, xclbin_path=…)` (the same helper
+   IRON's `@jit` calls — it shells out to `aiecc` with `--aie-generate-xclbin`; insts
+   come out alongside). So the explicit flow is fully buildable without IRON; the open
+   work is writing the module by hand (tiles, cores, objectfifos, `cascade_flow`).
 2. **2-core K-cascade**: split K across 2 cores, cascade-accumulate, validate all-ones
    equals the single-core result (the cascade sum is correct).
 3. **4-core column** (full K-split down a column), then **8 columns** = 32 cores.
