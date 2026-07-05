@@ -170,6 +170,23 @@ impl Architecture for Llama {
                 DType::F32,
                 Replicate,
             ));
+            // Qwen3 per-head Q/K RMSNorm (`[head_dim]`); absent on LLaMA/Mistral.
+            if cfg.has_qk_norm {
+                m.push(WeightEntry::layer(
+                    "q_norm",
+                    l,
+                    vec![hd],
+                    DType::F32,
+                    Replicate,
+                ));
+                m.push(WeightEntry::layer(
+                    "k_norm",
+                    l,
+                    vec![hd],
+                    DType::F32,
+                    Replicate,
+                ));
+            }
             m.push(WeightEntry::layer(
                 "ffn_norm",
                 l,
@@ -200,7 +217,14 @@ impl Architecture for Llama {
     /// empty here. No recurrent/conv state.
     fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
         (0..cfg.n_layers)
-            .map(|l| StateEntry::new(StateKind::Kv { quant: String::new() }, l))
+            .map(|l| {
+                StateEntry::new(
+                    StateKind::Kv {
+                        quant: String::new(),
+                    },
+                    l,
+                )
+            })
             .collect()
     }
 

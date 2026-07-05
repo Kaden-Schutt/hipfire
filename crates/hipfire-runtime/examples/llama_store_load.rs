@@ -2,24 +2,19 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-//! Phase-3 walking skeleton: load a REAL llama-family `.mq4` model's quantized
-//! projection weights through the generic `fulfill_manifest` + `WeightStore`,
-//! and prove each placed tensor is **byte- and dtype-identical** to the bespoke
-//! `Llama::load_weights` output. This is the "wire `WeightStore` into a real
-//! load" bridge (device-mesh §4): the manifest + a per-arch `source` closure
-//! replace the bespoke imperative loader for these tensors.
+//! Phase-3 store→forward bridge: load a REAL llama-family `.mq4` model's **whole**
+//! weight set through the generic `fulfill_manifest` + `WeightStore` (a per-arch
+//! `source` closure replaces the bespoke imperative loader), assemble a
+//! `LlamaWeights` entirely from the store, and prove a real forward through it is
+//! **logit-identical** to bespoke `Llama::load_weights`.
 //!
-//! Scope — the quantized attention/MLP projections (`wq/wk/wv/wo/ffn_gate/
-//! ffn_up/ffn_down`), which the HFQ loader uploads **raw, verbatim** (no
-//! transform), so a raw-byte fulfill matches byte-for-byte. Norms / embedding /
-//! lm_head undergo an F16→F32 host dequant in the loader; reproducing that in
-//! the `source` closure is a follow-up (the store already carries the real
-//! dtype, so it is a source-side change only).
-//!
-//! Then the **consumption** half: assemble a `LlamaWeights` whose projections
-//! are the store buffers (norms/embed/lm_head from the bespoke load) and run a
-//! real forward through it — proving the store tensors' metadata (dtype/shape)
-//! is end-to-end usable by the kernels, i.e. the store *feeds the forward*.
+//! The `source` closure mirrors the HFQ loader's per-tensor rule exactly:
+//! `quant_type 1` (F16) and `2` (F32) → dequant to F32; every other (quantized)
+//! type → raw bytes verbatim + its real `DType`. So norms/embed/lm_head (F16→F32
+//! or raw-quant) and the projection matrices all land byte-for-byte as the
+//! bespoke loader would store them. A byte+dtype spot-check on the projections
+//! runs first; the full-model logit parity is the end-to-end proof (any wrong
+//! byte / dtype / shape / embd_format would diverge the logits).
 //!
 //! Run: cargo run -p hipfire-runtime --release --example llama_store_load \
 //!         [~/.hipfire/models/qwen3-0.6b-llama.mq4]
@@ -28,40 +23,19 @@ use hipfire_arch_llama::Llama;
 use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, KvCache, LayerWeights, LlamaWeights, WeightTensor};
+use hipfire_runtime::llama::{
+    self, f16_to_f32, EmbeddingFormat, KvCache, LayerWeights, LlamaWeights, WeightTensor,
+};
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::weight_manifest::WeightEntry;
 use hipfire_runtime::weight_store::{fulfill_manifest, WeightHandle, WeightStore};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Move a resident projection out of the store (for arch-weight assembly).
-fn take_resident(store: &mut WeightStore, name: &str, l: usize) -> GpuTensor {
-    match store.take(name, Some(l), 0) {
-        Some(WeightHandle::Resident(t)) => t,
-        _ => panic!("store missing {name}[{l}] for assembly"),
-    }
-}
-
-/// Build a `WeightTensor` around a store-loaded buffer, reusing the bespoke
-/// tensor's metadata (m/k/row_stride/paro/awq — not captured by the manifest).
-/// Only `buf` (and its already-verified dtype) come from the store, so the
-/// forward genuinely consumes the store buffer.
-fn wt_from(buf: GpuTensor, b: WeightTensor) -> WeightTensor {
-    WeightTensor {
-        buf,
-        gpu_dtype: b.gpu_dtype,
-        m: b.m,
-        k: b.k,
-        row_stride: b.row_stride,
-        paro: b.paro,
-        awq_scale: b.awq_scale,
-    }
-}
-
-/// HFQ `quant_type` byte → the `DType` the bespoke loader assigns
-/// (`WeightTensor.gpu_dtype`). Covers the quantized projection formats; norms /
-/// F16 tensors are out of scope here (they dequant to F32).
+/// HFQ `quant_type` byte → the `DType` the bespoke loader assigns for a
+/// *quantized* (raw-uploaded) tensor. F16(1)/F32(2) are handled separately
+/// (dequant to F32), so they are absent here.
 fn qtype_to_dtype(q: u8) -> Option<DType> {
     Some(match q {
         0 => DType::Q4F16G64,
@@ -81,35 +55,41 @@ fn qtype_to_dtype(q: u8) -> Option<DType> {
     })
 }
 
-/// Logical manifest name → on-disk HFQ tensor name, for the quantized
-/// projections only (`None` for everything else — norms, embed, lm_head).
-fn on_disk(name: &str, layer: usize) -> Option<String> {
-    let p = format!("model.layers.{layer}");
-    Some(match name {
-        "wq" => format!("{p}.self_attn.q_proj.weight"),
-        "wk" => format!("{p}.self_attn.k_proj.weight"),
-        "wv" => format!("{p}.self_attn.v_proj.weight"),
-        "wo" => format!("{p}.self_attn.o_proj.weight"),
-        "ffn_gate" => format!("{p}.mlp.gate_proj.weight"),
-        "ffn_up" => format!("{p}.mlp.up_proj.weight"),
-        "ffn_down" => format!("{p}.mlp.down_proj.weight"),
+/// Logical manifest name (+ layer) → on-disk HFQ tensor name (HF/safetensors
+/// convention, the `.mq4` / `load_weights_hfq` path).
+fn on_disk(name: &str, layer: Option<usize>) -> Option<String> {
+    Some(match (name, layer) {
+        ("token_embd", None) => "model.embed_tokens.weight".to_string(),
+        ("output_norm", None) => "model.norm.weight".to_string(),
+        ("lm_head", None) => "lm_head.weight".to_string(),
+        (n, Some(l)) => {
+            let p = format!("model.layers.{l}");
+            match n {
+                "wq" => format!("{p}.self_attn.q_proj.weight"),
+                "wk" => format!("{p}.self_attn.k_proj.weight"),
+                "wv" => format!("{p}.self_attn.v_proj.weight"),
+                "wo" => format!("{p}.self_attn.o_proj.weight"),
+                "q_norm" => format!("{p}.self_attn.q_norm.weight"),
+                "k_norm" => format!("{p}.self_attn.k_norm.weight"),
+                "attn_norm" => format!("{p}.input_layernorm.weight"),
+                "ffn_norm" => format!("{p}.post_attention_layernorm.weight"),
+                "ffn_gate" => format!("{p}.mlp.gate_proj.weight"),
+                "ffn_up" => format!("{p}.mlp.up_proj.weight"),
+                "ffn_down" => format!("{p}.mlp.down_proj.weight"),
+                _ => return None,
+            }
+        }
         _ => return None,
     })
 }
 
-/// The bespoke `WeightTensor` for a logical projection name.
-fn bespoke<'a>(w: &'a LlamaWeights, name: &str, layer: usize) -> Option<&'a WeightTensor> {
-    let l = w.layers.get(layer)?;
-    Some(match name {
-        "wq" => &l.wq,
-        "wk" => &l.wk,
-        "wv" => &l.wv,
-        "wo" => &l.wo,
-        "ffn_gate" => &l.w_gate,
-        "ffn_up" => &l.w_up,
-        "ffn_down" => &l.w_down,
-        _ => return None,
-    })
+/// F16 little-endian bytes → F32 bytes (the loader's `load_f16_tensor` dequant).
+fn f16_bytes_to_f32_bytes(bytes: &[u8]) -> Vec<u8> {
+    let f32: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    f32.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
 fn readback(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
@@ -117,6 +97,46 @@ fn readback(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
     let mut b = vec![0u8; n];
     gpu.hip.memcpy_dtoh(&mut b, &t.buf).expect("memcpy_dtoh");
     b
+}
+
+/// Move a resident tensor out of the store (panics if missing / an alias).
+fn take_gpu(store: &mut WeightStore, name: &str, layer: Option<usize>) -> GpuTensor {
+    match store.take(name, layer, 0) {
+        Some(WeightHandle::Resident(t)) => t,
+        _ => panic!("store missing resident {name}[{layer:?}]"),
+    }
+}
+
+/// Logical `(m, k)` of a per-layer projection, from its manifest entry.
+fn mk(manifest: &[WeightEntry], name: &str, l: usize) -> (usize, usize) {
+    let e = manifest
+        .iter()
+        .find(|e| e.name == name && e.layer == Some(l))
+        .unwrap_or_else(|| panic!("no manifest entry {name}[{l}]"));
+    (e.logical_shape[0], e.logical_shape[1])
+}
+
+/// A `WeightTensor` wrapping a store buffer (its dtype is the store dtype).
+fn wt(buf: GpuTensor, m: usize, k: usize) -> WeightTensor {
+    WeightTensor {
+        gpu_dtype: buf.dtype,
+        buf,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    }
+}
+
+/// One greedy forward at pos 0 for token 1 → the logit vector.
+fn forward_logits(gpu: &mut Gpu, w: &LlamaWeights, cfg: &llama::LlamaConfig) -> Vec<f32> {
+    let mut kv =
+        KvCache::new_gpu_q8(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, 256).expect("kv");
+    let scratch = <Llama as Architecture>::new_state(gpu, cfg).expect("scratch");
+    llama::forward_scratch_embed(gpu, w, cfg, 1u32, 0, &scratch).expect("embed");
+    llama::forward_scratch_compute(gpu, w, cfg, 0, &mut kv, &scratch).expect("compute");
+    gpu.download_f32(&scratch.logits).expect("logits")
 }
 
 fn main() {
@@ -127,160 +147,167 @@ fn main() {
     let cfg = Llama::config_from_hfq(&hfq).expect("config_from_hfq");
     let n_layers = cfg.n_layers;
 
-    // The manifest, filtered to the quantized projections this skeleton covers.
-    let manifest: Vec<_> = Llama::weight_manifest(&cfg)
-        .into_iter()
-        .filter(|e| e.layer.is_some() && on_disk(&e.name, e.layer.unwrap()).is_some())
-        .collect();
+    // Whole-model manifest.
+    let manifest: Vec<WeightEntry> = Llama::weight_manifest(&cfg);
+    let has_lm_head = hfq.tensor_data("lm_head.weight").is_some();
 
-    // Pre-read each projection's raw bytes + real dtype (immutable HFQ borrows
-    // finish here, before the &mut load below). Keyed (logical_name, layer).
-    let mut src: HashMap<(String, usize), (Vec<u8>, DType)> = HashMap::new();
+    // Pre-read every tensor's (bytes, dtype) mirroring the HFQ loader's rule:
+    // F16/F32 → dequant to F32; else raw + real quant dtype. (Immutable HFQ
+    // borrows finish here, before the &mut bespoke load below.)
+    let mut src: HashMap<(String, Option<usize>), (Vec<u8>, DType)> = HashMap::new();
     for e in &manifest {
-        let layer = e.layer.unwrap();
-        let name = on_disk(&e.name, layer).unwrap();
+        // Tied lm_head: no lm_head.weight → bespoke dequants token_embd to F32.
+        if e.name == "lm_head" && !has_lm_head {
+            let (_, bytes) = hfq.tensor_data("model.embed_tokens.weight").unwrap();
+            src.insert(
+                (e.name.clone(), e.layer),
+                (f16_bytes_to_f32_bytes(&bytes), DType::F32),
+            );
+            continue;
+        }
+        let name = on_disk(&e.name, e.layer)
+            .unwrap_or_else(|| panic!("no on-disk name for {}[{:?}]", e.name, e.layer));
         let (info, bytes) = hfq
             .tensor_data(&name)
             .unwrap_or_else(|| panic!("HFQ missing tensor {name}"));
-        let dt = qtype_to_dtype(info.quant_type)
-            .unwrap_or_else(|| panic!("{name}: unhandled quant_type {}", info.quant_type));
-        src.insert((e.name.clone(), layer), (bytes.to_vec(), dt));
+        let (blob, dt) = match info.quant_type {
+            1 => (f16_bytes_to_f32_bytes(&bytes), DType::F32), // F16 → F32 dequant
+            2 => (bytes.to_vec(), DType::F32),                 // already F32
+            q => (
+                bytes.to_vec(),
+                qtype_to_dtype(q).unwrap_or_else(|| panic!("{name}: unhandled quant_type {q}")),
+            ),
+        };
+        src.insert((e.name.clone(), e.layer), (blob, dt));
     }
 
-    // Bespoke load (the reference), then wrap the device into a 1×1 Gpus.
+    // Bespoke reference load + its forward logits.
     let mut gpu = Gpu::init().expect("Gpu::init");
     let bespoke_w = Llama::load_weights(&mut hfq, &cfg, &mut gpu).expect("bespoke load_weights");
+    let ref_logits = forward_logits(&mut gpu, &bespoke_w, &cfg);
     let mut gpus = Gpus::single(gpu, n_layers);
 
-    // Store-backed load via the generic fulfill_manifest + our source closure.
+    // Whole-model store-backed load.
     let mut store = fulfill_manifest(&manifest, &DeviceMesh::single(), n_layers, &gpus, |e| {
-        src.get(&(e.name.clone(), e.layer.unwrap()))
+        src.get(&(e.name.clone(), e.layer))
             .cloned()
             .ok_or_else(|| format!("no source bytes for {}[{:?}]", e.name, e.layer))
     })
     .expect("fulfill_manifest");
 
-    // Compare every fulfilled tensor to the bespoke WeightTensor: real dtype +
-    // exact device bytes.
-    let mut n_ok = 0usize;
-    let mut example_dtype = None;
-    for e in &manifest {
-        let layer = e.layer.unwrap();
-        let store_t = match store.get(&e.name, e.layer, 0) {
-            Some(WeightHandle::Resident(t)) => t,
-            _ => panic!("store missing {}[{layer}]", e.name),
-        };
-        let bt = bespoke(&bespoke_w, &e.name, layer).unwrap();
-        assert_eq!(
-            store_t.dtype, bt.gpu_dtype,
-            "{}[{layer}] dtype mismatch: store {:?} vs bespoke {:?}",
-            e.name, store_t.dtype, bt.gpu_dtype
-        );
-        let sb = readback(&gpus.devices[0], store_t);
-        let bb = readback(&gpus.devices[0], &bt.buf);
-        assert_eq!(
-            sb.len(),
-            bb.len(),
-            "{}[{layer}] byte-length mismatch",
-            e.name
-        );
-        assert!(
-            sb == bb,
-            "{}[{layer}] bytes differ from bespoke loader",
-            e.name
-        );
-        example_dtype.get_or_insert(store_t.dtype);
-        n_ok += 1;
+    // Byte+dtype spot-check on the projections vs bespoke (localises a failure
+    // to the source before the assembly/forward).
+    let mut spot = 0usize;
+    for l in 0..n_layers {
+        for (lname, field) in [
+            ("wq", &bespoke_w.layers[l].wq),
+            ("wk", &bespoke_w.layers[l].wk),
+            ("wv", &bespoke_w.layers[l].wv),
+            ("wo", &bespoke_w.layers[l].wo),
+            ("ffn_gate", &bespoke_w.layers[l].w_gate),
+            ("ffn_up", &bespoke_w.layers[l].w_up),
+            ("ffn_down", &bespoke_w.layers[l].w_down),
+        ] {
+            let st = match store.get(lname, Some(l), 0) {
+                Some(WeightHandle::Resident(t)) => t,
+                _ => panic!("store missing {lname}[{l}]"),
+            };
+            assert_eq!(st.dtype, field.gpu_dtype, "{lname}[{l}] dtype");
+            assert!(
+                readback(&gpus.devices[0], st) == readback(&gpus.devices[0], &field.buf),
+                "{lname}[{l}] bytes differ from bespoke"
+            );
+            spot += 1;
+        }
     }
+    println!("llama_store_load: {spot} projection tensors byte+dtype identical to bespoke");
 
-    println!(
-        "llama_store_load: OK — {n_ok} quantized projection tensors across {n_layers} layers \
-         byte+dtype identical to bespoke Llama::load_weights (e.g. {:?})",
-        example_dtype.unwrap()
-    );
+    // Assemble a LlamaWeights ENTIRELY from the store.
+    let token_embd = take_gpu(&mut store, "token_embd", None);
+    let embd_format = match token_embd.dtype {
+        DType::Q8_0 => EmbeddingFormat::Q8_0,
+        DType::Q4K => EmbeddingFormat::Q4K,
+        DType::HFQ4G256 => EmbeddingFormat::HFQ4G256,
+        DType::HFQ4G128 => EmbeddingFormat::HFQ4G128,
+        DType::F32 => EmbeddingFormat::F32,
+        other => panic!("unexpected token_embd dtype {other:?}"),
+    };
+    let output_norm = take_gpu(&mut store, "output_norm", None);
+    let lm = take_gpu(&mut store, "lm_head", None);
+    let output = wt(lm, cfg.vocab_size, cfg.dim);
 
-    // ── Phase-3 CONSUMPTION: assemble a LlamaWeights whose projections come
-    // from the store, then run a REAL forward through it. Byte-identity is
-    // already proven, so this proves the store tensors' metadata (dtype/shape)
-    // is end-to-end usable by the kernels — the store *feeds the forward*.
-    // (Norms / embed / lm_head come from the bespoke load: their F16→F32-dequant
-    // source is a documented follow-up; here we exercise the store buffers.)
-    let LlamaWeights {
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let (wqm, wqk) = mk(&manifest, "wq", l);
+        let (wkm, wkk) = mk(&manifest, "wk", l);
+        let (wvm, wvk) = mk(&manifest, "wv", l);
+        let (wom, wok) = mk(&manifest, "wo", l);
+        let (gm, gk) = mk(&manifest, "ffn_gate", l);
+        let (um, uk) = mk(&manifest, "ffn_up", l);
+        let (dm, dk) = mk(&manifest, "ffn_down", l);
+        layers.push(LayerWeights {
+            attn_norm: take_gpu(&mut store, "attn_norm", Some(l)),
+            wq: wt(take_gpu(&mut store, "wq", Some(l)), wqm, wqk),
+            wk: wt(take_gpu(&mut store, "wk", Some(l)), wkm, wkk),
+            wv: wt(take_gpu(&mut store, "wv", Some(l)), wvm, wvk),
+            wo: wt(take_gpu(&mut store, "wo", Some(l)), wom, wok),
+            q_norm: cfg
+                .has_qk_norm
+                .then(|| take_gpu(&mut store, "q_norm", Some(l))),
+            k_norm: cfg
+                .has_qk_norm
+                .then(|| take_gpu(&mut store, "k_norm", Some(l))),
+            ffn_norm: take_gpu(&mut store, "ffn_norm", Some(l)),
+            w_gate: wt(take_gpu(&mut store, "ffn_gate", Some(l)), gm, gk),
+            w_up: wt(take_gpu(&mut store, "ffn_up", Some(l)), um, uk),
+            w_down: wt(take_gpu(&mut store, "ffn_down", Some(l)), dm, dk),
+        });
+    }
+    let stored_w = LlamaWeights {
         token_embd,
         embd_format,
         output_norm,
         output,
         layers,
-    } = bespoke_w;
-    let mut new_layers = Vec::with_capacity(layers.len());
-    for (l, bl) in layers.into_iter().enumerate() {
-        let LayerWeights {
-            attn_norm,
-            wq,
-            wk,
-            wv,
-            wo,
-            q_norm,
-            k_norm,
-            ffn_norm,
-            w_gate,
-            w_up,
-            w_down,
-        } = bl;
-        new_layers.push(LayerWeights {
-            attn_norm,
-            wq: wt_from(take_resident(&mut store, "wq", l), wq),
-            wk: wt_from(take_resident(&mut store, "wk", l), wk),
-            wv: wt_from(take_resident(&mut store, "wv", l), wv),
-            wo: wt_from(take_resident(&mut store, "wo", l), wo),
-            q_norm,
-            k_norm,
-            ffn_norm,
-            w_gate: wt_from(take_resident(&mut store, "ffn_gate", l), w_gate),
-            w_up: wt_from(take_resident(&mut store, "ffn_up", l), w_up),
-            w_down: wt_from(take_resident(&mut store, "ffn_down", l), w_down),
-        });
-    }
-    let merged = LlamaWeights {
-        token_embd,
-        embd_format,
-        output_norm,
-        output,
-        layers: new_layers,
     };
 
-    let gpu = &mut gpus.devices[0];
-    let mut kv = KvCache::new_gpu_q8(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, 256)
-        .expect("kv cache");
-    let scratch = <Llama as Architecture>::new_state(gpu, &cfg).expect("scratch");
-    llama::forward_scratch_embed(gpu, &merged, &cfg, 1u32, 0, &scratch).expect("forward embed");
-    llama::forward_scratch_compute(gpu, &merged, &cfg, 0, &mut kv, &scratch)
-        .expect("forward compute");
-    let logits = gpu.download_f32(&scratch.logits).expect("download logits");
-
+    // Forward through the store-assembled model and compare to bespoke.
+    let asm_logits = forward_logits(&mut gpus.devices[0], &stored_w, &cfg);
+    assert_eq!(asm_logits.len(), ref_logits.len(), "logit-length mismatch");
+    let max_abs = asm_logits
+        .iter()
+        .zip(&ref_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let (asm_argmax, ref_argmax) = (argmax(&asm_logits), argmax(&ref_logits));
     assert!(
-        logits.iter().all(|x| x.is_finite()),
+        asm_logits.iter().all(|x| x.is_finite()),
         "store-assembled forward produced non-finite logits"
     );
-    let argmax = logits
-        .iter()
+    assert_eq!(
+        asm_argmax, ref_argmax,
+        "argmax diverged: store {asm_argmax} vs bespoke {ref_argmax}"
+    );
+    assert!(
+        max_abs == 0.0,
+        "store-assembled logits differ from bespoke (max |Δ| = {max_abs})"
+    );
+    println!(
+        "llama_store_load: WHOLE-MODEL store→forward OK — {} tensors fulfilled, forward \
+         logit-IDENTICAL to bespoke (max |Δ|=0, argmax token {asm_argmax})",
+        manifest.len()
+    );
+}
+
+fn argmax(v: &[f32]) -> usize {
+    v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-            if v > bv {
-                (i, v)
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+            if x > bv {
+                (i, x)
             } else {
                 (bi, bv)
             }
         })
-        .0;
-    assert!(
-        argmax < cfg.vocab_size,
-        "argmax {argmax} out of vocab {}",
-        cfg.vocab_size
-    );
-    println!(
-        "llama_store_load: forward on store-assembled weights OK — {} finite logits, argmax token \
-         {argmax} (the real forward consumed the store's projection buffers)",
-        logits.len()
-    );
+        .0
 }
