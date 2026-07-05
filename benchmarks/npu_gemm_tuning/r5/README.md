@@ -88,8 +88,20 @@ so the MLIR's `link_with` resolves).
 using `aie::accum::extract<16>(i).to_native()` → `put_mcd`, and `get_scd_v16acc32()`
 → `aie::accum::insert`.
 
-**Next:** hand-write the 2-core cascade MLIR (place 2 cores in a column,
-`aie.cascade_flow(core0, core1)`, feed A/W per core, drain C from the tail) using the
-existing `aie.mlir` as a template + the 3 cascade `.o`s; build via the recipe above;
-dispatch via NpuKernel; validate the cascade sum equals the single-core result on
-all-ones. Then 4-core column, 8 columns, and measure real (INNER=0) TOPS vs SOTA ~5.
+**3. 2-core K-cascade WORKS on hardware.** `r5_2core.mlir` places two adjacent cores
+in column 0 (head=(0,3) north of tail=(0,2) — cascade source must be North/West of
+dest), `aie.cascade_flow(head, tail)`, broadcasts all-ones A/W to both, and drains C
+from the tail. Built via `r5_build.sh` and dispatched through NpuKernel:
+**`C[0]=512`** — each core's KSLICE=16 partial is 256, and the cascade summed them
+core-to-core (256 would mean the cascade dropped the head). dispatch2 (A=2) = 1024,
+confirming linearity. **First working cascade GEMM through hipfire — the K-resident-C
+systolic dataflow no shipped kernel uses is validated end-to-end.**
+
+`r5_build.sh <mlir> <workdir> [KSLICE]` builds any R5 cascade design (compiles the
+head/mid/tail objects, runs aiecc) → `final.xclbin` + `insts.bin`, reproducibly.
+
+**Next:** scale to a **4-core column** (head + 2 middle + tail, full K-split down the
+column via `r5_cascade_mid`) — validate the sum still holds — then broadcast across
+**8 columns = 32 cores** and measure the real (INNER=0) TOPS through NpuKernel against
+SOTA's ~5. If the cascade keeps C resident and kills the per-tile reload, this is
+where it should break past ~15.7 toward the ~40 capacity.
