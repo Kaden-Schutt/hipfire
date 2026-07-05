@@ -306,10 +306,21 @@ impl DiffusionPipeline {
                 plan.latent_shape.width
             )));
         }
-        let strength = request.denoising_strength.clamp(0.0, 1.0);
-        let denoise_steps = ((plan.schedule.timesteps.len() as f32) * strength).ceil() as usize;
-        let start_step = plan.schedule.timesteps.len().saturating_sub(denoise_steps);
-        let schedule = plan.schedule.slice_from_step(start_step)?;
+        // MrFlow staged-sampling refine: an explicit direct-sigma schedule
+        // replaces the strength-derived slice of the base schedule. `start_step`
+        // is 0 because the refine schedule already starts at `first_sigma`.
+        let (schedule, start_step) = if let Some(refine) = request.refine_sigma.as_ref() {
+            let refine_schedule =
+                plan.schedule
+                    .refine_direct_sigma(refine.first_sigma, refine.steps, refine.shifted)?;
+            (refine_schedule, 0usize)
+        } else {
+            let strength = request.denoising_strength.clamp(0.0, 1.0);
+            let denoise_steps =
+                ((plan.schedule.timesteps.len() as f32) * strength).ceil() as usize;
+            let start_step = plan.schedule.timesteps.len().saturating_sub(denoise_steps);
+            (plan.schedule.slice_from_step(start_step)?, start_step)
+        };
         let expanded_mask = if let Some(mask) = request.mask.as_ref() {
             let mask = expand_rgb_batch_for_prompts(mask, request.batch.prompts.len())?;
             let target_width = match request.resize_mode {
@@ -381,8 +392,14 @@ impl DiffusionPipeline {
         let mut latents = denoise_init_latents.clone();
         if !schedule.timesteps.is_empty() {
             let noise = plan.latents;
-            plan.schedule
-                .add_noise_to_latents(&mut latents, &noise.data, start_step)?;
+            if request.refine_sigma.is_some() {
+                // Flow-match interpolation noising: the re-encoded super-resolved
+                // image is a clean x0, so inject (1 - sigma) * x0 + sigma * noise.
+                schedule.add_flow_match_refine_noise(&mut latents, &noise.data)?;
+            } else {
+                plan.schedule
+                    .add_noise_to_latents(&mut latents, &noise.data, start_step)?;
+            }
             let masked_reference =
                 mask_weights
                     .as_ref()

@@ -3270,6 +3270,25 @@ fn validate_img2img_request(
             )));
         }
     }
+    if let Some(refine) = request.refine_sigma.as_ref() {
+        if !refine.first_sigma.is_finite() || !(0.0 < refine.first_sigma && refine.first_sigma < 1.0)
+        {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "refine_sigma.first_sigma {} must be in (0, 1)",
+                refine.first_sigma
+            )));
+        }
+        if refine.steps == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "refine_sigma.steps must be greater than zero".to_string(),
+            ));
+        }
+        if request.mask.is_some() {
+            return Err(DiffusionError::InvalidRequest(
+                "refine_sigma (MrFlow refine) does not support masked/inpaint requests".to_string(),
+            ));
+        }
+    }
     if request.init_image.batch == 0 {
         return Err(DiffusionError::InvalidRequest(
             "init image batch must be non-empty".to_string(),

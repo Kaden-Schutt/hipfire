@@ -409,6 +409,101 @@ impl DiffusionSchedule {
         })
     }
 
+    /// MrFlow "direct sigma" refine schedule: an explicit short sigma ramp from
+    /// `first_sigma` down to 0, independent of the model's base denoise
+    /// schedule. Used for the high-resolution refine pass in staged sampling
+    /// (low-res generate -> pixel-space super-resolution -> re-encode -> short
+    /// refine).
+    ///
+    /// `steps == 1` yields `[first_sigma, 0.0]`. With `shifted` and `steps > 1`
+    /// the interior points follow the flow-match time shift
+    /// (`mu = 0.25 * (steps - 1)`), matching the reference MrFlow refine; a plain
+    /// linear ramp from `first_sigma` to 0 is used otherwise (for a single step
+    /// the two are identical). Timestep values reuse this schedule's
+    /// `sigma -> timestep` scaling so the transformer receives the correct
+    /// timestep embedding. Only defined for flow-match backbones
+    /// (FLUX / Qwen-Image / Z-Image / Krea-2).
+    pub fn refine_direct_sigma(
+        &self,
+        first_sigma: f32,
+        steps: u32,
+        shifted: bool,
+    ) -> DiffusionResult<Self> {
+        if self.solver != SchedulerSolver::FlowMatchEuler {
+            return Err(DiffusionError::InvalidRequest(
+                "MrFlow direct-sigma refine requires a flow-match schedule".to_string(),
+            ));
+        }
+        if !first_sigma.is_finite() || !(0.0 < first_sigma && first_sigma < 1.0) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "refine first_sigma {first_sigma} must be in (0, 1)"
+            )));
+        }
+        if steps == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "refine steps must be greater than zero".to_string(),
+            ));
+        }
+        let steps = steps as usize;
+        let sigmas = if steps == 1 {
+            vec![first_sigma, 0.0]
+        } else if shifted {
+            // Flow-match time shift on a linspace(1, 0) base, normalized so the
+            // first interior sigma is `first_sigma` and the tail is 0. Mirrors
+            // the reference MrFlow shifted refine path.
+            let mu = 0.25 * (steps as f32 - 1.0);
+            let e = mu.exp();
+            let shift = |t: f32| {
+                let t = t.clamp(1.0e-6, 1.0 - 1.0e-6);
+                e / (e + (1.0 / t - 1.0))
+            };
+            let mut shifted_vals = (0..=steps)
+                .map(|idx| shift(1.0 - idx as f32 / steps as f32))
+                .collect::<Vec<f32>>();
+            let last = *shifted_vals.last().unwrap();
+            let span = shifted_vals[0] - last;
+            let span = if span.abs() <= f32::EPSILON { 1.0 } else { span };
+            for value in &mut shifted_vals {
+                *value = (*value - last) / span * first_sigma;
+            }
+            *shifted_vals.first_mut().unwrap() = first_sigma;
+            *shifted_vals.last_mut().unwrap() = 0.0;
+            shifted_vals
+        } else {
+            let mut ramp = (0..=steps)
+                .map(|idx| first_sigma * (1.0 - idx as f32 / steps as f32))
+                .collect::<Vec<f32>>();
+            *ramp.last_mut().unwrap() = 0.0;
+            ramp
+        };
+
+        // Recover the base schedule's sigma -> timestep scale (e.g. 1000 for a
+        // 1000-train-timestep flow-match model) so the refine timesteps match.
+        let scale = self
+            .sigmas
+            .iter()
+            .zip(self.timesteps.iter())
+            .find(|(sigma, _)| **sigma > f32::EPSILON)
+            .map(|(sigma, timestep)| timestep / sigma)
+            .unwrap_or(1000.0);
+        let timesteps = sigmas[..steps]
+            .iter()
+            .map(|sigma| sigma * scale)
+            .collect::<Vec<f32>>();
+
+        Ok(Self {
+            timesteps,
+            sigmas,
+            prediction_type: self.prediction_type,
+            input_scaling: self.input_scaling,
+            solver: self.solver,
+            train_timesteps: Vec::new(),
+            alpha_t: Vec::new(),
+            sigma_t: Vec::new(),
+            lambda_t: Vec::new(),
+        })
+    }
+
     pub fn scale_model_input(&self, sample: &CpuTensor, step: usize) -> DiffusionResult<CpuTensor> {
         match self.input_scaling {
             SchedulerInputScaling::None => Ok(sample.clone()),
@@ -470,6 +565,37 @@ impl DiffusionSchedule {
         })?;
         for (latent, noise) in latents.data.iter_mut().zip(noise) {
             *latent += *noise * sigma;
+        }
+        Ok(())
+    }
+
+    /// Flow-match forward noising for the MrFlow refine pass:
+    /// `x = (1 - sigma) * x0 + sigma * noise` at the schedule's first sigma.
+    ///
+    /// This is the flow-match interpolation (matching diffusers'
+    /// `FlowMatchEulerDiscreteScheduler::scale_noise`), distinct from the
+    /// additive `x0 + sigma * noise` in [`add_noise_to_latents`] used by the
+    /// epsilon/Euler img2img path. The refine pass re-encodes a super-resolved
+    /// image (a clean `x0`) and injects matched noise before a short flow-match
+    /// denoise; the additive form would leave an `x0`-scaled residual after the
+    /// Euler step, so the refine path must use this interpolation.
+    pub fn add_flow_match_refine_noise(
+        &self,
+        latents: &mut LatentBatch,
+        noise: &[f32],
+    ) -> DiffusionResult<()> {
+        if noise.len() != latents.data.len() {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "noise length {} != latent length {}",
+                noise.len(),
+                latents.data.len()
+            )));
+        }
+        let sigma = *self.sigmas.first().ok_or_else(|| {
+            DiffusionError::InvalidRequest("refine schedule has no sigmas".to_string())
+        })?;
+        for (latent, noise) in latents.data.iter_mut().zip(noise) {
+            *latent = (1.0 - sigma) * *latent + sigma * *noise;
         }
         Ok(())
     }

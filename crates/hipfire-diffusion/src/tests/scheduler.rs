@@ -172,6 +172,108 @@ fn flow_match_euler_step_uses_model_output_as_velocity() {
     assert_eq!(latents.data, vec![0.75, -0.5]);
 }
 
+fn flow_match_base_schedule_for_refine() -> DiffusionSchedule {
+    let config = SchedulerConfig {
+        class_name: "FlowMatchEulerDiscreteScheduler".into(),
+        num_train_timesteps: Some(1000),
+        shift: Some(1.0),
+        ..SchedulerConfig::default()
+    };
+    DiffusionSchedule::from_config(&config, 12).unwrap()
+}
+
+#[test]
+fn refine_direct_sigma_single_step_is_ramp_to_zero_with_scaled_timestep() {
+    let base = flow_match_base_schedule_for_refine();
+    let refine = base.refine_direct_sigma(0.12, 1, false).unwrap();
+
+    // One step: sigmas [first_sigma, 0]; timestep = sigma * 1000 (base scale).
+    assert_eq!(refine.solver, SchedulerSolver::FlowMatchEuler);
+    assert_eq!(refine.sigmas, vec![0.12, 0.0]);
+    assert_eq!(refine.timesteps.len(), 1);
+    assert!((refine.timesteps[0] - 120.0).abs() < 1e-3);
+}
+
+#[test]
+fn refine_direct_sigma_single_step_ignores_shifted_flag() {
+    let base = flow_match_base_schedule_for_refine();
+    let linear = base.refine_direct_sigma(0.16, 1, false).unwrap();
+    let shifted = base.refine_direct_sigma(0.16, 1, true).unwrap();
+    // For a single refine step the shifted and linear schedules are identical.
+    assert_eq!(linear.sigmas, shifted.sigmas);
+    assert_eq!(linear.sigmas, vec![0.16, 0.0]);
+}
+
+#[test]
+fn refine_direct_sigma_multistep_ramps_from_first_sigma_to_zero() {
+    let base = flow_match_base_schedule_for_refine();
+    let refine = base.refine_direct_sigma(0.2, 4, false).unwrap();
+
+    assert_eq!(refine.sigmas.len(), 5);
+    assert_eq!(refine.timesteps.len(), 4);
+    assert!((refine.sigmas[0] - 0.2).abs() < 1e-6);
+    assert_eq!(*refine.sigmas.last().unwrap(), 0.0);
+    // Monotonically decreasing toward zero.
+    for pair in refine.sigmas.windows(2) {
+        assert!(pair[0] >= pair[1]);
+    }
+
+    // Shifted variant keeps the same endpoints but bends the interior.
+    let shifted = base.refine_direct_sigma(0.2, 4, true).unwrap();
+    assert!((shifted.sigmas[0] - 0.2).abs() < 1e-6);
+    assert_eq!(*shifted.sigmas.last().unwrap(), 0.0);
+    assert_ne!(shifted.sigmas, refine.sigmas);
+}
+
+#[test]
+fn refine_direct_sigma_rejects_bad_params_and_non_flow_match() {
+    let base = flow_match_base_schedule_for_refine();
+    assert!(base.refine_direct_sigma(0.0, 1, false).is_err());
+    assert!(base.refine_direct_sigma(1.0, 1, false).is_err());
+    assert!(base.refine_direct_sigma(0.12, 0, false).is_err());
+
+    // A non-flow-match (linear/Euler) schedule is rejected.
+    let euler = DiffusionSchedule::linear(4).unwrap();
+    assert!(euler.refine_direct_sigma(0.12, 1, false).is_err());
+}
+
+#[test]
+fn flow_match_refine_noise_then_euler_step_recovers_clean_latent() {
+    // The refine round trip: inject flow-match noise into a clean x0, then take
+    // one Euler step with the exact flow-match velocity (noise - x0). The result
+    // must recover x0 -- the property the additive noising would violate.
+    let base = flow_match_base_schedule_for_refine();
+    let refine = base.refine_direct_sigma(0.12, 1, false).unwrap();
+
+    let x0 = vec![0.5_f32, -0.25, 1.0, 0.0];
+    let noise = vec![0.9_f32, 0.1, -0.4, 0.2];
+    let mut latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 4,
+        data: x0.clone(),
+    };
+
+    refine
+        .add_flow_match_refine_noise(&mut latents, &noise)
+        .unwrap();
+    // x = (1 - 0.12) * x0 + 0.12 * noise
+    for ((got, x0v), n) in latents.data.iter().zip(&x0).zip(&noise) {
+        let expected = 0.88 * x0v + 0.12 * n;
+        assert!((got - expected).abs() < 1e-6, "noised: {got} vs {expected}");
+    }
+
+    // Flow-match velocity target for x_t = (1-s) x0 + s noise is (noise - x0).
+    let velocity: Vec<f32> = noise.iter().zip(&x0).map(|(n, x)| n - x).collect();
+    let mut state = SchedulerStepState::default();
+    refine.step(&mut latents, &velocity, 0, &mut state).unwrap();
+
+    for (got, x0v) in latents.data.iter().zip(&x0) {
+        assert!((got - x0v).abs() < 1e-6, "recovered: {got} vs {x0v}");
+    }
+}
+
 #[test]
 fn karras_scheduler_uses_power_law_sigmas_and_nearest_train_timesteps() {
     let mut config = SchedulerConfig {

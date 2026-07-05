@@ -455,6 +455,7 @@ fn tiny_sd_pipeline_generates_one_step_img2img_png_when_import_exists() {
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();

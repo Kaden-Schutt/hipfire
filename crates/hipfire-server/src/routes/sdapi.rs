@@ -542,6 +542,7 @@ async fn execute_hfq_diffusion_txt2img(
                 inpainting_fill: None,
                 resize_mode: DiffusionImg2ImgResizeMode::Image,
                 denoising_strength: worker_body.denoising_strength.unwrap_or(0.75) as f32,
+                refine_sigma: None,
             };
             let highres_step_offset =
                 base_step_offset.saturating_add(first_output_steps(&worker_first_pass_body));
@@ -682,6 +683,7 @@ async fn execute_hfq_diffusion_img2img(
                 inpainting_fill,
                 resize_mode: sdapi_img2img_diffusion_resize_mode(&worker_body),
                 denoising_strength,
+                refine_sigma: None,
             };
             let step_offset = iter as usize * sdapi_img2img_denoise_steps(&worker_body);
             let total_steps = sdapi_img2img_denoise_steps(&worker_body) * n_iter as usize;

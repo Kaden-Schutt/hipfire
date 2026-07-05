@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use base64::Engine;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 // GGUF-style split: the diffusers/checkpoint importer (pickle + zip parsing)
 // now lives in the offline hipfire-diffusion-coexist crate, out of the
@@ -16,7 +16,7 @@ use hipfire_diffusion::{
     calibrate_diffusion_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
     resize_rgb_batch_to_cover_nearest, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
     DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
-    DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RgbImageBatch,
+    DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule, RgbImageBatch,
 };
 use hipfire_diffusion_coexist::{import_diffusers_to_hfq, DiffusersImportOptions};
 use serde::Serialize;
@@ -299,6 +299,102 @@ pub struct DiffusionTxt2ImgArgs {
     /// is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable.
     #[arg(long)]
     pub rocm_device_id: Option<i32>,
+    /// Enable MrFlow staged sampling: a fast low-resolution pass, pixel-space
+    /// super-resolution, re-encode, and a short direct-sigma refine. --width and
+    /// --height are the final resolution; the low-res pass runs at those divided
+    /// by the upscale factor. Flow-match backbones only (FLUX / Qwen-Image /
+    /// Z-Image / Krea-2). Overrides --enable-hr.
+    #[arg(long, value_enum)]
+    pub mrflow: Option<MrFlowPreset>,
+    /// Override the MrFlow refine start sigma (preset default). Larger values
+    /// (0.16-0.20) can improve text-heavy generations.
+    #[arg(long)]
+    pub mrflow_refine_sigma: Option<f32>,
+    /// Override the MrFlow pixel-space upscale factor (preset default 2.0).
+    #[arg(long)]
+    pub mrflow_upscale: Option<f64>,
+    /// Use the flow-match shifted interior refine schedule (only affects refine
+    /// passes with more than one step).
+    #[arg(long)]
+    pub mrflow_shifted: bool,
+}
+
+/// MrFlow staged-sampling presets. The numbers follow the reference MrFlow /
+/// Rebels ports: `stageN + 1` denotes N low-resolution steps and one
+/// high-resolution direct-sigma refine step.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MrFlowPreset {
+    /// Z-Image Turbo, 9 low-res + 1 refine, sigma 0.11, no CFG (paper demo).
+    #[value(name = "zit-9plus1")]
+    Zit9Plus1,
+    /// Krea-2 base, 12 low-res + 1 refine, sigma 0.12, cfg 4.0.
+    #[value(name = "krea2-12plus1")]
+    Krea2Base12Plus1,
+    /// Krea-2 base, 20 low-res + 1 refine, sigma 0.15, cfg 4.0.
+    #[value(name = "krea2-20plus1")]
+    Krea2Base20Plus1,
+    /// Krea-2 Turbo, 8 low-res + 1 refine, sigma 0.11, no CFG.
+    #[value(name = "krea2-turbo-8plus1")]
+    Krea2Turbo8Plus1,
+}
+
+struct MrFlowPresetParams {
+    stage1_steps: u32,
+    refine_steps: u32,
+    refine_sigma: f32,
+    cfg_scale: f32,
+    upscale_factor: f64,
+}
+
+impl MrFlowPreset {
+    fn params(self) -> MrFlowPresetParams {
+        match self {
+            MrFlowPreset::Zit9Plus1 => MrFlowPresetParams {
+                stage1_steps: 9,
+                refine_steps: 1,
+                refine_sigma: 0.11,
+                cfg_scale: 1.0,
+                upscale_factor: 2.0,
+            },
+            MrFlowPreset::Krea2Base12Plus1 => MrFlowPresetParams {
+                stage1_steps: 12,
+                refine_steps: 1,
+                refine_sigma: 0.12,
+                cfg_scale: 4.0,
+                upscale_factor: 2.0,
+            },
+            MrFlowPreset::Krea2Base20Plus1 => MrFlowPresetParams {
+                stage1_steps: 20,
+                refine_steps: 1,
+                refine_sigma: 0.15,
+                cfg_scale: 4.0,
+                upscale_factor: 2.0,
+            },
+            MrFlowPreset::Krea2Turbo8Plus1 => MrFlowPresetParams {
+                stage1_steps: 8,
+                refine_steps: 1,
+                refine_sigma: 0.11,
+                cfg_scale: 1.0,
+                upscale_factor: 2.0,
+            },
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MrFlowPreset::Zit9Plus1 => "zit-9plus1",
+            MrFlowPreset::Krea2Base12Plus1 => "krea2-12plus1",
+            MrFlowPreset::Krea2Base20Plus1 => "krea2-20plus1",
+            MrFlowPreset::Krea2Turbo8Plus1 => "krea2-turbo-8plus1",
+        }
+    }
+}
+
+/// Round a low-resolution dimension to the nearest multiple of 16 (min 16), so
+/// the stage-1 latent grid is valid. Mirrors the Rebels preset node.
+fn mrflow_round16(value: f64) -> u32 {
+    let snapped = (value / 16.0).round() * 16.0;
+    (snapped as u32).max(16)
 }
 
 #[derive(Debug, Args)]
@@ -635,7 +731,9 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
     let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
     let batch_images = request.prompts.len();
     let wall_start = Instant::now();
-    let output = if args.enable_hr {
+    let output = if let Some(preset) = args.mrflow {
+        generate_mrflow_txt2img(&pipeline, request, &args, preset, runtime_options)?
+    } else if args.enable_hr {
         generate_highres_txt2img(&pipeline, request, &args, runtime_options)?
     } else {
         let mut progress = step_timing_progress("txt2img", batch_images);
@@ -661,6 +759,112 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         }))?
     );
     Ok(())
+}
+
+/// MrFlow staged sampling: fast low-resolution generate, pixel-space
+/// super-resolution to the target size, re-encode, then a short direct-sigma
+/// refine. Reuses the same decode/upscale/img2img plumbing as the high-res
+/// path, but the second pass runs the flow-match direct-sigma refine schedule
+/// instead of a strength-based img2img.
+///
+/// The pixel-space super-resolution here is a placeholder cover-resize; a
+/// native SR model (RealESRGAN-class) is the intended Stage-2 upgrade. The
+/// staging, re-encode, noise injection, and refine schedule are otherwise the
+/// production path.
+fn generate_mrflow_txt2img(
+    pipeline: &DiffusionPipeline,
+    mut first_pass_request: DiffusionBatchRequest,
+    args: &DiffusionTxt2ImgArgs,
+    preset: MrFlowPreset,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+) -> anyhow::Result<hipfire_diffusion::DiffusionBatchOutput> {
+    let params = preset.params();
+    let target_width = args.width;
+    let target_height = args.height;
+    if target_width == 0 || target_height == 0 {
+        anyhow::bail!("MrFlow requires non-zero --width and --height (the final resolution)");
+    }
+    let upscale = args.mrflow_upscale.unwrap_or(params.upscale_factor);
+    if !upscale.is_finite() || upscale <= 1.0 {
+        anyhow::bail!("--mrflow-upscale {upscale} must be greater than 1");
+    }
+    let refine_sigma = args.mrflow_refine_sigma.unwrap_or(params.refine_sigma);
+    if !refine_sigma.is_finite() || !(0.0 < refine_sigma && refine_sigma < 1.0) {
+        anyhow::bail!("--mrflow-refine-sigma {refine_sigma} must be in (0, 1)");
+    }
+    let low_width = mrflow_round16(target_width as f64 / upscale);
+    let low_height = mrflow_round16(target_height as f64 / upscale);
+    let batch_images = first_pass_request.prompts.len();
+
+    // Stage 1: fast low-resolution generate with the preset step count and CFG.
+    first_pass_request.width = low_width;
+    first_pass_request.height = low_height;
+    first_pass_request.steps = params.stage1_steps;
+    first_pass_request.cfg_scale = params.cfg_scale;
+    first_pass_request.send_images = true;
+    let mut stage1_progress = step_timing_progress("mrflow-stage1", batch_images);
+    let first_pass = pipeline.generate_batch_with_progress_and_runtime_options(
+        first_pass_request.clone(),
+        runtime_options,
+        &mut stage1_progress,
+    )?;
+
+    // Stage 2: decode + pixel-space upscale to the target resolution.
+    // (Placeholder cover-resize until the native SR model lands.)
+    let decoded = decode_png_images_to_rgb_batch(&first_pass.images)?;
+    let upscaled = resize_rgb_batch_to_cover_nearest(&decoded, target_width, target_height)?;
+
+    // Stage 3+4: re-encode the upscaled image and run the direct-sigma refine.
+    let mut refine_batch = first_pass_request;
+    refine_batch.width = target_width;
+    refine_batch.height = target_height;
+    refine_batch.steps = params.refine_steps.max(1);
+    refine_batch.send_images = true;
+    let mut refine_progress = step_timing_progress("mrflow-refine", batch_images);
+    let mut output = pipeline.generate_img2img_batch_with_progress_and_runtime_options(
+        DiffusionImg2ImgRequest {
+            batch: refine_batch,
+            init_image: upscaled,
+            mask: None,
+            inpainting_fill: None,
+            resize_mode: Default::default(),
+            // Ignored when refine_sigma is set; the direct-sigma schedule drives
+            // the refine.
+            denoising_strength: 1.0,
+            refine_sigma: Some(RefineSigmaSchedule {
+                first_sigma: refine_sigma,
+                steps: params.refine_steps.max(1),
+                shifted: args.mrflow_shifted,
+            }),
+        },
+        runtime_options,
+        &mut refine_progress,
+    )?;
+    if let Some(map) = output.info.as_object_mut() {
+        map.insert("mode".to_string(), serde_json::json!("txt2img-mrflow"));
+        map.insert("mrflow_preset".to_string(), serde_json::json!(preset.as_str()));
+        map.insert("stage1_width".to_string(), serde_json::json!(low_width));
+        map.insert("stage1_height".to_string(), serde_json::json!(low_height));
+        map.insert(
+            "stage1_steps".to_string(),
+            serde_json::json!(params.stage1_steps),
+        );
+        map.insert("refine_sigma".to_string(), serde_json::json!(refine_sigma));
+        map.insert(
+            "refine_steps".to_string(),
+            serde_json::json!(params.refine_steps.max(1)),
+        );
+        map.insert("upscale_factor".to_string(), serde_json::json!(upscale));
+        map.insert("target_width".to_string(), serde_json::json!(target_width));
+        map.insert("target_height".to_string(), serde_json::json!(target_height));
+        // Flag that Stage 2 is still the placeholder SR; drives expectations for
+        // output sharpness until the native SR model is wired in.
+        map.insert(
+            "super_resolution".to_string(),
+            serde_json::json!("nearest-cover (placeholder)"),
+        );
+    }
+    Ok(output)
 }
 
 fn generate_highres_txt2img(
@@ -718,6 +922,7 @@ fn generate_highres_txt2img(
             inpainting_fill: None,
             resize_mode: Default::default(),
             denoising_strength: args.hr_denoising_strength,
+            refine_sigma: None,
         },
         runtime_options,
     )?;
@@ -892,6 +1097,7 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
         inpainting_fill: None,
         resize_mode: Default::default(),
         denoising_strength: args.denoising_strength,
+        refine_sigma: None,
     };
     let model = resolve_model_path(args.model);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
@@ -973,6 +1179,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
             inpainting_fill: None,
             resize_mode: Default::default(),
             denoising_strength: args.denoising_strength,
+            refine_sigma: None,
         };
         let img2img_output = pipeline
             .generate_img2img_batch_with_runtime_options(img2img_request, runtime_options)?;
@@ -996,6 +1203,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
                 inpainting_fill: None,
                 resize_mode: Default::default(),
                 denoising_strength: args.denoising_strength,
+                refine_sigma: None,
             };
             let masked_output = pipeline
                 .generate_img2img_batch_with_runtime_options(masked_request, runtime_options)?;
@@ -1403,7 +1611,39 @@ mod tests {
             hr_second_pass_steps: None,
             hr_denoising_strength: 0.75,
             rocm_device_id: None,
+            mrflow: None,
+            mrflow_refine_sigma: None,
+            mrflow_upscale: None,
+            mrflow_shifted: false,
         }
+    }
+
+    #[test]
+    fn mrflow_round16_snaps_to_multiple_of_16_with_floor() {
+        assert_eq!(mrflow_round16(512.0), 512);
+        assert_eq!(mrflow_round16(1024.0 / 2.0), 512);
+        // Rounds to nearest multiple of 16.
+        assert_eq!(mrflow_round16(520.0), 528);
+        assert_eq!(mrflow_round16(519.0), 512);
+        // Never below 16 even for tiny targets.
+        assert_eq!(mrflow_round16(1.0), 16);
+    }
+
+    #[test]
+    fn mrflow_presets_match_reference_numbers() {
+        let turbo = MrFlowPreset::Krea2Turbo8Plus1.params();
+        assert_eq!(turbo.stage1_steps, 8);
+        assert_eq!(turbo.refine_steps, 1);
+        assert!((turbo.refine_sigma - 0.11).abs() < 1e-6);
+        assert!((turbo.cfg_scale - 1.0).abs() < 1e-6);
+
+        let base = MrFlowPreset::Krea2Base12Plus1.params();
+        assert_eq!(base.stage1_steps, 12);
+        assert!((base.refine_sigma - 0.12).abs() < 1e-6);
+        assert!((base.cfg_scale - 4.0).abs() < 1e-6);
+
+        assert_eq!(MrFlowPreset::Zit9Plus1.params().stage1_steps, 9);
+        assert_eq!(MrFlowPreset::Krea2Base20Plus1.params().stage1_steps, 20);
     }
 
     fn smoke_args() -> DiffusionSmokeArgs {

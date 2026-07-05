@@ -1000,6 +1000,7 @@ fn diffusion_pipeline_img2img_uses_inpaint_conditioning_for_inpaint_channel_mode
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();
@@ -1049,6 +1050,7 @@ fn diffusion_pipeline_img2img_resizes_init_and_mask_to_request_dimensions() {
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();
@@ -1106,6 +1108,7 @@ fn diffusion_pipeline_img2img_latent_resize_mode_resizes_encoded_latents() {
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Latent,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();
@@ -1429,6 +1432,7 @@ fn generate_img2img_runtime_options_route_vae_mask_boundaries_when_gpu_is_availa
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline
@@ -2078,6 +2082,7 @@ fn diffusion_pipeline_open_hfq_generates_img2img_png_with_native_tiny_components
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();
