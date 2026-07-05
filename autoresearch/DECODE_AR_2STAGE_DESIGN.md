@@ -87,6 +87,23 @@ Stage 1 exhausted ──► Claude workflow reads stage1_ledger.jsonl (+ final B
   `dry_streak >= N` (default 10): write `stage1_exhausted` marker + a final BOD
   snapshot, stop the loop.
 
+### 2a. Rollover (stack → new baseline) — driver-owned, verification-gated
+When the stack reaches `K` accepted wins (default `K=8`) OR at Stage-1 exhaustion,
+the driver **rolls the stack over into a new baseline** so subsequent A/Bs re-anchor
+to it (measuring marginals against the *original* base N-deep is noisy) and the wins
+consolidate (`baseline_v(n)` → `baseline_v(n+1)`). Rollover is **gated**, never blind:
+1. **Fresh-process cumulative re-measure** — build the stack-tip daemon + the baseline
+   daemon, DPM-warm, warm A/B in **separate processes** (per `perf-benchmarking.md`);
+   the stack must beat baseline by a real margin (not the noise band).
+2. **Coherence gate** — `coherence-gate.sh` (+ arch-specific gate) on the stack tip.
+3. **Only on both passing**: fast-forward `loop_baseline_<arch>` (and its
+   `baseline_v(n+1)` tag) to the stack tip, **rebuild the `PREBUILT_BASE` cache** from
+   it, reset `loop/cardN` to the new baseline, and continue exploring from the higher
+   base. On fail: do NOT promote — flag the stack for review (a within-session-WIN
+   stack that fails fresh-probe is the accumulated-noise case the gate exists to catch).
+The K-win auto-rollover keeps the measurement baseline close and the stack honest;
+`loop/cardN_recovered` still preserves the pre-rollover stack.
+
 ### 3. `hip_task_bod.txt` (Stage-1 prompt — the immediate deliverable)
 - Same as `hip_task.txt` (`.hip`-only, parity-gated, kernel-set injected) PLUS:
   > After EACH certify, READ the returned `profile_feedback` / `target_var`
