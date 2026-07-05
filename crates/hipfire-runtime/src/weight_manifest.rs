@@ -66,6 +66,19 @@ pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize
     }
 }
 
+/// The per-layer all-reduce schedule the executor injects, derived purely from
+/// the manifest's sharded weights (single source of truth — see
+/// [`collective_for_policy`]). Each `(layer, hint)` is a reduce a row-sharded or
+/// expert-sharded weight in that layer implies; the executor applies it over the
+/// mesh group at run time. PP `BandXfer` (inter-layer) comes from
+/// [`hipfire_hardware::DeviceMesh::band_xfer_after`], not this per-op map.
+pub fn layer_collectives(manifest: &[WeightEntry]) -> Vec<(usize, CollectiveHint)> {
+    manifest
+        .iter()
+        .filter_map(|e| Some((e.layer?, collective_for_policy(&e.policy)?)))
+        .collect()
+}
+
 /// Non-layer placement targets (resolved against the mesh, not hardcoded).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PinTarget {
@@ -255,6 +268,51 @@ mod tests {
             collective_for_policy(&ShardPolicy::Pin(PinTarget::Embed)),
             None
         );
+    }
+
+    #[test]
+    fn layer_collectives_from_toy_dense_manifest() {
+        // Build a 2-layer dense manifest by hand (mirrors the toy arch): each
+        // layer has wo + ffn_down row-parallel → 2 Tp all-reduces per layer.
+        let mut m = Vec::new();
+        for l in 0..2 {
+            m.push(WeightEntry::layer(
+                "wq",
+                l,
+                vec![8, 8],
+                DType::F16,
+                ShardPolicy::ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wo",
+                l,
+                vec![8, 8],
+                DType::F16,
+                ShardPolicy::RowShard { axis: 1 },
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_down",
+                l,
+                vec![8, 32],
+                DType::F16,
+                ShardPolicy::RowShard { axis: 1 },
+            ));
+            m.push(WeightEntry::layer(
+                "norm",
+                l,
+                vec![8],
+                DType::F32,
+                ShardPolicy::Replicate,
+            ));
+        }
+        let sched = layer_collectives(&m);
+        // 2 per layer × 2 layers = 4 Tp all-reduces; column/replicate contribute none.
+        assert_eq!(sched.len(), 4);
+        assert!(sched
+            .iter()
+            .all(|(_, h)| matches!(h, CollectiveHint::AllReduce { kind: DimKind::Tp })));
+        assert_eq!(sched.iter().filter(|(l, _)| *l == 0).count(), 2);
+        assert_eq!(sched.iter().filter(|(l, _)| *l == 1).count(), 2);
     }
 
     #[test]
