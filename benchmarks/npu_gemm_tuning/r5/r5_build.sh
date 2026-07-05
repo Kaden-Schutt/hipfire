@@ -8,9 +8,10 @@
 # Usage: r5_build.sh <mlir-file> <workdir> [KSLICE]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MLIR="${1:?usage: r5_build.sh <mlir> <workdir> [KSLICE]}"
+MLIR="${1:?usage: r5_build.sh <mlir> <workdir> [KSLICE] [INNER]}"
 W="${2:?workdir}"
 KSLICE="${3:-16}"
+INNER="${4:-0}"
 
 : "${HIPFIRE_NPU_VENV:=$HOME/.venv}"
 source "$HIPFIRE_NPU_VENV/bin/activate"
@@ -19,7 +20,7 @@ MA_ROOT="$(python -c 'import mlir_aie;print(list(mlir_aie.__path__)[0])')"
 export PATH="$PEANO/bin:$MA_ROOT/bin:$PATH"
 INC="$MA_ROOT/include"
 CF=(-std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body
-    -O2 -DNDEBUG --target=aie2p-none-unknown-elf "-DKSLICE=$KSLICE")
+    -O2 -DNDEBUG --target=aie2p-none-unknown-elf "-DKSLICE=$KSLICE" "-DINNER=$INNER")
 
 rm -rf "$W"; mkdir -p "$W"
 # One object per cascade role (the .mlir's link_with picks which each core needs).

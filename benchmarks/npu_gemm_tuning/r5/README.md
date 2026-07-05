@@ -107,11 +107,32 @@ the generated **8×4 = 32-core** design builds and dispatches with **all 8 colum
 blocks = 1024** — the cascade dataflow works at full array scale. So the mechanism is
 proven end-to-end from 2 → 4 → 32 cores.
 
-**Next — the payoff measurement.** The current design does one cascade round per
-dispatch (overhead-dominated for throughput). To measure whether keeping C resident
-beats the ~5-TOPS real-GEMM wall, the cores need to stream many output tiles per
-dispatch (an `N_BTILES` loop, streaming each core's K-slice weights, tail storing
-C[n]) so the per-output-tile cost (one cascade transfer + fifo acquire, *no* C
-reload) is amortized and measurable. That streaming-cascade kernel + a
-`r5_gen.py`-style array is the next build; then measure real (INNER=0) TOPS through
-NpuKernel vs SOTA's ~5 and the 15.7 reference.
+**5. First compute-rate measurement: ~4 TOPS — a per-core stall to diagnose.**
+Added an `INNER` reuse knob to `r5_cascade.cc` (four register-resident K-tiles
+reused INNER times — the II=1 recipe, pure register macs). The 32-core array with
+INNER=16384 is bit-exact (C[0]=4,194,560) but sustains only **~4 TOPS** — ~12× below
+an r4b core. Key clue: **1 accumulator (4.44) ≈ 4 accumulators (4.03)**, so it is
+*not* mac-pipeline/II or accumulator spill; each cascade core is individually slow
+regardless. **Diagnostic run (ROLE=3 standalone, cascade op removed, single core) isolates TWO
+separable slowdowns:**
+
+| kernel | TOPS/core | vs r2a |
+|---|---|---|
+| r2a_mac (r4b reference) | ~1.6 | 1× |
+| r5 standalone, NO cascade | **0.40** | **~4× slow** |
+| r5 in 32-core cascade array | **0.126** | ~13× slow |
+
+So (a) the **base kslice_partial is ~4× slower than r2a even without any cascade**,
+and (b) the **cascade adds a further ~3×** on top. Both are tunable:
+- Kernel (4×): r2a keeps 4 A-tiles + **one shared** W-tile in registers; r5 loads 4
+  A **and 4 W** tiles + does an accum-sum at the end → register pressure/spill. Fix:
+  share the weight tile across the 4 accumulators (or reduce live tiles), drop the
+  end-sum onto fewer accumulators.
+- Cascade (3×): the 4 cores in a column aren't overlapping — likely the cascade
+  FIFO depth / the get-then-compute ordering serializing them. Fix: deepen the
+  cascade path, and ensure compute is issued *before* the blocking `get_scd`.
+
+The cascade *mechanism* is fully validated (2/4/32 cores, exact sums); reaching a
+SOTA-beating number is now a two-part **perf-tuning** problem on a working dataflow,
+not a correctness one. Next: land the kernel fix (target ~1.6 TOPS/core standalone),
+then the cascade-overlap fix, then re-measure the 32-core array vs SOTA ~5.
