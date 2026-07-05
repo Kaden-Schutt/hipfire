@@ -5795,4 +5795,68 @@ impl Gpu {
             )
         }
     }
+
+    /// GQA sliding-window batched attention over a staged per-kv-head window
+    /// cache. `k_staged`/`v_staged` are `[batch, n_kv_heads, head_dim, window]`
+    /// (produced by `swa_visibility_stage_batched`, once per kv head);
+    /// `n_valid` is `[batch]` (= min(pos+1, window) per row); `q`/`out` are
+    /// `[batch, n_heads, head_dim]`. GQA twin of `deepseek4_attn_swa_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_swa_gqa_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_staged: &GpuTensor,
+        v_staged: &GpuTensor,
+        n_valid: &GpuTensor,
+        out: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+        batch_size: usize,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_swa_gqa_batched",
+            kernels::ATTENTION_SWA_GQA_BATCHED_SRC,
+            "attention_swa_gqa_batched",
+        )?;
+        let func = &self.functions["attention_swa_gqa_batched"];
+        let qp = q.buf.as_ptr();
+        let kp = k_staged.buf.as_ptr();
+        let vp = v_staged.buf.as_ptr();
+        let np = n_valid.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut win = window as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut win as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block = head_dim.max(32) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
 }

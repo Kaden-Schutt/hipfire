@@ -3784,6 +3784,13 @@ pub const HC_SPLIT_FINALIZE_BATCHED_SRC: &str =
 pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/swa_visibility_stage_batched.hip");
 
+/// GQA sliding-window batched attention over a staged per-kv-head window cache
+/// ([batch, n_kv_heads, head_dim, window]). GQA twin of
+/// `deepseek4_attn_swa_batched` (per-kv-head indexing, no attention sink, passed
+/// softmax scale) for the gemma3 SWA prefill path.
+pub const ATTENTION_SWA_GQA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_swa_gqa_batched.hip");
+
 /// DeepSeek V4 top-K K/V gather — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// top-K gather from the shared main compressed-K cache into a
 /// `[B, head_dim, out_stride]` buffer fed to deepseek4_attn_swa_topk_batched.
