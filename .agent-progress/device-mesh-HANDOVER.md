@@ -22,30 +22,32 @@ loops forever). Suggested next goal: `/goal implement device-mesh Phase 2 fulfil
   deterministic compile). `Architecture::{weight_manifest,state_manifest}` implemented for
   llama, qwen2, minimax, toy.
 
-## DONE this session: `fulfill_manifest` whole-tensor path (Phase 2 GPU exec)
+## DONE (last 2 sessions): `fulfill_manifest` whole-tensor + ExpertSharded (Phase 2 GPU exec)
 `crates/hipfire-runtime/src/weight_store.rs` — `fulfill_manifest(weights, mesh, n_layers, gpus,
 source) -> Result<WeightStore, FulfillError>`. GPU-validated on gfx1151 (`fulfill_manifest_probe`:
-single-1×1 + emulated PP-2, placement + `memcpy_dtoh` byte-oracle; the oracle caught a real
-missing-`layer`-in-key bug). Whole-tensor upload only; `ExpertSharded` + dense-TP slice return
-`Err` (deferred). Takes a `source(entry)->bytes` closure (the arch owns on-disk HFQ naming; the
-engine only does placement). Additive — forward path untouched (Tier-1; store-read is Phase 3).
+single-1×1 + emulated PP-2 + emulated EP-2; placement + `memcpy_dtoh` byte-oracle; the oracle
+caught a real missing-`layer`-in-key bug). Implemented: whole-tensor upload (single/PP/Replicate/
+Pin/Tied→Alias) + **`ExpertSharded`** (each rank = compact blob of its owned experts, generic
+expert-outermost gather via `expert_compact_blob` + `ShardConfig`). **Dense-TP slice returns `Err`**
+(Phase 5). `source(entry)->bytes` closure keeps arch on-disk HFQ naming out of the engine. Additive
+— forward untouched (Tier-1; store-read is Phase 3). NOTE: the EP path produces the placed *bytes*;
+the per-expert pointer-table + zeroed-dummy the deepseek4 kernel indexes through
+(`crates/hipfire-arch-deepseek4/src/arch.rs:163-333`) is forward-consumption, wired in Phase 3.
 
-## The NEXT unit — pick ONE (both build on `fulfill_manifest`):
-**Option A (recommended — self-contained, byte-validatable like this session): `ExpertSharded`
-upload.** Finish Phase-2 EP placement: host-pack owned experts + zeroed-dummy for non-owned,
-reusing the deepseek4 convention (`crates/hipfire-arch-deepseek4/src/arch.rs:163-333`
-`upload_layer_routed_experts` — compact blob via `gpu.upload_raw`, per-expert ptr table,
-`gpu.zeros` dummy for `gate_up`, `ShardConfig::owns_expert`). The `source` closure yields the
-experts tensor bytes; fulfill host-slices owned experts. Validate against `deepseek4
-load_weights_sharded` bytes on a small MoE, or extend the probe with an ExpertSharded entry on Ep-2.
-
-**Option B: wire `WeightStore` into a real load (Phase 3 start).** Give an arch (llama — has
+## The NEXT unit — pick ONE:
+**Option A: wire `WeightStore` into a real load (Phase 3 start).** Give an arch (llama — has
 `weight_manifest`/`state_manifest` but NO multi-loader) a `source` backed by its real HFQ + name
 resolver (study `qwen35_tensor_data`, `qwen35.rs:1155`), fulfill on PP-2, forward reads the store
 not arch fields. Higher risk (forward rewiring); pairs with the ModelParallel/ArchDispatch hoist.
+Validation: `HIPFIRE_EMULATE_GPUS=2` PP on qwen3.5-4b; byte-identical vs bespoke `load_model_pp`.
 
-Original PP validation target (for whenever the forward reads the store): `HIPFIRE_EMULATE_GPUS=2`
-PP on qwen3.5-4b; compare to bespoke `load_model_pp`/`_ep` output (byte-identical).
+**Option B: dense-TP slice (Phase 5 placement).** Implement `ColumnShard`/`RowShard`/`FusedQkv`/
+`VocabShard` host-slicing (the quant-blob row-gather — see `tp_shard::wq_row_range`/`wo_col_range`
+notes: column-of-row-major is a per-row gather, NOT contiguous). Highest-risk slicing; only worth
+it alongside the live-TP forward (Phase 5-dense), which is greenfield.
+
+Recommended: **Option A** — `fulfill_manifest` now covers PP+EP placement, so the payoff is
+letting a forward actually *consume* the store (the Tier-1→real-load bridge).
 
 ## GOTCHAS (bit me this session)
 - **GPU lock goes stale** (`/tmp/hipfire-gpu.lock`, noclobber variant). Verify dead (dead pid

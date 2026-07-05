@@ -30,7 +30,7 @@ Plan: docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md
 Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed for any.
 
 ## REMAINING (GPU-integration / hot-path; multi-session, one PR per phase)
-- Phase 2 cont: fulfill_manifest EXPERT/TP slice+upload (whole-tensor path DONE, see below); production-arch manifests for qwen2/qwen35/ds4/minimax; state_manifest impls; transactional-OOM guard.
+- Phase 2 cont: fulfill_manifest DENSE-TP slice+upload (whole-tensor + ExpertSharded DONE, see below); production-arch manifests for qwen2/qwen35/ds4/minimax; state_manifest impls; transactional-OOM guard.
 - Phase 1a/1b: wire collective hints + band_xfer into the executor; PP executor loop; PP byte-exact oracle (needs building); 1c llama-PP walking skeleton.
 - Phase 3: WeightStore/StateStore + ModelParallel + ArchDispatch (hoist EpArch/LoadedModel out of daemon example binary → runtime lib). Highest-risk.
 - Phase 4: qwen2 ForwardBindings reach.
@@ -43,22 +43,25 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
   `fulfill_manifest(weights, mesh, n_layers, gpus, source) -> Result<WeightStore, FulfillError>`.
   Additive — does NOT touch the forward/hot path (Tier-1; forward-read-from-store is Phase 3).
 - Scope: whole-tensor upload (single + all PP + Replicate/Pin + group-size-1 degenerate) via
-  `Gpu::upload_raw`, Tied→Alias; **dense TP slice (Column/Row/FusedQkv/Head/Vocab @ Tp>1) and
-  ExpertSharded return `Err`** (deferred — Phase 5 / EP-unit; refuse, don't mis-place).
+  `Gpu::upload_raw`, Tied→Alias; **ExpertSharded on Ep>1** = each rank gets a compact blob of its
+  owned experts (generic expert-outermost host gather; `expert_compact_blob` + `ShardConfig`;
+  the arch's forward owns the per-expert ptr-table + zeroed-dummy — that's forward-indexing, not
+  placement); **dense TP slice (Column/Row/FusedQkv/Head/Vocab @ Tp>1) returns `Err`** (Phase 5).
 - DECISION: takes a `source(entry) -> raw bytes` closure, NOT `&HfqFile` — manifest names are
   *logical* ("wq"), on-disk HFQ names are arch-specific; the closure keeps the engine free of
   on-disk naming (pulls complexity to the arch; Tier-1). Same shape as the plan's
   `fulfill_manifest(manifest, hfq, mesh)` with the name-resolution seam made explicit.
 - GPU-validated on gfx1151 via `examples/fulfill_manifest_probe.rs` (synthetic byte source,
-  no model file): single-1×1 + emulated PP-2 both PASS — placement matches `placement_devices`,
-  byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device, Tied→Alias, TP refusal.
+  no model file): single-1×1 + emulated PP-2 + emulated EP-2 all PASS — placement matches
+  `placement_devices`, byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device,
+  Tied→Alias, dense-TP refusal, EP compact-blob per rank (rank0 experts [0,2,4,6], rank1 [1,3,5,7]).
   **The byte-oracle caught a real bug**: `(name, device)` key aliased all layers' `wq` onto one
   cell → fixed by adding `layer` to the key.
-- 3 no-GPU unit tests (classifier + store keying + refusal decision). +3 in hipfire-runtime.
+- 4 no-GPU unit tests (classifier + expert_compact_blob + store keying + refusal decision).
 
 ## Validation done
 - coherence-gate.sh CLEAN on qwen35 matrix (Phase 0). 
-- fulfill_manifest_probe: single-1×1 + PP-2-emulated PASS on gfx1151 (placement + byte-oracle).
+- fulfill_manifest_probe: single-1×1 + PP-2 + EP-2 emulated PASS on gfx1151 (placement + byte-oracle).
 - ep_decode_parity tp=1 ANCHOR PASS (mesh-driven EP == production, 35B-A3B).
 - All commits build; per-file rustfmt only (never qwen35/ds4/minimax/daemon fmt-debt files).
 
