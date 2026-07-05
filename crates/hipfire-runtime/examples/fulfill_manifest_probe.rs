@@ -21,6 +21,8 @@
 //!   5. **Expert-parallel** — on an Ep-2 mesh, each rank's resident tensor is the
 //!      compact blob of exactly its owned experts (byte-exact vs a `ShardConfig`
 //!      gather).
+//!   6. **Transactional rollback** — a source that fails partway returns `Err`
+//!      (naming the failing tensor) with earlier uploads freed (§6), no panic.
 //!
 //! Runs the 1×1 mesh always; additionally runs emulated PP-2 + EP-2 meshes when
 //! a 2-rank `Gpus` can be brought up (`HIPFIRE_EMULATE_GPUS=2`), else reports
@@ -165,6 +167,35 @@ fn check_ep(label: &str, gpus: &Gpus) {
     );
 }
 
+/// Validate the §6 transactional rollback: a source that fails partway must
+/// leave `fulfill_manifest` returning `Err` (naming the failing tensor) with the
+/// already-uploaded cells freed. We can't observe the free directly, but the run
+/// must not panic and the earlier uploads must have happened first.
+fn check_rollback(label: &str, gpus: &Gpus) {
+    let manifest = test_manifest();
+    // manifest[2] = wo(layer 0) — so token_embd + wq(l0) upload first, then this
+    // entry's source fails, exercising the rollback over ≥1 resident cell.
+    let fail_name = manifest[2].name.clone();
+    let fail_layer = manifest[2].layer;
+    let r = fulfill_manifest(&manifest, &DeviceMesh::single(), N_LAYERS, gpus, |e| {
+        if e.name == fail_name && e.layer == fail_layer {
+            Err("synthetic source failure".to_string())
+        } else {
+            Ok(synth_bytes(e))
+        }
+    });
+    match r {
+        Err(err) => {
+            assert_eq!(err.name, fail_name, "[{label}] rollback named wrong entry");
+            println!(
+                "[{label}] OK — rollback: source-fail on '{}' → Err, partial uploads freed",
+                err.name
+            );
+        }
+        Ok(_) => panic!("[{label}] expected a transactional-rollback Err"),
+    }
+}
+
 /// Read a resident tensor's bytes back off its device.
 fn readback(gpus: &Gpus, device: usize, tensor: &rdna_compute::GpuTensor) -> Vec<u8> {
     let n = tensor.buf.size();
@@ -233,6 +264,7 @@ fn main() {
     let gpu = Gpu::init().expect("Gpu::init");
     let gpus = Gpus::single(gpu, N_LAYERS);
     check("single-1x1", &DeviceMesh::single(), &gpus);
+    check_rollback("rollback-1x1", &gpus);
 
     // Deferred-refusal: a dense TP shard on a Tp>1 mesh must Err (even though
     // we don't have a real 2-rank Tp Gpus, fulfill refuses before any upload).

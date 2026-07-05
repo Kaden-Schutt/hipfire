@@ -99,6 +99,19 @@ impl WeightStore {
         self.placements
             .insert((name.to_string(), layer, device), handle);
     }
+
+    /// Free every resident buffer (best-effort, on the device it was uploaded
+    /// to) and consume the store — the transactional rollback for
+    /// [`fulfill_manifest`]. `Alias` handles own no buffer, so they are skipped.
+    fn free_all(self, gpus: &crate::multi_gpu::Gpus) {
+        for ((_, _, dev), handle) in self.placements {
+            if let WeightHandle::Resident(t) = handle {
+                if let Some(g) = gpus.devices.get(dev) {
+                    let _ = g.hip.free(t.buf);
+                }
+            }
+        }
+    }
 }
 
 /// A weight that `fulfill_manifest` could not place. `device` is the cell it was
@@ -184,10 +197,11 @@ fn expert_compact_blob(bytes: &[u8], n_experts: usize, owned: &[usize]) -> Resul
 /// is Phase-5 work; refusing keeps a caller from mistaking a half-supported mesh
 /// for a full one.
 ///
-/// Not transactional on mid-load OOM yet (matches the existing bespoke loaders,
-/// which `hipMalloc` + leak): the §6 free-and-`Err`-all guard is a documented
-/// follow-up. On the *first* failing cell it returns `Err` and drops the
-/// partial store.
+/// **Transactional** (device-mesh plan §6): on the first failing cell it frees
+/// every already-uploaded buffer (best-effort, each on its own device) and
+/// returns `Err` — never a half-loaded mesh leaking VRAM. Unlike the bespoke
+/// loaders (which `hipMalloc` + leak on partial failure), a mid-load
+/// source-read / shard-math / upload failure rolls back cleanly.
 pub fn fulfill_manifest<F>(
     weights: &[WeightEntry],
     mesh: &DeviceMesh,
@@ -199,6 +213,29 @@ where
     F: Fn(&WeightEntry) -> Result<Vec<u8>, String>,
 {
     let mut store = WeightStore::new();
+    match fulfill_into(&mut store, weights, mesh, n_layers, gpus, &source) {
+        Ok(()) => Ok(store),
+        Err(e) => {
+            // Roll back every cell uploaded before the failure.
+            store.free_all(gpus);
+            Err(e)
+        }
+    }
+}
+
+/// The upload loop, writing into `store` so a partial result is reclaimable by
+/// [`fulfill_manifest`]'s transactional rollback on error.
+fn fulfill_into<F>(
+    store: &mut WeightStore,
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpus: &crate::multi_gpu::Gpus,
+    source: &F,
+) -> Result<(), FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<Vec<u8>, String>,
+{
     for entry in weights {
         let devices = placement_devices(entry, mesh, n_layers);
 
@@ -319,7 +356,7 @@ where
             );
         }
     }
-    Ok(store)
+    Ok(())
 }
 
 #[cfg(test)]
