@@ -77,8 +77,14 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
   stage (`placement_devices` == `store.devices_for`); gather + forward. **311 tensors banded 155/156
   (embed→0, output_norm+lm_head→1, 28 layers by `stage_for_layer`); gathered forward logit-IDENTICAL
   to bespoke (max |Δ|=0), gfx1151.** Mesh-driven PP placement correct + forward-usable.
-  Next: banded EXECUTION (range-parameterized llama forward + `boundary_copy`) — Phase 1c; then
-  `ModelParallel`/`ArchDispatch` daemon hoist.
+- **PP-2 banded EXECUTION done + GPU-validated (Phase 1c):** refactored llama's monolithic forward —
+  extracted `forward_scratch_band(gpu, w, cfg, layer_range, pos, kv, scratch)` (range-parameterized
+  layer loop) + `forward_scratch_head` (final norm + lm_head); `forward_scratch_compute` = `band(0..n)`
+  + `head` (bit-exact — stable argmax across the refactor). `llama_store_pp` now runs a REAL banded
+  PP forward: **stage 0 embed+band(0..14) on dev0 → `boundary_copy` residual → stage 1 band(14..28)+
+  head on dev1, logit-IDENTICAL to bespoke (max |Δ|=0)**. Full pipeline-parallel LOAD + EXECUTE on a
+  real model, mesh-driven. (Emulated 2-GPU; each band touches only its stage's layers on its device.)
+  Next: `ModelParallel`/`ArchDispatch` daemon hoist (serve-reach); real 2-GPU (hiptrx/hipx).
 - GPU-validated on gfx1151 via `examples/fulfill_manifest_probe.rs` (synthetic byte source,
   no model file): single-1×1 + emulated PP-2 + emulated EP-2 all PASS — placement matches
   `placement_devices`, byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device,

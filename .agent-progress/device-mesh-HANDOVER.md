@@ -62,20 +62,25 @@ drop-in bit-exact replacement for the bespoke llama loader on a single GPU.
 (311 tensors 155/156; embed→0, output_norm+lm_head→1, layers by `stage_for_layer`), and the gathered
 forward is **logit-IDENTICAL to bespoke (max |Δ|=0, gfx1151)**. The load half of PP is validated.
 
-## The NEXT unit — pick ONE (Phase 3 continuation):
-**Option A (recommended): banded EXECUTION (Phase 1c — real PP forward).** The load half is done;
-the missing piece is per-stage execution. `forward_scratch_layers`/`_compute` run ALL layers +
-sample (llama.rs:3012/2946) — extract a **range-parameterized** `forward_scratch_band(gpu, weights,
-cfg, layer_range, pos, kv, scratch)` (the layer-loop body, writing `scratch.x`) + a
-`forward_scratch_head` (final norm + lm_head → logits); keep `forward_scratch_embed`. Then a PP
-driver: embed+band[0..k] on stage 0 → `gpus.boundary_copy` the residual `scratch.x` → band[k..n]+head
-on stage 1. Assert PP-2 logits == single-GPU. Touches llama.rs (editable; NOT a fmt-debt file).
+**Also DONE (Phase 1c: PP-2 banded EXECUTION).** Refactored llama's forward: `forward_scratch_band(
+gpu, w, cfg, layer_range, pos, kv, scratch)` (range-parameterized layer loop) + `forward_scratch_head`
+(final norm + lm_head); `forward_scratch_compute` = band(0..n)+head (bit-exact). `llama_store_pp` runs
+a REAL banded PP forward — stage0 embed+band(0..14)/dev0 → `boundary_copy` → stage1 band(14..28)+head
+/dev1 — **logit-IDENTICAL to bespoke (max |Δ|=0)**. Full pipeline-parallel LOAD + EXECUTE, mesh-driven.
 
-**Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study,
-`qwen35.rs:2876-2945`).
+## The NEXT unit — pick ONE:
+**Option A: serve-reach — the `ModelParallel`/`ArchDispatch` daemon hoist (Phase 3).** All the pieces
+(store load + banded forward) are proven in an *example*; now hoist them into the daemon so `serve`
+can actually run PP. This is the god-struct refactor (`EpArch`/`LoadedModel`/`load_model_pp` guard at
+`daemon.rs:4843`) → `ModelParallel{gpus, mesh, weights: WeightStore, state}` + `Box<dyn ArchDispatch>`.
+Highest-value, highest-risk; the documented EP-rehome blocker.
 
-**Option C: store→forward for a MoE arch** (deepseek4/minimax) — reuse the `ExpertSharded` manifest
-+ a source closure, EP-forward parity.
+**Option B: real 2-GPU HW validation** — run `llama_store_pp` on hiptrx (4× gfx1201) or hipx
+(gfx1151+gfx1010) with real distinct devices (drop the emulation); confirms `boundary_copy` peer path
++ per-stage kv on genuine multi-GPU (emulation aliases device 0).
+
+**Option C: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study,
+`qwen35.rs:2876-2945`). **Option D: store→forward for a MoE arch** (deepseek4/minimax EP-forward parity).
 
 **Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study;
 per-`LayerType` weight sets, `qwen35.rs:2876-2945`).
