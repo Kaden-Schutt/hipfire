@@ -236,6 +236,12 @@ pub(crate) fn validate_performance_metrics(
                 | "accept_rate"
                 | "emitted_tokens"
                 | "cycles"
+                | "spec_windows"
+                | "spec_proposed"
+                | "spec_accepted"
+                | "spec_committed"
+                | "mean_draft_len"
+                | "mean_committed"
                 | "vram_peak_bytes"
                 | "vram_used_bytes"
                 | "vram_used_mb"
@@ -288,6 +294,15 @@ pub(crate) fn normalize_performance_metric(key: &str) -> Option<&'static str> {
         "vram_free_mb" => Some("vram_free_mb"),
         "kv_bytes" => Some("kv_bytes"),
         "workspace_bytes" => Some("workspace_bytes"),
+        // Unified spec-decode metrics (the SpecMetrics `done` block, emitted by
+        // every strategy: dflash/ddtree/mtp/dspark/deepseek4). `tau`/`accept_rate`
+        // are handled above; these are the rest of the canonical block.
+        "windows" | "spec_windows" => Some("spec_windows"),
+        "proposed" | "spec_proposed" => Some("spec_proposed"),
+        "accepted" | "spec_accepted" => Some("spec_accepted"),
+        "committed" | "spec_committed" => Some("spec_committed"),
+        "mean_draft_len" => Some("mean_draft_len"),
+        "mean_committed" => Some("mean_committed"),
         _ => None,
     }
 }
