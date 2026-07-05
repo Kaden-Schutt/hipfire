@@ -47,3 +47,43 @@ Real but modest — this measurement is the input to the runtime-offload go/no-g
 Reaching compute-bound *beyond* the reference ceiling would need the R4 weight-
 broadcast/cascade array dataflow (unbuilt; findings.md shows no existing kernel on
 this hardware demonstrates it).
+
+## R4b — FULL 32-core array via memtile routing (`r4b_grid_run.py`)
+
+R4a used only **8 of 32 cores** (one tile row). Feeding more cores straight from
+each column shim exhausts shim DMA capacity ("no ShimNOCTile with sufficient DMA
+capacity" past ~1 core/column). R4b routes through the **memtile** (tile row 1) per
+column — the R4 weight-stationary dataflow:
+
+- **W broadcast** to all ROWS cores in the column (`.forward(Tile(col,1))` +
+  multiple `.cons()`): one shim stream, weight reused ROWS× spatially.
+- **A distribute** into ROWS distinct activation blocks (`.split(Tile(col,1))`).
+- **C gather** from the ROWS cores (`.join(Tile(col,1))`).
+
+3 shim channels/column regardless of ROWS, so it scales to the full 4×8 = 32 cores.
+
+### Result (halo, 4 rows × 8 cols = 32 cores, through NpuKernel)
+
+| config | reuse | TOPS |
+|---|---|---|
+| 8-core (R4a), INNER=64 | fake | 12.8 |
+| **32-core (R4b), INNER=64** | **fake** | **~40** (42.4 @ NB1024, 39.4 @ NB4096) |
+| 32-core (R4b), INNER=0 | spatial only, 16×16 tiles | 5.25 |
+| IRON whole_array int8 reference (big tiles) | real | 15.7 |
+
+### Read (corrects R4a's "modest")
+
+- **The array scales.** 32 cores sustain ~3.1× the 8-core rate → a **~40-TOPS W4A8
+  compute capacity** (fake-reuse ceiling). The silicon can do it, and the memtile
+  weight-broadcast dataflow feeds all 32 cores. Beats the 15.7 int8 reference.
+- **But real streaming GEMM is per-tile-overhead-bound, not compute-bound.** The
+  INNER sweep is the proof: 0 → 64 moves 5.25 → 40 TOPS purely by adding
+  compute-per-tile to amortize the fixed per-acquire fifo/DMA overhead. With tiny
+  16×16 tiles the real (INNER=0) rate is only 5.25 — *below* the reference, which
+  uses big 64×64 tiles to amortize overhead and reaches 15.7.
+- **So the deliverable real-W4A8 ceiling is still ~15.7 TOPS** (reference dataflow),
+  vs GPU ~50 → concurrent offload ~+30% at best. The ~40-TOPS capacity is real
+  headroom, but capturing it for *real* GEMM needs bigger tiles + lower per-tile
+  overhead (cross-core cascade / K-resident C) — the unbuilt dataflow. Next step to
+  chase it: R4b with a larger mmul tile (m/k/n = 64) and measure the real (INNER=0)
+  rate against the 15.7 reference.
