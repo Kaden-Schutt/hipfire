@@ -110,6 +110,27 @@ on the memtile's 8-way broadcast sync over the N-slabs, not compute. Still below
 GPU's ~50 TOPS, so *sync* offload stays gated; the aggregate win is a concurrent
 NPU ‖ GPU split.
 
+### Batch prefill — throughput is flat in M (weight-bandwidth-bound)
+
+Sweeping M (= total prefill tokens = batch × seq) at K=512, N=4096, all validated:
+
+| M (tokens) | multi-dispatch (`r6_mp_e2e`, any M) | whole-GEMM 1-dispatch (`r6_mp1_e2e`) |
+|---|---|---|
+| 256  | 1.37 | — |
+| 768  | 1.46 | ~1.9 |
+| 2048 | 1.40 | 1.83 |
+| 4096 | 1.47 | 1.75 |
+| 8192 | 1.42 | — |
+
+**Throughput does not scale with batch** — it's weight-bandwidth-bound. L1 caps weight
+reuse at MT=8 M-rows per weight load, so W is re-read ≈ M/32 times *regardless of batch*;
+total weight traffic scales with M, so the compute rate stays constant. This is the
+opposite of the GPU (bigger batch → bigger WMMA tiles → more weight reuse → higher
+throughput). The NPU array is already feed-saturated at small M, so batching buys
+nothing here. The whole-GEMM one-dispatch stays ~0.3–0.4 TOPS ahead at every size (no
+inter-dispatch host stalls) but needs a per-M xclbin; multi-dispatch handles any M with
+one xclbin.
+
 ### Two dataflow lessons (cost real debugging)
 
 1. **Pipelined read-back needs a cache reconcile.** The host read-back of one C buffer
