@@ -297,16 +297,22 @@ impl NpuGemm {
             }
             self.load_a(&a_sub);
             let off = (ko_i * nns + no_i) * wl;
-            if off != last_w_off {
+            let w_changed = off != last_w_off;
+            if w_changed {
                 self.w_buf
                     .as_mut_slice()
                     .copy_from_slice(&packed_w[off..off + wl]);
                 last_w_off = off;
             }
-            let seq = self
-                .kernel
-                .submit(&[&self.a_buf, &self.w_buf, &self.c_buf[i % 2]])?;
+            // Flush A (rewritten every dispatch) and W (only when re-copied). C must
+            // still be synced: the to-device flush also manages the CPU cache so the
+            // post-dispatch read-back sees the kernel's DMA writes, not stale lines.
+            let seq = self.kernel.submit_synced(
+                &[&self.a_buf, &self.w_buf, &self.c_buf[i % 2]],
+                Some(&[true, w_changed, true]),
+            )?;
             if let Some((_, pi)) = prev {
+                self.kernel.sync_output(&self.c_buf[pi % 2])?; // invalidate before read
                 let (pm, pn, pk) = coord(pi);
                 self.readback(pi % 2, pm, pn, pk, nks, &mut c_acc, &mut c_blk, n, c);
             }
@@ -314,6 +320,7 @@ impl NpuGemm {
         }
         if let Some((seq, pi)) = prev {
             self.kernel.wait(seq)?;
+            self.kernel.sync_output(&self.c_buf[pi % 2])?;
             let (pm, pn, pk) = coord(pi);
             self.readback(pi % 2, pm, pn, pk, nks, &mut c_acc, &mut c_blk, n, c);
         }

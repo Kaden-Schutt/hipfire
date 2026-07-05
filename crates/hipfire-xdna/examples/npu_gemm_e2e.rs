@@ -82,7 +82,9 @@ fn main() {
         println!(
             "M={m} K={k} N={n}  block {bm}x{bn}x{bk}  {dispatches} dispatches/run  (prepack {pp_ms:.1} ms once)"
         );
-        println!("run_packed: {ms:.2} ms/run  =>  {tops:.3} TOPS end-to-end  (row 0 correct)");
+        println!(
+            "run_packed: {ms:.2} ms/run  =>  {tops:.3} TOPS end-to-end  (rows 0/mid/last correct)"
+        );
     }
     #[cfg(not(target_os = "linux"))]
     eprintln!("amdxdna is Linux-only");

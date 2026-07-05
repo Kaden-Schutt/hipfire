@@ -103,9 +103,24 @@ impl NpuKernel {
     /// complete. Pair each `submit` with exactly one `wait`, and double-buffer any
     /// output the next submit would overwrite before you read it.
     pub fn submit(&self, args: &[&DeviceBuffer]) -> Result<u64, XdnaError> {
-        for a in args {
-            self.dev
-                .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
+        self.submit_synced(args, None)
+    }
+
+    /// Like [`Self::submit`], but only flush the args whose `sync[i]` is true. `None`
+    /// flushes all (same as `submit`). Use this to skip the `sync_bo` on inputs the host
+    /// did not change since their last dispatch, and on pure outputs (the kernel writes
+    /// them, so they never need a host→device flush; SHMEM is coherent for read-back once
+    /// the timeline signals). Each unnecessary flush is a full-buffer cache op.
+    pub fn submit_synced(
+        &self,
+        args: &[&DeviceBuffer],
+        sync: Option<&[bool]>,
+    ) -> Result<u64, XdnaError> {
+        for (i, a) in args.iter().enumerate() {
+            if sync.is_none_or(|s| s[i]) {
+                self.dev
+                    .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
+            }
         }
 
         // Reuse the command BO per argument set — the packet's device addresses are
@@ -135,6 +150,20 @@ impl NpuKernel {
     /// buffers are then readable directly (SHMEM is coherent once the timeline signals).
     pub fn wait(&self, seq: u64) -> Result<(), XdnaError> {
         self.dev.syncobj_wait(self.syncobj, seq)
+    }
+
+    /// Reconcile the host cache for an output buffer before a CPU read-back. Call after
+    /// [`Self::wait`], before reading. A blocking dispatch+read is coherent without this,
+    /// but a *pipelined* loop overlaps the read-back of one buffer with a concurrent DMA
+    /// write to another; the hardware prefetcher can pull stale lines of the in-flight
+    /// buffer into cache, and there is no invalidate before its later read. `TO_DEVICE`
+    /// clean+invalidates on this driver (`FROM_DEVICE` EINVALs on data BOs), which clears
+    /// those stale lines so the read sees the kernel's writes. Verified: without this,
+    /// pipelined read-back fails intermittently (~1 run in 3); with it, 0/16 across the
+    /// single- and multi-K-chunk paths.
+    pub fn sync_output(&self, buf: &DeviceBuffer) -> Result<(), XdnaError> {
+        self.dev
+            .sync_bo(buf.handle(), submit::SYNC_DIRECT_TO_DEVICE, buf.len())
     }
 }
 
