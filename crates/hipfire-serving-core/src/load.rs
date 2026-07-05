@@ -276,9 +276,21 @@ fn clamp_max_seq_to_model_context(max_seq: usize, metadata_json: &str) -> usize 
 /// 65536: ~10.7 GB global F32 KV + ~0.9 GB local rings + ~15 GB weights ≈ 27 GB.
 const GEMMA3_STOPGAP_MAX_SEQ: usize = 65_536;
 
-fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32) -> usize {
+fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32, kv_mode: &str) -> usize {
     let is_gemma3 = arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL;
-    if !is_gemma3 || max_seq <= GEMMA3_STOPGAP_MAX_SEQ {
+    if !is_gemma3 {
+        return max_seq;
+    }
+    // q8/int8 global KV is ~4× smaller than F32, so with sliding-window local
+    // layers the full trained context fits — no gemma3-specific cap needed
+    // (the model-context clamp still applies). Only F32 global KV needs the cap.
+    let quantized_global = matches!(kv_mode, "q8" | "int8");
+    let cap = if quantized_global {
+        max_seq
+    } else {
+        GEMMA3_STOPGAP_MAX_SEQ
+    };
+    if max_seq <= cap {
         return max_seq;
     }
     if std::env::var("HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE").ok().as_deref() == Some("1") {
@@ -402,7 +414,7 @@ pub fn load_model(
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
-    let max_seq = cap_gemma3_stopgap_max_seq(max_seq, hfq.arch_id);
+    let max_seq = cap_gemma3_stopgap_max_seq(max_seq, hfq.arch_id, &kv_mode);
     let model_memory = hfq_model_memory(path, &hfq);
     // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
     // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
