@@ -261,6 +261,43 @@ fn clamp_max_seq_to_model_context(max_seq: usize, metadata_json: &str) -> usize 
     }
 }
 
+/// STOPGAP (pending gemma3 sliding-window attention): `Gemma3State` allocates a
+/// FULL `max_seq` KV cache for **every** layer — it does not yet honor gemma3's
+/// sliding-window (5-of-6 local layers only need a `sliding_window`=1024 span).
+/// At the model's trained 128K context that is ~35 GB (q8) / ~133 GB (f32) of
+/// KV across 62 layers, which OOMs the shared GTT pool on RDNA APUs. Until the
+/// SWA migration lands (KvCache-backed windowed KV), cap gemma3's context to a
+/// budget-safe default. Operators can force the full value with
+/// `HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1`.
+///
+/// 8192 is chosen for the RDNA APU shared-GTT case: ~15 GB weights + ~8.3 GB
+/// F32 KV (62 layers × kv_dim × 8192 × 2) ≈ 23 GB, leaving headroom under a
+/// ~32 GB effective budget (the 43 GB GTT is shared with the host OS). The full
+/// context returns once SWA caps local-layer KV at `sliding_window`.
+const GEMMA3_STOPGAP_MAX_SEQ: usize = 8_192;
+
+fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32) -> usize {
+    let is_gemma3 = arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL;
+    if !is_gemma3 || max_seq <= GEMMA3_STOPGAP_MAX_SEQ {
+        return max_seq;
+    }
+    if std::env::var("HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "  WARNING: gemma3 max_seq={max_seq} allocates full-context KV for every layer \
+             (no sliding-window yet) and may OOM the GTT pool; \
+             HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 set — proceeding."
+        );
+        max_seq
+    } else {
+        eprintln!(
+            "  NOTE: gemma3 has no sliding-window KV yet; capping max_seq {max_seq} -> \
+             {GEMMA3_STOPGAP_MAX_SEQ} to fit the GTT pool. Set \
+             HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 to force the full context."
+        );
+        GEMMA3_STOPGAP_MAX_SEQ
+    }
+}
+
 // Auto-upgrade DeltaNet state to FP32 for low-redundancy models when the caller
 // has not made an explicit non-default choice. Q8/Q4 state accumulates quality
 // drift on long outputs; the recurrent state is the model's numerical anchor
@@ -365,6 +402,7 @@ pub fn load_model(
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
+    let max_seq = cap_gemma3_stopgap_max_seq(max_seq, hfq.arch_id);
     let model_memory = hfq_model_memory(path, &hfq);
     // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
     // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
