@@ -1490,6 +1490,64 @@ pub(crate) fn silu_hip_on_gpu(
     })
 }
 
+/// Elementwise LeakyReLU: `x >= 0 ? x : alpha * x`. `alpha` is the negative
+/// slope (0.2 for RealESRGAN / RRDBNet). Used by the super-resolution model in
+/// the MrFlow staged-sampling pipeline.
+#[allow(dead_code)]
+pub(crate) fn leaky_relu_hip_on_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &CpuTensor,
+    alpha: f32,
+) -> DiffusionResult<CpuTensor> {
+    let elements = checked_shape_elements("LeakyReLU input", &input.shape)?;
+    if elements == 0 {
+        return Ok(CpuTensor::zeros(&input.shape));
+    }
+    let n = i32_kernel_dim("LeakyReLU elements", elements)?;
+    let output_bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            DiffusionError::InvalidMetadata("LeakyReLU output size overflows".to_string())
+        })?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output_gpu = gpu
+        .hip
+        .malloc(output_bytes)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input_gpu.buf.as_ptr());
+    kernargs.push_ptr(output_gpu.as_ptr());
+    kernargs.push_i32(n);
+    kernargs.push_f32(alpha);
+    kernargs.pad_to(16);
+    let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_leaky_relu_f32",
+        DIFFUSION_LEAKY_RELU_HIP_SRC,
+        "diffusion_leaky_relu_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu, elements)?;
+    gpu.hip
+        .free(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: input.shape.clone(),
+        data,
+    })
+}
+
 pub(crate) fn quick_gelu_hip_on_gpu(
     gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
@@ -2772,6 +2830,40 @@ pub(crate) fn silu_resident(
         "diffusion_silu_f32",
         DIFFUSION_SILU_HIP_SRC,
         "diffusion_silu_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
+/// Device-resident LeakyReLU: `x >= 0 ? x : alpha * x`. `alpha` is the negative
+/// slope (0.2 for RealESRGAN / RRDBNet). The resident sibling of
+/// [`leaky_relu_hip_on_gpu`], for the super-resolution forward chain.
+#[allow(dead_code)]
+pub(crate) fn leaky_relu_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    alpha: f32,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let elements = checked_shape_elements("LeakyReLU input", &input.shape)?;
+    let n = i32_kernel_dim("LeakyReLU elements", elements)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &input.shape)?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(n);
+    kernargs.push_f32(alpha);
+    kernargs.pad_to(16);
+    let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_leaky_relu_f32",
+        DIFFUSION_LEAKY_RELU_HIP_SRC,
+        "diffusion_leaky_relu_f32",
         grid,
         [256, 1, 1],
         0,

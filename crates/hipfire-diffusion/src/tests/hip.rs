@@ -925,6 +925,37 @@ fn hip_silu_matches_cpu_reference_when_gpu_is_available() {
 }
 
 #[test]
+fn hip_leaky_relu_matches_cpu_reference_when_gpu_is_available() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for LeakyReLU kernel parity test: {error}");
+            return;
+        }
+    };
+    let input = CpuTensor {
+        shape: vec![2, 2, 2, 2],
+        data: vec![
+            -8.0, -4.0, -1.0, -0.25, 0.0, 0.25, 1.0, 4.0, 8.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0,
+            0.125,
+        ],
+    };
+    // RealESRGAN / RRDBNet negative slope.
+    let alpha = 0.2_f32;
+
+    let cpu = tensor_map(&input, |value| if value >= 0.0 { value } else { alpha * value });
+    let hip = leaky_relu_hip_on_gpu(&mut gpu, &input, alpha).unwrap();
+
+    assert_eq!(hip.shape, cpu.shape);
+    for (index, (actual, expected)) in hip.data.iter().zip(&cpu.data).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 1e-6,
+            "LeakyReLU mismatch at {index}: hip={actual} cpu={expected}"
+        );
+    }
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,

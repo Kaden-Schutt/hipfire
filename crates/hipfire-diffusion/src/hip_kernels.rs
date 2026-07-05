@@ -671,6 +671,24 @@ extern "C" __global__ void diffusion_silu_f32(
 }
 "#;
 
+pub(crate) const DIFFUSION_LEAKY_RELU_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void diffusion_leaky_relu_f32(
+    const float* input,
+    float* output,
+    int n,
+    float alpha
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float value = input[idx];
+    output[idx] = value >= 0.0f ? value : alpha * value;
+}
+"#;
+
 pub(crate) const DIFFUSION_QUICK_GELU_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
