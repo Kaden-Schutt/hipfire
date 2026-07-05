@@ -26,13 +26,29 @@ Streamed (A resident, W streamed, C per block), bit-exact (C[0]=256):
 first W4A8 kernel here that reaches per-core compute-bound on a *real* (no-fake-reuse)
 tile.
 
-## Next — the array measurement (the payoff)
+## Array measurement — R6 BEATS SOTA on real prefill
 
-32 **independent** R6 cores (no cascade — each does its own M×N tile; the array is the
-M-parallelism). Single-core wants ~22 GB/s of weight feed; 32 cores would need ~700
-GB/s but the fabric caps at ~55 GB/s, so the array goes **feed-bound at 55 GB/s** — at
-this tile's effective AI (~66, A resident) that projects to **~7 TOPS aggregate, above
-SOTA's ~5**. Build a 32-core independent-R6 array (low-level MLIR generator, like the
-R5 array but no `cascade_flow`), sweep MT/KCHUNK to push AI, and measure the real
-aggregate vs SOTA ~5 and the 15.7 reference. That is the number that decides whether
-NPU prefill offload is a real win.
+8 **independent** R6 cores (`r6_gen.py COLS NB` — one per column, no cascade; the
+array is the M-parallelism). Real streaming (A resident, W streamed), bit-exact
+(C[0]=256):
+
+| config | W feed | TOPS (8-core aggregate) |
+|---|---|---|
+| MT=8 NT=4 KCHUNK=16, **shared** W region | (compute ceiling) | 19.5 |
+| MT=8 NT=4 KCHUNK=16, **independent** W (16 MB) | feed-bound ~68 GB/s | **9.15** |
+
+**9.15 TOPS on real, independent-weight streaming beats SOTA FastFlowLM's ~5 by
+1.8×** — the first dataflow in this whole investigation (R2a → R4 memtile → R5
+cascade) to beat SOTA on real prefill. The feed cap makes it feed-bound, so 8 cores
+already ≈ saturate; the compute headroom (19.5 shared) is reachable by raising AI
+(more weight reuse per streamed byte).
+
+**The lever, confirmed:** the win came from the **2D tile** (reuse both operands),
+i.e. **M/AI, exactly as the R5 verdict predicted — not the cascade.** Everything
+before had a 1D tile stuck at 3–5 TOPS; R6's 2D tile clears the feed wall.
+
+**Next (tuning toward the 15.7 reference):** raise MT (more M-row blocks → more
+weight reuse → higher AI → less feed-bound). MT=16 overran L1 (A + double-buffered W
++ C > 64 KB) — needs KCHUNK/depth tuning or single-buffered W. Sweep MT/KCHUNK for
+the L1-optimal point, and scale past 8 columns (feed permitting). But the headline is
+settled: **NPU W4A8 prefill offload is a real win — R6 beats SOTA.**
