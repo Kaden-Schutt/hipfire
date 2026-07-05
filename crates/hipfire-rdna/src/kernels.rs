@@ -184,6 +184,22 @@ pub const ATTENTION_Q8_0_KV_BATCHED_GFX1103_SRC: &str =
 pub const ATTENTION_F32_BATCHED_GFX1103_SRC: &str =
     include_str!("../../../kernels/src/gfx1103/attention_f32_batched.gfx1103.hip");
 
+/// gfx1103 (Phoenix) no-LDS routed batched Q8_0 attention (session-routed
+/// prefill). One wave32 per (head, row); register online softmax. head_dim%32==0.
+pub const ATTENTION_Q8_0_ROUTED_BATCHED_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_q8_0_routed_batched.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS routed batched F32 attention (session-routed AR
+/// prefill). One wave32 per (head, row); register online softmax. head_dim%32==0.
+pub const ATTENTION_F32_ROUTED_BATCHED_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_f32_routed_batched.gfx1103.hip");
+
+/// gfx1103 (Phoenix) no-LDS batched F32 GQA-4 attention (KLD prefill fast path;
+/// 4 query heads share one KV head). Four register online-softmax states per
+/// wave32, replacing scores[4 * max_ctx_len] LDS. head_dim % 32 == 0.
+pub const ATTENTION_F32_BATCHED_GQA4_GFX1103_SRC: &str =
+    include_str!("../../../kernels/src/gfx1103/attention_f32_batched_gqa4.gfx1103.hip");
+
 /// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
 /// ABI as the generic conv1d split kernel plus a companion state update entry.
 #[cfg(feature = "deltanet")]
