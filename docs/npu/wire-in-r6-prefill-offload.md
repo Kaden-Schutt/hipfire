@@ -45,6 +45,31 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
    dispatch it on the NPU. Gate behind a flag first (`HIPFIRE_NPU_PREFILL`), measure
    end-to-end, then consider default-on.
 
+## CRITICAL measured finding — marshaling, not the kernel, is the bottleneck
+
+Array `NpuGemm` is validated correct, but end-to-end it is **catastrophically slow**:
+`NpuGemm::run` on M=768 K=512 N=4096 (peak config, 32 dispatches) = **351 ms/run =
+0.01 TOPS** (result numerically correct). The kernel computes at 20.7 TOPS in ~µs; the
+**CPU marshaling** (re-shuffling row-major A/W into the tile-major int4 SHMEM layout,
+per-element bit-packing) takes ~348 ms and dwarfs everything. Dispatch latency is
+~78 µs × 32 = 2.5 ms — also non-trivial but small next to marshaling.
+
+**So the wire-in's hard problem is marshaling + dispatch overhead, not the kernel.**
+The fixes, in impact order:
+1. **Pre-marshal weights once at load** (weights are static): re-marshaling W every
+   dispatch is most of the 348 ms. Marshal each layer's W into its tile-major SHMEM
+   form at model load; per inference, only activations move. Projected: 0.01 → ~0.6
+   TOPS (then latency-bound).
+2. **Fewer dispatches**: the array can stream the whole GEMM in one dispatch (large
+   NB) instead of one M-block/K-chunk per call — removes the ×32 latency and the
+   per-dispatch re-marshal. The 20.7-TOPS bench used one huge-NB dispatch; realistic
+   shapes must stream similarly.
+3. **Fast A marshal / C un-marshal** (SIMD/memcpy-shaped), and keep A resident.
+
+Until (1)+(2) land, the offload is a net loss vs the GPU (which needs no marshaling).
+The 20.7 TOPS is a real *compute* rate; the deliverable end-to-end rate depends
+entirely on beating this overhead — that, not the kernel, is now the open question.
+
 ## The one architectural decision (needs a call)
 
 **Concurrency model.** The win is *concurrent* NPU-prefill ‖ GPU-work. Options:
