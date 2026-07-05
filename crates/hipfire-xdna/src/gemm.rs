@@ -29,7 +29,8 @@ pub struct NpuGemm {
     groups: usize,
     a_buf: DeviceBuffer, // MT*KCHUNK tiles of MR*MK int8 (one M-block, shared)
     w_buf: DeviceBuffer, // groups * NT*KCHUNK tiles of MK*MN int4 (2/byte)
-    c_buf: DeviceBuffer, // groups * MT*NT tiles of MR*MN int32
+    c_buf: [DeviceBuffer; 2], // double-buffered: one dispatch writes while the host
+                         // reads the other back (pipelined run_packed).
 }
 
 impl NpuGemm {
@@ -59,7 +60,8 @@ impl NpuGemm {
         let kernel = NpuKernel::load(xclbin, insts)?;
         let a_buf = kernel.alloc_arg(mt * kchunk * MR * MK)?;
         let w_buf = kernel.alloc_arg(groups * nt * kchunk * MK * MN / 2)?;
-        let c_buf = kernel.alloc_arg(groups * mt * nt * MR * MN * 4)?;
+        let csz = groups * mt * nt * MR * MN * 4;
+        let c_buf = [kernel.alloc_arg(csz)?, kernel.alloc_arg(csz)?];
         Ok(Self {
             kernel,
             mt,
@@ -158,8 +160,8 @@ impl NpuGemm {
         }
 
         self.kernel
-            .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
-        self.unpack_c(c);
+            .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf[0]])?;
+        self.unpack_c_block(0, c, 0, n); // c is exactly the bm×bn (=n-wide) block
         Ok(())
     }
 
@@ -192,23 +194,28 @@ impl NpuGemm {
         }
     }
 
-    // Copy c_buf into row-major `c` `(MT·MR) × (groups·NT·MN)`. The R6-TS kernel already
-    // writes each group's block ROW-MAJOR (its tensor stream de-tiles in-core), so per
-    // group gi this is a straight block copy — no reshuffle.
-    fn unpack_c(&self, c: &mut [i32]) {
+    // Copy c_buf[slot] into `dst` at `dst[base + row*row_stride + col]`. The R6-TS kernel
+    // writes each group's block ROW-MAJOR (its C tensor stream de-tiles in-core), so this
+    // is a straight per-group block copy — no reshuffle. `base`/`row_stride` place the
+    // (MT·MR)×(groups·NT·MN) result anywhere in a larger output (e.g. the (mo,no) block of
+    // the full GEMM), so no intermediate copy is needed on the single-K-chunk path.
+    fn unpack_c_block(&self, slot: usize, dst: &mut [i32], base: usize, row_stride: usize) {
         let (mt, nt, g) = (self.mt, self.nt, self.groups);
-        let n = g * nt * MN;
-        let bw = nt * MN; // block width (cols per group)
-        let bh = mt * MR; // block height (rows)
+        let bw = nt * MN; // group width (cols per group)
+        let bh = mt * MR; // rows
         let out: &[i32] = unsafe {
-            std::slice::from_raw_parts(self.c_buf.as_slice().as_ptr() as *const i32, g * bh * bw)
+            std::slice::from_raw_parts(
+                self.c_buf[slot].as_slice().as_ptr() as *const i32,
+                g * bh * bw,
+            )
         };
         for gi in 0..g {
             let cbase = gi * bh * bw;
-            let ncol0 = gi * bw;
+            let gcol0 = gi * bw; // this group's column offset within the block
             for row in 0..bh {
                 let src = cbase + row * bw;
-                c[row * n + ncol0..row * n + ncol0 + bw].copy_from_slice(&out[src..src + bw]);
+                let d = base + row * row_stride + gcol0;
+                dst[d..d + bw].copy_from_slice(&out[src..src + bw]);
             }
         }
     }
@@ -253,37 +260,100 @@ impl NpuGemm {
             m % bm == 0 && n % bn == 0 && k % bk == 0,
             "M/N/K must tile evenly"
         );
-        let (nns, wl) = (n / bn, self.wbuf_len());
+        let (nms, nns, nks) = (m / bm, n / bn, k / bk);
+        let wl = self.wbuf_len();
+        let ndisp = nms * nns * nks;
+        if ndisp == 0 {
+            return Ok(());
+        }
+
         let mut a_sub = vec![0i8; bm * bk];
-        let mut c_blk = vec![0i32; bm * bn];
+        let mut c_blk = vec![0i32; bm * bn]; // K-accumulation scratch (nks > 1 only)
         let mut c_acc = vec![0i32; bm * bn];
-        for mo in (0..m).step_by(bm) {
-            for (no_i, no) in (0..n).step_by(bn).enumerate() {
-                c_acc.iter_mut().for_each(|x| *x = 0);
-                for (ko_i, ko) in (0..k).step_by(bk).enumerate() {
-                    for i in 0..bm {
-                        a_sub[i * bk..(i + 1) * bk]
-                            .copy_from_slice(&a[(mo + i) * k + ko..(mo + i) * k + ko + bk]);
-                    }
-                    self.load_a(&a_sub);
-                    let off = (ko_i * nns + no_i) * wl;
-                    self.w_buf
-                        .as_mut_slice()
-                        .copy_from_slice(&packed_w[off..off + wl]);
-                    self.kernel
-                        .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
-                    self.unpack_c(&mut c_blk);
-                    for (acc, &v) in c_acc.iter_mut().zip(c_blk.iter()) {
-                        *acc += v;
-                    }
-                }
-                for i in 0..bm {
-                    c[(mo + i) * n + no..(mo + i) * n + no + bn]
-                        .copy_from_slice(&c_acc[i * bn..(i + 1) * bn]);
-                }
+
+        // Flat dispatch order: mo outer, no, ko inner. coord(i) -> (mo_i, no_i, ko_i).
+        let coord = |i: usize| {
+            let per_m = nns * nks;
+            let (mo_i, r) = (i / per_m, i % per_m);
+            (mo_i, r / nks, r % nks)
+        };
+
+        // Software-pipelined: submit dispatch i (into c_buf[i%2]) BEFORE reading dispatch
+        // i-1 back, so the host read-back overlaps dispatch i's execution on the NPU.
+        // a_buf/w_buf are single-buffered but only refilled after wait(i-1), so the
+        // in-flight dispatch never sees torn inputs; c_buf is double-buffered so dispatch
+        // i's output can't clobber i-1's before we read it. W copy is skipped when the
+        // slab is unchanged from the previous dispatch (same (ko,no)).
+        let mut prev: Option<(u64, usize)> = None; // (timeline seq, dispatch index)
+        let mut last_w_off = usize::MAX;
+        for i in 0..ndisp {
+            if let Some((seq, _)) = prev {
+                self.kernel.wait(seq)?; // i-1 done: a_buf/w_buf free, its C readable
             }
+            let (mo_i, no_i, ko_i) = coord(i);
+            for r in 0..bm {
+                let src = (mo_i * bm + r) * k + ko_i * bk;
+                a_sub[r * bk..(r + 1) * bk].copy_from_slice(&a[src..src + bk]);
+            }
+            self.load_a(&a_sub);
+            let off = (ko_i * nns + no_i) * wl;
+            if off != last_w_off {
+                self.w_buf
+                    .as_mut_slice()
+                    .copy_from_slice(&packed_w[off..off + wl]);
+                last_w_off = off;
+            }
+            let seq = self
+                .kernel
+                .submit(&[&self.a_buf, &self.w_buf, &self.c_buf[i % 2]])?;
+            if let Some((_, pi)) = prev {
+                let (pm, pn, pk) = coord(pi);
+                self.readback(pi % 2, pm, pn, pk, nks, &mut c_acc, &mut c_blk, n, c);
+            }
+            prev = Some((seq, i));
+        }
+        if let Some((seq, pi)) = prev {
+            self.kernel.wait(seq)?;
+            let (pm, pn, pk) = coord(pi);
+            self.readback(pi % 2, pm, pn, pk, nks, &mut c_acc, &mut c_blk, n, c);
         }
         Ok(())
+    }
+
+    /// Read one completed dispatch's C back. Single K-chunk (`nks == 1`): unpack straight
+    /// into the output block, no host accumulation. Otherwise accumulate this K-chunk into
+    /// `c_acc`, flushing the finished `(mo,no)` block to `c` on the last chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn readback(
+        &self,
+        slot: usize,
+        mo_i: usize,
+        no_i: usize,
+        ko_i: usize,
+        nks: usize,
+        c_acc: &mut [i32],
+        c_blk: &mut [i32],
+        n: usize,
+        c: &mut [i32],
+    ) {
+        let (bm, bn) = (self.block_m(), self.block_n());
+        if nks == 1 {
+            self.unpack_c_block(slot, c, mo_i * bm * n + no_i * bn, n);
+            return;
+        }
+        if ko_i == 0 {
+            c_acc.fill(0);
+        }
+        self.unpack_c_block(slot, c_blk, 0, bn);
+        for (acc, &v) in c_acc.iter_mut().zip(c_blk.iter()) {
+            *acc += v;
+        }
+        if ko_i == nks - 1 {
+            for r in 0..bm {
+                let dst = (mo_i * bm + r) * n + no_i * bn;
+                c[dst..dst + bn].copy_from_slice(&c_acc[r * bn..(r + 1) * bn]);
+            }
+        }
     }
 
     // Copy `a` `(MT·MR) × (KCHUNK·MK)` int8 row-major into a_buf. The R6-TS kernel's A

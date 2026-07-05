@@ -35,8 +35,9 @@ pub struct NpuKernel {
     instr_bo: u32,
     instr_addr: u64,
     instr_size: usize,
-    // Reused across dispatches with the same argument buffers.
-    cmd_cache: std::cell::RefCell<Option<CachedCmd>>,
+    // Reused across dispatches; one entry per distinct argument set (e.g. the two
+    // C-buffers of a pipelined loop), so alternating arg sets don't thrash the cache.
+    cmd_cache: std::cell::RefCell<Vec<CachedCmd>>,
 }
 
 impl NpuKernel {
@@ -76,7 +77,7 @@ impl NpuKernel {
             instr_bo,
             instr_addr,
             instr_size: insts.len(),
-            cmd_cache: std::cell::RefCell::new(None),
+            cmd_cache: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -91,34 +92,48 @@ impl NpuKernel {
     /// completes; on return the output buffers are readable directly (SHMEM is
     /// coherent once the timeline signals).
     pub fn dispatch(&self, args: &[&DeviceBuffer]) -> Result<(), XdnaError> {
+        let seq = self.submit(args)?;
+        self.wait(seq)
+    }
+
+    /// Non-blocking submit: flush inputs and enqueue the command, returning the
+    /// timeline sequence to [`Self::wait`] on. Lets the caller overlap host work (e.g.
+    /// reading a previous dispatch's output) with this dispatch's execution — commands
+    /// on the hwctx run in submit order, so a later [`Self::wait`] still sees this one
+    /// complete. Pair each `submit` with exactly one `wait`, and double-buffer any
+    /// output the next submit would overwrite before you read it.
+    pub fn submit(&self, args: &[&DeviceBuffer]) -> Result<u64, XdnaError> {
         for a in args {
             self.dev
                 .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
         }
 
-        // Reuse the command BO when the same argument buffers are passed again — the
-        // packet's device addresses are fixed per buffer, so only the first dispatch
-        // of a given arg set pays the CREATE_BO + mmap. Rebuild on a different set.
+        // Reuse the command BO per argument set — the packet's device addresses are
+        // fixed per buffer, so only the first submit of a given set pays CREATE_BO +
+        // mmap. One cache entry per set so alternating (pipelined) sets don't thrash.
         let arg_handles: Vec<u32> = args.iter().map(|b| b.handle()).collect();
         let mut cache = self.cmd_cache.borrow_mut();
-        if cache.as_ref().is_none_or(|c| c.arg_handles != arg_handles) {
+        if !cache.iter().any(|c| c.arg_handles == arg_handles) {
             let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
             let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
             let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
             cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
             let mut exec_handles = arg_handles.clone();
             exec_handles.push(self.instr_bo); // instruction BO is an EXEC arg (residency)
-            *cache = Some(CachedCmd {
+            cache.push(CachedCmd {
                 arg_handles: arg_handles.clone(),
                 exec_handles,
                 cmd_bo,
             });
         }
-        let cmd = cache.as_ref().unwrap();
+        let cmd = cache.iter().find(|c| c.arg_handles == arg_handles).unwrap();
+        self.dev
+            .exec_cmd(self.hwctx, cmd.cmd_bo.handle(), &cmd.exec_handles)
+    }
 
-        let seq = self
-            .dev
-            .exec_cmd(self.hwctx, cmd.cmd_bo.handle(), &cmd.exec_handles)?;
+    /// Block until the submitted command at timeline point `seq` completes; its output
+    /// buffers are then readable directly (SHMEM is coherent once the timeline signals).
+    pub fn wait(&self, seq: u64) -> Result<(), XdnaError> {
         self.dev.syncobj_wait(self.syncobj, seq)
     }
 }

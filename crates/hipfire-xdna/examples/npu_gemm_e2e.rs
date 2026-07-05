@@ -50,18 +50,25 @@ fn main() {
         gemm.run_packed(m, k, n, &av, &packed, &mut cv)
             .expect("run"); // warm + correctness
 
-        // Correctness spot-check (first output row) vs CPU.
+        // Correctness vs CPU on rows 0, m/2, m-1 (covers early/mid/late M-blocks so a
+        // pipelining hazard across blocks would show).
         let mut bad = 0usize;
-        for nn in 0..n {
-            let acc: i32 = (0..k)
-                .map(|kk| av[kk] as i32 * wv[kk * n + nn] as i32)
-                .sum();
-            if cv[nn] != acc {
-                bad += 1;
+        for &mm in &[0usize, m / 2, m - 1] {
+            for nn in 0..n {
+                let acc: i32 = (0..k)
+                    .map(|kk| av[mm * k + kk] as i32 * wv[kk * n + nn] as i32)
+                    .sum();
+                if cv[mm * n + nn] != acc {
+                    bad += 1;
+                }
             }
         }
         if bad != 0 {
-            eprintln!("CORRECTNESS FAIL: {bad}/{n} in row 0");
+            eprintln!(
+                "CORRECTNESS FAIL: {bad} mismatches across rows 0/{}/{}",
+                m / 2,
+                m - 1
+            );
             std::process::exit(4);
         }
 
