@@ -13363,11 +13363,13 @@ pub fn forward_prefill_batch_ep(
         if is_moe && !ep_skip_ar {
             let t_a = std::time::Instant::now();
             let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+            // EP reduces over all ranks → the full device group.
+            let ar_group: Vec<usize> = (0..refs.len()).collect();
             if ep_peer_ar {
-                gpus.all_reduce_sum_f32_peer(&refs, n * dim)
+                gpus.all_reduce_sum_f32_peer(&ar_group, &refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             } else {
-                gpus.all_reduce_sum_f32(&refs, n * dim)
+                gpus.all_reduce_sum_f32(&ar_group, &refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             }
             if ep_timing {

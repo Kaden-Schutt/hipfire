@@ -524,15 +524,35 @@ impl Gpus {
     /// immediately; the buffers are valid only after a subsequent
     /// `stream_synchronize` (or a downstream dispatch that's already
     /// ordered behind the same stream).
-    pub fn all_reduce_sum_f32(&mut self, buffers: &[&DeviceBuffer], count: usize) -> HipResult<()> {
-        if buffers.len() != self.devices.len() {
+    ///
+    /// `group` lists the global device ids participating (buffers are aligned
+    /// to it: `buffers[k]` lives on `self.devices[group[k]]`). The RCCL path
+    /// reduces over its single all-device communicator, so today it requires
+    /// the **full** device set (`group == 0..n`); true sub-group reduction
+    /// needs `ncclCommSplit` (Phase 5b). Pass `group = &(0..n)` for the 1D
+    /// case — byte-identical to the previous all-devices behavior. For genuine
+    /// sub-groups use `all_reduce_sum_f32_peer`, which is group-capable now.
+    pub fn all_reduce_sum_f32(
+        &mut self,
+        group: &[usize],
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        if buffers.len() != group.len() {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "all_reduce_sum_f32: buffers.len()={} != n_devices={}",
+                    "all_reduce_sum_f32: buffers.len()={} != group.len()={}",
                     buffers.len(),
-                    self.devices.len()
+                    group.len()
                 ),
+            ));
+        }
+        if group.len() != self.devices.len() {
+            return Err(HipError::new(
+                0,
+                "all_reduce_sum_f32 (RCCL): sub-group reduction needs ncclCommSplit \
+                 (Phase 5b); use all_reduce_sum_f32_peer for sub-groups.",
             ));
         }
         // Single-rank (TP=1) degenerate case: the all-reduce-sum over one
@@ -631,37 +651,53 @@ impl Gpus {
     /// identity (no-op). Requires peer access (caller's `enable_peer_all`) for
     /// the fast P2P path; without it `boundary_copy` host-stages (slower but
     /// correct). In-place: `buffers[r]` is both input and output.
+    ///
+    /// `group` lists the global device ids participating; `buffers[k]` lives on
+    /// `self.devices[group[k]]`. Unlike the RCCL path, this is **genuinely
+    /// sub-group-capable** — it reduces only over `group` (peer copies + local
+    /// add among those devices). Pass `group = &(0..n)` for the 1D all-devices
+    /// case — byte-identical to the previous behavior.
     pub fn all_reduce_sum_f32_peer(
         &mut self,
+        group: &[usize],
         buffers: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
-        let n = self.devices.len();
-        if buffers.len() != n {
+        let g = group.len();
+        if buffers.len() != g {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}",
+                    "all_reduce_sum_f32_peer: buffers.len()={} != group.len()={g}",
                     buffers.len()
                 ),
             ));
         }
-        if n == 1 {
+        if g <= 1 {
             return Ok(());
         }
         let bytes = count * 4;
+        // Sizes n-1 temp slots per physical device; a sub-group of size g uses
+        // the first g-1 (g <= n ⇒ g-1 <= n-1), so no resize needed.
         self.ensure_peer_ar_tmp(bytes)?;
 
         // Phase 1: read every peer's ORIGINAL buffer into a local temp.
-        let mut evts = Vec::with_capacity(n * (n - 1));
-        for r in 0..n {
+        let mut evts = Vec::with_capacity(g * (g - 1));
+        for k in 0..g {
+            let dev_k = group[k];
             let mut slot = 0usize;
-            for j in 0..n {
-                if j == r {
+            for m in 0..g {
+                if m == k {
                     continue;
                 }
-                let evt =
-                    self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
+                let dev_m = group[m];
+                let evt = self.boundary_copy(
+                    dev_m,
+                    dev_k,
+                    buffers[m],
+                    &self.peer_ar_tmp[dev_k][slot],
+                    bytes,
+                )?;
                 evts.push(evt);
                 slot += 1;
             }
@@ -671,22 +707,23 @@ impl Gpus {
         }
 
         // Phase 2: add the peer temps into each rank's buffer.
-        for r in 0..n {
+        for k in 0..g {
+            let dev_k = group[k];
             let dst = GpuTensor {
-                buf: unsafe { buffers[r].alias() },
+                buf: unsafe { buffers[k].alias() },
                 shape: vec![count],
                 dtype: DType::F32,
             };
-            let srcs: Vec<GpuTensor> = (0..n - 1)
+            let srcs: Vec<GpuTensor> = (0..g - 1)
                 .map(|slot| GpuTensor {
-                    buf: unsafe { self.peer_ar_tmp[r][slot].alias() },
+                    buf: unsafe { self.peer_ar_tmp[dev_k][slot].alias() },
                     shape: vec![count],
                     dtype: DType::F32,
                 })
                 .collect();
-            self.devices[r].bind_thread()?;
+            self.devices[dev_k].bind_thread()?;
             for src in &srcs {
-                self.devices[r].add_inplace_f32(&dst, src)?;
+                self.devices[dev_k].add_inplace_f32(&dst, src)?;
             }
         }
         Ok(())
