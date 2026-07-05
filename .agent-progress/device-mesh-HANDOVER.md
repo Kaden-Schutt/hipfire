@@ -43,13 +43,21 @@ and **deepseek4 `weight_manifest` + `state_manifest`** (MLA replicated, routed e
 (weight+state); qwen35 (state only); deepseek4 (weight+state). Only **qwen35 `weight_manifest`**
 (DeltaNet fused projections + MoE variants) is left in Phase-2 arch coverage.
 
-## The NEXT unit — pick ONE:
-**Option A (recommended): wire `WeightStore` into a real load (Phase 3 start).** `fulfill_manifest`
-now covers PP+EP placement, so the payoff is letting a forward actually *consume* the store. Give an
-arch (llama — has `weight_manifest`/`state_manifest` but NO multi-loader) a `source` backed by its
-real HFQ + name resolver (study `qwen35_tensor_data`, `qwen35.rs:1155`), fulfill on PP-2, forward
-reads the store not arch fields. Higher risk (forward rewiring); pairs with ModelParallel/ArchDispatch
-hoist. Validation: `HIPFIRE_EMULATE_GPUS=2` PP on qwen3.5-4b; byte-identical vs bespoke `load_model_pp`.
+**Also DONE (Phase 3 START): store-backed REAL llama load.** `source(entry)` now returns
+`(bytes, DType)` (real quant type → forward-ready store tensor, not `Raw`). `examples/llama_store_load.rs`
+loads `qwen3-0.6b-llama.mq4`'s quantized projections via generic `fulfill_manifest` + a llama
+HFQ-backed source and byte+dtype-matches bespoke `Llama::load_weights` — **196 tensors/28 layers,
+identical (MQ4G256), GPU-validated**. Loader name map: HF names `model.layers.{i}.self_attn.q_proj.weight`
+via `hfq::load_weights_hfq` (NOT the GGUF `blk.*` path); quant projections upload raw/verbatim (match),
+norms/embed/tied-lm_head do F16→F32 host dequant (scoped out).
+
+## The NEXT unit — pick ONE (Phase 3 continuation):
+**Option A (recommended): store→forward CONSUMPTION.** Placement + real-load now proven; the payoff
+is a forward actually *using* the store. Two sub-steps: (1) extend the llama `source` to cover
+norms/embed/tied-lm_head (reproduce the F16→F32 host dequant — return `(f32_bytes, DType::F32)`; see
+`hfq.rs:551 load_f16_tensor`), so the WHOLE model loads via the store; (2) assemble `LlamaWeights`
+from the store (pull each `(name, layer, 0)` → the arch field) and run a forward, asserting logits ==
+bespoke. Then PP-2 (`HIPFIRE_EMULATE_GPUS=2`). This is the ModelParallel/ArchDispatch-hoist track.
 
 **Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage). Pure-CPU like the ds4/qwen35
 work just done, but needs DeltaNet loader study: per-`LayerType` weight sets (LinearAttention fused

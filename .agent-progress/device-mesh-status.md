@@ -51,10 +51,21 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
   upload), `WeightStore::free_all` frees every already-uploaded buffer on its own device (best-
   effort via `Gpu::hip.free`) and returns `Err`. Never a half-loaded VRAM-leaking mesh (unlike the
   bespoke loaders). `Alias` cells hold no buffer.
-- DECISION: takes a `source(entry) -> raw bytes` closure, NOT `&HfqFile` — manifest names are
-  *logical* ("wq"), on-disk HFQ names are arch-specific; the closure keeps the engine free of
-  on-disk naming (pulls complexity to the arch; Tier-1). Same shape as the plan's
-  `fulfill_manifest(manifest, hfq, mesh)` with the name-resolution seam made explicit.
+- DECISION: takes a `source(entry) -> (raw bytes, DType)` closure, NOT `&HfqFile` — manifest names
+  are *logical* ("wq"), on-disk HFQ names are arch-specific; the closure keeps the engine free of
+  on-disk naming (pulls complexity to the arch; Tier-1). The dtype is the tensor's REAL on-disk quant
+  type, stamped onto the store tensor so it is forward-ready (correct kernel dispatch), not `Raw`.
+
+### Phase 3 START — store-backed REAL llama load, byte+dtype-identical (GPU-validated)
+- `examples/llama_store_load.rs`: loads `qwen3-0.6b-llama.mq4`'s quantized projections
+  (wq/wk/wv/wo/ffn_gate/ffn_up/ffn_down) through generic `fulfill_manifest` + a llama HFQ-backed
+  `source` (HF names `model.layers.{i}.self_attn.q_proj.weight`; quant_type→DType) and asserts each
+  store tensor is byte+dtype IDENTICAL to bespoke `Llama::load_weights`.
+- GPU-validated gfx1151: **196 projection tensors / 28 layers, byte+dtype identical (MQ4G256)**.
+  These are uploaded raw/verbatim by the loader (no transform) → raw-byte fulfill matches exactly.
+- Scoped out: norms/embed/tied-lm_head (F16→F32 host dequant) — a source-side follow-up (store
+  already carries dtype). The store→forward *consumption* (assemble LlamaWeights from the store,
+  or forward reads the store) is the next Phase-3 step.
 - GPU-validated on gfx1151 via `examples/fulfill_manifest_probe.rs` (synthetic byte source,
   no model file): single-1×1 + emulated PP-2 + emulated EP-2 all PASS — placement matches
   `placement_devices`, byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device,
