@@ -2239,7 +2239,7 @@ pub fn forward_ep(
                     skip_ffn,
                 });
             }
-            hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
+            hipfire_runtime::ep::run_layer_program_ep(&hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(hipfire_runtime::multi_gpu::DimKind::Ep, partials.len())]), gpus, binds.as_mut_slice(), partials, &program, hidden)
                 .map_err(|e| format!("ds4 forward_ep run_layer_program_ep L{l}: {e}"))?;
         }
         if dump_pos_hit {
@@ -2885,7 +2885,7 @@ pub fn mtp_forward_ep(
                 skip_ffn: false,
             });
         }
-        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
+        hipfire_runtime::ep::run_layer_program_ep(&hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(hipfire_runtime::multi_gpu::DimKind::Ep, partials.len())]), gpus, binds.as_mut_slice(), partials, &program, hidden)
             .map_err(|e| format!("mtp_forward_ep run_layer_program_ep: {e}"))?;
     }
 

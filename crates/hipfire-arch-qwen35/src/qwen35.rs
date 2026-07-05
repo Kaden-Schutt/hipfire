@@ -13181,7 +13181,7 @@ pub fn forward_ep(
                 hd,
             });
         }
-        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, dim)
+        hipfire_runtime::ep::run_layer_program_ep(&hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(hipfire_runtime::multi_gpu::DimKind::Ep, partials.len())]), gpus, binds.as_mut_slice(), partials, &program, dim)
             .map_err(|e| HipError::new(0, &e.to_string()))?;
         if matches!(
             &weights_per_rank[0].layers[layer_idx],

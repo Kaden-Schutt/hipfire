@@ -36,7 +36,7 @@ use crate::context::DispatchCtx;
 use crate::pipeline::superop::{dispatch_super_op, ForwardBindings, LayerProgram, SuperOpKind};
 use crate::types::DispatchError;
 use hip_bridge::{DeviceBuffer, HipError};
-use hipfire_hardware::Gpus;
+use hipfire_hardware::{DeviceMesh, DimKind, Gpus};
 use rdna_compute::GpuTensor;
 
 fn hip_err(e: HipError) -> DispatchError {
@@ -69,6 +69,7 @@ pub fn ensure_rank_streams(gpus: &mut Gpus) -> Result<(), DispatchError> {
 ///
 /// Every device must have an `active_stream` set ([`ensure_rank_streams`]).
 pub fn run_layer_program_ep<B: ForwardBindings>(
+    mesh: &DeviceMesh,
     gpus: &mut Gpus,
     bindings: &mut [B],
     partials: &[GpuTensor],
@@ -128,8 +129,17 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
             //    that path uses all_reduce_sum_f32_peer directly. Opt decode into
             //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
             let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            // EP reduces over all ranks → the full device group.
-            let group: Vec<usize> = (0..refs.len()).collect();
+            // EP all-reduce group comes from the mesh's `Ep` axis (the ranks
+            // sharing this device's other coords). For the current 1×N EP mesh
+            // that is all ranks → byte-identical to the previous 0..n. Composed
+            // meshes (2×2, per-stage Ep groups) are Phase 5b: this single-group
+            // reduce asserts one Ep group spanning all ranks.
+            let group = mesh.group_along(DimKind::Ep, &mesh.coord_of(0));
+            debug_assert_eq!(
+                group.len(),
+                refs.len(),
+                "run_layer_program_ep: single Ep-group (1×N) only; composed/multi-group EP is Phase 5b",
+            );
             static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let use_peer = *PEER_DECODE.get_or_init(|| {
                 std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")

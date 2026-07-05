@@ -1186,7 +1186,7 @@ pub fn forward_ep(
                 l,
             });
         }
-        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, hidden)
+        hipfire_runtime::ep::run_layer_program_ep(&hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(hipfire_runtime::multi_gpu::DimKind::Ep, partials.len())]), gpus, binds.as_mut_slice(), partials, &program, hidden)
             .map_err(|e| format!("forward_ep run_layer_program_ep L{l}: {e}"))?;
     }
 
