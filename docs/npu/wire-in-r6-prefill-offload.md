@@ -104,12 +104,21 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
        broadcast sync over 64 N-slabs, not compute. Standalone array + benches
        (`r6_mp_verify`, `r6_mp_e2e`); wiring an M-parallel mode into `NpuGemm` is the
        follow-up.
-     Levers left: (1) pipeline the 3 C read-backs / reduce broadcast-sync overhead
-       (bigger MT, fewer larger N-slabs); (2) the endgame — encode the **whole GEMM in one
-       instruction stream** (loop the `runtime_sequence` DMAs over all M/N/K blocks) so a
-       single dispatch computes the entire GEMM: one exec, one wait, one C read-back, no
-       per-block latency and no read-back coherence issue; (3) zero-copy C handoff. At
-       ~1.45 TOPS this is still below GPU (~50), so the step-4 hot-path hook stays gated.
+     - **Whole-GEMM-in-one-dispatch DONE + best (`r6_gen_mp.py` ROUNDS).** Each core
+       streams ROUNDS M-blocks, so the whole GEMM is a **single dispatch** (ROUNDS=3 ×
+       COLS=8 = 24 M-blocks): the array runs continuously (no inter-dispatch host stall),
+       one exec, one C read-back, no coherence dance. **~1.9 TOPS** (1.5–1.7 ms, 0/6 fail,
+       all 24 M-blocks correct), reliable via a single blocking dispatch. Lesson: stream
+       via **pure-linear** DMAs, not repeat BD dims — a repeat dim doesn't re-check the
+       objectfifo semaphore, so rounds >0 overrun (round 0 correct, rest garbage); W is
+       replicated ROUNDS× in DRAM since the broadcast fifo can't replay.
+
+     **Full progression (M768·K512·N4096): 0.02 → 1.0 → 1.45 → ~1.9 TOPS (~95× over the
+     CPU-marshaling floor).** Levers left: (1) reduce the broadcast-sync feed cost (raw
+     single-dispatch ceiling is ~3 TOPS); (2) the real aggregate win — a **concurrent
+     NPU ‖ GPU split** (the ~40% prefill win lives here, not in sync offload). At ~1.9
+     TOPS this is still below GPU (~50), so the step-4 hot-path hook stays gated for
+     *sync* offload; the concurrent split is its own effort.
 
    - **(superseded) 3c-old. Activations + output → the DMA (dynamic, per inference).** A and C are
      computed at runtime, so the loader can't pre-arrange them. Feed A row-major and
