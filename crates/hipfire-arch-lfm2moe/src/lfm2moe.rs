@@ -592,6 +592,11 @@ impl Lfm2MoeWeights {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
+            hipfire_runtime::load_progress::report(
+                l as u32 + 1,
+                cfg.num_hidden_layers as u32,
+                "weights",
+            );
             let p = format!("model.layers.{l}");
             let operator_norm =
                 load_f32(hfq, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;

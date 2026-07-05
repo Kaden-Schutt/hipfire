@@ -64,6 +64,7 @@ pub fn load_nemotron_weights(
     let mut layer_norm = Vec::with_capacity(cfg.num_layers);
     let mut blocks = Vec::with_capacity(cfg.num_layers);
     for (l, kind) in cfg.blocks.iter().enumerate() {
+        hipfire_runtime::load_progress::report(l as u32 + 1, cfg.num_layers as u32, "weights");
         let p = format!("backbone.layers.{l}");
         layer_norm.push(get(src, &format!("{p}.norm.weight"))?);
         let m = format!("{p}.mixer");

@@ -492,6 +492,7 @@ impl ZayaGpuWeights {
         let norm = up(hfq, gpu, "model.norm.weight")?;
         let mut layers = Vec::with_capacity(cfg.num_blocks);
         for l in 0..cfg.num_blocks {
+            hipfire_runtime::load_progress::report(l as u32 + 1, cfg.num_blocks as u32, "weights");
             let p = format!("model.layers.{l}");
             let qkv = format!("{p}.self_attn.qkv_proj");
             let gate = format!("{p}.mlp.gate");
