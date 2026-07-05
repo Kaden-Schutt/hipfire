@@ -75,3 +75,22 @@ file. Weight is fed once (broadcast) and reused across the array ⇒ ~53 TOPS
 compute-bound at the ~55 GB/s feed. Spatial reuse across cores, not temporal
 per-core accumulators, is what makes W4A8 GEMM compute-bound. That array kernel
 (cascade/broadcast) is the next major build.
+
+## Wire-in dispatch validation (hipfire-xdna NpuKernel)
+
+Both kernels now dispatch through hipfire's amdxdna path (`crates/hipfire-xdna`,
+`NpuKernel`) — no XRT. R2a is validated bit-exact on halo: A=all-1s int8 ×
+W=all-1s int4 gives the exact `16·(INNER+1)` per lane, and two back-to-back
+dispatches (A=1 then A=2) give the clean 2× a linear GEMM must (`run_smoke`).
+
+**R3a caveat (correctness, not dispatch):** driven with the all-ones reference,
+R3a's output is ~half the expected `KCHUNK·16` and only near-deterministic
+(e.g. 512/513/580 for the 1024 case), invariant to host-side delays. Because R2a
+is bit-exact through the same dispatch path, the dispatch + int4 mac primitive are
+sound; the discrepancy is in R3a's multi-tile weight *streaming/indexing*, which
+was only ever validated for **bandwidth** with random inputs — its numerical
+result was never checked. R3a also carries the resident K accumulator C across
+dispatches without a per-dispatch reset, so it is **reuse-unsafe** as written (the
+first super-tile of each call must reseed C rather than accumulate). Both — the
+weight-streaming correctness bug and the C-reset — need a correctness pass before
+R3a is usable from the runtime; R2a is the validated W4A8 kernel today.
