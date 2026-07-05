@@ -27,7 +27,11 @@ export PATH="$PEANO/bin:$MA_ROOT/bin:$PATH"
 # r6_gemm_ts.cc for the tensor-buffer-stream variant (row-major A/C, no CPU marshaling);
 # R6_OUT_TAG names its cache dir (default r6). Buffer sizes are identical either way, so
 # the MLIR is unchanged.
-SRC="${R6_KERNEL_SRC:-$HERE/r6_gemm.cc}"; TAG="${R6_OUT_TAG:-r6}"
+# Kernel source: default r6_gemm.cc; set R6_KERNEL_SRC=r6_gemm_ts.cc for the tensor-stream
+# variant. R6_GEN picks the array generator: r6_gen.py (N-parallel, default) or r6_gen_mp.py
+# (M-parallel W-broadcast: COLS distinct M-blocks share one broadcast W). R6_OUT_TAG names
+# the cache dir. Buffer sizes are identical, so the kernel object is shared.
+SRC="${R6_KERNEL_SRC:-$HERE/r6_gemm.cc}"; TAG="${R6_OUT_TAG:-r6}"; GEN="${R6_GEN:-r6_gen.py}"
 OUT="$HOME/.hipfire/npu/${TAG}_${MT}x${NT}x${KCHUNK}_c${COLS}_nb${NB}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
@@ -37,7 +41,7 @@ AW=$((MT * KCHUNK * 64)); WW=$((NT * KCHUNK * 128)); CW=$((MT * NT * 64))
 "$PEANO/bin/clang++" "$SRC" -c -o "$OUT/r6_mac.o" -I"$MA_ROOT/include" \
   -std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -O2 -DNDEBUG --target=aie2p-none-unknown-elf -DMT="$MT" -DNT="$NT" -DKCHUNK="$KCHUNK"
-python3 "$HERE/r6_gen.py" "$COLS" "$NB" "$AW" "$WW" "$CW" > "$OUT/aie.mlir"
+python3 "$HERE/$GEN" "$COLS" "$NB" "$AW" "$WW" "$CW" > "$OUT/aie.mlir"
 
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
