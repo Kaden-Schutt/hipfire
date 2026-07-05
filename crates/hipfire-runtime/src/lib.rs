@@ -26,6 +26,7 @@ pub mod safetensors_source;
 pub mod loop_guard;
 pub mod multi_gpu;
 pub mod tp_shard;
+pub mod weight_manifest;
 pub mod ep;
 pub mod sampler;
 #[cfg(feature = "deltanet")]

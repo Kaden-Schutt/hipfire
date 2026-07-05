@@ -153,6 +153,17 @@ pub trait Architecture: Send + 'static {
     ///   workspace; no recurrent state.
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String>;
 
+    /// Declarative weight-placement manifest (Phase 2, device-mesh plan): for
+    /// each tensor, its logical shape/dtype + [`ShardPolicy`]. The engine slices
+    /// each tensor to its `(stage, tp_rank)` via the mesh before the arch sees
+    /// it, so the arch declares *what it needs*, not *where it goes*. Pure CPU,
+    /// no GPU/HFQ dependency — implement by transcribing the arch's existing
+    /// imperative loader; unit-test before the fulfillment loop exists. Default
+    /// is unimplemented so arches opt in incrementally.
+    fn weight_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::WeightEntry> {
+        unimplemented!("weight_manifest not yet implemented for this arch")
+    }
+
     // Forward pass shapes are arch-specific; declare the surface but
     // don't constrain types in this trait — concrete arch crates
     // expose their own typed forward methods. The runtime's generic
