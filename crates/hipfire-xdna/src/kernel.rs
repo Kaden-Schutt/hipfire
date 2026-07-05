@@ -164,18 +164,89 @@ impl NpuKernel {
         self.dev.syncobj_wait(self.syncobj, seq)
     }
 
-    /// Reconcile the host cache for an output buffer before a CPU read-back. Call after
-    /// [`Self::wait`], before reading. A blocking dispatch+read is coherent without this,
-    /// but a *pipelined* loop overlaps the read-back of one buffer with a concurrent DMA
-    /// write to another; the hardware prefetcher can pull stale lines of the in-flight
-    /// buffer into cache, and there is no invalidate before its later read. `TO_DEVICE`
-    /// clean+invalidates on this driver (`FROM_DEVICE` EINVALs on data BOs), which clears
-    /// those stale lines so the read sees the kernel's writes. Verified: without this,
-    /// pipelined read-back fails intermittently (~1 run in 3); with it, 0/16 across the
-    /// single- and multi-K-chunk paths.
-    pub fn sync_output(&self, buf: &DeviceBuffer) -> Result<(), XdnaError> {
-        self.dev
-            .sync_bo(buf.handle(), submit::SYNC_DIRECT_TO_DEVICE, buf.len())
+    /// Submit `args` WITHOUT blocking, returning an in-flight handle. Where
+    /// [`Self::dispatch`] fuses submit + wait, this lets the caller drive another engine
+    /// (the GPU) while the NPU runs, then [`Self::poll`] / [`Self::wait`] for completion —
+    /// the basis for a GPU‖NPU microbatch pipeline (e.g. GPU verifies step N while the NPU
+    /// drafts N+1). The argument buffers must outlive the handle (the caller owns them),
+    /// and the handle must be waited (or polled to completion) before it is dropped.
+    pub fn submit(&self, args: &[&DeviceBuffer]) -> Result<NpuInFlight, XdnaError> {
+        self.submit_tagged(args, 0)
+    }
+
+    /// [`Self::submit`] with a caller-defined `tag` carried on the handle. The scheduler
+    /// stamps the microbatch / layer / expert id so it can correlate NPU completions with
+    /// the per-token grouping it is pipelining across the GPU without a side table — the
+    /// explicit shared state between dispatcher and scheduler.
+    ///
+    /// Each submit builds its OWN command BO, owned by the returned handle so it stays
+    /// resident until the dispatch completes. (The single-slot cache behind `dispatch`
+    /// cannot back multiple in-flight dispatches: a second submit with different buffers
+    /// would free the first's command BO mid-flight.)
+    pub fn submit_tagged(
+        &self,
+        args: &[&DeviceBuffer],
+        tag: u64,
+    ) -> Result<NpuInFlight, XdnaError> {
+        for a in args {
+            self.dev
+                .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
+        }
+        let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
+        let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
+        let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
+        cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
+        let mut exec_handles: Vec<u32> = args.iter().map(|b| b.handle()).collect();
+        exec_handles.push(self.instr_bo); // instruction BO is an EXEC arg (residency)
+        let seq = self
+            .dev
+            .exec_cmd(self.hwctx, cmd_bo.handle(), &exec_handles)?;
+        Ok(NpuInFlight {
+            seq,
+            tag,
+            _cmd_bo: cmd_bo,
+        })
+    }
+
+    /// Non-blocking completion check for an in-flight dispatch (`true` = done). Lets the
+    /// scheduler reap finished NPU work between GPU steps without parking the GPU thread.
+    pub fn poll(&self, f: &NpuInFlight) -> Result<bool, XdnaError> {
+        self.dev.syncobj_poll(self.syncobj, f.seq)
+    }
+
+    /// Block until an in-flight dispatch completes; on return its output buffers are
+    /// readable (SHMEM is coherent once the timeline signals). Consumes the handle,
+    /// freeing its command BO. Dispatches on one kernel complete in submission order.
+    pub fn wait(&self, f: NpuInFlight) -> Result<(), XdnaError> {
+        self.dev.syncobj_wait(self.syncobj, f.seq)
+    }
+}
+
+/// An in-flight NPU dispatch from [`NpuKernel::submit`]. Owns the command BO backing the
+/// submission, keeping it resident until [`NpuKernel::wait`] (or drop). Carries the
+/// timeline `seq` (submission order on the kernel's hwctx) and a caller `tag` (the
+/// scheduler's microbatch / layer / expert id) so the dispatcher and scheduler share
+/// in-flight state explicitly: poll by handle, correlate by tag, order by seq.
+pub struct NpuInFlight {
+    seq: u64,
+    tag: u64,
+    _cmd_bo: DeviceBuffer,
+}
+
+impl NpuInFlight {
+    /// Timeline point for this dispatch — monotonic per kernel; the scheduler's ordering hint.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Caller-defined correlation id (microbatch / layer / expert).
+    pub fn tag(&self) -> u64 {
+        self.tag
+    }
+
+    /// Re-tag in place, e.g. when the scheduler regroups tokens across a layer boundary.
+    pub fn set_tag(&mut self, tag: u64) {
+        self.tag = tag;
     }
 }
 
