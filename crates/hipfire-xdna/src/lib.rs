@@ -147,6 +147,12 @@ pub mod kernel;
 #[cfg(target_os = "linux")]
 pub use kernel::NpuKernel;
 
+// Wire-in step 2: NpuGemm — W4A8 GEMM primitive over the R6 kernel (tile marshaling).
+#[cfg(target_os = "linux")]
+pub mod gemm;
+#[cfg(target_os = "linux")]
+pub use gemm::NpuGemm;
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*; // brings the crate-root `submit` module into scope
