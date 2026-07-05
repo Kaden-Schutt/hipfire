@@ -11,7 +11,7 @@
 #           var_coh=BAD -> COHERENCE_FAIL ;  clock skew -> VOID   (both regardless of f)
 set -u
 ARCH=$1 DEV=$2 CARD=$3 MODEL=$4 KERNEL=$5 LABEL=$6 VARIANT=$7
-MAIN=~/hipfire; WT="$MAIN/.aw/sw_card${CARD}"
+MAIN=~/hipfire; WT="${WT_OVERRIDE:-$MAIN/.aw/sw_card${CARD}}"   # WT_OVERRIDE = per-worker worktree for the swarm (parallel builds must not share kernels/src+target)
 export PATH=$HOME/.bun/bin:$PATH
 export HOME="$WT/.swhome"; mkdir -p "$HOME/.hipfire"
 export HIPFIRE_DAEMON_ID="sw_card${CARD}"; ID="$HIPFIRE_DAEMON_ID"
@@ -54,9 +54,14 @@ except:c=[]
 print(f"{dec if dec is not None else 0:.2f} {'OK' if (len(t)>15 and u>0.35) else 'BAD'} {max(c) if c else 0}")
 PY
 }
-# build baseline + variant (keep both binaries)
-build || { echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"BASELINE_BUILD_FAIL\"}"; exit 0; }
-cp "$DB" /tmp/v2_base_$ID
+# build baseline + variant (keep both binaries). PREBUILT_BASE lets the swarm build ONE baseline daemon and
+# share it across all parallel variant-certifies (the baseline is identical per campaign) — no N× rebuild.
+if [ -n "${PREBUILT_BASE:-}" ] && [ -s "${PREBUILT_BASE}" ]; then
+  cp "$PREBUILT_BASE" /tmp/v2_base_$ID
+else
+  build || { echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"BASELINE_BUILD_FAIL\"}"; exit 0; }
+  cp "$DB" /tmp/v2_base_$ID
+fi
 cp "$VARIANT" "$KSRC"
 if ! build; then git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null; echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"VARIANT_BUILD_FAIL\"}"; exit 0; fi
 cp "$DB" /tmp/v2_var_$ID
