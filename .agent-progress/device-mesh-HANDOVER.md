@@ -36,20 +36,29 @@ on-disk HFQ naming out of the engine. Additive
 the per-expert pointer-table + zeroed-dummy the deepseek4 kernel indexes through
 (`crates/hipfire-arch-deepseek4/src/arch.rs:163-333`) is forward-consumption, wired in Phase 3.
 
+**Also DONE (arch manifests):** qwen35 `state_manifest` (hybrid Kv+Recurrent+Conv by `layer_types`)
+and **deepseek4 `weight_manifest` + `state_manifest`** (MLA replicated, routed experts
+`ExpertSharded`, `num_hash_layers` gate-bias split; compressor/indexer/HC/MTP scoped out — all
+`Replicate`/file-shaped; 2 unit tests). Phase-2 arch coverage now: llama, qwen2, minimax, toy
+(weight+state); qwen35 (state only); deepseek4 (weight+state). Only **qwen35 `weight_manifest`**
+(DeltaNet fused projections + MoE variants) is left in Phase-2 arch coverage.
+
 ## The NEXT unit — pick ONE:
-**Option A: wire `WeightStore` into a real load (Phase 3 start).** Give an arch (llama — has
-`weight_manifest`/`state_manifest` but NO multi-loader) a `source` backed by its real HFQ + name
-resolver (study `qwen35_tensor_data`, `qwen35.rs:1155`), fulfill on PP-2, forward reads the store
-not arch fields. Higher risk (forward rewiring); pairs with the ModelParallel/ArchDispatch hoist.
-Validation: `HIPFIRE_EMULATE_GPUS=2` PP on qwen3.5-4b; byte-identical vs bespoke `load_model_pp`.
+**Option A (recommended): wire `WeightStore` into a real load (Phase 3 start).** `fulfill_manifest`
+now covers PP+EP placement, so the payoff is letting a forward actually *consume* the store. Give an
+arch (llama — has `weight_manifest`/`state_manifest` but NO multi-loader) a `source` backed by its
+real HFQ + name resolver (study `qwen35_tensor_data`, `qwen35.rs:1155`), fulfill on PP-2, forward
+reads the store not arch fields. Higher risk (forward rewiring); pairs with ModelParallel/ArchDispatch
+hoist. Validation: `HIPFIRE_EMULATE_GPUS=2` PP on qwen3.5-4b; byte-identical vs bespoke `load_model_pp`.
 
-**Option B: dense-TP slice (Phase 5 placement).** Implement `ColumnShard`/`RowShard`/`FusedQkv`/
-`VocabShard` host-slicing (the quant-blob row-gather — see `tp_shard::wq_row_range`/`wo_col_range`
-notes: column-of-row-major is a per-row gather, NOT contiguous). Highest-risk slicing; only worth
-it alongside the live-TP forward (Phase 5-dense), which is greenfield.
+**Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage). Pure-CPU like the ds4/qwen35
+work just done, but needs DeltaNet loader study: per-`LayerType` weight sets (LinearAttention fused
+`in_proj_qkv`/`in_proj_z`/`in_proj_a`/`in_proj_b` + `A_log`/`dt_bias`/`conv1d`/`norm` vs FullAttention
+gated QKV), dense-vs-MoE variants. FusedQkv/HeadSharded policies for the DeltaNet head axis. Study
+`qwen35.rs:2876-2945` (the per-layer-type loader) + `LayerType`.
 
-Recommended: **Option A** — `fulfill_manifest` now covers PP+EP placement, so the payoff is
-letting a forward actually *consume* the store (the Tier-1→real-load bridge).
+**Option C: dense-TP slice (Phase 5 placement).** Greenfield quant-blob row-gather; only worth it
+alongside the live-TP forward (Phase 5-dense).
 
 ## GOTCHAS (bit me this session)
 - **GPU lock goes stale** (`/tmp/hipfire-gpu.lock`, noclobber variant). Verify dead (dead pid
