@@ -49,10 +49,12 @@ for c in range(COLS):
       }}
       aie.end
     }}''')
-# Shared A (resident). W: each core reads its OWN NB*WW region (independent DDR feed
-# = realistic aggregate weight traffic, not a shared-region read). Per-core C block.
+# Shared A (resident, one M-block). W: each core reads its OWN NB*WW region. C: each
+# core writes NB distinct output blocks (real GEMM output, not an overwritten DCE
+# guard) to its own NB*CW region.
 WTOT = COLS * NB * WW
-args = ", ".join([f"%A: memref<{AW}xi8>", f"%W: memref<{WTOT}xi8>", f"%C: memref<{COLS*CW}xi32>"])
+CTOT = COLS * NB * CW
+args = ", ".join([f"%A: memref<{AW}xi8>", f"%W: memref<{WTOT}xi8>", f"%C: memref<{CTOT}xi32>"])
 out.append(f"    aie.runtime_sequence({args}) {{")
 for c in range(COLS):
     out.append(f'''      %ta{c} = aiex.dma_configure_task_for @fa{c} {{
@@ -66,7 +68,7 @@ for c in range(COLS):
       }}
       aiex.dma_start_task(%tw{c})
       %tc{c} = aiex.dma_configure_task_for @fc{c} {{
-        aie.dma_bd(%C : memref<{COLS*CW}xi32>, {c*CW}, {CW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {CW}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%C : memref<{CTOT}xi32>, {c*NB*CW}, {NB*CW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {NB*CW}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tc{c})''')

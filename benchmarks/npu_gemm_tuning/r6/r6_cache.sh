@@ -9,10 +9,12 @@
 # NpuGemm::load expects (single-core, one (MT*4)x(NT*16)x(KCHUNK*16) block/dispatch =
 # r6_gen.py COLS=1 NB=1).
 #
-# Usage: r6_cache.sh [MT] [NT] [KCHUNK]   (defaults 16 4 16)
+# Usage: r6_cache.sh [MT] [NT] [KCHUNK] [COLS] [NB]   (defaults 16 4 16 1 1)
+# COLS>1 / NB>1 build the streaming ARRAY (COLS cores × NB blocks = COLS*NB N-slabs
+# per dispatch = NpuGemm `groups`); COLS=1 NB=1 is the single-core one-slab form.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MT="${1:-16}"; NT="${2:-4}"; KCHUNK="${3:-16}"
+MT="${1:-16}"; NT="${2:-4}"; KCHUNK="${3:-16}"; COLS="${4:-1}"; NB="${5:-1}"
 [ "$NT" = 4 ] || { echo "NT must be 4 (r6_mac accumulator count)"; exit 1; }
 
 : "${HIPFIRE_NPU_VENV:=$HOME/.venv}"
@@ -21,16 +23,16 @@ PEANO="$(pip show llvm-aie 2>/dev/null | awk '/^Location:/{print $2}')/llvm-aie"
 MA_ROOT="$(python -c 'import mlir_aie;print(list(mlir_aie.__path__)[0])')"
 export PATH="$PEANO/bin:$MA_ROOT/bin:$PATH"
 
-OUT="$HOME/.hipfire/npu/r6_${MT}x${NT}x${KCHUNK}"
+OUT="$HOME/.hipfire/npu/r6_${MT}x${NT}x${KCHUNK}_c${COLS}_nb${NB}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 # Tile buffer sizes: A = MT*KCHUNK tiles (MR*MK=64 int8), W = NT*KCHUNK tiles (128 B),
-# C = MT*NT tiles (MR*MN=64 int32).
+# C = MT*NT tiles (MR*MN=64 int32). groups = COLS*NB N-slabs/dispatch.
 AW=$((MT * KCHUNK * 64)); WW=$((NT * KCHUNK * 128)); CW=$((MT * NT * 64))
 "$PEANO/bin/clang++" "$HERE/r6_gemm.cc" -c -o "$OUT/r6_mac.o" -I"$MA_ROOT/include" \
   -std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -O2 -DNDEBUG --target=aie2p-none-unknown-elf -DMT="$MT" -DNT="$NT" -DKCHUNK="$KCHUNK"
-python3 "$HERE/r6_gen.py" 1 1 "$AW" "$WW" "$CW" > "$OUT/aie.mlir"
+python3 "$HERE/r6_gen.py" "$COLS" "$NB" "$AW" "$WW" "$CW" > "$OUT/aie.mlir"
 
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
