@@ -1794,6 +1794,7 @@ pub use vae::*;
 mod superres;
 #[allow(unused_imports)]
 use superres::*;
+pub use superres::DiffusionSuperResModel;
 
 /// Domain-separation salts so VAE-encode Gaussian noise does not alias the
 /// initial-latent noise stream (which seeds the request seed directly) or other

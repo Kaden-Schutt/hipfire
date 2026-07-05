@@ -317,6 +317,11 @@ pub struct DiffusionTxt2ImgArgs {
     /// passes with more than one step).
     #[arg(long)]
     pub mrflow_shifted: bool,
+    /// RealESRGAN RRDBNet super-resolution .hfq (from `hipfire-coexistence`) for
+    /// the MrFlow Stage-2 upscale. Without it, Stage 2 falls back to a plain
+    /// cover-resize (much softer output).
+    #[arg(long)]
+    pub mrflow_sr: Option<PathBuf>,
 }
 
 /// MrFlow staged-sampling presets. The numbers follow the reference MrFlow /
@@ -809,10 +814,29 @@ fn generate_mrflow_txt2img(
         &mut stage1_progress,
     )?;
 
-    // Stage 2: decode + pixel-space upscale to the target resolution.
-    // (Placeholder cover-resize until the native SR model lands.)
+    // Stage 2: decode + pixel-space upscale to the target resolution. With a
+    // RealESRGAN model, run it (by its native factor) then cover-resize to the
+    // exact target; otherwise a plain cover-resize placeholder.
     let decoded = decode_png_images_to_rgb_batch(&first_pass.images)?;
-    let upscaled = resize_rgb_batch_to_cover_nearest(&decoded, target_width, target_height)?;
+    let (upscaled, sr_label) = if let Some(sr_path) = args.mrflow_sr.as_ref() {
+        let sr_model = hipfire_diffusion::DiffusionSuperResModel::open_hfq(&resolve_model_path(
+            sr_path.clone(),
+        ))?;
+        let sr_start = Instant::now();
+        let sr_upscaled = sr_model.upscale_rgb_batch(&decoded, args.rocm_device_id)?;
+        eprintln!(
+            "[mrflow-superres] RealESRGAN x{} on {batch_images} image(s) in {:.1}s",
+            sr_model.scale(),
+            sr_start.elapsed().as_secs_f64(),
+        );
+        let resized = resize_rgb_batch_to_cover_nearest(&sr_upscaled, target_width, target_height)?;
+        (resized, format!("realesrgan-x{}", sr_model.scale()))
+    } else {
+        (
+            resize_rgb_batch_to_cover_nearest(&decoded, target_width, target_height)?,
+            "nearest-cover (placeholder)".to_string(),
+        )
+    };
 
     // Stage 3+4: re-encode the upscaled image and run the direct-sigma refine.
     let mut refine_batch = first_pass_request;
@@ -857,12 +881,9 @@ fn generate_mrflow_txt2img(
         map.insert("upscale_factor".to_string(), serde_json::json!(upscale));
         map.insert("target_width".to_string(), serde_json::json!(target_width));
         map.insert("target_height".to_string(), serde_json::json!(target_height));
-        // Flag that Stage 2 is still the placeholder SR; drives expectations for
-        // output sharpness until the native SR model is wired in.
-        map.insert(
-            "super_resolution".to_string(),
-            serde_json::json!("nearest-cover (placeholder)"),
-        );
+        // Records the Stage-2 super-resolution path: the RealESRGAN model (by
+        // native factor) or the cover-resize placeholder.
+        map.insert("super_resolution".to_string(), serde_json::json!(sr_label));
     }
     Ok(output)
 }
@@ -1615,6 +1636,7 @@ mod tests {
             mrflow_refine_sigma: None,
             mrflow_upscale: None,
             mrflow_shifted: false,
+            mrflow_sr: None,
         }
     }
 

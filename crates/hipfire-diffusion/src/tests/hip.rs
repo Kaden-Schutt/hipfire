@@ -1310,6 +1310,54 @@ fn realesrgan_import_loads_and_runs_x4_anime_6b() {
     let _ = std::fs::remove_file(&out_hfq);
 }
 
+/// Exercise the public DiffusionSuperResModel surface (RGB<->tensor conversion,
+/// batch handling) with the x2plus model, which also covers the input
+/// pixel-unshuffle branch. Skips when the checkpoint is not present.
+#[test]
+fn diffusion_superres_model_upscales_rgb_batch_x2() {
+    let checkpoint = std::path::Path::new("/home/sadara/RealESRGAN_x2plus.pth");
+    if !checkpoint.exists() {
+        eprintln!("skip: RealESRGAN_x2plus.pth not present on this host");
+        return;
+    }
+    if hipfire_rdna::Gpu::init_with_device(0).is_err() {
+        eprintln!("skip: ROCm GPU unavailable for super-res upscale test");
+        return;
+    }
+
+    let out_hfq = std::env::temp_dir().join("hipfire_test_realesrgan_x2plus.hfq");
+    let summary = import_realesrgan_to_hfq(RealesrganImportOptions {
+        source: checkpoint.to_path_buf(),
+        output: out_hfq.clone(),
+        model_name: None,
+    })
+    .unwrap();
+    assert_eq!(summary.scale, 2, "x2plus is an x2 model");
+    assert_eq!(summary.num_block, 23);
+
+    let model = DiffusionSuperResModel::open_hfq(&out_hfq).unwrap();
+    assert_eq!(model.scale(), 2);
+
+    // A 2-image u8 RGB batch at 12x8 -> x2 -> 24x16.
+    let (w, h, batch) = (12usize, 8usize, 2usize);
+    let input = RgbImageBatch {
+        batch,
+        width: w,
+        height: h,
+        data: (0..(batch * w * h * 3))
+            .map(|v| (v % 256) as u8)
+            .collect(),
+    };
+    let upscaled = model.upscale_rgb_batch(&input, Some(0)).unwrap();
+
+    assert_eq!(upscaled.batch, batch);
+    assert_eq!(upscaled.width, w * 2);
+    assert_eq!(upscaled.height, h * 2);
+    assert_eq!(upscaled.data.len(), batch * (w * 2) * (h * 2) * 3);
+
+    let _ = std::fs::remove_file(&out_hfq);
+}
+
 #[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {

@@ -13,6 +13,120 @@
 
 use super::*;
 
+/// Public pixel-space super-resolution model for the MrFlow Stage-2 upscale.
+/// Wraps the RRDBNet with RGB<->tensor conversion and device dispatch so callers
+/// (the CLI) work in `RgbImageBatch` and never touch the resident kernels.
+pub struct DiffusionSuperResModel {
+    net: SuperResRrdbNet,
+}
+
+impl DiffusionSuperResModel {
+    /// Open a RealESRGAN RRDBNet `.hfq` produced by the coexist importer.
+    pub fn open_hfq(path: &std::path::Path) -> DiffusionResult<Self> {
+        Ok(Self {
+            net: SuperResRrdbNet::open_hfq(path)?,
+        })
+    }
+
+    /// The model's native upscale factor (2 or 4 for RealESRGAN x2/x4).
+    pub fn scale(&self) -> usize {
+        self.net.scale
+    }
+
+    /// Upscale every image in `images` by the model's native factor. Runs the
+    /// device-resident forward on `device_id` (or device 0 when `None`); falls
+    /// back to the CPU reference forward if no GPU is available. Images are
+    /// processed one at a time to keep peak memory low.
+    pub fn upscale_rgb_batch(
+        &self,
+        images: &RgbImageBatch,
+        device_id: Option<i32>,
+    ) -> DiffusionResult<RgbImageBatch> {
+        if images.batch == 0 || images.width == 0 || images.height == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "super-resolution input image batch is empty".to_string(),
+            ));
+        }
+        let out_width = images.width * self.net.scale;
+        let out_height = images.height * self.net.scale;
+        let mut out_data = Vec::with_capacity(images.batch * out_width * out_height * 3);
+
+        let mut gpu = hipfire_rdna::Gpu::init_with_device(device_id.unwrap_or(0)).ok();
+        let mut cache = RocmWeightCache::default();
+        for index in 0..images.batch {
+            let input = sr_image_to_tensor(images, index);
+            let upscaled = match gpu.as_mut() {
+                Some(gpu) => {
+                    let input_gpu = gpu
+                        .upload_f32(&input.data, &input.shape)
+                        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                    let out_gpu = self.net.forward_resident(&input_gpu, gpu, &mut cache)?;
+                    let out = download_resident(gpu, &out_gpu)?;
+                    free_resident(gpu, out_gpu)?;
+                    free_resident(gpu, input_gpu)?;
+                    out
+                }
+                None => self.net.forward(&input)?,
+            };
+            sr_tensor_append_u8(&upscaled, &mut out_data)?;
+        }
+
+        Ok(RgbImageBatch {
+            batch: images.batch,
+            width: out_width,
+            height: out_height,
+            data: out_data,
+        })
+    }
+}
+
+/// One image of a `RgbImageBatch` (u8 NHWC) -> `[1, 3, H, W]` f32 NCHW in the
+/// RealESRGAN [0, 1] pixel range.
+fn sr_image_to_tensor(images: &RgbImageBatch, index: usize) -> CpuTensor {
+    let (h, w) = (images.height, images.width);
+    let bytes_per_image = h * w * 3;
+    let base = index * bytes_per_image;
+    let mut out = CpuTensor::zeros(&[1, 3, h, w]);
+    for y in 0..h {
+        for x in 0..w {
+            let rgb = base + (y * w + x) * 3;
+            for c in 0..3 {
+                out.data[(c * h + y) * w + x] = images.data[rgb + c] as f32 / 255.0;
+            }
+        }
+    }
+    out
+}
+
+/// `[1, 3, H, W]` f32 NCHW in [0, 1] -> appended u8 NHWC RGB (clamped).
+fn sr_tensor_append_u8(tensor: &CpuTensor, out: &mut Vec<u8>) -> DiffusionResult<()> {
+    let [batch, channels, height, width] = match tensor.shape.as_slice() {
+        [b, c, h, w] => [*b, *c, *h, *w],
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "super-res output tensor must be 4-D NCHW, got {other:?}"
+            )))
+        }
+    };
+    if channels != 3 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "super-res output must have 3 channels, got {channels}"
+        )));
+    }
+    for b in 0..batch {
+        for y in 0..height {
+            for x in 0..width {
+                for c in 0..3 {
+                    let value = tensor.data[((b * channels + c) * height + y) * width + x];
+                    let value = (value.clamp(0.0, 1.0) * 255.0).round();
+                    out.push(value as u8);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// RealESRGAN / RRDBNet residual negative slope.
 pub(crate) const RRDB_LEAKY_SLOPE: f32 = 0.2;
 /// RealESRGAN / RRDBNet residual scaling (applied before the residual add).
