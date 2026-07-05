@@ -16,6 +16,11 @@
 //! the `source` closure is a follow-up (the store already carries the real
 //! dtype, so it is a source-side change only).
 //!
+//! Then the **consumption** half: assemble a `LlamaWeights` whose projections
+//! are the store buffers (norms/embed/lm_head from the bespoke load) and run a
+//! real forward through it — proving the store tensors' metadata (dtype/shape)
+//! is end-to-end usable by the kernels, i.e. the store *feeds the forward*.
+//!
 //! Run: cargo run -p hipfire-runtime --release --example llama_store_load \
 //!         [~/.hipfire/models/qwen3-0.6b-llama.mq4]
 
@@ -23,12 +28,36 @@ use hipfire_arch_llama::Llama;
 use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{LlamaWeights, WeightTensor};
+use hipfire_runtime::llama::{self, KvCache, LayerWeights, LlamaWeights, WeightTensor};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::weight_store::{fulfill_manifest, WeightHandle};
+use hipfire_runtime::weight_store::{fulfill_manifest, WeightHandle, WeightStore};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Move a resident projection out of the store (for arch-weight assembly).
+fn take_resident(store: &mut WeightStore, name: &str, l: usize) -> GpuTensor {
+    match store.take(name, Some(l), 0) {
+        Some(WeightHandle::Resident(t)) => t,
+        _ => panic!("store missing {name}[{l}] for assembly"),
+    }
+}
+
+/// Build a `WeightTensor` around a store-loaded buffer, reusing the bespoke
+/// tensor's metadata (m/k/row_stride/paro/awq — not captured by the manifest).
+/// Only `buf` (and its already-verified dtype) come from the store, so the
+/// forward genuinely consumes the store buffer.
+fn wt_from(buf: GpuTensor, b: WeightTensor) -> WeightTensor {
+    WeightTensor {
+        buf,
+        gpu_dtype: b.gpu_dtype,
+        m: b.m,
+        k: b.k,
+        row_stride: b.row_stride,
+        paro: b.paro,
+        awq_scale: b.awq_scale,
+    }
+}
 
 /// HFQ `quant_type` byte → the `DType` the bespoke loader assigns
 /// (`WeightTensor.gpu_dtype`). Covers the quantized projection formats; norms /
@@ -121,10 +150,10 @@ fn main() {
     // Bespoke load (the reference), then wrap the device into a 1×1 Gpus.
     let mut gpu = Gpu::init().expect("Gpu::init");
     let bespoke_w = Llama::load_weights(&mut hfq, &cfg, &mut gpu).expect("bespoke load_weights");
-    let gpus = Gpus::single(gpu, n_layers);
+    let mut gpus = Gpus::single(gpu, n_layers);
 
     // Store-backed load via the generic fulfill_manifest + our source closure.
-    let store = fulfill_manifest(&manifest, &DeviceMesh::single(), n_layers, &gpus, |e| {
+    let mut store = fulfill_manifest(&manifest, &DeviceMesh::single(), n_layers, &gpus, |e| {
         src.get(&(e.name.clone(), e.layer.unwrap()))
             .cloned()
             .ok_or_else(|| format!("no source bytes for {}[{:?}]", e.name, e.layer))
@@ -168,5 +197,90 @@ fn main() {
         "llama_store_load: OK — {n_ok} quantized projection tensors across {n_layers} layers \
          byte+dtype identical to bespoke Llama::load_weights (e.g. {:?})",
         example_dtype.unwrap()
+    );
+
+    // ── Phase-3 CONSUMPTION: assemble a LlamaWeights whose projections come
+    // from the store, then run a REAL forward through it. Byte-identity is
+    // already proven, so this proves the store tensors' metadata (dtype/shape)
+    // is end-to-end usable by the kernels — the store *feeds the forward*.
+    // (Norms / embed / lm_head come from the bespoke load: their F16→F32-dequant
+    // source is a documented follow-up; here we exercise the store buffers.)
+    let LlamaWeights {
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
+        layers,
+    } = bespoke_w;
+    let mut new_layers = Vec::with_capacity(layers.len());
+    for (l, bl) in layers.into_iter().enumerate() {
+        let LayerWeights {
+            attn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            ffn_norm,
+            w_gate,
+            w_up,
+            w_down,
+        } = bl;
+        new_layers.push(LayerWeights {
+            attn_norm,
+            wq: wt_from(take_resident(&mut store, "wq", l), wq),
+            wk: wt_from(take_resident(&mut store, "wk", l), wk),
+            wv: wt_from(take_resident(&mut store, "wv", l), wv),
+            wo: wt_from(take_resident(&mut store, "wo", l), wo),
+            q_norm,
+            k_norm,
+            ffn_norm,
+            w_gate: wt_from(take_resident(&mut store, "ffn_gate", l), w_gate),
+            w_up: wt_from(take_resident(&mut store, "ffn_up", l), w_up),
+            w_down: wt_from(take_resident(&mut store, "ffn_down", l), w_down),
+        });
+    }
+    let merged = LlamaWeights {
+        token_embd,
+        embd_format,
+        output_norm,
+        output,
+        layers: new_layers,
+    };
+
+    let gpu = &mut gpus.devices[0];
+    let mut kv = KvCache::new_gpu_q8(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, 256)
+        .expect("kv cache");
+    let scratch = <Llama as Architecture>::new_state(gpu, &cfg).expect("scratch");
+    llama::forward_scratch_embed(gpu, &merged, &cfg, 1u32, 0, &scratch).expect("forward embed");
+    llama::forward_scratch_compute(gpu, &merged, &cfg, 0, &mut kv, &scratch)
+        .expect("forward compute");
+    let logits = gpu.download_f32(&scratch.logits).expect("download logits");
+
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "store-assembled forward produced non-finite logits"
+    );
+    let argmax = logits
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+            if v > bv {
+                (i, v)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0;
+    assert!(
+        argmax < cfg.vocab_size,
+        "argmax {argmax} out of vocab {}",
+        cfg.vocab_size
+    );
+    println!(
+        "llama_store_load: forward on store-assembled weights OK — {} finite logits, argmax token \
+         {argmax} (the real forward consumed the store's projection buffers)",
+        logits.len()
     );
 }

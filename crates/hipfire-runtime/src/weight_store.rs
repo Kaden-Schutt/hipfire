@@ -103,6 +103,18 @@ impl WeightStore {
             .insert((name.to_string(), layer, device), handle);
     }
 
+    /// Move a placed handle out of the store (transferring ownership of its
+    /// `GpuTensor`) — used when assembling an arch's weight struct *from* the
+    /// store (the Phase-3 store→forward bridge). Leaves the cell empty.
+    pub fn take(
+        &mut self,
+        name: &str,
+        layer: Option<usize>,
+        device: usize,
+    ) -> Option<WeightHandle> {
+        self.placements.remove(&(name.to_string(), layer, device))
+    }
+
     /// Free every resident buffer (best-effort, on the device it was uploaded
     /// to) and consume the store — the transactional rollback for
     /// [`fulfill_manifest`]. `Alias` handles own no buffer, so they are skipped.
