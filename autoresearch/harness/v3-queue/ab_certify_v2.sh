@@ -114,10 +114,22 @@ python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUND
 import sys,json
 (arch,kern,label,variant,verdict,rounds,f,delta,bm,vm,bc,vc,committed,ledger,bs,vs,bp,vp)=sys.argv[1:19]
 def prow(p):
+  # match the profile row by KERNEL: the arg is the SOURCE-FILE base name, but rocprof reports the RUNTIME
+  # SYMBOL name, and they can diverge after the core (gate_up file "..._indexed_batched" vs symbol
+  # "..._k8_indexed"). So: exact/prefix-either-direction wins outright; else best LEADING-TOKEN overlap (>=4
+  # core tokens, so moe_gate_up != moe_down which split at token 4). This is the "no profile" fix.
   try: d=json.loads(p)
   except: return None
+  kt=kern.split("_"); best=None; bestn=0
   for r in d.get("rows",[]):
-    if r["kernel"].startswith(kern): return {x:r.get(x) for x in ("wall_pct","occ","l2_hit_pct","mem_busy","vgpr","lds")}
+    rk=r.get("kernel",""); rt=rk.split("_"); n=0
+    for a,b in zip(kt,rt):
+      if a==b: n+=1
+      else: break
+    if rk==kern or rk.startswith(kern) or kern.startswith(rk): n=999
+    if n>bestn: bestn=n; best=r
+  if best and bestn>=4:
+    return {x:best.get(x) for x in ("wall_pct","occ","l2_hit_pct","mem_busy","vgpr","lds")}
   return None
 b=prow(bp); v=prow(vp)
 roof={"target_base":b,"target_var":v} if (b or v) else None
