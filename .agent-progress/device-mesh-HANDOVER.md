@@ -57,13 +57,25 @@ whole model; `llama_store_load` fulfills the FULL manifest, assembles a complete
 the store, and the forward is **logit-IDENTICAL to bespoke (max |Δ|=0, 311 tensors, gfx1151)** — a
 drop-in bit-exact replacement for the bespoke llama loader on a single GPU.
 
+**Also DONE (Phase 3, PP-2 PLACEMENT): mesh-driven pipeline load.** llama `output_norm`→`Pin(Output)`;
+`llama_store_pp` fulfills the WHOLE manifest on a PP-2 emulated mesh, asserts mesh-correct banding
+(311 tensors 155/156; embed→0, output_norm+lm_head→1, layers by `stage_for_layer`), and the gathered
+forward is **logit-IDENTICAL to bespoke (max |Δ|=0, gfx1151)**. The load half of PP is validated.
+
 ## The NEXT unit — pick ONE (Phase 3 continuation):
-**Option A (recommended): PP-2 store load + banded forward.** `HIPFIRE_EMULATE_GPUS=2` → a PP-2
-mesh; fulfill the llama manifest across 2 stages (embed→stage 0, output→last, layers banded by
-`stage_for_layer`); assemble per-stage `LlamaWeights` from the store and drive the existing
-`gpus.boundary_copy` PP forward (or the qwen35 `forward_scratch_layers_multi` pattern). Assert
-PP-2 logits == single-GPU (the PP oracle). Reuses everything just built; the new piece is the
-banded assembly + inter-stage residual copy. This is the ModelParallel/ArchDispatch-hoist track.
+**Option A (recommended): banded EXECUTION (Phase 1c — real PP forward).** The load half is done;
+the missing piece is per-stage execution. `forward_scratch_layers`/`_compute` run ALL layers +
+sample (llama.rs:3012/2946) — extract a **range-parameterized** `forward_scratch_band(gpu, weights,
+cfg, layer_range, pos, kv, scratch)` (the layer-loop body, writing `scratch.x`) + a
+`forward_scratch_head` (final norm + lm_head → logits); keep `forward_scratch_embed`. Then a PP
+driver: embed+band[0..k] on stage 0 → `gpus.boundary_copy` the residual `scratch.x` → band[k..n]+head
+on stage 1. Assert PP-2 logits == single-GPU. Touches llama.rs (editable; NOT a fmt-debt file).
+
+**Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study,
+`qwen35.rs:2876-2945`).
+
+**Option C: store→forward for a MoE arch** (deepseek4/minimax) — reuse the `ExpertSharded` manifest
++ a source closure, EP-forward parity.
 
 **Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study;
 per-`LayerType` weight sets, `qwen35.rs:2876-2945`).

@@ -71,7 +71,14 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
   assembles a complete `LlamaWeights` from the store (embd_format derived from dtype), and runs a
   forward: **311 tensors, logits IDENTICAL to bespoke (max |Δ|=0, same argmax) on gfx1151**. The
   generic manifest path is a drop-in, bit-exact replacement for the bespoke llama loader (single-GPU).
-  Next: `ModelParallel`/`ArchDispatch` daemon hoist + PP-2 (`HIPFIRE_EMULATE_GPUS=2`).
+- **PP-2 store PLACEMENT done + GPU-validated:** llama `output_norm` Replicate→Pin(Output) fix
+  (final norm must co-locate with lm_head on the last stage). `llama_store_pp`: `HIPFIRE_EMULATE_GPUS=2`
+  → PP-2 mesh; fulfill the WHOLE manifest across 2 stages; assert every tensor on its mesh-correct
+  stage (`placement_devices` == `store.devices_for`); gather + forward. **311 tensors banded 155/156
+  (embed→0, output_norm+lm_head→1, 28 layers by `stage_for_layer`); gathered forward logit-IDENTICAL
+  to bespoke (max |Δ|=0), gfx1151.** Mesh-driven PP placement correct + forward-usable.
+  Next: banded EXECUTION (range-parameterized llama forward + `boundary_copy`) — Phase 1c; then
+  `ModelParallel`/`ArchDispatch` daemon hoist.
 - GPU-validated on gfx1151 via `examples/fulfill_manifest_probe.rs` (synthetic byte source,
   no model file): single-1×1 + emulated PP-2 + emulated EP-2 all PASS — placement matches
   `placement_devices`, byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device,
