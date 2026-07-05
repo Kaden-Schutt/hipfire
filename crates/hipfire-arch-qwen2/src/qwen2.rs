@@ -285,6 +285,7 @@ pub fn load_weights(
             i + 1,
             cfg.num_hidden_layers
         );
+        hipfire_runtime::load_progress::report(i as u32 + 1, cfg.num_hidden_layers as u32, "weights");
         layers.push(load_layer(hfq, gpu, cfg, i)?);
     }
 

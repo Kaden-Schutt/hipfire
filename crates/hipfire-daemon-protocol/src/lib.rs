@@ -123,6 +123,20 @@ pub struct KldChunkEvent {
     pub mean_kld: f32,
 }
 
+/// Streaming progress for a [`DaemonRequest::Load`] op, emitted by the daemon on
+/// the framed stdout channel as the loader walks phases (weights, then any
+/// post-weight setup). `current == total` (> 0) means that phase's units are all
+/// done. The frontend surfaces this to the chat UI's load bar; unlike scraping
+/// human stderr, this channel is structured and UTF-8-safe.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoadProgressEvent {
+    pub current: u32,
+    pub total: u32,
+    /// Coarse phase label (e.g. `"weights"`). Free-form; the UI treats an
+    /// unknown phase as generic progress.
+    pub phase: String,
+}
+
 /// Begin a steering CAPTURE session: the in-forward `maybe_steer_block` hook
 /// accumulates per-block residuals until `SteerFinishCapture`. `num_layers` /
 /// `hidden` size the per-block means.
@@ -281,6 +295,7 @@ pub enum DaemonResponse {
     ModelRegistry {
         registry: LlmModelRegistry,
     },
+    LoadProgress(LoadProgressEvent),
     Token(TokenEvent),
     ToolCalls(ToolCallsEvent),
     Done(DoneEvent),

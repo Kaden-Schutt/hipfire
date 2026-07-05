@@ -92,6 +92,22 @@ fn invalid_kld_ref(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
 }
 
+/// Emit a `load_progress` frame on the framed stdout channel. Called by the
+/// load-progress sink the `load` handler installs around `load_model`. Takes a
+/// fresh `std::io::stdout()` lock (rather than the handler's local `stdout`) so
+/// it can be a plain free fn invoked from the sink closure; loads run on this
+/// thread, so this never races the handler's own writes. `phase` is a controlled
+/// identifier (e.g. `"weights"`) — no JSON escaping needed.
+fn emit_load_progress(current: u32, total: u32, phase: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(
+        out,
+        r#"{{"type":"load_progress","current":{current},"total":{total},"phase":"{phase}"}}"#
+    );
+    let _ = out.flush();
+}
+
 fn json_u64(meta: &serde_json::Value, key: &str) -> std::io::Result<u64> {
     meta.get(key)
         .and_then(|v| v.as_u64())
@@ -3069,7 +3085,18 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                match load_model(
+                // Stream per-layer load progress to the client on the framed
+                // stdout channel (see `emit_load_progress`). Loaders call
+                // `load_progress::report`, which this sink turns into a
+                // `load_progress` frame. Installed only for the duration of this
+                // load and cleared right after the match, so no stray frames
+                // leak into later ops. `load_model` runs synchronously on this
+                // thread, so the sink writes interleave safely with our own
+                // stdout writes (each is a whole locked line).
+                hipfire_runtime::load_progress::set_sink(Some(Box::new(
+                    |current, total, phase| emit_load_progress(current, total, phase),
+                )));
+                let load_result = load_model(
                     path,
                     max_seq,
                     requested_physical_cap,
@@ -3079,7 +3106,9 @@ fn main() {
                     &cask,
                     pp,
                     &mut gpu,
-                ) {
+                );
+                hipfire_runtime::load_progress::set_sink(None);
+                match load_result {
                     Ok(mut m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",

@@ -5585,6 +5585,7 @@ pub fn load_weights(
             config.layer_types[i],
             if is_moe { " + MoE" } else { "" }
         );
+        hipfire_runtime::load_progress::report(i as u32 + 1, config.n_layers as u32, "weights");
         let p = format!("layers.{i}");
         // Track page range for this layer so we can MADV_DONTNEED after upload.
         let layer_page_start = hfq.layer_data_range(&p);
@@ -6175,6 +6176,7 @@ pub fn load_weights_paroquant(
             "  loading layer {i}/{} ({:?}, ParoQuant)...",
             config.n_layers, config.layer_types[i]
         );
+        hipfire_runtime::load_progress::report(i as u32 + 1, config.n_layers as u32, "weights");
         let p = format!("layers.{i}");
         let is_moe = config.num_experts > 0;
 
@@ -6588,6 +6590,7 @@ pub fn load_weights_multi(
             config.layer_types[i],
             if is_moe { " + MoE" } else { "" },
         );
+        hipfire_runtime::load_progress::report(i as u32 + 1, config.n_layers as u32, "weights");
         let p = format!("layers.{i}");
         let layer_page_start = hfq.layer_data_range(&p);
         layers.push(load_layer_into(

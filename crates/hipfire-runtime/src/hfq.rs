@@ -1962,6 +1962,7 @@ pub fn load_weights_hfq(
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
         eprintln!("  loading layer {i}/{} ...", config.n_layers);
+        crate::load_progress::report(i as u32 + 1, config.n_layers as u32, "weights");
         let p = format!("model.layers.{i}");
         let kv_dim = config.n_kv_heads * config.head_dim;
         let q_out_dim = config.n_heads * config.head_dim;
@@ -2442,6 +2443,7 @@ pub fn load_weights_paroquant_llama(
             "  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...",
             config.n_layers
         );
+        crate::load_progress::report(i as u32 + 1, config.n_layers as u32, "weights");
         let p = format!("layers.{i}");
         let q_out_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;

@@ -30,11 +30,17 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
 // ── Model-load progress ──────────────────────────────────────────────────────
-// The daemon prints per-layer load progress (`<arch>: loading layer N/M...`) to
-// stderr as it loads a model. We pipe + parse that stream (see `StdioTransport::
-// spawn`) into this global so the HTTP server can surface a real progress bar to
-// the chat UI during the (often multi-second) load. One daemon loads one model
-// at a time, so a single global suffices. Packed as `(current << 32) | total`.
+// The daemon streams structured per-layer progress as `load_progress` frames on
+// its framed stdout channel (see `Daemon::load`), which we store here so the
+// HTTP server can surface a real progress bar to the chat UI during the (often
+// multi-second) load. One daemon loads one model at a time, so a single global
+// suffices. Packed as `(current << 32) | total`.
+//
+// This used to be scraped from the daemon's human "loading layer N/M" stderr —
+// fragile (coupled to log wording across arches) and, on a piped stderr,
+// deadlock-prone on non-UTF-8. The stdout frame is structured and UTF-8-safe.
+// `spawn_stderr_progress_reader` still drains + re-emits daemon stderr for
+// operator logs, but no longer parses progress from it.
 static LOAD_PROGRESS: AtomicU64 = AtomicU64::new(0);
 
 /// Current model-load progress as `(current_layer, total_layers)`. `(_, 0)` means
@@ -49,33 +55,19 @@ fn set_load_progress(current: u32, total: u32) {
     LOAD_PROGRESS.store(((current as u64) << 32) | total as u64, Ordering::Relaxed);
 }
 
-/// Parse `current`/`total` from a `... loading layer N/M ...` stderr line.
-fn parse_load_layer_line(line: &str) -> Option<(u32, u32)> {
-    let rest = line.split("loading layer ").nth(1)?;
-    let (n, m) = rest.split_once('/')?;
-    let n: u32 = n.trim().parse().ok()?;
-    // `M` is followed by `...` / ` (` / ` on dev` across arches — take the digits.
-    let m: u32 = m
-        .trim_start()
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()?;
-    Some((n, m))
-}
-
-/// Drain the daemon's stderr: parse load progress into `LOAD_PROGRESS`, and
-/// re-emit every line to our own stderr so operator logs are unchanged. Draining
-/// is also required — an unread piped stderr would eventually block the daemon.
+/// Drain the daemon's piped stderr and re-emit every line to our own stderr so
+/// operator logs are unchanged. Draining is required regardless — an unread
+/// piped stderr fills (~64 KB) and blocks the daemon on its next write.
+///
+/// We read raw bytes, not `.lines()`: `Lines::next_line()` errors on the first
+/// non-UTF-8 byte, and `while let Ok(_)` would treat that as EOF — silently
+/// ending the drain and deadlocking the daemon. Model load, hipcc compiles, and
+/// HIP errors can all emit non-UTF-8, so we drain via `read_until` + lossy
+/// decode; only a true EOF (0 bytes) or a hard IO error stops us. Load progress
+/// no longer comes from here — it arrives as structured `load_progress` frames
+/// on stdout (see `Daemon::load`).
 fn spawn_stderr_progress_reader(stderr: ChildStderr) {
     tokio::spawn(async move {
-        // Drain raw bytes, not `.lines()`: `Lines::next_line()` errors on the
-        // first non-UTF-8 byte, and `while let Ok(_)` would treat that as EOF —
-        // silently ending the drain. The daemon's stderr pipe would then fill
-        // (~64 KB) and the daemon would block on its next write (hang). Model
-        // load, hipcc compiles, and HIP errors can all emit non-UTF-8, so we
-        // must keep draining regardless of content via `read_until` + lossy
-        // decode. Only a true EOF (0 bytes) or a hard IO error stops us.
         let mut reader = BufReader::new(stderr);
         let mut buf: Vec<u8> = Vec::with_capacity(256);
         loop {
@@ -85,25 +77,15 @@ fn spawn_stderr_progress_reader(stderr: ChildStderr) {
                 Ok(_) => {}
                 Err(_) => break, // Hard IO error on the pipe.
             }
-            // Trim the trailing newline for parsing / re-emit.
+            // Trim the trailing newline for re-emit.
             if buf.last() == Some(&b'\n') {
                 buf.pop();
                 if buf.last() == Some(&b'\r') {
                     buf.pop();
                 }
             }
-            let line = String::from_utf8_lossy(&buf);
-            if line.contains("loading layer ") {
-                if let Some((cur, tot)) = parse_load_layer_line(&line) {
-                    // `current < total` = actively loading (UI shows a determinate
-                    // bar); `current == total` = weights done, prefill next (UI
-                    // falls back to indeterminate). A new load resets `current`
-                    // back to 1, so no explicit clear is needed.
-                    set_load_progress(cur, tot);
-                }
-            }
             // Re-emit to our real stderr so operator logs are unchanged.
-            eprintln!("{line}");
+            eprintln!("{}", String::from_utf8_lossy(&buf));
         }
     });
 }
@@ -270,6 +252,11 @@ impl DaemonEngine {
                     }
                     self.worker_key_id = Some(r.worker_key_id.clone());
                     return Ok(r);
+                }
+                DaemonResponse::LoadProgress(p) => {
+                    // Structured per-layer progress from the daemon's framed
+                    // stdout channel — the correct source (vs. scraping stderr).
+                    set_load_progress(p.current, p.total);
                 }
                 DaemonResponse::Error(e) => anyhow::bail!("daemon load error: {}", e.message),
                 DaemonResponse::Unknown => {}

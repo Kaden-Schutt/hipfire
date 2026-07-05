@@ -37,6 +37,7 @@ pub mod kv;
 pub mod kv_hier;
 pub mod llama;
 pub mod llama_spec;
+pub mod load_progress;
 pub mod logging;
 pub mod loop_guard;
 pub mod model_source;
