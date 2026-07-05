@@ -130,3 +130,47 @@ them — not further blind ioctl guessing. This warrants a human call on approac
 Landed so far (all tested): W1 ABI, W2 BO alloc/mmap/sync (hardware-validated),
 W3a AXLF parse, W3b AIE_PARTITION/PDI extract, W3c create/destroy_hwctx + dev_heap
 (reaches the resource-solver frontier).
+
+## Captured submission recipe (from a working pyxrt run)
+
+Traced a working mlir-aie/pyxrt run of my own kernel on `/dev/accel/accel0`
+(strace + an LD_PRELOAD ioctl dumper). This is the byte-exact ground truth for the
+whole path — the "capture-based de-risking" the plan called for:
+
+Ordered ioctl sequence (fd = accel device):
+1. `CREATE_BO(DEV_HEAP, 64 MB, flags=0, vaddr=0)` + `GET_BO_INFO` → `map_offset=0x1_0000_0000`
+2. `CREATE_BO(SHMEM, in)` , `CREATE_BO(SHMEM, out)` (+ GET_BO_INFO each)
+3. `GET_INFO` (device query)
+4. **`CREATE_HWCTX{ num_tiles=32, mem_size=0, max_opc=0x800, qos=all-zeros }`** → handle, syncobj
+5. `CREATE_BO(DEV, instr.bin)` → the instruction BO
+6. `CONFIG_HWCTX{ param_type=0 (CONFIG_CU), param_val=ptr, size=16 }` → loads the CU/PDI
+7. `CREATE_BO(SHMEM)`, `CREATE_BO(CMD, 144 B)` → the ERT command BO
+8. `CONFIG_HWCTX{ param_type=1 }` → **-EINVAL, expected** (XRT probes a debug-buf option)
+9. `CREATE_BO(DEV)`, `CREATE_BO(CMD)`
+10. **`EXEC_CMD{ hwctx, type=0 (SUBMIT_EXEC_BUF), cmd_handles=[cmd_bo], args=[3 BOs], cmd_cnt=1, arg_cnt=3 }`** → seq
+11. `SYNCOBJ_TIMELINE_WAIT` (on the hwctx syncobj) → completion
+12. `GEM_CLOSE`×, `SYNCOBJ_DESTROY`, `DESTROY_HWCTX`
+
+Command packet (W4): the DPU kernel arg vector is in every xclbin's
+EMBEDDED_METADATA — `{opcode:u64, instr:ptr, ninstr:u32, bo0, bo1, …}`,
+`dpu_kernel_id=0x901` (same for FLM and my kernels). So the CMD BO is an ERT
+packet wrapping those args; `EXEC_CMD` passes `cmd_handles=[cmd_bo]` +
+`args=[data BOs]`.
+
+### The one remaining gap: DEV_HEAP must be MAP_FIXED at a device-matched VA
+
+`create_hwctx` in `hipfire-xdna` is now **byte-identical** to pyxrt's call
+(confirmed under the ioctl dumper: same num_tiles/mem_size/max_opc/qos, same
+CREATE_BO flags, same `map_offset=0x1_0000_0000`). It still `-EINVAL`s, and dmesg
+pins it to `aie2_hwctx_init: Map host buffer failed` — the firmware rejects mapping
+the dev_heap. Ruled out: args (identical), BO flags (identical), map offset
+(identical), page population, MAP_LOCKED (memlock is unlimited). The sole remaining
+difference is that XRT mmaps the heap **MAP_FIXED at a specific VA**
+(`mmap(0x7b20_5000_0000, 64M, RW, MAP_SHARED|MAP_FIXED|MAP_LOCKED, fd, 0x1_0000_0000)`),
+whereas a kernel-chosen VA is rejected by the firmware host-buffer map. Next step:
+work out how XRT computes that heap VA (its amdxdna shim / device-VA scheme) and
+mmap MAP_FIXED there. Everything downstream (CONFIG_HWCTX, ERT packet, EXEC_CMD) is
+now a known quantity from the capture above.
+
+Tooling: the LD_PRELOAD ioctl dumper + strace method is the reusable capture path
+for any remaining byte-matching.

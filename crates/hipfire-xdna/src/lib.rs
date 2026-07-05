@@ -403,7 +403,9 @@ mod imp {
                     std::ptr::null_mut(),
                     size,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
+                    // MAP_LOCKED pins the pages so the firmware can map the buffer
+                    // (a DEV_HEAP without it fails aie2_hwctx_init's host-buf map).
+                    libc::MAP_SHARED | libc::MAP_LOCKED,
                     self.fd,
                     info.map_offset as libc::off_t,
                 )
@@ -417,6 +419,79 @@ mod imp {
                 len: size,
                 xdna_addr: info.xdna_addr,
             })
+        }
+
+        /// Allocate + map the device heap the way XRT does: CREATE_BO(DEV_HEAP),
+        /// then mmap at the fixed DEV_HEAP offset 0x1_0000_0000 with MAP_LOCKED so
+        /// the firmware host-buffer map in aie2_hwctx_init succeeds. Returns the
+        /// mapped DeviceBuffer (keep it alive for the hwctx's lifetime).
+        pub fn alloc_dev_heap(&self, size: usize) -> Result<DeviceBuffer, XdnaError> {
+            let mut cb = submit::CreateBo {
+                size: size as u64,
+                bo_type: submit::AMDXDNA_BO_DEV_HEAP,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::CREATE_BO_REQUEST,
+                &mut cb as *mut _ as *mut libc::c_void,
+            )?;
+            let handle = cb.handle;
+            let mut info = submit::GetBoInfo {
+                handle,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::GET_BO_INFO_REQUEST,
+                &mut info as *mut _ as *mut libc::c_void,
+            )?;
+            // The DEV_HEAP maps at a fixed fake offset (GET_BO_INFO returns
+            // 0x1_0000_0000). XRT additionally mmaps it MAP_FIXED at a device-
+            // matched VA; a kernel-chosen VA still fails the firmware host-buffer
+            // map (the one remaining wire-in gap — see the doc).
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_LOCKED,
+                    self.fd,
+                    info.map_offset as libc::off_t,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(XdnaError::Ioctl(std::io::Error::last_os_error()));
+            }
+            Ok(DeviceBuffer {
+                handle,
+                ptr: ptr as *mut u8,
+                len: size,
+                xdna_addr: info.xdna_addr,
+            })
+        }
+
+        /// Create a buffer object WITHOUT mmap-ing it (for DEV_HEAP / device BOs
+        /// that userspace must not map — the firmware maps their physical pages).
+        /// Returns `(handle, xdna_addr)`.
+        pub fn create_bo(&self, size: usize, bo_type: u32) -> Result<(u32, u64), XdnaError> {
+            let mut cb = submit::CreateBo {
+                size: size as u64,
+                bo_type,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::CREATE_BO_REQUEST,
+                &mut cb as *mut _ as *mut libc::c_void,
+            )?;
+            let handle = cb.handle;
+            let mut info = submit::GetBoInfo {
+                handle,
+                ..Default::default()
+            };
+            self.submit_ioctl(
+                submit::GET_BO_INFO_REQUEST,
+                &mut info as *mut _ as *mut libc::c_void,
+            )?;
+            Ok((handle, info.xdna_addr))
         }
 
         /// Sync a BO's cache to/from the device (`submit::SYNC_DIRECT_*`).

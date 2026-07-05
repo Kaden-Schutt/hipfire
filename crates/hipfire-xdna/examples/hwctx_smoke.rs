@@ -23,9 +23,12 @@ fn main() {
         // aie2_hwctx_init requires the client to have a device heap first, else
         // CREATE_HWCTX returns -ENOENT ("dev heap object not exist").
         const HEAP: usize = 64 * 1024 * 1024;
-        let _heap = match dev.alloc_buffer(HEAP, AMDXDNA_BO_DEV_HEAP) {
+        // DEV_HEAP: mmap it AND fault in the pages (fill), else the firmware
+        // host-buffer map fails ("Map host buffer failed" on lazy MAP_SHARED).
+        let _ = AMDXDNA_BO_DEV_HEAP;
+        let _heap = match dev.alloc_dev_heap(HEAP) {
             Ok(b) => {
-                println!("dev_heap: {} MB BO handle={}", HEAP >> 20, b.handle());
+                println!("dev_heap: {} MB handle={}", HEAP >> 20, b.handle());
                 b
             }
             Err(e) => {
@@ -34,30 +37,30 @@ fn main() {
             }
         };
 
-        // The resource solver rejects an all-zero QoS; give it realistic caps.
-        let qos = QosInfo {
-            gops: 1000,
-            fps: 60,
-            dma_bandwidth: 0,
-            latency: 0,
-            frame_exec_time: 0,
-            priority: 0x180,
-        };
-        let mut created_any = false;
-        // aie2p Strix Halo: 4 core rows/col, 8 cols. Probe 1..8 columns worth.
-        for &num_tiles in &[4u32, 8, 16, 20, 32] {
-            match dev.create_hwctx(num_tiles, 0, 0x800, &qos) {
-                Ok((handle, syncobj)) => {
-                    created_any = true;
-                    println!("  num_tiles={num_tiles:>2} -> hwctx handle={handle} syncobj={syncobj}  (created OK)");
-                    if let Err(e) = dev.destroy_hwctx(handle) {
-                        eprintln!("    destroy_hwctx({handle}): {e}");
-                    }
+        // Mirror the captured pyxrt order: two SHMEM BOs, then CREATE_HWCTX with
+        // exactly the args XRT uses (num_tiles=32=8col*4row, mem_size=0,
+        // max_opc=0x800, all-zero QoS).
+        use hipfire_xdna::submit::AMDXDNA_BO_SHMEM;
+        let _b2 = dev.alloc_buffer(256 * 1024, AMDXDNA_BO_SHMEM);
+        let _b3 = dev.alloc_buffer(256, AMDXDNA_BO_SHMEM);
+        // pyxrt issues a GET_INFO query right before CREATE_HWCTX; replicate it in
+        // case it lazily initializes the resource solver / AIE metadata.
+        let _ = dev.resource_info();
+        let _ = dev.clocks();
+        let qos = QosInfo::default();
+        match dev.create_hwctx(32, 0, 0x800, &qos) {
+            Ok((handle, syncobj)) => {
+                println!("CREATE_HWCTX ok: handle={handle} syncobj={syncobj}");
+                if let Err(e) = dev.destroy_hwctx(handle) {
+                    eprintln!("destroy_hwctx: {e}");
                 }
-                Err(e) => println!("  num_tiles={num_tiles:>2} -> {e}"),
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("CREATE_HWCTX(32,0,0x800,zeros): {e}");
+                std::process::exit(5);
             }
         }
-        std::process::exit(if created_any { 0 } else { 5 });
     }
     #[cfg(not(target_os = "linux"))]
     {
