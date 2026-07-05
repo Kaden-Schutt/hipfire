@@ -18,7 +18,9 @@ use hip_bridge::HipResult;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
-use hipfire_runtime::weight_manifest::{FusedQkvLayout, PinTarget, ShardPolicy, WeightEntry};
+use hipfire_runtime::weight_manifest::{
+    FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+};
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 
@@ -189,6 +191,17 @@ impl Architecture for Llama {
             Pin(PinTarget::Output),
         ));
         m
+    }
+
+    /// State manifest (device-mesh Phase 2): llama is full-attention only, so
+    /// its per-layer state is a KV cache (one [`StateEntry::Kv`] per layer,
+    /// keyed by global layer index, co-resident with the layer's stage under
+    /// PP). The quant mode is a load-time choice, resolved at fulfillment —
+    /// empty here. No recurrent/conv state.
+    fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
+        (0..cfg.n_layers)
+            .map(|l| StateEntry::new(StateKind::Kv { quant: String::new() }, l))
+            .collect()
     }
 
     // Optional overrides: defaults from `hipfire_runtime::arch` already
