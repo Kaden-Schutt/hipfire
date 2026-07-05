@@ -1166,7 +1166,7 @@ pub const ENV_HIPFIRE_DSPARK: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK_ADAPTIVE_BLOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK_ADAPTIVE_BLOCK",
     description: "Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today)",
-    source: "crates/hipfire-specdecode-dspark/src/dspark_core.rs:1362",
+    source: "crates/hipfire-specdecode-dspark/src/dspark_core.rs:1426",
 };
 
 /// `HIPFIRE_DSPARK_HFQ4_WMMA` — Runtime variable controlling dspark hfQ4 wmma in hipfire

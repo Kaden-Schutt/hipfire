@@ -1000,6 +1000,18 @@ pub struct DsparkDrafter {
     /// Adaptive block-size controller. `None` when `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`
     /// (opt-out; fixed block == pre-change behaviour).
     block_controller: Option<crate::dspark_block_controller::BlockController>,
+    /// Per-request truncation-length histogram: `metrics_trunc_hist[l]` counts
+    /// windows whose confidence gate left `l` surviving draft slots
+    /// (`0..=block_size`). This is the direct explanation of `mean_draft_len`
+    /// (all mass at `l=1` ⇒ the confidence head truncates every block to one
+    /// token). Observe-only; drained + reset by `drain_extra_metrics`.
+    metrics_trunc_hist: Vec<u64>,
+    /// Sum of per-slot `sigmoid(confidence)` over drafted slots this request
+    /// (accumulated only when `enable_confidence`). `/ metrics_conf_count` is the
+    /// mean per-slot confidence surfaced in the drained metrics.
+    metrics_conf_sum: f64,
+    /// Count of drafted slots contributing to `metrics_conf_sum`.
+    metrics_conf_count: u64,
 }
 
 impl MtpDrafter for DsparkDrafter {
@@ -1163,6 +1175,24 @@ impl MtpDrafter for DsparkDrafter {
             }
             l.max(1)
         };
+        // ── metrics: observe truncation length + per-slot confidence ─────────
+        // Observe-only (no drafting behaviour change): record how many slots
+        // survived the gate this window (explains `mean_draft_len`) and the
+        // per-slot confidence mass. `confident_len ∈ 1..=block`, so it indexes
+        // safely into a `block+1`-sized histogram.
+        if self.metrics_trunc_hist.len() <= block {
+            self.metrics_trunc_hist.resize(block + 1, 0);
+        }
+        self.metrics_trunc_hist[confident_len] += 1;
+        if self.weights.cfg.enable_confidence {
+            for &c in draft.confidence.iter().take(block) {
+                let s = 1.0f32 / (1.0 + (-c).exp());
+                if s.is_finite() {
+                    self.metrics_conf_sum += s as f64;
+                    self.metrics_conf_count += 1;
+                }
+            }
+        }
         drafts.truncate(confident_len);
         let n_proposed = drafts.len();
 
@@ -1302,6 +1332,40 @@ impl MtpDrafter for DsparkDrafter {
             let _ = gpu.free_tensor(dev);
         }
         self.ctx_positions.clear();
+        // Per-request metrics are scoped to one request; clear them here too so a
+        // reused drafter doesn't leak the previous request's histogram if the
+        // `done`-site drain was skipped (e.g. an aborted request).
+        self.metrics_trunc_hist.clear();
+        self.metrics_conf_sum = 0.0;
+        self.metrics_conf_count = 0;
+    }
+
+    fn drain_extra_metrics(&mut self) -> Option<serde_json::Value> {
+        // Return the accumulated confidence-gate metrics and RESET them, so the
+        // next request starts clean. Namespaced under `"dspark"` so the serving
+        // layer merges it into the `done` event's ext without naming the strategy.
+        use serde_json::json;
+        let hist: Vec<u64> = std::mem::take(&mut self.metrics_trunc_hist);
+        let mean_confidence = if self.metrics_conf_count > 0 {
+            Some(self.metrics_conf_sum / self.metrics_conf_count as f64)
+        } else {
+            None
+        };
+        self.metrics_conf_sum = 0.0;
+        self.metrics_conf_count = 0;
+        // Controller's current chosen block (adaptive path) or null when the
+        // fixed-block opt-out is in effect.
+        let adaptive_block = self.block_controller.as_ref().map(|c| c.block());
+        Some(json!({
+            "dspark": {
+                "conf_threshold": self.conf_threshold,
+                "conf_enabled": self.weights.cfg.enable_confidence,
+                "mean_confidence": mean_confidence,
+                "truncation_hist": hist,
+                "block_size": self.weights.cfg.block_size,
+                "adaptive_block": adaptive_block,
+            }
+        }))
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
@@ -1387,5 +1451,8 @@ pub fn build_dspark_speculator(
         ctx_positions: Vec::new(),
         profiler: DsparkProfiler::new(),
         block_controller,
+        metrics_trunc_hist: Vec::new(),
+        metrics_conf_sum: 0.0,
+        metrics_conf_count: 0,
     }))
 }

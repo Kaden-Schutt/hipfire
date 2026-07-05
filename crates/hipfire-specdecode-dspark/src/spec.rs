@@ -768,6 +768,15 @@ pub trait MtpDrafter {
     fn supports_temp_verify(&self) -> bool {
         false
     }
+
+    /// Drain the drafter's strategy-SPECIALIZED per-request metrics, forwarded
+    /// verbatim by [`MtpSpeculator`] to [`Speculator::drain_extra_metrics`].
+    /// Default `None`: a greedy MTP head contributes nothing beyond the canonical
+    /// primitives. The DSpark drafter overrides this to surface its confidence-gate
+    /// truncation histogram. `&mut` so the impl may reset its accumulators.
+    fn drain_extra_metrics(&mut self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
@@ -889,6 +898,12 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         // drafter inside `step` (before `mtp_step`).
         self.top_p = top_p;
         self.top_k = top_k;
+    }
+
+    fn drain_extra_metrics(&mut self) -> Option<serde_json::Value> {
+        // Delegate to the concrete drafter — the MTP adapter is arch-agnostic and
+        // never names the strategy; DSpark returns its confidence-gate histogram.
+        self.arch.drain_extra_metrics()
     }
 }
 
