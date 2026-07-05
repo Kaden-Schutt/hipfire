@@ -34,9 +34,16 @@ use crate::forward::{self};
 use crate::grammar;
 use hipfire_rdna::Gpu;
 
-/// One acceptance window of speculative decoding.
+/// One acceptance window of DeepSeek4 MTP speculative decoding.
+///
+/// This is the lightweight MTP result and is intentionally distinct from the
+/// core `hipfire_specdecode::SpecStepResult` (the DeltaNet/DFlash step, which
+/// carries `bonus_token`/`drafted`/`committed`/rollback+verify-graph modes this
+/// path never computes). Its `n_proposed`/`n_accepted`/`accepted_tokens.len()`
+/// map directly onto the unified `SpecMetrics::record_window(proposed, accepted,
+/// committed)` at the daemon call site — do not re-merge it with the core type.
 #[derive(Debug, Clone)]
-pub struct SpecStepResult {
+pub struct SpecWindow {
     /// Tokens accepted this window (in emission order). At minimum
     /// always contains the verifier's preferred token at the
     /// divergence position; on full acceptance contains all K drafts.
@@ -89,7 +96,7 @@ pub fn speculative_decode_step_with_pbs(
     last_position: u32,
     last_hidden: Option<&hipfire_rdna::GpuTensor>,
     k: usize,
-) -> Result<SpecStepResult, String> {
+) -> Result<SpecWindow, String> {
     speculative_decode_impl(
         cfg,
         weights,
@@ -118,7 +125,7 @@ pub fn speculative_decode_step_with_pbs_grammar(
     matcher: &mut grammar::Matcher,
     decoded_vocab: &[String],
     grammar_mask: &mut Vec<bool>,
-) -> Result<SpecStepResult, String> {
+) -> Result<SpecWindow, String> {
     speculative_decode_impl(
         cfg,
         weights,
@@ -147,7 +154,7 @@ pub fn speculative_decode_step(
     last_position: u32,
     last_hidden: Option<&hipfire_rdna::GpuTensor>,
     k: usize,
-) -> Result<SpecStepResult, String> {
+) -> Result<SpecWindow, String> {
     speculative_decode_impl(
         cfg,
         weights,
@@ -174,7 +181,7 @@ fn speculative_decode_impl(
     last_hidden: Option<&hipfire_rdna::GpuTensor>,
     k: usize,
     mut grammar: Option<SpecGrammar<'_>>,
-) -> Result<SpecStepResult, String> {
+) -> Result<SpecWindow, String> {
     if k == 0 {
         return Err("speculative_decode_step: k must be > 0".to_string());
     }
@@ -301,7 +308,7 @@ fn speculative_decode_impl(
     // returned to the pool on EVERY exit path — `PrefillBatchScratch` has no
     // Drop and the body has several `?` early returns. Cached-PBS callers pass
     // `Some`, so `owned_pbs` is `None` for them and the free below is a no-op.
-    let result = (|| -> Result<SpecStepResult, String> {
+    let result = (|| -> Result<SpecWindow, String> {
         let pbs: &forward::PrefillBatchScratch =
             cached_pbs.unwrap_or_else(|| owned_pbs.as_ref().unwrap());
         if pbs.max_batch < k {
@@ -420,7 +427,7 @@ fn speculative_decode_impl(
         // indices can still alias rejected-token cache entries on a later read.
         state.n_tokens = initial_n_tokens + accepted_tokens.len() as u64;
 
-        Ok(SpecStepResult {
+        Ok(SpecWindow {
             accepted_tokens,
             n_accepted: n_accept,
             n_proposed: k,
