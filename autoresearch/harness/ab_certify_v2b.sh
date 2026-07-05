@@ -90,6 +90,15 @@ git checkout "$BASELINE_REF" -- kernels/src crates/rdna-compute/src 2>/dev/null;
 #      Reentrant within a process tree + kernel auto-releases on death. This is what makes a build-parallel /
 #      measure-serial swarm safe to fan out onto one card.
 GPULK="$MAIN/scripts/gpu-lock.sh"; [ -f "$GPULK" ] && { . "$GPULK"; gpu_acquire "cert_${ARCH}_c${CARD}_${LABEL}" >/dev/null 2>&1; }
+# ---- PARITY GATE (v2b): candidate token-ids MUST equal baseline at temp 0. Catches numerically-WRONG launch
+#      configs (e.g. a halved grid that drops output rows but still reads coherent) that the weak coherence
+#      check misses. A value-preserving change keeps parity; a wrong grid/kernel breaks it. ----
+pids(){ rm -f .hipfire_kernels/*/*.hsaco 2>/dev/null; printf '{"type":"load","model":"%s","params":{"max_seq":2048,"kv_mode":"q8"}}
+{"type":"generate","id":"p","prompt":"Write a detailed paragraph about the history and future of computing.","temperature":0.0,"max_tokens":48}
+{"type":"unload"}
+' "$MODEL" | HIPFIRE_EMIT_TOKEN_IDS=1 HIP_VISIBLE_DEVICES=$DEV "$1" 2>/dev/null | python3 -c "import json,sys;print(','.join(str(json.loads(l).get('tok_id')) for l in sys.stdin if chr(34)+'committed'+chr(34) in l and chr(34)+'p'+chr(34) in l))"; }
+PB=$(pids /tmp/v2_base_$ID); PC=$(pids /tmp/v2_var_$ID)
+if [ -z "$PB" ] || [ "$PB" != "$PC" ]; then [ -f "$GPULK" ] && gpu_release >/dev/null 2>&1; echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"PARITY_FAIL\",\"base_ids\":\"${PB:0:36}\",\"cand_ids\":\"${PC:0:36}\"}"; exit 0; fi
 # ---- ADAPTIVE SAMPLING ----
 BASE=();VAR=();BK=();VK=();BC=OK;VC=OK
 sample(){ local n=$1 r d c k; for r in $(seq 1 "$n"); do
