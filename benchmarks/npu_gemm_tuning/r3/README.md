@@ -83,14 +83,31 @@ Both kernels now dispatch through hipfire's amdxdna path (`crates/hipfire-xdna`,
 W=all-1s int4 gives the exact `16·(INNER+1)` per lane, and two back-to-back
 dispatches (A=1 then A=2) give the clean 2× a linear GEMM must (`run_smoke`).
 
-**R3a caveat (correctness, not dispatch):** driven with the all-ones reference,
-R3a's output is ~half the expected `KCHUNK·16` and only near-deterministic
-(e.g. 512/513/580 for the 1024 case), invariant to host-side delays. Because R2a
-is bit-exact through the same dispatch path, the dispatch + int4 mac primitive are
-sound; the discrepancy is in R3a's multi-tile weight *streaming/indexing*, which
-was only ever validated for **bandwidth** with random inputs — its numerical
-result was never checked. R3a also carries the resident K accumulator C across
-dispatches without a per-dispatch reset, so it is **reuse-unsafe** as written (the
-first super-tile of each call must reseed C rather than accumulate). Both — the
-weight-streaming correctness bug and the C-reset — need a correctness pass before
-R3a is usable from the runtime; R2a is the validated W4A8 kernel today.
+**R3a was numerically wrong — two bugs found and fixed (2026-07-05).** Driving it
+with an all-ones reference (`C = KCHUNK·16` per lane) surfaced ~half-magnitude,
+partly non-deterministic output. Since R2a is bit-exact through the *same* dispatch
+path, the dispatch was exonerated; both bugs were in the R3a kernel, which had only
+ever been validated for **bandwidth** with random inputs — its numeric result was
+never checked.
+
+1. **Sub-byte pointer stride (the "half the K" bug).** The per-tile weight load did
+   `w + j*MMUL::size_B` on a `const int4*`. Pointer arithmetic on the sub-byte
+   `int4` type advances **one byte per element**, so the stride was 2× too far — it
+   read tiles 0, 2, 4… and ran the second half of `j` off the buffer end. A clean
+   KCHUNK sweep pinned it exactly: KCHUNK=1 correct (no stride), KCHUNK=N≥2 gave
+   N/2 tiles' worth. The OOB tail read zeros under XRT (clean 512) but adjacent tile
+   memory under hipfire (the noise) — one bug, both symptoms. Fix: stride in **bytes**
+   on the `int8*` buffer (`wbytes + j*(size_B/2)`), then reinterpret as `int4`.
+2. **Reuse-unsafe resident C.** The K accumulator C lives in a tile-local buffer
+   that persists across dispatches; the original kernel always did `C = load(C)+partial`,
+   so the first super-tile of each call accumulated onto the *previous* dispatch's C.
+   Fix: split into `r3a_matvec_init` (stores/reseeds) + `r3a_matvec` (accumulates),
+   in separate TUs (shared `r3a_gemv_common.h`) to avoid duplicate symbols, and peel
+   the first super-tile in `r3a_run.py` to call init.
+
+Both fixes verified: XRT all-ones gives the exact analytic value (KCHUNK 1/2/4/8 →
+16/32/64/128; N_SUPER 1/2/4 → 1024/2048/4096, uniform), and through hipfire two
+back-to-back dispatches (A=1 then A=2) give 4096 then 8192 — the clean 2× a linear
+GEMV must, reuse-safe. R3a now matches R2a: a validated, dispatchable W4A8 kernel.
+(The bandwidth numbers above are unchanged — `rt.fill` streams the same bytes; only
+the compute's tile indexing was wrong.)

@@ -31,20 +31,36 @@ ina_ty = np.ndarray[(N_SUPER * A_SUPER,), np.dtype[np.int8]]
 inw_ty = np.ndarray[(N_SUPER * W_SUPER,), np.dtype[np.int8]]
 
 flags = ["-std=c++20", "-O2", f"-DKCHUNK={KCHUNK}"]
+# The kernels share r3a_gemv_common.h, which lives next to this script (mlir-aie
+# copies only the .cc into the build dir, so add our dir to the include path).
+HERE = os.path.dirname(os.path.abspath(__file__))
+incs = [INC, HERE]
+# init RESEEDS the K accumulator on the first super-tile; matvec ACCUMULATES the
+# rest. Peeling the first call keeps the resident C reuse-safe across dispatches
+# (else the tile-local C carries stale state from the prior dispatch).
+kern_init = ExternalFunction("r3a_matvec_init", source_file="r3a_gemv_init.cc",
+                             arg_types=[asuper_ty, wsuper_ty, c_ty], include_dirs=incs, compile_flags=flags)
 kern = ExternalFunction("r3a_matvec", source_file="r3a_gemv.cc",
-                        arg_types=[asuper_ty, wsuper_ty, c_ty], include_dirs=[INC], compile_flags=flags)
+                        arg_types=[asuper_ty, wsuper_ty, c_ty], include_dirs=incs, compile_flags=flags)
 
 
 @jit(use_cache=True)
-def r3a(A, W, C, k):
+def r3a(A, W, C, k_init, k):
     dev = aie_utils.get_current_device()
     of_a = ObjectFifo(asuper_ty, name="fa", depth=2)
     of_w = ObjectFifo(wsuper_ty, name="fw", depth=4)
     of_c = ObjectFifo(c_ty, name="fc", depth=1)
 
-    def core(a_in, w_in, c_out, kk):
+    def core(a_in, w_in, c_out, kk_init, kk):
         c = c_out.acquire(1)
-        for _ in range_(N_SUPER):
+        # Peel the first super-tile: init RESEEDS c (reuse-safe), then accumulate
+        # the remaining N_SUPER-1 super-tiles into the running K partial.
+        asup = a_in.acquire(1)
+        wsup = w_in.acquire(1)
+        kk_init(asup, wsup, c)
+        a_in.release(1)
+        w_in.release(1)
+        for _ in range_(N_SUPER - 1):
             asup = a_in.acquire(1)
             wsup = w_in.acquire(1)
             kk(asup, wsup, c)                    # folds this super-tile into C
@@ -52,7 +68,7 @@ def r3a(A, W, C, k):
             w_in.release(1)
         c_out.release(1)
 
-    w = Worker(core, [of_a.cons(), of_w.cons(), of_c.prod(), k])
+    w = Worker(core, [of_a.cons(), of_w.cons(), of_c.prod(), k_init, k])
     rt = Runtime()
     with rt.sequence(ina_ty, inw_ty, c_ty) as (a, wstream, c):
         rt.start(w)
@@ -66,7 +82,7 @@ A = randint(-8, 8, (N_SUPER * A_SUPER,), dtype=np.int8)
 W = randint(-8, 8, (N_SUPER * W_SUPER,), dtype=np.int8)
 C = zeros(SZ_C, dtype=np.int32)
 t = time.perf_counter()
-r3a(A, W, C, kern)
+r3a(A, W, C, kern_init, kern)
 dt = time.perf_counter() - t
 
 gbs = STREAMED_W / dt / 1e9
