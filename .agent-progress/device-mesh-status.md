@@ -64,12 +64,14 @@ Total unit tests added: ~20 (10 mesh + 7 manifest + config + toy). No GPU needed
 - GPU-validated gfx1151: **196 projection tensors / 28 layers, byte+dtype identical (MQ4G256)**.
   These are uploaded raw/verbatim by the loader (no transform) → raw-byte fulfill matches exactly.
 - Scoped out (byte-validation): norms/embed/tied-lm_head (F16→F32 host dequant) — source-side follow-up.
-- **Store→forward CONSUMPTION done + GPU-validated:** `WeightStore::take` moves resident handles out;
-  `llama_store_load` assembles a `LlamaWeights` whose projection `WeightTensor`s wrap the STORE
-  buffers (norms/embed/lm_head from bespoke) and runs a REAL forward — 151936 finite logits, valid
-  argmax on gfx1151. Byte-identity + consumption together close the load→forward loop for projections.
-  Next: whole-model source (norms F16→F32) so the WHOLE model loads via the store, then the
-  `ModelParallel`/`ArchDispatch` daemon hoist + PP-2.
+- **WHOLE-MODEL store→forward done + GPU-validated (bit-exact):** llama `weight_manifest` gained
+  q_norm/k_norm (qwen3 per-head RMSNorm, gated on `has_qk_norm` — manifest was incomplete). A
+  universal `source` mirrors the HFQ loader rule (quant_type 1→F16→F32, 2→F32, else raw+real dtype),
+  covering norms/embed/lm_head(+tied)/projections. `llama_store_load` fulfills the FULL manifest,
+  assembles a complete `LlamaWeights` from the store (embd_format derived from dtype), and runs a
+  forward: **311 tensors, logits IDENTICAL to bespoke (max |Δ|=0, same argmax) on gfx1151**. The
+  generic manifest path is a drop-in, bit-exact replacement for the bespoke llama loader (single-GPU).
+  Next: `ModelParallel`/`ArchDispatch` daemon hoist + PP-2 (`HIPFIRE_EMULATE_GPUS=2`).
 - GPU-validated on gfx1151 via `examples/fulfill_manifest_probe.rs` (synthetic byte source,
   no model file): single-1×1 + emulated PP-2 + emulated EP-2 all PASS — placement matches
   `placement_devices`, byte-oracle readback (`memcpy_dtoh`) == uploaded bytes on every device,

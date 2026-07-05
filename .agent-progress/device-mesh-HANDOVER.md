@@ -51,22 +51,25 @@ identical (MQ4G256), GPU-validated**. Loader name map: HF names `model.layers.{i
 via `hfq::load_weights_hfq` (NOT the GGUF `blk.*` path); quant projections upload raw/verbatim (match),
 norms/embed/tied-lm_head do F16→F32 host dequant (scoped out).
 
-**Also DONE (Phase 3 consumption): store→forward.** `WeightStore::take` moves handles out;
-`llama_store_load` now assembles a `LlamaWeights` whose projection `WeightTensor`s wrap the STORE
-buffers and runs a REAL forward — **151936 finite logits, valid argmax, gfx1151**. Byte-identity +
-consumption close the load→forward loop for the quantized projections.
+**Also DONE (Phase 3, WHOLE-MODEL, bit-exact): store→forward.** llama `weight_manifest` gained
+q_norm/k_norm; a universal `source` (quant_type 1→F16→F32, 2→F32, else raw+real dtype) covers the
+whole model; `llama_store_load` fulfills the FULL manifest, assembles a complete `LlamaWeights` from
+the store, and the forward is **logit-IDENTICAL to bespoke (max |Δ|=0, 311 tensors, gfx1151)** — a
+drop-in bit-exact replacement for the bespoke llama loader on a single GPU.
 
 ## The NEXT unit — pick ONE (Phase 3 continuation):
-**Option A (recommended): whole-model store load, then PP-2.** (1) Extend the llama `source` to cover
-norms/embed/tied-lm_head — reproduce the F16→F32 host dequant (`llama::f16_to_f32` is public; return
-`(f32_bytes, DType::F32)`; see `hfq.rs:551 load_f16_tensor` + the embed `EmbeddingFormat` branch,
-`hfq.rs:792`), so the WHOLE model loads via the store (drop the projection-only filter in
-`llama_store_load`). Then assemble the FULL `LlamaWeights` from the store (no bespoke fallback) and
-assert a forward logit-matches bespoke. (2) Then `HIPFIRE_EMULATE_GPUS=2` PP-2 fulfill + banded
-forward. This is the ModelParallel/ArchDispatch-hoist track.
+**Option A (recommended): PP-2 store load + banded forward.** `HIPFIRE_EMULATE_GPUS=2` → a PP-2
+mesh; fulfill the llama manifest across 2 stages (embed→stage 0, output→last, layers banded by
+`stage_for_layer`); assemble per-stage `LlamaWeights` from the store and drive the existing
+`gpus.boundary_copy` PP forward (or the qwen35 `forward_scratch_layers_multi` pattern). Assert
+PP-2 logits == single-GPU (the PP oracle). Reuses everything just built; the new piece is the
+banded assembly + inter-stage residual copy. This is the ModelParallel/ArchDispatch-hoist track.
 
 **Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study;
-see `qwen35.rs:2876-2945` per-`LayerType` weight sets).
+per-`LayerType` weight sets, `qwen35.rs:2876-2945`).
+
+**Option C: extend store→forward to a second arch** (deepseek4/minimax MoE) — reuse the ds4/minimax
+`ExpertSharded` manifest + a source closure, assemble from the store, EP-forward parity.
 
 **Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage). Pure-CPU like the ds4/qwen35
 work just done, but needs DeltaNet loader study: per-`LayerType` weight sets (LinearAttention fused
