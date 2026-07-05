@@ -1,14 +1,12 @@
-//! Probe whether the RAW amdxdna path (no XRT) can import an amdgpu GTT dma-buf and share
-//! memory zero-copy with the GPU — the NPU⇄GPU data primitive a heterogeneous prefill /
-//! spec-draft pipeline needs, and the fix for the ~37%-of-e2e C-readback host copy. Ported
-//! from the gfx1103/XDNA1 investigation (PR #182) to test halo (gfx1151 / XDNA2, OOT DKMS
-//! driver 2.25.0) — whose uapi (/usr/include/drm/amdxdna_accel.h) has the va_tbl dmabuf_fd
-//! import path.
+//! Probe whether the RAW amdxdna path (no XRT) can import an amdgpu GTT dma-buf and
+//! share memory zero-copy with the GPU — the NPU⇄GPU data primitive the heterogeneous
+//! prefill / spec-draft pipeline needs. Prior interop was proven only via XRT on halo
+//! (aie2p); this checks the raw path on THIS box (gfx1103 / XDNA1).
 //!
-//! Flow: amdgpu (renderD128) GEM_CREATE a GTT BO → mmap → write a marker → PRIME export →
-//! amdxdna (accel0) imports the dma-buf as a SHMEM BO with a va_tbl → mmap → read back
-//! (does the NPU side see the GPU's marker?) → write a marker on the NPU side → read on the
-//! GPU side (bidirectional coherence?).
+//! Flow: amdgpu (renderD128) GEM_CREATE a GTT BO → mmap → write a marker → PRIME export
+//! → amdxdna (accel0) imports the dma-buf as a SHARE BO → mmap → read back (does the NPU
+//! side see the GPU's marker?) → write a second marker on the NPU side → read on the GPU
+//! side (bidirectional coherence?).
 //!
 //! Run: cargo run -p hipfire-xdna --example dmabuf_probe
 
@@ -31,6 +29,7 @@ fn main() {
         const CPU_ACCESS_REQUIRED: u64 = 1;
         const SZ: usize = 4096;
 
+        // amdgpu union drm_amdgpu_gem_create (in is 32B; out.handle overlays offset 0).
         #[repr(C)]
         #[derive(Default)]
         struct GemCreate {
@@ -90,7 +89,7 @@ fn main() {
             die("mmap amdgpu BO");
         }
         let gpu_i32 = gpu_ptr as *mut i32;
-        const MARK_GPU: i32 = 0x1122_3344;
+        const MARK_GPU: i32 = 0x11223344;
         unsafe { *gpu_i32 = MARK_GPU };
         println!("[2] GPU wrote marker 0x{MARK_GPU:08x} into the GTT BO");
 
@@ -123,14 +122,23 @@ fn main() {
             Err(e) => {
                 eprintln!("FAIL amdxdna import_dmabuf: {e:?}");
                 eprintln!(
-                    "  The amdgpu half (GTT alloc + dma-buf export) works. EINVAL here means"
+                    "  Go/no-go: the amdgpu half (GTT alloc + dma-buf export) works on the raw"
                 );
-                eprintln!("  the driver rejected the va_tbl import path for this BO.");
+                eprintln!(
+                    "  path. EINVAL here means the INSTALLED amdxdna lacks the import UAPI: the"
+                );
+                eprintln!(
+                    "  mainline 6.17 header has no amdxdna_drm_va_tbl / AMDXDNA_BO_SHARE. The"
+                );
+                eprintln!(
+                    "  out-of-tree ~/xdna-driver implements it (create_ubuf_object -> dma_buf_get"
+                );
+                eprintln!("  -> prime_import); build+load that module to enable zero-copy import.");
                 std::process::exit(2);
             }
         };
         unsafe { libc::close(dmabuf_fd) };
-        println!("[4] amdxdna imported the dma-buf as a SHMEM BO (import OK)");
+        println!("[4] amdxdna imported the dma-buf as a SHARE BO (import OK)");
 
         // 6) NPU side reads back → does it see the GPU's marker? (zero-copy share)
         let seen = unsafe { *(npu_bo.as_slice().as_ptr() as *const i32) };
@@ -141,7 +149,7 @@ fn main() {
         );
 
         // 7) NPU writes a marker → does the GPU side see it? (bidirectional coherence)
-        const MARK_NPU: i32 = 0x5566_7788;
+        const MARK_NPU: i32 = 0x55667788;
         unsafe { *(npu_bo.as_mut_slice().as_mut_ptr() as *mut i32) = MARK_NPU };
         let gpu_sees = unsafe { *gpu_i32 };
         let share_write = gpu_sees == MARK_NPU;
@@ -151,7 +159,8 @@ fn main() {
         );
 
         println!(
-            "\nRESULT (halo gfx1151/XDNA2): raw-amdxdna dma-buf import=OK, zero-copy share r/w={}/{}",
+            "\nRESULT: raw-amdxdna dma-buf import={}, zero-copy share r/w={}/{}",
+            "OK",
             if share_read { "yes" } else { "no" },
             if share_write { "yes" } else { "no" }
         );

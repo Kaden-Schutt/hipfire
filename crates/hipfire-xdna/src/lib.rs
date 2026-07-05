@@ -614,12 +614,13 @@ mod imp {
         }
 
         /// Import an external dma-buf (e.g. an amdgpu GTT BO exported via
-        /// `PRIME_HANDLE_TO_FD`) zero-copy: `CREATE_BO(SHMEM)` with `vaddr` → a
-        /// `amdxdna_drm_va_tbl { dmabuf_fd, num_entries=0 }`, which selects the driver's
-        /// prime-import path. On success the NPU and the exporting engine (the GPU)
-        /// address the *same physical pages* — the NPU⇄GPU data path with no host copy.
-        /// `size` is the exported buffer's byte size; the driver `dma_buf_get`s the fd, so
-        /// the caller may close it after this returns. `map=true` also CPU-maps the BO.
+        /// `PRIME_HANDLE_TO_FD`) as a SHARE BO and mmap it. Zero-copy: the NPU and the
+        /// exporting engine (the GPU) then address the *same physical pages* — the
+        /// NPU→GPU data path with no host round-trip. `size` must be the exported
+        /// buffer's byte size. The driver `dma_buf_get`s the fd, so the caller may
+        /// close `fd` after this returns. `map` controls whether we also CPU-map the
+        /// imported BO (some importers don't expose a map offset; `false` still yields
+        /// a usable device handle for kernel args).
         pub fn import_dmabuf(
             &self,
             fd: i32,
@@ -633,7 +634,7 @@ mod imp {
             let mut cb = submit::CreateBo {
                 vaddr: &va as *const _ as u64,
                 size: size as u64,
-                bo_type: submit::AMDXDNA_BO_SHMEM,
+                bo_type: submit::AMDXDNA_BO_SHARE,
                 ..Default::default()
             };
             self.submit_ioctl(
@@ -650,7 +651,7 @@ mod imp {
                 &mut info as *mut _ as *mut libc::c_void,
             )?;
             let ptr = if map {
-                // SAFETY: map_offset is the driver's mmap cookie for the imported BO.
+                // SAFETY: map_offset is the driver's mmap cookie for this BO on our fd.
                 let p = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
