@@ -52,6 +52,23 @@ pub const SYNCOBJ_TIMELINE_WAIT_REQUEST: u64 = ioc(
 /// rather than erroring if it hasn't been yet (what XRT passes for a fresh submit).
 pub const SYNCOBJ_WAIT_FOR_SUBMIT: u32 = 0x2;
 
+/// `DRM_IOCTL_GEM_CLOSE` — a *core* DRM ioctl (`_IOW('d', 0x09, drm_gem_close)`)
+/// that releases a BO handle without closing the device fd.
+pub const GEM_CLOSE_REQUEST: u64 = ioc(
+    1, // _IOC_WRITE
+    DRM_TYPE,
+    0x09,
+    core::mem::size_of::<GemClose>() as u64,
+);
+
+/// struct drm_gem_close (core DRM).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GemClose {
+    pub handle: u32,
+    pub pad: u32,
+}
+
 pub const CREATE_HWCTX_REQUEST: u64 = iowr!(DRM_AMDXDNA_CREATE_HWCTX, CreateHwctx);
 pub const DESTROY_HWCTX_REQUEST: u64 = iowr!(DRM_AMDXDNA_DESTROY_HWCTX, DestroyHwctx);
 pub const CONFIG_HWCTX_REQUEST: u64 = iowr!(DRM_AMDXDNA_CONFIG_HWCTX, ConfigHwctx);

@@ -43,6 +43,16 @@ pub enum XdnaError {
     ShortResponse,
     /// A DEV BO's device address fell outside the backing heap mapping.
     DevBoOutsideHeap,
+    /// The kernel container failed to parse as an xclbin.
+    Xclbin(xclbin::XclbinError),
+    /// The xclbin has no AIE_PARTITION section (no PDI to load).
+    NoAiePartition,
+}
+
+impl From<xclbin::XclbinError> for XdnaError {
+    fn from(e: xclbin::XclbinError) -> Self {
+        XdnaError::Xclbin(e)
+    }
 }
 
 impl fmt::Display for XdnaError {
@@ -54,6 +64,8 @@ impl fmt::Display for XdnaError {
             XdnaError::Ioctl(e) => write!(f, "amdxdna ioctl: {e}"),
             XdnaError::ShortResponse => write!(f, "kernel returned a short telemetry buffer"),
             XdnaError::DevBoOutsideHeap => write!(f, "DEV BO device address outside heap mapping"),
+            XdnaError::Xclbin(e) => write!(f, "xclbin parse: {e}"),
+            XdnaError::NoAiePartition => write!(f, "xclbin has no AIE_PARTITION section"),
         }
     }
 }
@@ -128,6 +140,12 @@ pub mod submit;
 // W3a: AXLF (xclbin2) container parser — enumerate sections / extract the AIE
 // partition + PDI. Pure byte parsing, target-independent.
 pub mod xclbin;
+
+// W5: reusable NPU kernel dispatch (Linux-only; consumes the imp/submit path).
+#[cfg(target_os = "linux")]
+pub mod kernel;
+#[cfg(target_os = "linux")]
+pub use kernel::NpuKernel;
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -529,6 +547,7 @@ mod imp {
                 return Err(XdnaError::Ioctl(std::io::Error::last_os_error()));
             }
             Ok(DeviceBuffer {
+                fd: self.fd,
                 handle,
                 ptr: ptr as *mut u8,
                 len: size,
@@ -580,6 +599,7 @@ mod imp {
                 return Err(XdnaError::Ioctl(std::io::Error::last_os_error()));
             }
             Ok(DeviceBuffer {
+                fd: self.fd,
                 handle,
                 ptr: ptr as *mut u8,
                 len: size,
@@ -641,6 +661,7 @@ mod imp {
     /// process. `xdna_addr` is its device virtual address (used in command args).
     /// The BO handle is released when the owning device fd closes.
     pub struct DeviceBuffer {
+        fd: libc::c_int,
         handle: u32,
         ptr: *mut u8,
         len: usize,
@@ -684,9 +705,22 @@ mod imp {
 
     impl Drop for DeviceBuffer {
         fn drop(&mut self) {
-            // SAFETY: ptr/len from a successful mmap; unmapped exactly once.
+            // SAFETY: ptr/len from a successful mmap; unmapped exactly once. Then
+            // release the GEM handle so repeated allocation (e.g. per-dispatch
+            // command BOs) does not leak handles until the fd closes.
             unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+                if !self.ptr.is_null() {
+                    libc::munmap(self.ptr as *mut libc::c_void, self.len);
+                }
+                let mut gc = submit::GemClose {
+                    handle: self.handle,
+                    pad: 0,
+                };
+                libc::ioctl(
+                    self.fd,
+                    submit::GEM_CLOSE_REQUEST as libc::c_ulong,
+                    &mut gc as *mut _ as *mut libc::c_void,
+                );
             }
         }
     }

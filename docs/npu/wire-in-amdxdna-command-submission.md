@@ -103,11 +103,19 @@ single-core W4A8 GEMM: A=all-1s int8 × W=all-1s int4 yields the exact expected
 `16 × (INNER+1) = 1040` per lane. The whole submission ABI is captured byte-exact
 from XRT (see recipe below) and locked with a unit test.
 
+**W5 DONE — reusable `NpuKernel` API.** `crates/hipfire-xdna/src/kernel.rs` hoists
+the dispatch flow behind `NpuKernel::load(xclbin, insts)` → `alloc_arg` → `dispatch`.
+It opens the device, sets up the heap/hwctx and loads the PDI + instruction stream
+once, then dispatches repeatedly. Validated on halo: two back-to-back dispatches of
+the R2a W4A8 GEMM with A=1 then A=2 give 1040 then 2080 (correct math, hwctx reuse,
+no BO-handle leak — `DeviceBuffer::drop` now `GEM_CLOSE`s). `run_smoke` is now a
+thin driver over this API.
+
 Kernels (benchmarks/npu_gemm_tuning): decode GEMV (R3a) works and is bandwidth-
 bound; prefill GEMM needs the weight-broadcast array dataflow (R3c → R4) to be
-compute-bound. Remaining wire-in: W5 — hoist the `run_smoke` flow into a reusable
-`NpuGemm` dispatch entry (shape → cached xclbin/instr, bind tensors) and call it
-from the runtime.
+compute-bound. Remaining: a shape→cached-xclbin registry (`npu_xclbin_for`) and
+the runtime call site that offloads prefill GEMMs to `NpuKernel` (the actual hot-
+path integration, to be designed against the GPU/NPU concurrency model).
 
 ### How W4 was de-risked
 
