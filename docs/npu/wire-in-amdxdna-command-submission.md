@@ -174,3 +174,22 @@ now a known quantity from the capture above.
 
 Tooling: the LD_PRELOAD ioctl dumper + strace method is the reusable capture path
 for any remaining byte-matching.
+
+## RESOLVED: CREATE_HWCTX works — the gap was the DEV_HEAP mmap VA
+
+The "Map host buffer failed" was the DEV_HEAP mmap placement, not the args. Fix:
+mmap the heap **MAP_FIXED at a fixed, moderate, 2 MiB-aligned VA** (hipfire-xdna
+uses `0x7000_0000_0000`). Confirmed:
+- MAP_FIXED at `0x7b20_5000_0000` (pyxrt's VA) → CREATE_HWCTX **ok**; `0x7000..` also ok.
+- The kernel's default placement (~`0x7f6a..`) is rejected by the firmware
+  host-buffer map, even though DMA is 64-bit — it's an IOMMU-aperture / placement
+  requirement, not a bit-width one.
+- The VA is **not** hardcoded in `libxrt_driver_xdna.so`, so XRT derives it the
+  same way (force a fixed in-range VA); the driver's heap `dev_addr = AIE2_DEVM_BASE
+  (0x400_0000)` is separate from this host VA.
+
+`XdnaDevice::create_hwctx` now succeeds on real hardware (`examples/hwctx_smoke`:
+alloc 64 MB dev_heap + 2 SHMEM BOs → CREATE_HWCTX → DESTROY_HWCTX, no dmesg errors).
+So W3c is done. Remaining: W3d CONFIG_HWCTX(CONFIG_CU) to load the PDI (arg struct
+captured), then W4 build the ERT command BO ({opcode,instr,ninstr,bo*}) + EXEC_CMD
++ syncobj wait — all now known quantities from the captured recipe.

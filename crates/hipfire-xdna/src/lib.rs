@@ -200,6 +200,11 @@ mod imp {
         core::mem::size_of::<GetInfo>() as u64,
     );
 
+    /// Fixed userspace VA for the device heap mapping — must be a moderate,
+    /// 2 MiB-aligned address inside the NPU's IOMMU-addressable window (the
+    /// kernel's default placement is too high and the firmware rejects it).
+    const DEV_HEAP_VA: usize = 0x7000_0000_0000;
+
     /// An open handle to the XDNA NPU accel device.
     pub struct XdnaDevice {
         fd: RawFd,
@@ -444,16 +449,19 @@ mod imp {
                 submit::GET_BO_INFO_REQUEST,
                 &mut info as *mut _ as *mut libc::c_void,
             )?;
-            // The DEV_HEAP maps at a fixed fake offset (GET_BO_INFO returns
-            // 0x1_0000_0000). XRT additionally mmaps it MAP_FIXED at a device-
-            // matched VA; a kernel-chosen VA still fails the firmware host-buffer
-            // map (the one remaining wire-in gap — see the doc).
+            // The DEV_HEAP must be mmap'd MAP_FIXED at a fixed VA inside the NPU's
+            // addressable window (GET_BO_INFO's map_offset is the fixed 0x1_0000_0000
+            // DEV_HEAP offset). Without MAP_FIXED the kernel places the heap too high
+            // (~0x7f..) and `aie2_hwctx_init`'s firmware host-buffer map is rejected;
+            // any moderate 2 MiB-aligned VA (~0x70..-0x7b..) is accepted — XRT does the
+            // same. Confirmed against the driver (dev_addr = AIE2_DEVM_BASE, 64-bit DMA).
+            let fixed_va = DEV_HEAP_VA as *mut libc::c_void;
             let ptr = unsafe {
                 libc::mmap(
-                    std::ptr::null_mut(),
+                    fixed_va,
                     size,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_LOCKED,
+                    libc::MAP_SHARED | libc::MAP_LOCKED | libc::MAP_FIXED,
                     self.fd,
                     info.map_offset as libc::off_t,
                 )
