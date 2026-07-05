@@ -245,6 +245,41 @@ mod tests {
     }
 
     #[test]
+    fn head_sharded_and_recurrent_conv_variants() {
+        // DeltaNet HeadSharded (w_alpha/w_beta/wz): per-head shard, no own-output
+        // all-reduce (the cross-head mix all-reduces on wo, like ColumnShard).
+        let hs = ShardPolicy::HeadSharded {
+            n_heads: 16,
+            head_dim: 128,
+        };
+        assert_eq!(collective_for_policy(&hs), None);
+        let e = WeightEntry::layer("w_alpha", 2, vec![16 * 128], DType::F16, hs);
+        // HeadSharded shards on the Tp axis → spans the Tp group; on an Ep-only
+        // mesh (no Tp axis) it lands on a singleton.
+        let tp = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        assert_eq!(placement_devices(&e, &tp, 4), vec![0, 1]);
+        let ep = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        assert_eq!(placement_devices(&e, &ep, 4), vec![0]);
+        // FusedQkv QkvZ layout (DeltaNet fused projection) is expressible.
+        let fq = ShardPolicy::FusedQkv {
+            q_heads: 8,
+            kv_heads: 2,
+            head_dim: 256,
+            layout: FusedQkvLayout::QkvZ,
+        };
+        assert_eq!(collective_for_policy(&fq), None);
+        // Recurrent + Conv state kinds (DeltaNet S-matrix + short conv).
+        assert!(matches!(
+            StateEntry::new(StateKind::Recurrent, 2).kind,
+            StateKind::Recurrent
+        ));
+        assert!(matches!(
+            StateEntry::new(StateKind::Conv, 5).kind,
+            StateKind::Conv
+        ));
+    }
+
+    #[test]
     fn collective_derived_from_policy() {
         // Row-parallel → Tp all-reduce; expert → Ep all-reduce.
         assert_eq!(
