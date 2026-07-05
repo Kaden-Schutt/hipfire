@@ -94,3 +94,10 @@ running before declaring XDNA1 W4A8 GEMM a hard ~0.6-TOPS floor.
 
 Repro: `R5_ARCH=aie2 ./r6_intensity.sh 4 4 1024 300 16 32 64 128`; NACC/INNER via
 `R5_NACC=4 R5_INNER=1 ../r5/r5_build.sh <mlir> <wd> <KSLICE>`.
+
+> **R8 correction:** the "op-throughput floor" verdict above is WRONG. The INNER probe
+> reloads `ldA`+`ldW` every mac, so it measured ~2 L1 loads/mmul, not the op. A resident
+> microbench (`../r8/`) clocks the same int4 `<4,16,8>` at **~1 ns/mmul (~489 GMAC/s/core,
+> ~15 TOPS array)** — ~25× above the streaming result. XDNA1 GEMM is **load-bound**
+> (no data reuse), not op-bound. NACC's weak ~1.35× is because it can't cut loads/mac.
+> The real fix is load-reuse register tiling (R9), not anything in R5–R7.
