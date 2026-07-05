@@ -172,6 +172,11 @@ struct RocmWeightCache {
     /// the same way as `entries`; populated lazily by converting the resident
     /// F32 weight once.
     f16_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
+    /// BF16 copies of weights for the bf16 WMMA-GEMM linear path. Keyed the same
+    /// way; built once by casting a *transient* F32 upload (freed immediately),
+    /// so only the BF16 buffer (1x the source bf16 size) stays resident. This is
+    /// the memory-efficient replacement for keeping the F32 weight resident.
+    bf16_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
     /// oq4 arch-combined device buffers, for the W4A* schedule rungs. Keyed the
     /// same way; built once by quantize_oq4g256 → pack_oq4_arch_combined → upload.
     oq4_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
@@ -233,6 +238,47 @@ impl RocmWeightCache {
             .entries
             .get(&key)
             .expect("weight just inserted")
+            .buf
+            .as_ptr())
+    }
+
+    /// Return the raw device pointer to a **BF16** copy of `tensor`, built once
+    /// on first use by uploading the F32 weight *transiently*, casting it to
+    /// BF16, and freeing the F32 immediately — so only the BF16 buffer (half the
+    /// F32 footprint, matching the model's native bf16 storage) stays resident.
+    /// The caller wraps it in a non-owning `DType::BF16` [`hipfire_rdna::GpuTensor`]
+    /// for the bf16 WMMA GEMM. Losslessly recovers the original bf16 weight
+    /// (bf16 -> f32 is exact, f32 -> bf16 RNE round-trips), unlike the bf16 -> f16
+    /// path which clips values outside f16's range.
+    fn resident_bf16_ptr(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        tensor: &CpuTensor,
+    ) -> DiffusionResult<*mut std::ffi::c_void> {
+        let key = (tensor.data.as_ptr() as usize, tensor.data.len());
+        if !self.bf16_entries.contains_key(&key) {
+            let n = tensor.data.len();
+            let f32_tmp = gpu
+                .upload_f32(&tensor.data, &tensor.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let bf16 = gpu
+                .alloc_tensor(&[n], hipfire_rdna::DType::BF16)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            gpu.cast_f32_to_bf16(&f32_tmp, &bf16)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            // The cast is enqueued on the stream; sync before freeing the
+            // transient F32 so the free cannot race the in-flight conversion.
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            gpu.free_tensor(f32_tmp)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            self.bf16_entries.insert(key, bf16);
+        }
+        Ok(self
+            .bf16_entries
+            .get(&key)
+            .expect("bf16 weight just inserted")
             .buf
             .as_ptr())
     }

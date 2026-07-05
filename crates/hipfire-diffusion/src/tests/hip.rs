@@ -1359,6 +1359,140 @@ fn diffusion_superres_model_upscales_rgb_batch_x2() {
 }
 
 #[test]
+fn bf16_resident_linear_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for bf16 linear parity test: {error}");
+            return;
+        }
+    };
+    if !gpu.arch_caps.has_wmma_w32() {
+        eprintln!("skip: bf16 WMMA linear needs wave32 WMMA");
+        return;
+    }
+    // in_features multiple of 16 -> exercises the bf16-native GEMM path.
+    let (rows, in_features, out_features) = (4usize, 32usize, 8usize);
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 13.0) - 6.0) / 6.0 * scale)
+            .collect()
+    };
+    let input = CpuTensor {
+        shape: vec![rows, in_features],
+        data: fill(rows * in_features, 1.0, 1.0),
+    };
+    let weight = CpuTensor {
+        shape: vec![out_features, in_features],
+        data: fill(out_features * in_features, 3.0, 0.5),
+    };
+    let bias = CpuTensor {
+        shape: vec![out_features],
+        data: fill(out_features, 7.0, 0.25),
+    };
+
+    // CPU f32 reference: Y[r,o] = sum_k input[r,k]*weight[o,k] + bias[o].
+    let mut cpu = vec![0.0f32; rows * out_features];
+    for r in 0..rows {
+        for o in 0..out_features {
+            let mut acc = bias.data[o];
+            for k in 0..in_features {
+                acc += input.data[r * in_features + k] * weight.data[o * in_features + k];
+            }
+            cpu[r * out_features + o] = acc;
+        }
+    }
+
+    let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+    let mut cache = RocmWeightCache::default();
+    let out_gpu =
+        linear_optional_bias_resident(&mut gpu, &mut cache, &input_gpu, &weight, Some(&bias))
+            .unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, input_gpu).unwrap();
+
+    assert_eq!(hip.shape, vec![rows, out_features]);
+    // bf16 inputs (~8-bit mantissa) accumulated in f32 over K=32.
+    let max_rel = hip
+        .data
+        .iter()
+        .zip(&cpu)
+        .map(|(a, b)| (a - b).abs() / (b.abs().max(1.0)))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rel <= 3e-2,
+        "bf16 linear vs cpu max rel error {max_rel} too large; hip={:?} cpu={:?}",
+        hip.data,
+        cpu
+    );
+}
+
+#[test]
+fn bf16_hip_on_gpu_linear_matches_cpu_reference() {
+    // The transformer (Krea2 DiT + Qwen3-VL text encoder) linears route through
+    // linear_optional_bias_hip_on_gpu; verify its bf16-WMMA path.
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for bf16 hip_on_gpu linear test: {error}");
+            return;
+        }
+    };
+    if !gpu.arch_caps.has_wmma_w32() {
+        eprintln!("skip: bf16 WMMA linear needs wave32 WMMA");
+        return;
+    }
+    let (rows, in_features, out_features) = (6usize, 48usize, 16usize);
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 17.0) - 8.0) / 8.0 * scale)
+            .collect()
+    };
+    let input = CpuTensor {
+        shape: vec![rows, in_features],
+        data: fill(rows * in_features, 2.0, 1.0),
+    };
+    let weight = CpuTensor {
+        shape: vec![out_features, in_features],
+        data: fill(out_features * in_features, 5.0, 0.5),
+    };
+    let bias = CpuTensor {
+        shape: vec![out_features],
+        data: fill(out_features, 9.0, 0.25),
+    };
+
+    let mut cpu = vec![0.0f32; rows * out_features];
+    for r in 0..rows {
+        for o in 0..out_features {
+            let mut acc = bias.data[o];
+            for k in 0..in_features {
+                acc += input.data[r * in_features + k] * weight.data[o * in_features + k];
+            }
+            cpu[r * out_features + o] = acc;
+        }
+    }
+
+    let mut cache = RocmWeightCache::default();
+    let hip = linear_optional_bias_hip_on_gpu(&mut gpu, &mut cache, &input, &weight, Some(&bias))
+        .unwrap();
+
+    assert_eq!(hip.shape, vec![rows, out_features]);
+    let max_rel = hip
+        .data
+        .iter()
+        .zip(&cpu)
+        .map(|(a, b)| (a - b).abs() / (b.abs().max(1.0)))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rel <= 3e-2,
+        "bf16 hip_on_gpu linear vs cpu max rel error {max_rel} too large; hip={:?} cpu={:?}",
+        hip.data,
+        cpu
+    );
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
