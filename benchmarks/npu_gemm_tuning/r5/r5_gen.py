@@ -10,9 +10,9 @@ import sys
 
 COLS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 ROWS = int(sys.argv[2]) if len(sys.argv) > 2 else 4  # cascade depth per column (tile rows 2..2+ROWS-1)
-AW = 1024   # KSLICE*size_A = 16*64
-WW = 2048   # KSLICE*128
-CW = 64     # size_C i32
+AW = 256    # 4 M-tiles * size_A (4*64)
+WW = 128    # one shared int4 weight tile
+CW = 256    # 4 M-tiles * size_C
 
 rows = list(range(2, 2 + ROWS))          # bottom..top tile rows
 top = rows[-1]                            # head (northernmost)

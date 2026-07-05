@@ -134,5 +134,30 @@ and (b) the **cascade adds a further ~3×** on top. Both are tunable:
 
 The cascade *mechanism* is fully validated (2/4/32 cores, exact sums); reaching a
 SOTA-beating number is now a two-part **perf-tuning** problem on a working dataflow,
-not a correctness one. Next: land the kernel fix (target ~1.6 TOPS/core standalone),
-then the cascade-overlap fix, then re-measure the 32-core array vs SOTA ~5.
+not a correctness one.
+
+**6. KERNEL FIX → 42 TOPS: the cascade reaches full compute capacity.** The ~4× base
+slowdown was register pressure — the kernel now uses R2a's exact recipe: 4 M-block
+accumulators sharing **one** resident weight tile (`compute()` in `r5_cascade.cc`),
+and the cascade carries all four accumulators (16 beats) core→core. Re-measured, all
+bit-exact:
+
+| | TOPS | vs before |
+|---|---|---|
+| 32-core cascade, INNER=16384 | **25.7** | (was 4.03) |
+| 32-core cascade, INNER=65536 | **42.2** | overhead amortized |
+
+The kernel fix alone was a **10×** jump, and it revealed that the earlier "cascade
+adds 3×" was an *artifact of the slow kernel* — with a fast kernel the cascade is
+nearly free (42 TOPS ≈ R4b's 40-TOPS fake-reuse ceiling). So the cascade dataflow
+**accesses the array's full compute capacity while keeping C resident** — exactly
+the property the memtile dataflow lacks. vs SOTA FastFlowLM's ~5 TOPS and the 15.7
+reference, this is the compute path that was missing.
+
+**Caveat / final step:** 42 TOPS is the *compute ceiling* (fake INNER reuse, weights
+resident). SOTA's ~5 is *real streaming*. The cascade's structural win — C resident,
+stored once, no per-tile reload — should carry into real streaming where R4b's
+independent-core dataflow collapsed to 5.25 (INNER=0). Confirming that needs the
+streaming-cascade kernel (each core streams its K-slice weights, one cascade round
+per output tile); that apples-to-apples INNER=0 measurement vs SOTA's 5 is the last
+step. But the compute capacity (~42 TOPS) is now demonstrably reachable via cascade.

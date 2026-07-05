@@ -1,94 +1,95 @@
-// R5: one core of a K-cascade W4A8 column. The ROWS cores in a column split the K
-// contraction; each computes its K-slice partial and the 512-bit cascade stream
-// carries the running accumulator core->core (put_mcd / get_scd), so C is
-// accumulated in-flight and stored ONCE by the tail core — eliminating the per-tile
-// C load/store that pins the memtile dataflow (and SOTA FastFlowLM) to ~5 TOPS.
+// R5: one core of a K-cascade W4A8 column. Each core computes 4 M-block partials
+// with the R2a II=1 recipe (4 named accumulators sharing ONE resident weight tile
+// — pure register macs, ~1.6 TOPS/core), and the 512-bit cascade stream carries all
+// four accumulators core->core (put_mcd/get_scd) so C accumulates in-flight and the
+// tail stores it ONCE — no per-tile C reload (the trap pinning the memtile dataflow
+// and SOTA FastFlowLM to ~5 TOPS).
 //
-// Cascade API (from aie_kernels/aie2/cascade_mm.cc + aie2p_streams.h): the 512-bit
-// cascade moves one v16acc32 per beat via put_mcd(v16acc32)/get_scd_v16acc32();
-// the mmul<4,16,16> accumulator is size_C=64 acc32 = 4 beats. The graph wires the
-// physical link with aie.cascade_flow(src,dst). Built -DROLE={0 head,1 mid,2 tail}.
+// Cascade API (aie_kernels/aie2/cascade_mm.cc + aie2p_streams.h): put_mcd(v16acc32)/
+// get_scd_v16acc32(), one 512-bit beat = 16 acc32, mmul<4,16,16> = 64 acc32 = 4 beats
+// per accumulator, 16 beats for the four. aie.cascade_flow(src,dst) wires the link.
+// Build -DROLE={0 head,1 mid,2 tail,3 solo(no cascade)} -DINNER=<reuse passes>.
 #include <aie_api/aie.hpp>
 
-#ifndef KSLICE
-#define KSLICE 16          // 16x16 mmul steps this core contracts (its K-slice)
-#endif
 #ifndef INNER
-#define INNER 0            // extra reuse passes over the resident K-slice (compute knob:
-#endif                     // isolates the array's compute rate from the weight feed)
+#define INNER 0            // reuse passes of the resident tile (compute-rate knob)
+#endif
 #ifndef ROLE
-#define ROLE 2             // 0=head (put only), 1=middle (get+put), 2=tail (get, store C)
+#define ROLE 2             // 0=head, 1=mid, 2=tail (stores C), 3=solo (no cascade)
 #endif
 
 using MMUL = aie::mmul<4, 16, 16, int8, int4>;
-using ACC = aie::accum<acc32, MMUL::size_C>;   // 4*16 = 64 acc32 partial C
-static constexpr int BEATS = MMUL::size_C / 16;  // cascade beats (16 acc32 each)
+using ACC = aie::accum<acc32, MMUL::size_C>;   // 64 acc32 = one M-block partial
+static constexpr int MB = 4;                    // M-blocks (accumulators) per core
+static constexpr int BEATS = MMUL::size_C / 16; // cascade beats per accumulator (4)
 
-// Load helpers: A tile / packed-int4 W tile j (weight stride is in BYTES on the int8
-// buffer, then reinterpret — int4* arithmetic is byte-addressed, the R3a fix).
-static inline aie::vector<int8, MMUL::size_A> ldA(const int8 *pA, int j) {
-  return aie::load_v<MMUL::size_A>(pA + j * MMUL::size_A);
-}
-static inline aie::vector<int4, MMUL::size_B> ldW(const int8 *wbytes, int j) {
-  return aie::load_v<MMUL::size_B>(reinterpret_cast<const int4 *>(wbytes + j * (MMUL::size_B / 2)));
-}
+struct Partials { ACC c[MB]; };
 
-// This core's K-slice partial. Four NAMED accumulators (independent dependency
-// chains) reach II=1 — a single accumulator serializes on mac latency (~5x slower).
-// The four (a_i, b_i) K-tiles are loaded ONCE into registers and reused INNER times
-// (pure register macs — reloading from L1 each mac is load-bound, the ~5-TOPS trap),
-// which isolates the array's compute rate from the DDR weight feed. The four K-slice
-// partials are summed before the cascade transfer.
-static inline ACC kslice_partial(const int8 *__restrict pA, const int8 *__restrict wbytes) {
-  aie::vector<int8, MMUL::size_A> a0 = ldA(pA, 0), a1 = ldA(pA, 1), a2 = ldA(pA, 2), a3 = ldA(pA, 3);
-  aie::vector<int4, MMUL::size_B> b0 = ldW(wbytes, 0), b1 = ldW(wbytes, 1), b2 = ldW(wbytes, 2), b3 = ldW(wbytes, 3);
+// Four M-block partials: a0..a3 (4 M rows) x one shared resident weight tile b,
+// reused INNER+1 times in four independent chains -> II=1. (R2a's recipe.)
+static inline Partials compute(const int8 *__restrict pA, const int8 *__restrict wbytes) {
+  aie::vector<int8, MMUL::size_A> a0 = aie::load_v<MMUL::size_A>(pA);
+  aie::vector<int8, MMUL::size_A> a1 = aie::load_v<MMUL::size_A>(pA + MMUL::size_A);
+  aie::vector<int8, MMUL::size_A> a2 = aie::load_v<MMUL::size_A>(pA + 2 * MMUL::size_A);
+  aie::vector<int8, MMUL::size_A> a3 = aie::load_v<MMUL::size_A>(pA + 3 * MMUL::size_A);
+  aie::vector<int4, MMUL::size_B> b = aie::load_v<MMUL::size_B>(reinterpret_cast<const int4 *>(wbytes));
   MMUL c0, c1, c2, c3;
-  c0.mul(a0, b0);
-  c1.mul(a1, b1);
-  c2.mul(a2, b2);
-  c3.mul(a3, b3);
+  c0.mul(a0, b);
+  c1.mul(a1, b);
+  c2.mul(a2, b);
+  c3.mul(a3, b);
   for (int r = 0; r < INNER; r++)
       chess_prepare_for_pipelining {
-    c0.mac(a0, b0);
-    c1.mac(a1, b1);
-    c2.mac(a2, b2);
-    c3.mac(a3, b3);
+    c0.mac(a0, b);
+    c1.mac(a1, b);
+    c2.mac(a2, b);
+    c3.mac(a3, b);
   }
-  return add(add(c0.to_accum(), c1.to_accum()), add(c2.to_accum(), c3.to_accum()));
+  return {{c0.to_accum(), c1.to_accum(), c2.to_accum(), c3.to_accum()}};
 }
 
-static inline void cascade_put(ACC acc) {
+static inline void put_acc(ACC acc) {
 #pragma unroll
   for (int i = 0; i < BEATS; i++)
     put_mcd(acc.template extract<16>(i).to_native());
 }
-
-static inline ACC cascade_get() {
+static inline ACC get_acc() {
   ACC acc;
 #pragma unroll
   for (int i = 0; i < BEATS; i++)
     acc.insert(i, aie::accum<acc32, 16>(get_scd_v16acc32()));
   return acc;
 }
+static inline void store4(int32 *pC, Partials p) {
+#pragma unroll
+  for (int m = 0; m < MB; m++)
+    aie::store_v(pC + m * MMUL::size_C, p.c[m].to_vector<int32>());
+}
 
-#if ROLE == 0   // HEAD: seed the cascade with this slice's partial.
+#if ROLE == 0   // HEAD: seed the cascade with the four partials.
 extern "C" void r5_cascade_head(const int8 *__restrict pA, const int8 *__restrict wbytes) {
-  cascade_put(kslice_partial(pA, wbytes));
+  Partials p = compute(pA, wbytes);
+#pragma unroll
+  for (int m = 0; m < MB; m++) put_acc(p.c[m]);
 }
-#elif ROLE == 1 // MIDDLE: add cascade-in + this slice, pass on.
+#elif ROLE == 1 // MIDDLE: add cascade-in + local partials, pass on.
 extern "C" void r5_cascade_mid(const int8 *__restrict pA, const int8 *__restrict wbytes) {
-  ACC sum = add(cascade_get(), kslice_partial(pA, wbytes));
-  cascade_put(sum);
+  Partials p = compute(pA, wbytes);
+#pragma unroll
+  for (int m = 0; m < MB; m++) put_acc(add(get_acc(), p.c[m]));
 }
-#elif ROLE == 2 // TAIL: add cascade-in + this slice, STORE C once.
+#elif ROLE == 2 // TAIL: add cascade-in + local partials, STORE C once.
 extern "C" void r5_cascade_tail(const int8 *__restrict pA, const int8 *__restrict wbytes,
                                 int32 *__restrict pC) {
-  ACC sum = add(cascade_get(), kslice_partial(pA, wbytes));
-  aie::store_v(pC, sum.to_vector<int32>());
+  Partials p = compute(pA, wbytes);
+  Partials out;
+#pragma unroll
+  for (int m = 0; m < MB; m++) out.c[m] = add(get_acc(), p.c[m]);
+  store4(pC, out);
 }
-#else           // STANDALONE (diagnostic): compute + store, NO cascade op.
+#else           // SOLO (diagnostic): compute + store, NO cascade.
 extern "C" void r5_cascade_solo(const int8 *__restrict pA, const int8 *__restrict wbytes,
                                 int32 *__restrict pC) {
-  aie::store_v(pC, kslice_partial(pA, wbytes).to_vector<int32>());
+  store4(pC, compute(pA, wbytes));
 }
 #endif
