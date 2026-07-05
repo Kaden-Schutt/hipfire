@@ -20,3 +20,20 @@ HIPFIRE_FORWARD_LOWERED oracle (single-GPU) + EP-decode byte-identity → GPU.
 - [x] EP executor mesh-driven: run_layer_program_ep takes &DeviceMesh, all-reduce group from group_along(Ep,..). a3cd931c. Byte-identical (1xN group == 0..n, unit-tested).
 - [x] resolve_mesh(pp,tp,emulate) -> DeviceMesh producer + tests (config.rs). Replaces flat resolve_parallelism as daemon adopts mesh routing.
 - [ ] Unify single-GPU run_layer_program + EP entry into ONE run_layer_program(mesh,..) — param reconciliation (single needs ctx, EP needs partials); single-GPU MoE != EP-1-rank MoE so it is a router. Hot-path → GPU oracle validation. NEXT.
+
+## Validation summary (Phase 0 + 0b foundation)
+- Phase 0 crate extraction: coherence-gate CLEAN on GPU (fluent qwen35 matrix, no hard errors).
+- Mesh-driven EP executor: `ep_decode_parity` tp=1 ANCHOR PASS — EP argmax stream == production forward_scratch on qwen3.6-35b-a3b (GPU-confirmed byte-identical, HEAD 5f4b581c).
+- DeviceMesh + resolve_mesh: 13 unit tests (8 mesh + 5 config), no GPU.
+- Every commit builds; daemon chain clean.
+=> Foundation is a clean, GPU-validated, self-contained PR unit (Phase 0 + 0b-foundation).
+
+## Remaining (multi-session, each a GPU-gated PR per the plan):
+- 0b finish: single-GPU + EP entry-point merge (hot path; needs HIPFIRE_FORWARD_LOWERED oracle).
+- Phase 1a: CollectiveHint derived-from-ShardPolicy (needs manifest) + n_rows IR.
+- Phase 1b/1c: PP band→BandXfer + PP oracle; llama PP walking skeleton.
+- Phase 2: weight/state manifests + mesh-driven fulfill_manifest.
+- Phase 3: WeightStore/StateStore + ModelParallel/ArchDispatch (hoist god-struct out of daemon example).
+- Phase 4: qwen2 ForwardBindings reach.
+- Phase 5/5a/5b: live head-axis TP + DeltaNet head-shard + emulation heterogeneity + ragged/mixed-arch.
+- Phase 6: Tier-2 slot-binding (optional). Phase 7: initiate follow-ups (spec-decode/VL/TP tracks).
