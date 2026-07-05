@@ -79,6 +79,59 @@ pub fn layer_collectives(manifest: &[WeightEntry]) -> Vec<(usize, CollectiveHint
         .collect()
 }
 
+/// Validate a manifest against a mesh at **load time** (the plan's shape-only
+/// safety, §6): every dim/head count a policy shards must divide evenly by its
+/// group size, and every `Tied` source must name a real entry. Catches TP
+/// shard-math bugs (a wrong-but-legal inner dim) as a load-time `Err` instead
+/// of a token-1 GPU page fault. Pure CPU — no upload needed.
+pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<(), String> {
+    let tp = mesh.size_of(DimKind::Tp);
+    let names: std::collections::HashSet<&str> = manifest.iter().map(|e| e.name.as_str()).collect();
+    for e in manifest {
+        let ctx = || format!("{}[layer {:?}]", e.name, e.layer);
+        match &e.policy {
+            ShardPolicy::ColumnShard { axis } | ShardPolicy::RowShard { axis } => {
+                let dim = e.logical_shape.get(*axis).copied().unwrap_or(0);
+                if tp > 1 && dim % tp != 0 {
+                    return Err(format!(
+                        "{}: shard dim {dim} (axis {axis}) not divisible by Tp={tp}",
+                        ctx()
+                    ));
+                }
+            }
+            ShardPolicy::FusedQkv {
+                q_heads, kv_heads, ..
+            } => {
+                if tp > 1 && (q_heads % tp != 0 || kv_heads % tp != 0) {
+                    return Err(format!(
+                        "{}: q_heads={q_heads}/kv_heads={kv_heads} not divisible by Tp={tp}",
+                        ctx()
+                    ));
+                }
+            }
+            ShardPolicy::HeadSharded { n_heads, .. } => {
+                if tp > 1 && n_heads % tp != 0 {
+                    return Err(format!(
+                        "{}: n_heads={n_heads} not divisible by Tp={tp}",
+                        ctx()
+                    ));
+                }
+            }
+            ShardPolicy::Tied { source } => {
+                if !names.contains(source.as_str()) {
+                    return Err(format!(
+                        "{}: Tied source '{source}' has no manifest entry",
+                        ctx()
+                    ));
+                }
+            }
+            // Replicate / ExpertSharded (Stride tolerates uneven) / Pin / Vocab: no divisibility gate.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Non-layer placement targets (resolved against the mesh, not hardcoded).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PinTarget {
@@ -242,6 +295,51 @@ mod tests {
         );
         assert_eq!(l.layer, Some(3));
         assert!(matches!(l.policy, ShardPolicy::RowShard { axis: 1 }));
+    }
+
+    #[test]
+    fn validate_manifest_catches_indivisible_and_dangling() {
+        let tp3 = DeviceMesh::rect(&[(DimKind::Tp, 3)]);
+        // 8 not divisible by Tp=3 → error at load.
+        let bad = vec![WeightEntry::layer(
+            "wo",
+            0,
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::RowShard { axis: 1 },
+        )];
+        assert!(validate_manifest(&bad, &tp3).is_err());
+        // Divisible (Tp=2) → ok.
+        let tp2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        assert!(validate_manifest(&bad, &tp2).is_ok());
+        // Dangling Tied source → error.
+        let dangling = vec![WeightEntry::model(
+            "lm_head",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "nope".into(),
+            },
+        )];
+        assert!(validate_manifest(&dangling, &DeviceMesh::single()).is_err());
+        // Tied to a present entry → ok.
+        let tied_ok = vec![
+            WeightEntry::model(
+                "token_embd",
+                vec![8, 8],
+                DType::F16,
+                ShardPolicy::Pin(PinTarget::Embed),
+            ),
+            WeightEntry::model(
+                "lm_head",
+                vec![8, 8],
+                DType::F16,
+                ShardPolicy::Tied {
+                    source: "token_embd".into(),
+                },
+            ),
+        ];
+        assert!(validate_manifest(&tied_ok, &tp2).is_ok());
     }
 
     #[test]
