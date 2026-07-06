@@ -2,7 +2,7 @@
 
 > Revised after a 3-reviewer adversarial pass (correctness, completeness, phasing). Findings integrated; two reviewer claims rejected with evidence (noted inline); the "maximal transparency" ambition kept but made reachable via explicit prerequisite phases.
 
-> ⚠️ **PIVOT (2026-07-06) — READ `## PIVOT` BELOW FIRST.** The master merge (`5b95cbd3`, 519 commits) landed master's new `dense_forward`→`execute_steps` dense spine (commit `2a41f98f`) and **reverted** this branch's `3a3c60e5` (qwen2 → `run_layer_program_mesh`). The plan's central §1 thesis — "ONE executor = `run_layer_program(mesh, gpus, …)`" on the `SuperOp`/`ForwardBindings` path — is **superseded**: the real universal chokepoint is `execute_steps` (63 call sites vs `run_layer_program`'s 7). The new spine is **`execute_steps(mesh, gpus, …)`**. Sections §0a/§0b(crate)/§4(loader)/§5/§6 and the mesh-tree/manifest/safety design **remain valid**; §1, §3's SuperOp framing, and the phase table are re-sequenced in `## PIVOT`. Everything below the PIVOT section is the original design record, kept for provenance.
+> ⚠️ **PIVOT (2026-07-06) — READ `## PIVOT` BELOW FIRST.** The master merge (`5b95cbd3`, 519 commits) landed master's new `dense_forward`→`execute_steps` dense spine (commit `2a41f98f`) and **reverted** this branch's `3a3c60e5` (qwen2 → `run_layer_program_mesh`). The plan's central §1 thesis — "ONE executor = `run_layer_program(mesh, gpus, …)`" on the `SuperOp`/`ForwardBindings` path — is **superseded**: the real universal chokepoint is `execute_steps` (63 call sites vs `run_layer_program`'s ~4 direct, 9 incl. `_ep`/`_mesh`). The new spine is **`execute_steps(mesh, gpus, …)`**. Sections §0a/§0b(crate)/§4(loader)/§5/§6 and the mesh-tree/manifest/safety design **remain valid**; §1, §3's SuperOp framing, and the phase table are re-sequenced in `## PIVOT`. Everything below the PIVOT section is the original design record, kept for provenance.
 
 ## IMPLEMENTATION STATUS (2026-07-05, branch `feature/device-mesh`, 26 commits, all green)
 
@@ -33,7 +33,7 @@ The 519-commit master merge (`5b95cbd3`) invalidated the plan's executor assumpt
   | Spine | Op IR | Driver | Arches | Call sites |
   |---|---|---|---|---|
   | **A — dense** | `Step` | `dense_forward` → `execute_steps(&mut Gpu)` | llama, qwen2 (+ qwen35 & cohere2moe call `execute_steps` directly) | **63** |
-  | **B — superop** | `SuperOp` | `run_layer_program[_mesh]` via `ForwardBindings` | deepseek4, minimax, lfm2moe | **7** |
+  | **B — superop** | `SuperOp` | `run_layer_program[_mesh]` via `ForwardBindings` | deepseek4, minimax, lfm2moe | **~4** (9 w/ `_ep`/`_mesh`) |
 
 - The device-mesh work built its whole executor (`run_layer_program_mesh`, `superop.rs:457`) on **Spine B**. Master made **Spine A** the dense default. `execute_steps` is the true chokepoint — even Spine B's prefill and `run_layer_program` bottom out in it. **The mesh belongs at `execute_steps`.**
 
@@ -42,7 +42,7 @@ The 519-commit master merge (`5b95cbd3`) invalidated the plan's executor assumpt
 
 **Decisions locked (2026-07-06):**
 - **Grand-unify** — MoE/EP folds into `execute_steps` too. The "live" EP path (`run_layer_program_mesh` EP branch serving deepseek4/minimax) is **this branch's own phase-2 feature work**, not a production contract — free to refactor/retire. One spine, no exceptions.
-- **Big-bang signature change** — flip `execute_steps(&mut Gpu → mesh, gpus)` across all 63 sites at once (every caller passes `DeviceMesh::single()` + the 1-device `Gpus`), then add the sharding. Same for the forward drivers that hold a `&mut Gpu` (`dense_forward`, qwen35 `forward_from_x_gpu`, cohere2moe `decode_step_body`, `superop::prefill_forward`).
+- **Big-bang signature change** — flip `execute_steps(&mut Gpu → mesh, gpus)` across all 63 sites at once (every caller passes `DeviceMesh::single()` + the 1-device `Gpus`), then add the sharding. Same for the forward drivers that hold a `&mut Gpu` (`dense_forward`, qwen35 `forward_from_x_gpu`, cohere2moe `decode_step_body`, `prefill_forward` at `crates/hipfire-runtime/src/llama.rs:1498`). **Path note:** llama lives in **`crates/hipfire-runtime/src/llama.rs`**, not a `hipfire-arch-llama` crate — CLAUDE.md's "one crate per family" blurb misleads here; the bare `llama.rs:NNNN` refs below all mean `crates/hipfire-runtime/src/llama.rs`.
 
 ### The three axes decompose to three homes (the original plan conflated them — that was the error)
 - **PP (inter-layer)** → lives **above** `execute_steps`, at the driver level. This is exactly what `forward_scratch_band(layer_range)` + `Gpus::boundary_copy` already do, **bit-exact** (`llama.rs:4205`, validated `max|Δ|=0`). Generalize that pattern into `dense_forward`; `mesh.stage_for_layer(L)` picks each stage's layer range. **KEEP.**
@@ -231,7 +231,7 @@ Safety lands incrementally: manifest diff (P0), shape-dry-run + NaN-poison (P1b)
 - **Spec-decode (DFlash/MTP/CASK/PFlash):** the unified executor drives the **target forward only**. Drafter-device placement is owned by the separate hetero-pflash-dflash PRD; today `pp>1`/`tp>1` refuse drafters (daemon), and those **refusals are retained** until that PRD lands. This plan must not fight it over `daemon.rs:1858-1926` / `generate_multi`.
 - **VL/multimodal (dots-ocr, qwen35-vl):** vision towers are bespoke hand-forwards that produce no `LayerProgram` and are refused under parallelism. **Out of scope**; arch reach targets text arches (llama, qwen2).
 - **TP vs EP:** today `tp>1` in routing == EP (expert shard). Real row/column TP is greenfield (Phase 5); when it lands the `tp>1→EP` routing must be disambiguated.
-- **cohere2moe (arch 12):** absent in this worktree — dropped from arch-reach claims until the crate lands.
+- **cohere2moe (arch 12):** ~~absent in this worktree — dropped from arch-reach claims until the crate lands.~~ **SUPERSEDED (2026-07-06 pivot):** the `crates/hipfire-arch-cohere2moe` crate IS present post-merge and calls `execute_steps` directly (`forward.rs:267,748`) — it's a P-A driver (`decode_step_body`), in scope.
 
 ## Follow-up tracks (each initiated at Phase 7 — issue + `NEXT-STEPS.md` entry, not silently deferred)
 Once the mesh spine (Phases 0–5b) lands, these are the axes deliberately out of the core plan. Phase 7's job is to *open* them, each with the first step below:

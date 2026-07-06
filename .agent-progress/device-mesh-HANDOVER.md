@@ -83,7 +83,7 @@ a REAL banded PP forward — stage0 embed+band(0..14)/dev0 → `boundary_copy` �
 `execute_steps(gpu: &mut Gpu, …)` → `execute_steps(mesh: &DeviceMesh, gpus: &mut Gpus, …)`
 (`crates/hipfire-dispatch/src/pipeline/steps.rs:600`) across **all 63 call sites** + the forward
 drivers that hold `&mut Gpu` (`dense_forward` `arch_spec.rs:131`, qwen35 `forward_from_x_gpu`,
-cohere2moe `decode_step_body`, `superop::prefill_forward`). Every caller passes `DeviceMesh::single()`.
+cohere2moe `decode_step_body`, `prefill_forward` at `crates/hipfire-runtime/src/llama.rs:1498`). Every caller passes `DeviceMesh::single()`.
 Internally degenerate to `gpus.devices[0]`, **never call `ensure_rank_streams`** (the memset sync→async
 trap). Validate: per-arch committed-token md5 A/B == pre-flip (`HIPFIRE_FORWARD_LOWERED`-style) +
 `coherence-gate.sh`. This threads the mesh to the chokepoint with zero behavior change — the safe

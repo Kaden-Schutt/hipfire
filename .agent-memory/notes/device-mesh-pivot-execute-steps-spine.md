@@ -19,7 +19,7 @@ The master merge (`5b95cbd3`, 519 commits) landed master's NEW dense spine and r
   - Spine A (dense): `Step` IR, `dense_forward`→`execute_steps(&mut Gpu)`, llama+qwen2 (+qwen35/cohere2moe
     call execute_steps directly). **63 call sites.**
   - Spine B (superop): `SuperOp` IR, `run_layer_program[_mesh]` via `ForwardBindings`, deepseek4/minimax/lfm2moe.
-    **7 call sites.**
+    **~4 direct call sites (9 incl. `_ep`/`_mesh`).**
 - The device-mesh executor (`run_layer_program_mesh`, `superop.rs:457`) was built on Spine B. Master made
   Spine A the dense default. `execute_steps` is the true chokepoint (even Spine B prefill + run_layer_program
   bottom out in it). **The mesh belongs at execute_steps.**
@@ -33,7 +33,8 @@ Retire `SuperOp`/`ForwardBindings`/`run_layer_program*` for parallelism; migrate
   ds4/minimax multi-GPU) is OUR phase-2 feature work, not a production contract → free to retire.
 - **Big-bang** — flip `execute_steps(&mut Gpu → mesh, gpus)` across all 63 sites at once (callers pass
   `DeviceMesh::single()`), then add sharding. Same for drivers holding `&mut Gpu` (`dense_forward`, qwen35
-  `forward_from_x_gpu`, cohere2moe `decode_step_body`, `prefill_forward`).
+  `forward_from_x_gpu`, cohere2moe `decode_step_body`, `prefill_forward` @ `crates/hipfire-runtime/src/llama.rs:1498`).
+  NB: llama lives in `crates/hipfire-runtime/src/llama.rs`, NOT a `hipfire-arch-llama` crate (CLAUDE.md misleads).
 
 ## Three axes → three homes (conflating them was the original plan's error)
 - **PP (inter-layer)** = driver level, ABOVE execute_steps. Already = `forward_scratch_band(layer_range)` +
