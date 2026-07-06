@@ -91,6 +91,16 @@ pub enum Step<'a> {
         up: &'a GpuTensor,
         out: &'a GpuTensor,
     },
+    /// In-place residual add: `x += y`. The single-GPU dense forward fuses this
+    /// into `GemvResidual`, but a row-parallel `GemvResidual` would all-reduce
+    /// `(partial + residual)` and sum the residual `tp×`. Under TP the row-parallel
+    /// projection is a plain `Gemv` → all-reduce → this `ResidualAdd`, so the
+    /// residual is added exactly once, after the collective.
+    ResidualAdd {
+        x: &'a GpuTensor,
+        y: &'a GpuTensor,
+        dim: usize,
+    },
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -104,6 +114,7 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::QkNorm { .. } => PipelineOp::QkNorm,
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
         Step::SiluMul { .. } => PipelineOp::SiluMul,
+        Step::ResidualAdd { .. } => PipelineOp::ResidualAdd,
     }
 }
 
@@ -984,6 +995,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             .map_err(|e| DispatchError::Hip(e.to_string())),
         Step::SiluMul { gate, up, out } => gpu
             .silu_mul_f32(gate, up, out)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::ResidualAdd { x, y, dim: _ } => gpu
+            .add_f32(x, y, x)
             .map_err(|e| DispatchError::Hip(e.to_string())),
     }
 }
