@@ -38,7 +38,30 @@ HIPFIRE_FORWARD_LOWERED oracle (single-GPU) + EP-decode byte-identity → GPU.
 - Phase 5/5a/5b: live head-axis TP + DeltaNet head-shard + emulation heterogeneity + ragged/mixed-arch.
 - Phase 6: Tier-2 slot-binding (optional). Phase 7: initiate follow-ups (spec-decode/VL/TP tracks).
 
-## DECISION: literal single-GPU+EP one-signature merge NOT pursued (0b)
+## DECISION (RETRACTED 2026-07-06): the single-GPU+EP merge IS the target
+**Superseded by user directive** — the "keep two mesh-aware executors" compromise
+below was a mistake; it drifted from plan §1 ("exactly ONE executor"). All paths
+must be merged into one `run_layer_program(mesh, gpus, bindings: &mut [B],
+program)`. The original N1 rejection was right about a *bad shape* (a union
+params-struct threaded through every hot-path call site) but wrong to conclude
+"therefore don't merge." The union struct is avoidable — each objection dissolves:
+- **DispatchCtx**: built INSIDE the executor per rank (EP already does this;
+  single-GPU builds it for `devices[0]`) → no longer a param.
+- **partials / residual_dim**: moved BEHIND `ForwardBindings` (the arch already
+  owns its routed-partial scratch for EP) → executor asks the binding, not a param.
+- **run_moe vs run_moe_ep**: an internal branch on `mesh.has_axis(Ep)` — no Ep
+  axis → `dispatch_super_op → run_moe` (byte-identical single-GPU hot path); Ep
+  axis → the zero/run_moe_ep/all-reduce/add path. Exactly plan §1's "per-op branch
+  not taken on 1×1".
+
+So the merged signature carries NO EP-specific params; single-GPU passes a
+1-element `bindings` slice + `DeviceMesh::single()` + a `Gpus` wrapping its one
+`Gpu` (`Gpus::single`, the anticipated "zero runtime cost" Phase-0b refactor).
+Byte-identity guarded by the existing `HIPFIRE_FORWARD_LOWERED=0/1` oracle (single)
++ EP decode byte-identity. Sequencing: see the "Executor merge" plan below.
+
+--- ORIGINAL (retained for history; DO NOT act on it) ---
+### DECISION: literal single-GPU+EP one-signature merge NOT pursued (0b)
 The plan's "ONE run_layer_program(mesh,...)" is served at the module level (both
 executors in dispatch, mesh-driven, sharing dispatch_super_op/ForwardBindings/
 LayerProgram). A literal single-signature merge would need a union params struct

@@ -15,7 +15,7 @@ Plan: docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md
 - a3cd931c EP all-reduce group from mesh.group_along(Ep,..). byte-identical (1×N == 0..n).
 - 5f4b581c resolve_mesh(pp,tp,emulate) → DeviceMesh producer.
 - e66d6f94 stage_for_layer + band_xfer_after (PP side of the mesh).
-- DECISION (610f6f0e): literal single+EP one-signature merge NOT pursued — N1-rejected shape; both executors mesh-aware in dispatch is the unification.
+- DECISION RETRACTED (2026-07-06, user directive): the single+EP merge IS the target — the "keep two executors" compromise (610f6f0e) was a mistake. ONE `run_layer_program(mesh, gpus, bindings: &mut [B], program)`; the N1 union-struct is dissolved (ctx built inside; partials/residual_dim behind ForwardBindings; run_moe vs run_moe_ep = internal `mesh.has_axis(Ep)` branch). See phase0.md "Executor merge" + plan §1.
 
 ### Phase 1a — collective-hint-from-policy (mini-partitioner)
 - e565d110 CollectiveHint + collective_for_policy(&ShardPolicy).
