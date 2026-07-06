@@ -1021,6 +1021,44 @@ extern "C" __global__ void diffusion_layer_norm_rows_f32(
 }
 "#;
 
+pub(crate) const DIFFUSION_RMS_NORM_ROWS_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Weighted RMSNorm, wave-per-row, single reduction pass, no LDS (gfx1103-safe).
+// out[c] = x[c] / sqrt(mean(x^2) + eps) * weight[c]. Matches the CPU
+// rms_norm_3d reference exactly.
+extern "C" __global__ void diffusion_rms_norm_rows_f32(
+    const float* input,
+    const float* weight,
+    float* output,
+    int rows,
+    int cols,
+    float eps
+) {
+    int lane = threadIdx.x & 31;
+    int wave = threadIdx.x >> 5;
+    int row = blockIdx.x * (blockDim.x >> 5) + wave;
+    if (row >= rows) {
+        return;
+    }
+    long base = (long)row * cols;
+
+    float ss = 0.0f;
+    for (int c = lane; c < cols; c += 32) {
+        float v = input[base + c];
+        ss += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_down(ss, off);
+    }
+    float inv_rms = rsqrtf(__shfl(ss, 0) / (float)cols + eps);
+
+    for (int c = lane; c < cols; c += 32) {
+        output[base + c] = input[base + c] * inv_rms * weight[c];
+    }
+}
+"#;
+
 pub(crate) const DIFFUSION_LAYER_NORM_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 

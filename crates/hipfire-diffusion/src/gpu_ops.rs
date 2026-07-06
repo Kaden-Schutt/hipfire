@@ -2105,6 +2105,96 @@ pub(crate) fn linear_resident_weight_hip_on_gpu(
     })
 }
 
+/// Fully resident linear: a resident `GpuTensor` activation × a streaming bf16
+/// `ResidentWeight` -> a resident `GpuTensor` output, with no host round-trip
+/// for the activation. The weight is uploaded once (name-keyed bf16 cache); the
+/// activation stays on-device. Leading dims of `input` are preserved; only the
+/// last dim (`in_features`) is replaced by `out_features`. Requires wave32 WMMA
+/// and 16-aligned `in_features` (the DiT/encoder hidden dims satisfy this).
+#[allow(dead_code)]
+pub(crate) fn linear_resident_weight_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    cache: &mut RocmWeightCache,
+    input: &hipfire_rdna::GpuTensor,
+    weight: &ResidentWeight,
+    bias: Option<&CpuTensor>,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let (out_features, in_features) = match weight.shape() {
+        [out, inf] => (*out, *inf),
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "resident linear weight must be 2-D [out, in], got {other:?}"
+            )))
+        }
+    };
+    let in_dim = input.shape.last().copied().ok_or_else(|| {
+        DiffusionError::InvalidMetadata("resident linear input has no dims".to_string())
+    })?;
+    if in_dim != in_features {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "resident linear input width {in_dim} != weight input width {in_features}"
+        )));
+    }
+    if !(gpu.arch_caps.has_wmma_w32() && in_features % 16 == 0) {
+        return Err(DiffusionError::BackendUnavailable(format!(
+            "resident linear needs wave32 WMMA and 16-aligned in_features (got {in_features})"
+        )));
+    }
+    let total = checked_shape_elements("resident linear input", &input.shape)?;
+    let rows = total / in_features;
+    let mut output_shape = input.shape.clone();
+    *output_shape.last_mut().expect("input has a last dim") = out_features;
+    let output_elements = rows
+        .checked_mul(out_features)
+        .ok_or_else(|| DiffusionError::InvalidMetadata("resident linear size overflows".to_string()))?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    if output_elements == 0 {
+        return Ok(output);
+    }
+    let weight_ptr = cache.resident_bf16_named(gpu, weight)?;
+    let weight_bytes = out_features
+        .checked_mul(in_features)
+        .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
+        .ok_or_else(|| DiffusionError::InvalidMetadata("linear weight size overflows".to_string()))?;
+    let weight_view = hipfire_rdna::GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
+        shape: vec![out_features, in_features],
+        dtype: hipfire_rdna::DType::BF16,
+    };
+    gpu.gemm_bf16_x_bf16_wmma(
+        &weight_view,
+        input,
+        &output,
+        out_features,
+        in_features,
+        rows,
+    )
+    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    if let Some(bias) = bias {
+        let bias_ptr = cache.resident_ptr(gpu, bias)?;
+        let mut bias_args = hip_bridge::KernargBlob::new();
+        bias_args.push_ptr(output.buf.as_ptr());
+        bias_args.push_ptr(bias_ptr);
+        bias_args.push_i32(i32_kernel_dim("linear bias elements", output_elements)?);
+        bias_args.push_i32(i32_kernel_dim("linear out features", out_features)?);
+        bias_args.pad_to(16);
+        let bias_grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+        ensure_and_launch_diffusion_kernel(
+            gpu,
+            "diffusion_row_bias_f32",
+            DIFFUSION_ROW_BIAS_HIP_SRC,
+            "diffusion_row_bias_f32",
+            bias_grid,
+            [256, 1, 1],
+            0,
+            &mut bias_args,
+        )?;
+    }
+    Ok(output)
+}
+
 pub(crate) fn layer_norm_hip_on_gpu(
     gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,
@@ -3800,6 +3890,59 @@ pub(crate) fn layer_norm_resident(
         "diffusion_layer_norm_rows_f32",
         DIFFUSION_LAYER_NORM_ROWS_HIP_SRC,
         "diffusion_layer_norm_rows_f32",
+        grid,
+        [(WAVES_PER_BLOCK * 32) as u32, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
+/// Device-resident weighted RMSNorm over the last dim: consumes and returns a
+/// resident `GpuTensor`, keeping the activation on-device (the DiT norm was a
+/// pure-CPU op that round-tripped every call). `out = x/sqrt(mean(x^2)+eps) * w`.
+#[allow(dead_code)]
+pub(crate) fn rms_norm_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    cache: &mut RocmWeightCache,
+    input: &hipfire_rdna::GpuTensor,
+    weight: &CpuTensor,
+    eps: f32,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let width = input.shape.last().copied().ok_or_else(|| {
+        DiffusionError::InvalidMetadata("rms_norm input must have at least one dim".to_string())
+    })?;
+    if weight.shape.as_slice() != [width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "rms_norm weight shape {:?} does not match width {width}",
+            weight.shape
+        )));
+    }
+    let output_elements = checked_shape_elements("rms_norm output", &input.shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &input.shape)?;
+    if output_elements == 0 || width == 0 {
+        return Ok(output);
+    }
+    let weight_ptr = cache.resident_ptr(gpu, weight)?;
+    let rows = output_elements / width;
+    const WAVES_PER_BLOCK: usize = 8;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(weight_ptr);
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("rms_norm rows", rows)?);
+    kernargs.push_i32(i32_kernel_dim("rms_norm width", width)?);
+    kernargs.push_f32(eps);
+    kernargs.pad_to(16);
+    let blocks = rows.div_ceil(WAVES_PER_BLOCK);
+    let grid = [i32_kernel_dim("rms_norm grid", blocks)? as u32, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_rms_norm_rows_f32",
+        DIFFUSION_RMS_NORM_ROWS_HIP_SRC,
+        "diffusion_rms_norm_rows_f32",
         grid,
         [(WAVES_PER_BLOCK * 32) as u32, 1, 1],
         0,
