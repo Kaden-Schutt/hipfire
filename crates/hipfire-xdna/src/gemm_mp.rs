@@ -274,4 +274,41 @@ impl NpuGemmMp {
     pub fn read_shared_rowmajor(&self, n: usize, c: &mut [i32]) {
         self.read_c_tile(0, n, c);
     }
+
+    /// Byte size the input buffer must be for one dispatch's A: `rows_per_dispatch()·K`
+    /// int8. The `a_buf` block layout is *exactly* row-major `A[rows_per][K]` (the COLS
+    /// M-blocks are contiguous M-rows), so a producer writes A with no reshuffle.
+    pub fn a_buf_bytes(&self) -> usize {
+        self.rows_per_dispatch() * self.k()
+    }
+
+    /// Replace the SHMEM input buffer with an imported GPU dma-buf (zero-copy input). After
+    /// this, a producer (the GPU, or the CPU on this UMA APU) writes one M-block of A —
+    /// row-major `A[rows_per][K]` int8 — into the shared pages, and [`Self::run_shared`]
+    /// dispatches with no host A-copy. `size` must be [`Self::a_buf_bytes`].
+    pub fn attach_input_dmabuf(&mut self, fd: i32, size: usize) -> Result<(), XdnaError> {
+        assert_eq!(size, self.a_buf_bytes(), "input dma-buf size");
+        self.a_buf = self.kernel.import_dmabuf(fd, size, true)?;
+        Ok(())
+    }
+
+    /// Fully zero-copy dispatch of ONE M-block: A is already in the attached input dma-buf
+    /// (written by the producer) and C goes to the attached output dma-buf — **no host
+    /// copies at all**. Requires [`Self::attach_input_dmabuf`] + [`Self::attach_output_dmabuf`]
+    /// + [`Self::load_weights`]. (`submit` still flushes the arg BOs, which reconciles the
+    /// shared pages across engines.)
+    pub fn run_shared(&mut self, k: usize, n: usize) -> Result<(), XdnaError> {
+        assert!(self.w_loaded, "call load_weights() before run_shared()");
+        assert_eq!(k, self.k(), "K");
+        assert_eq!(n, self.n(), "N");
+        self.kernel
+            .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])
+    }
+
+    /// Host view of the input dma-buf as one row-major `rows_per × K` int8 M-block — for a
+    /// CPU producer / validation to fill A directly on this UMA APU.
+    pub fn input_slice_mut(&mut self) -> &mut [i8] {
+        let s = self.a_buf.as_mut_slice();
+        unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut i8, s.len()) }
+    }
 }
