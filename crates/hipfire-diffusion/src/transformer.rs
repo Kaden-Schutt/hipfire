@@ -695,6 +695,33 @@ impl NativeTransformerBlockModulation {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
         let _ = runtime_context;
+        self.krea_scale_shift(time_modulation)
+    }
+
+    /// Test-only: Krea modulation with just a scale_shift_table `[6, hidden]`.
+    #[cfg(test)]
+    pub(crate) fn krea_for_test(hidden_width: usize, table: &[f32]) -> Self {
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            hidden_width,
+            img_mod_weight: None,
+            img_mod_bias: None,
+            txt_mod_weight: None,
+            txt_mod_bias: None,
+            scale_shift_table: Some(CpuTensor {
+                shape: vec![6, hidden_width],
+                data: table.to_vec(),
+            }),
+        }
+    }
+
+    /// CPU-only Krea adaLN chunks: `[batch, chunks, hidden]` = broadcast add of
+    /// `scale_shift_table[chunk, hidden]` to the reshaped `time_modulation`.
+    pub(crate) fn krea_scale_shift(
+        &self,
+        time_modulation: &CpuTensor,
+    ) -> DiffusionResult<CpuTensor> {
         let table = self.scale_shift_table.as_ref().ok_or_else(|| {
             DiffusionError::InvalidMetadata("Krea transformer scale_shift_table is missing".into())
         })?;
@@ -1910,6 +1937,35 @@ impl NativeTransformerFeedForward {
             .forward_with_runtime_context(hidden, runtime_context)
     }
 
+    /// Test-only: Krea SwiGLU FFN wrapping an image stream.
+    #[cfg(test)]
+    pub(crate) fn krea_swiglu_for_test(
+        hidden: usize,
+        inner: usize,
+        up: &[f32],
+        gate: &[f32],
+        down: &[f32],
+    ) -> Self {
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            hidden_width: hidden,
+            image: TransformerFeedForwardStream::swiglu_for_test(hidden, inner, up, gate, down),
+            text: None,
+        }
+    }
+
+    /// Fully resident image-stream FFN forward.
+    #[allow(dead_code)]
+    pub(crate) fn forward_image_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        self.image.forward_resident(hidden, gpu, cache)
+    }
+
     pub(crate) fn forward_text_with_runtime_context(
         &self,
         hidden: &CpuTensor,
@@ -2035,6 +2091,91 @@ impl NativeTransformerBlock {
             .feed_forward
             .forward_image_with_runtime_context(&ff_input, runtime_context)?;
         gated_residual_3d(&hidden, &feed_forward, &postgate)
+    }
+
+    /// Test-only: assemble a minimal Krea2 block from constructed parts.
+    #[cfg(test)]
+    pub(crate) fn krea_for_test(
+        modulation: NativeTransformerBlockModulation,
+        attention: NativeTransformerAttentionProjection,
+        feed_forward: NativeTransformerFeedForward,
+        norm1: CpuTensor,
+        norm2: CpuTensor,
+    ) -> Self {
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            modulation,
+            attention,
+            feed_forward,
+            norm1_weight: Some(norm1),
+            norm2_weight: Some(norm2),
+        }
+    }
+
+    /// Fully device-resident Krea2 block forward: resident hidden in/out, no host
+    /// round-trip for the per-token activation. The six small adaLN chunks are
+    /// computed on CPU and uploaded once. Mirrors forward_krea_with_runtime_context.
+    #[allow(dead_code)]
+    pub(crate) fn forward_krea_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        time_modulation: &CpuTensor,
+        rotary: Option<&RotaryFrequencies>,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        if !matches!(self.family, TransformerDenoiserFamily::Krea2) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer block {} family {:?} is not Krea2-style",
+                self.block_index, self.family
+            )));
+        }
+        let norm1_weight = self.norm1_weight.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("Krea transformer block norm1 weight is missing".into())
+        })?;
+        let norm2_weight = self.norm2_weight.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("Krea transformer block norm2 weight is missing".into())
+        })?;
+        // adaLN chunks (CPU) -> upload the six [batch, width] tensors once.
+        let modulation = self.modulation.krea_scale_shift(time_modulation)?;
+        let mut upload = |i: usize| -> DiffusionResult<hipfire_rdna::GpuTensor> {
+            let chunk = extract_modulation_chunk_2d(&modulation, i)?;
+            gpu.upload_f32(&chunk.data, &chunk.shape)
+                .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))
+        };
+        let prescale = upload(0)?;
+        let preshift = upload(1)?;
+        let pregate = upload(2)?;
+        let postscale = upload(3)?;
+        let postshift = upload(4)?;
+        let postgate = upload(5)?;
+
+        // Attention: modulate(rms_norm(norm1)) -> attn -> gated residual.
+        let normed1 = rms_norm_resident(gpu, cache, hidden, norm1_weight, 1e-5)?;
+        let attn_input = modulate_3d_resident(gpu, &normed1, &preshift, &prescale)?;
+        free_resident(gpu, normed1)?;
+        let attention = self
+            .attention
+            .attend_krea_self_gated_resident(&attn_input, rotary, gpu, cache)?;
+        free_resident(gpu, attn_input)?;
+        let hidden2 = gated_residual_3d_resident(gpu, hidden, &attention, &pregate)?;
+        free_resident(gpu, attention)?;
+
+        // FFN: modulate(rms_norm(norm2)) -> ffn -> gated residual.
+        let normed2 = rms_norm_resident(gpu, cache, &hidden2, norm2_weight, 1e-5)?;
+        let ff_input = modulate_3d_resident(gpu, &normed2, &postshift, &postscale)?;
+        free_resident(gpu, normed2)?;
+        let feed_forward = self.feed_forward.forward_image_resident(&ff_input, gpu, cache)?;
+        free_resident(gpu, ff_input)?;
+        let out = gated_residual_3d_resident(gpu, &hidden2, &feed_forward, &postgate)?;
+        free_resident(gpu, hidden2)?;
+        free_resident(gpu, feed_forward)?;
+
+        for chunk in [prescale, preshift, pregate, postscale, postshift, postgate] {
+            free_resident(gpu, chunk)?;
+        }
+        Ok(out)
     }
 
     pub(crate) fn forward_qwen_with_runtime_context(
