@@ -2066,6 +2066,55 @@ fn ds4_moe_block_core(
     Ok(())
 }
 
+/// ds4's per-rank adapter for [`Gpus::ep_moe_allreduce`]'s phase-tagged closure.
+///
+/// - `RunOwned`: shared expert (`ffn_stub`, replicated into `state.ffn_out`) +
+///   owned routed experts → the zeroed `partial`; the HC mix is DEFERRED.
+/// - `AddResidual`: `ffn_out += all_reduced_partial` (→ shared + routed), then
+///   the deferred `hc_ffn_mix` folds it into `residual_streams`.
+///
+/// Same two operations as the retired `Deepseek4Bindings::{run_moe_ep,
+/// ep_add_into_residual}` — byte-identical, just off the SuperOp trait.
+#[allow(clippy::too_many_arguments)]
+fn ds4_ep_moe_rank(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+    skip_ffn: bool,
+    partial: &GpuTensor,
+    phase: hipfire_runtime::multi_gpu::EpMoePhase,
+) -> Result<(), hip_bridge::HipError> {
+    use hipfire_runtime::multi_gpu::EpMoePhase;
+    match phase {
+        EpMoePhase::RunOwned => ds4_moe_block_core(
+            cfg,
+            weights,
+            state,
+            gpu,
+            layer_idx,
+            token_id,
+            skip_ffn,
+            Some(partial),
+            /*do_mix=*/ false,
+        )
+        .map_err(|s| hip_bridge::HipError::new(0, &s)),
+        EpMoePhase::AddResidual => {
+            {
+                let ffn_out = state.ffn_out.as_ref().ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "ds4 ep_add_into_residual: ffn_out unset")
+                })?;
+                gpu.add_inplace_f32(ffn_out, partial)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            }
+            hc_ffn_mix(cfg, weights, state, gpu, layer_idx)
+                .map_err(|s| hip_bridge::HipError::new(0, &s))
+        }
+    }
+}
+
 /// Per-layer execution context for the lowered decode path (rebuilt each layer).
 struct Deepseek4Bindings<'a> {
     cfg: &'a DeepseekV4Config,
@@ -2361,24 +2410,42 @@ pub fn forward_ep(
         })
         .unwrap_or(false);
     let t_layers = std::time::Instant::now();
-    let program = ds4_lower_program();
+    let group: Vec<usize> = (0..n).collect();
     for l in 0..cfg.num_hidden_layers {
-        {
-            let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
-            for (r, st) in state_per_rank.iter_mut().enumerate() {
-                binds.push(Deepseek4Bindings {
-                    cfg,
-                    weights: &weights_per_rank[r],
-                    state: st,
-                    layer_idx: l,
-                    position,
-                    token_id: token,
-                    skip_ffn,
-                });
-            }
-            hipfire_runtime::ep::run_layer_program_ep(&hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(hipfire_runtime::multi_gpu::DimKind::Ep, partials.len())]), gpus, binds.as_mut_slice(), partials, &program, hidden)
-                .map_err(|e| format!("ds4 forward_ep run_layer_program_ep L{l}: {e}"))?;
+        // Attend replicated: every rank holds full MLA weights + full KV, so the
+        // per-rank attention is a deterministic function of replicated inputs
+        // and stays bit-identical across ranks (the only EP divergence is Moe).
+        for r in 0..n {
+            gpus.devices[r]
+                .bind_thread()
+                .map_err(|e| format!("ds4 forward_ep attn bind {r} L{l}: {e:?}"))?;
+            ds4_attn_block(
+                cfg,
+                &weights_per_rank[r],
+                &mut state_per_rank[r],
+                &mut gpus.devices[r],
+                l,
+                position,
+            )
+            .map_err(|e| format!("ds4 forward_ep attn L{l} r{r}: {e}"))?;
         }
+        // Moe all-reduce EP: each rank runs its owned routed experts (+ the
+        // replicated shared expert) into a partial, the partials all-reduce over
+        // the Ep group, and each rank folds the reduced routed sum into residual.
+        gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
+            ds4_ep_moe_rank(
+                cfg,
+                &weights_per_rank[r],
+                &mut state_per_rank[r],
+                gpu,
+                l,
+                token,
+                skip_ffn,
+                partial,
+                phase,
+            )
+        })
+        .map_err(|e| format!("ds4 forward_ep ep_moe_allreduce L{l}: {e}"))?;
         if dump_pos_hit {
             for r in 0..n {
                 gpus.devices[r]
@@ -3038,21 +3105,21 @@ pub fn mtp_forward_ep(
     //    + routed ffn_routed→partial; the executor all-reduces the partial;
     //    ep_add_into_residual = ffn_out += partial, then hc_ffn_mix.
     {
-        let program = vec![ds4_superop(SuperOpKind::Moe)];
-        let mut binds: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
-        for (r, st) in state_per_rank.iter_mut().enumerate() {
-            binds.push(Deepseek4Bindings {
+        let group: Vec<usize> = (0..n).collect();
+        gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
+            ds4_ep_moe_rank(
                 cfg,
-                weights: &weights_per_rank[r],
-                state: st,
-                layer_idx: mtp_layer_idx,
-                position,
-                token_id: next_token,
-                skip_ffn: false,
-            });
-        }
-        hipfire_runtime::ep::run_layer_program_ep(&hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(hipfire_runtime::multi_gpu::DimKind::Ep, partials.len())]), gpus, binds.as_mut_slice(), partials, &program, hidden)
-            .map_err(|e| format!("mtp_forward_ep run_layer_program_ep: {e}"))?;
+                &weights_per_rank[r],
+                &mut state_per_rank[r],
+                gpu,
+                mtp_layer_idx,
+                next_token,
+                /*skip_ffn=*/ false,
+                partial,
+                phase,
+            )
+        })
+        .map_err(|e| format!("mtp_forward_ep ep_moe_allreduce: {e}"))?;
     }
 
     // 3. Per-rank capture (residual_streams → mtp_last_hidden), replicated.

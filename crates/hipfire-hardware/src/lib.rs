@@ -736,6 +736,95 @@ impl Gpus {
         }
         Ok(())
     }
+
+    /// Expert-parallel MoE all-reduce collective — the one device-mesh EP
+    /// primitive. One MoE layer across `group.len()` ranks:
+    ///
+    /// 1. zero each rank's routed partial on its active stream,
+    /// 2. `moe_rank(gpu_r, r, partial_r, RunOwned)` writes rank r's
+    ///    owned-expert contribution into `partial_r`,
+    /// 3. all-reduce-sum the partials over `group` (peer-direct if
+    ///    `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1`, else RCCL),
+    /// 4. `moe_rank(gpu_r, r, partial_r, AddResidual)` folds the reduced partial
+    ///    back into rank r's residual stream.
+    ///
+    /// `partials[k]` is a zeroable f32 buffer of `residual_dim` elements on
+    /// `self.devices[group[k]]`; this call owns its zero/reduce lifecycle so the
+    /// arch closure only writes/reads it. Every participating device must have an
+    /// `active_stream` set. A SINGLE `FnMut` (phase-tagged) sidesteps the
+    /// two-closures-both-borrow-`state` problem: run-owned and add-residual both
+    /// need `&mut` the same per-rank arch state, so they share one closure.
+    pub fn ep_moe_allreduce(
+        &mut self,
+        group: &[usize],
+        partials: &[GpuTensor],
+        residual_dim: usize,
+        mut moe_rank: impl FnMut(&mut Gpu, usize, &GpuTensor, EpMoePhase) -> HipResult<()>,
+    ) -> HipResult<()> {
+        let g = group.len();
+        debug_assert_eq!(
+            partials.len(),
+            g,
+            "ep_moe_allreduce: partials/group mismatch"
+        );
+        // 1. zero each rank's partial on its stream
+        for k in 0..g {
+            let r = group[k];
+            self.devices[r].bind_thread()?;
+            let stream = self.devices[r].active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("ep_moe_allreduce: device {r} has no active_stream"),
+                )
+            })?;
+            self.devices[r]
+                .hip
+                .memset_async(&partials[k].buf, 0, residual_dim * 4, stream)?;
+        }
+        // 2. owned-expert partial (the arch runs shared+routed; shared stays
+        //    replicated outside the partial, routed lands in it)
+        for k in 0..g {
+            let r = group[k];
+            self.devices[r].bind_thread()?;
+            let partial = &partials[k];
+            moe_rank(&mut self.devices[r], r, partial, EpMoePhase::RunOwned)?;
+        }
+        // 3. all-reduce over the group
+        let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+        if ep_peer_allreduce_decode() {
+            self.all_reduce_sum_f32_peer(group, &refs, residual_dim)?;
+        } else {
+            self.all_reduce_sum_f32(group, &refs, residual_dim)?;
+        }
+        // 4. fold the reduced partial into each rank's residual
+        for k in 0..g {
+            let r = group[k];
+            self.devices[r].bind_thread()?;
+            let partial = &partials[k];
+            moe_rank(&mut self.devices[r], r, partial, EpMoePhase::AddResidual)?;
+        }
+        Ok(())
+    }
+}
+
+/// Which half of the EP MoE lifecycle an `ep_moe_allreduce` closure call is
+/// serving. A single phase-tagged closure lets the arch reuse one `&mut state`
+/// borrow across both the pre-all-reduce owned-expert run and the
+/// post-all-reduce residual fold (two separate closures can't both hold it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EpMoePhase {
+    /// Compute this rank's owned-expert contribution INTO the zeroed partial.
+    RunOwned,
+    /// Fold the all-reduced partial back into this rank's residual stream.
+    AddResidual,
+}
+
+/// `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` selects the RCCL-free peer-direct
+/// all-reduce for the EP MoE collective (no librccl dependency). Cached for
+/// process lifetime.
+fn ep_peer_allreduce_decode() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1"))
 }
 
 fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
