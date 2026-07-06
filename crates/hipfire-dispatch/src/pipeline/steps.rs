@@ -4,6 +4,7 @@
 //! Op-list interpreter. Phase 2a: GEMV + a fused rmsnorm-rotate producer; empty
 //! fusion table (all per-op fallback).
 
+use hipfire_hardware::DeviceMesh;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
@@ -613,6 +614,32 @@ pub fn execute_steps(
         }
     }
     Ok(())
+}
+
+/// Mesh-aware spine (P-A). Threads the device mesh to the dispatch chokepoint so
+/// per-`Step` parallelism (TP in P-B, PP/EP in later phases) can be resolved
+/// here. For the single-device (1×1) mesh it forwards `gpu` unchanged and is
+/// byte-identical to calling [`execute_steps`] directly — this is the
+/// zero-behavior-change foundation the executor half of the pivot builds on.
+///
+/// P-A threads only the mesh (a cheap value) alongside the existing `&mut Gpu`,
+/// so every call site migrates by adding a `mesh` argument with no borrow
+/// rework. The `&mut Gpu` → `&mut Gpus` promotion (for real cross-rank TP)
+/// happens in P-B, where it is bundled with the serve-path `Gpus` hoist and
+/// applied only to the paths that shard.
+pub fn execute_steps_mesh(
+    mesh: &DeviceMesh,
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step],
+) -> Result<(), DispatchError> {
+    debug_assert_eq!(
+        mesh.n_devices(),
+        1,
+        "execute_steps_mesh: only the single (1×1) mesh is supported in P-A; \
+         TP/PP/EP sharding lands in P-B..P-E"
+    );
+    execute_steps(gpu, ctx, steps)
 }
 
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
