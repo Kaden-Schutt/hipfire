@@ -303,7 +303,14 @@ fn run_scoped(
     poll_secs: u64,
     command: &[String],
 ) -> anyhow::Result<i32> {
-    run_scoped_at(&lockfile_path(), label, timeout_secs, poll_secs, command, true)
+    run_scoped_at(
+        &lockfile_path(),
+        label,
+        timeout_secs,
+        poll_secs,
+        command,
+        true,
+    )
 }
 
 /// Core of `lock run`, parameterized on the lockfile path and whether to install
@@ -462,10 +469,8 @@ mod tests {
     use super::*;
 
     fn temp_lock(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-lock-run-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-lock-run-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("gpu.lock")
     }
@@ -498,7 +503,10 @@ mod tests {
         assert!(held.try_lock().unwrap());
 
         let code = run_scoped_at(&path, "waiter", 1, 1, &["true".into()], false).unwrap();
-        assert_eq!(code, 2, "a held lock must make `run` time out, not run the child");
+        assert_eq!(
+            code, 2,
+            "a held lock must make `run` time out, not run the child"
+        );
 
         drop(held);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
