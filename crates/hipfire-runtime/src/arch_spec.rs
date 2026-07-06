@@ -24,8 +24,9 @@
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::pipeline::{execute_steps_mesh, GemvInput, Step};
 use hipfire_dispatch::types::RotationPlan;
+use hipfire_hardware::DeviceMesh;
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Config-derived scalars that parameterize the shared dense forward. Built once
@@ -131,6 +132,10 @@ fn herr(e: impl std::fmt::Display) -> hip_bridge::HipError {
 pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -> HipResult<()> {
     let k = arch.knobs();
     let s = arch.scratch();
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint. Real
+    // mesh resolution replaces this construction in P-B; the executor stays the
+    // shared dense spine (execute_steps_mesh).
+    let mesh = DeviceMesh::single();
 
     for l in 0..arch.n_layers() {
         let layer = arch.layer(l);
@@ -232,20 +237,21 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                 // llama: attention is a first-class step → one contiguous list.
                 steps.push(Step::Attend { plan, io: attn_io });
                 steps.push(o_proj);
-                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+                execute_steps_mesh(&mesh, gpu, ctx, &steps).map_err(herr)?;
             }
             None => {
                 // Bespoke-attention arch (qwen2 GQA-flash): keep the split —
                 // pre-attend steps, then the side-effecting attend, then o-proj.
                 // Identical kernels/order to the pre-seam path.
-                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+                execute_steps_mesh(&mesh, gpu, ctx, &steps).map_err(herr)?;
                 arch.attend(gpu, l)?;
-                execute_steps(gpu, ctx, &[o_proj]).map_err(herr)?;
+                execute_steps_mesh(&mesh, gpu, ctx, &[o_proj]).map_err(herr)?;
             }
         }
 
         // FFN: rmsnorm-rotate + gate/up.
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             ctx,
             &[
@@ -275,7 +281,8 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
 
         // SwiGLU + down projection + residual.
         gpu.silu_mul_f32(s.gate, s.up, s.ffn_hidden)?;
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             ctx,
             &[Step::GemvResidual {

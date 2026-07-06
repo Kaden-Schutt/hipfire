@@ -29,8 +29,9 @@
 
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::pipeline::{execute_steps_mesh, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
@@ -1141,6 +1142,8 @@ fn forward_step_after_x(
     let kv_dim = n_kv_heads * head_dim;
 
     let ctx = DispatchCtx::new(gpu);
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint.
+    let mesh = DeviceMesh::single();
 
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
@@ -1152,7 +1155,8 @@ fn forward_step_after_x(
         let wrq = layer.wq.dispatch_ref();
         let wrk = layer.wk.dispatch_ref();
         let wrv = layer.wv.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[
@@ -1288,7 +1292,8 @@ fn forward_step_after_x(
 
         // (7–8) o_proj + residual via execute_steps.
         let wro = layer.wo.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[Step::GemvResidual {
@@ -1305,7 +1310,8 @@ fn forward_step_after_x(
         let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
         let wrg = layer.w_gate.dispatch_ref();
         let wru = layer.w_up.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[
@@ -1336,7 +1342,8 @@ fn forward_step_after_x(
         // SwiGLU activation + w_down + residual.
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         let wrd = layer.w_down.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[Step::GemvResidual {
@@ -1352,7 +1359,8 @@ fn forward_step_after_x(
     // Final RMSNorm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(
+    execute_steps_mesh(
+        &mesh,
         gpu,
         &ctx,
         &[Step::Gemv {
@@ -1907,6 +1915,8 @@ fn forward_step_after_x_lowered(
     pos: usize,
 ) -> HipResult<()> {
     let ctx = DispatchCtx::new(gpu);
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint.
+    let mesh = DeviceMesh::single();
     let knobs = DenseKnobs {
         attn_bias: true,
         qk_norm: false,
@@ -1929,7 +1939,8 @@ fn forward_step_after_x_lowered(
     // Final RMSNorm + lm_head (outside layer loop).
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(
+    execute_steps_mesh(
+        &mesh,
         gpu,
         &ctx,
         &[Step::Gemv {

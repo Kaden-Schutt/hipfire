@@ -314,6 +314,7 @@ version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-runtime",
  "rdna-compute",
  "serde",
@@ -364,6 +365,7 @@ version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-runtime",
  "rdna-compute",
 ]
@@ -387,6 +389,7 @@ version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-runtime",
  "rdna-compute",
  "serde",

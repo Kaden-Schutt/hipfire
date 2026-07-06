@@ -3434,9 +3434,12 @@ fn forward_scratch_layers_lowered(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
-    use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+    use hipfire_dispatch::pipeline::{execute_steps_mesh, GemvInput, Step};
+    use hipfire_hardware::DeviceMesh;
 
     let ctx = DispatchCtx::new(gpu);
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint.
+    let mesh = DeviceMesh::single();
 
     let knobs = crate::arch_spec::DenseKnobs {
         attn_bias: false,
@@ -3467,7 +3470,8 @@ fn forward_scratch_layers_lowered(
         config.norm_eps,
     )?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(
+    execute_steps_mesh(
+        &mesh,
         gpu,
         &ctx,
         &[Step::Gemv {

@@ -25,8 +25,9 @@ use rdna_compute::DType;
 use rdna_compute::Gpu;
 
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::pipeline::{execute_steps_mesh, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::llama::{attention_family, AttnParams, KvTierInputs, KvTierPlan};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
@@ -289,6 +290,8 @@ impl Llama {
         repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
         let ctx = DispatchCtx::new(gpu);
+        // P-A: single (1×1) device mesh threaded to the dispatch chokepoint.
+        let mesh = DeviceMesh::single();
 
         let n_heads = config.n_heads;
         let n_kv_heads = config.n_kv_heads;
@@ -307,7 +310,8 @@ impl Llama {
             let wrq = layer.wq.dispatch_ref();
             let wrk = layer.wk.dispatch_ref();
             let wrv = layer.wv.dispatch_ref();
-            execute_steps(
+            execute_steps_mesh(
+                &mesh,
                 gpu,
                 &ctx,
                 &[
@@ -439,7 +443,8 @@ impl Llama {
 
             // ── Attention output projection + residual ─────────
             let wro = layer.wo.dispatch_ref();
-            execute_steps(
+            execute_steps_mesh(
+                &mesh,
                 gpu,
                 &ctx,
                 &[Step::GemvResidual {
@@ -456,7 +461,8 @@ impl Llama {
             let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
             let wrg = layer.w_gate.dispatch_ref();
             let wru = layer.w_up.dispatch_ref();
-            execute_steps(
+            execute_steps_mesh(
+                &mesh,
                 gpu,
                 &ctx,
                 &[
@@ -486,7 +492,8 @@ impl Llama {
             // ── SwiGLU + down projection + residual ─────────────
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
             let wrd = layer.w_down.dispatch_ref();
-            execute_steps(
+            execute_steps_mesh(
+                &mesh,
                 gpu,
                 &ctx,
                 &[Step::GemvResidual {
@@ -506,7 +513,8 @@ impl Llama {
             config.norm_eps,
         )?;
         let wr_out = weights.output.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[Step::Gemv {
