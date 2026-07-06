@@ -68,6 +68,15 @@ enum LockAction {
     Release,
     /// Print lock status: "gpu is free" or "gpu BUSY: <holder>".
     Status,
+    /// Forcibly free the lock by signalling its recorded holder — and, for a
+    /// `run`-held lock, the whole workload process group. SIGTERM by default;
+    /// `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free
+    /// or if the recorded holder is already gone.
+    Kill {
+        /// Escalate to SIGKILL instead of SIGTERM.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Acquire the lock, run `command` under it, release on exit — the scoped
     /// form. The lock lives exactly as long as this process (killing it drops
     /// the flock via the kernel); no detached holder or watched pid. Exit code
@@ -141,6 +150,7 @@ pub fn run(args: LockArgs) -> anyhow::Result<()> {
             println!("{}", status_line());
             Ok(())
         }
+        LockAction::Kill { force } => kill_holder(force),
         LockAction::Run {
             label,
             timeout_secs,
@@ -250,6 +260,52 @@ fn release() -> anyhow::Result<()> {
         unsafe { libc::kill(holder_pid, libc::SIGTERM) };
     }
     eprintln!("[gpu-lock] released");
+    Ok(())
+}
+
+fn kill_holder(force: bool) -> anyhow::Result<()> {
+    kill_holder_at(&lockfile_path(), force)
+}
+
+/// Signal the lock's recorded holder to free it. For a `run`-held lock the
+/// holder line also carries `pgid=`, so the whole workload group is signalled
+/// (the GPU work actually stops, not just the wrapper). No-op if the lock is
+/// free or the recorded holder is already gone — never signals a stale/reused
+/// pid. Parameterized on `path` for tests.
+fn kill_holder_at(path: &std::path::Path, force: bool) -> anyhow::Result<()> {
+    if matches!(hipfire_lock::probe(path), Ok(hipfire_lock::LockState::Free)) {
+        eprintln!("[gpu-lock] free — nothing to kill");
+        return Ok(());
+    }
+    let Some(pid) = read_holder_pid(path) else {
+        eprintln!(
+            "[gpu-lock] held, but no holder pid is recorded in the lockfile — cannot target it"
+        );
+        return Ok(());
+    };
+    if !pid_alive(pid) {
+        eprintln!(
+            "[gpu-lock] recorded holder pid {pid} is already gone; the lock will free itself"
+        );
+        return Ok(());
+    }
+    let holder = read_holder(path).unwrap_or_default();
+    let (sig, name) = if force {
+        (libc::SIGKILL, "SIGKILL")
+    } else {
+        (libc::SIGTERM, "SIGTERM")
+    };
+    eprintln!("[gpu-lock] {name} holder pid {pid} ({holder})");
+    unsafe {
+        // A `run` wrapper records the child's process group; signal the whole
+        // workload tree first so the GPU work stops, then the holder itself.
+        if let Some(pgid) = read_holder_field(path, "pgid") {
+            if pgid > 1 {
+                libc::kill(-pgid, sig);
+            }
+        }
+        libc::kill(pid, sig);
+    }
     Ok(())
 }
 
@@ -364,12 +420,15 @@ fn run_scoped_at(
     CHILD_PGID.store(child.id() as i32, Ordering::SeqCst);
 
     // Record holder metadata: OUR pid is the holder (`release`/`kill` find it via
-    // `holder=`). Written under the held flock — rewriting contents can't drop it.
+    // `holder=`), and `pgid=` is the child's process group so `kill` can signal
+    // the whole workload tree. Written under the held flock — rewriting contents
+    // can't drop it.
     let meta = format!(
-        "{label} host={} acquired_epoch={} holder={} mode=run",
+        "{label} host={} acquired_epoch={} holder={} pgid={} mode=run",
         hostname(),
         now_iso(),
-        std::process::id()
+        std::process::id(),
+        child.id()
     );
     let _ = guard.write_holder(&meta);
 
@@ -426,9 +485,35 @@ fn read_holder(path: &std::path::Path) -> Option<String> {
 }
 
 fn read_holder_pid(path: &std::path::Path) -> Option<i32> {
-    let line = read_holder(path)?;
+    read_holder_pid_from_line(&read_holder(path)?)
+}
+
+/// Extract the holder pid, tolerating the shapes different writers use:
+/// `holder=<pid>` (CLI acquire/run), `pid=<pid>`, or a bare leading `<pid>`
+/// (the daemon's singleton-lock style). `holder=` wins over `pid=` because in
+/// the acquire line `pid=` is the *watched* process (often the shell), not the
+/// lock holder.
+fn read_holder_pid_from_line(line: &str) -> Option<i32> {
+    for key in ["holder=", "pid="] {
+        if let Some(pid) = line
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix(key))
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            return Some(pid);
+        }
+    }
     line.split_whitespace()
-        .find_map(|tok| tok.strip_prefix("holder="))
+        .next()
+        .and_then(|tok| tok.parse::<i32>().ok())
+}
+
+/// A `key=<int>` field from the holder line (e.g. `pgid`), if present.
+fn read_holder_field(path: &std::path::Path, key: &str) -> Option<i32> {
+    let line = read_holder(path)?;
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(prefix.as_str()))
         .and_then(|v| v.parse().ok())
 }
 
@@ -533,6 +618,45 @@ mod tests {
     fn empty_command_is_rejected() {
         let path = temp_lock("empty");
         assert!(run_scoped_at(&path, "t", 5, 1, &[], false).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn read_holder_pid_tolerates_writer_formats() {
+        // run/acquire: `holder=` wins over `pid=` (pid= is the watched shell).
+        assert_eq!(
+            read_holder_pid_from_line("job pid=555 host=h holder=4242 pgid=4242 mode=run"),
+            Some(4242)
+        );
+        // acquire without a holder yet → fall back to pid=.
+        assert_eq!(read_holder_pid_from_line("job pid=555 host=h"), Some(555));
+        // daemon style: a bare pid.
+        assert_eq!(read_holder_pid_from_line("31337"), Some(31337));
+        assert_eq!(read_holder_pid_from_line("no numbers here"), None);
+    }
+
+    #[test]
+    fn kill_on_free_lock_is_noop() {
+        let path = temp_lock("kill-free");
+        assert!(kill_holder_at(&path, false).is_ok());
+        assert!(kill_holder_at(&path, true).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn kill_does_not_signal_a_dead_or_reused_holder_pid() {
+        // A held lock whose recorded holder pid is not alive: kill must detect
+        // that and do nothing (never signal a random/reused pid).
+        let path = temp_lock("kill-dead");
+        let mut guard = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(guard.try_lock().unwrap());
+        guard
+            .write_holder("job holder=2147483646 pgid=2147483646 mode=run")
+            .unwrap();
+        // We still hold the flock, so probe() sees Busy; the recorded pid is dead.
+        assert!(kill_holder_at(&path, true).is_ok());
+        assert!(guard.is_locked(), "our own lock must be untouched");
+        drop(guard);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

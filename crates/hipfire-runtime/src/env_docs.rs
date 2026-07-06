@@ -143,14 +143,14 @@ pub const ENV_FP32_STATE: EnvVarDoc = EnvVarDoc {
 pub const ENV_GPU_LOCK_TIMEOUT: EnvVarDoc = EnvVarDoc {
     name: "GPU_LOCK_TIMEOUT",
     description: "Runtime variable controlling gpu lock timeout in hipfire",
-    source: "crates/hipfire-cli/src/commands/lock.rs:111",
+    source: "crates/hipfire-cli/src/commands/lock.rs:120",
 };
 
 /// `GPU_POLL_INTERVAL` — Runtime variable controlling gpu poll interval in hipfire
 pub const ENV_GPU_POLL_INTERVAL: EnvVarDoc = EnvVarDoc {
     name: "GPU_POLL_INTERVAL",
     description: "Runtime variable controlling gpu poll interval in hipfire",
-    source: "crates/hipfire-cli/src/commands/lock.rs:104",
+    source: "crates/hipfire-cli/src/commands/lock.rs:113",
 };
 
 /// `HFHS_REAL` — Runtime variable controlling hfhs real in hipfire
