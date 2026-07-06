@@ -1,0 +1,53 @@
+RDNA3 QKVZA split-tail benchmark system info
+Captured: 2026-07-06T16:49:11+08:00
+
+Benchmark device:
+  The benchmark script was run with GPU_ID=0, which exports
+  HIP_VISIBLE_DEVICES=0. On this host that maps to ROCm device 0 /
+  rocminfo Agent 2:
+
+    Name:           gfx1100
+    Marketing Name: AMD Radeon Pro W7900
+    Uuid:           GPU-dee503dba9717041
+    Compute Units:  96
+    Wavefront Size: 32
+    Fast F16:       TRUE
+
+rocm-smi concise info:
+
+  Device  Node  IDs              Temp    Power  Partitions          SCLK  MCLK   Fan    Perf  PwrCap  VRAM%  GPU%
+                (DID,     GUID)  (Edge)  (Avg)  (Mem, Compute, ID)
+  0       1     0x7448,   61205  29.0C   10.0W  N/A, N/A, 0         0Mhz  96Mhz  20.0%  auto  241.0W  0%     0%
+  1       2     0x744a,   35059  30.0C   13.0W  N/A, N/A, 0         0Mhz  96Mhz  20.0%  auto  241.0W  0%     0%
+
+rocminfo selected GPU agents:
+
+  Agent 2
+    Name:                    gfx1100
+    Uuid:                    GPU-dee503dba9717041
+    Marketing Name:          AMD Radeon Pro W7900
+    Cacheline Size:          128(0x80)
+    Max Clock Freq. (MHz):   1760
+    Internal Node ID:        1
+    Compute Unit:            96
+    SIMDs per CU:            2
+    Shader Engines:          6
+    Fast F16 Operation:      TRUE
+    Wavefront Size:          32(0x20)
+    Workgroup Max Size:      1024(0x400)
+    ISA Name:                amdgcn-amd-amdhsa--gfx1100
+
+  Agent 3
+    Name:                    gfx1100
+    Uuid:                    GPU-ecb57a743c42951e
+    Marketing Name:          AMD Radeon Pro W7900 Dual Slot
+    Cacheline Size:          128(0x80)
+    Max Clock Freq. (MHz):   1760
+    Internal Node ID:        2
+    Compute Unit:            96
+    SIMDs per CU:            2
+    Shader Engines:          6
+    Fast F16 Operation:      TRUE
+    Wavefront Size:          32(0x20)
+    Workgroup Max Size:      1024(0x400)
+    ISA Name:                amdgcn-amd-amdhsa--gfx1100
