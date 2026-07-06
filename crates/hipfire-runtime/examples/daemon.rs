@@ -1418,18 +1418,18 @@ fn main() {
                     std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
             }
         }
-        let mut gpu = match rdna_compute::Gpu::init() {
+        let mut gpus = Gpus::single(match rdna_compute::Gpu::init() {
             Ok(g) => g,
             Err(e) => {
                 report_gpu_init_failure(&e);
                 std::process::exit(1);
             }
-        };
-        eprintln!("Pre-compiling kernels for {}...", gpu.arch);
+        }, 0);
+        eprintln!("Pre-compiling kernels for {}...", gpus.devices[0].arch);
         let mut errors = 0usize;
         for kv in &["asym3", "q8"] {
             for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
-                if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
+                if let Err(e) = gpus.devices[0].precompile_qwen35(wq, kv, 256) {
                     eprintln!("  {wq}/{kv}: {e}");
                     errors += 1;
                 }
@@ -1449,13 +1449,13 @@ fn main() {
     // Kept in a binding so the fd lives for the full process lifetime.
     let _daemon_lock = acquire_daemon_lock();
 
-    let mut gpu = match rdna_compute::Gpu::init() {
+    let mut gpus = Gpus::single(match rdna_compute::Gpu::init() {
         Ok(g) => g,
         Err(e) => {
             report_gpu_init_failure(&e);
             std::process::exit(1);
         }
-    };
+    }, 0);
     let mut model: Option<LoadedModel> = None;
     // PFlash speculative-prefill state. None unless the load message
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
@@ -1552,14 +1552,14 @@ fn main() {
                     if let Some(mut dg) = pflash_drafter_gpu.take() {
                         dg.bind_thread_or_warn();
                         pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                        gpu.bind_thread_or_warn();
+                        gpus.devices[0].bind_thread_or_warn();
                     } else {
-                        pf.unload_drafter(&mut gpu);
+                        pf.unload_drafter(&mut gpus.devices[0]);
                     }
                 }
                 pflash_cfg = None;
                 if let Some(m) = model.take() {
-                    unload_model(m, &mut gpu);
+                    unload_model(m, &mut gpus.devices[0]);
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -1729,14 +1729,14 @@ fn main() {
                     .and_then(|p| p.get("mmq_screen"))
                     .and_then(|v| v.as_bool())
                 {
-                    gpu.mmq_screen.enabled = v;
+                    gpus.devices[0].mmq_screen.enabled = v;
                 }
                 if let Some(v) = msg
                     .get("params")
                     .and_then(|p| p.get("mmq_screen_threshold"))
                     .and_then(|v| v.as_f64())
                 {
-                    gpu.mmq_screen.threshold = v as f32;
+                    gpus.devices[0].mmq_screen.threshold = v as f32;
                 }
 
                 // ── PFlash load-time params (Phase 4.0 #93) ──────────────
@@ -1921,7 +1921,7 @@ fn main() {
                         state_quant_override.as_deref(),
                         &cask,
                         pp,
-                        &mut gpu,
+                        &mut gpus.devices[0],
                     )
                 };
                 match loaded {
@@ -1991,7 +1991,7 @@ fn main() {
                         if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
                             if let Ok(secs) = secs_str.parse::<f32>() {
                                 if secs > 0.0 {
-                                    if let Err(e) = gpu.dpm_warmup(secs) {
+                                    if let Err(e) = gpus.devices[0].dpm_warmup(secs) {
                                         eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
                                     }
                                 }
@@ -2081,7 +2081,7 @@ fn main() {
                                         }
                                     }
                                     let dg: &mut rdna_compute::Gpu =
-                                        sibling.as_mut().unwrap_or(&mut gpu);
+                                        sibling.as_mut().unwrap_or(&mut gpus.devices[0]);
                                     dg.bind_thread_or_warn();
                                     match hipfire_arch_qwen35::pflash::load_drafter(
                                         &mut pf_state,
@@ -2129,13 +2129,13 @@ fn main() {
                         model = Some(m);
                     }
                     Err(e) => {
-                        let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+                        let (vram_free, vram_total) = gpus.devices[0].hip.get_vram_info().unwrap_or((0, 0));
                         let free_mb = vram_free / (1024 * 1024);
                         let total_mb = vram_total / (1024 * 1024);
                         // serde-escape: raw HipError debug contains { } and "
                         // which corrupt the JSONL protocol if interpolated raw.
                         write_error(&mut stdout, "", &format!(
-                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", gpu.arch));
+                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", gpus.devices[0].arch));
                     }
                 }
                 let _ = stdout.flush();
@@ -2425,17 +2425,17 @@ fn main() {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
                         m.conversation_tokens.clear();
-                        free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
-                        free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                        free_checkpoints(&mut m.prefill_checkpoints, &mut gpus.devices[0]);
+                        free_checkpoints(&mut m.dflash_checkpoints, &mut gpus.devices[0]);
                         if let Some(ref dn) = m.dn_state {
                             for s in &dn.s_matrices {
-                                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                                let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                             }
                             for s in &dn.s_scales {
-                                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                                let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                             }
                             for s in &dn.conv_states {
-                                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                                let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                             }
                         }
                         if let Some(kv) = m.kv_cache.as_mut() {
@@ -2499,9 +2499,9 @@ fn main() {
                         max_think_tokens: vl_max_think_tokens,
                     };
                     if is_dots_ocr {
-                        generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);
+                        generate_vl_dots_ocr(m, &mut gpus.devices[0], &mut stdout, &params);
                     } else {
-                        generate_vl(m, &mut gpu, &mut stdout, &params);
+                        generate_vl(m, &mut gpus.devices[0], &mut stdout, &params);
                     }
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
@@ -2592,7 +2592,7 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
+                        m, &mut gpus.devices[0], pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
                         temp, top_p, max_tokens, repeat_penalty, repeat_window,
                         presence_penalty, frequency_penalty,
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
@@ -2617,8 +2617,8 @@ fn main() {
                     }
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
-                    free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
-                    free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                    free_checkpoints(&mut m.prefill_checkpoints, &mut gpus.devices[0]);
+                    free_checkpoints(&mut m.dflash_checkpoints, &mut gpus.devices[0]);
                     // Multi-GPU branch: route per-LA-layer memsets through
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
@@ -2649,13 +2649,13 @@ fn main() {
                     } else if let Some(ref dn) = m.dn_state {
                         // Zero DeltaNet recurrent state (Qwen3.5)
                         for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                            let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                         }
                         for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                            let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                         }
                         for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                            let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
                     if let Some(kv) = m.kv_cache.as_mut() {
@@ -2695,14 +2695,14 @@ fn main() {
                         // `ar_forward_warmed_up = false` in `reset()`
                         // ensures we retrace warmup → capture → replay
                         // rather than jumping straight back to replay.
-                        gpu.invalidate_graph_state();
+                        gpus.devices[0].invalidate_graph_state();
                     }
                     // arch_id=11: rewind the Lfm2MoeState KV + conv-state
                     // cursors so the next prefill writes from slot 0. Same
                     // rationale as the qwen2/deepseek4 resets above — without
                     // it, prior-turn KV/conv residue leaks into the new turn.
                     if let Some(ref mut s) = m.lfm2moe_state {
-                        let _ = s.reset(&mut gpu);
+                        let _ = s.reset(&mut gpus.devices[0]);
                     }
                     // arch_id=10 (MiniMax-M2): clear the KV cursor between turns.
                     // No captured hipGraph on this path by default, so no graph
@@ -2736,14 +2736,14 @@ fn main() {
                     if let Some(mut dg) = pflash_drafter_gpu.take() {
                         dg.bind_thread_or_warn();
                         pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                        gpu.bind_thread_or_warn();
+                        gpus.devices[0].bind_thread_or_warn();
                     } else {
-                        pf.unload_drafter(&mut gpu);
+                        pf.unload_drafter(&mut gpus.devices[0]);
                     }
                 }
                 pflash_cfg = None;
                 if let Some(m) = model.take() {
-                    unload_model(m, &mut gpu);
+                    unload_model(m, &mut gpus.devices[0]);
                 }
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
@@ -2755,8 +2755,8 @@ fn main() {
             }
 
             "diag" => {
-                let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
-                let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
+                let (vram_free, vram_total) = gpus.devices[0].hip.get_vram_info().unwrap_or((0, 0));
+                let hip_ver = gpus.devices[0].hip.runtime_version().unwrap_or((0, 0));
                 let has_model = model.is_some();
                 let model_arch = model
                     .as_ref()
@@ -2775,7 +2775,7 @@ fn main() {
                     .ok()
                     .and_then(|e| {
                         e.parent()
-                            .map(|p| p.join("kernels").join("compiled").join(&gpu.arch))
+                            .map(|p| p.join("kernels").join("compiled").join(&gpus.devices[0].arch))
                     })
                     .filter(|p| p.is_dir());
                 let (hsaco_count, hash_count) = kernel_dir
@@ -2818,7 +2818,7 @@ fn main() {
                 let _ = writeln!(
                     stdout,
                     r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
-                    gpu.arch,
+                    gpus.devices[0].arch,
                     hip_ver.0,
                     hip_ver.1,
                     vram_free / (1024 * 1024),
@@ -2885,13 +2885,13 @@ fn main() {
                 m.conversation_tokens.clear();
                 if let Some(ref dn) = m.dn_state {
                     for s in &dn.s_matrices {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.s_scales {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.conv_states {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                     }
                 }
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
@@ -2905,7 +2905,7 @@ fn main() {
                 // measured interval, then time forward_prefill_batch + a
                 // trailing device_synchronize so we capture actual GPU
                 // completion (kernel launches are async by default).
-                let _ = gpu.hip.device_synchronize();
+                let _ = gpus.devices[0].hip.device_synchronize();
                 let t0 = Instant::now();
                 let run_ok = if m.arch_id == 5 || m.arch_id == 6 {
                     let config = m.q35_config.as_ref().unwrap();
@@ -2914,7 +2914,7 @@ fn main() {
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
                     qwen35::forward_prefill_batch(
-                        &mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None,
+                        &mut gpus.devices[0], weights, config, &synthetic, 0, kv, dn, scratch, None, None,
                         None, None,
                     )
                     .is_ok()
@@ -2927,7 +2927,7 @@ fn main() {
                     let state = m.qwen2_state.as_mut().unwrap();
                     let mut ok = true;
                     for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                        if qwen2::forward_step(&mut gpus.devices[0], weights, config, state, tok).is_err() {
                             ok = false;
                             break;
                         }
@@ -2946,7 +2946,7 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if deepseek4::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
+                            config, weights, state, &mut gpus.devices[0], tok, i as u32,
                         )
                         .is_err()
                         {
@@ -2967,7 +2967,7 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if lfm2moe::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
+                            config, weights, state, &mut gpus.devices[0], tok, i as u32,
                         )
                         .is_err()
                         {
@@ -2987,7 +2987,7 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if minimax::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
+                            config, weights, state, &mut gpus.devices[0], tok, i as u32,
                         )
                         .is_err()
                         {
@@ -3004,7 +3004,7 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if llama::forward_scratch(
-                            &mut gpu, weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0,
+                            &mut gpus.devices[0], weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0,
                         )
                         .is_err()
                         {
@@ -3014,7 +3014,7 @@ fn main() {
                     }
                     ok
                 };
-                let _ = gpu.hip.device_synchronize();
+                let _ = gpus.devices[0].hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
 
                 // Reset state AFTER measurement — we've written N KV slots and a
@@ -3023,19 +3023,19 @@ fn main() {
                 m.conversation_tokens.clear();
                 if let Some(ref dn) = m.dn_state {
                     for s in &dn.s_matrices {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.s_scales {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.conv_states {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = gpus.devices[0].hip.memset(&s.buf, 0, s.buf.size());
                     }
                 }
                 // LFM2.5-MoE state carries its own KV + conv-state cache;
                 // reset cursors (takes gpu) so the next request starts cold.
                 if let Some(ref mut s) = m.lfm2moe_state {
-                    let _ = s.reset(&mut gpu);
+                    let _ = s.reset(&mut gpus.devices[0]);
                 }
                 // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
                 // reset its cursor (no gpu) for a cold prefill on the next request.
@@ -3073,11 +3073,11 @@ fn main() {
                 for kv in &["q8"] {
                     for wq in &["hfq4", "hfq6", "q8"] {
                         for hd in &[128usize, 256] {
-                            let _ = gpu.precompile_qwen35(wq, kv, *hd);
+                            let _ = gpus.devices[0].precompile_qwen35(wq, kv, *hd);
                         }
                     }
                 }
-                let (cap, kernels) = gpu.profile();
+                let (cap, kernels) = gpus.devices[0].profile();
                 let kernels_json: Vec<String> = kernels.iter().map(|k| k.to_json()).collect();
                 let _ = writeln!(
                     stdout,
