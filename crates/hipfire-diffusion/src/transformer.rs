@@ -371,10 +371,12 @@ impl NativeTransformerDenoiserIo {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
         // Krea2 final adaLN: RMSNorm(hidden) then modulate by the [2, hidden]
-        // scale/shift table combined with the timestep embedding. NOTE: the
-        // (scale, shift) chunk order and the time-embedding modulation source
-        // follow the per-block adaLN convention; verify against the Krea2
-        // reference during numerical parity before trusting decoded pixels.
+        // scale/shift table combined with the timestep embedding. Chunk order is
+        // [shift, scale] (row 0 = shift, row 1 = scale), matching the diffusers
+        // scale_shift_table convention (`shift, scale = (table + emb).chunk(2)`
+        // in PixArt/Sana final layers). NOTE: the time-embedding modulation
+        // source (same temb added to both rows here vs a split 2*width emb in
+        // diffusers) is still unverified against the Krea2 reference.
         if matches!(self.family, TransformerDenoiserFamily::Krea2) {
             let Some(norm_weight) = self.krea_final_norm_weight.as_ref() else {
                 return Ok(hidden.clone());
@@ -406,8 +408,8 @@ impl NativeTransformerDenoiserIo {
             for b in 0..batch {
                 for col in 0..width {
                     let temb = timestep_embedding.data[b * width + col];
-                    scale.data[b * width + col] = table.data[col] + temb;
-                    shift.data[b * width + col] = table.data[width + col] + temb;
+                    shift.data[b * width + col] = table.data[col] + temb;
+                    scale.data[b * width + col] = table.data[width + col] + temb;
                 }
             }
             return modulate_3d(&normalized, &shift, &scale);
@@ -2146,11 +2148,16 @@ impl NativeTransformerBlock {
         let modulation = self
             .modulation
             .krea_scale_shift_with_runtime_context(time_modulation, runtime_context)?;
-        let prescale = extract_modulation_chunk_2d(&modulation, 0)?;
-        let preshift = extract_modulation_chunk_2d(&modulation, 1)?;
+        // adaLN chunk order is [shift, scale, gate] per stream, matching diffusers
+        // for the `scale_shift_table + temb -> chunk(6)` family (Sana / PixArt /
+        // Qwen-Image: `shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
+        // gate_mlp`). Chunk 0 is SHIFT, chunk 1 is SCALE. Swapping them corrupts
+        // the modulation (shift applied as 1+scale) and yields a near-noise DiT.
+        let preshift = extract_modulation_chunk_2d(&modulation, 0)?;
+        let prescale = extract_modulation_chunk_2d(&modulation, 1)?;
         let pregate = extract_modulation_chunk_2d(&modulation, 2)?;
-        let postscale = extract_modulation_chunk_2d(&modulation, 3)?;
-        let postshift = extract_modulation_chunk_2d(&modulation, 4)?;
+        let postshift = extract_modulation_chunk_2d(&modulation, 3)?;
+        let postscale = extract_modulation_chunk_2d(&modulation, 4)?;
         let postgate = extract_modulation_chunk_2d(&modulation, 5)?;
 
         let attn_input = modulate_3d(
@@ -2227,11 +2234,13 @@ impl NativeTransformerBlock {
             gpu.upload_f32(&chunk.data, &chunk.shape)
                 .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))
         };
-        let prescale = upload(0)?;
-        let preshift = upload(1)?;
+        // adaLN chunk order [shift, scale, gate] per stream (see the CpuTensor
+        // path): chunk 0 is SHIFT, chunk 1 is SCALE, matching diffusers.
+        let preshift = upload(0)?;
+        let prescale = upload(1)?;
         let pregate = upload(2)?;
-        let postscale = upload(3)?;
-        let postshift = upload(4)?;
+        let postshift = upload(3)?;
+        let postscale = upload(4)?;
         let postgate = upload(5)?;
 
         // Attention: modulate(rms_norm(norm1)) -> attn -> gated residual.
