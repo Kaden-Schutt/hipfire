@@ -1347,3 +1347,36 @@ extern "C" __global__ void diffusion_geglu_gate_3d_f32(
     output[idx] = value * gate;
 }
 "#;
+
+pub(crate) const DIFFUSION_TWO_INPUT_GATE_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// SwiGLU gate from two separate projections: out = up * silu(gate).
+extern "C" __global__ void diffusion_swiglu_gate_f32(
+    const float* up,
+    const float* gate,
+    float* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float g = gate[idx];
+    output[idx] = up[idx] * (g / (1.0f + expf(-g)));
+}
+
+// Sigmoid gate: out = value * sigmoid(gate).
+extern "C" __global__ void diffusion_sigmoid_gate_f32(
+    const float* value,
+    const float* gate,
+    float* output,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    output[idx] = value[idx] * (1.0f / (1.0f + expf(-gate[idx])));
+}
+"#;

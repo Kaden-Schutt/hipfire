@@ -3993,6 +3993,81 @@ pub(crate) fn geglu_gate_3d_resident(
     Ok(output)
 }
 
+/// Device-resident SwiGLU gate from two resident projections: `up * silu(gate)`.
+/// Both inputs share shape; the activation stays on-device.
+#[allow(dead_code)]
+pub(crate) fn swiglu_gate_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    up: &hipfire_rdna::GpuTensor,
+    gate: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    two_input_gate_resident(
+        gpu,
+        up,
+        gate,
+        "diffusion_swiglu_gate_f32",
+        "SwiGLU",
+    )
+}
+
+/// Device-resident sigmoid gate from two resident tensors: `value * sigmoid(gate)`
+/// (the Krea2 single-stream attention output gate).
+#[allow(dead_code)]
+pub(crate) fn sigmoid_gate_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    value: &hipfire_rdna::GpuTensor,
+    gate: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    two_input_gate_resident(
+        gpu,
+        value,
+        gate,
+        "diffusion_sigmoid_gate_f32",
+        "sigmoid gate",
+    )
+}
+
+#[allow(dead_code)]
+fn two_input_gate_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    a: &hipfire_rdna::GpuTensor,
+    b: &hipfire_rdna::GpuTensor,
+    kernel: &str,
+    label: &str,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    if a.shape != b.shape {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "{label} input shape mismatch {:?} vs {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let elements = checked_shape_elements(label, &a.shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &a.shape)?;
+    if elements == 0 {
+        return Ok(output);
+    }
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(a.buf.as_ptr());
+    kernargs.push_ptr(b.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim(label, elements)?);
+    kernargs.pad_to(16);
+    let grid = [((elements as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        kernel,
+        DIFFUSION_TWO_INPUT_GATE_HIP_SRC,
+        kernel,
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
 /// Device-resident NCHW channel concatenation ([n,ca,h,w] ++ [n,cb,h,w] ->
 /// [n,ca+cb,h,w]).
 pub(crate) fn concat_channels_nchw_resident(

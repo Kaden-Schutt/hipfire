@@ -1688,6 +1688,60 @@ fn linear_resident_weight_resident_matches_cpu_reference() {
 }
 
 #[test]
+fn resident_swiglu_and_sigmoid_gates_match_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for resident gate test: {error}");
+            return;
+        }
+    };
+    let shape = vec![2usize, 3, 8];
+    let n = 2 * 3 * 8;
+    let fill = |seed: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 11.0) - 5.0) / 3.0)
+            .collect()
+    };
+    let a = CpuTensor {
+        shape: shape.clone(),
+        data: fill(1.0),
+    };
+    let g = CpuTensor {
+        shape: shape.clone(),
+        data: fill(4.0),
+    };
+    let silu = |x: f32| x / (1.0 + (-x).exp());
+    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let swiglu_cpu: Vec<f32> = a.data.iter().zip(&g.data).map(|(u, x)| u * silu(*x)).collect();
+    let sigmoid_cpu: Vec<f32> = a
+        .data
+        .iter()
+        .zip(&g.data)
+        .map(|(v, x)| v * sigmoid(*x))
+        .collect();
+
+    let a_gpu = gpu.upload_f32(&a.data, &a.shape).unwrap();
+    let g_gpu = gpu.upload_f32(&g.data, &g.shape).unwrap();
+    let sw = swiglu_gate_3d_resident(&mut gpu, &a_gpu, &g_gpu).unwrap();
+    let sw_h = download_resident(&mut gpu, &sw).unwrap();
+    free_resident(&mut gpu, sw).unwrap();
+    let sg = sigmoid_gate_3d_resident(&mut gpu, &a_gpu, &g_gpu).unwrap();
+    let sg_h = download_resident(&mut gpu, &sg).unwrap();
+    free_resident(&mut gpu, sg).unwrap();
+    free_resident(&mut gpu, a_gpu).unwrap();
+    free_resident(&mut gpu, g_gpu).unwrap();
+
+    assert_eq!(sw_h.shape, shape);
+    for (i, (h, c)) in sw_h.data.iter().zip(&swiglu_cpu).enumerate() {
+        assert!((h - c).abs() <= 1e-5, "swiglu mismatch at {i}: {h} vs {c}");
+    }
+    for (i, (h, c)) in sg_h.data.iter().zip(&sigmoid_cpu).enumerate() {
+        assert!((h - c).abs() <= 1e-5, "sigmoid gate mismatch at {i}: {h} vs {c}");
+    }
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
