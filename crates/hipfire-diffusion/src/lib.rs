@@ -1132,6 +1132,28 @@ fn decode_to_rgb8_with_runtime_context(
     latents: &LatentBatch,
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(RgbImageBatch, DiffusionRuntimeKind)> {
+    // Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent
+    // (the exact tensor about to be VAE-decoded) as a raw little-endian blob:
+    // 4x u32 header [batch, channels, height, width] then f32 data. Lets an
+    // offline golden VAE decode the identical latent to split DiT vs VAE bugs.
+    if let Ok(path) = std::env::var("HIPFIRE_DUMP_LATENT") {
+        if !path.is_empty() {
+            let mut bytes = Vec::with_capacity(16 + latents.data.len() * 4);
+            for dim in [latents.batch, latents.channels, latents.height, latents.width] {
+                bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+            }
+            for v in &latents.data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => eprintln!(
+                    "[dump] final latent [{},{},{},{}] -> {path}",
+                    latents.batch, latents.channels, latents.height, latents.width
+                ),
+                Err(e) => eprintln!("[dump] failed to write latent to {path}: {e}"),
+            }
+        }
+    }
     let decoded = decoder.decode_to_rgb_tensor_with_runtime_context(latents, runtime_context)?;
     let rgb = rgb_tensor_to_u8_with_runtime_context(&decoded, runtime_context)?;
     Ok((rgb, runtime_kind_for_context(runtime_context)))

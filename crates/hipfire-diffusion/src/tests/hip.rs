@@ -2094,6 +2094,119 @@ fn krea_block_forward_resident_matches_runtime_context_path() {
 }
 
 #[test]
+fn krea_block_forward_resident_matches_runtime_context_real_op_set() {
+    // The REAL Krea2 op set (what actually runs on the model), which the MHA
+    // parity test above does NOT exercise: grouped-query attention (kv_heads <
+    // heads), per-head QK-norm, interleaved RoPE on q/k, and the sigmoid to_gate.
+    // If the resident GPU path diverges from the CpuTensor reference here, the
+    // resident refactor has a composition bug — the leading suspect for the
+    // noise render, since txt2img runs the resident path with --rocm-device-id.
+    if hipfire_rdna::Gpu::init_with_device(0).is_err() {
+        eprintln!("skip: ROCm GPU unavailable for resident real-op-set block test");
+        return;
+    }
+    let (batch, seq, heads, kv_heads, head_dim) = (1usize, 4, 4, 2, 8);
+    let width = heads * head_dim; // 32
+    let inner_kv = kv_heads * head_dim; // 16
+    let inner_ff = 64usize;
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 29.0) - 14.0) / 14.0 * scale)
+            .collect()
+    };
+    // GQA stream: Q is full width, K/V are narrow (kv_heads), QK-norm on both.
+    let attn_stream = TransformerAttentionStreamProjection::gqa_qknorm_for_test(
+        width,
+        inner_kv,
+        width,
+        &fill(width * width, 1.0, 0.3),      // q  [32,32]
+        &fill(inner_kv * width, 2.0, 0.3),   // k  [16,32]
+        &fill(inner_kv * width, 3.0, 0.3),   // v  [16,32]
+        &fill(width * width, 4.0, 0.3),      // out[32,32]
+        &fill(head_dim, 5.0, 0.5),           // norm_q [8]
+        &fill(head_dim, 6.0, 0.5),           // norm_k [8]
+        head_dim,
+    );
+    let attention = NativeTransformerAttentionProjection::krea_gqa_gated_for_test(
+        heads,
+        head_dim,
+        attn_stream,
+        &fill(width * width, 7.0, 0.2), // to_gate [32,32]
+    );
+    let ffn = NativeTransformerFeedForward::krea_swiglu_for_test(
+        width,
+        inner_ff,
+        &fill(inner_ff * width, 8.0, 0.3),
+        &fill(inner_ff * width, 9.0, 0.3),
+        &fill(width * inner_ff, 10.0, 0.3),
+    );
+    let modulation = NativeTransformerBlockModulation::krea_for_test(width, &fill(6 * width, 11.0, 0.2));
+    let block = NativeTransformerBlock::krea_for_test(
+        modulation,
+        attention,
+        ffn,
+        CpuTensor { shape: vec![width], data: fill(width, 12.0, 0.3) },
+        CpuTensor { shape: vec![width], data: fill(width, 13.0, 0.3) },
+    );
+    let hidden_in = CpuTensor {
+        shape: vec![batch, seq, width],
+        data: fill(batch * seq * width, 2.0, 1.0),
+    };
+    let time_modulation = CpuTensor {
+        shape: vec![batch, 6 * width],
+        data: fill(batch * 6 * width, 14.0, 0.5),
+    };
+    // Interleaved RoPE tables [seq, head_dim/2] = [4, 4]; non-trivial per token.
+    let freq_width = head_dim / 2;
+    let cos: Vec<f32> = (0..seq * freq_width)
+        .map(|i| ((i as f32) * 0.37).cos())
+        .collect();
+    let sin: Vec<f32> = (0..seq * freq_width)
+        .map(|i| ((i as f32) * 0.37).sin())
+        .collect();
+    let rotary = RotaryFrequencies::for_test(seq, freq_width, &cos, &sin);
+
+    let mut ctx = DiffusionGenerationRuntimeContext::new(
+        DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+    );
+    let cpu_out = block
+        .forward_krea_with_runtime_context(&hidden_in, &time_modulation, Some(&rotary), &mut ctx)
+        .unwrap();
+    let resident_out = ctx
+        .with_rocm_gpu_weighted(|gpu, cache| {
+            let hidden_gpu = gpu
+                .upload_f32(&hidden_in.data, &hidden_in.shape)
+                .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+            let out_gpu = block.forward_krea_resident(
+                &hidden_gpu,
+                &time_modulation,
+                Some(&rotary),
+                gpu,
+                cache,
+            )?;
+            let out = download_resident(gpu, &out_gpu)?;
+            free_resident(gpu, out_gpu)?;
+            free_resident(gpu, hidden_gpu)?;
+            Ok(out)
+        })
+        .unwrap();
+
+    assert_eq!(resident_out.shape, cpu_out.shape);
+    assert_eq!(resident_out.shape, vec![batch, seq, width]);
+    let max_rel = resident_out
+        .data
+        .iter()
+        .zip(&cpu_out.data)
+        .map(|(a, b)| (a - b).abs() / (b.abs().max(1.0)))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rel <= 3e-2,
+        "resident real-op-set block vs runtime-context path max rel {max_rel} too large \
+         (GQA/QK-norm/RoPE/gate composition diverges)"
+    );
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,

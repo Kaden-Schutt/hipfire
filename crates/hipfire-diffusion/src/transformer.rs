@@ -1074,6 +1074,39 @@ impl TransformerAttentionStreamProjection {
         }
     }
 
+    /// Test-only: a GQA stream with per-head QK-norm. `inner_q = heads*head_dim`,
+    /// `inner_kv = kv_heads*head_dim` (kv_heads <= heads). `norm_q`/`norm_k` are
+    /// per-head-dim RMSNorm weights (length `head_dim`). Exercises the real Krea2
+    /// op set (QK-norm + grouped-query expand) that `mha_for_test` skips.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gqa_qknorm_for_test(
+        inner_q: usize,
+        inner_kv: usize,
+        hidden: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &[f32],
+        norm_q: &[f32],
+        norm_k: &[f32],
+        head_dim: usize,
+    ) -> Self {
+        Self {
+            stream_label: "test",
+            q_weight: ResidentWeight::from_bf16_parts("attn.q", vec![inner_q, hidden], q),
+            q_bias: None,
+            k_weight: ResidentWeight::from_bf16_parts("attn.k", vec![inner_kv, hidden], k),
+            k_bias: None,
+            v_weight: ResidentWeight::from_bf16_parts("attn.v", vec![inner_kv, hidden], v),
+            v_bias: None,
+            norm_q_weight: Some(CpuTensor { shape: vec![head_dim], data: norm_q.to_vec() }),
+            norm_k_weight: Some(CpuTensor { shape: vec![head_dim], data: norm_k.to_vec() }),
+            out_weight: ResidentWeight::from_bf16_parts("attn.out", vec![hidden, inner_q], out),
+            out_bias: None,
+        }
+    }
+
     /// Fully resident Q/K/V projection: resident hidden -> (q, k, v) resident,
     /// each `[batch, seq, heads*head_dim]`, with per-head QK-norm and GQA expand
     /// applied on-device. Mirrors project_qkv_with_runtime_context.
@@ -1143,6 +1176,17 @@ pub(crate) struct NativeTransformerAttentionProjection {
 pub(crate) struct RotaryFrequencies {
     cos: CpuTensor,
     sin: CpuTensor,
+}
+
+impl RotaryFrequencies {
+    /// Test-only: build frequencies from raw `[seq, head_dim/2]` cos/sin tables.
+    #[cfg(test)]
+    pub(crate) fn for_test(seq: usize, freq_width: usize, cos: &[f32], sin: &[f32]) -> Self {
+        Self {
+            cos: CpuTensor { shape: vec![seq, freq_width], data: cos.to_vec() },
+            sin: CpuTensor { shape: vec![seq, freq_width], data: sin.to_vec() },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1361,6 +1405,35 @@ impl NativeTransformerAttentionProjection {
             image,
             text: None,
             gate_weight: None,
+            gate_bias: None,
+        }
+    }
+
+    /// Test-only: Krea2 self-gated GQA attention with a `to_gate` sigmoid gate.
+    /// `kv_heads` (<= `heads`) is derived at runtime from the stream's narrower
+    /// K/V weights; `gate` is the `[heads*head_dim, heads*head_dim]` gate weight.
+    #[cfg(test)]
+    pub(crate) fn krea_gqa_gated_for_test(
+        heads: usize,
+        head_dim: usize,
+        image: TransformerAttentionStreamProjection,
+        gate: &[f32],
+    ) -> Self {
+        let inner = heads * head_dim;
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            heads,
+            head_dim,
+            hidden_width: inner,
+            inner_width: inner,
+            image,
+            text: None,
+            gate_weight: Some(ResidentWeight::from_bf16_parts(
+                "attn.to_gate",
+                vec![inner, inner],
+                gate,
+            )),
             gate_bias: None,
         }
     }
