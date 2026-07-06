@@ -21,7 +21,10 @@ CAP=16                    # max A/B rounds before parking INCONCLUSIVE
 WIN_F=0.90 ; DEAD_F=0.65  # resolve band edges
 BASELINE_REF="${BASELINE_REF:-loop_baseline_gfx1201}"   # env-overridable (smoke tests use an isolated ref)
 CARD_BRANCH="loop/card${CARD}"
-SCLK=/sys/class/drm/card${CARD}/device/pp_dpm_sclk
+# clock-skew gate reads DRM pp_dpm_sclk. The WORKTREE slot (CARD) need not match the DRM card
+# index of the GPU under test (e.g. gfx1151 = HIP dev 1 = DRM card1, but its worktree is sw_card2).
+# SCLK env override lets the caller point the gate at the ACTUAL device's clock node.
+SCLK="${SCLK:-/sys/class/drm/card${CARD}/device/pp_dpm_sclk}"
 KSRC="kernels/src/${KERNEL}.hip"
 LEDGER="$MAIN/autoresearch/ledger/swarm_${ARCH}_${KERNEL}.jsonl"
 cd "$WT" || { echo "{\"label\":\"$LABEL\",\"error\":\"no worktree $WT\"}"; exit 1; }

@@ -1,10 +1,12 @@
 import json, sys, glob, os
-# args: <exhaustion.json> <round> <main_repo>  -- update per-kernel consecutive-dead counters
+# args: <exhaustion.json> <round> <main_repo> [arch=gfx1201]  -- update per-kernel consecutive-dead counters
+# arch selects the ledger glob so a per-arch loop only counts its OWN verdicts (BODs/ledgers don't cross-talk).
 exh_path, rnd, main = sys.argv[1], sys.argv[2], sys.argv[3]
+arch = sys.argv[4] if len(sys.argv) > 4 else "gfx1201"
 exh = json.load(open(exh_path)) if os.path.exists(exh_path) else {}
 prefix = f"R{rnd}c"
 byk = {}   # kernel -> [verdicts this round]
-for f in glob.glob(main + "/autoresearch/ledger/swarm_gfx1201_*.jsonl"):
+for f in glob.glob(main + f"/autoresearch/ledger/swarm_{arch}_*.jsonl"):
     for l in open(f):
         try: d = json.loads(l)
         except: continue
