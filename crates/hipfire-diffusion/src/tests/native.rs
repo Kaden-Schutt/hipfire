@@ -1054,16 +1054,13 @@ fn native_transformer_attention_applies_qwen_rope_to_image_and_text_qk() {
 }
 
 #[test]
-fn qwen_rope_grid_uses_centered_scale_rope_coordinates() {
-    // Golden convention pin: Qwen-Image-family RoPE uses scale_rope=True, i.e.
-    // CENTERED height/width grid coordinates (diffusers hardcodes this in every
-    // Qwen*Transformer). For an HxW grid, spatial axis positions run
-    // [-(N-N/2) .. N/2-1], so the grid-center token sits at spatial position 0
-    // (identity rotation), while corner tokens sit at non-zero positions.
-    // A 0-based (scale_rope=False) implementation would put the center token at
-    // position N/2 != 0 and fail this test -- that bug scrambles image attention
-    // into high-frequency noise. axes=[4,4,4] over head_dim=12 -> freq_width=6:
-    // band layout [frame(2), height(2), width(2)].
+fn krea2_rope_grid_uses_flux_zero_based_coordinates() {
+    // Convention pin per the Krea2 source (Krea2RotaryPosEmbed is "Copied from
+    // FluxPosEmbed"): image tokens use 0-based grid coordinates
+    // `[0, arange(H), arange(W)]` -- NOT Qwen-Image's centered scale_rope. So the
+    // grid-ORIGIN token (y=0, x=0) sits at position 0 (identity rotation) and
+    // off-origin tokens carry rotation. axes=[4,4,4] over head_dim=12 ->
+    // freq_width=6: band layout [frame(2), height(2), width(2)].
     let (frame, height, width) = (1usize, 4usize, 4usize);
     let rotary =
         qwen_rotary_embeddings_for_grid([4, 4, 4], 1000.0, 12, frame, height, width, 2).unwrap();
@@ -1072,23 +1069,26 @@ fn qwen_rope_grid_uses_centered_scale_rope_coordinates() {
     let row = |t: usize| -> (&[f32], &[f32]) {
         (&img_cos[t * fw..t * fw + fw], &img_sin[t * fw..t * fw + fw])
     };
-    // Grid center (y=2, x=2): centered h/w position = 2 - (4 - 2) = 0, frame = 0,
-    // so every axis is at position 0 -> cos == 1, sin == 0 across all bands.
-    let center = 2 * width + 2;
-    let (ccos, csin) = row(center);
-    for (i, (&c, &s)) in ccos.iter().zip(csin.iter()).enumerate() {
+    // Grid origin (y=0, x=0) -> position [0,0,0] -> identity: cos == 1, sin == 0.
+    let (ocos, osin) = row(0);
+    for (i, (&c, &s)) in ocos.iter().zip(osin.iter()).enumerate() {
         assert!(
             (c - 1.0).abs() < 1e-6 && s.abs() < 1e-6,
-            "center token freq {i}: cos={c} sin={s}, expected identity (position 0) \
-             -- rope is not using centered scale_rope=True coordinates"
+            "origin token freq {i}: cos={c} sin={s}, expected identity (0-based position 0)"
         );
     }
-    // Corner (y=0, x=0): centered h/w position = -2 (non-zero) -> height & width
-    // bands (freqs 2..6) must carry real rotation (some non-zero sin).
-    let (_, corner_sin) = row(0);
+    // Corner (y=3, x=3) is off-origin -> the height & width bands (freqs 2..6)
+    // carry real rotation (some non-zero sin).
+    let (_, corner_sin) = row(3 * width + 3);
     assert!(
         corner_sin[2..6].iter().any(|&s| s.abs() > 1e-6),
-        "corner token has no spatial rotation; centered coordinates not applied"
+        "off-origin token has no spatial rotation; 0-based coordinates not applied"
+    );
+    // Text tokens use all-zero position ids -> identity rotation everywhere.
+    let (tcos, tsin) = (rotary.text.cos_data(), rotary.text.sin_data());
+    assert!(
+        tcos.iter().all(|&c| (c - 1.0).abs() < 1e-6) && tsin.iter().all(|&s| s.abs() < 1e-6),
+        "text tokens must use all-zero position ids (identity rotation)"
     );
 }
 

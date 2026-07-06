@@ -331,6 +331,8 @@ impl NativeTransformerDenoiserIo {
                 self.krea_txt_linear1_bias.as_ref(),
                 runtime_context,
             )?;
+            // Krea2 txt_in: linear_2(gelu(linear_1(norm(x)))) (tanh-GELU).
+            let hidden = gelu_tanh(hidden);
             let linear2 = self.krea_txt_linear2_weight.as_ref().ok_or_else(|| {
                 DiffusionError::InvalidMetadata("Krea txt_in.linear_2 weight is missing".into())
             })?;
@@ -377,11 +379,10 @@ impl NativeTransformerDenoiserIo {
     ) -> DiffusionResult<CpuTensor> {
         // Krea2 final adaLN: RMSNorm(hidden) then modulate by the [2, hidden]
         // scale/shift table combined with the timestep embedding. Chunk order is
-        // [shift, scale] (row 0 = shift, row 1 = scale), matching the diffusers
-        // scale_shift_table convention (`shift, scale = (table + emb).chunk(2)`
-        // in PixArt/Sana final layers). NOTE: the time-embedding modulation
-        // source (same temb added to both rows here vs a split 2*width emb in
-        // diffusers) is still unverified against the Krea2 reference.
+        // [scale, shift] (row 0 = scale, row 1 = shift), per the Krea2 source
+        // (Krea2FinalLayer.forward: `scale, shift = (temb + table).chunk(2)` then
+        // `(1 + scale) * norm(x) + shift`). The same timestep embedding is added
+        // to both rows, matching the source (temb broadcasts over the 2 rows).
         if matches!(self.family, TransformerDenoiserFamily::Krea2) {
             let Some(norm_weight) = self.krea_final_norm_weight.as_ref() else {
                 return Ok(hidden.clone());
@@ -413,8 +414,8 @@ impl NativeTransformerDenoiserIo {
             for b in 0..batch {
                 for col in 0..width {
                     let temb = timestep_embedding.data[b * width + col];
-                    shift.data[b * width + col] = table.data[col] + temb;
-                    scale.data[b * width + col] = table.data[width + col] + temb;
+                    scale.data[b * width + col] = table.data[col] + temb;
+                    shift.data[b * width + col] = table.data[width + col] + temb;
                 }
             }
             return modulate_3d(&normalized, &shift, &scale);
@@ -533,7 +534,12 @@ impl NativeTransformerTimestepEmbedding {
             &self.linear_1_bias,
             runtime_context,
         )?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
+        // Krea2 time_embed uses tanh-GELU (not SiLU): linear_2(gelu(linear_1)).
+        let hidden = if matches!(self.family, TransformerDenoiserFamily::Krea2) {
+            gelu_tanh(hidden)
+        } else {
+            silu_with_runtime_context(&hidden, runtime_context)?
+        };
         linear_with_runtime_context(
             &hidden,
             &self.linear_2_weight,
@@ -555,7 +561,10 @@ impl NativeTransformerTimestepEmbedding {
                 "transformer time_mod_proj weight is present but bias is missing".to_string(),
             )
         })?;
-        linear_with_runtime_context(timestep_embedding, weight, bias, runtime_context).map(Some)
+        // Krea2: temb_mod = time_mod_proj(gelu(temb)) (main forward applies a
+        // tanh-GELU to the timestep embedding before the modulation projection).
+        let activated = gelu_tanh(timestep_embedding.clone());
+        linear_with_runtime_context(&activated, weight, bias, runtime_context).map(Some)
     }
 }
 
@@ -821,6 +830,19 @@ pub(crate) fn rms_gain_plus_one(mut weight: CpuTensor) -> CpuTensor {
         *v += 1.0;
     }
     weight
+}
+
+/// Tanh-approximate GELU, matching PyTorch `F.gelu(x, approximate="tanh")`.
+/// Krea2 uses this in `time_embed`, `time_mod_proj` (on temb) and `txt_in`
+/// (where hipfire previously used SiLU or no activation). Operates elementwise
+/// on the (small) embedding tensors, so a plain CPU pass is fine.
+pub(crate) fn gelu_tanh(mut input: CpuTensor) -> CpuTensor {
+    const C: f32 = 0.797_884_560_8; // sqrt(2/pi)
+    for v in &mut input.data {
+        let x = *v;
+        *v = 0.5 * x * (1.0 + (C * (x + 0.044715 * x * x * x)).tanh());
+    }
+    input
 }
 
 pub(crate) fn rms_gain_plus_one_opt(weight: Option<CpuTensor>) -> Option<CpuTensor> {
@@ -2185,16 +2207,16 @@ impl NativeTransformerBlock {
         let modulation = self
             .modulation
             .krea_scale_shift_with_runtime_context(time_modulation, runtime_context)?;
-        // adaLN chunk order is [shift, scale, gate] per stream, matching diffusers
-        // for the `scale_shift_table + temb -> chunk(6)` family (Sana / PixArt /
-        // Qwen-Image: `shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
-        // gate_mlp`). Chunk 0 is SHIFT, chunk 1 is SCALE. Swapping them corrupts
-        // the modulation (shift applied as 1+scale) and yields a near-noise DiT.
-        let preshift = extract_modulation_chunk_2d(&modulation, 0)?;
-        let prescale = extract_modulation_chunk_2d(&modulation, 1)?;
+        // adaLN chunk order is [scale, shift, gate] per stream, per the Krea2
+        // source (transformer_krea2.py Krea2TransformerBlock.forward:
+        // `prescale, preshift, pregate, postscale, postshift, postgate =
+        // modulation.unbind(-2)` then `(1 + prescale) * norm1(x) + preshift`).
+        // Chunk 0 is SCALE, chunk 1 is SHIFT. (Krea2 differs from Sana/Qwen-Image.)
+        let prescale = extract_modulation_chunk_2d(&modulation, 0)?;
+        let preshift = extract_modulation_chunk_2d(&modulation, 1)?;
         let pregate = extract_modulation_chunk_2d(&modulation, 2)?;
-        let postshift = extract_modulation_chunk_2d(&modulation, 3)?;
-        let postscale = extract_modulation_chunk_2d(&modulation, 4)?;
+        let postscale = extract_modulation_chunk_2d(&modulation, 3)?;
+        let postshift = extract_modulation_chunk_2d(&modulation, 4)?;
         let postgate = extract_modulation_chunk_2d(&modulation, 5)?;
 
         let attn_input = modulate_3d(
@@ -2271,13 +2293,13 @@ impl NativeTransformerBlock {
             gpu.upload_f32(&chunk.data, &chunk.shape)
                 .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))
         };
-        // adaLN chunk order [shift, scale, gate] per stream (see the CpuTensor
-        // path): chunk 0 is SHIFT, chunk 1 is SCALE, matching diffusers.
-        let preshift = upload(0)?;
-        let prescale = upload(1)?;
+        // adaLN chunk order [scale, shift, gate] per stream (see the CpuTensor
+        // path): chunk 0 is SCALE, chunk 1 is SHIFT, per the Krea2 source.
+        let prescale = upload(0)?;
+        let preshift = upload(1)?;
         let pregate = upload(2)?;
-        let postshift = upload(3)?;
-        let postscale = upload(4)?;
+        let postscale = upload(3)?;
+        let postshift = upload(4)?;
         let postgate = upload(5)?;
 
         // Attention: modulate(rms_norm(norm1)) -> attn -> gated residual.
@@ -3086,17 +3108,11 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
         })?;
     let mut image_cos = CpuTensor::zeros(&[image_seq_len, freq_width]);
     let mut image_sin = CpuTensor::zeros(&[image_seq_len, freq_width]);
-    // Qwen-Image family RoPE uses scale_rope=True (hardcoded in every diffusers
-    // Qwen*Transformer / controlnet): the height/width axes use CENTERED grid
-    // coordinates, not 0-based. diffusers builds each spatial axis as
-    // cat([neg_freqs[-(N-N/2):], pos_freqs[:N/2]]), i.e. positions
-    // [-(N-N/2) .. -1, 0 .. N/2-1]. Equivalently position(i) = i - (N - N/2).
-    // The frame axis stays 0-based. Text tokens sit just past the image span at
-    // base = max(H/2, W/2) (also halved under scale_rope). Using 0-based spatial
-    // positions here scrambles image attention into high-frequency noise.
-    let h_offset = (height - height / 2) as isize;
-    let w_offset = (width - width / 2) as isize;
-    let max_vid_index = (height / 2).max(width / 2);
+    // Krea2 RoPE follows Flux (Krea2RotaryPosEmbed is "Copied from FluxPosEmbed"):
+    // the pipeline's prepare_position_ids gives image tokens 0-based grid
+    // coordinates `[0, arange(grid_height), arange(grid_width)]` (frame axis 0,
+    // NOT centered), and text tokens all-zero position ids `[0, 0, 0]` (identity
+    // rotation). This differs from Qwen-Image's scale_rope centered coordinates.
     let mut token = 0usize;
     for f in 0..frame {
         for y in 0..height {
@@ -3108,13 +3124,14 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
                     freq_width,
                     axes,
                     theta,
-                    [f as isize, y as isize - h_offset, x as isize - w_offset],
+                    [f as isize, y as isize, x as isize],
                 );
                 token += 1;
             }
         }
     }
 
+    // Text tokens use all-zero position ids -> identity rotation (cos 1, sin 0).
     let mut text_cos = CpuTensor::zeros(&[text_seq_len, freq_width]);
     let mut text_sin = CpuTensor::zeros(&[text_seq_len, freq_width]);
     for token in 0..text_seq_len {
@@ -3125,11 +3142,7 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
             freq_width,
             axes,
             theta,
-            [
-                (max_vid_index + token) as isize,
-                (max_vid_index + token) as isize,
-                (max_vid_index + token) as isize,
-            ],
+            [0, 0, 0],
         );
     }
 
