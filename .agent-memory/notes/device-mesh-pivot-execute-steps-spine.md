@@ -180,9 +180,14 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   `AttnParams`+`KvTierPlan` surface is heavy — synthesizing it by hand is fragile; the REAL `attend_plan` builds it in
   the forward, and PB-3 already validated the attention math numerically). Downstream Gemv after RmsnormAutomatic uses
   `GemvInput::Raw(out)` (F32→no-op alias; equivalent to Prerotated for RotationPlan::None).
-- **PB-TP3..5 REMAINING:** TP3 = close the silu gap — the Step IR has NO activation op (silu fused into gate-up), so a
-  full FFN through the executor needs a new `Step::SiluMul`/activation variant (touches the total `op_kind`+`launch_op`
-  matches + `PipelineOp`) OR the fused gate-up path → whole TP transformer layer through the executor. TP4 = wire
+- **PB-TP3 DONE + validated** (`5c1274c8`) — added `Step::SiluMul { gate, up, out }` → `gpu.silu_mul_f32`
+  (`PipelineOp::SiluMul` already existed in types.rs; just added the enum variant + its arm in the TWO total Step
+  matches `op_kind`+`launch_op` — no other crate matches Step exhaustively, confirmed by full dispatch+runtime build).
+  Closes the FFN silu gap: a whole SwiGLU FFN block is now one per-rank step list — rmsnorm → col W_gate + col W_up →
+  `SiluMul`(on-rank inter/tp slice, no cross-rank dep) → row W_down + all-reduce. `tp_execute_steps_ffn_parity`: full
+  FFN through `execute_steps_tp` == single-device on Tp-2, max|Δ|=2.79e-9 (+ in-example host-math cross-check). dispatch
+  lib 172/0. `SiluMul` carries no weight → `TpCollective::None`; `tp_step_out_buf` returns None for it (never row-parallel).
+- **PB-TP4..5 REMAINING:** TP4 = wire
   `dense_forward` to emit per-rank sharded Steps when `mesh` Tp>1; thread `&mut Gpus`; real llama forward TP; full-model
   logit parity (FP32+DETERMINISTIC). TP5 = daemon `load_model_tp`+serve AFTER the EP-vs-TP intent fork (config.rs:155
   `tp`→Ep) + `tp_decode_parity`. **RAISE THE EP-vs-TP FORK with bjoern before TP5/daemon work** (his standing ask).
