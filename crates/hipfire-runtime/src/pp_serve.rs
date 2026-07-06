@@ -195,6 +195,14 @@ impl PpModel {
             self.gpus.wait_boundary(evt).map_err(herr)?;
             let g = &mut self.gpus.devices[s];
             g.bind_thread().map_err(herr)?;
+            // `forward_scratch_band` reads `scratch.pos_buf` for RoPE + attention,
+            // but only `forward_scratch_embed` (stage 0) sets it — so every
+            // downstream stage must set its own pos_buf, else it RoPEs/attends at a
+            // stale position (0). This is invisible at pos 0 (the init value), which
+            // is why the single-position oracle missed it.
+            g.hip
+                .memcpy_htod(&self.scratch[s].pos_buf, &(pos as i32).to_ne_bytes())
+                .map_err(herr)?;
             llama::forward_scratch_band(
                 g,
                 &self.weights,
