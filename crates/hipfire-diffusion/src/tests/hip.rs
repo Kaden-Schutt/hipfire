@@ -1742,6 +1742,75 @@ fn resident_swiglu_and_sigmoid_gates_match_cpu_reference() {
 }
 
 #[test]
+fn rope_qwen_resident_matches_cpu_reference() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for resident RoPE test: {error}");
+            return;
+        }
+    };
+    let (batch, seq, heads, head_dim) = (2usize, 4, 3, 8);
+    let width = heads * head_dim;
+    let freq_width = head_dim / 2;
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 13.0) - 6.0) / 6.0 * scale)
+            .collect()
+    };
+    let input = CpuTensor {
+        shape: vec![batch, seq, width],
+        data: fill(batch * seq * width, 1.0, 1.0),
+    };
+    // cos/sin as normalized cos(theta)/sin(theta) so |out| stays sane.
+    let mut cos_d = vec![0.0f32; seq * freq_width];
+    let mut sin_d = vec![0.0f32; seq * freq_width];
+    for t in 0..seq {
+        for p in 0..freq_width {
+            let theta = (t as f32 + 1.0) * 0.1 * (p as f32 + 1.0);
+            cos_d[t * freq_width + p] = theta.cos();
+            sin_d[t * freq_width + p] = theta.sin();
+        }
+    }
+    let cos = CpuTensor { shape: vec![seq, freq_width], data: cos_d };
+    let sin = CpuTensor { shape: vec![seq, freq_width], data: sin_d };
+
+    // CPU reference (interleaved pairs).
+    let mut cpu = vec![0.0f32; batch * seq * width];
+    for b in 0..batch {
+        for t in 0..seq {
+            for h in 0..heads {
+                let tb = (b * seq + t) * width + h * head_dim;
+                for p in 0..freq_width {
+                    let ri = tb + p * 2;
+                    let (re, im) = (input.data[ri], input.data[ri + 1]);
+                    let (c, s) = (cos.data[t * freq_width + p], sin.data[t * freq_width + p]);
+                    cpu[ri] = re * c - im * s;
+                    cpu[ri + 1] = re * s + im * c;
+                }
+            }
+        }
+    }
+
+    let input_gpu = gpu.upload_f32(&input.data, &input.shape).unwrap();
+    let mut cache = RocmWeightCache::default();
+    let out_gpu =
+        rope_qwen_resident(&mut gpu, &mut cache, &input_gpu, &cos, &sin, heads, head_dim).unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, input_gpu).unwrap();
+
+    assert_eq!(hip.shape, vec![batch, seq, width]);
+    let max_abs = hip
+        .data
+        .iter()
+        .zip(&cpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_abs <= 1e-5, "rope resident vs cpu max abs {max_abs}");
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,

@@ -1380,3 +1380,47 @@ extern "C" __global__ void diffusion_sigmoid_gate_f32(
     output[idx] = value[idx] * (1.0f / (1.0f + expf(-gate[idx])));
 }
 "#;
+
+pub(crate) const DIFFUSION_ROPE_QWEN_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Qwen interleaved RoPE: one thread per (b, token, head, pair). Rotates the
+// (real=2p, imag=2p+1) pair in each head by cos/sin[token, pair]. Matches the
+// CPU apply_qwen_rotary_embedding. cos/sin are [seq, head_dim/2].
+extern "C" __global__ void diffusion_rope_qwen_f32(
+    const float* input,
+    const float* cos_tab,
+    const float* sin_tab,
+    float* output,
+    int total_pairs,
+    int seq,
+    int heads,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) {
+        return;
+    }
+    int freq_width = head_dim >> 1;
+    int width = heads * head_dim;
+
+    int pair = idx % freq_width;
+    int t = idx / freq_width;
+    int head = t % heads;
+    int t2 = t / heads;
+    int token = t2 % seq;
+    int b = t2 / seq;
+
+    long token_base = ((long)(b * seq + token)) * width + (long)head * head_dim;
+    long real_idx = token_base + (long)pair * 2;
+    long imag_idx = real_idx + 1;
+    long freq_idx = (long)token * freq_width + pair;
+
+    float real = input[real_idx];
+    float imag = input[imag_idx];
+    float c = cos_tab[freq_idx];
+    float s = sin_tab[freq_idx];
+    output[real_idx] = real * c - imag * s;
+    output[imag_idx] = real * s + imag * c;
+}
+"#;

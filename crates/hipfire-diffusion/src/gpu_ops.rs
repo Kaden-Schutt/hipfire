@@ -4068,6 +4068,65 @@ fn two_input_gate_resident(
     Ok(output)
 }
 
+/// Device-resident Qwen interleaved RoPE over `[batch, seq, heads*head_dim]`.
+/// `cos`/`sin` are `[seq, head_dim/2]` frequency tables (resident-cached by
+/// pointer, stable across steps). Keeps the activation on-device.
+#[allow(dead_code)]
+pub(crate) fn rope_qwen_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    cache: &mut RocmWeightCache,
+    input: &hipfire_rdna::GpuTensor,
+    cos: &CpuTensor,
+    sin: &CpuTensor,
+    heads: usize,
+    head_dim: usize,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, seq, width] = resident_dims3(&input.shape, "RoPE input")?;
+    if heads == 0 || head_dim == 0 || head_dim % 2 != 0 || width != heads * head_dim {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "RoPE input width {width} incompatible with heads {heads} head_dim {head_dim}"
+        )));
+    }
+    let freq_width = head_dim / 2;
+    if cos.shape.as_slice() != [seq, freq_width] || sin.shape.as_slice() != [seq, freq_width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "RoPE cos/sin shapes {:?}/{:?} != [{seq}, {freq_width}]",
+            cos.shape, sin.shape
+        )));
+    }
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &input.shape)?;
+    let total_pairs = batch * seq * heads * freq_width;
+    if total_pairs == 0 {
+        return Ok(output);
+    }
+    let cos_ptr = cache.resident_ptr(gpu, cos)?;
+    let sin_ptr = cache.resident_ptr(gpu, sin)?;
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(cos_ptr);
+    kernargs.push_ptr(sin_ptr);
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("RoPE total pairs", total_pairs)?);
+    kernargs.push_i32(i32_kernel_dim("RoPE seq", seq)?);
+    kernargs.push_i32(i32_kernel_dim("RoPE heads", heads)?);
+    kernargs.push_i32(i32_kernel_dim("RoPE head_dim", head_dim)?);
+    kernargs.pad_to(16);
+    let grid = [((total_pairs as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_rope_qwen_f32",
+        DIFFUSION_ROPE_QWEN_HIP_SRC,
+        "diffusion_rope_qwen_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
 /// Device-resident NCHW channel concatenation ([n,ca,h,w] ++ [n,cb,h,w] ->
 /// [n,ca+cb,h,w]).
 pub(crate) fn concat_channels_nchw_resident(
