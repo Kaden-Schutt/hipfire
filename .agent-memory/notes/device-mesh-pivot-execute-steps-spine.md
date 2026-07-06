@@ -170,9 +170,19 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   GEMV pair routed THROUGH the executor == single-device on emulated Tp-2 (gfx1151), max|Δ|=1.21e-8; dispatch lib 172/0.
   NEW `execute_steps_tp` entry, NOT a signature change to `execute_steps_mesh` (P-A kept `&mut Gpu` for 40+ sites);
   unify once proven. Additive/off-path (only the example calls it). Uses `_peer` all-reduce; per-rank `DispatchCtx`.
-- **PB-TP2..5 REMAINING:** TP2 = derive per_rank_steps+collectives from a sharded `WeightStore`+`ShardPolicy`
-  (`collective_for_policy`), add replicated `RmsnormAutomatic` + attention Steps (Rope/Attend on owned heads, from PB-3).
-  TP3 = close the silu gap (new Step or fused gate-up) → whole TP transformer layer through the executor. TP4 = wire
+- **PB-TP2 DONE + validated** (`5a97ca9e`) — `tp_execute_steps_layer_parity`: rmsnorm → col W1 → row W2 through
+  `execute_steps_tp` == single-device on Tp-2, max|Δ|=5.59e-8. Two additions: (1) a REPLICATED non-Gemv step
+  (`Step::RmsnormAutomatic`, `RotationPlan::None` → plain `gpu.rmsnorm_f32` into `out`, x_plain unused) flows through
+  the TP executor unchanged (launch_op already handles every Step variant, so no executor change needed — just build
+  the per-rank Steps + `TpCollective::None`); (2) the `collectives` list is DERIVED from each step's weight
+  `ShardPolicy` via `collective_for_policy` (weight_manifest.rs:30; `RowShard`→`AllReduce{Tp}`→`AllReduceOut{dim}`,
+  else None) — single source of truth, no hand-authored reduce. **DECISION:** `Step::Attend` deferred to PB-TP4 (its
+  `AttnParams`+`KvTierPlan` surface is heavy — synthesizing it by hand is fragile; the REAL `attend_plan` builds it in
+  the forward, and PB-3 already validated the attention math numerically). Downstream Gemv after RmsnormAutomatic uses
+  `GemvInput::Raw(out)` (F32→no-op alias; equivalent to Prerotated for RotationPlan::None).
+- **PB-TP3..5 REMAINING:** TP3 = close the silu gap — the Step IR has NO activation op (silu fused into gate-up), so a
+  full FFN through the executor needs a new `Step::SiluMul`/activation variant (touches the total `op_kind`+`launch_op`
+  matches + `PipelineOp`) OR the fused gate-up path → whole TP transformer layer through the executor. TP4 = wire
   `dense_forward` to emit per-rank sharded Steps when `mesh` Tp>1; thread `&mut Gpus`; real llama forward TP; full-model
   logit parity (FP32+DETERMINISTIC). TP5 = daemon `load_model_tp`+serve AFTER the EP-vs-TP intent fork (config.rs:155
   `tp`→Ep) + `tp_decode_parity`. **RAISE THE EP-vs-TP FORK with bjoern before TP5/daemon work** (his standing ask).
