@@ -217,7 +217,7 @@ pub async fn post_txt2img(
     if let Err(error) = sdapi_validate_supported_scripts(&body) {
         return diffusion_error_response(error);
     }
-    if let Err(error) = sdapi_validate_request_geometry(&body) {
+    if let Err(error) = sdapi_validate_request_geometry(&body, &state.sdapi_geometry_limits) {
         return diffusion_error_response(error);
     }
     execute_sd_generation(state, body, None).await
@@ -231,7 +231,7 @@ pub async fn post_img2img(
     if let Err(error) = sdapi_validate_supported_scripts(&body) {
         return diffusion_error_response(error);
     }
-    if let Err(error) = sdapi_validate_request_geometry(&body) {
+    if let Err(error) = sdapi_validate_request_geometry(&body, &state.sdapi_geometry_limits) {
         return diffusion_error_response(error);
     }
     let images = body.init_images.clone().filter(|images| !images.is_empty());
@@ -392,14 +392,17 @@ async fn resolve_diffusion_hfq_for_request(
             cfg.default_model.clone()
         }
     }?;
-    resolve_diffusion_hfq_candidate(&candidate)
+    resolve_diffusion_hfq_candidate(&candidate, state.models_network_dir.as_deref())
 }
 
-pub(crate) fn resolve_diffusion_hfq_candidate(candidate: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_diffusion_hfq_candidate(
+    candidate: &str,
+    network_dir: Option<&Path>,
+) -> Option<PathBuf> {
     if candidate.is_empty() {
         return None;
     }
-    if let Some(path) = find_model(candidate) {
+    if let Some(path) = find_model(candidate, network_dir) {
         if inspect_hfq(&path).is_ok() {
             return Some(path);
         }
@@ -439,7 +442,12 @@ async fn execute_hfq_diffusion_txt2img(
         Ok(body) => body,
         Err(error) => return diffusion_error_response(error),
     };
-    let request = match sd_request_to_diffusion_batch_request(&first_pass_body, None, 0) {
+    let request = match sd_request_to_diffusion_batch_request(
+        &first_pass_body,
+        None,
+        0,
+        &state.sdapi_geometry_limits,
+    ) {
         Ok(request) => request,
         Err(error) => return diffusion_error_response(error),
     };
@@ -482,6 +490,9 @@ async fn execute_hfq_diffusion_txt2img(
     let worker_body = body.clone();
     let worker_first_pass_body = first_pass_body.clone();
     let first_pass_pipeline = pipeline.clone();
+    // `SdapiGeometryLimits` is `Copy`; capture it by value so the blocking
+    // closure does not have to borrow `state` (which is used again later).
+    let geometry_limits = state.sdapi_geometry_limits;
     let output = match tokio::task::spawn_blocking(move || {
         let mut outputs = Vec::with_capacity(n_iter as usize);
         for iter in 0..n_iter {
@@ -490,6 +501,7 @@ async fn execute_hfq_diffusion_txt2img(
                 &worker_first_pass_body,
                 None,
                 iter_seed_offset,
+                &geometry_limits,
             )?;
             if save_images || highres_target.is_some() {
                 iter_request.send_images = true;
@@ -531,6 +543,7 @@ async fn execute_hfq_diffusion_txt2img(
                 &highres_body,
                 Some(target_dimensions),
                 iter_seed_offset,
+                &geometry_limits,
             )?;
             if save_images {
                 highres_batch.send_images = true;
@@ -634,7 +647,12 @@ async fn execute_hfq_diffusion_img2img(
         Err(error) => return diffusion_error_response(error),
     };
     let default_dimensions = Some(prepared.processing_dimensions);
-    let _first_batch = match sd_request_to_diffusion_batch_request(&body, default_dimensions, 0) {
+    let _first_batch = match sd_request_to_diffusion_batch_request(
+        &body,
+        default_dimensions,
+        0,
+        &state.sdapi_geometry_limits,
+    ) {
         Ok(request) => request,
         Err(error) => return diffusion_error_response(error),
     };
@@ -665,6 +683,9 @@ async fn execute_hfq_diffusion_img2img(
     let worker_body = body.clone();
     let worker_init_image = prepared.init_image.clone();
     let worker_mask = prepared.mask.clone();
+    // `SdapiGeometryLimits` is `Copy`; capture it by value so the blocking
+    // closure does not have to borrow `state` (which is used again later).
+    let geometry_limits = state.sdapi_geometry_limits;
     let output = match tokio::task::spawn_blocking(move || {
         let mut outputs = Vec::with_capacity(n_iter as usize);
         for iter in 0..n_iter {
@@ -672,6 +693,7 @@ async fn execute_hfq_diffusion_img2img(
                 &worker_body,
                 default_dimensions,
                 iter.saturating_mul(batch_size_for_body(&worker_body)),
+                &geometry_limits,
             )?;
             if save_images {
                 iter_batch.send_images = true;
@@ -974,20 +996,54 @@ fn sdapi_validate_supported_scripts(body: &SdGenerationRequest) -> Result<(), Di
 ///
 /// Request geometry drives `batch × channels × height × width` allocations
 /// before any model-specific validation runs, so unbounded values are a
-/// remote OOM/compute-DoS vector on the network-facing routes. Caps are
-/// portability-safe for the smallest supported GPU class (UMA APUs): a
-/// request above them could not complete there anyway.
-const SDAPI_MAX_DIMENSION: u32 = 4096;
-const SDAPI_MAX_STEPS: u32 = 200;
-const SDAPI_MAX_BATCH_SIZE: u32 = 8;
-const SDAPI_MAX_N_ITER: u32 = 16;
-const SDAPI_MAX_TOTAL_BATCHES: u32 = 32;
+/// remote OOM/compute-DoS vector on the network-facing routes. These caps are
+/// the admin's DoS ceiling: sourced from `HipfireConfig` (defaults are
+/// portability-safe for the smallest supported GPU class — UMA APUs — a
+/// request above them could not complete there anyway). Clients may request
+/// smaller geometry, never larger.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SdapiGeometryLimits {
+    pub max_dimension: u32,
+    pub max_steps: u32,
+    pub max_batch_size: u32,
+    pub max_n_iter: u32,
+    pub max_total_batches: u32,
+}
+
+impl SdapiGeometryLimits {
+    pub(crate) fn from_config(config: &hipfire_config::HipfireConfig) -> Self {
+        Self {
+            max_dimension: config.sdapi_max_dimension,
+            max_steps: config.sdapi_max_steps,
+            max_batch_size: config.sdapi_max_batch_size,
+            max_n_iter: config.sdapi_max_n_iter,
+            max_total_batches: config.sdapi_max_total_batches,
+        }
+    }
+}
+
+impl Default for SdapiGeometryLimits {
+    /// Canonical defaults, single-sourced from `hipfire-config` so the
+    /// hardcoded ceiling and the config default can never drift.
+    fn default() -> Self {
+        Self {
+            max_dimension: hipfire_config::default_sdapi_max_dimension(),
+            max_steps: hipfire_config::default_sdapi_max_steps(),
+            max_batch_size: hipfire_config::default_sdapi_max_batch_size(),
+            max_n_iter: hipfire_config::default_sdapi_max_n_iter(),
+            max_total_batches: hipfire_config::default_sdapi_max_total_batches(),
+        }
+    }
+}
 
 /// Boundary gate on raw client fields, called from `post_txt2img` /
 /// `post_img2img` so oversized requests get a clear 400 before any work.
 /// Highres/firstphase fields are capped here too: they become real
 /// width/height in the cloned second-pass request.
-fn sdapi_validate_request_geometry(body: &SdGenerationRequest) -> Result<(), DiffusionError> {
+fn sdapi_validate_request_geometry(
+    body: &SdGenerationRequest,
+    limits: &SdapiGeometryLimits,
+) -> Result<(), DiffusionError> {
     for (field, value) in [
         ("width", body.width),
         ("height", body.height),
@@ -996,10 +1052,11 @@ fn sdapi_validate_request_geometry(body: &SdGenerationRequest) -> Result<(), Dif
         ("hr_resize_x", body.hr_resize_x),
         ("hr_resize_y", body.hr_resize_y),
     ] {
-        if value.is_some_and(|value| value > SDAPI_MAX_DIMENSION) {
+        if value.is_some_and(|value| value > limits.max_dimension) {
             return Err(DiffusionError::InvalidRequest(format!(
-                "{field} {} exceeds the maximum supported dimension {SDAPI_MAX_DIMENSION}",
-                value.unwrap_or_default()
+                "{field} {} exceeds the maximum supported dimension {}",
+                value.unwrap_or_default(),
+                limits.max_dimension
             )));
         }
     }
@@ -1010,30 +1067,34 @@ fn sdapi_validate_request_geometry(body: &SdGenerationRequest) -> Result<(), Dif
         ("steps", body.steps),
         ("hr_second_pass_steps", body.hr_second_pass_steps),
     ] {
-        if value.is_some_and(|value| value > SDAPI_MAX_STEPS) {
+        if value.is_some_and(|value| value > limits.max_steps) {
             return Err(DiffusionError::InvalidRequest(format!(
-                "{field} {} exceeds the maximum supported step count {SDAPI_MAX_STEPS}",
-                value.unwrap_or_default()
+                "{field} {} exceeds the maximum supported step count {}",
+                value.unwrap_or_default(),
+                limits.max_steps
             )));
         }
     }
     let batch_size = body.batch_size.unwrap_or(1).max(1);
-    if batch_size > SDAPI_MAX_BATCH_SIZE {
+    if batch_size > limits.max_batch_size {
         return Err(DiffusionError::InvalidRequest(format!(
-            "batch_size {batch_size} exceeds the maximum supported batch size {SDAPI_MAX_BATCH_SIZE}"
+            "batch_size {batch_size} exceeds the maximum supported batch size {}",
+            limits.max_batch_size
         )));
     }
     let n_iter = body.n_iter.unwrap_or(1).max(1);
-    if n_iter > SDAPI_MAX_N_ITER {
+    if n_iter > limits.max_n_iter {
         return Err(DiffusionError::InvalidRequest(format!(
-            "n_iter {n_iter} exceeds the maximum supported iteration count {SDAPI_MAX_N_ITER}"
+            "n_iter {n_iter} exceeds the maximum supported iteration count {}",
+            limits.max_n_iter
         )));
     }
     // Both factors are already capped above, so the product cannot overflow.
-    if batch_size * n_iter > SDAPI_MAX_TOTAL_BATCHES {
+    if batch_size * n_iter > limits.max_total_batches {
         return Err(DiffusionError::InvalidRequest(format!(
-            "batch_size × n_iter = {} exceeds the maximum total batch count {SDAPI_MAX_TOTAL_BATCHES}",
-            batch_size * n_iter
+            "batch_size × n_iter = {} exceeds the maximum total batch count {}",
+            batch_size * n_iter,
+            limits.max_total_batches
         )));
     }
     Ok(())
@@ -1049,20 +1110,24 @@ fn sdapi_validate_resolved_geometry(
     height: u32,
     batch_size: u32,
     steps: u32,
+    limits: &SdapiGeometryLimits,
 ) -> Result<(), DiffusionError> {
-    if width > SDAPI_MAX_DIMENSION || height > SDAPI_MAX_DIMENSION {
+    if width > limits.max_dimension || height > limits.max_dimension {
         return Err(DiffusionError::InvalidRequest(format!(
-            "resolved dimensions {width}×{height} exceed the maximum supported dimension {SDAPI_MAX_DIMENSION}"
+            "resolved dimensions {width}×{height} exceed the maximum supported dimension {}",
+            limits.max_dimension
         )));
     }
-    if steps > SDAPI_MAX_STEPS {
+    if steps > limits.max_steps {
         return Err(DiffusionError::InvalidRequest(format!(
-            "resolved steps {steps} exceeds the maximum supported step count {SDAPI_MAX_STEPS}"
+            "resolved steps {steps} exceeds the maximum supported step count {}",
+            limits.max_steps
         )));
     }
-    if batch_size > SDAPI_MAX_BATCH_SIZE {
+    if batch_size > limits.max_batch_size {
         return Err(DiffusionError::InvalidRequest(format!(
-            "resolved batch_size {batch_size} exceeds the maximum supported batch size {SDAPI_MAX_BATCH_SIZE}"
+            "resolved batch_size {batch_size} exceeds the maximum supported batch size {}",
+            limits.max_batch_size
         )));
     }
     Ok(())
@@ -1809,6 +1874,7 @@ fn sd_request_to_diffusion_batch_request(
     body: &SdGenerationRequest,
     default_dimensions: Option<(u32, u32)>,
     seed_offset: u32,
+    limits: &SdapiGeometryLimits,
 ) -> Result<DiffusionBatchRequest, DiffusionError> {
     let batch_size = body.batch_size.unwrap_or(1).max(1);
     let base_seed = body.seed.unwrap_or(-1);
@@ -1838,7 +1904,7 @@ fn sd_request_to_diffusion_batch_request(
         .or_else(|| default_dimensions.map(|dimensions| dimensions.1))
         .unwrap_or(512);
     let steps = body.steps.unwrap_or(20);
-    sdapi_validate_resolved_geometry(width, height, batch_size, steps)?;
+    sdapi_validate_resolved_geometry(width, height, batch_size, steps, limits)?;
     let conditioning = sdapi_external_conditioning(body, batch_size as usize)?;
     Ok(DiffusionBatchRequest {
         prompts,
@@ -4100,7 +4166,9 @@ pub async fn post_reload_checkpoint(State(state): State<SharedState>) -> Respons
         }))
         .into_response();
     };
-    let Some(path) = resolve_diffusion_hfq_candidate(&requested_model) else {
+    let Some(path) =
+        resolve_diffusion_hfq_candidate(&requested_model, state.models_network_dir.as_deref())
+    else {
         return diffusion_error_response(DiffusionError::InvalidRequest(format!(
             "sd_model_checkpoint {requested_model:?} could not be resolved"
         )));
@@ -4434,10 +4502,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -4489,7 +4560,7 @@ mod tests {
 
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -4514,7 +4585,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-override.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
             steps: Some(1),
@@ -4524,7 +4598,7 @@ mod tests {
             send_images: Some(true),
             save_images: Some(false),
             override_settings: Some(json!({
-                "sd_model_checkpoint": hfq_path,
+                "sd_model_checkpoint": hfq_path.file_name().unwrap().to_string_lossy().into_owned(),
             })),
             ..empty_request()
         };
@@ -4551,9 +4625,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-infotext.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             send_images: Some(true),
             save_images: Some(false),
             infotext: Some(
@@ -4670,13 +4747,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-webui-ignored-fields-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
 
         let response = post_txt2img(
             State(state),
             Json(SdGenerationRequest {
                 prompt: "a styled tiled cat".to_string(),
-                model: Some(hfq_path.to_string_lossy().into_owned()),
+                model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
                 steps: Some(1),
                 cfg_scale: Some(1.0),
                 width: Some(2),
@@ -4802,10 +4882,13 @@ mod tests {
         let hfq_path = dir.join("tiny-route-diffusion-save.hfq");
         let output_dir = dir.join("outputs");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -4850,10 +4933,13 @@ mod tests {
         let hfq_path = dir.join("tiny-route-diffusion-do-not-save.hfq");
         let output_dir = dir.join("outputs");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a no-save cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -4893,10 +4979,12 @@ mod tests {
         write_tiny_diffusion_hfq(&hfq_path);
         let mut cfg = hipfire_config::HipfireConfig::default();
         cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
-        let state = crate::AppState::new(cfg);
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a grid-save cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -4946,10 +5034,13 @@ mod tests {
         let hfq_path = dir.join("tiny-route-diffusion-no-grid-save.hfq");
         let output_dir = dir.join("outputs");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a no-grid-save cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -4987,10 +5078,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-highres.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a highres cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(4),
@@ -5062,10 +5156,12 @@ mod tests {
         write_tiny_diffusion_hfq(&hfq_path);
         let mut cfg = hipfire_config::HipfireConfig::default();
         cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
-        let state = crate::AppState::new(cfg);
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a highres saved cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             seed: Some(9),
             steps: Some(1),
             cfg_scale: Some(1.0),
@@ -5117,11 +5213,24 @@ mod tests {
         let second_hfq_path = dir.join("tiny-route-diffusion-highres-second.hfq");
         write_tiny_diffusion_hfq(&first_hfq_path);
         write_tiny_diffusion_hfq(&second_hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
-        let checkpoint = second_hfq_path.to_string_lossy().into_owned();
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
+        let checkpoint = second_hfq_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let body = SdGenerationRequest {
             prompt: "a highres cat".to_string(),
-            model: Some(first_hfq_path.to_string_lossy().into_owned()),
+            model: Some(
+                first_hfq_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5166,10 +5275,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-highres-checkpoint.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a highres cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5199,11 +5311,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let init_image = tiny_png_base64();
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5243,11 +5358,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-include-init.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let init_image = tiny_png_base64();
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5283,10 +5401,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-batch.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             seed: Some(21),
             steps: Some(1),
             cfg_scale: Some(1.0),
@@ -5330,10 +5451,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-niter.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             seed: Some(30),
             steps: Some(1),
             cfg_scale: Some(1.0),
@@ -5371,10 +5495,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-mask.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5412,10 +5539,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-resize.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5460,10 +5590,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-latent-upscale.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5509,10 +5642,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-full-res-inpaint.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5563,10 +5699,12 @@ mod tests {
         write_tiny_diffusion_hfq(&hfq_path);
         let mut cfg = hipfire_config::HipfireConfig::default();
         cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
-        let state = crate::AppState::new(cfg);
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5612,10 +5750,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-img2img-resize-mask.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             steps: Some(1),
             cfg_scale: Some(1.0),
             width: Some(2),
@@ -5828,10 +5969,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             seed: Some(10),
             steps: Some(1),
             cfg_scale: Some(1.0),
@@ -5872,10 +6016,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-return-grid.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a grid cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             seed: Some(10),
             steps: Some(1),
             cfg_scale: Some(1.0),
@@ -5917,10 +6064,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let hfq_path = dir.join("tiny-route-diffusion-niter.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
-        let state = crate::AppState::new(hipfire_config::HipfireConfig::default());
+        let mut cfg = hipfire_config::HipfireConfig::default();
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
         let body = SdGenerationRequest {
             prompt: "a cat".to_string(),
-            model: Some(hfq_path.to_string_lossy().into_owned()),
+            model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
             seed: Some(20),
             steps: Some(1),
             cfg_scale: Some(1.0),
@@ -6632,7 +6782,9 @@ mod tests {
         write_tiny_diffusion_hfq(&hfq_path);
         let mut cfg = hipfire_config::HipfireConfig::default();
         cfg.sdapi_output_root = server_root.to_string_lossy().into_owned();
-        let state = crate::AppState::new(cfg);
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
 
         // Stored outdir_* (set through the unauthenticated options route) and
         // per-request override_settings outdir_* must both be ignored.
@@ -6652,7 +6804,7 @@ mod tests {
             State(state.clone()),
             Json(SdGenerationRequest {
                 prompt: "a stored options cat".to_string(),
-                model: Some(hfq_path.to_string_lossy().into_owned()),
+                model: Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned()),
                 steps: Some(1),
                 cfg_scale: Some(1.0),
                 width: Some(2),
@@ -6700,8 +6852,10 @@ mod tests {
         let hfq_path = dir.join("tiny-reload-diffusion.hfq");
         write_tiny_diffusion_hfq(&hfq_path);
         let mut cfg = hipfire_config::HipfireConfig::default();
-        cfg.default_model = Some(hfq_path.to_string_lossy().into_owned());
-        let state = crate::AppState::new(cfg);
+        cfg.default_model = Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned());
+        let mut loaded = hipfire_config::LoadedConfig::from_config(cfg);
+        loaded.config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        let state = crate::AppState::new_loaded(loaded);
 
         let response = post_reload_checkpoint(State(state.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -7135,7 +7289,9 @@ mod tests {
             ..empty_request()
         };
 
-        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        let request =
+            sd_request_to_diffusion_batch_request(&body, None, 0, &SdapiGeometryLimits::default())
+                .unwrap();
 
         assert_eq!(request.prompts.len(), 2);
         assert_eq!(request.prompts[0].seed, 41);
@@ -7184,7 +7340,9 @@ mod tests {
             ..empty_request()
         };
 
-        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        let request =
+            sd_request_to_diffusion_batch_request(&body, None, 0, &SdapiGeometryLimits::default())
+                .unwrap();
         let conditioning = request.conditioning.unwrap();
 
         assert_eq!(conditioning.prompt_embeddings.shape, vec![2, 1, 2]);
@@ -7225,7 +7383,9 @@ mod tests {
             ..empty_request()
         };
 
-        let error = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap_err();
+        let error =
+            sd_request_to_diffusion_batch_request(&body, None, 0, &SdapiGeometryLimits::default())
+                .unwrap_err();
 
         assert!(error
             .to_string()
@@ -7242,7 +7402,9 @@ mod tests {
             ..empty_request()
         };
 
-        let iter_request = sd_request_to_diffusion_batch_request(&body, None, 2).unwrap();
+        let iter_request =
+            sd_request_to_diffusion_batch_request(&body, None, 2, &SdapiGeometryLimits::default())
+                .unwrap();
 
         assert_eq!(iter_request.prompts.len(), 2);
         assert_eq!(iter_request.prompts[0].seed, 43);
@@ -7257,7 +7419,9 @@ mod tests {
             ..empty_request()
         };
 
-        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        let request =
+            sd_request_to_diffusion_batch_request(&body, None, 0, &SdapiGeometryLimits::default())
+                .unwrap();
 
         assert_eq!(request.scheduler, "Euler");
     }
@@ -7271,7 +7435,9 @@ mod tests {
             ..empty_request()
         };
 
-        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        let request =
+            sd_request_to_diffusion_batch_request(&body, None, 0, &SdapiGeometryLimits::default())
+                .unwrap();
 
         assert_eq!(request.scheduler, "Euler Karras");
 
@@ -7281,9 +7447,14 @@ mod tests {
             ..empty_request()
         };
         assert_eq!(
-            sd_request_to_diffusion_batch_request(&automatic, None, 0)
-                .unwrap()
-                .scheduler,
+            sd_request_to_diffusion_batch_request(
+                &automatic,
+                None,
+                0,
+                &SdapiGeometryLimits::default()
+            )
+            .unwrap()
+            .scheduler,
             "DDIM"
         );
 
@@ -7293,9 +7464,14 @@ mod tests {
             ..empty_request()
         };
         assert_eq!(
-            sd_request_to_diffusion_batch_request(&full_scheduler_wins, None, 0)
-                .unwrap()
-                .scheduler,
+            sd_request_to_diffusion_batch_request(
+                &full_scheduler_wins,
+                None,
+                0,
+                &SdapiGeometryLimits::default()
+            )
+            .unwrap()
+            .scheduler,
             "DPM++ 2M"
         );
     }
@@ -7315,7 +7491,9 @@ mod tests {
             ..empty_request()
         };
 
-        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        let request =
+            sd_request_to_diffusion_batch_request(&body, None, 0, &SdapiGeometryLimits::default())
+                .unwrap();
 
         assert_eq!(request.width, 768);
         assert_eq!(request.height, 512);
@@ -7785,7 +7963,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(body.hipfire_distilled_guidance_scale, Some(2.75));
-        let request = sd_request_to_diffusion_batch_request(&body, None, 0).unwrap();
+        let request =
+            sd_request_to_diffusion_batch_request(&body, None, 0, &SdapiGeometryLimits::default())
+                .unwrap();
         assert_eq!(request.distilled_guidance_scale, Some(2.75));
     }
 
@@ -7834,7 +8014,13 @@ mod tests {
         };
 
         let second = sdapi_highres_second_pass_body(&body, (8, 6));
-        let request = sd_request_to_diffusion_batch_request(&second, None, 0).unwrap();
+        let request = sd_request_to_diffusion_batch_request(
+            &second,
+            None,
+            0,
+            &SdapiGeometryLimits::default(),
+        )
+        .unwrap();
 
         assert_eq!(second.scheduler.as_deref(), Some("DDIM"));
         assert_eq!(second.sampler_name.as_deref(), Some("Euler"));
@@ -7854,7 +8040,13 @@ mod tests {
         };
 
         let second = sdapi_highres_second_pass_body(&body, (8, 6));
-        let request = sd_request_to_diffusion_batch_request(&second, None, 0).unwrap();
+        let request = sd_request_to_diffusion_batch_request(
+            &second,
+            None,
+            0,
+            &SdapiGeometryLimits::default(),
+        )
+        .unwrap();
 
         assert_eq!(second.sampler_name.as_deref(), Some("Euler"));
         assert_eq!(second.scheduler.as_deref(), Some("Karras"));
@@ -7865,18 +8057,22 @@ mod tests {
     fn request_geometry_gate_rejects_oversized_dimensions() {
         // The review's DoS payload: a tiny JSON body driving a
         // batch×channels×height×width allocation in the hundreds of GB.
-        let err = sdapi_validate_request_geometry(&SdGenerationRequest {
-            width: Some(100_000),
-            height: Some(100_000),
-            ..empty_request()
-        })
+        let limits = SdapiGeometryLimits::default();
+        let err = sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                width: Some(100_000),
+                height: Some(100_000),
+                ..empty_request()
+            },
+            &limits,
+        )
         .unwrap_err();
         assert!(matches!(err, DiffusionError::InvalidRequest(_)));
 
         for (field_req, _label) in [
             (
                 SdGenerationRequest {
-                    firstphase_width: Some(SDAPI_MAX_DIMENSION + 8),
+                    firstphase_width: Some(limits.max_dimension + 8),
                     ..empty_request()
                 },
                 "firstphase_width",
@@ -7890,69 +8086,120 @@ mod tests {
             ),
             (
                 SdGenerationRequest {
-                    hr_resize_y: Some(SDAPI_MAX_DIMENSION + 1),
+                    hr_resize_y: Some(limits.max_dimension + 1),
                     ..empty_request()
                 },
                 "hr_resize_y",
             ),
         ] {
-            assert!(sdapi_validate_request_geometry(&field_req).is_err());
+            assert!(sdapi_validate_request_geometry(&field_req, &limits).is_err());
         }
     }
 
     #[test]
     fn request_geometry_gate_accepts_supported_geometry() {
-        for dim in [512, 1024, SDAPI_MAX_DIMENSION] {
+        let limits = SdapiGeometryLimits::default();
+        for dim in [512, 1024, limits.max_dimension] {
             assert!(
-                sdapi_validate_request_geometry(&SdGenerationRequest {
-                    width: Some(dim),
-                    height: Some(dim),
-                    steps: Some(SDAPI_MAX_STEPS),
-                    batch_size: Some(SDAPI_MAX_BATCH_SIZE),
-                    n_iter: Some(SDAPI_MAX_TOTAL_BATCHES / SDAPI_MAX_BATCH_SIZE),
-                    ..empty_request()
-                })
+                sdapi_validate_request_geometry(
+                    &SdGenerationRequest {
+                        width: Some(dim),
+                        height: Some(dim),
+                        steps: Some(limits.max_steps),
+                        batch_size: Some(limits.max_batch_size),
+                        n_iter: Some(limits.max_total_batches / limits.max_batch_size),
+                        ..empty_request()
+                    },
+                    &limits,
+                )
                 .is_ok(),
                 "dim {dim} should be accepted"
             );
         }
         // Absent fields fall back to safe defaults and must pass.
-        assert!(sdapi_validate_request_geometry(&empty_request()).is_ok());
+        assert!(sdapi_validate_request_geometry(&empty_request(), &limits).is_ok());
     }
 
     #[test]
     fn request_geometry_gate_caps_steps_batch_and_iterations() {
-        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
-            steps: Some(SDAPI_MAX_STEPS + 1),
-            ..empty_request()
-        })
+        let limits = SdapiGeometryLimits::default();
+        assert!(sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                steps: Some(limits.max_steps + 1),
+                ..empty_request()
+            },
+            &limits,
+        )
         .is_err());
-        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
-            hr_second_pass_steps: Some(999),
-            ..empty_request()
-        })
+        assert!(sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                hr_second_pass_steps: Some(999),
+                ..empty_request()
+            },
+            &limits,
+        )
         .is_err());
-        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
-            batch_size: Some(SDAPI_MAX_BATCH_SIZE + 1),
-            ..empty_request()
-        })
+        assert!(sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                batch_size: Some(limits.max_batch_size + 1),
+                ..empty_request()
+            },
+            &limits,
+        )
         .is_err());
-        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
-            n_iter: Some(SDAPI_MAX_N_ITER + 1),
-            ..empty_request()
-        })
+        assert!(sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                n_iter: Some(limits.max_n_iter + 1),
+                ..empty_request()
+            },
+            &limits,
+        )
         .is_err());
         // Individually legal factors whose product exceeds the total cap.
-        assert!(sdapi_validate_request_geometry(&SdGenerationRequest {
-            batch_size: Some(SDAPI_MAX_BATCH_SIZE),
-            n_iter: Some(SDAPI_MAX_TOTAL_BATCHES / SDAPI_MAX_BATCH_SIZE + 1),
-            ..empty_request()
-        })
+        assert!(sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                batch_size: Some(limits.max_batch_size),
+                n_iter: Some(limits.max_total_batches / limits.max_batch_size + 1),
+                ..empty_request()
+            },
+            &limits,
+        )
         .is_err());
     }
 
     #[test]
+    fn request_geometry_gate_honors_config_derived_limits() {
+        // Admin config drives the ceiling: a request legal under defaults can
+        // be rejected under a tighter config, and clients only go smaller.
+        let tight = SdapiGeometryLimits {
+            max_dimension: 1024,
+            max_steps: 30,
+            max_batch_size: 2,
+            max_n_iter: 2,
+            max_total_batches: 2,
+        };
+        assert!(sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                width: Some(2048),
+                ..empty_request()
+            },
+            &tight,
+        )
+        .is_err());
+        assert!(sdapi_validate_request_geometry(
+            &SdGenerationRequest {
+                width: Some(1024),
+                steps: Some(30),
+                ..empty_request()
+            },
+            &tight,
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn batch_request_funnel_rejects_oversized_resolved_geometry() {
+        let limits = SdapiGeometryLimits::default();
         // Direct client geometry.
         assert!(sd_request_to_diffusion_batch_request(
             &SdGenerationRequest {
@@ -7962,6 +8209,7 @@ mod tests {
             },
             None,
             0,
+            &limits,
         )
         .is_err());
         // The cloned highres second-pass body carries DERIVED width/height
@@ -7969,16 +8217,17 @@ mod tests {
         // gate as raw fields — the funnel must stop them.
         assert!(sd_request_to_diffusion_batch_request(
             &SdGenerationRequest {
-                width: Some(SDAPI_MAX_DIMENSION * 2),
+                width: Some(limits.max_dimension * 2),
                 height: Some(512),
                 ..empty_request()
             },
             None,
             0,
+            &limits,
         )
         .is_err());
         // Defaults resolve to 512×512 and pass.
-        assert!(sd_request_to_diffusion_batch_request(&empty_request(), None, 0).is_ok());
+        assert!(sd_request_to_diffusion_batch_request(&empty_request(), None, 0, &limits).is_ok());
     }
 
     fn empty_request() -> SdGenerationRequest {

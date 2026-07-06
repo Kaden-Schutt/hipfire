@@ -99,6 +99,13 @@ pub struct AppState {
     /// Server-owned root for images saved by the SD API routes. Derived from
     /// config at construction; request `outdir_*` overrides never reach it.
     pub sdapi_output_root: PathBuf,
+    /// Admin-configured DoS ceiling on SD API request geometry. Derived from
+    /// config at construction; clients may request smaller, never larger.
+    pub(crate) sdapi_geometry_limits: crate::routes::sdapi::SdapiGeometryLimits,
+    /// Optional admin-configured extra read-only model root (e.g. an NFS
+    /// share). Network model resolution is confined to `~/.hipfire/models`
+    /// plus this root; unset by default. Derived from config at construction.
+    pub models_network_dir: Option<PathBuf>,
     /// Local admin bearer secret (`~/.hipfire/admin.secret`); same-box
     /// CLI/TUI present this to skip the `/admin` login flow.
     pub admin_secret: String,
@@ -124,6 +131,12 @@ impl AppState {
         let scheduler_env = SchedulerPolicyEnv::from_pairs(std::env::vars());
         let config = loaded_config.config.clone();
         let sdapi_output_root = PathBuf::from(&config.sdapi_output_root);
+        let sdapi_geometry_limits = crate::routes::sdapi::SdapiGeometryLimits::from_config(&config);
+        let models_network_dir = config
+            .models_network_dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
         Arc::new(Self {
             engine: Mutex::new(None),
             loaded_config: Mutex::new(loaded_config),
@@ -150,6 +163,8 @@ impl AppState {
             last_request_unix_secs: Mutex::new(now_secs()),
             training_runs_dir,
             sdapi_output_root,
+            sdapi_geometry_limits,
+            models_network_dir,
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
         })

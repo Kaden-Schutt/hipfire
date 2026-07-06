@@ -182,6 +182,60 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Root directory for images saved by the SD API compatibility routes (save_images: true). Client-supplied outdir_* override_settings are ignored; every SD API image write stays under this root."
     ),
     field!(
+        "sdapi_max_dimension",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("4096"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on any single SD API dimension (width/height and their highres/firstphase variants). Requests above it get a 400. The admin's DoS ceiling; clients may request smaller, never larger."
+    ),
+    field!(
+        "sdapi_max_steps",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("200"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on SD API step counts (steps and hr_second_pass_steps)."
+    ),
+    field!(
+        "sdapi_max_batch_size",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("8"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on SD API batch_size."
+    ),
+    field!(
+        "sdapi_max_n_iter",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("16"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on SD API n_iter."
+    ),
+    field!(
+        "sdapi_max_total_batches",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("32"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on batch_size × n_iter (total images generated per request)."
+    ),
+    field!(
+        "models_network_dir",
+        ConfigType::Path,
+        Requirement::Optional,
+        None,
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to ~/.hipfire/models. Unset by default; local CLI/eval callers are unaffected."
+    ),
+    field!(
         "default_model",
         ConfigType::String,
         Requirement::Optional,

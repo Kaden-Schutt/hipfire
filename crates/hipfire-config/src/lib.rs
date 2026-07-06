@@ -36,6 +36,26 @@ fn default_admin_user() -> String {
 fn default_sdapi_output_root() -> String {
     "/tmp/hipfire-sdapi".to_string()
 }
+// SD API request-geometry caps. These bound `batch × channels × height ×
+// width` allocations on the network-facing routes, so they are the admin's
+// DoS ceiling. Defaults are portability-safe for the smallest supported GPU
+// class (UMA APUs); clients may request smaller, never larger. `pub` so the
+// server can reuse them as the canonical default for its in-memory limits.
+pub fn default_sdapi_max_dimension() -> u32 {
+    4096
+}
+pub fn default_sdapi_max_steps() -> u32 {
+    200
+}
+pub fn default_sdapi_max_batch_size() -> u32 {
+    8
+}
+pub fn default_sdapi_max_n_iter() -> u32 {
+    16
+}
+pub fn default_sdapi_max_total_batches() -> u32 {
+    32
+}
 fn default_max_seq() -> u32 {
     8192
 }
@@ -160,6 +180,28 @@ pub struct HipfireConfig {
     /// are ignored; every SD API image write stays under this root.
     #[serde(default = "default_sdapi_output_root")]
     pub sdapi_output_root: String,
+    /// Upper bound on any single SD API dimension (width/height and their
+    /// highres/firstphase variants). Client requests above it get a 400.
+    #[serde(default = "default_sdapi_max_dimension")]
+    pub sdapi_max_dimension: u32,
+    /// Upper bound on SD API step counts (steps and hr_second_pass_steps).
+    #[serde(default = "default_sdapi_max_steps")]
+    pub sdapi_max_steps: u32,
+    /// Upper bound on SD API `batch_size`.
+    #[serde(default = "default_sdapi_max_batch_size")]
+    pub sdapi_max_batch_size: u32,
+    /// Upper bound on SD API `n_iter`.
+    #[serde(default = "default_sdapi_max_n_iter")]
+    pub sdapi_max_n_iter: u32,
+    /// Upper bound on `batch_size × n_iter` (total images per request).
+    #[serde(default = "default_sdapi_max_total_batches")]
+    pub sdapi_max_total_batches: u32,
+    /// Optional extra read-only model root (e.g. an NFS share such as
+    /// `/srv/hipfire`). When set, the network-facing server routes resolve
+    /// model identifiers within this root in addition to `~/.hipfire/models`.
+    /// Unset by default; local CLI/eval callers are unaffected.
+    #[serde(default)]
+    pub models_network_dir: Option<String>,
     #[serde(default)]
     pub default_model: Option<String>,
     #[serde(default = "default_max_seq")]
@@ -332,6 +374,12 @@ impl Default for HipfireConfig {
             cors_allowed_origins: default_cors_allowed_origins(),
             admin_user: default_admin_user(),
             sdapi_output_root: default_sdapi_output_root(),
+            sdapi_max_dimension: default_sdapi_max_dimension(),
+            sdapi_max_steps: default_sdapi_max_steps(),
+            sdapi_max_batch_size: default_sdapi_max_batch_size(),
+            sdapi_max_n_iter: default_sdapi_max_n_iter(),
+            sdapi_max_total_batches: default_sdapi_max_total_batches(),
+            models_network_dir: None,
             default_model: None,
             max_seq: default_max_seq(),
             max_tokens: default_max_tokens(),
@@ -747,6 +795,38 @@ mod tests {
         assert_eq!(cfg.prefill_drafter_device, -1);
         assert!(!cfg.prefill_profile);
         assert_eq!(cfg.prefill_sparse_threshold, 32768);
+        assert_eq!(cfg.sdapi_max_dimension, 4096);
+        assert_eq!(cfg.sdapi_max_steps, 200);
+        assert_eq!(cfg.sdapi_max_batch_size, 8);
+        assert_eq!(cfg.sdapi_max_n_iter, 16);
+        assert_eq!(cfg.sdapi_max_total_batches, 32);
+        assert_eq!(cfg.models_network_dir, None);
+    }
+
+    #[test]
+    fn loaded_config_preserves_sdapi_caps_and_network_dir() {
+        // Regression: these fields must be registered in `config_schema()`, or
+        // the schema-driven `from_config` round-trip silently drops any
+        // admin-set value and the SD API caps / network model root never take
+        // effect. Set non-default values and require they survive.
+        let mut cfg = HipfireConfig::default();
+        cfg.sdapi_max_dimension = 2048;
+        cfg.sdapi_max_steps = 40;
+        cfg.sdapi_max_batch_size = 4;
+        cfg.sdapi_max_n_iter = 4;
+        cfg.sdapi_max_total_batches = 8;
+        cfg.models_network_dir = Some("/srv/hipfire".to_string());
+
+        let loaded = LoadedConfig::from_config(cfg);
+        assert_eq!(loaded.config.sdapi_max_dimension, 2048);
+        assert_eq!(loaded.config.sdapi_max_steps, 40);
+        assert_eq!(loaded.config.sdapi_max_batch_size, 4);
+        assert_eq!(loaded.config.sdapi_max_n_iter, 4);
+        assert_eq!(loaded.config.sdapi_max_total_batches, 8);
+        assert_eq!(
+            loaded.config.models_network_dir.as_deref(),
+            Some("/srv/hipfire")
+        );
     }
 
     #[test]

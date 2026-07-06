@@ -481,8 +481,8 @@ pub(crate) async fn ensure_model_loaded(
     model_arg: &str,
     required_max_seq: u32,
 ) -> Result<LoadedModelContext, String> {
-    let model_path =
-        find_model(model_arg).ok_or_else(|| format!("model not found: {model_arg}"))?;
+    let model_path = find_model(model_arg, state.models_network_dir.as_deref())
+        .ok_or_else(|| format!("model not found: {model_arg}"))?;
     let model_str = model_path.to_string_lossy().into_owned();
 
     let (params, daemon_spawn_env) = {
@@ -1691,7 +1691,7 @@ async fn blocking_chat_preflight_error(
             json!({"error": {"message": message, "type": "invalid_request_error"}}),
         ));
     }
-    if find_model(&model_arg).is_none() {
+    if find_model(&model_arg, state.models_network_dir.as_deref()).is_none() {
         return Some((
             StatusCode::NOT_FOUND,
             json!({"error": {"message": format!("model not found: {model_arg}"), "type": "invalid_request_error"}}),

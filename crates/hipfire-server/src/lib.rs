@@ -497,7 +497,9 @@ async fn prewarm_default_model(state: &SharedState) {
 }
 
 async fn prewarm_diffusion_model(state: &SharedState, model: &str) -> bool {
-    let Some(path) = routes::sdapi::resolve_diffusion_hfq_candidate(model) else {
+    let Some(path) =
+        routes::sdapi::resolve_diffusion_hfq_candidate(model, state.models_network_dir.as_deref())
+    else {
         return false;
     };
 
@@ -607,7 +609,8 @@ mod tests {
         write_metadata_only_diffusion_hfq(&hfq_path);
 
         let mut config = HipfireConfig::default();
-        config.default_model = Some(hfq_path.to_string_lossy().into_owned());
+        config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        config.default_model = Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned());
         let state = AppState::new(config);
 
         prewarm_default_model(&state).await;
@@ -653,7 +656,8 @@ mod tests {
             idle_timeout: 1,
             ..HipfireConfig::default()
         };
-        config.default_model = Some(hfq_path.to_string_lossy().into_owned());
+        config.models_network_dir = Some(dir.to_string_lossy().into_owned());
+        config.default_model = Some(hfq_path.file_name().unwrap().to_string_lossy().into_owned());
         let state = AppState::new(config);
         prewarm_default_model(&state).await;
         assert_eq!(state.diffusion_pipelines.lock().await.len(), 1);

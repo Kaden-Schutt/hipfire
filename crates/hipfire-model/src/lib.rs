@@ -1174,6 +1174,97 @@ pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) 
     candidates.into_iter().next()
 }
 
+/// True if a model identifier is safe to resolve *within* a fixed set of
+/// roots — i.e. it cannot escape a root via an absolute path or a `..`
+/// component. Bare names (`qwen3.5`), `name.hfq`, and `subdir/name` are fine;
+/// `/etc/passwd`, `../secret`, and `a/../../secret` are rejected.
+fn model_identifier_is_confined(arg: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(arg);
+    if path.is_absolute() {
+        return false;
+    }
+    !path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+/// True once `candidate` exists and canonicalizes to a path inside `root`.
+/// Canonicalizing both defeats symlinks that would otherwise escape the root.
+fn path_confined_to_root(candidate: &Path, root: &Path) -> bool {
+    match (candidate.canonicalize(), root.canonicalize()) {
+        (Ok(candidate), Ok(root)) => candidate.starts_with(&root),
+        _ => false,
+    }
+}
+
+/// Resolve a model identifier to a file path, restricted to a fixed set of
+/// read-only `roots`.
+///
+/// Unlike [`find_model_in`], this NEVER honors an arbitrary absolute path or a
+/// `..`-escaping identifier, and every returned path is canonicalized and
+/// confirmed to live inside one of `roots`. It is the resolver for **untrusted
+/// (network) callers**, which must only reach models under `~/.hipfire/models`
+/// and any admin-configured extra root — not arbitrary filesystem locations.
+/// Local CLI/eval callers keep using [`find_model_in`], where naming an
+/// explicit `./path` or absolute path is expected UX.
+///
+/// `aliases_path`, when given, is the admin-authored `models.json`; an alias is
+/// only honored when its target also resolves inside one of `roots`, so an
+/// alias cannot become a second escape vector.
+pub fn find_model_in_roots(
+    arg: &str,
+    roots: &[PathBuf],
+    aliases_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if !model_identifier_is_confined(arg) {
+        return None;
+    }
+    let query = ModelLookupQuery::parse(arg);
+    for root in roots {
+        let mut candidates = vec![root.join(arg), root.join(format!("{arg}.hfq"))];
+        if query.normalized != arg.to_ascii_lowercase() {
+            candidates.push(root.join(&query.normalized));
+            candidates.push(root.join(format!("{}.hfq", query.normalized)));
+        }
+        for candidate in candidates {
+            if candidate.exists() && path_confined_to_root(&candidate, root) {
+                return Some(candidate);
+            }
+        }
+        let mut scanned = scan_models_dir(root, &query);
+        scanned.sort_by_key(|path| model_candidate_rank(path, &query));
+        if let Some(path) = scanned
+            .into_iter()
+            .find(|path| path_confined_to_root(path, root))
+        {
+            return Some(path);
+        }
+    }
+
+    // Admin-authored aliases: honor only when the target stays inside a root.
+    if let Some(aliases_path) = aliases_path {
+        if let Ok(contents) = std::fs::read_to_string(aliases_path) {
+            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(target) = map.get(arg).and_then(|value| value.as_str()) {
+                    let target = PathBuf::from(target);
+                    if target.exists()
+                        && roots
+                            .iter()
+                            .any(|root| path_confined_to_root(&target, root))
+                    {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// List all non-sidecar `.hfq` files directly under a models directory.
 pub fn list_local_models_in(models_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(models_dir) else {
@@ -3228,6 +3319,66 @@ mod tests {
         let listed = list_local_models_in(&models);
         assert_eq!(listed, vec![lfm_mq4pp, lfm_mq6, lfm_oq4pp, mq6]);
         assert!(!listed.contains(&sidecar));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn network_model_resolution_is_confined_to_roots() {
+        let root = temp_dir("hipfire-model-roots");
+        let models = root.join("models");
+        let network = root.join("srv-hipfire");
+        fs::create_dir_all(&models).unwrap();
+        fs::create_dir_all(&network).unwrap();
+        // A secret the network caller must never reach.
+        let secret = root.join("secret.hfq");
+        fs::write(&secret, "").unwrap();
+        let local = models.join("qwen3.5-9b-mq4.hfq");
+        let remote = network.join("gemma-4-8b.oq4.hfq");
+        fs::write(&local, "").unwrap();
+        fs::write(&remote, "").unwrap();
+
+        let roots = vec![models.clone(), network.clone()];
+
+        // Bare names resolve within each allowed root.
+        assert_eq!(
+            find_model_in_roots("qwen3.5-9b-mq4.hfq", &roots, None),
+            Some(local.clone())
+        );
+        assert_eq!(
+            find_model_in_roots("gemma-4-8b.oq4.hfq", &roots, None),
+            Some(remote)
+        );
+
+        // Absolute paths are refused even though the file exists.
+        assert_eq!(
+            find_model_in_roots(secret.to_str().unwrap(), &roots, None),
+            None
+        );
+        // `..` traversal out of a root is refused.
+        assert_eq!(find_model_in_roots("../secret.hfq", &roots, None), None);
+        assert_eq!(
+            find_model_in_roots("nested/../../secret.hfq", &roots, None),
+            None
+        );
+
+        // An alias whose target escapes every root is refused; one that stays
+        // inside a root is honored.
+        let aliases = root.join("models.json");
+        fs::write(
+            &aliases,
+            serde_json::to_string(&json!({
+                "escape": secret.display().to_string(),
+                "ok": local.display().to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(find_model_in_roots("escape", &roots, Some(&aliases)), None);
+        assert_eq!(
+            find_model_in_roots("ok", &roots, Some(&aliases)),
+            Some(local)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

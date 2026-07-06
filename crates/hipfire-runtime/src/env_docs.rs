@@ -185,7 +185,7 @@ pub const ENV_HFQ_TEST_ZP_MAX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HF_HOME: EnvVarDoc = EnvVarDoc {
     name: "HF_HOME",
     description: "Runtime variable controlling hf home in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:4235",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:4303",
 };
 
 /// `HIPFIRE_ADAPTIVE_B_DOWN` — Runtime variable controlling adaptive b down in hipfire
@@ -1244,6 +1244,13 @@ pub const ENV_HIPFIRE_DUMP_HIDDEN_POS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN_POS",
     description: "Runtime variable controlling dump hidden pos in hipfire",
     source: "crates/hipfire-arch-qwen35/src/qwen35.rs:16878",
+};
+
+/// `HIPFIRE_DUMP_LATENT` — Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent
+pub const ENV_HIPFIRE_DUMP_LATENT: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DUMP_LATENT",
+    description: "Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent",
+    source: "crates/hipfire-diffusion/src/lib.rs:1139",
 };
 
 /// `HIPFIRE_DUMP_REQUEST` — a strace. Off by default — gigantic for typical agent prompts
@@ -3548,7 +3555,7 @@ pub const ENV_HIPFIRE_TINY_QUANT_PROBE_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_TINY_SD_HFQ: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TINY_SD_HFQ",
     description: "Runtime variable controlling tiny sd hfq in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:4410",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:4478",
 };
 
 /// `HIPFIRE_TP_BENCH_ITERS` — Runtime variable controlling tp bench iters in hipfire
@@ -3732,7 +3739,7 @@ pub const ENV_HOSTNAME: EnvVarDoc = EnvVarDoc {
 pub const ENV_HUGGINGFACE_HUB_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HUGGINGFACE_HUB_CACHE",
     description: "Runtime variable controlling huggingface hub cache in hipfire",
-    source: "crates/hipfire-server/src/routes/sdapi.rs:4238",
+    source: "crates/hipfire-server/src/routes/sdapi.rs:4306",
 };
 
 /// `MAX_TOKENS` — Parses "MAX_TOKENS" with fallback defaults
@@ -4031,6 +4038,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DUMP_HIDDEN_ALLLAYERS,
     ENV_HIPFIRE_DUMP_HIDDEN_LAYER,
     ENV_HIPFIRE_DUMP_HIDDEN_POS,
+    ENV_HIPFIRE_DUMP_LATENT,
     ENV_HIPFIRE_DUMP_REQUEST,
     ENV_HIPFIRE_EMIT_TOKEN_IDS,
     ENV_HIPFIRE_EP_DECODE_TIMING,
