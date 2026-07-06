@@ -21,8 +21,8 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `DEBUG_LAYERS` | Runtime variable controlling debug layers in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:8757` |
 | `DFLASH_LIVE_TAU` | Runtime variable controlling dflash live tau in hipfire | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:1540` |
 | `FP32_STATE` | Runtime variable controlling fp32 state in hipfire | `crates/hipfire-runtime/examples/infer_qwen35.rs:223` |
-| `GPU_LOCK_TIMEOUT` | Runtime variable controlling gpu lock timeout in hipfire | `crates/hipfire-cli/src/commands/lock.rs:86` |
-| `GPU_POLL_INTERVAL` | Runtime variable controlling gpu poll interval in hipfire | `crates/hipfire-cli/src/commands/lock.rs:79` |
+| `GPU_LOCK_TIMEOUT` | Runtime variable controlling gpu lock timeout in hipfire | `crates/hipfire-cli/src/commands/lock.rs:111` |
+| `GPU_POLL_INTERVAL` | Runtime variable controlling gpu poll interval in hipfire | `crates/hipfire-cli/src/commands/lock.rs:104` |
 | `HFHS_REAL` | Runtime variable controlling hfhs real in hipfire | `crates/hipfire-quantize/src/hfhs_diag.rs:223` |
 | `HFQ_TEST_N_ITER` | Parses "HFQ_TEST_N_ITER" with fallback defaults | `crates/hipfire-rdna/examples/test_hfq4_residual_dp4a.rs:111` |
 | `HFQ_TEST_SCALE_LOG10` | Parses "HFQ_TEST_SCALE_LOG10" with fallback defaults | `crates/hipfire-rdna/examples/test_hfq4_residual_dp4a.rs:233` |
