@@ -357,6 +357,36 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   `run_layer_program_ep` + the 2 ForwardBindings EP methods (keep the trait for the lowered single-GPU path).
 - **Honest flag raised to bjoern:** P-C's follow-ups (batched prefill, real-HW banding) are lower-risk/higher-observable-
   value than a live-EP rewrite; offered the redirect. Awaiting "proceed all P-D items" vs redirect before the P-D-1 flip.
+
+## P-D REFRAMED 2026-07-06 — SuperOp was a mistake: REMOVE it + redo EP clean (bjoern's call). Green baseline PASSED.
+- **The Step::Moe fold is DEAD.** Reading ds4 `run_moe_ep` (forward.rs:2114): it IGNORES the OpBinding, dispatches via
+  bespoke `self.state` (`ds4_moe_block_core` + deferred `hc_ffn_mix`); ds4 has NO fine-grained Steps (`run_proj`→"no Proj
+  super-op"). EP arches are bespoke-callback-shaped (MLA + arch MoE), so a typed `Step::Moe` doesn't fit — it'd need a
+  boxed closure (breaks POD Step) or a huge cross-arch plan. **bjoern: "SuperOp was a mistake from this branch, revert if
+  needed, find a clean design" → "redo clean in the same pass."**
+- **SuperOp topology:** #397 Ship 6 (9545e4cc/393d2a2b/eedf7ebe/55a539ce/fd879524) — IN origin/master (not branch-unique;
+  the 519-commit merge pulled it in). It's the OLD parallelism substrate this pivot replaces with Step executors. Reverting
+  it on device-mesh diverges from master + removes the shipped ds4/minimax EP multi-GPU serve → redo EP clean (no regression).
+- **Footprint (full recon, subagent):** DELETE `superop.rs`(616L) + both `ep.rs` + per-arch `*_lowered`/`ForwardBindings`
+  impl/`lower_program`/orphan-block-helpers/toggles across **4 arches** (ds4/minimax/lfm2moe/qwen35; qwen2 already OFF
+  superop→dense_forward) + steps.rs `match_fused_prefix`/`step_op_kind` + the WHOLE daemon/loader EP serve (daemon: 8 fns
+  generate_ep/ep_serve_ds4/_minimax/ep_emit_*+routing 6741-6774; loader: `ep` field/`EpState`/`EpArch`/`load_model_ep`(+_ds4/
+  _minimax)/2 staging/unload branch/`ep-fault-inject` feature) + 3 EP example files (`ep_decode_parity`, `ep_deepseek4`,
+  `ep_minimax`). **KEEP:** Step IR (`execute_steps`/`_mesh`/`_tp`, `match_prefix`/`FUSED_TABLE`/`op_kind`), `dense_forward`,
+  TpModel/PpModel (all superop-INDEPENDENT — comments only), `all_reduce_sum_f32[_peer]` (shared w/ TP), single-GPU serve
+  for ALL arches. **git-revert WON'T work** (arch adoption + EP wiring in separate commits + superop rewritten 4× + master
+  merge) → manual surgical delete-forward, iterate on `cargo build --all-targets`.
+- **GREEN BASELINE DONE (not committed — validation):** qwen3.5-4b `HIPFIRE_FORWARD_LOWERED=0` (hand path) == default
+  (lowered), byte-identical + coherent. Confirms the single-GPU deletion is PURE (hand-written is a coherent sole-path).
+- **SEQUENCE (green→change→build+test→commit; no broken EP window):** [1 DONE] green baseline. [2 NEXT — the big build]
+  clean EP: a reusable `ep_moe_allreduce`(zero partials→run owned experts→all_reduce→add, extract from
+  run_layer_program_mesh:479-525) + an `EpModel` (loader, analog TpModel/PpModel) driving the hand-written forward per-rank
+  calling it at MoE layers — **minimax first, validate emulated EP-2 byte-identical to `run_layer_program_ep` WHILE IT STILL
+  EXISTS**; ds4 mirrors (live check deferred to hipx — ds4 only fits hipx, NOT this gfx1151 box). [3] delete SuperOp + route
+  EP through EpModel; make hand-written sole. [4] validate coherence gates (qwen35 dense+A3B, qwen2, minimax) + EP gate.
+- **STATUS: multi-session pass. Step 1 (green baseline) validated; steps 2-3 (clean EpModel rebuild for ds4+minimax + the
+  ~2000L deletion) are the large remaining work — handed off with the full footprint above.** Local plan (obsolete fold
+  version, ignore): `docs/superpowers/plans/2026-07-06-P-D-ep-fold-step-moe.md`.
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
