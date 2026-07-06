@@ -642,6 +642,120 @@ pub fn execute_steps_mesh(
     execute_steps(gpu, ctx, steps)
 }
 
+/// Collective to inject after a step ran on every rank of the `Tp` group.
+/// Keyed by step index in the per-rank step lists (see [`execute_steps_tp`]).
+pub enum TpCollective {
+    /// Column-parallel (or replicated) step — output stays on-rank, no collective.
+    None,
+    /// Row-parallel step — each rank produced a partial `out` of length `dim`;
+    /// sum them in place across the `Tp` group so every rank holds the whole.
+    AllReduceOut { dim: usize },
+}
+
+/// The `out` buffer of a step that can be row-parallel (the only kind that needs
+/// an all-reduce). `None` for step kinds that never carry a row-parallel output.
+fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
+    match step {
+        Step::Gemv { out, .. } => Some(&out.buf),
+        Step::GemvResidual { out, .. } => Some(&out.buf),
+        _ => None,
+    }
+}
+
+/// Tensor-parallel executor (P-B grand-unify, PB-TP1). The `Tp>1` counterpart of
+/// [`execute_steps_mesh`]: instead of one whole-model step list on one `Gpu`, it
+/// takes **per-rank step lists** (`per_rank_steps[r]` references rank `r`'s own
+/// sharded weights + buffers, built by the caller from a sharded `WeightStore`)
+/// and runs them **lock-step** across the mesh's `Tp` group — every rank executes
+/// step `i`, then a `Tp` all-reduce is injected for the row-parallel steps.
+///
+/// Column-parallel `Gemv`s leave their output sharded (`inter/tp`) to feed the
+/// next step; row-parallel `Gemv`s each produce a partial `[dim]` which this
+/// executor sums in place via `all_reduce_sum_f32_peer` — so after a
+/// `TpCollective::AllReduceOut` step every rank holds the whole result. Residual
+/// adds must be a SEPARATE post-collective step (a row-parallel `GemvResidual`
+/// would sum the residual `tp×`), so row-parallel ops are plain `Gemv`s here.
+///
+/// This is the EP `run_layer_program_mesh` shape in the `Step` world, keyed by
+/// the caller-supplied `collectives` (from `ShardPolicy`) instead of
+/// `SuperOpKind::Moe`. Fusion is intentionally not applied on the TP path yet
+/// (F32 GEMV needs none); per-rank `DispatchCtx` is built like the EP path.
+///
+/// Preconditions the caller owns: each device in the `Tp` group has an
+/// `active_stream` set and peer access enabled (`ensure_rank_streams` +
+/// `enable_peer_all`).
+pub fn execute_steps_tp(
+    mesh: &DeviceMesh,
+    gpus: &mut hipfire_hardware::Gpus,
+    per_rank_steps: &[Vec<Step>],
+    collectives: &[TpCollective],
+) -> Result<(), DispatchError> {
+    let group = mesh.group_along(hipfire_hardware::DimKind::Tp, &mesh.coord_of(0));
+    let tp = group.len();
+    if tp <= 1 {
+        return Err(DispatchError::Hip(format!(
+            "execute_steps_tp: Tp group size {tp} — needs a Tp>1 mesh"
+        )));
+    }
+    if per_rank_steps.len() != tp {
+        return Err(DispatchError::Hip(format!(
+            "execute_steps_tp: {} step lists for a Tp group of {tp}",
+            per_rank_steps.len()
+        )));
+    }
+    let n_steps = per_rank_steps[0].len();
+    for (r, s) in per_rank_steps.iter().enumerate() {
+        if s.len() != n_steps {
+            return Err(DispatchError::Hip(format!(
+                "execute_steps_tp: rank {r} has {} steps, rank 0 has {n_steps} (must be lock-step)",
+                s.len()
+            )));
+        }
+    }
+    if collectives.len() != n_steps {
+        return Err(DispatchError::Hip(format!(
+            "execute_steps_tp: {} collectives for {n_steps} steps",
+            collectives.len()
+        )));
+    }
+
+    let hip_err = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+
+    for i in 0..n_steps {
+        // Run step i on every rank (each with its own sharded weights/buffers).
+        for (r, &dev) in group.iter().enumerate() {
+            gpus.devices[dev].bind_thread().map_err(hip_err)?;
+            let ctx = DispatchCtx::new(&gpus.devices[dev]);
+            launch_op(&mut gpus.devices[dev], &ctx, &per_rank_steps[r][i])?;
+        }
+        // Row-parallel step → all-reduce its partial outputs over the Tp group.
+        if let TpCollective::AllReduceOut { dim } = collectives[i] {
+            for &dev in &group {
+                let g = &gpus.devices[dev];
+                g.bind_thread().map_err(hip_err)?;
+                let stream = g.active_stream.as_ref().ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_tp: device {dev} has no active_stream"
+                    ))
+                })?;
+                g.hip.stream_synchronize(stream).map_err(hip_err)?;
+            }
+            let mut refs: Vec<&hip_bridge::DeviceBuffer> = Vec::with_capacity(tp);
+            for (r, _) in group.iter().enumerate() {
+                let buf = tp_step_out_buf(&per_rank_steps[r][i]).ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_tp: step {i} marked row-parallel but has no out buffer"
+                    ))
+                })?;
+                refs.push(buf);
+            }
+            gpus.all_reduce_sum_f32_peer(&group, &refs, dim)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
 /// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
 fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {

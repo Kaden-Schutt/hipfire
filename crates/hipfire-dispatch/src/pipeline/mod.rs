@@ -11,7 +11,10 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 pub(crate) mod steps;
-pub use steps::{execute_steps, execute_steps_mesh, FusedPattern, GemvInput, Step};
+pub use steps::{
+    execute_steps, execute_steps_mesh, execute_steps_tp, FusedPattern, GemvInput, Step,
+    TpCollective,
+};
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
