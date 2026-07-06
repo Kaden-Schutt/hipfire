@@ -1293,10 +1293,19 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
+                // Dense llama-family (arch 0/1) + pp>1 → the P-C driver-owned PP
+                // path (PpModel). qwen35 (5/6) keeps its hand-coded multi-path via
+                // load_model below.
+                let dense_llama_pp = pp > 1
+                    && hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
+                        .map(|h| matches!(h.arch_id, 0 | 1))
+                        .unwrap_or(false);
                 let loaded = if ep > 1 {
                     hipfire_loader::load_model_ep(path, max_seq, ep)
                 } else if tp > 1 {
                     hipfire_loader::load_model_tp(path, max_seq, tp)
+                } else if dense_llama_pp {
+                    hipfire_loader::load_model_pp(path, max_seq, pp)
                 } else {
                     hipfire_loader::load_model(
                         path,
@@ -2662,16 +2671,50 @@ struct EpSampling {
     min_p: Option<f32>,
 }
 
-/// Dense tensor-parallel serve (PB-TP5). Serves a llama-family model sharded
-/// across the `Tp` axis via `m.tp` (a `TpModel`): ChatFrame-render the prompt,
-/// prefill it token-by-token through the tensor-parallel forward, then greedy-or-
-/// sampled decode. Each request starts at pos 0 (stateless — no multi-turn KV
-/// reuse). Lean by design: no spec-decode / PFlash / eviction / grammar / tools;
-/// the TP forward is `execute_steps_tp` over the store→forward bridge (validated
-/// argmax-exact vs single-GPU in `tp_decode_parity`).
+/// A dense llama-family model served by the shared [`generate_dense`] loop: a
+/// per-token forward + logits over its own multi-GPU state. Implemented by both
+/// `TpModel` (Tp axis, PB-TP5) and `PpModel` (Pp axis, P-C) so the daemon's decode
+/// loop is agnostic to which parallelism axis the model is served on. (Inherent
+/// methods are called via the fully-qualified path so the trait forwarders don't
+/// self-recurse.)
+trait DenseServed {
+    fn forward_token(&mut self, token: u32, pos: usize) -> Result<(), String>;
+    fn logits(&mut self) -> Result<Vec<f32>, String>;
+    fn eos_token(&self) -> u32;
+}
+impl DenseServed for hipfire_runtime::tp_serve::TpModel {
+    fn forward_token(&mut self, t: u32, p: usize) -> Result<(), String> {
+        hipfire_runtime::tp_serve::TpModel::forward_token(self, t, p)
+    }
+    fn logits(&mut self) -> Result<Vec<f32>, String> {
+        hipfire_runtime::tp_serve::TpModel::logits(self)
+    }
+    fn eos_token(&self) -> u32 {
+        hipfire_runtime::tp_serve::TpModel::eos_token(self)
+    }
+}
+impl DenseServed for hipfire_runtime::pp_serve::PpModel {
+    fn forward_token(&mut self, t: u32, p: usize) -> Result<(), String> {
+        hipfire_runtime::pp_serve::PpModel::forward_token(self, t, p)
+    }
+    fn logits(&mut self) -> Result<Vec<f32>, String> {
+        hipfire_runtime::pp_serve::PpModel::logits(self)
+    }
+    fn eos_token(&self) -> u32 {
+        hipfire_runtime::pp_serve::PpModel::eos_token(self)
+    }
+}
+
+/// Dense multi-GPU serve (PB-TP5 / P-C). Serves a llama-family model over ANY
+/// parallelism axis (`TpModel` or `PpModel` via [`DenseServed`]): ChatFrame-render
+/// the prompt, prefill it token-by-token, then greedy-or-sampled decode. Each
+/// request starts at pos 0 (stateless — no multi-turn KV reuse). Lean by design:
+/// no spec-decode / PFlash / eviction / grammar / tools. Validated argmax-exact vs
+/// single-GPU (`tp_decode_parity` / `pp_decode_parity`).
 #[allow(clippy::too_many_arguments)]
-fn generate_tp(
-    m: &mut LoadedModel,
+fn generate_dense<M: DenseServed>(
+    model: &mut M,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2687,8 +2730,6 @@ fn generate_tp(
     use hipfire_runtime::sampler::{self, SamplerConfig};
     let t0 = std::time::Instant::now();
 
-    // Disjoint field borrows: `m.tokenizer` (read) + `m.tp` (mut) are distinct fields.
-    let tokenizer = m.tokenizer.as_ref().expect("tp serve: tokenizer");
     let frame = ChatFrame {
         tokenizer,
         system: system_prompt,
@@ -2698,8 +2739,7 @@ fn generate_tp(
     }
     .build();
     let prefill_n = frame.len();
-    let tp = m.tp.as_mut().expect("tp serve: TpModel");
-    let eos = tp.eos_token();
+    let eos = model.eos_token();
 
     macro_rules! fail {
         ($e:expr) => {{
@@ -2707,7 +2747,7 @@ fn generate_tp(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":{}}}"#,
                 id,
-                serde_json::to_string(&format!("tp serve: {}", $e)).unwrap_or_default()
+                serde_json::to_string(&format!("dense serve: {}", $e)).unwrap_or_default()
             );
             let _ = stdout.flush();
             return;
@@ -2716,7 +2756,7 @@ fn generate_tp(
 
     // Prefill (per token — no batched prefill yet).
     for (pos, &tok) in frame.iter().enumerate() {
-        if let Err(e) = tp.forward_token(tok, pos) {
+        if let Err(e) = model.forward_token(tok, pos) {
             fail!(e);
         }
     }
@@ -2734,7 +2774,7 @@ fn generate_tp(
         top_k,
         min_p,
     };
-    let mut logits = match tp.logits() {
+    let mut logits = match model.logits() {
         Ok(l) => l,
         Err(e) => fail!(e),
     };
@@ -2768,11 +2808,11 @@ fn generate_tp(
                 break;
             }
         }
-        if let Err(e) = tp.forward_token(next, pos) {
+        if let Err(e) = model.forward_token(next, pos) {
             fail!(e);
         }
         pos += 1;
-        logits = match tp.logits() {
+        logits = match model.logits() {
             Ok(l) => l,
             Err(e) => fail!(e),
         };
@@ -6676,21 +6716,24 @@ fn generate(
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
-    // Dense tensor-parallel (PB-TP5): route to generate_tp BEFORE any arch
-    // short-circuit / EP. TP mode holds its model in `m.tp` (a TpModel over its
-    // own Gpus); the single-GPU arch fields are None.
+    // Dense multi-GPU serve (PB-TP5 Tp / P-C Pp): route to the shared generate_dense
+    // BEFORE any arch short-circuit / EP. The model lives in `m.tp` (TpModel) or
+    // `m.pp_dense` (PpModel) over its own Gpus; the single-GPU arch fields are None.
+    // Disjoint field borrows: `m.tokenizer` (read) + the model field (mut).
     if m.tp.is_some() {
-        generate_tp(
-            m,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            temp,
-            top_p,
-            top_k,
-            min_p,
-            max_tokens,
+        let tok = m.tokenizer.as_ref().expect("dense serve: tokenizer");
+        let model = m.tp.as_mut().expect("dense serve: TpModel");
+        generate_dense(
+            model, tok, stdout, id, prompt, system_prompt, temp, top_p, top_k, min_p, max_tokens,
+            stop,
+        );
+        return;
+    }
+    if m.pp_dense.is_some() {
+        let tok = m.tokenizer.as_ref().expect("dense serve: tokenizer");
+        let model = m.pp_dense.as_mut().expect("dense serve: PpModel");
+        generate_dense(
+            model, tok, stdout, id, prompt, system_prompt, temp, top_p, top_k, min_p, max_tokens,
             stop,
         );
         return;

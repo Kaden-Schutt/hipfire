@@ -281,6 +281,11 @@ pub struct LoadedModel {
     /// `ep` (expert-parallel, `Ep` axis): dense row/col sharding of a llama-family
     /// model. When `Some`, the daemon serves via `generate_tp`.
     pub tp: Option<hipfire_runtime::tp_serve::TpModel>,
+    /// Dense pipeline-parallel served model (P-C, the `Pp` axis): a llama-family
+    /// model banded across stages. Distinct from the qwen35 hand-coded PP path
+    /// (`pp_gpus`/`pp_scratch_set`). When `Some`, the daemon serves via
+    /// `generate_pp` (through the shared `generate_dense` loop).
+    pub pp_dense: Option<hipfire_runtime::pp_serve::PpModel>,
     // Shared arch state
     pub state: Option<ModelState>,
     pub kv_cache: Option<llama::KvCache>,
@@ -370,6 +375,7 @@ impl LoadedModel {
             pp: 1,
             ep: None,
             tp: None,
+            pp_dense: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -1327,6 +1333,42 @@ pub fn load_model_tp(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     })
 }
 
+/// Load a dense llama-family HFQ for **pipeline-parallel (PP)** serving — layers
+/// banded across `pp` stages, residual handed across each seam via
+/// `boundary_copy` (P-C, the `Pp` axis). Distinct from the qwen35 hand-coded PP
+/// path (`load_qwen35_pp`); this is the arch-generic driver-owned loop for
+/// llama-family models. Served via the daemon's `generate_pp` (the shared
+/// `generate_dense` loop).
+pub fn load_model_pp(path: &str, max_seq: usize, pp: usize) -> Result<LoadedModel, String> {
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let arch_id = hfq.arch_id;
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+    drop(hfq); // PpModel::load reopens; free this handle before GPU work.
+
+    let pp_model = hipfire_runtime::pp_serve::PpModel::load(path, pp, max_seq)?;
+    let eos_tok = pp_model.eos_token();
+
+    Ok(LoadedModel {
+        pp, // requested degree (informational; PP state lives in pp_dense)
+        pp_dense: Some(pp_model),
+        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (PP state is in `pp_dense`)
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
+    })
+}
+
 fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
@@ -1575,6 +1617,11 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // `gpu` is untouched (unused for tp>1).
     if let Some(tp) = m.tp.take() {
         drop(tp);
+    }
+    // Dense-PP unload (P-C): PpModel owns its own Gpus + per-stage scratch/KV;
+    // dropping it tears down the stage device contexts. Daemon `gpu` untouched.
+    if let Some(pp) = m.pp_dense.take() {
+        drop(pp);
     }
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
