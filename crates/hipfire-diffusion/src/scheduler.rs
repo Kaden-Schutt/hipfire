@@ -239,13 +239,25 @@ impl DiffusionSchedule {
     }
 
     pub fn from_config(config: &SchedulerConfig, steps: u32) -> DiffusionResult<Self> {
+        Self::from_config_with_image_seq_len(config, steps, None)
+    }
+
+    /// Like `from_config`, but forwards the packed image token count to the
+    /// FlowMatchEuler dynamic-shift `mu` (diffusers `calculate_shift`). Passing
+    /// `None` computes `mu` at the config's `base_image_seq_len`, which
+    /// under-shifts higher resolutions.
+    pub fn from_config_with_image_seq_len(
+        config: &SchedulerConfig,
+        steps: u32,
+        image_seq_len: Option<usize>,
+    ) -> DiffusionResult<Self> {
         if steps == 0 {
             return Err(DiffusionError::InvalidRequest(
                 "scheduler steps must be greater than zero".to_string(),
             ));
         }
         if config.class_name == "FlowMatchEulerDiscreteScheduler" {
-            return Self::flow_match_euler(config, steps);
+            return Self::flow_match_euler_with_image_seq_len(config, steps, image_seq_len);
         }
         let (Some(beta_start), Some(beta_end), Some(num_train_timesteps)) = (
             config.beta_start,

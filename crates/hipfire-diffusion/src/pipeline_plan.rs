@@ -80,7 +80,24 @@ impl DiffusionPipeline {
             .config
             .scheduler
             .resolve_request_scheduler(&request.scheduler)?;
-        let schedule = DiffusionSchedule::from_config(&scheduler_config, request.steps)?;
+        // Packed image token count drives the FlowMatchEuler dynamic-shift mu.
+        // The transformer patchifies the latent by patch_size, so the token grid
+        // is (latent_h / p) x (latent_w / p). Passing this (vs the config base
+        // seq len) gives the correct, resolution-dependent sigma schedule.
+        let patch_size = self
+            .config
+            .transformer
+            .as_ref()
+            .and_then(|t| t.patch_size)
+            .unwrap_or(1)
+            .max(1);
+        let image_seq_len =
+            (latent_shape.height / patch_size).max(1) * (latent_shape.width / patch_size).max(1);
+        let schedule = DiffusionSchedule::from_config_with_image_seq_len(
+            &scheduler_config,
+            request.steps,
+            Some(image_seq_len),
+        )?;
         schedule.scale_initial_latents(&mut latents);
         Ok(DiffusionRunPlan {
             latent_shape,

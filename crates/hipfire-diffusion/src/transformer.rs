@@ -1539,6 +1539,27 @@ impl NativeTransformerAttentionProjection {
         let gated = match self.gate_weight.as_ref() {
             Some(weight) => {
                 let gate = linear_resident_weight_resident(gpu, cache, hidden, weight, self.gate_bias.as_ref())?;
+                // Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate
+                // collapses toward 0 the attention output is suppressed and tokens
+                // stop mixing (a candidate for the residual token-grid).
+                if std::env::var("HIPFIRE_DUMP_GATE").is_ok_and(|v| !v.is_empty()) {
+                    if let Ok(g_host) = download_resident(gpu, &gate) {
+                        let n = g_host.data.len().max(1);
+                        let (mut s, mut lo, mut hi) = (0.0f64, 1.0f32, 0.0f32);
+                        for v in &g_host.data {
+                            let sg = 1.0f32 / (1.0 + (-v).exp());
+                            s += sg as f64;
+                            lo = lo.min(sg);
+                            hi = hi.max(sg);
+                        }
+                        eprintln!(
+                            "[gate] sigmoid(gate) mean={:.4} min={:.4} max={:.4}",
+                            s / n as f64,
+                            lo,
+                            hi
+                        );
+                    }
+                }
                 let g = sigmoid_gate_3d_resident(gpu, &attention, &gate)?;
                 free_resident(gpu, gate)?;
                 free_resident(gpu, attention)?;
