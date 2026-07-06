@@ -164,25 +164,42 @@ impl NpuKernel {
         self.dev.syncobj_wait(self.syncobj, seq)
     }
 
-    /// Submit `args` WITHOUT blocking, returning an in-flight handle. Where
+    /// Reconcile the host cache for an output buffer before a CPU read-back. Call after
+    /// [`Self::wait`], before reading. A blocking dispatch+read is coherent without this,
+    /// but a *pipelined* loop overlaps the read-back of one buffer with a concurrent DMA
+    /// write to another; the hardware prefetcher can pull stale lines of the in-flight
+    /// buffer into cache, and there is no invalidate before its later read. `TO_DEVICE`
+    /// clean+invalidates on this driver (`FROM_DEVICE` EINVALs on data BOs), which clears
+    /// those stale lines so the read sees the kernel's writes. Verified: without this,
+    /// pipelined read-back fails intermittently (~1 run in 3); with it, 0/16 across the
+    /// single- and multi-K-chunk paths.
+    pub fn sync_output(&self, buf: &DeviceBuffer) -> Result<(), XdnaError> {
+        self.dev
+            .sync_bo(buf.handle(), submit::SYNC_DIRECT_TO_DEVICE, buf.len())
+    }
+
+    /// Submit `args` WITHOUT blocking, returning an owning in-flight handle. Where
     /// [`Self::dispatch`] fuses submit + wait, this lets the caller drive another engine
-    /// (the GPU) while the NPU runs, then [`Self::poll`] / [`Self::wait`] for completion —
-    /// the basis for a GPU‖NPU microbatch pipeline (e.g. GPU verifies step N while the NPU
-    /// drafts N+1). The argument buffers must outlive the handle (the caller owns them),
-    /// and the handle must be waited (or polled to completion) before it is dropped.
-    pub fn submit(&self, args: &[&DeviceBuffer]) -> Result<NpuInFlight, XdnaError> {
+    /// (the GPU) while the NPU runs, then [`Self::poll`] / [`Self::wait_inflight`] for
+    /// completion — the basis for a GPU‖NPU microbatch pipeline (e.g. GPU verifies step N
+    /// while the NPU drafts N+1). The argument buffers must outlive the handle (the caller
+    /// owns them), and the handle must be waited (or polled to completion) before drop.
+    ///
+    /// Async counterpart to the blocking [`Self::submit`] (which returns a timeline `seq`);
+    /// this returns an owning [`NpuInFlight`] so multiple dispatches can be in flight at once.
+    pub fn submit_inflight(&self, args: &[&DeviceBuffer]) -> Result<NpuInFlight, XdnaError> {
         self.submit_tagged(args, 0)
     }
 
-    /// [`Self::submit`] with a caller-defined `tag` carried on the handle. The scheduler
-    /// stamps the microbatch / layer / expert id so it can correlate NPU completions with
-    /// the per-token grouping it is pipelining across the GPU without a side table — the
-    /// explicit shared state between dispatcher and scheduler.
+    /// [`Self::submit_inflight`] with a caller-defined `tag` carried on the handle. The
+    /// scheduler stamps the microbatch / layer / expert id so it can correlate NPU
+    /// completions with the per-token grouping it is pipelining across the GPU without a
+    /// side table — the explicit shared state between dispatcher and scheduler.
     ///
     /// Each submit builds its OWN command BO, owned by the returned handle so it stays
-    /// resident until the dispatch completes. (The single-slot cache behind `dispatch`
-    /// cannot back multiple in-flight dispatches: a second submit with different buffers
-    /// would free the first's command BO mid-flight.)
+    /// resident until the dispatch completes. (The blocking `submit_synced` path's shared
+    /// command-BO cache cannot back multiple in-flight dispatches: a second submit with
+    /// different buffers would free the first's command BO mid-flight.)
     pub fn submit_tagged(
         &self,
         args: &[&DeviceBuffer],
@@ -217,16 +234,17 @@ impl NpuKernel {
     /// Block until an in-flight dispatch completes; on return its output buffers are
     /// readable (SHMEM is coherent once the timeline signals). Consumes the handle,
     /// freeing its command BO. Dispatches on one kernel complete in submission order.
-    pub fn wait(&self, f: NpuInFlight) -> Result<(), XdnaError> {
+    /// Async counterpart to the blocking [`Self::wait`], which takes a timeline `seq`.
+    pub fn wait_inflight(&self, f: NpuInFlight) -> Result<(), XdnaError> {
         self.dev.syncobj_wait(self.syncobj, f.seq)
     }
 }
 
-/// An in-flight NPU dispatch from [`NpuKernel::submit`]. Owns the command BO backing the
-/// submission, keeping it resident until [`NpuKernel::wait`] (or drop). Carries the
-/// timeline `seq` (submission order on the kernel's hwctx) and a caller `tag` (the
-/// scheduler's microbatch / layer / expert id) so the dispatcher and scheduler share
-/// in-flight state explicitly: poll by handle, correlate by tag, order by seq.
+/// An in-flight NPU dispatch from [`NpuKernel::submit_inflight`]. Owns the command BO
+/// backing the submission, keeping it resident until [`NpuKernel::wait_inflight`] (or
+/// drop). Carries the timeline `seq` (submission order on the kernel's hwctx) and a caller
+/// `tag` (the scheduler's microbatch / layer / expert id) so the dispatcher and scheduler
+/// share in-flight state explicitly: poll by handle, correlate by tag, order by seq.
 pub struct NpuInFlight {
     seq: u64,
     tag: u64,

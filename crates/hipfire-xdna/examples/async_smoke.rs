@@ -35,12 +35,12 @@ fn main() {
         // 1) submit -> poll -> wait
         let mut c1 = k.alloc_arg(csz).unwrap();
         c1.as_mut_slice().fill(0);
-        let f = k.submit(&[&aw, &ww, &c1]).expect("submit");
+        let f = k.submit_inflight(&[&aw, &ww, &c1]).expect("submit");
         let mut polls = 0u64;
         while !k.poll(&f).expect("poll") {
             polls += 1;
         }
-        k.wait(f).expect("wait");
+        k.wait_inflight(f).expect("wait");
         let r1 = c0(&c1);
         println!("[1] submit/poll/wait: polls-before-done={polls}  C[0]={r1} (expect {expect})");
         assert_eq!(r1, expect, "async single-dispatch result wrong");
@@ -65,8 +65,8 @@ fn main() {
             "second submit must have a later timeline seq"
         );
         assert_eq!((f2.tag(), f3.tag()), (101, 202), "tags not preserved");
-        k.wait(f2).expect("wait c2");
-        k.wait(f3).expect("wait c3");
+        k.wait_inflight(f2).expect("wait c2");
+        k.wait_inflight(f3).expect("wait c3");
         let (r2, r3) = (c0(&c2), c0(&c3));
         println!("    C2[0]={r2}  C3[0]={r3} (expect {expect} each)");
         assert!(
