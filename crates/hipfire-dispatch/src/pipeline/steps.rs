@@ -82,6 +82,15 @@ pub enum Step<'a> {
         bias: &'a GpuTensor,
         dim: usize,
     },
+    /// SwiGLU activation: `out = silu(gate) * up` (elementwise). Present so a
+    /// dense FFN block can be one contiguous step list — the IR previously fused
+    /// silu into gate-up kernels, leaving no standalone activation op, which
+    /// blocked expressing a column-parallel FFN's on-rank intermediate as Steps.
+    SiluMul {
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        out: &'a GpuTensor,
+    },
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -94,6 +103,7 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::Rope { .. } => PipelineOp::Rope,
         Step::QkNorm { .. } => PipelineOp::QkNorm,
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
+        Step::SiluMul { .. } => PipelineOp::SiluMul,
     }
 }
 
@@ -971,6 +981,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             .map_err(|e| DispatchError::Hip(e.to_string())),
         Step::BiasAdd { x, bias, dim } => gpu
             .bias_add_f32(x, bias, 1, *dim)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        Step::SiluMul { gate, up, out } => gpu
+            .silu_mul_f32(gate, up, out)
             .map_err(|e| DispatchError::Hip(e.to_string())),
     }
 }
