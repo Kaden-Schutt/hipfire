@@ -223,7 +223,34 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   pattern. **Constraint: every sharded k-dim must stay %256==0** (validate_manifest's group-alignment job). No lib change.
   This is the linchpin: TP4c's bridge assembles per-rank quant `WeightRef`s from the store and runs them through the
   UNCHANGED executor; the single-GPU reference is the quant `forward_scratch`.
-- **PB-TP4b..5 REMAINING (real-model integration — the capstone):** TP4b = drive `Step::Attend` through the executor
+- **PB-TP4b DONE + validated** (`567a85d8`) — `examples/tp_execute_steps_attn_parity.rs`: the whole head-parallel
+  attention block through `execute_steps_tp` via a first-class `Step::Attend` == single-device, max|Δ|=**7.45e-8** on
+  emulated Tp-2 (gfx1151). Closes the executor gap PB-3 left (PB-3 validated the attention MATH on RAW ops). Per-rank
+  Step list: RmsnormAutomatic[Replicate] → Wq/Wk/Wv[ColumnShard, rank owns heads] → Rope[per-head] →
+  `Step::Attend{KvTierPlan, AttnParams}`[owned heads + per-rank KV cache] → Wo[RowShard]→AllReduceOut{D} →
+  `Step::ResidualAdd`. **KEY: `Step::Attend` carries a REAL `KvTierPlan`+`AttnParams`** (the shape llama's
+  `attend_plan` @llama.rs:3575 builds). Used the F32/`Simple` tier (`KvTierInputs` all-quant-false → `AttnF32`,
+  same kernel PB-3 used raw) so parity is clean F32 — hand-built `KvTierInputs` since a plain F32 cache isn't a
+  quantised `KvCache` (NB: the KV tier system has NO F32 KvMode; lowest is Q8 → a real-model TP4c uses Q8 KV, common-mode
+  vs a Q8 single-GPU reference). Each rank's KV cache sized to its OWN kv heads (clean GQA split preserves nh/nkv per
+  rank), seeded with its column-slice of F32 history; `Step::Attend` writes the current token per rank. `AttnParams`
+  built inline in the Step (not Clone; `KvTierPlan` IS Clone). Reference = identical per-op kernels (same `run_attention`)
+  on whole heads. flash_partials sized `n_heads*ceil(max_seq/128)*(2+head_dim)`. No lib change.
+- **EXECUTOR IS NOW FEATURE-COMPLETE for a dense layer** — every op validated through `execute_steps_tp` on Tp-2:
+  Gemv col/row (PB-TP1), RmsnormAutomatic + manifest-derived collectives (PB-TP2), SiluMul/full FFN (PB-TP3),
+  ResidualAdd (PB-TP4a), **native-quant MQ4G256 FFN (PB-TP4-quant, no executor change)**, **head-parallel Step::Attend
+  (PB-TP4b)**. A whole attn+FFN layer = the mechanical concatenation of the two proven per-rank Step lists.
+- **PB-TP4c REMAINING (the capstone — all primitives now PROVEN):** assemble `dense_forward_tp<A:DenseArch>(gpus,
+  mesh, ...)` mirroring `dense_forward` (arch_spec.rs:132) but emitting per-rank Step lists (row `GemvResidual` → split
+  Gemv→AllReduceOut→ResidualAdd per PB-TP4a) + the store→forward bridge: `fulfill_manifest(llama weight_manifest @
+  arch.rs:98, Tp-2)` gives native-quant per-rank buffers in a `WeightStore`; assemble per-rank `DenseLayer{WeightRef}`
+  via `WeightStore::take` + build `WeightRef` (bare GpuTensor + dtype/m/k, like the examples' `wref`; or
+  `WeightTensor::dispatch_ref`). Per-rank `ForwardScratch`(n_heads=nh/tp)+`KvCache::new_gpu_q8(_,1,nkv/tp,hd,max_seq)`.
+  Thread `&mut Gpus`. Single-GPU reference = the goal-1 harness (`llama::forward_scratch` on qwen3-0.6b-llama.mq4,
+  Q8 KV). Validate full-model token/logit parity FP32+HIPFIRE_DETERMINISTIC=1 (Q8 KV common-mode). **Constraint: every
+  sharded k-dim %256==0 (qwen3-0.6b Tp-2 OK: qkv k=1024, wo k=2048→1024, down k=3072→1536, gate/up k=1024).** Then TP5 =
+  daemon `load_model_tp`+serve AFTER the EP-vs-TP fork (RAISE with bjoern: config.rs:155 `tp`→Ep).
+- **(historical) PB-TP4b..5 REMAINING (real-model integration — the capstone):** TP4b = drive `Step::Attend` through the executor
   via the REAL llama `attend_plan` (builds `KvTierPlan{write_key,attend_key,...}` + `AttnParams` — needs a real model;
   synthesizing KvTierPlan by hand is fragile, do NOT). TP4c = the store→forward bridge (assemble per-rank sharded
   `LlamaWeights`/`DenseLayer` from a `WeightStore` via `take`) + a `dense_forward_tp<A:DenseArch>(gpus, mesh, ...)` that
