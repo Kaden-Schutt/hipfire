@@ -34,6 +34,7 @@ use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, moe_family, rotate_x_mq_batched_for, rotate_x_mq_for,
     weight_gemv, weight_gemv_residual,
@@ -113,7 +114,11 @@ pub fn decode_step(
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("cohere2moe: htod pos: {e:?}"))?;
     embed_lookup(gpu, weights, cfg.hidden_size, token_id, &mut state.h)?;
-    decode_step_body(cfg, weights, state, gpu, position)?;
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint. Real
+    // mesh resolution replaces this construction in P-B without touching the
+    // internal threading.
+    let mesh = DeviceMesh::single();
+    decode_step_body(cfg, weights, state, &mesh, gpu, position)?;
     let mut logits = gpu
         .download_f32(&state.logits)
         .map_err(|e| format!("cohere2moe: download logits: {e:?}"))?;
@@ -157,6 +162,7 @@ fn decode_step_body(
     cfg: &Cohere2MoeConfig,
     weights: &Cohere2MoeWeights,
     state: &mut Cohere2MoeState,
+    mesh: &DeviceMesh,
     gpu: &mut Gpu,
     position: u32,
 ) -> Result<(), String> {
@@ -264,7 +270,8 @@ fn decode_step_body(
             block_cols: 0,
             output: &state.fa_attn_out,
         };
-        hipfire_dispatch::pipeline::execute_steps(
+        hipfire_dispatch::pipeline::execute_steps_mesh(
+            mesh,
             gpu,
             &ctx,
             &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
@@ -586,6 +593,9 @@ pub fn forward_batch(
                 .to_string(),
         );
     }
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint (see
+    // decode_step). Replaced by resolved-mesh in P-B.
+    let mesh = DeviceMesh::single();
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
@@ -745,7 +755,8 @@ pub fn forward_batch(
             block_cols: 0,
             output: &attn_out,
         };
-        hipfire_dispatch::pipeline::execute_steps(
+        hipfire_dispatch::pipeline::execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
