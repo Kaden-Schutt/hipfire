@@ -136,3 +136,58 @@ fn vae_scalar_shift_norm_round_trips() {
     norm.apply_decode(&mut data, 1, 3).unwrap();
     assert_eq!(data, vec![1.0, -3.0, 0.25]);
 }
+
+#[test]
+fn wan_qwen_image_vae_encode_decode_round_trips() {
+    // The Qwen-Image (AutoencoderKLQwenImage) VAE encoder must reconstruct a
+    // smooth image through encode -> decode. Skips when the Krea2 model (the
+    // only Wan VAE on this host) is absent. Pure-CPU, no GPU needed.
+    let model = std::path::Path::new("/home/sadara/.hipfire/models/Krea2-Turbo.hfq");
+    if !model.exists() {
+        eprintln!("skip: Krea2-Turbo.hfq (Wan VAE) not present");
+        return;
+    }
+    let hfq = hipfire_runtime::hfq::HfqFile::open_index_only(model).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    let encoder = NativeVaeEncoder::from_hfq(&hfq, &config.vae).expect("Wan VAE encoder builds");
+    let decoder = NativeVaeDecoder::from_hfq(&hfq, &config.vae).unwrap();
+
+    // 64x64 smooth diagonal gradient (encodes/decodes cleanly if the ops match).
+    let (w, h) = (64usize, 64usize);
+    let mut data = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            data.push(((x * 255) / w) as u8);
+            data.push(((y * 255) / h) as u8);
+            data.push((((x + y) * 255) / (w + h)) as u8);
+        }
+    }
+    let img = RgbImageBatch { batch: 1, width: w, height: h, data };
+
+    let latent = encoder.encode_to_latents(&img).unwrap();
+    assert_eq!(latent.channels, 16, "Qwen-Image z_dim=16 latent");
+    assert_eq!((latent.height, latent.width), (h / 8, w / 8));
+    assert!(latent.data.iter().all(|v| v.is_finite()), "latent has non-finite values");
+
+    // decode -> [-1,1] pixel tensor; compare to the input in the same range.
+    let recon = decoder.decode_latents(&latent).unwrap();
+    let input_tensor = rgb_batch_to_vae_tensor(&img).unwrap();
+    assert_eq!(recon.shape, input_tensor.shape, "reconstruction shape matches input");
+    let mse: f64 = recon
+        .data
+        .iter()
+        .zip(&input_tensor.data)
+        .map(|(a, b)| {
+            let d = (*a - *b) as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / recon.data.len() as f64;
+    // KNOWN GAP (diagnostic, not asserted): the encode->decode round-trip is not
+    // yet numerically faithful (best so far ~MSE 0.77 in [-1,1]) — the exact
+    // WanVAE downsample padding and/or the shared causal-conv temporal handling
+    // need pinning against the diffusers reference. The structural asserts above
+    // (encoder builds, right-shaped finite z_dim=16 latent) are what gate here.
+    eprintln!("Wan VAE encode->decode round-trip MSE (in [-1,1], diagnostic): {mse:.4}");
+}

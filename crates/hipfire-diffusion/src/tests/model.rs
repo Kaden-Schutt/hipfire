@@ -283,13 +283,13 @@ fn tiny_sd_native_vae_encoder_loads_when_import_exists() {
     let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
     let encoder = NativeVaeEncoder::from_hfq(&hfq, &config.vae).unwrap();
 
-    assert_eq!(encoder.conv_in.weight.shape, vec![128, 3, 3, 3]);
+    assert_eq!(encoder.conv_in.as_ref().unwrap().weight.shape, vec![128, 3, 3, 3]);
     assert_eq!(encoder.down_blocks.len(), 4);
     assert!(encoder.down_blocks[0].downsampler.is_some());
     assert!(encoder.down_blocks[1].downsampler.is_some());
     assert!(encoder.down_blocks[2].downsampler.is_some());
     assert!(encoder.down_blocks[3].downsampler.is_none());
-    assert_eq!(encoder.conv_out.weight.shape, vec![8, 512, 3, 3]);
+    assert_eq!(encoder.conv_out.as_ref().unwrap().weight.shape, vec![8, 512, 3, 3]);
     assert!(encoder.quant_conv.is_some());
 }
 

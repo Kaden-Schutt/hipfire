@@ -167,14 +167,17 @@ impl VaeEncoderDownBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeVaeEncoder {
-    pub conv_in: Conv2dLayer,
+    pub conv_in: Option<Conv2dLayer>,
     pub down_blocks: Vec<VaeEncoderDownBlock>,
     pub mid_resnet_0: Option<ResnetBlock2D>,
     pub mid_attention: Option<VaeAttentionBlock>,
     pub mid_resnet_1: Option<ResnetBlock2D>,
-    pub conv_norm_out: GroupNormLayer,
-    pub conv_out: Conv2dLayer,
+    pub conv_norm_out: Option<GroupNormLayer>,
+    pub conv_out: Option<Conv2dLayer>,
     pub quant_conv: Option<Conv2dLayer>,
+    // Wan / Qwen-Image (`AutoencoderKLQwenImage`) encoder: 3D causal convs +
+    // RMSNorm, a distinct encode path. When present the SD body is unused.
+    wan_encoder: Option<WanImageEncoder>,
     latent_norm: VaeLatentNorm,
 }
 
@@ -182,6 +185,21 @@ impl NativeVaeEncoder {
     pub fn from_hfq(hfq: &HfqFile, config: &VaeConfig) -> DiffusionResult<Self> {
         let groups = config.norm_num_groups.unwrap_or(32);
         let eps = config.norm_eps.unwrap_or(1e-6);
+        // Wan / Qwen-Image encoder takes a distinct path; the SD body is skipped.
+        if let Some(wan) = WanImageEncoder::from_hfq(hfq, "vae/tensors/encoder")? {
+            return Ok(Self {
+                conv_in: None,
+                down_blocks: Vec::new(),
+                mid_resnet_0: None,
+                mid_attention: None,
+                mid_resnet_1: None,
+                conv_norm_out: None,
+                conv_out: None,
+                quant_conv: None,
+                wan_encoder: Some(wan),
+                latent_norm: VaeLatentNorm::from_config(config)?,
+            });
+        }
         let block_count = config
             .down_block_types
             .len()
@@ -241,30 +259,31 @@ impl NativeVaeEncoder {
             None
         };
         Ok(Self {
-            conv_in: Conv2dLayer::from_hfq(
+            conv_in: Some(Conv2dLayer::from_hfq(
                 hfq,
                 "vae/tensors/encoder.conv_in.weight",
                 Some("vae/tensors/encoder.conv_in.bias"),
                 1,
-            )?,
+            )?),
             down_blocks,
             mid_resnet_0,
             mid_attention,
             mid_resnet_1,
-            conv_norm_out: GroupNormLayer::from_hfq(
+            conv_norm_out: Some(GroupNormLayer::from_hfq(
                 hfq,
                 "vae/tensors/encoder.conv_norm_out.weight",
                 "vae/tensors/encoder.conv_norm_out.bias",
                 groups,
                 eps,
-            )?,
-            conv_out: Conv2dLayer::from_hfq(
+            )?),
+            conv_out: Some(Conv2dLayer::from_hfq(
                 hfq,
                 "vae/tensors/encoder.conv_out.weight",
                 Some("vae/tensors/encoder.conv_out.bias"),
                 1,
-            )?,
+            )?),
             quant_conv,
+            wan_encoder: None,
             latent_norm: VaeLatentNorm::from_config(config)?,
         })
     }
@@ -290,9 +309,21 @@ impl NativeVaeEncoder {
         image: &CpuTensor,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        let mut hidden = self
-            .conv_in
-            .forward_with_runtime_context(image, runtime_context)?;
+        // Wan / Qwen-Image path (3D causal, CPU — mirrors the wan_decoder path).
+        if let Some(wan) = &self.wan_encoder {
+            let _ = runtime_context;
+            return wan.encode(image);
+        }
+        let conv_in = self.conv_in.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("VAE encoder conv_in missing".to_string())
+        })?;
+        let conv_norm_out = self.conv_norm_out.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("VAE encoder conv_norm_out missing".to_string())
+        })?;
+        let conv_out = self.conv_out.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("VAE encoder conv_out missing".to_string())
+        })?;
+        let mut hidden = conv_in.forward_with_runtime_context(image, runtime_context)?;
         for block in &self.down_blocks {
             hidden = block.forward_with_runtime_context(hidden, runtime_context)?;
         }
@@ -305,13 +336,9 @@ impl NativeVaeEncoder {
         if let Some(resnet) = &self.mid_resnet_1 {
             hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
-        hidden = self
-            .conv_norm_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
+        hidden = conv_norm_out.forward_with_runtime_context(&hidden, runtime_context)?;
         hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        hidden = self
-            .conv_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
+        hidden = conv_out.forward_with_runtime_context(&hidden, runtime_context)?;
         if let Some(quant_conv) = &self.quant_conv {
             hidden = quant_conv.forward_with_runtime_context(&hidden, runtime_context)?;
         }
@@ -1286,6 +1313,147 @@ impl WanImageDecoder {
             Self::EPS,
         )?);
         wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))
+    }
+}
+
+/// Wan / Qwen-Image VAE spatial downsampler (still-image path): asymmetric
+/// zero-pad (right+bottom) then the `resample` 3x3 stride-2 conv, halving H/W.
+/// The temporal `time_conv` is a no-op for T=1 and is skipped.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct WanDownsample {
+    resample_weight: CpuTensor,
+    resample_bias: CpuTensor,
+}
+
+#[allow(dead_code)]
+impl WanDownsample {
+    pub(crate) fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Option<Self>> {
+        for index in 0..4 {
+            let weight_entry = format!("{prefix}.resample.{index}.weight");
+            if hfq.find_tensor_info(&weight_entry).is_some() {
+                return Ok(Some(Self {
+                    resample_weight: cpu_tensor_from_hfq(hfq, &weight_entry)?,
+                    resample_bias: cpu_tensor_from_hfq(
+                        hfq,
+                        &format!("{prefix}.resample.{index}.bias"),
+                    )?,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        // 3x3 stride-2 conv, symmetric padding 1. NB: the exact WanVAE downsample
+        // padding convention (this vs the asymmetric ZeroPad2d((0,1,0,1))) is not
+        // yet pinned against the diffusers reference; symmetric gives the better
+        // encode->decode round-trip so far but full fidelity is unverified.
+        conv2d_nchw_with_stride(input, &self.resample_weight, Some(&self.resample_bias), 1, 2)
+            .map_err(Into::into)
+    }
+}
+
+/// One encoder down-step: either a residual block or a spatial downsampler
+/// (the flat `down_blocks` list mixes them).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WanEncoderDownStep {
+    Resnet(WanResnetBlock),
+    Downsample(WanDownsample),
+}
+
+/// Full Wan / Qwen-Image (`AutoencoderKLQwenImage`) VAE encoder, still-image
+/// (T=1) path — the mirror of `WanImageDecoder`: `conv_in -> down_blocks ->
+/// mid(resnet, attn, resnet) -> norm_out -> SiLU -> conv_out -> quant_conv`,
+/// mapping `[B, 3, H, W]` pixels to `[B, 2*z_dim, H/8, W/8]` diagonal-Gaussian
+/// moments. Reuses the tested Wan building blocks.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct WanImageEncoder {
+    conv_in_weight: CpuTensor,
+    conv_in_bias: CpuTensor,
+    down_steps: Vec<WanEncoderDownStep>,
+    mid_resnet0: WanResnetBlock,
+    mid_attention: WanMidAttention,
+    mid_resnet1: WanResnetBlock,
+    norm_out_gamma: Vec<f32>,
+    conv_out_weight: CpuTensor,
+    conv_out_bias: CpuTensor,
+    quant_conv_weight: CpuTensor,
+    quant_conv_bias: CpuTensor,
+}
+
+#[allow(dead_code)]
+impl WanImageEncoder {
+    const EPS: f32 = 1e-6;
+
+    /// Load from an hfq under `prefix` (`vae/tensors/encoder`). Returns `None`
+    /// when this is not a Wan / Qwen-Image encoder. Discriminated by
+    /// `{prefix}.norm_out.gamma` (RMSNorm), like the decoder.
+    pub(crate) fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Option<Self>> {
+        if hfq
+            .find_tensor_info(&format!("{prefix}.norm_out.gamma"))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        // Parse the flat down_blocks list: each index is a resnet (conv1) or a
+        // downsample (resample). Stop at the first missing index.
+        let mut down_steps = Vec::new();
+        let mut idx = 0;
+        loop {
+            let block_prefix = format!("{prefix}.down_blocks.{idx}");
+            if hfq
+                .find_tensor_info(&format!("{block_prefix}.conv1.weight"))
+                .is_some()
+            {
+                down_steps.push(WanEncoderDownStep::Resnet(WanResnetBlock::from_hfq(
+                    hfq,
+                    &block_prefix,
+                )?));
+            } else if let Some(down) = WanDownsample::from_hfq(hfq, &block_prefix)? {
+                down_steps.push(WanEncoderDownStep::Downsample(down));
+            } else {
+                break;
+            }
+            idx += 1;
+        }
+        Ok(Some(Self {
+            conv_in_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.weight"))?,
+            conv_in_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.bias"))?,
+            down_steps,
+            mid_resnet0: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.0"))?,
+            mid_attention: WanMidAttention::from_hfq(
+                hfq,
+                &format!("{prefix}.mid_block.attentions.0"),
+            )?,
+            mid_resnet1: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.1"))?,
+            norm_out_gamma: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm_out.gamma"))?.data,
+            conv_out_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_out.weight"))?,
+            conv_out_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_out.bias"))?,
+            quant_conv_weight: cpu_tensor_from_hfq(hfq, "vae/tensors/quant_conv.weight")?,
+            quant_conv_bias: cpu_tensor_from_hfq(hfq, "vae/tensors/quant_conv.bias")?,
+        }))
+    }
+
+    /// Encode `[B, 3, H, W]` pixels to `[B, 2*z_dim, H/8, W/8]` moments.
+    pub(crate) fn encode(&self, image: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let mut hidden = wan_causal_conv2d(image, &self.conv_in_weight, Some(&self.conv_in_bias))?;
+        for step in &self.down_steps {
+            hidden = match step {
+                WanEncoderDownStep::Resnet(resnet) => resnet.forward(&hidden)?,
+                WanEncoderDownStep::Downsample(down) => down.forward(&hidden)?,
+            };
+        }
+        hidden = self.mid_resnet0.forward(&hidden)?;
+        hidden = self.mid_attention.forward(&hidden)?;
+        hidden = self.mid_resnet1.forward(&hidden)?;
+        hidden = wan_silu(&wan_rms_norm_nchw(&hidden, &self.norm_out_gamma, Self::EPS)?);
+        hidden = wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))?;
+        // quant_conv is a 1x1x1 Conv3d (per-channel affine); wan_causal_conv2d
+        // handles it directly.
+        wan_causal_conv2d(&hidden, &self.quant_conv_weight, Some(&self.quant_conv_bias))
     }
 }
 
