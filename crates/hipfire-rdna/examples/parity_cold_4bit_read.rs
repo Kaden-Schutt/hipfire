@@ -97,6 +97,7 @@ fn main() {
         false,
         false,
         15.0,
+        15.0,
     );
     let nvc = cold.n_valid;
     let ns = cold.n_slots; // padded even — tile width

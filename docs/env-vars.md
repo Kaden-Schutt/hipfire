@@ -259,19 +259,20 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_KVNOISE_FOLD` | Defaults to 4 when unset | `crates/hipfire-train/examples/qat_w3_kvarn.rs:140` |
 | `HIPFIRE_KVNOISE_HOT` | Defaults to 4 when unset | `crates/hipfire-train/examples/qat_w3_kvarn.rs:139` |
 | `HIPFIRE_KVNOISE_LR` | Runtime variable controlling KVnoise lr in hipfire | `crates/hipfire-train/examples/kvnoise_recovery_supra50m.rs:61` |
-| `HIPFIRE_KV_COLD_BITS` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:174` |
-| `HIPFIRE_KV_CORE_FRAC` | Runtime variable controlling KV core frac in hipfire | `crates/hipfire-runtime/src/kv_hier.rs:164` |
-| `HIPFIRE_KV_FOLD_M` | Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure | `crates/hipfire-runtime/src/kv_hier.rs:159` |
+| `HIPFIRE_KV_COLD_BITS` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:180` |
+| `HIPFIRE_KV_COLD_V_BITS` | match it. Defaults to "cold_bits" (symmetric) when unset | `crates/hipfire-runtime/src/kv_hier.rs:190` |
+| `HIPFIRE_KV_CORE_FRAC` | Runtime variable controlling KV core frac in hipfire | `crates/hipfire-runtime/src/kv_hier.rs:170` |
+| `HIPFIRE_KV_FOLD_M` | Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure | `crates/hipfire-runtime/src/kv_hier.rs:165` |
 | `HIPFIRE_KV_HIERARCHICAL` | (→ qwen35_prefill_active_session → per-token forward_scratch), which honours | `crates/hipfire-serving-core/src/qwen35_prefill.rs:545` |
 | `HIPFIRE_KV_HIER_KEEP` | Parsed as value configuration from environment value | `crates/hipfire-runtime/examples/parity_kv_hier.rs:78` |
 | `HIPFIRE_KV_HIER_TEST_IDLE` | Optional: exercise the deferred between-turns drain. idle_compact moves hot | `crates/hipfire-runtime/examples/parity_kv_hier.rs:77` |
-| `HIPFIRE_KV_HOT_BUDGET` | Runtime variable controlling KV hot budget in hipfire | `crates/hipfire-runtime/src/kv_hier.rs:146` |
+| `HIPFIRE_KV_HOT_BUDGET` | Runtime variable controlling KV hot budget in hipfire | `crates/hipfire-runtime/src/kv_hier.rs:152` |
 | `HIPFIRE_KV_IDLE_KEEP` | Runtime variable controlling KV idle keep in hipfire | `crates/hipfire-serving-core/src/qwen35_prefill.rs:139` |
-| `HIPFIRE_KV_IMPORTANCE` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:169` |
-| `HIPFIRE_KV_MIGRATE_BATCH` | Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure | `crates/hipfire-runtime/src/kv_hier.rs:150` |
+| `HIPFIRE_KV_IMPORTANCE` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:175` |
+| `HIPFIRE_KV_MIGRATE_BATCH` | Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure | `crates/hipfire-runtime/src/kv_hier.rs:156` |
 | `HIPFIRE_KV_MODE` | Runtime variable controlling KV mode in hipfire | `crates/hipfire-serving-core/src/load.rs:2667` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults | `crates/hipfire-serving-core/src/load.rs:625` |
-| `HIPFIRE_KV_POS_LOCAL` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:171` |
+| `HIPFIRE_KV_POS_LOCAL` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:177` |
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | Runtime variable controlling lfm2 capture postmixer in hipfire | `crates/hipfire-arch-lfm2moe/src/forward.rs:1154` |
 | `HIPFIRE_LFM2_DFLASH` | Environment toggle value controls runtime behavior | `crates/hipfire-serving-core/src/load.rs:492` |
 | `HIPFIRE_LFM2_DFLASH_F16` | Enabled when set to 1 | `crates/hipfire-arch-lfm2moe/src/dflash.rs:25` |
@@ -550,6 +551,6 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/hipfire-rdna/src/compiler.rs:228` |
 | `USE_SAMPLE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:138` |
 
-- Total env vars: **545**
-- `HIPFIRE_*` vars: **499**
+- Total env vars: **546**
+- `HIPFIRE_*` vars: **500**
 - non-`HIPFIRE_*` vars: **46**

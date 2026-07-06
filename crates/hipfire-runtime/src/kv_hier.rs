@@ -80,10 +80,12 @@ impl ImportanceMode {
 pub struct ColdSegmentGpu {
     pub k_recs: GpuTensor, // [n_kv_heads × rec_bytes] as f32-view (bytes/4 elems)
     pub v_recs: GpuTensor,
-    pub n_valid: usize, // real slots attended
-    pub n_slots: usize, // padded tile width (= slot_stride for the cold read)
-    pub rec_bytes: usize,
-    pub bits: usize, // quant bits per code (4 or 2) — for the dequant unpack
+    pub n_valid: usize,     // real slots attended
+    pub n_slots: usize,     // padded tile width (= slot_stride for the cold read)
+    pub rec_bytes: usize,   // K record stride
+    pub bits: usize,        // K quant bits per code (4 or 2) — for the dequant unpack
+    pub v_rec_bytes: usize, // V record stride (may differ from K when v_bits != bits)
+    pub v_bits: usize,      // V quant bits per code
 }
 
 /// Reusable read scratch (lazily sized to the largest cold segment seen).
@@ -113,10 +115,14 @@ pub struct HierKvState {
     /// Group merged (non-core) cold tokens by adjacent position (similar RoPE
     /// phase → less merge blur) rather than importance rank. Default on.
     pub position_local: bool,
-    /// Max quant code for cold tiles (15=4-bit default, 3=2-bit probe).
+    /// Max quant code for cold K tiles (15=4-bit default, 3=2-bit probe).
     pub cold_qmax: f32,
-    /// Bits per cold code (4 or 2) — drives real sub-nibble packing + dequant.
+    /// Bits per cold K code (4 or 2) — drives real sub-nibble packing + dequant.
     pub cold_bits: usize,
+    /// Max quant code for cold V tiles (independent of K — asymmetric K2V4 etc.).
+    pub cold_v_qmax: f32,
+    /// Bits per cold V code (`HIPFIRE_KV_COLD_V_BITS`, defaults to `cold_bits`).
+    pub cold_v_bits: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
@@ -177,6 +183,16 @@ impl HierKvState {
             .unwrap_or(4)
             .clamp(1, 4);
         let cold_qmax = ((1u32 << cold_bits) - 1) as f32;
+        // V may carry a DIFFERENT bit width than K (asymmetric cold, e.g. K2V4):
+        // V is the "easy" operand (weighted average, no outlier channels), so it
+        // can hold more bits than an aggressive cold K for a small extra cost, or
+        // match it. Defaults to `cold_bits` (symmetric) when unset.
+        let cold_v_bits: u32 = std::env::var("HIPFIRE_KV_COLD_V_BITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(cold_bits)
+            .clamp(1, 4);
+        let cold_v_qmax = ((1u32 << cold_v_bits) - 1) as f32;
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         let mut attn_mass = Vec::with_capacity(n_layers);
@@ -197,6 +213,8 @@ impl HierKvState {
             position_local,
             cold_qmax,
             cold_bits: cold_bits as usize,
+            cold_v_qmax,
+            cold_v_bits: cold_v_bits as usize,
             n_heads,
             n_kv_heads,
             hot_k,
@@ -335,30 +353,34 @@ impl HierKvState {
             false,
             self.position_local,
             self.cold_qmax,
+            self.cold_v_qmax,
         );
         let n_slots = cold.n_slots;
         let bits = self.cold_bits;
-        let rec_bytes = kvarn_record_bytes_bits(HD, n_slots, bits);
-        // rec_bytes must be a multiple of 4 to upload as an f32-view buffer; pad up.
-        let rec_words = rec_bytes.div_ceil(4);
-        let padded = rec_words * 4;
-        let mut krecs = vec![0u8; nkv * padded];
-        let mut vrecs = vec![0u8; nkv * padded];
+        let v_bits = self.cold_v_bits;
+        // K and V may pack at different bit widths → separate record strides.
+        // Each rec_bytes is padded up to a multiple of 4 for the f32-view upload.
+        let k_padded = kvarn_record_bytes_bits(HD, n_slots, bits).div_ceil(4) * 4;
+        let v_padded = kvarn_record_bytes_bits(HD, n_slots, v_bits).div_ceil(4) * 4;
+        let mut krecs = vec![0u8; nkv * k_padded];
+        let mut vrecs = vec![0u8; nkv * v_padded];
         for h in 0..nkv {
             let kp = pack_kvarn_tile_bits(&cold.k_tiles[h], bits);
-            let vp = pack_kvarn_tile_bits(&cold.v_tiles[h], bits);
-            krecs[h * padded..h * padded + kp.len()].copy_from_slice(&kp);
-            vrecs[h * padded..h * padded + vp.len()].copy_from_slice(&vp);
+            let vp = pack_kvarn_tile_bits(&cold.v_tiles[h], v_bits);
+            krecs[h * k_padded..h * k_padded + kp.len()].copy_from_slice(&kp);
+            vrecs[h * v_padded..h * v_padded + vp.len()].copy_from_slice(&vp);
         }
-        let k_recs = gpu.upload_raw(&krecs, &[nkv * rec_words])?;
-        let v_recs = gpu.upload_raw(&vrecs, &[nkv * rec_words])?;
+        let k_recs = gpu.upload_raw(&krecs, &[nkv * k_padded / 4])?;
+        let v_recs = gpu.upload_raw(&vrecs, &[nkv * v_padded / 4])?;
         self.cold[layer].push(ColdSegmentGpu {
             k_recs,
             v_recs,
             n_valid: cold.n_valid,
             n_slots,
-            rec_bytes: padded,
+            rec_bytes: k_padded,
             bits,
+            v_rec_bytes: v_padded,
+            v_bits,
         });
         self.migrated[layer] += mb;
 
@@ -517,8 +539,8 @@ impl HierKvState {
                 nkv,
                 HD,
                 seg.n_slots,
-                seg.rec_bytes,
-                seg.bits,
+                seg.v_rec_bytes,
+                seg.v_bits,
             )?;
             gpu.attention_cold_slots(
                 q,

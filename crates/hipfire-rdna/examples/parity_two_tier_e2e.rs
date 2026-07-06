@@ -135,6 +135,7 @@ fn main() {
         true,
         false,
         15.0,
+        15.0,
     );
     let nvc = cold.n_valid;
 

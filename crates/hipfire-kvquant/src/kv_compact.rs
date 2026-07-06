@@ -58,9 +58,12 @@ pub fn compact_cold_kv(
     fold_m: usize,
     rotate: bool,
     position_local: bool,
-    // Max quant code for the cold tiles: 15 = 4-bit (default), 3 = 2-bit, etc.
-    // Lower = lower-precision cold quant (quality probe; same nibble storage).
-    qmax: f32,
+    // Max quant code for the cold K / V tiles, independently: 15 = 4-bit, 3 =
+    // 2-bit, etc. Asymmetric (e.g. K2V4: k_qmax=3, v_qmax=15) is supported — V is
+    // the "easy" operand (weighted-average, no outlier channels), so it can carry
+    // more bits than K for the same footprint budget, or match it.
+    k_qmax: f32,
+    v_qmax: f32,
 ) -> ColdTier {
     assert_eq!(head_dim, 256, "KVarN v1 FWHT is 256-wide");
     assert!(fold_m >= 1);
@@ -150,8 +153,8 @@ pub fn compact_cold_kv(
                 vtile[d * n_slots + s] = vvec[d];
             }
         }
-        k_tiles.push(kvarn::quantize_tile_qmax(&ktile, head_dim, n_slots, qmax));
-        v_tiles.push(kvarn::quantize_tile_qmax(&vtile, head_dim, n_slots, qmax));
+        k_tiles.push(kvarn::quantize_tile_qmax(&ktile, head_dim, n_slots, k_qmax));
+        v_tiles.push(kvarn::quantize_tile_qmax(&vtile, head_dim, n_slots, v_qmax));
     }
 
     ColdTier {
@@ -357,7 +360,20 @@ mod tests {
         let ref_out = attn(&q, &k, &v, nt, d);
 
         for &(cf, m) in &[(0.25f32, 8usize), (0.125, 16), (0.5, 4)] {
-            let cold = compact_cold_kv(&k, &v, nt, h, d, &importance, cf, m, true, false, 15.0);
+            let cold = compact_cold_kv(
+                &k,
+                &v,
+                nt,
+                h,
+                d,
+                &importance,
+                cf,
+                m,
+                true,
+                false,
+                15.0,
+                15.0,
+            );
             let (kr, vr) = cold.dequant_head(0);
             let out = attn_slots(&q, &kr, &vr, &cold, d);
             let c = cos(&out, &ref_out);
@@ -395,7 +411,7 @@ mod tests {
             *x = rng.n();
         }
         let imp: Vec<f32> = (0..nt).map(|t| 1.0 + (t % 5) as f32).collect(); // varied weights
-        let cold = compact_cold_kv(&k, &v, nt, 1, d, &imp, 0.0, 8, true, false, 15.0); // all merged
+        let cold = compact_cold_kv(&k, &v, nt, 1, d, &imp, 0.0, 8, true, false, 15.0, 15.0); // all merged
         let (kr, _) = cold.dequant_head(0);
         // recompute the true weighted-average of slot 0's members and compare.
         let mem = &cold.slot_members[0];
@@ -452,6 +468,7 @@ mod tests {
             true,
             false,
             15.0,
+            15.0,
         );
         let (ck, cv) = cold.dequant_head(0);
         let hot_k = &k[n_cold * d..];
@@ -489,7 +506,7 @@ mod tests {
         let imp: Vec<f32> = (0..nt)
             .map(|t| (0..d).map(|i| q[i] * k[t * d + i]).sum::<f32>())
             .collect();
-        let cold = compact_cold_kv(&k, &v, nt, h, d, &imp, 0.25, 4, false, false, 15.0);
+        let cold = compact_cold_kv(&k, &v, nt, h, d, &imp, 0.25, 4, false, false, 15.0, 15.0);
         let (kr, _vr) = cold.dequant_head(0);
         assert_eq!(kr.len(), cold.n_valid * d);
         assert!(kr.iter().all(|x| x.is_finite()));
