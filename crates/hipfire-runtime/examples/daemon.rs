@@ -864,12 +864,18 @@ fn main() {
                 // ranks). For the single-GPU / pp path the prior model is
                 // unloaded eagerly here as before (load_model uses the daemon's
                 // `gpu` directly, so it can't be deferred without a major
-                // refactor). `tp` is parsed authoritatively below; peek it here.
-                let load_tp = msg
-                    .get("params")
-                    .and_then(|p| p.get("tp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
+                // refactor). The multi-GPU SHARD degree (expert-parallel `ep` OR
+                // tensor-parallel `tp`) is parsed authoritatively below; peek the
+                // max here (either shard path defers the prior-model unload).
+                let load_tp = {
+                    let peek = |k: &str| {
+                        msg.get("params")
+                            .and_then(|p| p.get(k))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1) as usize
+                    };
+                    peek("ep").max(peek("tp"))
+                };
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -1204,26 +1210,47 @@ fn main() {
                     .and_then(|p| p.get("pp"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
-                // Expert-parallel degree (EP, task #26). tp>1 shards routed
-                // experts across ranks via load_model_ep. Mutually exclusive
-                // with pp; v1 refuses DFlash. See docs/plans/daemon-ep-wiring.md.
+                // Multi-GPU sharding, EP↔TP disentangled (PB-TP5 prep):
+                //   `ep` = expert-parallel (Ep axis, MoE routed experts, load_model_ep),
+                //   `tp` = tensor-parallel (Tp axis, dense row/col, load_model_tp).
+                // Back-compat: a legacy `tp>1` on an EP-capable MoE arch (9/10)
+                // means EP (the `--tp` serve flag historically drove EP), so `tp`
+                // reads as "shard across N GPUs; the arch picks the axis".
                 let tp = msg
                     .get("params")
                     .and_then(|p| p.get("tp"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
-                if tp > 1 && pp > 1 {
+                let ep = msg
+                    .get("params")
+                    .and_then(|p| p.get("ep"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                // Peek the arch to route a legacy `tp` correctly (MoE → EP).
+                let moe_arch = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(
+                    msg.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+                ))
+                .map(|h| matches!(h.arch_id, 9 | 10))
+                .unwrap_or(false);
+                let (ep, tp) = if ep > 1 {
+                    (ep, 1) // explicit expert-parallel
+                } else if tp > 1 && moe_arch {
+                    (tp, 1) // legacy: --tp on a MoE arch == expert-parallel
+                } else {
+                    (1, tp) // dense: real tensor-parallel (Tp axis)
+                };
+                if (ep > 1 || tp > 1) && pp > 1 {
                     let _ = writeln!(
                         stdout,
-                        r#"{{"type":"error","message":"tp (expert-parallel) and pp (pipeline-parallel) are mutually exclusive; set only one."}}"#
+                        r#"{{"type":"error","message":"tp/ep (tensor/expert-parallel) and pp (pipeline-parallel) are mutually exclusive; set only one."}}"#
                     );
                     let _ = stdout.flush();
                     continue;
                 }
-                if tp > 1 && draft_path.is_some() {
+                if (ep > 1 || tp > 1) && draft_path.is_some() {
                     let _ = writeln!(
                         stdout,
-                        r#"{{"type":"error","message":"EP serving (tp>1) does not support DFlash drafters in v1; reload without a draft."}}"#
+                        r#"{{"type":"error","message":"EP/TP serving (ep>1 or tp>1) does not support DFlash drafters in v1; reload without a draft."}}"#
                     );
                     let _ = stdout.flush();
                     continue;
@@ -1266,8 +1293,10 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                let loaded = if tp > 1 {
-                    hipfire_loader::load_model_ep(path, max_seq, tp)
+                let loaded = if ep > 1 {
+                    hipfire_loader::load_model_ep(path, max_seq, ep)
+                } else if tp > 1 {
+                    hipfire_loader::load_model_tp(path, max_seq, tp)
                 } else {
                     hipfire_loader::load_model(
                         path,

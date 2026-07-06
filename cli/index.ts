@@ -820,14 +820,19 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   }
   const params: any = { max_seq };
 
-  // Expert-parallel degree (EP, task #26). `hipfire serve --tp N` (which sets
-  // HIPFIRE_TP) shards the routed experts across N GPUs via the daemon's
-  // load_model_ep (MiniMax-M2 / DeepSeek-V4). Forwarded only when > 1 so
-  // single-GPU loads stay byte-identical; the daemon refuses tp>1 for
-  // non-EP arches and for DFlash drafters (mutually exclusive with pp).
+  // Multi-GPU sharding degree. EP↔TP disentangled (PB-TP5 prep):
+  //   `--tp N` / HIPFIRE_TP → params.tp = "shard across N GPUs; the arch picks
+  //     the axis" — the daemon routes a MoE arch (DeepSeek-V4 / MiniMax) to
+  //     expert-parallel load_model_ep, and a dense arch to real tensor-parallel
+  //     load_model_tp (the Tp axis; serve wiring is PB-TP5).
+  //   `HIPFIRE_EP=N` → params.ep = explicit expert-parallel (forces the Ep axis).
+  // Forwarded only when > 1 so single-GPU loads stay byte-identical; mutually
+  // exclusive with pp; the daemon refuses ep/tp>1 for DFlash drafters.
   {
     const tp = parseInt(process.env.HIPFIRE_TP ?? "1", 10);
     if (Number.isInteger(tp) && tp > 1) params.tp = tp;
+    const ep = parseInt(process.env.HIPFIRE_EP ?? "1", 10);
+    if (Number.isInteger(ep) && ep > 1) params.ep = ep;
   }
 
   // Pipeline-parallel degree (PP). `HIPFIRE_PP=N` routes qwen35 (dense/MoE)

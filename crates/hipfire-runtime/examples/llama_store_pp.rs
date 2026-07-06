@@ -177,7 +177,7 @@ fn main() {
         Llama::load_weights(&mut hfq, &cfg, &mut gpus.devices[0]).expect("bespoke load_weights");
     let ref_logits = forward_logits(&mut gpus.devices[0], &bespoke_w, &cfg);
 
-    let mesh = resolve_mesh(2, 1, Some(2));
+    let mesh = resolve_mesh(2, 1, 1, Some(2));
     assert!(mesh.has_axis(DimKind::Pp), "expected a Pp mesh");
     assert_eq!(mesh.n_devices(), 2);
 

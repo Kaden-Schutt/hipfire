@@ -1269,15 +1269,38 @@ impl Drop for MinimaxEpStaging {
 /// (`HIPFIRE_EP_FAIL_RANK`) fires AFTER a rank's constructor returns `Ok`, so it
 /// tests the completed-rank cleanup path (which IS fixed), not this inner window.
 /// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
-pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+pub fn load_model_ep(path: &str, max_seq: usize, ep: usize) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, tp),
-        10 => load_model_ep_minimax(path, max_seq, tp),
+        9 => load_model_ep_ds4(path, max_seq, ep),
+        10 => load_model_ep_minimax(path, max_seq, ep),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
     }
+}
+
+/// Load a model for **real tensor-parallel (TP)** serving — dense row/col
+/// sharding across `tp` GPUs (the `Tp` axis), distinct from expert-parallel
+/// ([`load_model_ep`], the `Ep` axis). This is the daemon entry the EP↔TP
+/// disentanglement reserves for the dense TP serve path.
+///
+/// The TP *forward* is validated end-to-end (see the `tp_*_parity` examples:
+/// `execute_steps_tp` + the store→forward bridge reproduce single-GPU logits at
+/// Tp-2). Wiring it into a served [`LoadedModel`] — per-rank sharded
+/// `LlamaWeights` from a `WeightStore`, per-rank scratch/KV, a `Gpus`-threaded
+/// decode loop, and `tp_decode_parity` — is **PB-TP5** and not yet done, so this
+/// returns a clear error rather than silently falling back to single-GPU.
+pub fn load_model_tp(path: &str, _max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    let arch = HfqFile::open(Path::new(path))
+        .map(|h| h.arch_id)
+        .unwrap_or(u32::MAX);
+    Err(format!(
+        "tensor-parallel serving (tp={tp}, arch_id={arch}) is not yet wired — PB-TP5. The TP \
+         forward is validated (execute_steps_tp + store→forward bridge == single-GPU logits; \
+         see the tp_full_model_parity example). Use `ep` for expert-parallel MoE (arch 9/10), \
+         or load single-GPU (tp=1) meanwhile."
+    ))
 }
 
 fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {

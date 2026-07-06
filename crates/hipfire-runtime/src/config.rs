@@ -126,33 +126,48 @@ impl RuntimeConfig {
     }
 }
 
-/// Decide the effective `(pp, tp)` parallelism degrees for a load. An
-/// explicitly-requested `pp > 1` or `tp > 1` (from the load message) always
-/// wins. Only when neither is requested does `HIPFIRE_EMULATE_GPUS` default
-/// the mode — to TP (EP), the primary multi-GPU path; PP stays opt-in via an
-/// explicit `pp`. The pp/tp mutual-exclusion check remains with the caller.
-pub fn resolve_parallelism(pp: usize, tp: usize, emulate_gpus: Option<usize>) -> (usize, usize) {
-    if pp == 1 && tp == 1 {
+/// Decide the effective `(pp, tp, ep)` parallelism degrees for a load. An
+/// explicitly-requested `pp`/`tp`/`ep > 1` (from the load message) always wins.
+/// Only when NONE is requested does `HIPFIRE_EMULATE_GPUS` default the mode — to
+/// EP (the primary working multi-GPU path, expert-parallel); PP and real
+/// tensor-parallel (`tp`) stay opt-in via an explicit degree. The
+/// mutual-exclusion check remains with the caller.
+pub fn resolve_parallelism(
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    emulate_gpus: Option<usize>,
+) -> (usize, usize, usize) {
+    if pp == 1 && tp == 1 && ep == 1 {
         if let Some(n) = emulate_gpus {
             if n >= 2 {
-                return (pp, n);
+                // Emulate defaults to EP (the Ep axis) — unchanged from the
+                // pre-disentanglement behavior where `tp` aliased EP.
+                return (pp, tp, n);
             }
         }
     }
-    (pp, tp)
+    (pp, tp, ep)
 }
 
-/// Resolve the `pp`/`tp` load knobs (with `HIPFIRE_EMULATE_GPUS` defaulting) to
-/// a [`DeviceMesh`] — the mesh producer that replaces the flat
-/// `resolve_parallelism` pair as the daemon adopts mesh-driven load/dispatch.
-/// Today `tp` == expert-parallel (`Ep` axis); real row/col TP and composed 2×N
-/// meshes are later phases. Degenerate: neither set → single-device (1×1) mesh.
-pub fn resolve_mesh(pp: usize, tp: usize, emulate_gpus: Option<usize>) -> DeviceMesh {
-    let (pp, tp) = resolve_parallelism(pp, tp, emulate_gpus);
+/// Resolve the `pp`/`tp`/`ep` load knobs (with `HIPFIRE_EMULATE_GPUS` defaulting)
+/// to a [`DeviceMesh`] — the mesh producer as the daemon adopts mesh-driven
+/// load/dispatch.
+///
+/// **EP↔TP disentangled (PB-TP5 prep):** each degree maps to its OWN axis —
+/// `pp`→`Pp` (pipeline), `ep`→`Ep` (expert-parallel, MoE routed experts),
+/// `tp`→`Tp` (real tensor-parallel, dense row/col sharding). `tp` no longer
+/// aliases the `Ep` axis. Single-axis only in this phase (precedence
+/// `pp > ep > tp`); composed 2×N meshes are a later phase. Degenerate: none set →
+/// single-device (1×1) mesh.
+pub fn resolve_mesh(pp: usize, tp: usize, ep: usize, emulate_gpus: Option<usize>) -> DeviceMesh {
+    let (pp, tp, ep) = resolve_parallelism(pp, tp, ep, emulate_gpus);
     if pp > 1 {
         DeviceMesh::rect(&[(DimKind::Pp, pp)])
+    } else if ep > 1 {
+        DeviceMesh::rect(&[(DimKind::Ep, ep)])
     } else if tp > 1 {
-        DeviceMesh::rect(&[(DimKind::Ep, tp)])
+        DeviceMesh::rect(&[(DimKind::Tp, tp)])
     } else {
         DeviceMesh::single()
     }
@@ -169,21 +184,26 @@ mod tests {
     #[test]
     fn resolve_mesh_maps_knobs_to_axes() {
         // single-GPU: no axes, one device.
-        assert_eq!(resolve_mesh(1, 1, None).n_devices(), 1);
+        assert_eq!(resolve_mesh(1, 1, 1, None).n_devices(), 1);
         // pp>1 → Pp axis.
-        let pp = resolve_mesh(2, 1, None);
+        let pp = resolve_mesh(2, 1, 1, None);
         assert_eq!(pp.n_devices(), 2);
         assert!(pp.has_axis(DimKind::Pp));
-        // tp>1 → Ep axis (tp == EP today).
-        let tp = resolve_mesh(1, 4, None);
+        // ep>1 → Ep axis (expert-parallel).
+        let ep = resolve_mesh(1, 1, 4, None);
+        assert_eq!(ep.n_devices(), 4);
+        assert!(ep.has_axis(DimKind::Ep));
+        // tp>1 → Tp axis (real tensor-parallel — the disentanglement).
+        let tp = resolve_mesh(1, 4, 1, None);
         assert_eq!(tp.n_devices(), 4);
-        assert!(tp.has_axis(DimKind::Ep));
-        // emulate defaults to Ep when neither pp nor tp set.
-        let em = resolve_mesh(1, 1, Some(2));
+        assert!(tp.has_axis(DimKind::Tp));
+        // emulate defaults to Ep when nothing else is set.
+        let em = resolve_mesh(1, 1, 1, Some(2));
         assert_eq!(em.n_devices(), 2);
         assert!(em.has_axis(DimKind::Ep));
-        // explicit pp wins over emulate.
-        assert!(resolve_mesh(2, 1, Some(4)).has_axis(DimKind::Pp));
+        // explicit pp wins over emulate; ep wins over tp.
+        assert!(resolve_mesh(2, 1, 1, Some(4)).has_axis(DimKind::Pp));
+        assert!(resolve_mesh(1, 2, 2, None).has_axis(DimKind::Ep));
     }
 
     #[test]
@@ -225,14 +245,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_parallelism_defaults_tp_only_when_unset() {
-        // Neither requested + emulate -> default TP.
-        assert_eq!(super::resolve_parallelism(1, 1, Some(2)), (1, 2));
-        // Explicit pp wins; no tp default.
-        assert_eq!(super::resolve_parallelism(2, 1, Some(2)), (2, 1));
-        // Explicit tp wins.
-        assert_eq!(super::resolve_parallelism(1, 4, Some(2)), (1, 4));
+    fn resolve_parallelism_defaults_ep_only_when_unset() {
+        // Nothing requested + emulate -> default EP (the tp slot carries the degree).
+        assert_eq!(super::resolve_parallelism(1, 1, 1, Some(2)), (1, 1, 2));
+        // Explicit pp wins; no default.
+        assert_eq!(super::resolve_parallelism(2, 1, 1, Some(2)), (2, 1, 1));
+        // Explicit tp (real tensor-parallel) wins.
+        assert_eq!(super::resolve_parallelism(1, 4, 1, Some(2)), (1, 4, 1));
+        // Explicit ep (expert-parallel) wins.
+        assert_eq!(super::resolve_parallelism(1, 1, 4, Some(2)), (1, 1, 4));
         // No emulate -> unchanged.
-        assert_eq!(super::resolve_parallelism(1, 1, None), (1, 1));
+        assert_eq!(super::resolve_parallelism(1, 1, 1, None), (1, 1, 1));
     }
 }
