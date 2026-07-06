@@ -1067,7 +1067,7 @@ pub const ENV_HIPFIRE_DIFFUSION_DUMP_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_LAYER_RUNG",
     description: "Selects behavior from recognized values",
-    source: "crates/hipfire-diffusion/src/denoise.rs:290",
+    source: "crates/hipfire-diffusion/src/denoise.rs:289",
 };
 
 /// `HIPFIRE_DIR` — Runtime variable controlling dir in hipfire
@@ -1586,7 +1586,7 @@ pub const ENV_HIPFIRE_GQA_CHUNK: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GQA_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GQA_FUSED",
     description: "Fused variant (opt-in via HIPFIRE_GQA_FUSED=1): single launch",
-    source: "crates/hipfire-arch-qwen2/src/qwen2.rs:1704",
+    source: "crates/hipfire-arch-qwen2/src/qwen2.rs:1700",
 };
 
 /// `HIPFIRE_GRAPH` — Used to configure runtime execution by explicitly setting "HIPFIRE_GRAPH"

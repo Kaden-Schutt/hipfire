@@ -558,6 +558,27 @@
     "env": []
   },
   {
+    "key": "models_network_dir",
+    "type": {
+      "kind": "path"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": null,
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to ~/.hipfire/models. Unset by default; local CLI/eval callers are unaffected.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "mtp_k",
     "type": {
       "kind": "u32"
@@ -938,6 +959,111 @@
     "owner": "hipfire-config",
     "description": "Default repeat penalty for generated text.",
     "validation": "0.0..",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "sdapi_max_batch_size",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "8",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Upper bound on SD API batch_size.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "sdapi_max_dimension",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "4096",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Upper bound on any single SD API dimension (width/height and their highres/firstphase variants). Requests above it get a 400. The admin's DoS ceiling; clients may request smaller, never larger.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "sdapi_max_n_iter",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "16",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Upper bound on SD API n_iter.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "sdapi_max_steps",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "200",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Upper bound on SD API step counts (steps and hr_second_pass_steps).",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "sdapi_max_total_batches",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "32",
+    "scopes": [
+      "global",
+      "runtime"
+    ],
+    "mutability": "static",
+    "owner": "hipfire-config",
+    "description": "Upper bound on batch_size × n_iter (total images generated per request).",
+    "validation": null,
     "secret": false,
     "restart_impact": "none",
     "env": []

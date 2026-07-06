@@ -290,6 +290,17 @@ secret = false
 restart_impact = "reload_model"
 
 [[field]]
+key = "models_network_dir"
+type = "path"
+requirement = "optional"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to ~/.hipfire/models. Unset by default; local CLI/eval callers are unaffected."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "mtp_k"
 type = "u32"
 requirement = "optional"
@@ -492,6 +503,66 @@ mutability = "request_only"
 owner = "hipfire-config"
 description = "Default repeat penalty for generated text."
 validation = "0.0.."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "sdapi_max_batch_size"
+type = "u32"
+requirement = "optional"
+default = "8"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Upper bound on SD API batch_size."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "sdapi_max_dimension"
+type = "u32"
+requirement = "optional"
+default = "4096"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Upper bound on any single SD API dimension (width/height and their highres/firstphase variants). Requests above it get a 400. The admin's DoS ceiling; clients may request smaller, never larger."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "sdapi_max_n_iter"
+type = "u32"
+requirement = "optional"
+default = "16"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Upper bound on SD API n_iter."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "sdapi_max_steps"
+type = "u32"
+requirement = "optional"
+default = "200"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Upper bound on SD API step counts (steps and hr_second_pass_steps)."
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "sdapi_max_total_batches"
+type = "u32"
+requirement = "optional"
+default = "32"
+scopes = ["global", "runtime"]
+mutability = "static"
+owner = "hipfire-config"
+description = "Upper bound on batch_size × n_iter (total images generated per request)."
 secret = false
 restart_impact = "none"
 

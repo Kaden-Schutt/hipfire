@@ -26,6 +26,7 @@
 | `mmq_screen` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ safety screening mode. |
 | `mmq_screen_threshold` | `f64` | optional | `0.10` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ screening rejection threshold. |
 | `model_overrides` | `json` | optional | `{}` | `global`, `model` | `load_time` | `reload_model` | Sparse per-model override map layered on top of global config. |
+| `models_network_dir` | `path` | optional | - | `global`, `runtime` | `static` | `none` | Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to ~/.hipfire/models. Unset by default; local CLI/eval callers are unaffected. |
 | `mtp_k` | `u32` | optional | `3` | `global`, `model`, `runtime` | `load_time` | `none` | Number of MTP candidate tokens to consider. |
 | `mtp_mode` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | Multi-token prediction sidecar mode. |
 | `port` | `u16` | optional | `11435` | `global`, `runtime` | `static` | `none` | Bind port for the OpenAI-compatible HTTP server. |
@@ -43,6 +44,11 @@
 | `prefill_threshold` | `u32` | optional | `32768` | `global`, `model`, `runtime` | `load_time` | `none` | Context length threshold for prefill compression. |
 | `prompt_normalize` | `bool` | optional | `true` | `global`, `model`, `request` | `request_only` | `none` | Whether prompts are normalized before tokenization. |
 | `repeat_penalty` | `f64` | optional | `1.05` | `global`, `model`, `request` | `request_only` | `none` | Default repeat penalty for generated text. |
+| `sdapi_max_batch_size` | `u32` | optional | `8` | `global`, `runtime` | `static` | `none` | Upper bound on SD API batch_size. |
+| `sdapi_max_dimension` | `u32` | optional | `4096` | `global`, `runtime` | `static` | `none` | Upper bound on any single SD API dimension (width/height and their highres/firstphase variants). Requests above it get a 400. The admin's DoS ceiling; clients may request smaller, never larger. |
+| `sdapi_max_n_iter` | `u32` | optional | `16` | `global`, `runtime` | `static` | `none` | Upper bound on SD API n_iter. |
+| `sdapi_max_steps` | `u32` | optional | `200` | `global`, `runtime` | `static` | `none` | Upper bound on SD API step counts (steps and hr_second_pass_steps). |
+| `sdapi_max_total_batches` | `u32` | optional | `32` | `global`, `runtime` | `static` | `none` | Upper bound on batch_size × n_iter (total images generated per request). |
 | `sdapi_output_root` | `string` | optional | `/tmp/hipfire-sdapi` | `global`, `runtime` | `static` | `none` | Root directory for images saved by the SD API compatibility routes (save_images: true). Client-supplied outdir_* override_settings are ignored; every SD API image write stays under this root. |
 | `temperature` | `f64` | optional | `0.3` | `global`, `model`, `request` | `request_only` | `none` | Default sampling temperature. |
 | `thinking` | `enum(off|on)` | optional | `off` | `global`, `model`, `request` | `request_only` | `none` | Reasoning/thinking display policy for compatible models. |
