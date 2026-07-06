@@ -257,10 +257,20 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
     the bridge into a reusable `assemble_sharded_layers(store)` is a clean follow-up (the borrow pattern is worked out
     — per-rank WeightRefs built inline from `resident_l(store,name,l,dev)`; `WeightRef` isn't Clone; `leak` for the
     `&WeightRef` the Step holds, or keep a per-rank Vec that outlives the Step list). No lib change landed this session.
-- **PB-TP5 NEXT (daemon serve) — RAISE THE EP-vs-TP FORK WITH BJOERN FIRST.** `resolve_mesh` (config.rs:150) hard-wires
-  the `tp` knob to the `Ep` axis; no way to express real row/col TP. Recommended: disentangle at the daemon load path
-  (`load_model_ep` vs a new `load_model_tp`) + give `resolve_mesh` an explicit axis. Then TP5 = `load_model_tp` + serve
-  + `tp_decode_parity` (FNV token-stream vs single-GPU, mirror `ep_decode_parity`).
+- **EP↔TP DISENTANGLED (`80d18401`) — the PB-TP5 prerequisite fork, RESOLVED (bjoern approved).** `resolve_mesh` was
+  hard-wiring `tp`→`Ep`; now `resolve_mesh(pp, tp, ep, emulate)` maps each degree to its OWN axis (pp→Pp, ep→Ep,
+  tp→Tp), precedence pp>ep>tp, emulate still defaults to EP. `resolve_parallelism` returns (pp,tp,ep). Daemon: parse an
+  explicit `ep` knob; route `ep>1`→`load_model_ep`, dense `tp>1`→NEW `load_model_tp` (hipfire-loader). **Back-compat: a
+  legacy `tp>1` on an EP-capable MoE arch (9/10) still means EP** (daemon peeks `HfqFile::arch_id`), so `--tp N` = "shard
+  across N GPUs; arch picks the axis" (MoE→EP, dense→TP). `load_model_tp` is a RESERVED stub returning a clear "PB-TP5
+  not yet wired" error (dense TP forward is validated by the examples; only the SERVE loop is unbuilt). CLI forwards
+  `HIPFIRE_EP`→params.ep. No behavior change for existing EP/single-GPU. config tests 4/4.
+- **PB-TP5 NEXT (the dense-TP serve loop) — fill in `load_model_tp`.** Now that the axis is disentangled: build a served
+  `LoadedModel` for dense TP — per-rank sharded `LlamaWeights` from a `WeightStore` (the store→forward bridge, validated
+  in `tp_full_model_parity`), per-rank scratch/KV, a `&mut Gpus`-threaded decode loop reusing the validated per-layer
+  Step lists, embed(rank0+broadcast) + final norm/lm_head(rank0). Then `tp_decode_parity` (FNV token-stream vs
+  single-GPU, mirror `ep_decode_parity`). The forward math is done; TP5 is the serve plumbing (daemon generate path +
+  unload + the deferred-unload already handles the shard degree via `load_tp`=max(ep,tp)).
 - **(historical) PB-TP4c REMAINING (the capstone — all primitives now PROVEN):** assemble `dense_forward_tp<A:DenseArch>(gpus,
   mesh, ...)` mirroring `dense_forward` (arch_spec.rs:132) but emitting per-rank Step lists (row `GemvResidual` → split
   Gemv→AllReduceOut→ResidualAdd per PB-TP4a) + the store→forward bridge: `fulfill_manifest(llama weight_manifest @
