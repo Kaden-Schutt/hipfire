@@ -106,10 +106,18 @@ EP path = the working template — `run_layer_program_mesh` EP arm `superop.rs:4
   Covers the REAL llama/qwen dense manifest (separate Column wq/wk/wv + Row o_proj/down + Replicate/Pin/Tied).
 - **PB-1b (FusedQkv/HeadSharded/VocabShard) DEFERRED** — emitted by NO current manifest (would be speculative);
   stays a clean `Err`. Implement when a manifest needs it.
-- **REMAINING (all large/structural, some forked):** PB-2 resolve_mesh real Tp axis — **FORK: `tp` knob currently
-  maps to the `Ep` axis (config.rs:155) for MoE serving; disentangling EP-vs-TP intent ripples into the daemon load
-  path** (needs bjoern's steer, like the P-A mesh-only call). PB-3 store→forward bridge (hand per-rank sharded
-  WeightRef into DenseLayer; sharded m/k). PB-4 execute_steps_mesh TP body + the `&mut Gpu→&mut Gpus` promotion
-  (core; mirror the EP arm — per-rank sharded GEMV + `all_reduce_sum_f32_peer` after RowShard via
-  `collective_for_policy`). PB-5 daemon `load_model_tp` + serve (mirror `load_model_ep`/`forward_ep`) + `tp_decode_parity`
-  harness (FNV parity vs single-GPU, FP32+DETERMINISTIC). Validate throughout with `HIPFIRE_EMULATE_GPUS=2`.
+- **PB-4 CORE VALIDATED** (`e513dc4f` + `62c5ee11`) — `tp_gemv_parity` example proves the TP compute+collective
+  numerically on emulated Tp-2 (gfx1151), composing PB-1a/1c slicing + `all_reduce_sum_f32_peer`:
+  (1) column-parallel `concat(W_r·x)==W·x` (2.4e-7), (2) row-parallel `all_reduce(W_r·x_r)==W·x` (4.8e-7),
+  (3) **composed FFN block** `W2·(W1·x)` col→row with sharded on-rank intermediate + ONE end-of-block all-reduce
+  == whole (1.2e-7). Every TP PRIMITIVE + the real block dataflow is proven correct. **GOTCHA found:** `gemv_f32`
+  returns WRONG results for a non-64-aligned reduction dim (INTER/TP=48 → 0.04 err; =64 → 1e-7) — a real TP split
+  must keep sharded reduction dims kernel-aligned (that's validate_manifest's group-alignment job).
+- **REMAINING = production INTEGRATION (large, de-risked; primitives all proven):** PB-2 resolve_mesh real Tp axis —
+  **FORK: `tp` knob maps to `Ep` (config.rs:155) for MoE; disentangle EP-vs-TP intent at the daemon load path
+  (`load_model_ep` vs new `load_model_tp`)** — recommended default, ripples into daemon. PB-3 store→forward bridge
+  (assemble per-rank sharded `LlamaWeights` from `WeightStore`). PB-4 FULL: wire the rank-loop + all-reduce into the
+  REAL `dense_forward`/`forward_scratch_layers` with `&mut Gpus` (mirror `forward_prefill_batch_ep`); attention is
+  head-parallel — Column-sharding qkv `[nh·hd,d]` by equal rows == head-split when `nh%tp==0`, then attention on
+  owned heads + Row o_proj all-reduce. PB-5 daemon `load_model_tp` + serve + real-model `tp_decode_parity` (FNV vs
+  single-GPU, FP32+DETERMINISTIC). This is the multi-session capstone; the hard primitives are done + validated.
