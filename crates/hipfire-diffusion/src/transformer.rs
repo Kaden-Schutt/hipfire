@@ -2707,13 +2707,41 @@ impl NativeTransformerDenoiser {
             })?;
 
         let mut joint = concat_sequence_3d(&text_hidden, &image_hidden)?;
-        for block in &self.blocks {
-            joint = block.forward_krea_with_runtime_context(
-                &joint,
-                &time_modulation,
-                joint_rotary.as_ref(),
-                runtime_context,
-            )?;
+        if runtime_context.rocm_device_id().is_some() {
+            // Resident block stack: upload the joint activation once, run the
+            // whole block stack on-device (no per-op host round-trip), download
+            // once. This is what removes the ~450-syncs-per-block cost.
+            let blocks = &self.blocks;
+            let time_modulation_ref = &time_modulation;
+            let joint_rotary_ref = joint_rotary.as_ref();
+            joint = runtime_context.with_rocm_gpu_weighted(move |gpu, cache| {
+                let mut resident = gpu
+                    .upload_f32(&joint.data, &joint.shape)
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                for block in blocks {
+                    let next = block.forward_krea_resident(
+                        &resident,
+                        time_modulation_ref,
+                        joint_rotary_ref,
+                        gpu,
+                        cache,
+                    )?;
+                    free_resident(gpu, resident)?;
+                    resident = next;
+                }
+                let out = download_resident(gpu, &resident)?;
+                free_resident(gpu, resident)?;
+                Ok(out)
+            })?;
+        } else {
+            for block in &self.blocks {
+                joint = block.forward_krea_with_runtime_context(
+                    &joint,
+                    &time_modulation,
+                    joint_rotary.as_ref(),
+                    runtime_context,
+                )?;
+            }
         }
         let image_hidden = slice_sequence_3d(&joint, text_seq, image_seq)?;
         self.io.project_hidden_to_latents_with_runtime_context(
