@@ -2592,7 +2592,7 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m, &mut gpus.devices[0], pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
+                        m, &mut gpus, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
                         temp, top_p, max_tokens, repeat_penalty, repeat_window,
                         presence_penalty, frequency_penalty,
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
@@ -8448,7 +8448,8 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
+fn generate(m: &mut LoadedModel, gpus: &mut Gpus, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
+    let gpu = &mut gpus.devices[0];
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
