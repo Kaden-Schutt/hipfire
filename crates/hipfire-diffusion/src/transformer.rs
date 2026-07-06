@@ -1187,6 +1187,16 @@ impl RotaryFrequencies {
             sin: CpuTensor { shape: vec![seq, freq_width], data: sin.to_vec() },
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn cos_data(&self) -> &[f32] {
+        &self.cos.data
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sin_data(&self) -> &[f32] {
+        &self.sin.data
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3024,7 +3034,17 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
         })?;
     let mut image_cos = CpuTensor::zeros(&[image_seq_len, freq_width]);
     let mut image_sin = CpuTensor::zeros(&[image_seq_len, freq_width]);
-    let max_vid_index = height.max(width);
+    // Qwen-Image family RoPE uses scale_rope=True (hardcoded in every diffusers
+    // Qwen*Transformer / controlnet): the height/width axes use CENTERED grid
+    // coordinates, not 0-based. diffusers builds each spatial axis as
+    // cat([neg_freqs[-(N-N/2):], pos_freqs[:N/2]]), i.e. positions
+    // [-(N-N/2) .. -1, 0 .. N/2-1]. Equivalently position(i) = i - (N - N/2).
+    // The frame axis stays 0-based. Text tokens sit just past the image span at
+    // base = max(H/2, W/2) (also halved under scale_rope). Using 0-based spatial
+    // positions here scrambles image attention into high-frequency noise.
+    let h_offset = (height - height / 2) as isize;
+    let w_offset = (width - width / 2) as isize;
+    let max_vid_index = (height / 2).max(width / 2);
     let mut token = 0usize;
     for f in 0..frame {
         for y in 0..height {
@@ -3036,7 +3056,7 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
                     freq_width,
                     axes,
                     theta,
-                    [f as isize, y as isize, x as isize],
+                    [f as isize, y as isize - h_offset, x as isize - w_offset],
                 );
                 token += 1;
             }
