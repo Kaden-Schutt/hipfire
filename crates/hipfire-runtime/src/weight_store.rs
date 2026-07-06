@@ -327,17 +327,88 @@ where
             }
         }
 
-        // Dense TP slicing across a real (≥2) group is not implemented in this
-        // landing — refuse rather than mis-place. A size-1 group degenerates to
-        // a whole-tensor upload and is fine.
+        // Dense TP — ColumnShard on the OUTERMOST (row / output) axis is a clean
+        // contiguous split (PB-1a): each row of a row-major quant blob is
+        // independently quantized along k, so cutting the output-row dim into
+        // `tp` equal parts is byte-clean for ANY quant format — no per-format
+        // group math. Rank r stores only its `m/tp` rows: bytes [r·B/tp,(r+1)·B/tp).
+        // (Row/FusedQkv/Head/Vocab, and non-axis-0 Column, still refuse below —
+        // those need strided / head-aware / group-aligned gathers, PB-1b/1c.)
+        if let ShardPolicy::ColumnShard { axis: 0 } = &entry.policy {
+            if devices.len() > 1 {
+                let tp = devices.len();
+                let rows = *entry.logical_shape.first().unwrap_or(&0);
+                if rows == 0 || rows % tp != 0 {
+                    return Err(FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: *devices.first().unwrap_or(&0),
+                        reason: format!(
+                            "ColumnShard: outermost dim {rows} not divisible by Tp {tp}"
+                        ),
+                    });
+                }
+                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: *devices.first().unwrap_or(&0),
+                    reason: format!("source read failed: {e}"),
+                })?;
+                if bytes.len() % tp != 0 {
+                    return Err(FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: *devices.first().unwrap_or(&0),
+                        reason: format!(
+                            "ColumnShard: blob {} bytes not divisible by Tp {tp} \
+                             (row-major quant rows must split evenly)",
+                            bytes.len()
+                        ),
+                    });
+                }
+                let chunk = bytes.len() / tp;
+                // Sharded logical shape: outermost dim becomes rows/tp.
+                let mut shape = entry.logical_shape.clone();
+                if let Some(first) = shape.first_mut() {
+                    *first = rows / tp;
+                }
+                for (rank, &dev) in devices.iter().enumerate() {
+                    let slice = &bytes[rank * chunk..(rank + 1) * chunk];
+                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                    })?;
+                    let mut tensor = gpu.upload_raw(slice, &shape).map_err(|e| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("upload_raw failed: {e}"),
+                    })?;
+                    tensor.dtype = dtype;
+                    store.insert(
+                        &entry.name,
+                        entry.layer,
+                        dev,
+                        WeightHandle::Resident(tensor),
+                    );
+                }
+                continue;
+            }
+        }
+
+        // Remaining dense TP slices across a real (≥2) group are not implemented
+        // yet (PB-1b/1c) — refuse rather than mis-place. A size-1 group degenerates
+        // to a whole-tensor upload and is fine.
         if is_dense_tp_slice(&entry.policy) && devices.len() > 1 {
             return Err(FulfillError {
                 name: entry.name.clone(),
                 layer: entry.layer,
                 device: *devices.first().unwrap_or(&0),
                 reason: format!(
-                    "dense TP slicing (Column/Row/FusedQkv/Head/Vocab) is Phase 5; \
-                     group size {} > 1",
+                    "dense TP slicing (Row/FusedQkv/Head/Vocab, or non-axis-0 Column) \
+                     is not yet implemented (PB-1b/1c); group size {} > 1",
                     devices.len()
                 ),
             });

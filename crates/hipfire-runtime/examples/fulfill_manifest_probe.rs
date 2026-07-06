@@ -167,6 +167,56 @@ fn check_ep(label: &str, gpus: &Gpus) {
     );
 }
 
+/// PB-1a byte-oracle: a `ColumnShard { axis: 0 }` weight on a Tp-2 mesh must land
+/// on each rank as its contiguous half of the row-major blob (rows [r·m/2,(r+1)·m/2)
+/// = bytes [r·B/2,(r+1)·B/2)). Format-agnostic contiguous split.
+fn check_column_shard_tp2(label: &str, gpus: &Gpus) {
+    const M: usize = 8; // output rows
+    const K: usize = 16; // input dim
+    let entry = WeightEntry::layer(
+        "wq",
+        0,
+        vec![M, K],
+        DType::F16,
+        ShardPolicy::ColumnShard { axis: 0 },
+    );
+    // Byte j = j as u8, so the expected per-rank slice is a plain range check.
+    let total = M * K; // treat as 1 byte/elem for the oracle (dtype set post-upload)
+    let bytes: Vec<u8> = (0..total as u32).map(|x| x as u8).collect();
+    let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+    let store = fulfill_manifest(&[entry.clone()], &mesh, N_LAYERS, gpus, |_| {
+        Ok((bytes.clone(), DType::F16))
+    })
+    .unwrap_or_else(|e| panic!("[{label}] fulfill_manifest(ColumnShard) failed: {e}"));
+
+    let devs = placement_devices(&entry, &mesh, N_LAYERS);
+    assert_eq!(devs.len(), 2, "[{label}] expected Tp-2 placement");
+    let chunk = bytes.len() / 2;
+    for (rank, &dev) in devs.iter().enumerate() {
+        let expected = bytes[rank * chunk..(rank + 1) * chunk].to_vec();
+        match store
+            .get("wq", Some(0), dev)
+            .unwrap_or_else(|| panic!("[{label}] wq missing on device {dev}"))
+        {
+            WeightHandle::Resident(t) => {
+                // Sharded shape: outermost dim halved.
+                assert_eq!(
+                    t.shape,
+                    vec![M / 2, K],
+                    "[{label}] rank {rank} shape not sharded"
+                );
+                let got = readback(gpus, dev, t);
+                assert_eq!(
+                    got, expected,
+                    "[{label}] rank {rank} (dev {dev}) contiguous half mismatch"
+                );
+            }
+            _ => panic!("[{label}] wq should be Resident, not Alias"),
+        }
+    }
+    println!("[{label}] OK — ColumnShard Tp-2 contiguous halves byte-verified on 2 ranks");
+}
+
 /// Validate the §6 transactional rollback: a source that fails partway must
 /// leave `fulfill_manifest` returning `Err` (naming the failing tensor) with the
 /// already-uploaded cells freed. We can't observe the free directly, but the run
@@ -298,6 +348,8 @@ fn main() {
             check("pp-2-emulated", &mesh, &gpus2);
             // Same 2 ranks, Ep axis: expert-parallel compact-blob placement.
             check_ep("ep-2-emulated", &gpus2);
+            // Same 2 ranks, Tp axis: ColumnShard contiguous-half slicing (PB-1a).
+            check_column_shard_tp2("tp-2-column-emulated", &gpus2);
         }
         Err(e) => {
             println!("pp-2-emulated: SKIPPED (could not bring up 2-rank Gpus: {e})");
