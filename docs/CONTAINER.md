@@ -78,6 +78,14 @@ Environment knobs:
 The wrapper mounts the host GPU lock file (`/tmp/hipfire-gpu.lock`) when present
 so a containerized gate coordinates with host GPU work.
 
+## Publishing to a registry (not yet wired)
+
+There is no CI workflow that publishes the image yet. When one is added, it
+should build the `runtime` target (no GPU needed — ROCm is dlopen'd) on a
+GitHub-hosted runner and push to a registry (Docker Hub or GHCR), e.g. `latest`
++ short SHA on `master` and a semver tag on release tags. The GPU gates cannot
+run in cloud CI and stay local via `scripts/container-gate.sh`.
+
 ## Related
 
 The older `docker/rocm7-builder.Dockerfile` is a separate, narrow helper for
