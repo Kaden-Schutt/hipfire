@@ -196,6 +196,33 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   max|Δ|=2.98e-8. dispatch lib 172/0. **Executor op coverage for a dense layer is now COMPLETE except `Step::Attend`**
   (Gemv col/row ✓, RmsnormAutomatic ✓, SiluMul ✓, ResidualAdd ✓, derived collectives ✓; BiasAdd/QkNorm/Rope are
   replicated/on-owned-heads → launch_op handles them, no collective, and PB-3 validated the attention math on raw ops).
+- **PB-TP4c PREREQ DONE + validated** (`827fac8f`) — `examples/llama_logit_dump.rs` drives the runtime
+  `llama::forward_scratch` STANDALONE single-GPU (loads a llama-family HFQ via `load_weights_hfq`, prefill +
+  greedy decode + per-step logit FNV). Validated gfx1151: `qwen3-0.6b-llama.mq4` (arch_id 1) → coherent
+  ("Also, explain why the dog is not a complete combustion."). **GATING FINDING:** raw-F32-dir load is NOT
+  wired for llama on this branch — llama carrier rejects `ModelSource::Dir`, no llama `ParoSource` (only qwen35
+  has one), and `Qwen3-0.6B-PARO` is 4-bit paroquant anyway. Every small qwen3-0.6b on disk is 4-bit → NO native
+  F32 checkpoint. **FP32 parity route = dequant HFQ→F32** (`weight_backend::dequant_f32` @575 exists): build F32
+  `LlamaWeights` (reference) + F32 sharded per-rank buffers (TP), both via `dequant_f32`, so parity isolates
+  sharding+collective (the note's chosen FP32 path; quant-GEMV-under-TP stays a later increment). NB `dense_forward`
+  (arch_spec.rs:132) is the `dense_forward_tp` template: RmsnormAutomatic→3×Gemv(Prerotated)→[bias]→[qknorm]→Rope→
+  `Step::Attend{plan,io}`(attend_plan Some)→o_proj `GemvResidual`; then FFN rmsnorm→gate/up→`silu_mul_f32`→down
+  `GemvResidual`. Under TP the two `GemvResidual` (wo, w_down) split to Gemv→AllReduceOut→ResidualAdd (PB-TP4a).
+- **DECISION 2026-07-06 — bjoern chose NATIVE-QUANT for the TP4c parity, NOT an F32-dequant detour.** The parity
+  runs on the real mq4 weights through the production quant GEMV path (deterministic for llama, no DeltaNet). This
+  reshaped the F32 question: the single-GPU reference is the existing quant `forward_scratch` (goal-1 harness),
+  and TP shards the native-quant WeightStore buffers.
+- **PB-TP4-quant DONE + validated** (`89f94d5b`) — `examples/tp_execute_steps_quant_ffn_parity.rs`: layer-0 FFN of
+  a REAL `qwen3-0.6b-llama.mq4` (gate/up [3072,1024] Column, down [1024,3072] Row; inter/tp=1536) through
+  `execute_steps_tp` == single-device, max|Δ|=**7.45e-9** on emulated Tp-2 (gfx1151). **KEY RESULT: the TP executor
+  handles a ROTATED quant format (MQ4G256→FwhtG256) under column/row sharding with NO executor change.** Why: `launch_op`
+  dispatches each dtype's rotation via `run_auto` (FWHT applied internally), and FWHT-G256 is block-diagonal per
+  256-element k-group → commutes with a group-aligned k-split; in correct TP dataflow the row-parallel op gets its own
+  on-rank k-slice (from column gate/up+silu), so each rank FWHTs exactly its groups and partials sum to the whole.
+  Reuses `fulfill_manifest` (quant-aware Column contiguous-byte / Row group-aligned strided-k gather) + the F32 harness
+  pattern. **Constraint: every sharded k-dim must stay %256==0** (validate_manifest's group-alignment job). No lib change.
+  This is the linchpin: TP4c's bridge assembles per-rank quant `WeightRef`s from the store and runs them through the
+  UNCHANGED executor; the single-GPU reference is the quant `forward_scratch`.
 - **PB-TP4b..5 REMAINING (real-model integration — the capstone):** TP4b = drive `Step::Attend` through the executor
   via the REAL llama `attend_plan` (builds `KvTierPlan{write_key,attend_key,...}` + `AttnParams` — needs a real model;
   synthesizing KvTierPlan by hand is fragile, do NOT). TP4c = the store→forward bridge (assemble per-rank sharded
