@@ -1,5 +1,28 @@
 {
   "arch": "gfx1100",
-  "generated": "2026-07-06 (bod-lever-discovery workflow)",
-  "queue": []
+  "generated": "2026-07-06 bod-lever-discovery",
+  "profile": "MALL-resident DRAM + cache-resident mix -> ALU/latency class (DRAM tapped, SLC/float4/tiling dead)",
+  "queue": [
+    {
+      "order": 1,
+      "kernel": "gemm_hfq4g256_moe_grouped_mmq_gfx11_dgpu",
+      "lever": "HFQ4 nibble->int8x16 WMMA unpack -> 2x v_perm_b32 byte-interleave (__builtin_amdgcn_perm); skip int8-lane materialize + bitcast",
+      "ev": 3.9,
+      "note": "DISASM-PROVEN ~4x VALU cut, register-neutral, byte-exact; same class as +7% attention"
+    },
+    {
+      "order": 2,
+      "kernel": "fused_rmsnorm_mq_rotate",
+      "lever": "Delete Phase-1c: fold weight[i]*rms into Phase-2 load ((x*weight)*rms)*signs1; remove strided LDS-RMW pass + __syncthreads (line 85)",
+      "ev": 3.85,
+      "note": "byte-exact, deletes barrier + 2K LDS ops from latency path (7.0% wall)"
+    },
+    {
+      "order": 3,
+      "kernel": "gated_delta_net_q8_fast",
+      "lever": "Promote S_tile __shared__ -> per-thread 16-VGPR array float S[4][4]; remove loop-carried ds_write/ds_read round-trip",
+      "ev": 2.6,
+      "note": "byte-exact per-thread-safe; +~16 VGPR but occ grid-limited"
+    }
+  ]
 }
