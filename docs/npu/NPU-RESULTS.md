@@ -351,3 +351,28 @@ Hardcoded `let use_graph = false;` at qwen35.rs:8331 (disabled 2026-05-15, token
 ### Takeaway
 
 The daemon already uses Q8 state by default. The 60.8 tok/s in the previous session was from `run.rs` which forced FP32 state. Real decode ceiling with current code: **~62 tok/s on gfx1103 MQ4**. Further gains require re-enabling hipGraph (needs bug investigation) or kernel-level optimization.
+
+## Branch integration history — `NpuKernel` API union (2026-07-06)
+
+When the local NPU line (R5–R15 + async dispatch) was rebased onto `chaingun`,
+it met a parallel NPU effort already upstream. Both had independently extended
+`NpuKernel` from the same base:
+
+- **upstream**: blocking `submit(-> u64)` / `wait(seq)`, `submit_synced`
+  (selective per-arg flush), `sync_output` (pipelined read-back cache reconcile),
+  `import_dmabuf`, multi-slot command-BO cache.
+- **local (kept)**: the async `NpuInFlight` owning-handle path for GPU∥NPU
+  overlap with scheduler correlation tags.
+
+Both were kept (union, nothing dropped). The only clash was the `submit`/`wait`
+names, resolved by renaming the async pair to **`submit_inflight` /
+`wait_inflight`** (`submit_tagged` / `poll` / `NpuInFlight` unchanged). The sole
+async caller is `examples/async_smoke.rs`.
+
+**Bisect note:** the reconciliation landed as a separate tip commit (`merge-fix(npu):
+unify local async NpuKernel API …`), so the three commits that introduce/inherit
+the async API before it — `feat(npu): async NPU dispatch split …` through
+`refactor(rdna): single-source kernarg lists …` — do **not** individually compile
+(duplicate `submit`/`wait` in `hipfire-xdna`). This is inherent to the divergent
+rebase; the branch tip is green. `git bisect skip` that span when bisecting a
+`hipfire-xdna` build across it.
