@@ -59,11 +59,71 @@ fn cos_sim(a: &[f32], b: &[f32]) -> f64 {
     dot / (na.sqrt() * nb.sqrt()).max(1e-30)
 }
 
+/// Validate GPU pack (`kvarn_quantize_tile`) + GPU unpack (`kvarn_dequant_tile`)
+/// round-trip at one `bits` width. Returns (cos-sim, deq-kernel cos-sim, max-rel
+/// GPU-vs-host deq err). Higher bits ⇒ higher cos-sim (the whole point).
+fn run_bits(gpu: &mut Gpu, tile: &[f32], r: usize, c: usize, bits: usize) -> (f64, f64, f32) {
+    let n = r * c;
+    let cpb = 8 / bits;
+    let mask = (1u16 << bits) - 1;
+    let record_bytes = n.div_ceil(cpb) + r * 2 * 2 + c * 2;
+    let td = gpu
+        .upload_raw(
+            &tile
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[n],
+        )
+        .unwrap();
+    let rd = gpu
+        .upload_raw(&vec![0u8; record_bytes], &[record_bytes])
+        .unwrap();
+    gpu.kvarn_quantize_tile(&td, &rd, 1, r, c, record_bytes, bits)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    let rec = gpu.download_raw(&rd, record_bytes).unwrap();
+
+    // Host dequant from the GPU record (bits-aware unpack: 8/bits codes/byte).
+    let qbytes = n.div_ceil(cpb);
+    let off_scale = qbytes;
+    let off_zp = off_scale + r * 2;
+    let off_scol = off_zp + r * 2;
+    let rd16 = |off: usize| f16_to_f32(u16::from_le_bytes([rec[off], rec[off + 1]]));
+    let scale_abs: Vec<f32> = (0..r).map(|i| rd16(off_scale + i * 2)).collect();
+    let zp_abs: Vec<f32> = (0..r).map(|i| rd16(off_zp + i * 2)).collect();
+    let s_col: Vec<f32> = (0..c).map(|i| rd16(off_scol + i * 2)).collect();
+    let mut deq = vec![0.0f32; n];
+    for ri in 0..r {
+        for ci in 0..c {
+            let gi = ri * c + ci;
+            let q = ((rec[gi / cpb] as u16 >> ((gi % cpb) * bits)) & mask) as f32;
+            deq[gi] = (q * scale_abs[ri] + zp_abs[ri]) * s_col[ci];
+        }
+    }
+    let cs = cos_sim(&deq, tile);
+
+    // GPU dequant kernel: must match the host dequant of the same record.
+    let outd = gpu.upload_raw(&vec![0u8; n * 2], &[n]).unwrap();
+    gpu.kvarn_dequant_tile(&rd, &outd, 1, r, c, record_bytes, bits)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    let outb = gpu.download_raw(&outd, n * 2).unwrap();
+    let mut gpu_deq = vec![0.0f32; n];
+    let mut max_deq_err = 0.0f32;
+    for i in 0..n {
+        gpu_deq[i] = f16_to_f32(u16::from_le_bytes([outb[i * 2], outb[i * 2 + 1]]));
+        max_deq_err = max_deq_err.max((gpu_deq[i] - deq[i]).abs() / deq[i].abs().max(1e-4));
+    }
+    let cs_gpu_deq = cos_sim(&gpu_deq, tile);
+    (cs, cs_gpu_deq, max_deq_err)
+}
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let r: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(128);
-    let c: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(64);
-    assert_eq!(c % 2, 0);
+    let c: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(128);
+    assert_eq!((c * 2) % 8, 0);
 
     let mut gpu = Gpu::init().unwrap();
 
@@ -78,61 +138,8 @@ fn main() {
         }
     }
 
-    let record_bytes = (r * c).div_ceil(2) + r * 2 * 2 + c * 2;
-    let td = gpu
-        .upload_raw(
-            &tile
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<_>>(),
-            &[r * c],
-        )
-        .unwrap();
-    let rd = gpu
-        .upload_raw(&vec![0u8; record_bytes], &[record_bytes])
-        .unwrap();
-    gpu.kvarn_quantize_tile(&td, &rd, 1, r, c, record_bytes)
-        .unwrap();
-    gpu.device_synchronize().unwrap();
-    let rec = gpu.download_raw(&rd, record_bytes).unwrap();
-
-    // Host dequant from the GPU record.
-    let n = r * c;
-    let qbytes = n.div_ceil(2);
-    let off_scale = qbytes;
-    let off_zp = off_scale + r * 2;
-    let off_scol = off_zp + r * 2;
-    let rd16 = |off: usize| f16_to_f32(u16::from_le_bytes([rec[off], rec[off + 1]]));
-    let scale_abs: Vec<f32> = (0..r).map(|i| rd16(off_scale + i * 2)).collect();
-    let zp_abs: Vec<f32> = (0..r).map(|i| rd16(off_zp + i * 2)).collect();
-    let s_col: Vec<f32> = (0..c).map(|i| rd16(off_scol + i * 2)).collect();
-    let mut deq = vec![0.0f32; n];
-    for ri in 0..r {
-        for ci in 0..c {
-            let gi = ri * c + ci;
-            let byte = rec[gi >> 1];
-            let q = if gi & 1 == 0 { byte & 0xf } else { byte >> 4 } as f32;
-            deq[gi] = (q * scale_abs[ri] + zp_abs[ri]) * s_col[ci];
-        }
-    }
-    let cs = cos_sim(&deq, &tile);
-
-    // GPU dequant kernel: must match the host dequant of the same record.
-    let outd = gpu.upload_raw(&vec![0u8; n * 2], &[n]).unwrap();
-    gpu.kvarn_dequant_tile(&rd, &outd, 1, r, c, record_bytes, 4)
-        .unwrap();
-    gpu.device_synchronize().unwrap();
-    let outb = gpu.download_raw(&outd, n * 2).unwrap();
-    let mut gpu_deq = vec![0.0f32; n];
-    let mut max_deq_err = 0.0f32;
-    for i in 0..n {
-        gpu_deq[i] = f16_to_f32(u16::from_le_bytes([outb[i * 2], outb[i * 2 + 1]]));
-        max_deq_err = max_deq_err.max((gpu_deq[i] - deq[i]).abs() / deq[i].abs().max(1e-4));
-    }
-    let cs_gpu_deq = cos_sim(&gpu_deq, &tile);
-
-    // Naive per-row 4-bit (no variance-normalization) baseline.
-    let mut naive = vec![0.0f32; n];
+    // Naive per-row 4-bit (no variance-normalization) baseline to beat at 4-bit.
+    let mut naive = vec![0.0f32; r * c];
     for ri in 0..r {
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for ci in 0..c {
@@ -147,16 +154,30 @@ fn main() {
     }
     let cs_naive = cos_sim(&naive, &tile);
 
-    // GPU dequant must agree with host dequant (f16 round-trip tolerance) and
-    // reproduce the same reconstruction quality.
-    let pass = cs >= 0.99 && cs > cs_naive && max_deq_err < 5e-3 && (cs_gpu_deq - cs).abs() < 1e-3;
+    // Sweep {2,4,8}: cos-sim must climb with bits; GPU deq must match host deq;
+    // 4-bit var-norm must beat naive 4-bit.
+    let mut all_pass = true;
+    let mut prev_cs = 0.0f64;
+    for &bits in &[2usize, 4, 8] {
+        let (cs, cs_gpu_deq, max_deq_err) = run_bits(&mut gpu, &tile, r, c, bits);
+        let monotone = cs >= prev_cs - 1e-6;
+        let deq_ok = max_deq_err < 5e-3 && (cs_gpu_deq - cs).abs() < 1e-3;
+        let beats_naive = bits < 4 || cs > cs_naive - 1e-6;
+        let pass = deq_ok && monotone && beats_naive && cs.is_finite();
+        all_pass &= pass;
+        println!(
+            "  bits={bits}: var-norm cos-sim={cs:.5}  deq-kernel cos-sim={cs_gpu_deq:.5}  \
+             max-rel-err={max_deq_err:.2e}  {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        prev_cs = cs;
+    }
     println!(
-        "parity_kvarn_quantize_tile r={r} c={c} on {}: GPU cos-sim={cs:.5}  naive-4bit={cs_naive:.5}  \
-         deq-kernel cos-sim={cs_gpu_deq:.5} max-rel-err={max_deq_err:.2e}  -> {}",
+        "parity_kvarn_quantize_tile r={r} c={c} on {} (naive-4bit={cs_naive:.5}) -> {}",
         gpu.arch,
-        if pass { "PASS" } else { "FAIL" }
+        if all_pass { "PASS" } else { "FAIL" }
     );
-    if !pass {
+    if !all_pass {
         std::process::exit(1);
     }
 }

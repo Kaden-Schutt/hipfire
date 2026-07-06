@@ -11,22 +11,23 @@
 // pack_kvarn_tile (the CPU golden oracle); GPU uses f32 where CPU uses f64, so
 // validate by dequant cos-sim, not bit-exact.
 //
-// Record layout (== pack_kvarn_tile):
-//   [ (r*c+1)/2 ]  4-bit packed q (2 nibbles/byte, row-major)
+// Record layout (== pack_kvarn_tile_bits), `bits` per code, 8/bits codes/byte:
+//   [ (r*c)/(8/bits) ]  packed q codes (LSB-first, row-major)
 //   [ r_dim*2  ]   scale_abs[r] fp16
 //   [ r_dim*2  ]   zp_abs[r]    fp16
 //   [ c_dim*2  ]   s_col[c]     fp16
 // Dequant: (q*scale_abs[r] + zp_abs[r]) * s_col[c].
 //
-// Constraints: c_dim even (nibble rows are whole bytes); r_dim,c_dim <= 256.
-// Grid:[n_tiles], block:[256]. SINKHORN_ITERS / QMAX match kvarn.rs.
+// `bits` in {2,4,8}: codes/byte = 8/bits; qmax = 2^bits - 1. bits=4 is the
+// legacy nibble layout. Constraints: c_dim*bits % 8 == 0 (each row owns whole
+// bytes → the one-thread-per-row pack is race-free); r_dim,c_dim <= 256.
+// Grid:[n_tiles], block:[256]. SINKHORN_ITERS matches kvarn.rs.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
 #define KVARN_SINKHORN_ITERS 10
-#define KVARN_QMAX 15.0f
 #define KVARN_RMAX 256
 
 __device__ __forceinline__ float kvarn_log_clamp(float x) {
@@ -38,8 +39,12 @@ __launch_bounds__(256)
 extern "C" __global__ void kvarn_quantize_tile(
     const float*  __restrict__ T,      // [n_tiles, r_dim*c_dim] f32 row-major tiles
     uint8_t*      __restrict__ REC,     // [n_tiles, record_bytes]
-    int n_tiles, int r_dim, int c_dim, int record_bytes
+    int n_tiles, int r_dim, int c_dim, int record_bytes,
+    int bits                            // per-code bits in {2,4,8}; 8/bits codes/byte
 ) {
+    const float qmax = (float)((1 << bits) - 1);
+    const int cpb = 8 / bits;           // codes per byte
+    const int codemask = (1 << bits) - 1;
     const int t = blockIdx.x;
     if (t >= n_tiles) return;
     const int tid = threadIdx.x;
@@ -133,9 +138,9 @@ extern "C" __global__ void kvarn_quantize_tile(
         __syncthreads();
     }
 
-    // ── Quantize using best scales: per-row 4-bit min/max of balanced tile.
+    // ── Quantize using best scales: per-row `bits`-bit min/max of balanced tile.
     const int n = r_dim * c_dim;
-    const int qbytes = (n + 1) / 2;
+    const int qbytes = (n + cpb - 1) / cpb;
     const int off_scale = qbytes;
     const int off_zp = off_scale + r_dim * 2;
     const int off_scol = off_zp + r_dim * 2;
@@ -146,17 +151,18 @@ extern "C" __global__ void kvarn_quantize_tile(
             float v = tile[r * c_dim + c] * er * __expf(-blc[c]);
             lo = fminf(lo, v); hi = fmaxf(hi, v);
         }
-        float scale = fmaxf((hi - lo) / KVARN_QMAX, 1e-8f);
+        float scale = fmaxf((hi - lo) / qmax, 1e-8f);
         float s_row = __expf(blr[r]);
-        // q codes for this row (c_dim contiguous; c_dim even → whole bytes).
+        // q codes for this row: c_dim*bits % 8 == 0 → each row owns whole bytes,
+        // so this single-thread-per-row pack is race-free. LSB-first within byte.
         for (int c = 0; c < c_dim; ++c) {
             float v = tile[r * c_dim + c] * er * __expf(-blc[c]);
-            int code = (int)(fminf(fmaxf(roundf((v - lo) / scale), 0.f), KVARN_QMAX));
+            int code = (int)(fminf(fmaxf(roundf((v - lo) / scale), 0.f), qmax));
             int gi = r * c_dim + c;
-            uint8_t nib = (uint8_t)(code & 0xf);
-            // Each row owns whole bytes (c_dim even), so no cross-thread race.
-            if ((gi & 1) == 0) rec[gi >> 1] = nib;
-            else rec[gi >> 1] |= nib << 4;
+            int sub = gi % cpb;
+            uint8_t shifted = (uint8_t)((code & codemask) << (sub * bits));
+            if (sub == 0) rec[gi / cpb] = shifted;   // first code in byte clears it
+            else rec[gi / cpb] |= shifted;
         }
         __half sa = __float2half(scale * s_row);
         __half za = __float2half(lo * s_row);

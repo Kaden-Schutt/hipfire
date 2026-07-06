@@ -207,6 +207,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
+                4,
             )
             .unwrap()
         }

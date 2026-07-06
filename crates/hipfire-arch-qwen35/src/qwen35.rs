@@ -20,6 +20,7 @@ use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::{DispatchError, RotationPlan};
 use hipfire_model::ModelSource;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::hfq_modules::HfqModuleKind;
 use hipfire_runtime::kv;
@@ -33,7 +34,6 @@ use hipfire_runtime::weights::{
     weight_gemv_prerotated, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
     ParoRotation, WeightTensor,
 };
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -27051,6 +27051,7 @@ fn kv_cache_attention_dispatch(
             None,
             0,
             0,
+            kv_cache.kvarn_bits,
         );
     }
     let plan = KvTierPlan::derive(KvTierInputs {

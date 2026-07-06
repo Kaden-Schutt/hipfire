@@ -126,7 +126,7 @@ fn main() {
             &[n_tiles * record_bytes],
         )
         .unwrap();
-    gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes)
+    gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes, 4)
         .unwrap();
     gpu.device_synchronize().unwrap();
     let recs = gpu.download_raw(&rd, n_tiles * record_bytes).unwrap();

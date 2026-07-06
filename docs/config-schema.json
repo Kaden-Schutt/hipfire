@@ -419,7 +419,11 @@
         "q8",
         "asym2",
         "asym3",
-        "asym4"
+        "asym4",
+        "kvarn2",
+        "kvarn",
+        "kvarn4",
+        "kvarn8"
       ]
     },
     "requirement": {

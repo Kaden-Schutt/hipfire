@@ -304,7 +304,7 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     field!(
         "kv_cache",
         ConfigType::Enum {
-            values: &["auto", "q8", "asym2", "asym3", "asym4"]
+            values: &["auto", "q8", "asym2", "asym3", "asym4", "kvarn2", "kvarn", "kvarn4", "kvarn8"]
         },
         Requirement::Optional,
         Some("auto"),

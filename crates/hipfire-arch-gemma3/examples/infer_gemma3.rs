@@ -37,9 +37,9 @@
 use std::path::Path;
 
 use hipfire_arch_gemma3 as gemma3;
+use hipfire_rdna::Gpu;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::Gpu;
 
 #[derive(Default)]
 struct Args {
@@ -161,8 +161,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut gpu = Gpu::init()?;
     let weights = gemma3::load_weights(&mut hfq, &cfg, &mut gpu)?;
-    let mut state = gemma3::Gemma3State::new_with_max_seq(&mut gpu, &cfg, args.max_seq, false)
-        .map_err(|e| format!("Gemma3State::new failed: {e:?}"))?;
+    let mut state = gemma3::Gemma3State::new_with_max_seq(
+        &mut gpu,
+        &cfg,
+        args.max_seq,
+        hipfire_runtime::kv::KvQuantMode::Unquantized,
+        4,
+    )
+    .map_err(|e| format!("Gemma3State::new failed: {e:?}"))?;
 
     eprintln!("[forward] prefilling {} tokens", prompt_ids.len());
     let t0 = std::time::Instant::now();

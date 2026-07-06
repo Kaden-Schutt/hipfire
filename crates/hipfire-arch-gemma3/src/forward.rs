@@ -26,9 +26,9 @@
 //! pre-scale baked into `q_norm` (see `load_weights`).
 
 use hip_bridge::{DeviceBuffer, HipResult};
-use hipfire_runtime::kv::KvCache;
-use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::kv::{KvCache, KvQuantMode};
+use hipfire_runtime::weights::{weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
 
 use crate::config::Gemma3Config;
 use crate::weights::Gemma3Weights;
@@ -82,11 +82,19 @@ pub struct Gemma3State {
     pub swa_window: usize,
     /// Next absolute KV write slot; bumped by `forward_step`.
     pub next_pos: usize,
+    // ── KVarN scratch (Some only when `kv_cache.quant_kvarn`) ─────────────
+    /// Reusable gather/quantize tile `[n_kv_heads × head_dim × GROUP]` for
+    /// `kvarn_attend`; allocated once (per-call alloc would leak — GpuTensor has
+    /// no pool-return Drop).
+    pub kvarn_tiles: Option<GpuTensor>,
+    /// FlashAttention partials for `attention_flash_kvarn_batched_masked`
+    /// (`n_heads × ceil(max_seq/128) × (2 + head_dim)` F32).
+    pub kvarn_flash_partials: Option<GpuTensor>,
 }
 
 impl Gemma3State {
     pub fn new(gpu: &mut Gpu, cfg: &Gemma3Config) -> Result<Self, String> {
-        Self::new_with_max_seq(gpu, cfg, DEFAULT_MAX_SEQ, false)
+        Self::new_with_max_seq(gpu, cfg, DEFAULT_MAX_SEQ, KvQuantMode::Unquantized, 4)
             .map_err(|e| format!("gemma3: Gemma3State::new failed: {e:?}"))
     }
 
@@ -94,7 +102,8 @@ impl Gemma3State {
         gpu: &mut Gpu,
         cfg: &Gemma3Config,
         max_seq: usize,
-        quant_q8: bool,
+        kv_mode: KvQuantMode,
+        kvarn_bits: usize,
     ) -> HipResult<Self> {
         let dim = cfg.hidden_size;
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
@@ -106,8 +115,13 @@ impl Gemma3State {
         let head_dim = cfg.head_dim;
 
         // q8_0 KV requires head_dim divisible by the 32-element block; fall back
-        // to F32 otherwise.
-        let kv_quant_q8 = quant_q8 && head_dim.is_multiple_of(32);
+        // to F32 otherwise. KVarN (variance-normalized 4-bit K + Q8 V) requires
+        // head_dim ∈ {128, 256} (the gemma3 shapes: 128 @27b, 256 @4b); the
+        // optional Hadamard rotation engages only at 256. Anything else → F32.
+        let kv_quant_q8 =
+            matches!(kv_mode, KvQuantMode::Q8 | KvQuantMode::Int8) && head_dim.is_multiple_of(32);
+        let kv_kvarn =
+            matches!(kv_mode, KvQuantMode::Kvarn) && (head_dim == 128 || head_dim == 256);
 
         // Sliding-window attention: gemma3 interleaves 5 local : 1 global layers.
         // When SWA applies (window in (0, max_seq) and at least one local layer),
@@ -125,15 +139,39 @@ impl Gemma3State {
 
         let kv_cache = if swa {
             let is_global: Vec<bool> = (0..n_layers).map(|l| cfg.is_global_layer(l)).collect();
-            if kv_quant_q8 {
+            // KVarN/Q8 apply to the GLOBAL full-context layers (where the
+            // long-context KV lives); local layers keep their own F32 rings.
+            if kv_kvarn {
+                KvCache::new_gpu_kvarn_filtered(
+                    gpu, &is_global, n_kv, head_dim, max_seq, kvarn_bits,
+                )?
+            } else if kv_quant_q8 {
                 KvCache::new_gpu_q8_filtered(gpu, &is_global, n_kv, head_dim, max_seq)?
             } else {
                 KvCache::new_gpu_filtered(gpu, &is_global, n_kv, head_dim, max_seq)?
             }
+        } else if kv_kvarn {
+            KvCache::new_gpu_kvarn(gpu, n_layers, n_kv, head_dim, max_seq, kvarn_bits)?
         } else if kv_quant_q8 {
             KvCache::new_gpu_q8(gpu, n_layers, n_kv, head_dim, max_seq)?
         } else {
             KvCache::new_gpu(gpu, n_layers, n_kv, head_dim, max_seq)?
+        };
+
+        // KVarN needs two reusable scratch buffers (see field docs). Allocate
+        // eagerly here so the single-token hot path never allocates. n=1 always
+        // for gemma3 KVarN (decode + per-token prefill), so flash_partials needs
+        // just one batch slot.
+        let (kvarn_tiles, kvarn_flash_partials) = if kv_kvarn {
+            let tiles = gpu.alloc_tensor(&[n_kv * head_dim * KvCache::KVARN_GROUP], DType::F32)?;
+            let max_tiles = max_seq.div_ceil(KvCache::KVARN_GROUP);
+            let partials = gpu.alloc_tensor(
+                &[cfg.num_attention_heads * max_tiles * (2 + head_dim)],
+                DType::F32,
+            )?;
+            (Some(tiles), Some(partials))
+        } else {
+            (None, None)
         };
 
         // Per-local-layer F32 rings + B=1 staging scratch. When SWA is off these
@@ -178,6 +216,8 @@ impl Gemma3State {
             swa_nvalid,
             swa_window,
             next_pos: 0,
+            kvarn_tiles,
+            kvarn_flash_partials,
         })
     }
 
@@ -211,6 +251,13 @@ impl Gemma3State {
             let _ = gpu.free_tensor(t);
         }
         for t in [self.swa_staged_k, self.swa_staged_v, self.swa_nvalid] {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self
+            .kvarn_tiles
+            .into_iter()
+            .chain(self.kvarn_flash_partials)
+        {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.hip.free(self.pos_buf);
@@ -373,7 +420,8 @@ fn forward_after_x(
             let ring_v = state.swa_v[layer_idx].as_ref().unwrap();
             // n_valid = min(pos+1, window) written into the [1] scalar buffer.
             let nv = ((pos + 1).min(win)) as i32;
-            gpu.hip.memcpy_htod(&state.swa_nvalid.buf, &nv.to_ne_bytes())?;
+            gpu.hip
+                .memcpy_htod(&state.swa_nvalid.buf, &nv.to_ne_bytes())?;
             // Stage each kv head's visible window from its ring + this token's KV.
             for kvh in 0..n_kv_heads {
                 gpu.swa_visibility_stage_batched(
@@ -430,6 +478,57 @@ fn forward_after_x(
                     1,
                 )?;
             }
+        } else if state.kv_cache.quant_kvarn {
+            // KVarN (variance-normalized 4-bit K + Q8 V), n=1. `kvarn_attend`
+            // fuses V-write, K window-append + 128-token block flush, and the
+            // fused flash read over [0, pos+1). Under SWA this branch is reached
+            // only for GLOBAL layers (locals took the ring branch above); with
+            // SWA off it serves every layer. Prefill routes here per-token too
+            // (see forward_prefill's KVarN guard), so this one hook covers
+            // prompt + decode.
+            //
+            // Optional Hadamard-incoherence rotation: rotate K and Q by the SAME
+            // orthonormal per-head FWHT-256, so (RQ)·(RK)ᵀ = Q·Kᵀ exactly — scores
+            // preserved, no un-rotation, no flash/dequant change. K lands in the
+            // cache rotated (self-consistent); V (Q8) stays un-rotated so the
+            // output basis and o_proj are unchanged. Requires head_dim==256; opt
+            // out with HIPFIRE_KVARN_ROTATE=0.
+            static KVARN_ROTATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let kvarn_rotate = *KVARN_ROTATE
+                .get_or_init(|| std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0"));
+            if kvarn_rotate && head_dim == 256 {
+                gpu.rotate_x_mq_batched(&state.k, &state.k, n_kv_heads * head_dim, 1)?;
+                gpu.rotate_x_mq_batched(&state.q, &state.q, n_heads * head_dim, 1)?;
+            }
+            // The KV kernels read positions from a GpuTensor; wrap the raw 4-byte
+            // i32 `pos_buf` as a non-owning [1] view (mirrors qwen35's KVarN hook).
+            let pos_view = GpuTensor {
+                buf: unsafe { DeviceBuffer::from_raw(state.pos_buf.as_ptr(), 4) },
+                shape: vec![1],
+                dtype: DType::F32,
+            };
+            gpu.kvarn_attend(
+                &state.kv_cache.k_gpu[layer_idx],
+                &state.kv_cache.k_window[layer_idx],
+                &state.kv_cache.v_gpu[layer_idx],
+                &state.q,
+                &state.k,
+                &state.v,
+                &pos_view,
+                &state.attn_out,
+                state.kvarn_flash_partials.as_ref().unwrap(),
+                state.kvarn_tiles.as_ref().unwrap(),
+                1,
+                pos,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                state.kv_cache.physical_cap,
+                None,
+                0,
+                0,
+                state.kv_cache.kvarn_bits,
+            )?;
         } else if state.kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(
                 &state.kv_cache.k_gpu[layer_idx],
@@ -458,8 +557,18 @@ fn forward_after_x(
                 state.kv_cache.physical_cap,
             )?;
         } else {
-            gpu.kv_cache_write(&state.kv_cache.k_gpu[layer_idx], &state.k, &state.pos_buf, kv_dim)?;
-            gpu.kv_cache_write(&state.kv_cache.v_gpu[layer_idx], &state.v, &state.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(
+                &state.kv_cache.k_gpu[layer_idx],
+                &state.k,
+                &state.pos_buf,
+                kv_dim,
+            )?;
+            gpu.kv_cache_write(
+                &state.kv_cache.v_gpu[layer_idx],
+                &state.v,
+                &state.pos_buf,
+                kv_dim,
+            )?;
             Gpu::attention_f32(
                 gpu,
                 &state.q,
@@ -598,7 +707,11 @@ pub fn forward_prefill_batch(
     // SWA is active; fall back per-token here too so any other caller (e.g.
     // calibration) stays correct — copy each row's embedding into `state.x`, run
     // the single-token stack, then emit the last position's logits.
-    if state.swa_window > 0 {
+    //
+    // KVarN forces the same per-token route regardless of SWA: its window/block
+    // write + fused flash (`kvarn_attend`) is a single-token (n=1) primitive with
+    // no batched variant, so a batched prefill would corrupt the K records.
+    if state.swa_window > 0 || state.kv_cache.quant_kvarn {
         for i in 0..m {
             gpu.memcpy_dtod_at_auto(&state.x.buf, 0, &x_batch.buf, i * dim * 4, dim * 4)?;
             gpu.hip
@@ -687,8 +800,20 @@ pub fn forward_prefill_batch(
                 m,
             )?;
         } else {
-            gpu.kv_cache_write_f32_batched(&state.kv_cache.k_gpu[layer_idx], &k, &positions, kv_dim, m)?;
-            gpu.kv_cache_write_f32_batched(&state.kv_cache.v_gpu[layer_idx], &v, &positions, kv_dim, m)?;
+            gpu.kv_cache_write_f32_batched(
+                &state.kv_cache.k_gpu[layer_idx],
+                &k,
+                &positions,
+                kv_dim,
+                m,
+            )?;
+            gpu.kv_cache_write_f32_batched(
+                &state.kv_cache.v_gpu[layer_idx],
+                &v,
+                &positions,
+                kv_dim,
+                m,
+            )?;
             gpu.attention_f32_batched(
                 &q,
                 &state.kv_cache.k_gpu[layer_idx],

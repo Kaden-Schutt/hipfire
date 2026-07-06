@@ -177,8 +177,14 @@ impl TinyModel {
                     gemma3::config_from_hfq(&hfq).ok_or("gemma3: config_from_hfq failed")?;
                 let weights = gemma3::load_weights(&mut hfq, &config, gpu)
                     .map_err(|e| format!("gemma3 load_weights: {e:?}"))?;
-                let state = gemma3::Gemma3State::new_with_max_seq(gpu, &config, max_seq, false)
-                    .map_err(|e| format!("gemma3 state: {e:?}"))?;
+                let state = gemma3::Gemma3State::new_with_max_seq(
+                    gpu,
+                    &config,
+                    max_seq,
+                    hipfire_runtime::kv::KvQuantMode::Unquantized,
+                    4,
+                )
+                .map_err(|e| format!("gemma3 state: {e:?}"))?;
                 Ok(Self::Gemma3 {
                     config,
                     weights,

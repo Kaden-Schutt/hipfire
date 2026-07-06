@@ -225,6 +225,7 @@ impl Qwen35RequestSessionState {
             layer_is_boundary: kv.layer_is_boundary.clone(),
             compact_offset: kv.compact_offset,
             quant_kvarn: kv.quant_kvarn,
+            kvarn_bits: kv.kvarn_bits,
             k_window: Self::clone_gpu_tensor_vec(gpu, &kv.k_window, "kv.k_window")?,
             // Read-side scratch is lazily re-allocated on first KVarN attention.
             kvarn_shadow: None,

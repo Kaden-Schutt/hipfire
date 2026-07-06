@@ -192,6 +192,10 @@ pub struct KvCache {
     /// blocks, plus an f32 recent-window ring for the partial trailing block;
     /// V stays Q8_0 (reuses the asym4 V layout). See `new_gpu_kvarn_capped`.
     pub quant_kvarn: bool,
+    /// KVarN K-code bit width in {2,4,8} (V stays Q8_0). 4 = the legacy default;
+    /// 8 = near-lossless; 2 = aggressive (cold/CASK tier). Meaningful only when
+    /// `quant_kvarn`; `4` is a harmless placeholder for every other mode.
+    pub kvarn_bits: usize,
     /// KVarN recent-window staging ring: `[n_layers]` buffers, each `GROUP × kv_dim`
     /// f32, holding the K rows of the not-yet-quantized trailing block. Empty
     /// unless `quant_kvarn`. A block is flush-quantized into `k_gpu` once full.
@@ -277,6 +281,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -346,6 +351,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -398,6 +404,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -473,6 +480,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -578,6 +586,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -628,6 +637,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -678,6 +688,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -730,6 +741,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -784,6 +796,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -886,6 +899,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -961,6 +975,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1037,6 +1052,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1140,6 +1156,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1152,13 +1169,18 @@ impl KvCache {
     /// the write/read kernels and `kvarn.rs`.
     pub const KVARN_GROUP: usize = 128;
 
-    /// Byte length of one KVarN K record (`[head_dim × GROUP]` tile): packed
-    /// 4-bit codes + fp16 per-channel scale_abs/zp_abs + fp16 per-token s_col.
-    /// Mirrors `hipfire_quantize::kvarn::kvarn_record_bytes(head_dim, GROUP)`
-    /// (inlined to avoid a runtime→quantize dep).
+    /// Byte length of one KVarN K record (`[head_dim × GROUP]` tile) at 4-bit.
     pub fn kvarn_k_record_bytes(head_dim: usize) -> usize {
+        Self::kvarn_k_record_bytes_bits(head_dim, 4)
+    }
+
+    /// Byte length of one KVarN K record at `bits` per code (`8/bits` codes/byte):
+    /// packed codes + fp16 per-channel scale_abs/zp_abs + fp16 per-token s_col.
+    /// Mirrors `hipfire_quantize::kvarn::kvarn_record_bytes_bits`.
+    pub fn kvarn_k_record_bytes_bits(head_dim: usize, bits: usize) -> usize {
         let (r, c) = (head_dim, Self::KVARN_GROUP);
-        (r * c).div_ceil(2) + r * 2 * 2 + c * 2
+        let cpb = 8 / bits;
+        (r * c).div_ceil(cpb) + r * 2 * 2 + c * 2
     }
 
     /// Create KVarN KV cache: K stored as variance-normalized 4-bit block
@@ -1172,6 +1194,7 @@ impl KvCache {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
+        bits: usize,
     ) -> HipResult<Self> {
         Self::new_gpu_kvarn_capped(
             gpu,
@@ -1180,6 +1203,7 @@ impl KvCache {
             head_dim,
             max_seq_len,
             max_seq_len,
+            bits,
         )
     }
 
@@ -1191,12 +1215,14 @@ impl KvCache {
         head_dim: usize,
         max_seq_len: usize,
         physical_cap: usize,
+        bits: usize,
     ) -> HipResult<Self> {
         assert!(
             head_dim == 128 || head_dim == 256,
             "kvarn requires head_dim=128 or 256"
         );
         assert!(head_dim % 32 == 0);
+        assert!(matches!(bits, 2 | 4 | 8), "kvarn bits must be 2, 4, or 8");
         assert!(
             physical_cap > 0 && physical_cap <= max_seq_len,
             "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
@@ -1207,7 +1233,7 @@ impl KvCache {
         // (fp16) until it fills, so allocate ceil(cap/GROUP) record slots.
         let group = Self::KVARN_GROUP;
         let n_blocks = physical_cap.div_ceil(group);
-        let rec_bytes = Self::kvarn_k_record_bytes(head_dim);
+        let rec_bytes = Self::kvarn_k_record_bytes_bits(head_dim, bits);
         let k_bytes = n_blocks * n_kv_heads * rec_bytes;
         let k_elems = k_bytes.div_ceil(4); // store as F32 buffer (byte-addressed by kernels)
                                            // V: Q8_0, identical layout to asym4 (34 bytes per 32-elem block).
@@ -1230,7 +1256,7 @@ impl KvCache {
         let k_bph = rec_bytes / n_kv_heads.max(1); // informational; record is per-head already
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: kvarn (K 4b var-norm block records {rec_bytes}B/tile [{}-tok blocks] + fp16 window + V Q8 {v_bph}B/head)",
+            "KV cache: kvarn (K {bits}b var-norm block records {rec_bytes}B/tile [{}-tok blocks] + fp16 window + V Q8 {v_bph}B/head)",
             group,
         );
         let _ = k_bph;
@@ -1258,6 +1284,110 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: true,
+            kvarn_bits: bits,
+            k_window,
+            kvarn_shadow: None,
+            kvarn_tiles: None,
+            hier: None,
+        })
+    }
+
+    /// Filtered variant of [`new_gpu_kvarn`]: only `is_kv_layer[i] == true`
+    /// layers get real KVarN buffers; the rest get 1-element placeholders. Used
+    /// by gemma3, whose sliding-window (local) layers keep their own small F32
+    /// rings and never touch the system cache — so only the GLOBAL full-context
+    /// layers carry KVarN records + window. `k_gpu`/`v_gpu`/`k_window` stay
+    /// `n_layers`-long so callers index by raw `layer_idx`.
+    pub fn new_gpu_kvarn_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        bits: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_kvarn_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+            bits,
+        )
+    }
+
+    /// Capped + filtered variant of [`new_gpu_kvarn`]. Same per-layer geometry as
+    /// [`new_gpu_kvarn_capped`], but skips allocation for non-KV layers.
+    pub fn new_gpu_kvarn_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        bits: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "kvarn requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        assert!(matches!(bits, 2 | 4 | 8), "kvarn bits must be 2, 4, or 8");
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let group = Self::KVARN_GROUP;
+        // K: block-tiled records (ceil(cap/GROUP) blocks) — same as the dense ctor.
+        let n_blocks = physical_cap.div_ceil(group);
+        let rec_bytes = Self::kvarn_k_record_bytes_bits(head_dim, bits);
+        let k_elems = (n_blocks * n_kv_heads * rec_bytes).div_ceil(4);
+        // V: Q8_0, 34 bytes per 32-elem block.
+        let v_bpp = n_kv_heads * (head_dim / 32) * 34;
+        let v_elems = (physical_cap * v_bpp).div_ceil(4);
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        // Recent-window ring (GROUP tokens × kv_dim, F32) per KV layer; placeholder
+        // for non-KV layers so `k_window[layer_idx]` stays valid.
+        let mut k_window = Vec::with_capacity(is_kv_layer.len());
+        for &is_kv in is_kv_layer {
+            k_window.push(if is_kv {
+                gpu.zeros(&[group * kv_dim], DType::F32)?
+            } else {
+                gpu.zeros(&[1], DType::F32)?
+            });
+        }
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: kvarn ({n_kv}/{} layers carry KV; K {bits}b var-norm records [{group}-tok blocks] + fp16 window + V Q8)",
+            is_kv_layer.len()
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            quant_kvarn: true,
+            kvarn_bits: bits,
             k_window,
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1369,6 +1499,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1440,6 +1571,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1517,6 +1649,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1604,6 +1737,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1673,6 +1807,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1749,6 +1884,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1883,6 +2019,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1927,6 +2064,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -1990,6 +2128,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2034,6 +2173,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2078,6 +2218,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2127,6 +2268,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2176,6 +2318,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2246,6 +2389,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2316,6 +2460,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2386,6 +2531,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2464,6 +2610,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2535,6 +2682,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,
@@ -2605,6 +2753,7 @@ impl KvCache {
             layer_is_boundary: vec![],
             compact_offset: 0,
             quant_kvarn: false,
+            kvarn_bits: 4,
             k_window: vec![],
             kvarn_shadow: None,
             kvarn_tiles: None,

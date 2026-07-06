@@ -1283,16 +1283,21 @@ impl Gpu {
         r_dim: usize,
         c_dim: usize,
         record_bytes: usize,
+        bits: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(
             r_dim <= 256 && c_dim <= 256,
             "kvarn_quantize_tile: r,c must be <= 256"
         );
+        assert!(
+            matches!(bits, 2 | 4 | 8),
+            "kvarn_quantize_tile: bits must be 2, 4, or 8"
+        );
         assert_eq!(
-            c_dim % 2,
+            (c_dim * bits) % 8,
             0,
-            "kvarn_quantize_tile: c_dim must be even (nibble rows)"
+            "kvarn_quantize_tile: c_dim*bits must be a multiple of 8 (rows own whole bytes)"
         );
         self.ensure_kernel(
             "kvarn_quantize_tile",
@@ -1305,6 +1310,7 @@ impl Gpu {
         let mut rd = r_dim as i32;
         let mut cd = c_dim as i32;
         let mut rb = record_bytes as i32;
+        let mut bt = bits as i32;
         let mut params: Vec<*mut c_void> = vec![
             &tp as *const _ as *mut c_void,
             &rp as *const _ as *mut c_void,
@@ -1312,6 +1318,7 @@ impl Gpu {
             &mut rd as *mut _ as *mut c_void,
             &mut cd as *mut _ as *mut c_void,
             &mut rb as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
         ];
         let func = &self.functions["kvarn_quantize_tile"];
         unsafe {
@@ -1514,11 +1521,15 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        bits: usize,
     ) -> HipResult<()> {
         const GROUP: usize = 128;
         let kv_dim = n_kv_heads * head_dim;
-        // kvarn_record_bytes(head_dim, GROUP), divisible by 4 → expressible as F32 elems.
-        let rec_bytes = (head_dim * GROUP).div_ceil(2) + head_dim * 2 * 2 + GROUP * 2;
+        // kvarn_record_bytes_bits(head_dim, GROUP, bits): 8/bits K codes/byte +
+        // fp16 scale_abs/zp_abs (per channel) + fp16 s_col (per token). Always a
+        // multiple of 4 → expressible as an F32-typed byte-addressed buffer.
+        let cpb = 8 / bits;
+        let rec_bytes = (head_dim * GROUP).div_ceil(cpb) + head_dim * 2 * 2 + GROUP * 2;
         let seq_len = start_pos + n;
 
         // 1. V write (Q8_0) by absolute position.
@@ -1548,7 +1559,9 @@ impl Gpu {
                 self.kvarn_gather_k_tiles(window, tiles, 1, n_kv_heads, head_dim, GROUP)?;
                 let rec_off_elems = block * n_kv_heads * rec_bytes / 4;
                 let rec_view = records.sub_offset(rec_off_elems, n_kv_heads * rec_bytes / 4);
-                self.kvarn_quantize_tile(tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes)?;
+                self.kvarn_quantize_tile(
+                    tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes, bits,
+                )?;
             }
         }
 
@@ -1576,6 +1589,7 @@ impl Gpu {
             block_cols,
             n_full_blocks,
             rec_bytes,
+            bits,
         )
     }
 }

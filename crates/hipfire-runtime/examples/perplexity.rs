@@ -48,9 +48,9 @@
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_kld::math::{log_z, score_position, top_k_log_softmax};
 use hipfire_kld::refblock::RefBlock;
+use hipfire_rdna::Gpu;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_rdna::Gpu;
 use std::path::Path;
 use std::time::Instant;
 
@@ -329,6 +329,7 @@ fn main() {
             config.n_kv_heads,
             config.head_dim,
             kv_max,
+            4,
         )
         .unwrap(),
         "asym3" => KvCache::new_gpu_asym3(

@@ -217,7 +217,7 @@ restart_impact = "none"
 
 [[field]]
 key = "kv_cache"
-type = "enum(auto|q8|asym2|asym3|asym4)"
+type = "enum(auto|q8|asym2|asym3|asym4|kvarn2|kvarn|kvarn4|kvarn8)"
 requirement = "optional"
 default = "auto"
 scopes = ["global", "model", "runtime"]

@@ -276,15 +276,31 @@ fn clamp_max_seq_to_model_context(max_seq: usize, metadata_json: &str) -> usize 
 /// 65536: ~10.7 GB global F32 KV + ~0.9 GB local rings + ~15 GB weights ≈ 27 GB.
 const GEMMA3_STOPGAP_MAX_SEQ: usize = 65_536;
 
+/// Map an operator `kv_mode` string to the gemma3 KV cache mode + KVarN bit
+/// width. gemma3's state wires F32, Q8 (`q8`/`int8`), and KVarN (variance-
+/// normalized K + Q8 V) at `kvarn2`/`kvarn`(=4)/`kvarn8`; the rotated asym/fwht
+/// tiers have no gemma3 kernel yet and fall back to F32. The `usize` is the
+/// KVarN K bit width (meaningful only for the Kvarn mode; 4 otherwise).
+fn gemma3_kv_mode(kv_mode: &str) -> (hipfire_runtime::kv::KvQuantMode, usize) {
+    use hipfire_runtime::kv::KvQuantMode;
+    match kv_mode {
+        "q8" | "int8" => (KvQuantMode::Q8, 4),
+        "kvarn2" => (KvQuantMode::Kvarn, 2),
+        "kvarn" | "kvarn4" => (KvQuantMode::Kvarn, 4),
+        "kvarn8" => (KvQuantMode::Kvarn, 8),
+        _ => (KvQuantMode::Unquantized, 4),
+    }
+}
+
 fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32, kv_mode: &str) -> usize {
     let is_gemma3 = arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL;
     if !is_gemma3 {
         return max_seq;
     }
-    // q8/int8 global KV is ~4× smaller than F32, so with sliding-window local
-    // layers the full trained context fits — no gemma3-specific cap needed
+    // q8/int8/kvarn global KV is ~4× smaller than F32, so with sliding-window
+    // local layers the full trained context fits — no gemma3-specific cap needed
     // (the model-context clamp still applies). Only F32 global KV needs the cap.
-    let quantized_global = matches!(kv_mode, "q8" | "int8");
+    let quantized_global = matches!(kv_mode, "q8" | "int8" | "kvarn");
     let cap = if quantized_global {
         max_seq
     } else {
@@ -293,7 +309,11 @@ fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32, kv_mode: &str) -> us
     if max_seq <= cap {
         return max_seq;
     }
-    if std::env::var("HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE").ok().as_deref() == Some("1") {
+    if std::env::var("HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "  WARNING: gemma3 max_seq={max_seq} — the global-layer F32 KV alone may OOM the \
              shared GTT pool at this context; HIPFIRE_MAX_SEQ_ALLOW_OVERRIDE=1 set — proceeding \
@@ -941,16 +961,16 @@ pub fn load_model(
                        Reload without --cask-sidecar."
                 .to_string());
         }
-        // gemma3 KV: F32 by default; honor an explicit q8/int8 kv_mode (q8_0
-        // KV ~4x smaller, lets larger contexts fit). Other quant modes (asym/
-        // fwht) have no gemma3 kernel yet and fall back to F32 in the state.
-        let quant_q8 = matches!(kv_mode.as_str(), "q8" | "int8");
+        // gemma3 KV: F32 by default; honor an explicit q8/int8/kvarn kv_mode
+        // (all ~4x smaller than F32, letting larger contexts fit). Other quant
+        // modes (asym/fwht) have no gemma3 kernel yet and fall back to F32.
+        let (kv_mode_g3, kvarn_bits_g3) = gemma3_kv_mode(&kv_mode);
         let _ = state_quant_override;
         let cfg = hipfire_arch_gemma3::config_from_hfq(&hfq)
             .ok_or_else(|| "gemma3: failed to parse Gemma3Config".to_string())?;
         let weights = hipfire_arch_gemma3::load_weights(&mut hfq, &cfg, gpu)
             .map_err(|e| format!("gemma3: load_weights failed: {e:?}"))?;
-        let state = Gemma3State::new_with_max_seq(gpu, &cfg, max_seq, quant_q8)
+        let state = Gemma3State::new_with_max_seq(gpu, &cfg, max_seq, kv_mode_g3, kvarn_bits_g3)
             .map_err(|e| format!("gemma3: Gemma3State::new_with_max_seq failed: {e:?}"))?;
         let backend = Gemma3Backend::new(cfg, weights, state);
         let chat_template = resolve_chat_template(&hfq, path);
@@ -1042,18 +1062,18 @@ pub fn load_model(
                        Reload without --cask-sidecar."
                 .to_string());
         }
-        // gemma3-vl KV: F32 by default; honor an explicit q8/int8 kv_mode
-        // (q8_0 KV ~4x smaller). Lets medgemma run a much larger context before
-        // exhausting the GTT pool.
-        let quant_q8 = matches!(kv_mode.as_str(), "q8" | "int8");
+        // gemma3-vl KV: F32 by default; honor an explicit q8/int8/kvarn kv_mode.
+        // Lets medgemma run a much larger context before exhausting the GTT pool.
+        let (kv_mode_g3, kvarn_bits_g3) = gemma3_kv_mode(&kv_mode);
         let _ = state_quant_override;
         let LoadedVl {
             text_cfg,
             vl_cfg,
             weights,
         } = load_vl(&mut hfq, gpu)?;
-        let state = Gemma3State::new_with_max_seq(gpu, &text_cfg, max_seq, quant_q8)
-            .map_err(|e| format!("gemma3-vl: Gemma3State::new_with_max_seq failed: {e:?}"))?;
+        let state =
+            Gemma3State::new_with_max_seq(gpu, &text_cfg, max_seq, kv_mode_g3, kvarn_bits_g3)
+                .map_err(|e| format!("gemma3-vl: Gemma3State::new_with_max_seq failed: {e:?}"))?;
         let backend = Gemma3VlBackend::new(text_cfg, vl_cfg, weights, state);
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
@@ -1821,6 +1841,7 @@ pub fn load_model(
                 config.head_dim,
                 max_seq,
                 physical_cap,
+                4,
             )
             .map_err(|e| format!("{e}"))?,
             "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
@@ -2264,6 +2285,7 @@ pub fn load_model_safetensors(
                 config.head_dim,
                 max_seq,
                 max_seq,
+                4,
             ),
             "asym3" => kv::KvCache::new_gpu_asym3_capped(
                 gpu,
@@ -2526,6 +2548,7 @@ pub fn load_model_safetensors(
             config.head_dim,
             max_seq,
             max_seq,
+            4,
         ),
         _ => kv::KvCache::new_gpu_asym3_capped(
             gpu,

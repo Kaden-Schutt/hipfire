@@ -1549,6 +1549,7 @@ impl Gpu {
         block_cols: usize,
         n_full_blocks: usize,
         rec_bytes: usize,
+        bits: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128; // == KVARN_GROUP
@@ -1600,6 +1601,7 @@ impl Gpu {
                 let bc = block_cols as i32;
                 let nfb = n_full_blocks as i32;
                 let rb = rec_bytes as i32;
+                let bt = bits as i32;
                 self.launch_kernargs(
                     "attention_flash_kvarn_tile_batched",
                     [n_heads as u32, max_tiles as u32, chunk as u32],
@@ -1609,7 +1611,7 @@ impl Gpu {
                         ptr q_ptr, ptr rec_ptr, ptr win_ptr, ptr v_ptr, ptr p_ptr,
                         ptr pos_ptr, ptr bias_ptr,
                         i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc,
-                        i32 ts, i32 mt, i32 bo, i32 bs, i32 bc, i32 nfb, i32 rb
+                        i32 ts, i32 mt, i32 bo, i32 bs, i32 bc, i32 nfb, i32 rb, i32 bt
                     ],
                 )?;
             }

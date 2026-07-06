@@ -118,7 +118,7 @@ fn build_session(gpu: &mut Gpu, seed: u32, n_full_blocks: usize, tail_len: usize
             .unwrap();
         gpu.kvarn_gather_k_tiles(&kd, &td, n_full_blocks, N_KV_HEADS, HEAD_DIM, GROUP)
             .unwrap();
-        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, HEAD_DIM, GROUP, record_bytes)
+        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, HEAD_DIM, GROUP, record_bytes, 4)
             .unwrap();
     }
     // window
@@ -227,6 +227,7 @@ fn main() {
             0,
             n_full,
             record_bytes,
+            4,
         )
         .unwrap();
         gpu.device_synchronize().unwrap();

@@ -149,7 +149,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize) -> bool {
             .unwrap();
         gpu.kvarn_gather_k_tiles(&kd, &td, n_full_blocks, n_kv_heads, head_dim, group)
             .unwrap();
-        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes)
+        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes, 4)
             .unwrap();
     }
     let recs = gpu.download_raw(&rd, rec_buf_bytes).unwrap();
@@ -318,6 +318,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize) -> bool {
         0,
         n_full_blocks,
         record_bytes,
+        4,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();
