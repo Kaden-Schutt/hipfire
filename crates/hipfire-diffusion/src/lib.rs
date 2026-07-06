@@ -303,16 +303,19 @@ impl RocmWeightCache {
         if !self.named_bf16.contains_key(&weight.name) {
             let n: usize = weight.shape.iter().product();
             let bf16 = if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 {
-                if weight.bytes.len() != n * 2 {
+                // Stream the bf16 bytes from disk, upload, drop — no persistent
+                // host copy alongside the device tensor (the UMA double-store).
+                let bytes = weight.read_bytes()?;
+                if bytes.len() != n * 2 {
                     return Err(DiffusionError::InvalidMetadata(format!(
                         "bf16 weight {:?} has {} bytes, expected {}",
                         weight.name,
-                        weight.bytes.len(),
+                        bytes.len(),
                         n * 2
                     )));
                 }
                 let mut tensor = gpu
-                    .upload_raw(&weight.bytes, &weight.shape)
+                    .upload_raw(&bytes, &weight.shape)
                     .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
                 tensor.dtype = hipfire_rdna::DType::BF16;
                 tensor
@@ -710,31 +713,41 @@ pub(crate) fn decode_tensor_payload(
     })
 }
 
-/// A weight kept resident in its **on-disk packed form** (bf16 ~2 B/elem, oq4
-/// ~0.5 B/elem, etc.) and decoded to `f32` **transiently per forward call**,
-/// instead of holding the expanded `f32` (4 B/elem) for the lifetime of the
-/// model. This roughly halves resident memory for a bf16 model (and cuts it ~8x
-/// for oq4), letting the full Krea2 model fit where the f32 working set would
-/// OOM. `decode()` allocates the f32 only for the duration of one op.
+/// A weight streamed from the HFQ on demand rather than held in memory. Stores
+/// only the file path and the tensor's byte range; `read_bytes()` `pread`s the
+/// packed payload just for the duration of one upload/decode, then drops it.
+///
+/// This is the memory-critical design on **UMA** (Phoenix / Strix Halo), where
+/// system RAM and GPU allocations share one pool: holding the packed bytes
+/// resident here *and* the uploaded device copy double-stores every weight in
+/// the same pool. It also helps discrete GPUs, which otherwise pay a full host
+/// staging copy alongside the VRAM copy. Committed host memory for weights drops
+/// to a single transient read buffer; the OS page cache backing the reads is
+/// reclaimable.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResidentWeight {
     name: String,
     quant_type: u8,
     shape: Vec<usize>,
-    bytes: Vec<u8>,
+    path: std::path::PathBuf,
+    data_offset: usize,
+    data_size: usize,
 }
 
 #[allow(dead_code)]
 impl ResidentWeight {
     pub(crate) fn from_hfq(hfq: &HfqFile, name: &str) -> DiffusionResult<Self> {
-        let (info, bytes) = hfq.tensor_data_vec(name).ok_or_else(|| {
+        // Capture only the location — do NOT read the payload into RAM here.
+        let info = hfq.find_tensor_info(name).ok_or_else(|| {
             DiffusionError::InvalidMetadata(format!("tensor {name:?} is missing"))
         })?;
         Ok(Self {
             name: name.to_string(),
             quant_type: info.quant_type,
             shape: info.shape.iter().map(|&dim| dim as usize).collect(),
-            bytes,
+            path: hfq.path().to_path_buf(),
+            data_offset: info.data_offset,
+            data_size: info.data_size,
         })
     }
 
@@ -742,8 +755,23 @@ impl ResidentWeight {
         &self.shape
     }
 
+    /// `pread` the packed payload from the HFQ. Transient: the caller uploads or
+    /// decodes it and drops it, so only one weight's bytes are in RAM at a time.
+    pub(crate) fn read_bytes(&self) -> DiffusionResult<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::open(&self.path).map_err(|err| {
+            DiffusionError::Io(format!("open {:?} for weight {:?}: {err}", self.path, self.name))
+        })?;
+        let mut buf = vec![0u8; self.data_size];
+        file.read_exact_at(&mut buf, self.data_offset as u64)
+            .map_err(|err| {
+                DiffusionError::Io(format!("read weight {:?}: {err}", self.name))
+            })?;
+        Ok(buf)
+    }
+
     /// Test-only: build a bf16-source `ResidentWeight` from f32 values (RNE
-    /// truncation to bf16), for exercising the raw-bytes resident path.
+    /// truncation to bf16), backed by a temp file so the streaming path applies.
     #[cfg(test)]
     pub(crate) fn from_bf16_parts(name: &str, shape: Vec<usize>, f32_data: &[f32]) -> Self {
         let mut bytes = Vec::with_capacity(f32_data.len() * 2);
@@ -753,19 +781,28 @@ impl ResidentWeight {
             let bf16 = ((bits + rounding_bias) >> 16) as u16;
             bytes.extend_from_slice(&bf16.to_le_bytes());
         }
+        let path = std::env::temp_dir().join(format!(
+            "hipfire_resident_weight_{}_{}.bin",
+            name.replace(['/', '.'], "_"),
+            f32_data.len()
+        ));
+        std::fs::write(&path, &bytes).expect("write test resident weight");
         Self {
             name: name.to_string(),
             quant_type: QT_DIFFUSION_TENSOR_BF16,
             shape,
-            bytes,
+            path,
+            data_offset: 0,
+            data_size: bytes.len(),
         }
     }
 
-    /// Decode the packed payload into an f32 `CpuTensor` (transient; drop it
-    /// immediately after the op to keep only one weight expanded at a time).
+    /// Decode the packed payload into an f32 `CpuTensor` (transient; the bytes
+    /// are read from disk and dropped, keeping only one weight expanded at once).
     pub(crate) fn decode(&self) -> DiffusionResult<CpuTensor> {
+        let bytes = self.read_bytes()?;
         let elem_count = self.shape.iter().product();
-        let data = decode_tensor_payload(&self.name, self.quant_type, &self.bytes, elem_count)?;
+        let data = decode_tensor_payload(&self.name, self.quant_type, &bytes, elem_count)?;
         // Register this decode's data pointer for activation calibration so the
         // per-linear Hessian is captured for resident-packed weights too (the
         // `cpu_tensor_from_hfq` calibration hook does not see them). No-op unless
