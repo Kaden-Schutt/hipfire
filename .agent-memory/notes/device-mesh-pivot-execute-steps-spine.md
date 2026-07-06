@@ -113,7 +113,16 @@ EP path = the working template — `run_layer_program_mesh` EP arm `superop.rs:4
   == whole (1.2e-7). Every TP PRIMITIVE + the real block dataflow is proven correct. **GOTCHA found:** `gemv_f32`
   returns WRONG results for a non-64-aligned reduction dim (INTER/TP=48 → 0.04 err; =64 → 1e-7) — a real TP split
   must keep sharded reduction dims kernel-aligned (that's validate_manifest's group-alignment job).
-- **REMAINING = production INTEGRATION (large, de-risked; primitives all proven):** PB-2 resolve_mesh real Tp axis —
+- **FUNCTIONAL TP FORWARD VALIDATED** (`4b13f9dd` + `c8489ece`) — `hipfire_runtime::tp_forward::tp_ffn_forward`
+  (reusable LIB fn, not just a demo) runs an n-layer FFN-residual stack tensor-parallel over the mesh's Tp group:
+  per-rank sharded weights from `WeightStore`, on-device rank loop (rmsnorm → Column gemv → silu → Row gemv), ONE
+  `all_reduce_sum_f32_peer` per row-parallel op, cross-layer residual, hidden kept replicated (no inter-layer
+  broadcast). Example `tp_forward_parity`: 4-layer TP == host F32 ref, max|Δ|=1.2e-7, ranks bit-identical. **This is
+  the production-callable TP executor pattern `dense_forward` adopts** (the FFN half). Preconds: caller sets
+  per-device `active_stream` + `enable_peer_all`. **REMAINING to daemon-served TP:** attention head-parallel layer
+  (Column head-split QKV + Row o_proj all-reduce — same machinery, `nh%tp==0`), wiring `tp_ffn_forward`'s pattern
+  into the REAL llama `forward_scratch_layers` with `&mut Gpus`, + daemon `load_model_tp`/serve (PB-2/3/5).
+- **Earlier REMAINING (production INTEGRATION):** PB-2 resolve_mesh real Tp axis —
   **FORK: `tp` knob maps to `Ep` (config.rs:155) for MoE; disentangle EP-vs-TP intent at the daemon load path
   (`load_model_ep` vs new `load_model_tp`)** — recommended default, ripples into daemon. PB-3 store→forward bridge
   (assemble per-rank sharded `LlamaWeights` from `WeightStore`). PB-4 FULL: wire the rank-loop + all-reduce into the
