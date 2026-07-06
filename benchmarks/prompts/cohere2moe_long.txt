@@ -1,0 +1,302 @@
+## Overview (note 1)
+In practice, Helix is a distributed log-structured storage engine designed for write-heavy analytical workloads.
+Notably, Each Helix cluster is a set of stateless coordinators fronting a sharded set of segment stores.
+By design, The system favours append-only segments over in-place mutation to keep write amplification predictable.
+As a result, Clients address data through logical streams, and Helix maps each stream to one or more physical partitions.
+Operationally, A partition is the unit of replication, placement, and recovery throughout the engine.
+
+## Architecture (note 1)
+In practice, Coordinators hold no durable state; they cache routing tables refreshed from the metadata service.
+Notably, The metadata service is a small Raft group that owns the partition map and the placement decisions.
+By design, Segment stores persist ordered runs of records and periodically compact overlapping runs in the background.
+As a result, Each record carries a monotonically increasing sequence number assigned at ingestion time.
+Operationally, Reads merge the relevant runs on the fly, using a per-partition skip index to bound the scan.
+Internally, Background compaction is throttled by an admission controller that watches device queue depth.
+
+## Consistency (note 1)
+In practice, Helix offers per-partition linearizability and cross-partition snapshot reads.
+Notably, Writes are acknowledged once a quorum of replicas has durably recorded the segment append.
+By design, A reader can request a snapshot token that pins a consistent sequence boundary across partitions.
+As a result, Stale replicas are detected by comparing the high-water sequence number against the quorum leader.
+Operationally, The engine never exposes a partially applied batch; batches commit atomically within a partition.
+
+## Storage (note 1)
+In practice, On disk, a segment is a header, a sorted block region, and a trailing footer with the block index.
+Notably, Blocks are compressed independently so a point read decompresses only the block it needs.
+By design, The footer stores a bloom filter that lets a reader skip segments that cannot contain a key.
+As a result, Cold segments are demoted to object storage and fetched on demand into a local block cache.
+Operationally, Checksums guard every block, and a mismatch triggers a repair read from a healthy replica.
+
+## Recovery (note 1)
+In practice, On restart a segment store replays its write-ahead log to rebuild any uncommitted tail.
+Notably, Partition recovery streams missing segments from a peer rather than replaying the entire history.
+By design, The coordinator quarantines a partition whose checksum failures exceed a configurable budget.
+As a result, A failed replica is replaced by allocating a fresh one and back-filling from the surviving quorum.
+Operationally, Recovery progress is reported to the metadata service so placement avoids overloaded hosts.
+
+## Performance (note 1)
+In practice, Ingestion throughput scales with the number of partitions because appends are independent.
+Notably, Tail latency is dominated by quorum acknowledgement, so replicas are placed within one failure domain hop.
+By design, The block cache uses a cost-aware admission policy that prefers small, frequently scanned indexes.
+As a result, Compaction cost is amortised by choosing run boundaries that align with natural key ranges.
+Operationally, Operators tune the admission controller to trade background compaction for foreground write headroom.
+
+## Overview (note 2)
+Notably, Helix is a distributed log-structured storage engine designed for write-heavy analytical workloads.
+By design, Each Helix cluster is a set of stateless coordinators fronting a sharded set of segment stores.
+As a result, The system favours append-only segments over in-place mutation to keep write amplification predictable.
+Operationally, Clients address data through logical streams, and Helix maps each stream to one or more physical partitions.
+Internally, A partition is the unit of replication, placement, and recovery throughout the engine.
+
+## Architecture (note 2)
+Notably, Coordinators hold no durable state; they cache routing tables refreshed from the metadata service.
+By design, The metadata service is a small Raft group that owns the partition map and the placement decisions.
+As a result, Segment stores persist ordered runs of records and periodically compact overlapping runs in the background.
+Operationally, Each record carries a monotonically increasing sequence number assigned at ingestion time.
+Internally, Reads merge the relevant runs on the fly, using a per-partition skip index to bound the scan.
+For context, Background compaction is throttled by an admission controller that watches device queue depth.
+
+## Consistency (note 2)
+Notably, Helix offers per-partition linearizability and cross-partition snapshot reads.
+By design, Writes are acknowledged once a quorum of replicas has durably recorded the segment append.
+As a result, A reader can request a snapshot token that pins a consistent sequence boundary across partitions.
+Operationally, Stale replicas are detected by comparing the high-water sequence number against the quorum leader.
+Internally, The engine never exposes a partially applied batch; batches commit atomically within a partition.
+
+## Storage (note 2)
+Notably, On disk, a segment is a header, a sorted block region, and a trailing footer with the block index.
+By design, Blocks are compressed independently so a point read decompresses only the block it needs.
+As a result, The footer stores a bloom filter that lets a reader skip segments that cannot contain a key.
+Operationally, Cold segments are demoted to object storage and fetched on demand into a local block cache.
+Internally, Checksums guard every block, and a mismatch triggers a repair read from a healthy replica.
+
+## Recovery (note 2)
+Notably, On restart a segment store replays its write-ahead log to rebuild any uncommitted tail.
+By design, Partition recovery streams missing segments from a peer rather than replaying the entire history.
+As a result, The coordinator quarantines a partition whose checksum failures exceed a configurable budget.
+Operationally, A failed replica is replaced by allocating a fresh one and back-filling from the surviving quorum.
+Internally, Recovery progress is reported to the metadata service so placement avoids overloaded hosts.
+
+## Performance (note 2)
+Notably, Ingestion throughput scales with the number of partitions because appends are independent.
+By design, Tail latency is dominated by quorum acknowledgement, so replicas are placed within one failure domain hop.
+As a result, The block cache uses a cost-aware admission policy that prefers small, frequently scanned indexes.
+Operationally, Compaction cost is amortised by choosing run boundaries that align with natural key ranges.
+Internally, Operators tune the admission controller to trade background compaction for foreground write headroom.
+
+## Overview (note 3)
+By design, Helix is a distributed log-structured storage engine designed for write-heavy analytical workloads.
+As a result, Each Helix cluster is a set of stateless coordinators fronting a sharded set of segment stores.
+Operationally, The system favours append-only segments over in-place mutation to keep write amplification predictable.
+Internally, Clients address data through logical streams, and Helix maps each stream to one or more physical partitions.
+For context, A partition is the unit of replication, placement, and recovery throughout the engine.
+
+## Architecture (note 3)
+By design, Coordinators hold no durable state; they cache routing tables refreshed from the metadata service.
+As a result, The metadata service is a small Raft group that owns the partition map and the placement decisions.
+Operationally, Segment stores persist ordered runs of records and periodically compact overlapping runs in the background.
+Internally, Each record carries a monotonically increasing sequence number assigned at ingestion time.
+For context, Reads merge the relevant runs on the fly, using a per-partition skip index to bound the scan.
+Concretely, Background compaction is throttled by an admission controller that watches device queue depth.
+
+## Consistency (note 3)
+By design, Helix offers per-partition linearizability and cross-partition snapshot reads.
+As a result, Writes are acknowledged once a quorum of replicas has durably recorded the segment append.
+Operationally, A reader can request a snapshot token that pins a consistent sequence boundary across partitions.
+Internally, Stale replicas are detected by comparing the high-water sequence number against the quorum leader.
+For context, The engine never exposes a partially applied batch; batches commit atomically within a partition.
+
+## Storage (note 3)
+By design, On disk, a segment is a header, a sorted block region, and a trailing footer with the block index.
+As a result, Blocks are compressed independently so a point read decompresses only the block it needs.
+Operationally, The footer stores a bloom filter that lets a reader skip segments that cannot contain a key.
+Internally, Cold segments are demoted to object storage and fetched on demand into a local block cache.
+For context, Checksums guard every block, and a mismatch triggers a repair read from a healthy replica.
+
+## Recovery (note 3)
+By design, On restart a segment store replays its write-ahead log to rebuild any uncommitted tail.
+As a result, Partition recovery streams missing segments from a peer rather than replaying the entire history.
+Operationally, The coordinator quarantines a partition whose checksum failures exceed a configurable budget.
+Internally, A failed replica is replaced by allocating a fresh one and back-filling from the surviving quorum.
+For context, Recovery progress is reported to the metadata service so placement avoids overloaded hosts.
+
+## Performance (note 3)
+By design, Ingestion throughput scales with the number of partitions because appends are independent.
+As a result, Tail latency is dominated by quorum acknowledgement, so replicas are placed within one failure domain hop.
+Operationally, The block cache uses a cost-aware admission policy that prefers small, frequently scanned indexes.
+Internally, Compaction cost is amortised by choosing run boundaries that align with natural key ranges.
+For context, Operators tune the admission controller to trade background compaction for foreground write headroom.
+
+## Overview (note 4)
+As a result, Helix is a distributed log-structured storage engine designed for write-heavy analytical workloads.
+Operationally, Each Helix cluster is a set of stateless coordinators fronting a sharded set of segment stores.
+Internally, The system favours append-only segments over in-place mutation to keep write amplification predictable.
+For context, Clients address data through logical streams, and Helix maps each stream to one or more physical partitions.
+Concretely, A partition is the unit of replication, placement, and recovery throughout the engine.
+
+## Architecture (note 4)
+As a result, Coordinators hold no durable state; they cache routing tables refreshed from the metadata service.
+Operationally, The metadata service is a small Raft group that owns the partition map and the placement decisions.
+Internally, Segment stores persist ordered runs of records and periodically compact overlapping runs in the background.
+For context, Each record carries a monotonically increasing sequence number assigned at ingestion time.
+Concretely, Reads merge the relevant runs on the fly, using a per-partition skip index to bound the scan.
+In practice, Background compaction is throttled by an admission controller that watches device queue depth.
+
+## Consistency (note 4)
+As a result, Helix offers per-partition linearizability and cross-partition snapshot reads.
+Operationally, Writes are acknowledged once a quorum of replicas has durably recorded the segment append.
+Internally, A reader can request a snapshot token that pins a consistent sequence boundary across partitions.
+For context, Stale replicas are detected by comparing the high-water sequence number against the quorum leader.
+Concretely, The engine never exposes a partially applied batch; batches commit atomically within a partition.
+
+## Storage (note 4)
+As a result, On disk, a segment is a header, a sorted block region, and a trailing footer with the block index.
+Operationally, Blocks are compressed independently so a point read decompresses only the block it needs.
+Internally, The footer stores a bloom filter that lets a reader skip segments that cannot contain a key.
+For context, Cold segments are demoted to object storage and fetched on demand into a local block cache.
+Concretely, Checksums guard every block, and a mismatch triggers a repair read from a healthy replica.
+
+## Recovery (note 4)
+As a result, On restart a segment store replays its write-ahead log to rebuild any uncommitted tail.
+Operationally, Partition recovery streams missing segments from a peer rather than replaying the entire history.
+Internally, The coordinator quarantines a partition whose checksum failures exceed a configurable budget.
+For context, A failed replica is replaced by allocating a fresh one and back-filling from the surviving quorum.
+Concretely, Recovery progress is reported to the metadata service so placement avoids overloaded hosts.
+
+## Performance (note 4)
+As a result, Ingestion throughput scales with the number of partitions because appends are independent.
+Operationally, Tail latency is dominated by quorum acknowledgement, so replicas are placed within one failure domain hop.
+Internally, The block cache uses a cost-aware admission policy that prefers small, frequently scanned indexes.
+For context, Compaction cost is amortised by choosing run boundaries that align with natural key ranges.
+Concretely, Operators tune the admission controller to trade background compaction for foreground write headroom.
+
+## Overview (note 5)
+Operationally, Helix is a distributed log-structured storage engine designed for write-heavy analytical workloads.
+Internally, Each Helix cluster is a set of stateless coordinators fronting a sharded set of segment stores.
+For context, The system favours append-only segments over in-place mutation to keep write amplification predictable.
+Concretely, Clients address data through logical streams, and Helix maps each stream to one or more physical partitions.
+In practice, A partition is the unit of replication, placement, and recovery throughout the engine.
+
+## Architecture (note 5)
+Operationally, Coordinators hold no durable state; they cache routing tables refreshed from the metadata service.
+Internally, The metadata service is a small Raft group that owns the partition map and the placement decisions.
+For context, Segment stores persist ordered runs of records and periodically compact overlapping runs in the background.
+Concretely, Each record carries a monotonically increasing sequence number assigned at ingestion time.
+In practice, Reads merge the relevant runs on the fly, using a per-partition skip index to bound the scan.
+Notably, Background compaction is throttled by an admission controller that watches device queue depth.
+
+## Consistency (note 5)
+Operationally, Helix offers per-partition linearizability and cross-partition snapshot reads.
+Internally, Writes are acknowledged once a quorum of replicas has durably recorded the segment append.
+For context, A reader can request a snapshot token that pins a consistent sequence boundary across partitions.
+Concretely, Stale replicas are detected by comparing the high-water sequence number against the quorum leader.
+In practice, The engine never exposes a partially applied batch; batches commit atomically within a partition.
+
+## Storage (note 5)
+Operationally, On disk, a segment is a header, a sorted block region, and a trailing footer with the block index.
+Internally, Blocks are compressed independently so a point read decompresses only the block it needs.
+For context, The footer stores a bloom filter that lets a reader skip segments that cannot contain a key.
+Concretely, Cold segments are demoted to object storage and fetched on demand into a local block cache.
+In practice, Checksums guard every block, and a mismatch triggers a repair read from a healthy replica.
+
+## Recovery (note 5)
+Operationally, On restart a segment store replays its write-ahead log to rebuild any uncommitted tail.
+Internally, Partition recovery streams missing segments from a peer rather than replaying the entire history.
+For context, The coordinator quarantines a partition whose checksum failures exceed a configurable budget.
+Concretely, A failed replica is replaced by allocating a fresh one and back-filling from the surviving quorum.
+In practice, Recovery progress is reported to the metadata service so placement avoids overloaded hosts.
+
+## Performance (note 5)
+Operationally, Ingestion throughput scales with the number of partitions because appends are independent.
+Internally, Tail latency is dominated by quorum acknowledgement, so replicas are placed within one failure domain hop.
+For context, The block cache uses a cost-aware admission policy that prefers small, frequently scanned indexes.
+Concretely, Compaction cost is amortised by choosing run boundaries that align with natural key ranges.
+In practice, Operators tune the admission controller to trade background compaction for foreground write headroom.
+
+## Overview (note 6)
+Internally, Helix is a distributed log-structured storage engine designed for write-heavy analytical workloads.
+For context, Each Helix cluster is a set of stateless coordinators fronting a sharded set of segment stores.
+Concretely, The system favours append-only segments over in-place mutation to keep write amplification predictable.
+In practice, Clients address data through logical streams, and Helix maps each stream to one or more physical partitions.
+Notably, A partition is the unit of replication, placement, and recovery throughout the engine.
+
+## Architecture (note 6)
+Internally, Coordinators hold no durable state; they cache routing tables refreshed from the metadata service.
+For context, The metadata service is a small Raft group that owns the partition map and the placement decisions.
+Concretely, Segment stores persist ordered runs of records and periodically compact overlapping runs in the background.
+In practice, Each record carries a monotonically increasing sequence number assigned at ingestion time.
+Notably, Reads merge the relevant runs on the fly, using a per-partition skip index to bound the scan.
+By design, Background compaction is throttled by an admission controller that watches device queue depth.
+
+## Consistency (note 6)
+Internally, Helix offers per-partition linearizability and cross-partition snapshot reads.
+For context, Writes are acknowledged once a quorum of replicas has durably recorded the segment append.
+Concretely, A reader can request a snapshot token that pins a consistent sequence boundary across partitions.
+In practice, Stale replicas are detected by comparing the high-water sequence number against the quorum leader.
+Notably, The engine never exposes a partially applied batch; batches commit atomically within a partition.
+
+## Storage (note 6)
+Internally, On disk, a segment is a header, a sorted block region, and a trailing footer with the block index.
+For context, Blocks are compressed independently so a point read decompresses only the block it needs.
+Concretely, The footer stores a bloom filter that lets a reader skip segments that cannot contain a key.
+In practice, Cold segments are demoted to object storage and fetched on demand into a local block cache.
+Notably, Checksums guard every block, and a mismatch triggers a repair read from a healthy replica.
+
+## Recovery (note 6)
+Internally, On restart a segment store replays its write-ahead log to rebuild any uncommitted tail.
+For context, Partition recovery streams missing segments from a peer rather than replaying the entire history.
+Concretely, The coordinator quarantines a partition whose checksum failures exceed a configurable budget.
+In practice, A failed replica is replaced by allocating a fresh one and back-filling from the surviving quorum.
+Notably, Recovery progress is reported to the metadata service so placement avoids overloaded hosts.
+
+## Performance (note 6)
+Internally, Ingestion throughput scales with the number of partitions because appends are independent.
+For context, Tail latency is dominated by quorum acknowledgement, so replicas are placed within one failure domain hop.
+Concretely, The block cache uses a cost-aware admission policy that prefers small, frequently scanned indexes.
+In practice, Compaction cost is amortised by choosing run boundaries that align with natural key ranges.
+Notably, Operators tune the admission controller to trade background compaction for foreground write headroom.
+
+## Overview (note 7)
+For context, Helix is a distributed log-structured storage engine designed for write-heavy analytical workloads.
+Concretely, Each Helix cluster is a set of stateless coordinators fronting a sharded set of segment stores.
+In practice, The system favours append-only segments over in-place mutation to keep write amplification predictable.
+Notably, Clients address data through logical streams, and Helix maps each stream to one or more physical partitions.
+By design, A partition is the unit of replication, placement, and recovery throughout the engine.
+
+## Architecture (note 7)
+For context, Coordinators hold no durable state; they cache routing tables refreshed from the metadata service.
+Concretely, The metadata service is a small Raft group that owns the partition map and the placement decisions.
+In practice, Segment stores persist ordered runs of records and periodically compact overlapping runs in the background.
+Notably, Each record carries a monotonically increasing sequence number assigned at ingestion time.
+By design, Reads merge the relevant runs on the fly, using a per-partition skip index to bound the scan.
+As a result, Background compaction is throttled by an admission controller that watches device queue depth.
+
+## Consistency (note 7)
+For context, Helix offers per-partition linearizability and cross-partition snapshot reads.
+Concretely, Writes are acknowledged once a quorum of replicas has durably recorded the segment append.
+In practice, A reader can request a snapshot token that pins a consistent sequence boundary across partitions.
+Notably, Stale replicas are detected by comparing the high-water sequence number against the quorum leader.
+By design, The engine never exposes a partially applied batch; batches commit atomically within a partition.
+
+## Storage (note 7)
+For context, On disk, a segment is a header, a sorted block region, and a trailing footer with the block index.
+Concretely, Blocks are compressed independently so a point read decompresses only the block it needs.
+In practice, The footer stores a bloom filter that lets a reader skip segments that cannot contain a key.
+Notably, Cold segments are demoted to object storage and fetched on demand into a local block cache.
+By design, Checksums guard every block, and a mismatch triggers a repair read from a healthy replica.
+
+## Recovery (note 7)
+For context, On restart a segment store replays its write-ahead log to rebuild any uncommitted tail.
+Concretely, Partition recovery streams missing segments from a peer rather than replaying the entire history.
+In practice, The coordinator quarantines a partition whose checksum failures exceed a configurable budget.
+Notably, A failed replica is replaced by allocating a fresh one and back-filling from the surviving quorum.
+By design, Recovery progress is reported to the metadata service so placement avoids overloaded hosts.
+
+## Performance (note 7)
+For context, Ingestion throughput scales with the number of partitions because appends are independent.
+Concretely, Tail latency is dominated by quorum acknowledgement, so replicas are placed within one failure domain hop.
+In practice, The block cache uses a cost-aware admission policy that prefers small, frequently scanned indexes.
+Notably, Compaction cost is amortised by choosing run boundaries that align with natural key ranges.
+By design, Operators tune the admission controller to trade background compaction for foreground write headroom.
+
+Question: In one sentence, what is the Helix system described above and what workload is it designed for?

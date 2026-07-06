@@ -40,14 +40,23 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet", "hipfire-hardware/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
 arch-qwen2 = []
 arch-deepseek4 = []
+arch-cohere2moe = []
 arch-dots-ocr = []
+# ep-fault-inject: enables the EP partial-load fault-injection knob
+# (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
+# return a synthetic Err after uploading its weights so the staging-guard VRAM
+# cleanup can be exercised on real GPUs without forcing an OOM. NOT in the
+# default set: a production build (`--features deltanet`) compiles the env read
+# and the synthetic-error branches OUT, so HIPFIRE_EP_FAIL_RANK has no effect.
+# Build the GPU cleanup test with `--features deltanet,ep-fault-inject`.
+ep-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
@@ -65,6 +74,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 libc = "0.2"
 rayon = "1"
+# Inline-small token buffer for `spec::SpecStep::emit` — keeps the
+# autoregressive one-token-per-step path heap-alloc-free; only large
+# speculative windows spill to the heap.
+smallvec = "1"
 # GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
 # (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,
 # then BPE each chunk independently; without that step the merge PQ runs
@@ -103,10 +116,14 @@ hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
+# In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
+tempfile = "3"
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
@@ -119,7 +136,7 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
 
 [[example]]
 name = "hfq_split"
@@ -340,6 +357,10 @@ required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "eval_hipfire"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "collect_e8_hessian_native"
 required-features = ["arch-qwen35", "deltanet"]
 
 # eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /

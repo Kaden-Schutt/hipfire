@@ -305,6 +305,11 @@ mkdir -p "$BIN_DIR" "$MODELS_DIR"
 # Remote: running via curl|bash — clone the repo
 INSTALL_MODE="remote"
 REPO_DIR=""
+# INSTALL-F1: tracks whether the source tree was (re)fetched/cloned/reset this
+# run. When source changed, an existing target/release/examples/daemon is STALE
+# and MUST NOT be trusted — we rebuild. Only a genuinely fresh prebuilt binary
+# (no source update this run) is allowed to short-circuit the build.
+SOURCE_UPDATED=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd 2>/dev/null)" || true
 if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ]; then
@@ -333,6 +338,7 @@ else
             exit 1
         }
         echo "  Cloned ✓"
+        SOURCE_UPDATED=1
     else
         echo "  Existing clone found at $SRC_DIR"
         # Stash any local modifications (Cargo.lock rewritten by cargo build,
@@ -352,10 +358,13 @@ else
         echo "  Updating..."
         # Fetch + hard-reset is safe now (tree is clean post-stash). Reset
         # handles both fast-forward and diverged-history cases uniformly.
-        git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
-        git -C "$SRC_DIR" reset --hard "origin/$GITHUB_BRANCH" 2>/dev/null || {
+        if git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
+           git -C "$SRC_DIR" reset --hard "origin/$GITHUB_BRANCH" 2>/dev/null; then
+            # Source was reset to origin — any prior build artifact is now stale.
+            SOURCE_UPDATED=1
+        else
             echo "  Update failed (non-fatal). Using existing checkout."
-        }
+        fi
     fi
     REPO_DIR="$SRC_DIR"
 fi
@@ -372,13 +381,32 @@ fi
 
 TARGET_DIR=$(cd "$REPO_DIR" && cargo metadata --format-version 1 | grep -oE '"target_directory" *: *"[^"]+"' | cut -d ':' -f 2- | tr -d '"')
 
-if [ -f "$TARGET_DIR/release/examples/daemon" ]; then
+# INSTALL-F1: only short-circuit on a prebuilt daemon when the source tree did
+# NOT change this run (SOURCE_UPDATED=0). A leftover binary from a prior build
+# against now-updated source is stale and must be rebuilt. HIPFIRE_FORCE_REBUILD=1
+# (set by `hipfire update`) always forces a rebuild.
+if [ -f "$TARGET_DIR/release/examples/daemon" ] && [ "$SOURCE_UPDATED" = "0" ] && [ "${HIPFIRE_FORCE_REBUILD:-0}" = "0" ]; then
     echo "  Pre-built binaries found ✓"
 else
-    echo "  No pre-built binaries. Building from source..."
+    if [ -f "$TARGET_DIR/release/examples/daemon" ]; then
+        echo "  Source updated — rebuilding (existing binary is stale)..."
+    else
+        echo "  No pre-built binaries. Building from source..."
+    fi
+    # MANDATORY build (daemon + inference examples). Stays inside the fatal
+    # &&-chain: under `set -e` a failure here aborts the install, which is
+    # correct — without the daemon there is nothing to install.
     (cd "$REPO_DIR" && \
         echo "  cargo build --release (this may take several minutes)..." && \
         cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --example triattn_validate -p hipfire-runtime 2>&1 | tail -5)
+    # OPTIONAL build (terminal UI). Run OUTSIDE the fatal chain so a tui build
+    # failure does NOT trip `set -e` and abort the whole install after the
+    # mandatory binaries already built. Warn clearly; the post-build copy step
+    # surfaces the unavailability + remedy.
+    (cd "$REPO_DIR" && \
+        echo "  cargo build --release -p hipfire-tui (terminal UI)..." && \
+        cargo build --release -p hipfire-tui 2>&1 | tail -5) \
+        || echo "  WARNING: hipfire-tui (terminal UI) build failed — continuing without it."
     if [ ! -f "$TARGET_DIR/release/examples/daemon" ]; then
         echo ""
         echo "  BUILD FAILED."
@@ -398,6 +426,26 @@ cp "$TARGET_DIR/release/examples/daemon" "$BIN_DIR/daemon"
 cp "$TARGET_DIR/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
 cp "$TARGET_DIR/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
 cp "$TARGET_DIR/release/examples/triattn_validate" "$BIN_DIR/triattn_validate" 2>/dev/null || true
+# Terminal UI (workspace bin — lives under target/release/, not examples/).
+# Build it on demand if the pre-built tree didn't include it. The TUI is
+# OPTIONAL — a failed build (or absent cargo) must not abort the install, but
+# it must not be swallowed silently either: warn clearly so the user knows the
+# terminal UI won't be available and how to get it (consistent w/ install.ps1).
+if [ ! -f "$TARGET_DIR/release/hipfire-tui" ]; then
+    if command -v cargo &>/dev/null; then
+        (cd "$REPO_DIR" && cargo build --release -p hipfire-tui 2>&1 | tail -3) || true
+    fi
+fi
+if [ -f "$TARGET_DIR/release/hipfire-tui" ]; then
+    cp "$TARGET_DIR/release/hipfire-tui" "$BIN_DIR/hipfire-tui"
+    echo "  hipfire-tui (terminal UI) installed ✓"
+else
+    echo "  WARNING: hipfire-tui (terminal UI) was not built — it will be unavailable."
+    # Linux remedy: `hipfire update` is Linux-aware and builds + installs the
+    # binary in one step. The direct cargo build is the fallback.
+    echo "           To get it: install Rust and run \`hipfire update\` (recommended),"
+    echo "           or build directly: \`cargo build --release -p hipfire-tui\`."
+fi
 
 # Copy CLI
 # Recursive copy of the whole cli/ directory, then prune dev/test artifacts

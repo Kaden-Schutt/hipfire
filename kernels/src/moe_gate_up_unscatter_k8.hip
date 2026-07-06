@@ -21,7 +21,10 @@
 //   y_gate            : [N × K_TOP × mi] f32 (written)
 //   y_up              : [N × K_TOP × mi] f32 (written)
 //
-// Grid: (ceil(mi/256), m_total). Block: [256]. LDS: 0.
+// Grid: (m_total, ceil(mi/256)). Block: [256]. LDS: 0.
+// NOTE: m_total (slot count = N*K_TOP) is in grid.x (limit 2^31-1). It must NOT
+// be grid.y/z (limit 65535) — at >~8k prefill tokens m_total exceeds 65535 and a
+// grid.y=m_total launch fails with hipErrorInvalidValue.
 
 extern "C" __global__ void moe_gate_up_unscatter_k8(
     const float* __restrict__ Y_grouped,
@@ -30,7 +33,7 @@ extern "C" __global__ void moe_gate_up_unscatter_k8(
     float*       __restrict__ y_up,
     int mi, int K_TOP, int m_total
 ) {
-    const int slot = blockIdx.y;
+    const int slot = blockIdx.x;
     if (slot >= m_total) return;
     const int flat = sorted_slot_index[slot];
     if (flat < 0) return; // padding slot — producer wrote 0; downstream
@@ -40,7 +43,7 @@ extern "C" __global__ void moe_gate_up_unscatter_k8(
     const int token = flat / K_TOP;
     const int krank = flat - token * K_TOP;
 
-    const int m_col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m_col = blockIdx.y * blockDim.x + threadIdx.x;
     if (m_col >= mi) return;
 
     const long long y_grp_base = (long long)slot * 2 * mi;

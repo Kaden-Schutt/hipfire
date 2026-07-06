@@ -16,8 +16,10 @@
 //! on different models sharing the same MQ scratch (which we won't, since
 //! speculative decode serializes draft-generate then target-verify).
 
+use crate::carrier::Qwen35Bundle;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
+use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -83,7 +85,12 @@ fn run_spec_gemm_key(
         rotation: None,
         awq_scale: None,
     };
-    let params = GemmParams { w: &w, x, y, batch_size: n };
+    let params = GemmParams {
+        w: &w,
+        x,
+        y,
+        batch_size: n,
+    };
     SPEC_CTX.with(|cell| {
         let needs_rebuild = {
             let slot = cell.borrow();
@@ -542,6 +549,57 @@ pub struct ModelSlot {
 }
 
 impl ModelSlot {
+    /// Assemble the spec-decode target slot from a live [`Qwen35Bundle`] that was
+    /// parked out of `ModelState`, opening the model's `HfqFile` (the mmap handle
+    /// `ModelSlot` carries but the spec kernels never read).
+    ///
+    /// **Fallible WITHOUT loss:** on a reopen failure the bundle is handed BACK in
+    /// the `Err` so the caller's RAII guard can re-park it and restore it into
+    /// `ModelState` on `Drop` — consuming the bundle on the error path would drop
+    /// it and leave `m.state == None`, reintroducing the #462 cross-request
+    /// state-bleed class this seam exists to prevent. This is the only piece of
+    /// `Qwen35Bundle` field knowledge the loader's guard previously inlined; it
+    /// lives here so the loader never names the bundle's fields.
+    pub fn from_bundle(bundle: Qwen35Bundle, path: &Path) -> Result<Self, (Qwen35Bundle, String)> {
+        let hfq = match HfqFile::open(path) {
+            Ok(h) => h,
+            Err(e) => return Err((bundle, format!("reopen model: {e}"))),
+        };
+        let Qwen35Bundle {
+            config,
+            weights,
+            scratch,
+            kv_cache,
+            dn_state,
+        } = bundle;
+        Ok(Self {
+            name: String::from("target"),
+            hfq,
+            config,
+            weights,
+            kv_cache,
+            dn_state,
+            scratch,
+            slot_config: ModelSlotConfig::default(),
+        })
+    }
+
+    /// Disassemble the slot back into a [`Qwen35Bundle`] — the `HfqFile` mmap,
+    /// `name`, and `slot_config` drop here; the five live pieces return to the
+    /// bundle. The inverse of [`from_bundle`](Self::from_bundle); the loader's
+    /// guard calls this on `Drop` to restore `ModelState`.
+    pub fn into_bundle(self) -> Qwen35Bundle {
+        Qwen35Bundle {
+            config: self.config,
+            weights: self.weights,
+            scratch: self.scratch,
+            kv_cache: self.kv_cache,
+            dn_state: self.dn_state,
+        }
+    }
+}
+
+impl ModelSlot {
     /// Load a model from `path` into a slot. The caller-supplied `gpu` is used
     /// for all allocations. `name` is a human-readable label used in logs.
     pub fn load(
@@ -554,13 +612,19 @@ impl ModelSlot {
         let mut hfq = HfqFile::open(path).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("open {} ({}): {}", path.display(), name, e))
         })?;
-        let config = qwen35::config_from_hfq(&hfq).ok_or_else(|| {
+        let config = qwen35::config_from_hfq(&hfq).map_err(|e| {
             hip_bridge::HipError::new(
                 0,
-                &format!("invalid Qwen3.5 config in {} ({})", path.display(), name),
+                &format!(
+                    "invalid Qwen3.5 config in {} ({}): {e}",
+                    path.display(),
+                    name
+                ),
             )
         })?;
-        let weights = qwen35::load_weights(&mut hfq, &config, gpu)?;
+        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+        let layout = qwen35::Layout::single(config.n_layers);
+        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &layout)?;
 
         // For hybrid arches (Qwen 3.5 = 48 DeltaNet LinearAttention + 16
         // FullAttention out of 64 total), only the FullAttention layers need
@@ -661,6 +725,7 @@ impl ModelSlot {
 
     /// Single-token forward pass. Writes logits into `self.scratch.logits`.
     pub fn forward(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> HipResult<()> {
+        gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
             gpu,
             &self.weights,
@@ -1063,7 +1128,12 @@ impl GdnTape {
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
-            return gpu.graphs.replay_graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), n_steps);
+            return gpu.graphs.replay_graph_launch(
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
+            );
         }
 
         if can_graph && gpu.graphs.replay_needs_warmup(n_steps) {
@@ -1074,19 +1144,27 @@ impl GdnTape {
 
         if can_graph {
             gpu.graphs.begin_replay_graph_capture(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), n_steps,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
             )?;
             let r = self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps);
             if r.is_ok() {
                 gpu.graphs.end_replay_graph_capture(
-                    &gpu.hip, gpu.device_id,
+                    &gpu.hip,
+                    gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
                 // Same pattern as verify_graph: hipStreamBeginCapture records
                 // without executing, so launch once here to apply this cycle's
                 // state updates.
-                gpu.graphs.replay_graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), n_steps)?;
+                gpu.graphs.replay_graph_launch(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    n_steps,
+                )?;
                 return Ok(());
             } else {
                 let _ = gpu
@@ -1742,9 +1820,13 @@ impl HiddenStateRingBuffer {
         src: &GpuTensor,
         n: usize,
     ) -> HipResult<()> {
-        debug_assert!(
+        // Hard assert (not debug_assert): a violation silently overran the
+        // staging buffer in release and surfaced as a cryptic d2d-bounds panic
+        // deep in ffi.rs. Fail loud and named instead.
+        assert!(
             n <= self.max_batch,
-            "write_rows_to_staging: n {} > max_batch {}",
+            "write_rows_to_staging: n {} > staging max_batch {} — staging buffer \
+             too small for this prefill chunk",
             n,
             self.max_batch
         );
@@ -1847,7 +1929,7 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 /// Temperature-scaled softmax. Writes into `out` (reused across calls to
 /// avoid per-position allocation in the rejection-sampling hot loop).
 #[inline]
-fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
+pub(crate) fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
     out.clear();
     out.reserve(logits.len());
     let inv_t = 1.0 / temp;
@@ -1870,9 +1952,90 @@ fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
     }
 }
 
+/// Apply a nucleus (top_p) truncation to a normalized probability row IN PLACE,
+/// given the per-row threshold `tau_cut` and kept mass `Z` produced by the GPU
+/// `softmax_temp_topp_batched_f32` kernel:
+///
+///   p'(x) = if p(x) >= tau_cut { p(x) / Z } else { 0 }
+///
+/// After this the row sums to 1 (it was divided by the kept mass Z), so
+/// `sample_categorical` / `sample_residual` operate on a proper distribution.
+///
+/// When `tau_cut == 0.0` (the kernel's top_p>=1.0 guard) this is the IDENTITY
+/// (every p >= 0 is kept, Z == 1) → byte-equivalent to no truncation.
+///
+/// This reproduces the AR nucleus cut in `mtp_spec.rs` (sort desc, accumulate,
+/// cut at the FIRST prefix whose cumulative >= top_p INCLUSIVE, renorm by kept
+/// mass) in threshold form. Exact float ties at the boundary are kept together
+/// here (`>=`), whereas AR cuts by sort position — a measure-zero divergence for
+/// real logits.
+#[inline]
+pub(crate) fn apply_topp_trunc(row: &mut [f32], tau_cut: f32, z: f32) {
+    if tau_cut <= 0.0 {
+        // top_p disabled (or single-token row already at full mass): identity.
+        return;
+    }
+    let inv_z = 1.0f32 / z.max(f32::MIN_POSITIVE);
+    for p in row.iter_mut() {
+        if *p >= tau_cut {
+            *p *= inv_z;
+        } else {
+            *p = 0.0;
+        }
+    }
+}
+
+/// Host-side nucleus (top_p) truncation of an ALREADY-normalized softmax row,
+/// IN PLACE, matching the AR rule in `mtp_spec.rs:307-325`: sort descending,
+/// accumulate, cut at the FIRST token whose cumulative prob >= top_p (inclusive
+/// crossing token), renormalize the kept set by its mass. Used on the non-fast
+/// DFlash temp arms (which compute the softmax on host, not GPU) so top_p is
+/// honored on the WHOLE temp path, not only under HIPFIRE_DFLASH_FAST_SAMPLE.
+///
+/// `top_p >= 1.0` is a no-op (identity). Produces the same kept-set and the same
+/// renormalized values as `apply_topp_trunc` would given the GPU `tau_cut/Z`,
+/// modulo the boundary-tie convention (this version keeps AR's sort-position
+/// tie-break exactly; `apply_topp_trunc` keeps all boundary-equal tokens).
+pub(crate) fn apply_host_nucleus(row: &mut [f32], top_p: f32) {
+    if top_p >= 1.0 {
+        return;
+    }
+    // Indices sorted by probability descending (stable for tie reproducibility).
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|&a, &b| {
+        row[b]
+            .partial_cmp(&row[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut cum = 0.0f64;
+    let mut kept_mass = 0.0f64;
+    let mut cutoff = order.len();
+    for (rank, &idx) in order.iter().enumerate() {
+        cum += row[idx] as f64;
+        kept_mass += row[idx] as f64;
+        if cum >= top_p as f64 {
+            cutoff = rank + 1;
+            break;
+        }
+    }
+    let inv = if kept_mass > 0.0 {
+        1.0f64 / kept_mass
+    } else {
+        0.0
+    };
+    // Zero out the dropped tail, renorm the kept head.
+    for (rank, &idx) in order.iter().enumerate() {
+        if rank < cutoff {
+            row[idx] = (row[idx] as f64 * inv) as f32;
+        } else {
+            row[idx] = 0.0;
+        }
+    }
+}
+
 /// Draw a categorical sample from `probs` given uniform u ∈ [0, 1).
 #[inline]
-fn sample_categorical(probs: &[f32], u: f32) -> u32 {
+pub(crate) fn sample_categorical(probs: &[f32], u: f32) -> u32 {
     let mut acc = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         acc += p;
@@ -1887,7 +2050,7 @@ fn sample_categorical(probs: &[f32], u: f32) -> u32 {
 /// sample the "corrective" bonus token in speculative rejection sampling
 /// (Chen & Leviathan 2023, algorithm 1).
 #[inline]
-fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
+pub(crate) fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
     let mut sum = 0.0f32;
     for i in 0..p_target.len() {
         let d = p_target[i] - p_draft[i];
@@ -1915,188 +2078,16 @@ fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
     (p_target.len() - 1) as u32
 }
 
-/// Rolling bigram n-gram cache. Keyed by the last two committed tokens
-/// `(a, b)`; value is a small map from possible next-token to count.
-///
-/// Populated incrementally from the committed output stream. Used as a
-/// "free" second opinion on top of the DFlash draft: if the cache has
-/// seen a (a, b) → c transition with high enough count, and the DFlash
-/// draft proposed something else at that position, the n-gram's `c`
-/// often turns out to match the target's argmax.
-///
-/// Scales: the cache size is bounded by the number of distinct bigrams
-/// in the committed output — typically a few hundred per session, so
-/// no eviction policy needed.
-pub struct NgramCache {
-    /// `(a, b) → { next: count, ... }` with the next-token histogram.
-    pub bigram: std::collections::HashMap<(u32, u32), std::collections::HashMap<u32, u32>>,
-    /// Minimum count before we trust the prediction. Smaller = more
-    /// aggressive (more overrides), larger = more conservative. 3 is a
-    /// reasonable default on hot-loop code / repetitive text.
-    pub min_count: u32,
-}
-
-impl NgramCache {
-    pub fn new(min_count: u32) -> Self {
-        Self {
-            bigram: std::collections::HashMap::new(),
-            min_count,
-        }
-    }
-
-    /// Record the triple `(a, b) → c` in the cache.
-    #[inline]
-    pub fn observe(&mut self, a: u32, b: u32, c: u32) {
-        *self.bigram.entry((a, b)).or_default().entry(c).or_insert(0) += 1;
-    }
-
-    /// Predict `c` from last-two `(a, b)` if the max-count next-token
-    /// reaches `min_count`. Returns (token, count).
-    #[inline]
-    pub fn predict(&self, a: u32, b: u32) -> Option<(u32, u32)> {
-        let map = self.bigram.get(&(a, b))?;
-        let (&tok, &cnt) = map.iter().max_by_key(|(_, &c)| c)?;
-        if cnt >= self.min_count {
-            Some((tok, cnt))
-        } else {
-            None
-        }
-    }
-
-    /// Record every consecutive triple in a slice of committed tokens.
-    /// Caller supplies the full token stream; this walks it in-place.
-    pub fn observe_many(&mut self, tokens: &[u32]) {
-        if tokens.len() >= 3 {
-            for w in tokens.windows(3) {
-                self.observe(w[0], w[1], w[2]);
-            }
-        }
-    }
-}
-
-/// Prompt Lookup Decoding (Saxena 2023): training-free deterministic draft
-/// built from context suffix self-match. If the last N tokens of context
-/// appeared earlier in context, the tokens that followed that earlier
-/// occurrence are a high-quality continuation guess.
-///
-/// Used as the draft source in Goose bypass mode (Jin et al. 2026,
-/// arXiv:2604.02047 §4.3): PLD-matched tokens have 2–18× higher acceptance
-/// than bigram (TR) tokens (median 6× across 5 models × 5 benchmarks).
-/// When PLD confidence is high, the spine — a deep linear chain of
-/// PLD-matched tokens — is verified in one target forward pass without
-/// tree construction. That's exactly what we need on Qwen3.5 hybrid
-/// (24 DeltaNet + 8 FullAttention): linear verify sidesteps the
-/// state-forking problem that tree verify imposes on recurrent LA layers.
-pub struct PldMatcher {
-    /// n-gram suffix lengths to try, longest first. Paper uses {5,4,3}.
-    /// Longer matches are more selective; if the longest fails we fall
-    /// back to shorter. Order matters: we return the first (longest) hit.
-    pub ngram_lens: Vec<usize>,
-    /// Hard cap on spine length. Paper uses 8 — sufficient for typical
-    /// block sizes and avoids running off the end of a match into drift.
-    pub max_extract: usize,
-    /// Minimum extracted length to count as a usable spine. Very short
-    /// spines aren't worth the PLD path (bigram covers 1-token lookahead
-    /// at lower risk); require at least this many continuation tokens.
-    pub min_extract: usize,
-}
-
-impl Default for PldMatcher {
-    fn default() -> Self {
-        Self {
-            ngram_lens: vec![5, 4, 3],
-            max_extract: 8,
-            min_extract: 3,
-        }
-    }
-}
-
-/// Result of a successful PLD lookup.
-#[derive(Debug, Clone)]
-pub struct PldMatch {
-    /// The extracted spine (continuation tokens after the matched suffix).
-    pub tokens: Vec<u32>,
-    /// The suffix length that produced this match (the longest that hit).
-    pub n: usize,
-    /// Number of tried n-gram lengths that agreed on `tokens[0]`. Paper
-    /// §4.3 uses this as part of the bypass-mode confidence signal;
-    /// higher consensus = more reliable spine. Ranges 1..=ngram_lens.len().
-    pub consensus: usize,
-}
-
-impl PldMatcher {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Find a spine continuation for `context`. Returns `None` if no tried
-    /// n-gram length produces a match of length ≥ `self.min_extract`.
-    ///
-    /// For each n in `self.ngram_lens`: take the last-n tokens as the
-    /// suffix, search for its last occurrence earlier in context, and
-    /// extract the `max_extract` tokens that followed it (stopping before
-    /// the suffix itself so we don't include tokens that would be about
-    /// to be re-predicted). Returns the longest-n match with a usable
-    /// spine; consensus counts how many alternate n's produced the same
-    /// first continuation token.
-    pub fn lookup(&self, context: &[u32]) -> Option<PldMatch> {
-        if self.ngram_lens.is_empty() {
-            return None;
-        }
-        // Per-n continuation, collected to compute consensus across lengths.
-        let mut firsts: Vec<u32> = Vec::with_capacity(self.ngram_lens.len());
-        let mut best: Option<(usize, Vec<u32>)> = None; // (n, spine)
-        for &n in &self.ngram_lens {
-            if context.len() <= n {
-                continue;
-            }
-            let suffix_start = context.len() - n;
-            let suffix = &context[suffix_start..];
-            let haystack = &context[..suffix_start];
-            if haystack.len() < n {
-                continue;
-            }
-            // Last occurrence (freshest) of `suffix` in `haystack`.
-            let mut found: Option<usize> = None;
-            for i in (0..=haystack.len() - n).rev() {
-                if &haystack[i..i + n] == suffix {
-                    found = Some(i);
-                    break;
-                }
-            }
-            let start = match found {
-                Some(s) => s,
-                None => continue,
-            };
-            let cont_start = start + n;
-            let cont_end = (cont_start + self.max_extract).min(suffix_start);
-            if cont_end <= cont_start {
-                continue;
-            }
-            let spine: Vec<u32> = context[cont_start..cont_end].to_vec();
-            if spine.len() < self.min_extract {
-                continue;
-            }
-            firsts.push(spine[0]);
-            if best.is_none() {
-                best = Some((n, spine));
-            }
-        }
-
-        let (n, tokens) = best?;
-        let consensus = firsts.iter().filter(|&&t| t == tokens[0]).count();
-        Some(PldMatch {
-            tokens,
-            n,
-            consensus,
-        })
-    }
-}
+// `NgramCache` / `PldMatcher` / `PldMatch` moved to `hipfire_runtime::spec` so
+// the arch-generic `NgramSpeculator` can use them without an arch-crate
+// dependency. Re-exported here so `spec_step_dflash` (and the dflash_spec_demo)
+// keep referring to them unqualified.
+pub use hipfire_runtime::spec::{NgramCache, PldMatch, PldMatcher};
 
 /// Small, fast RNG for per-cycle sampling u ∈ [0, 1). Xorshift64*; deterministic
 /// given the seed, cheap enough to inline into the B-rejection loop.
 #[inline]
-fn xorshift_next_unit(state: &mut u64) -> f32 {
+pub(crate) fn xorshift_next_unit(state: &mut u64) -> f32 {
     let mut s = *state;
     s ^= s << 13;
     s ^= s >> 7;
@@ -2448,6 +2439,16 @@ fn verify_dflash_block_inner(
         }
     }
     let tree_ok_for_graph = !tree_verify_present || tree_graph_enabled;
+    // NB: NO Q8-long-context skip-gate here. The captured single-chunk verify
+    // forward is capture-safe at any physical_cap for Q8 (non-asym) KV:
+    // forward_prefill_chunk routes max_ctx_len > 8192 to the tiled
+    // attention_flash_q8_0_tile_batched (O(1) LDS, no per-position malloc), so there
+    // is no malloc-in-capture and no per-ctx LDS scaling — see the comment in
+    // forward_prefill_batch_single_chunk_captured in qwen35.rs. The former
+    // `VERIFY_GRAPH_Q8_CTX_LIMIT = 15000` skip (re-introduced by #481, obsolete once
+    // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
+    // would skip a verify-graph that now replays fine and forfeit the long-context
+    // spec speedup.
     let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
         && tree_ok_for_graph
         && matches!(
@@ -2487,8 +2488,10 @@ fn verify_dflash_block_inner(
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
             gpu.graphs.verify_graph_launch(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), b,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
             )?;
             Ok(())
         } else if gpu.graphs.verify_needs_warmup(b) {
@@ -2527,8 +2530,10 @@ fn verify_dflash_block_inner(
             // Capture path: first call at this B after warmup.
             let capture_lmhead_argmax = moe_lmhead_graph_ok;
             gpu.graphs.begin_verify_graph_capture(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), b,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
             )?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
@@ -2563,7 +2568,8 @@ fn verify_dflash_block_inner(
             if r.is_ok() {
                 let blob_count = gpu.graphs.capture_blobs.len();
                 gpu.graphs.end_verify_graph_capture(
-                    &gpu.hip, gpu.device_id,
+                    &gpu.hip,
+                    gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
                 if capture_lmhead_argmax {
@@ -2579,8 +2585,10 @@ fn verify_dflash_block_inner(
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
                 gpu.graphs.verify_graph_launch(
-                    &gpu.hip, gpu.device_id,
-                    gpu.active_stream.as_ref().unwrap(), b,
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    b,
                 )?;
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
@@ -2939,6 +2947,18 @@ pub fn spec_step_dflash(
     ctx_slice: Option<usize>,
     gdn_tape: Option<&mut GdnTape>,
     temp: f32,
+    // Nucleus (top_p) cutoff applied IDENTICALLY to both the draft and target
+    // softmax rows on the temp sampling path. 1.0 (or >= 0.999) disables it →
+    // the path is byte-equivalent to plain temp-T full-vocab sampling. Lossless
+    // == AR-at-this-top_p holds via the TARGET truncation (Leviathan marginal
+    // preservation); the draft is truncated too for parity + acceptance
+    // efficiency. See apply_topp_trunc / apply_host_nucleus.
+    top_p: f32,
+    // Top-k cutoff, applied identically to draft + target softmax rows on the
+    // sampled path (folded into tau by the GPU kernel: tau = max(tau_p, tau_k)).
+    // 0 = disabled (top_p-only). Lossless == AR-at-(top_k,top_p), same cut both
+    // sides.
+    top_k: usize,
     rng_state: &mut u64,
     block_size_override: Option<usize>,
     ngram_cache: Option<&NgramCache>,
@@ -3015,6 +3035,11 @@ pub fn spec_step_dflash(
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
+    // Nucleus active only when a non-default top_p was requested. Mirrors the
+    // AR/MTP convention (top_p >= 0.999 ≈ disabled). When inactive the GPU
+    // kernel writes tau_cut=0/Z=1 and the host helpers are identity, so the
+    // sampled path is byte-equivalent to the prior pure-temp behavior.
+    let topp_active = use_temp_sampling && top_p < 0.999;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
@@ -3026,7 +3051,34 @@ pub fn spec_step_dflash(
     let ngram_block_env = *NGRAM_BLOCK_ENV
         .get_or_init(|| std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1"));
     let ngram_block_active = !use_temp_sampling && ngram_block_env;
-    let host_path_active = rp_active || ngram_block_active;
+    // HIPFIRE_DFLASH_LOGIT_DUMP=1: per-cycle diagnostic. Forces the host-logits
+    // path and prints, at the acceptance boundary, the target top1/top2 margin
+    // and the logit gap to the drafted (rejected) token. A tiny gap at the
+    // first divergence position is the signature of a sub-ULP numerics
+    // tie-break (noise), vs a large gap = a real forward divergence. Greedy
+    // only; zero cost when unset.
+    static LOGIT_DUMP_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let logit_dump_active = !use_temp_sampling
+        && *LOGIT_DUMP_ENV.get_or_init(|| {
+            std::env::var("HIPFIRE_DFLASH_LOGIT_DUMP").ok().as_deref() == Some("1")
+        });
+    let host_path_active = rp_active || ngram_block_active || logit_dump_active;
+    // HIPFIRE_DFLASH_FAST_SAMPLE (default ON, opt out with =0): in the temp>0
+    // sampled path, compute the per-row softmax (and the top_p nucleus cutoff) on
+    // the GPU instead of the host `exp` loop over the full vocab. The host RNG,
+    // accept test, residual sampler, and CACTUS math are UNCHANGED — they just
+    // read the GPU-produced probabilities instead of host-recomputed ones. The
+    // D2H transfer size is identical (full-vocab probs vs full-vocab logits);
+    // what moves to the GPU is the ~31×vocab `exp`/max/normalize work per
+    // cycle. PARITY: distribution-only, NOT byte-identical (GPU tree-reduction
+    // vs host sequential sum can differ at the last ULP and rarely flip a
+    // borderline `u*p_d <= p_t` accept) — validated coherent across genres
+    // (no attractors), so default-on. Greedy path (temp==0) is never affected.
+    static FAST_SAMPLE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast_sample_active = use_temp_sampling
+        && *FAST_SAMPLE_ENV.get_or_init(|| {
+            std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0")
+        });
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
@@ -3292,7 +3344,63 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            if use_temp_sampling {
+            if use_temp_sampling && fast_sample_active {
+                // FAST_SAMPLE: GPU softmax → download probs (same D2H size as
+                // logits). Host RNG/sample math is byte-for-byte the same calls
+                // as the default arm below — only the softmax `exp` work moved
+                // off-host. Distribution-parity, not byte-parity (see flag doc).
+                let probs_gpu = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+                // top_p nucleus: when active, the GPU kernel additionally emits
+                // per-row tau_cut/Z so the host can apply the SAME nucleus cut as
+                // the target side (parity + acceptance efficiency). When
+                // inactive, fall back to the plain softmax (tau_cut/Z absent →
+                // truncation identity).
+                let (host_tau, host_z) = if topp_active {
+                    let tau_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    let z_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    gpu.softmax_temp_topp_batched_into_f32(
+                        &logits_batch,
+                        &probs_gpu,
+                        &tau_gpu,
+                        &z_gpu,
+                        vocab,
+                        batch,
+                        temp,
+                        top_p,
+                        top_k,
+                        0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                    )?;
+                    let tau = gpu.download_f32(&tau_gpu)?;
+                    let z = gpu.download_f32(&z_gpu)?;
+                    let _ = gpu.free_tensor(tau_gpu);
+                    let _ = gpu.free_tensor(z_gpu);
+                    (Some(tau), Some(z))
+                } else {
+                    gpu.softmax_temp_batched_into_f32(
+                        &logits_batch,
+                        &probs_gpu,
+                        vocab,
+                        batch,
+                        temp,
+                    )?;
+                    (None, None)
+                };
+                let host_probs = gpu.download_f32(&probs_gpu)?;
+                let _ = gpu.free_tensor(probs_gpu);
+                debug_assert_eq!(host_probs.len(), batch * vocab);
+                draft_softmaxes.reserve(batch);
+                for i in 0..batch {
+                    let mut probs = host_probs[i * vocab..(i + 1) * vocab].to_vec();
+                    if let (Some(tau), Some(z)) = (&host_tau, &host_z) {
+                        apply_topp_trunc(&mut probs, tau[i], z[i]);
+                    }
+                    let u = xorshift_next_unit(rng_state);
+                    let t = sample_categorical(&probs, u);
+                    draft_probs_at_drafted.push(probs[t as usize]);
+                    drafted.push(t);
+                    draft_softmaxes.push(probs);
+                }
+            } else if use_temp_sampling {
                 // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
                 let host_logits = gpu.download_f32(&logits_batch)?;
                 debug_assert_eq!(host_logits.len(), batch * vocab);
@@ -3301,6 +3409,11 @@ pub fn spec_step_dflash(
                     let row = &host_logits[i * vocab..(i + 1) * vocab];
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(row, temp, &mut probs);
+                    // Host nucleus on the non-fast temp arm so top_p is honored
+                    // on the whole DFlash temp path (not only under FAST_SAMPLE).
+                    if topp_active {
+                        apply_host_nucleus(&mut probs, top_p);
+                    }
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -3355,6 +3468,9 @@ pub fn spec_step_dflash(
                 if use_temp_sampling {
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(&logits, temp, &mut probs);
+                    if topp_active {
+                        apply_host_nucleus(&mut probs, top_p);
+                    }
                     let u = xorshift_next_unit(rng_state);
                     let t = sample_categorical(&probs, u);
                     draft_probs_at_drafted.push(probs[t as usize]);
@@ -3465,7 +3581,12 @@ pub fn spec_step_dflash(
         position,
         hidden_rb,
         gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling || host_path_active, // full target logits needed for rejection sampling, RP, or n-gram block
+        // Full target logits are D2H'd to the host for rejection sampling, RP,
+        // or n-gram block. Under FAST_SAMPLE the rejection sampler reads the
+        // GPU-softmaxed target probs directly from the resident
+        // `verify_scratch.logits` buffer, so the host full-logit download +
+        // host argmax are skipped — that's the target-side half of the cost cut.
+        (use_temp_sampling && !fast_sample_active) || host_path_active,
         verify_scratch,
     )?;
 
@@ -3491,9 +3612,55 @@ pub fn spec_step_dflash(
     let mut accept_len = 0usize;
     let bonus_token;
     if use_temp_sampling {
-        let tgt_logits = &verify_out.logits_per_pos;
-        debug_assert_eq!(tgt_logits.len(), b * vocab);
         debug_assert_eq!(draft_softmaxes.len(), b - 1);
+        // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
+        // all B rows and download the probs. The accept loop below then reads
+        // `target_probs` from this buffer instead of calling the host
+        // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
+        // distribution-parity probs. The verify logits are still resident in
+        // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
+        // and only ran GPU-argmax afterwards, which does not overwrite it).
+        // On the fast path, GPU per-row target softmax (+ optional nucleus
+        // tau_cut/Z when topp_active) for all b rows.
+        let mut fast_tgt_tau: Option<Vec<f32>> = None;
+        let mut fast_tgt_z: Option<Vec<f32>> = None;
+        let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+            let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+            let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+            if topp_active {
+                let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                gpu.softmax_temp_topp_batched_into_f32(
+                    &logits_batch,
+                    &probs_gpu,
+                    &tau_gpu,
+                    &z_gpu,
+                    vocab,
+                    b,
+                    temp,
+                    top_p,
+                    top_k,
+                    0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                )?;
+                fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
+                fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
+                let _ = gpu.free_tensor(tau_gpu);
+                let _ = gpu.free_tensor(z_gpu);
+            } else {
+                gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
+            }
+            let host = gpu.download_f32(&probs_gpu)?;
+            let _ = gpu.free_tensor(probs_gpu);
+            debug_assert_eq!(host.len(), b * vocab);
+            Some(host)
+        } else {
+            // Non-fast path: the host full-vocab logits from verify are the
+            // softmax input. Bound here so the fast path never touches the
+            // (now-empty) `logits_per_pos`.
+            debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
+            None
+        };
+        let tgt_logits = &verify_out.logits_per_pos;
         let mut target_probs = Vec::with_capacity(vocab);
         let mut rejected_bonus: Option<u32> = None;
         // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5) relaxes the
@@ -3502,11 +3669,24 @@ pub fn spec_step_dflash(
         // δ==0 reduces to vanilla SpS. Paper's strongest setting is δ=1.0.
         let use_cactus = cactus_delta > 0.0;
         for i in 0..b - 1 {
-            softmax_temp_into(
-                &tgt_logits[i * vocab..(i + 1) * vocab],
-                temp,
-                &mut target_probs,
-            );
+            if let Some(fast) = &fast_tgt_probs {
+                target_probs.clear();
+                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                // top_p nucleus, IDENTICAL cut to the draft side (GPU tau/Z).
+                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                }
+            } else {
+                softmax_temp_into(
+                    &tgt_logits[i * vocab..(i + 1) * vocab],
+                    temp,
+                    &mut target_probs,
+                );
+                // Non-fast temp arm: host nucleus so top_p holds here too.
+                if topp_active {
+                    apply_host_nucleus(&mut target_probs, top_p);
+                }
+            }
             let t = block[i + 1] as usize;
             let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
             let p_t = target_probs[t];
@@ -3553,11 +3733,22 @@ pub fn spec_step_dflash(
         } else {
             // All accepted: sample from target_softmax at position B-1.
             let i = b - 1;
-            softmax_temp_into(
-                &tgt_logits[i * vocab..(i + 1) * vocab],
-                temp,
-                &mut target_probs,
-            );
+            if let Some(fast) = &fast_tgt_probs {
+                target_probs.clear();
+                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                }
+            } else {
+                softmax_temp_into(
+                    &tgt_logits[i * vocab..(i + 1) * vocab],
+                    temp,
+                    &mut target_probs,
+                );
+                if topp_active {
+                    apply_host_nucleus(&mut target_probs, top_p);
+                }
+            }
             let u = xorshift_next_unit(rng_state);
             sample_categorical(&target_probs, u)
         };
@@ -3590,14 +3781,50 @@ pub fn spec_step_dflash(
         } else {
             std::borrow::Cow::Borrowed(verify_out.argmax_per_pos.as_slice())
         };
-        for i in 0..b - 1 {
-            if argmax_per_pos[i] == block[i + 1] {
-                accept_len += 1;
-            } else {
-                break;
+        // Shared greedy accept-prefix (eos=None: DFlash never early-stops on EOS
+        // here — the daemon handles EOS downstream). drafts = block[1..b],
+        // target_pick = the (repeat-penalty / n-gram-adjusted) argmax;
+        // bonus = target_pick[accept_len].
+        let acc = hipfire_runtime::spec::accept_greedy_prefix(&block[1..b], &argmax_per_pos, None);
+        accept_len = acc.accepted;
+        bonus_token = *acc.committed.last().expect("eos=None yields a bonus");
+
+        if logit_dump_active {
+            // Inspect the acceptance boundary. If accept_len < b-1 the block
+            // was rejected at position accept_len (drafted loser = block[accept_len+1]);
+            // otherwise the whole block accepted and we report the bonus slot.
+            let tgt = &verify_out.logits_per_pos;
+            let rej_i = accept_len.min(b - 1);
+            let row = &tgt[rej_i * vocab..(rej_i + 1) * vocab];
+            let (mut top1_idx, mut top1, mut top2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for (j, &v) in row.iter().enumerate() {
+                if v > top1 {
+                    top2 = top1;
+                    top1 = v;
+                    top1_idx = j;
+                } else if v > top2 {
+                    top2 = v;
+                }
             }
+            let rejected = accept_len < b - 1;
+            let rej_tok: i64 = if rejected {
+                block[accept_len + 1] as i64
+            } else {
+                -1
+            };
+            let (rej_logit, gap, rej_rank) = if rejected {
+                let rv = row[rej_tok as usize];
+                let rank = row.iter().filter(|&&v| v > rv).count() + 1;
+                (rv, top1 - rv, rank as i64)
+            } else {
+                (f32::NAN, f32::NAN, -1)
+            };
+            eprintln!(
+                "DFLDUMP pos={} b={} accept={} rejected={} top1_tok={} top1={:.5} top2={:.5} margin={:.5} rej_tok={} rej_logit={:.5} gap={:.5} rej_rank={} bonus={}",
+                position, b, accept_len, rejected as u8, top1_idx, top1, top2,
+                top1 - top2, rej_tok, rej_logit, gap, rej_rank, bonus_token
+            );
         }
-        bonus_token = argmax_per_pos[accept_len];
     }
 
     // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────
@@ -5103,60 +5330,60 @@ pub fn spec_step_ddtree_batched(
             //    All asym* and q8 KV variants supported. F16 unquantized
             //    isn't on the batched path so we panic here — see the
             //    fa_batched_ok gate in qwen35.rs:3081.
-            if kv.quant_asym3 {
-                let ct = kv.givens_cos.as_ref().expect("asym3 requires Givens cos");
-                let st = kv.givens_sin.as_ref().expect("asym3 requires Givens sin");
-                // The batched K writer expects a contiguous K source of
-                // [n × n_kv_heads × head_dim] F32 — pbs.fa_k_batch is
-                // exactly that. We give it the REAL kv.v_gpu as the V
-                // dst (so writer indices stay in-bounds for absolute slot
-                // numbers). The V values it writes are garbage (sourced
-                // from pbs.fa_v_batch, leftover from the last FA layer)
-                // but we OVERWRITE every committed V slot below from a
-                // proper gather of the raced-but-correctly-quantized V
-                // values. So the garbage V write is a transient no-op.
-                gpu.kv_cache_write_asym3_batched(
-                    &kv.k_gpu[layer_idx],
-                    &kv.v_gpu[layer_idx],
-                    &pbs.fa_k_batch,
-                    &pbs.fa_v_batch,
-                    &scratch.kv_gather_indices,
-                    ct,
-                    st,
-                    n_kv_heads,
-                    head_dim,
-                    n_positions,
-                )?;
-                // V byte-gather: read pre-quantized V from raced slots
-                // [position+0, position+1+acc[0], ...] into a contiguous
-                // scratch, then memcpy scratch → kv.v_gpu at committed
-                // slots [position..position+accept_len]. Using a scratch
-                // intermediate avoids same-slot src=dst memcpys (which
-                // are HIP UB) when the accept chain happens to hit the
-                // rank-0 prefix early.
-                gpu.kv_compact_gather(
-                    &kv.v_gpu[layer_idx],
-                    &scratch.kv_gather_scratch_v,
-                    &scratch.tape_gather_scratch,
-                    v_bpp,
-                    n_positions,
-                )?;
-                gpu.hip.memcpy_dtod_at(
-                    &kv.v_gpu[layer_idx].buf,
-                    position * v_bpp,
-                    &scratch.kv_gather_scratch_v.buf,
-                    0,
-                    n_positions * v_bpp,
-                )?;
-            } else {
-                // TODO: asym4 / asym2 / q8 paths — same pattern as asym3
-                // but with the matching kv_cache_write_*_batched call.
-                // For initial Phase 2 prototype, panic so we notice if a
-                // non-asym3 model accidentally enables Path B.
-                panic!(
-                    "Path B Phase 2 only supports asym3 KV today (got: q8={} asym4={} asym2={})",
-                    kv.quant_q8, kv.quant_asym4, kv.quant_asym2
-                );
+            match kv.k_tier() {
+                KTier::Asym3 { .. } => {
+                    let ct = kv.givens_cos.as_ref().expect("asym3 requires Givens cos");
+                    let st = kv.givens_sin.as_ref().expect("asym3 requires Givens sin");
+                    // The batched K writer expects a contiguous K source of
+                    // [n × n_kv_heads × head_dim] F32 — pbs.fa_k_batch is
+                    // exactly that. We give it the REAL kv.v_gpu as the V
+                    // dst (so writer indices stay in-bounds for absolute slot
+                    // numbers). The V values it writes are garbage (sourced
+                    // from pbs.fa_v_batch, leftover from the last FA layer)
+                    // but we OVERWRITE every committed V slot below from a
+                    // proper gather of the raced-but-correctly-quantized V
+                    // values. So the garbage V write is a transient no-op.
+                    gpu.kv_cache_write_asym3_batched(
+                        &kv.k_gpu[layer_idx],
+                        &kv.v_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &scratch.kv_gather_indices,
+                        ct,
+                        st,
+                        n_kv_heads,
+                        head_dim,
+                        n_positions,
+                    )?;
+                    // V byte-gather: read pre-quantized V from raced slots
+                    // [position+0, position+1+acc[0], ...] into a contiguous
+                    // scratch, then memcpy scratch → kv.v_gpu at committed
+                    // slots [position..position+accept_len]. Using a scratch
+                    // intermediate avoids same-slot src=dst memcpys (which
+                    // are HIP UB) when the accept chain happens to hit the
+                    // rank-0 prefix early.
+                    gpu.kv_compact_gather(
+                        &kv.v_gpu[layer_idx],
+                        &scratch.kv_gather_scratch_v,
+                        &scratch.tape_gather_scratch,
+                        v_bpp,
+                        n_positions,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &kv.v_gpu[layer_idx].buf,
+                        position * v_bpp,
+                        &scratch.kv_gather_scratch_v.buf,
+                        0,
+                        n_positions * v_bpp,
+                    )?;
+                }
+                other => {
+                    // TODO: asym4 / asym2 / q8 paths — same pattern as asym3
+                    // but with the matching kv_cache_write_*_batched call.
+                    // For initial Phase 2 prototype, panic so we notice if a
+                    // non-asym3 model accidentally enables Path B.
+                    panic!("Path B Phase 2 only supports asym3 KV today (got {other:?})");
+                }
             }
         }
 
@@ -5839,7 +6066,9 @@ pub fn seed_target_hidden_from_prompt_abortable(
             &mut target.dn_state,
             &target.scratch,
             Some(hidden_rb),
-            None, None, None,
+            None,
+            None,
+            None,
         )?;
         let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
         target_hidden_host.extend_from_slice(&block);
@@ -5903,7 +6132,9 @@ pub fn seed_target_hidden_suffix_abortable(
             &mut target.dn_state,
             &target.scratch,
             Some(hidden_rb),
-            None, None, None,
+            None,
+            None,
+            None,
         )?;
         pos += chunk.len();
         off = end;
@@ -5992,6 +6223,93 @@ pub fn apply_eviction_retain_to_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CPU mirror of the GPU `softmax_temp_topp_batched_f32` nucleus phase:
+    /// bisect tau over [0, p_max] for the inclusive crossing threshold and
+    /// recompute Z = mass(tau) exactly. Used only by the parity test below.
+    fn cpu_tau_cut_z(probs: &[f32], top_p: f32) -> (f32, f32) {
+        if top_p >= 1.0 {
+            return (0.0, 1.0);
+        }
+        let pmax = probs.iter().cloned().fold(0.0f32, f32::max);
+        let mass = |tau: f32| -> f32 { probs.iter().filter(|&&p| p >= tau).sum() };
+        let (mut lo, mut hi) = (0.0f32, pmax);
+        for _ in 0..30 {
+            let mid = 0.5 * (lo + hi);
+            if mass(mid) >= top_p {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let tau = lo;
+        (tau, mass(tau))
+    }
+
+    #[test]
+    fn apply_topp_trunc_matches_ar_nucleus_cut() {
+        // A row with a clear nucleus boundary (no exact ties): the GPU-style
+        // threshold cut must reproduce the AR sort-and-cut nucleus exactly
+        // (same kept set, same renormalized values).
+        let base = [0.40f32, 0.25, 0.20, 0.10, 0.05];
+        for &top_p in &[0.5f32, 0.6, 0.85, 0.95, 0.99] {
+            // AR reference (sort desc, cumulative >= top_p inclusive, renorm).
+            let mut ar = base.to_vec();
+            apply_host_nucleus(&mut ar, top_p);
+
+            // GPU-style: compute tau_cut/Z by bisection, then host truncate.
+            let (tau, z) = cpu_tau_cut_z(&base, top_p);
+            let mut gpu_style = base.to_vec();
+            apply_topp_trunc(&mut gpu_style, tau, z);
+
+            // Same kept set.
+            for i in 0..base.len() {
+                assert_eq!(
+                    ar[i] == 0.0,
+                    gpu_style[i] == 0.0,
+                    "kept-set mismatch at idx {i}, top_p {top_p}: ar={:?} gpu={:?}",
+                    ar,
+                    gpu_style
+                );
+            }
+            // Same renormalized values for kept tokens.
+            for i in 0..base.len() {
+                assert!(
+                    (ar[i] - gpu_style[i]).abs() < 1e-5,
+                    "value mismatch at idx {i}, top_p {top_p}: ar={} gpu={}",
+                    ar[i],
+                    gpu_style[i]
+                );
+            }
+            // Renormalized row sums to 1.
+            let s: f32 = gpu_style.iter().sum();
+            assert!((s - 1.0).abs() < 1e-4, "row should renorm to 1, got {s}");
+        }
+    }
+
+    #[test]
+    fn apply_topp_trunc_identity_when_disabled() {
+        let base = [0.4f32, 0.3, 0.2, 0.1];
+        let mut row = base.to_vec();
+        // tau_cut == 0.0 (the kernel's top_p>=1.0 guard) → identity.
+        apply_topp_trunc(&mut row, 0.0, 1.0);
+        assert_eq!(row, base.to_vec());
+        // apply_host_nucleus with top_p>=1.0 → identity too.
+        let mut row2 = base.to_vec();
+        apply_host_nucleus(&mut row2, 1.0);
+        assert_eq!(row2, base.to_vec());
+    }
+
+    #[test]
+    fn apply_topp_trunc_single_token_nucleus() {
+        // Very tight top_p keeps only the top token; Z == p_max.
+        let base = [0.7f32, 0.2, 0.07, 0.03];
+        let (tau, z) = cpu_tau_cut_z(&base, 0.5);
+        let mut row = base.to_vec();
+        apply_topp_trunc(&mut row, tau, z);
+        assert!((row[0] - 1.0).abs() < 1e-5, "single-token nucleus → 1.0");
+        assert_eq!(&row[1..], &[0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn dflash_gdn_tape_replay_uses_actual_verify_eligibility() {

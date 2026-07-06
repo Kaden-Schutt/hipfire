@@ -445,9 +445,7 @@ impl Matcher {
             // content, so this buffer is not guaranteed ASCII.
             let drop = self.ngram_history.len() - NGRAM_WINDOW;
             let mut idx = drop;
-            while idx < self.ngram_history.len()
-                && !self.ngram_history.is_char_boundary(idx)
-            {
+            while idx < self.ngram_history.len() && !self.ngram_history.is_char_boundary(idx) {
                 idx += 1;
             }
             self.ngram_history.drain(..idx);
@@ -773,8 +771,7 @@ impl Matcher {
                 // found, drop everything up to and including that
                 // substring and transition.
                 if let Some(idx) = self.partial_buf.find("<tool_call>") {
-                    self.partial_buf
-                        .drain(..idx + "<tool_call>".len());
+                    self.partial_buf.drain(..idx + "<tool_call>".len());
                     self.state = State::AfterOpen;
                     return Transition::Advanced;
                 }
@@ -783,10 +780,8 @@ impl Matcher {
                 // growing without bound during long free-emission runs.
                 let max_keep = "<tool_call>".len() - 1;
                 if self.partial_buf.len() > max_keep {
-                    let drop = Self::drain_boundary(
-                        &self.partial_buf,
-                        self.partial_buf.len() - max_keep,
-                    );
+                    let drop =
+                        Self::drain_boundary(&self.partial_buf, self.partial_buf.len() - max_keep);
                     self.partial_buf.drain(..drop);
                 }
                 Transition::Stay
@@ -832,8 +827,7 @@ impl Matcher {
             State::InArgs => {
                 // Look for `</tool_call>` anywhere in the buffer.
                 if let Some(idx) = self.partial_buf.find("</tool_call>") {
-                    self.partial_buf
-                        .drain(..idx + "</tool_call>".len());
+                    self.partial_buf.drain(..idx + "</tool_call>".len());
                     self.state = State::Out;
                     // Returning to Out — reset the n-gram guard's
                     // bookkeeping so a subsequent tool_call body starts
@@ -852,10 +846,8 @@ impl Matcher {
                 }
                 let max_keep = "</tool_call>".len() - 1;
                 if self.partial_buf.len() > max_keep {
-                    let drop = Self::drain_boundary(
-                        &self.partial_buf,
-                        self.partial_buf.len() - max_keep,
-                    );
+                    let drop =
+                        Self::drain_boundary(&self.partial_buf, self.partial_buf.len() - max_keep);
                     self.partial_buf.drain(..drop);
                 }
                 Transition::Stay
@@ -1074,16 +1066,16 @@ mod tests {
         // These mirror the actual qwen3.6:27b vocab strings that
         // appeared in the Pi turn-12 emit.
         let vocab: Vec<String> = vec![
-            "<|im_start|>".to_string(),       // 0: attractor (Pi failure)
-            "<|im_end|>".to_string(),         // 1: another invalid
-            "assistant".to_string(),          // 2: invalid prose
-            "\n".to_string(),                 // 3: valid header start
-            "\n{".to_string(),                // 4: valid header
-            "\n{\"name".to_string(),          // 5: valid header progression
+            "<|im_start|>".to_string(),        // 0: attractor (Pi failure)
+            "<|im_end|>".to_string(),          // 1: another invalid
+            "assistant".to_string(),           // 2: invalid prose
+            "\n".to_string(),                  // 3: valid header start
+            "\n{".to_string(),                 // 4: valid header
+            "\n{\"name".to_string(),           // 5: valid header progression
             "\n{\"name\": \"bash".to_string(), // 6: valid header
-            "evil".to_string(),               // 7: not in tool schema
-            " arguments".to_string(),         // 8: irrelevant
-            "</tool_call>".to_string(),       // 9: premature close — also invalid
+            "evil".to_string(),                // 7: not in tool schema
+            " arguments".to_string(),          // 8: irrelevant
+            "</tool_call>".to_string(),        // 9: premature close — also invalid
         ];
         // Logits where the attractor wins by a wide margin. This mimics
         // the Pi turn-12 distribution: after long context, the model's
@@ -1215,10 +1207,10 @@ mod tests {
         let mut m = Matcher::new(schemas(&["bash"]));
         // dflash's spec_step would commit a batch — simulate that batch.
         let bad_batch: &[&str] = &[
-            "<tool_call>", // accepted: transitions to AfterOpen
-            "\n",          // accepted: matches header prefix
+            "<tool_call>",  // accepted: transitions to AfterOpen
+            "\n",           // accepted: matches header prefix
             "<|im_start|>", // REJECTED: not a header prefix from current pos
-            "assistant",   // would-be-next, never reached
+            "assistant",    // would-be-next, never reached
         ];
         let mut accepted = 0;
         let mut violated = false;
@@ -1231,7 +1223,10 @@ mod tests {
             accepted += 1;
         }
         assert!(violated, "dflash post-validation must detect the attractor");
-        assert_eq!(accepted, 2, "the two valid tokens are accepted; the 3rd is rejected");
+        assert_eq!(
+            accepted, 2,
+            "the two valid tokens are accepted; the 3rd is rejected"
+        );
     }
 
     #[test]
@@ -1270,7 +1265,10 @@ mod tests {
         // the daemon-side check `grammar_active = !schemas.is_empty()`
         // skips the matcher entirely when schemas is empty.
         let grammar_active = false; // mirrors the daemon's gate
-        assert!(!grammar_active, "empty schemas must disable grammar at the daemon level");
+        assert!(
+            !grammar_active,
+            "empty schemas must disable grammar at the daemon level"
+        );
     }
 
     // ─── Multi-tool / schema variation coverage ──────────────────────
@@ -1288,11 +1286,17 @@ mod tests {
         // The full short name with closing quote works.
         let mut a = m.clone();
         a.advance("\n{\"name\": \"bash\", \"arguments\": ");
-        assert!(matches!(a.state(), State::InArgs), "short name `bash` must settle to InArgs");
+        assert!(
+            matches!(a.state(), State::InArgs),
+            "short name `bash` must settle to InArgs"
+        );
         // The longer name also works.
         let mut b = m.clone();
         b.advance("\n{\"name\": \"bash_long\", \"arguments\": ");
-        assert!(matches!(b.state(), State::InArgs), "long name `bash_long` must settle to InArgs");
+        assert!(
+            matches!(b.state(), State::InArgs),
+            "long name `bash_long` must settle to InArgs"
+        );
     }
 
     #[test]
@@ -1320,9 +1324,7 @@ mod tests {
                 required: Vec::new(),
             })
             .collect();
-        let vocab: Vec<String> = (0..150_000)
-            .map(|i| format!("tok_{}", i))
-            .collect();
+        let vocab: Vec<String> = (0..150_000).map(|i| format!("tok_{}", i)).collect();
         let mut m = Matcher::new(tools);
         m.advance("<tool_call>");
         let mut mask = vec![false; vocab.len()];
@@ -1422,9 +1424,9 @@ mod tests {
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>");
         let vocab = vec![
-            "".to_string(),               // empty/control token
-            "\n".to_string(),             // valid prefix
-            "<|im_start|>".to_string(),   // attractor
+            "".to_string(),             // empty/control token
+            "\n".to_string(),           // valid prefix
+            "<|im_start|>".to_string(), // attractor
         ];
         let mut mask = vec![false; vocab.len()];
         m.token_mask(&vocab, &mut mask);
@@ -1509,7 +1511,9 @@ mod tests {
         // blocks back-to-back. The matcher must return to Out after
         // the first close and constrain the second open the same way.
         let mut m = Matcher::new(schemas(&["bash", "read"]));
-        m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>");
+        m.advance(
+            "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>",
+        );
         assert!(matches!(m.state(), State::Out));
         // Second open.
         m.advance("\n<tool_call>");
@@ -1518,7 +1522,9 @@ mod tests {
         assert!(!m.is_token_allowed("\n{\"name\": \"unknown"));
         assert!(m.is_token_allowed("\n{\"name\": \"read"));
         // Complete the second call.
-        m.advance("\n{\"name\": \"read\", \"arguments\": {\"path\": \"/etc/hostname\"}}\n</tool_call>");
+        m.advance(
+            "\n{\"name\": \"read\", \"arguments\": {\"path\": \"/etc/hostname\"}}\n</tool_call>",
+        );
         assert!(matches!(m.state(), State::Out));
     }
 
@@ -1622,9 +1628,13 @@ mod tests {
                 );
                 m.advance(&s);
             }
-            assert!(matches!(m.state(), State::Out),
+            assert!(
+                matches!(m.state(), State::Out),
                 "valid sequence didn't return to Out (tool={}, args=`{}`, final state={:?})",
-                names[tool_idx], arg_value, m.state());
+                names[tool_idx],
+                arg_value,
+                m.state()
+            );
         }
     }
 
@@ -1649,7 +1659,9 @@ mod tests {
                     assert!(
                         !m2.is_token_allowed(tok),
                         "attractor {:?} accepted at header position {} (partial={:?})",
-                        tok, end, m2.partial()
+                        tok,
+                        end,
+                        m2.partial()
                     );
                 }
             }
@@ -1707,7 +1719,9 @@ mod tests {
                 assert!(
                     logits[i].is_infinite() && logits[i].is_sign_negative(),
                     "attractor vocab[{}]={:?} not -INF at header position {}",
-                    i, vocab[i], end,
+                    i,
+                    vocab[i],
+                    end,
                 );
             }
             // At least ONE token in the vocab must still be allowed —
@@ -1794,7 +1808,10 @@ mod tests {
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         m.advance("{\"arr\": [1,1,1]}");
-        assert!(!m.attractor_detected(), "3-repeats must stay below threshold");
+        assert!(
+            !m.attractor_detected(),
+            "3-repeats must stay below threshold"
+        );
     }
 
     #[test]
@@ -1806,7 +1823,10 @@ mod tests {
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         // 4-byte gram × 5 = 20 bytes; under the new default of 6.
         m.advance("{\"x\": \"typetypetypetypetype");
-        assert!(!m.attractor_detected(), "5-repeats must stay below the bumped threshold");
+        assert!(
+            !m.attractor_detected(),
+            "5-repeats must stay below the bumped threshold"
+        );
     }
 
     #[test]
@@ -1819,7 +1839,10 @@ mod tests {
         m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"fn a(){}\\n\\nfn b(){}\\n\\nfn c(){}\\n\\nfn d(){}\\n\\nfn e(){}");
         // `\n\n` repeats 4 times — under old defaults this tripped on
         // legit code emitted between blank-separated declarations.
-        assert!(!m.attractor_detected(), "double-newline blocks between defs must NOT trip");
+        assert!(
+            !m.attractor_detected(),
+            "double-newline blocks between defs must NOT trip"
+        );
     }
 
     #[test]
@@ -1832,7 +1855,10 @@ mod tests {
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
         // 64 spaces — deeper than any realistic indent.
         m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"return                                                                ; ");
-        assert!(!m.attractor_detected(), "uniform whitespace runs must NOT trip the guard");
+        assert!(
+            !m.attractor_detected(),
+            "uniform whitespace runs must NOT trip the guard"
+        );
     }
 
     #[test]
@@ -1843,7 +1869,10 @@ mod tests {
         let mut m = Matcher::new(schemas(&["write"]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
         m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"// ============================================================\\n// section\\n");
-        assert!(!m.attractor_detected(), "ASCII divider runs must NOT trip the guard");
+        assert!(
+            !m.attractor_detected(),
+            "ASCII divider runs must NOT trip the guard"
+        );
     }
 
     #[test]
@@ -1895,7 +1924,10 @@ mod tests {
             payload.push(c as char);
         }
         m.advance(&payload);
-        assert!(!m.attractor_detected(), "varied (LCG) content must not trip");
+        assert!(
+            !m.attractor_detected(),
+            "varied (LCG) content must not trip"
+        );
     }
 
     // ─── Required-field guard tests ──────────────────────────────────
@@ -1917,7 +1949,7 @@ mod tests {
         m.advance("\n{\"name\": \"write\", \"arguments\": ");
         assert!(matches!(m.state(), State::InArgs));
         m.advance("{}"); // empty args body
-        // Body has no "path" or "content" — close-marker tokens are blocked.
+                         // Body has no "path" or "content" — close-marker tokens are blocked.
         assert!(!m.is_token_allowed("\n</tool_call>"));
         assert!(!m.is_token_allowed("</tool_call>"));
         assert!(!m.is_token_allowed("\n<"));
@@ -2114,12 +2146,12 @@ mod tests {
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
         m.advance("{}");
         let vocab = vec![
-            "\n</tool_call>".to_string(),   // close marker — must be blocked
-            "</tool_call>".to_string(),     // close marker — must be blocked
-            "\n<".to_string(),              // close-marker prefix — blocked
-            "\"path".to_string(),           // valid field name — allowed
-            "\"content".to_string(),        // valid field name — allowed
-            "anything".to_string(),         // arbitrary content — allowed
+            "\n</tool_call>".to_string(), // close marker — must be blocked
+            "</tool_call>".to_string(),   // close marker — must be blocked
+            "\n<".to_string(),            // close-marker prefix — blocked
+            "\"path".to_string(),         // valid field name — allowed
+            "\"content".to_string(),      // valid field name — allowed
+            "anything".to_string(),       // arbitrary content — allowed
         ];
         let mut mask = vec![false; vocab.len()];
         m.token_mask(&vocab, &mut mask);
@@ -2260,12 +2292,12 @@ mod tests {
         assert!(m.attractor_detected());
 
         let vocab = vec![
-            "type".to_string(),     // attractor token — must be -INF
-            "abc".to_string(),      // normal prose — must be -INF
-            "<".to_string(),        // close-marker prefix — must be allowed
-            "</tool".to_string(),   // close-marker prefix — must be allowed
+            "type".to_string(),         // attractor token — must be -INF
+            "abc".to_string(),          // normal prose — must be -INF
+            "<".to_string(),            // close-marker prefix — must be allowed
+            "</tool".to_string(),       // close-marker prefix — must be allowed
             "</tool_call>".to_string(), // full close — must be allowed
-            "".to_string(),         // empty/control — always allowed
+            "".to_string(),             // empty/control — always allowed
         ];
         let mut mask = vec![false; vocab.len()];
         m.token_mask(&vocab, &mut mask);
@@ -2329,6 +2361,10 @@ mod tests {
             .unwrap()
             .0;
         // `\n` is the only valid next char (header starts with `\n`).
-        assert_eq!(vocab[pick], "\n", "masked argmax should pick `\\n` (vocab[{}]={:?})", pick, vocab[pick]);
+        assert_eq!(
+            vocab[pick], "\n",
+            "masked argmax should pick `\\n` (vocab[{}]={:?})",
+            pick, vocab[pick]
+        );
     }
 }

@@ -110,7 +110,10 @@ impl MtpProbeState {
         config: &Qwen35Config,
         prompt_tokens: &[u32],
     ) -> HipResult<Self> {
-        assert!(!prompt_tokens.is_empty(), "MTP probe requires non-empty prompt");
+        assert!(
+            !prompt_tokens.is_empty(),
+            "MTP probe requires non-empty prompt"
+        );
         let dim = config.dim;
         let max_n = MTP_PROBE_MAX_BATCH;
         let vocab = config.vocab_size;
@@ -224,10 +227,10 @@ pub fn mtp_probe_step(
     // Slot 0 always carries the most-recent committed token. Cycle 0 must
     // have been preceded by prompt-prefill, which committed the final
     // prompt token; the caller seeds `state.last_committed` from that.
-    let slot0_tok = state
-        .last_committed
-        .expect("mtp_probe_step requires last_committed to be seeded \
-                 from the prompt prefill's final token");
+    let slot0_tok = state.last_committed.expect(
+        "mtp_probe_step requires last_committed to be seeded \
+                 from the prompt prefill's final token",
+    );
 
     // Build the batch. Always 2 or 3 slots: [slot0, candidate?, mask].
     let (batch, mask_slot, candidate_slot): (Vec<u32>, usize, Option<usize>) =
@@ -256,10 +259,10 @@ pub fn mtp_probe_step(
         &mut target.kv_cache,
         &mut target.dn_state,
         &target.scratch,
-        None,                       // hidden_rb: MTP probe doesn't drive a draft model
-        Some(&final_hidden_view),    // post-output-norm hidden for all N rows
-        None,                       // gdn_tape
-        None,                       // tree_verify
+        None,                     // hidden_rb: MTP probe doesn't drive a draft model
+        Some(&final_hidden_view), // post-output-norm hidden for all N rows
+        None,                     // gdn_tape
+        None,                     // tree_verify
         Some(&state.pbs),
         Some(MaskEmbedOverride {
             slot: mask_slot,
@@ -285,14 +288,22 @@ pub fn mtp_probe_step(
             // through gemm_qkv_q8_0_wmma — would break greedy-parity with
             // GEMV.
             gpu.gemm_q8_0_batched(
-                &w_out.buf, &final_hidden_view, &logits_batch,
-                w_out.m, w_out.k, n,
+                &w_out.buf,
+                &final_hidden_view,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                n,
             )?;
         }
         DType::HFQ4G256 => {
             gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf, &final_hidden_view, &logits_batch,
-                w_out.m, w_out.k, n,
+                &w_out.buf,
+                &final_hidden_view,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                n,
             )?;
         }
         DType::MQ4G256 => {
@@ -300,30 +311,46 @@ pub fn mtp_probe_step(
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
             gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf, &rot_view, &logits_batch,
-                w_out.m, w_out.k, n,
+                &w_out.buf,
+                &rot_view,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                n,
             )?;
         }
         DType::MQ3G256 => {
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
             gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf, &rot_view, &logits_batch,
-                w_out.m, w_out.k, n,
+                &w_out.buf,
+                &rot_view,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                n,
             )?;
         }
         DType::HFQ6G256 => {
             gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf, &final_hidden_view, &logits_batch,
-                w_out.m, w_out.k, n,
+                &w_out.buf,
+                &final_hidden_view,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                n,
             )?;
         }
         DType::MQ6G256 => {
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
             gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf, &rot_view, &logits_batch,
-                w_out.m, w_out.k, n,
+                &w_out.buf,
+                &rot_view,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                n,
             )?;
         }
         // Fallback for less-common lm_head dtypes: per-position GEMV.
@@ -413,17 +440,11 @@ fn embed_lookup_to_scratch(
         EmbeddingFormat::HFQ4G128 => {
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, out, token, dim)
         }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, out, token, dim)
-        }
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, out, token, dim),
         // Q4K is not currently produced by qwen35.rs embedding-format assignment;
         // kept defensively in case it lands later — verify call convention then.
-        EmbeddingFormat::Q4K => {
-            gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim)
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup(&weights.token_embd, out, token, dim)
-        }
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, out, token, dim),
     }
 }
 

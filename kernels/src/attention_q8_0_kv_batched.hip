@@ -61,9 +61,16 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     if (h >= n_heads) return;
 
     const bool tree_mode = (tree_bias != nullptr);
+    // hipGraph-safe block_start: under captured tree-verify replay the
+    // `block_start` scalar kernarg is baked at capture time and goes stale as
+    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
+    // cycle and the linearized tree root sits at positions[0] == start_pos ==
+    // block_start, so derive it from the device buffer instead of the scalar.
+    // Eager (non-capture) value is identical, so this is a no-op off-graph.
+    const int eff_block_start = tree_mode ? positions[0] : block_start;
     // Tree mode: iterate over the full cache including the block.
     // Causal mode: attend to 0..positions[b] inclusive (unchanged).
-    const int seq_len = tree_mode ? (block_start + block_cols) : (positions[b] + 1);
+    const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[b] + 1);
     extern __shared__ float sdata[];
 
     const int kv_group = n_heads / n_kv_heads;
@@ -109,8 +116,8 @@ extern "C" __global__ void attention_q8_0_kv_batched(
         // the max when every non-ancestor gets -inf — but the ancestor set
         // always includes the root (slot 0 in the block) so at least one
         // in-block score is finite on every row.
-        if (tree_mode && t >= block_start) {
-            s += tree_bias[b * block_cols + (t - block_start)];
+        if (tree_mode && t >= eff_block_start) {
+            s += tree_bias[b * block_cols + (t - eff_block_start)];
         }
         scores[t] = s;
         local_max = fmaxf(local_max, s);

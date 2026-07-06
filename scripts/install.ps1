@@ -219,6 +219,11 @@ if (Get-Command bun -ErrorAction SilentlyContinue) {
 Write-Host ""
 Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
 
+# INSTALL-F1: tracks whether the source tree was (re)fetched/cloned/reset this
+# run. When source changed, a repo-side target\release\examples\daemon.exe from
+# a prior build is STALE and must not be reused — we force a rebuild.
+$SourceUpdated = $false
+
 if (-not (Test-Path "$SrcDir\.git")) {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         Write-Host "  ERROR: git is required. Install from https://git-scm.com and re-run." -ForegroundColor Red
@@ -228,6 +233,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
     try {
         git clone --depth 1 --branch $GithubBranch "https://github.com/$GithubRepo.git" $SrcDir
         Write-Host "  Cloned ✓" -ForegroundColor Green
+        $SourceUpdated = $true
     } catch {
         Write-Host "  Clone failed: $_" -ForegroundColor Red
         Write-Host "  Try manually: git clone https://github.com/$GithubRepo.git $SrcDir"
@@ -244,6 +250,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
                 & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
                 & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
                 Write-Host "  Updated ✓" -ForegroundColor Green
+                $SourceUpdated = $true
             } catch {
                 Write-Host "  Update failed (non-fatal)." -ForegroundColor Yellow
             }
@@ -257,6 +264,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
             & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
             & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
             Write-Host "  Updated ✓" -ForegroundColor Green
+            $SourceUpdated = $true
         } catch {
             Write-Host "  Update failed (non-fatal). Using existing checkout." -ForegroundColor Yellow
         }
@@ -289,10 +297,17 @@ if (Get-Command cargo -ErrorAction SilentlyContinue) {
 # paths (only meaningful when running install.ps1 from a checkout) are
 # treated as developer-authoritative and used if present; everyone else
 # always pulls the latest release asset.
-$PreBuilt = @(
-    "$TargetDir\release\examples\daemon.exe",
-    "$RepoDir\bin\daemon.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+# INSTALL-F1: when the source tree was updated this run, any repo-side build
+# artifact is stale — drop those candidates so we rebuild (or pull a release).
+if ($SourceUpdated) {
+    Write-Host "  Source updated — ignoring any prior repo build artifact (will rebuild)." -ForegroundColor Yellow
+    $PreBuilt = $null
+} else {
+    $PreBuilt = @(
+        "$TargetDir\release\examples\daemon.exe",
+        "$RepoDir\bin\daemon.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
 
 if (-not $PreBuilt) {
     # Query the latest GitHub release dynamically — never pin to an old tag.
@@ -376,6 +391,21 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Push-Location $RepoDir
     try {
         cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
+        # OPTIONAL build (terminal UI). Must NOT abort the install if it fails:
+        # the mandatory daemon/CLI are installed regardless. Under PowerShell 7
+        # `$PSNativeCommandUseErrorActionPreference` a native non-zero exit from
+        # cargo throws a NativeCommandExitException, so guard BOTH the exception
+        # path (try/catch) AND the plain non-zero-exit path ($LASTEXITCODE);
+        # either way warn + continue down to the daemon copy.
+        Write-Host "  cargo build --release -p hipfire-tui (terminal UI)..."
+        try {
+            cargo build --release -p hipfire-tui
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "hipfire-tui (terminal UI) build failed — continuing without it."
+            }
+        } catch {
+            Write-Warning "hipfire-tui (terminal UI) build failed — continuing without it. ($_)"
+        }
     } finally {
         Pop-Location
     }
@@ -409,6 +439,28 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
 foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     $src = "$TargetDir\release\examples\$exe"
     if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
+}
+
+# Terminal UI (workspace bin — lives under target\release\, not examples\).
+# Build on demand if the pre-built tree didn't include it. The TUI is
+# OPTIONAL — a failed build (or absent cargo) must NOT abort the install,
+# but it must NOT be swallowed silently either: warn clearly so the user
+# knows the terminal UI won't be available and how to get it.
+$TuiExe = "$TargetDir\release\hipfire-tui.exe"
+if (-not (Test-Path $TuiExe)) {
+    if (Get-Command cargo -ErrorAction SilentlyContinue) {
+        Push-Location $RepoDir
+        try { cargo build --release -p hipfire-tui } catch {} finally { Pop-Location }
+    }
+}
+if (Test-Path $TuiExe) {
+    Copy-Item $TuiExe "$BinDir\hipfire-tui.exe" -Force
+    Write-Host "  hipfire-tui (terminal UI) installed ✓" -ForegroundColor Green
+} else {
+    # Windows remedy: `hipfire update` is NOT Windows-aware (its GPU-arch +
+    # git-reset path is Linux/sysfs-only), so recommend the direct cargo build
+    # as the PRIMARY fix on Windows, then re-running this installer to copy it.
+    Write-Warning "hipfire-tui (terminal UI) was not built — it will be unavailable. To get it: install Rust, then ``cargo build --release -p hipfire-tui`` and re-run scripts\install.ps1 (copies it into ~/.hipfire/bin/)."
 }
 
 # ─── CLI ─────────────────────────────────────────────────

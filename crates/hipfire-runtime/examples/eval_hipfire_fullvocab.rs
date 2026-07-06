@@ -57,15 +57,30 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--oracle" => { oracle = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--candidate" => { candidate = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--ref" => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--max-chunks" => { max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int")); i += 2; }
+            "--oracle" => {
+                oracle = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--candidate" => {
+                candidate = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--ref" => {
+                ref_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--max-chunks" => {
+                max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int"));
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: eval_hipfire_fullvocab --oracle <f32.hfq> --candidate <quant.hfq> --ref <hfkldr.bin> [--max-chunks N]");
                 std::process::exit(0);
             }
-            o => { eprintln!("unknown arg: {o}"); std::process::exit(1); }
+            o => {
+                eprintln!("unknown arg: {o}");
+                std::process::exit(1);
+            }
         }
     }
     let oracle = oracle.expect("--oracle required");
@@ -94,12 +109,17 @@ fn main() {
     let n_ctx = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
     let ref_n_vocab = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
     let n_chunk_total = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
-    let n_chunk = match max_chunks { Some(m) => m.min(n_chunk_total), None => n_chunk_total };
+    let n_chunk = match max_chunks {
+        Some(m) => m.min(n_chunk_total),
+        None => n_chunk_total,
+    };
     let n_tokens = n_ctx * n_chunk_total;
     let mut tok_raw = vec![0u8; n_tokens * 4];
     ref_in.read_exact(&mut tok_raw).expect("read ref tokens");
-    let tokens: Vec<u32> = tok_raw.chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let tokens: Vec<u32> = tok_raw
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
     drop(ref_in);
 
     let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
@@ -111,30 +131,58 @@ fn main() {
     let mut hfq_o = HfqFile::open(&oracle).expect("open oracle");
     let config = qwen35::config_from_hfq(&hfq_o).expect("oracle config");
     assert_eq!(config.vocab_size, ref_n_vocab, "oracle vocab != ref vocab");
-    let weights_o = qwen35::load_weights(&mut hfq_o, &config, &mut gpu).expect("load oracle");
+    let mut src_o = qwen35::HfqSource::new(&mut hfq_o, &config);
+    let layout_o = qwen35::Layout::single(config.n_layers);
+    let weights_o = qwen35::load_weights(&mut src_o, std::slice::from_mut(&mut gpu), &layout_o)
+        .expect("load oracle");
     eprintln!("loaded oracle ({} layers)", weights_o.layers.len());
 
     let (cfg_c, weights_c) = if candidate.is_dir() {
         use hipfire_runtime::safetensors_source::SafetensorsSource;
         let source = SafetensorsSource::open(&candidate).expect("safetensors open");
         let cfg_c = qwen35::config_from_safetensors(&source).expect("cand config");
-        let w = qwen35::load_weights_paroquant(&source, &cfg_c, &mut gpu).expect("load cand paroquant");
+        let mut paro_c = qwen35::ParoSource::new(&source, &cfg_c).expect("ParoSource::new");
+        let layout_c = qwen35::Layout::single(cfg_c.n_layers);
+        let w = qwen35::load_weights(&mut paro_c, std::slice::from_mut(&mut gpu), &layout_c)
+            .expect("load_weights");
         (cfg_c, w)
     } else {
         let mut hfq_c = HfqFile::open(&candidate).expect("open candidate");
         let cfg_c = qwen35::config_from_hfq(&hfq_c).expect("cand config");
-        let w = qwen35::load_weights(&mut hfq_c, &cfg_c, &mut gpu).expect("load cand");
+        let mut src_c = qwen35::HfqSource::new(&mut hfq_c, &cfg_c);
+        let layout_c = qwen35::Layout::single(cfg_c.n_layers);
+        let w = qwen35::load_weights(&mut src_c, std::slice::from_mut(&mut gpu), &layout_c)
+            .expect("load cand");
         (cfg_c, w)
     };
-    assert_eq!(cfg_c.vocab_size, config.vocab_size, "candidate vocab mismatch");
+    assert_eq!(
+        cfg_c.vocab_size, config.vocab_size,
+        "candidate vocab mismatch"
+    );
     eprintln!("loaded candidate ({} layers)", weights_c.layers.len());
 
     // -------- two KV caches / DeltaNet states / scratches (true FP32 KV) --------
     let kv_max = n_ctx + 16;
-    let mut kv_o = KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max).expect("kv_o");
-    let mut kv_c = KvCache::new_gpu(&mut gpu, cfg_c.n_layers, cfg_c.n_kv_heads, cfg_c.head_dim, kv_max).expect("kv_c");
-    let scratch_o = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_max).expect("scratch_o");
-    let scratch_c = Qwen35Scratch::new_with_kv_max(&mut gpu, &cfg_c, 128, kv_max).expect("scratch_c");
+    let mut kv_o = KvCache::new_gpu(
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_max,
+    )
+    .expect("kv_o");
+    let mut kv_c = KvCache::new_gpu(
+        &mut gpu,
+        cfg_c.n_layers,
+        cfg_c.n_kv_heads,
+        cfg_c.head_dim,
+        kv_max,
+    )
+    .expect("kv_c");
+    let scratch_o =
+        Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_max).expect("scratch_o");
+    let scratch_c =
+        Qwen35Scratch::new_with_kv_max(&mut gpu, &cfg_c, 128, kv_max).expect("scratch_c");
     let mut dn_o = DeltaNetState::new(&mut gpu, &config).expect("dn_o");
     let mut dn_c = DeltaNetState::new(&mut gpu, &cfg_c).expect("dn_c");
 
@@ -146,9 +194,15 @@ fn main() {
     // log-softmax in fp64 -> returns (log_probs: Vec<f64>, log_z, max_logit).
     let log_probs_f64 = |logits: &[f32]| -> Vec<f64> {
         let mut max_l = f32::NEG_INFINITY;
-        for &v in logits { if v > max_l { max_l = v; } }
+        for &v in logits {
+            if v > max_l {
+                max_l = v;
+            }
+        }
         let mut sum_exp = 0.0f64;
-        for &v in logits { sum_exp += ((v - max_l) as f64).exp(); }
+        for &v in logits {
+            sum_exp += ((v - max_l) as f64).exp();
+        }
         let log_z = (max_l as f64) + sum_exp.ln();
         logits.iter().map(|&v| (v as f64) - log_z).collect()
     };
@@ -158,10 +212,20 @@ fn main() {
         dn_c.reset(&mut gpu);
         let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
         for pos in 0..(n_ctx - 1) {
-            qwen35::forward_scratch(&mut gpu, &weights_o, &config, chunk[pos], pos, &mut kv_o, &mut dn_o, &scratch_o).expect("fwd oracle");
-            qwen35::forward_scratch(&mut gpu, &weights_c, &cfg_c, chunk[pos], pos, &mut kv_c, &mut dn_c, &scratch_c).expect("fwd cand");
-            if pos < scoring_start { continue; }
-            let lo = gpu.download_f32(&scratch_o.logits).expect("dl oracle logits");
+            qwen35::forward_scratch(
+                &mut gpu, &weights_o, &config, chunk[pos], pos, &mut kv_o, &mut dn_o, &scratch_o,
+            )
+            .expect("fwd oracle");
+            qwen35::forward_scratch(
+                &mut gpu, &weights_c, &cfg_c, chunk[pos], pos, &mut kv_c, &mut dn_c, &scratch_c,
+            )
+            .expect("fwd cand");
+            if pos < scoring_start {
+                continue;
+            }
+            let lo = gpu
+                .download_f32(&scratch_o.logits)
+                .expect("dl oracle logits");
             let lc = gpu.download_f32(&scratch_c.logits).expect("dl cand logits");
             let lp_o = log_probs_f64(&lo);
             let lp_c = log_probs_f64(&lc);
@@ -176,13 +240,21 @@ fn main() {
             kld_sum += kl.max(0.0);
             // candidate NLL on actual next token (sanity / PPL parity).
             let actual = chunk[pos + 1] as usize;
-            if actual < lp_c.len() { nll_sum += -lp_c[actual]; }
+            if actual < lp_c.len() {
+                nll_sum += -lp_c[actual];
+            }
             scored_done += 1;
             if scored_done % 256 == 0 || scored_done == total_scored {
                 let el = t0.elapsed().as_secs_f64();
-                eprint!("\r  chunk {:4}/{}  scored {:7}/{:7}  ({:.0} tok/s)  KLD~{:.6}   ",
-                    c + 1, n_chunk, scored_done, total_scored, scored_done as f64 / el.max(1e-9),
-                    kld_sum / scored_done as f64);
+                eprint!(
+                    "\r  chunk {:4}/{}  scored {:7}/{:7}  ({:.0} tok/s)  KLD~{:.6}   ",
+                    c + 1,
+                    n_chunk,
+                    scored_done,
+                    total_scored,
+                    scored_done as f64 / el.max(1e-9),
+                    kld_sum / scored_done as f64
+                );
             }
         }
     }

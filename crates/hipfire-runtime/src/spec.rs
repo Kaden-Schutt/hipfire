@@ -1,0 +1,1202 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Transparent speculative-decode seam.
+//!
+//! The daemon's decode loop drives a `&mut dyn Speculator` and never learns
+//! which drafter/mode (DFlash chain, DDTree tree, DeepSeek4 MTP, future
+//! n-gram / EAGLE) is in use. Adding a drafter is a bounded-context change:
+//! implement [`Speculator`] and register one arm in the loader's
+//! `build_speculator` — no daemon edits.
+//!
+//! This is the arch-generic boundary anticipated by the `hipfire-arch-qwen35`
+//! crate docs ("speculative.rs will become arch-generic"): the trait and the
+//! unified result live here in the arch-agnostic runtime, while the
+//! arch-coupled impls (which need `qwen35::*` / `deepseek4::*` symbols) stay in
+//! their arch crates and `impl` this trait under the orphan rule.
+//!
+//! Status: the trait, the unified [`SpecStep`] result, and the borrowed-target /
+//! erased-grammar interfaces are live. The daemon's DFlash decode loop drives a
+//! `&mut dyn Speculator` (`examples/daemon.rs::generate_dflash`), with the
+//! loader's `DflashSpeculator` as the sole impl. Still future work: a generic
+//! `build_speculator` registry (dispatch on arch/draft kind) and additional
+//! drafters (n-gram, MTP, EAGLE) — the AR one-token path still runs through
+//! `generate()`, not this trait.
+
+use rdna_compute::Gpu;
+use smallvec::SmallVec;
+
+/// Outcome of one speculative-decode acceptance window, drafter-agnostic.
+///
+/// The daemon advances by `emit.len()` and reseeds from `next_seed` without
+/// knowing which drafter ran. The two arch result types lower onto this:
+/// - qwen35 `SpecStepResult` → `emit = committed[1..]` (the seed re-echo is
+///   dropped), `next_seed = bonus_token`.
+/// - deepseek4 MTP → `emit = accepted_tokens`, `next_seed = accepted_tokens.last()`.
+///
+/// `committed[1..].len()` equals `accepted + 1` for the chain drafters and
+/// `accepted_tokens.len()` equals the MTP position advance, so a single
+/// `position += emit.len()` is correct for both. `proposed`/`accepted` are τ
+/// accounting only; they do NOT drive position math.
+#[derive(Debug, Clone)]
+pub struct SpecStep {
+    /// Tokens to emit this window, in order, with any seed re-echo already
+    /// stripped. `position += emit.len()`. Non-empty on `Ok` (forward progress).
+    ///
+    /// `SmallVec` so a future one-token-per-step drafter (e.g. n-gram) stays
+    /// heap-alloc-free; only large spec windows spill to the heap.
+    pub emit: SmallVec<[u32; 8]>,
+    /// Seed for the next window — the verifier's preferred token at the
+    /// divergence point (qwen35 `bonus_token`; MTP `accepted_tokens.last()`).
+    pub next_seed: u32,
+    /// Drafts offered this window (τ denominator).
+    pub proposed: usize,
+    /// Drafts accepted this window (τ numerator).
+    pub accepted: usize,
+}
+
+impl SpecStep {
+    /// Build a step from an `emit` iterator, hiding the `SmallVec` backing from
+    /// caller crates that don't depend on `smallvec` (the per-arch lowering
+    /// adapters `lower_qwen35` / `lower_mtp` live in the loader / arch crates).
+    pub fn new(
+        emit: impl IntoIterator<Item = u32>,
+        next_seed: u32,
+        proposed: usize,
+        accepted: usize,
+    ) -> Self {
+        Self {
+            emit: emit.into_iter().collect(),
+            next_seed,
+            proposed,
+            accepted,
+        }
+    }
+}
+
+/// Outcome of the shared greedy accept-prefix rule ([`accept_greedy_prefix`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GreedyAccept {
+    /// Accepted drafts in order, followed by the bonus token — UNLESS an
+    /// accepted draft was itself the EOS token (then it stops there, no bonus).
+    /// This is the committed tail the caller emits (callers that track a seed
+    /// prepend it themselves).
+    pub committed: Vec<u32>,
+    /// Number of drafts accepted (excludes the bonus). `0..=drafts.len()`.
+    pub accepted: usize,
+    /// Whether decoding hit EOS inside this window (only possible when `eos`
+    /// was `Some`): either an accepted draft or the bonus was the EOS token.
+    pub hit_eos: bool,
+}
+
+/// The one greedy speculative-accept rule, shared by every drafter (DFlash,
+/// MTP, deepseek4 non-grammar, n-gram). **Precompute-then-match**: the caller
+/// supplies `target_pick[i]` — the verifier's chosen token at slot `i`, computed
+/// however that arch needs (plain argmax, grammar-masked argmax, n-gram /
+/// repeat-penalty-overridden argmax) — and this does ONLY the arch-invariant
+/// part: accept the longest prefix where `target_pick[i] == drafts[i]`, then take
+/// the bonus `target_pick[accepted]`.
+///
+/// `eos = Some(id)` enables EOS-early-stop *inside* the prefix (MTP semantics):
+/// if an accepted draft equals `id`, stop there and emit no bonus. `eos = None`
+/// (DFlash / n-gram) never early-stops and always appends the bonus.
+///
+/// Non-greedy rules (DFlash `temp>0` rejection sampling, MTP residual
+/// acceptance) and stateful per-position grammar masking (deepseek4 tool-call
+/// path, where `target_pick[i+1]` depends on the token accepted at `i`) are NOT
+/// expressible here and stay at their call sites.
+///
+/// Requires `target_pick.len() >= drafts.len() + 1` (one extra slot for the
+/// bonus at full acceptance).
+pub fn accept_greedy_prefix(drafts: &[u32], target_pick: &[u32], eos: Option<u32>) -> GreedyAccept {
+    debug_assert!(
+        target_pick.len() >= drafts.len() + 1,
+        "accept_greedy_prefix: target_pick (len {}) needs drafts+1 (len {})",
+        target_pick.len(),
+        drafts.len() + 1,
+    );
+    let mut committed = Vec::with_capacity(drafts.len() + 1);
+    let mut accepted = 0usize;
+    let mut hit_eos = false;
+    for (i, &d) in drafts.iter().enumerate() {
+        if target_pick[i] == d {
+            committed.push(d);
+            accepted += 1;
+            if eos == Some(d) {
+                hit_eos = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if !hit_eos {
+        let bonus = target_pick[accepted];
+        committed.push(bonus);
+        if eos == Some(bonus) {
+            hit_eos = true;
+        }
+    }
+    GreedyAccept {
+        committed,
+        accepted,
+        hit_eos,
+    }
+}
+
+/// The verifier (target) model's GPU state, borrowed by [`Speculator::step`]
+/// for the duration of one window. A `Speculator` impl recovers its concrete
+/// target via `as_any_mut().downcast_mut::<T>()` (e.g. the qwen35 `ModelSlot`).
+///
+/// The borrowed-not-owned shape lets one decode loop hold the target across all
+/// windows (taken from the model bundle once, via the loader's RAII slot guard)
+/// while the speculator borrows it per step — no per-step ownership transfer.
+pub trait SpecTarget {
+    /// Downcast hook: `target.as_any_mut().downcast_mut::<ModelSlot>()`.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// Zero the target's recurrent (DeltaNet) state and reset the KV eviction
+    /// offset — used by the daemon's mid-generation abort path in place of its
+    /// current inline memset loop.
+    fn reset_recurrent(&mut self, gpu: &mut Gpu);
+
+    // ── Arch-generic speculation primitives ─────────────────────────────────
+    //
+    // These let a *model-free* speculator (n-gram / PLD) drive any arch's target
+    // without knowing its internals: the target owns ALL verify mechanics (the
+    // batched forward, the per-position lm_head, the recurrent snapshot/rewind,
+    // and the arch-specific scratch), while the speculator owns only policy
+    // (drafting + acceptance). The arch-specific verify scratch is created by the
+    // target via [`new_spec_scratch`](Self::new_spec_scratch) and handed back on
+    // every call as an erased `&mut dyn SpecScratch`, so no arch type leaks into
+    // the speculator and the speculator owns the scratch's lifetime.
+
+    /// Allocate arch-specific verify scratch sized to `block_size` (the max
+    /// speculation window). The speculator owns the returned box for its lifetime
+    /// and frees it via [`SpecScratch::free`].
+    fn new_spec_scratch(
+        &mut self,
+        gpu: &mut Gpu,
+        block_size: usize,
+    ) -> Result<Box<dyn SpecScratch>, String>;
+
+    /// Advance the target over `tokens` from absolute `start_pos` (chunked,
+    /// abortable), returning the greedy argmax at the LAST position. `reset`
+    /// zeroes recurrent + KV state first (cache-miss prefill); `false` continues
+    /// from the current state (cache-hit suffix, or the partial-accept replay).
+    fn spec_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        reset: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<SpecAdvance, String>;
+
+    /// Run the target over `block` at absolute `position`, returning the greedy
+    /// argmax at each of the `block.len()` positions (`argmax[i]` is the target's
+    /// next-token prediction after consuming `block[0..=i]`). Leaves target state
+    /// advanced by `block.len()`.
+    ///
+    /// CONTRACT: this MUST first snapshot whatever recurrent state
+    /// [`commit_prefix`](Self::commit_prefix) needs to rewind (e.g. the DeltaNet
+    /// S/conv state AND the Q8 error-feedback residual) INTO `scratch`, *before*
+    /// running the forward that advances it. Stateless (pure-attention) arches
+    /// snapshot nothing.
+    fn verify_block(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<Vec<u32>, String>;
+
+    /// Like [`verify_block`](Self::verify_block) but returns per-position SAMPLED
+    /// tokens (sample `s_i ~ p_T(top_k,top_p)` from the target logits) instead of
+    /// argmax. For a point-mass n-gram draft this makes the shared
+    /// `accept_greedy_prefix(draft, picks)` flow faithful temp-T speculation:
+    /// "accept the guess iff it equals the target sample" is exactly
+    /// distribution-preserving (the committed token is always the target sample).
+    /// Same snapshot CONTRACT as `verify_block`.
+    ///
+    /// Default: `Err` — a target that has NOT implemented sampled verify must
+    /// never silently fall back to greedy (that would decode temp>0 at argmax).
+    /// The drafter's `requires_greedy()`/`build_speculator` gate is what keeps a
+    /// temp>0 request off this path for such a target; the `Err` is the
+    /// belt-and-suspenders guard if one ever slips through.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        rng_state: &mut u64,
+    ) -> Result<Vec<u32>, String> {
+        let _ = (gpu, block, position, scratch, temp, top_p, top_k, rng_state);
+        Err("verify_block_sampled: this target does not support sampled verify".into())
+    }
+
+    /// Fix target state to reflect exactly the committed prefix
+    /// `block[..accept_len + 1]` (after [`verify_block`](Self::verify_block)
+    /// over-advanced it by `block.len()`). Cases:
+    /// - full accept (`accept_len == block.len() - 1`): no-op — verify already
+    ///   left state at the right position;
+    /// - recurrent + partial: restore the snapshot saved in `scratch` (incl. the
+    ///   s_ef residual) and replay `block[..accept_len + 1]` with the SAME batched
+    ///   forward `verify_block` used (numerics must match the accepted argmax);
+    /// - stateless + partial: no-op — the accepted-prefix KV the verify wrote is
+    ///   already correct, and the rejected tail is overwritten by the next verify.
+    fn commit_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        accept_len: usize,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String>;
+
+    /// The target's EOS token id (for the daemon's decode-loop terminator check).
+    fn eos_token(&self) -> u32;
+
+    /// The target's usable context capacity (decode-loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
+    /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
+    /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation
+    /// (e.g. qwen2's `Qwen2State`) return `None` (the default): they don't support
+    /// eviction, and the daemon's eviction sites are `if let Some(ev)`-gated so
+    /// this is never reached for a non-evicting target. Keeping it `Option` is
+    /// what lets a `Qwen2State`-backed target implement `SpecTarget` at all
+    /// (it has no `llama::KvCache` to hand back).
+    fn kv_cache_mut(&mut self) -> Option<&mut crate::llama::KvCache> {
+        None
+    }
+}
+
+/// RAII borrow of the spec-decode target as `&mut dyn SpecTarget`, dispatched
+/// per-arch by the loader's `spec_target_guard()`.
+///
+/// The guard restores any moved-out model state on Drop — the qwen35 arm moves
+/// its bundle out of `ModelState`, reopens its `HfqFile`, and rebuilds the bundle
+/// on *every* exit path (return / `?` / panic), which is what structurally
+/// eliminates the #462 cross-request state-bleed class; a pure-attention arm
+/// borrows its bundle in place (no reopen needed). `generate_dflash` only ever
+/// sees `Box<dyn SpecTargetGuard>` and never learns which arch it drives — this
+/// folds the old hand-written `SpecSlotGuard` enum into a single trait object.
+pub trait SpecTargetGuard {
+    /// Borrow the target. The qwen35 arm opens its `HfqFile` lazily on first
+    /// call (an AR-only caller never pays the mmap); a reopen failure returns
+    /// `Err` with the bundle still parked for `Drop` to restore, so `m.state` is
+    /// never left `None`.
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String>;
+}
+
+/// In-place spec-target borrow for arches whose bundle *is* a [`SpecTarget`]
+/// directly — the pure-attention family (LLaMA / plain Qwen3, Qwen2, DeepSeek V4).
+/// Unlike qwen35 there is no `HfqFile` to reopen and nothing to move out of
+/// `ModelState`: the `&mut` is held for the guard's life and released on `Drop`
+/// like any borrow, with no restore step. Generic over the bundle type so this
+/// single impl replaces the per-arch `LlamaSlotGuard` / `Qwen2SlotGuard` /
+/// `Deepseek4SlotGuard` (which differed only by bundle type).
+pub struct InPlaceGuard<'m, B: SpecTarget> {
+    pub bundle: &'m mut B,
+}
+
+impl<B: SpecTarget> SpecTargetGuard for InPlaceGuard<'_, B> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        Ok(&mut *self.bundle as &mut dyn SpecTarget)
+    }
+}
+
+/// Erased, arch-specific verify scratch owned by a model-free speculator.
+///
+/// The concrete scratch (qwen35: `VerifyScratch` + `DeltaNetSnapshot` + s_ef
+/// backup + hidden ring; llama: lm_head/argmax buffers) is crate-local to each
+/// arch and this crate depends on none of them — so it is threaded through the
+/// trait erased, mirroring [`SpecGrammar`]. The arch's [`SpecTarget`] impl
+/// recovers it via `scratch.as_any_mut().downcast_mut::<T>()`.
+pub trait SpecScratch {
+    /// Downcast hook for the owning [`SpecTarget`] impl.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// Release all GPU buffers the scratch owns. Explicit because `GpuTensor` /
+    /// `DeviceBuffer` have no `Drop` in this codebase — a bare `drop` of the box
+    /// would orphan device memory. Called from the speculator's `free`.
+    fn free(self: Box<Self>, gpu: &mut Gpu);
+}
+
+/// Outcome of [`SpecTarget::spec_advance`].
+#[derive(Debug, Clone)]
+pub enum SpecAdvance {
+    /// Advanced to the end; `last_argmax` is the greedy token at the final
+    /// position (the first decode seed on prefill; ignored on replay).
+    Ready { last_argmax: u32 },
+    /// Client cancelled mid-advance; the target reset its own state.
+    Aborted,
+}
+
+/// Erased grammar-mask interface for tool-call-constrained spec-decode.
+///
+/// The concrete per-arch grammar `Matcher` types
+/// (`hipfire_arch_qwen35::grammar`, `hipfire_arch_deepseek4::grammar`) are
+/// crate-local and distinct, and this crate depends on neither — so grammar is
+/// threaded through the trait as an erased `&mut dyn SpecGrammar`, not a shared
+/// concrete struct (a shared struct would invert the crate dependency graph; an
+/// associated type would break `Box<dyn Speculator>`). Marker for now; the
+/// mask-fill / accept method set will be defined when a grammar-consuming
+/// drafter (MTP / EAGLE) first needs it. `DflashSpeculator` ignores grammar —
+/// qwen35 enforces tool-call grammar post-hoc in the daemon.
+///
+/// `as_any_mut` lets an in-step grammar consumer (the deepseek4 MTP drafter)
+/// downcast the erased handle back to its concrete arch grammar type
+/// (`hipfire_arch_deepseek4::mtp_speculator::Deepseek4SpecGrammar`) to reach the
+/// `Matcher` + decoded-vocab + mask the fused grammar step needs.
+pub trait SpecGrammar {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// Outcome of [`Speculator::prefill`].
+#[derive(Debug, Clone)]
+pub enum PrefillOutcome {
+    /// Prompt prefilled; `first_token` is the target's argmax at the last prompt
+    /// position (the seed for the first decode window).
+    Ready { first_token: u32 },
+    /// Client cancelled mid-prefill. The caller resets conversation state and
+    /// emits the aborted/done events; the slot guard restores the target bundle.
+    Aborted,
+}
+
+/// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
+/// compact its cached target-hidden rows to match the target KV after a
+/// FlashCASK eviction the daemon already applied to the target.
+#[derive(Debug, Clone)]
+pub struct EvictRetain {
+    /// Per-physical-slot retain mask from the eviction policy.
+    pub retain_mask: Vec<u32>,
+    /// Physical fill before the eviction (rows to compact).
+    pub pre_phys: usize,
+}
+
+/// A speculative-decode drafter+verifier, owned by the loaded model behind a
+/// `Box<dyn Speculator>`. The daemon's decode loop holds `&mut dyn Speculator`
+/// and is agnostic to whether the impl is a DFlash chain, a DDTree tree, an MTP
+/// head, or a future n-gram / EAGLE drafter — chain-vs-tree, path_c, K, budget,
+/// and topk are all resolved at build time and stored inside the impl.
+pub trait Speculator {
+    /// Prefill the prompt: seed the target's hidden state (advancing its KV +
+    /// recurrent state) and prime the drafter's cached target-hidden buffer,
+    /// returning the target's first token. `prefill_tokens` is the suffix to
+    /// seed on a cache hit (from `prefill_start`) or the full prompt on a miss;
+    /// `prompt_tokens` is the full rendered prompt (used to size the drafter
+    /// cursor). `resume_from`, when set, drops the drafter projection cursor to a
+    /// divergent-render checkpoint position.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+        resume_from: Option<usize>,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String>;
+
+    /// Run one acceptance window starting from `seed` at absolute `position`.
+    /// `target` is the borrowed verifier; `emitted` is the prior committed
+    /// tokens (repeat-penalty / n-gram context); `grammar` constrains both the
+    /// draft and verify logits (`None` = unconstrained).
+    fn step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<SpecStep, String>;
+
+    /// Compact drafter-local cached state after a target KV eviction the daemon
+    /// already applied. Default no-op for drafters with no target-hidden cache.
+    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
+        let _ = (gpu, retain);
+        Ok(())
+    }
+
+    /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
+    /// recurrent state is the daemon's concern (it owns the bundle); this clears
+    /// only the drafter's own scratch + checkpoint ring.
+    fn reset(&mut self, gpu: &mut Gpu);
+
+    /// Snapshot drafter-local recurrent state at `position` for divergent-render
+    /// prompt-cache reuse. Default no-op for stateless drafters (n-gram).
+    fn checkpoint(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<(), String> {
+        let _ = (gpu, target, position);
+        Ok(())
+    }
+
+    /// Restore drafter-local state to the nearest checkpoint `<= position`,
+    /// returning the position actually restored to. Default no-op (returns
+    /// `position`) for stateless drafters.
+    fn rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        let _ = (gpu, target);
+        Ok(position)
+    }
+
+    /// The drafter's speculation window (DFlash block size / MTP K). The daemon
+    /// uses it for capacity checks and the decode-loop overflow guard.
+    fn block_size(&self) -> usize;
+
+    /// The target's usable context capacity (for the loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// Divergent-render checkpoint positions (ascending), for prompt-cache
+    /// resume planning. Default empty for drafters with no checkpoint ring.
+    fn checkpoint_positions(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Release all GPU buffers the drafter owns. Called from `unload_model`,
+    /// so a drafter that forgets to free is a missing-trait-method compile
+    /// error rather than a silent VRAM leak.
+    fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Whether this drafter requires greedy verification (temperature 0).
+    /// A greedy-only drafter (n-gram chain, the MTP-via-`Speculator` wrapper)
+    /// returns `true`; a sampling-capable drafter (DFlash with lossless rejection
+    /// sampling) returns `false`. The daemon dispatch consults this per request:
+    /// a temp>0 request may take the spec path only against a drafter that returns
+    /// `false`; against a `true` drafter it falls through to AR rather than being
+    /// silently decoded greedy.
+    fn requires_greedy(&self) -> bool {
+        true
+    }
+
+    /// Configure per-request sampling for the next acceptance window(s). Called
+    /// by the daemon's spec wrapper (`generate_dflash`) once before the step
+    /// loop, threading the request's resolved temp/top_p/top_k/cactus down to
+    /// the drafter. Default no-op: a greedy-only drafter ignores it and keeps
+    /// decoding at argmax. A sampling-capable drafter (DFlash) stores these and
+    /// applies the IDENTICAL (top_k,top_p) nucleus truncation to draft + target
+    /// inside `step` (lossless == AR-at-(top_k,top_p)). `temp <= 0` ⇒ greedy.
+    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
+}
+
+// ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
+//
+// Every MTP drafter (qwen35 MTP head, deepseek4 MTP layer) shares one shape: a
+// prompt prefill that primes the arch's MTP history + recurrent/KV state and
+// returns a greedy seed, then a per-window draft+verify+accept step returning
+// the committed tail (accepted prefix + bonus, seed excluded). The arches differ
+// only in the fused kernels they run — that difference is [`MtpDrafter`], and
+// [`MtpSpeculator`] adapts any `MtpDrafter` to the generic [`Speculator`]
+// interface (prefill→`PrefillOutcome`, window→`SpecStep`) ONCE, so a new MTP arch
+// implements only `MtpDrafter` (+ `SpecTarget`), never a whole `Speculator`.
+
+/// One acceptance window's committed tokens: the accepted draft prefix plus the
+/// verifier's bonus, EXCLUDING the seed. Identical in meaning to qwen35's
+/// `MtpSpecResult.committed` and deepseek4's `accepted_tokens`.
+#[derive(Debug, Clone)]
+pub struct MtpWindow {
+    /// Tokens committed this window (accepted drafts + bonus, seed excluded).
+    /// `committed.len()` is what drives the daemon's `position += emit.len()`.
+    pub committed: Vec<u32>,
+    /// Drafts accepted, excluding the bonus (τ numerator).
+    pub accepted: usize,
+    /// Drafts offered this window, ≤ `k` (τ denominator).
+    pub drafts_generated: usize,
+}
+
+/// Per-arch MTP draft+verify core. The impl owns its draft scratch (qwen35:
+/// `MtpSpecState` + head; deepseek4: the relocated `PrefillBatchScratch`) and
+/// downcasts `target` (`&mut dyn SpecTarget`) to its concrete model type to run
+/// the fused head-draft + trunk-verify kernels. Everything arch-INvariant
+/// (prefill outcome, window→step lowering, position/seed advance) lives once in
+/// [`MtpSpeculator`].
+pub trait MtpDrafter {
+    /// Prefill `fill_tokens` from absolute `start_pos`: advance the target's
+    /// KV/recurrent state AND the MTP head's position-aligned cache, returning
+    /// the greedy seed (argmax at the last prefilled position). `cache_hit=false`
+    /// ⇒ cold start (reset recurrent + MTP cache first); `true` ⇒ warm suffix
+    /// extension (preserve prior state).
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+    ) -> Result<u32, String>;
+
+    /// One acceptance window: seed at absolute `position`; draft `k`, verify,
+    /// greedily accept the longest matching prefix + bonus. `grammar` is the
+    /// IN-STEP grammar (deepseek4 masks draft+verify logits with it; qwen35
+    /// ignores it and relies on post-hoc grammar in the emission layer).
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        k: usize,
+        eos: u32,
+        grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<MtpWindow, String>;
+
+    /// Reset drafter-local state for a fresh conversation (MTP cache + any
+    /// captured graphs). The target's KV/recurrent reset is the daemon's job.
+    fn mtp_reset(&mut self, gpu: &mut Gpu);
+
+    /// Release all GPU buffers the drafter owns.
+    fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Draft window size (K).
+    fn k(&self) -> usize;
+
+    /// Target context capacity (for the loop overflow guard).
+    fn ctx_capacity(&self) -> usize;
+
+    /// Whether verification is greedy-only (temp≈0). qwen35 MTP → `true`.
+    fn requires_greedy(&self) -> bool;
+}
+
+/// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
+/// interface. One impl serves every MTP arch; the arch-specific work is the
+/// `MtpDrafter` (+ `SpecTarget`) impl in the arch crate.
+pub struct MtpSpeculator<A: MtpDrafter> {
+    arch: A,
+}
+
+impl<A: MtpDrafter> MtpSpeculator<A> {
+    pub fn new(arch: A) -> Self {
+        Self { arch }
+    }
+}
+
+/// Lower an [`MtpWindow`] to the generic [`SpecStep`]. `committed` already
+/// excludes the seed and includes the bonus, so it maps 1:1 to `emit`; the next
+/// window's seed is the last committed token (the daemon's `position +=
+/// emit.len()` / `seed = next_seed` contract). An empty `committed` would stall
+/// the loop (no position/`generated` advance) — surface it as an error so the
+/// loop breaks instead of spinning.
+fn lower_mtp_window(w: MtpWindow) -> Result<SpecStep, String> {
+    let next_seed = *w
+        .committed
+        .last()
+        .ok_or("MtpSpeculator: drafter committed 0 tokens (would stall the decode loop)")?;
+    Ok(SpecStep::new(
+        w.committed.iter().copied(),
+        next_seed,
+        w.drafts_generated,
+        w.accepted,
+    ))
+}
+
+impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+    fn prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+        _resume_from: Option<usize>,
+        _abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String> {
+        // Cache hit ⇒ warm suffix prefill from `prefill_start`; miss ⇒ full
+        // prefill from 0 (the drafter resets recurrent + MTP cache on miss).
+        let (fill_tokens, start_pos): (&[u32], usize) = if cache_hit {
+            (prefill_tokens, prefill_start)
+        } else {
+            (prompt_tokens, 0)
+        };
+        let first_token = self
+            .arch
+            .mtp_prefill(gpu, target, fill_tokens, start_pos, cache_hit)?;
+        Ok(PrefillOutcome::Ready { first_token })
+    }
+
+    fn step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        _emitted: &[u32],
+        grammar: Option<&mut dyn SpecGrammar>,
+    ) -> Result<SpecStep, String> {
+        let k = self.arch.k();
+        let eos = target.eos_token();
+        let window = self
+            .arch
+            .mtp_step(gpu, target, position, seed, k, eos, grammar)?;
+        lower_mtp_window(window)
+    }
+
+    fn reset(&mut self, gpu: &mut Gpu) {
+        self.arch.mtp_reset(gpu);
+    }
+
+    fn block_size(&self) -> usize {
+        self.arch.k()
+    }
+
+    fn ctx_capacity(&self) -> usize {
+        self.arch.ctx_capacity()
+    }
+
+    fn free(self: Box<Self>, gpu: &mut Gpu) {
+        // Move the drafter out of the box and hand it its own boxed-self free.
+        Box::new(self.arch).mtp_free(gpu);
+    }
+
+    fn requires_greedy(&self) -> bool {
+        self.arch.requires_greedy()
+    }
+}
+
+// ─── Per-token emission seam (SpecEmit) ─────────────────────────────────────
+//
+// The daemon's spec-decode loops emit committed tokens twice over: qwen35/llama
+// in `generate_dflash` (an `EosFilter` byte stream + post-hoc grammar matcher +
+// max-think force-close + user stop-sequence match), and deepseek4 in
+// `generate_deepseek4` (a DSML `StreamParser`). `SpecEmit` is the arch-generic
+// boundary between "the loop committed token N" and "what the client sees" so a
+// future single decode loop can drive any arch's emission without learning its
+// quirks. The trait returns SEMANTIC events ([`ClientEvent`]) — the daemon owns
+// the JSONL rendering and timing, and the loop-state bookkeeping (KV/recurrent
+// resets, position/seed advance, conversation-token bake, eviction) stays in the
+// decode loop; only the per-token emit decisions move behind this seam.
+
+/// One client-visible emission produced by a [`SpecEmit`] step. The daemon
+/// renders these to its JSONL wire format (`{"type":"token",...}` etc.) and
+/// supplies its own timing; this carries only the semantic payload.
+#[derive(Debug, Clone)]
+pub enum ClientEvent {
+    /// Visible answer text (post-filter, post-think-strip). → `{"type":"token"}`.
+    Token(String),
+    /// Reasoning/think-block text surfaced separately (DSML reasoning channel).
+    /// → `{"type":"reasoning"}`. Unused by the qwen35 emitter (it strips think
+    /// only when configured and never emits a separate reasoning channel), but
+    /// part of the shared vocabulary the deepseek4 emitter will populate.
+    Reasoning(String),
+    /// Parsed tool calls for this turn. → `{"type":"tool_calls"}`.
+    ToolCalls(Vec<crate::prompt_frame::ToolCall>),
+    /// A committed token id at output index `idx`. → `{"type":"committed"}`
+    /// (gated by `HIPFIRE_EMIT_TOKEN_IDS=1` at the daemon). The daemon attaches
+    /// its own `t_ms` timestamp when rendering.
+    Committed { id: u32, idx: usize },
+}
+
+/// Why a [`SpecEmit`] decided this token ends generation. The daemon maps this
+/// to its `done` envelope's `finish_reason` and to the post-loop cleanup
+/// (grammar-violation forces a full KV/recurrent reset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// A natural end-of-turn terminator (EOS / `<|im_end|>` / tokenizer
+    /// terminator). `finish_reason` resolves to `stop` (or `tool_calls` when the
+    /// turn parsed any).
+    Eos,
+    /// `max_think_tokens` reached inside an open `<think>` block — the emitter
+    /// force-closed the block. `finish_reason` = `stop`.
+    ThinkCap,
+    /// A user-supplied stop sequence matched the decoded suffix. `finish_reason`
+    /// = `stop`.
+    StopSequence,
+    /// A committed token violated the active tool-call grammar. The daemon
+    /// treats this as EOS for the turn AND forces a full KV/recurrent reset so
+    /// the next turn starts clean.
+    GrammarViolation,
+}
+
+/// Outcome of a single [`SpecEmit::begin`] / [`SpecEmit::observe`] step: the
+/// client events to render (in order) plus an optional stop signal. A non-`None`
+/// `stop` means the decode loop must stop AFTER rendering `events`.
+#[derive(Debug, Clone, Default)]
+pub struct EmitOutcome {
+    /// Events to render this step, in order.
+    pub events: Vec<ClientEvent>,
+    /// If set, generation stops after this step's events.
+    pub stop: Option<StopReason>,
+}
+
+impl EmitOutcome {
+    /// An empty outcome (filter held all bytes; no stop). The common case when
+    /// the `EosFilter` is buffering a partial UTF-8 codepoint or marker prefix.
+    pub fn held() -> Self {
+        Self::default()
+    }
+}
+
+/// Terminal flush of a [`SpecEmit`], consumed by value at end of turn. Carries
+/// any final events (e.g. a `tool_calls` event parsed from the full decoded
+/// text) plus the resolved `finish_reason` and parsed tool-call count for the
+/// daemon's `done` envelope. The daemon still owns the length-cap decision
+/// (`generated >= max_tokens` ⇒ `length`), so `finish_reason` here is the
+/// emitter's view (`stop` / `tool_calls`); the caller overrides with `length`
+/// when the loop hit the token cap.
+#[derive(Debug, Clone, Default)]
+pub struct FinishSummary {
+    /// Final events to render (e.g. the turn's `ToolCalls`).
+    pub events: Vec<ClientEvent>,
+    /// The emitter's finish reason (`stop` or `tool_calls`); the caller may
+    /// override with `length` on a token-cap exit.
+    pub finish_reason: &'static str,
+    /// Number of tool calls parsed this turn (for the `done` envelope).
+    pub tool_calls: usize,
+}
+
+/// Model-independent context for constructing a turn's [`SpecEmit`].
+///
+/// Built by `generate_spec` *after* it has acquired the spec target (so `eos`
+/// is `slot.eos_token()`), then handed to the arch's carrier, whose
+/// `make_spec_emitter` constructs the concrete `Box<dyn SpecEmit>`. Every field
+/// is a model-independent request/render output — tool definitions are passed
+/// as **raw JSON** (`tools`) because the two arch emitters extract different
+/// schema shapes from them, and the only lossless rep both accept is the
+/// original JSON. The arch carrier owns the JSON→its-own-`ToolSchema`
+/// conversion, so no arch type appears here.
+pub struct SpecEmitCtx<'a> {
+    /// Tokenizer for decoding committed tokens to text (byte filter, grammar,
+    /// think-scan, tool-call extraction).
+    pub tokenizer: &'a crate::tokenizer::Tokenizer,
+    /// The target's EOS token (`slot.eos_token()`), known only after slot
+    /// acquisition — which is why the emitter is built here, not by the caller.
+    pub eos: u32,
+    /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
+    pub im_end: Option<u32>,
+    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
+    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
+    /// tool-call grammar.
+    pub tools: Option<&'a [serde_json::Value]>,
+    /// User stop sequences matched against the decoded suffix.
+    pub stop: Vec<String>,
+    /// `max_think_tokens` budget (0 ⇒ no think force-close).
+    pub max_think: usize,
+    /// The turn's `max_tokens` cap. Used by arches whose emitter sizes a
+    /// think-token reserve against it (cohere2moe's think-budget force-close);
+    /// ignored by emitters without a generation-side think guard.
+    pub max_tokens: usize,
+    /// Whether the prompt opened a `<think>` span via the assistant prefix.
+    pub assistant_prefix: crate::prompt_frame::AssistantPrefix,
+    /// Requested reasoning-effort level (arch interprets the frame mapping).
+    pub think_mode: crate::prompt_frame::ThinkMode,
+    /// Pre-decoded vocab for arches whose grammar masks per-token (DeepSeek V4).
+    /// The daemon builds/caches this Arc before the call so the neutral ctx
+    /// never has to mutate `LoadedModel`.
+    pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+}
+
+/// Per-token emission policy for a spec-decode turn. The decode loop calls
+/// [`begin`](Self::begin) once for the prefill's first token, then
+/// [`observe`](Self::observe) for each subsequently-committed token, rendering
+/// the returned [`EmitOutcome::events`] and stopping when a step returns a
+/// [`StopReason`]. At end of turn it calls [`finish`](Self::finish) for the
+/// terminal flush.
+///
+/// The emitter OWNS the per-turn emission state (byte filter, grammar matcher,
+/// think counter, decoded-token history) so the decode loop stays arch-agnostic.
+/// It does NOT own loop/cache state (position, seed, KV/recurrent resets,
+/// conversation-token bake) — those stay in the loop.
+pub trait SpecEmit {
+    /// Emit the prefill's first token. Returns the events to render and any
+    /// immediate stop (the first token can itself be a terminator).
+    fn begin(&mut self, first_token: u32) -> EmitOutcome;
+
+    /// Emit one subsequently-committed token. Returns the events to render and
+    /// any stop signal (EOS / grammar / stop-sequence / think-cap).
+    fn observe(&mut self, token: u32) -> EmitOutcome;
+
+    /// Terminal flush at end of turn (parse tool calls, resolve finish reason).
+    fn finish(self: Box<Self>) -> FinishSummary;
+
+    /// In-step grammar mask interface, when the emitter applies grammar to the
+    /// verifier's logits. The qwen35 emitter applies grammar POST-hoc inside
+    /// `observe` and returns `None` here; a future in-step grammar consumer
+    /// returns its erased matcher.
+    fn grammar(&mut self) -> Option<&mut dyn SpecGrammar> {
+        None
+    }
+
+    /// The full committed-token stream (incl. the first token), for the decode
+    /// loop's post-turn bookkeeping (the qwen35 asst-turn cache store). Default
+    /// empty for emitters whose wrapper does no token-replay cache.
+    fn streamed_tokens(&self) -> &[u32] {
+        &[]
+    }
+
+    /// Whether a committed token tripped the grammar matcher — the decode loop
+    /// forces a full KV/recurrent reset for the next turn when true. Default
+    /// `false` for emitters without post-hoc grammar enforcement.
+    fn grammar_violated(&self) -> bool {
+        false
+    }
+
+    /// Hint the emitter of the decode loop's current `generated` count so an
+    /// attractor-detect log message can report the same number it did inline.
+    /// Default no-op.
+    fn set_generated_hint(&mut self, _generated: usize) {}
+
+    /// Generation-intervention hook: tokens the emitter wants the loop to FORCE
+    /// into the stream after the just-observed token, suppressing this step's
+    /// terminator. The decode loop, when this returns non-empty, advances the
+    /// target over each token, re-feeds it through [`observe`](Self::observe),
+    /// and continues WITHOUT honoring the current step's `stop` — used by arches
+    /// whose bespoke AR loop does generation-side recovery a pure emitter cannot
+    /// express (e.g. cohere2moe's empty-turn guard force-injects `<|START_TEXT|>`
+    /// when the model ends thinking with no visible output, and its think-budget
+    /// force-close injects `<|END_THINKING|><|START_TEXT|>`). The emitter must
+    /// drain the queue (return-and-clear) and bound its own re-entry (e.g. a max
+    /// suppression count) so forcing terminates. Default empty ⇒ the loop never
+    /// enters the force path, so every other emitter is byte-identical no-op.
+    fn take_forced(&mut self) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+// ─── Model-free drafting sources (arch-agnostic, pure CPU) ──────────────────
+//
+// Moved here from `hipfire-arch-qwen35::speculative` so the arch-generic
+// `NgramSpeculator` can use them without an arch-crate dependency. qwen35's
+// `spec_step_dflash` still uses them via a `pub use` re-export in that crate.
+
+/// Rolling bigram n-gram cache. Keyed by the last two committed tokens
+/// `(a, b)`; value is a small map from possible next-token to count.
+///
+/// Populated incrementally from the committed output stream. Used as a
+/// "free" second opinion on top of the DFlash draft: if the cache has
+/// seen a (a, b) → c transition with high enough count, and the DFlash
+/// draft proposed something else at that position, the n-gram's `c`
+/// often turns out to match the target's argmax.
+///
+/// Scales: the cache size is bounded by the number of distinct bigrams
+/// in the committed output — typically a few hundred per session, so
+/// no eviction policy needed.
+pub struct NgramCache {
+    /// `(a, b) → { next: count, ... }` with the next-token histogram.
+    pub bigram: std::collections::HashMap<(u32, u32), std::collections::HashMap<u32, u32>>,
+    /// Minimum count before we trust the prediction. Smaller = more
+    /// aggressive (more overrides), larger = more conservative. 3 is a
+    /// reasonable default on hot-loop code / repetitive text.
+    pub min_count: u32,
+}
+
+impl NgramCache {
+    pub fn new(min_count: u32) -> Self {
+        Self {
+            bigram: std::collections::HashMap::new(),
+            min_count,
+        }
+    }
+
+    /// Record the triple `(a, b) → c` in the cache.
+    #[inline]
+    pub fn observe(&mut self, a: u32, b: u32, c: u32) {
+        *self.bigram.entry((a, b)).or_default().entry(c).or_insert(0) += 1;
+    }
+
+    /// Predict `c` from last-two `(a, b)` if the max-count next-token
+    /// reaches `min_count`. Returns (token, count).
+    #[inline]
+    pub fn predict(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        let map = self.bigram.get(&(a, b))?;
+        let (&tok, &cnt) = map.iter().max_by_key(|(_, &c)| c)?;
+        if cnt >= self.min_count {
+            Some((tok, cnt))
+        } else {
+            None
+        }
+    }
+
+    /// Record every consecutive triple in a slice of committed tokens.
+    /// Caller supplies the full token stream; this walks it in-place.
+    pub fn observe_many(&mut self, tokens: &[u32]) {
+        if tokens.len() >= 3 {
+            for w in tokens.windows(3) {
+                self.observe(w[0], w[1], w[2]);
+            }
+        }
+    }
+}
+
+/// Prompt Lookup Decoding (Saxena 2023): training-free deterministic draft
+/// built from context suffix self-match. If the last N tokens of context
+/// appeared earlier in context, the tokens that followed that earlier
+/// occurrence are a high-quality continuation guess.
+///
+/// Used as the draft source in Goose bypass mode (Jin et al. 2026,
+/// arXiv:2604.02047 §4.3): PLD-matched tokens have 2–18× higher acceptance
+/// than bigram (TR) tokens (median 6× across 5 models × 5 benchmarks).
+/// When PLD confidence is high, the spine — a deep linear chain of
+/// PLD-matched tokens — is verified in one target forward pass without
+/// tree construction. That's exactly what we need on Qwen3.5 hybrid
+/// (24 DeltaNet + 8 FullAttention): linear verify sidesteps the
+/// state-forking problem that tree verify imposes on recurrent LA layers.
+pub struct PldMatcher {
+    /// n-gram suffix lengths to try, longest first. Paper uses {5,4,3}.
+    /// Longer matches are more selective; if the longest fails we fall
+    /// back to shorter. Order matters: we return the first (longest) hit.
+    pub ngram_lens: Vec<usize>,
+    /// Hard cap on spine length. Paper uses 8 — sufficient for typical
+    /// block sizes and avoids running off the end of a match into drift.
+    pub max_extract: usize,
+    /// Minimum extracted length to count as a usable spine. Very short
+    /// spines aren't worth the PLD path (bigram covers 1-token lookahead
+    /// at lower risk); require at least this many continuation tokens.
+    pub min_extract: usize,
+}
+
+impl Default for PldMatcher {
+    fn default() -> Self {
+        Self {
+            ngram_lens: vec![5, 4, 3],
+            max_extract: 8,
+            min_extract: 3,
+        }
+    }
+}
+
+/// Result of a successful PLD lookup.
+#[derive(Debug, Clone)]
+pub struct PldMatch {
+    /// The extracted spine (continuation tokens after the matched suffix).
+    pub tokens: Vec<u32>,
+    /// The suffix length that produced this match (the longest that hit).
+    pub n: usize,
+    /// Number of tried n-gram lengths that agreed on `tokens[0]`. Paper
+    /// §4.3 uses this as part of the bypass-mode confidence signal;
+    /// higher consensus = more reliable spine. Ranges 1..=ngram_lens.len().
+    pub consensus: usize,
+}
+
+impl PldMatcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Find a spine continuation for `context`. Returns `None` if no tried
+    /// n-gram length produces a match of length ≥ `self.min_extract`.
+    ///
+    /// For each n in `self.ngram_lens`: take the last-n tokens as the
+    /// suffix, search for its last occurrence earlier in context, and
+    /// extract the `max_extract` tokens that followed it (stopping before
+    /// the suffix itself so we don't include tokens that would be about
+    /// to be re-predicted). Returns the longest-n match with a usable
+    /// spine; consensus counts how many alternate n's produced the same
+    /// first continuation token.
+    pub fn lookup(&self, context: &[u32]) -> Option<PldMatch> {
+        if self.ngram_lens.is_empty() {
+            return None;
+        }
+        // Per-n continuation, collected to compute consensus across lengths.
+        let mut firsts: Vec<u32> = Vec::with_capacity(self.ngram_lens.len());
+        let mut best: Option<(usize, Vec<u32>)> = None; // (n, spine)
+        for &n in &self.ngram_lens {
+            if context.len() <= n {
+                continue;
+            }
+            let suffix_start = context.len() - n;
+            let suffix = &context[suffix_start..];
+            let haystack = &context[..suffix_start];
+            if haystack.len() < n {
+                continue;
+            }
+            // Last occurrence (freshest) of `suffix` in `haystack`.
+            let mut found: Option<usize> = None;
+            for i in (0..=haystack.len() - n).rev() {
+                if &haystack[i..i + n] == suffix {
+                    found = Some(i);
+                    break;
+                }
+            }
+            let start = match found {
+                Some(s) => s,
+                None => continue,
+            };
+            let cont_start = start + n;
+            let cont_end = (cont_start + self.max_extract).min(suffix_start);
+            if cont_end <= cont_start {
+                continue;
+            }
+            let spine: Vec<u32> = context[cont_start..cont_end].to_vec();
+            if spine.len() < self.min_extract {
+                continue;
+            }
+            firsts.push(spine[0]);
+            if best.is_none() {
+                best = Some((n, spine));
+            }
+        }
+
+        let (n, tokens) = best?;
+        let consensus = firsts.iter().filter(|&&t| t == tokens[0]).count();
+        Some(PldMatch {
+            tokens,
+            n,
+            consensus,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Locks the load-bearing loop contract: the daemon advances `position` by
+    // `emit.len()`, NOT by `accepted`. For a chain window that accepted 2 of 4
+    // drafts, emit is `[d0, d1, bonus]` (len 3 = accepted + 1) and the next
+    // seed is the bonus = `emit.last()`. The adversarial review certified this
+    // equivalence against `speculative.rs:3737-3744`; this test pins it so a
+    // future lowering change can't silently break the position math.
+    #[test]
+    fn emit_len_drives_advance_not_accepted() {
+        let step = SpecStep {
+            emit: SmallVec::from_slice(&[10, 11, 12]),
+            next_seed: 12,
+            proposed: 4,
+            accepted: 2,
+        };
+        assert_eq!(step.emit.len(), step.accepted + 1);
+        assert_eq!(*step.emit.last().unwrap(), step.next_seed);
+    }
+
+    // ── accept_greedy_prefix ────────────────────────────────────────────────
+
+    #[test]
+    fn accept_greedy_none_partial() {
+        // drafts [11,12,13]; target picks [11,12,99,..] → accept 11,12; diverge
+        // at slot 2 (99 != 13); bonus = target_pick[2] = 99.
+        let r = accept_greedy_prefix(&[11, 12, 13], &[11, 12, 99, 0], None);
+        assert_eq!(r.accepted, 2);
+        assert_eq!(r.committed, vec![11, 12, 99]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_none_full() {
+        // all drafts match; bonus = target_pick[3].
+        let r = accept_greedy_prefix(&[11, 12, 13], &[11, 12, 13, 77], None);
+        assert_eq!(r.accepted, 3);
+        assert_eq!(r.committed, vec![11, 12, 13, 77]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_none_zero() {
+        // first draft rejected; accept nothing, bonus = target_pick[0].
+        let r = accept_greedy_prefix(&[11, 12], &[42, 0, 0], None);
+        assert_eq!(r.accepted, 0);
+        assert_eq!(r.committed, vec![42]);
+        assert!(!r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_eos_stop_midprefix() {
+        // eos=2; drafts [11,2,13]; accept 11, then 2==eos → stop, NO bonus.
+        let r = accept_greedy_prefix(&[11, 2, 13], &[11, 2, 13, 0], Some(2));
+        assert_eq!(r.accepted, 2);
+        assert_eq!(r.committed, vec![11, 2]);
+        assert!(r.hit_eos);
+    }
+
+    #[test]
+    fn accept_greedy_eos_as_bonus() {
+        // eos=2; drafts [11] accepted; bonus = target_pick[1] = 2 == eos.
+        let r = accept_greedy_prefix(&[11], &[11, 2], Some(2));
+        assert_eq!(r.accepted, 1);
+        assert_eq!(r.committed, vec![11, 2]);
+        assert!(r.hit_eos);
+    }
+
+    // ── lower_mtp_window (MtpWindow → SpecStep) ─────────────────────────────
+
+    #[test]
+    fn lower_mtp_window_maps_committed_and_last_seed() {
+        // 4 drafts offered, 2 accepted + bonus ⇒ committed = [a, b, bonus].
+        let step = lower_mtp_window(MtpWindow {
+            committed: vec![10, 11, 12],
+            accepted: 2,
+            drafts_generated: 4,
+        })
+        .unwrap();
+        assert_eq!(step.emit.as_slice(), &[10, 11, 12]);
+        assert_eq!(step.next_seed, 12); // committed.last() == bonus
+        assert_eq!(step.proposed, 4);
+        assert_eq!(step.accepted, 2);
+        // The load-bearing loop contract still holds for the MTP lowering.
+        assert_eq!(step.emit.len(), step.accepted + 1);
+    }
+
+    #[test]
+    fn lower_mtp_window_single_bonus_only() {
+        // 0 accepted ⇒ committed = [bonus] (still non-empty).
+        let step = lower_mtp_window(MtpWindow {
+            committed: vec![99],
+            accepted: 0,
+            drafts_generated: 4,
+        })
+        .unwrap();
+        assert_eq!(step.emit.as_slice(), &[99]);
+        assert_eq!(step.next_seed, 99);
+        assert_eq!(step.accepted, 0);
+    }
+
+    #[test]
+    fn lower_mtp_window_empty_is_error() {
+        // An empty window would stall the daemon loop — must be an error.
+        assert!(lower_mtp_window(MtpWindow {
+            committed: vec![],
+            accepted: 0,
+            drafts_generated: 4,
+        })
+        .is_err());
+    }
+
+    // ── SpecEmit seam types ─────────────────────────────────────────────────
+
+    #[test]
+    fn emit_outcome_held_is_empty_no_stop() {
+        let o = EmitOutcome::held();
+        assert!(o.events.is_empty());
+        assert!(o.stop.is_none());
+    }
+
+    #[test]
+    fn emit_outcome_carries_events_and_stop() {
+        let o = EmitOutcome {
+            events: vec![
+                ClientEvent::Committed { id: 42, idx: 7 },
+                ClientEvent::Token("hi".to_string()),
+            ],
+            stop: Some(StopReason::Eos),
+        };
+        assert_eq!(o.events.len(), 2);
+        assert_eq!(o.stop, Some(StopReason::Eos));
+        // Ordering is load-bearing: committed before token, matching the
+        // daemon's emit_committed_event-then-token-write order.
+        assert!(matches!(
+            o.events[0],
+            ClientEvent::Committed { id: 42, idx: 7 }
+        ));
+        assert!(matches!(&o.events[1], ClientEvent::Token(t) if t == "hi"));
+    }
+}

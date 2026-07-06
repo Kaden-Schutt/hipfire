@@ -81,6 +81,13 @@ __global__ void attention_flash_asym4_wmma_tile_batched(
     const int my_bid_local = m_start + lane_row;
     const int my_bid_global = batch_offset + my_bid_local;
     const bool tree_mode = (tree_bias != nullptr);
+    // hipGraph-safe block_start: under captured tree-verify replay the
+    // `block_start` scalar kernarg is baked at capture time and goes stale as
+    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
+    // cycle and the linearized tree root sits at positions[0] == start_pos ==
+    // block_start, so derive it from the device buffer instead of the scalar.
+    // Eager (non-capture) value is identical, so this is a no-op off-graph.
+    const int eff_block_start = tree_mode ? positions[0] : block_start;
 
     // ── Per-row OOB guard for this lane's row ───────────────────────────
     // For threads with my_bid_local >= chunk_batch_size, lane_row position
@@ -97,7 +104,7 @@ __global__ void attention_flash_asym4_wmma_tile_batched(
     // get masked when their seq_len_for_this_lane is checked. This matches
     // the scalar kernel's "trust the caller" pattern.
     const int my_seq_len = tree_mode
-        ? (block_start + block_cols)
+        ? (eff_block_start + block_cols)
         : (positions[my_bid_global] + 1);
     const int tile_start = tile_id * TILE_SIZE;
     const int tile_end_uncapped = tile_start + TILE_SIZE;
@@ -133,7 +140,7 @@ __global__ void attention_flash_asym4_wmma_tile_batched(
         // for OOB rows — that's fine as long as we mask before writing.
         int p = positions[bid];
         lds_q_pos[tid]   = p;
-        lds_seq_len[tid] = tree_mode ? (block_start + block_cols) : (p + 1);
+        lds_seq_len[tid] = tree_mode ? (eff_block_start + block_cols) : (p + 1);
     }
     __syncthreads();
 
@@ -258,8 +265,8 @@ __global__ void attention_flash_asym4_wmma_tile_batched(
             float masked = (ok_kv && ok_mask) ? val : -1e30f;
 
             // Tree-bias addition (in-block only).
-            if (tree_mode && ok_kv && my_col_pos >= block_start) {
-                int bias_col = my_col_pos - block_start;
+            if (tree_mode && ok_kv && my_col_pos >= eff_block_start) {
+                int bias_col = my_col_pos - eff_block_start;
                 int gbid = batch_offset + m_start + cell_row;
                 masked += tree_bias[gbid * block_cols + bias_col];
             }

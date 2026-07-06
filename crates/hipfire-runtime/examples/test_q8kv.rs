@@ -23,7 +23,8 @@ fn main() {
     // Write at pos=0
     let pos_buf = gpu.hip.malloc(4).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &0i32.to_ne_bytes()).unwrap();
-    gpu.kv_cache_write_q8_0(&d_cache, &d_src, &pos_buf, n_kv_heads, head_dim).unwrap();
+    gpu.kv_cache_write_q8_0(&d_cache, &d_src, &pos_buf, n_kv_heads, head_dim)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     // Read back raw bytes
@@ -36,7 +37,11 @@ fn main() {
 
     eprintln!("Input:  {:?}", &kv_data[..8]);
     eprintln!("scale_f16=0x{:04x} scale_f32={:.6}", scale_bits, scale);
-    eprintln!("Expected amax={:.3}, expected scale≈{:.6}", 3.2, 3.2 / 127.0);
+    eprintln!(
+        "Expected amax={:.3}, expected scale≈{:.6}",
+        3.2,
+        3.2 / 127.0
+    );
 
     let mut max_err = 0.0f32;
     for i in 0..head_dim {
@@ -45,8 +50,10 @@ fn main() {
         let err = (kv_data[i] - dequant).abs();
         max_err = max_err.max(err);
         if i < 8 || i >= head_dim - 2 {
-            eprintln!("  [{i:>2}] input={:.3} q={:>4} dequant={:.4} err={:.4}",
-                kv_data[i], q, dequant, err);
+            eprintln!(
+                "  [{i:>2}] input={:.3} q={:>4} dequant={:.4} err={:.4}",
+                kv_data[i], q, dequant, err
+            );
         }
     }
     eprintln!("Max roundtrip error: {:.6}", max_err);
@@ -67,19 +74,27 @@ fn main() {
     let total_blocks2 = n_kv_heads2 * (head_dim2 / 32); // 2
     let cache_bytes2 = max_seq2 * total_blocks2 * 34;
     let cache_elems2 = (cache_bytes2 + 3) / 4;
-    let d_cache2 = gpu.zeros(&[cache_elems2], rdna_compute::DType::F32).unwrap();
+    let d_cache2 = gpu
+        .zeros(&[cache_elems2], rdna_compute::DType::F32)
+        .unwrap();
 
     // Write pos=0: head0=[1.0]*32, head1=[2.0]*32
-    let kv0: Vec<f32> = (0..kv_dim2).map(|i| if i < head_dim2 { 1.0 } else { 2.0 }).collect();
+    let kv0: Vec<f32> = (0..kv_dim2)
+        .map(|i| if i < head_dim2 { 1.0 } else { 2.0 })
+        .collect();
     let d_src0 = gpu.upload_f32(&kv0, &[kv_dim2]).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &0i32.to_ne_bytes()).unwrap();
-    gpu.kv_cache_write_q8_0(&d_cache2, &d_src0, &pos_buf, n_kv_heads2, head_dim2).unwrap();
+    gpu.kv_cache_write_q8_0(&d_cache2, &d_src0, &pos_buf, n_kv_heads2, head_dim2)
+        .unwrap();
 
     // Write pos=1: head0=[3.0]*32, head1=[4.0]*32
-    let kv1: Vec<f32> = (0..kv_dim2).map(|i| if i < head_dim2 { 3.0 } else { 4.0 }).collect();
+    let kv1: Vec<f32> = (0..kv_dim2)
+        .map(|i| if i < head_dim2 { 3.0 } else { 4.0 })
+        .collect();
     let d_src1 = gpu.upload_f32(&kv1, &[kv_dim2]).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &1i32.to_ne_bytes()).unwrap();
-    gpu.kv_cache_write_q8_0(&d_cache2, &d_src1, &pos_buf, n_kv_heads2, head_dim2).unwrap();
+    gpu.kv_cache_write_q8_0(&d_cache2, &d_src1, &pos_buf, n_kv_heads2, head_dim2)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     // Read back ALL cache data
@@ -97,7 +112,11 @@ fn main() {
             let s_bits = u16::from_le_bytes([raw2[off], raw2[off + 1]]);
             let s = f16_to_f32(s_bits);
             let q0 = raw2[off + 2] as i8;
-            let expected_val = if h == 0 { (pos * 2 + 1) as f32 } else { (pos * 2 + 2) as f32 };
+            let expected_val = if h == 0 {
+                (pos * 2 + 1) as f32
+            } else {
+                (pos * 2 + 2) as f32
+            };
             let dequant0 = s * q0 as f32;
             eprintln!("  pos={pos} head={h}: scale={s:.4} q[0]={q0} dequant={dequant0:.4} expected={expected_val:.1}");
         }
@@ -126,8 +145,10 @@ fn main() {
     let ones32 = vec![1.0f32; hd_a];
     let d_ones = gpu.upload_f32(&ones32, &[hd_a]).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &0i32.to_ne_bytes()).unwrap();
-    gpu.kv_cache_write_q8_0(&d_kcache, &d_ones, &pos_buf, n_kv_a, hd_a).unwrap();
-    gpu.kv_cache_write_q8_0(&d_vcache, &d_ones, &pos_buf, n_kv_a, hd_a).unwrap();
+    gpu.kv_cache_write_q8_0(&d_kcache, &d_ones, &pos_buf, n_kv_a, hd_a)
+        .unwrap();
+    gpu.kv_cache_write_q8_0(&d_vcache, &d_ones, &pos_buf, n_kv_a, hd_a)
+        .unwrap();
 
     // Write K pos1 = [0.5]*32, V pos1 = [2.0]*32
     let half32 = vec![0.5f32; hd_a];
@@ -135,8 +156,10 @@ fn main() {
     let d_half = gpu.upload_f32(&half32, &[hd_a]).unwrap();
     let d_twos = gpu.upload_f32(&twos32, &[hd_a]).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &1i32.to_ne_bytes()).unwrap();
-    gpu.kv_cache_write_q8_0(&d_kcache, &d_half, &pos_buf, n_kv_a, hd_a).unwrap();
-    gpu.kv_cache_write_q8_0(&d_vcache, &d_twos, &pos_buf, n_kv_a, hd_a).unwrap();
+    gpu.kv_cache_write_q8_0(&d_kcache, &d_half, &pos_buf, n_kv_a, hd_a)
+        .unwrap();
+    gpu.kv_cache_write_q8_0(&d_vcache, &d_twos, &pos_buf, n_kv_a, hd_a)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     // Q = [1.0]*32
@@ -145,7 +168,10 @@ fn main() {
 
     // Run attention at pos=1 (seq_len=2: see both positions)
     gpu.hip.memcpy_htod(&pos_buf, &1i32.to_ne_bytes()).unwrap();
-    gpu.attention_q8_0_kv(&d_q, &d_kcache, &d_vcache, &d_out, &pos_buf, 2, n_heads_a, n_kv_a, hd_a, 4).unwrap();
+    gpu.attention_q8_0_kv(
+        &d_q, &d_kcache, &d_vcache, &d_out, &pos_buf, 2, n_heads_a, n_kv_a, hd_a, 4,
+    )
+    .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     let out_vals = gpu.download_f32(&d_out).unwrap();
@@ -159,7 +185,10 @@ fn main() {
     if (out_vals[0] - expected).abs() < 0.2 {
         eprintln!("PASS: Q8_0 attention output correct");
     } else {
-        eprintln!("FAIL: Q8_0 attention output wrong (got {:.4}, expected ~{:.3})", out_vals[0], expected);
+        eprintln!(
+            "FAIL: Q8_0 attention output wrong (got {:.4}, expected ~{:.3})",
+            out_vals[0], expected
+        );
     }
 
     // Test 4: 8B dimensions (n_heads=32, n_kv_heads=8, head_dim=128)
@@ -180,16 +209,20 @@ fn main() {
     let d_k0 = gpu.upload_f32(&k0, &[kv_dim_8b]).unwrap();
     let d_v0 = gpu.upload_f32(&v0, &[kv_dim_8b]).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &0i32.to_ne_bytes()).unwrap();
-    gpu.kv_cache_write_q8_0(&d_kc8, &d_k0, &pos_buf, n_kv, hd).unwrap();
-    gpu.kv_cache_write_q8_0(&d_vc8, &d_v0, &pos_buf, n_kv, hd).unwrap();
+    gpu.kv_cache_write_q8_0(&d_kc8, &d_k0, &pos_buf, n_kv, hd)
+        .unwrap();
+    gpu.kv_cache_write_q8_0(&d_vc8, &d_v0, &pos_buf, n_kv, hd)
+        .unwrap();
 
     let k1: Vec<f32> = (0..kv_dim_8b).map(|i| -0.01 * ((i % 128) as f32)).collect();
     let v1: Vec<f32> = vec![2.0f32; kv_dim_8b];
     let d_k1 = gpu.upload_f32(&k1, &[kv_dim_8b]).unwrap();
     let d_v1 = gpu.upload_f32(&v1, &[kv_dim_8b]).unwrap();
     gpu.hip.memcpy_htod(&pos_buf, &1i32.to_ne_bytes()).unwrap();
-    gpu.kv_cache_write_q8_0(&d_kc8, &d_k1, &pos_buf, n_kv, hd).unwrap();
-    gpu.kv_cache_write_q8_0(&d_vc8, &d_v1, &pos_buf, n_kv, hd).unwrap();
+    gpu.kv_cache_write_q8_0(&d_kc8, &d_k1, &pos_buf, n_kv, hd)
+        .unwrap();
+    gpu.kv_cache_write_q8_0(&d_vc8, &d_v1, &pos_buf, n_kv, hd)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     // Q: 32 heads, each [0.01]*128 (aligned with K pos0)
@@ -198,7 +231,10 @@ fn main() {
     let d_out8 = gpu.zeros(&[n_h * hd], rdna_compute::DType::F32).unwrap();
 
     gpu.hip.memcpy_htod(&pos_buf, &1i32.to_ne_bytes()).unwrap();
-    gpu.attention_q8_0_kv(&d_q8, &d_kc8, &d_vc8, &d_out8, &pos_buf, 2, n_h, n_kv, hd, 4).unwrap();
+    gpu.attention_q8_0_kv(
+        &d_q8, &d_kc8, &d_vc8, &d_out8, &pos_buf, 2, n_h, n_kv, hd, 4,
+    )
+    .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     let out8 = gpu.download_f32(&d_out8).unwrap();
@@ -218,13 +254,27 @@ fn f16_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as i32;
     let frac = (bits & 0x3FF) as u32;
     if exp == 0 {
-        if frac == 0 { return if sign == 1 { -0.0 } else { 0.0 }; }
+        if frac == 0 {
+            return if sign == 1 { -0.0 } else { 0.0 };
+        }
         let v = (frac as f32) / 1024.0 * 2.0f32.powi(-14);
         return if sign == 1 { -v } else { v };
     }
     if exp == 31 {
-        return if frac == 0 { if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY } } else { f32::NAN };
+        return if frac == 0 {
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
+        } else {
+            f32::NAN
+        };
     }
     let v = 2.0f32.powi(exp - 15) * (1.0 + frac as f32 / 1024.0);
-    if sign == 1 { -v } else { v }
+    if sign == 1 {
+        -v
+    } else {
+        v
+    }
 }

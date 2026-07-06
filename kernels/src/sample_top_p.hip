@@ -6,16 +6,23 @@
 
 // GPU-side sampling. Matches CPU llama::sample_top_p + apply_repeat_penalty:
 //   - Frequency-weighted + recency-decayed repeat penalty (count + cap at 1.5×)
-//   - Top-K (=20) selection directly from raw logits (no threshold race)
-//   - Softmax over top-K only (matches CPU normalization)
-//   - Top-p sampling within the top-K distribution
+//   - Top-K (gather budget =64) selection directly from raw logits (no race)
+//   - Softmax over the CAPPED candidate set only (matches CPU normalization)
+//   - Top-p sampling within the capped distribution
 //
 // Output: result[0] = token_id, result[1] = new rng state.
 //
-// Launch: 1 block × 256 threads. Shared mem required:
-//   topk_val[256 × 20] = 20480 bytes (per-thread top-K buffer)
-//   topk_idx[256 × 20] = 20480 bytes
-//   + reduction scratch = ~41 KB total. Within 64 KB LDS limit.
+// W7 P2b: the gather budget TOP_K was widened 20 → 64 so request top_k>20
+// (e.g. minimax top_k=40) is honored. BYTE-PRESERVATION: the softmax sum
+// feeding p_thresh is computed over the CAPPED set [0,cap) (cap defaults to
+// top_k_req=20), so the default path sums the same top-20 probabilities and
+// stays byte-identical to the pre-widen kernel.
+//
+// Launch: 1 block × 128 threads. Shared mem required:
+//   topk_val[128 × 64] = 32768 bytes (per-thread top-K buffer)
+//   topk_idx[128 × 64] = 32768 bytes
+//   = 65536 bytes = 64 KiB, the RDNA wave32 group-segment limit. The host
+//   MUST launch with blockDim.x = 128 (256 would request 128 KiB and fail).
 //
 // Why this replaces the prior "threshold + atomicAdd into cand_buf[512]"
 // approach: at temperature >= 1 many vocab entries exceed the threshold, so
@@ -33,9 +40,11 @@ extern "C" __global__ void sample_top_p(
     int repeat_window,
     float repeat_penalty,
     float presence_penalty,                         // OpenAI: flat logit subtraction for any token seen in window
-    float frequency_penalty                         // OpenAI: logit subtraction scaled by occurrence count
+    float frequency_penalty,                        // OpenAI: logit subtraction scaled by occurrence count
+    int   top_k_req,                                // request top-K cutoff; <=0 or >=TOP_K means "no extra cut" (default 20 → byte-identical to legacy)
+    float min_p                                     // request min-p cutoff; 0.0 disables (byte-identical to legacy)
 ) {
-    const int TOP_K = 20;
+    const int TOP_K = 64;
     extern __shared__ char smem[];
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
@@ -95,7 +104,7 @@ extern "C" __global__ void sample_top_p(
     // Use a fixed-size local buffer with manual min-tracking (same algorithm
     // as CPU `sample_top_p` but sharded across threads). After this pass,
     // every thread owns TOP_K candidates covering its strip.
-    float my_vals[20]; int my_idx[20];
+    float my_vals[64]; int my_idx[64];
     #pragma unroll
     for (int k = 0; k < TOP_K; k++) { my_vals[k] = -1e30f; my_idx[k] = 0; }
     int min_pos = 0;
@@ -149,7 +158,7 @@ extern "C" __global__ void sample_top_p(
 
     // Phase 3: thread 0 owns the final top-K — softmax, sort descending, top-p sample.
     if (tid == 0) {
-        float vals[20]; int idx[20];
+        float vals[64]; int idx[64];
         #pragma unroll
         for (int k = 0; k < TOP_K; k++) {
             vals[k] = topk_val[k];
@@ -171,21 +180,19 @@ extern "C" __global__ void sample_top_p(
             return;
         }
 
-        // Softmax over top-K only (matches CPU `sample_top_p`).
+        // Softmax over the candidate set (matches CPU `sample_top_p`). The sum
+        // is taken AFTER the cap is known (see below) so the default path sums
+        // only the legacy top-20.
         float inv_temp = 1.0f / temperature;
-        float sum = 0.0f;
-        float probs[20];
+        float probs[64];
         #pragma unroll
         for (int k = 0; k < TOP_K; k++) {
             if (vals[k] <= -1e29f) { probs[k] = 0.0f; continue; }
-            float p = expf((vals[k] - max_val) * inv_temp);
-            probs[k] = p;
-            sum += p;
+            probs[k] = expf((vals[k] - max_val) * inv_temp);
         }
-        if (sum <= 0.0f) { result[0] = (unsigned int)idx[0]; result[1] = rand_seed; return; }
 
-        // Sort indices by probability descending (insertion sort on 20 elems).
-        int order[20];
+        // Sort indices by probability descending (insertion sort).
+        int order[64];
         #pragma unroll
         for (int k = 0; k < TOP_K; k++) order[k] = k;
         for (int i = 1; i < TOP_K; i++) {
@@ -203,11 +210,39 @@ extern "C" __global__ void sample_top_p(
         unsigned int rng = rand_seed;
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
 
+        // Request-driven candidate cap (applied to the sorted order BEFORE
+        // top-p). Two cuts:
+        //   - top_k_req: keep at most this many candidates. The host passes 20
+        //     by default (the legacy nucleus); a request may widen up to TOP_K.
+        //   - min_p: drop candidates whose prob < min_p * max_prob. The sort
+        //     above is descending, so order[0] holds the max prob; we scan
+        //     until a candidate falls below the floor. 0.0 disables.
+        int cap = TOP_K;
+        if (top_k_req > 0 && top_k_req < TOP_K) cap = top_k_req;
+        if (min_p > 0.0f) {
+            float floor_p = min_p * probs[order[0]];
+            int mp_cap = cap;
+            for (int i = 1; i < cap; i++) {
+                if (probs[order[i]] < floor_p) { mp_cap = i; break; }
+            }
+            cap = mp_cap;
+        }
+        if (cap < 1) cap = 1;
+
+        // BYTE-PRESERVATION: softmax sum over the CAPPED set [0,cap) of the
+        // descending-sorted candidates, NOT the full TOP_K=64 gather. With the
+        // legacy default cap=20 this sums exactly the same top-20 probabilities
+        // as the pre-widen 20-wide kernel, so p_thresh and the truncation are
+        // byte-identical. A wider request (top_k=40) sums a wider nucleus.
+        float sum = 0.0f;
+        for (int i = 0; i < cap; i++) sum += probs[order[i]];
+        if (sum <= 0.0f) { result[0] = (unsigned int)idx[order[0]]; result[1] = rand_seed; return; }
+
         // Top-p filtering: find cutoff where cumulative mass reaches top_p * sum.
         float p_thresh = top_p * sum;
         float trunc_sum = 0.0f;
-        int trunc_k = TOP_K;
-        for (int i = 0; i < TOP_K; i++) {
+        int trunc_k = cap;
+        for (int i = 0; i < cap; i++) {
             trunc_sum += probs[order[i]];
             if (trunc_sum >= p_thresh) { trunc_k = i + 1; break; }
         }

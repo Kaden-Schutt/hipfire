@@ -40,6 +40,26 @@ set -e
 # List files staged for this commit.
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# ── rustfmt-changed gate (every commit, GPU-free, ~instant) ─────────────
+# Mirror CI's changed-file rustfmt check (scripts/ci-rustfmt-changed.sh) on
+# the staged Rust files. The repo carries historical format debt so we only
+# check files in THIS commit, not the workspace. Fix with:
+#   scripts/fmt-changed.sh
+# Bypass (e.g. mid-rebase) with: SKIP_FMT_CHECK=1 git commit ...
+if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
+    mapfile -t fmt_files < <(echo "$CHANGED" | grep -E '\.rs$' || true)
+    if [[ "${#fmt_files[@]}" -gt 0 ]]; then
+        if ! rustfmt --edition 2021 --check --config skip_children=true "${fmt_files[@]}"; then
+            echo "" >&2
+            echo "✗ rustfmt: staged Rust file(s) are not formatted (CI's changed-file gate will flag this)." >&2
+            echo "  Fix:    scripts/fmt-changed.sh && git add -u" >&2
+            echo "  Bypass: SKIP_FMT_CHECK=1 git commit ..." >&2
+            echo "  Do NOT run 'cargo fmt' — it reformats the whole workspace's format debt." >&2
+            exit 1
+        fi
+    fi
+fi
+
 # Hotspots that can affect forward-pass output or speed.
 #
 # Updated for post-0.1.20 modular topology (PR 7+):
@@ -52,7 +72,12 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 # - `gemma4\.rs` covered for when the gemma branch forward-ports.
 # multi_gpu\.rs is listed here so that touching the PP dispatch path
 # triggers the coherence battery (same contract as single-GPU forward).
-HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|deepseek4\.rs|spec_decode\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs|mtp_head\.rs|mtp_spec\.rs|mtp_compose\.rs|mtp_probe\.rs'
+HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|deepseek4\.rs|spec_decode\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs|mtp_head\.rs|mtp_spec\.rs|mtp_compose\.rs|mtp_probe\.rs|examples/daemon\.rs|speculative\.rs'
+
+# Serve recurrent-state machine — files whose changes can leak DeltaNet/KV state
+# ACROSS requests (issue #462). These get an extra MULTI-REQUEST serve-output
+# gate (serve-loop-gate.sh) that the single-request coherence battery misses.
+SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs|cli/index\.ts'
 
 # Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
 # runs only when one of these is touched AND 2+ GPUs are visible; otherwise
@@ -134,6 +159,59 @@ echo "hard errors. Read the report above and confirm each model's output is"
 echo "coherent (fluent, on-topic, not stuck in a verbatim loop) before"
 echo "proceeding with the commit."
 echo
+
+# ── Multi-request serve OUTPUT gate (issue #462) ─────────────────────────
+# The coherence battery above drives the daemon SINGLE-request. Cross-request
+# recurrent-state contamination (DeltaNet/KV state bleeding between requests →
+# </think> / token-loop attractor) only shows on a real, multi-request serve —
+# every single-request gate passed while serve was broken. Path-gated to the
+# serve state machine (daemon.rs / speculative.rs / cli serve wrapper).
+if echo "$CHANGED" | grep -qE "$SERVE_HOTSPOT"; then
+    echo "=== Serve-loop gate (multi-request output) ==="
+    echo "Serve/daemon code changed. Firing repeated + distinct greedy requests at"
+    echo "one warm serve to catch cross-request state contamination (#462)..."
+    echo
+    if ! ./scripts/serve-loop-gate.sh; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: serve-loop gate detected a cross-request attractor."
+        echo "========================================================================"
+        echo
+        echo "A multi-request serve produced a </think> / token-loop attractor —"
+        echo "recurrent DeltaNet/KV state is leaking across requests (the #462 class,"
+        echo "which every single-request gate passes). See the per-request output above."
+        echo
+        echo "  ./scripts/serve-loop-gate.sh         # re-run (DFlash path)"
+        echo "  ./scripts/serve-loop-gate.sh --ar    # also test the AR path"
+        echo
+        exit 1
+    fi
+    echo
+
+    # qwen2 (arch_id=7) per-request reset regression (#462 bundle class).
+    # serve-loop-gate above is qwen3.5/DeltaNet-only; this exercises the plain
+    # qwen2 reset path that the Qwen2Carrier bundle migration broke — the reset
+    # handler rewound the dead `m.qwen2_state` field, not the live ModelState::
+    # Qwen2 bundle state, so next_pos bled across requests. Only a real reset
+    # no-op (exit 1) blocks; SKIP (3, no qwen2 model) / infra (2) warn-only.
+    if [ -r ./scripts/qwen2-reset-gate.sh ]; then
+        echo "=== qwen2 per-request reset gate ==="
+        bash ./scripts/qwen2-reset-gate.sh; q2rc=$?
+        if [ "$q2rc" -eq 1 ]; then
+            echo
+            echo "========================================================================"
+            echo "COMMIT BLOCKED: qwen2 per-request reset no-op — next_pos bled across requests."
+            echo "========================================================================"
+            echo
+            echo "The daemon reset handler must rewind the live ModelState::Qwen2 bundle"
+            echo "state via m.qwen2_mut(), not just the dots-ocr-only m.qwen2_state field."
+            echo "  ./scripts/qwen2-reset-gate.sh   # re-run"
+            echo
+            exit 1
+        fi
+        echo
+    fi
+fi
 
 echo
 

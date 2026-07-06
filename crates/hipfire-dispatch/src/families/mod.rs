@@ -40,6 +40,7 @@
 pub mod gemv;
 
 pub mod moe;
+pub mod moe_buckets;
 
 pub mod rotation;
 

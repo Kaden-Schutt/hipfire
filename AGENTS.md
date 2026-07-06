@@ -133,20 +133,19 @@ or vendoring this repository.
 
 ---
 
-# Testing playbook (v0.1.9-alpha)
+# Testing playbook
 
 **Audience:** agents (or humans) running smoke / perf / correctness
-tests on hipfire v0.1.9-alpha — particularly the production-ready MQ3
-sub-4-bit Magnum Quant family, the DFlash MQ3 cross-quant matrix, and
-the existing DFlash draft pull / prompt-shape adaptation paths
-inherited from v0.1.8.
+tests on hipfire — particularly the MQ3 sub-4-bit Magnum Quant family,
+the DFlash MQ3 cross-quant matrix, and the DFlash draft pull /
+prompt-shape adaptation paths.
 
 **Companion docs:** [`CLAUDE.md`](CLAUDE.md) holds project-wide rules
 (non-negotiable hard rules, e.g. coherence-gate is the canonical gate).
-This file holds the *testing playbook* — how to verify v0.1.9-alpha
+This file holds the *testing playbook* — how to verify the engine
 works, what to measure, what counts as pass/fail.
 
-**v0.1.9-alpha default behavior to be aware of:**
+**Default behavior to be aware of:**
 - **MQ3 is production on gfx11** (`gfx1100/1101/1102/1150/1151`) and
   gfx12 (`gfx1200/1201`). On gfx10 / gfx906 / gfx94x, MQ3 weights still
   load and run via per-token GEMV fallback — correct, just slower
@@ -155,9 +154,9 @@ works, what to measure, what counts as pass/fail.
 - **MQ2 is refused by default.** The quantizer requires
   `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
   cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
-- **`dflash_mode=off` default carries over from v0.1.8.** Any test
-  exercising DFlash still needs `hipfire config set dflash_mode auto`
-  or `HIPFIRE_DFLASH_DRAFT=<path>` first.
+- **`dflash_mode=off` is the default.** Any test exercising DFlash
+  still needs `hipfire config set dflash_mode auto` or
+  `HIPFIRE_DFLASH_DRAFT=<path>` first.
 
 ---
 
@@ -264,95 +263,57 @@ cargo build --release --features deltanet \
 
 ---
 
-## 2 · What v0.1.9-alpha added (test surface)
+## 2 · Test surface (quant formats, DFlash, prompt-shape)
 
-### A. MQ3 production (sub-4-bit Magnum Quant)
+### A. MQ3 (sub-4-bit Magnum Quant)
 
-The headline of v0.1.9-alpha. MQ3 = FWHT-rotated 3-bit weight format,
-104 B/group (3.25 bpw vs MQ4's 4 bpw at 136 B/group). Three new things
-are now wired:
+MQ3 = FWHT-rotated 3-bit weight format, 104 B/group (3.25 bpw vs MQ4's
+4 bpw at 136 B/group). What's wired:
 
-- **K4-unrolled GEMV decode + fused residual** on gfx1100. Decode
-  matches MQ4 within 2% (9B 141 tok/s vs MQ4's 128.7).
-- **WMMA prefill family** (`gemm_qkvza/qkv/gate_up/residual hfq3`)
-  closing the 17× prefill gap that gated ship. Arch-gated to gfx11
-  wave32 WMMA. gfx12 K4 variant ships in the same release.
-- **DFlash cross-quant matrix.** MQ3↔MQ3, MQ3↔MQ4, MQ4↔MQ3 all valid
-  for dense models. MoE/A3B + MQ3 still refused at daemon load.
+- **K4-unrolled GEMV decode + fused residual** on gfx1100 — decode matches
+  MQ4 within ~2% (9B ~141 vs MQ4 ~129 tok/s).
+- **WMMA prefill family** (`gemm_qkvza/qkv/gate_up/residual hfq3`), arch-gated
+  to gfx11 wave32 WMMA; gfx12 ships a K4 variant.
+- **DFlash cross-quant matrix** — MQ3↔MQ3, MQ3↔MQ4, MQ4↔MQ3 all valid for
+  dense models. MoE/A3B + MQ3 is refused at daemon load.
 
-Sweep harness for MQ3 quality + perf:
-```bash
-./scripts/mq3-mq2-sweep.sh   # 4-prompt × 5-model bench, md5-stamped
-```
+Sweep harness (quality + perf, md5-stamped): `./scripts/mq3-mq2-sweep.sh`.
 
-### B. Cache-invalidation lifecycle
+### B. Cache invalidation on model swap
 
-`Gpu::unload_model` now drains `mmq_screen_cache` + `fp16_shadow_cache`
-and tears down captured hipGraphs (verify, replay, AR forward). Three
-Codex stop-time follow-ups, all pointer-keyed cache silent-corruption
-class. Smoke test: rapid `hipfire serve` model swap loop should NOT
-emit garbage on the new model's first decode.
+`Gpu::unload_model` drains `mmq_screen_cache` + `fp16_shadow_cache` and tears
+down captured hipGraphs (verify, replay, AR forward) — a pointer-keyed
+silent-corruption class. **Smoke test:** a rapid `hipfire serve` model-swap
+loop must NOT emit garbage on the new model's first decode.
 
-### C. Defensive `parseToolCalls` (#111 stopgap)
+### C. Prompt-shape adaptation (default ON)
 
-Three known MQ4 attractor malformations are repaired before the
-OpenAI shape returns: spec form, flat form, XML-tag corruption.
-Token-attractor root cause (calibration retrain) deferred. Smoke
-test: tool-calling prompt against `qwen3.5-9b.mq4` should never
-return raw `<tool_call>` text in `message.content`.
-
-### D. Inherited from v0.1.8 (still load-bearing)
-
-- **Phase 1: prompt-shape adaptation — DEFAULT ON (2026-04-26)**
-
-Engine-side `\n{3,}` → `\n\n` collapse before tokenize, eliminating the
-rare BPE token 1358 (`\n\n\n`) in favor of HOT token 271 (`\n\n`) on
-Qwen3.5/3.6 vocab.
-
-**Default ON since 2026-04-26** — empirical 199 tok/s on 27B-3.5 LRU
-DFlash (vs 159 with opt-out). The original v0.1.8-alpha ship had this
-opt-in; it was promoted to default after the 2026-04-26 perf-regression
-recovery confirmed +24% τ with zero correctness cost (commit 9a2c667).
-
-To **opt out** (rare — only when raw `\n{3,}` whitespace is semantically
-load-bearing):
+Engine-side `\n{3,}` → `\n\n` collapse before tokenize (drops the rare BPE
+token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
+**Default ON** — worth +14–27% tok/s on PEP-8-style code prompts containing
+`\n{3,}`, zero effect otherwise, zero correctness cost. Opt out only when raw
+`\n{3,}` whitespace is semantically load-bearing:
 
 - Env: `HIPFIRE_NORMALIZE_PROMPT=0`
 - TUI: `hipfire config set prompt_normalize false`
 - Per-model: `hipfire config qwen3.5:27b set prompt_normalize false`
 
-**Expected lift over OPT-OUT baseline:** +14% to +27% tok/s on PEP-8-style
-code prompts that contain `\n{3,}` patterns. Zero effect on prompts
-without those patterns.
-
 **Verify:** see §3 prompt-shape A/B test.
 
-### B. Token heat diagnostic
+### D. Token-heat diagnostic
 
-`HIPFIRE_PROMPT_TOKEN_HEAT=1` triggers `Tokenizer::dump_prompt_heat()`
-at every encode site. Output goes to stderr (pretty) or stdout (JSON
-when `HIPFIRE_PROMPT_HEAT_JSON=1`).
+`HIPFIRE_PROMPT_TOKEN_HEAT=1` triggers `Tokenizer::dump_prompt_heat()` at every
+encode site (stderr pretty, or stdout JSON with `HIPFIRE_PROMPT_HEAT_JSON=1`).
+Standalone: `./target/release/examples/encode_prompt MODEL.hfq PROMPT.txt --heat`.
 
-Standalone tool: `./target/release/examples/encode_prompt MODEL.hfq
-PROMPT.txt --heat`.
+### E. DFlash draft endpoints (HuggingFace)
 
-### C. EOT-stop fix
-
-Daemon, run, and dflash_spec_demo now stop on `<|endoftext|>` token,
-not just `<|im_end|>`. The Fibonacci-attractor loop in raw-text DFlash
-is killed.
-
-### D. DFlash drafts on HuggingFace
-
-Three new HF endpoints (uploaded 2026-04-25, schuttdev account):
 - `schuttdev/hipfire-qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
 - `schuttdev/hipfire-qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.6-27b/qwen36-27b-dflash-mq4.hfq`
+- `schuttdev/hipfire-qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
+  target `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`)
 
-Plus the 3.6 27B target itself: `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`.
-
-Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and
-`hipfire pull qwen3.6:27b`.
+Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6:27b`.
 
 ---
 
@@ -393,7 +354,7 @@ The `def add(x, y)` prompt is the canonical peak case (we beat 207
 tok/s here, vs. Lucebox's RTX 3090 demo peak):
 
 ```bash
-PROMPT=$(python3 -c "import json; print([json.loads(l) for l in open('/home/kaden/.hipfire/datasets/HumanEval.jsonl')][53]['prompt'])")
+PROMPT=$(python3 -c "import json; print([json.loads(l) for l in open('~/.hipfire/datasets/HumanEval.jsonl')][53]['prompt'])")
 HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo \
   --target ~/.hipfire/models/qwen3.5-27b.mq4 \
   --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
@@ -507,8 +468,8 @@ For dataclass benches:
 
 ### Pinned Hugging Face bench fixture
 
-For hiptrx dense Qwen3.6-27B AWQ MTP/DFlash perf work, do not identify
-the canonical trunk by local filename. Local filenames drift and lookalike
+For dense Qwen3.6-27B AWQ MTP/DFlash perf work, do not identify the
+canonical trunk by local filename. Local filenames drift and lookalike
 AWQ/MQ4 files are not comparable.
 
 The canonical trunk is whichever local artifact byte-matches the current
@@ -531,14 +492,14 @@ should be discarded.
 
 ### Pinned A3B MoE DFlash fixtures
 
-For hiptrx Qwen3.6-35B-A3B MoE DFlash perf/profiling work, use the
+For Qwen3.6-35B-A3B MoE DFlash perf/profiling work, use the
 following command shape and do not substitute other prompts unless the
 user explicitly updates this fixture section:
 
 ```bash
 ./target/release/examples/dflash_spec_demo \
-  --target /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
-  --draft /home/kaden/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
+  --target ~/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
+  --draft ~/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
   --prompt-file <allowed-prompt> \
   --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
   --block-size 6 --no-adaptive-b
@@ -623,7 +584,7 @@ If you want to actively contribute findings, these are open:
    τ? Run `encode_prompt --heat` on a wide variety of prompts and look
    for patterns.
 2. **Path C training**: a target-aligned custom DFlash draft. Recipe at
-   `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md`.
+   an out-of-repo recipe (ask the maintainer).
 3. **Path D engineering**: stale-context overlap pipelining — the only
    structural lever still on the table for 27B-3.5 code beyond +8.2%.
 4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
@@ -633,9 +594,5 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-05-02 (v0.1.9-alpha — MQ3 production-ready: K4
-decode, WMMA prefill family, DFlash cross-quant matrix, gfx12 port,
-cache-invalidation lifecycle, defensive parseToolCalls (#111 stopgap),
-gfx906 + gfx1152 arch gating, speed-gate DPM warmup). When this doc
-gets stale (more than 1-2 releases behind HEAD), update it as part of
-the release PR.*
+*Last updated: 2026-06-22. When this doc gets stale (more than 1-2
+releases behind HEAD), update it as part of the release PR.*

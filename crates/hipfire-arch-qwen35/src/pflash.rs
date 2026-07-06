@@ -16,10 +16,11 @@
 //! returns `Bypass` regardless of mode. Drafter loading + scoring +
 //! selection land in subsequent phases.
 
+use hip_bridge::HipResult;
+use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::tokenizer::Tokenizer;
-use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu};
 use std::path::Path;
 
@@ -102,41 +103,53 @@ impl PflashConfig {
     pub fn from_env() -> Self {
         let mut cfg = PflashConfig::default();
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_COMPRESSION") {
-            cfg.mode = PflashMode::parse(&v)
-                .unwrap_or_else(|| panic!("HIPFIRE_PREFILL_COMPRESSION={v} not in {{off,auto,always}}"));
+            cfg.mode = PflashMode::parse(&v).unwrap_or_else(|| {
+                panic!("HIPFIRE_PREFILL_COMPRESSION={v} not in {{off,auto,always}}")
+            });
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_THRESHOLD") {
-            cfg.threshold_tokens = v.parse()
+            cfg.threshold_tokens = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_THRESHOLD={v} not a usize"));
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_KEEP_RATIO") {
-            cfg.keep_ratio = v.parse()
+            cfg.keep_ratio = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_KEEP_RATIO={v} not f32"));
-            assert!(cfg.keep_ratio > 0.0 && cfg.keep_ratio <= 1.0,
-                "HIPFIRE_PREFILL_KEEP_RATIO must be in (0, 1], got {}", cfg.keep_ratio);
+            assert!(
+                cfg.keep_ratio > 0.0 && cfg.keep_ratio <= 1.0,
+                "HIPFIRE_PREFILL_KEEP_RATIO must be in (0, 1], got {}",
+                cfg.keep_ratio
+            );
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_ALPHA") {
-            cfg.alpha = v.parse()
+            cfg.alpha = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_ALPHA={v} not f32"));
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_MIN_KEEP") {
-            cfg.min_keep_tokens = v.parse()
+            cfg.min_keep_tokens = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_MIN_KEEP={v} not usize"));
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_SINK") {
-            cfg.sink_tokens = v.parse()
+            cfg.sink_tokens = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_SINK={v} not usize"));
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_RECENT") {
-            cfg.recent_tokens = v.parse()
+            cfg.recent_tokens = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_RECENT={v} not usize"));
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_BLOCK") {
-            cfg.block_size = v.parse()
+            cfg.block_size = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_BLOCK={v} not usize"));
         }
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_SPARSE_THRESHOLD") {
-            cfg.sparse_threshold = v.parse()
+            cfg.sparse_threshold = v
+                .parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_SPARSE_THRESHOLD={v} not usize"));
         }
         if std::env::var("HIPFIRE_PREFILL_PROFILE").ok().as_deref() == Some("1") {
@@ -222,21 +235,29 @@ impl DrafterModel {
         match self {
             DrafterModel::Plain { .. } => Some(0),
             #[cfg(feature = "deltanet")]
-            DrafterModel::Hybrid { config, .. } => {
-                config.layer_types.iter().enumerate()
-                    .find(|(_, t)| **t == qwen35::LayerType::FullAttention)
-                    .map(|(i, _)| i)
-            }
+            DrafterModel::Hybrid { config, .. } => config
+                .layer_types
+                .iter()
+                .enumerate()
+                .find(|(_, t)| **t == qwen35::LayerType::FullAttention)
+                .map(|(i, _)| i),
         }
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
         match self {
-            DrafterModel::Plain { weights, scratch, .. } => {
+            DrafterModel::Plain {
+                weights, scratch, ..
+            } => {
                 weights.free_gpu(gpu);
                 scratch.free_gpu(gpu);
             }
             #[cfg(feature = "deltanet")]
-            DrafterModel::Hybrid { weights, scratch, dn_state, .. } => {
+            DrafterModel::Hybrid {
+                weights,
+                scratch,
+                dn_state,
+                ..
+            } => {
                 weights.free_gpu(gpu);
                 scratch.free_gpu(gpu);
                 dn_state.free_gpu(gpu);
@@ -519,9 +540,9 @@ impl DrafterKvMode {
                 "HIPFIRE_PFLASH_DRAFTER_KV=asym3 is banned for drafter scoring — \
                  use fwht3 (similar throughput, better scorer accuracy)"
             ),
-            Some(other) => panic!(
-                "HIPFIRE_PFLASH_DRAFTER_KV={other:?} not in {{q8, fwht4, fwht3, fwht2}}"
-            ),
+            Some(other) => {
+                panic!("HIPFIRE_PFLASH_DRAFTER_KV={other:?} not in {{q8, fwht4, fwht3, fwht2}}")
+            }
         }
     }
 }
@@ -534,12 +555,15 @@ pub fn load_drafter(
     max_kv_seq: usize,
 ) -> HipResult<()> {
     let kv_mode = DrafterKvMode::from_env();
-    let mut hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
-        "pflash: open drafter HFQ at {}: {e}", path.display(),
-    )))?;
-    let drafter_tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e|
+    let mut hfq = HfqFile::open(path).map_err(|e| {
+        hip_bridge::HipError::new(
+            0,
+            &format!("pflash: open drafter HFQ at {}: {e}", path.display(),),
+        )
+    })?;
+    let drafter_tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| {
         hip_bridge::HipError::new(0, &format!("pflash: drafter tokenizer load failed: {e}"))
-    )?;
+    })?;
 
     // Detect drafter family via the HFQ header's `arch_id` (set at
     // quantize time by hipfire-quantize):
@@ -556,9 +580,15 @@ pub fn load_drafter(
     #[cfg(feature = "deltanet")]
     {
         if is_hybrid {
-            let q35_cfg = qwen35::config_from_hfq(&hfq).ok_or_else(||
-                hip_bridge::HipError::new(0, "pflash: hybrid tensors detected but qwen35 config parse failed"))?;
-            let weights = qwen35::load_weights(&mut hfq, &q35_cfg, gpu)?;
+            let q35_cfg = qwen35::config_from_hfq(&hfq).map_err(|e| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("pflash: hybrid tensors detected but qwen35 config parse failed: {e}"),
+                )
+            })?;
+            let mut src = qwen35::HfqSource::new(&mut hfq, &q35_cfg);
+            let layout = qwen35::Layout::single(q35_cfg.n_layers);
+            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(gpu), &layout)?;
             let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
             let dn_state = qwen35::DeltaNetState::new(gpu, &q35_cfg)?;
             // Hybrid drafter only stores K (and V for chat-path) at
@@ -575,22 +605,41 @@ pub fn load_drafter(
                 .collect();
             let kv = match kv_mode {
                 DrafterKvMode::Q8 => KvCache::new_gpu_q8_filtered(
-                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                    gpu,
+                    &is_kv_layer,
+                    q35_cfg.n_kv_heads,
+                    q35_cfg.head_dim,
+                    max_kv_seq,
                 )?,
                 DrafterKvMode::Fwht4 => KvCache::new_gpu_fwht4_filtered(
-                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                    gpu,
+                    &is_kv_layer,
+                    q35_cfg.n_kv_heads,
+                    q35_cfg.head_dim,
+                    max_kv_seq,
                 )?,
                 DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
-                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                    gpu,
+                    &is_kv_layer,
+                    q35_cfg.n_kv_heads,
+                    q35_cfg.head_dim,
+                    max_kv_seq,
                 )?,
                 DrafterKvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
-                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                    gpu,
+                    &is_kv_layer,
+                    q35_cfg.n_kv_heads,
+                    q35_cfg.head_dim,
+                    max_kv_seq,
                 )?,
             };
             let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
             state.drafter_path = Some(path.display().to_string());
             state.drafter_model = Some(DrafterModel::Hybrid {
-                config: q35_cfg, weights, scratch, dn_state,
+                config: q35_cfg,
+                weights,
+                scratch,
+                dn_state,
             });
             state.drafter_tokenizer = Some(drafter_tokenizer);
             state.drafter_kv = Some(kv);
@@ -600,8 +649,8 @@ pub fn load_drafter(
         }
     }
 
-    let config = hfq::config_from_hfq(&hfq).ok_or_else(|| hip_bridge::HipError::new(0,
-        "pflash: drafter HFQ has no recoverable config (neither qwen35 hybrid nor plain LlamaConfig)",
+    let config = hfq::config_from_hfq(&hfq).map_err(|e| hip_bridge::HipError::new(0,
+        &format!("pflash: drafter HFQ has no recoverable config (neither qwen35 hybrid nor plain LlamaConfig): {e}"),
     ))?;
     let weights = hfq::load_weights_hfq(&hfq, &config, gpu)?;
     let scratch = ForwardScratch::new(gpu, &config)?;
@@ -612,21 +661,41 @@ pub fn load_drafter(
     let is_kv_layer: Vec<bool> = vec![true; config.n_layers];
     let kv = match kv_mode {
         DrafterKvMode::Q8 => KvCache::new_gpu_q8_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+            gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            max_kv_seq,
         )?,
         DrafterKvMode::Fwht4 => KvCache::new_gpu_fwht4_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+            gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            max_kv_seq,
         )?,
         DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+            gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            max_kv_seq,
         )?,
         DrafterKvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
-            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+            gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            max_kv_seq,
         )?,
     };
     let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
     state.drafter_path = Some(path.display().to_string());
-    state.drafter_model = Some(DrafterModel::Plain { config, weights, scratch });
+    state.drafter_model = Some(DrafterModel::Plain {
+        config,
+        weights,
+        scratch,
+    });
     state.drafter_tokenizer = Some(drafter_tokenizer);
     state.drafter_kv = Some(kv);
     state.tokenizer_compat = compat;
@@ -653,13 +722,12 @@ pub struct BlockScores {
 ///
 /// Pure CPU helper; pulls Q8 K out of a downloaded cache buffer for
 /// pflash scoring without needing a HIP kernel.
-fn dequant_q8_kv_position(
-    bytes: &[u8],
-    n_kv_heads: usize,
-    head_dim: usize,
-    out: &mut [f32],
-) {
-    assert_eq!(head_dim % 32, 0, "Q8 KV cache requires head_dim multiple of 32");
+fn dequant_q8_kv_position(bytes: &[u8], n_kv_heads: usize, head_dim: usize, out: &mut [f32]) {
+    assert_eq!(
+        head_dim % 32,
+        0,
+        "Q8 KV cache requires head_dim multiple of 32"
+    );
     let blocks_per_head = head_dim / 32;
     let bytes_per_head = blocks_per_head * 34;
     debug_assert_eq!(bytes.len(), n_kv_heads * bytes_per_head);
@@ -712,7 +780,10 @@ fn drafter_prefill(
         .as_ref()
         .and_then(|m| m.score_layer_idx())
         .map(|l| l + 1);
-    let model = state.drafter_model.as_mut().expect("loaded -> drafter_model");
+    let model = state
+        .drafter_model
+        .as_mut()
+        .expect("loaded -> drafter_model");
     let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
     // Drafter KV must be one of the four modes we know how to score
     // against: Q8 (the historical default) or fwht{4,3,2} (the
@@ -722,31 +793,56 @@ fn drafter_prefill(
     // quant_fwht flag). asym* WITHOUT quant_fwht (Givens-rotated) is
     // intentionally rejected here — banned from drafter scoring per
     // project policy.
-    let fwht_storage_ok =
-        (kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2) && kv.quant_fwht;
+    let tier = kv.k_tier();
     assert!(
-        kv.quant_q8 || fwht_storage_ok,
-        "drafter_prefill: drafter KV must be Q8 or fwht{{4,3,2}} \
-         (quant_q8={}, quant_asym4={}, quant_asym3={}, quant_asym2={}, quant_fwht={})",
-        kv.quant_q8, kv.quant_asym4, kv.quant_asym3, kv.quant_asym2, kv.quant_fwht,
+        tier.storage_ok_for_pflash(),
+        "drafter_prefill: drafter KV must be Q8 or fwht{{4,3,2}} (got {tier:?})"
     );
-    assert!(n <= kv.physical_cap, "drafter_prefill: source {n} > physical_cap {}", kv.physical_cap);
+    assert!(
+        n <= kv.physical_cap,
+        "drafter_prefill: source {n} > physical_cap {}",
+        kv.physical_cap
+    );
 
     match model {
-        DrafterModel::Plain { config, weights, scratch } => {
-            assert!(config.head_dim % 32 == 0, "drafter_prefill: head_dim must be multiple of 32");
+        DrafterModel::Plain {
+            config,
+            weights,
+            scratch,
+        } => {
+            assert!(
+                config.head_dim % 32 == 0,
+                "drafter_prefill: head_dim must be multiple of 32"
+            );
             // Plain path: max_layer not yet plumbed through
             // llama::forward_prefill_batch; full stack runs. Wiring it is
             // a follow-up — Plain drafters are uncommon (Qwen3, no hybrid)
             // and their score_layer_idx is 0, so the win there is even
             // larger but the call surface change is larger too.
             let _ = max_layer; // suppress unused warning until follow-up lands
-            llama::forward_prefill_batch(gpu, weights, config, source_tokens, 0, kv, scratch, None)?;
+            llama::forward_prefill_batch(
+                gpu,
+                weights,
+                config,
+                source_tokens,
+                0,
+                kv,
+                scratch,
+                None,
+            )?;
             Ok((config.n_layers, config.n_kv_heads, config.head_dim))
         }
         #[cfg(feature = "deltanet")]
-        DrafterModel::Hybrid { config, weights, scratch, dn_state } => {
-            assert!(config.head_dim % 32 == 0, "drafter_prefill: head_dim must be multiple of 32");
+        DrafterModel::Hybrid {
+            config,
+            weights,
+            scratch,
+            dn_state,
+        } => {
+            assert!(
+                config.head_dim % 32 == 0,
+                "drafter_prefill: head_dim must be multiple of 32"
+            );
             // DeltaNet recurrent state (s_matrices, s_scales, conv_states)
             // is advanced by every forward pass, so a previous scoring run
             // on a different prompt would leave stale GDN trajectory in
@@ -754,9 +850,15 @@ fn drafter_prefill(
             // from a fresh prompt at start_pos = 0, so there is no prior
             // state to keep. Plain LLaMA path has no recurrent state, so
             // this is hybrid-only.
-            for s in &dn_state.s_matrices { gpu.hip.memset(&s.buf, 0, s.buf.size())?; }
-            for s in &dn_state.s_scales   { gpu.hip.memset(&s.buf, 0, s.buf.size())?; }
-            for s in &dn_state.conv_states { gpu.hip.memset(&s.buf, 0, s.buf.size())?; }
+            for s in &dn_state.s_matrices {
+                gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+            }
+            for s in &dn_state.s_scales {
+                gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+            }
+            for s in &dn_state.conv_states {
+                gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+            }
             // qwen35 batched prefill writes the same Q8_0 K cache layout
             // as llama::forward_prefill_batch. None on hidden_rb /
             // per_token_hidden_out / gdn_tape / tree_verify -- pflash
@@ -764,8 +866,18 @@ fn drafter_prefill(
             // trailing `max_layer` truncates the layer loop at the
             // scoring layer + 1 and skips the final norm + lm_head.
             qwen35::forward_prefill_batch_with_pbs(
-                gpu, weights, config, source_tokens, 0, kv, dn_state, scratch,
-                None, None, None, None,
+                gpu,
+                weights,
+                config,
+                source_tokens,
+                0,
+                kv,
+                dn_state,
+                scratch,
+                None,
+                None,
+                None,
+                None,
                 scratch.prefill_batch.as_ref(),
                 None, // mask_override: pflash doesn't use MTP probe hook
                 max_layer,
@@ -803,13 +915,21 @@ pub fn compute_scores_batched(
 ) -> HipResult<BlockScores> {
     let n = source_tokens.len();
     assert!(n > 0, "compute_scores_batched: empty source");
-    assert!(block_size > 0, "compute_scores_batched: block_size must be > 0");
-    assert!(state.drafter_loaded, "compute_scores_batched: drafter not loaded");
+    assert!(
+        block_size > 0,
+        "compute_scores_batched: block_size must be > 0"
+    );
+    assert!(
+        state.drafter_loaded,
+        "compute_scores_batched: drafter not loaded"
+    );
 
     let (n_layers, n_kv_heads, head_dim) = drafter_prefill(state, gpu, source_tokens)?;
     // Same auto-pick + env-override policy as compute_scores_batched_gpu so
     // the CPU reference path scores from the same layer as the GPU path.
-    let auto_layer = state.drafter_model.as_ref()
+    let auto_layer = state
+        .drafter_model
+        .as_ref()
         .and_then(|m| m.score_layer_idx())
         .unwrap_or(n_layers - 1);
     let layer_idx = std::env::var("HIPFIRE_PFLASH_SCORE_LAYER")
@@ -824,9 +944,8 @@ pub fn compute_scores_batched(
     let bytes_per_pos = n_kv_heads * bytes_per_head;
     let kv_dim = n_kv_heads * head_dim;
     let cache_f32 = gpu.download_f32(&kv.k_gpu[layer_idx])?;
-    let cache_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(cache_f32.as_ptr() as *const u8, cache_f32.len() * 4)
-    };
+    let cache_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(cache_f32.as_ptr() as *const u8, cache_f32.len() * 4) };
 
     // 4. Dequant per position into a flat [n × kv_dim] f32 buffer.
     let mut k_per_pos = vec![0.0f32; n * kv_dim];
@@ -866,7 +985,12 @@ pub fn compute_scores_batched(
         scores[b] = dot / denom;
     }
 
-    Ok(BlockScores { scores, block_size, n_blocks, source_tokens: n })
+    Ok(BlockScores {
+        scores,
+        block_size,
+        n_blocks,
+        source_tokens: n,
+    })
 }
 
 /// Phase 2.1 GPU fast path: drafter scoring entirely on the GPU. Same
@@ -887,8 +1011,14 @@ pub fn compute_scores_batched_gpu(
 ) -> HipResult<BlockScores> {
     let n = source_tokens.len();
     assert!(n > 0, "compute_scores_batched_gpu: empty source");
-    assert!(block_size > 0, "compute_scores_batched_gpu: block_size must be > 0");
-    assert!(state.drafter_loaded, "compute_scores_batched_gpu: drafter not loaded");
+    assert!(
+        block_size > 0,
+        "compute_scores_batched_gpu: block_size must be > 0"
+    );
+    assert!(
+        state.drafter_loaded,
+        "compute_scores_batched_gpu: drafter not loaded"
+    );
 
     let (n_layers, n_kv_heads, head_dim) = drafter_prefill(state, gpu, source_tokens)?;
     let kv = state.drafter_kv.as_ref().expect("loaded -> kv");
@@ -904,7 +1034,9 @@ pub fn compute_scores_batched_gpu(
     // operators bisecting the issue further or experimenting with
     // alternative scoring layers; if set and in range it overrides the
     // auto-pick.
-    let auto_layer = state.drafter_model.as_ref()
+    let auto_layer = state
+        .drafter_model
+        .as_ref()
         .and_then(|m| m.score_layer_idx())
         .unwrap_or(n_layers - 1);
     let layer_idx = std::env::var("HIPFIRE_PFLASH_SCORE_LAYER")
@@ -925,43 +1057,58 @@ pub fn compute_scores_batched_gpu(
     // `quant_fwht == true`; asym* without fwht (Givens-rotated) is
     // disallowed here (drafter scoring policy bans asym3 — see
     // assert in drafter_prefill).
-    if kv.quant_q8 {
-        gpu.pflash_score_q8_kv(
-            &kv.k_gpu[layer_idx], &scores_buf,
-            n, n_kv_heads, head_dim, block_size, n_blocks,
+    match kv.k_tier() {
+        KTier::Q8 => gpu.pflash_score_q8_kv(
+            &kv.k_gpu[layer_idx],
+            &scores_buf,
+            n,
+            n_kv_heads,
+            head_dim,
+            block_size,
+            n_blocks,
             n - 1, // last_pos
-        )?;
-    } else if kv.quant_fwht && kv.quant_asym4 {
-        gpu.pflash_score_fwht4_kv(
-            &kv.k_gpu[layer_idx], &scores_buf,
-            n, n_kv_heads, head_dim, block_size, n_blocks,
+        )?,
+        KTier::Asym4 { fwht: true } => gpu.pflash_score_fwht4_kv(
+            &kv.k_gpu[layer_idx],
+            &scores_buf,
+            n,
+            n_kv_heads,
+            head_dim,
+            block_size,
+            n_blocks,
             n - 1,
-        )?;
-    } else if kv.quant_fwht && kv.quant_asym3 {
-        gpu.pflash_score_fwht3_kv(
-            &kv.k_gpu[layer_idx], &scores_buf,
-            n, n_kv_heads, head_dim, block_size, n_blocks,
+        )?,
+        KTier::Asym3 { fwht: true } => gpu.pflash_score_fwht3_kv(
+            &kv.k_gpu[layer_idx],
+            &scores_buf,
+            n,
+            n_kv_heads,
+            head_dim,
+            block_size,
+            n_blocks,
             n - 1,
-        )?;
-    } else if kv.quant_fwht && kv.quant_asym2 {
-        gpu.pflash_score_fwht2_kv(
-            &kv.k_gpu[layer_idx], &scores_buf,
-            n, n_kv_heads, head_dim, block_size, n_blocks,
+        )?,
+        KTier::Asym2 { fwht: true } => gpu.pflash_score_fwht2_kv(
+            &kv.k_gpu[layer_idx],
+            &scores_buf,
+            n,
+            n_kv_heads,
+            head_dim,
+            block_size,
+            n_blocks,
             n - 1,
-        )?;
-    } else {
-        panic!(
-            "compute_scores_batched_gpu: unsupported drafter KV mode \
-             (quant_q8={}, quant_asym4={}, quant_asym3={}, quant_asym2={}, \
-              quant_fwht={})",
-            kv.quant_q8, kv.quant_asym4, kv.quant_asym3, kv.quant_asym2,
-            kv.quant_fwht,
-        );
+        )?,
+        other => panic!("compute_scores_batched_gpu: unsupported drafter KV mode (got {other:?})"),
     }
     let scores = gpu.download_f32(&scores_buf)?;
     let _ = gpu.free_tensor(scores_buf);
 
-    Ok(BlockScores { scores, block_size, n_blocks, source_tokens: n })
+    Ok(BlockScores {
+        scores,
+        block_size,
+        n_blocks,
+        source_tokens: n,
+    })
 }
 
 /// Run the drafter over `source_tokens` token by token, capturing post-RoPE
@@ -996,12 +1143,18 @@ pub fn compute_scores_cpu(
     let n = source_tokens.len();
     assert!(n > 0, "compute_scores_cpu: empty source_tokens");
     assert!(block_size > 0, "compute_scores_cpu: block_size must be > 0");
-    assert!(state.drafter_loaded, "compute_scores_cpu: drafter not loaded");
+    assert!(
+        state.drafter_loaded,
+        "compute_scores_cpu: drafter not loaded"
+    );
 
     // Phase 1.2 per-token path is Plain-only (uses llama::forward_scratch_*
     // which doesn't have a Qwen3.5 hybrid equivalent that captures K the
     // same way). Hybrid drafters route through compute_scores_batched(_gpu).
-    let model = state.drafter_model.as_ref().expect("drafter loaded -> model");
+    let model = state
+        .drafter_model
+        .as_ref()
+        .expect("drafter loaded -> model");
     let (cfg, weights, scratch) = match model {
         DrafterModel::Plain { config, weights, scratch } =>
             (config.clone(), weights, scratch),
@@ -1011,8 +1164,11 @@ pub fn compute_scores_cpu(
         ),
     };
     let kv = state.drafter_kv.as_mut().expect("drafter loaded -> kv");
-    assert!(n <= kv.physical_cap,
-        "compute_scores_cpu: source {n} exceeds drafter kv physical_cap {}", kv.physical_cap);
+    assert!(
+        n <= kv.physical_cap,
+        "compute_scores_cpu: source {n} exceeds drafter kv physical_cap {}",
+        kv.physical_cap
+    );
 
     let kv_dim = cfg.n_kv_heads * cfg.head_dim;
     let mut k_per_pos: Vec<f32> = Vec::with_capacity(n * kv_dim);
@@ -1025,8 +1181,12 @@ pub fn compute_scores_cpu(
         // f32 elements regardless of cache quantization (it's the pre-quant
         // K that gets fed into the cache write).
         let k_row = gpu.download_f32(&scratch.k)?;
-        debug_assert_eq!(k_row.len(), kv_dim,
-            "scratch.k size {} != expected kv_dim {kv_dim}", k_row.len());
+        debug_assert_eq!(
+            k_row.len(),
+            kv_dim,
+            "scratch.k size {} != expected kv_dim {kv_dim}",
+            k_row.len()
+        );
         k_per_pos.extend_from_slice(&k_row);
     }
 
@@ -1065,7 +1225,12 @@ pub fn compute_scores_cpu(
         scores[b] = dot / denom;
     }
 
-    Ok(BlockScores { scores, block_size, n_blocks, source_tokens: n })
+    Ok(BlockScores {
+        scores,
+        block_size,
+        n_blocks,
+        source_tokens: n,
+    })
 }
 
 fn norm_l2(v: &[f32]) -> f32 {
@@ -1109,16 +1274,16 @@ pub fn select_spans(
     min_keep_tokens: usize,
     must_keep_spans: &[(usize, usize)],
 ) -> Vec<(usize, usize)> {
-    assert!(keep_ratio > 0.0 && keep_ratio <= 1.0,
-        "keep_ratio {keep_ratio} must be in (0, 1]");
+    assert!(
+        keep_ratio > 0.0 && keep_ratio <= 1.0,
+        "keep_ratio {keep_ratio} must be in (0, 1]"
+    );
     let n = scores.source_tokens;
     let bs = scores.block_size;
     let n_blocks = scores.n_blocks;
 
-    let target_kept = std::cmp::max(
-        min_keep_tokens,
-        (n as f32 * keep_ratio).ceil() as usize,
-    ).min(n);
+    let target_kept =
+        std::cmp::max(min_keep_tokens, (n as f32 * keep_ratio).ceil() as usize).min(n);
 
     // If the prompt is shorter than the floor, keep everything.
     if target_kept >= n {
@@ -1126,7 +1291,11 @@ pub fn select_spans(
     }
 
     let sink_end = sink_tokens.min(n);
-    let recent_start = if recent_tokens >= n { 0 } else { n - recent_tokens };
+    let recent_start = if recent_tokens >= n {
+        0
+    } else {
+        n - recent_tokens
+    };
 
     // Build the mandatory-keep set up-front so it counts against budget.
     // Clamp must_keep entries to [0, n) and drop empty / inverted spans.
@@ -1181,13 +1350,14 @@ pub fn select_spans(
         }
         (end - start).saturating_sub(covered)
     }
-    let mut middle: Vec<(usize, f32)> = (0..n_blocks)
-        .map(|b| (b, scores.scores[b]))
-        .collect();
+    let mut middle: Vec<(usize, f32)> = (0..n_blocks).map(|b| (b, scores.scores[b])).collect();
     // Stable sort by descending score; tie-break on block index for
     // determinism.
-    middle.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        .then(a.0.cmp(&b.0)));
+    middle.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
 
     let mut spans = anchors;
     let mut middle_kept = 0usize;
@@ -1277,7 +1447,10 @@ pub enum BypassReason {
     /// Compression mode is `Off`.
     ModeOff,
     /// Source token count is below `threshold_tokens` and mode is `Auto`.
-    BelowThreshold { source_tokens: usize, threshold: usize },
+    BelowThreshold {
+        source_tokens: usize,
+        threshold: usize,
+    },
     /// Vision request -- image-bearing prompts always bypass for now.
     VisionRequest,
     /// Tool-calling request or prompt with structured JSON tool definitions.
@@ -1298,16 +1471,16 @@ impl BypassReason {
     pub fn as_str(&self) -> String {
         match self {
             BypassReason::ModeOff => "mode_off".to_string(),
-            BypassReason::BelowThreshold { source_tokens, threshold } =>
-                format!("below_threshold ({source_tokens} < {threshold})"),
+            BypassReason::BelowThreshold {
+                source_tokens,
+                threshold,
+            } => format!("below_threshold ({source_tokens} < {threshold})"),
             BypassReason::VisionRequest => "vision_request".to_string(),
             BypassReason::ToolCallRequest => "tool_call_request".to_string(),
             BypassReason::DrafterUnavailable => "drafter_unavailable".to_string(),
             BypassReason::TokenizerMismatch => "tokenizer_mismatch".to_string(),
-            BypassReason::UnsupportedDrafter { reason } =>
-                format!("unsupported_drafter: {reason}"),
-            BypassReason::ScoringDegenerate { detail } =>
-                format!("scoring_degenerate: {detail}"),
+            BypassReason::UnsupportedDrafter { reason } => format!("unsupported_drafter: {reason}"),
+            BypassReason::ScoringDegenerate { detail } => format!("scoring_degenerate: {detail}"),
         }
     }
 }
@@ -1490,8 +1663,12 @@ pub fn maybe_compress_prompt(
     // 2. Select spans.
     let t_select = std::time::Instant::now();
     let kept_spans = select_spans(
-        &bs, cfg.sink_tokens, cfg.recent_tokens, cfg.keep_ratio,
-        cfg.min_keep_tokens, must_keep_spans,
+        &bs,
+        cfg.sink_tokens,
+        cfg.recent_tokens,
+        cfg.keep_ratio,
+        cfg.min_keep_tokens,
+        must_keep_spans,
     );
     let select_ms = t_select.elapsed().as_millis();
 
@@ -1556,7 +1733,10 @@ mod tests {
 
     #[test]
     fn bypass_when_off() {
-        let cfg = PflashConfig { mode: PflashMode::Off, ..Default::default() };
+        let cfg = PflashConfig {
+            mode: PflashMode::Off,
+            ..Default::default()
+        };
         let state = PflashState::new(&cfg);
         let tokens = vec![1u32; 50_000];
         let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
@@ -1569,14 +1749,21 @@ mod tests {
         let state = PflashState::new(&cfg);
         let tokens = vec![1u32; 8_000];
         let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
-        assert_eq!(r, Some(BypassReason::BelowThreshold {
-            source_tokens: 8_000, threshold: 32_768,
-        }));
+        assert_eq!(
+            r,
+            Some(BypassReason::BelowThreshold {
+                source_tokens: 8_000,
+                threshold: 32_768,
+            })
+        );
     }
 
     #[test]
     fn bypass_vision_and_tool_call() {
-        let cfg = PflashConfig { mode: PflashMode::Always, ..Default::default() };
+        let cfg = PflashConfig {
+            mode: PflashMode::Always,
+            ..Default::default()
+        };
         let state = PflashState::new(&cfg);
         let tokens = vec![1u32; 100_000];
         let r1 = decide_bypass(&state, &cfg, &tokens, RequestKind::Vision);
@@ -1608,16 +1795,25 @@ mod tests {
 
     #[test]
     fn no_bypass_when_always_with_loaded_drafter_over_threshold() {
-        let cfg = PflashConfig { mode: PflashMode::Always, ..Default::default() };
+        let cfg = PflashConfig {
+            mode: PflashMode::Always,
+            ..Default::default()
+        };
         let state = synthetic_loaded(true);
         let tokens = vec![1u32; 100];
         let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
-        assert_eq!(r, None, "always mode + drafter loaded + compat must reach scoring");
+        assert_eq!(
+            r, None,
+            "always mode + drafter loaded + compat must reach scoring"
+        );
     }
 
     #[test]
     fn bypass_on_tokenizer_mismatch() {
-        let cfg = PflashConfig { mode: PflashMode::Always, ..Default::default() };
+        let cfg = PflashConfig {
+            mode: PflashMode::Always,
+            ..Default::default()
+        };
         let state = synthetic_loaded(false);
         let tokens = vec![1u32; 100];
         let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
@@ -1661,9 +1857,12 @@ mod tests {
         // budget pulls the next two tied-score blocks (2 and 3, ascending
         // index tie-break) which coalesce with the sink into [0, 32).
         let spans = select_spans(&scores, 16, 16, 0.40, 0, &[]);
-        assert_eq!(spans, vec![(0, 32), (56, 64), (112, 128)],
+        assert_eq!(
+            spans,
+            vec![(0, 32), (56, 64), (112, 128)],
             "block 7 must survive on score; ties pull lowest-index first → \
-             blocks 2+3 coalesce with sink");
+             blocks 2+3 coalesce with sink"
+        );
     }
 
     #[test]
@@ -1674,8 +1873,10 @@ mod tests {
         s[8] = 5.0;
         let scores = synthetic_scores(s, 8);
         let spans = select_spans(&scores, 16, 16, 0.50, 0, &[]);
-        assert!(spans.iter().any(|&(a, b)| a == 56 && b == 72),
-            "blocks 7+8 (56..64 + 64..72) must coalesce, got {spans:?}");
+        assert!(
+            spans.iter().any(|&(a, b)| a == 56 && b == 72),
+            "blocks 7+8 (56..64 + 64..72) must coalesce, got {spans:?}"
+        );
     }
 
     #[test]
@@ -1691,10 +1892,14 @@ mod tests {
         let must = vec![(50, 51), (51, 52)];
         let spans = select_spans(&scores, 4, 4, 0.05, 0, &must);
         // Boundaries must show up in the output.
-        assert!(spans.iter().any(|&(a, b)| a <= 50 && 51 <= b),
-            "must_keep position 50 dropped, spans = {spans:?}");
-        assert!(spans.iter().any(|&(a, b)| a <= 51 && 52 <= b),
-            "must_keep position 51 dropped, spans = {spans:?}");
+        assert!(
+            spans.iter().any(|&(a, b)| a <= 50 && 51 <= b),
+            "must_keep position 50 dropped, spans = {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|&(a, b)| a <= 51 && 52 <= b),
+            "must_keep position 51 dropped, spans = {spans:?}"
+        );
     }
 
     #[test]
@@ -1710,13 +1915,21 @@ mod tests {
         let spans = select_spans(&scores, 16, 16, 0.30, 0, &[(14, 18)]);
         // Whatever extra blocks come in, the prefix must still be one
         // contiguous span starting at 0 and covering the must-keep range.
-        let prefix = spans.iter().find(|&&(s, _)| s == 0)
+        let prefix = spans
+            .iter()
+            .find(|&&(s, _)| s == 0)
             .copied()
             .unwrap_or_else(|| panic!("missing prefix anchor in {spans:?}"));
-        assert!(prefix.1 >= 18, "prefix {prefix:?} must cover must_keep end 18");
+        assert!(
+            prefix.1 >= 18,
+            "prefix {prefix:?} must cover must_keep end 18"
+        );
         // No two output spans may overlap or be adjacent without merging.
         for w in spans.windows(2) {
-            assert!(w[0].1 < w[1].0, "spans must be disjoint and gapped, got {spans:?}");
+            assert!(
+                w[0].1 < w[1].0,
+                "spans must be disjoint and gapped, got {spans:?}"
+            );
         }
     }
 
@@ -1736,10 +1949,15 @@ mod tests {
         let total: usize = spans.iter().map(|(a, b)| b - a).sum();
         // 50% of 128 = 64 token target. Anchors alone contribute 16
         // incremental tokens, so middle selection MUST add ~48 more.
-        assert!(total >= 64, "selector starved -- expected >=64 kept, got {total} (spans = {spans:?})");
+        assert!(
+            total >= 64,
+            "selector starved -- expected >=64 kept, got {total} (spans = {spans:?})"
+        );
         // Block 7 is the highest-scored, so it should appear.
-        assert!(spans.iter().any(|&(a, b)| a <= 56 && 64 <= b),
-            "block 7 (highest score) must survive despite anchor overlap, got {spans:?}");
+        assert!(
+            spans.iter().any(|&(a, b)| a <= 56 && 64 <= b),
+            "block 7 (highest score) must survive despite anchor overlap, got {spans:?}"
+        );
     }
 
     #[test]
@@ -1785,14 +2003,18 @@ mod tests {
         let tok_a = Tokenizer::from_hf_json(json_a).expect("tokenizer A");
         let tok_b = Tokenizer::from_hf_json(json_b).expect("tokenizer B");
         // tokenizers_compatible must reject (slot 1 diverges: padding vs BAR).
-        assert!(!tokenizers_compatible(&tok_a, &tok_b),
-            "tokenizers_compatible must reject slot-shuffle pairs");
+        assert!(
+            !tokenizers_compatible(&tok_a, &tok_b),
+            "tokenizers_compatible must reject slot-shuffle pairs"
+        );
         // compat_signature must also diverge (otherwise pretok would silently
         // load tokens authored by A under B).
-        assert_ne!(tokenizer_compat_signature(&tok_a),
-                   tokenizer_compat_signature(&tok_b),
-                   "compat signature must encode slot position, not just \
-                    the set of non-padding strings");
+        assert_ne!(
+            tokenizer_compat_signature(&tok_a),
+            tokenizer_compat_signature(&tok_b),
+            "compat signature must encode slot position, not just \
+                    the set of non-padding strings"
+        );
     }
 
     #[test]
@@ -1810,8 +2032,10 @@ mod tests {
         }"#;
         let tok = Tokenizer::from_hf_json(json).expect("tokenizer");
         assert!(tokenizers_compatible(&tok, &tok));
-        assert_eq!(tokenizer_compat_signature(&tok),
-                   tokenizer_compat_signature(&tok));
+        assert_eq!(
+            tokenizer_compat_signature(&tok),
+            tokenizer_compat_signature(&tok)
+        );
     }
 
     #[test]
@@ -1826,7 +2050,12 @@ mod tests {
         let bs = synthetic_scores(vec![0.0; 4], 8);
         assert!(bs.well_formed().unwrap_err().contains("all scores"));
         // Empty -> reject.
-        let bs = BlockScores { scores: vec![], block_size: 8, n_blocks: 0, source_tokens: 0 };
+        let bs = BlockScores {
+            scores: vec![],
+            block_size: 8,
+            n_blocks: 0,
+            source_tokens: 0,
+        };
         assert!(bs.well_formed().unwrap_err().contains("empty"));
         // Healthy -> ok.
         let bs = synthetic_scores(vec![0.1, 0.2, 0.3, 0.4], 8);
@@ -1839,9 +2068,14 @@ mod tests {
         let scores = synthetic_scores(s, 8); // 32 tokens
         let spans = select_spans(&scores, 0, 0, 0.5, 0, &[(100, 200), (5, 1000)]);
         // First span clamps to nothing (start > n), second clamps to (5, 32).
-        assert!(spans.iter().all(|&(_, e)| e <= 32), "spans must stay in range, got {spans:?}");
-        assert!(spans.iter().any(|&(a, b)| a == 5 && b == 32),
-            "expected clamped (5, 32), got {spans:?}");
+        assert!(
+            spans.iter().all(|&(_, e)| e <= 32),
+            "spans must stay in range, got {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|&(a, b)| a == 5 && b == 32),
+            "expected clamped (5, 32), got {spans:?}"
+        );
     }
 
     #[test]

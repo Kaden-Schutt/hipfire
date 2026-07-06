@@ -262,9 +262,13 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
             PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
             PipelineOp::Attend => SuperOpKind::Attend,
-            // Current Step has only the 4 variants above; other PipelineOp
-            // values are not producible from a Step, so this is unreachable
-            // in practice (kept total).
+            // Rope/QkNorm/BiasAdd are per-op-only Step vocabulary: never fused,
+            // never lowered via superop. Emitting them into a lowered program
+            // is a bug (no SuperOpKind exists for them).
+            PipelineOp::Rope | PipelineOp::QkNorm | PipelineOp::BiasAdd => {
+                unreachable!("Rope/QkNorm/BiasAdd are per-op only; not lowerable via superop")
+            }
+            // Remaining PipelineOp values are not producible from a Step.
             _ => SuperOpKind::Norm,
         },
         |i| match_fused_prefix(&steps[i..], ctx),

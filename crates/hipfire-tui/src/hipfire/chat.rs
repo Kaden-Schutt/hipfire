@@ -4,7 +4,11 @@
 
 use std::{
     io::{BufRead, BufReader},
-    sync::mpsc::Sender,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+        Arc,
+    },
     time::Duration,
 };
 
@@ -21,7 +25,6 @@ pub struct ChatMessage {
 #[derive(Debug)]
 pub enum ChatEvent {
     Delta(String),
-    Status(String),
     Done,
     Error(String),
 }
@@ -31,31 +34,49 @@ pub fn stream_chat(
     port: u16,
     model: &str,
     messages: &[ChatMessage],
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     tx: Sender<ChatEvent>,
+    abort: Arc<AtomicBool>,
 ) -> Result<()> {
-    let result = stream_chat_inner(host, port, model, messages, &tx);
+    let result = stream_chat_inner(host, port, model, messages, temperature, top_p, &tx, &abort);
     if let Err(err) = result {
         let _ = tx.send(ChatEvent::Error(err.to_string()));
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_chat_inner(
     host: &str,
     port: u16,
     model: &str,
     messages: &[ChatMessage],
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     tx: &Sender<ChatEvent>,
+    abort: &Arc<AtomicBool>,
 ) -> Result<()> {
     let url = format!("http://{host}:{port}/v1/chat/completions");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(600))
+        // Per-read bound: a stalled socket (half-open TCP, server hang) errors out
+        // within this window instead of parking the worker thread for the full
+        // total timeout — paired with the optimistic UI abort in request_abort.
+        .timeout_read(Duration::from_secs(120))
         .build();
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "stream": true,
         "messages": messages,
     });
+    // Per-session sampling overrides (set via /temp and /top_p).
+    if let Some(t) = temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(p) = top_p {
+        body["top_p"] = json!(p);
+    }
     let resp = match agent
         .post(&url)
         .set("Content-Type", "application/json")
@@ -73,8 +94,14 @@ fn stream_chat_inner(
     };
 
     let reader = BufReader::new(resp.into_reader());
-    let _ = tx.send(ChatEvent::Status("connected; waiting for tokens".into()));
     for line in reader.lines() {
+        // Cooperative cancel: checked once per streamed line, so an in-flight
+        // generation stops within ~one token of the user pressing Esc. The
+        // partial reply already streamed stays on screen.
+        if abort.load(Ordering::Relaxed) {
+            let _ = tx.send(ChatEvent::Done);
+            return Ok(());
+        }
         let line = line?;
         let trimmed = line.trim();
         if !trimmed.starts_with("data:") {
@@ -104,11 +131,17 @@ fn stream_chat_inner(
         else {
             continue;
         };
+        // Coalesce reasoning + content into ONE Delta per chunk so the UI's
+        // delta-count token proxy isn't double-counted for reasoning models.
+        let mut chunk = String::new();
         if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
-            let _ = tx.send(ChatEvent::Delta(text.to_string()));
+            chunk.push_str(text);
         }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            let _ = tx.send(ChatEvent::Delta(text.to_string()));
+            chunk.push_str(text);
+        }
+        if !chunk.is_empty() {
+            let _ = tx.send(ChatEvent::Delta(chunk));
         }
     }
 

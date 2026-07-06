@@ -6,8 +6,11 @@ name: CI
 # crates/hip-bridge — libloading, no build.rs, no link-time -lamdhip64),
 # so the entire workspace compiles and unit-tests on a stock runner with
 # no GPU and no ROCm installed. The GPU-bound gates (test_kernels,
-# coherence-gate.sh, speed-gate.sh) need real RDNA hardware and run on a
-# self-hosted runner instead — see .github/workflows/gpu-gates.yml (TODO).
+# coherence-gate.sh, serve-multiturn-gate.sh, speed-gate.sh) need real RDNA
+# hardware and run on a self-hosted runner instead — see
+# .github/workflows/gpu-gates.yml (TODO). serve-multiturn-gate.sh is the
+# multi-request serve-output guard for the #462-class regression (recurrent
+# state bleeding across requests) that single-request gates structurally miss.
 #
 # Required vs advisory: `build` and `test` are the load-bearing
 # "is it broken" gates and are intended to be required status checks on

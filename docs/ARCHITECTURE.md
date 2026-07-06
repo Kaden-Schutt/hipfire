@@ -155,7 +155,27 @@ before the linear-attention update for local mixing. Per-head
 learnable decay + per-head per-token gate parameterize the state
 update; see `crates/hipfire-arch-qwen35/src/qwen35.rs` for the exact form.
 
-## DFlash (speculative decode)
+## Speculative decode
+
+The decode loop drives a `&mut dyn Speculator`
+(`crates/hipfire-runtime/src/spec.rs`) and never names an arch. The seam
+splits into *policy* (the `Speculator` — what to draft + the accept rule) and
+*mechanics* (the `SpecTarget`, impl'd on each model bundle — how to run that
+arch's verify forward + snapshot/rewind its state). Drafter kinds:
+
+- **n-gram** (model-free, opt-in `HIPFIRE_NGRAM_DRAFT=1`) — proposes tokens from
+  the prompt/output suffix; verify always falls back to the target's greedy
+  argmax, so output is **byte-identical to AR**. Any arch earns it by
+  implementing `SpecTarget` + two registry lines — no kernels, no draft model.
+- **DFlash** (below), **MTP** (multi-token-prediction head), **EAGLE** (upstream
+  heads) — *learned* drafters with trained weights + per-arch kernels.
+
+Per-arch support status + measured acceptance (τ) per workload lives in
+`docs/speculation-support-inventory.md`. **Adding speculative decode to a new
+arch** is documented as step 7 of the arch-port skill:
+`.agents/skills/hipfire-arch-port/speculation.md`.
+
+### DFlash
 
 `crates/hipfire-arch-qwen35/src/dflash.rs`. Target model + small same-family draft
 model run in parallel; the draft proposes K tokens, the target

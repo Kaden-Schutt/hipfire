@@ -144,6 +144,11 @@ pub struct Tokenizer {
     /// Sorted longest-first for greedy matching.
     special_tokens: Vec<(String, u32)>,
     pub bos_id: u32,
+    /// Prepend `bos_id` in `encode()` when the model's HF tokenizer_config has
+    /// `add_bos_token: true` (e.g. Cohere2: true, BOS=`<BOS_TOKEN>`=2). Without
+    /// the leading BOS, BOS-trained models (Cohere, Llama) emit degenerate
+    /// output. Default false (Qwen/ChatML models add no BOS).
+    pub add_bos: bool,
     pub eos_id: u32,
     /// Auxiliary end-of-generation id (e.g. `<|endoftext|>` when `eos_id` is
     /// `<|im_end|>`). When a raw-text draft without ChatML finishes naturally
@@ -329,6 +334,7 @@ impl Tokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            add_bos: false,
             eot_id,
             is_gpt2_bpe,
         })
@@ -453,6 +459,7 @@ impl Tokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            add_bos: false,
             eot_id,
             is_gpt2_bpe,
         })
@@ -500,6 +507,13 @@ impl Tokenizer {
                     if (e as usize) < t.vocab.len() {
                         t.eos_id = e as u32;
                     }
+                }
+            }
+            // Honor HF `add_bos_token` from the embedded tokenizer_config (e.g.
+            // Cohere2 = true). Drives the BOS prepend in `encode()`.
+            if let Some(tc) = meta.get("tokenizer_config") {
+                if let Some(ab) = tc.get("add_bos_token").and_then(|v| v.as_bool()) {
+                    t.add_bos = ab;
                 }
             }
             return Ok(t);
@@ -603,6 +617,7 @@ impl Tokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            add_bos: false,
             eot_id,
             is_gpt2_bpe,
         })
@@ -681,12 +696,21 @@ impl Tokenizer {
     /// Special tokens (e.g. <|im_start|>) are matched first, then remaining
     /// segments are encoded via BPE or SentencePiece.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut result = Vec::new();
+        // Honor HF `add_bos_token` (Cohere2 add_bos_token=true, BOS=2): prepend
+        // the BOS id once. Raw-text/PPL eval relies on this; without it
+        // BOS-trained models degenerate. (A chat-template serving path that
+        // already emits <BOS_TOKEN> must encode with add_bos disabled to avoid
+        // a double BOS — a serving concern, separate from raw encode.)
+        if self.add_bos {
+            result.push(self.bos_id);
+        }
         if self.special_tokens.is_empty() {
-            return self.encode_raw(text);
+            result.extend(self.encode_raw(text));
+            return result;
         }
 
         // Split text at special token boundaries (greedy longest match)
-        let mut result = Vec::new();
         let mut remaining = text;
         while !remaining.is_empty() {
             // Try to match a special token at current position
@@ -1592,6 +1616,7 @@ mod bpe_tests {
             special_tokens: Vec::new(),
             bos_id: 0,
             eos_id: 0,
+            add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
         }
@@ -1899,6 +1924,7 @@ mod sp_tests {
             special_tokens: Vec::new(),
             bos_id: 0,
             eos_id: 0,
+            add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
         }

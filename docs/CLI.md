@@ -26,6 +26,24 @@ flag-level detail; this page is the index.
 file path (`./my.mq4`). For a prompt with shell-special characters,
 quote it: `hipfire run qwen3.5:9b "What's 2+2?"`.
 
+### `hipfire run` speculative-decode flags
+
+One-shot overrides (override config for that invocation only). They follow
+llama.cpp's `speculative` flag naming and resolve through the ladder
+**env > flag > per-model > global**. See [CONFIG.md](CONFIG.md#speculative-decode)
+for the persistent config keys.
+
+| Flag | Purpose |
+|---|---|
+| `--spec <m>` | Mechanism selector: `off` / `auto` / `ngram` / `dflash` / `mtp`. |
+| `-md, --model-draft <path>` | DFlash draft model path. Implies `--spec dflash` unless `--spec` is also given. |
+| `--draft-max, --draft <N>` | Draft window of the active mechanism (n-gram K / MTP k). |
+
+```bash
+hipfire run qwen3.5:9b --spec ngram "Repeat verbatim: ..."   # model-free, byte-identical to AR
+hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq "..."  # draft-model DFlash
+```
+
 ## Configuration
 
 | Command | Purpose |

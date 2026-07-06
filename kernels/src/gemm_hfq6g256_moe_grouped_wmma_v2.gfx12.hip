@@ -142,10 +142,13 @@ extern "C" __global__ void gemm_hfq6g256_moe_grouped_wmma_v2_gfx12(
                 const int bb = (kt + sub) * 12 + k_grp * 6;
                 const unsigned char* dp0 = (const unsigned char*)(gp0 + 8 + bb);
                 const unsigned char* dp1 = (const unsigned char*)(gp1 + 8 + bb);
+                // d1 uses only bits 0..23 (3 B); *(uint*)(dp+3) reads a 4th byte
+                // (dp+6) that is 1 B past the group on the last tile → GPU VM
+                // read fault on tightly-packed buffers. Read 3 B (bit-identical).
                 unsigned int d0_a = *(const unsigned int*)(dp0);
-                unsigned int d1_a = *(const unsigned int*)(dp0 + 3);
+                unsigned int d1_a = (unsigned int)dp0[3] | ((unsigned int)dp0[4] << 8) | ((unsigned int)dp0[5] << 16);
                 unsigned int d0_b = *(const unsigned int*)(dp1);
-                unsigned int d1_b = *(const unsigned int*)(dp1 + 3);
+                unsigned int d1_b = (unsigned int)dp1[3] | ((unsigned int)dp1[4] << 8) | ((unsigned int)dp1[5] << 16);
 
                 half8_t b_reg;
                 if (xg != nullptr) {

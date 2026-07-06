@@ -56,9 +56,19 @@ impl CpuRouter {
     /// (typically MQ4G256) to F32 — there's nothing CPU-paging-specific about
     /// that step, so it lives in `hipfire_arch_qwen35::qwen35` alongside other tensor
     /// dequant helpers.
-    pub fn from_f32_weights(layer: u16, weights: Vec<f32>, num_experts: usize, hidden: usize) -> Self {
+    pub fn from_f32_weights(
+        layer: u16,
+        weights: Vec<f32>,
+        num_experts: usize,
+        hidden: usize,
+    ) -> Self {
         debug_assert_eq!(weights.len(), num_experts * hidden);
-        Self { layer, weights, num_experts, hidden }
+        Self {
+            layer,
+            weights,
+            num_experts,
+            hidden,
+        }
     }
 
     /// Run the router GEMV: `logits = weights × x_norm`, then return the
@@ -93,13 +103,14 @@ impl CpuRouter {
         let mut top = indexed[..k].to_vec();
         // Sort the chosen k for stable iteration order across runs (helps
         // when comparing CPU and GPU top-k sets during validation).
-        top.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        top.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let indices: Vec<u16> = top.iter().map(|(i, _)| *i as u16).collect();
         let logits_top: Vec<f32> = top.iter().map(|(_, l)| *l).collect();
-        TopK { indices, logits: logits_top }
+        TopK {
+            indices,
+            logits: logits_top,
+        }
     }
 }
 
@@ -178,9 +189,7 @@ mod tests {
     fn topk_logits_are_descending() {
         let n_exp = 16;
         let hidden = 32;
-        let weights: Vec<f32> = (0..n_exp * hidden)
-            .map(|i| (i as f32) * 0.001)
-            .collect();
+        let weights: Vec<f32> = (0..n_exp * hidden).map(|i| (i as f32) * 0.001).collect();
         let router = CpuRouter::from_f32_weights(0, weights, n_exp, hidden);
         let x: Vec<f32> = (0..hidden).map(|i| (i as f32).sin()).collect();
         let top = router.compute_topk(&x, 4);

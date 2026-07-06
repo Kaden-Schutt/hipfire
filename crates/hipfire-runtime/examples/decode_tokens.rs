@@ -18,7 +18,8 @@ fn main() {
         .expect("tokenizer");
 
     let content = std::fs::read_to_string(tokens_path).expect("read tokens");
-    let tokens: Vec<u32> = content.lines()
+    let tokens: Vec<u32> = content
+        .lines()
         .filter_map(|l| l.trim().parse().ok())
         .collect();
     let text = tokenizer.decode(&tokens);

@@ -11,6 +11,7 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 rdna-compute = { path = "../rdna-compute" }
 hip-bridge = { path = "../hip-bridge" }
+hipfire-reap = { path = "../hipfire-reap" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

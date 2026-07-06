@@ -83,6 +83,15 @@ pub struct SamplerConfig {
     /// Token IDs whose logit is unconditionally set to `-INF` before
     /// sampling. Used for the unclosed-opener attractor block (#111).
     pub blocked_tokens: Vec<u32>,
+    /// Request-driven top-K candidate cutoff. `None` preserves the kernel's
+    /// legacy hard-coded K=20 candidate gather exactly (the gather pool is
+    /// always 20; a `Some(k)` only narrows the post-softmax nucleus to the
+    /// top-`min(k, 20)` candidates). Values `>= 20` are no-ops.
+    pub top_k: Option<u32>,
+    /// Request-driven min-p cutoff: drop candidates whose probability is
+    /// below `min_p * max_prob`. `None` (or `Some(0.0)`) disables the cut,
+    /// byte-identical to the legacy path.
+    pub min_p: Option<f32>,
 }
 
 impl SamplerConfig {
@@ -97,6 +106,8 @@ impl SamplerConfig {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
+            top_k: None,
+            min_p: None,
         }
     }
 }
@@ -115,6 +126,8 @@ impl Default for SamplerConfig {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
+            top_k: None,
+            min_p: None,
         }
     }
 }
@@ -203,6 +216,8 @@ pub fn sample(
             cfg.repeat_penalty,
             cfg.presence_penalty,
             cfg.frequency_penalty,
+            cfg.top_k,
+            cfg.min_p,
         )
         .expect("sample_top_p kernel launch / readback failed");
     *rng_state = new_rng;

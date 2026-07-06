@@ -9,16 +9,22 @@
 //! 1. Generate K candidate tokens by iterating `mtp_forward` K times,
 //!    seeding each step with the previous step's predicted token and
 //!    the previous step's MTP-layer hidden state.
-//! 2. Run the main DeepSeek V4 forward as `forward_prefill_batch_chunk` at B=K
-//!    on `[committed_token, draft_1, draft_2, ..., draft_{K-1}]`.
-//! 3. Compare main's top-1 at each verify position against the next
-//!    draft's predicted token; accept the longest matching prefix.
-//! 4. Return `accepted_tokens` + the main model's preferred token at
-//!    the divergence position (to keep generation moving forward even
-//!    on a rejected suffix).
+//! 2. Run the main DeepSeek V4 forward as `forward_prefill_batch_chunk` at
+//!    B=K+1 on `[committed_token, draft_1, ..., draft_K]`. The extra (K+1)'th
+//!    verify position predicts the token AFTER the last draft — the full-accept
+//!    bonus.
+//! 3. Compare main's top-1 at each of the first K verify positions against the
+//!    matching draft; accept the longest matching prefix. The acceptance rule is
+//!    the shared `hipfire_runtime::spec::accept_greedy_prefix` core (non-grammar
+//!    path); the grammar/tool-call path stays sequential (stateful per-position
+//!    masking) but appends the same full-accept bonus.
+//! 4. Return `accepted_tokens` = accepted prefix + bonus, where the bonus is the
+//!    main model's preferred token at the divergence position (partial accept) or
+//!    at the (K+1)'th position (full accept) — keeping generation moving forward
+//!    by one extra free token per full-accept window.
 //!
-//! When all K drafts are accepted, the next call starts from
-//! `accepted_tokens[K-1]` and the previously-cached hidden state.
+//! When all K drafts are accepted, the next call starts from the bonus token
+//! `accepted_tokens[K]` and the verify pass's hidden state at that position.
 //!
 //! ## Status
 //!
@@ -274,20 +280,21 @@ fn speculative_decode_impl(
         }
     }
 
-    // ── 3. Single B=K main verify pass ────────────────────────────────
-    // Tokens to feed the verifier: the last committed token plus the
-    // first K-1 drafts. The verifier outputs logits at K positions,
-    // each predicting "what comes after my input token" — these are
-    // the predictions we compare to the drafts.
+    // ── 3. Single B=K+1 main verify pass ──────────────────────────────
+    // Tokens to feed the verifier: the last committed token plus ALL K
+    // drafts. The verifier outputs logits at K+1 positions, each predicting
+    // "what comes after my input token" — the first K are the predictions we
+    // compare to the drafts; the (K+1)'th is the full-accept bonus.
     //
-    //   verify_tokens[0] = last_token   → predicts pos N+1's token (= draft[0]'s target)
-    //   verify_tokens[1] = draft[0]     → predicts pos N+2's token (= draft[1]'s target)
+    //   verify_tokens[0]  = last_token   → predicts pos N+1   (= draft[0]'s target)
+    //   verify_tokens[1]  = draft[0]     → predicts pos N+2   (= draft[1]'s target)
     //   ...
-    //   verify_tokens[K-1] = draft[K-2] → predicts pos N+K  's token
+    //   verify_tokens[K-1] = draft[K-2]  → predicts pos N+K   (= draft[K-1]'s target)
+    //   verify_tokens[K]   = draft[K-1]  → predicts pos N+K+1 (= full-accept bonus)
     let verify_tokens: Vec<u32> = std::iter::once(last_token)
-        .chain(draft_tokens.iter().take(k - 1).copied())
+        .chain(draft_tokens.iter().take(k).copied())
         .collect();
-    debug_assert_eq!(verify_tokens.len(), k);
+    debug_assert_eq!(verify_tokens.len(), k + 1);
 
     // Use the caller-provided PBS if available; otherwise allocate one.
     // The owned variant exists so single-shot callers / tests still work
@@ -295,14 +302,15 @@ fn speculative_decode_impl(
     // critical path used by tight spec-decode loops.
     let owned_pbs: Option<forward::PrefillBatchScratch> = match cached_pbs {
         Some(_) => None,
-        None => Some(forward::PrefillBatchScratch::new(gpu, cfg, k)?),
+        None => Some(forward::PrefillBatchScratch::new(gpu, cfg, k + 1)?),
     };
     let pbs: &forward::PrefillBatchScratch =
         cached_pbs.unwrap_or_else(|| owned_pbs.as_ref().unwrap());
-    if pbs.max_batch < k {
+    if pbs.max_batch < k + 1 {
         return Err(format!(
-            "spec_decode: cached PBS max_batch ({}) < k ({})",
-            pbs.max_batch, k
+            "spec_decode: cached PBS max_batch ({}) < k+1 ({})",
+            pbs.max_batch,
+            k + 1
         ));
     }
     forward::forward_prefill_batch_chunk(
@@ -315,41 +323,65 @@ fn speculative_decode_impl(
         last_position + 1,
     )?;
 
-    // ── 4. Per-position top-1 from the verifier ───────────────────────
-    let all_logits = forward::final_norm_and_head_all_batched(cfg, weights, state, pbs, gpu, k)?;
+    // ── 4. Per-position top-1 from the verifier (K+1 positions) ────────
+    let all_logits =
+        forward::final_norm_and_head_all_batched(cfg, weights, state, pbs, gpu, k + 1)?;
     let mut verify_matcher = grammar.as_ref().map(|g| (*g.matcher).clone());
 
     // ── 5. Longest matching prefix → acceptance ────────────────────────
     //
-    // In tool-call mode the verifier's preferred token is chosen after the
-    // same DSML grammar mask as the non-spec decode path. The verifier matcher
-    // advances only along the actually accepted prefix; at divergence, the
-    // appended verifier token is legal for the grammar state reached by that
-    // prefix.
-    let mut accepted_tokens: Vec<u32> = Vec::with_capacity(k);
-    let mut n_accept = 0usize;
-    for (idx, &draft) in draft_tokens.iter().enumerate() {
-        let main = match (grammar.as_mut(), verify_matcher.as_ref()) {
-            (Some(g), Some(matcher)) => {
-                let mut logits = all_logits[idx].clone();
-                apply_grammar_mask(matcher, g.decoded_vocab, g.mask, &mut logits);
-                logits_argmax(&logits) as u32
+    // Two paths share the same shape (accept the longest prefix where the
+    // verifier's argmax matches the draft, then take a bonus) but differ in how
+    // the verifier's pick is computed:
+    //
+    //   - NON-GRAMMAR: the pick at slot i is plain argmax of `all_logits[i]`,
+    //     independent of the accepted prefix → precompute all K+1 picks and run
+    //     the shared `accept_greedy_prefix` core (the one rule used by DFlash,
+    //     MTP, and n-gram). The (K+1)'th pick is the full-accept bonus.
+    //   - GRAMMAR (tool-call): the pick at slot i depends on the DSML matcher
+    //     state reached by accepting slots `0..i` (the mask changes per token),
+    //     so it CANNOT be precomputed. Stays sequential. A throwaway
+    //     `verify_matcher` clone walks the masks; on full accept it appends the
+    //     same (K+1)'th masked-argmax bonus.
+    //
+    // Either way `accepted_tokens` = accepted prefix + one bonus token, and the
+    // real `g.matcher` is advanced over that final prefix below (unchanged).
+    let mut accepted_tokens: Vec<u32>;
+    let n_accept: usize;
+    if let Some(g) = grammar.as_mut() {
+        let vm = verify_matcher
+            .as_mut()
+            .expect("grammar Some ⇒ verify_matcher Some");
+        accepted_tokens = Vec::with_capacity(k + 1);
+        let mut n = 0usize;
+        let mut diverged = false;
+        for (idx, &draft) in draft_tokens.iter().enumerate() {
+            let mut logits = all_logits[idx].clone();
+            apply_grammar_mask(vm, g.decoded_vocab, g.mask, &mut logits);
+            let main = logits_argmax(&logits) as u32;
+            if draft == main {
+                accepted_tokens.push(draft);
+                n += 1;
+                advance_matcher_token(vm, g.decoded_vocab, draft);
+            } else {
+                accepted_tokens.push(main);
+                advance_matcher_token(vm, g.decoded_vocab, main);
+                diverged = true;
+                break;
             }
-            _ => logits_argmax(&all_logits[idx]) as u32,
-        };
-        if draft == main {
-            accepted_tokens.push(draft);
-            n_accept += 1;
-            if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
-                advance_matcher_token(matcher, g.decoded_vocab, draft);
-            }
-        } else {
-            accepted_tokens.push(main);
-            if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
-                advance_matcher_token(matcher, g.decoded_vocab, main);
-            }
-            break;
         }
+        if !diverged {
+            // Full accept → bonus from the (K+1)'th masked verify position.
+            let mut logits = all_logits[k].clone();
+            apply_grammar_mask(vm, g.decoded_vocab, g.mask, &mut logits);
+            accepted_tokens.push(logits_argmax(&logits) as u32);
+        }
+        n_accept = n;
+    } else {
+        let target_pick: Vec<u32> = all_logits.iter().map(|l| logits_argmax(l) as u32).collect();
+        let acc = hipfire_runtime::spec::accept_greedy_prefix(&draft_tokens, &target_pick, None);
+        n_accept = acc.accepted;
+        accepted_tokens = acc.committed;
     }
 
     if let Some(g) = grammar.as_mut() {

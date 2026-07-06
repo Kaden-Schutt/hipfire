@@ -45,7 +45,50 @@ export interface RegistryModelEntryV1 {
   size_bytes?: number | null;
   arch_id?: number | null;
   quant?: string | null;
+  /// Optional per-model KV-cache default. When present it takes precedence
+  /// over the per-GPU archDefaults fallback in resolveKvMode (the registry is
+  /// the per-model card). Must be one of REGISTRY_KV_MODE_VALUES — an invalid
+  /// value rejects the whole entry (fail-closed, same as arch_id/quant).
+  default_kv_mode?: string | null;
+  /// Optional curated author-recommended INFERENCE settings, inherited from
+  /// the model's parent card. Layered UNDER per-model models.json config and
+  /// OVER the CLI global default (resolveModelConfig). Each field is optional;
+  /// out-of-bounds values reject the whole entry (fail-closed, see validEntry).
+  recommended_settings?: RegistryRecommendedSettings | null;
 }
+
+/// Curated author-recommended sampling + framing defaults for a registry model
+/// (the "card recs"). Richer than the .hfq-baked generation_config: it can also
+/// carry a default system prompt. All fields optional. Bounds enforced in
+/// validEntry (fail-closed).
+export interface RegistryRecommendedSettings {
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  min_p?: number;
+  presence_penalty?: number;
+  repeat_penalty?: number;
+  system_prompt?: string;
+}
+
+/// Canonical KV-mode allowlist accepted as a per-model `default_kv_mode`.
+/// MUST stay in sync with the CLI's resolveKvMode/validateConfigValue set
+/// (cli/index.ts) and scripts/registry_gen.py KNOWN_KV_MODES. Includes the
+/// legacy turbo* aliases since resolveKvMode still maps them.
+export const REGISTRY_KV_MODE_VALUES: readonly string[] = [
+  "auto",
+  "q8",
+  "asym4",
+  "asym3",
+  "asym2",
+  "fwht4",
+  "fwht3",
+  "fwht2",
+  "turbo",
+  "turbo4",
+  "turbo3",
+  "turbo2",
+];
 
 export interface RegistryV1 {
   schema_version: number;
@@ -87,6 +130,67 @@ function validEntry(v: unknown): v is RegistryModelEntryV1 {
   if (typeof v.desc !== "string") return false;
   if (v.triattn !== undefined && !validSidecar(v.triattn)) return false;
   if (v.mtp !== undefined && !validSidecar(v.mtp)) return false;
+  // Fail-closed on default_kv_mode: a present value must be a known KV mode.
+  // null/undefined means "no per-model recommendation" → arch fallback.
+  if (v.default_kv_mode !== undefined && v.default_kv_mode !== null) {
+    if (
+      typeof v.default_kv_mode !== "string" ||
+      !REGISTRY_KV_MODE_VALUES.includes(v.default_kv_mode)
+    ) {
+      return false;
+    }
+  }
+  // Fail-closed bounds-check on recommended_settings: any present numeric knob
+  // out of range, or a non-string system_prompt, rejects the whole entry.
+  if (v.recommended_settings !== undefined && v.recommended_settings !== null) {
+    if (!validRecommendedSettings(v.recommended_settings)) return false;
+  }
+  return true;
+}
+
+/// Bounds for the curated card recs. Each present field is range-checked so a
+/// malformed registry never feeds an absurd sampler value into the daemon.
+///   temperature 0..2, top_p 0..1, top_k > 0 (int), min_p 0..1,
+///   presence_penalty 0..2, repeat_penalty 0.5..2, system_prompt = string.
+function validRecommendedSettings(v: unknown): boolean {
+  if (!isRecord(v)) return false;
+  const numInRange = (
+    x: unknown,
+    lo: number,
+    hi: number,
+    intOnly = false,
+  ): boolean => {
+    if (typeof x !== "number" || !Number.isFinite(x)) return false;
+    if (intOnly && !Number.isInteger(x)) return false;
+    return x >= lo && x <= hi;
+  };
+  if (v.temperature !== undefined && !numInRange(v.temperature, 0, 2)) {
+    return false;
+  }
+  if (v.top_p !== undefined && !numInRange(v.top_p, 0, 1)) return false;
+  // top_k > 0 (exclusive) integer — 0 would disable sampling entirely.
+  if (
+    v.top_k !== undefined &&
+    (!numInRange(v.top_k, 1, 100000, true))
+  ) {
+    return false;
+  }
+  if (v.min_p !== undefined && !numInRange(v.min_p, 0, 1)) return false;
+  if (
+    v.presence_penalty !== undefined &&
+    !numInRange(v.presence_penalty, 0, 2)
+  ) {
+    return false;
+  }
+  if (
+    v.repeat_penalty !== undefined &&
+    !numInRange(v.repeat_penalty, 0.5, 2)
+  ) {
+    return false;
+  }
+  if (v.system_prompt !== undefined && typeof v.system_prompt !== "string") {
+    return false;
+  }
   return true;
 }
 

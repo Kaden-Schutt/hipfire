@@ -49,39 +49,67 @@ presets pick a built-in floor/threshold schedule; the
 and V floor (lloyd4/lloyd3/lloyd2). With adaptive on, `max_seq` is the
 context guaranteed at the floor tier.
 
-## Speculative decode (DFlash)
+## Speculative decode
+
+hipfire has three speculative-decode mechanisms; **only one runs at a time**.
+The `speculation` selector is the canonical knob — it picks the mechanism, so
+there's a single place that decides and no "which one wins?" ambiguity.
 
 | Key | Default | Values | Notes |
 |---|---|---|---|
-| `dflash_mode` | off | on / off / auto | `auto` enables DFlash on dense Qwen 3.5+ targets and skips configs known to lose. |
+| `speculation` | auto | off / auto / ngram / dflash / mtp | The mechanism selector (see below). |
+
+- **`off`** — plain autoregressive decode.
+- **`auto`** — cascade by availability, priority **dflash > mtp > ngram**. Each
+  mechanism's legacy mode knob (`dflash_mode` / `mtp_mode` / `ngram_mode`) acts
+  as its eligibility filter and keeps its own heuristic. This is where the
+  legacy knobs fine-tune behavior.
+- **`dflash` / `mtp` / `ngram`** — force exactly that mechanism (bypassing the
+  heuristics). If its prerequisite is missing (a draft model for dflash, MTP
+  weights for mtp) the CLI warns and falls back to AR.
+
+The selector resolves through the config ladder **env > CLI flag > per-model >
+global** (`HIPFIRE_SPECULATION` / `--spec` > per-model JSON > global JSON).
+Default `speculation=auto` with the legacy defaults below reproduces prior
+behavior exactly.
+
+### Mechanism knobs (fine-tune the `auto` cascade)
+
+| Key | Default | Values | Notes |
+|---|---|---|---|
+| `dflash_mode` | off | on / off / auto | Draft-model speculation. `auto` enables on dense Qwen 3.5+ and skips configs known to lose (e.g. A3B without a sidecar). |
 | `dflash_adaptive_b` | true | true / false | Adaptive draft block size. |
-| `dflash_ngram_block` | auto | true / false / auto | n-gram cache prefilling. |
+| `dflash_ngram_block` | auto | true / false / auto | n-gram cache prefilling (DFlash verify-path defense). |
+| `mtp_mode` | auto | off / on / auto | Built-in Multi-Token-Prediction head. `auto` enables when MTP weights are present — **DeepSeek V4 (arch_id=9)** only. (qwen3.5 `.mq4-mtp` MTP is gated separately by the `HIPFIRE_QWEN35_MTP=1` env var, not by `mtp_mode`/`speculation`.) |
+| `mtp_k` | 3 | 1–10 | MTP draft tokens per window. |
+| `ngram_mode` | off | off / on / auto | Model-free n-gram drafter — **byte-identical to AR** (no draft weights). `on` joins the auto cascade (lowest priority); `auto` = last-resort. |
+| `ngram_k` | 12 | 2–32 | n-gram draft window K. Acceptance saturates ~12. |
+| `ngram_min_count` | 2 | 1–10 | Min n-gram match count before proposing. |
 
-DFlash speedup is genre-conditional: large on code, modest on
-instruct, can be a net loss on prose. See [BENCHMARKS.md](BENCHMARKS.md)
-for measured speedups. Per-model override is the most common knob:
-`hipfire config qwen3.5:9b set dflash_mode off` if your workload is
-mostly long-form prose.
+**Which to use.** DFlash is genre-conditional: large win on code, modest on
+instruct, can be a net loss on prose (see [BENCHMARKS.md](BENCHMARKS.md)). MTP
+needs a model that ships an MTP head. n-gram needs nothing and never changes the
+output — it just speeds up high-repetition workloads (verbatim copy,
+long-context retrieval, structured output) and is a wash-to-slight-loss on prose.
 
-## Speculative decode (MTP)
-
-| Key | Default | Values | Notes |
-|---|---|---|---|
-| `mtp_mode` | auto | off / on / auto | MTP spec-decode using the model's built-in Multi-Token Prediction head. `auto` enables when MTP weights are present. Currently applies to DeepSeek V4 (arch_id=9). |
-| `mtp_k` | 3 | 1–10 | Draft tokens per spec-decode window. Higher = more parallelism, lower acceptance probability per draft step. |
-
-`auto` discovers MTP weights from `<model>-mtp.*` sibling files (e.g.
-`deepseek-v4-flash-mtp.mq2lloyd` alongside the main `.mq2lloyd`). Set `off`
-to skip the sibling scan entirely and use plain AR decode.
-
-Per-model override:
+Per-model override (most common):
 ```bash
-hipfire config deepseek-v4-flash-mtp:latest set mtp_mode on
+hipfire config qwen3.5:9b set dflash_mode off          # prose-heavy workload
 hipfire config deepseek-v4-flash-mtp:latest set mtp_k 5
+hipfire config qwen3.5:0.8b set speculation ngram      # force model-free n-gram
 ```
 
-Legacy env vars `HIPFIRE_DEEPSEEK4_SPEC_DECODE` and `HIPFIRE_DEEPSEEK4_SPEC_K`
-continue to work and take precedence over config values.
+CLI flags (llama.cpp-style; one-shot, override config for that invocation):
+```bash
+hipfire run qwen3.5:9b --spec ngram "..."              # force a mechanism
+hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq "..."  # draft model → dflash
+hipfire run qwen3.5:9b --spec ngram --draft-max 16 "..."      # window of active mech
+```
+
+Legacy env vars `HIPFIRE_NGRAM_DRAFT` / `HIPFIRE_NGRAM_DRAFT_K` /
+`HIPFIRE_NGRAM_MIN_COUNT` (n-gram) and `HIPFIRE_DEEPSEEK4_SPEC_DECODE` /
+`HIPFIRE_DEEPSEEK4_SPEC_K` (MTP) continue to work and, like all env vars, sit at
+the **top** of the ladder.
 
 ## Attention
 

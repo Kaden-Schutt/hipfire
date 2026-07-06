@@ -111,7 +111,6 @@ fn compare_with_tol(name: &str, ref_out: &[f32], test_out: &[f32], tol: f32) -> 
     ok
 }
 
-
 fn alloc_zero(gpu: &mut rdna_compute::Gpu, n_elem: usize) -> GpuTensor {
     let zeros = vec![0.0f32; n_elem];
     gpu.upload_f32(&zeros, &[n_elem]).unwrap()
@@ -130,7 +129,9 @@ fn main() {
     let mut any_fail = false;
 
     let weight_bytes = synth_hfq3_bytes(m, k, 42);
-    let d_w = gpu.upload_raw(&weight_bytes, &[weight_bytes.len()]).unwrap();
+    let d_w = gpu
+        .upload_raw(&weight_bytes, &[weight_bytes.len()])
+        .unwrap();
 
     for &n in &batches {
         eprintln!("\n-- batch_size = {n} --");
@@ -144,9 +145,11 @@ fn main() {
         // tolerance at N>1 (auto-routing hits dot2 or fp16, dequant in FP16).
         // dp4a / MMQ modes quantize X to Q8_1 on top of the FP16 weight
         // dequant, so they need a wider tolerance (~3× the dot2 error band).
-        let env_truthy = |k: &str| std::env::var(k)
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-            .unwrap_or(false);
+        let env_truthy = |k: &str| {
+            std::env::var(k)
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+                .unwrap_or(false)
+        };
         let int8_x_mode = env_truthy("HIPFIRE_HFQ3_DP4A") || env_truthy("HIPFIRE_HFQ3_MMQ");
         let tol: f32 = if n == 1 {
             1e-3
@@ -158,7 +161,8 @@ fn main() {
 
         // Test 1: gemm_hfq3g256_residual (Y starts zero, accumulates).
         let d_y = alloc_zero(&mut gpu, n * m);
-        gpu.gemm_hfq3g256_residual(&d_w, &d_x, &d_y, m, k, n).unwrap();
+        gpu.gemm_hfq3g256_residual(&d_w, &d_x, &d_y, m, k, n)
+            .unwrap();
         let y_resid = gpu.download_f32(&d_y).unwrap();
         any_fail |= !compare_with_tol("residual", &y_ref, &y_resid, tol);
         gpu.free_tensor(d_y).unwrap();
@@ -167,10 +171,8 @@ fn main() {
         let d_yq = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
         let d_yk = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
         let d_yv = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
-        gpu.gemm_qkv_hfq3g256(
-            &d_w, &d_w, &d_w, &d_x, &d_yq, &d_yk, &d_yv, m, m, m, k, n,
-        )
-        .unwrap();
+        gpu.gemm_qkv_hfq3g256(&d_w, &d_w, &d_w, &d_x, &d_yq, &d_yk, &d_yv, m, m, m, k, n)
+            .unwrap();
         let yq = gpu.download_f32(&d_yq).unwrap();
         let yk = gpu.download_f32(&d_yk).unwrap();
         let yv = gpu.download_f32(&d_yv).unwrap();
@@ -199,9 +201,7 @@ fn main() {
         let d_y3 = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
         let d_y4 = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
         gpu.gemm_qkvza_hfq3g256(
-            &d_w, &d_w, &d_w, &d_w, &d_x,
-            &d_y1, &d_y2, &d_y3, &d_y4,
-            m, m, m, m, k, n,
+            &d_w, &d_w, &d_w, &d_w, &d_x, &d_y1, &d_y2, &d_y3, &d_y4, m, m, m, m, k, n,
         )
         .unwrap();
         let y1 = gpu.download_f32(&d_y1).unwrap();
@@ -226,9 +226,8 @@ fn main() {
             let d_yq = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
             let d_yk = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
             let d_yv = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
-            gpu.gemm_qkv_hfq3g256_fp16(
-                &d_w, &d_w, &d_w, &d_x, &d_yq, &d_yk, &d_yv, m, m, m, k, n,
-            ).unwrap();
+            gpu.gemm_qkv_hfq3g256_fp16(&d_w, &d_w, &d_w, &d_x, &d_yq, &d_yk, &d_yv, m, m, m, k, n)
+                .unwrap();
             let yq = gpu.download_f32(&d_yq).unwrap();
             any_fail |= !compare_with_tol("fp16 qkv (y_q)", &y_ref, &yq, tol);
             gpu.free_tensor(d_yq).unwrap();
@@ -240,10 +239,9 @@ fn main() {
             let d_y3 = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
             let d_y4 = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
             gpu.gemm_qkvza_hfq3g256_fp16(
-                &d_w, &d_w, &d_w, &d_w, &d_x,
-                &d_y1, &d_y2, &d_y3, &d_y4,
-                m, m, m, m, k, n,
-            ).unwrap();
+                &d_w, &d_w, &d_w, &d_w, &d_x, &d_y1, &d_y2, &d_y3, &d_y4, m, m, m, m, k, n,
+            )
+            .unwrap();
             let y1 = gpu.download_f32(&d_y1).unwrap();
             any_fail |= !compare_with_tol("fp16 qkvza (qkv arm)", &y_ref, &y1, tol);
             gpu.free_tensor(d_y1).unwrap();
@@ -253,14 +251,16 @@ fn main() {
 
             let d_yg = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
             let d_yu = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
-            gpu.gemm_gate_up_hfq3g256_fp16(&d_w, &d_w, &d_x, &d_yg, &d_yu, m, m, k, n).unwrap();
+            gpu.gemm_gate_up_hfq3g256_fp16(&d_w, &d_w, &d_x, &d_yg, &d_yu, m, m, k, n)
+                .unwrap();
             let yg = gpu.download_f32(&d_yg).unwrap();
             any_fail |= !compare_with_tol("fp16 gate_up (gate)", &y_ref, &yg, tol);
             gpu.free_tensor(d_yg).unwrap();
             gpu.free_tensor(d_yu).unwrap();
 
             let d_y = alloc_zero(&mut gpu, n * m);
-            gpu.gemm_hfq3g256_residual_fp16(&d_w, &d_x, &d_y, m, k, n).unwrap();
+            gpu.gemm_hfq3g256_residual_fp16(&d_w, &d_x, &d_y, m, k, n)
+                .unwrap();
             let y_resid = gpu.download_f32(&d_y).unwrap();
             any_fail |= !compare_with_tol("fp16 residual", &y_ref, &y_resid, tol);
             gpu.free_tensor(d_y).unwrap();
@@ -280,7 +280,9 @@ fn main() {
         eprintln!("\n-- MMQ selector/fallback (qkv + gate_up at m=256) --");
         let m_mmq = 256usize;
         let weight_bytes_mmq = synth_hfq3_bytes(m_mmq, k, 42);
-        let d_w_mmq = gpu.upload_raw(&weight_bytes_mmq, &[weight_bytes_mmq.len()]).unwrap();
+        let d_w_mmq = gpu
+            .upload_raw(&weight_bytes_mmq, &[weight_bytes_mmq.len()])
+            .unwrap();
 
         // FP16 mantissa + Q8_1 X tolerance.
         let mmq_tol = 5e-1_f32;
@@ -289,7 +291,8 @@ fn main() {
         for &n in &[16usize, 32, 128] {
             let x_mmq = synth_x(n, k, 17);
             let d_x_mmq = gpu.upload_f32(&x_mmq, &[n * k]).unwrap();
-            let y_ref_mmq = cpu_reference_via_gemv(&mut gpu, &weight_bytes_mmq, &x_mmq, m_mmq, k, n);
+            let y_ref_mmq =
+                cpu_reference_via_gemv(&mut gpu, &weight_bytes_mmq, &x_mmq, m_mmq, k, n);
 
             eprintln!("  -- batch_size = {n} --");
 
@@ -298,9 +301,10 @@ fn main() {
             let d_yk = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
             let d_yv = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
             gpu.gemm_qkv_hfq3g256_mmq(
-                &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_x_mmq,
-                &d_yq, &d_yk, &d_yv, m_mmq, m_mmq, m_mmq, k, n,
-            ).unwrap();
+                &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_x_mmq, &d_yq, &d_yk, &d_yv, m_mmq, m_mmq, m_mmq,
+                k, n,
+            )
+            .unwrap();
             let yq = gpu.download_f32(&d_yq).unwrap();
             any_fail |= !compare_with_tol("mmq qkv (y_q)", &y_ref_mmq, &yq, mmq_tol);
             gpu.free_tensor(d_yq).unwrap();
@@ -312,7 +316,8 @@ fn main() {
             let d_yu = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
             gpu.gemm_gate_up_hfq3g256_mmq(
                 &d_w_mmq, &d_w_mmq, &d_x_mmq, &d_yg, &d_yu, m_mmq, m_mmq, k, n,
-            ).unwrap();
+            )
+            .unwrap();
             let yg = gpu.download_f32(&d_yg).unwrap();
             any_fail |= !compare_with_tol("mmq gate_up (gate)", &y_ref_mmq, &yg, mmq_tol);
             gpu.free_tensor(d_yg).unwrap();
@@ -324,10 +329,10 @@ fn main() {
             let d_y3 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
             let d_y4 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
             gpu.gemm_qkvza_hfq3g256_mmq(
-                &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_x_mmq,
-                &d_y1, &d_y2, &d_y3, &d_y4,
+                &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_x_mmq, &d_y1, &d_y2, &d_y3, &d_y4,
                 m_mmq, m_mmq, m_mmq, m_mmq, k, n,
-            ).unwrap();
+            )
+            .unwrap();
             let y1 = gpu.download_f32(&d_y1).unwrap();
             any_fail |= !compare_with_tol("mmq qkvza (qkv arm)", &y_ref_mmq, &y1, mmq_tol);
             gpu.free_tensor(d_y1).unwrap();

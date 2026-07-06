@@ -55,19 +55,21 @@ struct Args {
 }
 
 fn parse_args() -> Args {
-    let mut out = Args { max_new_tokens: 16, max_seq: 512, ..Default::default() };
+    let mut out = Args {
+        max_new_tokens: 16,
+        max_seq: 512,
+        ..Default::default()
+    };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--hfq" => out.hfq = it.next(),
             "--prompt-file" => out.prompt_file = it.next(),
             "--reference" => out.reference = it.next(),
-            "--max-new-tokens" => out.max_new_tokens = it.next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16),
-            "--max-seq" => out.max_seq = it.next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(512),
+            "--max-new-tokens" => {
+                out.max_new_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(16)
+            }
+            "--max-seq" => out.max_seq = it.next().and_then(|s| s.parse().ok()).unwrap_or(512),
             "--no-load" => out.no_load = true,
             "-h" | "--help" => {
                 print_help();
@@ -102,8 +104,7 @@ fn print_help() {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
-    let hfq_path = args.hfq.as_deref()
-        .ok_or("--hfq is required")?;
+    let hfq_path = args.hfq.as_deref().ok_or("--hfq is required")?;
 
     eprintln!("[1/5] opening HFQ: {hfq_path}");
     let mut hfq = HfqFile::open(Path::new(hfq_path))?;
@@ -120,8 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("[2/5] parsing Qwen2Config");
-    let cfg = qwen2::config_from_hfq(&hfq)
-        .ok_or("qwen2: failed to parse config from HFQ metadata")?;
+    let cfg = qwen2::config_from_hfq(&hfq)?;
     eprintln!(
         "      hidden={}, layers={}, n_heads={}, n_kv_heads={}, \
          head_dim={}, vocab={}, attention_bias={}, tie_word_embeddings={}, \
@@ -206,7 +206,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, &tok) in prompt_ids.iter().enumerate() {
         qwen2::forward_step(&mut gpu, &weights, &cfg, &mut state, tok)?;
         if i % 8 == 0 || i + 1 == prompt_ids.len() {
-            eprintln!("  prompt pos {i:3}: token {tok} → pos_after={}", state.next_pos);
+            eprintln!(
+                "  prompt pos {i:3}: token {tok} → pos_after={}",
+                state.next_pos
+            );
         }
     }
     let prefill_ms = prefill_start.elapsed().as_millis();
@@ -262,9 +265,7 @@ fn check_completion_parity(
         .collect();
 
     let n = ref_first16.len().min(hipfire_ids.len());
-    eprintln!(
-        "[validate] comparing first {n} generated tokens vs HF reference"
-    );
+    eprintln!("[validate] comparing first {n} generated tokens vs HF reference");
 
     let mut matches = 0usize;
     for i in 0..n {
@@ -285,7 +286,9 @@ fn check_completion_parity(
             "top-1 token match FAILED: {matches}/{n} positions match \
              between hipfire and HF reference. First divergence at \
              position {}.",
-            (0..n).find(|&i| hipfire_ids[i] != ref_first16[i]).unwrap_or(n)
+            (0..n)
+                .find(|&i| hipfire_ids[i] != ref_first16[i])
+                .unwrap_or(n)
         )
         .into())
     }
@@ -319,7 +322,9 @@ fn check_tokenizer_parity(
     eprintln!("      ✗ tokenizer parity FAILED");
     eprintln!("        reference: {:?}", ref_ids);
     eprintln!("        hipfire:   {:?}", hipfire_ids);
-    let first_div = hipfire_ids.iter().zip(ref_ids.iter())
+    let first_div = hipfire_ids
+        .iter()
+        .zip(ref_ids.iter())
         .position(|(a, b)| a != b);
     if let Some(pos) = first_div {
         eprintln!(
@@ -328,9 +333,7 @@ fn check_tokenizer_parity(
             hipfire_ids[pos], ref_ids[pos]
         );
     } else {
-        eprintln!(
-            "        prefix matches up to common length; lengths differ"
-        );
+        eprintln!("        prefix matches up to common length; lengths differ");
     }
     Err("tokenizer parity check failed — see above".into())
 }

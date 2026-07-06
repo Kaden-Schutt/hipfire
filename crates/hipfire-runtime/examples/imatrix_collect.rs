@@ -89,15 +89,42 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--bf16-gguf" => { bf16_gguf = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--corpus" => { corpus = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--n-ctx" => { n_ctx = argv[i + 1].parse().expect("--n-ctx must be u32"); i += 2; }
-            "--n-batch" => { n_batch = argv[i + 1].parse().expect("--n-batch must be u32"); i += 2; }
-            "--chunks" => { chunks = Some(argv[i + 1].parse().expect("--chunks must be int")); i += 2; }
-            "--llama-imatrix-bin" => { llama_imatrix_bin = argv[i + 1].clone(); i += 2; }
-            "--process-output" => { process_output = true; i += 1; }
-            "-h" | "--help" => { print_usage(); std::process::exit(0); }
+            "--bf16-gguf" => {
+                bf16_gguf = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--corpus" => {
+                corpus = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--n-ctx" => {
+                n_ctx = argv[i + 1].parse().expect("--n-ctx must be u32");
+                i += 2;
+            }
+            "--n-batch" => {
+                n_batch = argv[i + 1].parse().expect("--n-batch must be u32");
+                i += 2;
+            }
+            "--chunks" => {
+                chunks = Some(argv[i + 1].parse().expect("--chunks must be int"));
+                i += 2;
+            }
+            "--llama-imatrix-bin" => {
+                llama_imatrix_bin = argv[i + 1].clone();
+                i += 2;
+            }
+            "--process-output" => {
+                process_output = true;
+                i += 1;
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 print_usage();
@@ -106,9 +133,18 @@ fn parse_args() -> Args {
         }
     }
 
-    let bf16_gguf = bf16_gguf.unwrap_or_else(|| { print_usage(); std::process::exit(1); });
-    let corpus = corpus.unwrap_or_else(|| { print_usage(); std::process::exit(1); });
-    let output = output.unwrap_or_else(|| { print_usage(); std::process::exit(1); });
+    let bf16_gguf = bf16_gguf.unwrap_or_else(|| {
+        print_usage();
+        std::process::exit(1);
+    });
+    let corpus = corpus.unwrap_or_else(|| {
+        print_usage();
+        std::process::exit(1);
+    });
+    let output = output.unwrap_or_else(|| {
+        print_usage();
+        std::process::exit(1);
+    });
 
     if !bf16_gguf.exists() {
         eprintln!("error: --bf16-gguf not found: {}", bf16_gguf.display());
@@ -120,8 +156,14 @@ fn parse_args() -> Args {
     }
 
     Args {
-        bf16_gguf, corpus, output, n_ctx, n_batch, chunks,
-        llama_imatrix_bin, process_output,
+        bf16_gguf,
+        corpus,
+        output,
+        n_ctx,
+        n_batch,
+        chunks,
+        llama_imatrix_bin,
+        process_output,
     }
 }
 
@@ -134,7 +176,9 @@ fn main() {
     // llama.cpp versions in subtle ways) yields different activation
     // statistics and the imatrix is silently miscalibrated.
     eval_common::verify_llama_commit(
-        &args.llama_imatrix_bin, PINNED_LLAMACPP_COMMIT, "imatrix_collect",
+        &args.llama_imatrix_bin,
+        PINNED_LLAMACPP_COMMIT,
+        "imatrix_collect",
     );
 
     eprintln!();
@@ -144,7 +188,10 @@ fn main() {
     eprintln!("  output:          {}", args.output.display());
     eprintln!("  n_ctx:           {}", args.n_ctx);
     eprintln!("  n_batch:         {}", args.n_batch);
-    eprintln!("  chunks:          {}", args.chunks.map_or("all".to_string(), |c| c.to_string()));
+    eprintln!(
+        "  chunks:          {}",
+        args.chunks.map_or("all".to_string(), |c| c.to_string())
+    );
     eprintln!("  process_output:  {}", args.process_output);
     eprintln!("  pinned commit:   {}", PINNED_LLAMACPP_COMMIT);
     eprintln!();
@@ -154,11 +201,11 @@ fn main() {
     // 9B ~30-60 min on gfx1100 with the default wikitext2 1175-chunk slice).
     let mut cmd = Command::new(&args.llama_imatrix_bin);
     cmd.args(["-m", &args.bf16_gguf.display().to_string()])
-       .args(["-f", &args.corpus.display().to_string()])
-       .args(["-c", &args.n_ctx.to_string()])
-       .args(["-b", &args.n_batch.to_string()])
-       .args(["-o", &args.output.display().to_string()])
-       .args(["--output-format", "gguf"]);
+        .args(["-f", &args.corpus.display().to_string()])
+        .args(["-c", &args.n_ctx.to_string()])
+        .args(["-b", &args.n_batch.to_string()])
+        .args(["-o", &args.output.display().to_string()])
+        .args(["--output-format", "gguf"]);
     if let Some(chunks) = args.chunks {
         cmd.args(["--chunks", &chunks.to_string()]);
     }
@@ -171,7 +218,8 @@ fn main() {
     cmd.arg("--no-mmap");
 
     eprintln!("imatrix_collect: invoking llama-imatrix...");
-    eprintln!("  {} {}",
+    eprintln!(
+        "  {} {}",
         args.llama_imatrix_bin,
         cmd.get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -242,7 +290,10 @@ fn summarize_imatrix(path: &std::path::Path) {
         std::process::exit(1);
     }
 
-    eprintln!("  file size:    {size} bytes ({:.2} MB)", size as f64 / 1_048_576.0);
+    eprintln!(
+        "  file size:    {size} bytes ({:.2} MB)",
+        size as f64 / 1_048_576.0
+    );
     eprintln!("  GGUF magic:   ok");
     eprintln!();
     eprintln!("=== Next step ===");
@@ -252,5 +303,8 @@ fn summarize_imatrix(path: &std::path::Path) {
     eprintln!("  quality-gap.md §5 Step 5 for the full quantizer-side recipe.");
     eprintln!();
     eprintln!("=== Inspection ===");
-    eprintln!("  llama-imatrix --in-file {} --show-statistics", path.display());
+    eprintln!(
+        "  llama-imatrix --in-file {} --show-statistics",
+        path.display()
+    );
 }

@@ -93,13 +93,15 @@ fn main() {
             // Scalar reference (FP32 dequant path).
             let d_y_s = gpu.upload_f32(&y_init, &[batch * m]).unwrap();
             std::env::set_var("HIPFIRE_FP16", "0");
-            gpu.gemm_hfq4g256_residual(&d_a, &d_x, &d_y_s, m, k, batch).unwrap();
+            gpu.gemm_hfq4g256_residual(&d_a, &d_x, &d_y_s, m, k, batch)
+                .unwrap();
             let ys = gpu.download_f32(&d_y_s).unwrap();
 
             // WMMA path (variant selected by HIPFIRE_WO_WMMA_VARIANT).
             let d_y_w = gpu.upload_f32(&y_init, &[batch * m]).unwrap();
             std::env::remove_var("HIPFIRE_FP16");
-            gpu.gemm_hfq4g256_residual_wmma(&d_a, &d_x, &d_y_w, m, k, batch).unwrap();
+            gpu.gemm_hfq4g256_residual_wmma(&d_a, &d_x, &d_y_w, m, k, batch)
+                .unwrap();
             let yw = gpu.download_f32(&d_y_w).unwrap();
 
             // Per-cell comparison with row-mod-16 histogram of bad cells.
@@ -148,7 +150,9 @@ fn main() {
                                 "      b={b} r={r}: scalar={scalar:.4} wmma={wmma:.4} err={err:.4} tol={tolerance:.4}"
                             );
                             shown += 1;
-                            if shown >= 8 { break 'outer; }
+                            if shown >= 8 {
+                                break 'outer;
+                            }
                         }
                     }
                 }
@@ -183,8 +187,16 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
         output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
         output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
         for i in 0..128 {
-            let lo = if 2*i < (end-start) { ((group[2*i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let hi = if 2*i+1 < (end-start) { ((group[2*i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let lo = if 2 * i < (end - start) {
+                ((group[2 * i] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let hi = if 2 * i + 1 < (end - start) {
+                ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
             output[out_off + 8 + i] = lo.min(15) | (hi.min(15) << 4);
         }
     }

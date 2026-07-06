@@ -24,8 +24,9 @@ spend a week chasing them.
 | `wmma-matrix.md` | WMMA operand-shape × builtin × lane-layout table per arch |
 | `validation.md` | The three gates every port must pass before merge |
 | `contributor-onboarding.md` | If you have hardware and want to help — start here |
+| `speculation.md` | Step 7 (optional): adding speculative decode to the new arch |
 
-## The arch-port workflow (the load-bearing 6 steps)
+## The arch-port workflow (6 load-bearing steps + optional step 7)
 
 ### 1. Read `wmma-matrix.md` first
 
@@ -207,11 +208,23 @@ If you don't have hardware for the target arch, you cannot merge
 — flag it in the PR and find a contributor with hardware (see
 `contributor-onboarding.md` and #45 watchers).
 
+### 7. (Optional) Add speculative decode — see `speculation.md`
+
+Once the AR forward pass is correct and gated, you can give the arch
+speculative decoding. The cheap, correctness-preserving win is the
+model-free **n-gram** drafter: `impl SpecTarget` on your bundle
+(`spec_impl.rs`, qwen2 is the template) + add your `arch_id` to two
+registries (`build_speculator`'s gate and `Carrier::spec_target_guard`).
+The daemon stays arch-agnostic and the output is **byte-identical to AR**.
+A learned drafter (DFlash / MTP / EAGLE) is a separate, larger effort on
+the same seam. Full interface contract + pitfalls in `speculation.md`.
+
 ## Quick reference
 
 - WMMA matrix → `wmma-matrix.md`
 - Validation procedure → `validation.md`
 - Contributing without privileged repo access → `contributor-onboarding.md`
+- Adding speculative decode → `speculation.md`
 - gfx11 C-mapping reference: commit `b7ac66a` ("wmma correctness
   fix"). The mapping `acc[j] = C[2*j + (tid>>4)][tid & 15]` was
   silently wrong for ~6 weeks before being caught — assume any

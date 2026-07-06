@@ -588,13 +588,18 @@ impl Gpus {
                     ),
                 )
             })?;
-            rccl.all_reduce_sum_f32(
-                r,
-                buf.as_ptr() as *const f32,
-                buf.as_ptr() as *mut f32,
-                count,
-                stream.raw_ptr(),
-            )
+            // SAFETY: `buf` is a live device buffer of `count` f32 on device
+            // `r`, and `stream` is that device's active stream. (RCCL binding
+            // became `unsafe fn` upstream.)
+            unsafe {
+                rccl.all_reduce_sum_f32(
+                    r,
+                    buf.as_ptr() as *const f32,
+                    buf.as_ptr() as *mut f32,
+                    count,
+                    stream.raw_ptr(),
+                )
+            }
             .map_err(|e| HipError::new(0, &format!("ncclAllReduce rank={r}: {e}")))?;
         }
         rccl.group_end()

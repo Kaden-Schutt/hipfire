@@ -19,7 +19,7 @@ use std::path::Path;
 
 fn main() {
     let path = std::env::args().nth(1).expect("Usage: ... <model.mq4>");
-    let hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
+    let mut hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config_from_hfq");
     eprintln!(
         "config: {} layers, vocab={}, dim={}, hidden={}",
@@ -34,8 +34,11 @@ fn main() {
         gpus.layer_to_device,
     );
 
-    println!("\n── load_weights_multi ────────────────────────────────────");
-    let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).expect("load_weights_multi");
+    println!("\n── load_weights (multi-GPU) ────────────────────────────");
+    let layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
+    let mut hfq_source = qwen35::HfqSource::new(&mut hfq, &config);
+    let weights =
+        qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout).expect("load_weights");
 
     println!("\n── verify per-tensor device placement ───────────────────");
     let attr0 = gpus.devices[0]
@@ -49,15 +52,27 @@ fn main() {
         .hip
         .pointer_get_attributes(&weights.output_norm.buf)
         .expect("attr output_norm");
-    println!("  output_norm: attr.device={} (expect {out_dev})", attr_norm.device);
-    assert_eq!(attr_norm.device, out_dev as i32, "output_norm must live on dev_last");
+    println!(
+        "  output_norm: attr.device={} (expect {out_dev})",
+        attr_norm.device
+    );
+    assert_eq!(
+        attr_norm.device, out_dev as i32,
+        "output_norm must live on dev_last"
+    );
 
     let attr_out = gpus.devices[out_dev]
         .hip
         .pointer_get_attributes(&weights.output.buf.buf)
         .expect("attr output");
-    println!("  output (lm_head): attr.device={} (expect {out_dev})", attr_out.device);
-    assert_eq!(attr_out.device, out_dev as i32, "output must live on dev_last");
+    println!(
+        "  output (lm_head): attr.device={} (expect {out_dev})",
+        attr_out.device
+    );
+    assert_eq!(
+        attr_out.device, out_dev as i32,
+        "output must live on dev_last"
+    );
 
     let probe_layers = [0usize, config.n_layers / 2, config.n_layers - 1];
     for &i in &probe_layers {

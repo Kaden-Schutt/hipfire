@@ -80,7 +80,10 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 }
 
 fn l2(v: &[f32]) -> f64 {
-    v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt()
+    v.iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// max_rel_err with denominator max(|ref_i|, rms(ref)); returns (max_rel, l2_ratio).
@@ -135,7 +138,9 @@ fn main() {
         // Deterministic LCG fill, same on every box, re-seeded per shape.
         let mut s: u64 = 0x1234_5678_9abc_def0 ^ ((m as u64) << 40 | (k as u64) << 16 | n as u64);
         let mut next = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
         };
         let w_f32: Vec<f32> = (0..m * k).map(|_| next() * 0.1).collect();
@@ -165,7 +170,9 @@ fn main() {
         let mut w_t = gpu.upload_raw(&w_bytes, &[m, k]).expect("upload w");
         w_t.dtype = DType::F16;
         let x_t = gpu.upload_f32(&x_f32, &[n, k]).expect("upload x");
-        let y_t = gpu.upload_f32(&vec![0f32; m * n], &[m * n]).expect("upload y");
+        let y_t = gpu
+            .upload_f32(&vec![0f32; m * n], &[m * n])
+            .expect("upload y");
 
         let shape_str = format!("({m},{k},{n})");
         let mut report = |name: &str, y: &[f32], y_ref: &[f32]| {
@@ -200,7 +207,8 @@ fn main() {
                 rotation: None,
                 awq_scale: None,
             };
-            gemv.run_auto(&ctx, &mut gpu, &wr, &x_t, &y_t).expect("run_auto");
+            gemv.run_auto(&ctx, &mut gpu, &wr, &x_t, &y_t)
+                .expect("run_auto");
             let y = gpu.download_f32(&y_t).expect("dl");
             report("dispatch run_auto", &y[..m], &y_ref_nm[..m]);
         } else {
@@ -210,7 +218,11 @@ fn main() {
                 "dispatch run_auto",
                 "-",
                 "-",
-                if n != 1 { "n>1: GEMV only" } else { "K%32!=0: WMMA contract" }
+                if n != 1 {
+                    "n>1: GEMV only"
+                } else {
+                    "K%32!=0: WMMA contract"
+                }
             );
         }
 
@@ -218,7 +230,8 @@ fn main() {
         //    mw16/mb8 WMMA require K%32==0; non-WMMA fallback handles any K.
         if k % 32 == 0 || !wmma {
             let _ = gpu.hip.memset(&y_t.buf, 0, m * n * 4);
-            gpu.gemm_f16_batched_lmhead(&w_t, &x_t, &y_t, m, k, n).expect("lmhead");
+            gpu.gemm_f16_batched_lmhead(&w_t, &x_t, &y_t, m, k, n)
+                .expect("lmhead");
             let y = gpu.download_f32(&y_t).expect("dl");
             report("gemm_f16_batched_lmhead", &y, &y_ref_nm);
         } else {
@@ -232,7 +245,8 @@ fn main() {
         //    arbitrary K, no skip).
         {
             let _ = gpu.hip.memset(&y_t.buf, 0, m * n * 4);
-            gpu.gemm_f16_tiled(&w_t, &x_t, &y_t, m, k, n).expect("tiled");
+            gpu.gemm_f16_tiled(&w_t, &x_t, &y_t, m, k, n)
+                .expect("tiled");
             let y = gpu.download_f32(&y_t).expect("dl");
             report("gemm_f16_tiled", &y, &y_ref_mn);
         }
@@ -253,8 +267,12 @@ fn main() {
             let w_bytes: Vec<u8> = (0..m * k * 2).map(|i| (i % 251) as u8).collect();
             let mut w_t = gpu.upload_raw(&w_bytes, &[m, k]).expect("upload w");
             w_t.dtype = DType::F16;
-            let x_t = gpu.upload_f32(&vec![0.25f32; n * k], &[n, k]).expect("upload x");
-            let y_t = gpu.upload_f32(&vec![0f32; m * n], &[m * n]).expect("upload y");
+            let x_t = gpu
+                .upload_f32(&vec![0.25f32; n * k], &[n, k])
+                .expect("upload x");
+            let y_t = gpu
+                .upload_f32(&vec![0f32; m * n], &[m * n])
+                .expect("upload y");
 
             let mut time = |name: &str, f: &mut dyn FnMut(&mut Gpu)| {
                 for _ in 0..10 {
@@ -274,7 +292,8 @@ fn main() {
                 g.gemm_f16_tiled(&w_t, &x_t, &y_t, m, k, n).expect("tiled");
             });
             time("gemm_f16_batched_lmhead", &mut |g: &mut Gpu| {
-                g.gemm_f16_batched_lmhead(&w_t, &x_t, &y_t, m, k, n).expect("lmhead");
+                g.gemm_f16_batched_lmhead(&w_t, &x_t, &y_t, m, k, n)
+                    .expect("lmhead");
             });
         }
     }

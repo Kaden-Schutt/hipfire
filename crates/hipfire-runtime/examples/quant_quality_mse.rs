@@ -56,26 +56,25 @@ struct SafetensorsIndex {
 
 impl SafetensorsIndex {
     fn open_dir_or_file(path: &Path) -> std::io::Result<Self> {
-        let shards: Vec<PathBuf> = if path.is_file()
-            && path.extension().map_or(false, |e| e == "safetensors")
-        {
-            vec![path.to_path_buf()]
-        } else if path.is_dir() {
-            let mut v = Vec::new();
-            for entry in std::fs::read_dir(path)? {
-                let p = entry?.path();
-                if p.extension().map_or(false, |e| e == "safetensors") {
-                    v.push(p);
+        let shards: Vec<PathBuf> =
+            if path.is_file() && path.extension().map_or(false, |e| e == "safetensors") {
+                vec![path.to_path_buf()]
+            } else if path.is_dir() {
+                let mut v = Vec::new();
+                for entry in std::fs::read_dir(path)? {
+                    let p = entry?.path();
+                    if p.extension().map_or(false, |e| e == "safetensors") {
+                        v.push(p);
+                    }
                 }
-            }
-            v.sort();
-            v
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("not a safetensors file or dir: {}", path.display()),
-            ));
-        };
+                v.sort();
+                v
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("not a safetensors file or dir: {}", path.display()),
+                ));
+            };
 
         let mut files: Vec<Mmap> = Vec::with_capacity(shards.len());
         let mut data_start: Vec<usize> = Vec::with_capacity(shards.len());
@@ -158,9 +157,7 @@ impl SafetensorsIndex {
             ),
             "BF16" => Some(
                 data.chunks_exact(2)
-                    .map(|c| {
-                        f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)
-                    })
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                     .collect(),
             ),
             _ => None,
@@ -175,7 +172,11 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
         })
         .collect()
 }
@@ -225,10 +226,14 @@ fn dequant_q8_0(data: &[u8], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     for b in 0..n_blocks {
         let off = b * block;
-        if off + block > data.len() { break; }
+        if off + block > data.len() {
+            break;
+        }
         let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
         for i in 0..group {
-            if out.len() >= n { break; }
+            if out.len() >= n {
+                break;
+            }
             let q = data[off + 2 + i] as i8;
             out.push(q as f32 * scale);
         }
@@ -243,15 +248,18 @@ fn dequant_mq4g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec
     let mut out = Vec::with_capacity(n_blocks * group);
     for b in 0..n_blocks {
         let off = b * block;
-        if off + block > data.len() { break; }
-        let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-        let min_val = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+        if off + block > data.len() {
+            break;
+        }
+        let scale = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let min_val =
+            f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
         let mut group_buf = [0.0f32; 256];
         for i in 0..128 {
             let byte = data[off + 8 + i];
             let lo = (byte & 0xF) as f32;
             let hi = (byte >> 4) as f32;
-            group_buf[2 * i]     = min_val + scale * lo;
+            group_buf[2 * i] = min_val + scale * lo;
             group_buf[2 * i + 1] = min_val + scale * hi;
         }
         // Inverse FWHT: forward operation with signs1 and signs2 swapped.
@@ -269,9 +277,12 @@ fn dequant_mq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec
     let mut out = Vec::with_capacity(n_blocks * group);
     for b in 0..n_blocks {
         let off = b * block;
-        if off + block > data.len() { break; }
-        let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-        let min_val = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+        if off + block > data.len() {
+            break;
+        }
+        let scale = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let min_val =
+            f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
         let mut group_buf = [0.0f32; 256];
         for i in (0..256usize).step_by(4) {
             let byte_off = 8 + (i / 4) * 3;
@@ -282,7 +293,7 @@ fn dequant_mq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec
             let q1 = ((b0 >> 6) as u32) | (((b1 & 0x0F) as u32) << 2);
             let q2 = ((b1 >> 4) as u32) | (((b2 & 0x03) as u32) << 4);
             let q3 = (b2 >> 2) as u32;
-            group_buf[i]     = min_val + scale * q0 as f32;
+            group_buf[i] = min_val + scale * q0 as f32;
             group_buf[i + 1] = min_val + scale * q1 as f32;
             group_buf[i + 2] = min_val + scale * q2 as f32;
             group_buf[i + 3] = min_val + scale * q3 as f32;
@@ -298,8 +309,7 @@ fn dequant_mq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec
 /// and crates/hipfire-quantize/src/main.rs E2M1_LUT). Eight signed
 /// magnitudes; sign bit at position 3.
 const E2M1_LUT: [f32; 16] = [
-    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// HFP4G32 dequant (qt=21). Per-row layout: 16-B header + (k/32) blocks
@@ -346,7 +356,9 @@ fn dequant_hfp4g32(data: &[u8], shape: &[u32], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(m * k);
     for r in 0..m {
         let row_off = r * row_bytes;
-        if row_off + row_bytes > data.len() { break; }
+        if row_off + row_bytes > data.len() {
+            break;
+        }
         dequant_hfp4g32_row(&data[row_off..row_off + row_bytes], k, &mut out);
     }
     out.truncate(n);
@@ -357,7 +369,13 @@ fn dequant_hfp4g32(data: &[u8], shape: &[u32], n: usize) -> Vec<f32> {
 /// `k` must additionally be a multiple of 256 because the rotation
 /// signs1/signs2 are fixed-256. Inverse FWHT is forward FWHT with
 /// signs1/signs2 swapped (orthogonal).
-fn dequant_mfp4g32(data: &[u8], shape: &[u32], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+fn dequant_mfp4g32(
+    data: &[u8],
+    shape: &[u32],
+    n: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<f32> {
     let (m, k) = match shape.len() {
         2 => (shape[0] as usize, shape[1] as usize),
         _ => return Vec::new(),
@@ -370,7 +388,9 @@ fn dequant_mfp4g32(data: &[u8], shape: &[u32], n: usize, signs1: &[f32], signs2:
     let mut row_buf: Vec<f32> = Vec::with_capacity(k);
     for r in 0..m {
         let row_off = r * row_bytes;
-        if row_off + row_bytes > data.len() { break; }
+        if row_off + row_bytes > data.len() {
+            break;
+        }
         row_buf.clear();
         dequant_hfp4g32_row(&data[row_off..row_off + row_bytes], k, &mut row_buf);
         // Inverse FWHT per 256-element segment. Matches the quantizer's
@@ -389,7 +409,14 @@ fn dequant_mfp4g32(data: &[u8], shape: &[u32], n: usize, signs1: &[f32], signs2:
     out
 }
 
-fn try_dequant(qt: u8, data: &[u8], shape: &[u32], n: usize, s1: &[f32], s2: &[f32]) -> Option<Vec<f32>> {
+fn try_dequant(
+    qt: u8,
+    data: &[u8],
+    shape: &[u32],
+    n: usize,
+    s1: &[f32],
+    s2: &[f32],
+) -> Option<Vec<f32>> {
     match qt {
         1 => Some(dequant_f16(data, n)),
         2 => Some(dequant_f32(data, n)),
@@ -442,19 +469,26 @@ fn translate_name(hfq_name: &str) -> Option<&str> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let st_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: quant_quality_mse <safetensors_dir_or_file> <model.hfq> [name_substring]");
+        eprintln!(
+            "usage: quant_quality_mse <safetensors_dir_or_file> <model.hfq> [name_substring]"
+        );
         std::process::exit(2);
     });
     let hfq_path = args.next().unwrap_or_else(|| {
-        eprintln!("usage: quant_quality_mse <safetensors_dir_or_file> <model.hfq> [name_substring]");
+        eprintln!(
+            "usage: quant_quality_mse <safetensors_dir_or_file> <model.hfq> [name_substring]"
+        );
         std::process::exit(2);
     });
     let filter = args.next();
 
     eprintln!("Loading safetensors index from {}...", st_path);
-    let st = SafetensorsIndex::open_dir_or_file(Path::new(&st_path))
-        .expect("open safetensors");
-    eprintln!("  {} shards, {} tensors total", st.files.len(), st.by_name.len());
+    let st = SafetensorsIndex::open_dir_or_file(Path::new(&st_path)).expect("open safetensors");
+    eprintln!(
+        "  {} shards, {} tensors total",
+        st.files.len(),
+        st.by_name.len()
+    );
 
     eprintln!("Loading hfq from {}...", hfq_path);
     let hfq = HfqFile::open(Path::new(&hfq_path)).expect("open hfq");
@@ -501,7 +535,14 @@ fn main() {
         }
 
         let (_info, hfq_data) = hfq.tensor_data_vec(&hfq_t.name).expect("read hfq");
-        let hfq_f32 = match try_dequant(hfq_t.quant_type, &hfq_data, &hfq_t.shape, n_hfq, &signs1, &signs2) {
+        let hfq_f32 = match try_dequant(
+            hfq_t.quant_type,
+            &hfq_data,
+            &hfq_t.shape,
+            n_hfq,
+            &signs1,
+            &signs2,
+        ) {
             Some(v) => v,
             None => {
                 *skipped_qt.entry(hfq_t.quant_type).or_insert(0) += 1;
@@ -546,7 +587,10 @@ fn main() {
     results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
 
     println!();
-    println!("{:<70} {:>9} {:>13} {:>13} {:>13}", "tensor", "qt", "n", "MSE", "max_abs_err");
+    println!(
+        "{:<70} {:>9} {:>13} {:>13} {:>13}",
+        "tensor", "qt", "n", "MSE", "max_abs_err"
+    );
     println!("{}", "-".repeat(120));
 
     // Print top 50 by MSE
@@ -554,7 +598,11 @@ fn main() {
     for (name, qt, n, mse, mxe) in &results[..n_print] {
         println!(
             "{:<70} {:>9} {:>13} {:>13.4e} {:>13.4e}",
-            if name.len() > 70 { &name[..70] } else { name.as_str() },
+            if name.len() > 70 {
+                &name[..70]
+            } else {
+                name.as_str()
+            },
             qt_label(*qt),
             n,
             mse,
@@ -565,8 +613,10 @@ fn main() {
     // Aggregate stats per qt
     println!();
     println!("=== Aggregate stats by quant type ===");
-    println!("{:<10} {:>8} {:>15} {:>15} {:>15} {:>15}",
-        "qt", "tensors", "total_params", "mean MSE", "p99 MSE", "max MSE");
+    println!(
+        "{:<10} {:>8} {:>15} {:>15} {:>15} {:>15}",
+        "qt", "tensors", "total_params", "mean MSE", "p99 MSE", "max MSE"
+    );
     println!("{}", "-".repeat(85));
     let mut by_qt: HashMap<u8, Vec<f64>> = HashMap::new();
     let mut params_by_qt: HashMap<u8, usize> = HashMap::new();

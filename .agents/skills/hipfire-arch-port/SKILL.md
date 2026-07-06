@@ -41,6 +41,11 @@ have hit are documented here so you don't repeat them.
 4. `contributor-onboarding.md` — workflow for someone with hardware
    who wants to land a port. Designed for collaboration with an
    agent (Claude Code / Cursor / Codex); includes guardrails.
+5. `speculation.md` — **step 7** (optional, after the forward pass is
+   correct): give the arch speculative decode. `impl SpecTarget` +
+   two registry lines earns the model-free n-gram drafter (output
+   byte-identical to AR). Read it before touching `spec.rs` or
+   `build_speculator`.
 
 ## Key facts to surface immediately
 
@@ -72,6 +77,7 @@ have hit are documented here so you don't repeat them.
 | `wmma-matrix.md` | Per-arch operand shape, builtin name, lane layout |
 | `validation.md` | Three-gate procedure with troubleshooting |
 | `contributor-onboarding.md` | Fork → port → PR workflow with agent-assist guidance |
+| `speculation.md` | Step 7: adding speculative decode (`SpecTarget` impl + n-gram registry) |
 
 ## Cross-references (commits + ops notes)
 

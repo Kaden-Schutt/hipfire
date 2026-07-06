@@ -32,6 +32,7 @@
 
 use crate::mtp_head::{self, Qwen35MtpHead, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch};
 use crate::qwen35::{self, Qwen35Weights};
+use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
@@ -125,6 +126,35 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     )
 }
 
+/// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
+/// the low-confidence tail of the K-chain — a win measured on the gfx1100 dGPU
+/// (2026-06-16 sweep: lifts every domain, even high-τ code +11%; 0.6 is the
+/// sweet spot, >0.7 over-truncates). DEFAULT-ON for the RDNA3 dGPU
+/// (gfx1100/1101/1102), the ONLY validated arch class. ANTIBLEED: the prior
+/// `starts_with("gfx11")` test also defaulted the RDNA3.5 iGPUs (gfx1150/1151/
+/// 1152) and the gfx1103 APU to 0.6, but p_min was NEVER validated there — they
+/// inherited a dGPU-tuned cutoff. They now default 0.0 (off) until validated in
+/// their own serve path (same as gfx12, whose W3v durability was measured at
+/// p_min=0). Override on any arch via HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable
+/// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
+fn default_mtp_p_min(arch: &str) -> f32 {
+    if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
+        return v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|x| (0.0..=1.0).contains(x))
+            .unwrap_or(0.0);
+    }
+    // is_rdna3_dgpu arch set (wide-BW GDDR6 dGPU); the iGPUs + gfx1103 APU are
+    // deliberately excluded — p_min there is unvalidated.
+    if matches!(arch, "gfx1100" | "gfx1101" | "gfx1102") {
+        0.6
+    } else {
+        0.0
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MtpProposalGraphPolicy {
     Off,
@@ -198,6 +228,15 @@ impl MtpRng {
     pub fn next_uniform_f32(&mut self) -> f32 {
         // 24-bit mantissa: [0.0, 1.0).
         (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
+    }
+    /// Reconstruct from a raw internal state (NO seed re-multiply), for resuming
+    /// a stream across calls; pairs with [`state`](Self::state). Zero → 1.
+    pub fn from_state(s: u64) -> Self {
+        Self(s.max(1))
+    }
+    /// Raw internal state, for persisting/resuming the stream across calls.
+    pub fn state(&self) -> u64 {
+        self.0
     }
 }
 
@@ -632,7 +671,7 @@ impl MtpSpecState {
             mtp_gather_prob_verify,
             gpu_rng_state: 42,
             max_n,
-            p_min: 0.0,
+            p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
         })
@@ -731,6 +770,19 @@ impl MtpSpecState {
             row * dim * 4,
             dim * 4,
         )
+    }
+
+    /// Drafter-local reset for a fresh conversation. Zeros the MTP head KV
+    /// (stale absolute positions from the prior turn must not be re-read) and
+    /// destroys any captured proposal graph (its node positions are turn-stale).
+    /// The trunk's KV + DeltaNet reset is the daemon's concern (it owns the
+    /// bundle and calls `reset_recurrent`); this clears only head-local state.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        destroy_mtp_proposal_graph(gpu, self);
+        self.mtp_proposal_graph_warmed = false;
+        self.mtp_proposal_graph_seq_cap = 0;
+        self.mtp_kv.reset(gpu)?;
+        Ok(())
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -1021,35 +1073,15 @@ fn greedy_trunk_spine_accept(
         argmax_per_pos.len(),
         candidates.len(),
     );
-
-    let mut accept_count = 0usize;
-    let mut hit_eos = false;
-    let mut committed: Vec<u32> = Vec::with_capacity(candidates.len() + 1);
-
-    for (k, &candidate) in candidates.iter().enumerate() {
-        if argmax_per_pos[k] == candidate {
-            committed.push(candidate);
-            accept_count += 1;
-            if candidate == eos_token_id {
-                hit_eos = true;
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if !hit_eos {
-        let bonus = argmax_per_pos[accept_count];
-        committed.push(bonus);
-        if bonus == eos_token_id {
-            hit_eos = true;
-        }
-    }
-
+    // Delegate to the shared greedy accept rule. MTP enables EOS-early-stop
+    // (eos=Some): an accepted candidate equal to EOS stops the prefix with no
+    // bonus. The trunk argmax IS the `target_pick`.
+    let acc =
+        hipfire_runtime::spec::accept_greedy_prefix(candidates, argmax_per_pos, Some(eos_token_id));
     GreedyTrunkSpineAccept {
-        committed,
-        accept_count,
-        hit_eos,
+        committed: acc.committed,
+        accept_count: acc.accepted,
+        hit_eos: acc.hit_eos,
     }
 }
 
@@ -1385,6 +1417,27 @@ pub fn spec_step_mtp(
     // `forward_prefill_batch_with_pbs` writes per-position post-output-norm
     // hidden into `state.verify_hidden` when per_token_hidden_out is Some.
     // Trunk KV cache and dn_state advance by max_n+1 (= verify_tokens.len()).
+    //
+    // GDN-tape capture gate: the batched (PBS) verify path writes the GDN
+    // innovation tape; the per-token fallback does not. Gate on the forward's
+    // OWN eligibility predicate so the rollback's cheap-vs-full replay choice
+    // tracks exactly whether the tape was written this cycle. Mirror
+    // compressed_serial (lines 2604-2616) and DFlash (speculative.rs:3452-3456).
+    let n_verify = max_n + 1;
+    let moe_router_logits_present = state.trunk_pbs.moe_router_logits_batch.is_some();
+    let tape_captured = qwen35::prefill_batch_pbs_eligible(
+        trunk_weights,
+        &target.config,
+        &target.dn_state,
+        n_verify,
+        gpu.arch.as_str(),
+        moe_router_logits_present,
+    );
+    let verify_tape: Option<&mut GdnTape> = if tape_captured {
+        Some(&mut state.trunk_gdn_tape)
+    } else {
+        None
+    };
     qwen35::forward_prefill_batch_with_pbs_opts(
         gpu,
         trunk_weights,
@@ -1396,7 +1449,7 @@ pub fn spec_step_mtp(
         &target.scratch,
         None, // hidden_rb: not used here (DFlash drafter not in the loop)
         Some(&state.verify_hidden),
-        None, // gdn_tape
+        verify_tape,
         None, // tree_verify
         Some(&state.trunk_pbs),
         None,  // mask_override
@@ -1409,7 +1462,7 @@ pub fn spec_step_mtp(
     // Mirrors verify_dflash_block's batched lm_head dispatch by dtype.
     // Sized to (max_n + 1). Greedy-only, so we use GPU-side batched argmax
     // to avoid the (max_n + 1) × vocab D2H.
-    let n_verify = max_n + 1;
+    // n_verify is hoisted above (before tape_captured computation).
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
     match w_out.gpu_dtype {
@@ -1594,41 +1647,80 @@ pub fn spec_step_mtp(
     // After verify, trunk dn_state is at position cur_pos + max_n + 1.
     // We need it at cur_pos + advance for next cycle. Restore snapshot
     // (back to cur_pos), then replay first `advance` of `verify_tokens`.
-    // Replay re-writes trunk KV slots [cur_pos..cur_pos + advance) with
-    // identical K/V (idempotent — same inputs, same positions), and
-    // re-runs DN recurrence.
+    //
+    // LEVER 1 (W3e): When the verify took the batched (PBS) path it populated
+    // `state.trunk_gdn_tape` with the GDN innovation (qkvza projection +
+    // post-sigmoid α/β) for each LA layer at each verify position. We replay
+    // ONLY the GDN recurrence from the tape (~0.30ms) instead of a full B=2
+    // trunk forward_prefill_batch (~12.7ms). This is the same GDN-only repair
+    // that DFlash uses (speculative.rs:3465 dflash_use_gdn_tape_replay) and that
+    // compressed_serial already wires at lines 2942-2987. Mirror that exactly.
+    //
+    // Safety: replay_gdn does NOT touch KV cache. Per the "MTP KV cache rollback:
+    // NOT NEEDED" argument below, the accepted prefix's KV slots
+    // [cur_pos..cur_pos+advance) are already correct from the verify forward (the
+    // verify wrote the same tokens to the same positions as the replay would).
+    // Stale slots beyond cur_pos+advance are overwritten in-order by next cycle
+    // before they are attended. Skipping the KV re-write is safe for both the
+    // full-replay and tape-replay paths.
+    //
+    // Instrument first cycle: print tape_captured so we can confirm the MoE
+    // batched verify populates the tape (HIPFIRE_DEBUG_BATCH=1 already prints
+    // eligibility; this one-shot print on cycle 0 is unconditional for W3e).
+    // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
+    let use_tape_replay = tape_captured
+        && advance >= 2
+        && std::env::var("HIPFIRE_MTP_TAPE_REPLAY").ok().as_deref() != Some("0");
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-    if advance >= 2 {
-        let replay = &verify_tokens[..advance];
-        qwen35::forward_prefill_batch(
+    if use_tape_replay {
+        // Batched verify populated the tape this cycle — cheap GDN-only replay.
+        // Only fire for advance >= 2: for advance=1 the baseline uses forward_scratch
+        // (decode-mode GEMV for wqkv), while the tape captured the batched WMMA
+        // result. These differ at ULP level. To preserve byte-identical streams,
+        // fall through to forward_scratch below when advance==1.
+        state.trunk_gdn_tape.replay_gdn(
             gpu,
             trunk_weights,
             &target.config,
-            replay,
-            cur_pos,
-            &mut target.kv_cache,
             &mut target.dn_state,
-            &target.scratch,
-            None,
-            None,
-            None,
-            None,
+            advance,
         )?;
     } else {
-        // advance == 1: only the seed (last_committed) is "replayed". This
-        // happens when EOS hits with accept_count==0 AND bonus==eos
-        // (very rare), or when the bonus was committed alone (also implies
-        // accept_count==0, which is the common AR-degraded case).
-        qwen35::forward_scratch(
-            gpu,
-            trunk_weights,
-            &target.config,
-            verify_tokens[0],
-            cur_pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-        )?;
+        // Either tape not captured, HIPFIRE_MTP_TAPE_REPLAY=0 (A/B gate), or advance=1
+        // (decode-mode-GEMV vs batch-WMMA ULP mismatch — use decode path for identity).
+        if advance >= 2 {
+            let replay = &verify_tokens[..advance];
+            qwen35::forward_prefill_batch(
+                gpu,
+                trunk_weights,
+                &target.config,
+                replay,
+                cur_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        } else {
+            // advance == 1: only the seed (last_committed) is "replayed". This
+            // happens when EOS hits with accept_count==0 AND bonus==eos
+            // (very rare), or when the bonus was committed alone (also implies
+            // accept_count==0, which is the common AR-degraded case).
+            gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
+            qwen35::forward_scratch(
+                gpu,
+                trunk_weights,
+                &target.config,
+                verify_tokens[0],
+                cur_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+            )?;
+        }
     }
 
     // ── 9. MTP KV cache rollback: NOT NEEDED ────────────────────────────
@@ -2009,6 +2101,7 @@ pub fn spec_step_mtp_compressed(
             None,
         )?;
     } else {
+        gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
             gpu,
             trunk_weights,
@@ -2030,6 +2123,141 @@ pub fn spec_step_mtp_compressed(
         chain_truncated: false,
         replay_skipped: false,
     })
+}
+
+/// F5c: distribution-preserving SAMPLED (temp>0) accept rule for full-vocab
+/// MTP, mirroring the proven, coherence-validated DFlash convention
+/// (`speculative.rs:3728-3855`) EXACTLY:
+///
+///   * INDEPENDENT per-side nuclei. The DRAFT truncated to its OWN top_p
+///     nucleus at draft time (`draft_softmaxes[k]`, `draft_probs[k]`); the
+///     TARGET truncates to its OWN top_p nucleus here (tau/Z from the target
+///     verify logits, NOT the draft's tau). The two supports differ.
+///   * Accept `u * p_d <= p_t`, with `p_d = draft_probs[k]` (the truncated
+///     draft prob at the drafted token) and `p_t = target_row_k[candidate]`
+///     (the truncated target prob at the same token). cactus_delta == 0 on the
+///     serve path, so accept_prob == p_t — NO CACTUS bump.
+///   * On rejection, the bonus is drawn from the residual
+///     `(target_nucleus − draft_nucleus)₊` via `sample_residual`, across the
+///     MISMATCHED nuclei. (NOT sample_top_p over the raw verify logits.)
+///   * On full accept, the bonus is `sample_categorical` over the target
+///     nucleus at position `*accept_count` (== drafts_generated).
+///
+/// `logits_view` is an OWNED `GpuTensor` (the caller's
+/// `state.verify_logits.sub_offset(..)`), so it borrows nothing from `state`
+/// and composes cleanly with the `&mut state` / `&mut gpu` here.
+///
+/// Returns `hit_eos`. Pushes committed tokens into `committed` and bumps
+/// `*accept_count` for each accepted draft (matching the legacy accept block's
+/// bookkeeping).
+///
+/// Full-vocab only: `candidates[k]` is already the trunk token id (vocab_map is
+/// None in full-vocab mode), so it indexes the target softmax row directly.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn mtp_sampled_accept(
+    gpu: &mut Gpu,
+    state: &mut MtpSpecState,
+    logits_view: &GpuTensor,
+    draft_softmaxes: &[Vec<f32>],
+    draft_probs: &[f32],
+    candidates: &[u32],
+    drafts_generated: usize,
+    vocab: usize,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    min_p: f32,
+    eos_token_id: u32,
+    committed: &mut Vec<u32>,
+    accept_count: &mut usize,
+) -> HipResult<bool> {
+    // Target nucleus rows for ALL n_verify = drafts_generated + 1 positions.
+    //
+    // NOTE (deviation from the F5c spec text, which said batch=drafts_generated):
+    // the all-accept bonus is sampled at row `*accept_count`, which equals
+    // `drafts_generated` on full accept — beyond the first `drafts_generated`
+    // rows. DFlash computes target softmax for ALL `b` (= drafts_generated + 1)
+    // rows for exactly this reason (speculative.rs:3730-3756 uses `b`). We
+    // follow the CODE/DFlash and softmax all `n_verify` rows so the all-accept
+    // bonus row exists. `logits_view` is already sized `n_verify * vocab`.
+    let n_verify = drafts_generated + 1;
+    let probs_gpu = gpu.alloc_tensor(&[n_verify * vocab], DType::F32)?;
+    let tau_gpu = gpu.alloc_tensor(&[n_verify], DType::F32)?;
+    let z_gpu = gpu.alloc_tensor(&[n_verify], DType::F32)?;
+    gpu.softmax_temp_topp_batched_into_f32(
+        logits_view,
+        &probs_gpu,
+        &tau_gpu,
+        &z_gpu,
+        vocab,
+        n_verify,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+    )?;
+    let host_probs = gpu.download_f32(&probs_gpu)?;
+    let tau = gpu.download_f32(&tau_gpu)?;
+    let z = gpu.download_f32(&z_gpu)?;
+    let _ = gpu.free_tensor(probs_gpu);
+    let _ = gpu.free_tensor(tau_gpu);
+    let _ = gpu.free_tensor(z_gpu);
+    debug_assert_eq!(host_probs.len(), n_verify * vocab);
+
+    // Build a single position's TRUNCATED target nucleus row on demand. The
+    // softmax kernel already folded any top_k cutoff into tau (tau = max(tau_p,
+    // tau_k)), so apply_topp_trunc applies the combined top_k+top_p nucleus.
+    let target_row_at = |pos: usize| -> Vec<f32> {
+        let mut row = host_probs[pos * vocab..(pos + 1) * vocab].to_vec();
+        apply_topp_trunc(&mut row, tau[pos], z[pos]);
+        row
+    };
+
+    let mut hit_eos = false;
+    let mut rejected = false;
+    for k in 0..drafts_generated {
+        let target_row_k = target_row_at(k);
+        let p_d = draft_probs[k].max(f32::MIN_POSITIVE);
+        let p_t = target_row_k[candidates[k] as usize];
+        let u = state.rng.next_uniform_f32();
+        if u * p_d <= p_t {
+            // Accept.
+            committed.push(candidates[k]);
+            *accept_count += 1;
+            if candidates[k] == eos_token_id {
+                hit_eos = true;
+                break;
+            }
+        } else {
+            // Reject: bonus from the residual (target_nucleus − draft_nucleus)₊
+            // across the MISMATCHED per-side nuclei. Both rows are full-vocab
+            // length `vocab` (different zero-support), so sample_residual's
+            // element-wise subtraction is well-formed.
+            let u2 = state.rng.next_uniform_f32();
+            let bonus = sample_residual(&target_row_k, &draft_softmaxes[k], u2);
+            committed.push(bonus);
+            if bonus == eos_token_id {
+                hit_eos = true;
+            }
+            rejected = true;
+            break;
+        }
+    }
+
+    if !rejected && !hit_eos {
+        // All `drafts_generated` accepted (and none was EOS): sample the bonus
+        // from the target nucleus at position `*accept_count` (== drafts_generated).
+        let row = target_row_at(*accept_count);
+        let u = state.rng.next_uniform_f32();
+        let bonus = sample_categorical(&row, u);
+        committed.push(bonus);
+        if bonus == eos_token_id {
+            hit_eos = true;
+        }
+    }
+
+    Ok(hit_eos)
 }
 
 // ─── FastMTP-style compressed SERIAL spec step (K serial roundtrips) ──────
@@ -2151,28 +2379,67 @@ pub fn spec_step_mtp_compressed_serial(
     // implementation — a low-confidence draft still gets to face trunk
     // verify, but we stop spending compute speculating further.
     let p_min = state.p_min;
-    let use_p_min = p_min > 0.0;
-    let log_p_min = if use_p_min {
-        p_min.ln()
-    } else {
-        f32::NEG_INFINITY
+    let sampling = state.sampling;
+    // The K-step draft pick and the trunk-verify accept rule run in exactly ONE
+    // of three modes per step. Modeling it as `DraftMode` makes the illegal
+    // `p_min + sampling` combination unrepresentable downstream — it was
+    // previously a runtime `panic!` deep inside the step. The legacy
+    // `use_p_min` / `use_sampling` / `log_p_min` bindings are derived from this
+    // single source of truth below so they can never disagree.
+    //
+    // Sampling vs greedy: when sampling.temp > 0, the K-chain SAMPLES from each
+    // draft distribution (instead of argmax) and trunk verify applies a residual
+    // acceptance rule (instead of strict argmax-match). Matches Unsloth/llama.cpp
+    // #22673 canonical MTP recipe (temp=1.0, top_p=0.95, top_k=20). p_min stops
+    // speculating further once a draft's confidence drops below the cutoff.
+    #[derive(Debug, Clone, Copy)]
+    enum DraftMode {
+        /// temp == 0, p_min == 0: argmax draft + strict argmax-match accept.
+        Greedy,
+        /// temp == 0, p_min > 0: top-2 logsumexp draft with a confidence cutoff.
+        PMin { log_p_min: f32 },
+        /// temp > 0: sampled draft + residual acceptance (temp/top_p in state.sampling).
+        Sampled,
+        /// temp > 0, p_min > 0: sampled draft (residual acceptance, as `Sampled`)
+        /// PLUS the `PMin` confidence cutoff — truncate the K-chain early when the
+        /// head's RAW top prob drops below p_min. Stays lossless (a shorter
+        /// speculative chain only lowers tau); the τ lever for sampled MTP.
+        SampledPMin { log_p_min: f32 },
+    }
+    let draft_mode = match (sampling.is_greedy(), p_min > 0.0) {
+        // temp>0 + p_min>0: sampled draft WITH the p_min confidence cutoff. The
+        // sampled draft samples from its own nucleus (not topk_logsumexp), and the
+        // cutoff reads the head's raw top prob (computed alongside), so the two
+        // compose — this used to be a hard Err (the kernels didn't share a path).
+        (false, true) => DraftMode::SampledPMin {
+            log_p_min: p_min.ln(),
+        },
+        (false, false) => DraftMode::Sampled,
+        (true, true) => DraftMode::PMin {
+            log_p_min: p_min.ln(),
+        },
+        (true, false) => DraftMode::Greedy,
+    };
+    let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
+    let use_sampling = matches!(draft_mode, DraftMode::Sampled | DraftMode::SampledPMin { .. });
+    let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
+    let log_p_min = match draft_mode {
+        DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,
+        _ => f32::NEG_INFINITY,
     };
     let mut chain_truncated = false;
-
-    // Sampling vs greedy: when sampling.temp > 0, K-chain SAMPLES from each
-    // draft distribution (instead of argmax) and trunk verify applies a
-    // residual acceptance rule (instead of strict argmax-match). Matches
-    // Unsloth/llama.cpp #22673 canonical MTP recipe (temp=1.0, top_p=0.95,
-    // top_k=20). Greedy path (temp=0) unchanged.
-    let sampling = state.sampling;
-    let use_sampling = !sampling.is_greedy();
-    if use_sampling && use_p_min {
-        // p_min logic uses the topk_logsumexp_batched output, which doesn't
-        // straightforwardly compose with arbitrary top_k/top_p sampling.
-        // Disallow the combination for now — caller picks one or the other.
-        panic!("spec_step_mtp_compressed_serial: --mtp-p-min and --temp > 0 are mutually exclusive (got p_min={p_min}, temp={})", sampling.temp);
-    }
     let mut draft_probs: Vec<f32> = if use_sampling {
+        Vec::with_capacity(max_n)
+    } else {
+        Vec::new()
+    };
+    // F5b: per-step TRUNCATED draft nucleus distributions (full-vocab sampled
+    // path). Mirrors DFlash `draft_softmaxes` (speculative.rs:3494-3504): each
+    // entry is the draft's OWN top_p-truncated, renormalized softmax row over
+    // the full vocab, captured at draft time. Consumed by `mtp_sampled_accept`
+    // for the residual bonus draw (sample_residual subtracts THIS draft nucleus
+    // from the target nucleus). Empty on greedy/p_min paths.
+    let mut draft_softmaxes: Vec<Vec<f32>> = if use_sampling {
         Vec::with_capacity(max_n)
     } else {
         Vec::new()
@@ -2410,67 +2677,124 @@ pub fn spec_step_mtp_compressed_serial(
 
             let draft_idx: usize;
             if use_sampling {
-                // GPU sample_top_p: kernel does the whole top_k(=20) + top_p +
-                // multinomial sample on-device. Returns 8 B (token id + new rng
-                // state). Eliminates the full 1 MB draft logits D2H + host
-                // softmax sample (~600 μs each step → ~3 ms/cycle saved).
+                // ── F5b: DFlash-convention sampled DRAFT (full-vocab only) ──
                 //
-                // sample_top_p modifies logits in-place ONLY if repeat_penalty > 1
-                // and repeat_window > 0; we pass 1.0/0 so logits are untouched
-                // and the subsequent prob-gather sees the same values.
-                let (token_u32, new_rng) = gpu.sample_top_p(
+                // Distribution-preserving spec-decode requires the draft to be
+                // sampled from its OWN top_p nucleus AND that exact truncated,
+                // renormalized distribution to be stored for the later residual
+                // bonus draw. The prior fused `sample_top_p` (top_k=20+top_p) +
+                // UNtruncated `softmax_prob_gather` violated this twice: it added
+                // a top_k=20 cut the convention does not use, and it gathered
+                // p_draft over the un-truncated softmax even though the sample
+                // came from a nucleus — silently shipping a token attractor.
+                //
+                // Mirrors DFlash speculative.rs:3457-3504 EXACTLY, applied to the
+                // single draft row of this step:
+                //   GPU softmax+nucleus tau/Z → download probs/tau/z →
+                //   apply_topp_trunc (host, same cut the target side uses) →
+                //   host-RNG sample_categorical → store the TRUNCATED row.
+                //
+                // Compressed-vocab sampled IS supported (cvs-sampled): softmax
+                // over the COMPRESSED draft row (argmax_vocab wide, ~15× cheaper
+                // than full vocab — the cvs win), sample a compressed token,
+                // remap to the full trunk id via vocab_map, and EMBED the
+                // compressed nucleus into a full-vocab vector so the residual
+                // bonus draw (sample_residual, on reject) subtracts it from the
+                // full-vocab target correctly. In full-vocab mode argmax_vocab ==
+                // vocab and the embed is a no-op (row already full-width). The
+                // accept ratio uses only the SCALAR draft prob, so it is
+                // mode-agnostic; losslessness holds because the residual covers
+                // the full vocab (unmapped slots keep the full target mass).
+
+                // GPU softmax(+nucleus) over the single draft row (full OR
+                // compressed width). idiom copied from speculative.rs:3457-3492.
+                let probs_gpu = gpu.alloc_tensor(&[argmax_vocab], DType::F32)?;
+                let tau_gpu = gpu.alloc_tensor(&[1], DType::F32)?;
+                let z_gpu = gpu.alloc_tensor(&[1], DType::F32)?;
+                gpu.softmax_temp_topp_batched_into_f32(
                     logits_for_argmax,
-                    &state.mtp_sample_result,
-                    &state.mtp_sample_repeat_buf,
+                    &probs_gpu,
+                    &tau_gpu,
+                    &z_gpu,
                     argmax_vocab,
+                    /* rows */ 1,
                     sampling.temp,
                     sampling.top_p,
-                    state.gpu_rng_state,
-                    /* repeat_window */ 0,
-                    /* repeat_penalty */ 1.0,
+                    sampling.top_k,
+                    sampling.min_p,
                 )?;
-                state.gpu_rng_state = new_rng;
-                draft_idx = token_u32 as usize;
+                let mut probs = gpu.download_f32(&probs_gpu)?;
+                let tau = gpu.download_f32(&tau_gpu)?;
+                let z = gpu.download_f32(&z_gpu)?;
+                let _ = gpu.free_tensor(probs_gpu);
+                let _ = gpu.free_tensor(tau_gpu);
+                let _ = gpu.free_tensor(z_gpu);
+                debug_assert_eq!(probs.len(), argmax_vocab);
+
+                // SampledPMin reads the head's RAW top prob (max over the
+                // UNtruncated softmax = the head's certainty at this step) for the
+                // chain-truncation cutoff below — NOT the sampled token's prob.
+                let top_prob = if use_sampled_pmin {
+                    probs.iter().cloned().fold(0.0f32, f32::max)
+                } else {
+                    0.0
+                };
+
+                // Host nucleus cut. The softmax kernel already folded
+                // sampling.top_k into tau (tau = max(tau_p, tau_k)), so
+                // apply_topp_trunc applies the combined top_k+top_p nucleus —
+                // the SAME cut the target side gets (keeps the accept lossless).
+                apply_topp_trunc(&mut probs, tau[0], z[0]);
+
+                // Host-RNG categorical sample from the SAME truncated nucleus we
+                // store — draft token and stored distribution agree (load-bearing
+                // for the residual). top_p-only under the DFlash convention.
+                let u = state.rng.next_uniform_f32();
+                draft_idx = sample_categorical(&probs, u) as usize;
                 assert!(
                     draft_idx < argmax_vocab,
-                    "draft sample {draft_idx} out of argmax_vocab {argmax_vocab}"
+                    "draft sample {draft_idx} out of draft vocab {argmax_vocab}"
                 );
 
-                // GPU p_draft gather: H2D the sampled token id, run the gather
-                // kernel with n_rows=1, D2H 4 B prob. Replaces the host
-                // softmax_prob_at_temp call (~600 μs).
-                let token_i32: i32 = token_u32 as i32;
-                let idx_bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(&token_i32 as *const i32 as *const u8, 4) };
-                gpu.hip
-                    .memcpy_htod(&state.mtp_gather_idx_draft.buf, idx_bytes)?;
-                gpu.softmax_prob_gather_batched_f32(
-                    logits_for_argmax,
-                    &state.mtp_gather_idx_draft,
-                    &state.mtp_gather_prob_draft,
-                    argmax_vocab,
-                    sampling.temp,
-                    /* n_rows */ 1,
-                )?;
-                let mut p_draft_host: [f32; 1] = [0.0];
-                {
-                    let bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(p_draft_host.as_mut_ptr() as *mut u8, 4)
-                    };
-                    gpu.hip
-                        .memcpy_dtoh(bytes, &state.mtp_gather_prob_draft.buf)?;
-                }
-                draft_probs.push(p_draft_host[0]);
+                draft_probs.push(probs[draft_idx]);
 
+                // Remap compressed → full trunk id (no-op in full-vocab mode);
+                // feeds the next MTP head forward via candidates[k-1].
                 let token_id = match vocab_map_opt {
                     Some(vm) => vm[draft_idx],
                     None => draft_idx as u32,
                 };
                 candidates.push(token_id);
-                // draft_logits_host is unused on the GPU sampling path; left
-                // allocated for symmetry with the (now-removed) host-sample
-                // fallback. Compiler will elide.
+
+                // Store the draft nucleus at FULL-vocab width for the residual.
+                // Full-vocab: the row already is full-width. Compressed: scatter
+                // each kept compressed prob to its full-vocab slot (vocab_map[j]);
+                // the unmapped slots stay 0, so residual = (target − draft)₊
+                // returns the full target mass there (lossless over full vocab).
+                if use_full_vocab {
+                    draft_softmaxes.push(probs);
+                } else {
+                    let vm = vocab_map_opt.expect("compressed mode carries a vocab_map");
+                    let mut full = vec![0.0f32; vocab];
+                    for (j, &pj) in probs.iter().enumerate() {
+                        if pj > 0.0 {
+                            full[vm[j] as usize] = pj;
+                        }
+                    }
+                    draft_softmaxes.push(full);
+                }
+                // draft_logits_host is unused on this GPU-softmax path.
                 let _ = &draft_logits_host;
+
+                // SampledPMin: confidence-prune the K-chain. Keep this candidate;
+                // skip the remaining draft steps if the head was unsure here. A
+                // shorter speculative chain only lowers tau — it never changes the
+                // committed (target) distribution, so this stays lossless. Mirrors
+                // the PMin cutoff below, but on the sampled draft + raw top prob.
+                if use_sampled_pmin && top_prob < p_min {
+                    chain_truncated = true;
+                    break;
+                }
             } else if use_p_min {
                 // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
                 gpu.topk_logsumexp_batched_f32(
@@ -2743,107 +3067,44 @@ pub fn spec_step_mtp_compressed_serial(
     }
 
     let mut accept_count = 0usize;
-    let mut hit_eos = false;
+    // Assigned exactly once in each arm below (sampled accept returns it; the
+    // legacy arm copies it out of the accept result), so no dead initializer.
+    let hit_eos;
     let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
 
     if use_sampling {
-        // ── Residual-acceptance sampling path (GPU-side gather + sample) ──
+        // ── F5c: distribution-preserving sampled accept (full-vocab) ──
         //
-        // For each draft candidate c_k, accept with probability
-        // min(1, p_target(c_k) / p_draft(c_k)). Both probs are un-truncated
-        // temp-scaled softmax probs — p_draft was gathered per-step in the
-        // K-chain above (state.mtp_gather_prob_draft); p_target is gathered
-        // here in one batched call (state.mtp_gather_prob_verify).
+        // Replaces the prior GPU-gather residual approximation (un-truncated
+        // p_target/p_draft accept ratio + sample_top_p bonus over raw verify
+        // logits) with the proven, coherence-validated DFlash convention
+        // (speculative.rs:3728-3855): INDEPENDENT per-side nuclei, accept
+        // `u*p_d <= p_t` over TRUNCATED probs, and a residual bonus drawn from
+        // (target_nucleus − draft_nucleus)₊. The old approximation gathered
+        // p_draft over the UN-truncated softmax while the draft was sampled from
+        // a nucleus — a mismatch that can silently ship a token attractor.
         //
-        // On rejection (or full accept), the bonus token is SAMPLED via
-        // gpu.sample_top_p on the trunk's verify_logits row at slot
-        // accept_count, using the same temp/top_p (top_k=20 hardcoded in
-        // the kernel — matches Unsloth default).
-        //
-        // GPU-side path saves vs prior host-side draft:
-        //   - 6 MB D2H of full verify_logits → 4·K B D2H of probs (~24 B)
-        //   - 5 × ~600 μs host softmax_prob_at_temp → one batched kernel
-        //   - 1 host sample_from_logits for bonus → one sample_top_p kernel
-        // Net: ~4 ms saved per cycle.
-        //
-        // Approximations vs. strict speculative-sampling (Chen et al.):
-        //   - Uses un-truncated p_target/p_draft in the accept ratio even
-        //     though draft sample was from a truncated nucleus
-        //   - Bonus is sample_top_p(trunk) not sample-from-residual
-        // Same approximations as before — practical posture matching
-        // llama.cpp / vLLM spec-decode implementations.
-
-        // Batched p_target gather: H2D the K candidate token ids as i32,
-        // dispatch the gather kernel, D2H K probs. Replaces the 6 MB D2H
-        // of full verify_logits + K host softmax_prob_at_temp calls.
-        let cand_indices: Vec<i32> = candidates[..drafts_generated]
-            .iter()
-            .map(|&t| t as i32)
-            .collect();
-        let idx_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(cand_indices.as_ptr() as *const u8, drafts_generated * 4)
-        };
-        gpu.hip
-            .memcpy_htod(&state.mtp_gather_idx_verify.buf, idx_bytes)?;
-        gpu.softmax_prob_gather_batched_f32(
+        // Mode-agnostic: candidates[k] is the full trunk token id in BOTH full
+        // and compressed modes (compressed drafts remapped via vocab_map at
+        // proposal time), and draft_softmaxes are full-vocab width (compressed
+        // nuclei embedded above), so the accept rule needs no use_full_vocab gate.
+        hit_eos = mtp_sampled_accept(
+            gpu,
+            state,
             &logits_view,
-            &state.mtp_gather_idx_verify,
-            &state.mtp_gather_prob_verify,
+            &draft_softmaxes,
+            &draft_probs,
+            &candidates,
+            drafts_generated,
             vocab,
             sampling.temp,
-            drafts_generated,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+            eos_token_id,
+            &mut committed,
+            &mut accept_count,
         )?;
-        let mut p_targets: Vec<f32> = vec![0.0; drafts_generated];
-        {
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    p_targets.as_mut_ptr() as *mut u8,
-                    drafts_generated * 4,
-                )
-            };
-            gpu.hip
-                .memcpy_dtoh(bytes, &state.mtp_gather_prob_verify.buf)?;
-        }
-
-        for k in 0..drafts_generated {
-            let p_t = p_targets[k];
-            let p_d = draft_probs[k].max(1e-30);
-            let accept_ratio = (p_t / p_d).min(1.0);
-            let r = state.rng.next_uniform_f32();
-            if r < accept_ratio {
-                committed.push(candidates[k]);
-                accept_count += 1;
-                if candidates[k] == eos_token_id {
-                    hit_eos = true;
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        if !hit_eos {
-            // Sample bonus on-device from trunk's verify_logits at slot
-            // accept_count. sub-offset gives a [vocab]-shape view that
-            // sample_top_p treats as a single row.
-            let bonus_row_view = logits_view.sub_offset(accept_count * vocab, vocab);
-            let (bonus_token, new_rng) = gpu.sample_top_p(
-                &bonus_row_view,
-                &state.mtp_sample_result,
-                &state.mtp_sample_repeat_buf,
-                vocab,
-                sampling.temp,
-                sampling.top_p,
-                state.gpu_rng_state,
-                /* repeat_window */ 0,
-                /* repeat_penalty */ 1.0,
-            )?;
-            state.gpu_rng_state = new_rng;
-            let bonus = bonus_token;
-            committed.push(bonus);
-            if bonus == eos_token_id {
-                hit_eos = true;
-            }
-        }
     } else {
         // ── Legacy greedy / argmax-match accept rule ─────────────────────
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
@@ -2970,6 +3231,7 @@ pub fn spec_step_mtp_compressed_serial(
                     None,
                 )?;
             } else {
+                gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
                 qwen35::forward_scratch(
                     gpu,
                     trunk_weights,

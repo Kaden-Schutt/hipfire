@@ -32,8 +32,9 @@
 //!   `hfhs_writer::write_hfhs`).
 //! - The BF16 forward pass + linear-layer capture hook wiring
 //!   (subagent C — `dispatch.rs` capture-handler call sites).
-//! - The BF16 safetensors loader implementation (subagent D —
-//!   `bf16_loader::load_bf16_model` body).
+//! - The BF16 safetensors loader implementation (subagent D — the
+//!   `bf16_loader::load_bf16_model` scaffold was removed 2026-06-15 as
+//!   unimplemented dead code; recover from git history if revived).
 //!
 //! When those APIs land, the `unimplemented!()` stubs marked
 //! `TODO(subagent-X)` below are the single-line wire-in points.
@@ -218,12 +219,7 @@ impl ImatrixCollector {
 }
 
 impl ActivationCapture for ImatrixCollector {
-    fn capture(
-        &self,
-        gpu: &mut Gpu,
-        tensor_name: &str,
-        input: &GpuTensor,
-    ) {
+    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor) {
         if !self.should_capture(tensor_name) {
             return;
         }
@@ -241,7 +237,14 @@ impl ActivationCapture for ImatrixCollector {
                 Ok(a) => a,
                 Err(_) => return,
             };
-            accs.insert(tensor_name.to_string(), ImatrixAccum { acc, n_tokens: 0, k });
+            accs.insert(
+                tensor_name.to_string(),
+                ImatrixAccum {
+                    acc,
+                    n_tokens: 0,
+                    k,
+                },
+            );
         }
         let accum = accs.get_mut(tensor_name).unwrap();
         // sumsq_reduce_bf16 needs a GPU scalar for n_tokens (writes into it).
@@ -371,12 +374,7 @@ impl Default for HessianCollector {
 }
 
 impl ActivationCapture for HessianCollector {
-    fn capture(
-        &self,
-        gpu: &mut Gpu,
-        tensor_name: &str,
-        input: &GpuTensor,
-    ) {
+    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor) {
         if !is_gptq_target(tensor_name) {
             return;
         }
@@ -454,11 +452,7 @@ mod tests {
         // panic on admitted tensors and that rejected tensors short-circuit.
         let coll = HessianCollector::new();
         // No accumulators yet — drain returns empty.
-        let dummy_gpu_drain_count = coll
-            .accumulators
-            .lock()
-            .map(|m| m.len())
-            .expect("mutex");
+        let dummy_gpu_drain_count = coll.accumulators.lock().map(|m| m.len()).expect("mutex");
         assert_eq!(dummy_gpu_drain_count, 0);
         // Verify the gate via is_gptq_target directly — same logic the
         // trait-impl gates on.
@@ -503,8 +497,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp");
         let tokenizer_path = tmp_dir.join("tokenizer.json");
-        std::fs::write(&tokenizer_path, tokenizer_json.to_string())
-            .expect("write tokenizer.json");
+        std::fs::write(&tokenizer_path, tokenizer_json.to_string()).expect("write tokenizer.json");
 
         // Call the driver helper.
         let ids = tokenize_corpus(&tmp_dir, "abc").expect("tokenize_corpus should succeed");
@@ -547,11 +540,7 @@ mod tests {
         // dispatch, so we never touch the pointer. The test verifies that
         // invariant: build the collector + check the map is empty + skip
         // the actual gpu.download_f32 calls.
-        let map_len = coll
-            .accumulators
-            .lock()
-            .map(|m| m.len())
-            .expect("mutex");
+        let map_len = coll.accumulators.lock().map(|m| m.len()).expect("mutex");
         assert_eq!(map_len, 0, "fresh collector should have zero accumulators");
     }
 
@@ -559,11 +548,7 @@ mod tests {
     #[test]
     fn hessian_drain_empty_skips_gpu_access() {
         let coll = HessianCollector::new();
-        let map_len = coll
-            .accumulators
-            .lock()
-            .map(|m| m.len())
-            .expect("mutex");
+        let map_len = coll.accumulators.lock().map(|m| m.len()).expect("mutex");
         assert_eq!(map_len, 0, "fresh collector should have zero accumulators");
     }
 }

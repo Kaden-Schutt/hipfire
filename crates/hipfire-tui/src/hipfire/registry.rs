@@ -184,6 +184,25 @@ impl RegistryState {
         self.models.iter().filter(|m| m.downloaded).count()
     }
 
+    /// `(tag, downloaded)` of the currently-selected MODEL row, or `None` when a
+    /// group header (or nothing) is selected. Used by the Models tab to decide
+    /// between pull (remote) and delete (local).
+    pub fn selected_model(&self) -> Option<(String, bool)> {
+        match self.visible_items().get(self.selected)? {
+            ModelListItem::Model { model_index } => {
+                let m = self.models.get(*model_index)?;
+                Some((m.tag.clone(), m.downloaded))
+            }
+            ModelListItem::Group { .. } => None,
+        }
+    }
+
+    /// Whether `tag` resolves to a known model (a registry/local entry or an
+    /// alias). Used by the Chat `/model <tag>` command.
+    pub fn has_model(&self, tag: &str) -> bool {
+        self.models.iter().any(|m| m.tag == tag) || self.aliases.contains_key(tag)
+    }
+
     pub fn visible_items(&self) -> Vec<ModelListItem> {
         let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (idx, row) in self.models.iter().enumerate() {

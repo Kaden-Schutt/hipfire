@@ -90,12 +90,12 @@ impl DdTree {
 /// occur routinely on near-uniform distributions).
 #[derive(PartialEq)]
 struct HeapEntry {
-    neg_logw: f32,     // negated so BinaryHeap (max-heap) pops MIN neg_logw = MAX logw first
-    push_order: u64,   // FIFO tie-break — earlier pushes win on equal neg_logw
-    depth: usize,      // 1-indexed; 1 = child of root
-    rank: usize,       // position in the top-K at this depth
+    neg_logw: f32,   // negated so BinaryHeap (max-heap) pops MIN neg_logw = MAX logw first
+    push_order: u64, // FIFO tie-break — earlier pushes win on equal neg_logw
+    depth: usize,    // 1-indexed; 1 = child of root
+    rank: usize,     // position in the top-K at this depth
     parent_index: i32, // -1 = parent is root; else nodes[parent_index]
-    logw: f32,         // cumulative log-weight of the path root→this-candidate
+    logw: f32,       // cumulative log-weight of the path root→this-candidate
 }
 
 impl Eq for HeapEntry {}
@@ -144,7 +144,14 @@ pub fn build_ddtree_tree(
     topk: usize,
     budget: usize,
 ) -> DdTree {
-    build_ddtree_tree_with_cutoff(top_tokens, top_log_probs, depth, topk, budget, f32::NEG_INFINITY)
+    build_ddtree_tree_with_cutoff(
+        top_tokens,
+        top_log_probs,
+        depth,
+        topk,
+        budget,
+        f32::NEG_INFINITY,
+    )
 }
 
 /// Same as `build_ddtree_tree`, but also stops expansion when the next
@@ -249,7 +256,11 @@ pub fn build_ddtree_tree_with_cutoff(
         child_maps.push(HashMap::new());
         // Register this node as a child of its parent by its draft token.
         // `parent_slot` maps the root-indexed convention (parent = -1 → slot 0).
-        let parent_slot = if parent_index < 0 { 0 } else { (parent_index as usize) + 1 };
+        let parent_slot = if parent_index < 0 {
+            0
+        } else {
+            (parent_index as usize) + 1
+        };
         child_maps[parent_slot].insert(token, current_index);
 
         // Push sibling at (d, rank+1) if any remain in the top-K at this depth.
@@ -294,7 +305,11 @@ pub fn build_ddtree_tree_with_cutoff(
     for i in 1..len {
         let parent_slot = {
             let p = nodes[i - 1].parent_index;
-            if p < 0 { 0 } else { (p as usize) + 1 }
+            if p < 0 {
+                0
+            } else {
+                (p as usize) + 1
+            }
         };
         // Clone parent's ancestor set.
         for j in 0..i {
@@ -449,11 +464,7 @@ pub fn enumerate_branches(
     for d in 0..=max_d {
         // Parent tree index in DdNode::parent_index convention: `-1` for
         // root (d == 0), `main_path[d-1]` otherwise (a node at depth d).
-        let parent_tree_idx: i32 = if d == 0 {
-            -1
-        } else {
-            main_path[d - 1] as i32
-        };
+        let parent_tree_idx: i32 = if d == 0 { -1 } else { main_path[d - 1] as i32 };
         // The main-path child at depth d+1 (if any) is the one to skip;
         // every other child of `parent_tree_idx` is a branch root.
         let main_child: Option<usize> = main_path.get(d).copied();
@@ -529,7 +540,8 @@ pub fn linearize_tree(
     seed_token: u32,
     base_pos: u32,
 ) -> (Vec<u32>, Vec<i32>, Vec<f32>) {
-    let (tokens, positions, mask_block, _) = linearize_tree_with_parents(tree, seed_token, base_pos);
+    let (tokens, positions, mask_block, _) =
+        linearize_tree_with_parents(tree, seed_token, base_pos);
     (tokens, positions, mask_block)
 }
 
@@ -587,7 +599,11 @@ pub fn linearize_tree_with_parents(
     let mut parent_indices: Vec<i32> = Vec::with_capacity(len);
     parent_indices.push(-1);
     for node in &tree.nodes {
-        let p = if node.parent_index < 0 { 0 } else { node.parent_index + 1 };
+        let p = if node.parent_index < 0 {
+            0
+        } else {
+            node.parent_index + 1
+        };
         parent_indices.push(p);
     }
     debug_assert_eq!(parent_indices.len(), len);
@@ -631,11 +647,18 @@ pub fn topk_from_logits(
             let mut best_idx: u32 = 0;
             let mut max = f32::NEG_INFINITY;
             for (i, &v) in row.iter().enumerate() {
-                if v > best_val { best_val = v; best_idx = i as u32; }
-                if v > max { max = v; }
+                if v > best_val {
+                    best_val = v;
+                    best_idx = i as u32;
+                }
+                if v > max {
+                    max = v;
+                }
             }
             let mut sum_exp = 0.0f64;
-            for &v in row { sum_exp += ((v - max) as f64).exp(); }
+            for &v in row {
+                sum_exp += ((v - max) as f64).exp();
+            }
             let log_z = max + sum_exp.ln() as f32;
             top_tokens.push(best_idx);
             top_log_probs.push(best_val - log_z);
@@ -659,7 +682,9 @@ pub fn topk_from_logits(
     impl Eq for Item {}
     impl Ord for Item {
         fn cmp(&self, other: &Self) -> Ordering {
-            self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
+            self.0
+                .partial_cmp(&other.0)
+                .unwrap_or(Ordering::Equal)
                 .then(self.1.cmp(&other.1))
         }
     }
@@ -677,7 +702,9 @@ pub fn topk_from_logits(
         heap.clear();
         let mut max = f32::NEG_INFINITY;
         for (i, &v) in row.iter().enumerate() {
-            if v > max { max = v; }
+            if v > max {
+                max = v;
+            }
             let item = std::cmp::Reverse(Item(v, i as u32));
             if heap.len() < k {
                 heap.push(item);
@@ -693,7 +720,9 @@ pub fn topk_from_logits(
         }
         // Pass 2: log-sum-exp (needs running max from pass 1).
         let mut sum_exp = 0.0f64;
-        for &v in row { sum_exp += ((v - max) as f64).exp(); }
+        for &v in row {
+            sum_exp += ((v - max) as f64).exp();
+        }
         let log_z = max + sum_exp.ln() as f32;
 
         // Extract heap contents sorted by value descending.
@@ -829,10 +858,22 @@ mod tests {
         assert_eq!(pos, vec![50, 51, 52, 53]);
         // 4×4 lower-triangular: visible = 0.0, invisible = -inf.
         let expected: Vec<f32> = vec![
-            0.0,               f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY,
-            0.0,               0.0,               f32::NEG_INFINITY, f32::NEG_INFINITY,
-            0.0,               0.0,               0.0,               f32::NEG_INFINITY,
-            0.0,               0.0,               0.0,               0.0,
+            0.0,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            0.0,
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         ];
         assert_eq!(mask, expected);
     }
@@ -859,11 +900,8 @@ mod tests {
         //   slot 4 (node 30 under 20, parent=node 20): {0, 3, 4}
         let ni = f32::NEG_INFINITY;
         let expected: Vec<f32> = vec![
-            0.0, ni,  ni,  ni,  ni,
-            0.0, 0.0, ni,  ni,  ni,
-            0.0, 0.0, 0.0, ni,  ni,
-            0.0, ni,  ni,  0.0, ni,
-            0.0, ni,  ni,  0.0, 0.0,
+            0.0, ni, ni, ni, ni, 0.0, 0.0, ni, ni, ni, 0.0, 0.0, 0.0, ni, ni, 0.0, ni, ni, 0.0, ni,
+            0.0, ni, ni, 0.0, 0.0,
         ];
         assert_eq!(mask, expected);
     }

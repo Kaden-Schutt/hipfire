@@ -1,0 +1,115 @@
+diff --git a/crates/rdna-compute/src/gemm.rs b/crates/rdna-compute/src/gemm.rs
+index e0dc63cf..f52de71e 100644
+--- a/crates/rdna-compute/src/gemm.rs
++++ b/crates/rdna-compute/src/gemm.rs
+@@ -6417,6 +6417,90 @@ impl Gpu {
+         }
+     }
+ 
++    /// wmmqa — int8-WMMA (iu8) HFQ4-G256 residual GEMM for gfx11 (RDNA3).
++    ///
++    /// Combines MMQ's light Q8_1 int8 activation traffic with WMMA matrix
++    /// cores: the activation X is pre-quantized to the shared block_q8_1_mmq
++    /// scratch (via `ensure_q8_1_mmq_x`, same buffer the scalar-sdot4 MMQ
++    /// residual path uses) and fed as the B operand to
++    /// `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32`; the HFQ4 weight is the A
++    /// operand, dequantized per 32-K Q8_1 sub-block (the int32 accumulator is
++    /// flushed every 32 K = 2 WMMA tiles to match the MMQ body's dequant
++    /// granularity exactly). Grid [ceil(M/16), ceil(B/16)], block [32], 0 LDS.
++    /// int32 accumulate is order-independent, so output is deterministic.
++    ///
++    /// Env-gated (HIPFIRE_HFQ4_RES_WMMQA=1) and gfx11-wave32-only; MMQ stays
++    /// the default residual path.
++    pub fn gemm_hfq4g256_residual_wmma_mmqload(
++        &mut self,
++        a_raw: &GpuTensor,
++        x: &GpuTensor,
++        y: &GpuTensor,
++        m: usize,
++        k: usize,
++        batch_size: usize,
++    ) -> HipResult<()> {
++        self.bind_thread()?;
++        self.ensure_kernel(
++            "gemm_hfq4g256_residual_wmma_mmqload",
++            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_MMQLOAD_SRC,
++            "gemm_hfq4g256_residual_wmma_mmqload",
++        )?;
++        // Q8_1 activation quant into the shared block_q8_1_mmq scratch
++        // (layout: Xq[(k/128) * batch_size + col], 144 B/block, 1 block = 128 K).
++        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
++
++        let mut a_ptr = a_raw.buf.as_ptr();
++        let mut x_ptr = xq_ptr;
++        let mut y_ptr = y.buf.as_ptr();
++        let mut m_val = m as i32;
++        let mut k_val = k as i32;
++        let mut bs_val = batch_size as i32;
++
++        let mut params: Vec<*mut c_void> = vec![
++            &mut a_ptr as *mut _ as *mut c_void,
++            &mut x_ptr as *mut _ as *mut c_void,
++            &mut y_ptr as *mut _ as *mut c_void,
++            &mut m_val as *mut _ as *mut c_void,
++            &mut k_val as *mut _ as *mut c_void,
++            &mut bs_val as *mut _ as *mut c_void,
++        ];
++
++        let row_tiles = (m + 15) / 16;
++        let batch_tiles = (batch_size + 15) / 16;
++
++        // Q8_1 int8 activation traffic (1 B/elem) — same accounting as MMQ.
++        let bytes =
++            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4 * 2;
++        let timer = crate::profile::begin_timer(
++            &self.hip,
++            "gemm",
++            "gemm_hfq4g256_residual_wmma_mmqload",
++            bytes,
++        );
++        let result = self.launch_maybe_blob(
++            "gemm_hfq4g256_residual_wmma_mmqload",
++            [row_tiles as u32, batch_tiles as u32, 1],
++            [32, 1, 1],
++            0,
++            &mut params,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(a_ptr);
++                b.push_ptr(x_ptr);
++                b.push_ptr(y_ptr);
++                b.push_i32(m_val);
++                b.push_i32(k_val);
++                b.push_i32(bs_val);
++                b
++            },
++        );
++        if let Some(t) = timer {
++            t.finish(&self.hip);
++        }
++        result
++    }
++
+     // ── HFQ4 qkv MMQ family (3-way fused Q+K+V) — issue #299 Phase 2 ────
+     #[allow(clippy::too_many_arguments)]
+     fn launch_qkv_hfq4_mmq_tile(
+@@ -11933,6 +12017,19 @@ impl Gpu {
+         batch_size: usize,
+     ) -> HipResult<()> {
+         self.bind_thread()?;
++        // wmmqa (int8-WMMA + Q8_1 MMQ-load) opt-in early-return — gfx11
++        // (RDNA3 wave32) only. MMQ stays the default residual path; this only
++        // fires under HIPFIRE_HFQ4_RES_WMMQA=1 for batched prefill on a wave32
++        // gfx11 (not gfx12, not wave64). See
++        // `gemm_hfq4g256_residual_wmma_mmqload`.
++        if batch_size > 1
++            && std::env::var("HIPFIRE_HFQ4_RES_WMMQA").ok().as_deref() == Some("1")
++            && self.arch_caps.has_wmma_w32()
++            && !self.arch_caps.has_wmma_w32_gfx12()
++            && !self.arch_caps.is_wave64_native()
++        {
++            return self.gemm_hfq4g256_residual_wmma_mmqload(a_raw, x, y, m, k, batch_size);
++        }
+         // gfx94x MFMA-direct opt-in: skips FP16 shadow + rocBLAS launch.
+         // Opt-in via HIPFIRE_GFX942_MFMA_PREFILL=1 while validating; this
+         // fires BEFORE the rocBLAS branch on purpose (rocBLAS goes through

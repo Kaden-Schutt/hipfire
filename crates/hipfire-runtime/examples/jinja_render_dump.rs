@@ -28,7 +28,9 @@ use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let model_path = args.get(1).expect("usage: <model.hfq> <template.jinja> <fixture.json> <out_prefix>");
+    let model_path = args
+        .get(1)
+        .expect("usage: <model.hfq> <template.jinja> <fixture.json> <out_prefix>");
     let tmpl_path = args.get(2).expect("template path");
     let fixture_path = args.get(3).expect("fixture path");
     let out_prefix = args.get(4).expect("out prefix");
@@ -44,10 +46,22 @@ fn main() {
         serde_json::from_str(&std::fs::read_to_string(fixture_path).expect("read fixture"))
             .expect("parse fixture");
 
-    let messages = fixture.get("messages").cloned().unwrap_or(serde_json::json!([]));
-    let tools = fixture.get("tools").cloned().unwrap_or(serde_json::Value::Null);
-    let enable_thinking = fixture.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(true);
-    let add_gen = fixture.get("add_generation_prompt").and_then(|v| v.as_bool()).unwrap_or(true);
+    let messages = fixture
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
+    let tools = fixture
+        .get("tools")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let enable_thinking = fixture
+        .get("enable_thinking")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let add_gen = fixture
+        .get("add_generation_prompt")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     // null / absent => omit (undefined, daemon-faithful). bool => include.
     let preserve = fixture.get("preserve_thinking").and_then(|v| v.as_bool());
 
@@ -55,12 +69,22 @@ fn main() {
     // Python reference consumes identical inputs.
     let mut ctx_map = serde_json::Map::new();
     ctx_map.insert("messages".into(), messages.clone());
-    ctx_map.insert("add_generation_prompt".into(), serde_json::Value::Bool(add_gen));
-    ctx_map.insert("enable_thinking".into(), serde_json::Value::Bool(enable_thinking));
+    ctx_map.insert(
+        "add_generation_prompt".into(),
+        serde_json::Value::Bool(add_gen),
+    );
+    ctx_map.insert(
+        "enable_thinking".into(),
+        serde_json::Value::Bool(enable_thinking),
+    );
     ctx_map.insert("bos_token".into(), serde_json::Value::String(bos.clone()));
     ctx_map.insert(
         "tools".into(),
-        if tools.is_null() { serde_json::json!([]) } else { tools.clone() },
+        if tools.is_null() {
+            serde_json::json!([])
+        } else {
+            tools.clone()
+        },
     );
     ctx_map.insert("documents".into(), serde_json::json!([]));
     ctx_map.insert("tool_call_kwargs".into(), serde_json::json!({}));
@@ -97,7 +121,6 @@ fn main() {
             println!("ERR  render failed: {e:#} -> {rust_out}");
         }
     }
-    std::fs::write(&ctx_out, serde_json::to_string_pretty(&ctx_json).unwrap())
-        .expect("write ctx");
+    std::fs::write(&ctx_out, serde_json::to_string_pretty(&ctx_json).unwrap()).expect("write ctx");
     println!("CTX  -> {ctx_out}");
 }

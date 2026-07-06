@@ -63,6 +63,7 @@ struct Args {
     max_tokens: Option<usize>,
     temperature: Option<f64>,
     max_seq: Option<usize>,
+    kv_mode: Option<String>,
     report_json: Option<String>,
     agentic: bool,
     stall_tokens: Option<usize>,
@@ -89,6 +90,7 @@ fn parse_args() -> Result<Args, String> {
             "--max-seq" => {
                 args.max_seq = it.next().and_then(|v| v.parse().ok());
             }
+            "--kv-mode" => args.kv_mode = it.next(),
             "--report-json" => args.report_json = it.next(),
             "--agentic" => args.agentic = true,
             "--stall-tokens" => {
@@ -121,6 +123,7 @@ fn print_help() {
           --max-tokens N        max generated tokens (default 200)\n  \
           --temperature F       sampling temperature (default 0.0)\n  \
           --max-seq N           daemon max_seq override (default 4096)\n  \
+          --kv-mode MODE        KV cache mode (q8|asym3|fwht3|...); default daemon's own\n  \
           --report-json OUT     also write the report as JSON\n  \
           --agentic             auto-engage tool-call shape detector\n  \
           --stall-tokens N      enable think_stall detector with budget N\n  \
@@ -224,13 +227,40 @@ impl DaemonChild {
 
 fn spawn_daemon(daemon: &PathBuf) -> Result<DaemonChild, String> {
     let mut cmd = Command::new(daemon);
+    // stderr is `piped()` (owned by us), NOT `inherit()`. Over ssh, an
+    // inherited stderr fd keeps the daemon's write end attached to the
+    // parent terminal/ssh channel: when the daemon child exits, the channel
+    // can stay open (the inherited pipe is never closed by us), hanging the
+    // probe and the ssh session. We never parse daemon stderr — diagnostics
+    // we rely on come from the stdout JSONL stream — so we drain stderr on a
+    // detached thread, forwarding it to the probe's own stderr to preserve
+    // the daemon's diagnostics. Because the read end is owned by this thread,
+    // the daemon's exit yields EOF here and the thread ends cleanly; the ssh
+    // channel is never held open by an inherited fd.
     cmd.env("HIPFIRE_EMIT_TOKEN_IDS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn daemon: {}", e))?;
     let stdin = child.stdin.take().ok_or("daemon stdin")?;
     let stdout = BufReader::new(child.stdout.take().ok_or("daemon stdout")?);
+    if let Some(child_stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(child_stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        // Forward daemon diagnostics to our own stderr so they
+                        // are not lost, prefixed for clarity.
+                        eprint!("[daemon] {}", line);
+                    }
+                }
+            }
+        });
+    }
     Ok(DaemonChild {
         child,
         stdin: Some(stdin),
@@ -239,15 +269,10 @@ fn spawn_daemon(daemon: &PathBuf) -> Result<DaemonChild, String> {
 }
 
 fn send(d: &mut DaemonChild, msg: &serde_json::Value) -> Result<(), String> {
-    let stdin = d
-        .stdin
-        .as_mut()
-        .ok_or("daemon stdin already closed")?;
+    let stdin = d.stdin.as_mut().ok_or("daemon stdin already closed")?;
     let line = serde_json::to_string(msg).map_err(|e| format!("encode: {}", e))?;
     writeln!(stdin, "{}", line).map_err(|e| format!("write daemon: {}", e))?;
-    stdin
-        .flush()
-        .map_err(|e| format!("flush daemon: {}", e))?;
+    stdin.flush().map_err(|e| format!("flush daemon: {}", e))?;
     Ok(())
 }
 
@@ -258,7 +283,10 @@ where
     let mut line = String::new();
     loop {
         line.clear();
-        let n = d.stdout.read_line(&mut line).map_err(|e| format!("read: {}", e))?;
+        let n = d
+            .stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("read: {}", e))?;
         if n == 0 {
             return Err("daemon closed stdout unexpectedly".into());
         }
@@ -317,9 +345,10 @@ fn drive_generate(
         "max_tokens": args.max_tokens.unwrap_or(200),
     });
     if let Some(sys) = system {
-        req.as_object_mut()
-            .unwrap()
-            .insert("system".to_string(), serde_json::Value::String(sys.to_string()));
+        req.as_object_mut().unwrap().insert(
+            "system".to_string(),
+            serde_json::Value::String(sys.to_string()),
+        );
     }
     send(d, &req)?;
 
@@ -382,10 +411,7 @@ fn drive_generate(
                 }
             }
             "done" => {
-                let total_tokens = v
-                    .get("tokens")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0) as usize;
+                let total_tokens = v.get("tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                 let wall_ms = t_start.elapsed().as_millis() as u64;
                 let ttft = ttft_ms.unwrap_or(wall_ms);
                 let ev = Event::Done {
@@ -401,8 +427,14 @@ fn drive_generate(
                 // Daemon-authoritative perf metrics from the done event.
                 // Default to 0 if absent (older daemons / non-Qwen35 paths).
                 let daemon_prefill_ms = v.get("prefill_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let daemon_prefill_tok_s = v.get("prefill_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let daemon_decode_tok_s = v.get("decode_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_prefill_tok_s = v
+                    .get("prefill_tok_s")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
+                let daemon_decode_tok_s = v
+                    .get("decode_tok_s")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
                 let daemon_ttft_ms = v.get("ttft_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 let daemon_tok_s = v.get("tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 done_stats = DoneStats {
@@ -553,11 +585,7 @@ fn run() -> Result<i32, String> {
             .map(|s| format!(" + {}", s))
             .unwrap_or_default()
     );
-    let combined_for_md5 = format!(
-        "{}\n----\n{}",
-        system.as_deref().unwrap_or(""),
-        prompt
-    );
+    let combined_for_md5 = format!("{}\n----\n{}", system.as_deref().unwrap_or(""), prompt);
     let md5 = prompt_md5(combined_for_md5.as_bytes());
 
     let daemon = find_daemon_binary()?;
@@ -565,10 +593,17 @@ fn run() -> Result<i32, String> {
 
     // Load
     let max_seq = effective_args.max_seq.unwrap_or(4096);
+    // KV mode passthrough (mirrors bench_sweep.ts `params.kv_mode`). Without it
+    // the daemon uses its default (asym3), so coherence must NOT be qualified on
+    // the shipped path — pass `--kv-mode q8` to probe the q8 KV path that ships.
+    let mut params = serde_json::json!({ "max_seq": max_seq });
+    if let Some(ref kv) = effective_args.kv_mode {
+        params["kv_mode"] = serde_json::Value::String(kv.clone());
+    }
     let load = serde_json::json!({
         "type": "load",
         "model": model,
-        "params": { "max_seq": max_seq },
+        "params": params,
     });
     send(&mut child, &load)?;
     let loaded = recv_until(&mut child, |_| {})?;

@@ -13,6 +13,7 @@
 //!   standard RMSNorm (weight * x̂, no +1), tie_word_embeddings.
 
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::model_source::ModelSource;
 use serde::Deserialize;
 
 /// Per-layer mixer kind, decoded from `layer_types`.
@@ -56,6 +57,14 @@ pub struct Lfm2MoeConfig {
     pub tie_word_embeddings: bool,
     /// Per-layer mixer choice (length == num_hidden_layers).
     pub layer_types: Vec<MixerKind>,
+
+    /// Optional REAP keep-map: emulate a pruned routed-expert pool by
+    /// partial-loading this full quant (load only the kept experts under
+    /// remapped names, gather the router's expert rows to the kept set).
+    /// Populated at config time from `HIPFIRE_REAP_PLAN=<dir>`; `None` ⇒
+    /// no pruning (today's behavior, byte-identical to baseline). Not
+    /// (de)serialized — `Lfm2MoeConfig` derives only `Clone`/`Debug`.
+    pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +147,31 @@ fn default_routed_scale() -> f32 {
     1.0
 }
 
+/// Apply an optional REAP keep-map to a freshly parsed `Lfm2MoeConfig`.
+///
+/// Reads `HIPFIRE_REAP_PLAN=<dir>` (lfm2moe has no legacy env alias). When
+/// set, loads `<dir>/reap_plan.json` (or the legacy `keep_by_layer.json`)
+/// via `ReapPlan::load_any`, validating against the ORIGINAL routed-expert
+/// count (`config.num_experts`) BEFORE overriding it to the kept count.
+/// This emulates a pruned expert pool by partial-loading the full quant:
+/// only kept experts are loaded (under remapped names) and the router's
+/// expert rows are gathered to the kept set in the MoE loader.
+///
+/// No env ⇒ no-op (`config.reap_keep` stays `None`); the MoE loader then
+/// takes the literal original full-load path — byte-identical to baseline.
+pub fn apply_reap_plan(config: &mut Lfm2MoeConfig) -> Result<(), String> {
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+        "lfm2moe",
+        None,
+        config.num_hidden_layers,
+        config.num_experts,
+    )? {
+        config.num_experts = plan.kept_per_layer();
+        config.reap_keep = Some(std::sync::Arc::new(plan));
+    }
+    Ok(())
+}
+
 impl Lfm2MoeConfig {
     pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
         let wrapper: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
@@ -145,7 +179,18 @@ impl Lfm2MoeConfig {
         let inner = wrapper
             .get("config")
             .ok_or_else(|| "lfm2moe: metadata_json missing `config` wrapper".to_string())?;
-        Self::from_config_value(inner)
+        let mut config = Self::from_config_value(inner)?;
+        // Apply the optional REAP keep-map HERE, inside the single public HFQ
+        // config entry point, so it is IMPOSSIBLE to bypass. `from_hfq` is the
+        // ONLY public HFQ→config path — the daemon (daemon.rs) and every
+        // example (infer/kld/graph_parity/dump) call it directly; there is no
+        // `Architecture` trait shim for lfm2moe to wire it into separately.
+        // Applied AFTER parse so validation sees the ORIGINAL num_experts;
+        // overrides num_experts to the kept count when active. No env ⇒ no-op
+        // (baseline behavior, byte-identical). `?`-propagates a malformed plan
+        // (REAP is opt-in: a bad plan must hard-fail, never silently no-op).
+        apply_reap_plan(&mut config)?;
+        Ok(config)
     }
 
     /// Parse from a raw `config.json` Value (the inner `config` blob).
@@ -222,6 +267,7 @@ impl Lfm2MoeConfig {
             routed_scaling_factor: raw.routed_scaling_factor,
             tie_word_embeddings: raw.tie_word_embeddings,
             layer_types,
+            reap_keep: None,
         })
     }
 
@@ -257,4 +303,13 @@ impl Lfm2MoeConfig {
             .filter(|&&t| t == MixerKind::Conv)
             .count()
     }
+}
+
+/// Parse Lfm2MoeConfig from a `&dyn ModelSource` (safetensors or HFQ wrapper).
+/// The metadata JSON should contain the `{"architecture":..., "config":{...}}` envelope
+/// as produced by SafetensorsSource::build_metadata_json.
+pub fn config_from_source(source: &dyn ModelSource) -> Option<Lfm2MoeConfig> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
+    let inner = meta.get("config")?;
+    Lfm2MoeConfig::from_config_value(inner).ok()
 }

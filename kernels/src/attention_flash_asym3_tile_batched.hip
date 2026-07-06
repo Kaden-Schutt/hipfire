@@ -52,7 +52,14 @@ __global__ void attention_flash_asym3_tile_batched(
 
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
-    const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
+    // hipGraph-safe block_start: under captured tree-verify replay the
+    // `block_start` scalar kernarg is baked at capture time and goes stale as
+    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
+    // cycle and the linearized tree root sits at positions[0] == start_pos ==
+    // block_start, so derive it from the device buffer instead of the scalar.
+    // Eager (non-capture) value is identical, so this is a no-op off-graph.
+    const int eff_block_start = tree_mode ? positions[0] : block_start;
+    const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
     const int tile_start = tile_id * tile_size;
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
@@ -125,8 +132,8 @@ __global__ void attention_flash_asym3_tile_batched(
             // Tree-attention bias on in-block keys. -inf bias makes exp(s-max)
             // collapse to 0; the ancestor set always contains the root so at
             // least one finite in-block score exists for every query row.
-            if (tree_mode && t >= block_start) {
-                s += tree_bias[global_bid * block_cols + (t - block_start)];
+            if (tree_mode && t >= eff_block_start) {
+                s += tree_bias[global_bid * block_cols + (t - eff_block_start)];
             }
             scores[t_local] = s;
         }

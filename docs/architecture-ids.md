@@ -14,6 +14,9 @@ file ids it actually loads.
 | 7 | Qwen2 dense (standalone) | `hipfire-arch-qwen2` | rev 0 skeleton; full bring-up in `docs/plans/dots-ocr-prd.md` phase 1 |
 | 8 | Qwen2-VL family (dots.ocr) | `hipfire-arch-dots-ocr` | vision tower + Strategy A E2E OCR validated 2026-05-21; daemon plumbing pending in `docs/plans/dots-ocr-prd.md` phase 3 |
 | 9 | DeepSeek V4 Flash | `hipfire-arch-deepseek4` | Hyper-Connections, compressed-KV indexer, tail-only RoPE, raw SWA; optional `mtp.0.*` MTP layer. |
+| 10 | MiniMax-M2 | `hipfire-arch-minimax` | Mixtral-style MoE: GQA + per-layer QK-norm + partial rotate_half RoPE + sigmoid+bias 256-expert routing. |
+| 11 | LFM2.5 / LFM2.5-MoE | `hipfire-arch-lfm2moe` | hybrid short-conv + GQA-attn; dense SwiGLU + top-4 MoE (sigmoid+expert_bias); tied embeddings. |
+| 12 | Cohere2-MoE (North-Mini-Code) | `hipfire-arch-cohere2moe` | parallel block (single mean-centered Cohere2LayerNorm feeds attn+ffn); interleaved sliding(RoPE)/global(NoPE) GQA; sigmoid 128-expert MoE (`norm_topk_prob=false`, no bias, no shared); dense layer-0 (`first_k_dense_replace=1`); tied embeddings. |
 | 0xFF | toy / template | `hipfire-arch-toy` | never shipped; daemon refuses to dispatch |
 
 ## Notes

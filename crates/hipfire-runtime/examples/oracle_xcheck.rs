@@ -18,13 +18,15 @@
 //!   env: HIPFIRE_GEN_STEPS (default 16), HIPFIRE_KV (default f32; f32|q8|asym3)
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use std::io::Write;
     use std::path::Path;
 
@@ -42,16 +44,36 @@ fn main() {
     let mut i = 2;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--prompt-file" => { prompt_file = Some(argv[i+1].clone()); i += 2; }
-            "--prompt"      => { prompt_str = Some(argv[i+1].clone()); i += 2; }
-            "--n-pos"       => { n_pos = argv[i+1].parse().unwrap(); i += 2; }
-            "--out"         => { out_path = Some(argv[i+1].clone()); i += 2; }
-            "--tokens-csv"  => { tokens_csv = Some(argv[i+1].clone()); i += 2; }
-            o => { eprintln!("unknown arg {o}"); std::process::exit(1); }
+            "--prompt-file" => {
+                prompt_file = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--prompt" => {
+                prompt_str = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--n-pos" => {
+                n_pos = argv[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--tokens-csv" => {
+                tokens_csv = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            o => {
+                eprintln!("unknown arg {o}");
+                std::process::exit(1);
+            }
         }
     }
-    let gen_steps: usize = std::env::var("HIPFIRE_GEN_STEPS").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(16);
+    let gen_steps: usize = std::env::var("HIPFIRE_GEN_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
     let kv_mode = std::env::var("HIPFIRE_KV").unwrap_or_else(|_| "f32".to_string());
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
@@ -59,9 +81,21 @@ fn main() {
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("oracle_xcheck: arch={} kv={} n_pos={} gen_steps={}", gpu.arch, kv_mode, n_pos, gen_steps);
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
-    eprintln!("loaded {} layers, vocab={}", weights.layers.len(), config.vocab_size);
+    eprintln!(
+        "oracle_xcheck: arch={} kv={} n_pos={} gen_steps={}",
+        gpu.arch, kv_mode, n_pos, gen_steps
+    );
+    let weights = {
+        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+        let layout = qwen35::Layout::single(config.n_layers);
+        qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+    }
+    .expect("load weights");
+    eprintln!(
+        "loaded {} layers, vocab={}",
+        weights.layers.len(),
+        config.vocab_size
+    );
 
     // Tokenize prompt.
     let prompt = if let Some(pf) = prompt_file {
@@ -71,20 +105,50 @@ fn main() {
     };
     let mut tokens: Vec<u32> = if let Some(tc) = tokens_csv {
         let raw = std::fs::read_to_string(&tc).expect("read tokens csv");
-        raw.trim().split(',').filter(|s| !s.is_empty())
-            .map(|s| s.trim().parse::<u32>().expect("token parse")).collect()
+        raw.trim()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().parse::<u32>().expect("token parse"))
+            .collect()
     } else {
         tokenizer.encode(&prompt)
     };
-    if tokens.len() > n_pos { tokens.truncate(n_pos); }
+    if tokens.len() > n_pos {
+        tokens.truncate(n_pos);
+    }
     let n = tokens.len();
-    eprintln!("prompt tokens: {} (first 16: {:?})", n, &tokens[..n.min(16)]);
+    eprintln!(
+        "prompt tokens: {} (first 16: {:?})",
+        n,
+        &tokens[..n.min(16)]
+    );
 
     let kv_max = (n + gen_steps + 16).max(512);
     let mut kv_cache = match kv_mode.as_str() {
-        "f32" | "f16" => KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max).unwrap(),
-        "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max).unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max).unwrap(),
+        "f32" | "f16" => KvCache::new_gpu(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
+        "q8" => KvCache::new_gpu_q8(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
+        "asym3" => KvCache::new_gpu_asym3(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         o => panic!("unknown HIPFIRE_KV {o}"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
@@ -95,13 +159,26 @@ fn main() {
     let mut argmax_tokens: Vec<u32> = Vec::with_capacity(n);
     for pos in 0..n {
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, tokens[pos], pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("forward_scratch");
+            &mut gpu,
+            &weights,
+            &config,
+            tokens[pos],
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward_scratch");
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
         // argmax
-        let mut am = 0usize; let mut mv = f32::NEG_INFINITY;
-        for (j, &v) in logits.iter().enumerate() { if v > mv { mv = v; am = j; } }
+        let mut am = 0usize;
+        let mut mv = f32::NEG_INFINITY;
+        for (j, &v) in logits.iter().enumerate() {
+            if v > mv {
+                mv = v;
+                am = j;
+            }
+        }
         argmax_tokens.push(am as u32);
         all_logits.extend_from_slice(&logits);
     }
@@ -109,17 +186,30 @@ fn main() {
 
     // Coherence signal: greedily continue from the last position.
     eprintln!("--- greedy continuation ({gen_steps} steps) ---");
-    let mut next = argmax_tokens[n-1];
+    let mut next = argmax_tokens[n - 1];
     let mut gen: Vec<u32> = vec![next];
     for s in 0..gen_steps {
         let pos = n + s;
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, next, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("forward_scratch gen");
+            &mut gpu,
+            &weights,
+            &config,
+            next,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward_scratch gen");
         let logits = gpu.download_f32(&scratch.logits).expect("download");
-        let mut am = 0usize; let mut mv = f32::NEG_INFINITY;
-        for (j, &v) in logits.iter().enumerate() { if v > mv { mv = v; am = j; } }
+        let mut am = 0usize;
+        let mut mv = f32::NEG_INFINITY;
+        for (j, &v) in logits.iter().enumerate() {
+            if v > mv {
+                mv = v;
+                am = j;
+            }
+        }
         next = am as u32;
         gen.push(next);
     }
@@ -129,12 +219,21 @@ fn main() {
     if let Some(op) = out_path {
         let mut out = std::fs::File::create(&op).expect("create out");
         let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(all_logits.as_ptr() as *const u8, all_logits.len()*4)
+            std::slice::from_raw_parts(all_logits.as_ptr() as *const u8, all_logits.len() * 4)
         };
         out.write_all(bytes).expect("write");
         // header sidecar: positions, vocab, token ids
         let mut meta = std::fs::File::create(format!("{op}.meta")).expect("create meta");
-        writeln!(meta, "n_pos={n}\nvocab={}\ntokens={:?}\nargmax={:?}", config.vocab_size, tokens, argmax_tokens).unwrap();
-        eprintln!("wrote {} f32 logits ([{n} x {}]) to {op}", all_logits.len(), config.vocab_size);
+        writeln!(
+            meta,
+            "n_pos={n}\nvocab={}\ntokens={:?}\nargmax={:?}",
+            config.vocab_size, tokens, argmax_tokens
+        )
+        .unwrap();
+        eprintln!(
+            "wrote {} f32 logits ([{n} x {}]) to {op}",
+            all_logits.len(),
+            config.vocab_size
+        );
     }
 }

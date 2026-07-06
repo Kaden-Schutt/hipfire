@@ -56,11 +56,15 @@ pub mod deepseek4;
 pub mod dsml;
 pub mod forward;
 pub mod grammar;
+pub mod mtp_speculator;
 pub mod sampling;
 pub mod spec_decode;
+pub mod spec_emit;
+pub mod spec_impl;
 
 pub use arch::DeepseekV4;
 pub use deepseek4::{
-    DeepseekV4Config, DeepseekV4State, DeepseekV4Weights, IndexerLayerState,
-    MainAttentionLayerState,
+    config_from_safetensors, DeepseekV4Config, DeepseekV4State, DeepseekV4Weights,
+    IndexerLayerState, MainAttentionLayerState,
 };
+pub use spec_impl::Deepseek4Bundle;

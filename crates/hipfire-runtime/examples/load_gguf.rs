@@ -9,11 +9,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| {
-            "/home/kaden/llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string()
-        });
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        "/home/kaden/llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string()
+    });
 
     println!("Opening: {path}");
     let gguf = GgufFile::open(Path::new(&path)).expect("failed to parse GGUF");
@@ -87,7 +85,10 @@ fn main() {
         // Estimate VRAM needed if dequantized to F32
         let total_params: usize = gguf.tensors.iter().map(|t| t.numel()).sum();
         let f32_bytes = total_params * 4;
-        println!("\n  Total params: {total_params} ({:.1}M)", total_params as f64 / 1e6);
+        println!(
+            "\n  Total params: {total_params} ({:.1}M)",
+            total_params as f64 / 1e6
+        );
         println!("  F32 VRAM needed: {:.1} GB", f32_bytes as f64 / 1e9);
     }
 }

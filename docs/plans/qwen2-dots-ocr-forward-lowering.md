@@ -500,10 +500,10 @@ Total surface: **one file**. The rest is validation.
 
 ### 12.1 · Byte-parity A/B on gfx1100 (RX 7900 XT) — PASS ✅
 
-**Date:** 2026-06-09  
-**Model:** `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (n_kv=2, n_heads=12, head_dim=128, attention_bias=true)  
-**Prompt:** "Paris is the capital of\n" (6 tokens)  
-**Tokens:** 128 generated (134 total with prompt)  
+**Date:** 2026-06-09
+**Model:** `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (n_kv=2, n_heads=12, head_dim=128, attention_bias=true)
+**Prompt:** "Paris is the capital of\n" (6 tokens)
+**Tokens:** 128 generated (134 total with prompt)
 **Platform:** gfx1100, ROCm 7.13, kernel JIT via hipcc (all kernels compiled successfully)
 
 | Path | Token count | Token IDs |
@@ -550,7 +550,7 @@ Per §6.4, the following test cells are still needed before flipping the toggle 
 
 ### 12.2 · GQA_FUSED A/B — PASS ✅
 
-**Model:** `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (n_kv=2, GQA model)  
+**Model:** `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (n_kv=2, GQA model)
 **Context:** 6 prompt tokens (short context, `attention_flash` fallback)
 
 | Path | Token count | Result |
@@ -562,9 +562,9 @@ The `HIPFIRE_GQA_FUSED=1` path exercises the `attention_flash_gqa_fused` kernel 
 
 ### 12.3 · Long-context A/B (3501-token context) — PASS ✅
 
-**Model:** `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (n_kv=2, head_dim=128)  
-**Context:** 3501 prompt tokens (≥ 4096 positions reached during decode)  
-**max_seq:** 8192  
+**Model:** `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (n_kv=2, head_dim=128)
+**Context:** 3501 prompt tokens (≥ 4096 positions reached during decode)
+**max_seq:** 8192
 
 | Path | Gen tokens | Result |
 |---|---|---|

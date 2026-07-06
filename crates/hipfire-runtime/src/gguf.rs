@@ -87,18 +87,18 @@ impl GgmlType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => 18,   // 2 (f16 scale) + 16 (32 x 4-bit)
-            Self::Q4_1 => 20,   // 2 (f16 scale) + 2 (f16 min) + 16
-            Self::Q5_0 => 22,   // 2 + 4 (high bits) + 16
+            Self::Q4_0 => 18, // 2 (f16 scale) + 16 (32 x 4-bit)
+            Self::Q4_1 => 20, // 2 (f16 scale) + 2 (f16 min) + 16
+            Self::Q5_0 => 22, // 2 + 4 (high bits) + 16
             Self::Q5_1 => 24,
-            Self::Q8_0 => 34,   // 2 (f16 scale) + 32 (32 x 8-bit)
+            Self::Q8_0 => 34, // 2 (f16 scale) + 32 (32 x 8-bit)
             Self::Q8_1 => 40,
             Self::Q2K => 2 + 2 + 16 + 64, // 84: d(2) + dmin(2) + scales(16) + qs(64)
             Self::Q3K => 2 + 32 + 12 + 64, // 110: d(2) + hmask(32) + scales(12) + qs(64)
             Self::Q4K => 2 + 2 + 12 + 128, // 144: d(2) + dmin(2) + scales(12) + qs(128)
             Self::Q5K => 2 + 2 + 12 + 128 + 32, // 176: d(2) + dmin(2) + scales(12) + qs(128) + qh(32)
-            Self::Q6K => 128 + 64 + 16 + 2, // ~210
-            Self::Q8K => 256 + 2 + 32, // ~290 (not commonly used)
+            Self::Q6K => 128 + 64 + 16 + 2,     // ~210
+            Self::Q8K => 256 + 2 + 32,          // ~290 (not commonly used)
             _ => 0,
         }
     }

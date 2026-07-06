@@ -21,7 +21,10 @@
 use rdna_compute::{DType, Gpu};
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -56,16 +59,16 @@ fn main() {
     let v_cache = gpu.upload_raw(&kv, &[cache_bytes]).expect("v upload");
 
     // Q: [n × n_heads × head_dim] f32.
-    let q_data: Vec<f32> = (0..n * nh * hd).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let q_data: Vec<f32> = (0..n * nh * hd)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
     let q = gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q upload");
     let out = gpu.zeros(&[n * nh * hd], DType::F32).expect("out");
 
     // positions: i32 bits in f32 slot — positions[b] = ctx - n + b (the
     // queries sit at the tail of the context, as in real tail-chunk prefill).
     let pos_data: Vec<i32> = (0..n).map(|b| (ctx - n + b) as i32).collect();
-    let pos_bytes = unsafe {
-        std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, n * 4)
-    };
+    let pos_bytes = unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, n * 4) };
     let positions = gpu.upload_raw(pos_bytes, &[n]).expect("pos upload");
 
     // flash_partials: [sub_batch × n_heads × max_tiles × (2+head_dim)].
@@ -95,35 +98,22 @@ fn main() {
         ts[ts.len() / 2]
     };
 
-    // (A) NEW batched.
+    // Windowed batched flash. WINDOW=0 is full causal; WINDOW>0 clips to the
+    // sliding window. The grid (max_tiles) AND the reduce (n_tiles) are sized by
+    // max_ctx_len regardless of window — so sweeping CTX at a FIXED window tests
+    // whether windowing actually reduces prefill cost, or only skips the dots
+    // while still paying O(ctx) tile-launch + reduce overhead.
+    let window = env_usize("WINDOW", 0) as i32;
     let new_ms = time(&mut gpu, &|g: &mut Gpu| {
-        g.attention_flash_q8_0_batched_masked(
-            &q, &k_cache, &v_cache, &out, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("new batched");
+        g.attention_flash_q8_0_batched_masked_windowed(
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
+            0, window,
+        )
+        .expect("windowed batched");
     });
 
-    // (B) OLD per-position loop — replicate the fallback this PR removed.
-    let pos_single: Vec<Vec<u8>> = (0..n)
-        .map(|b| ((ctx - n + b) as i32).to_ne_bytes().to_vec())
-        .collect();
-    let pos_bufs: Vec<_> = pos_single.iter()
-        .map(|bytes| gpu.upload_raw(bytes, &[1]).expect("pos1"))
-        .collect();
-    let old_ms = time(&mut gpu, &|g: &mut Gpu| {
-        for b in 0..n {
-            let q_b = q.sub_offset(b * nh * hd, nh * hd);
-            let out_b = out.sub_offset(b * nh * hd, nh * hd);
-            let seq_len = ctx - n + b + 1;
-            g.attention_flash_q8_0(
-                &q_b, &k_cache, &v_cache, &out_b,
-                &pos_bufs[b].buf, seq_len, nh, nkv, hd, ctx, &partials,
-            ).expect("old per-pos");
-        }
-    });
-
-    println!("\n=== Q8 long-ctx attention: NEW batched vs OLD per-position ===");
-    println!("NEW attention_flash_q8_0_batched_masked : {new_ms:8.2} ms");
-    println!("OLD per-position loop (n={n} launches)   : {old_ms:8.2} ms");
-    println!("speedup (OLD/NEW)                         : {:.2}x", old_ms / new_ms);
+    println!(
+        "WINDOW={window:6} CTX={ctx:6} N={n:4} HD={hd} : batched flash {new_ms:8.2} ms  ({:6.1} us/query-row)",
+        new_ms * 1000.0 / n as f64
+    );
 }

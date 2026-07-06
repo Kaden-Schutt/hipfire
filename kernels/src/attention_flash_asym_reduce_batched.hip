@@ -36,16 +36,26 @@ __global__ void attention_flash_asym_reduce_batched(
     const int stride = 2 + head_dim;
 
     const int global_bid = batch_offset + local_bid;
-    const int seq_len = (block_cols > 0) ? (block_start + block_cols)
+    // hipGraph-safe block_start: under captured tree-verify replay the
+    // `block_start` scalar kernarg is baked at capture time and goes stale as
+    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
+    // cycle and the linearized tree root sits at positions[0] == start_pos ==
+    // block_start, so derive it from the device buffer instead of the scalar.
+    // Eager (non-capture) value is identical, so this is a no-op off-graph. The
+    // tile kernel applies the same fix; n_tiles here must match its seq_len.
+    const int eff_block_start = (block_cols > 0) ? positions[0] : block_start;
+    const int seq_len = (block_cols > 0) ? (eff_block_start + block_cols)
                                           : (positions[global_bid] + 1);
     const int n_tiles = (seq_len + tile_size - 1) / tile_size;
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
-    // Per-thread assignment: 8 consecutive dims per thread (matches asym3 tile),
-    // but since partials are dim-indexed we could use any per-thread split.
-    // Using tid*8 to match the asym3 tile layout exactly.
-    const int d_base = tid * 8;
+    // Per-thread assignment: dims-per-thread = head_dim/32 (4 for hd=128, 8 for
+    // hd=256), matching the tile kernel's d0 = tid*dpt layout exactly. Partials
+    // are dim-indexed, so reduce MUST use the identical split or it reads the
+    // wrong slots / writes past `out` (head_dim).
+    const int dpt = head_dim / 32;
+    const int d_base = tid * dpt;
 
     // Pass 1: global max
     float global_max = -1e30f;
@@ -65,8 +75,7 @@ __global__ void attention_flash_asym_reduce_batched(
         float tile_sum = p[1];
         if (tile_sum <= 0.0f) continue;
         float corr = expf(tile_max - global_max);
-        #pragma unroll
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < dpt; i++)
             g[i] += p[2 + d_base + i] * corr;
         global_sum += tile_sum * corr;
     }
@@ -75,7 +84,6 @@ __global__ void attention_flash_asym_reduce_batched(
 
     const int q_dim = n_heads * head_dim;
     float* my_out = out + local_bid * q_dim + h * head_dim;
-    #pragma unroll
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < dpt; i++)
         my_out[d_base + i] = g[i] * inv_sum;
 }

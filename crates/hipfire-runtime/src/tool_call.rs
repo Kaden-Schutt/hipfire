@@ -81,15 +81,21 @@ pub trait ToolCallParser: Send + Sync {
 pub struct HermesJsonParser;
 
 impl HermesJsonParser {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for HermesJsonParser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolCallParser for HermesJsonParser {
-    fn name(&self) -> &'static str { "hermes_json" }
+    fn name(&self) -> &'static str {
+        "hermes_json"
+    }
 
     fn parse(&self, text: &str) -> ToolCallParseResult {
         if !text.contains("<tool_call>") {
@@ -104,9 +110,7 @@ impl ToolCallParser for HermesJsonParser {
             let open_abs = cursor + open_off;
             let body_start = open_abs + "<tool_call>".len();
             let close_off = text[body_start..].find("</tool_call>");
-            let body_end = close_off
-                .map(|o| body_start + o)
-                .unwrap_or(text.len());
+            let body_end = close_off.map(|o| body_start + o).unwrap_or(text.len());
             let raw = text[body_start..body_end].trim();
             cursor = match close_off {
                 Some(_) => body_end + "</tool_call>".len(),
@@ -120,11 +124,15 @@ impl ToolCallParser for HermesJsonParser {
                 working = working["<tool_call>".len()..].trim_start().to_string();
                 stripped += 1;
             }
-            if working.is_empty() { continue; }
+            if working.is_empty() {
+                continue;
+            }
             if let Some(parsed) = parse_one_hermes(&working, stripped > 0) {
                 tool_calls.push(parsed);
             }
-            if close_off.is_none() { break; }
+            if close_off.is_none() {
+                break;
+            }
         }
         // Prose is the text before the FIRST `<tool_call>` opener.
         let prose = match text.find("<tool_call>") {
@@ -154,7 +162,9 @@ fn parse_one_hermes(raw: &str, already_repaired: bool) -> Option<ParsedToolCall>
                 let mut args = serde_json::Map::new();
                 let mut coerced = false;
                 for (k, v) in map.iter() {
-                    if drop.contains(&k.as_str()) { continue; }
+                    if drop.contains(&k.as_str()) {
+                        continue;
+                    }
                     args.insert(k.clone(), v.clone());
                     coerced = true;
                 }
@@ -189,7 +199,11 @@ fn parse_one_hermes(raw: &str, already_repaired: bool) -> Option<ParsedToolCall>
         if let Some(rest) = raw.strip_prefix(open) {
             if let Some(close_idx) = rest.find(close) {
                 let name = rest[..close_idx].trim().trim_matches('"');
-                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                {
                     let after = rest[close_idx + close.len()..].trim();
                     let args = extract_first_json_object(after).unwrap_or(serde_json::json!({}));
                     return Some(ParsedToolCall {
@@ -215,9 +229,17 @@ fn extract_first_json_object(s: &str) -> Option<serde_json::Value> {
     for i in start..bytes.len() {
         let ch = bytes[i] as char;
         if in_str {
-            if escape { escape = false; continue; }
-            if ch == '\\' { escape = true; continue; }
-            if ch == '"' { in_str = false; }
+            if escape {
+                escape = false;
+                continue;
+            }
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+            if ch == '"' {
+                in_str = false;
+            }
             continue;
         }
         match ch {
@@ -238,7 +260,11 @@ fn extract_first_json_object(s: &str) -> Option<serde_json::Value> {
 
 fn trim_to_option(s: &str) -> Option<String> {
     let trimmed = s.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 // ── Qwen3.5/3.6 XML parser ──────────────────────────────────────────
@@ -264,15 +290,21 @@ fn trim_to_option(s: &str) -> Option<String> {
 pub struct Qwen35XmlParser;
 
 impl Qwen35XmlParser {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for Qwen35XmlParser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolCallParser for Qwen35XmlParser {
-    fn name(&self) -> &'static str { "qwen35_xml" }
+    fn name(&self) -> &'static str {
+        "qwen35_xml"
+    }
 
     fn parse(&self, text: &str) -> ToolCallParseResult {
         if !text.contains("<tool_call>") {
@@ -301,10 +333,15 @@ impl ToolCallParser for Qwen35XmlParser {
                 // into JSON shape). Lets `Qwen35XmlParser` recover
                 // without a separate format hint.
                 if let Some(parsed) = parse_one_hermes(body, false) {
-                    tool_calls.push(ParsedToolCall { repaired: true, ..parsed });
+                    tool_calls.push(ParsedToolCall {
+                        repaired: true,
+                        ..parsed
+                    });
                 }
             }
-            if close_off.is_none() { break; }
+            if close_off.is_none() {
+                break;
+            }
         }
         let prose = match text.find("<tool_call>") {
             Some(idx) => trim_to_option(&text[..idx]),
@@ -321,10 +358,14 @@ fn parse_one_qwen35_xml(body: &str) -> Option<ParsedToolCall> {
     let after_fn_open = &body[fn_idx + fn_open.len()..];
     let name_end = after_fn_open.find('>')?;
     let name = after_fn_open[..name_end].trim();
-    if name.is_empty() { return None; }
+    if name.is_empty() {
+        return None;
+    }
     // Walk parameters between <function=NAME> and </function>.
     let after_name_open = &after_fn_open[name_end + 1..];
-    let fn_close = after_name_open.find("</function>").unwrap_or(after_name_open.len());
+    let fn_close = after_name_open
+        .find("</function>")
+        .unwrap_or(after_name_open.len());
     let params_region = &after_name_open[..fn_close];
     let mut args = serde_json::Map::new();
     let mut walker = params_region;
@@ -342,7 +383,10 @@ fn parse_one_qwen35_xml(body: &str) -> Option<ParsedToolCall> {
         };
         // Value may have a leading + trailing newline (template
         // emits `<parameter=ARG>\nVALUE\n</parameter>`); strip them.
-        let value_str = after_arg_open[..p_close].trim_matches('\n').trim().to_string();
+        let value_str = after_arg_open[..p_close]
+            .trim_matches('\n')
+            .trim()
+            .to_string();
         // If the value parses as a JSON value (e.g., model emitted
         // `{"key": "..."}` because the parameter is structured), use
         // that. Otherwise treat as a raw string.
@@ -372,15 +416,21 @@ fn parse_one_qwen35_xml(body: &str) -> Option<ParsedToolCall> {
 pub struct Gemma4NativeParser;
 
 impl Gemma4NativeParser {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for Gemma4NativeParser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolCallParser for Gemma4NativeParser {
-    fn name(&self) -> &'static str { "gemma4_native" }
+    fn name(&self) -> &'static str {
+        "gemma4_native"
+    }
 
     fn parse(&self, text: &str) -> ToolCallParseResult {
         const OPEN: &str = "<|tool_call|>";
@@ -408,7 +458,8 @@ impl ToolCallParser for Gemma4NativeParser {
                     if let Some(name) = map.get("name").and_then(|v| v.as_str()) {
                         // Gemma uses `args`; accept `arguments` as a
                         // Hermes-shape alias.
-                        let args = map.get("args")
+                        let args = map
+                            .get("args")
                             .or_else(|| map.get("arguments"))
                             .cloned()
                             .unwrap_or(serde_json::json!({}));
@@ -420,7 +471,9 @@ impl ToolCallParser for Gemma4NativeParser {
                     }
                 }
             }
-            if close_off.is_none() { break; }
+            if close_off.is_none() {
+                break;
+            }
         }
         let prose = match text.find(OPEN) {
             Some(idx) => trim_to_option(&text[..idx]),
@@ -434,7 +487,9 @@ impl ToolCallParser for Gemma4NativeParser {
 mod tests {
     use super::*;
 
-    fn args_eq(a: &serde_json::Value, b: serde_json::Value) -> bool { *a == b }
+    fn args_eq(a: &serde_json::Value, b: serde_json::Value) -> bool {
+        *a == b
+    }
 
     // ── Hermes JSON parser ────────────────────────────────────────
 
@@ -445,7 +500,10 @@ mod tests {
         let r = p.parse(text);
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].name, "read");
-        assert!(args_eq(&r.tool_calls[0].arguments, serde_json::json!({"path":"/etc/hosts"})));
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({"path":"/etc/hosts"})
+        ));
         assert!(!r.tool_calls[0].repaired);
         assert_eq!(r.prose.as_deref(), Some("Sure, calling read."));
     }
@@ -461,11 +519,15 @@ mod tests {
     #[test]
     fn hermes_flat_form_coerced() {
         let p = HermesJsonParser::new();
-        let text = "<tool_call>{\"name\":\"write\",\"path\":\"/tmp/x\",\"contents\":\"hi\"}</tool_call>";
+        let text =
+            "<tool_call>{\"name\":\"write\",\"path\":\"/tmp/x\",\"contents\":\"hi\"}</tool_call>";
         let r = p.parse(text);
         assert_eq!(r.tool_calls.len(), 1);
         assert!(r.tool_calls[0].repaired);
-        assert!(args_eq(&r.tool_calls[0].arguments, serde_json::json!({"path":"/tmp/x","contents":"hi"})));
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({"path":"/tmp/x","contents":"hi"})
+        ));
     }
 
     #[test]
@@ -516,7 +578,10 @@ mod tests {
         let r = p.parse(text);
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].name, "read_file");
-        assert!(args_eq(&r.tool_calls[0].arguments, serde_json::json!({"path":"/etc/hosts"})));
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({"path":"/etc/hosts"})
+        ));
         assert!(!r.tool_calls[0].repaired);
     }
 
@@ -526,9 +591,12 @@ mod tests {
         let text = "<tool_call><function=write><parameter=path>\n/tmp/x\n</parameter><parameter=contents>\nhello world\n</parameter></function></tool_call>";
         let r = p.parse(text);
         assert_eq!(r.tool_calls.len(), 1);
-        assert!(args_eq(&r.tool_calls[0].arguments, serde_json::json!({
-            "path":"/tmp/x", "contents":"hello world"
-        })));
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({
+                "path":"/tmp/x", "contents":"hello world"
+            })
+        ));
     }
 
     #[test]
@@ -536,10 +604,14 @@ mod tests {
         let p = Qwen35XmlParser::new();
         // VALUE contains < but parameter close is full `</parameter>`,
         // so the scanner should not be fooled.
-        let text = "<tool_call><function=set><parameter=expr>\nx<5\n</parameter></function></tool_call>";
+        let text =
+            "<tool_call><function=set><parameter=expr>\nx<5\n</parameter></function></tool_call>";
         let r = p.parse(text);
         assert_eq!(r.tool_calls.len(), 1);
-        assert!(args_eq(&r.tool_calls[0].arguments, serde_json::json!({"expr":"x<5"})));
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({"expr":"x<5"})
+        ));
     }
 
     #[test]
@@ -563,7 +635,10 @@ mod tests {
         let r = p.parse(text);
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].name, "read");
-        assert!(args_eq(&r.tool_calls[0].arguments, serde_json::json!({"path":"/x"})));
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({"path":"/x"})
+        ));
     }
 
     #[test]
@@ -572,7 +647,10 @@ mod tests {
         let text = "<|tool_call|>{\"name\":\"read\",\"arguments\":{\"path\":\"/x\"}}<|/tool_call|>";
         let r = p.parse(text);
         assert_eq!(r.tool_calls.len(), 1);
-        assert!(args_eq(&r.tool_calls[0].arguments, serde_json::json!({"path":"/x"})));
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({"path":"/x"})
+        ));
     }
 
     #[test]

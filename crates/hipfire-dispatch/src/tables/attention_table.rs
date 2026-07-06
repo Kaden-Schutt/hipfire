@@ -7,17 +7,67 @@ use crate::types::*;
 pub fn populate(registry: &mut KernelRegistry) {
     // ── KV Cache Write — single-token (decode + per-token fallback) ──
     let kv_write_variants: &[(KernelKey, ArchPredicate, Option<ShapePredicate>)] = &[
-        (KernelKey::KvWriteAsym4,     ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteAsym4Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteAsym3,     ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteAsym3Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteAsym2,     ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteAsym2Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteQ8_0,      ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteF32,       ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (
+            KernelKey::KvWriteAsym4,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym4Fwht,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym3,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym3Fwht,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym2,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym2Fwht,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteQ8_0,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteF32,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
         // Llama legacy quant KV write (decode only)
-        (KernelKey::KvWriteHfq4,      ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::KvWriteQ4,        ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (
+            KernelKey::KvWriteHfq4,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteQ4,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteInt8c,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteHfq8,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
     ];
     for (key, arch, shape) in kv_write_variants {
         registry.register(KernelVariant {
@@ -32,13 +82,41 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // ── KV Cache Write — batched prefill ───────────────────────
     let kv_write_batched: &[(KernelKey, ArchPredicate, Option<ShapePredicate>)] = &[
-        (KernelKey::KvWriteAsym4Batched,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::KvWriteAsym4FwhtBatched, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::KvWriteAsym3Batched,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::KvWriteAsym3FwhtBatched, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::KvWriteAsym2Batched,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::KvWriteAsym2FwhtBatched, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::KvWriteQ8_0Batched,      ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
+        (
+            KernelKey::KvWriteAsym4Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym4FwhtBatched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym3Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym3FwhtBatched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym2Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::KvWriteAsym2FwhtBatched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::KvWriteQ8_0Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
     ];
     for (key, arch, shape) in kv_write_batched {
         registry.register(KernelVariant {
@@ -53,19 +131,99 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // ── Flash Attention — single-token (decode + per-token fallback) ──
     let attn_variants: &[(KernelKey, ArchPredicate, Option<ShapePredicate>)] = &[
-        (KernelKey::AttnFlashAsym4,     ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnFlashAsym4Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnFlashAsym3,     ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnFlashAsym3Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnFlashAsym2,     ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnFlashAsym2Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnFlashQ8_0,      ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnQ8_0Kv,         ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnGqaFused,       ArchPredicate::HasWmma, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnF32,            ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (
+            KernelKey::AttnFlashAsym4,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym4Fwht,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym3,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym3Fwht,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym2,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym2Fwht,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashQ8_0,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashQ8_0Windowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnQ8_0Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnGqaFused,
+            ArchPredicate::HasWmma,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnF32,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
         // Llama legacy quant KV (decode only)
-        (KernelKey::AttnHfq4Kv,        ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
-        (KernelKey::AttnQ4Kv,          ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (
+            KernelKey::AttnHfq4Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnQ4Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnInt8cKv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnHfq8Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        // F32 GQA-flash decode family (qwen2). derive does the shape selection;
+        // the registry just arch/batch-gates. Generic split-K kernels → Always.
+        (
+            KernelKey::AttnGqaWarp,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashGqa,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlash,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
     ];
     for (key, arch, shape) in attn_variants {
         registry.register(KernelVariant {
@@ -113,13 +271,37 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // Scalar batched (fallback when WMMA doesn't apply)
     let attn_batched: &[(KernelKey, ArchPredicate, Option<ShapePredicate>)] = &[
-        (KernelKey::AttnFlashAsym4BatchedMasked,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::AttnFlashAsym4FwhtBatchedMasked, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::AttnFlashAsym3BatchedMasked,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::AttnFlashAsym3FwhtBatchedMasked, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
+        (
+            KernelKey::AttnFlashAsym4BatchedMasked,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym4FwhtBatchedMasked,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym3BatchedMasked,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym3FwhtBatchedMasked,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
         // 2-bit tiers: _batched only (no _masked — tree-verify gap, 3.3)
-        (KernelKey::AttnFlashAsym2Batched,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        (KernelKey::AttnFlashAsym2FwhtBatched, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
+        (
+            KernelKey::AttnFlashAsym2Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::AttnFlashAsym2FwhtBatched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
         // Q8_0: P-1 no-LDS-cap tiled kernel.
         // NOTE(F2): This dispatches to the P-1 tiled kernel for ALL Q8 batched
         // prefill, replacing the old single-pass LDS-staged softmax that was used
@@ -127,7 +309,16 @@ pub fn populate(registry: &mut KernelRegistry) {
         // to master's ≤15k path. Numerically verified (NIAH 32k passed). Any
         // regression investigation should compare against master's two-path Q8,
         // not against this single-path kernel.
-        (KernelKey::AttnQ8_0KvBatchedMasked,   ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
+        (
+            KernelKey::AttnQ8_0KvBatchedMasked,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::AttnQ8_0KvBatchedMaskedWindowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
     ];
     for (key, arch, shape) in attn_batched {
         registry.register(KernelVariant {

@@ -11,6 +11,46 @@ import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync, readFileSync, writeFileSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import {
+  DEFAULT_MAX_REQUEST_BYTES,
+  checkContentLength,
+  BoundedBodyReader,
+  BoundedLock,
+  LockSaturatedError,
+  buildStatsBody,
+  parseServePidFile,
+  serializeServePidRecord,
+  validatePidOwnership,
+  reapPlanForPlatform,
+  epKvModeWarning,
+  sanitizeDaemonName,
+  parseListenInodesForPort,
+  decideProcfsPortOwnership,
+  type ServePidRecord,
+  type PidEvidence,
+} from "./serve_admission";
+import {
+  EXIT,
+  formatErrorMessage,
+  formatProgressLine,
+} from "./cli_format";
+
+// ─── Top-level safety net (registered FIRST) ────────────
+// Last-resort handlers so a stray rejected promise / synchronous throw —
+// including one from the startup init below (mkdirSync / loadConfig /
+// initDynamicRegistry / refreshModelsCatalog) — NEVER surfaces a raw Bun/V8
+// stack to the user. Registered before ANY init runs so a startup failure is
+// caught here too. Intended `process.exit()` paths are unaffected (they
+// terminate the process directly, not via thrown errors).
+function dieClean(err: unknown): never {
+  process.stderr.write(`hipfire: ${formatErrorMessage(err)}\n`);
+  process.stderr.write(`Run \`hipfire diag\` for diagnostics.\n`);
+  process.exit(EXIT.ERROR);
+}
+process.on("unhandledRejection", (reason) => dieClean(reason));
+process.on("uncaughtException", (err) => dieClean(err));
+// Clean SIGINT exit code (130) instead of a partial/garbled teardown.
+process.on("SIGINT", () => { process.stderr.write("\n"); process.exit(EXIT.SIGINT); });
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -21,7 +61,24 @@ const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
 const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
-const TEMP_CORRECTION = 0.82;
+// Named thinking budgets → per-turn <think> token cap. uncapped=0 means unlimited.
+// `med: 2048` preserves the historical default; `max` is the existing 32768
+// validation ceiling; `uncapped: 0` matches max_think_tokens' "0 = unlimited"
+// semantics. The thinking_budget preset drives max_think_tokens in
+// resolveModelConfig unless the user set a raw max_think_tokens override.
+const THINKING_BUDGET: Record<string, number> = {
+  low: 512, med: 2048, high: 8192, xhigh: 24576, max: 32768, uncapped: 0,
+};
+const THINKING_BUDGET_KEYS = Object.keys(THINKING_BUDGET);
+// NOTE: the legacy global `TEMP_CORRECTION = 0.82` (an April-2026 ×0.82 fudge
+// "for HFQ4 logit noise") was REMOVED 2026-06-18. It silently scaled every
+// resolved temperature — including W7 card-recommended temps and explicit API
+// `temperature` — across all formats, not just 4-bit. The sampler now applies
+// standard softmax(logits/T) on both host and GPU paths (identical to
+// llama.cpp), modern quants sit at KLD ~0.02–0.06 vs f16, and a coherence A/B
+// (q08-mq4 + A3B mfp4-E8, temps 0.574→1.0) showed ZERO hard fails and no
+// degradation at the uncorrected temps — the 0.82 case was if anything MORE
+// repetitive. Temperatures are now honored verbatim. See UX_progress.md.
 
 mkdirSync(MODELS_DIR, { recursive: true });
 
@@ -44,14 +101,39 @@ export interface HipfireConfig {
   temperature: number;    // default temperature for run
   top_p: number;
   repeat_penalty: number;
+  /// Computed (never persisted): set by resolveModelConfig when the model
+  /// carries a registry `sampling` recipe. Tells the run/serve paths to send
+  /// temperature RAW (skip the global TEMP_CORRECTION) — the recipe value IS
+  /// the intended sampler temperature.
+  sampling_authoritative?: boolean;
   max_tokens: number;     // per-turn generation cap
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
-  max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
+  // Named thinking budget preset (low/med/high/xhigh/max/uncapped). Drives the
+  // effective max_think_tokens in resolveModelConfig. This is the user-facing
+  // knob; max_think_tokens is the raw advanced override that still wins if set.
+  thinking_budget: string;
+  // per-turn budget for <think>...</think> reasoning (0 = unlimited). OPTIONAL:
+  // absent-by-default so the thinking_budget preset drives it. Present only when
+  // a user explicitly sets a raw override. resolveModelConfig ALWAYS resolves
+  // this to a concrete number, so downstream readers stay numeric.
+  max_think_tokens?: number;
   max_total_think_tokens: number; // re-arm-proof TOTAL <think> budget across the turn (0 = off). Force-closes + blocks <think> re-open at the cap; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.
   host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
+  // serve: max /v1/chat/completions request body, bytes. Checked from
+  // Content-Length BEFORE acquiring the serve lock (→ HTTP 413) so a giant
+  // upload can't block the daemon lock; chunked bodies are read with a
+  // byte-counting cap. Default 64 MiB. (BUG req-body-no-cap)
+  max_request_bytes: number;
+  // serve: max waiters queued behind the in-flight request before new requests
+  // get HTTP 503 + Retry-After instead of enqueuing unboundedly. 0 disables the
+  // cap (legacy unbounded FIFO). (BUG lock-no-backpressure)
+  serve_max_queue: number;
+  // serve: max ms a request waits in the admission queue before 503. 0 = no
+  // wait timeout (depth cap still applies). (BUG lock-no-backpressure)
+  serve_queue_timeout_ms: number;
   // ── Experimental / research knobs (OFF by default, no stable contract) ──
   // Gates the daemon's `budget_alert_at_tok` + `budget_alert_text` generate
   // params. When false (default), the daemon ignores those params entirely.
@@ -172,14 +254,78 @@ export interface HipfireConfig {
   // ── MTP speculative decode ──────────────────────────────
   mtp_mode: string;      // "off" | "on" | "auto"
   mtp_k: number;         // draft tokens per spec-decode window
+
+  // ── Unified speculation selector ──────────────────────────
+  // `speculation` is the CANONICAL knob: it picks the mechanism, so "all three
+  // legacy modes on" can't be ambiguous. Only ONE speculator ever runs (the
+  // daemon holds a single drafter), selected by the first-match cascade
+  // dflash > mtp > ngram.
+  //   "off"   → plain autoregressive decode.
+  //   "auto"  → cascade by availability; the legacy knobs (dflash_mode /
+  //             mtp_mode / ngram_mode) act as per-mechanism eligibility filters
+  //             and keep their own heuristics (e.g. dflash's A3B gate). DEFAULT.
+  //   "dflash"/"mtp"/"ngram" → force exactly that mechanism (bypass the
+  //             heuristics; warn if its prerequisite — a draft model / MTP
+  //             weights — is missing, then fall back to AR).
+  // The selector is lowered CLI-side into the per-mechanism load params, so the
+  // daemon needs no selector of its own. Default "auto" + the legacy defaults
+  // (dflash_mode=off, mtp_mode=auto, ngram_mode=off) reproduces prior behavior.
+  speculation: "off" | "auto" | "ngram" | "dflash" | "mtp";
+
+  // ── Model-free n-gram speculative decode ──────────────────
+  // n-gram is model-free (no draft weights): it proposes tokens from the
+  // prompt+output suffix and verifies against the target's own greedy argmax,
+  // so output is byte-identical to AR — only tok/s differs. It wins on
+  // high-repetition workloads (verbatim copy, long-context retrieval,
+  // structured output) and loses on free-form prose, so it stays opt-in.
+  //   "off"  → never (default).
+  //   "on"   → eligible in the `auto` cascade (lowest priority) and selectable.
+  //   "auto" → last-resort: enable only when neither dflash nor mtp can run.
+  ngram_mode: "off" | "on" | "auto";
+  ngram_k: number;         // draft window K (2–32). Higher = more parallelism.
+  ngram_min_count: number; // min n-gram match count to propose (1–10).
+
+  // ── Chat-template overrides ───────────────────────────────────────────
+  // Lift the two env-only chat-template knobs (HIPFIRE_CHAT_TEMPLATE_FILE,
+  // HIPFIRE_DEFAULT_CHATML) onto the config surface so they can be set/edited
+  // via `hipfire config` + the TUI without exporting shell env.
+  //
+  // `chat_template`: path to a `.j2`/`.jinja` chat template. Empty = unset
+  // (engine resolves model/bundled/embedded as usual). When set, projects to
+  // HIPFIRE_CHAT_TEMPLATE_FILE. NOTE the froggeric pillar: for qwen3* models a
+  // set template overrides the arch-bundled froggeric pillar, which the daemon
+  // flags with an intentional "[chat_template] WARNING: ... overriding the
+  // qwen3 froggeric pillar" message — that warning is correct and is not
+  // suppressed here.
+  chat_template: string;
+  // `default_chatml`: whether the never-bare ChatML fallback applies when no
+  // template resolves. true (default) keeps the fallback; false projects to
+  // HIPFIRE_DEFAULT_CHATML=0 (Plain-only framing). The env var is only
+  // load-bearing at value "0", so we only set it when false.
+  default_chatml: boolean;
 }
 
-// Detect GPU at import time for smart defaults
+// Detect GPU at import time (for diagnostics / display only — no longer drives
+// the KV default).
 const DETECTED_ARCH = detectGpuArch();
-const ARCH_DEFAULTS = archDefaults(DETECTED_ARCH);
+
+// Universal KV cache default. q8 (near-reference, ~2x vs fp16, DFlash-safe) is the
+// go-forward default for every card; a model can recommend a compressed mode via
+// its registry `default_kv_mode`, and the user can override per-config / per-model.
+// (We used to guess a per-arch fwht mode from a hardcoded `vram_gb` table — but
+// those numbers were wrong for the unified-memory APUs, fed no actual fit logic,
+// and silently handed unregistered models a lossy default. Removed. If genuine
+// fit-safety is wanted on a tight card, gate on the REAL vram_free_mb the daemon
+// already reports, not a static per-arch number — or set a per-model
+// default_kv_mode in the registry.)
+const DEFAULT_KV_MODE = "q8";
 
 const CONFIG_DEFAULTS: HipfireConfig = {
-  kv_cache: ARCH_DEFAULTS.kv_cache,
+  // "auto" = the inherit sentinel: resolve to the model's registry
+  // default_kv_mode, else DEFAULT_KV_MODE (q8). Keeping the literal default as
+  // "auto" (not a concrete mode) is what makes the registry path live for a clean
+  // config — a concrete literal here would bypass it.
+  kv_cache: "auto",
   kv_adaptive: "off",
   flash_mode: "auto",
   default_model: "qwen3.5:9b",
@@ -200,16 +346,20 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   max_tokens: 4096,
   max_seq: 32768,
   thinking: "on",
-  // Default reasoning budget (was 0 = unlimited). A non-zero cap bounds the
-  // <think> span so a long-reasoning turn force-closes and commits to its
-  // answer (daemon splices the continuation) instead of running until the
-  // client times out and terminates the stream mid-think. Override per-model
-  // or set 0 for unlimited (e.g. reasoning.effort=xhigh maps to 0).
-  max_think_tokens: 2048,
+  // Named thinking budget preset. "med" (=2048 tokens) preserves the historical
+  // max_think_tokens default. resolveModelConfig resolves this preset to a
+  // concrete max_think_tokens unless the user set a raw max_think_tokens
+  // override. The raw `max_think_tokens` default is intentionally ABSENT here so
+  // it is undefined-by-default and the preset can drive it; it remains a valid
+  // explicit advanced override (validated in validateConfigValue).
+  thinking_budget: "med",
   max_total_think_tokens: 0,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
+  max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+  serve_max_queue: 64,
+  serve_queue_timeout_ms: 30_000,
   experimental_budget_alert: false,
   dflash_adaptive_b: true,
   dflash_mode: "off",
@@ -250,6 +400,15 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_sparse_threshold: 32768,
   mtp_mode: "auto",
   mtp_k: 3,
+  // Unified speculation selector. "auto" + the legacy mode defaults reproduces
+  // prior behavior (dflash off, mtp auto, n-gram off).
+  speculation: "auto",
+  ngram_mode: "off",
+  ngram_k: 12,
+  ngram_min_count: 2,
+  // Chat-template overrides. Empty/true = engine defaults (no env projected).
+  chat_template: "",
+  default_chatml: true,
 };
 
 const KV_ADAPTIVE_OPTIONS = [
@@ -285,11 +444,15 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 131072;
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
+    case "thinking_budget": return typeof value === "string" && THINKING_BUDGET_KEYS.includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
     case "max_total_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1000000;
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
+    case "max_request_bytes": return typeof value === "number" && Number.isInteger(value) && value >= 4096 && value <= 4 * 1024 * 1024 * 1024;
+    case "serve_max_queue": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100000;
+    case "serve_queue_timeout_ms": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 3600000;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     case "experimental_budget_alert": return typeof value === "boolean";
     case "dflash_adaptive_b": return typeof value === "boolean";
@@ -319,6 +482,19 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     case "mtp_mode": return ["off", "on", "auto"].includes(value);
     case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
+    case "speculation": return ["off", "auto", "ngram", "dflash", "mtp"].includes(value);
+    case "ngram_mode": return ["off", "on", "auto"].includes(value);
+    case "ngram_k": return typeof value === "number" && Number.isInteger(value) && value >= 2 && value <= 32;
+    case "ngram_min_count": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
+    // chat_template: empty (unset) OR a path that exists + is readable. Tilde
+    // is expanded for the existence check so `~/templates/x.j2` validates.
+    case "chat_template": {
+      if (typeof value !== "string") return false;
+      if (value.length === 0) return true;
+      const p = value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
+      try { return existsSync(p) && statSync(p).isFile(); } catch { return false; }
+    }
+    case "default_chatml": return typeof value === "boolean";
     default: return false;
   }
 }
@@ -337,6 +513,13 @@ function loadConfig(): HipfireConfig {
       if (key in raw && validateConfigValue(key, raw[key])) {
         (result as any)[key] = raw[key];
       }
+    }
+    // max_think_tokens is an OPTIONAL raw override with no entry in
+    // CONFIG_DEFAULTS (the thinking_budget preset is the default driver), so the
+    // loop above won't copy it. Carry an explicitly-saved value through so power
+    // users keep their raw override; absence is the signal that the preset drives.
+    if ("max_think_tokens" in raw && validateConfigValue("max_think_tokens", raw.max_think_tokens)) {
+      result.max_think_tokens = raw.max_think_tokens;
     }
     return result;
   } catch { return { ...CONFIG_DEFAULTS }; }
@@ -365,7 +548,7 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
   "kv_cache", "kv_adaptive", "flash_mode", "temperature", "top_p",
-  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens", "max_total_think_tokens",
+  "repeat_penalty", "max_tokens", "max_seq", "thinking", "thinking_budget", "max_think_tokens", "max_total_think_tokens",
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
@@ -380,8 +563,17 @@ const PER_MODEL_KEYS = [
   "prefill_block", "prefill_drafter", "prefill_drafter_device", "prefill_profile",
   "prefill_sparse_threshold",
   "mtp_mode", "mtp_k",
+  "speculation", "ngram_mode", "ngram_k", "ngram_min_count",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
+
+// All settable config keys. CONFIG_DEFAULTS no longer carries max_think_tokens
+// (the thinking_budget preset is its default driver), but it remains a valid
+// raw override — both `config get/set` and the listing must still recognize it.
+const ALL_CONFIG_KEYS = [
+  ...(Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[]),
+  "max_think_tokens" as keyof HipfireConfig,
+];
 
 type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
 type PerModelConfigs = Record<string, PerModelOverride>;
@@ -430,9 +622,15 @@ function savePerModelConfigs(all: PerModelConfigs) {
 // win over global. If tag is null/undefined, returns the global config.
 // Reads the global config fresh each call so edits via `hipfire config set`
 // take effect without restarting a running `hipfire serve`.
-function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
+// resolveModelConfig ALWAYS resolves max_think_tokens to a concrete number (via
+// resolveThinkingBudget), so its return type narrows the optional field to
+// required — downstream readers can use `cfg.max_think_tokens > 0` without a
+// possibly-undefined check.
+type ResolvedConfig = HipfireConfig & { max_think_tokens: number; max_think_explicit: boolean };
+
+function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
   const base = loadConfig();
-  if (!tag) return base;
+  if (!tag) { resolveThinkingBudget(base); return base as ResolvedConfig; }
   const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
   const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
@@ -440,12 +638,133 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   // registry tag AND under the user alias. Alias wins where both set a
   // key, but neither drops the other. Previous `resolved ?? tag` picked
   // exactly one entry, so any key only present on the other vanished.
-  return {
+  // Layer the registry card's recommended_settings UNDER per-model config and
+  // OVER the global base, so a curated card temp/top_p/etc. flows into the
+  // resolved HipfireConfig (and thus into `hipfire config <tag> show`,
+  // sizeAwareKvMode, etc.). Per-model models.json still wins. See
+  // resolveSamplingForSend for the explicit-SEND guard that decides which of
+  // these actually get transmitted to the daemon.
+  const card = tag ? REGISTRY[resolved]?.recommended_settings : undefined;
+  const cardLayer: Partial<HipfireConfig> = {};
+  if (card) {
+    if (typeof card.temperature === "number") cardLayer.temperature = card.temperature;
+    if (typeof card.top_p === "number") cardLayer.top_p = card.top_p;
+    if (typeof card.repeat_penalty === "number") cardLayer.repeat_penalty = card.repeat_penalty;
+  }
+  const merged: HipfireConfig = {
     ...base,
+    ...cardLayer,
     ...(catalogId ? (all[catalogId] ?? {}) : {}),
     ...(all[resolved] ?? {}),
     ...(tag !== resolved ? (all[tag] ?? {}) : {}),
   };
+  resolveThinkingBudget(merged);
+  return merged as ResolvedConfig;
+}
+
+// thinking_budget preset drives max_think_tokens unless the user set a raw
+// max_think_tokens override explicitly (back-compat / power users). After this
+// runs, `cfg.max_think_tokens` is ALWAYS a concrete number, so downstream
+// genMsg/genParams readers stay numeric and unchanged.
+//
+// "Explicitly set" = max_think_tokens is present (not undefined/null) on the
+// MERGED config. Because the raw `max_think_tokens` default was removed from
+// CONFIG_DEFAULTS — and loadConfig only carries it through when the user saved
+// it explicitly, and the per-model layers are sparse (only keys the user set) —
+// a present value can ONLY have come from an explicit global save or a per-model
+// override. Absence is the signal that the preset should drive.
+function resolveThinkingBudget(cfg: HipfireConfig): asserts cfg is ResolvedConfig {
+  // Did the operator set a think-budget EXPLICITLY, or is it the bare preset
+  // default? A raw `max_think_tokens` (absent from CONFIG_DEFAULTS) present here
+  // can only be an explicit save/override; a `thinking_budget` other than the
+  // "med" default is likewise an explicit choice. The serve path uses this to
+  // stay uncapped by default (so DFlash/MTP engage) while still honoring an
+  // explicit budget — see the serve handler's max_think_tokens block.
+  (cfg as ResolvedConfig).max_think_explicit =
+    (cfg.max_think_tokens !== undefined && cfg.max_think_tokens !== null) ||
+    (cfg.thinking_budget !== undefined && cfg.thinking_budget !== "med");
+  if (cfg.max_think_tokens === undefined || cfg.max_think_tokens === null) {
+    const tb = cfg.thinking_budget ?? "med";
+    cfg.max_think_tokens = THINKING_BUDGET[tb] ?? THINKING_BUDGET.med;
+  }
+}
+
+/// Sampling fields to actually TRANSMIT to the daemon, with the explicit-send
+/// guard. A field is `defined` ONLY when it came from one of:
+///   (1) an explicit `--flag` (passed in `flags`),
+///   (2) per-model models.json config, or
+///   (3) the registry card's `recommended_settings`.
+/// A field that is merely the bare global CONFIG_DEFAULTS value is left
+/// `undefined` so the CLI omits it from the request — letting the daemon's own
+/// resolution (`.hfq` generation_config → arch ladder) apply instead of the CLI
+/// silently overriding the card with temp=0.3/top_p=0.8. (Without this guard
+/// the daemon NEVER sees its own card/arch defaults: the CLI always sent the
+/// global default.)
+///
+/// NOTE: top_k is now HONORED by the daemon sampler (the spec-sampling kernel
+/// folds it into the nucleus on AR + DFlash + MTP). min_p is still carried-but-
+/// inert (unimplemented). presence_penalty, temperature, top_p, repeat_penalty
+/// also take effect.
+interface SamplingForSend {
+  temperature?: number;
+  top_p?: number;
+  repeat_penalty?: number;
+  presence_penalty?: number;
+  top_k?: number; // honored by the daemon (spec-sampling kernel folds into nucleus)
+  min_p?: number; // carried-but-inert (daemon unimplemented)
+  system_prompt?: string;
+}
+export function resolveSamplingForSend(
+  tag: string | null | undefined,
+  flags?: {
+    temperature?: number;
+    top_p?: number;
+    repeat_penalty?: number;
+    presence_penalty?: number;
+  },
+): SamplingForSend {
+  const out: SamplingForSend = {};
+  const resolved = tag ? resolveModelTag(tag) : null;
+  const card = resolved ? REGISTRY[resolved]?.recommended_settings : undefined;
+
+  // Per-model explicit overrides: the union of the keys the user actually set
+  // under any of the layered config keys (catalog id / canonical tag / alias).
+  // Presence of a KEY (not its value) marks it explicit.
+  const perModel: Record<string, unknown> = {};
+  if (tag) {
+    const all = loadPerModelConfigs();
+    const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
+    if (catalogId && all[catalogId]) Object.assign(perModel, all[catalogId]);
+    if (resolved && all[resolved]) Object.assign(perModel, all[resolved]);
+    if (resolved && tag !== resolved && all[tag]) Object.assign(perModel, all[tag]);
+  }
+
+  // Layer order (lowest → highest): card < per-model < explicit --flag.
+  const pick = (
+    key: "temperature" | "top_p" | "repeat_penalty",
+  ): number | undefined => {
+    const flagVal = flags ? (flags as any)[key] : undefined;
+    if (typeof flagVal === "number") return flagVal;
+    if (typeof perModel[key] === "number") return perModel[key] as number;
+    if (card && typeof (card as any)[key] === "number") return (card as any)[key] as number;
+    return undefined;
+  };
+  out.temperature = pick("temperature");
+  out.top_p = pick("top_p");
+  out.repeat_penalty = pick("repeat_penalty");
+
+  // presence_penalty: flag > card (no per-model HipfireConfig field for it).
+  if (flags && typeof flags.presence_penalty === "number") {
+    out.presence_penalty = flags.presence_penalty;
+  } else if (card && typeof card.presence_penalty === "number") {
+    out.presence_penalty = card.presence_penalty;
+  }
+
+  // top_k / min_p: card-only today (no flag/per-model surface). Carried-but-inert.
+  if (card && typeof card.top_k === "number") out.top_k = card.top_k;
+  if (card && typeof card.min_p === "number") out.min_p = card.min_p;
+  if (card && typeof card.system_prompt === "string") out.system_prompt = card.system_prompt;
+  return out;
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -482,7 +801,7 @@ void _applyThinkingMode_deprecated;
 function sizeAwareKvMode(baseMode: string, resolved: HipfireConfig, tag?: string | null): string {
   if (baseMode !== "asym3") return baseMode;
   if (process.env.HIPFIRE_KV_MODE) return baseMode; // explicit env wins
-  if (resolved.kv_cache !== ARCH_DEFAULTS.kv_cache) return baseMode; // explicit config/per-model
+  if (resolved.kv_cache !== "auto") return baseMode; // explicit config/per-model — respect it
   if (!tag) return baseMode;
   const t = resolveModelTag(tag).toLowerCase();
   const isLarge = t.includes(":27b") || t.includes(":35b") || t.includes("-27b") || t.includes("-35b");
@@ -523,7 +842,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
   // applies size-aware default so 27B+ gets asym4 automatically. Daemon
   // prefers params.kv_mode over the HIPFIRE_KV_MODE env var.
-  const baseMode = resolveKvMode(resolved);
+  const baseMode = resolveKvMode(resolved, tag);
   const effectiveMode = sizeAwareKvMode(baseMode, resolved, tag);
   if (effectiveMode !== baseMode) {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
@@ -567,7 +886,37 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   const targetBn = basename(path);
   const isA3B = /a3b/i.test(targetBn);
   const hasSidecar = !!(resolved.cask_sidecar && resolved.cask_sidecar.length > 0 && existsSync(resolved.cask_sidecar));
-  const mode = resolved.dflash_mode;
+
+  // ── Unified speculation selector ───────────────────────────────────────
+  // Resolve `speculation` (env > per-model > global; CLI `--spec` lowers into
+  // HIPFIRE_SPECULATION) and lower it into the three per-mechanism enables.
+  // Only ONE speculator runs (daemon cascade dflash > mtp > ngram), so this
+  // decides which by gating the others off. `auto` keeps every mechanism's
+  // legacy knob as its eligibility filter; an explicit mechanism forces one.
+  const speculation = (process.env.HIPFIRE_SPECULATION || resolved.speculation || "auto").toLowerCase();
+  let effDflashMode: "on" | "off" | "auto" = resolved.dflash_mode;
+  let effMtpMode = resolved.mtp_mode; // "off" | "on" | "auto"
+  // n-gram enable: env (HIPFIRE_NGRAM_DRAFT) wins; else the selector + ngram_mode.
+  let ngramOn: boolean;
+  switch (speculation) {
+    case "off":    effDflashMode = "off"; effMtpMode = "off"; ngramOn = false; break;
+    case "dflash": effDflashMode = "on";  effMtpMode = "off"; ngramOn = false; break;
+    case "mtp":    effDflashMode = "off"; effMtpMode = "on";  ngramOn = false; break;
+    case "ngram":  effDflashMode = "off"; effMtpMode = "off"; ngramOn = true;  break;
+    case "auto":
+    default:
+      // n-gram joins the auto cascade only when explicitly enabled (it loses on
+      // prose). `ngram_mode=auto` is last-resort: the daemon's cascade reaches
+      // n-gram only after dflash+mtp are unavailable, so "on" and "auto" both
+      // emit ngram_draft=true here and the cascade order does the gating.
+      ngramOn = resolved.ngram_mode === "on" || resolved.ngram_mode === "auto";
+      break;
+  }
+  // env top-of-ladder override for the n-gram enable specifically.
+  if (process.env.HIPFIRE_NGRAM_DRAFT === "1") ngramOn = true;
+  else if (process.env.HIPFIRE_NGRAM_DRAFT !== undefined) ngramOn = false;
+
+  const mode = effDflashMode;
   params.dflash_mode = mode;
   const autoOn = !isA3B || hasSidecar;
   const dflashAllowed = mode === "on" || (mode === "auto" && autoOn);
@@ -645,6 +994,34 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // treats absent keys as "use engine defaults" so older daemons stay
   // compatible even when the CLI passes new keys.
   params.dflash_adaptive_b = resolved.dflash_adaptive_b;
+
+  // ── MTP + n-gram speculation params (unified selector lowering) ─────────
+  // `--draft-max` lowers into HIPFIRE_DRAFT_MAX and routes to the ACTIVE
+  // mechanism's window (mtp_k when mtp runs, ngram_k when n-gram runs).
+  const draftMaxEnv = process.env.HIPFIRE_DRAFT_MAX
+    ? parseInt(process.env.HIPFIRE_DRAFT_MAX, 10)
+    : undefined;
+  // MTP: emit the effective mode (the selector may have forced it off). Window
+  // = --draft-max override else resolved mtp_k. This is the SOLE mtp_mode/mtp_k
+  // emission — it supersedes the old unconditional `params.mtp_* = resolved.*`
+  // that used to sit before the return (removed: it ran last and clobbered the
+  // selector, leaving MTP un-gated when speculation forced another mechanism).
+  params.mtp_mode = effMtpMode;
+  params.mtp_k = (draftMaxEnv && effMtpMode !== "off") ? draftMaxEnv : resolved.mtp_k;
+  // n-gram: byte-identical-to-AR model-free drafter. ngram_draft is the
+  // per-load enable the loader reads (env HIPFIRE_NGRAM_DRAFT still wins there).
+  params.ngram_draft = ngramOn;
+  params.ngram_k = (draftMaxEnv && ngramOn) ? draftMaxEnv : resolved.ngram_k;
+  params.ngram_min_count = resolved.ngram_min_count;
+
+  // Forced-mechanism prerequisite check: `--spec dflash` (or speculation=dflash)
+  // with no draft model resolvable is a no-op that would silently fall through
+  // the cascade — warn instead. (mtp/ngram prerequisites are discovered
+  // daemon-side, so only dflash is checkable here.)
+  // (skip the hint when the draft was explicitly opted out via HIPFIRE_DFLASH_DRAFT="").
+  if (speculation === "dflash" && !params.draft && process.env.HIPFIRE_DFLASH_DRAFT !== "") {
+    console.error(`[hipfire] speculation=dflash but no draft model found (set HIPFIRE_DFLASH_DRAFT or --model-draft <path>) — falling back to AR.`);
+  }
 
   // Auto-attach a TriAttention sidecar when:
   //   (1) user hasn't manually set cask_sidecar (resolved value is empty)
@@ -764,6 +1141,11 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   params.mtp_mode = resolved.mtp_mode;
   params.mtp_k = resolved.mtp_k;
 
+  // (Former DFlash+Q8 max_seq cap removed.) The captured-flash LDS cliff that
+  // 0-token'd Q8 KV at physical_cap>15000 is fixed in the engine: the captured
+  // verify forward now dispatches the tiled attention_flash_q8_0_batched_masked
+  // at any context (O(1) LDS, no per-position malloc). DFlash serves at the full
+  // resolved max_seq, VRAM-bound by the drafter context rather than a fixed cap.
   return { type: "load", model: path, params };
 }
 
@@ -792,6 +1174,12 @@ interface ModelEntry {
   size_gb: number;
   min_vram_gb: number;
   desc: string;
+  /// Per-model sampling recipe — the model's recommended defaults (e.g. the
+  /// HF card's values). Enforced as the default in `resolveModelConfig`: ABOVE
+  /// the global default, BELOW any user per-model override. Sent RAW to the
+  /// sampler (bypasses the global TEMP_CORRECTION). Omit to inherit the global
+  /// default (0.3/0.8 — the qwen-family tune).
+  sampling?: { temperature?: number; top_p?: number; repeat_penalty?: number };
   /// Optional published TriAttention sidecar in the same HF repo. When set,
   /// `hipfire pull` also fetches it next to the weights, and `serve`/`run`
   /// auto-attaches the file at startup if `cask_sidecar` is unset and the
@@ -806,6 +1194,25 @@ interface ModelEntry {
   /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
   /// is required once the file is in MODELS_DIR.
   mtp?: { file: string };
+  /// Optional per-model KV-cache default (the registry is the per-model card).
+  /// When present it takes precedence over the q8 default in resolveKvMode (but
+  /// still loses to HIPFIRE_KV_MODE env and per-model config). This is the
+  /// supported way to ship a compressed KV default for a specific model.
+  /// Validated against REGISTRY_KV_MODE_VALUES at registry-load time.
+  default_kv_mode?: string | null;
+  /// Optional curated author-recommended INFERENCE settings inherited from the
+  /// parent model card. Layered UNDER per-model models.json config and OVER the
+  /// CLI global default in resolveModelConfig. Bounds-validated at
+  /// registry-load time (registry_loader.ts validRecommendedSettings).
+  recommended_settings?: {
+    temperature?: number;
+    top_p?: number;
+    top_k?: number;
+    min_p?: number;
+    presence_penalty?: number;
+    repeat_penalty?: number;
+    system_prompt?: string;
+  } | null;
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -912,49 +1319,40 @@ function detectGpuArch(): string {
   return "unknown";
 }
 
-interface ArchDefaults {
-  kv_cache: string;        // best KV mode for this hardware
-  vram_gb: number;         // approximate VRAM
-}
-
-function archDefaults(arch: string): ArchDefaults {
-  // Default KV cache policy (FWHT-rotated, DFlash-safe):
-  //   fwht3 (K 3-bit FWHT-rotated + V Q8) is the default across arches — same
-  //   ~5.5× compression and byte layout as asym3, but the K-rotation basis
-  //   matches the MQ4 weight/draft FWHT convention, so DFlash speculative
-  //   acceptance stays high. asym3/asym4 use a Givens basis the draft was not
-  //   calibrated against → degraded acceptance / attractors with DFlash (which
-  //   is default-on for the 27B). Memory-tight cards get fwht2 (the asym2 byte
-  //   tier, FWHT-rotated). Override to `q8` for byte-exact reference quality,
-  //   or the `asym*` modes for the legacy Givens behavior.
-  switch (arch) {
-    // RDNA3
-    case "gfx1100": return { kv_cache: "fwht3", vram_gb: 24 };  // 7900 XTX
-    case "gfx1101": return { kv_cache: "fwht3", vram_gb: 16 };  // 7900 XT
-    case "gfx1102": return { kv_cache: "fwht3", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "fwht2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
-    // RDNA4
-    case "gfx1200": case "gfx1201":
-      return { kv_cache: "fwht3", vram_gb: 16 };                // 9070 XT
-    // RDNA2
-    case "gfx1030": return { kv_cache: "fwht3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
-    case "gfx1031": return { kv_cache: "fwht3", vram_gb: 12 };  // 6700 XT
-    case "gfx1032": return { kv_cache: "fwht2", vram_gb: 8 };   // 6600 XT (8 GB — fwht2 for headroom)
-    // RDNA1
-    case "gfx1010": return { kv_cache: "fwht2", vram_gb: 8 };   // 5700 XT
-    case "gfx1013": return { kv_cache: "fwht2", vram_gb: 14 };  // BC-250 APU
-    // Fallback — unknown arch, fwht3 is the safe DFlash-compatible default.
-    default: return { kv_cache: "fwht3", vram_gb: 8 };
-  }
-}
+// KV cache mode notes (for picking a non-default mode, per-model or by hand):
+//   q8     — near-reference, ~2× vs fp16. The default. DFlash-safe.
+//   fwht3  — K 3-bit FWHT-rotated + V Q8, ~5.5× compression. The K-rotation basis
+//            matches the MQ4 weight/draft FWHT convention, so DFlash speculative
+//            acceptance stays high — prefer fwht* over asym* when DFlash is on.
+//   fwht2  — 2-bit FWHT tier, for genuinely memory-tight setups.
+//   asym3/asym4 — Givens basis the draft was NOT calibrated against → degraded
+//            DFlash acceptance / attractors. Legacy; avoid with DFlash.
+// Set a compressed mode per-model via the registry `default_kv_mode`, or globally
+// via `hipfire config set kv_cache <mode>` — not by guessing from the GPU arch.
 
 // ─── KV cache mode resolver ──────────────────────────────
 // Canonical modes: q8, asym4, asym3, asym2.
 // Legacy aliases: turbo→asym3, turbo2→asym2, turbo3→asym3, turbo4→asym4
-// (plus "auto" → arch default).
-function resolveKvMode(cfg: HipfireConfig): string {
-  const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
-  if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
+// (plus "auto" → registry default_kv_mode, else q8).
+// Precedence (highest → lowest):
+//   HIPFIRE_KV_MODE env  >  per-model config (models.json per-tag kv_cache)
+//   >  the resolved model's registry `default_kv_mode`  >  DEFAULT_KV_MODE (q8).
+// The first two arrive folded into `cfg.kv_cache` (env via `||`, per-model via
+// resolveModelConfig before this call). `cfg.kv_cache === "auto"` means "no
+// explicit user/per-model config" — only THEN does the registry's per-model
+// recommendation, and finally the q8 fallback, apply.
+function resolveKvMode(cfg: HipfireConfig, tag?: string | null): string {
+  let raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
+  if (raw === "auto") {
+    // No env / no explicit per-model config: prefer the registry's per-model
+    // default_kv_mode if the resolved model carries one, else the q8 default.
+    const regDefault = tag ? REGISTRY[resolveModelTag(tag)]?.default_kv_mode : undefined;
+    raw = (typeof regDefault === "string" && regDefault.length > 0)
+      ? regDefault
+      : DEFAULT_KV_MODE;
+    // A registry default_kv_mode of "auto" collapses to the q8 default.
+    if (raw === "auto") return DEFAULT_KV_MODE;
+  }
   if (raw === "turbo" || raw === "turbo3") return "asym3";
   if (raw === "turbo2") return "asym2";
   if (raw === "turbo4") return "asym4";
@@ -980,7 +1378,7 @@ function resolveNgramBlock(value: "auto" | boolean, modelTag: string | null | un
 // auto-resolution of model-size-dependent flags (currently only
 // dflash_ngram_block).
 function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
-  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
+  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg, modelTag);
   // Only set HIPFIRE_ATTN_FLASH if the user hasn't already set it in their
   // shell (env overrides config). `auto` is the engine default — skip the
   // env var in that case so the engine's own default applies.
@@ -1023,6 +1421,24 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   }
   process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
   process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
+  // Chat-template overrides. Shell env wins over config (don't clobber an
+  // explicitly-exported HIPFIRE_CHAT_TEMPLATE_FILE / HIPFIRE_DEFAULT_CHATML).
+  // chat_template: project the path only when set; empty config = leave the
+  // engine's model/bundled/embedded resolution untouched. For qwen3* targets
+  // a set template makes the daemon emit its intentional froggeric pillar-
+  // shadow WARNING — that is the correct, expected behavior (not suppressed).
+  if (!process.env.HIPFIRE_CHAT_TEMPLATE_FILE && cfg.chat_template && cfg.chat_template.length > 0) {
+    const p = cfg.chat_template.startsWith("~/")
+      ? join(homedir(), cfg.chat_template.slice(2))
+      : cfg.chat_template;
+    process.env.HIPFIRE_CHAT_TEMPLATE_FILE = p;
+  }
+  // default_chatml: the daemon's HIPFIRE_DEFAULT_CHATML is only load-bearing
+  // at value "0" (disables the never-bare ChatML fallback). Project "0" only
+  // when the config opts out AND the shell hasn't already set the var.
+  if (!process.env.HIPFIRE_DEFAULT_CHATML && cfg.default_chatml === false) {
+    process.env.HIPFIRE_DEFAULT_CHATML = "0";
+  }
 }
 
 // ─── Background serve lifecycle ─────────────────────────
@@ -1032,17 +1448,412 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
 const SERVE_PID_FILE = join(HIPFIRE_DIR, "serve.pid");
 const SERVE_LOG_FILE = join(HIPFIRE_DIR, "serve.log");
 
+// Small, scoped `--flag value` / `--flag=value` reader for the handful of
+// serve passthrough flags. NOT a general parser rewrite (W2) — it extracts a
+// single named flag's value from an argv slice and removes the consumed tokens
+// IN PLACE so the positional host/port loop never sees them. Returns the value
+// string, or null when the flag is absent. Errors out on a missing value.
+// Pure core of takeFlagValue (no process.exit, no I/O) so the dash-value
+// acceptance/rejection decision is unit-testable (HF-CLI-005). Returns:
+//   { kind: "absent" }                  flag not present
+//   { kind: "value", value, splice }    value found; `splice` = [index, count]
+//   { kind: "missing" }                 flag present but no usable value
+// allowDashValue=true permits a value that starts with "-" (free-form string
+// flags like --system/--image); otherwise a dash-leading value is "missing".
+export type FlagValueResult =
+  | { kind: "absent" }
+  | { kind: "value"; value: string; splice: [number, number] }
+  | { kind: "missing" };
+export function peekFlagValue(args: string[], name: string, opts?: { allowDashValue?: boolean }): FlagValueResult {
+  const allowDash = opts?.allowDashValue === true;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === name) {
+      const v = args[i + 1];
+      if (v === undefined || (!allowDash && v.startsWith("-"))) return { kind: "missing" };
+      return { kind: "value", value: v, splice: [i, 2] };
+    }
+    if (a.startsWith(name + "=")) {
+      const v = a.slice(name.length + 1);
+      if (!v) return { kind: "missing" };
+      return { kind: "value", value: v, splice: [i, 1] };
+    }
+  }
+  return { kind: "absent" };
+}
+
+// Small, scoped `--flag value` / `--flag=value` reader for the handful of
+// serve passthrough flags. NOT a general parser rewrite (W2) — it extracts a
+// single named flag's value from an argv slice and removes the consumed tokens
+// IN PLACE so the positional host/port loop never sees them. Returns the value
+// string, or null when the flag is absent. Errors out on a missing value.
+// HF-CLI-005: by default a value starting with "-" is rejected (catches a
+// dangling flag like `--temp --json`). Free-form STRING flags (--system,
+// --image) legitimately take dash-leading values (`--system "- terse"`,
+// a path like `-img.png`), so they pass { allowDashValue: true }. Enum /
+// numeric flags keep the strict dash-rejection.
+export function takeFlagValue(args: string[], name: string, opts?: { allowDashValue?: boolean }): string | null {
+  const r = peekFlagValue(args, name, opts);
+  if (r.kind === "absent") return null;
+  if (r.kind === "missing") {
+    console.error(`Error: ${name} requires a value`);
+    process.exit(1);
+  }
+  args.splice(r.splice[0], r.splice[1]);
+  return r.value;
+}
+
+// Boolean `--flag` reader: removes the token in place and reports presence.
+function takeFlag(args: string[], ...names: string[]): boolean {
+  let found = false;
+  for (let i = args.length - 1; i >= 0; i--) {
+    if (names.includes(args[i])) { args.splice(i, 1); found = true; }
+  }
+  return found;
+}
+
+// After a command has consumed all of its known flags (via takeFlag /
+// takeFlagValue, which splice their tokens out of `rest`), call this to reject
+// any leftover dash-prefixed token. Without it, commands like list/ps/chat/diag
+// silently IGNORE typos like `--josn`, hiding user error. Positional args (no
+// leading "-") are left untouched. A bare "-" (stdin convention) is allowed.
+function rejectUnknownFlags(rest: string[], cmd: string): void {
+  const unknown = rest.find(a => a.startsWith("-") && a !== "-");
+  if (unknown !== undefined) {
+    console.error(`hipfire: unknown flag ${unknown} (see hipfire ${cmd} --help)`);
+    process.exit(EXIT.USAGE);
+  }
+}
+
+// HF-CLI-002: resolve the port `hipfire restart` should free/poll, the SAME
+// way `runServe` does. A naive `for (a of args)` scan treated FLAG VALUES as
+// ports — `restart -d --tp 2` parsed port=2, then pid-validated against port 2
+// and unlinked the real pidfile. We consume the serve VALUE-flags (and their
+// values) from a COPY first (so the real `args` forwarded to runServe is
+// untouched), then only a bare host/port positional sets the port. Pure (no
+// process.exit / I/O) so it is unit-testable; uses peekFlagValue to splice
+// known value-flags without erroring on a dangling value.
+export function parseRestartPort(args: string[], defaultPort: number): number {
+  let port = defaultPort;
+  const scan = args.slice();
+  for (const f of ["--kv-mode", "--idle-timeout", "--tp"]) {
+    const r = peekFlagValue(scan, f);
+    if (r.kind === "value") scan.splice(r.splice[0], r.splice[1]);
+    // "missing" (dangling --flag) / "absent": leave it — it is not a port.
+  }
+  for (const a of scan) {
+    if (a === "-d" || a === "--detach" || a === "--background" || a === "--no-prewarm") continue;
+    if (a.startsWith("-")) continue; // any other flag is not a port positional
+    if (/^\d+$/.test(a)) { const n = parseInt(a, 10); if (n >= 1 && n <= 65535) port = n; }
+    else if (/^\[[^\]]+\]:\d+$/.test(a)) port = parseInt(a.match(/:(\d+)$/)![1], 10);
+    else if (/^[^:]+:\d+$/.test(a)) port = parseInt(a.slice(a.lastIndexOf(":") + 1), 10);
+  }
+  return port;
+}
+
+// HF-CLI-003: pure predicate mirroring runServe's dangling-`--tp` end-state —
+// true iff a space-form `--tp` was given with no consumable value. That happens
+// when `--tp` is the final token, OR when the token AFTER `--tp` starts with
+// "-" (a flag like `-d`, which is NOT a TP value — the runServe loop refuses to
+// consume it). The `--tp=` form never dangles (handled separately).
+// Unit-testable.
+export function serveTpDangling(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== "--tp") continue;
+    const next = args[i + 1];
+    if (next === undefined || next.startsWith("-")) return true;
+  }
+  return false;
+}
+
+// HF-CLI-004: validate the args that follow a `config` action verb. Rejects
+// stray dash-flags (e.g. the `--josn` typo that previously made `config list
+// --josn` exit 0 with human output) and over-arity. `set`/`cask-profile` take
+// free-form VALUE tokens that may start with "-", so only their <key> slot is
+// flag-checked; list/get/reset reject any dash token in their tail. Pure: it
+// returns a verdict instead of exiting, so it is unit-testable.
+export type ConfigArgsVerdict = { ok: true } | { ok: false; error: string };
+export function validateConfigActionArgs(action: string, tail: string[], key: string | undefined): ConfigArgsVerdict {
+  const badFlag = tail.find(a => a.startsWith("-") && a !== "-");
+  if (action === "list") {
+    if (badFlag !== undefined) return { ok: false, error: `unknown flag ${badFlag}` };
+    if (tail.some(a => !a.startsWith("-"))) return { ok: false, error: "config list takes no positional args" };
+    return { ok: true };
+  }
+  if (action === "get" || action === "reset") {
+    if (badFlag !== undefined) return { ok: false, error: `unknown flag ${badFlag}` };
+    // Exactly one positional (the <key>). `config get temperature extra`
+    // previously exited 0 ignoring `extra`; reject the extra positional tail.
+    const positionals = tail.filter(a => !a.startsWith("-"));
+    if (positionals.length > 1) {
+      return { ok: false, error: `config ${action} takes exactly one key (unexpected: ${positionals.slice(1).join(" ")})` };
+    }
+    return { ok: true };
+  }
+  if (action === "cask-profile") {
+    // `set`/`cask-profile` allow free-form (dash-leading) VALUE tokens, so only
+    // the <key>/<name> slot is flag-checked. cask-profile takes 0 or 1 name.
+    if (key !== undefined && key.startsWith("-")) return { ok: false, error: `unknown flag ${key}` };
+    if (tail.length > 1) {
+      return { ok: false, error: `config cask-profile takes at most one profile name (unexpected: ${tail.slice(1).join(" ")})` };
+    }
+    return { ok: true };
+  }
+  if (action === "set") {
+    if (key !== undefined && key.startsWith("-")) return { ok: false, error: `unknown flag ${key}` };
+    return { ok: true };
+  }
+  return { ok: true };
+}
+
+// Reap ORPHAN daemon / quantize processes and free a serve port. Mirrors
+// scripts/serve-restart.sh: `pkill -x daemon` (exact-name, NOT -f, so the bun
+// CLI itself is never matched) + `fuser -k <port>/tcp`. Used by
+// `hipfire stop --force` / `--all`. Returns a short human summary per action.
+function reapOrphans(port: number, all: boolean): string[] {
+  const out: string[] = [];
+  const sh = (cmd: string): { code: number; out: string } => {
+    try {
+      const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+      return { code: r.exitCode ?? 0, out: (r.stdout?.toString() ?? "").trim() };
+    } catch { return { code: 1, out: "" }; }
+  };
+  // BUG reap-linux-only: the pgrep/pkill/fuser commands are Linux-specific. On
+  // non-Linux do NOT run them (they'd silently no-op and then we'd falsely
+  // claim the port was freed). Report the limitation explicitly + try an
+  // lsof/ss port-owner probe where available.
+  const plan = reapPlanForPlatform(process.platform);
+  if (!plan.supported) {
+    out.push(`orphan reap unsupported: ${plan.note}`);
+    // Best-effort port-owner identification (don't claim a kill we can't do).
+    const owner = sh(`lsof -ti tcp:${port} 2>/dev/null || true`).out
+      || sh(`ss -ltnp 2>/dev/null | grep -w ${port} || true`).out;
+    if (owner) out.push(`port ${port} held by: ${owner} (kill it manually; reap is Linux-only)`);
+    else out.push(`port ${port}: could not determine owner (no lsof/ss); not freed`);
+    return out;
+  }
+  // The configurable daemon cmdline (default `daemon`). Lets a non-standard
+  // daemon binary name still be reaped without code edits.
+  // BUG reap-escape: HIPFIRE_DAEMON_NAME is interpolated into the pgrep/pkill
+  // shell commands below, so it MUST be sanitized first — an unvalidated value
+  // like `daemon; rm -rf ~` would run arbitrary shell. sanitizeDaemonName
+  // allowlists [A-Za-z0-9._-] and falls back to "daemon" on anything else.
+  const rawDaemonName = process.env.HIPFIRE_DAEMON_NAME;
+  const daemonName = sanitizeDaemonName(rawDaemonName);
+  if (rawDaemonName !== undefined && rawDaemonName.trim() !== "" && daemonName !== rawDaemonName.trim()) {
+    out.push(`HIPFIRE_DAEMON_NAME ${JSON.stringify(rawDaemonName)} rejected (only [A-Za-z0-9._-] allowed); using ${JSON.stringify(daemonName)}`);
+  }
+  // Exact-name match on the inference daemon binary (examples/daemon). -x guards
+  // against killing the bun CLI / unrelated procs that merely mention "daemon".
+  // `-x --` : -x = exact comm match; `--` ends option parsing so even a name
+  // that started with a dash (already rejected by sanitizeDaemonName) can never
+  // be interpreted as an option flag.
+  const daemons = sh(`pgrep -x -- ${daemonName}`).out.split("\n").filter(Boolean);
+  if (daemons.length) {
+    sh(`pkill -x -- ${daemonName}`);
+    out.push(`reaped ${daemons.length} orphan daemon proc(s): ${daemons.join(" ")}`);
+  } else {
+    out.push("no orphan daemon procs");
+  }
+  if (all) {
+    // The quantize binary is `hipfire-quantize` (16 chars) → comm truncates to
+    // `hipfire-quantiz`, so `pgrep -x hipfire-quantize` never matches. Anchor on
+    // the release binary PATH via -f instead — this matches the real compute
+    // process while NOT matching the bun CLI's own `quantize` subcommand (which
+    // is `bun .../cli/index.ts quantize ...`, a different cmdline).
+    const quant = sh(`pgrep -f 'release/hipfire-quantize'`).out.split("\n").filter(Boolean);
+    if (quant.length) {
+      sh(`pkill -f 'release/hipfire-quantize'`);
+      out.push(`reaped ${quant.length} orphan quantize proc(s): ${quant.join(" ")}`);
+    } else {
+      out.push("no orphan quantize procs");
+    }
+  }
+  // Free the serve port (fuser -k SIGKILLs whatever holds <port>/tcp).
+  const before = sh(`fuser ${port}/tcp 2>/dev/null`).out;
+  if (before) {
+    sh(`fuser -k ${port}/tcp 2>/dev/null`);
+    out.push(`freed port ${port} (was held by:${before})`);
+  } else {
+    out.push(`port ${port} already free`);
+  }
+  return out;
+}
+
 function isPidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function readServePid(): number | null {
+// Module-level shell capture (the one in reapOrphans is function-local). Returns
+// trimmed stdout; empty string on any failure. Used by the pid-ownership probes.
+function shCapture(cmd: string): { code: number; out: string } {
   try {
-    const raw = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
-    const pid = parseInt(raw, 10);
-    if (!pid || !isPidAlive(pid)) return null;
-    return pid;
+    const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+    return { code: r.exitCode ?? 0, out: (r.stdout?.toString() ?? "").trim() };
+  } catch { return { code: 1, out: "" }; }
+}
+
+// BUG pid-reuse: read THIS process's /proc starttime (clock ticks, field 22) so
+// the serve pidfile stores a value comparable to gatherPidEvidence()'s
+// procStartTime — the definitive reused-pid discriminator on Linux. null off
+// Linux (the validator then leans on token / cmdline / port).
+function readOwnProcStartTime(): number | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = require("fs").readFileSync(`/proc/${process.pid}/stat`, "utf-8") as string;
+    const rparen = stat.lastIndexOf(")");
+    const rest = stat.slice(rparen + 2).split(" ");
+    const st = parseInt(rest[19], 10);
+    return Number.isInteger(st) ? st : null;
   } catch { return null; }
+}
+
+// BUG pid-reuse: read the serve pidfile as a RECORD ({pid,startTime,host,port,
+// token}), tolerating an OLD bare-numeric serve.pid (marked legacy). Returns the
+// parsed record (alive or not — callers decide) or null on garbage/missing.
+function readServePidRecord(): ServePidRecord | null {
+  try {
+    const raw = require("fs").readFileSync(SERVE_PID_FILE, "utf-8");
+    return parseServePidFile(raw);
+  } catch { return null; }
+}
+
+// Back-compat shim: many call sites just want "is a serve live?" → pid or null.
+function readServePid(): number | null {
+  const rec = readServePidRecord();
+  if (!rec) return null;
+  if (!isPidAlive(rec.pid)) return null;
+  return rec.pid;
+}
+
+// BUG pid-reuse: probe whether `pid` actually OWNS `port` (TCP listener). Tries
+// lsof, then ss, then a Linux procfs walk (/proc/<pid>/fd → socket inodes vs
+// /proc/net/tcp{,6}). Returns true/false when it could determine ownership, or
+// undefined when no tool/evidence was available (the validator treats undefined
+// as "unknown", not a refusal).
+function probePortOwner(pid: number, port: number): boolean | undefined {
+  // lsof: list pids holding the TCP port. -t = terse (pids only).
+  const lsof = shCapture(`lsof -ti tcp:${port} -sTCP:LISTEN 2>/dev/null || true`).out.trim();
+  if (lsof) {
+    const pids = lsof.split(/\s+/).map(s => parseInt(s, 10)).filter(Number.isInteger);
+    if (pids.length) return pids.includes(pid);
+  }
+  // ss: parse `pid=<n>` out of the process column for the listening socket.
+  const ss = shCapture(`ss -ltnHp 2>/dev/null | grep -w ${port} || true`).out;
+  if (ss && /pid=\d+/.test(ss)) {
+    const owners = new Set<number>();
+    for (const m of ss.matchAll(/pid=(\d+)/g)) owners.add(parseInt(m[1], 10));
+    if (owners.size) return owners.has(pid);
+  }
+  // procfs (Linux): AUTHORITATIVE whenever /proc/net/tcp{,6} is readable. We parse
+  // the LISTEN entries for `port` (their socket inodes) and the candidate pid's
+  // own socket inodes, then decide:
+  //   - no LISTEN entry on the port      → port is free → false (our serve gone)
+  //   - LISTEN entry, candidate holds it → true
+  //   - LISTEN entry, candidate doesn't  → false (foreign/recycled pid)
+  // Only a genuinely UNREADABLE /proc/net/tcp{,6} (and lsof/ss both failed above)
+  // leaves the answer undefined. This removes the old "candidate holds no socket
+  // fds → inconclusive even though /proc shows the port owned elsewhere" gap.
+  if (process.platform === "linux") {
+    const fs = require("fs");
+    // Parse the port's LISTEN inodes from both tcp + tcp6. Track whether we could
+    // read ANY of the two files — if neither is readable, procfs is unusable.
+    const listenInodes: string[] = [];
+    let procNetReadable = false;
+    for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+      let txt: string;
+      try { txt = fs.readFileSync(f, "utf-8"); } catch { continue; }
+      procNetReadable = true;
+      listenInodes.push(...parseListenInodesForPort(txt, port));
+    }
+    if (procNetReadable) {
+      // Collect the candidate pid's socket inodes (may be empty — that's fine and
+      // is exactly the case the old code mis-handled). An unreadable fd dir just
+      // yields an empty set → "candidate holds nothing".
+      const candidateInodes = new Set<string>();
+      try {
+        const fdDir = `/proc/${pid}/fd`;
+        for (const fd of fs.readdirSync(fdDir)) {
+          try {
+            const link = fs.readlinkSync(`${fdDir}/${fd}`) as string;
+            const m = link.match(/^socket:\[(\d+)\]$/);
+            if (m) candidateInodes.add(m[1]);
+          } catch {}
+        }
+      } catch {}
+      return decideProcfsPortOwnership(listenInodes, candidateInodes);
+    }
+  }
+  return undefined;
+}
+
+// BUG pid-reuse: hit http://<host>:<port>/health and return the echoed instance
+// token (the bun serve now includes `token` in its /health JSON). undefined when
+// /health is unreachable or carries no token. Pure-TS probe (no daemon).
+async function probeHealthToken(host: string | undefined, port: number | undefined): Promise<string | undefined> {
+  if (port === undefined) return undefined;
+  const h = serveProbeHost(host ?? "127.0.0.1");
+  try {
+    const ctl = AbortSignal.timeout(800);
+    const r = await fetch(`http://${h}:${port}/health`, { signal: ctl });
+    if (!r.ok) return undefined;
+    const j = await r.json() as any;
+    return typeof j?.token === "string" ? j.token : undefined;
+  } catch { return undefined; }
+}
+
+// BUG pid-reuse (fix3): gather evidence for a pid so validatePidOwnership() can
+// confirm we're not about to SIGTERM a REUSED pid. Collects /proc starttime +
+// cmdline (Linux), port-ownership of the RESOLVED TARGET PORT (threaded in by
+// the caller — the stop/restart/serve port we're operating on, NOT just
+// rec.port, so legacy bare-pid records get a real port probe too), AND the
+// /health-echoed token on that target port. Best-effort: any field we can't
+// read stays undefined (the validator handles partial evidence).
+async function gatherPidEvidence(rec: ServePidRecord, targetPort: number): Promise<PidEvidence> {
+  const ev: PidEvidence = {};
+  if (process.platform === "linux") {
+    try {
+      const stat = require("fs").readFileSync(`/proc/${rec.pid}/stat`, "utf-8") as string;
+      // Field 22 (1-indexed) = starttime. comm (field 2) may contain spaces in
+      // parens, so split after the last ')'.
+      const rparen = stat.lastIndexOf(")");
+      const rest = stat.slice(rparen + 2).split(" ");
+      // rest[0] = state (field 3) → starttime is rest[19] (field 22).
+      const st = parseInt(rest[19], 10);
+      if (Number.isInteger(st)) ev.procStartTime = st;
+    } catch {}
+    try {
+      const cl = require("fs").readFileSync(`/proc/${rec.pid}/cmdline`) as Buffer;
+      ev.cmdline = cl.toString("utf-8").replace(/\0/g, " ").trim();
+    } catch {}
+  }
+  // PORT FIRST: probe whether the recorded pid owns the RESOLVED TARGET port.
+  // This is authoritative in the validator and applies to legacy records too
+  // (which carry no rec.port) — we always probe the port the caller is acting on.
+  {
+    const owns = probePortOwner(rec.pid, targetPort);
+    if (owns !== undefined) ev.ownsPort = owns;
+  }
+  // /health token echo (definitive ownership when it matches rec.token), probed
+  // on the target port. Only meaningful for new records (legacy carries no token).
+  if (rec.token !== undefined) {
+    const tok = await probeHealthToken(rec.host, targetPort);
+    if (tok !== undefined) ev.healthToken = tok;
+  }
+  return ev;
+}
+
+// BUG pid-reuse (fix3): decide whether `rec.pid` is safe to kill, against the
+// RESOLVED TARGET PORT the caller is operating on (stop/restart/serve all know
+// their port — thread it in). Wraps the pure validator with the liveness check +
+// gathered evidence (proc + target-port ownership + /health token). NEVER kill on
+// a false verdict — the caller unlinks the stale pidfile instead. async because
+// it probes /health.
+async function validateServePid(rec: ServePidRecord, targetPort: number): Promise<{ owned: boolean; reason: string }> {
+  const alive = isPidAlive(rec.pid);
+  if (!alive) return validatePidOwnership(rec, {}, false);
+  const ev = await gatherPidEvidence(rec, targetPort);
+  return validatePidOwnership(rec, ev, alive);
 }
 
 export function serveProbeHost(host: string): string {
@@ -1072,20 +1883,36 @@ async function runViaHttp(
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   system?: string,
+  sampling?: SamplingForSend,
 ): Promise<boolean> {
   // VL requests proxy through the daemon's `image_base64` IPC field —
   // `hipfire run --image` can hit a running serve instead of cold-spawning
   // a fresh daemon per call.
 
   const messages: any[] = [];
-  if (system) messages.push({ role: "system", content: system });
+  // Explicit --system wins; else the card's recommended system_prompt.
+  const effectiveSystem = system ?? sampling?.system_prompt;
+  if (effectiveSystem) messages.push({ role: "system", content: effectiveSystem });
   messages.push({ role: "user", content: prompt });
-  const body: any = {
-    model, stream: true,
-    messages,
-    temperature: temp, max_tokens: maxTokens,
-    repeat_penalty: repeatPenalty, top_p: topP,
-  };
+  const body: any = { model, stream: true, messages, max_tokens: maxTokens };
+  // Explicit-send guard (same as the local genMsg path): transmit a sampling
+  // field only when it's in the explicit-send view; omitted fields fall through
+  // to the daemon's .hfq/arch-card resolution. Legacy callers (no view) send
+  // the concrete args as today.
+  if (sampling) {
+    if (typeof sampling.temperature === "number") body.temperature = sampling.temperature;
+    if (typeof sampling.top_p === "number") body.top_p = sampling.top_p;
+    if (typeof sampling.repeat_penalty === "number") body.repeat_penalty = sampling.repeat_penalty;
+    if (typeof sampling.presence_penalty === "number") body.presence_penalty = sampling.presence_penalty;
+    // top_k is now HONORED by the daemon (folded into the nucleus on AR + DFlash
+    // + MTP by the spec-sampling kernel); min_p remains carried-but-inert.
+    if (typeof sampling.top_k === "number") body.top_k = sampling.top_k;
+    if (typeof sampling.min_p === "number") body.min_p = sampling.min_p;
+  } else {
+    body.temperature = temp;
+    body.repeat_penalty = repeatPenalty;
+    body.top_p = topP;
+  }
 
   if (image) {
     const imgBuf = Bun.file(resolve(image));
@@ -1440,21 +2267,36 @@ async function pull(tag: string): Promise<string> {
   const writer = Bun.file(tmpDest).writer();
   let downloaded = 0;
   let lastPrint = 0;
+  // Rolling-window rate: bytes downloaded since the last sample / elapsed.
+  const startMs = Date.now();
+  let windowBytes = 0;
+  let windowStartMs = startMs;
+  let lastRate = 0; // bytes/sec, smoothed across windows
+  let lastLineLen = 0;
 
   for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
     writer.write(chunk);
     downloaded += chunk.length;
+    windowBytes += chunk.length;
     const now = Date.now();
     if (now - lastPrint > 500 || downloaded === total) {
-      const pct = total > 0 ? ((downloaded / total) * 100).toFixed(1) : "?";
-      const mb = (downloaded / 1e6).toFixed(0);
-      const totalMb = total > 0 ? (total / 1e6).toFixed(0) : "?";
-      process.stderr.write(`\r  ${mb}/${totalMb} MB (${pct}%)`);
+      const windowMs = now - windowStartMs;
+      if (windowMs >= 250) {
+        const inst = (windowBytes / windowMs) * 1000; // bytes/sec this window
+        // EMA smoothing so the rate/ETA don't jitter wildly.
+        lastRate = lastRate > 0 ? lastRate * 0.6 + inst * 0.4 : inst;
+        windowBytes = 0;
+        windowStartMs = now;
+      }
+      const line = `  ${formatProgressLine({ downloaded, total, bytesPerSec: lastRate })}`;
+      // Pad to overwrite any longer previous line, then carriage-return.
+      process.stderr.write(`\r${line.padEnd(lastLineLen)}`);
+      lastLineLen = line.length;
       lastPrint = now;
     }
   }
   await writer.end();
-  console.error("");
+  process.stderr.write("\n");
 
   // Rename tmp → final (atomic-ish)
   const { renameSync } = await import("fs");
@@ -1530,7 +2372,21 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string) {
+interface RunExtra {
+  kvMode?: string;
+  // --seed: awaits engine sampler-seed support (GenerateRequest has none; engine nondeterministic at temp0)
+  jsonOut?: boolean;
+  noStream?: boolean;
+  // Explicit-send sampling view (resolveSamplingForSend). When present, the
+  // run/genMsg path sends a sampling field ONLY if it appears here (came from
+  // --flag / per-model config / registry card); a field that's merely the bare
+  // global default is OMITTED so the daemon's .hfq/arch-card resolution applies.
+  // When undefined (legacy callers), the explicit temp/topP/repeatPenalty args
+  // are sent as today.
+  sampling?: SamplingForSend;
+}
+
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string, extra: RunExtra = {}) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -1552,9 +2408,16 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // If a serve daemon is already running on this port, proxy through its HTTP
   // API — saves the 2-5s cold-start cost of loading the model every invocation.
   // Local spawn falls through only when no serve is present (or HTTP errors out).
-  const useLocal = process.env.HIPFIRE_LOCAL === "1";
+  //
+  // BUT: --kv-mode is a load-time knob that a long-lived serve (model already
+  // loaded with a fixed kv_mode) can't honor per-request, and --json /
+  // --no-stream change how WE collect output. So when any of those are set,
+  // force the local daemon so they actually apply.
+  const wantsLocalControl = extra.kvMode !== undefined
+    || extra.jsonOut === true || extra.noStream === true;
+  const useLocal = process.env.HIPFIRE_LOCAL === "1" || wantsLocalControl;
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
-    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
+    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, extra.sampling);
     if (ok) return;
     // runViaHttp logged its own failure reason.
     // hunt3 B-6: only fall back to a LOCAL daemon if the serve is now GONE.
@@ -1571,11 +2434,16 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   }
 
   applyConfigEnv(cfg, model);
+  // --kv-mode override: the daemon prefers params.kv_mode over the env var, so
+  // also export HIPFIRE_KV_MODE for any code path that reads the env.
+  if (extra.kvMode !== undefined) process.env.HIPFIRE_KV_MODE = extra.kvMode;
   const e = new Engine();
   e.oneShot = true; // hunt3 H-B: one-shot run — recv() may exit on daemon EOF
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send(buildLoadMessage(path, model));
+  const loadMsg = buildLoadMessage(path, model);
+  if (extra.kvMode !== undefined) loadMsg.params.kv_mode = extra.kvMode;
+  await e.send(loadMsg);
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -1589,9 +2457,27 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const modelCfg = resolveModelConfig(model);
   const genMsg: any = {
     type: "generate", id: "run", prompt,
-    temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
-    repeat_penalty: repeatPenalty, top_p: topP,
+    max_tokens: maxTokens,
   };
+  // Explicit-send guard: when an explicit-send view is supplied, transmit a
+  // sampling field ONLY if it's in the view (flag / per-model / card). Anything
+  // omitted falls through to the daemon's .hfq/arch-card resolution. Legacy
+  // callers (no view) keep sending the concrete temp/topP/repeatPenalty args.
+  const sv = extra.sampling;
+  if (sv) {
+    if (typeof sv.temperature === "number") genMsg.temperature = sv.temperature;
+    if (typeof sv.top_p === "number") genMsg.top_p = sv.top_p;
+    if (typeof sv.repeat_penalty === "number") genMsg.repeat_penalty = sv.repeat_penalty;
+    if (typeof sv.presence_penalty === "number") genMsg.presence_penalty = sv.presence_penalty;
+    // top_k is now HONORED by the daemon (spec-sampling kernel); min_p stays
+    // carried-but-inert (sent so a future daemon inherits the card value).
+    if (typeof sv.top_k === "number") genMsg.top_k = sv.top_k;
+    if (typeof sv.min_p === "number") genMsg.min_p = sv.min_p;
+  } else {
+    genMsg.temperature = temp;
+    genMsg.repeat_penalty = repeatPenalty;
+    genMsg.top_p = topP;
+  }
   // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
   // a closed `<think></think>` block via assistant_prefix=closed_think, so
   // the model never starts a thinking turn at all. This mirrors the
@@ -1613,8 +2499,17 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
   }
-  if (system) genMsg.system = system;
+  // System prompt: explicit --system wins; else the card's recommended
+  // system_prompt (e.g. MiniMax-M2.7's identity prompt) if one is present.
+  const effectiveSystem = system ?? sv?.system_prompt;
+  if (effectiveSystem) genMsg.system = effectiveSystem;
 
+  // --json / --no-stream: accumulate the (think-stripped) content instead of
+  // streaming it to stdout token-by-token, then emit a single object/blob.
+  const collect = extra.jsonOut === true || extra.noStream === true;
+  let acc = "";
+  let doneTokens = 0;
+  let doneTokS = 0;
   let inThink = false;
   let stripNextLeadingNl = false;
   for await (const msg of e.generate(genMsg)) {
@@ -1631,17 +2526,29 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
       text = text.replace(/<\|im_end\|>/g, "");
       if (!text) continue;
       if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
-      process.stdout.write(text);
+      if (collect) acc += text;
+      else process.stdout.write(text);
     }
-    else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    else if (msg.type === "done") {
+      doneTokens = msg.tokens; doneTokS = msg.tok_s;
+      if (!collect) console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
+    }
     else if (msg.type === "error") {
       // Surface daemon-side rejections (e.g. KV-budget overrun) instead of
       // exiting 0 with no visible output. Sets exitCode so downstream shell
       // pipelines can detect the failure.
       process.stderr.write(`\n[hipfire] ${msg.message || "generation failed"}\n`);
       process.exitCode = 1;
-      break;
+      await e.stop();
+      return;
     }
+  }
+  if (extra.jsonOut) {
+    console.log(JSON.stringify({ content: acc, tokens: doneTokens, tok_s: doneTokS }));
+  } else if (extra.noStream) {
+    process.stdout.write(acc);
+    if (!acc.endsWith("\n")) process.stdout.write("\n");
+    console.error(`[${doneTokens} tok, ${doneTokS} tok/s]`);
   }
   await e.stop();
 }
@@ -1653,6 +2560,9 @@ async function serve(port: number, host: string) {
   // HIPFIRE_NO_PID_FILE=1 suppresses the write — used by `hipfire chat` when it
   // spawns an ephemeral daemon, so it doesn't clobber a long-lived `serve -d`.
   const ownsPidFile = !process.env.HIPFIRE_NO_PID_FILE;
+  // BUG pid-reuse: an opaque token written to the pidfile and (future) echoed by
+  // /health, so a kill path can positively confirm "this pid is OUR serve".
+  const serveToken = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   if (ownsPidFile) {
     // hunt3 B-3: a foreground `serve` run over a running `serve -d` would
     // overwrite the live daemon's pid file, then (on exit, cleanupPid below)
@@ -1665,7 +2575,18 @@ async function serve(port: number, host: string) {
       process.exit(1);
     }
     try {
-      require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
+      // BUG pid-reuse: write a RECORD so stop/restart/serve-dedup can validate
+      // ownership before killing (vs trusting a bare pid that may have been
+      // reused). startTime stores the /proc starttime (Linux) for the strongest
+      // reused-pid discriminator; token lets a future /health check confirm us.
+      const rec: ServePidRecord = {
+        pid: process.pid,
+        startTime: readOwnProcStartTime() ?? Date.now(),
+        host,
+        port,
+        token: serveToken,
+      };
+      require("fs").writeFileSync(SERVE_PID_FILE, serializeServePidRecord(rec));
     } catch {}
   }
   const cleanupPid = () => {
@@ -1674,8 +2595,11 @@ async function serve(port: number, host: string) {
     // (or anything else) has since rewritten it, deleting it would orphan
     // that live daemon's pid record. Read-back-and-compare.
     try {
-      const cur = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
-      if (cur === String(process.pid)) require("fs").unlinkSync(SERVE_PID_FILE);
+      const cur = parseServePidFile(require("fs").readFileSync(SERVE_PID_FILE, "utf-8"));
+      // Unlink only if the file STILL names us — match on token (new format) or
+      // bare pid (legacy/own write). Either confirms we are the rightful owner.
+      const mine = cur && cur.pid === process.pid && (cur.legacy || cur.token === serveToken);
+      if (mine) require("fs").unlinkSync(SERVE_PID_FILE);
     } catch {}
   };
   process.on("exit", cleanupPid);
@@ -1726,42 +2650,83 @@ async function serve(port: number, host: string) {
   // next tick re-evaluates and evicts cleanly if the connection has
   // since gone idle.
   let lastRequestTime = Date.now();
-  const idleTimeoutMs = cfg.idle_timeout * 1000;
+  // O3c-1 live-serve observability (consumed by GET /stats + the TUI Dashboard):
+  //   serveStartMs    — process start, for uptime_s
+  //   requestsServed  — cumulative admitted /v1/chat/completions count
+  //   recentTokS      — decode tok/s from the most recent `done` event, or null
+  //                     until a real generation has completed (never faked)
+  const serveStartMs = Date.now();
+  let requestsServed = 0;
+  let recentTokS: number | null = null;
+  // Env override (set by `hipfire serve --idle-timeout <secs>`) wins over the
+  // persisted config, and — unlike a cfg mutation — propagates to the detached
+  // child (which re-loads cfg from disk but inherits the parent's env).
+  const idleTimeoutSec = (() => {
+    const ev = process.env.HIPFIRE_IDLE_TIMEOUT;
+    if (ev !== undefined) {
+      const n = parseInt(ev, 10);
+      if (Number.isInteger(n) && n >= 0) return n;
+    }
+    return cfg.idle_timeout;
+  })();
+  const idleTimeoutMs = idleTimeoutSec * 1000;
 
   // Serve lock: serializes all daemon stdin/stdout access so only one
   // caller is mid-send/recv on the single IPC pipe at a time. Declared
   // BEFORE the eviction interval so the eviction tick can take it too
-  // (hunt3 B-1/B-5). `busy` covers the WHOLE lock-held window (incl. the
+  // (hunt3 B-1/B-5). The lock covers the WHOLE held window (incl. the
   // model-reload window where e.generating is still false).
-  let busy = false;
-  const queue: Array<{ resolve: () => void }> = [];
-  async function acquireLock() {
-    if (!busy) { busy = true; return; }
-    await new Promise<void>(resolve => queue.push({ resolve }));
-  }
-  function releaseLock() {
-    const next = queue.shift();
-    if (next) next.resolve();
-    else busy = false;
-  }
+  //
+  // BUG lock-no-backpressure: the queue is now BOUNDED. At capacity a new
+  // request is rejected (HTTP 503 + Retry-After) instead of enqueuing
+  // unboundedly; a disconnected client is removed from the queue (no dead
+  // {resolve} entry left behind). serve_max_queue=0 → effectively unbounded.
+  const serveMaxQueue = (() => {
+    const ev = process.env.HIPFIRE_SERVE_MAX_QUEUE;
+    if (ev !== undefined) { const n = parseInt(ev, 10); if (Number.isInteger(n) && n >= 0) return n; }
+    return cfg.serve_max_queue;
+  })();
+  const serveQueueTimeoutMs = (() => {
+    const ev = process.env.HIPFIRE_SERVE_QUEUE_TIMEOUT_MS;
+    if (ev !== undefined) { const n = parseInt(ev, 10); if (Number.isInteger(n) && n >= 0) return n; }
+    return cfg.serve_queue_timeout_ms;
+  })();
+  const serveLock = new BoundedLock({
+    // 0 → unbounded FIFO (a very large cap, never rejects on depth).
+    maxQueueDepth: serveMaxQueue > 0 ? serveMaxQueue : Number.MAX_SAFE_INTEGER,
+    maxWaitMs: serveMaxQueue > 0 ? serveQueueTimeoutMs : 0,
+  });
+  // Eviction-tick acquire is INTERNAL/privileged — it must never be rejected by
+  // the request admission cap. It only runs when the lock is uncontended (the
+  // tick pre-checks `serveLock.isBusy` and bails), so a plain acquire resolves
+  // immediately; on the off chance it would queue, we swallow a saturation
+  // reject and skip this tick rather than throwing inside the interval.
+  function releaseLock() { serveLock.release(); }
+  const maxRequestBytes = (() => {
+    const ev = process.env.HIPFIRE_MAX_REQUEST_BYTES;
+    if (ev !== undefined) { const n = parseInt(ev, 10); if (Number.isInteger(n) && n > 0) return n; }
+    return cfg.max_request_bytes;
+  })();
 
   const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
     // Cheap pre-checks before paying the lock-wait cost.
     if (!current) return;                              // nothing to unload
     if (e.generating) return;                          // active stream — don't yank
-    if (busy) return;                                  // hunt3 B-5: request holds the lock (incl. reload window) — don't contend
+    if (serveLock.isBusy) return;                      // hunt3 B-5: request holds the lock (incl. reload window) — don't contend
     if (Date.now() - lastRequestTime < idleTimeoutMs) return;
     // hunt3 B-1: take the serve lock before touching the daemon pipe.
     // Without it, this send(unload)+recv() races a concurrent request's
-    // recv() on the one stdout — two recv() callers cross-route acks.
-    await acquireLock();
+    // recv() on the one stdout — two recv() callers cross-route acks. The
+    // isBusy pre-check above means this acquire resolves immediately; guard
+    // the (unreachable) saturation reject so the interval never throws.
+    try { await serveLock.acquire().promise; } catch { return; }
     try {
       // hunt3 B-1: re-validate the idle precondition AFTER the lock wait —
       // a request may have arrived (and finished) while we were queued.
       if (!current) return;
       if (e.generating) return;
       if (Date.now() - lastRequestTime < idleTimeoutMs) return;
-      console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
+      console.error(`[hipfire] idle for ${idleTimeoutSec}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
       // Reset capability state only on a successful unload.
@@ -1805,9 +2770,11 @@ async function serve(port: number, host: string) {
   // Keep process alive irrespective of the interval; clean up on exit.
   if (evictionInterval) process.on("exit", () => clearInterval(evictionInterval));
 
-  // Pre-warm: load default model and compile kernels before accepting requests
+  // Pre-warm: load default model and compile kernels before accepting requests.
+  // `hipfire serve --no-prewarm` sets HIPFIRE_NO_PREWARM=1 to skip this entirely
+  // (model loads lazily on the first request instead).
   const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
-  const rawWarmPath = findModel(defaultModel);
+  const rawWarmPath = process.env.HIPFIRE_NO_PREWARM === "1" ? null : findModel(defaultModel);
   const warmPath = rawWarmPath ? resolve(rawWarmPath) : null;
   if (warmPath) {
     try {
@@ -1848,14 +2815,35 @@ async function serve(port: number, host: string) {
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/health") {
+        // BUG pid-reuse: echo the instance token we wrote to the pidfile. A kill
+        // path can hit /health and treat a matching token as DEFINITIVE proof the
+        // pid is OUR serve (not a reused pid). This is the bun serve responding —
+        // pure TS, no Rust daemon involvement.
         return Response.json({
           status: "ok",
           model: current,
-          idle_timeout_sec: cfg.idle_timeout,
+          idle_timeout_sec: idleTimeoutSec,
           pid: process.pid,
+          token: serveToken,
         });
       }
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
+
+      // O3c-1: live serve telemetry for the TUI Dashboard. Pure-TS (no daemon
+      // round-trip), so it answers instantly and works even with NO model
+      // loaded / serve idle (model:null, queue_depth 0). `current` is the
+      // real loaded-model path or null; recent_tok_s is omitted until a real
+      // generation has completed (no fabricated numbers).
+      if (url.pathname === "/stats") {
+        return Response.json(buildStatsBody({
+          model: current,
+          startMs: serveStartMs,
+          nowMs: Date.now(),
+          queueDepth: serveLock.inflight,
+          requestsServed,
+          recentTokS,
+        }));
+      }
 
       if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
         return Response.json({ error: "not found" }, { status: 404 });
@@ -1863,13 +2851,100 @@ async function serve(port: number, host: string) {
       // Update idle timer on every real request (eviction loop checks against this).
       lastRequestTime = Date.now();
 
-      await acquireLock();
+      // BUG req-body-no-cap: reject an oversized body from Content-Length BEFORE
+      // acquiring the serve lock, so a multi-GB upload can never block the
+      // daemon lock. Chunked / no-Content-Length bodies fall through to a
+      // byte-counting cap on the read below.
+      const clVerdict = checkContentLength(req.headers.get("content-length"), maxRequestBytes);
+      if (clVerdict.reject) {
+        return Response.json(
+          { error: { message: `request body too large (${clVerdict.reason}); max ${maxRequestBytes} bytes`, type: "invalid_request_error", code: "request_too_large" } },
+          { status: 413 },
+        );
+      }
+
+      // BUG req-body-no-cap: read the FULL body (size-capped) BEFORE touching the
+      // serve lock. For EVERY body shape — declared Content-Length, chunked,
+      // absent, or malformed Content-Length — the byte-counting cap + 413 happen
+      // entirely pre-lock, so no body byte is ever read inside the daemon-lock
+      // critical section. A slow / multi-GB upload can no longer pin the lock and
+      // starve every other client. We always stream through BoundedBodyReader
+      // (never req.json()) so the cap applies uniformly regardless of whether the
+      // declared Content-Length was trustworthy.
+      let body: any;
+      {
+        const reader = new BoundedBodyReader(maxRequestBytes);
+        const chunks: Uint8Array[] = [];
+        let overflowed = false;
+        const stream = req.body;
+        if (stream) {
+          const rd = stream.getReader();
+          try {
+            for (;;) {
+              const { done, value } = await rd.read();
+              if (done) break;
+              if (value) {
+                chunks.push(value);
+                if (!reader.push(value.byteLength)) { overflowed = true; try { await rd.cancel(); } catch {} break; }
+              }
+            }
+          } catch {
+            // Client disconnected / aborted mid-upload: treat as a malformed
+            // request rather than letting the throw escape (no lock held yet).
+            return Response.json(
+              { error: { message: "request body read aborted", type: "invalid_request_error", code: "bad_request" } },
+              { status: 400 },
+            );
+          }
+        }
+        if (overflowed) {
+          return Response.json(
+            { error: { message: `request body too large (streamed > ${maxRequestBytes} bytes)`, type: "invalid_request_error", code: "request_too_large" } },
+            { status: 413 },
+          );
+        }
+        const joined = new Uint8Array(reader.bytesRead);
+        let off = 0;
+        for (const c of chunks) { joined.set(c, off); off += c.byteLength; }
+        try {
+          body = JSON.parse(new TextDecoder().decode(joined));
+        } catch {
+          return Response.json(
+            { error: { message: "request body is not valid JSON", type: "invalid_request_error", code: "bad_request" } },
+            { status: 400 },
+          );
+        }
+      }
+
+      // BUG lock-no-backpressure: bounded admission. At capacity the client gets
+      // 503 + Retry-After instead of being enqueued forever; if the client
+      // disconnects while queued we abort() its waiter so the slot frees.
+      const adm = serveLock.acquire();
+      const onAbort = () => adm.abort();
+      try { req.signal?.addEventListener("abort", onAbort, { once: true }); } catch {}
+      try {
+        await adm.promise;
+      } catch (admErr: any) {
+        try { req.signal?.removeEventListener?.("abort", onAbort); } catch {}
+        if (admErr instanceof LockSaturatedError) {
+          return new Response(
+            JSON.stringify({ error: { message: "server busy: admission queue saturated; retry shortly", type: "server_error", code: "queue_saturated" } }),
+            { status: 503, headers: { "content-type": "application/json", "retry-after": String(admErr.retryAfterSec) } },
+          );
+        }
+        throw admErr;
+      }
+      try { req.signal?.removeEventListener?.("abort", onAbort); } catch {}
       // hunt3 B-5: re-bump after the lock wait so a request that sat QUEUED
       // behind a long generation (potentially longer than idle_timeout) does
       // not let the eviction tick fire the instant it finally begins. The
-      // `busy` lock flag already blocks eviction for the whole lock-held
-      // window (incl. the reload window where e.generating is still false).
+      // lock flag already blocks eviction for the whole lock-held window
+      // (incl. the reload window where e.generating is still false).
       lastRequestTime = Date.now();
+      // O3c-1: count an admitted chat request (one per accepted /v1/chat/completions
+      // turn that holds the serve lock). Rejected (503) / bad-body requests above
+      // are intentionally not counted.
+      requestsServed++;
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
 
@@ -1903,7 +2978,9 @@ async function serve(port: number, host: string) {
       }
 
       try {
-        const body = (await req.json()) as any;
+        // BUG req-body-no-cap: `body` was already read + size-capped BEFORE the
+        // serve lock (see above). No body byte is read inside this critical
+        // section, so a slow/oversized upload can't pin the daemon lock.
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -1943,15 +3020,20 @@ async function serve(port: number, host: string) {
         // Prefer the daemon's advertised `cache_capable` flag (source of
         // truth, next to the cache impl). Fall back to the arch-string
         // allowlist only for older daemons that don't send the flag.
-        const cacheCapable = currentCacheCapable !== null
+        // PRE-reload capability: decides whether to reset the CURRENTLY-loaded
+        // model's KV before any reload. The reset must reflect the model that
+        // is loaded RIGHT NOW (a stateless arch loaded now needs its KV cleared
+        // regardless of what the request will reload to). Prompt shaping below
+        // uses the POST-reload `activeCacheCapable` instead — see HF-CLI-001.
+        const cacheCapableForArch = (arch: string | null) =>
+          arch === "deepseek4" || arch === "qwen3_5" || arch === "qwen3_5_moe";
+        const preReloadCacheCapable = currentCacheCapable !== null
           ? currentCacheCapable
-          : (currentArch === "deepseek4"
-            || currentArch === "qwen3_5"
-            || currentArch === "qwen3_5_moe");
+          : cacheCapableForArch(currentArch);
         if (process.env.HIPFIRE_QWEN_CACHE_TRACE === "1") {
-          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} cacheCapable=${cacheCapable} -> ${cacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
+          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} preReloadCacheCapable=${preReloadCacheCapable} -> ${preReloadCacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
         }
-        if (!cacheCapable) {
+        if (!preReloadCacheCapable) {
           await e.send({ type: "reset" }); await e.recv();
         }
 
@@ -2062,7 +3144,20 @@ async function serve(port: number, host: string) {
             }
             const entry: any = { role, content: "" };
             if (role === "assistant") {
-              entry.content = stripThinkingInline(extractText(m.content));
+              const rawContent = extractText(m.content);
+              entry.content = stripThinkingInline(rawContent);
+              // Preserve prior-turn reasoning for Cohere/North "interleaved
+              // thinking": carry it in `tool_plan` (rendered into the template's
+              // <|START_THINKING|>{{message.tool_plan}}<|END_THINKING|> slot on
+              // agentic turns). Content stays stripped — Qwen needs that and
+              // ignores tool_plan; only the Cohere template reads it. Prefer an
+              // explicit reasoning field, else fall back to an inline <think>.
+              const inlineThink = (rawContent.match(/<think>([\s\S]*?)<\/think>/)?.[1] ?? "").trim();
+              const reasoning =
+                (typeof m.reasoning === "string" && m.reasoning) ||
+                (typeof m.reasoning_content === "string" && m.reasoning_content) ||
+                inlineThink || "";
+              if (reasoning) entry.tool_plan = reasoning;
               if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
                 const tcs: any[] = [];
                 for (const tc of m.tool_calls) {
@@ -2098,7 +3193,15 @@ async function serve(port: number, host: string) {
         // if both happen to be present (last-wins would silently shadow
         // an upstream system block).
         const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
-        if (sysMsg) systemPrompt = extractText(sysMsg.content);
+        if (sysMsg) {
+          systemPrompt = extractText(sysMsg.content);
+        } else {
+          // No client system message — fall back to the registry card's
+          // recommended system_prompt when one is curated (e.g. MiniMax-M2.7's
+          // identity prompt). A client-supplied system message always wins.
+          const cardSys = resolveSamplingForSend(body.model).system_prompt;
+          if (cardSys) systemPrompt = cardSys;
+        }
 
         // The legacy Hermes `<tools>` block injection happens LATER, after
         // the model has actually been loaded/reloaded and `currentArch` is
@@ -2238,7 +3341,10 @@ async function serve(port: number, host: string) {
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
         // Clamp the KV-cache sizing to a hard ceiling (matches the daemon's
         // independent max_seq <= 524288 clamp, hunt3 H-D contract).
-        const requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
+        let requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
+        // (Former DFlash+Q8 reload-bump guard removed alongside the load cap:
+        // buildLoadMessage no longer caps max_seq, so requiredMaxSeq need not be
+        // held down to the loaded cap — the engine serves the full context.)
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
@@ -2268,6 +3374,13 @@ async function serve(port: number, host: string) {
 
         // Now that currentArch reflects the model we're ACTUALLY sending
         // to (post-reload), apply the arch-conditional prompt shaping.
+        //
+        // HF-CLI-001: recompute cache-capability AGAINST THE NOW-LOADED model.
+        // `preReloadCacheCapable` was the old model's flag and is stale once a
+        // request triggered a reload; prompt shaping must use this active value.
+        const activeCacheCapable = currentCacheCapable !== null
+          ? currentCacheCapable
+          : cacheCapableForArch(currentArch);
         //
         // 1. Hermes `<tools>` block in systemPrompt: legacy daemon paths
         //    (Qwen2 generate) only see tools through prompt text and rely
@@ -2325,7 +3438,7 @@ async function serve(port: number, host: string) {
         //    Legacy arches (Qwen2 in particular) ignore the structured
         //    `messages` field and ONLY read `prompt` — they NEED the
         //    full ChatML rebuild for multi-turn to survive. Don't touch.
-        if (cacheCapable) {
+        if (activeCacheCapable) {
           const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
           if (last && last.role === "user") {
             const lastContent = extractContent(last.content);
@@ -2476,30 +3589,57 @@ async function serve(port: number, host: string) {
         const reasoningEffort: number | null =
           effortStr && effortStr in effortMap ? effortMap[effortStr] : null;
 
+        // Explicit-send guard at the serve layer. Precedence per field:
+        //   request body  >  per-model config / registry card (resolveSamplingForSend)
+        //   >  OMIT (let the daemon's .hfq generation_config → arch ladder resolve).
+        // A bare global CONFIG_DEFAULTS value is NOT sent, so the daemon's own
+        // card/arch resolution is no longer masked by the CLI's temp=0.3.
+        const sendView = resolveSamplingForSend(body.model);
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
-          temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
           // The daemon now applies OpenAI presence/frequency penalties natively
           // (subtractive, over the full repeat window) — strictly better than the
           // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
-          repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
-          presence_penalty: Math.max(0, Number(body.presence_penalty) || 0),
           frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
-          top_p: body.top_p ?? effective.top_p,
         };
+        // temperature is sent verbatim (the legacy ×0.82 TEMP_CORRECTION was
+        // removed 2026-06-18 — see the note at the top of the file).
+        {
+          const t = body.temperature ?? sendView.temperature;
+          if (typeof t === "number") genParams.temperature = t;
+          const tp = body.top_p ?? sendView.top_p;
+          if (typeof tp === "number") genParams.top_p = tp;
+          const rp = body.repeat_penalty ?? sendView.repeat_penalty;
+          if (typeof rp === "number") genParams.repeat_penalty = rp;
+          // presence_penalty: explicit request (any non-null) > card > omit.
+          // Clamp negatives to 0 (boosts aren't meaningful for the kernel).
+          const pp = body.presence_penalty != null
+            ? Math.max(0, Number(body.presence_penalty) || 0)
+            : sendView.presence_penalty;
+          if (typeof pp === "number") genParams.presence_penalty = pp;
+          // top_k is now HONORED by the daemon (folded into the nucleus on AR +
+          // DFlash + MTP); min_p remains carried-but-inert.
+          if (typeof sendView.top_k === "number") genParams.top_k = sendView.top_k;
+          if (typeof sendView.min_p === "number") genParams.min_p = sendView.min_p;
+        }
         void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
-        // Mirror the `hipfire run` path's per-model max_think_tokens
-        // propagation. Without this, models with thinking=on can consume
-        // the entire max_tokens budget inside a single <think>...</think>
-        // block, leaving message.content empty after the downstream strip.
-        // Reported in #74 with qwen3.6:27b returning empty content + full
-        // 8192 completion_tokens despite max_think_tokens=2048 in config.
-        // thinking=off: hard-suppress by capping to 1 token, same as
-        // enable_thinking=false. Overrides any per-model max_think_tokens.
+        // Serve API is UNCAPPED by default (OpenAI/o1 convention — the client
+        // bounds length via max_tokens). The CLI-chat think-budget preset is a
+        // chat convenience, NOT an API default: forwarding the bare "med" preset
+        // here made the daemon route EVERY thinking request to AR (its
+        // `budgeted_thinking_needs_ar` gate), which DISABLED DFlash/MTP through
+        // the serve — they can't continue past a *forced* </think> so a budget
+        // sends them to AR. So forward a budget only when the operator set one
+        // EXPLICITLY (raw max_think_tokens or a non-default thinking_budget);
+        // `reasoning_effort` still caps per-request below and thinking=off
+        // hard-suppresses. (#74 trade-off accepted per design: an uncapped
+        // thinking model on a SMALL max_tokens can return empty content, so
+        // clients should size max_tokens for the reasoning they ask for, or pass
+        // reasoning_effort. The `hipfire run`/chat paths keep the preset budget.)
         if (effective.thinking === "off") {
           genParams.max_think_tokens = 1;
-        } else if (effective.max_think_tokens > 0) {
+        } else if (effective.max_think_tokens > 0 && effective.max_think_explicit) {
           genParams.max_think_tokens = effective.max_think_tokens;
         }
         // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
@@ -3012,6 +4152,10 @@ async function serve(port: number, host: string) {
                 // at 2725). Start in-think so the leading reasoning streams as
                 // reasoning_content and is split off content at the first </think>.
                 let inThink = genParams.assistant_prefix === "open_think";
+                // Latches once the daemon sends an explicit `reasoning:true` token
+                // (Cohere2/North marker-machine split). After that, unflagged
+                // tokens are visible content, not `<think>`-delimited reasoning.
+                let sawReasoningFlag = false;
                 let stripNextLeadingNl = false;
                 // Track whether we've emitted any visible content yet. Used
                 // to detect an orphan `</think>` opener — when the daemon
@@ -3035,11 +4179,44 @@ async function serve(port: number, host: string) {
                 // `"stop"` (OpenAI spec — Pi / OpenCode use this signal to
                 // decide whether the message ended with a callable action).
                 let structuredToolCallsEmitted = false;
+                // ds4/V4F: the daemon's DSML StreamParser splits reasoning
+                // (type:"reasoning") from content (type:"token") server-side and
+                // strips `<think>`/`</think>`. Once we've seen a structured
+                // reasoning event the daemon OWNS that split, so we must stop
+                // applying the CLI's own `</think>` heuristic (which can never
+                // fire on the already-stripped stream and would re-trap the
+                // post-think answer in reasoning_content).
+                let sawDaemonReasoning = false;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
                     completionTokens++;
                     let text = msg.text as string;
+                    // Cohere2-MoE / North-Mini-Code (and any arch whose daemon
+                    // marker state machine splits reasoning itself) tags thinking
+                    // tokens with an explicit `reasoning:true` flag and emits NO
+                    // `<think>`/`</think>` text. Honor the flag — it's
+                    // authoritative. The default thinking-on path sets
+                    // assistant_prefix="open_think" (inThink starts true) on the
+                    // assumption the model closes its reasoning with a `</think>`
+                    // token; North never emits one, so the `</think>` heuristic
+                    // below would trap the entire visible answer in
+                    // reasoning_content. Once we've seen the flag, a token WITHOUT
+                    // it is the visible answer → clear inThink so it streams as
+                    // `content`. Arches that stream literal `<think>` tags (Qwen)
+                    // never set the flag, so this is inert for them.
+                    if ((msg as any).reasoning === true) {
+                      sawReasoningFlag = true;
+                      if (text) {
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                          choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }]
+                        })}\n\n`));
+                        visibleChunkSent = true;
+                      }
+                      continue;
+                    }
+                    if (sawReasoningFlag || sawDaemonReasoning) inThink = false;
                     if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
                       if (text.includes("</think>")) {
@@ -3097,6 +4274,10 @@ async function serve(port: number, host: string) {
                       visibleChunkSent = true;
                     }
                   } else if (msg.type === "reasoning") {
+                    // The daemon owns the split now — see sawDaemonReasoning
+                    // comment above. Latch it so subsequent token events stream
+                    // as content instead of being trapped by the inThink gate.
+                    sawDaemonReasoning = true;
                     // V4F daemon arm emits structured `reasoning` events
                     // from the DSML StreamParser; `<think>` / `</think>`
                     // have already been stripped server-side. Forward as
@@ -3171,6 +4352,12 @@ async function serve(port: number, host: string) {
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
+                    // O3c-1: record the real decode rate for GET /stats. Prefer
+                    // the spec-decode-aware decode_tok_s; fall back to tok_s.
+                    {
+                      const r = (msg as any).decode_tok_s ?? (msg as any).tok_s;
+                      if (typeof r === "number" && Number.isFinite(r) && r > 0) recentTokS = r;
+                    }
                     // Daemon-authoritative finish_reason (V4F sets it
                     // from the decode-loop exit condition). Falls back
                     // to "stop" when an older daemon build didn't carry
@@ -3383,18 +4570,44 @@ async function serve(port: number, host: string) {
         // body that surfaces under `message.reasoning_content` below.
         let reasoningContent = "";
         let daemonFinishReason: string | null = null;
+        // Latches when the daemon sends an explicit `reasoning:true` token
+        // (Cohere2/North marker-machine split — see the streaming path). After
+        // that, reasoning accumulates separately and `content` holds only the
+        // visible answer, so the open_think `<think>`-strip below must be skipped
+        // (it would prepend a synthetic `<think>` and, finding no `</think>`,
+        // strip the whole answer).
+        let nsSawReasoningFlag = false;
+        // Latches when the daemon emits a STRUCTURED `reasoning` event (ds4/V4F's
+        // DSML StreamParser). Like nsSawReasoningFlag, this means the daemon has
+        // already split reasoning from content server-side — so `content` here is
+        // the clean visible answer and the open_think `<think>`-strip below MUST
+        // be skipped (it would prepend a synthetic `<think>`, find no `</think>`,
+        // and strip the whole answer). ds4 uses reasoning EVENTS, not the
+        // `reasoning:true` flag, so nsSawReasoningFlag alone doesn't cover it.
+        let nsSawDaemonReasoning = false;
         for await (const msg of e.generate(genParams)) {
           if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
-          if (msg.type === "token") { content += msg.text; completionTokens++; }
+          if (msg.type === "token") {
+            completionTokens++;
+            if ((msg as any).reasoning === true) { reasoningContent += msg.text; nsSawReasoningFlag = true; }
+            else content += msg.text;
+          }
           else if (msg.type === "reasoning") {
             // V4F's StreamParser splits `<think>…</think>` content out
             // as `reasoning` events. Accumulate so the non-stream chat
             // completion response can surface it under
             // `message.reasoning_content` — without this the reasoning
             // text was silently dropped on every think-mode V4F turn.
+            nsSawDaemonReasoning = true;
             if (typeof msg.text === "string") reasoningContent += msg.text;
           }
           else if (msg.type === "done") {
+            // O3c-1: record the real decode rate for GET /stats (see streaming
+            // path). Prefer decode_tok_s, fall back to tok_s.
+            {
+              const r = (msg as any).decode_tok_s ?? (msg as any).tok_s;
+              if (typeof r === "number" && Number.isFinite(r) && r > 0) recentTokS = r;
+            }
             // `prompt_tokens` is the full client-visible prompt size
             // (V4F emits it). When absent, derive as `cached + prefill`
             // — i.e. the total of cached-hit tokens plus the new tokens
@@ -3470,13 +4683,22 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think");
+        const extracted = extractVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think" && !nsSawReasoningFlag && !nsSawDaemonReasoning);
+        content = extracted.content;
+        // Surface the reasoning the split pulled out of the token-text stream
+        // (Qwen / MiniMax open_think) under reasoning_content — UNLESS structured
+        // `reasoning` events already populated it (ds4/V4F) or preserve_thinking
+        // keeps it inline (then `reasoning` is "" anyway). Without this the
+        // reasoning was silently dropped, and an unclosed <think> nuked the whole
+        // answer. Mirrors the streaming path's inThink→reasoning_content routing.
+        if (extracted.reasoning && !reasoningContent) reasoningContent = extracted.reasoning;
 
-        // Diagnostic: detect empty-after-unclosed-think-strip.
+        // Diagnostic: the model produced no separate post-think answer. No longer
+        // data loss (the reasoning is surfaced above), kept as a quality signal.
         let thinkWarning: string | null = null;
         if (!content && completionTokens > 0 && strippedContent.includes("<think>")) {
-          thinkWarning = "empty after unclosed think strip";
-          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
+          thinkWarning = "no visible content after think (reasoning surfaced)";
+          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens, all inside the think block`);
         }
 
         // Tool calls. V4F and qwen35 daemon arms yield them as
@@ -3649,6 +4871,235 @@ async function serve(port: number, host: string) {
       }
     }
   });
+}
+
+// Drive `hipfire serve` / `hipfire restart`: parse args, resolve bind +
+// optional positional model, apply passthrough flags as env (so they survive
+// the detach re-spawn), then either fork-detach (with /health readiness poll)
+// or run the in-process server. `args` is a MUTABLE copy of argv rest.
+async function runServe(args: string[]) {
+  let port: number | null = null;
+  let host: string | null = null;
+
+  // ── Passthrough flags (env, so they propagate to a detached child) ──
+  // Extracted BEFORE the positional loop so host/port parsing never sees them.
+  if (takeFlag(args, "--no-prewarm")) process.env.HIPFIRE_NO_PREWARM = "1";
+  const kvMode = takeFlagValue(args, "--kv-mode");
+  if (kvMode !== null) {
+    const validKv = ["auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4", "turbo3", "turbo2"];
+    if (!validKv.includes(kvMode)) {
+      console.error(`Invalid --kv-mode: ${kvMode} (expected one of ${validKv.join(", ")})`);
+      process.exit(1);
+    }
+    process.env.HIPFIRE_KV_MODE = kvMode; // resolveKvMode() honors env over cfg
+  }
+  const idleTimeout = takeFlagValue(args, "--idle-timeout");
+  if (idleTimeout !== null) {
+    const n = parseInt(idleTimeout, 10);
+    if (!Number.isInteger(n) || n < 0 || n > 86400) {
+      console.error(`Invalid --idle-timeout: ${idleTimeout} (expected 0..86400 seconds)`);
+      process.exit(1);
+    }
+    process.env.HIPFIRE_IDLE_TIMEOUT = String(n); // serve() honors env over cfg
+  }
+
+  let detach = false;
+  const setPort = (raw: string) => {
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      console.error(`Invalid serve port: ${raw}`);
+      process.exit(1);
+    }
+    if (port !== null && port !== n) {
+      console.error(`Serve port specified more than once: ${port} and ${n}`);
+      process.exit(1);
+    }
+    port = n;
+  };
+  const setHost = (raw: string) => {
+    if (!raw) {
+      console.error("Serve host cannot be empty");
+      process.exit(1);
+    }
+    if (host !== null && host !== raw) {
+      console.error(`Serve host specified more than once: ${host} and ${raw}`);
+      process.exit(1);
+    }
+    host = raw;
+  };
+  // Expert-parallel degree for `--tp N` (or `--tp=N`). Sets HIPFIRE_TP, which
+  // buildLoadMessage forwards as params.tp so the daemon loads via
+  // load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
+  let tpPending = false;
+  let tpDangling = false;
+  const setTp = (raw: string) => {
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 64) {
+      console.error(`Invalid --tp value: ${raw} (expected 1..64)`);
+      process.exit(1);
+    }
+    process.env.HIPFIRE_TP = String(n);
+  };
+  // A positional model arg (`hipfire serve <model>`) pre-warms a SPECIFIC model
+  // for this run without a persistent `config set default_model`. Resolved via
+  // the same findModel() resolver used by run/pull; set as HIPFIRE_MODEL (which
+  // serve()'s pre-warm reads, and which propagates to a detached child).
+  let modelArg: string | null = null;
+  const setModel = (raw: string) => {
+    if (modelArg !== null && modelArg !== raw) {
+      console.error(`Serve model specified more than once: ${modelArg} and ${raw}`);
+      process.exit(1);
+    }
+    modelArg = raw;
+  };
+  for (const a of args) {
+    // HF-CLI-003: the `--tp` value consumer must NOT swallow a following flag.
+    // `serve --tp -d` previously consumed `-d` as the TP value → setTp parsed
+    // NaN → rc1 "Invalid --tp value". A next-token that starts with "-" is not
+    // a value: leave tpPending set so the end-of-loop check below fires a
+    // MISSING-VALUE USAGE error, and let the flag itself be parsed this pass.
+    if (tpPending && !a.startsWith("-")) { setTp(a); tpPending = false; continue; }
+    if (tpPending) { tpPending = false; tpDangling = true; }
+    if (a === "--tp") { tpPending = true; continue; }
+    else if (a.startsWith("--tp=")) setTp(a.slice(5));
+    else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
+    else if (/^\d+$/.test(a)) setPort(a);
+    else if (/^\[[^\]]+\]:\d+$/.test(a)) {
+      const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
+      setHost(m[1]);
+      setPort(m[2]);
+    }
+    else if (/^[^:]+:\d+$/.test(a)) {
+      const idx = a.lastIndexOf(":");
+      setHost(a.slice(0, idx));
+      setPort(a.slice(idx + 1));
+    }
+    else if (a === "-h" || a === "--help") {
+      console.error(`Usage: hipfire serve [model] [host] [port] [flags]\n\n`
+        + `  [model]    Pre-warm a SPECIFIC model this run (resolved like \`run\`/\`pull\`;\n`
+        + `             without it, serve pre-warms cfg.default_model = ${cfg.default_model})\n`
+        + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
+        + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
+        + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n\n`
+        + `Flags:\n`
+        + `  -d, --detach          Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n`
+        + `  --kv-mode <m>         KV cache mode this run (q8, asym4, asym3, asym2, fwht4/3/2, auto)\n`
+        + `  --idle-timeout <s>    Unload model after <s> idle seconds (0 = never; max 86400)\n`
+        + `  --no-prewarm          Skip pre-warm; load the model lazily on the first request\n`
+        + `  --tp N                Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N GPUs)\n\n`
+        + `Background daemon:\n`
+        + `  hipfire serve -d                       # start in background\n`
+        + `  hipfire serve qwen3.5:9b 0.0.0.0:11435 -d\n`
+        + `  hipfire serve --kv-mode q8 --idle-timeout 0 -d\n`
+        + `  hipfire restart -d                     # stop + force-reap + start\n`
+        + `  hipfire stop                           # kill the tracked daemon\n`
+        + `  hipfire stop --force                   # also reap orphans + free the port\n`
+        + `  hipfire ps                             # check if running\n`
+        + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
+      process.exit(0);
+    }
+    // A registry/alias-resolvable tag (or name:tag shape) is a MODEL to
+    // pre-warm, not a bind address. (Previously this was a hard error.)
+    else if (REGISTRY[resolveModelTag(a)] || findModel(a) || /^[a-z0-9.-]+:[a-z0-9.-]+$/i.test(a)) {
+      setModel(a);
+    }
+    else setHost(a);
+  }
+  // HF-CLI-003: `--tp` was the last token (no value) — tpPending never consumed.
+  // Without this, serve silently starts EP-off instead of erroring. (The pure
+  // `serveTpDangling` predicate is the unit-tested equivalent of this state.)
+  if (tpPending || tpDangling) {
+    console.error(`--tp requires a value (expected 1..64, e.g. --tp 2)`);
+    process.exit(EXIT.USAGE);
+  }
+  if (modelArg !== null) {
+    // Resolve via the shared resolver so a tag, alias, filename, or path all work.
+    const resolved = findModel(modelArg);
+    if (!resolved) {
+      console.error(`Model not found: '${modelArg}'`);
+      console.error(`  List local models: hipfire list    |    pull one: hipfire pull ${modelArg}`);
+      process.exit(1);
+    }
+    // serve()'s pre-warm does findModel(HIPFIRE_MODEL) again; pass the tag so
+    // per-model config still resolves (findModel handles a path too).
+    process.env.HIPFIRE_MODEL = modelArg;
+  }
+  host = host ?? cfg.host;
+  port = port ?? cfg.port;
+
+  // BUG ep-ignores-kvmode: the daemon EP/multi-GPU load currently drops
+  // kv_mode_override. When the operator asks for BOTH tp>1 and a non-default
+  // --kv-mode, warn loudly so they aren't misled into thinking it took effect.
+  {
+    const tpForWarn = parseInt(process.env.HIPFIRE_TP ?? "1", 10);
+    const kvForWarn = process.env.HIPFIRE_KV_MODE ?? null;
+    const w = epKvModeWarning(tpForWarn, kvForWarn);
+    if (w) console.error(`[serve] WARNING: ${w}`);
+  }
+
+  if (detach) {
+    // Refuse to start a second one — but ONLY when the pidfile names a pid that
+    // VALIDATES as a live hipfire serve (BUG pid-reuse). A stale pidfile whose
+    // pid was reused by an unrelated process must NOT block a new serve; unlink
+    // it and proceed.
+    const existingRec = readServePidRecord();
+    if (existingRec) {
+      const v = await validateServePid(existingRec, port);
+      if (v.owned) {
+        console.error(`hipfire serve already running (PID ${existingRec.pid}) on port ${port}.`);
+        console.error(`  Stop it: hipfire stop   |   Replace it: hipfire restart`);
+        process.exit(1);
+      } else {
+        console.error(`[serve] ignoring stale pidfile (PID ${existingRec.pid}): ${v.reason}`);
+        try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+      }
+    }
+    // Fork a detached child. `setsid` gives it its own session so Ctrl-C in the
+    // parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout + stderr go
+    // to the log file. HIPFIRE_DETACHED prevents infinite forking. The child
+    // re-runs `serve host port`; all passthrough flags ride along as env vars.
+    const runBg = process.platform === "win32" ? ["cmd", "/c", "start", "/b"] : ["setsid", "nohup"];
+    const self = process.argv[0];
+    const script = process.argv[1];
+    const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
+    const childArgs = ["serve", host, String(port)];
+    const child = Bun.spawn([...runBg, self, script, ...childArgs], {
+      stdin: "ignore",
+      stdout: logFd,
+      stderr: logFd,
+      env: { ...process.env, HIPFIRE_DETACHED: "1" },
+    });
+    child.unref();
+    // Poll until /health is reachable. First-run kernel JIT on slower hardware
+    // (APUs, gfx1013) can take well over a minute for a 9B model, so give it a
+    // generous window. Subsequent starts hit the kernel cache (seconds).
+    const READINESS_TIMEOUT_MS = 300_000;   // 5 minutes
+    const startTime = Date.now();           // FIXED start for true elapsed
+    const deadline = startTime + READINESS_TIMEOUT_MS;
+    console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
+    let nextProgressAt = 30;                // seconds
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 500));
+      if (await isServeUp(port, host)) break;
+      // Progress every ~30s, computed off the FIXED start (not the deadline).
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      if (elapsed >= nextProgressAt) {
+        process.stderr.write(`  ...still starting (${elapsed}s elapsed — tail ${SERVE_LOG_FILE} to watch)\r`);
+        nextProgressAt += 30;
+      }
+    }
+    if (await isServeUp(port, host)) {
+      const bind = formatServeBind(host, port);
+      console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
+      console.log(`  log:  ${SERVE_LOG_FILE}`);
+      console.log(`  stop: hipfire stop`);
+    } else {
+      console.error(`Serve started (PID ${child.pid}) but /health did not respond within ${READINESS_TIMEOUT_MS / 1000}s.`);
+      console.error(`Check the log: tail -f ${SERVE_LOG_FILE}`);
+    }
+    return;
+  }
+  await serve(port, host);
 }
 
 // ─── Quantize ───────────────────────────────────────────
@@ -4422,7 +5873,7 @@ async function benchPrefill(e: Engine, tokens: number, timeoutMs = 60_000): Prom
   }
 }
 
-async function bench(model: string, runs: number, experimental: boolean, prompt: string) {
+async function bench(model: string, runs: number, experimental: boolean, prompt: string, jsonOut = false) {
   let modelPath = findModel(model);
   if (!modelPath) {
     const resolved = resolveModelTag(model);
@@ -4680,6 +6131,24 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     const p = stats(prefills);
     const t = stats(ttfts);
     const w = stats(walls);
+
+    if (jsonOut) {
+      // Machine-readable: user-prompt prefill + decode means, plus the
+      // synthetic pp-scaling table (pp128/pp512/...) and per-run samples.
+      const prefillTokS = p.mean > 0 ? p.mean : (ppResults[0] ? stats(ppResults[0].samples).mean : 0);
+      console.log(JSON.stringify({
+        model: basename(modelPath!),
+        arch: loaded.arch ?? null,
+        prefill_tok_s: Number(prefillTokS.toFixed(2)),
+        gen_tok_s: Number(d.mean.toFixed(2)),
+        ttft_ms: t.mean > 0 ? Number(t.mean.toFixed(1)) : null,
+        runs,
+        decode_samples: decodes.map(x => Number(x.toFixed(2))),
+        prefill_scaling: ppResults.map(pp => ({ size: pp.size, tok_s: Number(stats(pp.samples).mean.toFixed(1)) })),
+      }, null, 2));
+      await e.stop();
+      return;
+    }
 
     console.log("");
 
@@ -5004,7 +6473,13 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     : {};
 
   // In per-model mode only show keys that can actually be overridden.
-  const allKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+  // max_think_tokens has no CONFIG_DEFAULTS entry (the thinking_budget preset is
+  // the default driver), so append it explicitly so the advanced raw override
+  // stays reachable in this TUI too.
+  const allKeys = [
+    ...(Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[]),
+    "max_think_tokens" as keyof HipfireConfig,
+  ];
   const keys = isPerModel
     ? allKeys.filter(k => (PER_MODEL_KEYS as readonly string[]).includes(k))
     : allKeys;
@@ -5024,8 +6499,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   let profilePickerSelected = 0;
 
   // Effective value for a key: override wins in per-model mode, else cfg.
-  const effective = (k: keyof HipfireConfig): any =>
-    isPerModel && (overrides as any)[k] !== undefined ? (overrides as any)[k] : cfg[k];
+  const effective = (k: keyof HipfireConfig): any => {
+    const v = isPerModel && (overrides as any)[k] !== undefined ? (overrides as any)[k] : cfg[k];
+    // max_think_tokens is absent-by-default; show the value the thinking_budget
+    // preset resolves to so the row never renders "undefined".
+    if (k === "max_think_tokens" && (v === undefined || v === null)) {
+      const tb = (effective("thinking_budget" as keyof HipfireConfig) as string) ?? "med";
+      return THINKING_BUDGET[tb] ?? THINKING_BUDGET.med;
+    }
+    return v;
+  };
   const isOverridden = (k: keyof HipfireConfig): boolean =>
     isPerModel && (overrides as any)[k] !== undefined;
 
@@ -5086,9 +6569,14 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Reasoning mode. on = model uses <think>...</think> (stripped from display); off = suppress thinking, answer directly",
       options: ["on", "off"],
     },
+    thinking_budget: {
+      label: "thinking_budget",
+      desc: "Named reasoning budget → <think> token cap. low=512, med=2048, high=8192, xhigh=24576, max=32768, uncapped=0 (unlimited). Drives max_think_tokens unless a raw override is set.",
+      options: THINKING_BUDGET_KEYS,
+    },
     max_think_tokens: {
       label: "max_think_tokens",
-      desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
+      desc: "Advanced raw override for the reasoning budget (0 = unlimited). Wins over thinking_budget when set. Leave unset to let the preset drive it.",
       range: [0, 32768], step: 128,
     },
     max_total_think_tokens: {
@@ -5109,6 +6597,21 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "idle_timeout",
       desc: "serve: seconds idle before unloading model (frees VRAM; 0 = never unload)",
       range: [0, 86400], step: 30,
+    },
+    max_request_bytes: {
+      label: "max_request_bytes",
+      desc: "serve: max /v1/chat/completions request body in bytes (checked before the serve lock; over-limit → HTTP 413). Default 64 MiB.",
+      range: [4096, 4 * 1024 * 1024 * 1024], step: 1024 * 1024,
+    },
+    serve_max_queue: {
+      label: "serve_max_queue",
+      desc: "serve: max requests queued behind the in-flight one before new requests get HTTP 503 + Retry-After (0 = unbounded FIFO)",
+      range: [0, 100000], step: 1,
+    },
+    serve_queue_timeout_ms: {
+      label: "serve_queue_timeout_ms",
+      desc: "serve: max ms a request waits in the admission queue before 503 (0 = no wait timeout)",
+      range: [0, 3600000], step: 1000,
     },
     experimental_budget_alert: {
       label: "experimental_budget_alert",
@@ -5248,6 +6751,35 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Number of draft tokens per multi-token-prediction spec-decode window (1-10).",
       range: [1, 10], step: 1,
     },
+    speculation: {
+      label: "speculation",
+      desc: "Speculative decode selector (canonical). off = AR; auto = cascade dflash>mtp>ngram gated by the legacy mode knobs; dflash/mtp/ngram = force one.",
+      options: ["off", "auto", "ngram", "dflash", "mtp"],
+    },
+    ngram_mode: {
+      label: "ngram_mode",
+      desc: "Model-free n-gram drafter (byte-identical to AR). off = never; on = eligible in auto cascade + selectable; auto = last-resort when no dflash/mtp.",
+      options: ["off", "on", "auto"],
+    },
+    ngram_k: {
+      label: "ngram_k",
+      desc: "n-gram draft window K (2-32). Higher = more parallelism, diminishing acceptance past ~12.",
+      range: [2, 32], step: 1,
+    },
+    ngram_min_count: {
+      label: "ngram_min_count",
+      desc: "Minimum n-gram match count before the drafter proposes a continuation (1-10).",
+      range: [1, 10], step: 1,
+    },
+    chat_template: {
+      label: "chat_template",
+      desc: "Path to a .j2/.jinja chat template → HIPFIRE_CHAT_TEMPLATE_FILE. Empty = engine default (model/bundled/embedded). For qwen3* a set path overrides the froggeric pillar (daemon warns, intentionally).",
+    },
+    default_chatml: {
+      label: "default_chatml",
+      desc: "Never-bare ChatML fallback when no template resolves. true = keep fallback; false = HIPFIRE_DEFAULT_CHATML=0 (Plain-only framing).",
+      options: ["true", "false"],
+    },
   };
 
   let selected = 0;
@@ -5329,8 +6861,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const commitEdit = () => {
     const k = keys[selected];
     const defaultVal = CONFIG_DEFAULTS[k];
+    // A key with no CONFIG_DEFAULTS entry (e.g. max_think_tokens) is still
+    // numeric when its meta carries a `range`; coerce off that too.
+    const isNumeric = typeof defaultVal === "number" || meta[k]?.range !== undefined;
     let parsed: any;
-    if (typeof defaultVal === "number") parsed = Number(editBuffer);
+    if (isNumeric) parsed = Number(editBuffer);
     else if (typeof defaultVal === "boolean") {
       if (editBuffer === "true") parsed = true;
       else if (editBuffer === "false") parsed = false;
@@ -5393,7 +6928,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
-      write(`${C.dim}GPU: ${DETECTED_ARCH} · auto = ${ARCH_DEFAULTS.kv_cache}${C.reset}\n`);
+      write(`${C.dim}GPU: ${DETECTED_ARCH} · auto = ${DEFAULT_KV_MODE} (unless a model recommends otherwise)${C.reset}\n`);
     }
     if (process.env.HIPFIRE_GRAPH === "1") {
       write(`${C.yellow}⚠ HIPFIRE_GRAPH=1 is set in your environment. AR forward hipGraph capture is${C.reset}\n`);
@@ -5798,10 +7333,17 @@ function modelPickerTui(): Promise<string | null> {
 }
 
 function listConfig(cfg: HipfireConfig): void {
-  const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+  const validKeys = ALL_CONFIG_KEYS;
   console.log(`Config: ${CONFIG_PATH}\n`);
   for (const k of validKeys) {
     const v = cfg[k];
+    // max_think_tokens is absent-by-default (thinking_budget drives it). Show the
+    // preset-resolved value with a marker instead of a bare "undefined".
+    if (k === "max_think_tokens" && (v === undefined || v === null)) {
+      const eff = THINKING_BUDGET[cfg.thinking_budget ?? "med"] ?? THINKING_BUDGET.med;
+      console.log(`  ${k.padEnd(18)} ${String(eff).padEnd(14)}(from thinking_budget)`);
+      continue;
+    }
     const isDefault = v === CONFIG_DEFAULTS[k];
     console.log(`  ${k.padEnd(18)} ${String(v).padEnd(14)}${isDefault ? "(default)" : ""}`);
   }
@@ -5833,21 +7375,34 @@ function findDep(binary: string, extraDirs: string[]): string | null {
   return null;
 }
 
-function stripVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): string {
-  if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
+// Split a token-text assistant turn into visible `content` and `reasoning`.
+// Token-text thinking models (Qwen, MiniMax via open_think) stream their
+// reasoning as literal `<think>…</think>` text in the content stream rather
+// than as structured `reasoning` events, so the non-stream path must pull the
+// reasoning OUT and SURFACE it under reasoning_content — not silently drop it
+// (the old `stripVisibleThinking` did), and crucially not NUKE the whole answer
+// when `</think>` is missing (the "empty after unclosed think strip" bug). This
+// mirrors the streaming path, which already routes inThink token text to
+// reasoning_content. Returns trimmed { content, reasoning }.
+function extractVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): { content: string; reasoning: string } {
+  if (preserveThinking) return { content: content.replace(/<\|im_end\|>/g, "").trim(), reasoning: "" };
+  let text = content.replace(/<\|im_end\|>/g, "");
   // `open_think` injects the opening <think> into the PROMPT, so the output
-  // begins INSIDE the think span and only a dangling </think> appears — none of
-  // the strips below (which key on a `<think>` opener) would fire, leaking the
-  // reasoning + a stray </think> into content. Prepend a synthetic opener so
-  // the closed case (strip the pair, keep the answer) and the unclosed case
-  // (strip <think>..end) are handled identically to a normal think span.
-  if (startedInThink && !content.includes("<think>")) content = "<think>" + content;
-  return content
-    .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-    .replace(/<think>[\s\S]*$/, "")
-    .replace(/^\s*<\/think>\s*/, "")
-    .replace(/<\|im_end\|>/g, "")
-    .trim();
+  // begins INSIDE the think span and only a dangling </think> appears. Prepend a
+  // synthetic opener so the closed case (split the pair) and the unclosed case
+  // (everything is reasoning) are handled identically to a normal think span.
+  if (startedInThink && !text.includes("<think>")) text = "<think>" + text;
+  let reasoning = "";
+  // Closed `<think>…</think>` pairs: pull the inner text into reasoning, remove
+  // the block from the visible content (keep what follows — the answer).
+  text = text.replace(/<think>([\s\S]*?)<\/think>\s*/g, (_m, r: string) => { reasoning += r; return ""; });
+  // Unclosed `<think>…<EOS>`: the model never closed the block, so the rest IS
+  // reasoning. SURFACE it (don't nuke) — the answer, if any, is whatever the
+  // prior closed-pair pass already left in `text`.
+  text = text.replace(/<think>([\s\S]*)$/, (_m, r: string) => { reasoning += r; return ""; });
+  // Orphan leading </think> (open_think with no opener in the body).
+  text = text.replace(/^\s*<\/think>\s*/, "");
+  return { content: text.trim(), reasoning: reasoning.trim() };
 }
 
 function pruneCliRuntimePayload(cliDir: string): void {
@@ -5899,236 +7454,309 @@ function syncCliRuntimePayload(repoDir: string): void {
 
 // ─── Main ───────────────────────────────────────────────
 
+// import.meta.main guard: the executable CLI dispatch below runs ONLY when this
+// file is the entrypoint (`bun run index.ts ...`). When index.ts is `import`ed
+// (e.g. by serve_ux_parse.test.ts to reach the exported pure helpers
+// parseRestartPort / serveTpDangling / validateConfigActionArgs / peekFlagValue),
+// import.meta.main is false, so main() never runs — no help text, no argv parse,
+// no process.exit on import. All those helpers are module-level exports defined
+// above, so they remain importable regardless of this guard.
+async function main() {
 // Dynamic registry first: refreshModelsCatalog() and every command below
 // read REGISTRY/ALIASES, so the swap must land before any of them run.
 // Cache-fresh path is one small file read; the network path is bounded by
 // REGISTRY_FETCH_TIMEOUT_MS so an offline box never hangs here.
-await initDynamicRegistry();
+//
+// This startup init is explicitly guarded: the process.on() safety net is
+// registered at the top of the file (after imports, before mkdirSync /
+// loadConfig), but we ALSO wrap the awaited init here so a thrown/rejected
+// startup error routes to dieClean → clean `hipfire: <msg>` + diag hint,
+// never a raw stack. dieClean exits, so control never falls through.
+try {
+  await initDynamicRegistry();
+  refreshModelsCatalog();
+} catch (err) {
+  dieClean(err);
+}
 
-refreshModelsCatalog();
+// Locate an INSTALLED hipfire-tui binary (env override -> ~/.hipfire/bin ->
+// workspace target/release). Returns undefined if none is present, so callers
+// can fall back gracefully instead of erroring.
+function findTuiBin(): string | undefined {
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const envBin = process.env.HIPFIRE_TUI_BIN;
+  const candidates = [
+    ...(envBin ? [envBin] : []),
+    join(HIPFIRE_DIR, "bin", `hipfire-tui${exe}`),
+    resolve(__dirname, `../target/release/hipfire-tui${exe}`),
+  ];
+  return candidates.find(p => existsSync(p));
+}
 
-const [cmd, ...rest] = process.argv.slice(2);
+let [cmd, ...rest] = process.argv.slice(2);
+
+// `hipfire help <command>` == `hipfire <command> --help`. Rewrites the
+// dispatch so the per-command help body is the single source of truth.
+// Bare `hipfire help` falls through to the default-case full command list.
+if (cmd === "help" && rest.length > 0 && !rest[0].startsWith("-")) {
+  cmd = rest[0];
+  rest = ["--help"];
+}
+
+try {
 switch (cmd) {
   case "serve": {
-    // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
-    // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
-    let port: number | null = null;
-    let host: string | null = null;
-    let detach = false;
-    const setPort = (raw: string) => {
-      const n = parseInt(raw, 10);
-      if (!Number.isInteger(n) || n < 1 || n > 65535) {
-        console.error(`Invalid serve port: ${raw}`);
-        process.exit(1);
-      }
-      if (port !== null && port !== n) {
-        console.error(`Serve port specified more than once: ${port} and ${n}`);
-        process.exit(1);
-      }
-      port = n;
-    };
-    const setHost = (raw: string) => {
-      if (!raw) {
-        console.error("Serve host cannot be empty");
-        process.exit(1);
-      }
-      if (host !== null && host !== raw) {
-        console.error(`Serve host specified more than once: ${host} and ${raw}`);
-        process.exit(1);
-      }
-      host = raw;
-    };
-    // Expert-parallel degree for `hipfire serve --tp N` (or `--tp=N`). Sets
-    // HIPFIRE_TP, which buildLoadMessage forwards as params.tp so the daemon
-    // loads via load_model_ep (MiniMax-M2 / DeepSeek-V4 across N GPUs).
-    let tpPending = false;
-    const setTp = (raw: string) => {
-      const n = parseInt(raw, 10);
-      if (!Number.isInteger(n) || n < 1 || n > 64) {
-        console.error(`Invalid --tp value: ${raw} (expected 1..64)`);
-        process.exit(1);
-      }
-      process.env.HIPFIRE_TP = String(n);
-    };
-    for (const a of rest) {
-      if (tpPending) { setTp(a); tpPending = false; continue; }
-      if (a === "--tp") { tpPending = true; continue; }
-      else if (a.startsWith("--tp=")) setTp(a.slice(5));
-      else if (a === "-d" || a === "--detach" || a === "--background") detach = true;
-      else if (/^\d+$/.test(a)) setPort(a);
-      else if (/^\[[^\]]+\]:\d+$/.test(a)) {
-        const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
-        setHost(m[1]);
-        setPort(m[2]);
-      }
-      else if (/^[^:]+:\d+$/.test(a)) {
-        const idx = a.lastIndexOf(":");
-        setHost(a.slice(0, idx));
-        setPort(a.slice(idx + 1));
-      }
-      else if (a === "-h" || a === "--help") {
-        console.error(`Usage: hipfire serve [host] [port] [-d|--detach] [--tp N]\n\n`
-          + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
-          + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
-          + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
-          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n`
-          + `  --tp N         Expert-parallel across N GPUs (MiniMax-M2 / DeepSeek-V4; needs N visible GPUs)\n\n`
-          + `Background daemon:\n`
-          + `  hipfire serve -d           # start in background\n`
-          + `  hipfire serve 0.0.0.0:11435 -d\n`
-          + `  hipfire stop               # kill it\n`
-          + `  hipfire ps                 # check if running\n`
-          + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
-        process.exit(0);
-      }
-      // Model-tag-as-host guard: `hipfire serve qwen3.5:9b` used to silently
-      // bind to host "qwen3.5:9b" and fail later. A name:tag shape with a
-      // non-numeric port part (host:port matched above) — or anything that
-      // resolves in the registry — is a model tag, not a bind address.
-      else if (REGISTRY[resolveModelTag(a)] || /^[a-z0-9.-]+:[a-z0-9.-]+$/i.test(a)) {
-        console.error(`'${a}' looks like a model tag — \`hipfire serve\` takes [host] [port], not a model.`);
-        console.error(`The server loads models per-request (or pre-warms cfg.default_model). Instead:`);
-        console.error(`  hipfire run ${a} "hello"                # one-shot (uses running serve if any)`);
-        console.error(`  hipfire config set default_model ${a}   # make serve pre-warm this model`);
-        console.error(`  hipfire serve [host] [port]`);
-        process.exit(1);
-      }
-      else setHost(a);
+    await runServe(rest.slice());
+    break;
+  }
+  case "restart": {
+    // Stop the tracked serve (force-reap orphans + free port), then start it
+    // again with the SAME passthrough flags. Reuses the serve start path so the
+    // /health readiness poll behaves identically.
+    const args = rest.slice();
+    if (takeFlag(args, "-h", "--help")) {
+      console.error(`Usage: hipfire restart [host] [port] [-d|--detach] [serve flags...]\n\n`
+        + `Stops the running serve (force-reaps orphan daemon procs + frees the\n`
+        + `port, like \`hipfire stop --force\`) then starts a fresh one with the\n`
+        + `given flags. Accepts every \`hipfire serve\` flag:\n\n`
+        + `  --kv-mode <m>        KV cache mode for this run (q8, asym4, ...)\n`
+        + `  --idle-timeout <s>   Idle-unload timeout in seconds (0 = never)\n`
+        + `  --no-prewarm         Skip pre-warm; load model lazily on first request\n`
+        + `  --tp N               Expert-parallel across N GPUs\n`
+        + `  -d, --detach         Run in background\n\n`
+        + `Examples:\n`
+        + `  hipfire restart -d\n`
+        + `  hipfire restart 0.0.0.0:11435 --kv-mode q8 -d\n`);
+      process.exit(0);
     }
-    host = host ?? cfg.host;
-    port = port ?? cfg.port;
-
-    if (detach) {
-      // Refuse to start a second one.
-      const existing = readServePid();
-      if (existing) {
-        console.error(`hipfire serve already running (PID ${existing}) on port ${port}.`);
-        console.error(`  Stop it: hipfire stop`);
-        process.exit(1);
-      }
-      // Fork a detached child. `setsid` gives it its own session so Ctrl-C
-      // in the parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout
-      // + stderr go to the log file. HIPFIRE_DETACHED prevents infinite forking.
-      const runBg = process.platform === "win32" ? ["cmd", "/c", "start", "/b"] : ["setsid", "nohup"]
-      const self = process.argv[0];
-      const script = process.argv[1];
-      const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-      const childArgs = ["serve", host, String(port)];
-      const child = Bun.spawn([...runBg, self, script, ...childArgs], {
-        stdin: "ignore",
-        stdout: logFd,
-        stderr: logFd,
-        env: { ...process.env, HIPFIRE_DETACHED: "1" },
-      });
-      child.unref();
-      // Poll until /health is reachable. First-run kernel JIT on slower
-      // hardware (APUs, gfx1013) can take well over a minute for a 9B model,
-      // so give it a generous window. Subsequent starts hit the kernel cache
-      // and return in seconds.
-      const READINESS_TIMEOUT_MS = 300_000;   // 5 minutes
-      const deadline = Date.now() + READINESS_TIMEOUT_MS;
-      console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 500));
-        if (await isServeUp(port, host)) break;
-        // Show progress every 30s
-        const elapsed = Math.floor((Date.now() - (deadline - READINESS_TIMEOUT_MS)) / 1000);
-        if (elapsed > 0 && elapsed % 30 === 0) {
-          process.stderr.write(`  ...still starting (${elapsed}s — tail ${SERVE_LOG_FILE} to watch)\r`);
+    // Resolve the port the same way serve does so we free/poll the right one.
+    // HF-CLI-002: a bare `for (a of args)` scan treated FLAG VALUES as ports —
+    // `restart -d --tp 2` parsed restartPort=2, then pid-validated against port
+    // 2 and unlinked the real pidfile. Consume the SAME serve value-flags serve
+    // does (and their values) from a COPY first (args itself is forwarded to
+    // runServe untouched), so only a real host/port positional sets the port.
+    const restartPort = parseRestartPort(args, cfg.port);
+    // Graceful stop of the tracked pid first (mirrors `hipfire stop`).
+    // BUG pid-reuse: validate ownership before SIGTERM/SIGKILL — NEVER kill a
+    // pid that fails validation (it was reused by an unrelated process); just
+    // unlink the stale pidfile.
+    const trackedRec = readServePidRecord();
+    if (trackedRec) {
+      const v = await validateServePid(trackedRec, restartPort);
+      if (!v.owned) {
+        console.error(`[restart] not killing PID ${trackedRec.pid}: ${v.reason} — removing stale pidfile`);
+        try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+      } else {
+        const tracked = trackedRec.pid;
+        try {
+          process.kill(tracked, "SIGTERM");
+          for (let i = 0; i < 50; i++) {
+            await new Promise(r => setTimeout(r, 100));
+            if (!isPidAlive(tracked)) break;
+          }
+          if (isPidAlive(tracked)) { try { process.kill(tracked, "SIGKILL"); } catch {} }
+          try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+          console.error(`[restart] stopped serve (PID ${tracked})`);
+        } catch (err: any) {
+          console.error(`[restart] failed to stop tracked PID ${tracked}: ${err?.message ?? err}`);
         }
       }
-      if (await isServeUp(port, host)) {
-        const bind = formatServeBind(host, port);
-        console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
-        console.log(`  log:  ${SERVE_LOG_FILE}`);
-        console.log(`  stop: hipfire stop`);
-      } else {
-        console.error(`Serve started (PID ${child.pid}) but /health did not respond within ${READINESS_TIMEOUT_MS / 1000}s.`);
-        console.error(`Check the log: tail -f ${SERVE_LOG_FILE}`);
-      }
-      break;
     }
-    await serve(port, host);
+    // Force-reap any orphans + free the port so the new serve binds cleanly.
+    for (const line of reapOrphans(restartPort, false)) console.error(`[restart] ${line}`);
+    // Brief settle so the port leaves TIME_WAIT/closing before rebind.
+    await new Promise(r => setTimeout(r, 500));
+    console.error(`[restart] starting serve...`);
+    await runServe(args);
     break;
   }
   case "stop": {
-    const pid = readServePid();
-    if (!pid) {
+    const stopArgs = rest.slice();
+    if (takeFlag(stopArgs, "-h", "--help")) {
+      console.error(`Usage: hipfire stop [port] [--force] [--all]\n\n`
+        + `Stops the tracked background serve (the PID in ${SERVE_PID_FILE}).\n\n`
+        + `  [port]     Port to free when --force/--all is given (default: cfg.port = ${cfg.port})\n`
+        + `  --force    Beyond the tracked PID, reap ORPHAN daemon procs\n`
+        + `             (\`pkill -x daemon\`) and free the port (\`fuser -k <port>/tcp\`)\n`
+        + `  --all      Like --force, and also reap orphan quantize procs\n\n`
+        + `Plain \`hipfire stop\` only touches the tracked PID. Use --force when a\n`
+        + `stale daemon holds VRAM or the port after a crash (\"port in use\").\n`);
+      process.exit(0);
+    }
+    const force = takeFlag(stopArgs, "--force");
+    const all = takeFlag(stopArgs, "--all");
+    // Optional positional port (used only by the force/all reap).
+    let stopPort = cfg.port;
+    for (const a of stopArgs) {
+      if (/^\d+$/.test(a)) {
+        const n = parseInt(a, 10);
+        if (n >= 1 && n <= 65535) stopPort = n;
+        else { console.error(`Invalid stop port: ${a}`); process.exit(1); }
+      } else {
+        console.error(`Unknown stop argument: ${a} (expected [port] [--force] [--all])`);
+        process.exit(1);
+      }
+    }
+
+    // BUG pid-reuse: validate ownership before killing. A pidfile whose pid was
+    // reused by an unrelated process must NOT be killed — unlink it instead.
+    const stopRec = readServePidRecord();
+    const stopVerdict = stopRec ? await validateServePid(stopRec, stopPort) : null;
+    if (stopRec && stopVerdict && stopVerdict.owned) {
+      const pid = stopRec.pid;
+      try {
+        process.kill(pid, "SIGTERM");
+        // Wait up to 5s for graceful shutdown
+        for (let i = 0; i < 50; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          if (!isPidAlive(pid)) break;
+        }
+        if (isPidAlive(pid)) {
+          console.error(`PID ${pid} did not exit within 5s — sending SIGKILL`);
+          try { process.kill(pid, "SIGKILL"); } catch {}
+        }
+        try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+        console.log(`hipfire serve stopped (PID ${pid})`);
+      } catch (err: any) {
+        console.error(`Failed to stop serve (PID ${pid}): ${err?.message ?? err}`);
+        if (!(force || all)) process.exit(1);
+      }
+    } else if (stopRec && stopVerdict && !stopVerdict.owned) {
+      // Pidfile present but the pid is not our serve (dead or reused).
+      console.error(`Not killing PID ${stopRec.pid}: ${stopVerdict.reason} — removing stale pidfile`);
+      try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+      if (!(force || all)) { console.log("hipfire serve is not running."); break; }
+    } else if (!(force || all)) {
       console.log("hipfire serve is not running.");
       break;
+    } else {
+      console.log("No tracked serve PID; reaping orphans...");
     }
-    try {
-      process.kill(pid, "SIGTERM");
-      // Wait up to 5s for graceful shutdown
-      for (let i = 0; i < 50; i++) {
-        await new Promise(r => setTimeout(r, 100));
-        if (!isPidAlive(pid)) break;
-      }
-      if (isPidAlive(pid)) {
-        console.error(`PID ${pid} did not exit within 5s — sending SIGKILL`);
-        try { process.kill(pid, "SIGKILL"); } catch {}
-      }
-      try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
-      console.log(`hipfire serve stopped (PID ${pid})`);
-    } catch (err: any) {
-      console.error(`Failed to stop serve (PID ${pid}): ${err?.message ?? err}`);
-      process.exit(1);
+
+    // --force / --all: reap orphan daemon (and, with --all, quantize) procs and
+    // free the port, per scripts/serve-restart.sh. Plain `stop` skips this.
+    if (force || all) {
+      for (const line of reapOrphans(stopPort, all)) console.log(`  ${line}`);
     }
     break;
   }
   case "run": {
+    // Consume ALL flags FIRST via the W1 helpers (takeFlag / takeFlagValue),
+    // splicing them out of `rest` in place — so flags work in ANY position
+    // (before OR after the model). What survives is purely positional:
+    // rest[0] = model, rest[1..] = prompt. This replaces the old "read model
+    // as rest[0] BEFORE a legacy --key value loop" design, which failed when a
+    // value-flag (e.g. --temp) was placed before the model (rest[0] became the
+    // flag name → "Model not found: --temp").
+    const wantHelp = takeFlag(rest, "-h", "--help");
+    const runJson = takeFlag(rest, "-j", "--json");
+    const runNoStream = takeFlag(rest, "--no-stream");
+    const kvModeVal = takeFlagValue(rest, "--kv-mode");
+    const imageVal = takeFlagValue(rest, "--image", { allowDashValue: true });
+    const systemVal = takeFlagValue(rest, "--system", { allowDashValue: true });
+    // Short aliases: -t/--temp, -n/--max-tokens. takeFlagValue returns the
+    // first matching name found; we OR the short and long forms so either
+    // works in any position.
+    const tempVal = takeFlagValue(rest, "--temp") ?? takeFlagValue(rest, "-t");
+    const topPVal = takeFlagValue(rest, "--top-p");
+    const repeatPenaltyVal = takeFlagValue(rest, "--repeat-penalty");
+    const maxTokensVal = takeFlagValue(rest, "--max-tokens") ?? takeFlagValue(rest, "-n");
+    // Speculative-decode flags (llama.cpp-style). They lower into env so the
+    // per-model resolver in buildLoadMessage (env > flag > per-model > global)
+    // picks them up. `-md` implies the dflash mechanism unless --spec overrides.
+    const modelDraftVal = takeFlagValue(rest, "--model-draft", { allowDashValue: true }) ?? takeFlagValue(rest, "-md", { allowDashValue: true });
+    const draftMaxVal = takeFlagValue(rest, "--draft-max") ?? takeFlagValue(rest, "--draft");
+    const specVal = takeFlagValue(rest, "--spec") ?? takeFlagValue(rest, "--speculation");
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 4096)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
-    // Parse --key value flags
-    const flagDefs: Record<string, { default: number | string | undefined }> = {
-      "--image": { default: undefined }, "--temp": { default: 0.3 },
-      "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
-      "--max-tokens": { default: 4096 },
-      "--system": { default: undefined },
-    };
-    const stringFlags = new Set(["--image", "--system"]);
-    const flags: Record<string, string> = {};
-    const flagIndices = new Set<number>();
-    for (const key of Object.keys(flagDefs)) {
-      const idx = rest.indexOf(key);
-      if (idx >= 0 && idx + 1 < rest.length) {
-        const val = rest[idx + 1];
-        // Reject flag values that look like other flags
-        if (val.startsWith("--")) { console.error(`Error: ${key} requires a value, got '${val}'`); process.exit(1); }
-        // Validate numeric flags
-        if (!stringFlags.has(key) && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
-        flags[key] = val;
-        flagIndices.add(idx); flagIndices.add(idx + 1);
-      } else if (idx >= 0) {
-        console.error(`Error: ${key} requires a value`); process.exit(1);
+    if (wantHelp || !model) {
+      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --spec <m>               Speculative decode: off|auto|ngram|dflash|mtp (default auto)\n  -md, --model-draft <p>   DFlash draft model path (implies --spec dflash)\n  --draft-max, --draft <N> Draft window for the active mechanism (n-gram K / MTP k)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:9b --spec ngram \"Repeat this verbatim: ...\"\n  hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq \"Refactor this\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"");
+      process.exit(wantHelp ? 0 : EXIT.USAGE);
+    }
+    // Validate --kv-mode against the same allowlist config validation uses.
+    if (kvModeVal !== null && !validateConfigValue("kv_cache", kvModeVal)) {
+      console.error(`Error: invalid --kv-mode '${kvModeVal}'. Valid: auto, q8, asym4, asym3, asym2, fwht4, fwht3, fwht2, turbo, turbo4, turbo3, turbo2`);
+      process.exit(1);
+    }
+    // Validate numeric value-flags (takeFlagValue already rejected dangling /
+    // dash-looking values; here we enforce numeric-ness).
+    for (const [name, val] of [["--temp", tempVal], ["--top-p", topPVal], ["--repeat-penalty", repeatPenaltyVal], ["--max-tokens", maxTokensVal], ["--draft-max", draftMaxVal]] as const) {
+      if (val !== null && isNaN(Number(val))) { console.error(`Error: ${name} requires a number, got '${val}'`); process.exit(1); }
+    }
+    // Speculation flags lower into env. Ladder is env > flag, so a flag only
+    // fills a var the shell did NOT already export (an exported env wins).
+    if (specVal !== null) {
+      if (!["off", "auto", "ngram", "dflash", "mtp"].includes(specVal)) {
+        console.error(`Error: invalid --spec '${specVal}'. Valid: off, auto, ngram, dflash, mtp`);
+        process.exit(1);
+      }
+      if (process.env.HIPFIRE_SPECULATION === undefined) process.env.HIPFIRE_SPECULATION = specVal;
+    }
+    if (modelDraftVal !== null) {
+      if (process.env.HIPFIRE_DFLASH_DRAFT === undefined) process.env.HIPFIRE_DFLASH_DRAFT = modelDraftVal;
+      // -md implies dflash unless the user (or env) already picked a mechanism.
+      if (specVal === null && process.env.HIPFIRE_SPECULATION === undefined) process.env.HIPFIRE_SPECULATION = "dflash";
+      // A draft model is only used by the dflash mechanism; warn if another was selected.
+      const effSpec = process.env.HIPFIRE_SPECULATION;
+      if (effSpec && effSpec !== "dflash" && effSpec !== "auto") {
+        console.error(`[hipfire] --model-draft is ignored under speculation=${effSpec} (draft models only feed DFlash).`);
       }
     }
-    const image = flags["--image"];
-    const system = flags["--system"];
+    if (draftMaxVal !== null && process.env.HIPFIRE_DRAFT_MAX === undefined) process.env.HIPFIRE_DRAFT_MAX = String(Math.floor(Number(draftMaxVal)));
+    const image = imageVal ?? undefined;
+    const system = systemVal ?? undefined;
     const runCfg = resolveModelConfig(model);
-    const temp = Number(flags["--temp"] ?? runCfg.temperature);
-    const topP = Number(flags["--top-p"] ?? runCfg.top_p);
-    const repeatPenalty = Number(flags["--repeat-penalty"] ?? runCfg.repeat_penalty);
-    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? runCfg.max_tokens));
+    const temp = Number(tempVal ?? runCfg.temperature);
+    const topP = Number(topPVal ?? runCfg.top_p);
+    const repeatPenalty = Number(repeatPenaltyVal ?? runCfg.repeat_penalty);
+    const maxTokens = Math.floor(Number(maxTokensVal ?? runCfg.max_tokens));
     if (temp < 0) { console.error("Error: --temp must be >= 0 (0 = greedy)"); process.exit(1); }
     if (topP <= 0 || topP > 1) { console.error("Error: --top-p must be in (0, 1]"); process.exit(1); }
     if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
-    const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
-    const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
+    const prompt = rest.slice(1).join(" ") || (image ? "Describe this image." : "Hello");
+    // Explicit-send view: only --flag / per-model / card values get transmitted;
+    // a bare global default is omitted so the daemon's .hfq/arch-card resolution
+    // applies. The concrete temp/topP/etc. above stay as the validation surface
+    // + legacy fallback (e.g. when no card/per-model value exists, the view's
+    // field is undefined and the daemon falls through to its own default).
+    const sampling = resolveSamplingForSend(model, {
+      temperature: tempVal !== null ? Number(tempVal) : undefined,
+      top_p: topPVal !== null ? Number(topPVal) : undefined,
+      repeat_penalty: repeatPenaltyVal !== null ? Number(repeatPenaltyVal) : undefined,
+    });
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system, {
+      kvMode: kvModeVal ?? undefined,
+      jsonOut: runJson,
+      noStream: runNoStream,
+      sampling,
+    });
     break;
   }
   case "chat": {
-    const chatArgs = rest.filter(a => !a.startsWith("--"));
-    const chatFlags = new Set(rest.filter(a => a.startsWith("--")));
-    const chatTag = chatArgs[0];
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire chat <model> [flags]
+
+  Interactive streaming chat TUI (multi-turn). Uses a running serve if one is
+  up on cfg.port, otherwise spawns a one-shot daemon for the session.
+
+Flags:
+  --no-color           Disable ANSI color in the TUI
+
+Examples:
+  hipfire chat qwen3.5:9b
+  hipfire chat qwen3.5:27b-mq6 --no-color`);
+      process.exit(0);
+    }
+    const noColor = takeFlag(rest, "--no-color");
+    rejectUnknownFlags(rest, "chat");
+    const chatTag = rest.filter(a => !a.startsWith("-"))[0];
     if (!chatTag) {
-      console.error("Usage: hipfire chat <tag> [--no-color]  (e.g. hipfire chat qwen3.5:9b)");
-      process.exit(1);
+      console.error("Usage: hipfire chat <model> [--no-color]  (e.g. hipfire chat qwen3.5:9b)");
+      console.error("Run `hipfire chat --help` for details.");
+      process.exit(EXIT.USAGE);
     }
     const { chatTui } = await import("./chat.ts");
-    await chatTui(chatTag, cfg, { noColor: chatFlags.has("--no-color") });
+    await chatTui(chatTag, cfg, { noColor });
     break;
   }
   case "pull": {
@@ -6138,8 +7766,59 @@ switch (cmd) {
     break;
   }
   case "list": {
-    const showRemote = rest.includes("--remote") || rest.includes("-r");
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire list [flags]
+
+  Show local models (and, with -r, every model available to pull). Also lists
+  user aliases registered via \`hipfire quantize --register\`.
+
+Flags:
+  -r, --remote         Also show registry models available to pull
+  -j, --json           Emit a machine-readable {models, registry} object
+
+Examples:
+  hipfire list
+  hipfire list -r
+  hipfire list --json`);
+      process.exit(0);
+    }
+    const asJson = takeFlag(rest, "-j", "--json");
+    const showRemote = takeFlag(rest, "--remote", "-r");
+    rejectUnknownFlags(rest, "list");
     const local = listLocal();
+    if (asJson) {
+      // Machine-readable: every local model + every registry entry (with a
+      // `downloaded` flag). `quant` is the file extension (mq4/hf6/q8/...) when
+      // recognizable, else null.
+      const catalog = loadModelsCatalog();
+      const byId = new Map(Object.values(catalog.models).map(m => [m.id, m]));
+      const quantOf = (file: string): string | null => {
+        const m = file.match(/\.([A-Za-z0-9]+)$/);
+        return m ? m[1].toLowerCase() : null;
+      };
+      const localFiles = new Set(local.map(m => m.name));
+      const models = local.map(m => {
+        const rec = byId.get(m.name);
+        return {
+          tag: m.tag || (rec?.registry_tag ?? null),
+          name: m.name,
+          path: rec?.path ?? null,
+          size_bytes: rec?.size_bytes ?? 0,
+          quant: quantOf(m.name),
+          downloaded: true,
+        };
+      });
+      const registry = Object.entries(REGISTRY).map(([tag, entry]) => ({
+        tag,
+        name: entry.file,
+        path: null as string | null,
+        size_bytes: Math.round((entry.size_gb || 0) * 1e9),
+        quant: quantOf(entry.file),
+        downloaded: localFiles.has(entry.file),
+      }));
+      console.log(JSON.stringify({ models, registry }, null, 2));
+      break;
+    }
     if (local.length > 0) {
       console.log("Local models:\n");
       for (const m of local) {
@@ -6170,8 +7849,32 @@ switch (cmd) {
     break;
   }
   case "ps": {
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire ps [flags]
+
+  List running hipfire processes: the inference daemon, quantize jobs, and HF
+  uploads, plus whether the configured serve port is in use.
+
+Flags:
+  -j, --json           Emit machine-readable {daemons, quantize, uploads, serve}
+
+Note: process discovery uses Linux tools (ps, ss). On non-Linux platforms the
+process groups are reported as unavailable.
+
+Examples:
+  hipfire ps
+  hipfire ps --json`);
+      process.exit(0);
+    }
     // List running hipfire-related processes: serve daemons, quantize jobs, uploads.
+    const psJson = takeFlag(rest, "-j", "--json");
+    rejectUnknownFlags(rest, "ps");
+    // Cross-platform honesty: ps/ss are Linux-only. On other platforms we
+    // can't enumerate processes — say so instead of printing a misleading
+    // "No hipfire processes running."
+    const psLinux = process.platform === "linux";
     const sh = (cmd: string) => {
+      if (!psLinux) return "";
       try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
       catch { return ""; }
     };
@@ -6188,6 +7891,10 @@ switch (cmd) {
       { label: "Quantize jobs", pattern: "quantize", entries: [] },
       { label: "HF uploads", pattern: "hf upload", entries: [] },
     ];
+    // Structured records (for --json) collected alongside the human entries.
+    const daemonRecs: { pid: number; etime: string; rss_mb: number; args: string }[] = [];
+    const quantizeRecs: { pid: number; etime: string; rss_mb: number; args: string }[] = [];
+    const uploadRecs: { pid: number; etime: string; rss_mb: number; args: string }[] = [];
     const lines = sh(`ps -eo pid,etime,rss,args | grep -E '${grepPatterns.join("|")}' | grep -v grep`).split("\n").filter(Boolean);
     for (const line of lines) {
       const m = line.match(/^\s*(\d+)\s+(\S+)\s+(\d+)\s+(.+)$/);
@@ -6196,9 +7903,36 @@ switch (cmd) {
       const rssMb = (parseInt(rss) / 1024).toFixed(0);
       const shortArgs = args.length > 140 ? args.slice(0, 140) + "…" : args;
       const entry = `  ${pid.padStart(7)}  ${etime.padStart(10)}  ${rssMb.padStart(6)}M  ${shortArgs}`;
-      if (/daemon/.test(args)) groups[0].entries.push(entry);
-      else if (/quantize/.test(args)) groups[1].entries.push(entry);
-      else if (/hf upload/.test(args)) groups[2].entries.push(entry);
+      const rec = { pid: parseInt(pid), etime, rss_mb: Math.round(parseInt(rss) / 1024), args };
+      if (/daemon/.test(args)) { groups[0].entries.push(entry); daemonRecs.push(rec); }
+      else if (/quantize/.test(args)) { groups[1].entries.push(entry); quantizeRecs.push(rec); }
+      else if (/hf upload/.test(args)) { groups[2].entries.push(entry); uploadRecs.push(rec); }
+    }
+    if (psJson) {
+      const port0 = cfg.port;
+      const portInUse0 = sh(`ss -tlnp 2>/dev/null | grep :${port0}`);
+      const detachedPid0 = readServePid();
+      console.log(JSON.stringify({
+        platform: process.platform,
+        process_scan: psLinux ? "linux" : `unavailable (ps/ss are Linux-only; running on ${process.platform})`,
+        daemons: daemonRecs,
+        quantize: quantizeRecs,
+        uploads: uploadRecs,
+        serve: {
+          host: cfg.host,
+          port: port0,
+          pid: detachedPid0,
+          up: !!(detachedPid0 || portInUse0),
+          detached: !!detachedPid0,
+        },
+      }, null, 2));
+      break;
+    }
+    if (!psLinux) {
+      console.log(`(Linux-only; ps/ss unavailable on ${process.platform} — cannot enumerate hipfire processes)`);
+      const detachedPidNl = readServePid();
+      if (detachedPidNl) console.log(`tracked serve PID (from pidfile): ${detachedPidNl}`);
+      break;
     }
     let total = 0;
     for (const g of groups) total += g.entries.length;
@@ -6233,18 +7967,41 @@ switch (cmd) {
     break;
   }
   case "profile": {
-    const jsonFlag = rest.includes("--json");
-    const kernelIdx = rest.indexOf("--kernel");
-    const kernelFilter = kernelIdx >= 0 && kernelIdx + 1 < rest.length ? rest[kernelIdx + 1] : undefined;
-    const skipSet = new Set<number>();
-    if (jsonFlag) skipSet.add(rest.indexOf("--json"));
-    if (kernelIdx >= 0) { skipSet.add(kernelIdx); skipSet.add(kernelIdx + 1); }
-    const positional = rest.filter((_, i) => !skipSet.has(i));
-    const profileModel = positional[0]; // optional: model to load (triggers kernel compile)
+    if (rest.includes("-h") || rest.includes("--help")) {
+      console.error(`Usage: hipfire profile [model] [--kernel <substr>] [--json]
+
+  Roofline + compiled-kernel report for the detected GPU. Pass a [model] to
+  load it first (forces its kernels to JIT-compile so they show up).
+
+Flags:
+  --kernel <substr>   Only report kernels whose name contains <substr>
+  -j, --json          Emit the full machine-readable hardware + kernel report
+
+Examples:
+  hipfire profile
+  hipfire profile qwen3.5:9b
+  hipfire profile qwen3.5:9b --kernel gemm --json`);
+      process.exit(0);
+    }
+    // takeFlag/takeFlagValue splice their tokens out of `rest`, so whatever
+    // survives is purely positional (the optional model). Supports -j alias.
+    const jsonFlag = takeFlag(rest, "-j", "--json");
+    const kernelFilter = takeFlagValue(rest, "--kernel") ?? undefined;
+    const profileModel = rest[0]; // optional: model to load (triggers kernel compile)
     await profile(profileModel, jsonFlag, kernelFilter);
     break;
   }
   case "update": {
+    // INSTALL-F3: the update flow builds the ROCm/sysfs-specific daemon from
+    // source (cargo build --features deltanet …) and copies Linux binaries.
+    // It is Linux-only; on macOS/Windows it would fetch+build then fail
+    // cryptically. Gate cleanly and point at the right path.
+    if (process.platform !== "linux") {
+      console.error("hipfire update is Linux-only (it builds the ROCm/AMD-GPU daemon from source).");
+      console.error("  • On Windows: re-run the platform installer (scripts/install.ps1).");
+      console.error("  • Otherwise: build from source manually — cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-runtime --example daemon");
+      process.exit(EXIT.USAGE);
+    }
     console.error("Updating hipfire...");
     const srcDir = join(HIPFIRE_DIR, "src");
     const repoDir = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
@@ -6360,7 +8117,9 @@ switch (cmd) {
     // config commands keep working. Previously the copy happened after the
     // cargo build, so a build failure left the CLI frozen at its install-time
     // version — users saw "unknown model" for entries added post-install.
-    const exe = process.platform === "win32" ? ".exe" : "";
+    // INSTALL-F3: this command is Linux-only (gated at the top of the case), so
+    // binaries never carry a `.exe` suffix here.
+    const exe = "";
     const binDir = join(HIPFIRE_DIR, "bin");
     // Keep index.ts and its sibling runtime modules in lockstep. This mirrors
     // scripts/install.{sh,ps1}: copy the whole cli/ tree, prune dev/test files,
@@ -6393,18 +8152,51 @@ switch (cmd) {
     if (buildQ.exitCode !== 0) {
       console.error("  hipfire-quantize build failed (quantize subcommand won't work). Continuing.");
     }
-    // Recopy binaries
-    // Example binaries live under target/release/examples/
+    // Build the terminal UI binary so `hipfire tui` works out of the box.
+    const buildTui = Bun.spawnSync(
+      [CARGO_BIN, "build", "--release", "-p", "hipfire-tui"],
+      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
+    );
+    if (buildTui.exitCode !== 0) {
+      console.error("  hipfire-tui build failed (tui subcommand won't work). Continuing.");
+    }
+    // Recopy binaries. Resolve the ACTUAL target directory: cargo writes to
+    // $CARGO_TARGET_DIR when set (common when sharing a build cache across
+    // projects), otherwise the conventional <repo>/target. Hardcoding
+    // repoDir/target/release silently skips the copy on those setups, leaving
+    // the user with a freshly-built-but-never-installed binary.
+    // INSTALL-F2: cargo resolves a RELATIVE CARGO_TARGET_DIR against the BUILD
+    // cwd (repoDir, where we spawned `cargo build`), NOT the user's launch cwd.
+    // `resolve(env)` alone anchored it to process.cwd() → the copy phase looked
+    // in the wrong directory. resolve(repoDir, env) joins relative values to
+    // repoDir while passing absolute values through unchanged.
+    const targetDir = process.env.CARGO_TARGET_DIR && process.env.CARGO_TARGET_DIR.length > 0
+      ? resolve(repoDir, process.env.CARGO_TARGET_DIR)
+      : join(repoDir, "target");
+    const releaseDir = join(targetDir, "release");
+    // Example binaries live under <target>/release/examples/
     for (const bin of ["daemon", "infer", "run", "triattn_validate"]) {
-      const src = join(repoDir, `target/release/examples/${bin}${exe}`);
+      const src = join(releaseDir, "examples", `${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
-    // Workspace binaries (e.g. hipfire-quantize) live under target/release/
-    for (const bin of ["hipfire-quantize"]) {
-      const src = join(repoDir, `target/release/${bin}${exe}`);
+    // Workspace binaries (e.g. hipfire-quantize, hipfire-tui) live under <target>/release/.
+    // If the build step reported success but the binary isn't where we expect,
+    // warn loudly instead of silently skipping — that mismatch (wrong target
+    // dir, renamed artifact) would otherwise look like a clean update.
+    const buildOk: Record<string, boolean> = {
+      "hipfire-quantize": buildQ.exitCode === 0,
+      "hipfire-tui": buildTui.exitCode === 0,
+    };
+    for (const bin of ["hipfire-quantize", "hipfire-tui"]) {
+      const src = join(releaseDir, `${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
-      if (existsSync(src)) { copyFileSync(src, dst); }
+      if (existsSync(src)) {
+        copyFileSync(src, dst);
+      } else if (buildOk[bin]) {
+        console.error(`  WARNING: ${bin} build succeeded but binary not found at ${src} — not installed.`);
+        console.error(`           Check CARGO_TARGET_DIR / the build output, then re-run 'hipfire update'.`);
+      }
     }
     // Detect GPU arch from sysfs (cross-platform, no external commands)
     let archOut = "";
@@ -6481,14 +8273,120 @@ switch (cmd) {
     break;
   }
   case "diag": {
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire diag [flags]
+
+  Diagnostics: platform, PCI GPUs, DRM/KFD nodes, amdgpu module, ROCm/HIP
+  version, daemon binary, local models, compiled kernels, and a live GPU
+  probe (VRAM, arch) via the HIP runtime.
+
+Flags:
+  -j, --json           Emit the full machine-readable diagnostics object
+
+Note: hardware probes (lspci, lsmod, rocminfo, ss) are Linux-only; on other
+platforms those fields are reported as unavailable.
+
+Examples:
+  hipfire diag
+  hipfire diag --json`);
+      process.exit(0);
+    }
+    const diagJson = takeFlag(rest, "-j", "--json");
+    rejectUnknownFlags(rest, "diag");
+    // Cross-platform honesty: the shell probes below are Linux-only.
+    const diagLinux = process.platform === "linux";
+    const sh = (cmd: string) => {
+      if (!diagLinux) return "";
+      try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
+      catch { return ""; }
+    };
+    if (diagJson) {
+      // Machine-readable diagnostics. Mirrors the human probe order but emits a
+      // single JSON object: platform, gpus (PCI), rocm, daemon, models, kernels,
+      // live GPU probe, config overrides.
+      const platform = process.platform;
+      const isWsl = existsSync("/proc/version") && (sh("cat /proc/version") || "").toLowerCase().includes("microsoft");
+      const platformLabel = isWsl ? "wsl2" : platform === "win32" ? "windows" : platform === "linux" ? "linux" : platform;
+      const lspci = sh("lspci 2>/dev/null | grep -i 'vga\\|display\\|3d'");
+      const pciGpus = lspci ? lspci.split("\n").map(l => l.trim()).filter(Boolean) : [];
+      const driNodes = sh("ls /dev/dri/ 2>/dev/null");
+      const hasKfd = existsSync("/dev/kfd");
+      const amdgpuLoaded = !!sh("lsmod 2>/dev/null | grep amdgpu | head -1");
+      const hipccVer = sh("hipcc --version 2>&1 | head -1");
+      const exeJ = process.platform === "win32" ? ".exe" : "";
+      const envBinJ = process.env.HIPFIRE_DAEMON_BIN;
+      const daemonBinJ = [
+        ...(envBinJ ? [envBinJ] : []),
+        resolve(__dirname, `../target/release/examples/daemon${exeJ}`),
+        join(HIPFIRE_DIR, "bin", `daemon${exeJ}`),
+      ].find(p => existsSync(p)) ?? null;
+      const modelsJ = listLocal();
+      // Kernels
+      const kernelsJ: { arch: string; blobs: number; hashes: number }[] = [];
+      const kBaseJ = (() => {
+        const a = join(HIPFIRE_DIR, "bin", "kernels", "compiled");
+        const b = resolve(__dirname, "../kernels/compiled");
+        return existsSync(a) ? a : existsSync(b) ? b : null;
+      })();
+      if (kBaseJ) {
+        for (const arch of readdirSync(kBaseJ).filter(d => d.startsWith("gfx"))) {
+          const dir = join(kBaseJ, arch);
+          kernelsJ.push({
+            arch,
+            blobs: readdirSync(dir).filter(f => f.endsWith(".hsaco")).length,
+            hashes: readdirSync(dir).filter(f => f.endsWith(".hash")).length,
+          });
+        }
+      }
+      // Live GPU probe
+      let gpu: any = null;
+      if (daemonBinJ) {
+        try {
+          const de = new Engine();
+          de.oneShot = true;
+          await de.start();
+          await de.send({ type: "ping" }); await de.recv();
+          await de.send({ type: "diag" });
+          const d = await de.recv();
+          if (d.type === "diag") {
+            gpu = {
+              arch: d.arch ?? null,
+              hip_version: d.hip_version ?? null,
+              vram_free_mb: d.vram_free_mb ?? null,
+              vram_total_mb: d.vram_total_mb ?? null,
+            };
+          }
+          await de.stop();
+        } catch (err: any) {
+          gpu = { error: err?.message ?? String(err) };
+        }
+      }
+      const overrides: Record<string, unknown> = {};
+      for (const k of Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[]) {
+        if (cfg[k] !== CONFIG_DEFAULTS[k]) overrides[k] = cfg[k];
+      }
+      console.log(JSON.stringify({
+        registry: REGISTRY_SOURCE,
+        platform: platformLabel,
+        hardware_probe: diagLinux ? "linux" : `unavailable (lspci/lsmod/rocminfo are Linux-only; running on ${process.platform})`,
+        gpus: pciGpus,
+        dri_nodes: driNodes ? driNodes.split("\n").filter(Boolean) : [],
+        kfd: hasKfd,
+        amdgpu_loaded: amdgpuLoaded,
+        rocm: { hipcc: hipccVer || null },
+        daemon: daemonBinJ ? "found" : null,
+        models: modelsJ.map(m => ({ name: m.name, tag: m.tag || null, size: m.size })),
+        kernels: kernelsJ,
+        gpu,
+        config_path: CONFIG_PATH,
+        config_overrides: overrides,
+      }, null, 2));
+      break;
+    }
     console.log("hipfire diagnostics\n");
     // Where the model list came from this run: network / cache / stale-cache
     // (dynamic registry/v1.json) or bundled (compiled-in registry.json).
     console.log(`registry:      ${REGISTRY_SOURCE}`);
-    const sh = (cmd: string) => {
-      try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
-      catch { return ""; }
-    };
 
     // ── 1. Platform detection ──────────────────────────────
     const platform = process.platform;
@@ -6514,7 +8412,7 @@ switch (cmd) {
       for (const line of lspci.split("\n")) console.log(`  ${line.trim()}`);
       gpuDetected = lspci.toLowerCase().includes("amd") || lspci.toLowerCase().includes("radeon");
     } else {
-      console.log("PCI GPUs:      (lspci not available)");
+      console.log(`PCI GPUs:      ${diagLinux ? "(lspci not available)" : `(Linux-only; lspci unavailable on ${process.platform})`}`);
     }
 
     // 2b. DRM render nodes + /dev/dxg
@@ -6553,7 +8451,7 @@ switch (cmd) {
 
     // 2g. amdgpu kernel module
     const amdgpuLoaded = sh("lsmod 2>/dev/null | grep amdgpu | head -1");
-    console.log(`amdgpu module: ${amdgpuLoaded ? "loaded" : "NOT LOADED"}`);
+    console.log(`amdgpu module: ${amdgpuLoaded ? "loaded" : diagLinux ? "NOT LOADED" : `(Linux-only; lsmod unavailable on ${process.platform})`}`);
 
     // ── 3. ROCm / HIP runtime ──────────────────────────────
     console.log("");
@@ -6624,8 +8522,7 @@ switch (cmd) {
           console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
           console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
 
-          const ad = archDefaults(diag.arch || "unknown");
-          console.log(`  kv default:  ${ad.kv_cache} (${ad.vram_gb}GB VRAM)`);
+          console.log(`  kv default:  ${DEFAULT_KV_MODE} (auto → registry default_kv_mode, else q8)`);
           const hasWmma = (diag.arch || "").startsWith("gfx11") || (diag.arch || "").startsWith("gfx12");
           console.log(`  WMMA:        ${hasWmma ? "yes (4.1x prefill)" : "no (FP16 packed, +15% prefill)"}`);
 
@@ -6690,6 +8587,7 @@ switch (cmd) {
     break;
   }
   case "bench": {
+    const benchJson = takeFlag(rest, "-j", "--json");
     const exp = rest.includes("--exp");
     const runsIdx = rest.indexOf("--runs");
     const runs = runsIdx >= 0 && runsIdx + 1 < rest.length ? parseInt(rest[runsIdx + 1]) : 5;
@@ -6701,39 +8599,80 @@ switch (cmd) {
     const positional = rest.filter((_, i) => !skipSet.has(i));
     const benchModel = positional[0];
     if (!benchModel) {
-      console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [prompt]
+      console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [--json] [prompt]
 
   Standard benchmark: measure decode + prefill tok/s over N runs.
   --exp    RDNA2 only: test all 5 kernel variants (occupancy/unroll/cache tradeoffs)
   --runs   Number of runs per variant (default: 5)
+  --json   Emit machine-readable {model,prefill_tok_s,gen_tok_s,runs,...} (standard mode only)
 
 Examples:
   hipfire bench qwen3.5:4b
-  hipfire bench qwen3.5:9b --runs 3
+  hipfire bench qwen3.5:9b --runs 3 --json
   hipfire bench --exp qwen3.5:4b --runs 5`);
       process.exit(1);
     }
+    if (benchJson && exp) {
+      console.error("Error: --json is not supported with --exp (variant comparison is human-only). Drop one.");
+      process.exit(1);
+    }
     const benchPrompt = positional.slice(1).join(" ") || "Explain the theory of general relativity in simple terms.";
-    await bench(benchModel, runs, exp, benchPrompt);
+    await bench(benchModel, runs, exp, benchPrompt, benchJson);
     break;
   }
   case "rm": {
+    const skipConfirm = takeFlag(rest, "--yes", "-y");
     const tag = rest[0] || "";
-    if (!tag) {
-      console.error("Usage: hipfire rm <model>   (e.g. hipfire rm qwen3.5:9b)");
+    if (!tag || tag === "-h" || tag === "--help") {
+      console.error("Usage: hipfire rm <model> [--yes|-y]   (e.g. hipfire rm qwen3.5:9b)");
+      console.error("  Removes the model file AND its sidecars (.triattn*.bin, *.mtp) next to it.");
+      console.error("  --yes / -y   Skip the confirmation prompt");
       console.error("  See installed models: hipfire list");
-      process.exit(1);
+      process.exit(tag ? 0 : 1);
     }
     const resolved = resolveModelTag(tag);
     const entry = REGISTRY[resolved];
     const path = entry ? join(MODELS_DIR, entry.file) : findModel(tag);
-    if (path && existsSync(path)) {
-      unlinkSync(path);
-      console.log(`Removed ${path}`);
-    } else {
+    if (!path || !existsSync(path)) {
       console.error(`Model not found: ${tag}`);
       console.error(`  See installed models: hipfire list`);
       process.exit(1);
+    }
+    // Discover associated sidecars next to the model: `<stem>.triattn*.bin`
+    // and any `<stem>*.mtp`. <stem> drops the model's own extension so e.g.
+    // `qwen35-27b.mq4` matches `qwen35-27b.triattn.bin` and `qwen35-27b.mtp`.
+    const modelDir = dirname(path);
+    const base = basename(path);
+    const stem = base.replace(/\.[^.]+$/, "");
+    const sidecars: string[] = [];
+    try {
+      for (const f of readdirSync(modelDir)) {
+        if (f === base) continue;
+        const full = join(modelDir, f);
+        if ((f.startsWith(stem + ".triattn") && f.endsWith(".bin")) ||
+            (f.startsWith(stem) && f.endsWith(".mtp"))) {
+          sidecars.push(full);
+        }
+      }
+    } catch {}
+    const targets = [path, ...sidecars];
+    console.error(`Will remove:`);
+    for (const t of targets) {
+      let sz = "";
+      try { sz = `  (${fmtBytes(statSync(t).size)})`; } catch {}
+      console.error(`  ${t}${sz}`);
+    }
+    if (!skipConfirm) {
+      const rl = require("readline").createInterface({ input: process.stdin, output: process.stderr });
+      const answer: string = await new Promise(res => rl.question(`Remove ${targets.length} file(s)? [y/N] `, (a: string) => { rl.close(); res(a); }));
+      if (!/^y(es)?$/i.test(answer.trim())) {
+        console.error("Aborted.");
+        process.exit(1);
+      }
+    }
+    for (const t of targets) {
+      try { unlinkSync(t); console.log(`Removed ${t}`); }
+      catch (e: any) { console.error(`Failed to remove ${t}: ${e?.message ?? e}`); }
     }
     break;
   }
@@ -6743,7 +8682,7 @@ Examples:
       console.error(`Usage: hipfire quantize <hf-model-id | local-dir | file.gguf> [flags]
 
 Flags:
-  --format <mq4|mq6|q8>      Quantization format (repeatable — default: mq4)
+  --format <fmt>             Quantization format (repeatable — default: mq4). See Formats below.
   --both                     Shorthand for --format mq4 --format mq6
   -o, --output <path>        Output file (single format only)
   --output-dir <dir>         Directory for outputs (multi-format: required)
@@ -6753,10 +8692,16 @@ Flags:
   --install                  Copy outputs into ~/.hipfire/models (so \`hipfire run\` finds them)
   --register <tag>           Add a local alias (e.g. my-finetune:4b) to ~/.hipfire/models.json
 
-Formats:
-  mq4   FWHT-rotated 4-bit, quality-gated — recommended for production
-  mq6   FWHT-rotated 6-bit — higher quality, ~1.47x file size (safetensors only)
-  q8    Symmetric Q8 — reference/debugging (safetensors only)
+Formats (safetensors / HF input):
+  mq4                FWHT-rotated 4-bit, quality-gated — recommended for production (Qwen3.5+ DeltaNet hot path)
+  mq6                FWHT-rotated 6-bit — higher quality, ~1.47x file size
+  q8 / q8f16         Symmetric Q8 — reference/debugging
+  hf4 / hfq4 / hfq4g256   HFQ4 (no FWHT rotation) — dense models (Llama / Mistral / Gemma / older Qwen)
+  hf6 / hfq6 / hfq6g256   HFQ6 (no FWHT rotation) — dense, higher quality
+
+  NOTE: graded per-expert MoE formats (mq4p / mfp4 / E8 / mq*-mqlloyd-tiered)
+  are NOT produced by this CLI path — they need --imatrix + extra flags and
+  run hipfire-quantize directly. See docs/ / the quantizer for the MoE recipe.
 
 GGUF input (single .gguf file): supports --format hf4 (default) /
 hf6 / mq4 / mq6. Source weights are dequantized (Q4_K_M / Q8_0 /
@@ -6853,7 +8798,9 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
                           "hf4", "hf6", "hfq4", "hfq4g256", "hfq6", "hfq6g256"];
     for (const f of formats) {
       if (!validFormats.includes(f)) {
-        console.error(`Unsupported format: ${f}\nSupported: mq4, mq6, q8`);
+        console.error(`Unsupported format: ${f}\nSupported: ${validFormats.join(", ")}`);
+        console.error(`  (GGUF input narrows to: hf4, hf6, mq4, mq6)`);
+        console.error(`  Graded MoE formats (mq4p/mfp4/E8) require running hipfire-quantize directly with --imatrix.`);
         process.exit(1);
       }
     }
@@ -7055,6 +9002,40 @@ Examples:
     // Disambiguate: first arg is a model tag if it maps to a local catalog
     // model, a known REGISTRY entry, or matches the `name:tag` shape.
     // Otherwise treat as action.
+    if (takeFlag(rest, "-h", "--help")) {
+      console.error(`Usage: hipfire config [<model:tag>] [action] [args] [--json]
+
+  No action          Open the interactive settings editor (TUI)
+  list               Print all keys, values, and which differ from defaults
+  get <key>          Print one key's value
+  set <key> <value>  Set a key (validated against its allowed range)
+  reset [key]        Reset one key (or all) to defaults
+  cask-profile [name] Show/apply a CASK eviction profile bundle
+
+  Prefix any action with a <model:tag> to scope it to that model's per-model
+  override (only PER_MODEL_KEYS are settable there).
+
+Flags:
+  -j, --json         For \`list\`/\`get\`: emit machine-readable JSON
+
+Examples:
+  hipfire config
+  hipfire config list
+  hipfire config list --json
+  hipfire config get kv_cache --json
+  hipfire config set temperature 0.7
+  hipfire config qwen3.5:9b set kv_cache q8
+  hipfire config reset`);
+      process.exit(0);
+    }
+    // Pull --json/-j out first (works for `config list --json` and
+    // `config get <key> --json`); harmless elsewhere.
+    const cfgJson = takeFlag(rest, "-j", "--json");
+    // HF-CLI-004: track the args that REMAIN after the optional model scope so
+    // we can reject leftover unknown flags / extra positionals per action.
+    // Without this, `config list --josn` exits 0 with human output (the typo'd
+    // flag is silently swallowed as an ignored `maybeKey`).
+    let scoped = rest;
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
@@ -7062,14 +9043,27 @@ Examples:
       const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), firstArg);
       if (catalogId || REGISTRY[resolved] || firstArg.includes(":")) {
         modelScope = catalogId ?? resolved;
-        [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
+        scoped = rest.slice(1);
+        [firstArg, maybeKey, ...valueArgs] = scoped;
       }
     }
     const action = firstArg;
     const key = maybeKey;
     const value = valueArgs.join(" ") || undefined;
 
-    const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+    // HF-CLI-004: validate per-action arity + reject stray dash-flags via the
+    // pure (unit-tested) verdict helper. `set`/`cask-profile` allow free-form
+    // (dash-leading) VALUE tokens, so only their <key> slot is flag-checked;
+    // list/get/reset reject any dash token in their tail.
+    if (action) {
+      const verdict = validateConfigActionArgs(action, scoped.slice(1), key);
+      if (!verdict.ok) {
+        console.error(`hipfire: ${verdict.error} (see hipfire config --help)`);
+        process.exit(EXIT.USAGE);
+      }
+    }
+
+    const validKeys = ALL_CONFIG_KEYS;
 
     // Per-model scripting helpers (shared between get/set/reset)
     const writePerModel = (k: PerModelKey, v: any) => {
@@ -7120,6 +9114,16 @@ Examples:
       if (modelScope) {
         const ov = loadPerModelConfigs()[modelScope] ?? {};
         const merged = resolveModelConfig(modelScope);
+        if (cfgJson) {
+          // { scope, path, keys: { <key>: { value, default, overridden } } }
+          const out: Record<string, any> = {};
+          for (const k of validKeys) {
+            if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
+            out[k] = { value: (merged as any)[k], default: (CONFIG_DEFAULTS as any)[k], overridden: k in ov };
+          }
+          console.log(JSON.stringify({ scope: modelScope, path: MODELS_CATALOG_PATH, keys: out }, null, 2));
+          break;
+        }
         console.log(`Per-model config: ${modelScope}  (${MODELS_CATALOG_PATH})\n`);
         for (const k of validKeys) {
           if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
@@ -7131,21 +9135,35 @@ Examples:
         console.log(`\nInteractive: hipfire config ${modelScope}`);
         console.log(`Set:         hipfire config ${modelScope} set <key> <value>`);
         console.log(`Unset:       hipfire config ${modelScope} reset <key>`);
+      } else if (cfgJson) {
+        // Global: { scope:"global", path, keys: { <key>: { value, default, is_default } } }
+        const out: Record<string, any> = {};
+        for (const k of validKeys) {
+          const v = cfg[k];
+          out[k] = { value: v, default: (CONFIG_DEFAULTS as any)[k], is_default: v === (CONFIG_DEFAULTS as any)[k] };
+        }
+        console.log(JSON.stringify({ scope: "global", path: CONFIG_PATH, keys: out }, null, 2));
       } else {
         listConfig(cfg);
       }
     } else if (action === "get") {
-      if (!key) { console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} get <key>`); process.exit(1); }
-      if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(1); }
+      if (!key) { console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} get <key> [--json]`); process.exit(EXIT.USAGE); }
+      if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(EXIT.USAGE); }
       if (modelScope) {
         if (!(PER_MODEL_KEYS as readonly string[]).includes(key)) {
           console.error(`${key} is not a per-model override (use global: hipfire config get ${key})`);
-          process.exit(1);
+          process.exit(EXIT.USAGE);
         }
         const v = (resolveModelConfig(modelScope) as any)[key];
-        console.log(v);
+        if (cfgJson) console.log(JSON.stringify({ scope: modelScope, key, value: v }));
+        else console.log(v);
       } else {
-        console.log(cfg[key as keyof HipfireConfig]);
+        // Read through resolveModelConfig(null) so preset-driven keys (e.g.
+        // max_think_tokens, absent-by-default) report their resolved value
+        // rather than `undefined`.
+        const v = (resolveModelConfig(null) as any)[key];
+        if (cfgJson) console.log(JSON.stringify({ scope: "global", key, value: v }));
+        else console.log(v);
       }
     } else if (action === "set") {
       if (!key || value === undefined) {
@@ -7159,14 +9177,17 @@ Examples:
         process.exit(1);
       }
       const defaultVal = CONFIG_DEFAULTS[key as keyof HipfireConfig];
+      // max_think_tokens is numeric but has no CONFIG_DEFAULTS entry (preset-
+      // driven); treat it as numeric explicitly so `config set` coerces it.
+      const wantsNumber = typeof defaultVal === "number" || key === "max_think_tokens";
       // Tri-state aware: "true"/"false" coerce to bool regardless of default
       // type, so fields like dflash_ngram_block ("auto" | boolean) accept
       // all three string forms cleanly.
-      const parsed = typeof defaultVal === "number" ? Number(value)
+      const parsed = wantsNumber ? Number(value)
                    : value === "true" ? true
                    : value === "false" ? false
                    : value;
-      if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
+      if (wantsNumber && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
           kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
@@ -7214,7 +9235,10 @@ Examples:
         if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}`); process.exit(1); }
         (cfg as any)[key] = CONFIG_DEFAULTS[key as keyof HipfireConfig];
         saveConfig(cfg);
-        console.log(`${key} reset to ${CONFIG_DEFAULTS[key as keyof HipfireConfig]}`);
+        const resetTo = key === "max_think_tokens"
+          ? "preset-driven (thinking_budget)"
+          : String(CONFIG_DEFAULTS[key as keyof HipfireConfig]);
+        console.log(`${key} reset to ${resetTo}`);
       } else {
         saveConfig({ ...CONFIG_DEFAULTS });
         console.log("All config reset to defaults");
@@ -7293,6 +9317,63 @@ Examples:
     }
     break;
   }
+  case "tui": {
+    const args = rest.slice();
+    if (takeFlag(args, "-h", "--help")) {
+      console.error(`Usage: hipfire tui [flags...]\n\n`
+        + `Launch the hipfire terminal UI (ratatui) — Home, Chat, Models, Settings,\n`
+        + `and System tabs over your local config, registry, and serve status.\n`
+        + `Requires a TTY. Any flags are passed through to the hipfire-tui binary.\n\n`
+        + `Flags forwarded to hipfire-tui:\n`
+        + `  --check        Load config/registry/models without entering the render\n`
+        + `                 loop, then exit (headless smoke; no TTY needed)\n`
+        + `  -V, --version  Print the hipfire-tui version and exit\n\n`
+        + `The binary is ~/.hipfire/bin/hipfire-tui (installed by \`hipfire update\`).\n`
+        + `In a source checkout (with cargo) it falls back to \`cargo run --release -p hipfire-tui\`;\n`
+        + `otherwise run \`hipfire update\` to build and install it.\n`);
+      process.exit(0);
+    }
+    const exe = process.platform === "win32" ? ".exe" : "";
+    const envBin = process.env.HIPFIRE_TUI_BIN;
+    const candidates = [
+      ...(envBin ? [envBin] : []),
+      join(HIPFIRE_DIR, "bin", `hipfire-tui${exe}`),
+      resolve(__dirname, `../target/release/hipfire-tui${exe}`),
+    ];
+    const bin = candidates.find(p => existsSync(p));
+    let proc;
+    if (bin) {
+      proc = spawn([bin, ...args], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env, HIPFIRE_CLI_SCRIPT: Bun.main } });
+    } else {
+      // Dev fallback: build-and-run from the workspace, but ONLY when a real
+      // workspace Cargo.toml AND a cargo toolchain are both present. In an
+      // installed layout (~/.hipfire/cli) neither exists, so a bare
+      // `cargo run` would surface a confusing "could not find Cargo.toml"
+      // error. Print an actionable message instead.
+      const cargoToml = resolve(__dirname, "../Cargo.toml");
+      const cargoBin = findDep("cargo", [join(process.env.HOME || "", ".cargo/bin"), "/usr/bin"]);
+      if (!existsSync(cargoToml) || !cargoBin) {
+        // Platform-correct remedy: `hipfire update` is NOT Windows-aware (its
+        // GPU-arch + reset path is Linux/sysfs-only), so on Windows recommend
+        // the direct cargo build as the primary fix. On Linux `hipfire update`
+        // builds + installs the binary in one step.
+        const remedy = process.platform === "win32"
+          ? `  Build from source:       cargo build --release -p hipfire-tui\n`
+            + `  (then copy target\\release\\hipfire-tui.exe to ~/.hipfire/bin/, or re-run scripts\\install.ps1)`
+          : `  Build + install it with: hipfire update\n`
+            + `  Or build from source:    cargo build --release -p hipfire-tui`;
+        console.error(`hipfire-tui (terminal UI) is not installed.\n`
+          + `  Looked in: ${candidates.join(", ")}\n`
+          + remedy);
+        process.exit(EXIT.ERROR);
+      }
+      console.error(`hipfire-tui binary not found; falling back to \`cargo run --release -p hipfire-tui\` (first run compiles)...`);
+      proc = spawn([cargoBin, "run", "--release", "-p", "hipfire-tui", "--", ...args],
+        { stdin: "inherit", stdout: "inherit", stderr: "inherit", cwd: resolve(__dirname, ".."), env: { ...process.env, HIPFIRE_CLI_SCRIPT: Bun.main } });
+    }
+    const code = await proc.exited;
+    process.exit(code);
+  }
   default: {
     // Unknown command: error to stderr + nonzero exit so scripts can detect
     // the typo instead of parsing help text off a 0-exit stdout.
@@ -7300,17 +9381,30 @@ Examples:
     if (cmd && !["help", "-h", "--help"].includes(cmd)) {
       console.error(`Unknown command: ${cmd}`);
       console.error(`Run \`hipfire help\` for the full command list.`);
-      process.exit(1);
+      process.exit(EXIT.USAGE);
     }
     // First-run hint: if no config, no models, show a friendly setup tip.
     // (Only when invoked with no args — still show full help text below.)
     if (!cmd) {
+      // Bare `hipfire` launches the terminal UI — the default surface — when run
+      // interactively and the binary is installed. Non-interactive contexts
+      // (pipes, CI, `hipfire | …`) or a not-yet-installed TUI fall through to the
+      // welcome + command list below. `hipfire help`/`-h`/`--help` still print help
+      // (they set `cmd`, so they never reach this branch).
+      const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+      const tuiBin = findTuiBin();
+      if (interactive && tuiBin) {
+        // Pass the CLI entrypoint so the TUI can shell back to it (serve control,
+        // pull, rm) from any cwd — including an installed ~/.hipfire layout.
+        const proc = spawn([tuiBin], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: { ...process.env, HIPFIRE_CLI_SCRIPT: Bun.main } });
+        process.exit(await proc.exited);
+      }
       const hasModels = existsSync(MODELS_DIR) && readdirSync(MODELS_DIR).length > 0;
       const hasConfig = existsSync(CONFIG_PATH);
       const isFirstRun = !hasModels && !hasConfig;
       if (isFirstRun) {
         console.log(`\x1b[1mWelcome to hipfire — LLM inference for AMD GPUs\x1b[0m`);
-        console.log(`\nDetected GPU: \x1b[36m${DETECTED_ARCH || "unknown"}\x1b[0m · KV default: \x1b[36m${ARCH_DEFAULTS.kv_cache}\x1b[0m`);
+        console.log(`\nDetected GPU: \x1b[36m${DETECTED_ARCH || "unknown"}\x1b[0m · KV default: \x1b[36m${DEFAULT_KV_MODE}\x1b[0m`);
         console.log(`\nFirst-run setup:`);
         console.log(`  1. Sanity-check your GPU:   \x1b[1mhipfire diag\x1b[0m`);
         console.log(`  2. Pull a model:            \x1b[1mhipfire pull qwen3.5:4b\x1b[0m`);
@@ -7325,6 +9419,8 @@ Examples:
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
   chat <model>          Interactive chat TUI (streaming, multi-turn; uses running serve if any)
+  tui                   Launch the terminal UI — Home/Chat/Models/Settings/System
+                        (also opens when you run bare \`hipfire\` in a terminal)
   serve [host] [port] [-d]
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
@@ -7338,6 +9434,10 @@ Examples:
   rm <model>            Delete model
   sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
   update                Pull latest code, rebuild, update kernels
+
+Help:
+  hipfire <command> --help    Detailed help for one command
+  hipfire help <command>      Same as <command> --help
 
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):
   hipfire pull qwen3.5:4b            # 2.6GB, best speed/quality balance
@@ -7362,4 +9462,19 @@ Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
   hipfire quantize ./my-finetune --format mq6 -o my-finetune.mq6`);
     break;
   }
+}
+} catch (err) {
+  // Any uncaught throw from a command (existing per-command catches still
+  // run first; this only fires for what escapes them). Print a clean line,
+  // never a raw stack. Set HIPFIRE_DEBUG=1 to see the full stack.
+  if (process.env.HIPFIRE_DEBUG === "1" && err instanceof Error) {
+    process.stderr.write((err.stack ?? String(err)) + "\n");
+  }
+  dieClean(err);
+}
+} // end main()
+
+// Run the CLI only as the entrypoint; importing this module (tests) is a no-op.
+if (import.meta.main) {
+  await main();
 }

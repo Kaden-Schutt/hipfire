@@ -798,6 +798,55 @@ row. ~3 hours GPTQ wall-time per α point on A100.
 
 ---
 
+## 3A. North-Mini-Code-1.0 (Cohere2-MoE, arch_id 12)
+
+CohereLabs/North-Mini-Code-1.0 — `Cohere2MoeForCausalLM`, 30.5B total / 3B active,
+128 experts top-8, parallel block, interleaved NoPE/RoPE, RMSNorm. Branch
+`nw_cohere2moe_support`. See [`project_cohere2moe_support.md`](../../memory/project_cohere2moe_support.md).
+
+### 3A.1 Quant cohort (gfx1151, KV=q8, prefill, n=2048, post-EM-fix `4b388a09`)
+
+- **Reference:** this arch's OWN native **bf16** oracle (61 GB) — there is no
+  llama.cpp GGUF baseline for Cohere2-MoE. KLD is `KL(bf16 ‖ tier)`. Per §0/§8
+  this is a self-similarity metric, NOT a cross-engine output-quality claim; it
+  ranks the format tiers (MQ4 vs MQ6 vs Q8) against this engine's own oracle.
+- **KV mode:** embed / lm_head / KV held **Q8** across all tiers (experts are the
+  `--format` knob), so KLD isolates expert+attention precision.
+- **Corpus:** 2048 BOS-prefixed wikitext-2 tokens (`wikitext-tokens.json`); scoring
+  `prefill` via `kld_logits --dump` + `analyze_dumps`. Sweep: `/tmp/kld_north_wiki/sweep.sh`.
+
+| Variant | bpw | KLD (mean) | p99 | PPL | vs bf16 |
+|---|---:|---|---:|---:|---:|
+| bf16 (oracle) | 16 | 0 | 0 | 6.398 | — |
+| **q8** | 8.5 | **0.00799** | 0.096 | **6.398** | lossless (PPL == bf16 @3dp) |
+| mq6 | ~6.5 | 0.01995 | 0.163 | 6.464 | +1.0% |
+| mq4 | ~4.25 | 0.09718 | 1.068 | 6.993 | +9.3% |
+
+Sizes: bf16 61 / Q8 31 / MQ6 24 / MQ4 16 GB. **Ship reco: Q8 is lossless; MQ4 carries
+a +9.3% PPL hit with a heavy per-token tail (p99 KLD 1.07) → prefer MQ6 for code-gen.**
+(Registry currently serves `north-mini-code.mq4.hfq`.)
+
+### 3A.2 EM-drop forward fix — before/after PPL on identical tokens (2026-06-11)
+
+The EM-drop fix (`19304fbb`: RMSNorm replacing mean-centered Cohere2LayerNorm +
+layer-0 force_rope, matching the HF `modular_cohere2_moe` reference) was validated
+behaviorally (a 2802-tok needle now emits `EMERALD-FALCON-7` at greedy). Quantified
+here at the PPL level — pre-fix `41d597e1` vs post-fix forward, **same 2048 wikitext tokens, same bf16 weights**:
+
+| forward | norm | layer-0 RoPE | PPL |
+|---|---|---|---:|
+| **PRE-FIX** (`41d597e1`) | mean-centered LayerNorm (wrong) | skipped (wrong) | 6.824 |
+| **POST-FIX** (`19304fbb`+) | RMSNorm (`rms_norm_eps`) | force_rope | **6.398** |
+
+**−6.2% PPL** — the divergence-from-reference hurt next-token prediction globally on
+held-out prose, not just the one needle. The pre-fix `6.824` ≈ the prior stale
+`6.828` table value (now removed), confirming that historical number was wikitext@2048
+from the **buggy** forward. Methodological note: the original quant sweep missed the
+bug entirely because the bf16 oracle had the SAME wrong norm → MQ4-vs-oracle KL stayed
+~0; correctness requires a diff-vs-HF-reference, not a self-KLD.
+
+---
+
 ## 4. KV-cache-mode contribution
 
 ### 4.1 Measurements

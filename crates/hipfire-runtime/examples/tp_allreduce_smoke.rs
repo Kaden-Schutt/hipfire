@@ -103,9 +103,8 @@ fn main() {
                 .hip
                 .memcpy_dtoh(&mut out, &buffers[r])
                 .expect("D2H");
-            let out_f32: &[f32] = unsafe {
-                std::slice::from_raw_parts(out.as_ptr() as *const f32, count)
-            };
+            let out_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(out.as_ptr() as *const f32, count) };
             let first = out_f32[0];
             let last = out_f32[count - 1];
             let mid = out_f32[count / 2];

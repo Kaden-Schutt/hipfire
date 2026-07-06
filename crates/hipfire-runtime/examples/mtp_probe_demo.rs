@@ -39,15 +39,42 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--target" => { target_path = Some(args[i + 1].clone()); i += 2; }
-            "--prompt" => { prompt_str = Some(args[i + 1].clone()); i += 2; }
-            "--prompt-file" => { prompt_file = Some(args[i + 1].clone()); i += 2; }
-            "--max" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
-            "--ctx" => { ctx_capacity = args[i + 1].parse().unwrap(); i += 2; }
-            "--lambda" => { lambda = args[i + 1].parse().unwrap(); i += 2; }
-            "--temp" => { temp = args[i + 1].parse().unwrap(); i += 2; }
-            "--no-chatml" => { chatml = false; i += 1; }
-            "--chatml" => { chatml = true; i += 1; }
+            "--target" => {
+                target_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompt" => {
+                prompt_str = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompt-file" => {
+                prompt_file = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--max" => {
+                max_tokens = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--ctx" => {
+                ctx_capacity = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--lambda" => {
+                lambda = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--temp" => {
+                temp = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--no-chatml" => {
+                chatml = false;
+                i += 1;
+            }
+            "--chatml" => {
+                chatml = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: mtp_probe_demo --target <target.hfq> \\\n  (--prompt \"Hello\" | --prompt-file <path>) \\\n  [--max 64] [--ctx 4096] [--lambda 0.1] [--temp 0.0] [--no-chatml]");
                 std::process::exit(0);
@@ -98,9 +125,8 @@ fn main() {
     // commit; the candidate slot writes to KV even on rejection). +8 padding.
     slot_cfg.max_seq = ctx_capacity + max_tokens * 3 + 8;
     let t_load = Instant::now();
-    let mut target = ModelSlot::load(
-        &mut gpu, Path::new(&target_path), "target", slot_cfg,
-    ).expect("load target");
+    let mut target = ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg)
+        .expect("load target");
     eprintln!("target loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     // ── Tokenize prompt ───────────────────────────────────────────────
@@ -125,7 +151,10 @@ fn main() {
         chat.extend_from_slice(&asst);
         chat.extend_from_slice(&nl);
         prompt_tokens = chat;
-        eprintln!("chatml wrapping: prompt {} tokens after wrap", prompt_tokens.len());
+        eprintln!(
+            "chatml wrapping: prompt {} tokens after wrap",
+            prompt_tokens.len()
+        );
     } else {
         eprintln!("prompt: {} tokens (no chatml)", prompt_tokens.len());
     }
@@ -133,7 +162,9 @@ fn main() {
     assert!(
         prompt_tokens.len() + max_tokens * 3 + 8 <= ctx_capacity,
         "prompt ({}) + max ({}) * 3 KV slots/cycle won't fit in --ctx {}; raise --ctx",
-        prompt_tokens.len(), max_tokens, ctx_capacity,
+        prompt_tokens.len(),
+        max_tokens,
+        ctx_capacity,
     );
 
     // ── Prefill the target's KV cache one token at a time ─────────────
@@ -155,7 +186,9 @@ fn main() {
     eprintln!("prefilling {} tokens...", prompt_tokens.len());
     let t_prefill = Instant::now();
     for (pos, &token) in prompt_tokens.iter().enumerate() {
-        target.forward(&mut gpu, token, pos).expect("prefill forward");
+        target
+            .forward(&mut gpu, token, pos)
+            .expect("prefill forward");
     }
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
@@ -164,9 +197,9 @@ fn main() {
     let eos_token = target.config.eos_token;
 
     // ── Init probe state ──────────────────────────────────────────────
-    let mut probe_state = MtpProbeState::new_for_prompt(
-        &mut gpu, &target.weights, &target.config, &prompt_tokens,
-    ).expect("init mtp probe state");
+    let mut probe_state =
+        MtpProbeState::new_for_prompt(&mut gpu, &target.weights, &target.config, &prompt_tokens)
+            .expect("init mtp probe state");
     probe_state.lambda = lambda;
     probe_state.last_committed = Some(*prompt_tokens.last().unwrap());
 
@@ -184,9 +217,9 @@ fn main() {
         // NOT committed.len(). Compute the advance BEFORE the call so we know
         // exactly how many slots this cycle consumes.
         let kv_advance = 2 + probe_state.pending_candidate.is_some() as usize;
-        let (committed, eos_hit) = mtp_probe::mtp_probe_step(
-            &mut gpu, &mut target, &mut probe_state, cur_pos, eos_token,
-        ).expect("mtp_probe_step");
+        let (committed, eos_hit) =
+            mtp_probe::mtp_probe_step(&mut gpu, &mut target, &mut probe_state, cur_pos, eos_token)
+                .expect("mtp_probe_step");
 
         for &t in &committed {
             emitted.push(t);
@@ -225,7 +258,10 @@ fn main() {
     println!("decode_secs:          {:.3}", decode_secs);
     println!("tok_s:                {:.2}", tok_per_s);
     println!("prefill_tok_s:        {:.2}", prefill_tok_s);
-    println!("eos_hit:              {}", if stats.eos_hit { "y" } else { "n" });
+    println!(
+        "eos_hit:              {}",
+        if stats.eos_hit { "y" } else { "n" }
+    );
     println!("lambda:               {lambda}");
 
     // Free probe GPU buffers (cosmetic — process exits next).

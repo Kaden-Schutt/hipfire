@@ -206,7 +206,11 @@ impl ShardConfig {
     /// Validate DeltaNet head geometry: both head counts split evenly and the
     /// value/key ratio is preserved per rank (so GQA repeat-interleave still
     /// works on the local shard). Call once at load.
-    pub fn validate_deltanet(&self, n_value_heads: usize, n_key_heads: usize) -> Result<(), String> {
+    pub fn validate_deltanet(
+        &self,
+        n_value_heads: usize,
+        n_key_heads: usize,
+    ) -> Result<(), String> {
         if n_value_heads % self.tp_size != 0 {
             return Err(format!(
                 "validate_deltanet: linear_num_value_heads ({n_value_heads}) not divisible by tp_size ({})",
@@ -531,7 +535,10 @@ mod tests {
         assert_eq!(r1[0], 1);
         // every expert owned by exactly one rank (partition)
         for e in 0..256 {
-            assert_eq!(s.owns_expert(0, e) as usize + s.owns_expert(1, e) as usize, 1);
+            assert_eq!(
+                s.owns_expert(0, e) as usize + s.owns_expert(1, e) as usize,
+                1
+            );
         }
     }
 

@@ -73,6 +73,12 @@
 //!   `+= 1.0` offset (see `load_norm_weight_raw`).
 
 pub mod arch;
+pub mod carrier;
 pub mod qwen2;
+/// Qwen2 impl of the arch-generic `hipfire_runtime::spec` seam
+/// (`impl SpecTarget for Qwen2Bundle`) — lets the model-free n-gram speculator
+/// drive VibeThinker / Qwen2 (arch_id=7).
+pub mod spec_impl;
 
 pub use arch::Qwen2;
+pub use carrier::{load_bundle as load_qwen2_bundle, Qwen2Bundle};

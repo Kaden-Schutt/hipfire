@@ -132,6 +132,28 @@ describe("validateRegistryV1", () => {
     expect(validateRegistryV1(r)).not.toBeNull();
   });
 
+  test("accepts a valid per-model default_kv_mode and null/missing", () => {
+    const r = goodRegistry();
+    (r.models["qwen3.5:9b"] as unknown as Record<string, unknown>).default_kv_mode = "q8";
+    expect(validateRegistryV1(r)).not.toBeNull();
+
+    const r2 = goodRegistry();
+    (r2.models["qwen3.5:9b"] as unknown as Record<string, unknown>).default_kv_mode = null;
+    expect(validateRegistryV1(r2)).not.toBeNull();
+    // missing field already covered by goodRegistry() (no field set)
+    expect(validateRegistryV1(goodRegistry())).not.toBeNull();
+  });
+
+  test("rejects an entry whose default_kv_mode is not in the KV allowlist", () => {
+    const r = goodRegistry();
+    (r.models["qwen3.5:9b"] as unknown as Record<string, unknown>).default_kv_mode = "lloyd9";
+    expect(validateRegistryV1(r)).toBeNull();
+
+    const r2 = goodRegistry();
+    (r2.models["qwen3.5:9b"] as unknown as Record<string, unknown>).default_kv_mode = 8;
+    expect(validateRegistryV1(r2)).toBeNull();
+  });
+
   test("drops aliases pointing at missing tags instead of failing", () => {
     const r = goodRegistry();
     r.aliases["ghost"] = "not:a:tag";

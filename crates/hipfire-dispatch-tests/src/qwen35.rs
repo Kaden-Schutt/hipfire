@@ -18,19 +18,31 @@ use rdna_compute::DType;
 fn qwen35_prefill_always_batchable() {
     use hipfire_runtime::llama::is_batchable_la;
     let batchable_archs = &[
-        "gfx906", "gfx908", "gfx940", "gfx941", "gfx942",
-        "gfx1010", "gfx1011", "gfx1012", "gfx1013",
-        "gfx1030", "gfx1031", "gfx1032",
-        "gfx1100", "gfx1101", "gfx1102", "gfx1103",
-        "gfx1150", "gfx1151", "gfx1152",
-        "gfx1200", "gfx1201",
+        "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", "gfx1010", "gfx1011", "gfx1012",
+        "gfx1013", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1101", "gfx1102", "gfx1103",
+        "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
     ];
     for &arch in batchable_archs {
-        assert!(is_batchable_la(DType::MQ4G256, arch), "MQ4G256 batchable on {arch}");
-        assert!(is_batchable_la(DType::HFQ4G256, arch), "HFQ4G256 batchable on {arch}");
-        assert!(is_batchable_la(DType::MQ6G256, arch), "MQ6G256 batchable on {arch}");
-        assert!(is_batchable_la(DType::HFQ6G256, arch), "HFQ6G256 batchable on {arch}");
-        assert!(is_batchable_la(DType::Q8_0, arch), "Q8_0 batchable on {arch}");
+        assert!(
+            is_batchable_la(DType::MQ4G256, arch),
+            "MQ4G256 batchable on {arch}"
+        );
+        assert!(
+            is_batchable_la(DType::HFQ4G256, arch),
+            "HFQ4G256 batchable on {arch}"
+        );
+        assert!(
+            is_batchable_la(DType::MQ6G256, arch),
+            "MQ6G256 batchable on {arch}"
+        );
+        assert!(
+            is_batchable_la(DType::HFQ6G256, arch),
+            "HFQ6G256 batchable on {arch}"
+        );
+        assert!(
+            is_batchable_la(DType::Q8_0, arch),
+            "Q8_0 batchable on {arch}"
+        );
     }
 }
 
@@ -38,26 +50,50 @@ fn qwen35_prefill_always_batchable() {
 fn qwen35_prefill_mq3_on_wmma_or_gfx10_scalar() {
     use hipfire_runtime::llama::is_batchable_la;
 
-    for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
-        assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3G256 batch on {arch} (WMMA)");
+    for &arch in &[
+        "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+    ] {
+        assert!(
+            is_batchable_la(DType::MQ3G256, arch),
+            "MQ3G256 batch on {arch} (WMMA)"
+        );
     }
-    for &arch in &["gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032"] {
-        assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3G256 batch on {arch} (scalar)");
+    for &arch in &[
+        "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+    ] {
+        assert!(
+            is_batchable_la(DType::MQ3G256, arch),
+            "MQ3G256 batch on {arch} (scalar)"
+        );
     }
     for &arch in &["gfx906", "gfx908", "gfx940", "gfx942"] {
-        assert!(!is_batchable_la(DType::MQ3G256, arch), "MQ3G256 fallback on {arch}");
+        assert!(
+            !is_batchable_la(DType::MQ3G256, arch),
+            "MQ3G256 fallback on {arch}"
+        );
     }
 }
 
 #[test]
 fn qwen35_prefill_fp4_only_on_wmma() {
     use hipfire_runtime::llama::is_batchable_la;
-    for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
-        assert!(is_batchable_la(DType::HFP4G32, arch), "HFP4G32 batch on {arch}");
-        assert!(is_batchable_la(DType::MFP4G32, arch), "MFP4G32 batch on {arch}");
+    for &arch in &[
+        "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+    ] {
+        assert!(
+            is_batchable_la(DType::HFP4G32, arch),
+            "HFP4G32 batch on {arch}"
+        );
+        assert!(
+            is_batchable_la(DType::MFP4G32, arch),
+            "MFP4G32 batch on {arch}"
+        );
     }
     for &arch in &["gfx906", "gfx1010", "gfx1030"] {
-        assert!(!is_batchable_la(DType::HFP4G32, arch), "HFP4G32 fallback on {arch}");
+        assert!(
+            !is_batchable_la(DType::HFP4G32, arch),
+            "HFP4G32 fallback on {arch}"
+        );
     }
 }
 
@@ -104,7 +140,10 @@ fn mq4_dtypes() -> MoeDtypes {
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
+        routed_has_mixed_experts: false,
         has_paro_shared: false,
+        per_expert_gate_up: None,
+        per_expert_down: None,
     }
 }
 
@@ -136,7 +175,10 @@ fn moe_resolve_non_indexable_routed_falls_back() {
         ..mq4_dtypes()
     };
     let res = MoeResolution::resolve(&d, 8);
-    assert!(!res.use_gpu_topk, "non-indexable routed dtype must fall back even with k=8");
+    assert!(
+        !res.use_gpu_topk,
+        "non-indexable routed dtype must fall back even with k=8"
+    );
     assert!(!res.routed_indexable_mq4);
     assert!(!res.routed_indexable());
 }
@@ -213,17 +255,26 @@ fn moe_decode_batch_size_guard_accepts_1() {
 #[test]
 fn moe_decode_batch_size_guard_rejects_0() {
     let err = hipfire_dispatch::pipeline::check_moe_decode_batch_size(0).unwrap_err();
-    assert!(matches!(err, hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }));
+    assert!(matches!(
+        err,
+        hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }
+    ));
 }
 
 #[test]
 fn moe_decode_batch_size_guard_rejects_2() {
     let err = hipfire_dispatch::pipeline::check_moe_decode_batch_size(2).unwrap_err();
-    assert!(matches!(err, hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }));
+    assert!(matches!(
+        err,
+        hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }
+    ));
 }
 
 #[test]
 fn moe_decode_batch_size_guard_rejects_16() {
     let err = hipfire_dispatch::pipeline::check_moe_decode_batch_size(16).unwrap_err();
-    assert!(matches!(err, hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }));
+    assert!(matches!(
+        err,
+        hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }
+    ));
 }

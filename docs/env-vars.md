@@ -250,11 +250,24 @@ PFlash long-context prefill compression. `prefill_compression=auto` enables. Mos
 - `HIPFIRE_PREFILL_MAX_BATCH` — max prefill batch size when batched mode is on.
 - `HIPFIRE_PREFILL_REUSE_PBS=1` — reuse the pre-batched scratch across prefill calls.
 
+### `SPECULATION-SELECTOR` (5)
+
+Top-of-ladder env overrides for the unified `speculation` config (see
+[CONFIG.md](CONFIG.md#speculative-decode)). The CLI's `--spec` / `-md` /
+`--draft-max` flags lower into these; an exported env var wins over both flag
+and config. The CLI then resolves them per-model into the load message.
+
+- `HIPFIRE_SPECULATION` — mechanism selector: `off`/`auto`/`ngram`/`dflash`/`mtp`. Maps to `cfg.speculation`.
+- `HIPFIRE_NGRAM_DRAFT=1` — force the model-free n-gram drafter (also the load-param `ngram_draft`). Maps to `cfg.ngram_mode`. **Read by the loader directly and always wins** (keeps a directly-driven daemon working).
+- `HIPFIRE_NGRAM_DRAFT_K` — n-gram draft window K. Maps to `cfg.ngram_k`.
+- `HIPFIRE_NGRAM_MIN_COUNT` — n-gram min match count. Maps to `cfg.ngram_min_count`.
+- `HIPFIRE_DRAFT_MAX` — `--draft-max`: window of the active mechanism (routed to `ngram_k` or `mtp_k`).
+
 ### `DFLASH-USER` (3)
 
 User-facing DFlash speculative-decode knobs. All TUI-exposed.
 
-- `HIPFIRE_DFLASH_DRAFT` — path to drafter model. Maps to `cfg.dflash_drafter`-derived auto-discovery.
+- `HIPFIRE_DFLASH_DRAFT` — path to drafter model. Maps to `cfg.dflash_drafter`-derived auto-discovery. Also set by `-md/--model-draft`.
 - `HIPFIRE_DFLASH_NGRAM_BLOCK` — n-gram blocking mode. Maps to `cfg.dflash_ngram_block`.
 - `HIPFIRE_FORCE_A3B_EVICTION=1` — force CASK eviction on A3B regardless of load-time heuristic.
 

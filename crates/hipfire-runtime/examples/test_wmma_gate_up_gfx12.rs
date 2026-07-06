@@ -72,13 +72,7 @@ fn main() {
     }
 }
 
-fn run_one(
-    gpu: &mut Gpu,
-    gate_m: usize,
-    up_m: usize,
-    k: usize,
-    n: usize,
-) -> Result<(), String> {
+fn run_one(gpu: &mut Gpu, gate_m: usize, up_m: usize, k: usize, n: usize) -> Result<(), String> {
     assert_eq!(gate_m % 16, 0);
     assert_eq!(up_m % 16, 0);
     assert_eq!(k % 256, 0);
@@ -105,27 +99,39 @@ fn run_one(
         .upload_f32(&x_f32, &[n, k])
         .map_err(|e| format!("upload x: {e}"))?;
 
-    let y_g_ref = gpu.alloc_tensor(&[n, gate_m], DType::F32).map_err(|e| format!("alloc yg_ref: {e}"))?;
-    let y_u_ref = gpu.alloc_tensor(&[n, up_m], DType::F32).map_err(|e| format!("alloc yu_ref: {e}"))?;
+    let y_g_ref = gpu
+        .alloc_tensor(&[n, gate_m], DType::F32)
+        .map_err(|e| format!("alloc yg_ref: {e}"))?;
+    let y_u_ref = gpu
+        .alloc_tensor(&[n, up_m], DType::F32)
+        .map_err(|e| format!("alloc yu_ref: {e}"))?;
 
-    gpu.gemm_gate_up_hfq4g256_dot2(
-        &a_gate, &a_up, &x, &y_g_ref, &y_u_ref, gate_m, up_m, k, n,
-    )
-    .map_err(|e| format!("dot2: {e}"))?;
+    gpu.gemm_gate_up_hfq4g256_dot2(&a_gate, &a_up, &x, &y_g_ref, &y_u_ref, gate_m, up_m, k, n)
+        .map_err(|e| format!("dot2: {e}"))?;
 
-    let ref_g = gpu.download_f32(&y_g_ref).map_err(|e| format!("download yg_ref: {e}"))?;
-    let ref_u = gpu.download_f32(&y_u_ref).map_err(|e| format!("download yu_ref: {e}"))?;
+    let ref_g = gpu
+        .download_f32(&y_g_ref)
+        .map_err(|e| format!("download yg_ref: {e}"))?;
+    let ref_u = gpu
+        .download_f32(&y_u_ref)
+        .map_err(|e| format!("download yu_ref: {e}"))?;
 
-    let y_g = gpu.alloc_tensor(&[n, gate_m], DType::F32).map_err(|e| format!("alloc yg: {e}"))?;
-    let y_u = gpu.alloc_tensor(&[n, up_m], DType::F32).map_err(|e| format!("alloc yu: {e}"))?;
+    let y_g = gpu
+        .alloc_tensor(&[n, gate_m], DType::F32)
+        .map_err(|e| format!("alloc yg: {e}"))?;
+    let y_u = gpu
+        .alloc_tensor(&[n, up_m], DType::F32)
+        .map_err(|e| format!("alloc yu: {e}"))?;
 
-    gpu.gemm_gate_up_hfq4g256_wmma_gfx12(
-        &a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n,
-    )
-    .map_err(|e| format!("wmma_gfx12: {e}"))?;
+    gpu.gemm_gate_up_hfq4g256_wmma_gfx12(&a_gate, &a_up, &x, &y_g, &y_u, gate_m, up_m, k, n)
+        .map_err(|e| format!("wmma_gfx12: {e}"))?;
 
-    let cand_g = gpu.download_f32(&y_g).map_err(|e| format!("download yg: {e}"))?;
-    let cand_u = gpu.download_f32(&y_u).map_err(|e| format!("download yu: {e}"))?;
+    let cand_g = gpu
+        .download_f32(&y_g)
+        .map_err(|e| format!("download yg: {e}"))?;
+    let cand_u = gpu
+        .download_f32(&y_u)
+        .map_err(|e| format!("download yu: {e}"))?;
 
     gpu.free_tensor(a_gate).ok();
     gpu.free_tensor(a_up).ok();
@@ -172,8 +178,12 @@ fn compare_proj(
             let b = refr[idx];
             let abs = (a - b).abs();
             let rel = abs / b.abs().max(1e-3);
-            if abs > max_abs { max_abs = abs; }
-            if rel > max_rel { max_rel = rel; }
+            if abs > max_abs {
+                max_abs = abs;
+            }
+            if rel > max_rel {
+                max_rel = rel;
+            }
             if abs > abs_tol && rel > rel_tol {
                 n_bad += 1;
                 hist_row_mod16[row % 16] += 1;

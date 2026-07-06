@@ -26,12 +26,28 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
         output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
         let actual_len = end - start;
         for i in (0..256).step_by(4) {
-            let q0 = if i < actual_len { ((group[i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q1 = if i + 1 < actual_len { ((group[i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q2 = if i + 2 < actual_len { ((group[i+2] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q3 = if i + 3 < actual_len { ((group[i+3] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q0 = if i < actual_len {
+                ((group[i] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q1 = if i + 1 < actual_len {
+                ((group[i + 1] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q2 = if i + 2 < actual_len {
+                ((group[i + 2] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q3 = if i + 3 < actual_len {
+                ((group[i + 3] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0.min(63) | (q1.min(63) << 6);
+            output[out_off + byte_off] = q0.min(63) | (q1.min(63) << 6);
             output[out_off + byte_off + 1] = (q1.min(63) >> 2) | (q2.min(63) << 4);
             output[out_off + byte_off + 2] = (q2.min(63) >> 4) | (q3.min(63) << 2);
         }
@@ -49,9 +65,15 @@ fn f32_to_f16_bytes(f32_data: &[f32]) -> Vec<u8> {
 }
 
 fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, batch: usize, label: &str) {
-    let weights_f32: Vec<f32> = (0..m*k).map(|i| ((i as f32) * 1e-4) % 1.0 - 0.5).collect();
-    let x_f32: Vec<f32> = (0..batch*k).map(|i| ((i as f32) * 1e-4) % 1.0 - 0.5).collect();
-    let y_init: Vec<f32> = (0..batch*m).map(|i| ((i as f32) * 7e-5) % 0.5 - 0.25).collect();
+    let weights_f32: Vec<f32> = (0..m * k)
+        .map(|i| ((i as f32) * 1e-4) % 1.0 - 0.5)
+        .collect();
+    let x_f32: Vec<f32> = (0..batch * k)
+        .map(|i| ((i as f32) * 1e-4) % 1.0 - 0.5)
+        .collect();
+    let y_init: Vec<f32> = (0..batch * m)
+        .map(|i| ((i as f32) * 7e-5) % 0.5 - 0.25)
+        .collect();
 
     let x_tensor = gpu.upload_f32(&x_f32, &[batch * k]).expect("x");
     let y_mw16 = gpu.alloc_tensor(&[batch * m], DType::F32).expect("y_mw16");
@@ -61,17 +83,20 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, batch: usize, label: &str) {
     let w_f16 = gpu.upload_raw(&f16_bytes, &[m * k]).expect("w_f16");
 
     let hfq6_bytes = quantize_hfq6g256(&weights_f32);
-    let w_hfq6 = gpu.upload_raw(&hfq6_bytes, &[m * k / 256 * 200]).expect("w_hfq6");
+    let w_hfq6 = gpu
+        .upload_raw(&hfq6_bytes, &[m * k / 256 * 200])
+        .expect("w_hfq6");
 
-    let y_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(y_init.as_ptr() as *const u8, y_init.len() * 4)
-    };
+    let y_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(y_init.as_ptr() as *const u8, y_init.len() * 4) };
 
     for _ in 0..5 {
         gpu.hip.memcpy_htod(&y_mw16.buf, y_bytes).unwrap();
-        gpu.gemm_f16_batched_lmhead(&w_f16, &x_tensor, &y_mw16, m, k, batch).unwrap();
+        gpu.gemm_f16_batched_lmhead(&w_f16, &x_tensor, &y_mw16, m, k, batch)
+            .unwrap();
         gpu.hip.memcpy_htod(&y_hfq6.buf, y_bytes).unwrap();
-        gpu.gemm_hfq6g256_residual_wmma(&w_hfq6, &x_tensor, &y_hfq6, m, k, batch).unwrap();
+        gpu.gemm_hfq6g256_residual_wmma(&w_hfq6, &x_tensor, &y_hfq6, m, k, batch)
+            .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
 
@@ -80,7 +105,8 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, batch: usize, label: &str) {
     gpu.hip.device_synchronize().unwrap();
     let t = Instant::now();
     for _ in 0..n_iters {
-        gpu.gemm_f16_batched_lmhead(&w_f16, &x_tensor, &y_mw16, m, k, batch).unwrap();
+        gpu.gemm_f16_batched_lmhead(&w_f16, &x_tensor, &y_mw16, m, k, batch)
+            .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let mw16_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
@@ -89,7 +115,8 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, batch: usize, label: &str) {
     gpu.hip.device_synchronize().unwrap();
     let t = Instant::now();
     for _ in 0..n_iters {
-        gpu.gemm_hfq6g256_residual_wmma(&w_hfq6, &x_tensor, &y_hfq6, m, k, batch).unwrap();
+        gpu.gemm_hfq6g256_residual_wmma(&w_hfq6, &x_tensor, &y_hfq6, m, k, batch)
+            .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let hfq6_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
@@ -102,7 +129,15 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, batch: usize, label: &str) {
     eprintln!("{label} M={m} K={k} N={batch}:");
     eprintln!("  f16_mw16:   {mw16_us:7.1} µs  {mw16_bw:6.1} GiB/s  (weight {mw16_mib:.1} MiB)");
     eprintln!("  hfq6g256:   {hfq6_us:7.1} µs  {hfq6_bw:6.1} GiB/s  (weight {hfq6_mib:.1} MiB)");
-    eprintln!("  ratio:      {:.3}×  ({})", mw16_us / hfq6_us, if hfq6_us < mw16_us { "HFQ6 faster" } else { "F16 faster" });
+    eprintln!(
+        "  ratio:      {:.3}×  ({})",
+        mw16_us / hfq6_us,
+        if hfq6_us < mw16_us {
+            "HFQ6 faster"
+        } else {
+            "F16 faster"
+        }
+    );
 }
 
 fn main() {

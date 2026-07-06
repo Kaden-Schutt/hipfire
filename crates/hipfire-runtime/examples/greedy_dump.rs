@@ -3,25 +3,30 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Pure greedy token dump for byte-exact regression comparison.
+//! Supports both HFQ (.hfq/.mq4) and safetensors-directory (PaRo) models.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
+    use hipfire_runtime::safetensors_source::SafetensorsSource;
     use std::io::Write;
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: greedy_dump <model.hfq> <out_tokens.txt> [prompt...]");
+    if args.len() < 2 {
+        eprintln!("Usage: greedy_dump <model.(hfq|mq4|dir)> [out_tokens.txt] [prompt...]");
+        eprintln!("  If out_tokens.txt is omitted, tokens go to stdout.");
         std::process::exit(1);
     }
     let model_path = &args[1];
-    let out_path = &args[2];
+    let out_path = args.get(2).cloned();
     let prompt_text = if args.len() > 3 {
         args[3..].join(" ")
     } else {
@@ -31,10 +36,54 @@ fn main() {
     let mode = std::env::var("PROMPT_MODE").unwrap_or_else(|_| "thinking".to_string());
     eprintln!("greedy_dump: {model_path} mode={mode}");
 
-    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
+    // ---- GPU init ----
+    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
 
+    // ---- Load model (HFQ or safetensors) ----
+    let model = Path::new(model_path);
+    let (config, weights, hfq_opt) = if model.is_dir() {
+        let source = SafetensorsSource::open(model).expect("safetensors open");
+        let config = qwen35::config_from_safetensors(&source).expect("read config");
+        let weights = {
+            let mut paro_source =
+                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
+            let paro_layout = qwen35::Layout::single(config.n_layers);
+            qwen35::load_weights(
+                &mut paro_source,
+                std::slice::from_mut(&mut gpu),
+                &paro_layout,
+            )
+            .expect("load paro")
+        };
+        (config, weights, None::<HfqFile>)
+    } else {
+        let mut hfq = HfqFile::open(model).expect("open model");
+        let config = qwen35::config_from_hfq(&hfq).expect("read config");
+        let weights = {
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+            let layout = qwen35::Layout::single(config.n_layers);
+            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+                .expect("load weights")
+        };
+        (config, weights, Some(hfq))
+    };
+
+    // ---- Tokenizer ----
+    let metadata_json = hfq_opt
+        .as_ref()
+        .map(|h| h.metadata_json.as_str())
+        .unwrap_or("");
+    let tokenizer = if !metadata_json.is_empty() {
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(metadata_json).expect("tok")
+    } else {
+        // Safetensors path: read tokenizer.json from the directory
+        let tok_path = model.join("tokenizer.json");
+        let tok_str = std::fs::read_to_string(&tok_path)
+            .unwrap_or_else(|_| panic!("missing tokenizer.json at {}", tok_path.display()));
+        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&tok_str).expect("tok")
+    };
+
+    // ---- Build prompt tokens ----
     let mut prompt_tokens: Vec<u32> = match mode.as_str() {
         "raw" => tokenizer.encode(&prompt_text),
         _ => {
@@ -63,18 +112,16 @@ fn main() {
     };
     eprintln!("prompt: {} tokens", prompt_tokens.len());
 
-    let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
-
+    // ---- KV / DeltaNet / scratch ----
     let kv_seq = 2048usize;
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
-    eprintln!("greedy_dump: kv_mode={kv_mode}");
-    let mut kv_cache = match kv_mode.as_str() {
-        "asym3" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        "asym2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-    };
+    let mut kv_cache = KvCache::new_gpu_q8(
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq,
+    )
+    .unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
@@ -82,35 +129,61 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(|| kv_seq.saturating_sub(prompt_tokens.len() + 8));
-    let mut out = std::fs::File::create(out_path).expect("create out");
+    let mut out: Box<dyn Write> = if let Some(ref path) = out_path {
+        Box::new(std::fs::File::create(path).expect("create out"))
+    } else {
+        Box::new(std::io::stdout())
+    };
 
-    // Route prefill through forward_prefill_batch so the quality gate
-    // exercises the batched prefill path directly — any future batching
-    // regression in that function will be caught here.
+    // ---- Prefill ----
     qwen35::forward_prefill_batch(
-        &mut gpu, &weights, &config, &prompt_tokens, 0,
-        &mut kv_cache, &mut dn_state, &scratch,
-        None, None, None, None,
-    ).expect("prefill forward failed");
+        &mut gpu,
+        &weights,
+        &config,
+        &prompt_tokens,
+        0,
+        &mut kv_cache,
+        &mut dn_state,
+        &scratch,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("prefill forward failed");
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
     writeln!(out, "{next_token}").ok();
     prompt_tokens.push(next_token);
 
+    // ---- Decode loop ----
     for step in 0..max_gen {
         let pos = prompt_tokens.len() - 1;
-        if pos >= kv_seq { break; }
+        if pos >= kv_seq {
+            break;
+        }
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, next_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("forward failed");
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
         writeln!(out, "{next_token}").ok();
         prompt_tokens.push(next_token);
-        if next_token == config.eos_token { break; }
-        if step % 500 == 0 { eprintln!("  step {step:4}"); }
+        if next_token == config.eos_token {
+            break;
+        }
+        if step % 500 == 0 {
+            eprintln!("  step {step:4}");
+        }
     }
     eprintln!("done");
 }

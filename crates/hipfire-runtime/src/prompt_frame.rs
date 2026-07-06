@@ -68,6 +68,41 @@ pub enum AssistantPrefix {
     ClosedThink,
 }
 
+/// Reasoning-effort level requested for a turn (OpenAI-compatible
+/// `reasoning_effort` / project-custom `thinking_mode`).
+///
+/// This is a model-independent *request* parameter (like temperature or
+/// top-p), carried through the serving path and the neutral `SpecEmitCtx` so
+/// per-arch emitters can interpret it. The arch-specific *frame* mapping — e.g.
+/// DeepSeek V4's `<｜Assistant｜></think>` vs `<think>` open-token, or its `Max`
+/// extended-reasoning preamble — lives in the arch crate that consumes this.
+#[derive(Copy, Clone, Debug)]
+pub enum ThinkMode {
+    /// Non-thinking: model skips reasoning and replies directly.
+    NonThink,
+    /// Thinking: model produces a `<think>` block before responding.
+    High,
+    /// Thinking-max: same as `High` plus an extended-reasoning preamble (the
+    /// consuming arch decides what that means). Some models recommend a large
+    /// context window for this mode.
+    Max,
+}
+
+impl ThinkMode {
+    /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
+    /// project-custom `thinking_mode`) to a mode.
+    /// Accepted: "none|off|chat|minimal" → NonThink;
+    ///           "low|medium|high|thinking" → High;
+    ///           "max" → Max. Anything else → NonThink (safe default).
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "max" => Self::Max,
+            "high" | "thinking" | "low" | "medium" => Self::High,
+            _ => Self::NonThink,
+        }
+    }
+}
+
 /// Role of a multi-turn history entry. `User` / `Assistant` are
 /// canonical for `ChatFrame::Plain` (the hand-rolled ChatML path).
 /// `System` / `Tool` are accepted by `JinjaChatFrame::render_messages`
@@ -518,6 +553,15 @@ pub struct Message {
     /// `is defined` against it don't see a misleading null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Assistant-turn reasoning that preceded a tool call ("interleaved
+    /// thinking"). Rendered into the Cohere/North chat template's
+    /// `<|START_THINKING|>{{message.tool_plan}}<|END_THINKING|>` slot so a
+    /// multi-turn agentic flow preserves prior reasoning (per the
+    /// North-Mini-Code model card — "pass model-generated thinking to future
+    /// agentic steps/turns"). Empty for plain turns / non-thinking models;
+    /// always serialized (templates that don't reference it ignore the field).
+    #[serde(default)]
+    pub tool_plan: String,
 }
 
 /// One assistant-emitted tool call, attached to an assistant `Message`.
@@ -577,7 +621,10 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfJsonFormatter);
     value.serialize(&mut ser).map_err(|e| {
-        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}"))
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson: {e}"),
+        )
     })?;
     String::from_utf8(buf).map_err(|e| {
         minijinja::Error::new(
@@ -585,6 +632,52 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
             format!("tojson utf8: {e}"),
         )
     })
+}
+
+/// Render-time `YYYY-MM-DD` date string for chat templates that surface a
+/// "Current date:" line (MiniMax-M2's `system_message.current_date`, and any
+/// future template using the same convention).
+///
+/// Some templates (MiniMax-M2) read `current_date` as an attribute of the
+/// **system message dict**, gated behind `{% if system_message and
+/// system_message.current_date %}`. Under minijinja strict-undefined a system
+/// message that lacks the key raises a render error instead of skipping the
+/// branch — so [`render_messages`](JinjaChatFrame::render_messages) injects this
+/// value onto the leading system message (see that method).
+///
+/// Determinism note: this is the **prompt-build** path, not the
+/// forward/sampler determinism path, so a wall-clock date here does not affect
+/// token-level reproducibility. To keep renders byte-stable across a test (or
+/// to honour a daemon request-time clock) callers can pin the value via the
+/// `HIPFIRE_CHAT_CURRENT_DATE` env var; otherwise we derive it from
+/// `SystemTime::now()` (NOT a determinism-forbidden argless engine `Date::now`).
+pub fn render_time_date() -> String {
+    if let Ok(pinned) = std::env::var("HIPFIRE_CHAT_CURRENT_DATE") {
+        if !pinned.trim().is_empty() {
+            return pinned;
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Convert days-since-Unix-epoch to a proleptic-Gregorian `(year, month, day)`.
+/// Howard Hinnant's `civil_from_days` algorithm — no `chrono` dependency.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 impl<'a> JinjaChatFrame<'a> {
@@ -610,6 +703,7 @@ impl<'a> JinjaChatFrame<'a> {
                 content: sys.to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             });
         }
         messages.push(Message {
@@ -617,6 +711,7 @@ impl<'a> JinjaChatFrame<'a> {
             content: self.user.to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         });
         self.render_messages(&messages, None, None)
     }
@@ -645,11 +740,19 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja_contrib::pycompat::unknown_method_callback;
 
         let mut env = Environment::new();
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        // Lenient undefined: undefined renders as "", is falsy in boolean
+        // context, and compares false — matching HuggingFace's jinja2 DEFAULT
+        // environment, which is what upstream chat templates are authored
+        // against. REQUIRED by Cohere2's tool_use template, which legitimately
+        // references optional fields the engine doesn't always populate
+        // (`message.tool_plan`, per-tool_call `id`, `{% if developer_preamble %}`,
+        // `{% if enable_citations %}`). Strict/SemiStrict raised on those and
+        // forced a fallback to the hand-rolled ChatML frame mid-conversation —
+        // the agentic multi-turn derail (the model then saw <|im_start|> markers
+        // and hallucinated). Complete templates (qwen, etc.) never hit undefined,
+        // so they render byte-identically; this only changes the
+        // previously-erroring paths, degrading them to HF-equivalent "".
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
         // Match HuggingFace's apply_chat_template Jinja environment, which is
         // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
         // block tags (`{% … %}`) leak their surrounding source whitespace into
@@ -683,7 +786,8 @@ impl<'a> JinjaChatFrame<'a> {
 
         env.add_template("chat", self.template)
             .map_err(|e| format!("template parse: {e}"))?;
-        let tmpl = env.get_template("chat")
+        let tmpl = env
+            .get_template("chat")
             .map_err(|e| format!("template lookup: {e}"))?;
 
         // Pass bos_token to the template context. Caller may override via
@@ -712,8 +816,45 @@ impl<'a> JinjaChatFrame<'a> {
             Some(k) => Value::from_serialize(k),
             None => Value::from_serialize(&empty_map),
         };
+        // Inject `current_date` onto the leading system message so templates
+        // that read `system_message.current_date` (MiniMax-M2, chat.jinja:37)
+        // don't raise under strict-undefined. The no-system-message path needs
+        // nothing — those templates gate the access behind `if system_message
+        // and …`, which short-circuits when `system_message` is `none` (the
+        // built-in model identity is injected instead). Adding the key here
+        // makes both paths render identically modulo the date line that the
+        // upstream template intends a system turn to carry. Only the FIRST
+        // message is patched, and only when it is a system turn — every other
+        // template / model serializes through unchanged.
+        let messages_val = {
+            let mut arr: Vec<serde_json::Value> = messages
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+                .collect();
+            if let Some(serde_json::Value::Object(map)) = arr.first_mut() {
+                let is_system = matches!(
+                    map.get("role"),
+                    Some(serde_json::Value::String(r)) if r == "system"
+                );
+                if is_system {
+                    // Populated date → the template's "Current date:" line
+                    // renders (its intended behaviour for a system turn).
+                    map.entry("current_date".to_string())
+                        .or_insert_with(|| serde_json::Value::String(render_time_date()));
+                    // Sibling optional attributes the same templates probe
+                    // (also gated `{% if system_message and system_message.X %}`)
+                    // would equally raise under strict-undefined on a system
+                    // dict that lacks them. Seed an empty string: falsy, so the
+                    // gate short-circuits and the line stays absent — matching
+                    // upstream "unset" semantics — without a render error.
+                    map.entry("current_location".to_string())
+                        .or_insert_with(|| serde_json::Value::String(String::new()));
+                }
+            }
+            Value::from_serialize(&arr)
+        };
         let ctx = minijinja::context! {
-            messages => Value::from_serialize(messages),
+            messages => messages_val,
             add_generation_prompt => true,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
@@ -721,7 +862,8 @@ impl<'a> JinjaChatFrame<'a> {
             documents => Value::from_serialize(&empty_list),
             tool_call_kwargs => kwargs_val,
         };
-        tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+        tmpl.render(ctx)
+            .map_err(|e| format!("template render: {e}"))
     }
 }
 
@@ -739,27 +881,43 @@ fn pick_splice_sentinel(tok: &Tokenizer) -> Option<String> {
     // Tokens the chat templates emit structurally — never use these as a
     // sentinel (their post-render count wouldn't equal the spliced-turn count).
     const STRUCTURAL: &[&str] = &[
-        "<|im_start|>", "<|im_end|>", "<think>", "</think>",
-        "<|endoftext|>", "<|begin_of_text|>", "<|end_of_text|>",
-        "<s>", "</s>", "<bos>", "<eos>", "<unk>", "<pad>", "<|file_separator|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "<|endoftext|>",
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<s>",
+        "</s>",
+        "<bos>",
+        "<eos>",
+        "<unk>",
+        "<pad>",
+        "<|file_separator|>",
     ];
     let atomic = |s: &str| -> bool {
-        tok.special_token_id(s).map_or(false, |id| tok.encode(s) == vec![id])
+        tok.special_token_id(s)
+            .map_or(false, |id| tok.encode(s) == vec![id])
     };
     // First pass: obviously-reserved scratch tokens.
     for (s, _id) in tok.special_tokens() {
-        if STRUCTURAL.contains(&s.as_str()) { continue; }
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
         let ls = s.to_ascii_lowercase();
-        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad"))
-            && atomic(s)
-        {
+        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad")) && atomic(s) {
             return Some(s.clone());
         }
     }
     // Second pass: any non-structural special token that round-trips atomically.
     for (s, _id) in tok.special_tokens() {
-        if STRUCTURAL.contains(&s.as_str()) { continue; }
-        if atomic(s) { return Some(s.clone()); }
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
+        if atomic(s) {
+            return Some(s.clone());
+        }
     }
     None
 }
@@ -819,6 +977,7 @@ pub fn build_cached_history_jinja(
                     content: sentinel.clone(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    tool_plan: String::new(),
                 });
                 continue;
             }
@@ -836,7 +995,8 @@ pub fn build_cached_history_jinja(
     if toks.iter().filter(|&&t| t == sentinel_id).count() != cached.len() {
         return plain(frame);
     }
-    let mut out: Vec<u32> = Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
+    let mut out: Vec<u32> =
+        Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
     let mut k = 0usize;
     for &t in &toks {
         if t == sentinel_id {
@@ -890,8 +1050,8 @@ mod tests {
         entries.push(r#""\n": 7"#.to_string());
         entries.push(r#""Ġ": 8"#.to_string()); // gpt-2 mode trigger
         entries.push(r#""<|reserved_0|>": 9"#.to_string()); // splice sentinel (atomic special)
-        // All 256 GPT-2-byte characters get unique ids 100..356 so
-        // any short string round-trips byte-by-byte.
+                                                            // All 256 GPT-2-byte characters get unique ids 100..356 so
+                                                            // any short string round-trips byte-by-byte.
         for b in 0u32..=255u32 {
             // Use rust escape; the encoder will look up the GPT-2 char
             // form of each byte directly.
@@ -969,7 +1129,10 @@ mod tests {
                 n += 1;
             }
         }
-        let idx = bs.iter().position(|&x| x == b as u32).expect("byte in table");
+        let idx = bs
+            .iter()
+            .position(|&x| x == b as u32)
+            .expect("byte in table");
         char::from_u32(cs[idx]).expect("valid char")
     }
 
@@ -1040,13 +1203,20 @@ mod tests {
         .build();
         // The test tokenizer always registers `<think>` as a special
         // token, so OpenThink must append exactly `<think>\n`.
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
         let mut expected = plain.clone();
         expected.push(think_id);
         expected.extend_from_slice(&t.encode("\n"));
-        assert_eq!(opened, expected, "OpenThink should append <think>\\n after the assistant prefix");
-        assert!(opened.len() > plain.len(), "OpenThink output must be strictly longer than Plain");
+        assert_eq!(
+            opened, expected,
+            "OpenThink should append <think>\\n after the assistant prefix"
+        );
+        assert!(
+            opened.len() > plain.len(),
+            "OpenThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -1068,9 +1238,11 @@ mod tests {
             raw: false,
         }
         .build();
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
-        let close_id = t.special_token_id("</think>")
+        let close_id = t
+            .special_token_id("</think>")
             .expect("test tokenizer registers </think> as special");
         let nl = t.encode("\n");
         let mut expected = plain.clone();
@@ -1081,8 +1253,14 @@ mod tests {
         expected.push(close_id);
         expected.extend_from_slice(&nl);
         expected.extend_from_slice(&nl);
-        assert_eq!(closed, expected, "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix");
-        assert!(closed.len() > plain.len(), "ClosedThink output must be strictly longer than Plain");
+        assert_eq!(
+            closed, expected,
+            "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix"
+        );
+        assert!(
+            closed.len() > plain.len(),
+            "ClosedThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -1105,7 +1283,10 @@ mod tests {
             raw: false,
         }
         .build();
-        assert_eq!(closed, plain, "ClosedThink without special tokens must fall back to Plain");
+        assert_eq!(
+            closed, plain,
+            "ClosedThink without special tokens must fall back to Plain"
+        );
     }
 
     #[test]
@@ -1126,8 +1307,7 @@ mod tests {
     #[test]
     fn build_multi_turn_two_turn_history() {
         let t = make_tokenizer();
-        let history: [(Role, &str); 2] =
-            [(Role::User, "hello"), (Role::Assistant, "hi")];
+        let history: [(Role, &str); 2] = [(Role::User, "hello"), (Role::Assistant, "hi")];
         let frame = ChatFrame {
             tokenizer: &t,
             system: None,
@@ -1184,7 +1364,10 @@ mod tests {
         };
         let via_string = frame.build();
         let via_tokens = frame.build_with_user_tokens(&t.encode(user_text));
-        assert_eq!(via_string, via_tokens, "build_with_user_tokens must match build() when tokens align");
+        assert_eq!(
+            via_string, via_tokens,
+            "build_with_user_tokens must match build() when tokens align"
+        );
     }
 
     #[test]
@@ -1244,14 +1427,28 @@ mod tests {
         // the assistant turn and (thinking-on) primes `<think>\n`.
         let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
         let frame = JinjaChatFrame {
-            tokenizer: &t, template, system: None, user: "",
-            enable_thinking: true, bos_token: Some(""),
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
         };
 
         // Turn 1: daemon prefills R1 (prompt, ends with the primed `<think>\n`)
         // then generates `reason</think>ok`.
-        let u1 = Message { role: Role::User, content: "hi".to_string(), tool_calls: vec![], tool_call_id: None };
-        let r1 = t.encode(&frame.render_messages(std::slice::from_ref(&u1), None, None).unwrap());
+        let u1 = Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let r1 = t.encode(
+            &frame
+                .render_messages(std::slice::from_ref(&u1), None, None)
+                .unwrap(),
+        );
         let t1_gen = t.encode("reason</think>ok");
         let mut conv_after_t1 = r1.clone();
         conv_after_t1.extend_from_slice(&t1_gen);
@@ -1264,27 +1461,52 @@ mod tests {
             v.extend_from_slice(&t1_gen);
             v
         };
-        let a1 = Message { role: Role::Assistant, content: "ok".to_string(), tool_calls: vec![], tool_call_id: None };
-        let u2 = Message { role: Role::User, content: "again".to_string(), tool_calls: vec![], tool_call_id: None };
+        let a1 = Message {
+            role: Role::Assistant,
+            content: "ok".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let u2 = Message {
+            role: Role::User,
+            content: "again".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
         let messages_t2 = vec![u1.clone(), a1, u2];
 
-        let rendered_t2 = build_cached_history_jinja(
-            &frame, &messages_t2, None,
-            |m| if matches!(m.role, Role::Assistant) { Some(asst_slot.clone()) } else { None },
-        ).expect("jinja splice render");
+        let rendered_t2 = build_cached_history_jinja(&frame, &messages_t2, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(asst_slot.clone())
+            } else {
+                None
+            }
+        })
+        .expect("jinja splice render");
 
         // No sentinel leaked.
         let sentinel_id = t.special_token_id("<|reserved_0|>").unwrap();
-        assert!(!rendered_t2.contains(&sentinel_id), "sentinel must be fully replaced: {rendered_t2:?}");
+        assert!(
+            !rendered_t2.contains(&sentinel_id),
+            "sentinel must be fully replaced: {rendered_t2:?}"
+        );
         // Verbatim splice happened.
         assert!(
-            rendered_t2.windows(asst_slot.len()).any(|w| w == asst_slot.as_slice()),
+            rendered_t2
+                .windows(asst_slot.len())
+                .any(|w| w == asst_slot.as_slice()),
             "cached assistant slot must be spliced verbatim",
         );
         // THE KEY PROPERTY: turn 2 strictly extends turn 1's conversation_tokens.
-        assert!(rendered_t2.len() > conv_after_t1.len(), "turn 2 must be longer than turn 1");
+        assert!(
+            rendered_t2.len() > conv_after_t1.len(),
+            "turn 2 must be longer than turn 1"
+        );
         assert_eq!(
-            &rendered_t2[..conv_after_t1.len()], conv_after_t1.as_slice(),
+            &rendered_t2[..conv_after_t1.len()],
+            conv_after_t1.as_slice(),
             "turn 2 render must extend turn 1's conversation_tokens as a strict prefix",
         );
 
@@ -1317,6 +1539,7 @@ mod tests {
             content: "hi".to_string(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_plan: String::new(),
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1379,12 +1602,14 @@ mod tests {
                 content: "be brief".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::User,
                 content: "weather?".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Assistant,
@@ -1394,19 +1619,27 @@ mod tests {
                     arguments: serde_json::json!({"city":"SF"}),
                 }],
                 tool_call_id: None,
+                tool_plan: String::new(),
             },
             Message {
                 role: Role::Tool,
                 content: "72F".to_string(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
+                tool_plan: String::new(),
             },
         ];
         let out = frame
             .render_messages(&messages, None, None)
             .expect("multi-turn render succeeds");
-        assert!(out.contains("system:be brief;"), "system content visible: {out:?}");
-        assert!(out.contains("user:weather?;"), "user content visible: {out:?}");
+        assert!(
+            out.contains("system:be brief;"),
+            "system content visible: {out:?}"
+        );
+        assert!(
+            out.contains("user:weather?;"),
+            "user content visible: {out:?}"
+        );
         assert!(
             out.contains("assistant:call=get_weather(SF);"),
             "assistant tool_call rendered: {out:?}",
@@ -1454,5 +1687,148 @@ mod tests {
             with_sys, expected,
             "system message should be a prefix of the rest of the frame"
         );
+    }
+
+    /// Faithful excerpt of the MiniMax-M2 `tokenizer_config.chat_template`
+    /// system-message logic. It reads `system_message.current_date` (and
+    /// `current_location`) as attributes of the leading system message dict,
+    /// gated behind `{% if system_message and system_message.<attr> %}`.
+    /// Under minijinja strict-undefined a system message that lacks the key
+    /// raises a render error — this is the exact byte sequence (chat.jinja:37)
+    /// the O1 e2e tripped when serving MiniMax with an explicit system message.
+    const MINIMAX_SYSTEM_TEMPLATE: &str = "\
+{%- macro build_system_message(system_message) -%}
+    {%- if system_message and system_message.content -%}
+        {{- system_message.content }}
+    {%- else -%}
+        {%- if model_identity is not defined -%}
+            {%- set model_identity = \"You are MiniMax AI.\" -%}
+        {%- endif -%}
+        {{- model_identity }}
+    {%- endif -%}
+    {%- if system_message and system_message.current_date -%}
+        {{- '\\n' ~ 'Current date: ' + system_message.current_date }}
+    {%- endif -%}
+    {%- if system_message and system_message.current_location -%}
+        {{- '\\n' ~ 'Current location: ' + system_message.current_location }}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set system_message = none -%}
+{%- set conversation_messages = messages -%}
+{%- if messages and messages[0].role == \"system\" -%}
+    {%- set system_message = messages[0] -%}
+    {%- set conversation_messages = messages[1:] -%}
+{%- endif -%}
+SYS:{{ build_system_message(system_message) }}:END
+{%- for m in conversation_messages -%}
+{{ m.role }}={{ m.content }};
+{%- endfor -%}";
+
+    #[test]
+    fn minimax_explicit_system_message_renders_with_current_date() {
+        // Regression: serving MiniMax with an EXPLICIT system message must NOT
+        // crash on `system_message.current_date` under strict-undefined. The
+        // render path injects `current_date` onto the leading system message
+        // so the gated access resolves to a populated string instead of
+        // raising. GPU-free, no model load — uses the embedded template excerpt.
+        std::env::set_var("HIPFIRE_CHAT_CURRENT_DATE", "2026-06-18");
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: MINIMAX_SYSTEM_TEMPLATE,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "Be concise.".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::User,
+                content: "hi".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+
+        // The crux: this previously errored with
+        //   "template render: ... system_message.current_date ... is undefined"
+        let out = frame
+            .render_messages(&messages, None, None)
+            .expect("explicit system message must render without strict-undefined error");
+
+        assert!(
+            out.contains("Be concise."),
+            "explicit system content must be present: {out:?}"
+        );
+        assert!(
+            out.contains("Current date: 2026-06-18"),
+            "current_date must be injected + rendered: {out:?}"
+        );
+        assert!(
+            out.contains("user=hi;"),
+            "conversation messages must still render: {out:?}"
+        );
+        // current_location is NOT supplied → its gated branch must stay silent
+        // (the `if system_message and system_message.current_location` guard
+        // short-circuits on the absent key without raising).
+        assert!(
+            !out.contains("Current location:"),
+            "current_location must not appear when unset: {out:?}"
+        );
+        std::env::remove_var("HIPFIRE_CHAT_CURRENT_DATE");
+    }
+
+    #[test]
+    fn minimax_no_system_message_injects_builtin_identity() {
+        // The no-system-message path must be unchanged: `system_message` stays
+        // `none`, the built-in model identity is injected, and the gated
+        // current_date/current_location accesses short-circuit on the falsy
+        // `none` so no date line appears.
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: MINIMAX_SYSTEM_TEMPLATE,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+
+        let out = frame
+            .render_messages(&messages, None, None)
+            .expect("no-system-message render must succeed");
+        assert!(
+            out.contains("You are MiniMax AI."),
+            "built-in identity must be injected on the no-system path: {out:?}"
+        );
+        assert!(
+            !out.contains("Current date:"),
+            "no date line on the no-system path (gated access short-circuits): {out:?}"
+        );
+        assert!(out.contains("user=hi;"), "user turn renders: {out:?}");
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        // Spot-check the chrono-free date conversion against known epochs.
+        assert_eq!(civil_from_days(0), (1970, 1, 1)); // Unix epoch
+        assert_eq!(civil_from_days(18_993), (2022, 1, 1));
+        // 2026-06-18 = 20622 days after 1970-01-01
+        assert_eq!(civil_from_days(20_622), (2026, 6, 18));
     }
 }

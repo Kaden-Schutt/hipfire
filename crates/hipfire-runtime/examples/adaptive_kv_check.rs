@@ -54,13 +54,14 @@ const N_POS: usize = 48; // positions to write/transcode/compare
 /// Deterministic Gaussian-ish source value for (layer, pos, head, dim).
 /// Box-Muller from a cheap LCG so both caches see byte-identical input.
 fn src_val(layer: usize, pos: usize, head: usize, dim: usize) -> f32 {
-    let seed = ((layer as u64) << 40)
-        ^ ((pos as u64) << 24)
-        ^ ((head as u64) << 12)
-        ^ (dim as u64);
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let seed = ((layer as u64) << 40) ^ ((pos as u64) << 24) ^ ((head as u64) << 12) ^ (dim as u64);
+    let mut s = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let mut next = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 33) as f64) / ((1u64 << 31) as f64)
     };
     let u1 = (next() + 1e-9).min(1.0 - 1e-9);
@@ -189,8 +190,16 @@ fn write_q8(gpu: &mut Gpu, kv: &KvCache) {
 /// Write the deterministic source directly at a lloyd tier via the matching
 /// V-write launcher (uses the cache's 256-wide FWHT signs).
 fn write_lloyd(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
-    let s1 = kv.givens_cos.as_ref().unwrap().sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
-    let s2 = kv.givens_sin.as_ref().unwrap().sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
+    let s1 = kv
+        .givens_cos
+        .as_ref()
+        .unwrap()
+        .sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
+    let s2 = kv
+        .givens_sin
+        .as_ref()
+        .unwrap()
+        .sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
     for layer in 0..N_LAYERS {
         for p in 0..N_POS {
             let src = build_pos_src(layer, p);
@@ -198,13 +207,37 @@ fn write_lloyd(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
             let pb = pos_buf(gpu, p as i32);
             match bits {
                 4 => gpu
-                    .kv_cache_write_v256_4bit_vec(&kv.v_gpu[layer], &st, &pb, &s1, &s2, N_KV_HEADS, HEAD_DIM)
+                    .kv_cache_write_v256_4bit_vec(
+                        &kv.v_gpu[layer],
+                        &st,
+                        &pb,
+                        &s1,
+                        &s2,
+                        N_KV_HEADS,
+                        HEAD_DIM,
+                    )
                     .unwrap(),
                 3 => gpu
-                    .kv_cache_write_fwht3_vec(&kv.v_gpu[layer], &st, &pb, &s1, &s2, N_KV_HEADS, HEAD_DIM)
+                    .kv_cache_write_fwht3_vec(
+                        &kv.v_gpu[layer],
+                        &st,
+                        &pb,
+                        &s1,
+                        &s2,
+                        N_KV_HEADS,
+                        HEAD_DIM,
+                    )
                     .unwrap(),
                 2 => gpu
-                    .kv_cache_write_v256_2bit_vec(&kv.v_gpu[layer], &st, &pb, &s1, &s2, N_KV_HEADS, HEAD_DIM)
+                    .kv_cache_write_v256_2bit_vec(
+                        &kv.v_gpu[layer],
+                        &st,
+                        &pb,
+                        &s1,
+                        &s2,
+                        N_KV_HEADS,
+                        HEAD_DIM,
+                    )
                     .unwrap(),
                 _ => unreachable!(),
             }
@@ -229,8 +262,16 @@ fn make_k_cache(gpu: &mut Gpu) -> KvCache {
 /// record into the cache's V buffer (v_mode_bits=8); we ignore V and only
 /// inspect K. Uses the cache's 128-wide FWHT signs.
 fn write_k_fwht(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
-    let s1 = kv.givens_cos.as_ref().unwrap().sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
-    let s2 = kv.givens_sin.as_ref().unwrap().sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
+    let s1 = kv
+        .givens_cos
+        .as_ref()
+        .unwrap()
+        .sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
+    let s2 = kv
+        .givens_sin
+        .as_ref()
+        .unwrap()
+        .sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
     for layer in 0..N_LAYERS {
         for p in 0..N_POS {
             let src = build_pos_src(layer, p);
@@ -241,14 +282,30 @@ fn write_k_fwht(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
             match bits {
                 4 => gpu
                     .kv_cache_write_fwht4_fused(
-                        &kv.k_gpu[layer], &kv.v_gpu[layer], &kt, &vt, &pb, &s1, &s2,
-                        N_KV_HEADS, HEAD_DIM, 8,
+                        &kv.k_gpu[layer],
+                        &kv.v_gpu[layer],
+                        &kt,
+                        &vt,
+                        &pb,
+                        &s1,
+                        &s2,
+                        N_KV_HEADS,
+                        HEAD_DIM,
+                        8,
                     )
                     .unwrap(),
                 2 => gpu
                     .kv_cache_write_fwht2_fused(
-                        &kv.k_gpu[layer], &kv.v_gpu[layer], &kt, &vt, &pb, &s1, &s2,
-                        N_KV_HEADS, HEAD_DIM, 8,
+                        &kv.k_gpu[layer],
+                        &kv.v_gpu[layer],
+                        &kt,
+                        &vt,
+                        &pb,
+                        &s1,
+                        &s2,
+                        N_KV_HEADS,
+                        HEAD_DIM,
+                        8,
                     )
                     .unwrap(),
                 _ => unreachable!(),
@@ -265,15 +322,31 @@ fn write_k_fwht(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
 /// fwht3 (256-wide) write. Reference for the fwht4→fwht3 transcode. The cache
 /// must already carry 256-wide signs (new_gpu_fwht3_filtered does).
 fn write_k_fwht3(gpu: &mut Gpu, kv: &KvCache, n_layers: usize) {
-    let s1 = kv.givens_cos.as_ref().unwrap().sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
-    let s2 = kv.givens_sin.as_ref().unwrap().sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
+    let s1 = kv
+        .givens_cos
+        .as_ref()
+        .unwrap()
+        .sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
+    let s2 = kv
+        .givens_sin
+        .as_ref()
+        .unwrap()
+        .sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
     for layer in 0..n_layers {
         for p in 0..N_POS {
             let src = build_pos_src(layer, p);
             let kt = upload_src(gpu, &src);
             let pb = pos_buf(gpu, p as i32);
-            gpu.kv_cache_write_fwht3_vec(&kv.k_gpu[layer], &kt, &pb, &s1, &s2, N_KV_HEADS, HEAD_DIM)
-                .unwrap();
+            gpu.kv_cache_write_fwht3_vec(
+                &kv.k_gpu[layer],
+                &kt,
+                &pb,
+                &s1,
+                &s2,
+                N_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
             gpu.hip.device_synchronize().unwrap();
             let _ = gpu.free_tensor(kt);
             gpu.hip.free(pb).unwrap();
@@ -363,7 +436,8 @@ fn dequant_k_fwht3_layer(gpu: &Gpu, buf: &GpuTensor, n_pos: usize) -> Vec<Vec<f3
             // 3-bit into 3 bytes at rec+4+tid*3.
             for tid in 0..32usize {
                 let b = rec + 4 + tid * 3;
-                let packed = (raw[b] as u32) | ((raw[b + 1] as u32) << 8) | ((raw[b + 2] as u32) << 16);
+                let packed =
+                    (raw[b] as u32) | ((raw[b + 1] as u32) << 8) | ((raw[b + 2] as u32) << 16);
                 for i in 0..8usize {
                     let idx = ((packed >> (i * 3)) & 7) as usize;
                     out[p][h * HEAD_DIM + tid * 8 + i] = cnorm * TURBO_C3_256[idx];
@@ -489,9 +563,7 @@ fn compare_all_layers(
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("adaptive_kv_check: synthetic V transcode correctness");
-    println!(
-        "  n_kv_heads={N_KV_HEADS} head_dim={HEAD_DIM} n_layers={N_LAYERS} n_pos={N_POS}"
-    );
+    println!("  n_kv_heads={N_KV_HEADS} head_dim={HEAD_DIM} n_layers={N_LAYERS} n_pos={N_POS}");
 
     let mut all_pass = true;
 
@@ -500,7 +572,9 @@ fn main() {
     // non-uniform — outer gaps are widest), scaled by that head's cnorm. Use the
     // max adjacent gap so the tolerance bounds a legitimate single-index flip.
     let max_gap = |lut: &[f32]| -> f32 {
-        lut.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max)
+        lut.windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max)
     };
     let step4 = max_gap(&TURBO_C4_256);
     let step3 = max_gap(&TURBO_C3_256);
@@ -512,7 +586,9 @@ fn main() {
         let trans = make_cache(&mut gpu);
         write_q8(&mut gpu, &trans);
         let mut trans = trans;
-        trans.transcode_v_step(&mut gpu, VMode::Lloyd4, N_POS).unwrap();
+        trans
+            .transcode_v_step(&mut gpu, VMode::Lloyd4, N_POS)
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
 
         // Reference cache: V resized to lloyd4, written directly at lloyd4.
@@ -544,7 +620,9 @@ fn main() {
         trans.set_v_mode_realloc(&mut gpu, VMode::Lloyd4).unwrap();
         write_lloyd(&mut gpu, &trans, 4);
         gpu.hip.device_synchronize().unwrap();
-        trans.transcode_v_step(&mut gpu, VMode::Lloyd3, N_POS).unwrap();
+        trans
+            .transcode_v_step(&mut gpu, VMode::Lloyd3, N_POS)
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
 
         // Reference: write directly at lloyd3 over the same source.
@@ -570,7 +648,9 @@ fn main() {
         trans.set_v_mode_realloc(&mut gpu, VMode::Lloyd3).unwrap();
         write_lloyd(&mut gpu, &trans, 3);
         gpu.hip.device_synchronize().unwrap();
-        trans.transcode_v_step(&mut gpu, VMode::Lloyd2, N_POS).unwrap();
+        trans
+            .transcode_v_step(&mut gpu, VMode::Lloyd2, N_POS)
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
 
         let mut refc = make_cache(&mut gpu);
@@ -628,7 +708,9 @@ fn main() {
         all_pass &= flipped;
         println!(
             "  [K mode flip]    quant_asym2={} quant_asym4={} quant_fwht={}  {}",
-            trans.quant_asym2, trans.quant_asym4, trans.quant_fwht,
+            trans.quant_asym2,
+            trans.quant_asym4,
+            trans.quant_fwht,
             if flipped { "PASS" } else { "FAIL" }
         );
     }
@@ -657,8 +739,12 @@ fn main() {
             let s2 = gpu.alloc_tensor(&[256], DType::F32).unwrap();
             gpu.hip.memcpy_htod(&s1.buf, &s1b).unwrap();
             gpu.hip.memcpy_htod(&s2.buf, &s2b).unwrap();
-            if let Some(old) = trans.givens_cos.take() { let _ = gpu.free_tensor(old); }
-            if let Some(old) = trans.givens_sin.take() { let _ = gpu.free_tensor(old); }
+            if let Some(old) = trans.givens_cos.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            if let Some(old) = trans.givens_sin.take() {
+                let _ = gpu.free_tensor(old);
+            }
             trans.givens_cos = Some(s1);
             trans.givens_sin = Some(s2);
         }
@@ -668,7 +754,8 @@ fn main() {
         // Reference cache: a fwht3 (256-wide) cache written DIRECTLY at fwht3
         // over the same source.
         let is_kv = vec![true; N_LAYERS];
-        let refc = KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ).unwrap();
+        let refc = KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ)
+            .unwrap();
         write_k_fwht3(&mut gpu, &refc, N_LAYERS);
         gpu.hip.device_synchronize().unwrap();
 
@@ -700,11 +787,15 @@ fn main() {
             if pass { "PASS" } else { "FAIL" }
         );
         // Verify the K-mode booleans flipped to fwht3.
-        let flipped = trans.quant_asym3 && !trans.quant_asym4 && !trans.quant_asym2 && trans.quant_fwht;
+        let flipped =
+            trans.quant_asym3 && !trans.quant_asym4 && !trans.quant_asym2 && trans.quant_fwht;
         all_pass &= flipped;
         println!(
             "  [K3 mode flip]   quant_asym3={} quant_asym4={} quant_asym2={} quant_fwht={}  {}",
-            trans.quant_asym3, trans.quant_asym4, trans.quant_asym2, trans.quant_fwht,
+            trans.quant_asym3,
+            trans.quant_asym4,
+            trans.quant_asym2,
+            trans.quant_fwht,
             if flipped { "PASS" } else { "FAIL" }
         );
     }

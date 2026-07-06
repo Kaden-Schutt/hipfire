@@ -81,3 +81,30 @@ gfx1201. This file lists the deliberate follow-ups.
 - **Perf** is zero-overhead pre-threshold by construction (one integer compare
   per token below the cap); transcode is a one-time O(ctx) pass per step.
   A formal short-ctx A/B is folded into the default-on decision (2).
+
+## EP serving — constructor-mid-failure VRAM leak (scoped follow-up)
+
+The daemon's EP-shard load path (`load_model_ep` / `load_model_ep_minimax` in
+`crates/hipfire-runtime/examples/daemon.rs`) builds each rank's weights+state
+into a staging guard (`Ds4EpStaging` / `MinimaxEpStaging`) whose `Drop` frees
+every COMPLETED rank on any early return. That handles a failure BETWEEN ranks
+and the `HIPFIRE_EP_FAIL_RANK` fault (which fires AFTER a rank's constructor
+returns `Ok`) — the primary completed-rank cleanup path, which is fixed and
+fault-injection-tested.
+
+RESIDUAL (not fixed): a failure INSIDE a single rank's constructor —
+`DeepseekV4::load_weights_sharded` / `DeepseekV4State::new` /
+`MiniMaxWeights::load` / `MiniMaxState::new_with_max_seq` — that occurs after it
+has uploaded some-but-not-all of that rank's tensors and before it returns `Ok`
+leaks those partial allocations. The half-built weights/state value is dropped
+on the `?` early-return, and `GpuTensor` has no `Drop`, so its already-uploaded
+device buffers are never returned to the pool. This is a partial-load-only leak
+(a clean load leaks nothing); a subsequent successful load reuses the pool, so
+the practical exposure is a repeatedly-failing big-model load.
+
+Proper fix: an unwind-safe allocation-tracking refactor of those four loaders —
+build each rank's tensors into a scratch list whose `Drop` frees every tensor on
+any early return, then commit the list into the weights/state struct only on
+full success (or give `GpuTensor` itself a pool-returning `Drop`, the broader
+change). Deferred. Documented inline at the constructor call sites and on the
+`load_model_ep` doc-comment.

@@ -51,6 +51,13 @@ __global__ void attention_flash_asym4_wmma_tile_batched_gfx12(
 
     const int m_start = m_tile * BLOCK_M;
     const bool tree_mode = (tree_bias != nullptr);
+    // hipGraph-safe block_start: under captured tree-verify replay the
+    // `block_start` scalar kernarg is baked at capture time and goes stale as
+    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
+    // cycle and the linearized tree root sits at positions[0] == start_pos ==
+    // block_start, so derive it from the device buffer instead of the scalar.
+    // Eager (non-capture) value is identical, so this is a no-op off-graph.
+    const int eff_block_start = tree_mode ? positions[0] : block_start;
     const int tile_start = tile_id * TILE_SIZE;
 
     const int kv_group = n_heads / n_kv_heads;
@@ -77,7 +84,7 @@ __global__ void attention_flash_asym4_wmma_tile_batched_gfx12(
         int bid = batch_offset + m_start + tid;
         int p = positions[bid];
         lds_q_pos[tid] = p;
-        lds_seq_len[tid] = tree_mode ? (block_start + block_cols) : (p + 1);
+        lds_seq_len[tid] = tree_mode ? (eff_block_start + block_cols) : (p + 1);
     }
     __syncthreads();
 
@@ -168,8 +175,8 @@ __global__ void attention_flash_asym4_wmma_tile_batched_gfx12(
             bool ok_mask = tree_mode ? true : (my_col_pos <= q_pos_j);
             float masked = (ok_kv && ok_mask) ? val : -1e30f;
 
-            if (tree_mode && ok_kv && my_col_pos >= block_start) {
-                int bias_col = my_col_pos - block_start;
+            if (tree_mode && ok_kv && my_col_pos >= eff_block_start) {
+                int bias_col = my_col_pos - eff_block_start;
                 int gbid = batch_offset + m_start + cell_row;
                 masked += tree_bias[gbid * block_cols + bias_col];
             }

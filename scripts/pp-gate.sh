@@ -492,11 +492,10 @@ if [ "$rebuild" -eq 1 ]; then
 fi
 
 # ── GPU lock ─────────────────────────────────────────────────────────────
-# Only acquire if no caller has already taken it. Otherwise we'd
-# deadlock on the parent's lock — gpu_acquire polls indefinitely and
-# doesn't recognize a parent agent's reservation. Detection: lockfile
-# present at script start.
-if [ -r "$LOCK_SCRIPT" ] && [ ! -f /tmp/hipfire-gpu.lock ]; then
+# gpu_acquire is reentrant: if a parent gate already holds the lock it
+# no-ops (HIPFIRE_GPU_LOCK_OWNER), and gpu_release in this child won't
+# release the ancestor's lock. So acquire unconditionally.
+if [ -r "$LOCK_SCRIPT" ]; then
     # shellcheck disable=SC1090
     . "$LOCK_SCRIPT"
     gpu_acquire "pp-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }

@@ -23,8 +23,14 @@
 pub mod arch;
 pub mod forward;
 pub mod minimax;
+/// MiniMax-M2 impl of the arch-generic `hipfire_runtime::spec` seam
+/// (`impl SpecTarget for MiniMaxBundle`) — lets the model-free n-gram
+/// speculator drive MiniMax-M2 (arch_id=10).
+pub mod spec_impl;
 
 pub use arch::MiniMaxM2;
 pub use minimax::{
-    MiniMaxConfig, MiniMaxExpertWeights, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights,
+    config_from_safetensors, load_weights_from_safetensors, MiniMaxConfig, MiniMaxExpertWeights,
+    MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights,
 };
+pub use spec_impl::{MiniMaxBundle, MiniMaxSpecScratch};

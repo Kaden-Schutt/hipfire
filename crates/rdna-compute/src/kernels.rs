@@ -897,6 +897,24 @@ pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC: &str =
 pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64_prefetch.hip");
 
+/// HFQ5-G256: flat 5-bit with 256-weight groups (168 B/group, 5.25 bpw).
+/// Block: [f32 scale][f32 min][160B data] = 168 bytes per 256 weights.
+/// Packing: 8 weights per 5 bytes (40 bits = 8x5 bits), cross-byte.
+pub const GEMV_HFQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq5g256.hip");
+pub const GEMV_HFQ5G256_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual.hip");
+
+/// Wave64-native HFQ5-G256 residual GEMV. Mirror of the HFQ6 sibling with
+/// 5-bit unpack from `gemv_hfq5g256_residual.hip`. Used for HFQ5/MQ5 `wo`
+/// and `w_down` projections on wave64-native arches (gfx906/908/94x).
+pub const GEMV_HFQ5G256_RESIDUAL_WAVE64_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual_wave64.hip");
+
+/// Wave64-native HFQ5-G256 residual GEMV with software-pipelined
+/// across-quad weight prefetch. Mirror of the HFQ6 prefetch sibling.
+pub const GEMV_HFQ5G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual_wave64_prefetch.hip");
+
 /// gfx906 wave64+dp4a fused single-token GEMVs for HFQ6/MQ6 — the
 /// Phase A.1c headline lever. Mirror of HFQ4 fused-dp4a family; uses
 /// sdot4 with HFQ6's 6-bit unsigned weights (no zp shift correction).
@@ -969,6 +987,8 @@ pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g1
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
+/// MQ5-G256 GEMV: FWHT-rotated HFQ5 (5-bit, 168 B/group). Uses pre-rotated x.
+pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
@@ -999,12 +1019,101 @@ pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_
 /// signs1 gather and FWHT.
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
 /// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.
 /// Block: per-row 16 B header (row_scale_a:f16, row_scale_b:f16, block_count, flags),
 /// then (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
 pub const GEMV_HFP4G32_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.hip");
+pub const GEMV_MFP4G32_LLOYD_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_lloyd.hip");
+pub const GEMV_MFP4G32_P_SRC: &str = include_str!("../../../kernels/src/gemv_mfp4g32_p.hip");
+pub const GEMV_MFP4G32_E8_SRC: &str = include_str!("../../../kernels/src/gemv_mfp4g32_e8.hip");
+/// gfx1151-specific mfp4-E8 GEMV with coalesced LDS-staged group loads.
+/// ONLY dispatched on gfx1151 (Strix Halo); all other archs use GEMV_MFP4G32_E8_SRC.
+pub const GEMV_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8.gfx1151.hip");
+/// mfp4-E8 SoA GEMV — generic fallback for non-gfx1151 arches.
+/// Reads the SoA layout (flag=0x06); bit-exact output vs AoS.
+pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.hip");
+/// gfx1151-specific mfp4-E8 SoA GEMV — fully-coalesced 128B codeword reads.
+/// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
+pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1151.hip");
+/// SoA E8 GEMV 4-way / 8-way unroll variants — bench experiments for the gfx1100
+/// cache-roofline MLP sweep (more codewords in flight per wave).
+pub const GEMV_MFP4G32_E8_SOA_U4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_u4.hip");
+pub const GEMV_MFP4G32_E8_SOA_U8_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_u8.hip");
+/// SoA E8 GEMV decode probes: STRIP (lattice decode removed → loads+scale+reduce
+/// ceiling) and LUT (2D constant-LUT coordinate conversion). Cache-regime decode-
+/// wall diagnostics for the gfx1100 roofline chase.
+pub const GEMV_MFP4G32_E8_SOA_STRIP_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_strip.hip");
+pub const GEMV_MFP4G32_E8_SOA_LUT_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_lut.hip");
+/// gfx1151-specific fused gate+up mfp4-E8 decode GEMV (2-way launch-fusion).
+/// ONLY dispatched on gfx1151 (Strix Halo) via the steps.rs guard; embeds the
+/// byte-identical gemv_mfp4g32_e8_gfx1151 per-row body. No bleed to other archs.
+pub const FUSED_GATE_UP_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_mfp4g32_e8.gfx1151.hip");
+/// gfx1151-specific fused QKVZA mfp4-E8 decode GEMV (4-way launch-fusion) for
+/// the Qwen3.5 DeltaNet LA preamble. ONLY dispatched on gfx1151.
+pub const FUSED_QKVZA_MFP4G32_E8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_mfp4g32_e8.gfx1151.hip");
+/// DIAGNOSTIC ONLY (env HIPFIRE_E8_STRIP=1): compute-stripped E8 GEMV that keeps
+/// the exact memory access but guts the decode — measures the compute ceiling.
+/// Output is garbage; for tok/s probing the memory-vs-compute bound only.
+pub const GEMV_MFP4G32_E8_STRIP_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_strip.gfx1151.hip");
+/// EXPERIMENT (env HIPFIRE_E8_LDSX=1): E8 GEMV with LDS-staged x + 4 rows/block
+/// (memory-level-parallelism lever). Bit-exact with gemv_mfp4g32_e8_gfx1151.
+pub const GEMV_MFP4G32_E8_LDSX_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_ldsx.gfx1151.hip");
+/// gfx1151 mfp4-E8 grouped MoE gate_up (k8 indexed) — mq4-parity expert kernel.
+pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx1151.hip");
+/// gfx1151 mfp4-E8 grouped MoE down (k8 indexed, atomic-free expanded).
+pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX1151_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx1151.hip"
+);
+/// gfx11_dgpu (RDNA3 discrete, e.g. gfx1100 RX 7900 XTX) twin of the gfx1151 E8 MoE
+/// gate_up kernel. Uses a 4-way group unroll with 4 independent accumulators +
+/// __launch_bounds__(32,4) to raise VGPR budget to ~94 (10 waves/SIMD) and expose
+/// 4× independent load streams per iteration, hiding GDDR6 latency.
+/// Guard: arch_caps.is_rdna3_dgpu(); kill-switch: HIPFIRE_E8_DGPU_TWIN=0.
+pub const GEMV_MFP4G32_E8_MOE_GATE_UP_K8_INDEXED_BATCHED_GFX11_DGPU_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx11_dgpu.hip"
+);
+/// SoA-coalesced E8 MoE gate_up (k8 indexed). Reads SoA-laid-out expert weights
+/// (scales contiguous, codewords contiguous 16B-aligned) — +38-73% on the GEMV
+/// bench by killing the AoS 17B-block cache-line over-fetch on the gfx1100 dGPU.
+/// Dispatched iff experts were transposed AoS->SoA at load (HIPFIRE_E8_SOA_EXPERTS=1)
+/// on an RDNA3 dGPU. 2-way unroll (max wave32 occupancy).
+pub const GEMV_MFP4G32_E8_SOA_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched.hip");
+/// gfx11_dgpu twin of the gfx1151 E8 MoE down (k8 indexed, atomic-free expanded) kernel.
+/// Same 4-way unroll strategy as the gate_up twin. Guard + kill-switch: see gate_up twin.
+pub const GEMV_MFP4G32_E8_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_GFX11_DGPU_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx11_dgpu.hip"
+);
+/// Batched sigmoid-scaled residual add (generic f32): y[t,:] += sigmoid(scalars[t]) * x[t,:].
+/// Folds the Q8 shared-expert down output into the residual in batched MoE prefill.
+pub const SIGMOID_SCALED_RESIDUAL_ADD_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_scaled_residual_add_batched.hip");
+/// gfx1151 mfp4-E8 grouped-WMMA-GEMM (Path 2 prefill). Amortizes expert-weight
+/// reads via the SGLang scatter pipeline + wave32 F16 WMMA with E8 lattice dequant.
+pub const GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip");
+/// gfx12 (RDNA4) sister of GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX1151_SRC. Same
+/// dispatch contract and kernarg layout; differs in WMMA intrinsic
+/// (`wmma_f32_16x16x16_f16` → `_w32_gfx12` variant) required on gfx1200/gfx1201.
+pub const GEMM_MFP4G32_E8_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx12.hip");
 pub const GEMV_HFP4G32_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
 // gfx11 (RDNA3) v_dot2_f32_f16-accelerated decode-path variant.
@@ -1083,6 +1192,12 @@ pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str =
 /// compatible with HFQ6G256, 200 B / group of 256).
 pub const GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_residual_sigmoid_scaled.hip");
+
+/// HFQ5G256 sibling of the sigmoid-scaled batched residual GEMV. Same
+/// shape; reads the 168 B/group 5-bit layout. Used for the batched MoE-FFN
+/// shared-expert `down` projection where shared.down is MQ5.
+pub const GEMV_HFQ5G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_residual_sigmoid_scaled.hip");
 
 /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in one
 /// launch. Grid.y is the expert rank (0..7); each block selects its
@@ -1258,11 +1373,29 @@ pub const GIVENS_ROTATE_TO_SRC: &str = include_str!("../../../kernels/src/givens
 pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_indexed.hip");
 
+/// Index-aware MoE gate_up GEMV for HFQ5G256-layout routed experts. Mirror
+/// of the HFQ6 sibling; reads the 168 B/group 5-bit layout.
+pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_moe_gate_up_indexed.hip");
+
 /// HFQ6G256 counterpart to the atomic-free expanded batched MoE down kernel.
 /// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`
 /// (combine is dtype-independent — operates on the f32 expanded buffer).
 pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// Merged per-expert MIXED-PRECISION expanded MoE down GEMV. Per-block branch
+/// on `dtype_tags[expert_id]` (0=MQ6 200B/group affine, 1=MQ2-Lloyd 72B/group
+/// codebook). Block-uniform branch (grid block-per-(row,krank,token)) -> no
+/// warp divergence. Single shared accumulator + expanded write; pairs with
+/// `MOE_DOWN_COMBINE_K8_BATCHED_SRC` (dtype-independent f32 combine).
+pub const GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded.hip");
+
+/// HFQ5G256 counterpart to the atomic-free expanded batched MoE down kernel.
+/// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
+pub const GEMV_HFQ5G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_moe_down_k8_indexed_batched_expanded.hip");
 
 /// HFQ6G256 batched gate_up: same kernarg signature + grid (M, K_TOP, N) +
 /// gate/up output split as the HFQ4 batched gate_up kernel, only the per-group
@@ -1270,6 +1403,19 @@ pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// kernel for the batched LFM2.5-MoE decode path (MQ6-promoted expert layers).
 pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_k8_indexed_batched.hip");
+
+/// Merged per-expert MIXED-PRECISION MoE gate_up GEMV. Per-block branch on
+/// `dtype_tags[expert_id]` (0=MQ6 200B/group affine, 1=MQ2-Lloyd 72B/group
+/// codebook). Block-uniform branch -> no divergence. Single shared accumulator
+/// + the gate/up split write (M = 2*MI). x indexed [bid*K] (per-token).
+pub const GEMV_MIXED_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mixed_moe_gate_up_k8_indexed_batched.hip");
+
+/// HFQ5G256 batched gate_up: same kernarg signature + grid (M, K_TOP, N) +
+/// gate/up output split as the HFQ6 batched gate_up kernel; only the
+/// per-group dequant differs (168 B/group, 5-bit).
+pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq5g256_moe_gate_up_k8_indexed_batched.hip");
 
 /// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
 /// slots per (token, m) with topk_weights applied; accumulates into the
@@ -1438,6 +1584,54 @@ pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 /// Gated on `HIPFIRE_MOE_HFQ6_V2=1` (default off).
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip");
+
+/// gfx11 (RDNA3/3.5) sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Same kernarg + grouped contract; differs in WMMA intrinsic
+/// (__builtin_amdgcn_wmma_f32_16x16x16_f16_w32, half16_t), output mapping
+/// (acc[j]=C[2*j+(tid>>4)][tid&15]), and the 6-bit unpack (200 B/group).
+/// Enables uniform MQ6 expert batched prefill on gfx1100+gfx1151.
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_k2.hip");
+
+/// gfx11 (RDNA3/3.5) MQ3-Lloyd grouped-WMMA GEMM for MoE prefill. 112 B/group
+/// = 16 B (8 × fp16 codebook) + 96 B (256 × 3-bit indices). Codebook into
+/// __shared__ _Float16[8], broadcast to all 32 lanes. T3-3L cold-tier block.
+pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip");
+
+/// gfx12 (RDNA4) MQ3-Lloyd sister. Same 112 B/group codebook layout;
+/// differs in WMMA (_gfx12), half8_t operands, k_grp=tid>>4 split, and
+/// acc[j]=C[8*k_grp+j][m_lane] output. Distinct from
+/// GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX12_SRC (that one is affine 104 B/group).
+pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256_lloyd_moe_grouped_wmma.gfx12.hip");
+
+/// gfx11 (RDNA3/3.5) merged dtype-tag MoE grouped-WMMA prefill kernel.
+/// Handles all four per-expert precision tiers in one kernel via a
+/// block-uniform `dtype_tags[expert_id]` branch (zero warp divergence):
+///   tag 0 = MQ6 (200 B/group), tag 1 = MQ2-Lloyd (72 B/group),
+///   tag 2 = MQ4 (136 B/group),  tag 3 = MQ3-Lloyd (112 B/group).
+/// Enables T3-3L graded-precision MoE batched prefill on gfx1100/gfx1151.
+/// Kernarg layout: expert_weight_ptrs, dtype_tags, expert_tile_ids,
+/// sorted_slot_index, X_src, Y_grouped, M, K, x_row_div, m_total.
+pub const GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma_k2.hip");
+
+/// 4-warp LDS-tiled variant of the mixed grouped kernel (gfx11/RDNA3 only).
+/// Stages the 16-slot X tile in LDS and shares it across 4 warps → ~4× less X
+/// re-read (the load-bound prefill lever). Env-gated via HIPFIRE_MOE_GROUPED_4W;
+/// default OFF (single-warp `_k2` remains production). Same kernarg layout.
+pub const GEMM_MIXED_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma_4w_k2.hip");
+
+/// gfx12 (RDNA4) merged dtype-tag MoE grouped-WMMA prefill kernel.
+/// Same four-tag dispatch as `GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC` but
+/// uses the gfx12 _w32_gfx12 WMMA intrinsic, half8_t operands, K4-unroll,
+/// and k_grp=tid>>4 output mapping. Covers all four dtype tiers including
+/// an inline gfx12 MQ2-Lloyd port (no separate source file exists for that
+/// one). Same kernarg layout as the gfx11 sibling.
+pub const GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mixed_moe_grouped_wmma.gfx12.hip");
 
 /// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
@@ -1655,6 +1849,12 @@ pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_LLOYD_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_lloyd_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_P_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_p_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_E8_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_e8_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 // LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for
@@ -2388,6 +2588,16 @@ pub const FUSED_GATE_UP_HFQ4G256_SRC: &str =
 pub const FUSED_GATE_UP_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/fused_gate_up_q8_0.hip");
 
+/// 4-way fused QKVZA for Q8_0 weights (DECODE, n=1). Mirrors
+/// fused_qkvza_hfq4g256 but with Q8_0 dequant. Grid=[total_m], block=[32].
+/// Bit-exact with four sequential gemv_q8_0 calls.
+pub const FUSED_QKVZA_Q8_0_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_q8_0.hip");
+
+/// 3-way fused QKV for Q8_0 weights (DECODE, n=1). Mirrors
+/// fused_qkv_hfq4g256 but with Q8_0 dequant. Grid=[q_m+k_m+v_m], block=[32].
+/// Bit-exact with three sequential gemv_q8_0 calls.
+pub const FUSED_QKV_Q8_0_SRC: &str = include_str!("../../../kernels/src/fused_qkv_q8_0.hip");
+
 /// Wave64-native counterpart to FUSED_GATE_UP_HFQ4G256_SRC for CDNA1/3.
 /// block=[64,1,1] with 2 rows per block (one per warp); grid halves from
 /// gate_m + up_m to (total + 1) / 2. Byte-exact with the wave32 base.
@@ -2448,6 +2658,15 @@ pub const ATTENTION_INT8_KV_SRC: &str = include_str!("../../../kernels/src/atten
 /// For prefill: Q/K/V come from batched projections. KV also written to cache.
 pub const ATTENTION_CAUSAL_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_causal_batched.hip");
+
+/// Batched decode-with-history attention over an F32 KV cache. One block per
+/// (query head, block row); each row at absolute position `base+row` attends to
+/// the full history [0..base+row] read from the persistent cache by absolute
+/// position. Drives block-parallel qwen2 spec-decode verify (arch_id=7).
+/// Grid: [n_heads, batch, 1]. Q/out: [batch × n_heads × head_dim].
+/// k_cache/v_cache: [max_seq × n_kv_heads × head_dim].
+pub const ATTENTION_DECODE_BATCHED_HISTORY_SRC: &str =
+    include_str!("../../../kernels/src/attention_decode_batched_history.hip");
 
 /// Batched Q8_0 KV cache write: quantize multiple positions at once.
 /// src: [batch_size × kv_dim] FP32. positions: [batch_size] int32.
@@ -2973,6 +3192,16 @@ pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
 pub const GATED_DELTA_NET_F32_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f32_batch_seq.hip");
 
+/// Chunked (parallel) FP32 GDN recurrence — chunked sibling of
+/// GATED_DELTA_NET_F32_BATCH_SEQ_SRC. One wave32 workgroup per (head, chunk);
+/// intra-chunk parallelism replaces the per-token serial inner loop.
+/// Numerically EQUAL to the sequential recurrence (oracle gdn_chunked_f32).
+/// Cross-chunk dependency is serialized host-side (one launch per chunk).
+/// Grid: [n_heads, n_chunks]. Block: [32]. Default OFF (HIPFIRE_GDN_CHUNKED).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F32_CHUNKED_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_chunked.hip");
+
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
 /// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
@@ -3031,6 +3260,14 @@ pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str =
 /// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
 pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
 
+/// Multi-workgroup parallel rewrite of `sample_top_p`: vocab top-K scan split
+/// across N blocks (`sample_topk_partial`) + single-block merge/softmax/top-p
+/// (`sample_topk_finalize`) + an in-place penalty prepass
+/// (`sample_apply_repeat_penalty`). Byte-identical token to the single-block
+/// kernel for distinct logits; recovers ~290 us/token on gfx1100 A3B decode.
+pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
+    include_str!("../../../kernels/src/sample_top_p_parallel.hip");
+
 /// Per-row temperature-scaled softmax probability gather. For each row r,
 /// returns the softmax prob of `indices[r]` under temp-scaled row logits.
 /// Used by MTP residual-acceptance sampling: gathers p_draft(c_k) and
@@ -3038,6 +3275,18 @@ pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top
 /// D2H + ~4 ms host softmax per spec-decode cycle.
 pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/softmax_prob_gather_batched.hip");
+
+/// Batched temperature-scaled softmax, out-of-place. One block per row;
+/// writes `probs[r] = softmax(logits[r] / temp)` leaving `logits` untouched.
+/// Distribution-parity (tree reduction) to the host `softmax_temp_into`;
+/// used behind HIPFIRE_DFLASH_FAST_SAMPLE in the DFlash sampled path.
+///
+/// This file holds TWO entry points: `softmax_temp_batched_f32` (above) and
+/// `softmax_temp_topp_batched_f32`, which additionally emits per-row nucleus
+/// (top_p) `tau_cut`/`Z` outputs for AR-equivalent nucleus truncation on the
+/// host (see `Gpu::softmax_temp_topp_batched_into_f32`).
+pub const SOFTMAX_TEMP_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/softmax_temp_batched.hip");
 
 /// GEMV Q4_F16_G64: matrix-vector multiply with on-the-fly Q4_F16 dequantization.
 /// Block layout: f16 scale (2B) + f16 min (2B) + uint8 quants[32] (32B) = 36 bytes per 64 elements.
@@ -3317,6 +3566,10 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC: &str =
 /// F16-weight × F32-input GEMV. Used for full-precision MTP weights where
 /// the WMMA F16×F16 path's F32→F16 input conversion loses precision.
 pub const GEMV_F16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_xf32.hip");
+/// BF16-weight × F32-input GEMV. Native-bf16 reference path (KLD oracle) —
+/// keeps the exact downloaded bf16 values (lossless widen = 16-bit shift),
+/// unlike re-quantizing to f16. arch_id 12 (Cohere2-MoE).
+pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_xf32.hip");
 
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
@@ -3734,19 +3987,15 @@ mod dispatch_tests {
     use std::sync::Arc;
 
     const ALL_ARCHS: &[&str] = &[
-        "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012",
-        "gfx1030", "gfx1031", "gfx1032",
-        "gfx1100", "gfx1101", "gfx1102", "gfx1103",
-        "gfx1150", "gfx1151", "gfx1152",
-        "gfx1200", "gfx1201",
-        "gfx940", "gfx941", "gfx942",
+        "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+        "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+        "gfx1201", "gfx940", "gfx941", "gfx942",
     ];
 
     /// WMMA-capable archs (RDNA3 + RDNA4).
     const WMMA_ARCHS: &[&str] = &[
-        "gfx1100", "gfx1101", "gfx1102", "gfx1103",
-        "gfx1150", "gfx1151", "gfx1152",
-        "gfx1200", "gfx1201",
+        "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+        "gfx1201",
     ];
 
     fn make_caps(arch: &str) -> ArchCaps {
@@ -3765,11 +4014,17 @@ mod dispatch_tests {
                 match arch {
                     "gfx1200" | "gfx1201" => {
                         let (src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
-                        assert!(mod_name.contains("rdna4"), "{arch}: expected rdna4, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna4"),
+                            "{arch}: expected rdna4, got {mod_name}"
+                        );
                     }
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
                         let (src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
-                        assert!(mod_name.contains("rdna3"), "{arch}: expected rdna3, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "{arch}: expected rdna3, got {mod_name}"
+                        );
                     }
                     _ => {
                         let result = std::panic::catch_unwind(|| {
@@ -3791,7 +4046,10 @@ mod dispatch_tests {
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
                         let (_, mod_name) = result.unwrap();
-                        assert!(mod_name.contains("mb4"), "expected mb4 variant, got {mod_name}");
+                        assert!(
+                            mod_name.contains("mb4"),
+                            "expected mb4 variant, got {mod_name}"
+                        );
                     }
                     "gfx1103" | "gfx1150" | "gfx1152" | "gfx1200" | "gfx1201" => {
                         assert!(result.is_err(), "{arch} should panic (no mb4 variant)");
@@ -3805,9 +4063,8 @@ mod dispatch_tests {
         fn gemm_qkvza_wmma_gfx11_gfx12() {
             for &arch in WMMA_ARCHS {
                 let caps = make_caps(arch);
-                let result = std::panic::catch_unwind(|| {
-                    gemm_qkvza_mq4g256_lloyd_wmma_for_arch(&caps)
-                });
+                let result =
+                    std::panic::catch_unwind(|| gemm_qkvza_mq4g256_lloyd_wmma_for_arch(&caps));
                 match arch {
                     "gfx1200" | "gfx1201" => {
                         let (_, mod_name) = result.unwrap();
@@ -3830,9 +4087,8 @@ mod dispatch_tests {
         fn gemm_qkv_wmma_gfx11_gfx12() {
             for &arch in WMMA_ARCHS {
                 let caps = make_caps(arch);
-                let result = std::panic::catch_unwind(|| {
-                    gemm_qkv_mq4g256_lloyd_wmma_for_arch(&caps)
-                });
+                let result =
+                    std::panic::catch_unwind(|| gemm_qkv_mq4g256_lloyd_wmma_for_arch(&caps));
                 match arch {
                     "gfx1200" | "gfx1201" => {
                         let (_, mod_name) = result.unwrap();
@@ -3840,7 +4096,10 @@ mod dispatch_tests {
                     }
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
                         let (_, mod_name) = result.unwrap();
-                        assert!(mod_name.contains("rdna3") || mod_name.contains("k4"), "got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3") || mod_name.contains("k4"),
+                            "got {mod_name}"
+                        );
                     }
                     _ => assert!(result.is_err(), "{arch} should panic"),
                 }
@@ -3851,9 +4110,8 @@ mod dispatch_tests {
         fn gemm_gate_up_wmma_gfx11_gfx12() {
             for &arch in WMMA_ARCHS {
                 let caps = make_caps(arch);
-                let result = std::panic::catch_unwind(|| {
-                    gemm_gate_up_mq4g256_lloyd_wmma_for_arch(&caps)
-                });
+                let result =
+                    std::panic::catch_unwind(|| gemm_gate_up_mq4g256_lloyd_wmma_for_arch(&caps));
                 match arch {
                     "gfx1200" | "gfx1201" => {
                         let (_, mod_name) = result.unwrap();
@@ -3861,7 +4119,10 @@ mod dispatch_tests {
                     }
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
                         let (_, mod_name) = result.unwrap();
-                        assert!(mod_name.contains("rdna3") || mod_name.contains("k4"), "got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3") || mod_name.contains("k4"),
+                            "got {mod_name}"
+                        );
                     }
                     _ => assert!(result.is_err(), "{arch} should panic"),
                 }
@@ -3875,10 +4136,16 @@ mod dispatch_tests {
                 let (_, mod_name) = gemv_mq4g256_lloyd_for_arch(&caps, false);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
-                        assert!(mod_name.contains("rdna3"), "K4 variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "K4 variant expected on {arch}, got {mod_name}"
+                        );
                     }
                     _ => {
-                        assert!(mod_name.ends_with("lloyd"), "baseline expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.ends_with("lloyd"),
+                            "baseline expected on {arch}, got {mod_name}"
+                        );
                     }
                 }
             }
@@ -3889,7 +4156,10 @@ mod dispatch_tests {
             for &arch in &["gfx1100", "gfx1151"] {
                 let caps = make_caps(arch);
                 let (_, mod_name) = gemv_mq4g256_lloyd_for_arch(&caps, true);
-                assert!(mod_name.ends_with("lloyd"), "force_baseline should return lloyd, got {mod_name}");
+                assert!(
+                    mod_name.ends_with("lloyd"),
+                    "force_baseline should return lloyd, got {mod_name}"
+                );
             }
         }
 
@@ -3898,7 +4168,10 @@ mod dispatch_tests {
             for &arch in ALL_ARCHS {
                 let caps = make_caps(arch);
                 let (_, mod_name) = gemv_mq4g256_lloyd_residual_for_arch(&caps, false);
-                assert!(mod_name.contains("residual"), "expected residual, got {mod_name}");
+                assert!(
+                    mod_name.contains("residual"),
+                    "expected residual, got {mod_name}"
+                );
             }
         }
 
@@ -3909,9 +4182,15 @@ mod dispatch_tests {
                 let (_, mod_name) = fused_gate_up_mq4g256_lloyd_for_arch(&caps, false);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
-                        assert!(mod_name.contains("rdna3"), "fast variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "fast variant expected on {arch}, got {mod_name}"
+                        );
                     }
-                    _ => assert!(mod_name.ends_with("lloyd"), "baseline expected on {arch}, got {mod_name}"),
+                    _ => assert!(
+                        mod_name.ends_with("lloyd"),
+                        "baseline expected on {arch}, got {mod_name}"
+                    ),
                 }
             }
         }
@@ -3923,9 +4202,15 @@ mod dispatch_tests {
                 let (_, mod_name) = fused_qkvza_mq4g256_lloyd_for_arch(&caps, false);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
-                        assert!(mod_name.contains("rdna3"), "fast variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "fast variant expected on {arch}, got {mod_name}"
+                        );
                     }
-                    _ => assert!(mod_name.ends_with("lloyd"), "baseline expected on {arch}, got {mod_name}"),
+                    _ => assert!(
+                        mod_name.ends_with("lloyd"),
+                        "baseline expected on {arch}, got {mod_name}"
+                    ),
                 }
             }
         }
@@ -3937,9 +4222,15 @@ mod dispatch_tests {
                 let (_, mod_name) = fused_qkv_mq4g256_lloyd_for_arch(&caps, false);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
-                        assert!(mod_name.contains("rdna3"), "fast variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "fast variant expected on {arch}, got {mod_name}"
+                        );
                     }
-                    _ => assert!(mod_name.ends_with("lloyd"), "baseline expected on {arch}, got {mod_name}"),
+                    _ => assert!(
+                        mod_name.ends_with("lloyd"),
+                        "baseline expected on {arch}, got {mod_name}"
+                    ),
                 }
             }
         }
@@ -3954,9 +4245,8 @@ mod dispatch_tests {
         fn gemm_residual_wmma_selects_correct_variant() {
             for &arch in WMMA_ARCHS {
                 let caps = make_caps(arch);
-                let result = std::panic::catch_unwind(|| {
-                    gemm_mq3g256_lloyd_residual_wmma_for_arch(&caps)
-                });
+                let result =
+                    std::panic::catch_unwind(|| gemm_mq3g256_lloyd_residual_wmma_for_arch(&caps));
                 match arch {
                     "gfx1200" | "gfx1201" => {
                         let (_, mod_name) = result.unwrap();
@@ -3978,10 +4268,16 @@ mod dispatch_tests {
                 let (_, mod_name) = gemv_mq3g256_lloyd_for_arch(&caps, false);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
-                        assert!(mod_name.contains("rdna3"), "K4 variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "K4 variant expected on {arch}, got {mod_name}"
+                        );
                     }
                     _ => {
-                        assert!(mod_name.ends_with("lloyd"), "baseline expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.ends_with("lloyd"),
+                            "baseline expected on {arch}, got {mod_name}"
+                        );
                     }
                 }
             }
@@ -3992,7 +4288,10 @@ mod dispatch_tests {
             for &arch in &["gfx1100", "gfx1151"] {
                 let caps = make_caps(arch);
                 let (_, mod_name) = gemv_mq3g256_lloyd_for_arch(&caps, true);
-                assert!(mod_name.ends_with("lloyd"), "force_baseline should return lloyd, got {mod_name}");
+                assert!(
+                    mod_name.ends_with("lloyd"),
+                    "force_baseline should return lloyd, got {mod_name}"
+                );
             }
         }
 
@@ -4051,13 +4350,22 @@ mod dispatch_tests {
                 let (_, mod_name) = gemv_hfq4g256_for_arch(&caps, None);
                 match arch {
                     "gfx1030" | "gfx1031" => {
-                        assert!(mod_name.contains("rdna2"), "RDNA2 variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna2"),
+                            "RDNA2 variant expected on {arch}, got {mod_name}"
+                        );
                     }
                     "gfx1100" | "gfx1101" | "gfx1102" => {
-                        assert!(mod_name.contains("rdna3"), "RDNA3 K4 variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "RDNA3 K4 variant expected on {arch}, got {mod_name}"
+                        );
                     }
                     _ => {
-                        assert_eq!(mod_name, "gemv_hfq4g256", "baseline expected on {arch}, got {mod_name}");
+                        assert_eq!(
+                            mod_name, "gemv_hfq4g256",
+                            "baseline expected on {arch}, got {mod_name}"
+                        );
                     }
                 }
             }
@@ -4068,8 +4376,10 @@ mod dispatch_tests {
             for &variant in &[1u32, 2, 3, 4, 5] {
                 let caps = make_caps("gfx1030");
                 let (_, mod_name) = gemv_hfq4g256_for_arch(&caps, Some(variant));
-                assert!(mod_name.contains(&format!("rdna2v{}", variant)),
-                    "variant {variant} expected rdna2v{variant}, got {mod_name}");
+                assert!(
+                    mod_name.contains(&format!("rdna2v{}", variant)),
+                    "variant {variant} expected rdna2v{variant}, got {mod_name}"
+                );
             }
         }
 
@@ -4078,7 +4388,10 @@ mod dispatch_tests {
             let caps = make_caps("gfx1030");
             // None should fall through to the baseline (variant 1)
             let (_, mod_name) = gemv_hfq4g256_for_arch(&caps, None);
-            assert!(mod_name.contains("rdna2"), "expected RDNA2 variant, got {mod_name}");
+            assert!(
+                mod_name.contains("rdna2"),
+                "expected RDNA2 variant, got {mod_name}"
+            );
         }
 
         #[test]
@@ -4088,10 +4401,16 @@ mod dispatch_tests {
                 let (_, mod_name) = gemv_hfp4g32_for_arch(&caps);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" => {
-                        assert!(mod_name.contains("rdna3"), "RDNA3 variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "RDNA3 variant expected on {arch}, got {mod_name}"
+                        );
                     }
                     _ => {
-                        assert_eq!(mod_name, "gemv_hfp4g32", "baseline expected on {arch}, got {mod_name}");
+                        assert_eq!(
+                            mod_name, "gemv_hfp4g32",
+                            "baseline expected on {arch}, got {mod_name}"
+                        );
                     }
                 }
             }
@@ -4104,10 +4423,16 @@ mod dispatch_tests {
                 let (_, mod_name) = gemv_hfq4g256_residual_for_arch(&caps);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" => {
-                        assert!(mod_name.contains("rdna3"), "residual rdna3 expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "residual rdna3 expected on {arch}, got {mod_name}"
+                        );
                     }
                     _ => {
-                        assert_eq!(mod_name, "gemv_hfq4g256_residual", "residual baseline on {arch}, got {mod_name}");
+                        assert_eq!(
+                            mod_name, "gemv_hfq4g256_residual",
+                            "residual baseline on {arch}, got {mod_name}"
+                        );
                     }
                 }
             }
@@ -4120,10 +4445,16 @@ mod dispatch_tests {
                 let (_, mod_name) = gemv_hfq3g256_for_arch(&caps);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" => {
-                        assert!(mod_name.contains("rdna3"), "RDNA3 variant expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "RDNA3 variant expected on {arch}, got {mod_name}"
+                        );
                     }
                     _ => {
-                        assert_eq!(mod_name, "gemv_hfq3g256", "baseline expected on {arch}, got {mod_name}");
+                        assert_eq!(
+                            mod_name, "gemv_hfq3g256",
+                            "baseline expected on {arch}, got {mod_name}"
+                        );
                     }
                 }
             }
@@ -4136,17 +4467,23 @@ mod dispatch_tests {
                 let (_, mod_name) = gemv_hfq3g256_residual_for_arch(&caps);
                 match arch {
                     "gfx1100" | "gfx1101" | "gfx1102" => {
-                        assert!(mod_name.contains("rdna3"), "residual rdna3 expected on {arch}, got {mod_name}");
+                        assert!(
+                            mod_name.contains("rdna3"),
+                            "residual rdna3 expected on {arch}, got {mod_name}"
+                        );
                     }
                     _ => {
-                        assert_eq!(mod_name, "gemv_hfq3g256_residual", "residual baseline on {arch}, got {mod_name}");
+                        assert_eq!(
+                            mod_name, "gemv_hfq3g256_residual",
+                            "residual baseline on {arch}, got {mod_name}"
+                        );
                     }
                 }
             }
         }
     }
 
-// ── Module name invariants ───────────────────────────────────
+    // ── Module name invariants ───────────────────────────────────
 
     mod invariants {
         use super::*;
@@ -4173,8 +4510,14 @@ mod dispatch_tests {
                     gemv_hfq4g256_residual_for_arch(&caps)
                 }));
                 if let Ok((_src, mod_name)) = r {
-                    assert!(!mod_name.contains(' '), "gemv_hfq4g256_residual on {arch}: spaces");
-                    assert!(!mod_name.is_empty(), "gemv_hfq4g256_residual on {arch}: empty name");
+                    assert!(
+                        !mod_name.contains(' '),
+                        "gemv_hfq4g256_residual on {arch}: spaces"
+                    );
+                    assert!(
+                        !mod_name.is_empty(),
+                        "gemv_hfq4g256_residual on {arch}: empty name"
+                    );
                 }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     gemv_hfq3g256_for_arch(&caps)
@@ -4187,8 +4530,14 @@ mod dispatch_tests {
                     gemv_hfq3g256_residual_for_arch(&caps)
                 }));
                 if let Ok((_src, mod_name)) = r {
-                    assert!(!mod_name.contains(' '), "gemv_hfq3g256_residual on {arch}: spaces");
-                    assert!(!mod_name.is_empty(), "gemv_hfq3g256_residual on {arch}: empty name");
+                    assert!(
+                        !mod_name.contains(' '),
+                        "gemv_hfq3g256_residual on {arch}: spaces"
+                    );
+                    assert!(
+                        !mod_name.is_empty(),
+                        "gemv_hfq3g256_residual on {arch}: empty name"
+                    );
                 }
             }
         }
@@ -4210,10 +4559,16 @@ mod dispatch_tests {
                     assert!(!src.is_empty(), "gemv_hfp4g32 on {arch}: empty source");
                 }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (gemv_hfq4g256_residual_for_arch(&caps), "gemv_hfq4g256_residual")
+                    (
+                        gemv_hfq4g256_residual_for_arch(&caps),
+                        "gemv_hfq4g256_residual",
+                    )
                 }));
                 if let Ok(((src, _), _name)) = r {
-                    assert!(!src.is_empty(), "gemv_hfq4g256_residual on {arch}: empty source");
+                    assert!(
+                        !src.is_empty(),
+                        "gemv_hfq4g256_residual on {arch}: empty source"
+                    );
                 }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     (gemv_hfq3g256_for_arch(&caps), "gemv_hfq3g256")
@@ -4222,10 +4577,16 @@ mod dispatch_tests {
                     assert!(!src.is_empty(), "gemv_hfq3g256 on {arch}: empty source");
                 }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (gemv_hfq3g256_residual_for_arch(&caps), "gemv_hfq3g256_residual")
+                    (
+                        gemv_hfq3g256_residual_for_arch(&caps),
+                        "gemv_hfq3g256_residual",
+                    )
                 }));
                 if let Ok(((src, _), _name)) = r {
-                    assert!(!src.is_empty(), "gemv_hfq3g256_residual on {arch}: empty source");
+                    assert!(
+                        !src.is_empty(),
+                        "gemv_hfq3g256_residual on {arch}: empty source"
+                    );
                 }
             }
         }

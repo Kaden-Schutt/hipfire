@@ -72,5 +72,7 @@ pub mod arch;
 pub mod dots_ocr;
 pub mod image;
 pub mod rope;
+pub mod spec_impl;
 
 pub use arch::DotsOcr;
+pub use spec_impl::DotsOcrBundle;

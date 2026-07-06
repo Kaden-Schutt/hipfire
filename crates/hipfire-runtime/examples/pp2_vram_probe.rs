@@ -36,16 +36,21 @@ fn fmt_per_card(label: &str, used: &[f64]) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("Usage: ... <model.mq4> [max_seq]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("Usage: ... <model.mq4> [max_seq]");
     let max_seq: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(4096);
-    let hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
+    let mut hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config_from_hfq");
     eprintln!(
         "{}: layers={}, dim={}, hidden={}, vocab={}, kv_heads={}, head_dim={}, max_seq={max_seq}",
-        Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+        Path::new(&path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?"),
         config.n_layers,
         config.dim,
         config.hidden_dim,
@@ -62,8 +67,11 @@ fn main() {
     let mut after = used_gb(&gpus, &baseline_free);
     fmt_per_card("baseline", &after);
 
-    // Stage 1: weights via load_weights_multi
-    let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).expect("load_weights_multi");
+    // Stage 1: weights via load_weights (multi-GPU)
+    let layout = qwen35::Layout::from_gpus(&gpus, config.n_layers);
+    let mut hfq_source = qwen35::HfqSource::new(&mut hfq, &config);
+    let weights =
+        qwen35::load_weights(&mut hfq_source, &mut gpus.devices, &layout).expect("load_weights");
     let after_weights = used_gb(&gpus, &baseline_free);
     let weights_delta: Vec<f64> = after_weights
         .iter()
@@ -98,16 +106,24 @@ fn main() {
     )
     .expect("kv asym3");
     let after_kv = used_gb(&gpus, &baseline_free);
-    let kv_delta: Vec<f64> = after_kv.iter().zip(after.iter()).map(|(a, b)| a - b).collect();
+    let kv_delta: Vec<f64> = after_kv
+        .iter()
+        .zip(after.iter())
+        .map(|(a, b)| a - b)
+        .collect();
     fmt_per_card("after KV", &after_kv);
     fmt_per_card("Δ KV", &kv_delta);
     after = after_kv;
 
     // Stage 4: DeltaNetState
-    let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8)
-        .expect("dn multi");
+    let (dn, la_to_device) =
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
     let after_dn = used_gb(&gpus, &baseline_free);
-    let dn_delta: Vec<f64> = after_dn.iter().zip(after.iter()).map(|(a, b)| a - b).collect();
+    let dn_delta: Vec<f64> = after_dn
+        .iter()
+        .zip(after.iter())
+        .map(|(a, b)| a - b)
+        .collect();
     fmt_per_card("after DN state", &after_dn);
     fmt_per_card("Δ DN state", &dn_delta);
 
@@ -124,7 +140,13 @@ fn main() {
     let total_max = after_dn.iter().cloned().fold(0.0_f64, f64::max);
     let total_sum: f64 = after_dn.iter().sum();
 
-    let quant_tag = if path.contains(".mq4") { "mq4" } else if path.contains(".mq3") { "mq3" } else { "?" };
+    let quant_tag = if path.contains(".mq4") {
+        "mq4"
+    } else if path.contains(".mq3") {
+        "mq3"
+    } else {
+        "?"
+    };
     let model_tag = Path::new(&path)
         .file_stem()
         .and_then(|s| s.to_str())

@@ -19,9 +19,11 @@
 //! is fast to iterate on. PRD §6 Phase 1 scope: prove the compress->target
 //! prefill plumbing, not Lucebox-class retrieval numbers.
 
+use hipfire_arch_qwen35::pflash::{
+    self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
+};
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache};
-use hipfire_arch_qwen35::pflash::{self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind};
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;
@@ -31,14 +33,70 @@ const QUESTION: &str = "What is the secret pass code?";
 const EXPECTED: &str = "mauve-velociraptor-7741";
 
 const FILLER_WORDS: &[&str] = &[
-    "the","quick","brown","fox","jumps","over","the","lazy","dog","while",
-    "a","gentle","breeze","carries","the","scent","of","distant","pine",
-    "forests","across","the","meadow","where","small","wildflowers","nod",
-    "their","heads","in","agreement","with","the","rhythm","of","the",
-    "afternoon","and","time","itself","seems","to","pause","for","a",
-    "moment","so","everything","alive","can","breathe","in","synchrony",
-    "before","the","sun","begins","its","slow","descent","toward","the",
-    "western","horizon",
+    "the",
+    "quick",
+    "brown",
+    "fox",
+    "jumps",
+    "over",
+    "the",
+    "lazy",
+    "dog",
+    "while",
+    "a",
+    "gentle",
+    "breeze",
+    "carries",
+    "the",
+    "scent",
+    "of",
+    "distant",
+    "pine",
+    "forests",
+    "across",
+    "the",
+    "meadow",
+    "where",
+    "small",
+    "wildflowers",
+    "nod",
+    "their",
+    "heads",
+    "in",
+    "agreement",
+    "with",
+    "the",
+    "rhythm",
+    "of",
+    "the",
+    "afternoon",
+    "and",
+    "time",
+    "itself",
+    "seems",
+    "to",
+    "pause",
+    "for",
+    "a",
+    "moment",
+    "so",
+    "everything",
+    "alive",
+    "can",
+    "breathe",
+    "in",
+    "synchrony",
+    "before",
+    "the",
+    "sun",
+    "begins",
+    "its",
+    "slow",
+    "descent",
+    "toward",
+    "the",
+    "western",
+    "horizon",
 ];
 
 fn build_prompt(target_chars: usize) -> String {
@@ -66,14 +124,23 @@ fn main() {
         std::process::exit(2);
     }
     let model_path = &args[1];
-    let keep_ratio: f32 = args.iter().position(|a| a == "--keep-ratio")
-        .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok())
+    let keep_ratio: f32 = args
+        .iter()
+        .position(|a| a == "--keep-ratio")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
         .unwrap_or(0.30);
-    let max_gen: usize = args.iter().position(|a| a == "--maxgen")
-        .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok())
+    let max_gen: usize = args
+        .iter()
+        .position(|a| a == "--maxgen")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
         .unwrap_or(48);
-    let block_size: usize = args.iter().position(|a| a == "--block-size")
-        .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok())
+    let block_size: usize = args
+        .iter()
+        .position(|a| a == "--block-size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
     eprintln!("=== PFlash compress + target re-prefill smoke ===");
@@ -85,14 +152,16 @@ fn main() {
     // ── Load TARGET ──────────────────────────────────────────────────────
     let target_hfq = HfqFile::open(Path::new(model_path)).expect("open target HFQ");
     let target_cfg = hfq::config_from_hfq(&target_hfq).expect("target config");
-    let target_tok = Tokenizer::from_hfq_metadata(&target_hfq.metadata_json)
-        .expect("target tokenizer");
+    let target_tok =
+        Tokenizer::from_hfq_metadata(&target_hfq.metadata_json).expect("target tokenizer");
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
-    let target_weights = hfq::load_weights_hfq(&target_hfq, &target_cfg, &mut gpu)
-        .expect("target weights");
+    let target_weights =
+        hfq::load_weights_hfq(&target_hfq, &target_cfg, &mut gpu).expect("target weights");
     let target_scratch = ForwardScratch::new(&mut gpu, &target_cfg).expect("scratch");
-    eprintln!("target arch: dim={} layers={} heads={} kv_heads={}",
-        target_cfg.dim, target_cfg.n_layers, target_cfg.n_heads, target_cfg.n_kv_heads);
+    eprintln!(
+        "target arch: dim={} layers={} heads={} kv_heads={}",
+        target_cfg.dim, target_cfg.n_layers, target_cfg.n_heads, target_cfg.n_kv_heads
+    );
 
     // ── Build prompt + tokenize ──────────────────────────────────────────
     // Aim for ~512 source tokens so tokenize stays under 1s (the encoder is
@@ -100,8 +169,12 @@ fn main() {
     let prompt_text = build_prompt(2000);
     let t_tok = Instant::now();
     let source_tokens = target_tok.encode(&prompt_text);
-    eprintln!("tokenize:    {} ms ({} tokens, {} chars)",
-        t_tok.elapsed().as_millis(), source_tokens.len(), prompt_text.len());
+    eprintln!(
+        "tokenize:    {} ms ({} tokens, {} chars)",
+        t_tok.elapsed().as_millis(),
+        source_tokens.len(),
+        prompt_text.len()
+    );
 
     // ── Load DRAFTER (same model) into PflashState ───────────────────────
     let mut cfg = PflashConfig {
@@ -117,19 +190,39 @@ fn main() {
     let mut state = PflashState::new(&cfg);
     let drafter_max_kv = source_tokens.len() + 64;
     pflash::load_drafter(
-        &mut state, &mut gpu, Path::new(model_path), &target_tok, drafter_max_kv,
-    ).expect("load_drafter");
-    eprintln!("drafter loaded; tokenizer_compat={}", state.tokenizer_compat);
+        &mut state,
+        &mut gpu,
+        Path::new(model_path),
+        &target_tok,
+        drafter_max_kv,
+    )
+    .expect("load_drafter");
+    eprintln!(
+        "drafter loaded; tokenizer_compat={}",
+        state.tokenizer_compat
+    );
 
     // ── Compress ─────────────────────────────────────────────────────────
     let t_compress = Instant::now();
     let decision = pflash::maybe_compress_prompt(
-        &mut gpu, &mut state, &cfg, &source_tokens, RequestKind::Text, &[],
-    ).expect("maybe_compress_prompt");
+        &mut gpu,
+        &mut state,
+        &cfg,
+        &source_tokens,
+        RequestKind::Text,
+        &[],
+    )
+    .expect("maybe_compress_prompt");
     let compress_ms = t_compress.elapsed().as_millis();
     let cp = match decision {
         PflashDecision::Compressed(cp) => cp,
-        PflashDecision::Bypass { reason: BypassReason::BelowThreshold { source_tokens, threshold } } => {
+        PflashDecision::Bypass {
+            reason:
+                BypassReason::BelowThreshold {
+                    source_tokens,
+                    threshold,
+                },
+        } => {
             // Documented behavior: when the budget would keep every source
             // token (e.g., keep_ratio=1.0, or min_keep_tokens >= source),
             // maybe_compress_prompt returns BelowThreshold so the daemon
@@ -148,40 +241,69 @@ fn main() {
             std::process::exit(2);
         }
     };
-    eprintln!("compress:    {compress_ms} ms (score={}ms select={}ms gather={}ms)",
-        cp.timings.score_ms, cp.timings.select_ms, cp.timings.gather_ms);
-    eprintln!("compressed:  {} -> {} tokens (ratio {:.3})",
-        cp.source_tokens, cp.kept_tokens,
-        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
+    eprintln!(
+        "compress:    {compress_ms} ms (score={}ms select={}ms gather={}ms)",
+        cp.timings.score_ms, cp.timings.select_ms, cp.timings.gather_ms
+    );
+    eprintln!(
+        "compressed:  {} -> {} tokens (ratio {:.3})",
+        cp.source_tokens,
+        cp.kept_tokens,
+        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32
+    );
     eprintln!("source_md5:  {}", cp.source_md5);
     eprintln!("compressed_md5: {}", cp.compressed_md5);
-    eprintln!("kept_spans:  {} ranges (first={:?} last={:?})",
-        cp.kept_spans.len(), cp.kept_spans.first(), cp.kept_spans.last());
+    eprintln!(
+        "kept_spans:  {} ranges (first={:?} last={:?})",
+        cp.kept_spans.len(),
+        cp.kept_spans.first(),
+        cp.kept_spans.last()
+    );
 
     // Free the drafter before the target prefill so the same VRAM pool is
     // available for the target's KV cache.
     state.unload_drafter(&mut gpu);
 
     // ── Re-prefill compressed stream through target ──────────────────────
-    let target_kv_seq = (cp.kept_tokens + max_gen + 64).next_power_of_two().max(1024);
+    let target_kv_seq = (cp.kept_tokens + max_gen + 64)
+        .next_power_of_two()
+        .max(1024);
     let mut target_kv = KvCache::new_gpu_q8(
-        &mut gpu, target_cfg.n_layers, target_cfg.n_kv_heads, target_cfg.head_dim, target_kv_seq,
-    ).expect("target kv");
+        &mut gpu,
+        target_cfg.n_layers,
+        target_cfg.n_kv_heads,
+        target_cfg.head_dim,
+        target_kv_seq,
+    )
+    .expect("target kv");
     let t_pre = Instant::now();
     llama::forward_prefill_batch(
-        &mut gpu, &target_weights, &target_cfg, &cp.token_ids, 0,
-        &mut target_kv, &target_scratch, None,
-    ).expect("target prefill on compressed stream");
+        &mut gpu,
+        &target_weights,
+        &target_cfg,
+        &cp.token_ids,
+        0,
+        &mut target_kv,
+        &target_scratch,
+        None,
+    )
+    .expect("target prefill on compressed stream");
     gpu.hip.device_synchronize().expect("sync after prefill");
     let prefill_ms = t_pre.elapsed().as_millis();
     let prefill_tps = if prefill_ms > 0 {
         cp.kept_tokens as f64 / (prefill_ms as f64 / 1000.0)
-    } else { 0.0 };
-    eprintln!("target prefill: {prefill_ms} ms ({} tokens, {prefill_tps:.0} tok/s)",
-        cp.kept_tokens);
+    } else {
+        0.0
+    };
+    eprintln!(
+        "target prefill: {prefill_ms} ms ({} tokens, {prefill_tps:.0} tok/s)",
+        cp.kept_tokens
+    );
 
     // ── Greedy decode ────────────────────────────────────────────────────
-    let logits = gpu.download_f32(&target_scratch.logits).expect("download logits");
+    let logits = gpu
+        .download_f32(&target_scratch.logits)
+        .expect("download logits");
     let first = llama::argmax(&logits);
     let mut next = first;
     let mut generated: Vec<u32> = vec![first];
@@ -192,10 +314,24 @@ fn main() {
             break;
         }
         let pos = cp.token_ids.len() + generated.len() - 1;
-        llama::forward_scratch_embed(&mut gpu, &target_weights, &target_cfg, next, pos, &target_scratch)
-            .expect("embed");
-        llama::forward_scratch_compute(&mut gpu, &target_weights, &target_cfg, pos, &mut target_kv, &target_scratch)
-            .expect("compute");
+        llama::forward_scratch_embed(
+            &mut gpu,
+            &target_weights,
+            &target_cfg,
+            next,
+            pos,
+            &target_scratch,
+        )
+        .expect("embed");
+        llama::forward_scratch_compute(
+            &mut gpu,
+            &target_weights,
+            &target_cfg,
+            pos,
+            &mut target_kv,
+            &target_scratch,
+        )
+        .expect("compute");
         let logits = gpu.download_f32(&target_scratch.logits).expect("download");
         next = llama::argmax(&logits);
         generated.push(next);
@@ -204,8 +340,12 @@ fn main() {
     let decode_ms = t_dec.elapsed().as_millis();
     let decode_tps = if decode_ms > 0 && decode_steps > 0 {
         decode_steps as f64 / (decode_ms as f64 / 1000.0)
-    } else { 0.0 };
-    eprintln!("decode:      {decode_ms} ms ({decode_steps} forward_scratch calls, {decode_tps:.1} tok/s)");
+    } else {
+        0.0
+    };
+    eprintln!(
+        "decode:      {decode_ms} ms ({decode_steps} forward_scratch calls, {decode_tps:.1} tok/s)"
+    );
 
     let answer = target_tok.decode(&generated);
     eprintln!("--- ANSWER ---");
@@ -217,9 +357,8 @@ fn main() {
     // unreliable at heavy compression, so the bar here is "did the
     // pipeline run end-to-end and produce a coherent text response",
     // not "did the model find the needle".
-    let pipeline_ok = !generated.is_empty()
-        && !answer.is_empty()
-        && answer.chars().any(|c| c.is_alphabetic());
+    let pipeline_ok =
+        !generated.is_empty() && !answer.is_empty() && answer.chars().any(|c| c.is_alphabetic());
     let needle_found = answer.contains(EXPECTED);
     eprintln!("pipeline_ok:  {pipeline_ok}");
     eprintln!("needle_found: {needle_found} (expected substring {EXPECTED:?})");

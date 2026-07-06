@@ -2,15 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire - see LICENSE and NOTICE in the project root.
 
-use std::{
-    env, fs,
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::{fs, process::Stdio};
 
 use anyhow::{anyhow, Result};
 
-use super::{config::ConfigState, HipfirePaths};
+use super::{dashboard::Dashboard, HipfirePaths};
 
 #[derive(Clone, Debug)]
 pub struct StatusState {
@@ -23,15 +19,19 @@ pub struct StatusState {
 }
 
 impl StatusState {
-    pub fn load(paths: &HipfirePaths, config: &ConfigState) -> Self {
+    /// Load ONLY the fast local state — pure file I/O (serve.pid read + `~/.hipfire`
+    /// path-existence checks). Performs NO network (/health) or hardware (lspci)
+    /// probe, so it is safe to call synchronously on the UI thread (startup and
+    /// the `r` reload). The live fields (`serve_http_ok`, `health_text`,
+    /// `gpu_lines`) start empty and are filled in by [`StatusState::overlay_live`]
+    /// from the background `DashboardWorker` snapshot.
+    pub fn load_local(paths: &HipfirePaths) -> Self {
         let serve_pid = fs::read_to_string(&paths.serve_pid)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         let serve_pid_alive = serve_pid
             .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
             .unwrap_or(false);
-        let (serve_http_ok, health_text) = probe_health(config);
-        let gpu_lines = detect_gpu_lines();
         let paths_ok = vec![
             ("~/.hipfire".into(), paths.root.exists()),
             ("models".into(), paths.models.exists()),
@@ -45,11 +45,26 @@ impl StatusState {
         Self {
             serve_pid,
             serve_pid_alive,
-            serve_http_ok,
-            health_text,
-            gpu_lines,
+            serve_http_ok: false,
+            health_text: String::new(),
+            gpu_lines: Vec::new(),
             paths_ok,
         }
+    }
+
+    /// Fold the latest background `DashboardWorker` snapshot into the live
+    /// fields. This is the ONLY path through which `serve_http_ok` / `health_text`
+    /// / `gpu_lines` are populated — the worker did the /health + rocm-smi probes
+    /// OFF the UI thread, so this is a cheap in-memory copy with no I/O. Called
+    /// every frame from `App::sync_dashboard`.
+    pub fn overlay_live(&mut self, dash: &Dashboard) {
+        self.serve_http_ok = dash.serve_up;
+        self.health_text = dash.health_text.clone();
+        self.gpu_lines = dash
+            .system
+            .as_ref()
+            .map(gpu_lines_from_system)
+            .unwrap_or_default();
     }
 
     pub fn serve_label(&self) -> String {
@@ -66,67 +81,34 @@ impl StatusState {
 }
 
 pub fn start_background_serve() -> Result<()> {
-    let cwd = env::current_dir()?;
-    let script = cwd.join("cli/index.ts");
-    if !script.exists() {
-        return Err(anyhow!(
-            "cli/index.ts not found; run this spike from the hipfire repo root"
-        ));
-    }
-
-    Command::new("bun")
-        .arg(script)
-        .arg("serve")
+    let mut cmd = super::cli_command().ok_or_else(|| {
+        anyhow!("cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run hipfire from the repo root)")
+    })?;
+    cmd.arg("serve")
         .arg("-d")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| anyhow!("failed to launch `bun cli/index.ts serve -d`: {err}"))?;
+        .map_err(|err| anyhow!("failed to launch `hipfire serve -d`: {err}"))?;
     Ok(())
 }
 
-fn probe_health(config: &ConfigState) -> (bool, String) {
-    let url = format!("http://{}:{}/health", config.probe_host(), config.port);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(450))
-        .build();
-
-    match agent.get(&url).call() {
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.into_string().unwrap_or_default();
-            (status < 400, body)
-        }
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            (false, format!("HTTP {code}: {body}"))
-        }
-        Err(err) => (false, err.to_string()),
-    }
-}
-
-fn detect_gpu_lines() -> Vec<String> {
+/// Derive the Home-tab GPU summary lines from the background-probed
+/// [`SystemInfo`] (rocm-smi product name + gfx arch) rather than running `lspci`
+/// synchronously on the UI thread. The worker probed this OFF the UI thread, so
+/// this is a pure in-memory format. Falls back to an honest hint when neither
+/// field probed cleanly.
+fn gpu_lines_from_system(system: &super::dashboard::SystemInfo) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Ok(out) = Command::new("lspci").output() {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let lower = line.to_lowercase();
-            if lower.contains("amd")
-                || lower.contains("ati")
-                || lower.contains("vga")
-                || lower.contains("display")
-                || lower.contains("3d controller")
-            {
-                lines.push(line.trim().to_string());
-            }
-            if lines.len() >= 6 {
-                break;
-            }
-        }
+    if system.gpu_name.is_available() {
+        lines.push(system.gpu_name.display().to_string());
+    }
+    if system.gpu_arch.is_available() {
+        lines.push(format!("arch  {}", system.gpu_arch.display()));
     }
     if lines.is_empty() {
-        lines.push("No GPU lines from lspci. Run hipfire diag for full probe.".into());
+        lines.push("No GPU detected via rocm-smi. Run hipfire diag for full probe.".into());
     }
     lines
 }

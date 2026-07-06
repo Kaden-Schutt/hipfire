@@ -50,12 +50,12 @@ fn main() {
     //   - multiple K-groups (the K accumulation loop)
     let shapes: &[(usize, usize, usize, usize, usize)] = &[
         // (q_m, k_m, v_m, K, N)
-        (16, 16, 16, 256, 16),    // minimal: 1 row-tile per proj, 1 K-grp, 1 batch-tile
-        (16, 16, 16, 512, 16),    // K=2 groups: exercises K accumulation
-        (16, 16, 16, 256, 32),    // batch=2 tiles
-        (32, 16, 16, 256, 16),    // q has 2 row-tiles
-        (32, 32, 32, 512, 32),    // multi-tile in every dim
-        (48, 16, 16, 256, 16),    // tile straddles projection boundary
+        (16, 16, 16, 256, 16), // minimal: 1 row-tile per proj, 1 K-grp, 1 batch-tile
+        (16, 16, 16, 512, 16), // K=2 groups: exercises K accumulation
+        (16, 16, 16, 256, 32), // batch=2 tiles
+        (32, 16, 16, 256, 16), // q has 2 row-tiles
+        (32, 32, 32, 512, 32), // multi-tile in every dim
+        (48, 16, 16, 256, 16), // tile straddles projection boundary
     ];
 
     for &(q_m, k_m, v_m, k, n) in shapes {
@@ -93,7 +93,11 @@ fn run_one(
     assert_eq!(q_m % 16, 0);
     assert_eq!(k_m % 16, 0);
     assert_eq!(v_m % 16, 0);
-    assert_eq!(k % 256, 0, "K must be multiple of 256 (HFQ4G256 group size)");
+    assert_eq!(
+        k % 256,
+        0,
+        "K must be multiple of 256 (HFQ4G256 group size)"
+    );
     assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
 
     // ── Build synthetic HFQ4G256 weights for q, k, v ───────────────────────
@@ -149,9 +153,15 @@ fn run_one(
     )
     .map_err(|e| format!("dot2: {e}"))?;
 
-    let ref_q = gpu.download_f32(&y_q_ref).map_err(|e| format!("download yq_ref: {e}"))?;
-    let ref_k = gpu.download_f32(&y_k_ref).map_err(|e| format!("download yk_ref: {e}"))?;
-    let ref_v = gpu.download_f32(&y_v_ref).map_err(|e| format!("download yv_ref: {e}"))?;
+    let ref_q = gpu
+        .download_f32(&y_q_ref)
+        .map_err(|e| format!("download yq_ref: {e}"))?;
+    let ref_k = gpu
+        .download_f32(&y_k_ref)
+        .map_err(|e| format!("download yk_ref: {e}"))?;
+    let ref_v = gpu
+        .download_f32(&y_v_ref)
+        .map_err(|e| format!("download yv_ref: {e}"))?;
 
     // ── Candidate outputs via the gfx12 WMMA scaffold ──────────────────────
     let y_q = gpu
@@ -164,14 +174,18 @@ fn run_one(
         .alloc_tensor(&[n, v_m], DType::F32)
         .map_err(|e| format!("alloc yv: {e}"))?;
 
-    gpu.gemm_qkv_hfq4g256_wmma_gfx12(
-        &aq, &ak, &av, &x, &y_q, &y_k, &y_v, q_m, k_m, v_m, k, n,
-    )
-    .map_err(|e| format!("wmma_gfx12: {e}"))?;
+    gpu.gemm_qkv_hfq4g256_wmma_gfx12(&aq, &ak, &av, &x, &y_q, &y_k, &y_v, q_m, k_m, v_m, k, n)
+        .map_err(|e| format!("wmma_gfx12: {e}"))?;
 
-    let cand_q = gpu.download_f32(&y_q).map_err(|e| format!("download yq: {e}"))?;
-    let cand_k = gpu.download_f32(&y_k).map_err(|e| format!("download yk: {e}"))?;
-    let cand_v = gpu.download_f32(&y_v).map_err(|e| format!("download yv: {e}"))?;
+    let cand_q = gpu
+        .download_f32(&y_q)
+        .map_err(|e| format!("download yq: {e}"))?;
+    let cand_k = gpu
+        .download_f32(&y_k)
+        .map_err(|e| format!("download yk: {e}"))?;
+    let cand_v = gpu
+        .download_f32(&y_v)
+        .map_err(|e| format!("download yv: {e}"))?;
 
     // Cleanup so successive iterations don't grow the pool unboundedly.
     gpu.free_tensor(aq).ok();
@@ -266,10 +280,7 @@ fn compare_proj(
                 a - ref_v
             );
         }
-        let _ = writeln!(
-            report,
-            "      mismatches by (row % 16): {hist_row_mod16:?}"
-        );
+        let _ = writeln!(report, "      mismatches by (row % 16): {hist_row_mod16:?}");
         false
     } else {
         let _ = writeln!(report);

@@ -17,7 +17,13 @@ fn main() {
     let raw_data = gguf.tensor_data(tensor_info);
     let m = 2048usize; // output dim (ne[1])
     let k = 2048usize; // input dim (ne[0])
-    eprintln!("Tensor: {} {:?} {:?} raw_bytes={}", tensor_info.name, tensor_info.dtype, tensor_info.shape, raw_data.len());
+    eprintln!(
+        "Tensor: {} {:?} {:?} raw_bytes={}",
+        tensor_info.name,
+        tensor_info.dtype,
+        tensor_info.shape,
+        raw_data.len()
+    );
 
     // ═══ Stage 1: Smoke test ═══
     eprintln!("\n=== Stage 1: Smoke test ===");
@@ -63,12 +69,18 @@ fn main() {
         if abs_err > 0.01 {
             errors += 1;
             if errors <= 3 {
-                eprintln!("  row {i}: gpu={:.6} ref={:.6} err={:.6}", y_gpu[i], y_ref[i], abs_err);
+                eprintln!(
+                    "  row {i}: gpu={:.6} ref={:.6} err={:.6}",
+                    y_gpu[i], y_ref[i], abs_err
+                );
             }
         }
     }
     eprintln!("  max_abs_err={max_abs_err:.8} max_rel_err={max_rel_err:.8} errors={errors}/{m}");
-    assert!(max_abs_err < 0.05, "Stage 2 FAIL: max_abs_err={max_abs_err}");
+    assert!(
+        max_abs_err < 0.05,
+        "Stage 2 FAIL: max_abs_err={max_abs_err}"
+    );
     eprintln!("  PASS");
 
     // ═══ Stage 3: Shape sweep ═══
@@ -103,7 +115,11 @@ fn main() {
     let d_y3 = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
     gpu.gemv_q4k(&d_raw, &d_x, &d_y3, m, k).unwrap();
     let y3 = gpu.download_f32(&d_y3).unwrap();
-    let max_diff: f32 = y_gpu.iter().zip(y3.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff: f32 = y_gpu
+        .iter()
+        .zip(y3.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("  max diff between two runs: {max_diff:.8}");
     assert!(max_diff < 1e-6, "Stage 4 FAIL: non-deterministic");
     gpu.free_tensor(d_y3).unwrap();
@@ -147,8 +163,15 @@ fn main() {
     let bw_f32 = (bytes_f32 * n_iter as f64) / (ms_f32 as f64 / 1000.0) / 1e9;
 
     eprintln!("  {m}x{k} F32 GEMV:  {avg_us_f32:.1} us/call");
-    eprintln!("  F32 bandwidth: {bw_f32:.1} GB/s ({:.1}% of peak)", bw_f32 / 448.0 * 100.0);
-    eprintln!("  Q4K speedup: {:.2}x (data is {:.1}x smaller)", avg_us_f32 / avg_us, (m * k * 4) as f64 / (m * (k / 256) * 144) as f64);
+    eprintln!(
+        "  F32 bandwidth: {bw_f32:.1} GB/s ({:.1}% of peak)",
+        bw_f32 / 448.0 * 100.0
+    );
+    eprintln!(
+        "  Q4K speedup: {:.2}x (data is {:.1}x smaller)",
+        avg_us_f32 / avg_us,
+        (m * k * 4) as f64 / (m * (k / 256) * 144) as f64
+    );
 
     // Cleanup
     gpu.free_tensor(d_raw).unwrap();

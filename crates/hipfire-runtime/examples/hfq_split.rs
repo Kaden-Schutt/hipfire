@@ -93,7 +93,10 @@ fn parse_hfq_header(file: &mut File) -> std::io::Result<ParsedHfq> {
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
     if &header[0..4] != b"HFQM" {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an .hfq file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not an .hfq file",
+        ));
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -114,14 +117,28 @@ fn parse_hfq_header(file: &mut File) -> std::io::Result<ParsedHfq> {
     let mut escape = false;
     let mut json_end = 0;
     for (i, &b) in meta_region.iter().enumerate() {
-        if escape { escape = false; continue; }
-        if b == b'\\' && in_string { escape = true; continue; }
-        if b == b'"' { in_string = !in_string; continue; }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_string = !in_string;
+            continue;
+        }
         if !in_string {
-            if b == b'{' { brace_depth += 1; }
+            if b == b'{' {
+                brace_depth += 1;
+            }
             if b == b'}' {
                 brace_depth -= 1;
-                if brace_depth == 0 { json_end = i + 1; break; }
+                if brace_depth == 0 {
+                    json_end = i + 1;
+                    break;
+                }
             }
         }
     }
@@ -145,7 +162,9 @@ fn parse_hfq_header(file: &mut File) -> std::io::Result<ParsedHfq> {
         // but defensively read more.
         let mut more = vec![0u8; 4096];
         let n_read = file.read(&mut more)?;
-        if n_read == 0 { break; }
+        if n_read == 0 {
+            break;
+        }
         idx_buf.extend_from_slice(&more[..n_read]);
     }
     for _ in 0..n_tensors {
@@ -153,11 +172,15 @@ fn parse_hfq_header(file: &mut File) -> std::io::Result<ParsedHfq> {
         pos += 2;
         let name = String::from_utf8_lossy(&idx_buf[pos..pos + name_len]).to_string();
         pos += name_len;
-        let quant_type = idx_buf[pos]; pos += 1;
-        let n_dims = idx_buf[pos] as usize; pos += 1;
+        let quant_type = idx_buf[pos];
+        pos += 1;
+        let n_dims = idx_buf[pos] as usize;
+        pos += 1;
         let mut shape = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
-            shape.push(u32::from_le_bytes(idx_buf[pos..pos + 4].try_into().unwrap()));
+            shape.push(u32::from_le_bytes(
+                idx_buf[pos..pos + 4].try_into().unwrap(),
+            ));
             pos += 4;
         }
         let group_size = u32::from_le_bytes(idx_buf[pos..pos + 4].try_into().unwrap());
@@ -192,7 +215,9 @@ fn write_partition(
     selected: &[&TensorEntry],
 ) -> std::io::Result<()> {
     let mut out = OpenOptions::new()
-        .write(true).create(true).truncate(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(out_path)?;
 
     // Compute the new tensor-index byte length so we can place data_offset.
@@ -201,9 +226,8 @@ fn write_partition(
         index_len += 2 + t.name.len() + 1 + 1 + t.shape.len() * 4 + 4 + 8;
     }
     let metadata_offset: u64 = 32;
-    let data_offset: u64 = metadata_offset
-        + parsed.metadata_json_bytes.len() as u64
-        + index_len as u64;
+    let data_offset: u64 =
+        metadata_offset + parsed.metadata_json_bytes.len() as u64 + index_len as u64;
 
     // Header
     let mut header = [0u8; 32];
@@ -227,7 +251,9 @@ fn write_partition(
         idx.extend_from_slice(name_bytes);
         idx.push(t.quant_type);
         idx.push(t.shape.len() as u8);
-        for &d in &t.shape { idx.extend_from_slice(&d.to_le_bytes()); }
+        for &d in &t.shape {
+            idx.extend_from_slice(&d.to_le_bytes());
+        }
         idx.extend_from_slice(&t.group_size.to_le_bytes());
         idx.extend_from_slice(&t.data_size.to_le_bytes());
     }
@@ -251,7 +277,8 @@ fn write_partition(
         if (i + 1) % 50 == 0 || i + 1 == selected.len() {
             eprintln!(
                 "  wrote {}/{} tensors ({:.2} GB so far)",
-                i + 1, selected.len(),
+                i + 1,
+                selected.len(),
                 total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
             );
         }
@@ -274,7 +301,10 @@ fn main() -> ExitCode {
             "--addon" => addon = args.next().map(PathBuf::from),
             "--addon-prefix" => prefix = args.next(),
             "--dry-run" => dry_run = true,
-            "-h" | "--help" => { print_usage(); return ExitCode::from(0); }
+            "-h" | "--help" => {
+                print_usage();
+                return ExitCode::from(0);
+            }
             s if s.starts_with("--") => {
                 eprintln!("error: unknown flag {s}");
                 print_usage();
@@ -292,11 +322,32 @@ fn main() -> ExitCode {
 
     let input = match input {
         Some(p) => p,
-        None => { print_usage(); return ExitCode::from(1); }
+        None => {
+            print_usage();
+            return ExitCode::from(1);
+        }
     };
-    let base = match base { Some(p) => p, None => { eprintln!("error: --base required"); return ExitCode::from(1); } };
-    let addon = match addon { Some(p) => p, None => { eprintln!("error: --addon required"); return ExitCode::from(1); } };
-    let prefix = match prefix { Some(p) => p, None => { eprintln!("error: --addon-prefix required"); return ExitCode::from(1); } };
+    let base = match base {
+        Some(p) => p,
+        None => {
+            eprintln!("error: --base required");
+            return ExitCode::from(1);
+        }
+    };
+    let addon = match addon {
+        Some(p) => p,
+        None => {
+            eprintln!("error: --addon required");
+            return ExitCode::from(1);
+        }
+    };
+    let prefix = match prefix {
+        Some(p) => p,
+        None => {
+            eprintln!("error: --addon-prefix required");
+            return ExitCode::from(1);
+        }
+    };
 
     if base == input || addon == input {
         eprintln!("error: --base/--addon must differ from input path (write to a tmp + rename)");
@@ -305,29 +356,42 @@ fn main() -> ExitCode {
 
     let mut src = match File::open(&input) {
         Ok(f) => f,
-        Err(e) => { eprintln!("error: open {}: {e}", input.display()); return ExitCode::from(1); }
+        Err(e) => {
+            eprintln!("error: open {}: {e}", input.display());
+            return ExitCode::from(1);
+        }
     };
 
     eprintln!("reading header from {}", input.display());
     let parsed = match parse_hfq_header(&mut src) {
         Ok(p) => p,
-        Err(e) => { eprintln!("error: parse_hfq_header: {e}"); return ExitCode::from(1); }
+        Err(e) => {
+            eprintln!("error: parse_hfq_header: {e}");
+            return ExitCode::from(1);
+        }
     };
     eprintln!(
         "  version={} arch_id={} n_tensors={} metadata_offset={} metadata_json_len={}",
-        parsed.version, parsed.arch_id, parsed.tensors.len(),
-        parsed.metadata_offset, parsed.metadata_json_bytes.len(),
+        parsed.version,
+        parsed.arch_id,
+        parsed.tensors.len(),
+        parsed.metadata_offset,
+        parsed.metadata_json_bytes.len(),
     );
 
-    let (addon_tensors, base_tensors): (Vec<&TensorEntry>, Vec<&TensorEntry>) =
-        parsed.tensors.iter().partition(|t| t.name.starts_with(&prefix));
+    let (addon_tensors, base_tensors): (Vec<&TensorEntry>, Vec<&TensorEntry>) = parsed
+        .tensors
+        .iter()
+        .partition(|t| t.name.starts_with(&prefix));
 
     let base_bytes: u64 = base_tensors.iter().map(|t| t.data_size).sum();
     let addon_bytes: u64 = addon_tensors.iter().map(|t| t.data_size).sum();
     eprintln!(
         "partition: base = {} tensors / {:.2} GB | addon = {} tensors / {:.2} GB (prefix={:?})",
-        base_tensors.len(), base_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
-        addon_tensors.len(), addon_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+        base_tensors.len(),
+        base_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+        addon_tensors.len(),
+        addon_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
         prefix,
     );
 

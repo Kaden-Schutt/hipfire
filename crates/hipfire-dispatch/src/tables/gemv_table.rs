@@ -36,16 +36,22 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::MQ4G128,
         DType::MQ3G256,
         DType::MQ2G256,
+        DType::MQ5G256,
         DType::MQ6G256,
         DType::MQ8G256,
         DType::MQ2G256Lloyd,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
         DType::MFP4G32,
+        DType::MFP4G32Lloyd,
+        DType::MFP4G32P,
+        DType::MFP4G32E8,
+        DType::MFP4G32E8SOA,
         DType::HFP4G32,
         DType::ParoQ4G128,
         DType::Q4F16G64,
         DType::Q4F16G32,
+        DType::BF16, // native bf16 reference (KLD oracle); plain gemv, no rotation
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv(dtype, GemvVariant::Plain, false) else {
@@ -67,12 +73,17 @@ fn register_prerotated(registry: &mut KernelRegistry) {
         DType::MQ4G256,
         DType::MQ3G256,
         DType::MQ2G256,
+        DType::MQ5G256,
         DType::MQ6G256,
         DType::MQ8G256,
         DType::MQ2G256Lloyd,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
         DType::MFP4G32,
+        DType::MFP4G32Lloyd,
+        DType::MFP4G32P,
+        DType::MFP4G32E8,
+        DType::MFP4G32E8SOA,
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv_prerotated(dtype) else {
@@ -96,6 +107,7 @@ fn register_residual(registry: &mut KernelRegistry) {
         DType::HFQ6G256,
         DType::MQ4G256,
         DType::MQ3G256,
+        DType::MQ5G256,
         DType::MQ6G256,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
@@ -133,6 +145,7 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
         DType::HFQ6G256,
         DType::MQ4G256,
         DType::MQ3G256,
+        DType::MQ5G256,
         DType::MQ6G256,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
@@ -151,4 +164,3 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
         });
     }
 }
-

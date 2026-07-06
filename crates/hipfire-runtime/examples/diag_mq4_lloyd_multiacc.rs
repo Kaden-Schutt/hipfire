@@ -13,8 +13,8 @@
 //! Reports: max-abs error, top-K rows by |err|, and for those rows the
 //! codebook span + index histogram so we can spot what triggers the drift.
 
-use rdna_compute::Gpu;
 use hipfire_runtime::hfq::HfqFile;
+use rdna_compute::Gpu;
 use std::path::Path;
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -76,8 +76,12 @@ fn report_row(row_bytes: &[u8], groups_per_row: usize) -> (f32, f32, [u32; 16]) 
         for k in 0..16 {
             let bits = u16::from_le_bytes([row_bytes[off + 2 * k], row_bytes[off + 2 * k + 1]]);
             let v = f16_to_f32(bits);
-            if v < min_cb { min_cb = v; }
-            if v > max_cb { max_cb = v; }
+            if v < min_cb {
+                min_cb = v;
+            }
+            if v > max_cb {
+                max_cb = v;
+            }
         }
         for i in 0..128 {
             let byte_val = row_bytes[off + 32 + i] as usize;
@@ -90,7 +94,9 @@ fn report_row(row_bytes: &[u8], groups_per_row: usize) -> (f32, f32, [u32; 16]) 
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model = args.next().expect("usage: diag_mq4_lloyd_multiacc <model.hfq> <tensor> [--rows N]");
+    let model = args
+        .next()
+        .expect("usage: diag_mq4_lloyd_multiacc <model.hfq> <tensor> [--rows N]");
     let tensor_name = args.next().expect("missing tensor name");
     let mut max_rows: usize = usize::MAX;
     while let Some(flag) = args.next() {
@@ -101,22 +107,36 @@ fn main() {
 
     let hfq = HfqFile::open(Path::new(&model)).expect("open model");
     let (info, bytes) = hfq.tensor_data(&tensor_name).expect("tensor not found");
-    assert_eq!(info.quant_type, 21, "tensor {tensor_name} is qt={}, expected MQ4G256Lloyd (21)", info.quant_type);
-    assert_eq!(info.shape.len(), 2, "expected 2D weight, got {:?}", info.shape);
+    assert_eq!(
+        info.quant_type, 21,
+        "tensor {tensor_name} is qt={}, expected MQ4G256Lloyd (21)",
+        info.quant_type
+    );
+    assert_eq!(
+        info.shape.len(),
+        2,
+        "expected 2D weight, got {:?}",
+        info.shape
+    );
     let m_full = info.shape[0] as usize;
     let k = info.shape[1] as usize;
     let m = m_full.min(max_rows);
     let groups_per_row = k / 256;
     let row_stride = groups_per_row * 160;
-    eprintln!("Tensor: {tensor_name}  shape=[{}, {}]  testing {m} rows", m_full, k);
+    eprintln!(
+        "Tensor: {tensor_name}  shape=[{}, {}]  testing {m} rows",
+        m_full, k
+    );
     eprintln!("Block: {groups_per_row} groups/row × 160 B = {row_stride} B/row");
 
     // Deterministic x (cheap PRNG).
     let mut state = 0xC0FFEEu32;
-    let x: Vec<f32> = (0..k).map(|_| {
-        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-        ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.5
-    }).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.5
+        })
+        .collect();
 
     // CPU reference.
     eprintln!("Computing CPU reference...");
@@ -137,13 +157,12 @@ fn main() {
     let d_a = gpu.upload_raw(upload_bytes, &[upload_bytes.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
     let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
-    gpu.gemv_mq4g256_lloyd_multiacc_diag(&d_a, &d_x, &d_y, m, k).unwrap();
+    gpu.gemv_mq4g256_lloyd_multiacc_diag(&d_a, &d_x, &d_y, m, k)
+        .unwrap();
     let y_gpu = gpu.download_f32(&d_y).unwrap();
 
     // Diff.
-    let mut diffs: Vec<(usize, f32)> = (0..m)
-        .map(|i| (i, (y_gpu[i] - y_cpu[i]).abs()))
-        .collect();
+    let mut diffs: Vec<(usize, f32)> = (0..m).map(|i| (i, (y_gpu[i] - y_cpu[i]).abs())).collect();
     diffs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let max_abs = diffs[0].1;
     let total: f64 = (0..m).map(|i| (y_gpu[i] - y_cpu[i]).abs() as f64).sum();

@@ -55,13 +55,13 @@ fn main() {
     //   - shape that mirrors a real 9B residual call site (intermediate=12288 → dim=4096)
     let shapes: &[(usize, usize, usize)] = &[
         // (M, K, N)
-        (16, 256, 16),       // minimal: 1 row-tile, 1 K-grp, 1 batch-tile
-        (16, 512, 16),       // K=2 groups: exercises K accumulation
-        (16, 256, 32),       // batch=2 tiles
-        (32, 256, 16),       // row=2 tiles
-        (32, 512, 32),       // multi-tile in every dim
-        (64, 1024, 32),      // larger but still tractable
-        (4096, 1024, 16),    // 9B-shape band: exercises real M/N ratio at small K
+        (16, 256, 16),    // minimal: 1 row-tile, 1 K-grp, 1 batch-tile
+        (16, 512, 16),    // K=2 groups: exercises K accumulation
+        (16, 256, 32),    // batch=2 tiles
+        (32, 256, 16),    // row=2 tiles
+        (32, 512, 32),    // multi-tile in every dim
+        (64, 1024, 32),   // larger but still tractable
+        (4096, 1024, 16), // 9B-shape band: exercises real M/N ratio at small K
     ];
 
     for &(m, k, n) in shapes {
@@ -101,7 +101,11 @@ fn main() {
 
 fn run_one_lmhead(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), String> {
     assert_eq!(m % 16, 0);
-    assert_eq!(k % 256, 0, "K must be multiple of 256 (HFQ4G256 group size)");
+    assert_eq!(
+        k % 256,
+        0,
+        "K must be multiple of 256 (HFQ4G256 group size)"
+    );
     assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
 
     let a_bytes = build_hfq4g256(m, k, 0xB4);
@@ -157,7 +161,11 @@ fn run_one_lmhead(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), Str
 
 fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), String> {
     assert_eq!(m % 16, 0);
-    assert_eq!(k % 256, 0, "K must be multiple of 256 (HFQ4G256 group size)");
+    assert_eq!(
+        k % 256,
+        0,
+        "K must be multiple of 256 (HFQ4G256 group size)"
+    );
     assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
 
     // ── Build synthetic HFQ4G256 weight bytes ──────────────────────────────
@@ -231,7 +239,14 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), String> {
     }
 }
 
-fn compare(name: &str, n: usize, m: usize, cand: &[f32], refr: &[f32], report: &mut String) -> bool {
+fn compare(
+    name: &str,
+    n: usize,
+    m: usize,
+    cand: &[f32],
+    refr: &[f32],
+    report: &mut String,
+) -> bool {
     assert_eq!(cand.len(), refr.len());
     assert_eq!(cand.len(), n * m);
 
@@ -289,8 +304,14 @@ fn compare(name: &str, n: usize, m: usize, cand: &[f32], refr: &[f32], report: &
                 a - ref_v
             );
         }
-        let _ = writeln!(report, "      mismatches by (row % 16):   {hist_row_mod16:?}");
-        let _ = writeln!(report, "      mismatches by (batch % 16): {hist_batch_mod16:?}");
+        let _ = writeln!(
+            report,
+            "      mismatches by (row % 16):   {hist_row_mod16:?}"
+        );
+        let _ = writeln!(
+            report,
+            "      mismatches by (batch % 16): {hist_batch_mod16:?}"
+        );
         false
     } else {
         let _ = writeln!(report);

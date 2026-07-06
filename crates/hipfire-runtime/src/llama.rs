@@ -6,6 +6,7 @@
 //! Supports loading from GGUF files and running inference.
 
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
+use crate::kv_mode::KvMode;
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -650,6 +651,27 @@ pub enum EmbeddingFormat {
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
 }
 
+/// Single-token embedding lookup, dispatched on the table's storage format.
+/// Centralizes the format→kernel mapping shared by every per-token decode path
+/// (and the dots-ocr VLM text path in the daemon), so a newly-added format only
+/// has to be wired in one place.
+pub fn embedding_lookup_dispatch(
+    gpu: &mut Gpu,
+    format: EmbeddingFormat,
+    table: &GpuTensor,
+    output: &GpuTensor,
+    token: u32,
+    dim: usize,
+) -> HipResult<()> {
+    match format {
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(table, output, token, dim),
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, output, token, dim),
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
+        EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
+    }
+}
+
 /// GPU-resident LLaMA model weights.
 pub struct LlamaWeights {
     pub token_embd: GpuTensor,
@@ -657,6 +679,10 @@ pub struct LlamaWeights {
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
+    /// True iff `output.buf` is a non-owning view of `token_embd.buf`
+    /// (tied lm_head, single-GPU alias). When true, `free_gpu` must NOT free
+    /// `output.buf`. Mirrors `Qwen35Weights` / `Qwen2Weights`.
+    pub lm_head_aliases_embd: bool,
 }
 
 pub struct LayerWeights {
@@ -678,7 +704,9 @@ impl LlamaWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
-        let _ = gpu.free_tensor(self.output.buf);
+        if !self.lm_head_aliases_embd {
+            let _ = gpu.free_tensor(self.output.buf);
+        }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
             let _ = gpu.free_tensor(l.wq.buf);
@@ -1423,6 +1451,29 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        // MQ4G256 = HFQ4G256 weight layout + an offline FWHT rotation, so the
+        // batched GEMM is: FWHT-rotate all `batch_size` activation columns once
+        // (`mq_rotate_x`, AWQ-aware), then feed the same INT4-G256 WMMA kernel
+        // HFQ4G256 uses. This is the batched twin of `weight_gemv`'s single-row
+        // `ensure_mq_signs + rotate_x_mq_for + gemv(Prerotated)` path, and mirrors
+        // DFlash's proven `gemm_dispatch` MQ4 arm (dflash.rs). Replaces the per-row
+        // GEMV fallback that re-read the weight `batch_size`× (the spec-verify
+        // bottleneck). NOTE: the WMMA path quantizes x to F16, so it is NOT
+        // bit-identical to the F32 GEMV — fine for any batched-prefill / spec-verify
+        // use (validated by coherence), same as HFQ4G256 already is.
+        DType::MQ4G256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            // `_batched_lmhead` routes batch>1 to the WMMA residual kernel on
+            // gfx11/gfx12 (zero-inits Y, so residual `+=` collapses to `=`), which
+            // the scalar `gemm_hfq4g256` path falls 8-10× short of at small batch
+            // (its own dispatch comment). It also invalidates the FP16-x cache for
+            // the freshly-pooled x_rot pointer, so no manual reset is needed here.
+            let r = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
         _ => {
             // Fallback: repeated GEMV (no batched kernel for this format)
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
@@ -1475,23 +1526,14 @@ pub fn prefill_forward(
     // Embedding: lookup each token individually into the batch buffer
     let x_single = gpu.alloc_tensor(&[dim], DType::F32)?;
     for (i, &token) in tokens.iter().enumerate() {
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::Q4K => {
-                gpu.embedding_lookup_q4k(&weights.token_embd, &x_single, token, dim)?
-            }
-            EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&weights.token_embd, &x_single, token, dim)?
-            }
-        }
+        embedding_lookup_dispatch(
+            gpu,
+            weights.embd_format,
+            &weights.token_embd,
+            &x_single,
+            token,
+            dim,
+        )?;
         gpu.hip
             .memcpy_dtod_at(&x_batch.buf, i * dim * 4, &x_single.buf, 0, dim * 4)?;
     }
@@ -2017,21 +2059,9 @@ pub fn forward_prefill_batch_chunk_captured(
         "forward_prefill_batch_chunk_captured requires batched-eligible weights + KV"
     );
 
-    // The Q8 long-context fallback in `forward_prefill_chunk` issues
-    // `hip.malloc` + per-row `memcpy_htod` inside the layer loop, which
-    // would error or bake stale data under capture. The threshold is
-    // baked from `physical_cap` in capture mode, not the live seq_len, so
-    // we have to gate on the cap regardless of how many tokens this chunk
-    // carries. Asym KV paths run pure-batched kernels and stay safe.
-    const LDS_CTX_LIMIT: usize = 15000;
-    assert!(
-        !(kv_cache.quant_q8 && kv_cache.physical_cap > LDS_CTX_LIMIT),
-        "Q8 KV with physical_cap {} > {} hits the per-position long-context fallback, \
-         which issues hip.malloc + memcpy_htod inside the captured region. \
-         Use asym3 KV for capture at long context, or shrink physical_cap.",
-        kv_cache.physical_cap,
-        LDS_CTX_LIMIT,
-    );
+    // Q8 long-context is now capture-safe: `forward_prefill_chunk`'s Q8 branch
+    // uses the tiled `attention_flash_q8_0_batched_masked` (O(1) LDS, no
+    // per-position malloc/memcpy), so no cap-based gate is needed.
 
     forward_prefill_chunk(
         gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, true,
@@ -2443,38 +2473,27 @@ fn forward_prefill_chunk(
                 &pbs.flash_partials,
             )?;
         } else if max_ctx_len > LDS_CTX_LIMIT {
-            // Long-context Q8 fallback: per-position flash.
-            //
-            // `pbs.positions` was uploaded as raw i32 bits but the dtype is
-            // F32 (slot-cosmetic, see PrefillBatchScratch::new). `download_f32`
-            // would reinterpret those bytes as floats, so positions like 15000
-            // would surface as ~1e-3 subnormals that cast to 0. Reconstruct
-            // from `start_pos + b` directly — the buffer layout is exactly
-            // [start_pos .. start_pos + n] in linear order.
-            let q_dim = config.n_heads * config.head_dim;
-            let pos_buf_tmp = gpu.hip.malloc(4)?;
-            for b in 0..n {
-                let pos_b = start_pos + b;
-                let seq_len_b = pos_b + 1;
-                let pos_i32 = pos_b as i32;
-                gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                gpu.attention_flash_q8_0(
-                    &q_b,
-                    &kv_cache.k_gpu[layer_idx],
-                    &kv_cache.v_gpu[layer_idx],
-                    &out_b,
-                    &pos_buf_tmp,
-                    seq_len_b,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    kv_cache.physical_cap,
-                    &pbs.flash_partials,
-                )?;
-            }
-            let _ = gpu.hip.free(pos_buf_tmp);
+            // Long-context Q8: tiled batched flash (O(1) LDS, capture-safe).
+            // Replaces the former per-position malloc+memcpy loop now that
+            // `attention_flash_q8_0_batched_masked` (the >8192 crossover kernel)
+            // exists — numerically equivalent, no per-row host uploads.
+            gpu.attention_flash_q8_0_batched_masked(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_cache.physical_cap,
+                max_ctx_len,
+                n,
+                &pbs.flash_partials,
+                None,
+                0,
+                0,
+            )?;
         } else {
             gpu.attention_q8_0_kv_batched_masked(
                 &pbs.fa_q_batch,
@@ -2986,6 +3005,7 @@ pub fn load_weights(
         output_norm,
         output,
         layers,
+        lm_head_aliases_embd: false,
     })
 }
 
@@ -3013,13 +3033,30 @@ pub struct ForwardScratch {
 }
 
 impl ForwardScratch {
+    /// Allocate scratch sized for the model's declared context. Callers that
+    /// know the runtime KV cap should prefer [`Self::new_with_max_seq`] so the
+    /// flash-attention partials buffer matches the cache (avoids both OOB at
+    /// large `max_seq` and over-allocation when the cap is small).
     pub fn new(gpu: &mut Gpu, config: &LlamaConfig) -> HipResult<Self> {
+        Self::new_with_max_seq(gpu, config, config.max_seq_len)
+    }
+
+    /// `max_seq` MUST be ≥ the KV cache's `physical_cap` — the flash-decoding
+    /// partials buffer is sized `n_heads × ceil(max_seq/128) × (2 + head_dim)`
+    /// and the asym/flash attends index it by `ceil(physical_cap/128)` tiles.
+    /// (Was hardcoded to 16 chunks = max_seq 2048; running at a larger cap
+    /// overflowed it → silent OOB / garbage on the flash-attention path.)
+    pub fn new_with_max_seq(
+        gpu: &mut Gpu,
+        config: &LlamaConfig,
+        max_seq: usize,
+    ) -> HipResult<Self> {
         let dim = config.dim;
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
-        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats
-        // max_chunks = ceil(2048 / 128) = 16
-        let max_chunks = 16;
+        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats.
+        // TILE_SIZE = 128 matches the flash attend kernels (attention.rs).
+        let max_chunks = max_seq.div_ceil(128);
         let partial_stride = 2 + config.head_dim;
         let partials_size = config.n_heads * max_chunks * partial_stride;
         Ok(Self {
@@ -3116,27 +3153,466 @@ pub fn forward_scratch_embed(
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
     // Embedding lookup
-    match weights.embd_format {
-        EmbeddingFormat::Q4K => {
-            gpu.embedding_lookup_q4k(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
-        }
-    }
+    embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &scratch.x,
+        token,
+        dim,
+    )?;
     Ok(())
 }
 
 /// Layer loop + final norm + logits + sampling. Graph-capturable.
+/// Cached `HIPFIRE_FORWARD_LOWERED` toggle for the llama-family decode path
+/// (N5 Phase A). Default ON; `HIPFIRE_FORWARD_LOWERED=0` forces the legacy
+/// hand-rolled [`forward_scratch_layers`] body as a byte-exact reference +
+/// escape hatch. Mirrors qwen2's `qwen2_forward_lowered_enabled` and qwen35's
+/// `forward_lowered_enabled`.
+fn llama_forward_lowered_enabled() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+}
+
+/// KV-cache write + single-token attention, extracted verbatim from the hand
+/// [`forward_scratch_layers`] 7-way KV-tier ladder so the lowered path (N5
+/// Phase A3a) can reuse it unchanged. The hand body keeps its own inline copy
+/// (left untouched as the byte-exact reference). Phase A3b replaces this
+/// helper's body with `attention_family()` + `KvTierPlan`; until then it is a
+/// pure extraction (same kernels, same order → byte-identical).
+fn llama_kv_write_attend(
+    gpu: &mut Gpu,
+    kv_cache: &KvCache,
+    scratch: &ForwardScratch,
+    layer_idx: usize,
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+) -> HipResult<()> {
+    if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+        // Asym/Givens KV: this hand ladder has no asym kernels, so route
+        // KV-write + flash-attend through the dispatch attention family (the
+        // same path qwen35 uses). tier_inputs() classifies the tier from the
+        // cache's quant flags; run_attention does both write and single-token
+        // attend. (This is the Phase A3b migration the helper doc anticipated.)
+        let ctx = DispatchCtx::new(gpu);
+        let plan = KvTierPlan::derive(KvTierInputs {
+            pos,
+            ..kv_cache.tier_inputs()
+        })
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        let io = AttnParams {
+            q: &scratch.q,
+            k: &scratch.k,
+            v: &scratch.v,
+            k_cache: &kv_cache.k_gpu[layer_idx],
+            v_cache: &kv_cache.v_gpu[layer_idx],
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &scratch.pos_buf,
+            pos,
+            positions: None,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            physical_cap: kv_cache.physical_cap,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&scratch.attn_partials),
+            givens_cos: kv_cache.givens_cos.as_ref(),
+            givens_sin: kv_cache.givens_sin.as_ref(),
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &scratch.attn_out,
+        };
+        attention_family()
+            .run_attention(&ctx, gpu, &plan, &io)
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    } else if kv_cache.quant_hfq4 {
+        gpu.kv_cache_write_hfq4(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_hfq4(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_hfq4_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quantized
+        && !kv_cache.k_scales.is_empty()
+        && !kv_cache.quant_int8
+        && !kv_cache.quant_q8
+    {
+        // HFQ8 flat layout
+        gpu.kv_cache_write_hfq8(
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.k_scales[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_hfq8(
+            &kv_cache.v_gpu[layer_idx],
+            &kv_cache.v_scales[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_hfq8_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.k_scales[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &kv_cache.v_scales[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quant_int8 {
+        gpu.kv_cache_write_int8c_f16(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_int8c_f16(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_int8c_f16_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quantized && kv_cache.quant_q8 {
+        gpu.kv_cache_write_q8_0(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_q8_0(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_q8_0_kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else if kv_cache.quantized {
+        gpu.kv_cache_write_q4(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.kv_cache_write_q4(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            n_kv_heads,
+            head_dim,
+        )?;
+        gpu.attention_q4kv(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    } else {
+        gpu.kv_cache_write(
+            &kv_cache.k_gpu[layer_idx],
+            &scratch.k,
+            &scratch.pos_buf,
+            kv_dim,
+        )?;
+        gpu.kv_cache_write(
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.v,
+            &scratch.pos_buf,
+            kv_dim,
+        )?;
+        gpu.attention_f32(
+            &scratch.q,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &scratch.attn_out,
+            &scratch.pos_buf,
+            pos + 1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_cache.physical_cap,
+        )?;
+    }
+    Ok(())
+}
+
+/// Lowered llama-family decode loop (N5 Phase A3a). Behaviorally equivalent to
+/// the hand [`forward_scratch_layers`] loop: projections (QKV / o_proj / gate-up
+/// / down / lm_head) go through `hipfire_dispatch::execute_steps` (which selects
+/// FusedQkvQ4K / fused-MQ / per-op + handles FWHT rotation + residual fusion),
+/// while qk_norm, RoPE, the KV ladder (via [`llama_kv_write_attend`]), final
+/// norm and sampling stay the same bare `gpu.*` calls. Validated against the
+/// hand path via the `HIPFIRE_FORWARD_LOWERED=0`-vs-default committed-token md5
+/// A/B (`scripts/forward-lowered-parity.sh`).
+///
+/// Note: like the dead `arch-llama` port this came from, the lowered QKV/gate-up
+/// `RmsnormAutomatic` always normalizes — including the Q4K branch the hand path
+/// previously skipped (the "F1 rmsnorm bug" fix). So Q4K output is intentionally
+/// *more correct* and may legitimately differ from the hand bytes; gate Q4K via
+/// coherence-gate, not byte-parity. MQ paths are expected byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn forward_scratch_layers_lowered(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    temperature: f32,
+    top_p: f32,
+    rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
+) -> HipResult<(u32, u32)> {
+    use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+
+    let ctx = DispatchCtx::new(gpu);
+
+    let knobs = crate::arch_spec::DenseKnobs {
+        attn_bias: false,
+        qk_norm: config.has_qk_norm,
+        rope_theta: config.rope_freq_base,
+        norm_eps: config.norm_eps,
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        q_dim: config.n_heads * config.head_dim,
+        kv_dim: config.n_kv_heads * config.head_dim,
+    };
+    let arch = LlamaDense {
+        weights,
+        config,
+        scratch,
+        kv_cache: &*kv_cache,
+        knobs,
+        pos,
+    };
+    crate::arch_spec::dense_forward(gpu, &ctx, &arch)?;
+
+    // ── Final norm + logits + sampling ──
+    gpu.rmsnorm_f32(
+        &scratch.x,
+        &weights.output_norm,
+        &scratch.tmp,
+        config.norm_eps,
+    )?;
+    let wr_out = weights.output.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr_out,
+            input: GemvInput::Raw(&scratch.tmp),
+            out: &scratch.logits,
+        }],
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+
+    gpu.sample_top_p(
+        &scratch.logits,
+        &scratch.sample_buf,
+        &scratch.repeat_buf,
+        config.vocab_size,
+        temperature,
+        top_p,
+        rng_state,
+        repeat_window,
+        repeat_penalty,
+    )
+}
+
+/// Per-forward [`crate::arch_spec::DenseArch`] wrapper for llama-family models.
+/// Borrows the layer weights + scratch + KV cache and routes the projection/FFN
+/// body through the shared `dense_forward`; attention stays llama's 7-tier KV
+/// ladder via [`llama_kv_write_attend`].
+struct LlamaDense<'a> {
+    weights: &'a LlamaWeights,
+    config: &'a LlamaConfig,
+    scratch: &'a ForwardScratch,
+    kv_cache: &'a KvCache,
+    knobs: crate::arch_spec::DenseKnobs,
+    pos: usize,
+}
+
+impl crate::arch_spec::DenseArch for LlamaDense<'_> {
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn knobs(&self) -> &crate::arch_spec::DenseKnobs {
+        &self.knobs
+    }
+    fn scratch(&self) -> crate::arch_spec::DenseScratch<'_> {
+        let s = self.scratch;
+        crate::arch_spec::DenseScratch {
+            x: &s.x,
+            tmp: &s.tmp,
+            x_rot: &s.x_rot,
+            q: &s.q,
+            k: &s.k,
+            v: &s.v,
+            attn_out: &s.attn_out,
+            o: &s.o,
+            gate: &s.gate,
+            up: &s.up,
+            ffn_hidden: &s.ffn_hidden,
+            ffn_out: &s.ffn_out,
+            pos_buf: &s.pos_buf,
+        }
+    }
+    fn layer(&self, l: usize) -> crate::arch_spec::DenseLayer<'_> {
+        let layer = &self.weights.layers[l];
+        crate::arch_spec::DenseLayer {
+            attn_norm: &layer.attn_norm,
+            ffn_norm: &layer.ffn_norm,
+            wq: layer.wq.dispatch_ref(),
+            wk: layer.wk.dispatch_ref(),
+            wv: layer.wv.dispatch_ref(),
+            wo: layer.wo.dispatch_ref(),
+            w_gate: layer.w_gate.dispatch_ref(),
+            w_up: layer.w_up.dispatch_ref(),
+            w_down: layer.w_down.dispatch_ref(),
+            wq_bias: None,
+            wk_bias: None,
+            wv_bias: None,
+            q_norm: layer.q_norm.as_ref(),
+            k_norm: layer.k_norm.as_ref(),
+            qkv_rot: dtype_rotation_plan(layer.wq.gpu_dtype),
+            ffn_rot: dtype_rotation_plan(layer.w_gate.gpu_dtype),
+            qkv_awq: layer.wq.awq_scale.as_ref(),
+            ffn_awq: layer.w_gate.awq_scale.as_ref(),
+            qkv_k: layer.wq.k,
+            ffn_k: layer.w_gate.k,
+        }
+    }
+    fn attend(&self, gpu: &mut Gpu, l: usize) -> HipResult<()> {
+        let c = self.config;
+        llama_kv_write_attend(
+            gpu,
+            self.kv_cache,
+            self.scratch,
+            l,
+            self.pos,
+            c.n_heads,
+            c.n_kv_heads,
+            c.head_dim,
+            c.n_kv_heads * c.head_dim,
+        )
+    }
+    fn attend_plan(&self, l: usize) -> HipResult<Option<(KvTierPlan, AttnParams<'_>)>> {
+        let kv = self.kv_cache;
+        let s = self.scratch;
+        let c = self.config;
+        let plan = KvTierPlan::derive(KvTierInputs {
+            pos: self.pos,
+            ..kv.tier_inputs()
+        })
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        // HFQ8 flat-layout needs the per-layer scale tables; every other tier
+        // (int8c included) is self-contained.
+        let (k_scales, v_scales) = if kv.is_hfq8_kv() {
+            (Some(&kv.k_scales[l]), Some(&kv.v_scales[l]))
+        } else {
+            (None, None)
+        };
+        let io = AttnParams {
+            q: &s.q,
+            k: &s.k,
+            v: &s.v,
+            k_cache: &kv.k_gpu[l],
+            v_cache: &kv.v_gpu[l],
+            k_scales,
+            v_scales,
+            pos_buf: &s.pos_buf,
+            pos: self.pos,
+            positions: None,
+            n_heads: c.n_heads,
+            n_kv_heads: c.n_kv_heads,
+            head_dim: c.head_dim,
+            physical_cap: kv.physical_cap,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&s.attn_partials),
+            givens_cos: kv.givens_cos.as_ref(),
+            givens_sin: kv.givens_sin.as_ref(),
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &s.attn_out,
+        };
+        Ok(Some((plan, io)))
+    }
+}
+
 pub fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &LlamaWeights,
@@ -3150,6 +3626,22 @@ pub fn forward_scratch_layers(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
+    if llama_forward_lowered_enabled() {
+        return forward_scratch_layers_lowered(
+            gpu,
+            weights,
+            config,
+            pos,
+            kv_cache,
+            scratch,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
+        );
+    }
+
     let n_heads = config.n_heads;
     let n_kv_heads = config.n_kv_heads;
     let head_dim = config.head_dim;
@@ -3215,7 +3707,47 @@ pub fn forward_scratch_layers(
             config.rope_freq_base,
         )?;
 
-        if kv_cache.quant_hfq4 {
+        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+            // Asym/Givens KV: the manual ladder below has no asym kernels, so
+            // route KV-write + flash-attend through the dispatch attention
+            // family (the same path qwen35 uses). tier_inputs() classifies the
+            // tier from the cache's quant flags; run_attention does both the
+            // KV write and the single-token flash attend.
+            let ctx = DispatchCtx::new(gpu);
+            let plan = KvTierPlan::derive(KvTierInputs {
+                pos,
+                ..kv_cache.tier_inputs()
+            })
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            let io = AttnParams {
+                q: &scratch.q,
+                k: &scratch.k,
+                v: &scratch.v,
+                k_cache: &kv_cache.k_gpu[layer_idx],
+                v_cache: &kv_cache.v_gpu[layer_idx],
+                k_scales: None,
+                v_scales: None,
+                pos_buf: &scratch.pos_buf,
+                pos,
+                positions: None,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap: kv_cache.physical_cap,
+                batch_size: 1,
+                max_ctx_len: 0,
+                flash_partials: Some(&scratch.attn_partials),
+                givens_cos: kv_cache.givens_cos.as_ref(),
+                givens_sin: kv_cache.givens_sin.as_ref(),
+                tree_bias: None,
+                block_start: 0,
+                block_cols: 0,
+                output: &scratch.attn_out,
+            };
+            attention_family()
+                .run_attention(&ctx, gpu, &plan, &io)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        } else if kv_cache.quant_hfq4 {
             gpu.kv_cache_write_hfq4(
                 &kv_cache.k_gpu[layer_idx],
                 &scratch.k,
@@ -3743,7 +4275,47 @@ pub fn forward_scratch_band(
             config.rope_freq_base,
         )?;
 
-        if kv_cache.quant_hfq4 {
+        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+            // Asym/Givens KV: the manual ladder below has no asym kernels, so
+            // route KV-write + flash-attend through the dispatch attention
+            // family (the same path qwen35 uses). tier_inputs() classifies the
+            // tier from the cache's quant flags; run_attention does both the
+            // KV write and the single-token flash attend.
+            let ctx = DispatchCtx::new(gpu);
+            let plan = KvTierPlan::derive(KvTierInputs {
+                pos,
+                ..kv_cache.tier_inputs()
+            })
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            let io = AttnParams {
+                q: &scratch.q,
+                k: &scratch.k,
+                v: &scratch.v,
+                k_cache: &kv_cache.k_gpu[layer_idx],
+                v_cache: &kv_cache.v_gpu[layer_idx],
+                k_scales: None,
+                v_scales: None,
+                pos_buf: &scratch.pos_buf,
+                pos,
+                positions: None,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap: kv_cache.physical_cap,
+                batch_size: 1,
+                max_ctx_len: 0,
+                flash_partials: Some(&scratch.attn_partials),
+                givens_cos: kv_cache.givens_cos.as_ref(),
+                givens_sin: kv_cache.givens_sin.as_ref(),
+                tree_bias: None,
+                block_start: 0,
+                block_cols: 0,
+                output: &scratch.attn_out,
+            };
+            attention_family()
+                .run_attention(&ctx, gpu, &plan, &io)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        } else if kv_cache.quant_hfq4 {
             gpu.kv_cache_write_hfq4(
                 &kv_cache.k_gpu[layer_idx],
                 &scratch.k,
@@ -4003,17 +4575,14 @@ pub fn forward(
 
     // Embedding lookup — GPU-side D2D copy of one row (8KB vs 262MB download)
     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    match weights.embd_format {
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
-    }
+    embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &x,
+        token,
+        dim,
+    )?;
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
 
@@ -4209,17 +4778,14 @@ fn forward_logits_gpu(
     let head_dim = config.head_dim;
 
     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    match weights.embd_format {
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
-    }
+    embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &x,
+        token,
+        dim,
+    )?;
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
     let q = gpu.alloc_tensor(&[n_heads * head_dim], DType::F32)?;
@@ -4443,10 +5009,163 @@ pub struct KvCache {
     pub compact_offset: usize,
 }
 
+/// Layer addressing for [`KvCache::from_mode`]: a per-layer "is this a
+/// full-attention layer" mask (→ `_filtered` family) OR a flat layer count
+/// (→ plain / flat-`_capped` family).
+pub enum KvLayers {
+    /// `is_kv_layer` mask — sites 1, 2, 6.
+    Mask(Vec<bool>),
+    /// `n_layers` — sites 3, 4, 5.
+    Flat(usize),
+}
+
+/// Geometry + cap inputs shared by every `new_gpu_*` constructor.
+pub struct KvDims {
+    pub layers: KvLayers,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    /// For minimax (site 5a) this MUST be the CLAMPED value (12288), not the
+    /// raw `ctx.max_seq`, or the allocation size changes.
+    pub max_seq: usize,
+    /// `Some(cap)` → request a `_capped` form. HONORED ONLY for modes that have
+    /// one (q8/asym3/fwht2/fwht3 on Mask sites; q8/asym3/asym4 on Flat sites);
+    /// silently DROPPED for asym2/asym4/fwht4 on Mask sites — faithful to today.
+    pub physical_cap: Option<usize>,
+}
+
+/// Single- vs multi-GPU dispatch for [`KvCache::from_mode`].
+pub enum KvTarget<'a> {
+    /// pp == 1: one GPU. Sites 1–5.
+    Single(&'a mut Gpu),
+    /// pp > 1: pipeline-parallel. Site 6 only (qwen35 HFQ pp>1).
+    Multi(&'a mut Gpus),
+}
+
 impl KvCache {
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
+    }
+
+    /// Zero every per-layer K/V (and scale) buffer on the GPU. Defense-in-depth
+    /// for arch `reset()`: positional KV is normally overwritten by the next
+    /// prefill (so the stale tail is never attended), but this guarantees no
+    /// prior-conversation bytes can survive a reset even under a future
+    /// window/LCP edge that reads an un-rewritten slot. Sub-millisecond memset
+    /// of the cache buffers; callers MUST also clear their token mirror so a
+    /// zeroed slot can never be stale-LCP-reused.
+    pub fn clear_gpu(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        for t in self
+            .k_gpu
+            .iter()
+            .chain(self.v_gpu.iter())
+            .chain(self.k_scales.iter())
+            .chain(self.v_scales.iter())
+        {
+            gpu.hip.memset(&t.buf, 0, t.buf.size())?;
+        }
+        Ok(())
+    }
+
+    /// The single dispatcher over the `new_gpu_*` constructor family. Each
+    /// non-error arm corresponds 1:1 to a line that exists in a load-site ladder
+    /// today (the byte-identical contract). Unreachable `(mode × layers × cap ×
+    /// target)` cells return `Err` rather than panic, so a future policy mis-wire
+    /// surfaces as a clean load failure.
+    pub fn from_mode(mode: KvMode, target: KvTarget, dims: &KvDims) -> HipResult<Self> {
+        debug_assert_ne!(
+            mode,
+            KvMode::Asym3Auto,
+            "from_mode received unresolved sentinel"
+        );
+        // GATE: the asym4 single-token flash-attention decode (AttnFlashAsym4)
+        // is correct only at head_dim=256 (validated via qwen35). At head_dim=128
+        // it deterministically produces garbage — the write/tile/reduce kernels
+        // nominally accept head_dim 128, but the flash decode path is broken
+        // there (tracked, not yet root-caused). Fail the load loudly here rather
+        // than let an asym4@128 cache silently emit garbage at inference.
+        if matches!(mode, KvMode::Asym4) && dims.head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "asym4 KV cache is unsupported at head_dim={} (the single-token \
+                     flash-attention path is broken below head_dim=256; gated to \
+                     prevent silent garbage output). Use --kv-mode q8.",
+                    dims.head_dim
+                ),
+            ));
+        }
+        match target {
+            KvTarget::Single(gpu) => Self::from_mode_single(mode, gpu, dims),
+            KvTarget::Multi(gpus) => Self::from_mode_multi(mode, gpus, dims),
+        }
+    }
+
+    fn from_mode_single(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
+        use KvLayers::*;
+        let nh = dims.n_kv_heads;
+        let hd = dims.head_dim;
+        let ms = dims.max_seq;
+        match (mode, &dims.layers, dims.physical_cap) {
+            // Mask + Some(cap): _capped_filtered (only q8/asym3/fwht2/fwht3 have it).
+            (KvMode::Q8, Mask(m), Some(cap)) => Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap),
+            // Mask + cap-but-no-capped-variant: cap DROPPED, use _filtered (faithful).
+            (KvMode::Asym2, Mask(m), _) => Self::new_gpu_asym2_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Asym4, Mask(m), _) => Self::new_gpu_asym4_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht4, Mask(m), _) => Self::new_gpu_fwht4_filtered(gpu, m, nh, hd, ms),
+            // Mask + None for the capped-capable modes: plain _filtered.
+            (KvMode::Q8, Mask(m), None) => Self::new_gpu_q8_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Asym3, Mask(m), None) => Self::new_gpu_asym3_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht2, Mask(m), None) => Self::new_gpu_fwht2_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht3, Mask(m), None) => Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms),
+            // Flat + Some(cap): _capped (only q8/asym3/asym4).
+            (KvMode::Q8, Flat(n), Some(cap)) => Self::new_gpu_q8_capped(gpu, *n, nh, hd, ms, cap),
+            (KvMode::Asym3, Flat(n), Some(cap)) => Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap),
+            (KvMode::Asym4, Flat(n), Some(cap)) => Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap),
+            // Flat + None: plain (only q8/asym3/asym4).
+            (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
+            (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
+            (KvMode::Asym4, Flat(n), None) => Self::new_gpu_asym4(gpu, *n, nh, hd, ms),
+            // No constructor exists for this combination.
+            (m, l, c) => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KvCache::from_mode_single: no constructor for (mode={m:?}, layers={}, cap={c:?}); \
+                     unreachable under current policies — a policy/accepted-set mis-wire, not a user error",
+                    match l {
+                        Mask(_) => "Mask",
+                        Flat(_) => "Flat",
+                    },
+                ),
+            )),
+        }
+    }
+
+    fn from_mode_multi(mode: KvMode, gpus: &mut Gpus, dims: &KvDims) -> HipResult<Self> {
+        use KvLayers::*;
+        let nh = dims.n_kv_heads;
+        let hd = dims.head_dim;
+        let ms = dims.max_seq;
+        // Site 6 only: Mask + Some(cap) + {q8,asym3,fwht3,fwht2} → _capped_multi_filtered.
+        match (mode, &dims.layers, dims.physical_cap) {
+            (KvMode::Q8, Mask(m), Some(cap)) => Self::new_gpu_q8_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
+            (m, l, c) => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KvCache::from_mode_multi: no multi constructor for (mode={m:?}, layers={}, cap={c:?})",
+                    match l {
+                        Mask(_) => "Mask",
+                        Flat(_) => "Flat",
+                    },
+                ),
+            )),
+        }
     }
 }
 
@@ -4653,6 +5372,99 @@ impl KvCache {
     /// V-mode bit-count to pass as a kernarg.
     pub fn v_mode_bits(&self) -> i32 {
         self.v_mode.bits()
+    }
+
+    /// Mode-derived `KvTierInputs` with per-call fields zero-filled. Each
+    /// attention dispatch site sets `pos`/`flash_mode`/`capture_mode`/
+    /// `batch_size`/`is_tree`/`is_boundary` after this returns (via functional
+    /// update). Single source of truth for the cache-stable tier flags,
+    /// replacing the four hand-copied literals.
+    /// The "quantized but no known format and no separate scales" residual —
+    /// the llama legacy Q4 KV path. Shared by `tier_inputs()` and `k_tier()`
+    /// so the two derivations can never silently diverge.
+    fn quant_q4_residual(&self) -> bool {
+        // The llama-legacy "plain Q4" KV tier is the residual: quantized but
+        // none of the named tiers. MUST also exclude asym{2,3,4} — those set
+        // `quantized:true` with empty `k_scales`, so without this guard an asym
+        // cache reports BOTH its asym flag AND quant_q4, tripping classify()'s
+        // "at most one tier flag" debug_assert (debug-build panic on the qwen35
+        // asym3 default) and breaking the byte-identical-to-legacy-literal
+        // invariant (the legacy qwen35 literals hardcoded quant_q4 = false).
+        // Release classify() output is unchanged either way (asym is matched
+        // before q4), so this is a true no-op for kernel selection.
+        self.quantized
+            && !self.quant_hfq4
+            && !self.quant_q8
+            && !self.quant_int8
+            && !self.quant_asym4
+            && !self.quant_asym3
+            && !self.quant_asym2
+            && self.k_scales.is_empty()
+    }
+
+    /// HFQ8 flat-layout KV: quantized with a separate per-block scale table,
+    /// and none of the other named tiers. Mirrors the hand ladder's hfq8 branch
+    /// condition (`llama.rs` `llama_kv_write_attend` `quantized && !k_scales.is_empty()
+    /// && !int8 && !q8`), extended with the exclusions that keep exactly one tier
+    /// flag set (asym caches set `quantized` with EMPTY `k_scales`; hfq4 is matched
+    /// earlier) so classify()'s "at most one tier flag" debug_assert holds.
+    fn is_hfq8_kv(&self) -> bool {
+        self.quantized
+            && !self.k_scales.is_empty()
+            && !self.quant_int8
+            && !self.quant_q8
+            && !self.quant_hfq4
+            && !self.quant_asym4
+            && !self.quant_asym3
+            && !self.quant_asym2
+    }
+
+    pub fn tier_inputs(&self) -> KvTierInputs {
+        let quant_q4 = self.quant_q4_residual();
+        KvTierInputs {
+            quant_asym4: self.quant_asym4,
+            quant_asym3: self.quant_asym3,
+            quant_asym2: self.quant_asym2,
+            quant_q8: self.quant_q8,
+            quant_fwht: self.quant_fwht,
+            quant_hfq4: self.quant_hfq4,
+            quant_q4,
+            quant_int8: self.quant_int8,
+            quant_hfq8: self.is_hfq8_kv(),
+            // llama F32 KV uses the plain attention_f32 kernel (qwen2's GQA-flash
+            // selector is set only by qwen2's own attend_plan).
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
+            v_mode_bits: self.v_mode_bits(),
+            // ── per-call defaults (note batch_size = 1, not 0), overwritten
+            //    by the caller via functional update ──
+            pos: 0,
+            flash_mode: 0,
+            capture_mode: false,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+            q8_windowed: false,
+            window: 0,
+        }
+    }
+
+    /// The sealed decode of this cache's storage tier. The sanctioned way to
+    /// branch on KV quant mode — replaces hand-rolled `if kv.quant_q8 { … }` ladders.
+    pub fn k_tier(&self) -> hipfire_dispatch::families::kv_tier::KTier {
+        // `quant_q4` is the residual (see quant_q4_residual()); same value
+        // derive() would see.
+        let quant_q4 = self.quant_q4_residual();
+        hipfire_dispatch::families::kv_tier::classify(
+            self.quant_q8,
+            self.quant_asym4,
+            self.quant_asym3,
+            self.quant_asym2,
+            self.quant_hfq4,
+            quant_q4,
+            self.quant_int8,
+            self.is_hfq8_kv(),
+            self.quant_fwht,
+        )
     }
 
     fn resize_real_tensors_zeroed(
@@ -7579,13 +8391,21 @@ pub fn argmax(logits: &[f32]) -> u32 {
     // NaN, so a NaN logit is never selected and never displaces the real max.
     // The previous `max_by(partial_cmp.unwrap_or(Less))` kept a trailing NaN
     // candidate (verified: [1,5,3,NaN] → idx 3) — a NaN-indexed garbage token
-    // on the greedy path poisons the recurrent DeltaNet state. Empty logits
-    // would be a caller bug; fold over an empty slice returns index 0.
+    // on the greedy path poisons the recurrent DeltaNet state.
+    //
+    // O2b-2 finite guard: this is also the degenerate fallback for the sampler
+    // (`sample_top_p` / `sample_full_dist`), so it must skip ALL non-finite
+    // values, not just NaN. A `+Inf` logit would otherwise win the bare `>`
+    // comparison and be selected over the real finite max — `is_finite()` in
+    // the predicate keeps both `+Inf` and `NaN` from displacing a finite token.
+    // Mixed finite + non-finite → the finite max. All-non-finite (or empty)
+    // never replaces the seed → deterministic index 0, matching the
+    // O1-accepted `sample_full_dist` degenerate behavior.
     logits
         .iter()
         .enumerate()
         .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
-            if v > best.1 {
+            if v.is_finite() && v > best.1 {
                 (i, v)
             } else {
                 best
@@ -7789,6 +8609,13 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
 
     // Single pass: find max AND top-K indices from raw logits simultaneously.
     // Uses a fixed-size array (no heap alloc) with manual min-tracking.
+    //
+    // FINITE GUARD (ported from sample_full_dist, the O1 fix): only finite
+    // logits feed `max_logit` and the top-K set. A `+Inf` logit must not become
+    // `max_logit` (then `(l - max)` = Inf - Inf = NaN → exp(NaN) = NaN → NaN sum
+    // → degenerate token-0 return), and a NaN logit (already `>`-false) must not
+    // occupy a top-K slot. Slots left at NEG_INFINITY are zeroed in the softmax
+    // below, and if no finite mass survives we fall back to the NaN-safe argmax.
     let mut topk_val = [f32::NEG_INFINITY; TOP_K];
     let mut topk_idx = [0u32; TOP_K];
     let mut min_pos = 0usize; // index of smallest element in topk
@@ -7796,6 +8623,9 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     let mut max_logit = f32::NEG_INFINITY;
 
     for (i, &l) in logits.iter().enumerate() {
+        if !l.is_finite() {
+            continue;
+        }
         if l > max_logit {
             max_logit = l;
         }
@@ -7813,13 +8643,31 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
 
-    // Softmax only the K candidates (temperature-scaled)
+    // Softmax only the K candidates (temperature-scaled). FINITE GUARD: a slot
+    // still holding NEG_INFINITY (fewer than TOP_K finite logits) or a non-
+    // finite computed prob contributes zero mass rather than poisoning `sum`.
     let mut probs = [0.0f32; TOP_K];
     let mut sum = 0.0f32;
     for i in 0..TOP_K {
-        let p = ((topk_val[i] - max_logit) * inv_temp).exp();
+        let p = if topk_val[i].is_finite() {
+            let pp = ((topk_val[i] - max_logit) * inv_temp).exp();
+            if pp.is_finite() {
+                pp
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         probs[i] = p;
         sum += p;
+    }
+
+    // Degenerate guard: if no finite mass survives (all-NaN / all-+Inf / all
+    // -inf logits), fall back to argmax of the raw logits (its own NaN guard
+    // returns a finite in-vocab index, never the poisoned token 0).
+    if sum <= 0.0 || !sum.is_finite() {
+        return argmax(logits);
     }
 
     // Sort descending by probability (insertion sort on 20 elements)
@@ -7860,6 +8708,169 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
     topk_idx[order[0]]
+}
+
+/// Host-side full-distribution sampler for the EP (multi-GPU) serve path.
+///
+/// The single-GPU handler resolves request>rec_*>arch-default sampling and runs
+/// the GPU `sample_top_p` kernel; the EP path (ds4/minimax) never reaches that
+/// handler and previously decoded with a hardcoded argmax, dropping the card's
+/// temp/top_p/top_k/min_p. ds4's card mandates temp=1.0/top_p=1.0 specifically
+/// because greedy argmax on the quantized instruct model falls into block-level
+/// attractor loops. This function restores those knobs host-side over the f32
+/// logits already downloaded by `download_f32`.
+///
+/// Pipeline mirrors the GPU sampler ordering: temperature scale → top_k cut →
+/// top_p (nucleus) cut → min_p cut → seeded multinomial draw. Uses the shared
+/// `simple_rand` RNG (SAMPLER_STATE), so a per-request `reset_cpu_sampler_rng`
+/// makes the draw deterministic and consistent with the rest of the daemon.
+///
+/// `temperature <= 1e-6` takes the argmax fast-path (greedy), matching the
+/// GPU kernel's `temperature <= 0` short-circuit but with a small epsilon so a
+/// near-zero temp never divides by ~0.
+pub fn sample_full_dist(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+) -> u32 {
+    if temperature <= 1e-6 {
+        return argmax(logits);
+    }
+    let n = logits.len();
+    if n == 0 {
+        return 0;
+    }
+    let top_p = top_p.clamp(0.0, 1.0);
+    // FIX #3: the request parser only filters `min_p > 0`, so a request can
+    // smuggle in min_p > 1.0 (which would `retain` an empty candidate set and
+    // panic on `cand[0]` below) or a negative min_p. Clamp at fn entry to the
+    // valid [0,1] probability-ratio range; min_p == 0 is the happy path (no cut).
+    let min_p = min_p.map(|mp| {
+        if mp.is_finite() {
+            mp.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    let inv_temp = 1.0 / temperature;
+
+    // Max logit (NaN-safe, mirrors argmax's `>` fold) for softmax stability.
+    // FIX #4: only finite logits feed the max; a NaN/Inf logit must not become
+    // `max_logit` (an Inf max would push every `(l - max)` to -Inf → all-zero
+    // probs → degenerate fallback even when finite tokens existed).
+    let mut max_logit = f32::NEG_INFINITY;
+    for &l in logits {
+        if l.is_finite() && l > max_logit {
+            max_logit = l;
+        }
+    }
+
+    // Materialize (idx, prob) with temperature-scaled softmax numerators.
+    // FIX #4: a non-finite logit (NaN/Inf) yields a non-finite prob that would
+    // poison `total` (NaN total → degenerate argmax fallback, silently dropping
+    // the whole finite distribution). Zero out the prob of any non-finite logit
+    // (and of any non-finite computed prob) so finite tokens still get sampled.
+    // A zeroed prob can never be selected, matching the greedy argmax NaN guard.
+    let mut cand: Vec<(u32, f32)> = Vec::with_capacity(n);
+    for (i, &l) in logits.iter().enumerate() {
+        let p = if l.is_finite() {
+            let pp = ((l - max_logit) * inv_temp).exp();
+            if pp.is_finite() {
+                pp
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        cand.push((i as u32, p));
+    }
+
+    // Sort descending by probability (top_k / top_p / min_p all operate on the
+    // ranked distribution). Unstable sort with a NaN-last comparator.
+    cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // top_k: keep at most k highest-prob candidates. None / 0 = no cut.
+    // FINDING #2 (intentional, do NOT "fix" by adding a default cap):
+    // `top_k == None` means NO top-k cap — the full sorted distribution is
+    // retained. This deliberately differs from the GPU sampler's gather-pool
+    // cap (which always pre-trims to a fixed candidate pool). For ds4 the card
+    // mandates temp=1.0 / top_p=1.0 / (no top_k), i.e. sampling from the full
+    // distribution; capping here would be LESS faithful to that card, not more.
+    if let Some(k) = top_k {
+        let k = k as usize;
+        if k > 0 && k < cand.len() {
+            cand.truncate(k);
+        }
+    }
+
+    // Degenerate guard over the (possibly k-truncated) set: if no finite mass
+    // survives (all -inf / all non-finite logits zeroed by FIX #4), fall back
+    // to argmax of the raw logits (which has its own NaN guard).
+    let pre_minp_total: f32 = cand.iter().map(|c| c.1).sum();
+    if pre_minp_total <= 0.0 || !pre_minp_total.is_finite() {
+        return argmax(logits);
+    }
+
+    // min_p: drop candidates whose prob is below `min_p * p_max` (the highest
+    // prob is cand[0] after the descending sort). Applied before nucleus.
+    // FIX #3: never let the retain empty the set — if the floor would drop
+    // everything (it can't here since cand[0] always passes `>= mp*cand[0]`
+    // for mp <= 1, but keep the invariant explicit and robust to fp edge
+    // cases), restore the single highest-prob candidate so `cand[0]` is safe.
+    if let Some(mp) = min_p {
+        if mp > 0.0 {
+            let top = cand[0];
+            let floor = mp * top.1;
+            cand.retain(|c| c.1 >= floor);
+            if cand.is_empty() {
+                cand.push(top);
+            }
+        }
+    }
+
+    // FIX #1: recompute the nucleus mass AFTER the min_p filter, over the final
+    // retained set, so `p_thresh = top_p * (post-min_p mass)`. Summing the mass
+    // before min_p (the old behavior) made the cumulative threshold too large
+    // relative to the surviving probabilities, over-keeping the tail — and
+    // diverging from the GPU sampler's cap-before-sum semantics.
+    let total: f32 = cand.iter().map(|c| c.1).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return cand[0].0;
+    }
+
+    // top_p (nucleus): keep the smallest prefix whose cumulative mass reaches
+    // top_p * total. Always keep at least the top candidate.
+    if top_p < 1.0 {
+        let threshold = top_p * total;
+        let mut cum = 0.0f32;
+        let mut keep = 0usize;
+        for c in cand.iter() {
+            cum += c.1;
+            keep += 1;
+            if cum >= threshold {
+                break;
+            }
+        }
+        cand.truncate(keep.max(1));
+    }
+
+    // Seeded multinomial draw over the surviving candidates.
+    let kept_total: f32 = cand.iter().map(|c| c.1).sum();
+    if kept_total <= 0.0 || !kept_total.is_finite() {
+        return cand[0].0;
+    }
+    let r = simple_rand() * kept_total;
+    let mut acc = 0.0f32;
+    for c in &cand {
+        acc += c.1;
+        if acc >= r {
+            return c.0;
+        }
+    }
+    cand[cand.len() - 1].0
 }
 
 /// Apply the repeat penalty in-place to a specific subset of (token_id, value)
@@ -8085,6 +9096,14 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // The CPU sampler RNG (`SAMPLER_STATE`) is a process-global atomic shared by
+    // every test. Tests that reset+draw from it must not interleave with each
+    // other (a concurrent `simple_rand` from a sibling test would mutate the
+    // state between a reset and the draw, breaking determinism). Serialize all
+    // RNG-touching `sample_full_dist` tests behind this mutex.
+    static RNG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     // hunt3 M-B (FinalFix): greedy argmax must drop NaN like the GPU kernel
     // (argmax.hip `data[i] > lmax`), never selecting a NaN-indexed token and
@@ -8107,6 +9126,179 @@ mod tests {
     fn argmax_finite_unaffected() {
         let logits = [0.1f32, 0.2, 0.9, 0.3];
         assert_eq!(argmax(&logits), 2);
+    }
+
+    // O2b-2 finite-guard: argmax is the sampler degenerate fallback, so it must
+    // skip ALL non-finite values (not just NaN). A `+Inf` must never win the
+    // bare `>` over a real finite max.
+
+    #[test]
+    fn argmax_pos_inf_does_not_displace_finite_max() {
+        // Pre-fix: +Inf at idx 2 wins `>` → idx 2. With the finite guard the
+        // real finite max (idx 1) is returned.
+        let logits = [1.0f32, 5.0, f32::INFINITY, 3.0];
+        assert_eq!(argmax(&logits), 1);
+    }
+
+    #[test]
+    fn argmax_mixed_finite_and_nonfinite_picks_finite() {
+        // +Inf, NaN, and a finite peak interleaved → the finite peak (idx 4).
+        let logits = [f32::INFINITY, f32::NAN, -2.0, f32::NAN, 9.0, f32::INFINITY];
+        assert_eq!(argmax(&logits), 4);
+    }
+
+    #[test]
+    fn argmax_all_pos_inf_returns_zero() {
+        // No finite value survives → deterministic index 0 (matches the
+        // sample_full_dist degenerate fallback contract).
+        let logits = [f32::INFINITY; 6];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    #[test]
+    fn argmax_all_nan_returns_zero() {
+        let logits = [f32::NAN; 6];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    // O2b-2 overflow-guard: the daemon capacity guards compute
+    // `prompt + max_tokens` (or `start + suffix + max_tokens`) in usize and
+    // compare against a cap. An adversarial `max_tokens` near usize::MAX must
+    // not wrap the sum below the cap and slip past the guard. The guards use
+    // `saturating_add`; this asserts the saturating comparison still rejects.
+    #[test]
+    fn capacity_guard_saturating_add_rejects_huge_max_tokens() {
+        let cap: usize = 32_768;
+        let prompt_n: usize = 100;
+        let max_tokens: usize = usize::MAX - 1;
+        // Unchecked `prompt_n + max_tokens` would panic in debug / wrap in
+        // release to `prompt_n - 2` (≈ usize::MAX), which is > cap by luck here,
+        // but for an adversarial max_tokens chosen to land the wrapped sum
+        // under the cap it would bypass. saturating_add can never wrap.
+        assert!(prompt_n.saturating_add(max_tokens) > cap);
+
+        // Choose max_tokens so the *wrapped* unchecked sum would fall under the
+        // cap: max_tokens = usize::MAX - prompt_n + 1 → wraps to 0 < cap, which
+        // would WRONGLY pass an unchecked guard. saturating_add saturates to
+        // usize::MAX, so the guard still rejects.
+        let adversarial = usize::MAX - prompt_n + 1;
+        assert_eq!(prompt_n.wrapping_add(adversarial), 0, "wrapped sum is 0");
+        assert!(
+            prompt_n.saturating_add(adversarial) > cap,
+            "saturating guard must still reject the wrap-to-zero adversarial max_tokens"
+        );
+
+        // Triple-add form used by the ds4 single-GPU guard.
+        let start_pos: usize = 50;
+        let suffix_len: usize = 50;
+        assert!(
+            start_pos
+                .saturating_add(suffix_len)
+                .saturating_add(usize::MAX)
+                > cap
+        );
+    }
+
+    // O1 fix-wave: edge-case guards for the host EP sampler `sample_full_dist`.
+    // All run CPU-only; they seed the shared RNG via `reset_cpu_sampler_rng`
+    // so the multinomial draw is deterministic.
+
+    #[test]
+    fn sample_full_dist_min_p_gt_one_no_panic() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #3: min_p = 1.5 would empty the candidate set and panic on cand[0]
+        // before the clamp. After the clamp + keep-at-least-one guard it must
+        // return a valid in-range index without panicking.
+        reset_cpu_sampler_rng(12345);
+        let logits = [0.5f32, 2.0, 1.0, 0.1, 3.0];
+        let idx = sample_full_dist(&logits, 1.0, 1.0, None, Some(1.5));
+        assert!(
+            (idx as usize) < logits.len(),
+            "min_p>1 must still return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn sample_full_dist_min_p_filters_low_prob() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #3 / general: min_p = 0.5 with a sharply peaked distribution must
+        // drop the low-prob tails. With temp=1.0 the dominant logit (idx 1 at
+        // 10.0) has prob ~1.0; min_p*p_max ~0.5 prunes everything else, so the
+        // draw can only return idx 1 regardless of RNG.
+        for seed in [1u32, 7, 99, 100000] {
+            reset_cpu_sampler_rng(seed);
+            let logits = [0.0f32, 10.0, 0.1, 0.2, 0.05];
+            let idx = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.5));
+            assert_eq!(idx, 1, "min_p=0.5 should leave only the peak (seed {seed})");
+        }
+    }
+
+    #[test]
+    fn sample_full_dist_nan_logit_samples_finite() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // FIX #4: a NaN logit must not poison `total` and force a silent greedy
+        // fallback / NaN-indexed token. The NaN index (3) must never be drawn,
+        // and the returned token must be a finite-logit index.
+        reset_cpu_sampler_rng(424242);
+        let logits = [1.0f32, 2.0, 0.5, f32::NAN, 1.5];
+        for _ in 0..64 {
+            let idx = sample_full_dist(&logits, 1.0, 1.0, None, None);
+            assert_ne!(idx, 3, "NaN-indexed token must never be selected");
+            assert!(
+                (idx as usize) < logits.len() && logits[idx as usize].is_finite(),
+                "must sample a finite-logit token, got idx {idx}"
+            );
+        }
+        // Also with +Inf present: must still pick a finite token, not the Inf.
+        reset_cpu_sampler_rng(424242);
+        let logits2 = [1.0f32, f32::INFINITY, 0.5, 2.0];
+        let idx2 = sample_full_dist(&logits2, 1.0, 1.0, None, None);
+        assert_ne!(idx2, 1, "Inf-indexed token must never be selected");
+        assert!(logits2[idx2 as usize].is_finite());
+    }
+
+    #[test]
+    fn sample_full_dist_happy_path_min_p_zero() {
+        // HAPPY PATH (the 3 cards): min_p = 0.0 with both top_k=None (full dist,
+        // ds4 card) and top_k=40, plus temp/top_p, must return a valid in-range
+        // index. The fixes are guarded on min_p>0 / non-finite / min_p>1, none
+        // of which trigger here, so behavior is unchanged.
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        for &top_k in &[None, Some(40u32)] {
+            for seed in [1u32, 2, 3, 42] {
+                reset_cpu_sampler_rng(seed);
+                let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9, 2.1, 0.4, 1.1];
+                let idx = sample_full_dist(&logits, 1.0, 1.0, top_k, Some(0.0));
+                assert!(
+                    (idx as usize) < logits.len(),
+                    "happy path must return in-range idx (top_k={top_k:?}, seed {seed})"
+                );
+            }
+        }
+        // min_p = None (the other happy-path encoding) must also be in-range.
+        reset_cpu_sampler_rng(7);
+        let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9];
+        let idx = sample_full_dist(&logits, 0.8, 0.95, Some(40), None);
+        assert!((idx as usize) < logits.len());
+    }
+
+    #[test]
+    fn sample_full_dist_fixed_seed_deterministic() {
+        // Determinism under a fixed seed (the daemon's `reset_cpu_sampler_rng`
+        // contract): two back-to-back resets to the same seed must produce the
+        // same token. The shared `SAMPLER_STATE` is a process-global atomic, so
+        // we serialize the two calls inside a single test (no other test runs
+        // between them in THIS function) — the standalone single-threaded proof
+        // of determinism is racy only across parallel tests, never within one.
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        let logits = [0.2f32, 1.5, 0.7, 3.0, 0.9, 2.1, 0.4, 1.1];
+        for seed in [1u32, 2, 3, 42] {
+            reset_cpu_sampler_rng(seed);
+            let a = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.0));
+            reset_cpu_sampler_rng(seed);
+            let b = sample_full_dist(&logits, 1.0, 1.0, None, Some(0.0));
+            assert_eq!(a, b, "fixed seed must be deterministic (seed {seed})");
+        }
     }
 
     #[test]
@@ -8332,5 +9524,230 @@ mod tests {
         // Mock KvCache to test is_boundary logic
         // Since KvCache requires GPU allocation, we test the predicate in isolation
         // by constructing the boolean checks that the dispatch uses.
+    }
+
+    // O2b-2 fix-wave: finite/NaN guards for the LEGACY CPU sampler `sample_top_p`
+    // (the single-GPU non-EP path). Before the fix an all-non-finite logit
+    // vector collapsed to token 0 (max_logit stayed -inf / Inf-Inf=NaN poisoned
+    // the softmax sum). These mirror the `sample_full_dist_*` guards above:
+    // every degenerate input must still return a FINITE, in-vocab token.
+
+    #[test]
+    fn legacy_sample_top_p_all_nan_returns_in_vocab() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        reset_cpu_sampler_rng(12345);
+        let logits = [f32::NAN; 8];
+        let idx = sample_top_p(&logits, 0.7, 0.9);
+        assert!(
+            (idx as usize) < logits.len(),
+            "all-NaN must return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn legacy_sample_top_p_all_pos_inf_returns_in_vocab() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        reset_cpu_sampler_rng(777);
+        // Pre-fix: +Inf max → (Inf - Inf) = NaN softmax → NaN sum → token 0.
+        let logits = [f32::INFINITY; 8];
+        let idx = sample_top_p(&logits, 0.7, 0.9);
+        assert!(
+            (idx as usize) < logits.len(),
+            "all-+Inf must return an in-range token, got {idx}"
+        );
+    }
+
+    #[test]
+    fn legacy_sample_top_p_mixed_finite_nan_picks_finite() {
+        let _g = RNG_TEST_LOCK.lock().unwrap();
+        // The only finite mass is at idx 2 (a sharp peak after temp). The NaN
+        // slots (0,1,3,4) must never be drawn, and the +Inf slot (5) must be
+        // skipped — the draw is forced onto the finite peak regardless of RNG.
+        for seed in [1u32, 7, 99, 100000] {
+            reset_cpu_sampler_rng(seed);
+            let logits = [
+                f32::NAN,
+                f32::NAN,
+                20.0f32,
+                f32::NAN,
+                f32::NAN,
+                f32::INFINITY,
+            ];
+            let idx = sample_top_p(&logits, 0.7, 0.9);
+            assert_eq!(
+                idx, 2,
+                "mixed finite+NaN+Inf must pick the lone finite peak (seed {seed})"
+            );
+        }
+    }
+    // ── KvCache::tier_inputs() accessor pin test ─────────────────
+
+    #[test]
+    fn tier_inputs_q8_is_byte_identical_to_legacy_literal() {
+        // Skip cleanly on a box with no GPU (CI); runs for real on gfx1151.
+        let mut gpu = match Gpu::init() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let kv = KvCache::new_gpu_q8(&mut gpu, 1, 8, 64, 16).unwrap();
+
+        // What the unified accessor produces for a decode call at pos=100.
+        let got = KvTierInputs {
+            pos: 100,
+            ..kv.tier_inputs()
+        };
+
+        // The exact literal the qwen35 decode site used before this refactor.
+        let legacy = KvTierInputs {
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            quant_q8: kv.quant_q8,
+            quant_fwht: kv.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
+            v_mode_bits: kv.v_mode_bits(),
+            pos: 100,
+            flash_mode: 0,
+            capture_mode: false,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+            q8_windowed: false,
+            window: 0,
+        };
+
+        assert_eq!(
+            got, legacy,
+            "tier_inputs() must be byte-identical to the legacy literal"
+        );
+        assert_eq!(
+            KvTierPlan::derive(got).unwrap().write_key,
+            KvTierPlan::derive(legacy).unwrap().write_key,
+        );
+        assert_eq!(
+            KvTierPlan::derive(got).unwrap().attend_key,
+            KvTierPlan::derive(legacy).unwrap().attend_key,
+        );
+
+        // Prefill case: the batched sites override the non-zero `batch_size`
+        // default (and set `is_tree`). Pin that the functional-update override
+        // wins over the accessor default, matching the old prefill literal.
+        let got_prefill = KvTierInputs {
+            pos: 100,
+            flash_mode: 2,
+            capture_mode: true,
+            batch_size: 4,
+            is_tree: true,
+            ..kv.tier_inputs()
+        };
+        let legacy_prefill = KvTierInputs {
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            quant_q8: kv.quant_q8,
+            quant_fwht: kv.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
+            v_mode_bits: kv.v_mode_bits(),
+            pos: 100,
+            flash_mode: 2,
+            capture_mode: true,
+            batch_size: 4,
+            is_tree: true,
+            is_boundary: false,
+            q8_windowed: false,
+            window: 0,
+        };
+        assert_eq!(
+            got_prefill, legacy_prefill,
+            "tier_inputs() prefill override must be byte-identical to the legacy prefill literal"
+        );
+        assert_eq!(
+            KvTierPlan::derive(got_prefill).unwrap().write_key,
+            KvTierPlan::derive(legacy_prefill).unwrap().write_key,
+        );
+        assert_eq!(
+            KvTierPlan::derive(got_prefill).unwrap().attend_key,
+            KvTierPlan::derive(legacy_prefill).unwrap().attend_key,
+        );
+    }
+
+    /// Regression guard for the L1/L2 review finding: on an asym cache,
+    /// `tier_inputs()` must NOT also set `quant_q4` (the residual previously
+    /// did, double-flagging asym3+q4 → classify()'s "at most one tier flag"
+    /// debug_assert fired in debug builds on the qwen35 asym3 default, and the
+    /// no-op-vs-legacy-literal proof was false). The legacy qwen35 literals
+    /// hardcoded `quant_q4: false`; pin that `tier_inputs()` matches, and that
+    /// `derive()` (which routes through classify) does not panic in debug.
+    #[test]
+    fn tier_inputs_asym3_has_no_residual_q4_flag() {
+        let mut gpu = match Gpu::init() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        // asym3 requires head_dim == 256.
+        let kv = KvCache::new_gpu_asym3(&mut gpu, 1, 8, 256, 16).unwrap();
+
+        let got = KvTierInputs {
+            pos: 100,
+            ..kv.tier_inputs()
+        };
+        assert!(kv.quant_asym3, "test setup: expected an asym3 cache");
+        assert!(
+            !got.quant_q4,
+            "tier_inputs() must not set quant_q4 on an asym cache (double-flag bug)"
+        );
+        // Exactly one tier flag set — what classify()'s debug_assert requires.
+        let tier_flags = [
+            got.quant_asym4,
+            got.quant_asym3,
+            got.quant_asym2,
+            got.quant_q8,
+            got.quant_hfq4,
+            got.quant_q4,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        assert_eq!(tier_flags, 1, "exactly one KV tier flag must be set");
+
+        // Byte-identical to the legacy literal (which hardcoded quant_q4=false),
+        // and derive() must not panic on the classify debug_assert.
+        let legacy = KvTierInputs {
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            quant_q8: kv.quant_q8,
+            quant_fwht: kv.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
+            v_mode_bits: kv.v_mode_bits(),
+            pos: 100,
+            flash_mode: 0,
+            capture_mode: false,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+            q8_windowed: false,
+            window: 0,
+        };
+        assert_eq!(
+            got, legacy,
+            "tier_inputs() must match the legacy asym3 literal"
+        );
+        assert_eq!(
+            KvTierPlan::derive(got).unwrap().write_key,
+            KvTierPlan::derive(legacy).unwrap().write_key,
+        );
     }
 }

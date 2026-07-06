@@ -1273,6 +1273,79 @@ impl Gpu {
         }
     }
 
+    /// Batched decode-with-history attention over an F32 KV cache.
+    ///
+    /// `q` is a `[batch × n_heads × head_dim]` block of query rows; row `i` lives
+    /// at absolute position `base + i`. K/V are read directly from the persistent
+    /// F32 cache (`[max_seq × n_kv_heads × head_dim]`, indexed by absolute
+    /// position), so each row attends to the FULL history `[0 .. base+i]`. The
+    /// caller MUST have written the block's own post-RoPE K/V into the cache at
+    /// positions `[base .. base+batch)` before calling, so the in-block causal
+    /// prefix is present.
+    ///
+    /// One block per `(head, row)` running a single-pass softmax over `ctx_len =
+    /// base + i + 1` — the same per-token flash-decode math `forward_step` runs
+    /// sequentially, but block-parallel. Writes `out` `[batch × n_heads × head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode_batched_history(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        batch: usize,
+        base: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_decode_batched_history",
+            kernels::ATTENTION_DECODE_BATCHED_HISTORY_SRC,
+            "attention_decode_batched_history",
+        )?;
+        let func = &self.functions["attention_decode_batched_history"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut b = batch as i32;
+        let mut base_i = base as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut base_i as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Max context any row attends to (the last block row sees the most).
+        let max_ctx = base + batch; // = base + (batch-1) + 1
+        let block_size = 128u32.min((max_ctx.max(head_dim) as u32).next_power_of_two());
+        // scores[max_ctx] + workspace[block_size]
+        let shared_mem = ((max_ctx + block_size as usize) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
     pub fn kv_cache_write_q8_0_batched(
         &mut self,
@@ -1583,7 +1656,62 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+        )
+    }
+
+    /// Sliding-window variant of [`attention_flash_q8_0_batched_masked`]. A
+    /// query at position `p` attends only to keys in `[p-window+1, p]` (the last
+    /// `window` keys); `window <= 0` is full causal (identical to the non-windowed
+    /// method). Used by cohere2moe's `sliding_attention` layers so context beyond
+    /// `sliding_window` clips correctly instead of running full-causal (degraded).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked_windowed(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            window,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -1605,6 +1733,42 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_windowed(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            0,
+        )
+    }
+
+    /// Sliding-window variant of [`attention_flash_q8_0`]: a query at position
+    /// `p` attends only to keys in `[p-window+1, p]`. `window <= 0` is full
+    /// causal (identical to the non-windowed method). Used by cohere2moe's
+    /// `sliding_attention` decode steps once context exceeds `sliding_window`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_windowed(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -1638,6 +1802,7 @@ impl Gpu {
             let ms = max_seq as i32;
             let sc = scale;
             let ts = TILE_SIZE as i32;
+            let wn = window;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((TILE_SIZE + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
@@ -1652,6 +1817,7 @@ impl Gpu {
                 &ms as *const _ as *mut c_void,
                 &sc as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
+                &wn as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "attention_flash_q8_0_tile",
@@ -1672,6 +1838,7 @@ impl Gpu {
                     b.push_i32(ms);
                     b.push_f32(sc);
                     b.push_i32(ts);
+                    b.push_i32(wn);
                     b
                 },
             )?;
@@ -2596,6 +2763,11 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
         v_mode_bits: i32,
+        // Sliding-window span for the tile kernel: a query at position p attends
+        // only to keys in [p-window+1, p]. <= 0 = full causal (legacy behavior).
+        // Pushed as a trailing scalar kernarg; only the q8 tile kernel reads it
+        // (asym/lloyd tile kernels declare fewer args and ignore the extra).
+        window: i32,
         // When true, use the WMMA grid shape `[n_heads, ceil(chunk/BLOCK_M),
         // max_tiles]` and omit the `v_mode_bits` kernarg, even if the inline
         // `wmma_ok` ladder evaluates to false. Set by the WMMA dispatch
@@ -2697,6 +2869,7 @@ impl Gpu {
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
                 let vm = v_mode_bits;
+                let wn = window;
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -2719,6 +2892,7 @@ impl Gpu {
                 ];
                 if !use_wmma_grid {
                     params.push(&vm as *const _ as *mut c_void);
+                    params.push(&wn as *const _ as *mut c_void);
                 }
                 let (grid, lds_bytes): ([u32; 3], u32) = if use_wmma_grid {
                     let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
@@ -2757,6 +2931,7 @@ impl Gpu {
                         b.push_i32(bc);
                         if !use_wmma_grid {
                             b.push_i32(vm);
+                            b.push_i32(wn);
                         }
                         b
                     },
@@ -3091,7 +3266,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3125,9 +3302,26 @@ impl Gpu {
             "attention_flash_asym4_wmma_tile_batched",
             kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
             "attention_flash_asym4_wmma_tile_batched",
-            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
-            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, V_MODE_Q8, /*force_wmma_grid=*/ true,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ true,
         )
     }
 
@@ -3158,9 +3352,26 @@ impl Gpu {
             "attention_flash_asym4_wmma_tile_batched_gfx12",
             kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC,
             "attention_flash_asym4_wmma_tile_batched_gfx12",
-            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
-            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, V_MODE_Q8, /*force_wmma_grid=*/ true,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ true,
         )
     }
 
@@ -3254,7 +3465,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            v_mode_bits, /*force_wmma_grid=*/ false,
+            v_mode_bits,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3299,7 +3512,9 @@ impl Gpu {
             None,
             0,
             0,
-            V_MODE_Q8, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3345,7 +3560,9 @@ impl Gpu {
             None,
             0,
             0,
-            v_mode_bits, /*force_wmma_grid=*/ false,
+            v_mode_bits,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3536,7 +3753,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8, /*force_wmma_grid=*/ false,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3627,7 +3846,9 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            v_mode_bits, /*force_wmma_grid=*/ false,
+            v_mode_bits,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
         )
     }
 
@@ -9584,8 +9805,16 @@ impl Gpu {
         max_n_total: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert_eq!(n_heads % 16, 0, "direct_wmma: n_heads must be %16 (got {n_heads})");
-        debug_assert_eq!(head_dim % 16, 0, "direct_wmma: head_dim must be %16 (got {head_dim})");
+        debug_assert_eq!(
+            n_heads % 16,
+            0,
+            "direct_wmma: n_heads must be %16 (got {n_heads})"
+        );
+        debug_assert_eq!(
+            head_dim % 16,
+            0,
+            "direct_wmma: head_dim must be %16 (got {head_dim})"
+        );
         let n_pad = ((max_n_total + 15) / 16) * 16;
         let lds_bytes = 16 * head_dim * 2 + 16 * n_pad * 4; // q f16 + s f32
         if lds_bytes > 64 * 1024 {
@@ -9679,8 +9908,16 @@ impl Gpu {
         max_n_total: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert_eq!(n_heads % 16, 0, "batched_wmma: n_heads must be %16 (got {n_heads})");
-        debug_assert_eq!(head_dim % 16, 0, "batched_wmma: head_dim must be %16 (got {head_dim})");
+        debug_assert_eq!(
+            n_heads % 16,
+            0,
+            "batched_wmma: n_heads must be %16 (got {n_heads})"
+        );
+        debug_assert_eq!(
+            head_dim % 16,
+            0,
+            "batched_wmma: head_dim must be %16 (got {head_dim})"
+        );
         let n_pad = ((max_n_total + 15) / 16) * 16;
         let lds_bytes = 16 * head_dim * 2 + 16 * n_pad * 4;
         if lds_bytes > 64 * 1024 {

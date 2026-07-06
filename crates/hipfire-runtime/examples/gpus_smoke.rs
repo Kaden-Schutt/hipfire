@@ -47,7 +47,10 @@ fn main() {
 
     println!("\n── Gpus::enable_peer_all() ───────────────────────────────");
     let peer_ok = gpus.enable_peer_all().expect("enable_peer_all");
-    assert!(peer_ok, "peer access should be bidirectional on 2× 7900 XTX");
+    assert!(
+        peer_ok,
+        "peer access should be bidirectional on 2× 7900 XTX"
+    );
     assert!(gpus.peer_access_enabled);
     println!("  peer_access_enabled = true");
 
@@ -67,10 +70,11 @@ fn main() {
     // the ROCm 6.4.3 quirk where memset immediately followed by a peer read
     // silently no-ops on the same page.
     let reverse_pattern: Vec<f32> = (0..n_elems).map(|i| -(i as f32) * 0.25).collect();
-    gpus.devices[1].bind_thread().expect("bind 1 for upload reverse");
-    let bytes_view = unsafe {
-        std::slice::from_raw_parts(reverse_pattern.as_ptr() as *const u8, bytes)
-    };
+    gpus.devices[1]
+        .bind_thread()
+        .expect("bind 1 for upload reverse");
+    let bytes_view =
+        unsafe { std::slice::from_raw_parts(reverse_pattern.as_ptr() as *const u8, bytes) };
     gpus.devices[1]
         .hip
         .memcpy_htod(&dst_t.buf, bytes_view)

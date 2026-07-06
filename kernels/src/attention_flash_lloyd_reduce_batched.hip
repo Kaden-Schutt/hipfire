@@ -45,7 +45,15 @@ __global__ void attention_flash_lloyd_reduce_batched(
     const int stride = 2 + head_dim;
 
     const int global_bid = batch_offset + local_bid;
-    const int seq_len = (block_cols > 0) ? (block_start + block_cols)
+    // hipGraph-safe block_start: under captured tree-verify replay the
+    // `block_start` scalar kernarg is baked at capture time and goes stale as
+    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
+    // cycle and the linearized tree root sits at positions[0] == start_pos ==
+    // block_start, so derive it from the device buffer instead of the scalar.
+    // Eager (non-capture) value is identical, so this is a no-op off-graph. The
+    // tile kernel applies the same fix; n_tiles here must match its seq_len.
+    const int eff_block_start = (block_cols > 0) ? positions[0] : block_start;
+    const int seq_len = (block_cols > 0) ? (eff_block_start + block_cols)
                                           : (positions[global_bid] + 1);
     const int n_tiles = (seq_len + tile_size - 1) / tile_size;
 

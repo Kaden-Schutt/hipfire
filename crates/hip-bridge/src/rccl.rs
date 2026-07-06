@@ -102,11 +102,7 @@ impl RcclComms {
     /// `ncclCommInitAll`. Each comm[i] binds to `device_ids[i]`.
     pub fn init_all(device_ids: &[i32]) -> RcclResult<Self> {
         let lib = unsafe {
-            let candidates = [
-                "librccl.so",
-                "librccl.so.1",
-                "librccl.so.1.0",
-            ];
+            let candidates = ["librccl.so", "librccl.so.1", "librccl.so.1.0"];
             let mut loaded = None;
             for name in &candidates {
                 if let Ok(l) = Library::new(name) {
@@ -133,14 +129,39 @@ impl RcclComms {
             }};
         }
 
-        let (fn_comm_init_all, fn_comm_destroy, fn_all_reduce, fn_group_start, fn_group_end, fn_get_error_string, fn_get_version) = unsafe {
+        let (
+            fn_comm_init_all,
+            fn_comm_destroy,
+            fn_all_reduce,
+            fn_group_start,
+            fn_group_end,
+            fn_get_error_string,
+            fn_get_version,
+        ) = unsafe {
             (
-                load_sym!("ncclCommInitAll", unsafe extern "C" fn(*mut NcclComm, c_int, *const c_int) -> u32),
+                load_sym!(
+                    "ncclCommInitAll",
+                    unsafe extern "C" fn(*mut NcclComm, c_int, *const c_int) -> u32
+                ),
                 load_sym!("ncclCommDestroy", unsafe extern "C" fn(NcclComm) -> u32),
-                load_sym!("ncclAllReduce", unsafe extern "C" fn(*const c_void, *mut c_void, usize, u32, u32, NcclComm, *mut c_void) -> u32),
+                load_sym!(
+                    "ncclAllReduce",
+                    unsafe extern "C" fn(
+                        *const c_void,
+                        *mut c_void,
+                        usize,
+                        u32,
+                        u32,
+                        NcclComm,
+                        *mut c_void,
+                    ) -> u32
+                ),
                 load_sym!("ncclGroupStart", unsafe extern "C" fn() -> u32),
                 load_sym!("ncclGroupEnd", unsafe extern "C" fn() -> u32),
-                load_sym!("ncclGetErrorString", unsafe extern "C" fn(u32) -> *const c_char),
+                load_sym!(
+                    "ncclGetErrorString",
+                    unsafe extern "C" fn(u32) -> *const c_char
+                ),
                 load_sym!("ncclGetVersion", unsafe extern "C" fn(*mut c_int) -> u32),
             )
         };
@@ -290,7 +311,13 @@ impl RcclComms {
 
     /// Typed convenience for f32 sum — the load-bearing TP all-reduce
     /// shape (residual stream summation across ranks).
-    pub fn all_reduce_sum_f32(
+    ///
+    /// # Safety
+    /// Caller asserts `sendbuff`/`recvbuff` point to `count` valid f32
+    /// elements of device memory associated with `rank`, and that `stream`
+    /// is a live stream on that device. See `all_reduce` for the rest of the
+    /// safety contract.
+    pub unsafe fn all_reduce_sum_f32(
         &self,
         rank: usize,
         sendbuff: *const f32,
@@ -298,17 +325,15 @@ impl RcclComms {
         count: usize,
         stream: *mut c_void,
     ) -> RcclResult<()> {
-        unsafe {
-            self.all_reduce(
-                rank,
-                sendbuff as *const c_void,
-                recvbuff as *mut c_void,
-                count,
-                RcclDataType::Float32,
-                RcclRedOp::Sum,
-                stream,
-            )
-        }
+        self.all_reduce(
+            rank,
+            sendbuff as *const c_void,
+            recvbuff as *mut c_void,
+            count,
+            RcclDataType::Float32,
+            RcclRedOp::Sum,
+            stream,
+        )
     }
 
     /// Typed convenience for fp16 sum (residual stream in mixed-precision).

@@ -83,6 +83,15 @@ echo "── coherence-gate.sh ${FULL} ──"
 echo "coherence: rc=$COH_RC $([ "$COH_RC" -eq 0 ] && echo PASS || echo FAIL)"
 echo
 
+# ── [1.5] Serve-loop — multi-request OUTPUT, HARD gate (#462) ───────────
+# Single-request coherence misses cross-request recurrent-state contamination
+# (DeltaNet/KV bleeding between requests → </think>/token-loop attractor).
+echo "── serve-loop-gate.sh ──"
+"$G/serve-loop-gate.sh"; SLG_RC=$?
+[ "$SLG_RC" -ne 0 ] && OVERALL=1
+echo "serve-loop: rc=$SLG_RC $([ "$SLG_RC" -eq 0 ] && echo PASS || echo FAIL)"
+echo
+
 # ── [2] DFlash spec-decode — HARD gate (conditional) ───────────────────
 if [ "$DFLASH" = "on" ]; then
     echo "── coherence-gate-dflash.sh ${FULL} ──"

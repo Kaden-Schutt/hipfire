@@ -34,7 +34,7 @@
 
 use crate::qwen35::{
     config_from_hfq as qwen35_config_from_hfq, load_weights as qwen35_load_weights, DeltaNetState,
-    LayerType, Qwen35Config, Qwen35Weights,
+    HfqSource, Layout, LayerType, Qwen35Config, Qwen35Weights,
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -64,8 +64,12 @@ impl Architecture for Qwen35 {
     }
 
     fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String> {
+        // REAP is applied INSIDE `qwen35_config_from_hfq` (the public free fn)
+        // so every caller — trait or direct — gets it; do NOT re-apply here,
+        // or the keep-map would be applied twice (double-overriding num_experts
+        // to kept-of-kept, which would then fail load_any's kept-count
+        // validation against the original count).
         qwen35_config_from_hfq(hfq)
-            .ok_or_else(|| "qwen35: failed to parse config from HFQ metadata".to_string())
     }
 
     fn load_weights(
@@ -73,7 +77,9 @@ impl Architecture for Qwen35 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        qwen35_load_weights(hfq, cfg, gpu)
+        let mut source = HfqSource::new(hfq, cfg);
+        let layout = Layout::single(cfg.n_layers);
+        qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
             .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))
     }
 

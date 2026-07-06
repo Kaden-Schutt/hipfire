@@ -12,8 +12,12 @@ fn main() {
         eprintln!("\n=== K = {k} ===");
 
         // Random input, weight
-        let x: Vec<f32> = (0..k).map(|i| ((i * 7 + 13) % 97) as f32 / 47.0 - 0.8).collect();
-        let w: Vec<f32> = (0..k).map(|i| 1.0 + ((i * 11 + 3) % 51) as f32 / 233.0).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 7 + 13) % 97) as f32 / 47.0 - 0.8)
+            .collect();
+        let w: Vec<f32> = (0..k)
+            .map(|i| 1.0 + ((i * 11 + 3) % 51) as f32 / 233.0)
+            .collect();
 
         let d_x = gpu.upload_f32(&x, &[k]).unwrap();
         let d_w = gpu.upload_f32(&w, &[k]).unwrap();
@@ -28,7 +32,8 @@ fn main() {
         gpu.rotate_x_mq(&d_tmp, &d_out_split, k).unwrap();
 
         // Path B: fused kernel
-        gpu.fused_rmsnorm_rotate_mq(&d_x, &d_w, &d_out_fused, k, 1e-6).unwrap();
+        gpu.fused_rmsnorm_rotate_mq(&d_x, &d_w, &d_out_fused, k, 1e-6)
+            .unwrap();
 
         let a = gpu.download_f32(&d_out_split).unwrap();
         let b = gpu.download_f32(&d_out_fused).unwrap();
@@ -37,12 +42,18 @@ fn main() {
         let mut max_rel = 0.0f32;
         let mut n_finite = 0;
         for i in 0..k {
-            if a[i].is_finite() && b[i].is_finite() { n_finite += 1; }
+            if a[i].is_finite() && b[i].is_finite() {
+                n_finite += 1;
+            }
             let d = (a[i] - b[i]).abs();
-            if d > max_abs { max_abs = d; }
+            if d > max_abs {
+                max_abs = d;
+            }
             let denom = a[i].abs().max(1e-6);
             let r = d / denom;
-            if r > max_rel { max_rel = r; }
+            if r > max_rel {
+                max_rel = r;
+            }
         }
         eprintln!("  n_finite:  {n_finite}/{k}");
         eprintln!("  max_abs:   {max_abs:.6e}");

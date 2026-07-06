@@ -38,9 +38,13 @@ __global__ void attention_flash_q8_0_tile(
     int head_dim,
     int max_seq,
     float scale_attn,
-    int tile_size
+    int tile_size,
+    int window                           // sliding-window span; <= 0 = full causal
 ) {
     const int seq_len = pos_buf[0] + 1;
+    // Sliding-window lower bound: keys at t < win_lo are outside the window
+    // [seq_len-window, seq_len) and masked. window <= 0 = full causal.
+    const int win_lo = (window > 0) ? (seq_len - window) : 0;
     const int h = blockIdx.x;
     if (h >= n_heads) return;
     const int tile_id = blockIdx.y;
@@ -88,6 +92,10 @@ __global__ void attention_flash_q8_0_tile(
 
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+        if (t < win_lo) {                  // outside sliding window → mask, skip dot
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;                      // t is wave-uniform, all lanes skip together
+        }
         float partial = 0.0f;
         for (int half = 0; half < n_halves; half++) {
             const int k_bi = half * 4 + tid / 8;

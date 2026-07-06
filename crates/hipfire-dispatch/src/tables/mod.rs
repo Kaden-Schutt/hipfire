@@ -89,6 +89,12 @@ impl ArchPredicate {
             // GQA-fused attn) was the || gfx12 OR on HasWmmaW32. A single HasWmma
             // predicate backed by ArchCaps::has_wmma() is equivalent and enforces that
             // a new ArchPredicate variant only lands with the kernel it gates.
+            // Every RDNA gen (RDNA1/2/3/4 = gfx10xx/11xx/12xx) — wave32 lane
+            // layout — but NOT CDNA/GCN wave64 (gfx906/908/90a/942). Gates
+            // WMMA-free [32,1,1] scalar kernels (MQ3G256, MQ2/3/4-Lloyd) that
+            // already run on RDNA1/2 via the qwen35 direct path. Strict superset
+            // of has_wmma() (RDNA3/4 ⊂ wave32) → RDNA3/4 routing is unchanged.
+            Self::HasWave32 => ctx.arch.is_wave32(),
             Self::HasWmma => ctx.arch.has_wmma(),
             // gfx11-family wave32 WMMA only (RDNA3 + RDNA3.5), EXCLUDES gfx12/RDNA4 —
             // for WMMA kernels with no gfx12 source sibling (mb4, q8_0_wmma_x64).
