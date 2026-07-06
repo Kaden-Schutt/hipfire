@@ -1869,6 +1869,88 @@ fn resident_adaln_modulate_and_gated_residual_match_cpu() {
 }
 
 #[test]
+fn feed_forward_stream_forward_resident_matches_cpu_reference() {
+    // End-to-end resident SwiGLU FFN: up/gate proj -> swiglu -> down proj, all
+    // resident (activation never leaves the device). Validates the composition
+    // of the resident ops against a bf16-weight CPU reference.
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for resident FFN test: {error}");
+            return;
+        }
+    };
+    if !gpu.arch_caps.has_wmma_w32() {
+        eprintln!("skip: needs wave32 WMMA");
+        return;
+    }
+    let (batch, seq, hidden, inner) = (1usize, 4, 32usize, 64usize);
+    let rows = batch * seq;
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 19.0) - 9.0) / 9.0 * scale)
+            .collect()
+    };
+    let hidden_in = CpuTensor {
+        shape: vec![batch, seq, hidden],
+        data: fill(rows * hidden, 1.0, 1.0),
+    };
+    let up_f32 = fill(inner * hidden, 3.0, 0.4);
+    let gate_f32 = fill(inner * hidden, 5.0, 0.4);
+    let down_f32 = fill(hidden * inner, 7.0, 0.4);
+    let stream =
+        TransformerFeedForwardStream::swiglu_for_test(hidden, inner, &up_f32, &gate_f32, &down_f32);
+
+    // CPU reference with bf16-rounded weights.
+    let bf16 = |v: f32| f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16);
+    let (uq, gq, dq): (Vec<f32>, Vec<f32>, Vec<f32>) = (
+        up_f32.iter().map(|&v| bf16(v)).collect(),
+        gate_f32.iter().map(|&v| bf16(v)).collect(),
+        down_f32.iter().map(|&v| bf16(v)).collect(),
+    );
+    let silu = |x: f32| x / (1.0 + (-x).exp());
+    let mut cpu = vec![0.0f32; rows * hidden];
+    for r in 0..rows {
+        let mut act = vec![0.0f32; inner];
+        for i in 0..inner {
+            let (mut up, mut gate) = (0.0f32, 0.0f32);
+            for k in 0..hidden {
+                up += hidden_in.data[r * hidden + k] * uq[i * hidden + k];
+                gate += hidden_in.data[r * hidden + k] * gq[i * hidden + k];
+            }
+            act[i] = up * silu(gate);
+        }
+        for h in 0..hidden {
+            let mut acc = 0.0f32;
+            for i in 0..inner {
+                acc += act[i] * dq[h * inner + i];
+            }
+            cpu[r * hidden + h] = acc;
+        }
+    }
+
+    let hidden_gpu = gpu.upload_f32(&hidden_in.data, &hidden_in.shape).unwrap();
+    let mut cache = RocmWeightCache::default();
+    let out_gpu = stream.forward_resident(&hidden_gpu, &mut gpu, &mut cache).unwrap();
+    let hip = download_resident(&mut gpu, &out_gpu).unwrap();
+    free_resident(&mut gpu, out_gpu).unwrap();
+    free_resident(&mut gpu, hidden_gpu).unwrap();
+
+    assert_eq!(hip.shape, vec![batch, seq, hidden]);
+    let max_rel = hip
+        .data
+        .iter()
+        .zip(&cpu)
+        .map(|(a, b)| (a - b).abs() / (b.abs().max(1.0)))
+        .fold(0.0f32, f32::max);
+    // Three chained bf16 GEMMs + bf16-staged activations.
+    assert!(
+        max_rel <= 6e-2,
+        "resident FFN vs cpu max rel error {max_rel} too large"
+    );
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,

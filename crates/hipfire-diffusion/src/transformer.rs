@@ -1600,6 +1600,108 @@ impl TransformerFeedForwardStream {
             runtime_context,
         )
     }
+
+    /// Test-only: build a bias-free SwiGLU stream from raw f32 weights (bf16
+    /// source), for exercising the resident FFN chain.
+    #[cfg(test)]
+    pub(crate) fn swiglu_for_test(
+        hidden_width: usize,
+        inner_width: usize,
+        up_f32: &[f32],
+        gate_f32: &[f32],
+        down_f32: &[f32],
+    ) -> Self {
+        Self {
+            stream_label: "test",
+            activation: TransformerFeedForwardActivation::SwiGlu,
+            hidden_width,
+            inner_width,
+            proj_weight: None,
+            proj_bias: None,
+            up_weight: Some(ResidentWeight::from_bf16_parts(
+                "test.up",
+                vec![inner_width, hidden_width],
+                up_f32,
+            )),
+            up_bias: None,
+            gate_weight: Some(ResidentWeight::from_bf16_parts(
+                "test.gate",
+                vec![inner_width, hidden_width],
+                gate_f32,
+            )),
+            gate_bias: None,
+            down_weight: ResidentWeight::from_bf16_parts(
+                "test.down",
+                vec![hidden_width, inner_width],
+                down_f32,
+            ),
+            down_bias: None,
+        }
+    }
+
+    /// Fully device-resident FFN forward: a resident `GpuTensor` in/out with no
+    /// host round-trip. Composes the resident linear/gate ops; frees each
+    /// intermediate as it goes (mirrors the VAE resident chains).
+    #[allow(dead_code)]
+    pub(crate) fn forward_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        let activated = match self.activation {
+            TransformerFeedForwardActivation::GeGlu => {
+                let proj_weight = self.proj_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata("GEGLU feed-forward projection weight missing".into())
+                })?;
+                let projected = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    proj_weight,
+                    self.proj_bias.as_ref(),
+                )?;
+                let gated = geglu_gate_3d_resident(gpu, &projected)?;
+                free_resident(gpu, projected)?;
+                gated
+            }
+            TransformerFeedForwardActivation::SwiGlu => {
+                let up_weight = self.up_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata("SwiGLU feed-forward up weight missing".into())
+                })?;
+                let gate_weight = self.gate_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata("SwiGLU feed-forward gate weight missing".into())
+                })?;
+                let up = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    up_weight,
+                    self.up_bias.as_ref(),
+                )?;
+                let gate = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    gate_weight,
+                    self.gate_bias.as_ref(),
+                )?;
+                let gated = swiglu_gate_3d_resident(gpu, &up, &gate)?;
+                free_resident(gpu, up)?;
+                free_resident(gpu, gate)?;
+                gated
+            }
+        };
+        let out = linear_resident_weight_resident(
+            gpu,
+            cache,
+            &activated,
+            &self.down_weight,
+            self.down_bias.as_ref(),
+        )?;
+        free_resident(gpu, activated)?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
