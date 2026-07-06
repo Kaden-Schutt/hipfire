@@ -66,3 +66,32 @@ None→Some flip that switches hot-path memset sync→async — CLAUDE.md trap);
 `feature/device-mesh` ⊇ `feature/parallel-expansion` (strict ancestor; parallel-expansion = HIPFIRE_EMULATE_GPUS
 + TP-default + PP plumbing, the enabling harness). The qwen35 per-device givens prefill fix also split out onto
 current master as standalone branch `fix/qwen35-multigpu-prefill-givens` (worktree hipfire-fix-qwen35-givens).
+
+## P-A DONE 2026-07-06 — mesh-only, NOT the "big-bang gpus flip" (bjoern chose it after evidence)
+Implemented P-A as `execute_steps_mesh(mesh: &DeviceMesh, gpu: &mut Gpu, ctx, steps)` (steps.rs, delegates to
+`execute_steps(gpu, ...)`; debug_asserts n_devices==1). NOT `&mut Gpus`. **Why the change from the plan's
+"gpus: &mut Gpus":** the single-GPU serve path (daemon `Gpu::init` @737/768/1491 + `llama.rs:9588/9691`) owns a
+BARE `Gpu`, never a `Gpus`, and its lifetime is decoupled from model load — so "every caller passes &mut Gpus"
+secretly REQUIRES the daemon god-struct hoist that the handover itself defers to post-P-C. bjoern picked mesh-only
+(threads the cheap mesh value, zero borrow rework, no hoist); the `gpu→gpus` promotion + daemon `Gpus` hoist move
+to **P-B**, applied only to sharding paths. Style: each calling fn builds a local `DeviceMesh::single()` (or inlines
+`&DeviceMesh::single()` in qwen35 — alloc-free empty Vec); `gpu` stays `&mut Gpu`; byte-identical by construction.
+
+**Scope reality (measured, not the handover's "4 drivers"):** 48 real call sites; 41 THREADS across 19 fns + 7 OWNS.
+**IN P-A (migrated, direct path):** cohere2moe (2), shared dense = arch_spec `dense_forward`(5) + arch-llama
+`forward_scratch_layers`(5) + qwen2 `forward_step_after_x`(+_lowered)(6) + runtime `forward_scratch_layers_lowered`(1),
+qwen35 (25 incl multi-GPU OWNS). **OUT (ForwardBindings lowered path, → P-D):** minimax `minimax_attn_block`, lfm2moe
+`attn_mixer_block`, deepseek4 (no direct execute_steps), qwen35 `run_residual_gemv`(13558, kept bare `execute_steps`
+in import). Commits: U0 shim `abb74fa9`, U2 cohere2moe, U3 dense, U5 qwen35 `8c024452`. Added `hipfire-hardware` dep to
+cohere2moe/arch-llama/arch-qwen2/qwen35.
+
+**Validated gfx1151, byte-identical:** cohere2moe gate 4/4 OK; coherence_probe qwen3-0.6b-llama + qwen25-0.5b OK
+(0 hard/0 soft); coherence-gate.sh 11/11 OK (qwen35 0.8b/4b/9b/27b × mq4/mq3/mq3-lloyd/mq6). Multi-GPU OWNS sites
+(forward_ep/_multi) are byte-identical drop-ins (execute_steps_mesh forwards the exact `&mut gpus.devices[i]`), not
+exercised by single-GPU gates. **U6 (rename execute_steps_mesh→execute_steps) DEFERRED to P-B** — cosmetic, and P-B
+reworks these signatures anyway. Local plan detail: `docs/superpowers/plans/2026-07-06-P-A-execute-steps-mesh-flip.md`.
+
+**P-B START HERE:** promote the sharding paths `&mut Gpu`→`&mut Gpus` + implement TP INSIDE `execute_steps_mesh`
+(per-Step ShardPolicy shard + Tp all-reduce); this is where the daemon `Gpus::single` hoist finally lands (the
+mesh-only P-A deliberately left it undone). `execute_steps_mesh` currently degenerates to the single gpu — flip its
+debug_assert to real multi-device handling there.
