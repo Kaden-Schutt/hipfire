@@ -180,6 +180,117 @@ fn main() {
         println!("[tp-row]    OK — all_reduce(W_r·x_r) == W·x  (max|Δ|={d:.2e}, {TP} ranks)");
     }
 
+    // ── 3. Composed block: Column → Row with a sharded intermediate ─────────
+    // The real FFN/attention TP dataflow: y = W2 · (W1 · x). W1 is column-parallel
+    // (rows), so rank r produces h_r = W1_r·x — its OWN slice of the intermediate,
+    // which stays on-rank (no comm). W2 is row-parallel (cols) consuming exactly
+    // that slice: p_r = W2_r·h_r. A single end-of-block all-reduce yields y. This
+    // proves the sharded intermediate lines up Column-out → Row-in with the ONLY
+    // collective at the block boundary (identity activation — the elementwise
+    // nonlinearity is per-slice and does not affect the sharding correctness).
+    {
+        // NOTE: INTER/TP (the reduction dim of the row-parallel W2 gemv) must stay
+        // aligned to the F32 gemv kernel's k-tile — `gemv_f32` returns wrong
+        // results for a non-64-aligned k (empirically: INTER/TP=48 → max|Δ|=0.04,
+        // INTER/TP=64 → 1e-7). A real TP split must therefore keep sharded
+        // reduction dims kernel-aligned (validate_manifest's group-alignment role).
+        const INTER: usize = 128; // intermediate dim (INTER/TP=64, k-aligned)
+        let w1: Vec<f32> = (0..INTER * K)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.05)
+            .collect();
+        let w2: Vec<f32> = (0..M * INTER)
+            .map(|i| ((i % 9) as f32 - 4.0) * 0.05)
+            .collect();
+        // Host reference: h = W1·x [INTER]; y = W2·h [M].
+        let mut h_ref = vec![0f32; INTER];
+        for i in 0..INTER {
+            let mut s = 0.0f32;
+            for j in 0..K {
+                s += w1[i * K + j] * x[j];
+            }
+            h_ref[i] = s;
+        }
+        let mut y_ref2 = vec![0f32; M];
+        for i in 0..M {
+            let mut s = 0.0f32;
+            for j in 0..INTER {
+                s += w2[i * INTER + j] * h_ref[j];
+            }
+            y_ref2[i] = s;
+        }
+
+        // W1 column-parallel (rows → INTER/tp per rank); W2 row-parallel
+        // (cols → INTER/tp per rank) — the two shardings ALIGN on the intermediate.
+        let e1 = WeightEntry::layer(
+            "w1",
+            0,
+            vec![INTER, K],
+            DType::F32,
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        let e2 = WeightEntry::layer(
+            "w2",
+            0,
+            vec![M, INTER],
+            DType::F32,
+            ShardPolicy::RowShard { axis: 1 },
+        );
+        let w1_bytes = f32_to_bytes(&w1);
+        let w2_bytes = f32_to_bytes(&w2);
+        let store = fulfill_manifest(&[e1, e2], &mesh, N_LAYERS, &gpus, |e| {
+            Ok((
+                if e.name == "w1" {
+                    w1_bytes.clone()
+                } else {
+                    w2_bytes.clone()
+                },
+                DType::F32,
+            ))
+        })
+        .expect("mlp shard");
+
+        let inter_r = INTER / TP;
+        let mut partials = Vec::with_capacity(TP);
+        for r in 0..TP {
+            let w1r = match store.get("w1", Some(0), r).unwrap() {
+                WeightHandle::Resident(t) => t,
+                _ => panic!(),
+            };
+            let w2r = match store.get("w2", Some(0), r).unwrap() {
+                WeightHandle::Resident(t) => t,
+                _ => panic!(),
+            };
+            let dev = &mut gpus.devices[r];
+            dev.bind_thread().expect("bind");
+            let xt = dev.upload_raw(&f32_to_bytes(&x), &[K]).expect("x upload");
+            let ht = dev.alloc_tensor(&[inter_r], DType::F32).expect("h alloc");
+            dev.gemv_f32(w1r, &xt, &ht).expect("gemv w1"); // h_r = W1_r·x (on-rank slice)
+            let pt = dev.alloc_tensor(&[M], DType::F32).expect("p alloc");
+            dev.gemv_f32(w2r, &ht, &pt).expect("gemv w2"); // p_r = W2_r·h_r
+            dev.hip
+                .stream_synchronize(dev.active_stream.as_ref().unwrap())
+                .expect("sync");
+            partials.push(pt);
+        }
+        let group: Vec<usize> = (0..TP).collect();
+        let refs: Vec<&_> = partials.iter().map(|t| &t.buf).collect();
+        gpus.all_reduce_sum_f32_peer(&group, &refs, M)
+            .expect("all_reduce");
+        gpus.devices[0].bind_thread().expect("bind");
+        gpus.devices[0]
+            .hip
+            .stream_synchronize(gpus.devices[0].active_stream.as_ref().unwrap())
+            .expect("sync");
+        let mut buf = vec![0u8; M * 4];
+        gpus.devices[0]
+            .hip
+            .memcpy_dtoh(&mut buf, &partials[0].buf)
+            .expect("dtoh");
+        let d = max_abs_diff(&bytes_to_f32(&buf), &y_ref2);
+        assert!(d < TOL, "composed MLP TP mismatch: max|Δ|={d}");
+        println!("[tp-mlp]    OK — W2·(W1·x) col→row, 1 all-reduce == whole  (max|Δ|={d:.2e})");
+    }
+
     // Tear down streams.
     for dev in gpus.devices.iter_mut() {
         if let Some(s) = dev.active_stream.take() {
