@@ -48,43 +48,16 @@ impl Gpu {
         let mt_val = m_total as i32;
         let xsr_val = x_src_rows as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-            &xsr_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 15) / 16) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let bytes = (m_total * k) + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b.push_i32(xsr_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val, i32 xsr_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -132,19 +105,6 @@ impl Gpu {
         let mt_val = m_total as i32;
         let xsr_val = x_src_rows as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-            &xsr_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 15) / 16) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         // BW estimate: Q8_1 X reads (~1 B/elem incl. (d,sum) metadata) +
@@ -152,26 +112,12 @@ impl Gpu {
         // uses 2 B/elem for X).
         let bytes = (m_total * k) + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b.push_i32(xsr_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val, i32 xsr_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

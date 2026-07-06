@@ -125,26 +125,15 @@ impl Gpu {
             &kernel_name,
         )?;
 
-        let mut a_a_p = a_a.buf.as_ptr();
-        let mut a_b_p = a_b.buf.as_ptr();
-        let mut xq = x_q8_ptr;
-        let mut y_a_p = y_a.buf.as_ptr();
-        let mut y_b_p = y_b.buf.as_ptr();
-        let mut m_a_val = m_a as i32;
-        let mut m_b_val = m_b as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_a_p as *mut _ as *mut c_void,
-            &mut a_b_p as *mut _ as *mut c_void,
-            &mut xq as *mut _ as *mut c_void,
-            &mut y_a_p as *mut _ as *mut c_void,
-            &mut y_b_p as *mut _ as *mut c_void,
-            &mut m_a_val as *mut _ as *mut c_void,
-            &mut m_b_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
+        let a_a_p = a_a.buf.as_ptr();
+        let a_b_p = a_b.buf.as_ptr();
+        let xq = x_q8_ptr;
+        let y_a_p = y_a.buf.as_ptr();
+        let y_b_p = y_b.buf.as_ptr();
+        let m_a_val = m_a as i32;
+        let m_b_val = m_b as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
         // KEEP IN SYNC WITH body.cuh: MMQ_Y is chosen by the wrapper
         // (`use_y64` above gates which wrapper is included). x_dm sizing
@@ -174,25 +163,12 @@ impl Gpu {
             "gemm_gate_up_hfq4g256_mmq_gfx906"
         };
         let timer = crate::profile::begin_timer(&self.hip, "gemm", timer_label, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             &kernel_name,
             [row_tiles as u32, col_tiles as u32, 1],
             [64, 4, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_a_p);
-                b.push_ptr(a_b_p);
-                b.push_ptr(xq);
-                b.push_ptr(y_a_p);
-                b.push_ptr(y_b_p);
-                b.push_i32(m_a_val);
-                b.push_i32(m_b_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_a_p, ptr a_b_p, ptr xq, ptr y_a_p, ptr y_b_p, i32 m_a_val, i32 m_b_val, i32 k_val, i32 bs_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -279,22 +255,13 @@ impl Gpu {
 
         self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut xq_ptr = x_q8_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
-        let mut add_val = 1i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut add_val as *mut _ as *mut c_void,
-        ];
+        let a_ptr = a_raw.buf.as_ptr();
+        let xq_ptr = x_q8_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let add_val = 1i32;
 
         // Option C streaming topology — KEEP IN SYNC WITH body.cuh:
         //   x_qs   : MMQ_Y * x_stride ints  (per-mmq_x: 40 if mmq_x≥32 else 33)
@@ -319,23 +286,12 @@ impl Gpu {
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", base_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             &kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [64, 4, 1], // nwarps=4
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(xq_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b.push_i32(add_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr xq_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 n_val, i32 add_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -408,22 +364,13 @@ impl Gpu {
 
         self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut xq_ptr = x_q8_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
-        let mut add_val = 0i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut add_val as *mut _ as *mut c_void,
-        ];
+        let a_ptr = a_raw.buf.as_ptr();
+        let xq_ptr = x_q8_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let add_val = 0i32;
 
         // Option C streaming topology — KEEP IN SYNC WITH body.cuh
         // (same layout invariant as residual variant above).
@@ -446,23 +393,12 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set_gfx906", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             &kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [64, 4, 1], // nwarps=4
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(xq_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b.push_i32(add_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr xq_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 n_val, i32 add_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -549,32 +485,18 @@ impl Gpu {
 
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
-        let mut a_q_p = a_q.buf.as_ptr();
-        let mut a_k_p = a_k.buf.as_ptr();
-        let mut a_v_p = a_v.buf.as_ptr();
-        let mut xq = xq_ptr;
-        let mut y_q_p = y_q.buf.as_ptr();
-        let mut y_k_p = y_k.buf.as_ptr();
-        let mut y_v_p = y_v.buf.as_ptr();
-        let mut q_m_val = q_m as i32;
-        let mut k_m_val = k_m as i32;
-        let mut v_m_val = v_m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_q_p as *mut _ as *mut c_void,
-            &mut a_k_p as *mut _ as *mut c_void,
-            &mut a_v_p as *mut _ as *mut c_void,
-            &mut xq as *mut _ as *mut c_void,
-            &mut y_q_p as *mut _ as *mut c_void,
-            &mut y_k_p as *mut _ as *mut c_void,
-            &mut y_v_p as *mut _ as *mut c_void,
-            &mut q_m_val as *mut _ as *mut c_void,
-            &mut k_m_val as *mut _ as *mut c_void,
-            &mut v_m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
+        let a_q_p = a_q.buf.as_ptr();
+        let a_k_p = a_k.buf.as_ptr();
+        let a_v_p = a_v.buf.as_ptr();
+        let xq = xq_ptr;
+        let y_q_p = y_q.buf.as_ptr();
+        let y_k_p = y_k.buf.as_ptr();
+        let y_v_p = y_v.buf.as_ptr();
+        let q_m_val = q_m as i32;
+        let k_m_val = k_m as i32;
+        let v_m_val = v_m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
         // Option C streaming topology — KEEP IN SYNC WITH body.cuh.
         // X_STRIDE varies with mmq_x (see body.cuh x_stride_for<>):
@@ -602,28 +524,12 @@ impl Gpu {
             + batch_size * (q_m + k_m + v_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_mmq_gfx906", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             &kernel_name,
             [row_tiles as u32, col_tiles as u32, 1],
             [64, 4, 1], // wave64 native: 4 wave64s = 256 threads
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_q_p);
-                b.push_ptr(a_k_p);
-                b.push_ptr(a_v_p);
-                b.push_ptr(xq);
-                b.push_ptr(y_q_p);
-                b.push_ptr(y_k_p);
-                b.push_ptr(y_v_p);
-                b.push_i32(q_m_val);
-                b.push_i32(k_m_val);
-                b.push_i32(v_m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_q_p, ptr a_k_p, ptr a_v_p, ptr xq, ptr y_q_p, ptr y_k_p, ptr y_v_p, i32 q_m_val, i32 k_m_val, i32 v_m_val, i32 k_val, i32 bs_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

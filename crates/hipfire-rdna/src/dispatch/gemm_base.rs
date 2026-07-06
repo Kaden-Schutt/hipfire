@@ -69,36 +69,18 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let ni = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &wp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mi as *const _ as *mut c_void,
-            &ki as *const _ as *mut c_void,
-            &ni as *const _ as *mut c_void,
-        ];
         let rows = ((m + 15) / 16) as u32;
         let batches = ((batch_size + 15) / 16) as u32;
         // Bytes: FP16 weight + FP16 x + FP32 y (read+write).
         let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4 * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_mw16_residual_wmma",
             [rows, batches, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(wp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(ni);
-                b
-            },
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 ni],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -481,35 +463,17 @@ impl Gpu {
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "gemm_f16_x_f16_wmma",
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bi);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         )
     }
     /// WMMA F16 weight × FP32 input → F32 output GEMM with (B, M)
@@ -547,35 +511,17 @@ impl Gpu {
         let ap = a_f16.buf.as_ptr();
         let xp = self.ensure_fp16_x(x_f32, batch_size * k)?;
         let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "gemm_f16_x_f16_wmma",
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bi);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         )
     }
     /// WMMA BF16 weight × BF16-staged input → F32 output GEMM with
@@ -749,37 +695,19 @@ impl Gpu {
         let ap = a_bf16.buf.as_ptr();
         let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
         let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
         let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", profile_label, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_bf16_x_bf16_wmma",
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bi);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -815,40 +743,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -882,40 +786,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled_b16", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -946,40 +826,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled_b32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1010,40 +866,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled_b64", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

@@ -44,47 +44,25 @@ impl Gpu {
 
         let n_bands = head_dim / 2;
 
-        let mut q_ptr = q_batch.as_ptr();
-        let mut sre_ptr = accs_sum_re.as_ptr();
-        let mut sim_ptr = accs_sum_im.as_ptr();
-        let mut sab_ptr = accs_sum_abs.as_ptr();
-        let mut cnt_ptr = accs_count.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut li = layer_idx as i32;
+        let q_ptr = q_batch.as_ptr();
+        let sre_ptr = accs_sum_re.as_ptr();
+        let sim_ptr = accs_sum_im.as_ptr();
+        let sab_ptr = accs_sum_abs.as_ptr();
+        let cnt_ptr = accs_count.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let li = layer_idx as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut sre_ptr as *mut _ as *mut c_void,
-            &mut sim_ptr as *mut _ as *mut c_void,
-            &mut sab_ptr as *mut _ as *mut c_void,
-            &mut cnt_ptr as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut li as *mut _ as *mut c_void,
-        ];
-
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "triattn_accumulate_f32",
             [n_heads as u32, n_bands as u32, 1],
             [64, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(sre_ptr);
-                b.push_ptr(sim_ptr);
-                b.push_ptr(sab_ptr);
-                b.push_ptr(cnt_ptr);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_i32(li);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr sre_ptr, ptr sim_ptr, ptr sab_ptr, ptr cnt_ptr,
+                i32 nt, i32 nh, i32 hd, i32 li
+            ],
         )
     }
     /// GPU-side GQA attention.
@@ -213,44 +191,18 @@ impl Gpu {
         let sc = scale;
         let cs = chunk_size as i32;
 
-        let mut params1: Vec<*mut c_void> = vec![
-            &q_ptr as *const _ as *mut c_void,
-            &k_ptr as *const _ as *mut c_void,
-            &v_ptr as *const _ as *mut c_void,
-            &p_ptr as *const _ as *mut c_void,
-            &sl as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ms as *const _ as *mut c_void,
-            &sc as *const _ as *mut c_void,
-            &cs as *const _ as *mut c_void,
-        ];
-
         let block_size = 128u32.min(chunk_size as u32).next_power_of_two();
         let shared_mem = ((chunk_size + block_size as usize) * 4) as u32;
 
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "attention_flash_partial",
             [n_heads as u32, n_chunks as u32, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params1,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptr);
-                b.push_ptr(v_ptr);
-                b.push_ptr(p_ptr);
-                b.push_i32(sl);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(ms);
-                b.push_f32(sc);
-                b.push_i32(cs);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptr, ptr v_ptr, ptr p_ptr,
+                i32 sl, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 cs
+            ],
         )?;
 
         // Phase 2: reduce partials
@@ -266,30 +218,13 @@ impl Gpu {
         let nc = n_chunks as i32;
         let hd2 = head_dim as i32;
 
-        let mut params2: Vec<*mut c_void> = vec![
-            &p_ptr2 as *const _ as *mut c_void,
-            &out_ptr as *const _ as *mut c_void,
-            &nh2 as *const _ as *mut c_void,
-            &nc as *const _ as *mut c_void,
-            &hd2 as *const _ as *mut c_void,
-        ];
-
         let reduce_block = head_dim.min(256) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "attention_flash_reduce",
             [n_heads as u32, 1, 1],
             [reduce_block, 1, 1],
             0,
-            &mut params2,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(p_ptr2);
-                b.push_ptr(out_ptr);
-                b.push_i32(nh2);
-                b.push_i32(nc);
-                b.push_i32(hd2);
-                b
-            },
+            &kernargs![ptr p_ptr2, ptr out_ptr, i32 nh2, i32 nc, i32 hd2],
         )
     }
     /// GQA-aware split-K flash decode: one phase-1 block per (kv_head, chunk)
@@ -334,42 +269,17 @@ impl Gpu {
         let ms = max_seq as i32;
         let sc = scale;
         let cs = chunk_size as i32;
-        let mut p1: Vec<*mut c_void> = vec![
-            &q_ptr as *const _ as *mut c_void,
-            &k_ptr as *const _ as *mut c_void,
-            &v_ptr as *const _ as *mut c_void,
-            &p_ptr as *const _ as *mut c_void,
-            &sl as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ms as *const _ as *mut c_void,
-            &sc as *const _ as *mut c_void,
-            &cs as *const _ as *mut c_void,
-        ];
         let block = 128u32.min(chunk_size as u32).next_power_of_two();
         let shmem = ((chunk_size + block as usize) * 4) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "attention_flash_gqa_partial",
             [n_kv_heads as u32, n_chunks as u32, 1],
             [block, 1, 1],
             shmem,
-            &mut p1,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptr);
-                b.push_ptr(v_ptr);
-                b.push_ptr(p_ptr);
-                b.push_i32(sl);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(ms);
-                b.push_f32(sc);
-                b.push_i32(cs);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptr, ptr v_ptr, ptr p_ptr,
+                i32 sl, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 cs
+            ],
         )?;
 
         self.ensure_kernel(
@@ -382,28 +292,12 @@ impl Gpu {
         let nh2 = n_heads as i32;
         let nc = n_chunks as i32;
         let hd2 = head_dim as i32;
-        let mut p2: Vec<*mut c_void> = vec![
-            &p2_ptr as *const _ as *mut c_void,
-            &o_ptr as *const _ as *mut c_void,
-            &nh2 as *const _ as *mut c_void,
-            &nc as *const _ as *mut c_void,
-            &hd2 as *const _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "attention_flash_reduce",
             [n_heads as u32, 1, 1],
             [head_dim.min(256) as u32, 1, 1],
             0,
-            &mut p2,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(p2_ptr);
-                b.push_ptr(o_ptr);
-                b.push_i32(nh2);
-                b.push_i32(nc);
-                b.push_i32(hd2);
-                b
-            },
+            &kernargs![ptr p2_ptr, ptr o_ptr, i32 nh2, i32 nc, i32 hd2],
         )
     }
     /// Single-launch GQA decode: one block per kv_head streams all KV once,
@@ -601,7 +495,10 @@ impl Gpu {
             let block_size = (seq_len_hint.max(head_dim) as u32)
                 .next_power_of_two()
                 .min(256);
-            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+            (
+                block_size,
+                ((seq_len_hint + block_size as usize) * 4) as u32,
+            )
         };
         unsafe {
             self.hip.launch_kernel(
@@ -756,7 +653,10 @@ impl Gpu {
             let block_size = (seq_len_hint.max(head_dim) as u32)
                 .next_power_of_two()
                 .min(256);
-            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+            (
+                block_size,
+                ((seq_len_hint + block_size as usize) * 4) as u32,
+            )
         };
         unsafe {
             self.hip.launch_kernel(
@@ -835,7 +735,10 @@ impl Gpu {
             let block_size = (seq_len_hint.max(head_dim) as u32)
                 .next_power_of_two()
                 .min(256);
-            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+            (
+                block_size,
+                ((seq_len_hint + block_size as usize) * 4) as u32,
+            )
         };
         unsafe {
             self.hip.launch_kernel(
@@ -1057,21 +960,6 @@ impl Gpu {
         let sc = scale;
         let bs = block_start as i32;
         let bc = block_cols as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &q_ptr as *const _ as *mut c_void,
-            &k_ptr as *const _ as *mut c_void,
-            &v_ptr as *const _ as *mut c_void,
-            &out_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &bias_ptr as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ms as *const _ as *mut c_void,
-            &sc as *const _ as *mut c_void,
-            &bs as *const _ as *mut c_void,
-            &bc as *const _ as *mut c_void,
-        ];
         let (block_size, shared_mem) = if use_gfx1103 {
             (32u32, 0u32)
         } else {
@@ -1088,29 +976,15 @@ impl Gpu {
                 * batch_size;
         let timer =
             crate::profile::begin_timer(&self.hip, "attention", "attention_f32_batched", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptr);
-                b.push_ptr(v_ptr);
-                b.push_ptr(out_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_ptr(bias_ptr);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(ms);
-                b.push_f32(sc);
-                b.push_i32(bs);
-                b.push_i32(bc);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptr, ptr v_ptr, ptr out_ptr, ptr pos_ptr, ptr bias_ptr,
+                i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 bs, i32 bc
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1166,21 +1040,6 @@ impl Gpu {
         let hd = head_dim as i32;
         let ms = max_seq as i32;
         let sc = scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &q_ptr as *const _ as *mut c_void,
-            &k_ptrs_ptr as *const _ as *mut c_void,
-            &v_ptrs_ptr as *const _ as *mut c_void,
-            &out_ptr as *const _ as *mut c_void,
-            &row_session_indices_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ms as *const _ as *mut c_void,
-            &sc as *const _ as *mut c_void,
-        ];
         let (block_size, shared_mem) = if use_gfx1103 {
             (32u32, 0u32)
         } else {
@@ -1201,29 +1060,16 @@ impl Gpu {
             "attention_f32_routed_batched",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptrs_ptr);
-                b.push_ptr(v_ptrs_ptr);
-                b.push_ptr(out_ptr);
-                b.push_ptr(row_session_indices_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(ptr_stride);
-                b.push_i32(layer);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(ms);
-                b.push_f32(sc);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptrs_ptr, ptr v_ptrs_ptr, ptr out_ptr,
+                ptr row_session_indices_ptr, ptr pos_ptr,
+                i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1279,21 +1125,6 @@ impl Gpu {
         let hd = head_dim as i32;
         let ms = max_seq as i32;
         let sc = scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &q_ptr as *const _ as *mut c_void,
-            &k_ptrs_ptr as *const _ as *mut c_void,
-            &v_ptrs_ptr as *const _ as *mut c_void,
-            &out_ptr as *const _ as *mut c_void,
-            &row_session_indices_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ms as *const _ as *mut c_void,
-            &sc as *const _ as *mut c_void,
-        ];
         let (block_size, shared_mem) = if use_gfx1103 {
             (32u32, 0u32)
         } else {
@@ -1314,29 +1145,16 @@ impl Gpu {
             "attention_q8_0_routed_batched",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptrs_ptr);
-                b.push_ptr(v_ptrs_ptr);
-                b.push_ptr(out_ptr);
-                b.push_ptr(row_session_indices_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(ptr_stride);
-                b.push_i32(layer);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(ms);
-                b.push_f32(sc);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptrs_ptr, ptr v_ptrs_ptr, ptr out_ptr,
+                ptr row_session_indices_ptr, ptr pos_ptr,
+                i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1392,54 +1210,20 @@ impl Gpu {
         let sc = scale;
         let rb = rec_bytes as i32;
         let gp = GROUP as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &q_ptr as *const _ as *mut c_void,
-            &rec_ptrs_ptr as *const _ as *mut c_void,
-            &win_ptrs_ptr as *const _ as *mut c_void,
-            &v_ptrs_ptr as *const _ as *mut c_void,
-            &out_ptr as *const _ as *mut c_void,
-            &rsi_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ms as *const _ as *mut c_void,
-            &sc as *const _ as *mut c_void,
-            &rb as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-        ];
         let block_size = (max_ctx_len.max(head_dim) as u32)
             .next_power_of_two()
             .min(256);
         let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "attention_kvarn_routed_batched",
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(q_ptr);
-                bb.push_ptr(rec_ptrs_ptr);
-                bb.push_ptr(win_ptrs_ptr);
-                bb.push_ptr(v_ptrs_ptr);
-                bb.push_ptr(out_ptr);
-                bb.push_ptr(rsi_ptr);
-                bb.push_ptr(pos_ptr);
-                bb.push_i32(ptr_stride);
-                bb.push_i32(layer);
-                bb.push_i32(nh);
-                bb.push_i32(nkv);
-                bb.push_i32(hd);
-                bb.push_i32(ms);
-                bb.push_f32(sc);
-                bb.push_i32(rb);
-                bb.push_i32(gp);
-                bb
-            },
+            &kernargs![
+                ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
+                ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
+                i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp
+            ],
         )
     }
     /// FP32 causal attention specialized for GQA groups where four query heads
@@ -1498,18 +1282,6 @@ impl Gpu {
         let hd = head_dim as i32;
         let mcl = max_ctx_len as i32;
         let sc = scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &q_ptr as *const _ as *mut c_void,
-            &k_ptr as *const _ as *mut c_void,
-            &v_ptr as *const _ as *mut c_void,
-            &out_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &mcl as *const _ as *mut c_void,
-            &sc as *const _ as *mut c_void,
-        ];
         let (block_size, shared_mem) = if use_gfx1103 {
             (32u32, 0u32)
         } else {
@@ -1534,26 +1306,15 @@ impl Gpu {
             "attention_f32_batched_gqa4",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [grid_x as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptr);
-                b.push_ptr(v_ptr);
-                b.push_ptr(out_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(mcl);
-                b.push_f32(sc);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptr, ptr v_ptr, ptr out_ptr, ptr pos_ptr,
+                i32 nh, i32 nkv, i32 hd, i32 mcl, f32 sc
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1610,38 +1371,23 @@ impl Gpu {
         };
         self.ensure_kernel(module, src, kname)?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let mut q_ptr = q.buf.as_ptr();
-        let mut k_ptr = k_cache.buf.as_ptr();
-        let mut v_ptr = v_cache.buf.as_ptr();
-        let mut out_ptr = out.buf.as_ptr();
-        let mut pos_ptr = positions.buf.as_ptr();
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
         // tree_bias = null when None; the kernel branches on bias != nullptr.
-        let mut bias_ptr: *mut std::ffi::c_void = match tree_bias {
+        let bias_ptr: *mut std::ffi::c_void = match tree_bias {
             Some(t) => t.buf.as_ptr(),
             None => std::ptr::null_mut(),
         };
-        let mut nh = n_heads as i32;
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut ms = max_seq as i32;
-        let mut sc = scale;
-        let mut bs = block_start as i32;
-        let mut bc = block_cols as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut k_ptr as *mut _ as *mut c_void,
-            &mut v_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut pos_ptr as *mut _ as *mut c_void,
-            &mut bias_ptr as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut ms as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
-            &mut bc as *mut _ as *mut c_void,
-        ];
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = scale;
+        let bs = block_start as i32;
+        let bc = block_cols as i32;
         let (block_size, shared_mem) = if use_gfx1103 {
             (32u32, 0u32)
         } else {
@@ -1660,30 +1406,15 @@ impl Gpu {
                 * batch_size;
         let timer =
             crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_batched", bytes);
-        let bias_raw = bias_ptr; // alias for move into closure
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptr);
-                b.push_ptr(v_ptr);
-                b.push_ptr(out_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_ptr(bias_raw);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(ms);
-                b.push_f32(sc);
-                b.push_i32(bs);
-                b.push_i32(bc);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptr, ptr v_ptr, ptr out_ptr, ptr pos_ptr, ptr bias_ptr,
+                i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 bs, i32 bc
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1869,56 +1600,17 @@ impl Gpu {
                 let bc = block_cols as i32;
                 let nfb = n_full_blocks as i32;
                 let rb = rec_bytes as i32;
-                let mut params: Vec<*mut c_void> = vec![
-                    &q_ptr as *const _ as *mut c_void,
-                    &rec_ptr as *const _ as *mut c_void,
-                    &win_ptr as *const _ as *mut c_void,
-                    &v_ptr as *const _ as *mut c_void,
-                    &p_ptr as *const _ as *mut c_void,
-                    &pos_ptr as *const _ as *mut c_void,
-                    &bias_ptr as *const _ as *mut c_void,
-                    &nh as *const _ as *mut c_void,
-                    &nkv as *const _ as *mut c_void,
-                    &hd as *const _ as *mut c_void,
-                    &ms as *const _ as *mut c_void,
-                    &sc as *const _ as *mut c_void,
-                    &ts as *const _ as *mut c_void,
-                    &mt as *const _ as *mut c_void,
-                    &bo as *const _ as *mut c_void,
-                    &bs as *const _ as *mut c_void,
-                    &bc as *const _ as *mut c_void,
-                    &nfb as *const _ as *mut c_void,
-                    &rb as *const _ as *mut c_void,
-                ];
-                self.launch_maybe_blob(
+                self.launch_kernargs(
                     "attention_flash_kvarn_tile_batched",
                     [n_heads as u32, max_tiles as u32, chunk as u32],
                     [32, 1, 1],
                     (TILE_SIZE * 4) as u32,
-                    &mut params,
-                    || {
-                        let mut b = hip_bridge::KernargBlob::new();
-                        b.push_ptr(q_ptr);
-                        b.push_ptr(rec_ptr);
-                        b.push_ptr(win_ptr);
-                        b.push_ptr(v_ptr);
-                        b.push_ptr(p_ptr);
-                        b.push_ptr(pos_ptr);
-                        b.push_ptr(bias_ptr);
-                        b.push_i32(nh);
-                        b.push_i32(nkv);
-                        b.push_i32(hd);
-                        b.push_i32(ms);
-                        b.push_f32(sc);
-                        b.push_i32(ts);
-                        b.push_i32(mt);
-                        b.push_i32(bo);
-                        b.push_i32(bs);
-                        b.push_i32(bc);
-                        b.push_i32(nfb);
-                        b.push_i32(rb);
-                        b
-                    },
+                    &kernargs![
+                        ptr q_ptr, ptr rec_ptr, ptr win_ptr, ptr v_ptr, ptr p_ptr,
+                        ptr pos_ptr, ptr bias_ptr,
+                        i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc,
+                        i32 ts, i32 mt, i32 bo, i32 bs, i32 bc, i32 nfb, i32 rb
+                    ],
                 )?;
             }
             {
@@ -1933,38 +1625,15 @@ impl Gpu {
                 let bo = offset as i32;
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
-                let mut params: Vec<*mut c_void> = vec![
-                    &p_ptr as *const _ as *mut c_void,
-                    &o_ptr as *const _ as *mut c_void,
-                    &pos_ptr as *const _ as *mut c_void,
-                    &nh as *const _ as *mut c_void,
-                    &hd as *const _ as *mut c_void,
-                    &ts as *const _ as *mut c_void,
-                    &mt as *const _ as *mut c_void,
-                    &bo as *const _ as *mut c_void,
-                    &bs as *const _ as *mut c_void,
-                    &bc as *const _ as *mut c_void,
-                ];
-                self.launch_maybe_blob(
+                self.launch_kernargs(
                     "attention_flash_asym_reduce_batched",
                     [n_heads as u32, chunk as u32, 1],
                     [32, 1, 1],
                     0,
-                    &mut params,
-                    || {
-                        let mut b = hip_bridge::KernargBlob::new();
-                        b.push_ptr(p_ptr);
-                        b.push_ptr(o_ptr);
-                        b.push_ptr(pos_ptr);
-                        b.push_i32(nh);
-                        b.push_i32(hd);
-                        b.push_i32(ts);
-                        b.push_i32(mt);
-                        b.push_i32(bo);
-                        b.push_i32(bs);
-                        b.push_i32(bc);
-                        b
-                    },
+                    &kernargs![
+                        ptr p_ptr, ptr o_ptr, ptr pos_ptr,
+                        i32 nh, i32 hd, i32 ts, i32 mt, i32 bo, i32 bs, i32 bc
+                    ],
                 )?;
             }
             offset += chunk;
@@ -2024,40 +1693,15 @@ impl Gpu {
             let ts = TILE_SIZE as i32;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((TILE_SIZE + head_dim) * 4) as u32;
-            let mut params: Vec<*mut c_void> = vec![
-                &q_ptr as *const _ as *mut c_void,
-                &k_ptr as *const _ as *mut c_void,
-                &v_ptr as *const _ as *mut c_void,
-                &p_ptr as *const _ as *mut c_void,
-                &pos_ptr as *const _ as *mut c_void,
-                &nh as *const _ as *mut c_void,
-                &nkv as *const _ as *mut c_void,
-                &hd as *const _ as *mut c_void,
-                &ms as *const _ as *mut c_void,
-                &sc as *const _ as *mut c_void,
-                &ts as *const _ as *mut c_void,
-            ];
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "attention_flash_q8_0_tile",
                 grid,
                 [32, 1, 1],
                 shared,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(q_ptr);
-                    b.push_ptr(k_ptr);
-                    b.push_ptr(v_ptr);
-                    b.push_ptr(p_ptr);
-                    b.push_ptr(pos_ptr);
-                    b.push_i32(nh);
-                    b.push_i32(nkv);
-                    b.push_i32(hd);
-                    b.push_i32(ms);
-                    b.push_f32(sc);
-                    b.push_i32(ts);
-                    b
-                },
+                &kernargs![
+                    ptr q_ptr, ptr k_ptr, ptr v_ptr, ptr p_ptr, ptr pos_ptr,
+                    i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 ts
+                ],
             )?;
         }
 
@@ -2075,32 +1719,12 @@ impl Gpu {
             let pos_ptr = pos_buf.as_ptr();
             let ts = TILE_SIZE as i32;
             let mt = max_tiles as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &p_ptr as *const _ as *mut c_void,
-                &o_ptr as *const _ as *mut c_void,
-                &nh as *const _ as *mut c_void,
-                &hd as *const _ as *mut c_void,
-                &pos_ptr as *const _ as *mut c_void,
-                &ts as *const _ as *mut c_void,
-                &mt as *const _ as *mut c_void,
-            ];
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "attention_flash_q8_0_reduce",
                 [n_heads as u32, 1, 1],
                 [32, 1, 1],
                 0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(p_ptr);
-                    b.push_ptr(o_ptr);
-                    b.push_i32(nh);
-                    b.push_i32(hd);
-                    b.push_ptr(pos_ptr);
-                    b.push_i32(ts);
-                    b.push_i32(mt);
-                    b
-                },
+                &kernargs![ptr p_ptr, ptr o_ptr, i32 nh, i32 hd, ptr pos_ptr, i32 ts, i32 mt],
             )?;
         }
         Ok(())
@@ -3272,28 +2896,16 @@ impl Gpu {
         };
         self.ensure_kernel(module, src, kname)?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let mut q_ptr = q.buf.as_ptr();
-        let mut k_ptr = k_cache.buf.as_ptr();
-        let mut v_ptr = v_cache.buf.as_ptr();
-        let mut out_ptr = out.buf.as_ptr();
-        let mut pos_ptr = pos_buf.as_ptr();
-        let mut nh = n_heads as i32;
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut ms = max_seq as i32;
-        let mut sc = scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut k_ptr as *mut _ as *mut c_void,
-            &mut v_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut pos_ptr as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut ms as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-        ];
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = scale;
         // hipGraph capture: `block_size` and `shared_mem` are launch-time host
         // scalars baked into the captured node. They are sized by `seq_len_hint`
         // (= current position + 1) on the direct path, which would lock a
@@ -3326,26 +2938,15 @@ impl Gpu {
         let bytes =
             crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [n_heads as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptr);
-                b.push_ptr(v_ptr);
-                b.push_ptr(out_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(ms);
-                b.push_f32(sc);
-                b
-            },
+            &kernargs![
+                ptr q_ptr, ptr k_ptr, ptr v_ptr, ptr out_ptr, ptr pos_ptr,
+                i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -3792,7 +3393,10 @@ impl Gpu {
             let block_size = (seq_len_hint.max(head_dim) as u32)
                 .next_power_of_two()
                 .min(256);
-            (block_size, ((seq_len_hint + block_size as usize) * 4) as u32)
+            (
+                block_size,
+                ((seq_len_hint + block_size as usize) * 4) as u32,
+            )
         };
         unsafe {
             self.hip.launch_kernel(
@@ -4281,30 +3885,17 @@ impl Gpu {
         let lds_f32 = 3 * 16 * head_dim + 16 * 16 + 16 * 3;
         let shared_mem = (lds_f32 * 4) as u32;
 
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k.buf.as_ptr();
-        let mut vp = v.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let mut bi = b as i32;
-        let mut li = l as i32;
-        let mut nh = n_heads as i32;
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut sc = scale;
-        let mut causal = 1i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-            &mut li as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-            &mut causal as *mut _ as *mut c_void,
-        ];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let bi = b as i32;
+        let li = l as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let sc = scale;
+        let causal = 1i32;
 
         let q_tiles = (b + 15) / 16;
         let bytes = b * n_heads * head_dim * 8 + l * n_kv_heads * head_dim * 8;
@@ -4314,27 +3905,15 @@ impl Gpu {
             "attention_dflash_wmma_causal_f32",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "attention_dflash_wmma_f32",
             [n_heads as u32, q_tiles as u32, 1],
             [32, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut blob = hip_bridge::KernargBlob::new();
-                blob.push_ptr(qp);
-                blob.push_ptr(kp);
-                blob.push_ptr(vp);
-                blob.push_ptr(op);
-                blob.push_i32(bi);
-                blob.push_i32(li);
-                blob.push_i32(nh);
-                blob.push_i32(nkv);
-                blob.push_i32(hd);
-                blob.push_f32(sc);
-                blob.push_i32(causal);
-                blob
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr op,
+                i32 bi, i32 li, i32 nh, i32 nkv, i32 hd, f32 sc, i32 causal
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -5005,30 +4584,17 @@ impl Gpu {
         let lds_f32 = (128 * head_dim) / 2 + (64 * 130) / 2 + 64 * 3;
         let shared_mem = (lds_f32 * 4) as u32;
 
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k_f16.buf.as_ptr();
-        let mut vp = v_f16.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let mut bi = b as i32;
-        let mut li = l as i32;
-        let mut nh = n_heads as i32;
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut sc = scale;
-        let mut causal = 1i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-            &mut li as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-            &mut causal as *mut _ as *mut c_void,
-        ];
+        let qp = q.buf.as_ptr();
+        let kp = k_f16.buf.as_ptr();
+        let vp = v_f16.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let bi = b as i32;
+        let li = l as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let sc = scale;
+        let causal = 1i32;
 
         let q_tiles = (b + 63) / 64;
         let bytes = b * n_heads * head_dim * 8 + l * n_kv_heads * head_dim * 4;
@@ -5038,27 +4604,15 @@ impl Gpu {
             "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32",
             [n_heads as u32, q_tiles as u32, 1],
             [128, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut blob = hip_bridge::KernargBlob::new();
-                blob.push_ptr(qp);
-                blob.push_ptr(kp);
-                blob.push_ptr(vp);
-                blob.push_ptr(op);
-                blob.push_i32(bi);
-                blob.push_i32(li);
-                blob.push_i32(nh);
-                blob.push_i32(nkv);
-                blob.push_i32(hd);
-                blob.push_f32(sc);
-                blob.push_i32(causal);
-                blob
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr op,
+                i32 bi, i32 li, i32 nh, i32 nkv, i32 hd, f32 sc, i32 causal
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -5710,35 +5264,16 @@ impl Gpu {
         let kp = kv.buf.as_ptr();
         let cp = cache.buf.as_ptr();
         let sb = slot_buf.buf.as_ptr();
-        let mut nh = n_kv_heads;
-        let mut hd = head_dim;
-        let mut wn = window;
-        let mut params: Vec<*mut c_void> = vec![
-            &kp as *const _ as *mut c_void,
-            &cp as *const _ as *mut c_void,
-            &sb as *const _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut wn as *mut _ as *mut c_void,
-        ];
+        let nh = n_kv_heads;
+        let hd = head_dim;
+        let wn = window;
         let grid = ((head_dim + 255) / 256) as u32;
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(kp);
-            b.push_ptr(cp);
-            b.push_ptr(sb);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_i32(wn);
-            b
-        };
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "swa_ring_write_f32_buf",
             [grid, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr kp, ptr cp, ptr sb, i32 nh, i32 hd, i32 wn],
         )
     }
     /// SWA visibility staging — BATCHED. For each batch position b at

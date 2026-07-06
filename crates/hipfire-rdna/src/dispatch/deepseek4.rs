@@ -305,35 +305,16 @@ impl Gpu {
         let sp = score_state.buf.as_ptr();
         let cp = kv_cache.buf.as_ptr();
         let sb = slot_buf.buf.as_ptr();
-        let mut tv = t;
-        let mut hd = head_dim;
-        let mut params: Vec<*mut c_void> = vec![
-            &kp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &cp as *const _ as *mut c_void,
-            &sb as *const _ as *mut c_void,
-            &mut tv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
+        let tv = t;
+        let hd = head_dim;
         let block = 256u32;
         let grid = ((head_dim as u32) + block - 1) / block;
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(kp);
-            b.push_ptr(sp);
-            b.push_ptr(cp);
-            b.push_ptr(sb);
-            b.push_i32(tv);
-            b.push_i32(hd);
-            b
-        };
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "compressor_softmax_pool_f32_buf",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr kp, ptr sp, ptr cp, ptr sb, i32 tv, i32 hd],
         )
     }
     /// Bulk F32→F16 conversion. dst must hold at least `n` F16s.
@@ -451,39 +432,16 @@ impl Gpu {
         let sp = scores.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
-        let mut tid = token_id;
-        let mut ne = n_exp;
-        let mut kv = k;
-        let mut rs = route_scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &mut tid as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut rs as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp);
-            b.push_ptr(sp);
-            b.push_ptr(ip);
-            b.push_ptr(wp);
-            b.push_i32(tid);
-            b.push_i32(ne);
-            b.push_i32(kv);
-            b.push_f32(rs);
-            b
-        };
-        self.launch_maybe_blob(
+        let tid = token_id;
+        let ne = n_exp;
+        let kv = k;
+        let rs = route_scale;
+        self.launch_kernargs(
             "hash_router_normalize_f32",
             [1, 1, 1],
             [1, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr tp, ptr sp, ptr ip, ptr wp, i32 tid, i32 ne, i32 kv, f32 rs],
         )
     }
     /// Batched twin of `hash_router_normalize_f32_buf` — for the prefill
@@ -516,41 +474,16 @@ impl Gpu {
         let tb = token_ids.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
-        let mut ne = n_exp;
-        let mut kv = k;
-        let mut rs = route_scale;
-        let mut bs = batch_size;
-        let mut params: Vec<*mut c_void> = vec![
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &tb as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut rs as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp);
-            b.push_ptr(sp);
-            b.push_ptr(tb);
-            b.push_ptr(ip);
-            b.push_ptr(wp);
-            b.push_i32(ne);
-            b.push_i32(kv);
-            b.push_f32(rs);
-            b.push_i32(bs);
-            b
-        };
-        self.launch_maybe_blob(
+        let ne = n_exp;
+        let kv = k;
+        let rs = route_scale;
+        let bs = batch_size;
+        self.launch_kernargs(
             "hash_router_normalize_f32_batched",
             [batch_size as u32, 1, 1],
             [1, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr tp, ptr sp, ptr tb, ptr ip, ptr wp, i32 ne, i32 kv, f32 rs, i32 bs],
         )
     }
     /// HIP-graphs-safe twin of `hash_router_normalize_f32` — reads
@@ -579,38 +512,15 @@ impl Gpu {
         let tb = token_id_buf.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
-        let mut ne = n_exp;
-        let mut kv = k;
-        let mut rs = route_scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &tb as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut rs as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp);
-            b.push_ptr(sp);
-            b.push_ptr(tb);
-            b.push_ptr(ip);
-            b.push_ptr(wp);
-            b.push_i32(ne);
-            b.push_i32(kv);
-            b.push_f32(rs);
-            b
-        };
-        self.launch_maybe_blob(
+        let ne = n_exp;
+        let kv = k;
+        let rs = route_scale;
+        self.launch_kernargs(
             "hash_router_normalize_f32_buf",
             [1, 1, 1],
             [1, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr tp, ptr sp, ptr tb, ptr ip, ptr wp, i32 ne, i32 kv, f32 rs],
         )
     }
     /// Phase 3 — Apply α scaling to the 24-element HC control vector
@@ -1028,27 +938,14 @@ impl Gpu {
             "hc_pre_post_sigmoid_scale_f32",
         )?;
         let xp = hc_c.buf.as_ptr();
-        let mut eps = hc_eps;
-        let mut ps = post_scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void,
-            &mut eps as *mut _ as *mut c_void,
-            &mut ps as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(xp);
-            b.push_f32(eps);
-            b.push_f32(ps);
-            b
-        };
-        self.launch_maybe_blob(
+        let eps = hc_eps;
+        let ps = post_scale;
+        self.launch_kernargs(
             "hc_pre_post_sigmoid_scale_f32",
             [1, 1, 1],
             [8, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr xp, f32 eps, f32 ps],
         )
     }
     /// Phase 3 — Sinkhorn-normalise a 4×4 gating matrix (in place).
@@ -1469,35 +1366,14 @@ impl Gpu {
         let wp = weights.buf.as_ptr();
         let sp = scores.buf.as_ptr();
         let nbp = n_buf.buf.as_ptr();
-        let mut hi = h;
-        let mut di = d;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &nbp as *const _ as *mut c_void,
-            &mut hi as *mut _ as *mut c_void,
-            &mut di as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(qp);
-            b.push_ptr(kp);
-            b.push_ptr(wp);
-            b.push_ptr(sp);
-            b.push_ptr(nbp);
-            b.push_i32(hi);
-            b.push_i32(di);
-            b
-        };
-        self.launch_maybe_blob(
+        let hi = h;
+        let di = d;
+        self.launch_kernargs(
             "indexer_relu_score_f32_buf",
             [max_n as u32, 1, 1],
             [h as u32, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr qp, ptr kp, ptr wp, ptr sp, ptr nbp, i32 hi, i32 di],
         )
     }
     /// Phase 2 — Per-head top-k selection.
@@ -1620,39 +1496,20 @@ impl Gpu {
         let ti = top_indices.buf.as_ptr();
         let nbp = n_compressed_buf.buf.as_ptr();
         let kbp = k_buf.buf.as_ptr();
-        let mut h = n_idx_heads;
-        let mut mk = max_k;
-        let mut params: Vec<*mut c_void> = vec![
-            &sp as *const _ as *mut c_void,
-            &ti as *const _ as *mut c_void,
-            &nbp as *const _ as *mut c_void,
-            &kbp as *const _ as *mut c_void,
-            &mut h as *mut _ as *mut c_void,
-            &mut mk as *mut _ as *mut c_void,
-        ];
+        let h = n_idx_heads;
+        let mk = max_k;
         let smem = max_n_compressed as u32;
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(sp);
-            b.push_ptr(ti);
-            b.push_ptr(nbp);
-            b.push_ptr(kbp);
-            b.push_i32(h);
-            b.push_i32(mk);
-            b
-        };
         // Block sized to parallelise the fast-path identity write of
         // up to max_k indices across threads (each thread writes
         // multiple slots via stride). The slow-path selection-sort
         // still serialises on thread 0 only — the extra threads
         // early-return in that branch.
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "indexer_top_k_buf",
             [n_idx_heads as u32, 1, 1],
             [128, 1, 1],
             smem,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr sp, ptr ti, ptr nbp, ptr kbp, i32 h, i32 mk],
         )
     }
     /// DeepSeek V4 MoE routing affinity: sqrt(softplus(x)) elementwise in-place.
@@ -1943,43 +1800,16 @@ impl Gpu {
         let sp = attn_sink.buf.as_ptr();
         let op = attn_out.buf.as_ptr();
         let nvp = n_valid_buf.buf.as_ptr();
-        let mut nh = n_heads;
-        let mut hd = head_dim;
-        let mut og = o_groups;
-        let mut wn = window;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &nvp as *const _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut og as *mut _ as *mut c_void,
-            &mut wn as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(qp);
-            b.push_ptr(kp);
-            b.push_ptr(vp);
-            b.push_ptr(sp);
-            b.push_ptr(op);
-            b.push_ptr(nvp);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_i32(og);
-            b.push_i32(wn);
-            b
-        };
-        self.launch_maybe_blob(
+        let nh = n_heads;
+        let hd = head_dim;
+        let og = o_groups;
+        let wn = window;
+        self.launch_kernargs(
             "deepseek4_attn_swa_buf",
             [n_heads as u32, 1, 1],
             [head_dim as u32, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr sp, ptr op, ptr nvp, i32 nh, i32 hd, i32 og, i32 wn],
         )
     }
     /// DeepSeek V4 batched indexer-extended SWA attention. Processes B query
@@ -2165,49 +1995,16 @@ impl Gpu {
         let op = attn_out.buf.as_ptr();
         let nvp = n_valid_swa_buf.buf.as_ptr();
         let nap = n_active_topk_buf.buf.as_ptr();
-        let mut nh = n_heads;
-        let mut hd = head_dim;
-        let mut sw = swa_window;
-        let mut tw = topk_window;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &tkp as *const _ as *mut c_void,
-            &tvp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &nvp as *const _ as *mut c_void,
-            &nap as *const _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut sw as *mut _ as *mut c_void,
-            &mut tw as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(qp);
-            b.push_ptr(kp);
-            b.push_ptr(vp);
-            b.push_ptr(tkp);
-            b.push_ptr(tvp);
-            b.push_ptr(sp);
-            b.push_ptr(op);
-            b.push_ptr(nvp);
-            b.push_ptr(nap);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_i32(sw);
-            b.push_i32(tw);
-            b
-        };
-        self.launch_maybe_blob(
+        let nh = n_heads;
+        let hd = head_dim;
+        let sw = swa_window;
+        let tw = topk_window;
+        self.launch_kernargs(
             "deepseek4_attn_swa_topk_f32_buf",
             [n_heads as u32, 1, 1],
             [head_dim as u32, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr tkp, ptr tvp, ptr sp, ptr op, ptr nvp, ptr nap, i32 nh, i32 hd, i32 sw, i32 tw],
         )
     }
     /// DeepSeek V4-asymmetric-clamped fused SwiGLU + FWHT rotation. Replaces
@@ -2239,15 +2036,6 @@ impl Gpu {
         let xrp = x_rot.buf.as_ptr();
         let kv = k as i32;
         let lim = swiglu_limit;
-        let mut params: Vec<*mut c_void> = vec![
-            &gp as *const _ as *mut c_void,
-            &up_p as *const _ as *mut c_void,
-            &s1_ptr as *const _ as *mut c_void,
-            &s2_ptr as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &kv as *const _ as *mut c_void,
-            &lim as *const _ as *mut c_void,
-        ];
         let bytes = k * 4 * 3 + 2 * 256 * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -2255,23 +2043,12 @@ impl Gpu {
             "deepseek4_fused_silu_mul_clamp_mq_rotate",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "deepseek4_fused_silu_mul_clamp_mq_rotate",
             [n_groups, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(gp);
-                b.push_ptr(up_p);
-                b.push_ptr(s1_ptr);
-                b.push_ptr(s2_ptr);
-                b.push_ptr(xrp);
-                b.push_i32(kv);
-                b.push_f32(lim);
-                b
-            },
+            &kernargs![ptr gp, ptr up_p, ptr s1_ptr, ptr s2_ptr, ptr xrp, i32 kv, f32 lim],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2307,15 +2084,6 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &rbp as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
         // MQ2-Lloyd: 72 bytes / 256-weight group.
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
@@ -2325,23 +2093,12 @@ impl Gpu {
             "deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
             [m as u32, k_top as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(rbp);
-                b.push_ptr(xrp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr pp, ptr ip, ptr wp, ptr rbp, ptr xrp, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2377,15 +2134,6 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &ygp as *const _ as *mut c_void,
-            &yup as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
         // MQ3-Lloyd: 112 bytes / 256-weight group.
         let mq3_weight_bytes = m * (k / 256) * 112;
         let bytes = (k_top as usize) * (mq3_weight_bytes + k * 4 + m * 4);
@@ -2395,23 +2143,12 @@ impl Gpu {
             "deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed",
             [m as u32, k_top as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(ygp);
-                b.push_ptr(yup);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2447,15 +2184,6 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &rbp as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
         // MQ3-Lloyd: 112 bytes / 256-weight group.
         let mq3_weight_bytes = m * (k / 256) * 112;
         let bytes = (k_top as usize) * (mq3_weight_bytes + k * 4 + m * 4);
@@ -2465,23 +2193,12 @@ impl Gpu {
             "deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
             [m as u32, k_top as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(rbp);
-                b.push_ptr(xrp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr pp, ptr ip, ptr wp, ptr rbp, ptr xrp, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2519,16 +2236,6 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &rbp as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &kt_val as *const _ as *mut c_void,
-        ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -2537,24 +2244,12 @@ impl Gpu {
             "deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(rbp);
-                b.push_ptr(xrp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(kt_val);
-                b
-            },
+            &kernargs![ptr pp, ptr ip, ptr wp, ptr rbp, ptr xrp, i32 m_val, i32 k_val, i32 kt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2591,15 +2286,6 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &ygp as *const _ as *mut c_void,
-            &yup as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
         // MQ2-Lloyd: 72 bytes / 256-weight group.
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
@@ -2609,23 +2295,12 @@ impl Gpu {
             "deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
             [m as u32, k_top as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(ygp);
-                b.push_ptr(yup);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2665,16 +2340,6 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &ygp as *const _ as *mut c_void,
-            &yup as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &kt_val as *const _ as *mut c_void,
-        ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -2683,24 +2348,12 @@ impl Gpu {
             "deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(ygp);
-                b.push_ptr(yup);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(kt_val);
-                b
-            },
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr ygp, ptr yup, i32 m_val, i32 k_val, i32 kt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2826,19 +2479,11 @@ impl Gpu {
         )?;
 
         let n = gate.numel() as i32;
-        let mut gate_ptr = gate.buf.as_ptr();
-        let mut up_ptr = up.buf.as_ptr();
-        let mut out_ptr = out.buf.as_ptr();
-        let mut n_val = n;
-        let mut limit_val = swiglu_limit;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut gate_ptr as *mut _ as *mut c_void,
-            &mut up_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut limit_val as *mut _ as *mut c_void,
-        ];
+        let gate_ptr = gate.buf.as_ptr();
+        let up_ptr = up.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n;
+        let limit_val = swiglu_limit;
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
@@ -2849,21 +2494,12 @@ impl Gpu {
             "deepseek4_silu_mul_clamp_f32",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "deepseek4_silu_mul_clamp_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(gate_ptr);
-                b.push_ptr(up_ptr);
-                b.push_ptr(out_ptr);
-                b.push_i32(n_val);
-                b.push_f32(limit_val);
-                b
-            },
+            &kernargs![ptr gate_ptr, ptr up_ptr, ptr out_ptr, i32 n_val, f32 limit_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2893,19 +2529,11 @@ impl Gpu {
         )?;
 
         let n_i32 = n as i32;
-        let mut gate_ptr = gate.buf.as_ptr();
-        let mut up_ptr = up.buf.as_ptr();
-        let mut out_ptr = out.buf.as_ptr();
-        let mut n_val = n_i32;
-        let mut limit_val = swiglu_limit;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut gate_ptr as *mut _ as *mut c_void,
-            &mut up_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut limit_val as *mut _ as *mut c_void,
-        ];
+        let gate_ptr = gate.buf.as_ptr();
+        let up_ptr = up.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n_i32;
+        let limit_val = swiglu_limit;
 
         let block = 256u32;
         let grid = ((n_i32 as u32) + block - 1) / block;
@@ -2916,21 +2544,12 @@ impl Gpu {
             "deepseek4_silu_mul_clamp_f32_batched",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "deepseek4_silu_mul_clamp_f32",
             [grid, batch as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(gate_ptr);
-                b.push_ptr(up_ptr);
-                b.push_ptr(out_ptr);
-                b.push_i32(n_val);
-                b.push_f32(limit_val);
-                b
-            },
+            &kernargs![ptr gate_ptr, ptr up_ptr, ptr out_ptr, i32 n_val, f32 limit_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -3035,41 +2654,16 @@ impl Gpu {
         let op = out.buf.as_ptr();
         let kbp = k_buf.buf.as_ptr();
         let ncp = n_compressed_buf.buf.as_ptr();
-        let mut hd = head_dim;
-        let mut os = out_stride;
-        let mut co = col_offset;
-        let mut sc = scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &cp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &kbp as *const _ as *mut c_void,
-            &ncp as *const _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut os as *mut _ as *mut c_void,
-            &mut co as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(cp);
-            b.push_ptr(ip);
-            b.push_ptr(op);
-            b.push_ptr(kbp);
-            b.push_ptr(ncp);
-            b.push_i32(hd);
-            b.push_i32(os);
-            b.push_i32(co);
-            b.push_f32(sc);
-            b
-        };
-        self.launch_maybe_blob(
+        let hd = head_dim;
+        let os = out_stride;
+        let co = col_offset;
+        let sc = scale;
+        self.launch_kernargs(
             "deepseek4_topk_kv_gather_f32_buf",
             [max_k as u32, 1, 1],
             [head_dim as u32, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr cp, ptr ip, ptr op, ptr kbp, ptr ncp, i32 hd, i32 os, i32 co, f32 sc],
         )
     }
     /// DeepSeek V4 identity gather — BATCHED. For ratio=128 layers without an
@@ -3138,31 +2732,14 @@ impl Gpu {
         let cp = kv_cache.buf.as_ptr();
         let op = out.buf.as_ptr();
         let kbp = k_buf.buf.as_ptr();
-        let mut hd = head_dim;
-        let mut os = out_stride;
-        let mut params: Vec<*mut c_void> = vec![
-            &cp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &kbp as *const _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut os as *mut _ as *mut c_void,
-        ];
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(cp);
-            b.push_ptr(op);
-            b.push_ptr(kbp);
-            b.push_i32(hd);
-            b.push_i32(os);
-            b
-        };
-        self.launch_maybe_blob(
+        let hd = head_dim;
+        let os = out_stride;
+        self.launch_kernargs(
             "deepseek4_topk_kv_gather_identity_f32_buf",
             [max_k as u32, 1, 1],
             [head_dim as u32, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr cp, ptr op, ptr kbp, i32 hd, i32 os],
         )
     }
     /// DeepSeek V4 per-group O-LoRA batched GEMV (F32 weights). Block-diagonal:
@@ -3493,15 +3070,6 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &kt_val as *const _ as *mut c_void,
-        ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -3510,23 +3078,12 @@ impl Gpu {
             "deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemv_mq2g256_lloyd_moe_down_expanded_k4",
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(kt_val);
-                b
-            },
+            &kernargs![ptr pp, ptr ip, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 kt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

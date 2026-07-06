@@ -41,32 +41,17 @@ impl Gpu {
             "embedding_f32_batched",
         )?;
 
-        let mut tp = table.buf.as_ptr();
-        let mut op = output.buf.as_ptr();
-        let mut tidp = token_ids.buf.as_ptr();
-        let mut d = dim as i32;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let tidp = token_ids.buf.as_ptr();
+        let d = dim as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &mut tp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut tidp as *mut _ as *mut c_void,
-            &mut d as *mut _ as *mut c_void,
-        ];
-
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "embedding_f32_batched",
             [n as u32, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(tp);
-                b.push_ptr(op);
-                b.push_ptr(tidp);
-                b.push_i32(d);
-                b
-            },
+            &kernargs![ptr tp, ptr op, ptr tidp, i32 d],
         )
     }
     /// Q8_0 embedding lookup: dequantize one row on GPU, output F32.
@@ -191,32 +176,17 @@ impl Gpu {
             "embedding_q8_batched",
         )?;
 
-        let mut tp = table.buf.as_ptr();
-        let mut op = output.buf.as_ptr();
-        let mut tidp = token_ids.buf.as_ptr();
-        let mut d = dim as i32;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let tidp = token_ids.buf.as_ptr();
+        let d = dim as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &mut tp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut tidp as *mut _ as *mut c_void,
-            &mut d as *mut _ as *mut c_void,
-        ];
-
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "embedding_q8_batched",
             [n as u32, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(tp);
-                b.push_ptr(op);
-                b.push_ptr(tidp);
-                b.push_i32(d);
-                b
-            },
+            &kernargs![ptr tp, ptr op, ptr tidp, i32 d],
         )
     }
     /// Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single
@@ -239,32 +209,17 @@ impl Gpu {
             "embedding_hfq4g256_batched",
         )?;
 
-        let mut tp = table.buf.as_ptr();
-        let mut op = output.buf.as_ptr();
-        let mut tidp = token_ids.buf.as_ptr();
-        let mut d = dim as i32;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let tidp = token_ids.buf.as_ptr();
+        let d = dim as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &mut tp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut tidp as *mut _ as *mut c_void,
-            &mut d as *mut _ as *mut c_void,
-        ];
-
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "embedding_hfq4g256_batched",
             [n as u32, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(tp);
-                b.push_ptr(op);
-                b.push_ptr(tidp);
-                b.push_i32(d);
-                b
-            },
+            &kernargs![ptr tp, ptr op, ptr tidp, i32 d],
         )
     }
     /// HFQ4-G128 embedding lookup: dequantize one row on GPU, output F32.

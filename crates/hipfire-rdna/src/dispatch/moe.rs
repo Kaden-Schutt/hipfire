@@ -7,7 +7,6 @@
 use super::{Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
-use std::ffi::c_void;
 
 impl Gpu {
     /// MoE router GPU softmax + top-K + (optional) renormalize. One
@@ -32,13 +31,6 @@ impl Gpu {
         let wp = topk_w.buf.as_ptr();
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
-        let mut params: Vec<*mut c_void> = vec![
-            &lp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &n as *const _ as *mut c_void,
-            &nr as *const _ as *mut c_void,
-        ];
         let bytes = n_exp * 4 + 8 * 8;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -46,21 +38,12 @@ impl Gpu {
             "moe_softmax_topk_renorm_k8",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_softmax_topk_renorm_k8",
             [1, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_i32(n);
-                b.push_i32(nr);
-                b
-            },
+            &kernargs![ptr lp, ptr ip, ptr wp, i32 n, i32 nr],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -90,31 +73,15 @@ impl Gpu {
         let wp = topk_w.buf.as_ptr();
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
-        let mut params: Vec<*mut c_void> = vec![
-            &lp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &n as *const _ as *mut c_void,
-            &nr as *const _ as *mut c_void,
-        ];
         let bytes = n_exp * 4 + 8 * 8;
         let timer =
             crate::profile::begin_timer(&self.hip, "elementwise", "moe_topk_renorm_k8", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_topk_renorm_k8",
             [1, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_i32(n);
-                b.push_i32(nr);
-                b
-            },
+            &kernargs![ptr lp, ptr ip, ptr wp, i32 n, i32 nr],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -144,13 +111,6 @@ impl Gpu {
         let wp = topk_w.buf.as_ptr();
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
-        let mut params: Vec<*mut c_void> = vec![
-            &lp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &n as *const _ as *mut c_void,
-            &nr as *const _ as *mut c_void,
-        ];
         let bytes = (n_exp * 4 + 8 * 8) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -158,21 +118,12 @@ impl Gpu {
             "moe_softmax_topk_renorm_k8_batched",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_softmax_topk_renorm_k8_batched",
             [batch_size as u32, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_i32(n);
-                b.push_i32(nr);
-                b
-            },
+            &kernargs![ptr lp, ptr ip, ptr wp, i32 n, i32 nr],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -204,13 +155,6 @@ impl Gpu {
         let wp = topk_w.buf.as_ptr();
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
-        let mut params: Vec<*mut c_void> = vec![
-            &lp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &n as *const _ as *mut c_void,
-            &nr as *const _ as *mut c_void,
-        ];
         let bytes = (n_exp * 4 + 8 * 8) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -218,21 +162,12 @@ impl Gpu {
             "moe_topk_renorm_k8_batched",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_topk_renorm_k8_batched",
             [batch_size as u32, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_i32(n);
-                b.push_i32(nr);
-                b
-            },
+            &kernargs![ptr lp, ptr ip, ptr wp, i32 n, i32 nr],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -263,13 +198,6 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let kt_val = k_top as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &eop as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &kt_val as *const _ as *mut c_void,
-        ];
         // BW: expert_outputs read N*K_TOP*M, topk_weights N*K_TOP, x_residual r+w 2*N*M.
         let bytes = (batch_size * k_top * m + batch_size * k_top + 2 * batch_size * m) * 4;
         let timer = crate::profile::begin_timer(
@@ -280,21 +208,12 @@ impl Gpu {
         );
         let block_m: u32 = 256;
         let grid_x = (m as u32 + block_m - 1) / block_m;
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_down_combine_k8_batched",
             [grid_x, batch_size as u32, 1],
             [block_m, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(eop);
-                b.push_ptr(wp);
-                b.push_ptr(xrp);
-                b.push_i32(m_val);
-                b.push_i32(kt_val);
-                b
-            },
+            &kernargs![ptr eop, ptr wp, ptr xrp, i32 m_val, i32 kt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -322,12 +241,6 @@ impl Gpu {
         let cp = expert_token_counts.buf.as_ptr();
         let ts_val = total_slots as i32;
         let ne_val = num_experts as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ip as *const _ as *mut c_void,
-            &cp as *const _ as *mut c_void,
-            &ts_val as *const _ as *mut c_void,
-            &ne_val as *const _ as *mut c_void,
-        ];
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (total_slots + num_experts) * 4;
         let timer = crate::profile::begin_timer(
@@ -336,20 +249,12 @@ impl Gpu {
             "moe_scatter_histogram_k8",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_scatter_histogram_k8",
             [1, 1, 1],
             [256, 1, 1],
             lds_bytes,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip);
-                b.push_ptr(cp);
-                b.push_i32(ts_val);
-                b.push_i32(ne_val);
-                b
-            },
+            &kernargs![ptr ip, ptr cp, i32 ts_val, i32 ne_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -377,30 +282,16 @@ impl Gpu {
         let op = expert_offsets.buf.as_ptr();
         let ne_val = num_experts as i32;
         let bm_val = block_m as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &cp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &ne_val as *const _ as *mut c_void,
-            &bm_val as *const _ as *mut c_void,
-        ];
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (3 * num_experts + 1) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_offsets_k8", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_scatter_offsets_k8",
             [1, 1, 1],
             [256, 1, 1],
             lds_bytes,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(cp);
-                b.push_ptr(op);
-                b.push_i32(ne_val);
-                b.push_i32(bm_val);
-                b
-            },
+            &kernargs![ptr cp, ptr op, i32 ne_val, i32 bm_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -439,42 +330,21 @@ impl Gpu {
         let ne_val = num_experts as i32;
         let mt_val = m_total as i32;
         let bm_val = block_m as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ip as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &invp as *const _ as *mut c_void,
-            &ts_val as *const _ as *mut c_void,
-            &ne_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-            &bm_val as *const _ as *mut c_void,
-        ];
         let lds_bytes = (num_experts * 4) as u32;
         // BW: topk_indices + offsets + sorted_slot_index (init + writes)
         //     + expert_tile_ids (writes).
         let bytes = (total_slots + num_experts + 2 * m_total + m_total / block_m.max(1)) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_permute_k8", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_scatter_permute_k8",
             [1, 1, 1],
             [256, 1, 1],
             lds_bytes,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip);
-                b.push_ptr(op);
-                b.push_ptr(sp);
-                b.push_ptr(tp);
-                b.push_ptr(invp);
-                b.push_i32(ts_val);
-                b.push_i32(ne_val);
-                b.push_i32(mt_val);
-                b.push_i32(bm_val);
-                b
-            },
+            &kernargs![
+                ptr ip, ptr op, ptr sp, ptr tp, ptr invp, i32 ts_val, i32 ne_val, i32 mt_val,
+                i32 bm_val
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -514,42 +384,19 @@ impl Gpu {
         let ne_val = num_experts as i32;
         let mtm_val = m_total_max as i32;
         let bm_val = block_m as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ip as *const _ as *mut c_void,
-            &cp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &invp as *const _ as *mut c_void,
-            &ts_val as *const _ as *mut c_void,
-            &ne_val as *const _ as *mut c_void,
-            &mtm_val as *const _ as *mut c_void,
-            &bm_val as *const _ as *mut c_void,
-        ];
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_fused_k8", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_scatter_fused_k8",
             [1, 1, 1],
             [256, 1, 1],
             lds_bytes,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip);
-                b.push_ptr(cp);
-                b.push_ptr(op);
-                b.push_ptr(sp);
-                b.push_ptr(tp);
-                b.push_ptr(invp);
-                b.push_i32(ts_val);
-                b.push_i32(ne_val);
-                b.push_i32(mtm_val);
-                b.push_i32(bm_val);
-                b
-            },
+            &kernargs![
+                ptr ip, ptr cp, ptr op, ptr sp, ptr tp, ptr invp, i32 ts_val, i32 ne_val,
+                i32 mtm_val, i32 bm_val
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -582,14 +429,6 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let dim_val = dim as i32;
         let kt_val = k_top as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &yp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &dim_val as *const _ as *mut c_void,
-            &kt_val as *const _ as *mut c_void,
-        ];
         let block: u32 = 256;
         let grid_x = (dim as u32 + block - 1) / block;
         let bytes = (n * dim * 4 * 2 + n * k_top * 4 + n * k_top * 4) as usize;
@@ -599,22 +438,12 @@ impl Gpu {
             "moe_down_combine_grouped_k8",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_down_combine_grouped_k8",
             [grid_x, n as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(yp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(xrp);
-                b.push_i32(dim_val);
-                b.push_i32(kt_val);
-                b
-            },
+            &kernargs![ptr yp, ptr ip, ptr wp, ptr xrp, i32 dim_val, i32 kt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -649,15 +478,6 @@ impl Gpu {
         let mi_val = mi as i32;
         let kt_val = k_top as i32;
         let mt_val = m_total as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &yp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &up as *const _ as *mut c_void,
-            &mi_val as *const _ as *mut c_void,
-            &kt_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
         let block: u32 = 256;
         let grid_x = (mi as u32 + block - 1) / block;
         // BW: Y_grouped read (m_total*2*mi*4) + y_gate write (m_total*mi*4)
@@ -669,25 +489,14 @@ impl Gpu {
             "moe_gate_up_unscatter_k8",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_gate_up_unscatter_k8",
             // m_total in grid.x (limit 2^31), mi-tile in grid.y — m_total exceeds
             // the 65535 grid.y limit past ~8k prefill tokens (m_total = N*K_TOP).
             [m_total as u32, grid_x, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(yp);
-                b.push_ptr(sp);
-                b.push_ptr(gp);
-                b.push_ptr(up);
-                b.push_i32(mi_val);
-                b.push_i32(kt_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr yp, ptr sp, ptr gp, ptr up, i32 mi_val, i32 kt_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -722,16 +531,7 @@ impl Gpu {
         let mi_val = mi as i32;
         let kt_val = k_top as i32;
         let mt_val = m_total as i32;
-        let mut swiglu_lim = swiglu_limit;
-        let mut params: Vec<*mut c_void> = vec![
-            &yp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &mi_val as *const _ as *mut c_void,
-            &kt_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-            &mut swiglu_lim as *mut _ as *mut c_void,
-        ];
+        let swiglu_lim = swiglu_limit;
         let block: u32 = 256;
         let grid_x = (mi as u32 + block - 1) / block;
         // BW: Y_grouped read (m_total*2*mi*4) + moe_gate_batch write
@@ -744,23 +544,12 @@ impl Gpu {
             "moe_unscatter_silu_clamp_k8",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "moe_unscatter_silu_clamp_k8",
             [grid_x, m_total as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(yp);
-                b.push_ptr(sp);
-                b.push_ptr(gp);
-                b.push_i32(mi_val);
-                b.push_i32(kt_val);
-                b.push_i32(mt_val);
-                b.push_f32(swiglu_lim);
-                b
-            },
+            &kernargs![ptr yp, ptr sp, ptr gp, i32 mi_val, i32 kt_val, i32 mt_val, f32 swiglu_lim],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

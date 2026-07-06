@@ -264,39 +264,18 @@ impl Gpu {
         let dim_val = hidden_dim as i32;
         let krot_val = krot as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &x_ptr as *const _ as *mut c_void,
-            &pairs_ptr as *const _ as *mut c_void,
-            &theta_ptr as *const _ as *mut c_void,
-            &cs_ptr as *const _ as *mut c_void,
-            &seq_val as *const _ as *mut c_void,
-            &dim_val as *const _ as *mut c_void,
-            &krot_val as *const _ as *mut c_void,
-        ];
-
         let smem = (cta_m * group_size * 4) as u32; // CTA_M * GROUP_SIZE * sizeof(float)
 
         // Bytes: read+write activation (2 × seq × dim × 4) + read pairs/theta/scales
         // (krot × dim × 2 for pairs+theta packed, dim × 2 for scales).
         let bytes = seq_len * hidden_dim * 4 * 2 + krot * hidden_dim * 2 + hidden_dim * 2;
         let timer = crate::profile::begin_timer(&self.hip, "rotate", "givens_rotate_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "givens_rotate_f32",
             [grid_x, groups_per_row, 1],
             [group_size / 2, 1, 1],
             smem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(x_ptr);
-                b.push_ptr(pairs_ptr);
-                b.push_ptr(theta_ptr);
-                b.push_ptr(cs_ptr);
-                b.push_i32(seq_val);
-                b.push_i32(dim_val);
-                b.push_i32(krot_val);
-                b
-            },
+            &kernargs![ptr x_ptr, ptr pairs_ptr, ptr theta_ptr, ptr cs_ptr, i32 seq_val, i32 dim_val, i32 krot_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -340,41 +319,18 @@ impl Gpu {
         let dim_val = hidden_dim as i32;
         let krot_val = krot as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &in_ptr as *const _ as *mut c_void,
-            &out_ptr as *const _ as *mut c_void,
-            &pairs_ptr as *const _ as *mut c_void,
-            &theta_ptr as *const _ as *mut c_void,
-            &cs_ptr as *const _ as *mut c_void,
-            &seq_val as *const _ as *mut c_void,
-            &dim_val as *const _ as *mut c_void,
-            &krot_val as *const _ as *mut c_void,
-        ];
-
         let smem = (cta_m * group_size * 4) as u32;
 
         // Bytes: read x_in (seq × dim × 4) + write x_out (seq × dim × 4)
         // + read pairs/theta/scales (krot × dim × 2 + dim × 2).
         let bytes = seq_len * hidden_dim * 4 * 2 + krot * hidden_dim * 2 + hidden_dim * 2;
         let timer = crate::profile::begin_timer(&self.hip, "rotate", "givens_rotate_to_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "givens_rotate_to_f32",
             [grid_x, groups_per_row, 1],
             [group_size / 2, 1, 1],
             smem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(in_ptr);
-                b.push_ptr(out_ptr);
-                b.push_ptr(pairs_ptr);
-                b.push_ptr(theta_ptr);
-                b.push_ptr(cs_ptr);
-                b.push_i32(seq_val);
-                b.push_i32(dim_val);
-                b.push_i32(krot_val);
-                b
-            },
+            &kernargs![ptr in_ptr, ptr out_ptr, ptr pairs_ptr, ptr theta_ptr, ptr cs_ptr, i32 seq_val, i32 dim_val, i32 krot_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -420,32 +376,15 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &x_ptr as *const _ as *mut c_void,
-            &x_rot_ptr as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
-
         let groups = (k / 128) as u32;
         let bytes = crate::profile::paro4g128t_rotate_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "format", "paro4g128_rotate", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "paro4g128_rotate",
             [groups, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(x_rot_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr x_rot_ptr, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -493,35 +432,16 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &gate_ptr as *const _ as *mut c_void,
-            &up_ptr as *const _ as *mut c_void,
-            &x_rot_ptr as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
-
         let groups = (k / 128) as u32;
         let bytes = crate::profile::paro4g128t_rotate_bytes(m, k) + k * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "format", "paro4g128_swiglu_rotate", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "paro4g128_swiglu_rotate",
             [groups, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(gate_ptr);
-                b.push_ptr(up_ptr);
-                b.push_ptr(x_rot_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr gate_ptr, ptr up_ptr, ptr x_rot_ptr, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -567,32 +487,15 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &x_ptr as *const _ as *mut c_void,
-            &x_rot_ptr as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
-
         let groups = (k / 128) as u32;
         let bytes = crate::profile::paro4g128t_rotate_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "format", "paro4g128t_rotate", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "paro4g128t_rotate",
             [groups, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(x_rot_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr x_rot_ptr, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -639,35 +542,16 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &gate_ptr as *const _ as *mut c_void,
-            &up_ptr as *const _ as *mut c_void,
-            &x_rot_ptr as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
-
         let groups = (k / 128) as u32;
         let bytes = crate::profile::paro4g128t_rotate_bytes(m, k) + k * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "format", "paro4g128t_swiglu_rotate", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "paro4g128t_swiglu_rotate",
             [groups, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(gate_ptr);
-                b.push_ptr(up_ptr);
-                b.push_ptr(x_rot_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr gate_ptr, ptr up_ptr, ptr x_rot_ptr, i32 m_val, i32 k_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -692,30 +576,14 @@ impl Gpu {
         let dst_ptr = dst.buf.as_ptr();
         let ni = n_idx as i32;
         let no = n_out as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &src_ptr as *const _ as *mut c_void,
-            &idx_ptr as *const _ as *mut c_void,
-            &dst_ptr as *const _ as *mut c_void,
-            &ni as *const _ as *mut c_void,
-            &no as *const _ as *mut c_void,
-        ];
         let block = 256u32;
         let grid = ((n_out as u32) + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "rq_gather_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(src_ptr);
-                bb.push_ptr(idx_ptr);
-                bb.push_ptr(dst_ptr);
-                bb.push_i32(ni);
-                bb.push_i32(no);
-                bb
-            },
+            &kernargs![ptr src_ptr, ptr idx_ptr, ptr dst_ptr, i32 ni, i32 no],
         )
     }
     /// RoughQuant writer scatter-add: `y[idx[j]] += c[j]` for j<n_idx.
@@ -736,28 +604,14 @@ impl Gpu {
         let idx_ptr = idx.buf.as_ptr();
         let c_ptr = c.buf.as_ptr();
         let ni = n_idx as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &y_ptr as *const _ as *mut c_void,
-            &idx_ptr as *const _ as *mut c_void,
-            &c_ptr as *const _ as *mut c_void,
-            &ni as *const _ as *mut c_void,
-        ];
         let block = 256u32;
         let grid = ((n_idx as u32) + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "rq_scatter_add_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(y_ptr);
-                bb.push_ptr(idx_ptr);
-                bb.push_ptr(c_ptr);
-                bb.push_i32(ni);
-                bb
-            },
+            &kernargs![ptr y_ptr, ptr idx_ptr, ptr c_ptr, i32 ni],
         )
     }
     pub fn scatter_session_last_logits_f32(
@@ -780,31 +634,14 @@ impl Gpu {
         let session_last_row_indices_ptr = session_last_row_indices.buf.as_ptr();
         let vocab = vocab_size as i32;
         let ns = sessions as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &batch_logits_ptr as *const _ as *mut c_void,
-            &logits_ptrs_ptr as *const _ as *mut c_void,
-            &session_last_row_indices_ptr as *const _ as *mut c_void,
-            &vocab as *const _ as *mut c_void,
-            &ns as *const _ as *mut c_void,
-        ];
-
         let block = 256u32;
         let grid_x = (vocab_size as u32 + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "scatter_session_last_logits_f32",
             [grid_x, sessions as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(batch_logits_ptr);
-                b.push_ptr(logits_ptrs_ptr);
-                b.push_ptr(session_last_row_indices_ptr);
-                b.push_i32(vocab);
-                b.push_i32(ns);
-                b
-            },
+            &kernargs![ptr batch_logits_ptr, ptr logits_ptrs_ptr, ptr session_last_row_indices_ptr, i32 vocab, i32 ns],
         )
     }
     /// Split a fused interleaved `[n_patches, 3 * hidden]` QKV buffer
@@ -843,15 +680,6 @@ impl Gpu {
         let np = n_patches as i32;
         let hd = hidden as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &qkvp as *const _ as *mut c_void,
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &np as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
-
         let block_size = 256u32;
         let grid_y = ((hidden as u32) + block_size - 1) / block_size;
         let grid = [n_patches as u32, grid_y, 1];
@@ -860,22 +688,12 @@ impl Gpu {
         let bytes = n_patches * hidden * 4 * 6;
         let timer =
             crate::profile::begin_timer(&self.hip, "qkv_split", "qkv_split_interleaved_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "qkv_split_interleaved_f32",
             grid,
             block,
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qkvp);
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_i32(np);
-                b.push_i32(hd);
-                b
-            },
+            &kernargs![ptr qkvp, ptr qp, ptr kp, ptr vp, i32 np, i32 hd],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -903,34 +721,18 @@ impl Gpu {
         let bp = out_b.buf.as_ptr();
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &inp as *const _ as *mut c_void,
-            &ap as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
         let total = (n_heads * head_dim) as u32;
         let block = 256u32;
         let grid = (total + block - 1) / block;
         let bytes = n_heads * head_dim * 4 * 3; // read interleaved, write both outputs
         let timer =
             crate::profile::begin_timer(&self.hip, "elementwise", "deinterleave_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "deinterleave_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(inp);
-                b.push_ptr(ap);
-                b.push_ptr(bp);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
+            &kernargs![ptr inp, ptr ap, ptr bp, i32 nh, i32 hd],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -956,20 +758,12 @@ impl Gpu {
             kernels::DEINTERLEAVE_BATCHED_SRC,
             "deinterleave_f32_batched",
         )?;
-        let mut inp = interleaved.buf.as_ptr();
-        let mut qp = out_q.buf.as_ptr();
-        let mut gp = out_gate.buf.as_ptr();
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut nn = n as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut inp as *mut _ as *mut c_void,
-            &mut qp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut nn as *mut _ as *mut c_void,
-        ];
+        let inp = interleaved.buf.as_ptr();
+        let qp = out_q.buf.as_ptr();
+        let gp = out_gate.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let nn = n as i32;
         let total = (n_heads * head_dim) as u32;
         let block = 256u32;
         let grid_x = (total + block - 1) / block;
@@ -980,22 +774,12 @@ impl Gpu {
             "deinterleave_f32_batched",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "deinterleave_f32_batched",
             [grid_x, n as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(inp);
-                b.push_ptr(qp);
-                b.push_ptr(gp);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_i32(nn);
-                b
-            },
+            &kernargs![ptr inp, ptr qp, ptr gp, i32 nh, i32 hd, i32 nn],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1214,28 +998,16 @@ impl Gpu {
             kernels::CONVERT_F32_TO_BF16_SRC,
             "convert_f32_to_bf16",
         )?;
-        let mut in_ptr = src.buf.as_ptr();
-        let mut out_ptr = dst.buf.as_ptr();
-        let mut n_val = n_src as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut in_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
+        let in_ptr = src.buf.as_ptr();
+        let out_ptr = dst.buf.as_ptr();
+        let n_val = n_src as i32;
         let grid = ((n_src + 255) / 256) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "convert_f32_to_bf16",
             [grid, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(in_ptr);
-                b.push_ptr(out_ptr);
-                b.push_i32(n_val);
-                b
-            },
+            &kernargs![ptr in_ptr, ptr out_ptr, i32 n_val],
         )
     }
     /// Split a fused f32 qkv `[N, 3*hidden]` into head-dim-padded q(f32),
@@ -1263,52 +1035,26 @@ impl Gpu {
             kernels::ATTN_PAD_F16KV_SRC,
             "attn_split_pad_f16kv",
         )?;
-        let mut qkvp = qkv.buf.as_ptr();
-        let mut qp = q_pad.buf.as_ptr();
-        let mut kp = k_pad.buf.as_ptr();
-        let mut vp = v_pad.buf.as_ptr();
-        let (mut ni, mut hi, mut nh, mut hd, mut hp) = (
+        let qkvp = qkv.buf.as_ptr();
+        let qp = q_pad.buf.as_ptr();
+        let kp = k_pad.buf.as_ptr();
+        let vp = v_pad.buf.as_ptr();
+        let (ni, hi, nh, hd, hp) = (
             n as i32,
             hidden as i32,
             num_heads as i32,
             head_dim as i32,
             hdp as i32,
         );
-        let mut qs = q_scale;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qkvp as *mut _ as *mut c_void,
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-            &mut hi as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut hp as *mut _ as *mut c_void,
-            &mut qs as *mut _ as *mut c_void,
-        ];
+        let qs = q_scale;
         let total = (n * num_heads * hdp) as u32;
         let grid = (total + 255) / 256;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "attn_split_pad_f16kv",
             [grid, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qkvp);
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_i32(ni);
-                b.push_i32(hi);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_i32(hp);
-                b.push_f32(qs);
-                b
-            },
+            &kernargs![ptr qkvp, ptr qp, ptr kp, ptr vp, i32 ni, i32 hi, i32 nh, i32 hd, i32 hp, f32 qs],
         )
     }
     /// Inverse of [`Self::attn_split_pad_f16kv`]'s padding: attention output
@@ -1324,36 +1070,17 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("attn_unpad", kernels::ATTN_PAD_F16KV_SRC, "attn_unpad")?;
-        let mut ip = input.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let (mut ni, mut nh, mut hd, mut hp) =
-            (n as i32, num_heads as i32, head_dim as i32, hdp as i32);
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ip as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut hp as *mut _ as *mut c_void,
-        ];
+        let ip = input.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let (ni, nh, hd, hp) = (n as i32, num_heads as i32, head_dim as i32, hdp as i32);
         let total = (n * num_heads * head_dim) as u32;
         let grid = (total + 255) / 256;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "attn_unpad",
             [grid, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip);
-                b.push_ptr(op);
-                b.push_i32(ni);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_i32(hp);
-                b
-            },
+            &kernargs![ptr ip, ptr op, i32 ni, i32 nh, i32 hd, i32 hp],
         )
     }
     /// f32 → f16 elementwise cast. `src` must be `DType::F32`, `dst`
@@ -1374,30 +1101,18 @@ impl Gpu {
             kernels::CAST_F32_TO_F16_SRC,
             "cast_f32_to_f16",
         )?;
-        let mut in_ptr = src.buf.as_ptr();
-        let mut out_ptr = dst.buf.as_ptr();
-        let mut n_val = n_src as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut in_ptr as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
+        let in_ptr = src.buf.as_ptr();
+        let out_ptr = dst.buf.as_ptr();
+        let n_val = n_src as i32;
         let grid = ((n_src + 255) / 256) as u32;
         let bytes = n_src * 6;
         let timer = crate::profile::begin_timer(&self.hip, "format", "cast_f32_to_f16", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "cast_f32_to_f16",
             [grid, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(in_ptr);
-                b.push_ptr(out_ptr);
-                b.push_i32(n_val);
-                b
-            },
+            &kernargs![ptr in_ptr, ptr out_ptr, i32 n_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

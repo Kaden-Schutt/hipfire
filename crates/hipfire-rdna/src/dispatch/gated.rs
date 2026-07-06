@@ -31,34 +31,14 @@ impl Gpu {
         let nh = n_heads as i32;
         let hd = head_dim as i32;
         let ep = eps;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void,
-            &zp as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ep as *const _ as *mut c_void,
-        ];
         let bytes = crate::profile::gated_norm_bytes(n_heads * head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "gated_norm_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_norm_f32",
             [n_heads as u32, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp);
-                b.push_ptr(zp);
-                b.push_ptr(wp);
-                b.push_ptr(op);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_f32(ep);
-                b
-            },
+            &kernargs![ptr xp, ptr zp, ptr wp, ptr op, i32 nh, i32 hd, f32 ep],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -80,42 +60,22 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gated_norm", kernels::GATED_NORM_SRC, "gated_norm_f32")?;
-        let mut xp = x.buf.as_ptr();
-        let mut zp = z.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut ep = eps;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut zp as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut ep as *mut _ as *mut c_void,
-        ];
+        let xp = x.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ep = eps;
         let bytes = crate::profile::gated_norm_bytes(n_heads * head_dim) * batch_size;
         let timer =
             crate::profile::begin_timer(&self.hip, "rmsnorm", "gated_norm_f32_batched", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_norm_f32",
             [n_heads as u32, batch_size as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp);
-                b.push_ptr(zp);
-                b.push_ptr(wp);
-                b.push_ptr(op);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_f32(ep);
-                b
-            },
+            &kernargs![ptr xp, ptr zp, ptr wp, ptr op, i32 nh, i32 hd, f32 ep],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -213,18 +173,6 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
         let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -233,26 +181,12 @@ impl Gpu {
             bytes,
         );
         let n_tiles = (128 / 4) as u32;
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_delta_net_f32",
             [n_heads as u32, n_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(sp);
-                b.push_ptr(op);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr op, i32 nt, i32 nh, i32 hd],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -297,21 +231,6 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &spp as *const _ as *mut c_void,
-            &rsp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
         let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -320,29 +239,15 @@ impl Gpu {
             bytes,
         );
         let n_tiles = (128 / 4) as u32;
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_delta_net_f32_routed_batch_seq",
             [n_heads as u32, n_tiles, n_sessions as u32],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(spp);
-                b.push_ptr(rsp);
-                b.push_ptr(op);
-                b.push_i32(ptr_stride);
-                b.push_i32(layer);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr spp, ptr rsp, ptr op,
+                i32 ptr_stride, i32 layer, i32 nt, i32 nh, i32 hd
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -391,23 +296,6 @@ impl Gpu {
         let nh = n_heads as i32;
         let hd = head_dim as i32;
         let fr = super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &spp as *const _ as *mut c_void,
-            &scpp as *const _ as *mut c_void,
-            &rsp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &fr as *const _ as *mut c_void,
-        ];
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -416,31 +304,15 @@ impl Gpu {
             bytes,
         );
         let n_tiles = (128 / 4) as u32;
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_delta_net_q8_routed_batch_seq",
             [n_heads as u32, n_tiles, n_sessions as u32],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(spp);
-                b.push_ptr(scpp);
-                b.push_ptr(rsp);
-                b.push_ptr(op);
-                b.push_i32(ptr_stride);
-                b.push_i32(layer);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_i32(fr);
-                b
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr spp, ptr scpp, ptr rsp, ptr op,
+                i32 ptr_stride, i32 layer, i32 nt, i32 nh, i32 hd, i32 fr
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -489,49 +361,18 @@ impl Gpu {
         let fr = super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let ef_null: *const c_void = std::ptr::null();
         let rqt: i32 = 0; // single-end requant (MQ4/HFQ4 fast path; per-token=1 for PARO)
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &scp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &fr as *const _ as *mut c_void,
-            &ef_null as *const _ as *mut c_void,
-            &rqt as *const _ as *mut c_void,
-        ];
         let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_delta_net_q8",
             [n_heads as u32, n_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(sp);
-                b.push_ptr(scp);
-                b.push_ptr(op);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_i32(fr);
-                b.push_ptr(ef_null);
-                b.push_i32(rqt);
-                b
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr scp, ptr op,
+                i32 nt, i32 nh, i32 hd, i32 fr, ptr ef_null, i32 rqt
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -597,37 +438,20 @@ impl Gpu {
 
         let n_tiles = (128 / 4) as u32;
 
-        let mut qp = q_batch.buf.as_ptr();
-        let mut kp = k_batch.buf.as_ptr();
-        let mut vp = v_batch.buf.as_ptr();
-        let mut gp = gate_batch.buf.as_ptr();
-        let mut bp = beta_batch.buf.as_ptr();
-        let mut sp = s_q8.buf.as_ptr();
-        let mut scp = s_scales.buf.as_ptr();
-        let mut op = output_batch.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut fr =
-            super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let qp = q_batch.buf.as_ptr();
+        let kp = k_batch.buf.as_ptr();
+        let vp = v_batch.buf.as_ptr();
+        let gp = gate_batch.buf.as_ptr();
+        let bp = beta_batch.buf.as_ptr();
+        let sp = s_q8.buf.as_ptr();
+        let scp = s_scales.buf.as_ptr();
+        let op = output_batch.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let fr = super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let ef_null: *const c_void = std::ptr::null();
-        let mut rqt: i32 = 0; // single-end requant (MQ4/HFQ4 fast path)
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut scp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut fr as *mut _ as *mut c_void,
-            &ef_null as *const _ as *mut c_void,
-            &mut rqt as *mut _ as *mut c_void,
-        ];
+        let rqt: i32 = 0; // single-end requant (MQ4/HFQ4 fast path)
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
@@ -641,30 +465,15 @@ impl Gpu {
         // happens once at the end instead of per-token, reducing noise
         // accumulation. Not byte-exact with N×1 decode calls but
         // strictly higher quality.
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_delta_net_q8",
             [n_heads as u32, n_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(sp);
-                b.push_ptr(scp);
-                b.push_ptr(op);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b.push_i32(fr);
-                b.push_ptr(ef_null);
-                b.push_i32(rqt);
-                b
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sp, ptr scp, ptr op,
+                i32 nt, i32 nh, i32 hd, i32 fr, ptr ef_null, i32 rqt
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -713,36 +522,20 @@ impl Gpu {
 
         let n_tiles = (128 / 4) as u32;
 
-        let mut qp = q_batch.buf.as_ptr();
-        let mut kp = k_batch.buf.as_ptr();
-        let mut vp = v_batch.buf.as_ptr();
-        let mut gp = gate_batch.buf.as_ptr();
-        let mut bp = beta_batch.buf.as_ptr();
-        let mut sip = s_q8_init.buf.as_ptr();
-        let mut scip = s_scales_init.buf.as_ptr();
-        let mut stp = s_tape_q8.buf.as_ptr();
-        let mut stsp = s_tape_scales.buf.as_ptr();
-        let mut pp = parent_indices.buf.as_ptr();
-        let mut op = output_batch.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sip as *mut _ as *mut c_void,
-            &mut scip as *mut _ as *mut c_void,
-            &mut stp as *mut _ as *mut c_void,
-            &mut stsp as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
+        let qp = q_batch.buf.as_ptr();
+        let kp = k_batch.buf.as_ptr();
+        let vp = v_batch.buf.as_ptr();
+        let gp = gate_batch.buf.as_ptr();
+        let bp = beta_batch.buf.as_ptr();
+        let sip = s_q8_init.buf.as_ptr();
+        let scip = s_scales_init.buf.as_ptr();
+        let stp = s_tape_q8.buf.as_ptr();
+        let stsp = s_tape_scales.buf.as_ptr();
+        let pp = parent_indices.buf.as_ptr();
+        let op = output_batch.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
@@ -751,30 +544,15 @@ impl Gpu {
             "gated_delta_net_q8_tree_batch_seq",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gated_delta_net_q8_tree",
             [n_heads as u32, n_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(sip);
-                b.push_ptr(scip);
-                b.push_ptr(stp);
-                b.push_ptr(stsp);
-                b.push_ptr(pp);
-                b.push_ptr(op);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr gp, ptr bp, ptr sip, ptr scip, ptr stp, ptr stsp,
+                ptr pp, ptr op, i32 nt, i32 nh, i32 hd
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

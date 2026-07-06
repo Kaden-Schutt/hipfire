@@ -51,21 +51,12 @@ impl Gpu {
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_f16_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
@@ -78,22 +69,12 @@ impl Gpu {
             "gemm_mq4g256_lloyd_residual_wmma",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_mq4g256_lloyd_residual_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 bs_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -121,21 +102,12 @@ impl Gpu {
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_f16_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 63) / 64;
@@ -148,22 +120,12 @@ impl Gpu {
             "gemm_mq4g256_lloyd_residual_wmma_mb4",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_mq4g256_lloyd_residual_wmma_mb4",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 bs_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -187,21 +149,12 @@ impl Gpu {
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma_mb2")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_f16_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 31) / 32;
@@ -214,22 +167,12 @@ impl Gpu {
             "gemm_mq4g256_lloyd_residual_wmma_mb2",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_mq4g256_lloyd_residual_wmma_mb2",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 bs_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -271,21 +214,12 @@ impl Gpu {
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_f16_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
@@ -298,22 +232,12 @@ impl Gpu {
             "gemm_mq3g256_lloyd_residual_wmma",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_mq3g256_lloyd_residual_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 bs_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -337,21 +261,12 @@ impl Gpu {
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_f16_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 63) / 64;
@@ -364,22 +279,12 @@ impl Gpu {
             "gemm_mq3g256_lloyd_residual_wmma_mb4",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_mq3g256_lloyd_residual_wmma_mb4",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 bs_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -422,21 +327,12 @@ impl Gpu {
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let mut ap = a.buf.as_ptr();
-        let mut xp = x_f16_ptr;
-        let mut yp = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
+        let ap = a.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
@@ -445,22 +341,12 @@ impl Gpu {
             crate::profile::gemv_hfp4g32_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfp4g32_residual_wmma", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_hfp4g32_residual_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 n_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -511,18 +397,6 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 127) / 128) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let bytes =
@@ -533,25 +407,12 @@ impl Gpu {
             "gemm_paro_q4g128_moe_grouped_wmma_k2",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_paro_q4g128_moe_grouped_wmma_k2",
             [row_tiles, slot_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -691,38 +552,19 @@ impl Gpu {
             "gemm_q8_0_batched",
         )?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
-
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "gemm_q8_0_batched",
             [m as u32, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 bs_val],
         )
     }
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
@@ -818,44 +660,26 @@ impl Gpu {
             "gemm_q8_0_wmma_x64",
         )?;
         let xp_owned = x.buf.as_ptr();
-        let mut xp = if matches!(x.dtype, DType::F16) {
+        let xp = if matches!(x.dtype, DType::F16) {
             xp_owned
         } else {
             self.ensure_fp16_x(x, batch_size * k)?
         };
-        let mut a_p = a.buf.as_ptr();
-        let mut y_p = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_p as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut y_p as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
+        let a_p = a.buf.as_ptr();
+        let y_p = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 63) / 64;
         let bytes = m * (k / 32) * 34 + batch_size * k * 2 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_wmma_x64", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_q8_0_wmma_x64",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_p);
-                b.push_ptr(xp);
-                b.push_ptr(y_p);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b
-            },
+            &kernargs![ptr a_p, ptr xp, ptr y_p, i32 m_val, i32 k_val, i32 n_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -995,47 +819,28 @@ impl Gpu {
         // `convert_fp16_x_uncached` always re-converts (one extra cheap F32→F16
         // kernel per call, negligible vs the GEMM).
         let xp_owned = x.buf.as_ptr();
-        let mut xp = if matches!(x.dtype, DType::F16) {
+        let xp = if matches!(x.dtype, DType::F16) {
             xp_owned
         } else {
             self.convert_fp16_x_uncached(x, batch_size * k)?
         };
 
-        let mut a_p = a.buf.as_ptr();
-        let mut y_p = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_p as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut y_p as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
+        let a_p = a.buf.as_ptr();
+        let y_p = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
         let bytes = m * (k / 32) * 34 + batch_size * k * 2 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_p);
-                b.push_ptr(xp);
-                b.push_ptr(y_p);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b
-            },
+            &kernargs![ptr a_p, ptr xp, ptr y_p, i32 m_val, i32 k_val, i32 n_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1079,43 +884,24 @@ impl Gpu {
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let mut a_p = a.buf.as_ptr();
-        let mut xp = x_f16_ptr;
-        let mut y_p = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_p as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut y_p as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-        ];
+        let a_p = a.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let y_p = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
 
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
         let bytes = m * (k / 32) * 34 + batch_size * k * 2 + batch_size * m * 4 * 2; // residual read + write
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_residual_wmma", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_q8_0_residual_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_p);
-                b.push_ptr(xp);
-                b.push_ptr(y_p);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b
-            },
+            &kernargs![ptr a_p, ptr xp, ptr y_p, i32 m_val, i32 k_val, i32 n_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1175,43 +961,18 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 15) / 16) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         // BW estimate: gather X (fp16) + weight rows (HFP4G32: 18 B/group, K/32 groups
         // per row, ~m_total/E shared per tile) + write Y. Use the existing helper.
         let bytes = m_total * k * 2 + (m_total * m) * 4 + crate::profile::gemv_hfp4g32_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1601,21 +1362,12 @@ impl Gpu {
             kernel_name,
         )?;
         let a_ptr = w_combined.buf.as_ptr();
-        let mut xq_ptr = x_q8_ptr;
+        let xq_ptr = x_q8_ptr;
         let y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = n as i32;
-        let mut add_val = if add { 1i32 } else { 0i32 };
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &y_ptr as *const _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut add_val as *mut _ as *mut c_void,
-        ];
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = n as i32;
+        let add_val = if add { 1i32 } else { 0i32 };
         const MMQ_X: usize = 128;
         const MMQ_Y: usize = 128;
         const MMQ_TILE_Y_K: usize = 36;
@@ -1624,23 +1376,12 @@ impl Gpu {
         let batch_tiles = n.div_ceil(MMQ_X);
         let shared_mem =
             ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 8, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(xq_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b.push_i32(add_val);
-                b
-            },
+            &kernargs![ptr a_ptr, ptr xq_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 n_val, i32 add_val],
         )
     }
 
@@ -1752,43 +1493,18 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 15) / 16) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         // BW: MQ2-Lloyd weight is 72 B/group, half of HFQ4's 136 B/group.
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1842,18 +1558,6 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         // Row tiles widen 16 → 64; slot tiles unchanged at 16.
         let row_tiles = ((m + 63) / 64) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
@@ -1862,25 +1566,12 @@ impl Gpu {
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [128, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1920,42 +1611,17 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 63) / 64) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [128, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1995,42 +1661,17 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 63) / 64) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [128, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2082,43 +1723,18 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 63) / 64) as u32;
         // Each block handles TWO 16-slot tiles → halve the slot-tile grid dim.
         let slot_tiles = (((m_total + 15) / 16 + 1) / 2) as u32;
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [128, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2168,42 +1784,17 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 63) / 64) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [128, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -2252,42 +1843,17 @@ impl Gpu {
         let xrd_val = x_row_div as i32;
         let mt_val = m_total as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &xrd_val as *const _ as *mut c_void,
-            &mt_val as *const _ as *mut c_void,
-        ];
-
         let row_tiles = ((m + 127) / 128) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [row_tiles, slot_tiles, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep);
-                b.push_ptr(tp);
-                b.push_ptr(sp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(xrd_val);
-                b.push_i32(mt_val);
-                b
-            },
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

@@ -33,32 +33,16 @@ impl Gpu {
         let wp = weight.buf.as_ptr();
         let sp = state.buf.as_ptr();
         let nc = n_channels as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &op as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &nc as *const _ as *mut c_void,
-        ];
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
         let bytes = n_channels * 4 * 6;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_decode_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "conv1d_decode_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(op);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(sp);
-                b.push_i32(nc);
-                b
-            },
+            &kernargs![ptr op, ptr ip, ptr wp, ptr sp, i32 nc],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -258,36 +242,16 @@ impl Gpu {
         let ss = seq_len as i32;
         let cc = channels as i32;
         let kk = kernel_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &bcxp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &oyp as *const _ as *mut c_void,
-            &ss as *const _ as *mut c_void,
-            &cc as *const _ as *mut c_void,
-            &kk as *const _ as *mut c_void,
-        ];
         let block = 256u32;
         let grid = (channels as u32).div_ceil(block);
         let bytes = crate::profile::conv1d_silu_bytes(channels) * seq_len;
         let timer = crate::profile::begin_timer(&self.hip, "lfm2", "conv1d_gated_seq_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "conv1d_gated_seq_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(bcxp);
-                b.push_ptr(sp);
-                b.push_ptr(wp);
-                b.push_ptr(oyp);
-                b.push_i32(ss);
-                b.push_i32(cc);
-                b.push_i32(kk);
-                b
-            },
+            &kernargs![ptr bcxp, ptr sp, ptr wp, ptr oyp, i32 ss, i32 cc, i32 kk],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -396,42 +360,18 @@ impl Gpu {
         let kd = k_dim as i32;
         let vd = v_dim as i32;
         let nt = n_tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &vd as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
         let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
         let timer =
             crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "conv1d_silu_split_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(sp);
-                b.push_i32(kd);
-                b.push_i32(vd);
-                b.push_i32(nt);
-                b
-            },
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr ip, ptr wp, ptr sp, i32 kd, i32 vd, i32 nt],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -474,20 +414,6 @@ impl Gpu {
         let kd = k_dim as i32;
         let vd = v_dim as i32;
         let nt = n_tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &rsp as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &vd as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
@@ -498,28 +424,15 @@ impl Gpu {
             "conv1d_silu_split_routed_f32_n",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "conv1d_silu_split_routed_f32",
             [grid, n_sessions as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(sp);
-                b.push_ptr(rsp);
-                b.push_i32(ptr_stride);
-                b.push_i32(layer);
-                b.push_i32(kd);
-                b.push_i32(vd);
-                b.push_i32(nt);
-                b
-            },
+            &kernargs![
+                ptr qp, ptr kp, ptr vp, ptr ip, ptr wp, ptr sp, ptr rsp, i32 ptr_stride,
+                i32 layer, i32 kd, i32 vd, i32 nt
+            ],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -583,43 +496,17 @@ impl Gpu {
         let kd = k_dim as i32;
         let vd = v_dim as i32;
         let nt = n_tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &pp as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &vd as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
         let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", timer_name, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kernel_name,
             [grid, grid_y, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(sp);
-                b.push_ptr(pp);
-                b.push_i32(kd);
-                b.push_i32(vd);
-                b.push_i32(nt);
-                b
-            },
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr ip, ptr wp, ptr sp, ptr pp, i32 kd, i32 vd, i32 nt],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

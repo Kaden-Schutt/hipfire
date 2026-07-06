@@ -53,29 +53,15 @@ impl Gpu {
         let xp_a = x.buf.as_ptr();
         let kv_a = k as i32;
         let eps_a = eps;
-        let mut params_a: Vec<*mut c_void> = vec![
-            &xp_a as *const _ as *mut c_void,
-            &rms_ptr as *const _ as *mut c_void,
-            &kv_a as *const _ as *mut c_void,
-            &eps_a as *const _ as *mut c_void,
-        ];
         let bytes_a = batch_size * k * 4;
         let timer_a =
             crate::profile::begin_timer(&self.hip, "fused", "rmsnorm_reduce_gfx942", bytes_a);
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "rmsnorm_reduce_gfx942",
             [batch_size as u32, 1, 1],
             [1024, 1, 1],
             0,
-            &mut params_a,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp_a);
-                b.push_ptr(rms_ptr);
-                b.push_i32(kv_a);
-                b.push_f32(eps_a);
-                b
-            },
+            &kernargs![ptr xp_a, ptr rms_ptr, i32 kv_a, f32 eps_a],
         )?;
         if let Some(t) = timer_a {
             t.finish(&self.hip);
@@ -88,36 +74,16 @@ impl Gpu {
         let s1_b = s1_ptr;
         let s2_b = s2_ptr;
         let kv_b = k as i32;
-        let mut params_b: Vec<*mut c_void> = vec![
-            &xp_b as *const _ as *mut c_void,
-            &wp_b as *const _ as *mut c_void,
-            &s1_b as *const _ as *mut c_void,
-            &s2_b as *const _ as *mut c_void,
-            &rms_ptr as *const _ as *mut c_void,
-            &xrp_b as *const _ as *mut c_void,
-            &kv_b as *const _ as *mut c_void,
-        ];
         let groups = (k / 256) as u32;
         let bytes_b = batch_size * (k * 4 * 3 + 2 * 256 * 4);
         let timer_b =
             crate::profile::begin_timer(&self.hip, "fused", "rotate_with_rms_gfx942", bytes_b);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "rotate_with_rms_gfx942",
             [groups, batch_size as u32, 1],
             [64, 1, 1],
             0,
-            &mut params_b,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp_b);
-                b.push_ptr(wp_b);
-                b.push_ptr(s1_b);
-                b.push_ptr(s2_b);
-                b.push_ptr(rms_ptr);
-                b.push_ptr(xrp_b);
-                b.push_i32(kv_b);
-                b
-            },
+            &kernargs![ptr xp_b, ptr wp_b, ptr s1_b, ptr s2_b, ptr rms_ptr, ptr xrp_b, i32 kv_b],
         );
         if let Some(t) = timer_b {
             t.finish(&self.hip);

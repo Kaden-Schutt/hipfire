@@ -87,15 +87,9 @@ impl Gpu {
         };
         self.ensure_kernel(module, src, kname)?;
 
-        let mut dp = data.buf.as_ptr();
-        let mut rp = result.buf.as_ptr();
-        let mut nn = n as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut dp as *mut _ as *mut c_void,
-            &mut rp as *mut _ as *mut c_void,
-            &mut nn as *mut _ as *mut c_void,
-        ];
+        let dp = data.buf.as_ptr();
+        let rp = result.buf.as_ptr();
+        let nn = n as i32;
 
         let block_size = 256u32;
         // f32 + i32 per thread (generic) vs 2 words per wave (gfx1103)
@@ -104,19 +98,12 @@ impl Gpu {
         } else {
             block_size * 8
         };
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             kname,
             [batch_size as u32, 1, 1],
             [block_size, 1, 1],
             shared,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dp);
-                b.push_ptr(rp);
-                b.push_i32(nn);
-                b
-            },
+            &kernargs![ptr dp, ptr rp, i32 nn],
         )
     }
     /// GPU-side single-row argmax that writes directly into an MTP token
@@ -152,25 +139,15 @@ impl Gpu {
         };
         self.ensure_kernel(module, src, kname)?;
 
-        let mut dp = data.buf.as_ptr();
-        let mut ap = argmax_out.buf.as_ptr();
-        let mut cp = token_chain.buf.as_ptr();
-        let mut vp = vocab_map
+        let dp = data.buf.as_ptr();
+        let ap = argmax_out.buf.as_ptr();
+        let cp = token_chain.buf.as_ptr();
+        let vp = vocab_map
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut::<c_void>());
-        let mut nn = n as i32;
-        let mut ds = dst_slot as i32;
-        let mut use_map = i32::from(vocab_map.is_some());
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut dp as *mut _ as *mut c_void,
-            &mut ap as *mut _ as *mut c_void,
-            &mut cp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut nn as *mut _ as *mut c_void,
-            &mut ds as *mut _ as *mut c_void,
-            &mut use_map as *mut _ as *mut c_void,
-        ];
+        let nn = n as i32;
+        let ds = dst_slot as i32;
+        let use_map = i32::from(vocab_map.is_some());
 
         let block_size = 256u32;
         // f32 + i32 per thread (generic) vs 2 words per wave (gfx1103)
@@ -179,23 +156,12 @@ impl Gpu {
         } else {
             block_size * 8
         };
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             kname,
             [1, 1, 1],
             [block_size, 1, 1],
             shared,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dp);
-                b.push_ptr(ap);
-                b.push_ptr(cp);
-                b.push_ptr(vp);
-                b.push_i32(nn);
-                b.push_i32(ds);
-                b.push_i32(use_map);
-                b
-            },
+            &kernargs![ptr dp, ptr ap, ptr cp, ptr vp, i32 nn, i32 ds, i32 use_map],
         )
     }
     /// Device-side greedy accept prefix scan over verify argmaxes and MTP
@@ -216,35 +182,18 @@ impl Gpu {
             "greedy_accept_from_argmax_i32",
         )?;
 
-        let mut ap = argmax_per_pos.buf.as_ptr();
-        let mut cp = candidates.buf.as_ptr();
-        let mut rp = result.buf.as_ptr();
-        let mut dg = drafts_generated as i32;
-        let mut eos = eos_token_id as i32;
+        let ap = argmax_per_pos.buf.as_ptr();
+        let cp = candidates.buf.as_ptr();
+        let rp = result.buf.as_ptr();
+        let dg = drafts_generated as i32;
+        let eos = eos_token_id as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap as *mut _ as *mut c_void,
-            &mut cp as *mut _ as *mut c_void,
-            &mut rp as *mut _ as *mut c_void,
-            &mut dg as *mut _ as *mut c_void,
-            &mut eos as *mut _ as *mut c_void,
-        ];
-
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "greedy_accept_from_argmax_i32",
             [1, 1, 1],
             [1, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(cp);
-                b.push_ptr(rp);
-                b.push_i32(dg);
-                b.push_i32(eos);
-                b
-            },
+            &kernargs![ptr ap, ptr cp, ptr rp, i32 dg, i32 eos],
         )
     }
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.

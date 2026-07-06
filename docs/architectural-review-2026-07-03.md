@@ -37,7 +37,7 @@ Progress on the §3 High findings since the review was written. Verified against
 
 | # | Finding | Status | Notes |
 |---|---|---|---|
-| 3.1 | Dual kernarg lists (~207 sites) | 🔴 Open | Pilot only: `launch_kernargs`/`KernArg` in `dispatch/{mod,norm}.rs`; ~306 launch sites remain. |
+| 3.1 | Dual kernarg lists (~207 sites) | ✅ Resolved (code) | **Done (2026-07-06)**: single-sourced **all ~400 `launch_maybe_blob` call sites** across all 24 `dispatch/` files onto `launch_kernargs(&kernargs![...])`, which derives both launch ABIs (capture-path `KernargBlob` + `kernelParams` array) from one `&[KernArg]` list — the two-list-must-agree hazard is gone by construction. Shared-across-arm sites use one `let args = kernargs![...]` referenced by each arm. Each site's two old lists were cross-checked before collapse — **0 disagreements found** (no latent corruption was hiding in the parallel lists). The now-unused `fn launch_maybe_blob` helper was deleted. `cargo check -p hipfire-rdna` clean, **0 warnings**; net **−8.8k LOC**. **Remaining before land**: GPU coherence gate (`coherence-gate-dflash.sh`) not yet run — code-complete, not yet GPU-validated. |
 | 3.2 | Kernel-selection cascades, 0 tests, dead duplicate | ✅ Resolved | Dead duplicate selector deleted; `kernels.rs` now has 26 tests. |
 | 3.3 | `Gpu` god object; arch dispatch in generic compute crate | 🔴 Open | 13 hipfire-rdna files still name specific arch families. |
 | 3.4 | `qwen35.rs` 32k-line file, 5.5k-line fn | 🔴 Open | 32,618 LOC; `forward_prefill_chunk` still 5,577 lines. Crate is really **58,036 LOC / 5 files** (`speculative.rs` 12,730 was missed) and **~65–70% generic**, not qwen-specific — see the not-in-original-review addendum below. Multi-session. |
