@@ -14,14 +14,15 @@
 //! value is a [`WeightHandle`] (`Resident` GPU tensor or `Alias` of another
 //! entry). See docs/…/2026-07-05-device-mesh-transparent-parallelism.md §4.
 //!
-//! **Scope of this landing.** Two placements are implemented: *whole-tensor
-//! upload* (single-GPU + all of PP + every `Replicate`/`Pin`/`Tied`, and any
-//! sharding policy that degenerates to a size-1 group) and *expert-parallel
-//! `ExpertSharded`* on an `Ep>1` mesh (each rank gets a compact blob of its
-//! owned experts — a generic expert-outermost host gather). **Dense tensor-
-//! parallel slicing** (`Column`/`Row`/`FusedQkv`/`Head`/`Vocab` at `Tp>1`)
-//! returns a clear [`FulfillError`]: it needs the quant-blob row-gather that is
-//! Phase-5 work, and refusing beats speculatively re-encoding it.
+//! **Scope.** Implemented placements: *whole-tensor upload* (single-GPU + all of
+//! PP + every `Replicate`/`Pin`/`Tied`, and any sharding policy that degenerates
+//! to a size-1 group); *expert-parallel `ExpertSharded`* on an `Ep>1` mesh (each
+//! rank a compact blob of its owned experts — generic expert-outermost gather);
+//! and dense tensor-parallel **`ColumnShard{axis:0}`** (PB-1a — contiguous
+//! output-row split, format-agnostic) + **`RowShard`** (PB-1c — strided per-row
+//! k-gather). Still returning a clear [`FulfillError`] at `Tp>1`: `FusedQkv` /
+//! `HeadSharded` / `VocabShard` (and non-axis-0 `Column`) — the head-aware /
+//! vocab gathers of PB-1b; refusing beats silently mis-placing.
 //!
 //! **Why a `source` closure, not `&HfqFile`.** A [`WeightEntry`] names tensors
 //! *logically* (`"wq"`, `"ffn_down"`); the on-disk HFQ names are arch-specific
