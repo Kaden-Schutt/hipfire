@@ -310,8 +310,12 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   `Gpus.device_for_layer` by construction (both uniform_split_counts), per-band KV `new_gpu_q8_multi`(llama.rs:7270)+
   `alloc_kv_per_layer_multi`(8246) ALREADY EXISTS, `fulfill_manifest` PP placement (`llama_store_pp` max|Δ|=**0**).
   s_ef_residual divergence is DeltaNet-Q8-state-only (qwen35.rs:5648), N/A to dense llama → =0 REACHABLE.
-- **Increments (reverted, imperative driver loop):** PC-0 fix the BROKEN oracle — `llama_store_pp`+`llama_store_load`
-  don't compile at HEAD (missing `LlamaWeights.lm_head_aliases_embd`, E0063; add to no-gpu-ci). PC-1 make the SHARED
+- **Increments (reverted, imperative driver loop):** **PC-0 DONE (`cc12222f`)** — un-broke the example gate:
+  `llama_store_pp`+`llama_store_load` (added `LlamaWeights.lm_head_aliases_embd: false`) + a SEPARATE pre-existing break
+  `ocr_e2e` (`qwen2::forward_step*(&mut gpus)`→`&mut gpus.devices[0]`, ×3, leftover from the master merge reverting
+  3a3c60e5). `cargo check --workspace --examples` (the no-gpu-ci gate) now GREEN → catches future rot. Re-ran the PP
+  oracle on gfx1151: banded PP forward (stage0 0..14 → boundary_copy → stage1 14..28+head) logit-IDENTICAL to bespoke,
+  **max|Δ|=0** — the anchor PC-1 generalizes into `dense_forward`. NEXT: PC-1. PC-1 make the SHARED
   `dense_forward` PP-aware via the imperative `forward_scratch_band` stage loop + `boundary_copy` (mirror qwen35
   14388-14396); `DenseArch` gains a per-stage weights+scratch view (the one real trait change; model on
   `Qwen35ScratchSet`); size-1 group inner op = single-device `execute_steps` (NEVER `_tp`/`_mesh`); =0 oracle vs
