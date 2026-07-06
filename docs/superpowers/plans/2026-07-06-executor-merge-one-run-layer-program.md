@@ -242,7 +242,7 @@ $(printf 'Fold the EP MoE branch into ONE mesh-driven executor core; single Ep-g
 
 ## STEP 2 — Migrate all call sites onto the merged entry; delete the shim + old signature
 
-The substantive step, split so the one wide edit is **byte-neutral and isolated** from the behavior-bearing ones. **2.0** swaps device ownership to `Gpus::single` inside `fn main()` with no signature changes anywhere (coherence-gated, bit-identical). **2.1–2.5** then thread `&mut Gpus` through one arch at a time, each `FORWARD_LOWERED` md5-gated, so a reviewer can reject one arch without blocking the others.
+The substantive step, split so the wide **byte-neutral** daemon edits are isolated (coherence-gated) from the behavior-bearing per-arch ones (md5-gated). Two byte-neutral prep tasks first — **2.0** (`main()` owns `Gpus::single`) and **2.0b** (the shared `generate()` dispatcher carries `Gpus`) — neither changes any forward. Then **2.1–2.5** migrate one arch at a time (its forward chain + the executor-call swap), each `FORWARD_LOWERED=0/1` md5-gated, so a reviewer can reject one arch without blocking the others. The daemon god-functions (`main`, `generate`) are threaded once in 2.0/2.0b; per-arch tasks only flip *their* `generate_<arch>` call from `&mut gpus.devices[0]` to `&mut gpus`.
 
 ### Task 2.0: Byte-neutral `Gpus::single` ownership swap in `fn main()` (daemon)
 
@@ -295,16 +295,38 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **BLOCKED escalation:** if a `gpus.devices[0]` reborrow conflicts with another live borrow of `gpus` in `main()` (should not happen in 2.0 — nothing takes `&mut gpus` yet), STOP and report. Do not paper over it with `.clone()` or `unsafe`.
 
+### Task 2.0b: Byte-neutral `Gpus` threading through the `generate()` dispatcher (daemon)
+
+**Why a separate task (verified 2026-07-06):** every arch's `generate_<arch>` is routed through ONE dispatcher `fn generate(m, gpu: &mut Gpu, drafter_gpu, …)` (daemon.rs:8451, **2463 lines, 62 direct `gpu` refs**), called once from `main()` at daemon.rs:2594. That dispatcher is shared plumbing the *first* arch would otherwise have to migrate; pulling it out as its own **byte-neutral** task keeps the per-arch tasks small and isolates the one big daemon edit behind the coherence gate (same pattern as 2.0).
+
+**Byte-neutral contract:** change ONLY `fn generate`'s own `gpu: &mut Gpu` → `gpus: &mut Gpus` and its 62 internal `gpu` uses → `gpus.devices[0]`; update `main()`'s call site (daemon.rs:2594) to pass `&mut gpus`. **Every `generate_<arch>` keeps its `&mut Gpu` parameter** and is fed `&mut gpus.devices[0]` (they migrate one at a time in 2.1–2.5). `drafter_gpu: Option<&mut Gpu>` is UNCHANGED (spec-decode drafter device, out of scope). No forward behavior change.
+
+**Files:**
+- Modify: `crates/hipfire-runtime/examples/daemon.rs` — `fn generate` (8451–~10914) + its `main()` call site (2594). **Do NOT rustfmt this file.**
+
+**Interfaces:**
+- Consumes: `gpus.devices: Vec<Gpu>` (main already owns `gpus: Gpus` from Task 2.0).
+- Produces: `generate()` carries `gpus: &mut Gpus`; all `generate_<arch>` still take `&mut Gpu`, fed `gpus.devices[0]`.
+
+- [ ] **Step 1:** `nix develop -c bash -c "awk 'NR>=8451 && NR<10914' crates/hipfire-runtime/examples/daemon.rs | grep -c '\bgpu\b'"` → ~62. Note the `generate_<arch>` call sites (each will receive `&mut gpus.devices[0]`) and the `drafter_gpu` uses (leave those alone).
+- [ ] **Step 2:** `fn generate(..., gpu: &mut rdna_compute::Gpu, ...)` → `gpus: &mut hipfire_hardware::Gpus`; every internal `gpu` (NOT `drafter_gpu`, NOT `pflash_drafter_gpu`) → `gpus.devices[0]` (`&mut gpu` → `&mut gpus.devices[0]`, etc.); each `generate_<arch>(m, gpu, …)` → `generate_<arch>(m, &mut gpus.devices[0], …)`. Update `main()`:2594 `generate(m, &mut gpus.devices[0]/gpu, …)` → `generate(m, &mut gpus, …)`.
+- [ ] **Step 3:** `nix develop -c cargo build --release -p hipfire-runtime --example daemon` → compiles.
+- [ ] **Step 4:** `nix develop -c ./scripts/coherence-gate.sh` → clean (byte-neutral regression net; no md5 A/B — forward unchanged).
+- [ ] **Step 5:** Commit (do NOT rustfmt daemon.rs): `refactor(daemon): generate() dispatcher carries Gpus (byte-neutral)`.
+
+**BLOCKED escalation:** if threading `gpus` collides with the `drafter_gpu`/spec-decode borrows, STOP and report — do not touch `drafter_gpu`.
+
 ### Task 2.1–2.5: Per-arch single-GPU driver migration (repeat for each arch)
 
 Do this **once per arch**, in this order (simplest dense first): **qwen2** (`qwen2.rs:1380`), **lfm2moe** (`forward.rs:696`), **minimax** (`forward.rs:754`), **deepseek4** (`forward.rs:2153`), **qwen35** (`qwen35.rs:13061`). Each is one commit with its own byte-exact gate.
 
-**Files (per arch):**
-- Modify: the arch's lowered driver function (e.g. qwen2 `forward_step_after_x_lowered`, qwen35 `forward_scratch_layers_lowered`, ds4/minimax `decode_step_body_lowered`, lfm2moe `decode_step_layers_and_head_lowered`) — rewrite the `run_layer_program` call.
-- Modify: the call chain from `main()` down to that driver — the arch's public forward entry (`qwen2::forward_step` / `llama::forward_scratch` / `<arch>::forward::decode_step` / `forward_prefill_batch`) and any intermediate wrapper — threading `&mut Gpus`.
-- Modify: `daemon.rs` `fn main()` — this arch's forward call site switches `&mut gpus.devices[0]` → `&mut gpus`. (Do NOT rustfmt daemon.rs or the fmt-debt arch `forward.rs`/`qwen35.rs`.)
+**Prereq:** Tasks 2.0 + 2.0b done, so `main()` and `generate()` already carry `gpus: Gpus` and feed `&mut gpus.devices[0]` to this (still-unmigrated) arch. This task flips exactly this arch to `&mut gpus`.
 
-**Threading rule:** each fn on the chain from `main()` to the lowered driver changes its `gpu: &mut Gpu` param to `gpus: &mut Gpus`; its OTHER internal `&mut Gpu` helper calls (attention, norms, kv) are fed `&mut gpus.devices[0]`; only the executor call gets the whole `gpus`. This must land atomically (signature + all its callers) or the crate won't build.
+**Files (per arch):**
+- Modify (arch crate): the whole forward chain from the public entry to the lowered driver — each `gpu: &mut Gpu` → `gpus: &mut Gpus`, internal helper calls fed `&mut gpus.devices[0]`, and the `run_layer_program(gpu, &ctx, &program, &mut bind)` call → `run_layer_program_mesh(...)`. **qwen2 (Task 2.1):** `forward_step`(:717), `forward_step_with_embed`(:747), `forward_step_greedy`(:969), `forward_step_after_x`(:813, incl. its non-lowered hand loop), `forward_step_after_x_lowered`(:1369, the executor call at :1380) — all funnel through `forward_step_after_x`, so atomic. (qwen35/ds4/minimax/lfm2moe: their `*_lowered` driver + entry chain, mapped in that task's brief.)
+- Modify (`daemon.rs`, do NOT rustfmt): `generate_<arch>` (e.g. `generate_qwen2`:12650) sig `gpu` → `gpus`, its internal `gpu` refs → `gpus.devices[0]`, and flip `generate()`'s `generate_<arch>(m, &mut gpus.devices[0], …)` → `(m, &mut gpus, …)`. Any OTHER daemon caller of this arch's forward entries migrates too — **qwen2 additionally:** `generate_vl_dots_ocr`(:13381, shares `forward_step_greedy`; sig `gpu`→`gpus`, ~15 refs, called from `main`:2502) and the `main` warm-pass `forward_step` at :2930.
+
+**Threading rule:** each fn on the chain changes `gpu: &mut Gpu` → `gpus: &mut Gpus`; its OTHER `&mut Gpu` helper calls (attention/norms/kv) are fed `&mut gpus.devices[0]` (sequential reborrows — do NOT hold a `&mut gpus.devices[0]` across the `run_layer_program_mesh(mesh, gpus, …)` call); only the executor call gets the whole `gpus`. Must land atomically (signature + all callers) or the crate won't build. qwen2.rs is NOT a fmt-debt file (per-file rustfmt OK); daemon.rs and the qwen35/ds4/minimax `forward.rs` ARE (do not rustfmt).
 
 **Interfaces:**
 - Consumes: `run_layer_program_mesh` (Task 1), `DeviceMesh::single()`, `std::slice::from_mut`.
