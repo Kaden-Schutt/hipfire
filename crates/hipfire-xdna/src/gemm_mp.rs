@@ -172,8 +172,7 @@ impl NpuGemmMp {
         assert_eq!(n, self.n(), "N");
         let rows_per = self.rows_per_dispatch();
         assert!(m % rows_per == 0, "M must be a multiple of {rows_per}");
-        let (cols, mt, nb) = (self.cols, self.mt, self.nb);
-        let (aw, cw) = (self.aw(), self.cw());
+        let (cols, mt, aw) = (self.cols, self.mt, self.aw());
         for d in 0..(m / rows_per) {
             let row0 = d * rows_per;
             // COLS row-major M-blocks -> a_buf (the kernel's A tensor stream tiles in-core).
@@ -190,24 +189,89 @@ impl NpuGemmMp {
             }
             self.kernel
                 .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
-            // C: core ci slab j block at (ci*nb+j)*cw, row-major -> output rows
-            // [row0+ci*mt*MR, +), cols [j*NT*MN, +).
-            let out: &[i32] = unsafe {
-                std::slice::from_raw_parts(
-                    self.c_buf.as_slice().as_ptr() as *const i32,
-                    cols * nb * cw,
-                )
-            };
+            self.read_c_tile(row0, n, c); // de-block c_buf -> rows [row0,+) of row-major c
+        }
+        Ok(())
+    }
+
+    // De-block the current c_buf (COLS*NB blocks, each (MT·MR)×(NT·MN) row-major) into rows
+    // [row0, row0+rows_per_dispatch()) of a row-major `c` `M×N`. This host copy is exactly
+    // what zero-copy avoids — a GPU consumer reads the block layout from the shared buffer
+    // directly (see `run_into_shared` + `c_block_offset`).
+    fn read_c_tile(&self, row0: usize, n: usize, c: &mut [i32]) {
+        let (cols, mt, nb, cw) = (self.cols, self.mt, self.nb, self.cw());
+        let out: &[i32] = unsafe {
+            std::slice::from_raw_parts(self.c_buf.as_slice().as_ptr() as *const i32, cols * nb * cw)
+        };
+        for ci in 0..cols {
+            for j in 0..nb {
+                for lr in 0..mt * MR {
+                    let base = (ci * nb + j) * cw + lr * (NT * MN);
+                    let dst = (row0 + ci * mt * MR + lr) * n + j * NT * MN;
+                    c[dst..dst + NT * MN].copy_from_slice(&out[base..base + NT * MN]);
+                }
+            }
+        }
+    }
+
+    /// Byte size the output buffer must be for one dispatch's C: `COLS·NB·(MT·NT·MR·MN)·4`.
+    pub fn c_buf_bytes(&self) -> usize {
+        self.cols * self.nb * self.cw() * 4
+    }
+
+    /// Replace the SHMEM output buffer with an imported GPU dma-buf (zero-copy). After this,
+    /// [`Self::run_into_shared`] writes C straight into the GPU-shared pages — no host copy.
+    /// `size` must be [`Self::c_buf_bytes`] (one dispatch's C). The dma-buf is typically an
+    /// amdgpu GTT BO exported via `PRIME_HANDLE_TO_FD`; the driver `dma_buf_get`s the fd.
+    pub fn attach_output_dmabuf(&mut self, fd: i32, size: usize) -> Result<(), XdnaError> {
+        assert_eq!(size, self.c_buf_bytes(), "output dma-buf size");
+        self.c_buf = self.kernel.import_dmabuf(fd, size, true)?;
+        Ok(())
+    }
+
+    /// Byte offset (into the output buffer) of the C block for (`core`, `slab`): a
+    /// (MT·MR)×(NT·MN) row-major int32 tile covering global rows
+    /// [`core*MT*MR`, +), cols [`slab*NT*MN`, +) of this dispatch's M-tile. Lets a GPU
+    /// consumer index the block-layout C in the shared buffer directly.
+    pub fn c_block_offset_i32(&self, core: usize, slab: usize) -> usize {
+        (core * self.nb + slab) * self.cw()
+    }
+
+    /// Run ONE M-block (`a` = `rows_per_dispatch()×K` row-major int8) with C written directly
+    /// into the attached output dma-buf — **no host readback**. The result lands in the
+    /// GPU-shared pages in the NPU block layout (see [`Self::c_block_offset_i32`]); the GPU
+    /// reads it with zero host involvement. Requires [`Self::attach_output_dmabuf`] +
+    /// [`Self::load_weights`]. For full M, drive this per M-tile and consume between calls
+    /// (the single output buffer is reused each dispatch).
+    pub fn run_into_shared(&mut self, k: usize, n: usize, a: &[i8]) -> Result<(), XdnaError> {
+        assert!(
+            self.w_loaded,
+            "call load_weights() before run_into_shared()"
+        );
+        assert_eq!(k, self.k(), "K");
+        assert_eq!(n, self.n(), "N");
+        let rows_per = self.rows_per_dispatch();
+        assert_eq!(a.len(), rows_per * k, "A must be exactly one M-block");
+        let (cols, mt, aw) = (self.cols, self.mt, self.aw());
+        {
+            let s = self.a_buf.as_mut_slice();
             for ci in 0..cols {
-                for j in 0..nb {
-                    for lr in 0..mt * MR {
-                        let base = (ci * nb + j) * cw + lr * (NT * MN);
-                        let dst = (row0 + ci * mt * MR + lr) * n + j * NT * MN;
-                        c[dst..dst + NT * MN].copy_from_slice(&out[base..base + NT * MN]);
+                for lr in 0..mt * MR {
+                    let src = (ci * mt * MR + lr) * k;
+                    for kk in 0..k {
+                        s[ci * aw + lr * k + kk] = a[src + kk] as u8;
                     }
                 }
             }
         }
-        Ok(())
+        self.kernel
+            .dispatch(&[&self.a_buf, &self.w_buf, &self.c_buf])?;
+        Ok(()) // C is now in the shared dma-buf; no host copy
+    }
+
+    /// De-block the shared/output buffer's current C into a row-major `rows_per × N` host
+    /// buffer — for validation or a host (non-GPU) consumer of [`Self::run_into_shared`].
+    pub fn read_shared_rowmajor(&self, n: usize, c: &mut [i32]) {
+        self.read_c_tile(0, n, c);
     }
 }

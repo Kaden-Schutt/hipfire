@@ -87,6 +87,18 @@ impl NpuKernel {
         self.dev.alloc_buffer(size, AMDXDNA_BO_SHMEM)
     }
 
+    /// Import an external dma-buf (e.g. an amdgpu GTT BO) as an argument buffer, zero-copy:
+    /// the kernel then reads/writes the *same physical pages* as the exporting engine (the
+    /// GPU) — no host round-trip. See [`crate::XdnaDevice::import_dmabuf`].
+    pub fn import_dmabuf(
+        &self,
+        fd: i32,
+        size: usize,
+        map: bool,
+    ) -> Result<DeviceBuffer, XdnaError> {
+        self.dev.import_dmabuf(fd, size, map)
+    }
+
     /// Run the kernel over `args` in kernel-signature order (e.g. A, W, C). Flushes
     /// the argument buffers to the device, submits the command, and blocks until it
     /// completes; on return the output buffers are readable directly (SHMEM is
