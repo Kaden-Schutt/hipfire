@@ -451,6 +451,7 @@ name = "hipfire-dispatch"
 version = "0.2.1"
 dependencies = [
  "hip-bridge",
+ "hipfire-hardware",
  "rdna-compute",
 ]
 
@@ -460,6 +461,14 @@ version = "0.2.1"
 dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
+ "rdna-compute",
+]
+
+[[package]]
+name = "hipfire-hardware"
+version = "0.2.1"
+dependencies = [
+ "hip-bridge",
  "rdna-compute",
 ]
 
@@ -524,6 +533,7 @@ dependencies = [
  "hipfire-atlas",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-loader",
  "libc",
  "memmap2",
