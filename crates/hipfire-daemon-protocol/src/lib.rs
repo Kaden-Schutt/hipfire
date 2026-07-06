@@ -255,6 +255,44 @@ pub struct LoraListResponse {
     pub adapters: Vec<LoraAdapterInfo>,
 }
 
+/// Compute PFlash prefill labels over `corpus` against the resident qwen3.5
+/// model, writing a JSONL score file plus an `.embed.bin` sidecar to `output`.
+/// Runtime preconditions (resident qwen3.5 family, corpus length) are checked
+/// by the daemon, not the wire schema.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PflashLabelsRequest {
+    pub corpus: String,
+    pub output: String,
+    #[serde(default = "default_pflash_seq")]
+    pub seq: usize,
+    #[serde(default = "default_pflash_block")]
+    pub block: usize,
+    #[serde(default = "default_pflash_n_chunks")]
+    pub n_chunks: usize,
+}
+
+fn default_pflash_seq() -> usize {
+    512
+}
+fn default_pflash_block() -> usize {
+    64
+}
+fn default_pflash_n_chunks() -> usize {
+    40
+}
+
+/// Micro-benchmark a single prefill of `tokens` tokens (pp == 1) against the
+/// resident model. Requires a loaded model with `tokens + 32 <= physical_cap`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BenchPrefillRequest {
+    #[serde(default = "default_bench_tokens")]
+    pub tokens: usize,
+}
+
+fn default_bench_tokens() -> usize {
+    128
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -282,6 +320,36 @@ pub enum DaemonRequest {
     CettLoadColnorms(CettLoadColnormsRequest),
     CettCapture(CettCaptureRequest),
     HneuronIntervene(HneuronInterveneRequest),
+
+    // Extended control-plane ops driven by internal callers (scheduler, eval,
+    // benches) rather than the `DaemonEngine` adapter. They live in the same
+    // enum so daemon dispatch is one exhaustive match — a new op cannot be
+    // added without the daemon handling it. The batch/prefill/state ops carry
+    // cross-field validation (exactly-one-of, id dedup, multi-key identity
+    // fallback, hex/format checks) that serde cannot express, so those variants
+    // are routing-only markers: the daemon re-runs the authoritative
+    // `validate_*` / `parse_*` parser on the raw message. Ops with a plain
+    // field schema carry a typed payload.
+    GenerateBatchPrefill,
+    PrefixHashPreflight,
+    GenerateBatchDecodeStep,
+    ReleaseSessions,
+    ReserveSessionState,
+    DescribeState,
+    /// Wire tag `release_state` or `release_session_state_reservation`; the two
+    /// share a handler and differ only in the response tag, which the daemon
+    /// selects from the raw `type` string.
+    #[serde(alias = "release_session_state_reservation")]
+    ReleaseState,
+    /// Wire tag `worker_status` or `list_workers` (identical handler).
+    #[serde(alias = "list_workers")]
+    WorkerStatus,
+    UnloadWorker,
+    PflashLabels(PflashLabelsRequest),
+    TrainDrafter,
+    Diag,
+    BenchPrefill(BenchPrefillRequest),
+    Profile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -607,6 +675,111 @@ mod tests {
         };
         assert_eq!(done.id, "req-1");
         assert_eq!(done.extra["backend_path"], "hip_hipfire_rdna");
+    }
+
+    #[test]
+    fn extended_ops_route_by_tag() {
+        // Every extended tag must land on its own variant so daemon dispatch is
+        // exhaustive. Marker variants ignore payload fields (the daemon re-runs
+        // the authoritative parser); typed variants deserialize their fields.
+        let cases: &[(serde_json::Value, fn(&DaemonRequest) -> bool)] = &[
+            (
+                json!({"type": "generate_batch_prefill", "batch_id": "b1",
+                       "sessions": [{"id": "s1", "prompt": "hi",
+                                     "state_handle": {"state_kinds": ["attention_kv"],
+                                                      "logical_position": 0}}],
+                       "worker_key_id": "w"}),
+                |r| matches!(r, DaemonRequest::GenerateBatchPrefill),
+            ),
+            (
+                json!({"type": "prefix_hash_preflight", "session": {}}),
+                |r| matches!(r, DaemonRequest::PrefixHashPreflight),
+            ),
+            (
+                json!({"type": "generate_batch_decode_step", "batch_id": "b1", "sessions": []}),
+                |r| matches!(r, DaemonRequest::GenerateBatchDecodeStep),
+            ),
+            (
+                json!({"type": "release_sessions", "sessions": ["s1"]}),
+                |r| matches!(r, DaemonRequest::ReleaseSessions),
+            ),
+            (
+                json!({"type": "reserve_session_state", "physical_cap": 2048}),
+                |r| matches!(r, DaemonRequest::ReserveSessionState),
+            ),
+            (
+                json!({"type": "describe_state", "runtime_state_handle": "h"}),
+                |r| matches!(r, DaemonRequest::DescribeState),
+            ),
+            (json!({"type": "unload_worker", "worker_id": "w"}), |r| {
+                matches!(r, DaemonRequest::UnloadWorker)
+            }),
+            (json!({"type": "train_drafter", "output": "d.hfq"}), |r| {
+                matches!(r, DaemonRequest::TrainDrafter)
+            }),
+            (json!({"type": "diag"}), |r| {
+                matches!(r, DaemonRequest::Diag)
+            }),
+            (json!({"type": "profile"}), |r| {
+                matches!(r, DaemonRequest::Profile)
+            }),
+        ];
+        for (value, check) in cases {
+            let req: DaemonRequest = serde_json::from_value(value.clone())
+                .unwrap_or_else(|e| panic!("deserialize {value} failed: {e}"));
+            assert!(check(&req), "unexpected variant for {value}");
+        }
+    }
+
+    #[test]
+    fn extended_op_tag_aliases_route_to_one_variant() {
+        for tag in ["worker_status", "list_workers"] {
+            let req: DaemonRequest = serde_json::from_value(json!({"type": tag})).unwrap();
+            assert!(matches!(req, DaemonRequest::WorkerStatus), "tag {tag}");
+        }
+        for tag in ["release_state", "release_session_state_reservation"] {
+            let req: DaemonRequest =
+                serde_json::from_value(json!({"type": tag, "id": "x"})).unwrap();
+            assert!(matches!(req, DaemonRequest::ReleaseState), "tag {tag}");
+        }
+    }
+
+    #[test]
+    fn pflash_labels_request_applies_field_defaults() {
+        let DaemonRequest::PflashLabels(req) = serde_json::from_value(json!({
+            "type": "pflash_labels", "corpus": "c.txt", "output": "o.bin"
+        }))
+        .unwrap() else {
+            panic!("expected pflash_labels");
+        };
+        assert_eq!(req.corpus, "c.txt");
+        assert_eq!(req.output, "o.bin");
+        assert_eq!((req.seq, req.block, req.n_chunks), (512, 64, 40));
+
+        let DaemonRequest::PflashLabels(req) = serde_json::from_value(json!({
+            "type": "pflash_labels", "corpus": "c", "output": "o",
+            "seq": 256, "block": 32, "n_chunks": 8
+        }))
+        .unwrap() else {
+            panic!("expected pflash_labels");
+        };
+        assert_eq!((req.seq, req.block, req.n_chunks), (256, 32, 8));
+    }
+
+    #[test]
+    fn bench_prefill_request_defaults_tokens() {
+        let DaemonRequest::BenchPrefill(req) =
+            serde_json::from_value(json!({"type": "bench_prefill"})).unwrap()
+        else {
+            panic!("expected bench_prefill");
+        };
+        assert_eq!(req.tokens, 128);
+        let DaemonRequest::BenchPrefill(req) =
+            serde_json::from_value(json!({"type": "bench_prefill", "tokens": 64})).unwrap()
+        else {
+            panic!("expected bench_prefill");
+        };
+        assert_eq!(req.tokens, 64);
     }
 
     #[test]
