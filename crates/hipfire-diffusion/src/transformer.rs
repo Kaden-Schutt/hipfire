@@ -1021,6 +1021,77 @@ impl TransformerAttentionStreamProjection {
             runtime_context,
         )
     }
+
+    /// Test-only: minimal MHA stream (no biases/norms) from raw f32 weights.
+    #[cfg(test)]
+    pub(crate) fn mha_for_test(
+        inner: usize,
+        hidden: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &[f32],
+    ) -> Self {
+        Self {
+            stream_label: "test",
+            q_weight: ResidentWeight::from_bf16_parts("attn.q", vec![inner, hidden], q),
+            q_bias: None,
+            k_weight: ResidentWeight::from_bf16_parts("attn.k", vec![inner, hidden], k),
+            k_bias: None,
+            v_weight: ResidentWeight::from_bf16_parts("attn.v", vec![inner, hidden], v),
+            v_bias: None,
+            norm_q_weight: None,
+            norm_k_weight: None,
+            out_weight: ResidentWeight::from_bf16_parts("attn.out", vec![hidden, inner], out),
+            out_bias: None,
+        }
+    }
+
+    /// Fully resident Q/K/V projection: resident hidden -> (q, k, v) resident,
+    /// each `[batch, seq, heads*head_dim]`, with per-head QK-norm and GQA expand
+    /// applied on-device. Mirrors project_qkv_with_runtime_context.
+    #[allow(dead_code)]
+    pub(crate) fn project_qkv_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        heads: usize,
+        head_dim: usize,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<(
+        hipfire_rdna::GpuTensor,
+        hipfire_rdna::GpuTensor,
+        hipfire_rdna::GpuTensor,
+    )> {
+        let q =
+            linear_resident_weight_resident(gpu, cache, hidden, &self.q_weight, self.q_bias.as_ref())?;
+        let k =
+            linear_resident_weight_resident(gpu, cache, hidden, &self.k_weight, self.k_bias.as_ref())?;
+        let v =
+            linear_resident_weight_resident(gpu, cache, hidden, &self.v_weight, self.v_bias.as_ref())?;
+        let kv_width = *k.shape.last().expect("k has a last dim");
+        let kv_heads = if head_dim == 0 { heads } else { kv_width / head_dim };
+
+        let q = qk_norm_heads_resident(gpu, cache, q, self.norm_q_weight.as_ref(), heads, head_dim, 1e-6)?;
+        let k = qk_norm_heads_resident(gpu, cache, k, self.norm_k_weight.as_ref(), kv_heads, head_dim, 1e-6)?;
+
+        let k_exp = repeat_kv_heads_resident(gpu, &k, heads, kv_heads, head_dim)?;
+        free_resident(gpu, k)?;
+        let v_exp = repeat_kv_heads_resident(gpu, &v, heads, kv_heads, head_dim)?;
+        free_resident(gpu, v)?;
+        Ok((q, k_exp, v_exp))
+    }
+
+    /// Fully resident output projection.
+    #[allow(dead_code)]
+    pub(crate) fn project_output_resident(
+        &self,
+        attention: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        linear_resident_weight_resident(gpu, cache, attention, &self.out_weight, self.out_bias.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1242,6 +1313,71 @@ impl NativeTransformerAttentionProjection {
             None => attention,
         };
         self.project_image_output_with_runtime_context(&gated, runtime_context)
+    }
+
+    /// Test-only: minimal Krea2 MHA attention (no gate) around an mha_for_test
+    /// stream.
+    #[cfg(test)]
+    pub(crate) fn krea_mha_for_test(
+        heads: usize,
+        head_dim: usize,
+        image: TransformerAttentionStreamProjection,
+    ) -> Self {
+        let inner = heads * head_dim;
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            heads,
+            head_dim,
+            hidden_width: inner,
+            inner_width: inner,
+            image,
+            text: None,
+            gate_weight: None,
+            gate_bias: None,
+        }
+    }
+
+    /// Fully device-resident Krea2 self-gated attention: resident hidden in/out,
+    /// no host round-trip. project_qkv -> rope(q,k) -> sdpa -> sigmoid gate ->
+    /// out proj, freeing intermediates as it goes.
+    #[allow(dead_code)]
+    pub(crate) fn attend_krea_self_gated_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        rotary: Option<&RotaryFrequencies>,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        let (mut q, mut k, v) =
+            self.image
+                .project_qkv_resident(hidden, self.heads, self.head_dim, gpu, cache)?;
+        if let Some(freqs) = rotary {
+            let q_rot = rope_qwen_resident(gpu, cache, &q, &freqs.cos, &freqs.sin, self.heads, self.head_dim)?;
+            free_resident(gpu, q)?;
+            q = q_rot;
+            let k_rot = rope_qwen_resident(gpu, cache, &k, &freqs.cos, &freqs.sin, self.heads, self.head_dim)?;
+            free_resident(gpu, k)?;
+            k = k_rot;
+        }
+        let attention = scaled_dot_product_attention_resident(gpu, &q, &k, &v, self.heads)?;
+        free_resident(gpu, q)?;
+        free_resident(gpu, k)?;
+        free_resident(gpu, v)?;
+
+        let gated = match self.gate_weight.as_ref() {
+            Some(weight) => {
+                let gate = linear_resident_weight_resident(gpu, cache, hidden, weight, self.gate_bias.as_ref())?;
+                let g = sigmoid_gate_3d_resident(gpu, &attention, &gate)?;
+                free_resident(gpu, gate)?;
+                free_resident(gpu, attention)?;
+                g
+            }
+            None => attention,
+        };
+        let out = self.image.project_output_resident(&gated, gpu, cache)?;
+        free_resident(gpu, gated)?;
+        Ok(out)
     }
 
     pub(crate) fn project_image_qkv_with_runtime_context(

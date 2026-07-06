@@ -1951,6 +1951,66 @@ fn feed_forward_stream_forward_resident_matches_cpu_reference() {
 }
 
 #[test]
+fn attend_krea_resident_matches_runtime_context_path() {
+    // Full resident attention (proj -> sdpa -> out proj, MHA, no gate/rope)
+    // vs the existing CpuTensor round-trip path — same weights, so they should
+    // match tightly. Validates the resident attention composition + ownership.
+    if hipfire_rdna::Gpu::init_with_device(0).is_err() {
+        eprintln!("skip: ROCm GPU unavailable for resident attention test");
+        return;
+    }
+    let (batch, seq, heads, head_dim) = (1usize, 4, 2, 16);
+    let width = heads * head_dim; // 32 (hidden == inner for MHA self-attn)
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 23.0) - 11.0) / 11.0 * scale)
+            .collect()
+    };
+    let q = fill(width * width, 1.0, 0.4);
+    let k = fill(width * width, 3.0, 0.4);
+    let v = fill(width * width, 5.0, 0.4);
+    let out = fill(width * width, 7.0, 0.4);
+    let stream = TransformerAttentionStreamProjection::mha_for_test(width, width, &q, &k, &v, &out);
+    let attn = NativeTransformerAttentionProjection::krea_mha_for_test(heads, head_dim, stream);
+    let hidden_in = CpuTensor {
+        shape: vec![batch, seq, width],
+        data: fill(batch * seq * width, 2.0, 1.0),
+    };
+
+    let mut ctx = DiffusionGenerationRuntimeContext::new(
+        DiffusionGenerationRuntimeOptions::rocm_hybrid(0),
+    );
+    let cpu_out = attn
+        .attend_krea_self_gated_with_runtime_context(&hidden_in, None, &mut ctx)
+        .unwrap();
+    let resident_out = ctx
+        .with_rocm_gpu_weighted(|gpu, cache| {
+            let hidden_gpu = gpu
+                .upload_f32(&hidden_in.data, &hidden_in.shape)
+                .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+            let out_gpu = attn.attend_krea_self_gated_resident(&hidden_gpu, None, gpu, cache)?;
+            let out = download_resident(gpu, &out_gpu)?;
+            free_resident(gpu, out_gpu)?;
+            free_resident(gpu, hidden_gpu)?;
+            Ok(out)
+        })
+        .unwrap();
+
+    assert_eq!(resident_out.shape, cpu_out.shape);
+    assert_eq!(resident_out.shape, vec![batch, seq, width]);
+    let max_rel = resident_out
+        .data
+        .iter()
+        .zip(&cpu_out.data)
+        .map(|(a, b)| (a - b).abs() / (b.abs().max(1.0)))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rel <= 2e-2,
+        "resident attention vs runtime-context path max rel {max_rel} too large"
+    );
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,

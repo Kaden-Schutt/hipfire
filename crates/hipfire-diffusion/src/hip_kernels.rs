@@ -1470,3 +1470,37 @@ extern "C" __global__ void diffusion_gated_residual_3d_f32(
     output[idx] = residual[idx] + update[idx] * gate[b * width + c];
 }
 "#;
+
+pub(crate) const DIFFUSION_REPEAT_KV_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// GQA expand: [b, s, kv_heads*head_dim] -> [b, s, heads*head_dim]. Query head h
+// reads KV head h/(heads/kv_heads) (PyTorch repeat_kv ordering). One thread per
+// output element.
+extern "C" __global__ void diffusion_repeat_kv_heads_f32(
+    const float* input,
+    float* output,
+    int total_out,
+    int seq,
+    int heads,
+    int kv_heads,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_out) {
+        return;
+    }
+    int in_width = kv_heads * head_dim;
+    int dim = idx % head_dim;
+    int t = idx / head_dim;
+    int head = t % heads;
+    int t2 = t / heads;
+    int token = t2 % seq;
+    int b = t2 / seq;
+
+    int group = heads / kv_heads;
+    int kv_head = head / group;
+    long src = ((long)(b * seq + token)) * in_width + (long)kv_head * head_dim + dim;
+    output[idx] = input[src];
+}
+"#;

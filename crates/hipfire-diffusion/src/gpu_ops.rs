@@ -4068,6 +4068,103 @@ fn two_input_gate_resident(
     Ok(output)
 }
 
+/// Device-resident per-head RMSNorm for QK-norm: normalizes each head over
+/// `head_dim`. Consumes `input` (freeing it) and returns a fresh resident
+/// tensor of the same `[batch, seq, heads*head_dim]` shape. `weight` is
+/// `[head_dim]`; `None` returns `input` unchanged. Reuses `rms_norm_resident`
+/// on a `[batch*seq*heads, head_dim]` view (same buffer, per-head rows).
+#[allow(dead_code)]
+pub(crate) fn qk_norm_heads_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    cache: &mut RocmWeightCache,
+    input: hipfire_rdna::GpuTensor,
+    weight: Option<&CpuTensor>,
+    heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let Some(weight) = weight else {
+        return Ok(input);
+    };
+    let [batch, seq, width] = resident_dims3(&input.shape, "QK-norm input")?;
+    if heads == 0 || head_dim == 0 || width != heads * head_dim {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "QK-norm width {width} incompatible with heads {heads} head_dim {head_dim}"
+        )));
+    }
+    let rows = batch * seq * heads;
+    let byte_len = rows
+        .checked_mul(head_dim)
+        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| DiffusionError::InvalidMetadata("QK-norm size overflows".to_string()))?;
+    let view = hipfire_rdna::GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(input.buf.as_ptr(), byte_len) },
+        shape: vec![rows, head_dim],
+        dtype: hipfire_rdna::DType::F32,
+    };
+    let mut normed = rms_norm_resident(gpu, cache, &view, weight, eps)?;
+    free_resident(gpu, input)?;
+    normed.shape = vec![batch, seq, width];
+    Ok(normed)
+}
+
+/// Device-resident GQA expand: `[batch, seq, kv_heads*head_dim] ->
+/// [batch, seq, heads*head_dim]`, query head `h` reading KV head
+/// `h/(heads/kv_heads)`. Identity clone when `heads == kv_heads`.
+#[allow(dead_code)]
+pub(crate) fn repeat_kv_heads_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, seq, width] = resident_dims3(&input.shape, "GQA expand input")?;
+    if kv_heads == 0 || head_dim == 0 || width != kv_heads * head_dim {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "GQA expand input width {width} incompatible with kv_heads {kv_heads} head_dim {head_dim}"
+        )));
+    }
+    if heads == 0 || heads % kv_heads != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "GQA expand target heads {heads} not a multiple of kv_heads {kv_heads}"
+        )));
+    }
+    if heads == kv_heads {
+        return clone_resident(gpu, input);
+    }
+    let out_width = heads * head_dim;
+    let output_shape = [batch, seq, out_width];
+    let total_out = checked_shape_elements("GQA expand output", &output_shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &output_shape)?;
+    if total_out == 0 {
+        return Ok(output);
+    }
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("GQA expand total", total_out)?);
+    kernargs.push_i32(i32_kernel_dim("GQA expand seq", seq)?);
+    kernargs.push_i32(i32_kernel_dim("GQA expand heads", heads)?);
+    kernargs.push_i32(i32_kernel_dim("GQA expand kv_heads", kv_heads)?);
+    kernargs.push_i32(i32_kernel_dim("GQA expand head_dim", head_dim)?);
+    kernargs.pad_to(16);
+    let grid = [((total_out as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_repeat_kv_heads_f32",
+        DIFFUSION_REPEAT_KV_HIP_SRC,
+        "diffusion_repeat_kv_heads_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
 /// Device-resident adaLN modulate: `out = input*(1+scale) + shift`, with
 /// `shift`/`scale` resident `[batch, width]` broadcast over seq.
 #[allow(dead_code)]
