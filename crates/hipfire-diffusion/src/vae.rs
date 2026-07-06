@@ -984,15 +984,23 @@ pub(crate) fn wan_causal_conv2d(
             "wan_causal_conv2d only supports square spatial kernels, got {kh}x{kw}"
         )));
     }
-    let tap = kt - 1;
+    // T=1 causal-conv temporal collapse. The Wan VAE initializes its temporal
+    // feature cache by REPLICATING the first frame, so for a single frame every
+    // temporal tap sees that frame and the effective 2D weight is the SUM over
+    // temporal taps — NOT just the last tap (which would assume zero padding).
+    // The last-tap form used only 1/3 of each conv's weight and corrupted every
+    // conv in the encoder and decoder (structured-but-wrong output).
     let mut weight2d = CpuTensor::zeros(&[out_c, in_c, kh, kw]);
     for o in 0..out_c {
         for i in 0..in_c {
             for y in 0..kh {
                 for x in 0..kw {
-                    let src = (((o * in_c + i) * kt + tap) * kh + y) * kw + x;
                     let dst = ((o * in_c + i) * kh + y) * kw + x;
-                    weight2d.data[dst] = weight3d.data[src];
+                    let mut acc = 0.0f32;
+                    for t in 0..kt {
+                        acc += weight3d.data[(((o * in_c + i) * kt + t) * kh + y) * kw + x];
+                    }
+                    weight2d.data[dst] = acc;
                 }
             }
         }
@@ -1486,8 +1494,10 @@ mod wan_vae_tests {
     }
 
     #[test]
-    fn wan_causal_conv2d_uses_last_temporal_tap() {
-        // 1x1 spatial, 3 temporal taps [5, 7, 11]; only the last (11) is used.
+    fn wan_causal_conv2d_sums_temporal_taps() {
+        // 1x1 spatial, 3 temporal taps [5, 7, 11]. For a single (T=1) frame the
+        // Wan causal conv replicates the frame across the temporal window, so all
+        // taps contribute: effective weight = 5+7+11 = 23.
         let weight3d = CpuTensor {
             shape: vec![1, 1, 3, 1, 1],
             data: vec![5.0, 7.0, 11.0],
@@ -1498,7 +1508,7 @@ mod wan_vae_tests {
         };
         let out = wan_causal_conv2d(&input, &weight3d, None).unwrap();
         assert_eq!(out.shape, vec![1, 1, 1, 2]);
-        assert_eq!(out.data, vec![22.0, 33.0]);
+        assert_eq!(out.data, vec![46.0, 69.0]);
     }
 
     #[test]

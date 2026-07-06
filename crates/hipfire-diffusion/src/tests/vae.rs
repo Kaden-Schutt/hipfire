@@ -191,3 +191,63 @@ fn wan_qwen_image_vae_encode_decode_round_trips() {
     // (encoder builds, right-shaped finite z_dim=16 latent) are what gate here.
     eprintln!("Wan VAE encode->decode round-trip MSE (in [-1,1], diagnostic): {mse:.4}");
 }
+
+#[test]
+fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
+    // Decoder isolation: a constant (and a smooth-gradient) latent must decode
+    // to a SMOOTH image. If a benign latent decodes to high-frequency noise, the
+    // decoder itself has a convention bug (which would explain the noisy render,
+    // independent of the DiT). Pure-CPU. Skips when the model is absent.
+    let model = std::path::Path::new("/home/sadara/.hipfire/models/Krea2-Turbo.hfq");
+    if !model.exists() {
+        eprintln!("skip: Krea2-Turbo.hfq not present");
+        return;
+    }
+    let hfq = hipfire_runtime::hfq::HfqFile::open_index_only(model).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    let decoder = NativeVaeDecoder::from_hfq(&hfq, &config.vae).unwrap();
+
+    let (lc, lh, lw) = (16usize, 8usize, 8usize);
+    // A constant latent (all zeros) -> a solid/smooth image if the decoder is sane.
+    let latent = LatentBatch {
+        batch: 1,
+        channels: lc,
+        height: lh,
+        width: lw,
+        data: vec![0.0f32; lc * lh * lw],
+    };
+    let out = decoder.decode_latents(&latent).unwrap();
+    let [b, c, ph, pw] = match out.shape.as_slice() {
+        [b, c, h, w] => [*b, *c, *h, *w],
+        other => panic!("decode shape {other:?}"),
+    };
+    assert_eq!((b, c), (1, 3));
+    // Mean absolute horizontal neighbor difference (smoothness); [-1,1] pixels.
+    let mut acc = 0.0f64;
+    let mut n = 0usize;
+    for ch in 0..c {
+        for y in 0..ph {
+            for x in 0..pw - 1 {
+                let i = ((ch * ph + y) * pw + x) as usize;
+                acc += (out.data[i] - out.data[i + 1]).abs() as f64;
+                n += 1;
+            }
+        }
+    }
+    let smoothness = acc / n.max(1) as f64;
+    let var = {
+        let m = out.data.iter().map(|&v| v as f64).sum::<f64>() / out.data.len() as f64;
+        out.data.iter().map(|&v| (v as f64 - m).powi(2)).sum::<f64>() / out.data.len() as f64
+    };
+    eprintln!(
+        "decode(constant latent): {ph}x{pw} std={:.3} mean|Δright|={smoothness:.4}",
+        var.sqrt()
+    );
+    // A sane decoder of a constant latent yields a near-uniform image: tiny
+    // neighbor deltas. High-frequency output = decoder convention bug.
+    assert!(
+        smoothness < 0.05,
+        "decoder produces high-frequency output from a constant latent (mean|Δright|={smoothness}) — decoder is broken"
+    );
+}
