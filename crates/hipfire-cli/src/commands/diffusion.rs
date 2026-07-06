@@ -14,10 +14,10 @@ use hipfire_diffusion::DiffusionHipRuntimeOptions;
 // server-linked hipfire-diffusion.
 use hipfire_diffusion::{
     calibrate_diffusion_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
-    resize_rgb_batch_to_cover_nearest, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
-    DiffusionError, DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline,
-    DiffusionProgress, DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule,
-    RgbImageBatch,
+    resize_rgb_batch_to_cover_nearest, DiffusionBatchRequest, DiffusionError,
+    DiffusionGenerationRuntimeOptions, DiffusionHfqInspection, DiffusionImg2ImgRequest,
+    DiffusionPipeline, DiffusionProgress, DiffusionPrompt, DiffusionQuantFormat, DiffusionResult,
+    RefineSigmaSchedule, RgbImageBatch,
 };
 use hipfire_diffusion_coexist::{import_diffusers_to_hfq, DiffusersImportOptions};
 use serde::Serialize;
@@ -907,7 +907,10 @@ fn generate_mrflow_txt2img(
     )?;
     if let Some(map) = output.info.as_object_mut() {
         map.insert("mode".to_string(), serde_json::json!("txt2img-mrflow"));
-        map.insert("mrflow_preset".to_string(), serde_json::json!(preset.as_str()));
+        map.insert(
+            "mrflow_preset".to_string(),
+            serde_json::json!(preset.as_str()),
+        );
         map.insert("stage1_width".to_string(), serde_json::json!(low_width));
         map.insert("stage1_height".to_string(), serde_json::json!(low_height));
         map.insert(
@@ -921,7 +924,10 @@ fn generate_mrflow_txt2img(
         );
         map.insert("upscale_factor".to_string(), serde_json::json!(upscale));
         map.insert("target_width".to_string(), serde_json::json!(target_width));
-        map.insert("target_height".to_string(), serde_json::json!(target_height));
+        map.insert(
+            "target_height".to_string(),
+            serde_json::json!(target_height),
+        );
         // Records the Stage-2 super-resolution path: the RealESRGAN model (by
         // native factor) or the cover-resize placeholder.
         map.insert("super_resolution".to_string(), serde_json::json!(sr_label));
@@ -1673,6 +1679,7 @@ mod tests {
             hr_second_pass_steps: None,
             hr_denoising_strength: 0.75,
             rocm_device_id: None,
+            preview_dir: None,
             mrflow: None,
             mrflow_refine_sigma: None,
             mrflow_upscale: None,

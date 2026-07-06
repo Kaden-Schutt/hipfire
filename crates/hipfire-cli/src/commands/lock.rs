@@ -23,6 +23,13 @@
 //! - `status` takes a non-blocking probe lock: success ⇒ free, EWOULDBLOCK ⇒
 //!   busy (prints the holder metadata line).
 //!
+//! Preferred form — `run <label> -- <cmd>`: acquire, spawn `<cmd>` as a child
+//! while holding the fd, and release on exit. The lock lives exactly as long as
+//! this process — no detached holder, no watched pid, no polling: if the wrapper
+//! (or its whole tree) is killed for any reason, the kernel drops the flock.
+//! `acquire`/`release`/`hold` remain for the split-across-processes pattern but
+//! `run` is the scoped, footgun-free way to hold the GPU for a unit of work.
+//!
 //! NB: the lockfile is never unlinked — unlinking a flock'd file lets the next
 //! acquirer lock a different inode and yields two simultaneous holders.
 
@@ -30,6 +37,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use clap::{Args, Subcommand};
 
@@ -60,6 +68,23 @@ enum LockAction {
     Release,
     /// Print lock status: "gpu is free" or "gpu BUSY: <holder>".
     Status,
+    /// Acquire the lock, run `command` under it, release on exit — the scoped
+    /// form. The lock lives exactly as long as this process (killing it drops
+    /// the flock via the kernel); no detached holder or watched pid. Exit code
+    /// is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`.
+    Run {
+        /// Human label recorded in the lockfile (who/what holds it).
+        label: String,
+        /// Hard cap in seconds to wait for a busy lock; 0 = wait forever.
+        #[arg(long, default_value_t = default_timeout())]
+        timeout_secs: u64,
+        /// Cadence of "busy" messages while waiting, in seconds.
+        #[arg(long, default_value_t = default_poll())]
+        poll_secs: u64,
+        /// The command (and args) to run under the lock — everything after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// INTERNAL: the detached lock holder spawned by `acquire`. Not for direct use.
     #[command(hide = true)]
     Hold {
@@ -115,6 +140,15 @@ pub fn run(args: LockArgs) -> anyhow::Result<()> {
         LockAction::Status => {
             println!("{}", status_line());
             Ok(())
+        }
+        LockAction::Run {
+            label,
+            timeout_secs,
+            poll_secs,
+            command,
+        } => {
+            let code = run_scoped(&label, timeout_secs, poll_secs.max(1), &command)?;
+            std::process::exit(code);
         }
         LockAction::Hold {
             lock_fd,
@@ -219,6 +253,130 @@ fn release() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Process-group id of the child spawned by `lock run`, for the signal
+/// forwarder to target. 0 = no child yet.
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// Signal handler installed by `lock run`: forward the received signal to the
+/// child's whole process group, then let `wait` reap it and propagate the code.
+/// Async-signal-safe: only an atomic load + `kill(2)`.
+extern "C" fn forward_signal(sig: i32) {
+    let pgid = CHILD_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        unsafe {
+            libc::kill(-pgid, sig);
+        }
+    }
+}
+
+fn install_signal_forwarder() -> anyhow::Result<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = forward_signal as extern "C" fn(i32) as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) == -1 {
+                anyhow::bail!("sigaction({sig}): {}", std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map a child's exit status to a process exit code: its own code, or the
+/// shell convention `128 + signal` when it was terminated by a signal.
+fn exit_code_from(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        code
+    } else if let Some(sig) = status.signal() {
+        128 + sig
+    } else {
+        1
+    }
+}
+
+fn run_scoped(
+    label: &str,
+    timeout_secs: u64,
+    poll_secs: u64,
+    command: &[String],
+) -> anyhow::Result<i32> {
+    run_scoped_at(&lockfile_path(), label, timeout_secs, poll_secs, command, true)
+}
+
+/// Core of `lock run`, parameterized on the lockfile path and whether to install
+/// the process-wide signal forwarder (tests pass `false` to avoid mutating the
+/// harness's signal disposition). Returns the exit code to surface.
+fn run_scoped_at(
+    path: &std::path::Path,
+    label: &str,
+    timeout_secs: u64,
+    poll_secs: u64,
+    command: &[String],
+    install_signals: bool,
+) -> anyhow::Result<i32> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("lock run requires a command after `--`"))?;
+
+    // Block (poll) until we hold LOCK_EX via the shared `hipfire-lock` primitive.
+    let mut guard = hipfire_lock::FlockGuard::open(path)?;
+    let timeout = (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs));
+    let mut waited = 0u64;
+    let acquired = guard.lock_blocking(
+        std::time::Duration::from_secs(poll_secs),
+        timeout,
+        |holder| {
+            waited += poll_secs;
+            let who = if holder.is_empty() { "unknown" } else { holder };
+            eprintln!("[gpu-lock] busy: {who} — waited {waited}s, still waiting…");
+        },
+    )?;
+    if !acquired {
+        eprintln!(
+            "[gpu-lock] TIMEOUT after {timeout_secs}s; holder still alive: {}",
+            guard.holder().unwrap_or_else(|| "unknown".into())
+        );
+        // Exit code 2 on timeout — the historical gpu-lock.sh contract.
+        return Ok(2);
+    }
+
+    // We hold it. FlockGuard's fd is O_CLOEXEC, so the child does NOT inherit
+    // it: THIS process is the sole owner, and when it dies for any reason the
+    // kernel drops the lock — no detached holder, no watch-pid. Put the child in
+    // its own process group so we are the sole recipient of terminal/kill
+    // signals and can forward them to the whole workload tree.
+    let mut cmd = Command::new(program);
+    cmd.args(args).process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {program:?}: {e}"))?;
+    // `process_group(0)` made the child a group leader, so pgid == child pid.
+    CHILD_PGID.store(child.id() as i32, Ordering::SeqCst);
+
+    // Record holder metadata: OUR pid is the holder (`release`/`kill` find it via
+    // `holder=`). Written under the held flock — rewriting contents can't drop it.
+    let meta = format!(
+        "{label} host={} acquired_epoch={} holder={} mode=run",
+        hostname(),
+        now_iso(),
+        std::process::id()
+    );
+    let _ = guard.write_holder(&meta);
+
+    if install_signals {
+        install_signal_forwarder()?;
+    }
+    eprintln!("[gpu-lock] acquired by {label} (run)");
+
+    let status = child.wait()?;
+    CHILD_PGID.store(0, Ordering::SeqCst);
+    // Returning drops `guard` (closes our fd) → the kernel releases the flock.
+    Ok(exit_code_from(status))
+}
+
 fn hold(lock_fd: i32, watch_pid: i32, poll_secs: u64) -> anyhow::Result<()> {
     // Take ownership of the inherited, already-locked fd so it stays open (and
     // is closed — releasing the flock — when this process exits for any reason,
@@ -297,4 +455,76 @@ fn now_iso() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_lock(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-lock-run-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("gpu.lock")
+    }
+
+    #[test]
+    fn run_scoped_propagates_child_exit_code_and_records_holder() {
+        let path = temp_lock("code");
+        // A successful command returns its own 0.
+        let code = run_scoped_at(&path, "t-ok", 5, 1, &["true".into()], false).unwrap();
+        assert_eq!(code, 0);
+        // The holder line the run wrapper wrote names our pid + mode=run, and is
+        // parseable by the same `holder=` reader `release`/`status` use.
+        let holder = read_holder(&path).unwrap();
+        assert!(holder.contains("mode=run"), "holder: {holder}");
+        assert_eq!(read_holder_pid(&path), Some(std::process::id() as i32));
+
+        // A failing command's non-zero code is surfaced. (Lock is free again —
+        // the previous guard dropped at return, so this re-acquires cleanly.)
+        let code = run_scoped_at(&path, "t-fail", 5, 1, &["false".into()], false).unwrap();
+        assert_eq!(code, 1);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn run_scoped_times_out_with_code_2_when_lock_is_held() {
+        let path = temp_lock("busy");
+        // Hold the lock out-of-band; the run wrapper must not steal it.
+        let mut held = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(held.try_lock().unwrap());
+
+        let code = run_scoped_at(&path, "waiter", 1, 1, &["true".into()], false).unwrap();
+        assert_eq!(code, 2, "a held lock must make `run` time out, not run the child");
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn run_scoped_reports_signal_death_as_128_plus_signal() {
+        let path = temp_lock("signal");
+        // Child SIGKILLs itself → 128 + 9 = 137.
+        let code = run_scoped_at(
+            &path,
+            "t-sig",
+            5,
+            1,
+            &["sh".into(), "-c".into(), "kill -9 $$".into()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 137);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn empty_command_is_rejected() {
+        let path = temp_lock("empty");
+        assert!(run_scoped_at(&path, "t", 5, 1, &[], false).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }
