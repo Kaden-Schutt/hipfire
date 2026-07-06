@@ -133,6 +133,21 @@ NixOS module:
 }
 ```
 
+## Container (podman/docker)
+
+A multi-stage `Containerfile` builds a slim deliverable inference image and a
+full-toolchain GPU gate-runner for reproducible PR/dev-build validation. See
+[docs/CONTAINER.md](docs/CONTAINER.md).
+
+```bash
+podman build -f Containerfile --target runtime -t hipfire .
+podman run --rm -it --device /dev/kfd --device /dev/dri \
+  --group-add keep-groups --security-opt seccomp=unconfined \
+  -v hipfire-models:/root/.hipfire/models \
+  -v hipfire-kcache:/var/cache/hipfire \
+  hipfire run qwen3.5:4b "2+2="
+```
+
 ## Inspiration: Lucebox
 
 hipfire's DFlash work was substantially shaped by Davide Ciffa's
