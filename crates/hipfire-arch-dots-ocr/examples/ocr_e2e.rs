@@ -183,10 +183,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (pos, &token) in prompt_ids.iter().enumerate() {
             if token == dots_ocr::IMGPAD_ID {
                 let emb = &merged[visual_idx * dim..(visual_idx + 1) * dim];
-                qwen2::forward_step_with_embed(&mut gpus, &text_weights, &text_cfg, &mut text_state, emb)?;
+                qwen2::forward_step_with_embed(&mut gpus.devices[0], &text_weights, &text_cfg, &mut text_state, emb)?;
                 visual_idx += 1;
             } else {
-                qwen2::forward_step(&mut gpus, &text_weights, &text_cfg, &mut text_state, token)?;
+                qwen2::forward_step(&mut gpus.devices[0], &text_weights, &text_cfg, &mut text_state, token)?;
             }
             if pos > 0 && pos % 500 == 0 {
                 let so_far = t.elapsed().as_secs_f32();
@@ -245,7 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 per_step / 1000.0, 1_000_000.0 / per_step);
         }
 
-        next = qwen2::forward_step_greedy(&mut gpus, &text_weights, &text_cfg, &mut text_state, next)?;
+        next = qwen2::forward_step_greedy(&mut gpus.devices[0], &text_weights, &text_cfg, &mut text_state, next)?;
         if step > 0 && step % 200 == 0 {
             let so_far = t.elapsed().as_secs_f32();
             eprintln!("  [generate] step {step}  {:.1}s  ({:.1} tok/s)",

@@ -269,6 +269,10 @@ fn main() {
         output_norm,
         output,
         layers,
+        // The store's lm_head is its own resident buffer (reuploaded from embed
+        // bytes in the tied case), never a view of token_embd — matching the llama
+        // loader convention (model_load.rs: "llama always returns false").
+        lm_head_aliases_embd: false,
     };
 
     // Forward through the store-assembled model and compare to bespoke.
