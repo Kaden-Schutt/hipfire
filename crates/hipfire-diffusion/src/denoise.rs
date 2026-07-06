@@ -445,6 +445,27 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
             runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
             guided
         };
+        // Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model
+        // velocity (the flow-match prediction, before the scheduler integrates
+        // it) as <dir>/vel_<step>.bin (4x u32 LE header [b,c,h,w] + f32 data).
+        // Lets us see whether a single forward already carries the token-grid
+        // (attention not mixing) or whether the grid only builds up over steps.
+        if let Ok(dir) = std::env::var("HIPFIRE_DUMP_VELOCITY") {
+            if !dir.is_empty() {
+                let mut bytes = Vec::with_capacity(16 + guided.data.len() * 4);
+                for dim in [latents.batch, latents.channels, latents.height, latents.width] {
+                    bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+                }
+                for v in &guided.data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let path = format!("{dir}/vel_{step}.bin");
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => eprintln!("[dump] step {step} velocity -> {path}"),
+                    Err(e) => eprintln!("[dump] velocity write to {path} failed: {e}"),
+                }
+            }
+        }
         let step_runtime_kind = scheduler_step_with_runtime_context(
             schedule,
             &mut latents,
