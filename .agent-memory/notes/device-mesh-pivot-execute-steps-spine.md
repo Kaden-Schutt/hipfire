@@ -187,7 +187,28 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   `SiluMul`(on-rank inter/tp slice, no cross-rank dep) → row W_down + all-reduce. `tp_execute_steps_ffn_parity`: full
   FFN through `execute_steps_tp` == single-device on Tp-2, max|Δ|=2.79e-9 (+ in-example host-math cross-check). dispatch
   lib 172/0. `SiluMul` carries no weight → `TpCollective::None`; `tp_step_out_buf` returns None for it (never row-parallel).
-- **PB-TP4..5 REMAINING:** TP4 = wire
+- **PB-TP4a DONE + validated** (`dfc2f850`) — added `Step::ResidualAdd { x, y, dim }` → `gpu.add_f32(x,y,x)`
+  (`PipelineOp::ResidualAdd` already existed). WHY: the real `dense_forward` fuses o_proj/down into
+  `Step::GemvResidual` (`out = W·x + residual`), but a ROW-PARALLEL GemvResidual would all-reduce `(partial+residual)`
+  → residual summed `tp×`. Under TP a row-parallel projection lowers to `Gemv (partial) → AllReduceOut → ResidualAdd`
+  (residual added once, AFTER the collective). `tp_execute_steps_residual_parity`: full FFN block WITH residual
+  (rmsnorm→col gate/up→SiluMul→row down+all-reduce→ResidualAdd) through `execute_steps_tp` == single-device on Tp-2,
+  max|Δ|=2.98e-8. dispatch lib 172/0. **Executor op coverage for a dense layer is now COMPLETE except `Step::Attend`**
+  (Gemv col/row ✓, RmsnormAutomatic ✓, SiluMul ✓, ResidualAdd ✓, derived collectives ✓; BiasAdd/QkNorm/Rope are
+  replicated/on-owned-heads → launch_op handles them, no collective, and PB-3 validated the attention math on raw ops).
+- **PB-TP4b..5 REMAINING (real-model integration — the capstone):** TP4b = drive `Step::Attend` through the executor
+  via the REAL llama `attend_plan` (builds `KvTierPlan{write_key,attend_key,...}` + `AttnParams` — needs a real model;
+  synthesizing KvTierPlan by hand is fragile, do NOT). TP4c = the store→forward bridge (assemble per-rank sharded
+  `LlamaWeights`/`DenseLayer` from a `WeightStore` via `take`) + a `dense_forward_tp<A:DenseArch>(gpus, mesh, ...)` that
+  emits per-rank Step lists (mirror `dense_forward` @ arch_spec.rs:132 — note it uses whole scratch + `GemvResidual`
+  for row ops, which TP must split per PB-TP4a) + thread `&mut Gpus`; full-model logit parity vs single-GPU (FP32 +
+  `HIPFIRE_DETERMINISTIC=1`) on a small F32 llama (candidate `~/.hipfire/models/Qwen3-0.6B-PARO`, raw safetensors dir;
+  NOTE: no existing example drives the runtime llama `forward_scratch` — needs a harness, and F32-raw-load on this
+  branch is UNVERIFIED). **KEY UNKNOWN to resolve first in TP4c:** can a small F32 llama be driven standalone via
+  `llama::load_weights`+`forward_scratch` (llama.rs:2794/3111) to produce a single-GPU logit reference? TP5 = daemon
+  `load_model_tp`+serve AFTER the EP-vs-TP fork (config.rs:155 `tp`→Ep) + `tp_decode_parity`. **RAISE EP-vs-TP with
+  bjoern before TP5.**
+- **(superseded numbering) old PB-TP4 = wire
   `dense_forward` to emit per-rank sharded Steps when `mesh` Tp>1; thread `&mut Gpus`; real llama forward TP; full-model
   logit parity (FP32+DETERMINISTIC). TP5 = daemon `load_model_tp`+serve AFTER the EP-vs-TP intent fork (config.rs:155
   `tp`→Ep) + `tp_decode_parity`. **RAISE THE EP-vs-TP FORK with bjoern before TP5/daemon work** (his standing ask).
