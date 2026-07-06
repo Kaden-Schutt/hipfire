@@ -387,6 +387,26 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
 - **STATUS: multi-session pass. Step 1 (green baseline) validated; steps 2-3 (clean EpModel rebuild for ds4+minimax + the
   ~2000L deletion) are the large remaining work — handed off with the full footprint above.** Local plan (obsolete fold
   version, ignore): `docs/superpowers/plans/2026-07-06-P-D-ep-fold-step-moe.md`.
+- **P-D STEP 2 DONE 2026-07-06 (commits 8783d35c ds4, 3cbbfc29 minimax).** DEVIATED from the note's "EpModel + delete the
+  EP serve" plan: instead of a new loader `EpModel`, I made the arch `forward_ep` **clean in place** and KEPT the daemon/
+  loader EP serve (generate_ep/ep_serve_ds4/_minimax + EpState/EpArch/load_model_ep) — it's EP-serve FEATURE wiring, NOT
+  SuperOp, and "redo EP clean, no regression" wants it serving. New primitive: **`Gpus::ep_moe_allreduce(group, partials,
+  residual_dim, moe_rank: FnMut(&mut Gpu, rank, &partial, EpMoePhase))`** + `pub enum EpMoePhase{RunOwned,AddResidual}` in
+  `hipfire-hardware/src/lib.rs` (after `all_reduce_sum_f32_peer`). Owns zero→run-owned→all_reduce[_peer]→fold; the ONE
+  phase-tagged closure sidesteps the two-closures-both-borrow-`&mut state` problem. Reads `HIPFIRE_EP_PEER_ALLREDUCE_DECODE`
+  internally. ds4/minimax `forward_ep` now loop: per-rank `ds4_attn_block`/`minimax_attn_block` (replicated) then
+  `ep_moe_allreduce` with a `{ds4,minimax}_ep_moe_rank` adapter (reuses the EXACT `ds4_moe_block_core`+`hc_ffn_mix` /
+  `minimax_moe_block`+`add_inplace_f32(&state.h,·)` the retired trait methods called → byte-identical). Dropped per-forward
+  `DeviceMesh::rect` + `run_layer_program_ep`. **VALIDATED gfx1151 emulated EP-2, peer all-reduce, DETERMINISTIC=1, byte-
+  identical to pre-change baseline:** ds4 (deepseek-v4-flash.mq2lloyd 82GB) forward_ep FNV `0x0c04faf471f9c016` + MTP-EP
+  draft "."==true next-next "." ACCEPT; minimax (MiniMax-M2.7.mq2 79GB) forward_ep FNV `0x31ede7c1d1cf140e`. Workspace
+  `--all-targets --locked` clean. **GOTCHA: EP all-reduce needs librccl.so which is NOT installed on this box → MUST run
+  EP with `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` (peer boundary_copy path, RCCL-free); bare RCCL path panics at
+  `RcclComms::init_all`.** **STEP 3 NEXT (the ~2000L deletion):** delete `superop.rs`+both `ep.rs`, per-arch lowered paths
+  (ds4/minimax/lfm2moe/qwen35 Bindings/`*_lower_program`/`decode_step_body_lowered`/toggles), qwen35 `forward_ep` (EXAMPLE-
+  ONLY EP — daemon EP dispatch is arch10→minimax else→ds4, NO ep_serve_qwen35) + `ep_decode_parity`, steps.rs
+  `match_fused_prefix`/`step_op_kind`, pipeline/mod.rs superop decl, incidental import trims (loader/llama/pp_serve/
+  arch_spec/mesh). KEEP daemon EP serve + clean forward_ep + ep_deepseek4/ep_minimax examples + Step IR.
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
