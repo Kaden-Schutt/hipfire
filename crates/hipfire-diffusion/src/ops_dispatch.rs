@@ -480,6 +480,57 @@ pub(crate) fn linear_3d_with_runtime_context(
     })
 }
 
+/// Linear over a source-reference [`ResidentWeight`]: on the GPU path the weight
+/// is uploaded once (bf16, keyed by name) and reused across forward steps —
+/// avoiding the per-step decode-to-f32 + re-upload that a decoded `CpuTensor`
+/// weight incurs. Falls back to decoding + the CPU-reference linear when no GPU
+/// is bound.
+pub(crate) fn linear_optional_bias_resident_with_runtime_context(
+    input: &CpuTensor,
+    weight: &ResidentWeight,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    if runtime_context.rocm_device_id().is_none() {
+        let decoded = weight.decode()?;
+        calib_observe_linear(&decoded, input);
+        return linear_optional_bias(input, &decoded, bias).map_err(Into::into);
+    }
+    runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+        linear_resident_weight_hip_on_gpu(gpu, cache, input, weight, bias)
+    })
+}
+
+/// 3-D (`[batch, seq, in]`) linear over a source-reference [`ResidentWeight`].
+pub(crate) fn linear_3d_resident_with_runtime_context(
+    input: &CpuTensor,
+    weight: &ResidentWeight,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    if runtime_context.rocm_device_id().is_none() {
+        return linear_3d(input, &weight.decode()?, bias);
+    }
+    let [batch, seq, in_features] = shape3(input)?;
+    let flat = CpuTensor {
+        shape: vec![batch * seq, in_features],
+        data: input.data.clone(),
+    };
+    let out =
+        linear_optional_bias_resident_with_runtime_context(&flat, weight, bias, runtime_context)?;
+    let [rows, out_features] = shape2(&out)?;
+    if rows != batch * seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "linear_3d row count {rows} != batch*seq {}",
+            batch * seq
+        )));
+    }
+    Ok(CpuTensor {
+        shape: vec![batch, seq, out_features],
+        data: out.data,
+    })
+}
+
 pub(crate) fn layer_norm_with_runtime_context(
     input: &CpuTensor,
     weight: &CpuTensor,

@@ -177,6 +177,12 @@ struct RocmWeightCache {
     /// so only the BF16 buffer (1x the source bf16 size) stays resident. This is
     /// the memory-efficient replacement for keeping the F32 weight resident.
     bf16_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
+    /// Persistent BF16 weights keyed by HFQ tensor **name** (not a transient
+    /// decode pointer), so a source-reference weight is uploaded once and reused
+    /// across every forward step instead of being re-decoded and re-uploaded
+    /// each step. bf16-source weights upload their raw bytes directly (no f32
+    /// decode); other dtypes decode to f32 transiently and cast once.
+    named_bf16: std::collections::HashMap<String, hipfire_rdna::GpuTensor>,
     /// oq4 arch-combined device buffers, for the W4A* schedule rungs. Keyed the
     /// same way; built once by quantize_oq4g256 → pack_oq4_arch_combined → upload.
     oq4_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
@@ -279,6 +285,61 @@ impl RocmWeightCache {
             .bf16_entries
             .get(&key)
             .expect("bf16 weight just inserted")
+            .buf
+            .as_ptr())
+    }
+
+    /// Return the device pointer to the persistent BF16 copy of a source-reference
+    /// [`ResidentWeight`], uploaded **once** and keyed by the weight's HFQ name so
+    /// it survives across forward steps (no per-step decode/upload). For a bf16
+    /// source the raw bytes are uploaded directly — no f32 host decode at all;
+    /// other dtypes decode to f32 transiently and cast once. The returned buffer
+    /// is a `DType::BF16` tensor shaped `[out, in]`.
+    fn resident_bf16_named(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        weight: &ResidentWeight,
+    ) -> DiffusionResult<*mut std::ffi::c_void> {
+        if !self.named_bf16.contains_key(&weight.name) {
+            let n: usize = weight.shape.iter().product();
+            let bf16 = if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 {
+                if weight.bytes.len() != n * 2 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "bf16 weight {:?} has {} bytes, expected {}",
+                        weight.name,
+                        weight.bytes.len(),
+                        n * 2
+                    )));
+                }
+                let mut tensor = gpu
+                    .upload_raw(&weight.bytes, &weight.shape)
+                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                tensor.dtype = hipfire_rdna::DType::BF16;
+                tensor
+            } else {
+                // Non-bf16 source: decode to f32 transiently, cast to bf16, free.
+                let cpu = weight.decode()?;
+                let f32_tmp = gpu
+                    .upload_f32(&cpu.data, &cpu.shape)
+                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                let bf16 = gpu
+                    .alloc_tensor(&[n], hipfire_rdna::DType::BF16)
+                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                gpu.cast_f32_to_bf16(&f32_tmp, &bf16)
+                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                gpu.free_tensor(f32_tmp)
+                    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+                bf16
+            };
+            self.named_bf16.insert(weight.name.clone(), bf16);
+        }
+        Ok(self
+            .named_bf16
+            .get(&weight.name)
+            .expect("named bf16 weight just inserted")
             .buf
             .as_ptr())
     }
@@ -679,6 +740,25 @@ impl ResidentWeight {
 
     pub(crate) fn shape(&self) -> &[usize] {
         &self.shape
+    }
+
+    /// Test-only: build a bf16-source `ResidentWeight` from f32 values (RNE
+    /// truncation to bf16), for exercising the raw-bytes resident path.
+    #[cfg(test)]
+    pub(crate) fn from_bf16_parts(name: &str, shape: Vec<usize>, f32_data: &[f32]) -> Self {
+        let mut bytes = Vec::with_capacity(f32_data.len() * 2);
+        for &value in f32_data {
+            let bits = value.to_bits();
+            let rounding_bias = 0x7fff + ((bits >> 16) & 1);
+            let bf16 = ((bits + rounding_bias) >> 16) as u16;
+            bytes.extend_from_slice(&bf16.to_le_bytes());
+        }
+        Self {
+            name: name.to_string(),
+            quant_type: QT_DIFFUSION_TENSOR_BF16,
+            shape,
+            bytes,
+        }
     }
 
     /// Decode the packed payload into an f32 `CpuTensor` (transient; drop it

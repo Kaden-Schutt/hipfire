@@ -962,21 +962,21 @@ impl TransformerAttentionStreamProjection {
     ) -> DiffusionResult<TransformerAttentionQkv> {
         // Decode the packed weights to f32 transiently for this op; each is
         // dropped before the next so only one is expanded at a time.
-        let q = linear_3d_with_runtime_context(
+        let q = linear_3d_resident_with_runtime_context(
             hidden,
-            &self.q_weight.decode()?,
+            &self.q_weight,
             self.q_bias.as_ref(),
             runtime_context,
         )?;
-        let k = linear_3d_with_runtime_context(
+        let k = linear_3d_resident_with_runtime_context(
             hidden,
-            &self.k_weight.decode()?,
+            &self.k_weight,
             self.k_bias.as_ref(),
             runtime_context,
         )?;
-        let v = linear_3d_with_runtime_context(
+        let v = linear_3d_resident_with_runtime_context(
             hidden,
-            &self.v_weight.decode()?,
+            &self.v_weight,
             self.v_bias.as_ref(),
             runtime_context,
         )?;
@@ -1014,9 +1014,9 @@ impl TransformerAttentionStreamProjection {
         attention: &CpuTensor,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        linear_3d_with_runtime_context(
+        linear_3d_resident_with_runtime_context(
             attention,
-            &self.out_weight.decode()?,
+            &self.out_weight,
             self.out_bias.as_ref(),
             runtime_context,
         )
@@ -1231,9 +1231,9 @@ impl NativeTransformerAttentionProjection {
         )?;
         let gated = match self.gate_weight.as_ref() {
             Some(weight) => {
-                let gate = linear_3d_with_runtime_context(
+                let gate = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &weight.decode()?,
+                    weight,
                     self.gate_bias.as_ref(),
                     runtime_context,
                 )?;
@@ -1559,9 +1559,9 @@ impl TransformerFeedForwardStream {
                         "GEGLU transformer feed-forward projection bias is missing".into(),
                     )
                 })?;
-                let projected = linear_3d_with_runtime_context(
+                let projected = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &proj_weight.decode()?,
+                    proj_weight,
                     Some(proj_bias),
                     runtime_context,
                 )?;
@@ -1578,24 +1578,24 @@ impl TransformerFeedForwardStream {
                         "SwiGLU transformer feed-forward gate weight is missing".into(),
                     )
                 })?;
-                let up = linear_3d_with_runtime_context(
+                let up = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &up_weight.decode()?,
+                    up_weight,
                     self.up_bias.as_ref(),
                     runtime_context,
                 )?;
-                let gate = linear_3d_with_runtime_context(
+                let gate = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &gate_weight.decode()?,
+                    gate_weight,
                     self.gate_bias.as_ref(),
                     runtime_context,
                 )?;
                 swiglu_gate_3d(&up, &gate)?
             }
         };
-        linear_3d_with_runtime_context(
+        linear_3d_resident_with_runtime_context(
             &activated,
-            &self.down_weight.decode()?,
+            &self.down_weight,
             self.down_bias.as_ref(),
             runtime_context,
         )
@@ -3266,12 +3266,24 @@ impl Qwen3EncoderLayer {
             Self::EPS,
             runtime_context,
         )?;
-        let mut q =
-            linear_3d_with_runtime_context(&normed, &self.q_proj.decode()?, None, runtime_context)?;
-        let mut k =
-            linear_3d_with_runtime_context(&normed, &self.k_proj.decode()?, None, runtime_context)?;
-        let v =
-            linear_3d_with_runtime_context(&normed, &self.v_proj.decode()?, None, runtime_context)?;
+        let mut q = linear_3d_resident_with_runtime_context(
+            &normed,
+            &self.q_proj,
+            None,
+            runtime_context,
+        )?;
+        let mut k = linear_3d_resident_with_runtime_context(
+            &normed,
+            &self.k_proj,
+            None,
+            runtime_context,
+        )?;
+        let v = linear_3d_resident_with_runtime_context(
+            &normed,
+            &self.v_proj,
+            None,
+            runtime_context,
+        )?;
         q = rms_norm_attention_heads_3d(
             &q,
             &CpuTensor {
@@ -3313,9 +3325,9 @@ impl Qwen3EncoderLayer {
             shape: vec![1, seq, inner],
             data: attention.data,
         };
-        let attention = linear_3d_with_runtime_context(
+        let attention = linear_3d_resident_with_runtime_context(
             &attention,
-            &self.o_proj.decode()?,
+            &self.o_proj,
             None,
             runtime_context,
         )?;
@@ -3330,15 +3342,15 @@ impl Qwen3EncoderLayer {
             Self::EPS,
             runtime_context,
         )?;
-        let gate = linear_3d_with_runtime_context(
+        let gate = linear_3d_resident_with_runtime_context(
             &normed2,
-            &self.gate_proj.decode()?,
+            &self.gate_proj,
             None,
             runtime_context,
         )?;
-        let up = linear_3d_with_runtime_context(
+        let up = linear_3d_resident_with_runtime_context(
             &normed2,
-            &self.up_proj.decode()?,
+            &self.up_proj,
             None,
             runtime_context,
         )?;
@@ -3347,9 +3359,9 @@ impl Qwen3EncoderLayer {
             let g = gate.data[idx];
             *slot = (g / (1.0 + (-g).exp())) * up.data[idx];
         }
-        let ff = linear_3d_with_runtime_context(
+        let ff = linear_3d_resident_with_runtime_context(
             &swish,
-            &self.down_proj.decode()?,
+            &self.down_proj,
             None,
             runtime_context,
         )?;

@@ -2010,6 +2010,101 @@ pub(crate) fn linear_optional_bias_hip_on_gpu(
     })
 }
 
+/// Linear over a source-reference `ResidentWeight`, using the persistent
+/// name-keyed BF16 weight cache (uploaded once, reused every step) and the bf16
+/// WMMA GEMM. Falls back to decoding + the CpuTensor linear when the bf16 WMMA
+/// path is unavailable (no wave32 WMMA, or non-16-aligned in_features).
+pub(crate) fn linear_resident_weight_hip_on_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    cache: &mut RocmWeightCache,
+    input: &CpuTensor,
+    weight: &ResidentWeight,
+    bias: Option<&CpuTensor>,
+) -> DiffusionResult<CpuTensor> {
+    let (out_features, in_features) = match weight.shape() {
+        [out, inf] => (*out, *inf),
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "resident linear weight must be 2-D [out, in], got {other:?}"
+            )))
+        }
+    };
+    let (rows, input_in) = input.rows_cols()?;
+    if input_in != in_features {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "linear input width {input_in} != weight input width {in_features}"
+        )));
+    }
+    // Non-eligible dims / archs: decode once and use the CpuTensor linear.
+    if !(gpu.arch_caps.has_wmma_w32() && in_features % 16 == 0) {
+        return linear_optional_bias_hip_on_gpu(gpu, cache, input, &weight.decode()?, bias);
+    }
+    let output_shape = [rows, out_features];
+    let output_elements = checked_shape_elements("linear output", &output_shape)?;
+    if output_elements == 0 {
+        return Ok(CpuTensor::zeros(&output_shape));
+    }
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let input_gpu = gpu
+        .upload_f32(&input.data, &input.shape)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let weight_ptr = cache.resident_bf16_named(gpu, weight)?;
+    let weight_bytes = out_features
+        .checked_mul(in_features)
+        .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
+        .ok_or_else(|| DiffusionError::InvalidMetadata("linear weight size overflows".to_string()))?;
+    let weight_view = hipfire_rdna::GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
+        shape: vec![out_features, in_features],
+        dtype: hipfire_rdna::DType::BF16,
+    };
+    let output_gpu = gpu
+        .alloc_tensor(&[rows, out_features], hipfire_rdna::DType::F32)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.gemm_bf16_x_bf16_wmma(
+        &weight_view,
+        &input_gpu,
+        &output_gpu,
+        out_features,
+        in_features,
+        rows,
+    )
+    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    if let Some(bias) = bias {
+        let bias_ptr = cache.resident_ptr(gpu, bias)?;
+        let mut bias_args = hip_bridge::KernargBlob::new();
+        bias_args.push_ptr(output_gpu.buf.as_ptr());
+        bias_args.push_ptr(bias_ptr);
+        bias_args.push_i32(i32_kernel_dim("linear bias elements", output_elements)?);
+        bias_args.push_i32(i32_kernel_dim("linear out features", out_features)?);
+        bias_args.pad_to(16);
+        let bias_grid = [((output_elements as u32).saturating_add(255)) / 256, 1, 1];
+        ensure_and_launch_diffusion_kernel(
+            gpu,
+            "diffusion_row_bias_f32",
+            DIFFUSION_ROW_BIAS_HIP_SRC,
+            "diffusion_row_bias_f32",
+            bias_grid,
+            [256, 1, 1],
+            0,
+            &mut bias_args,
+        )?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let data = download_f32_buffer(gpu, &output_gpu.buf, output_elements)?;
+    gpu.free_tensor(output_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    gpu.free_tensor(input_gpu)
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    Ok(CpuTensor {
+        shape: output_shape.to_vec(),
+        data,
+    })
+}
+
 pub(crate) fn layer_norm_hip_on_gpu(
     gpu: &mut hipfire_rdna::Gpu,
     input: &CpuTensor,

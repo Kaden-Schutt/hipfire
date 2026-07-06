@@ -1493,6 +1493,75 @@ fn bf16_hip_on_gpu_linear_matches_cpu_reference() {
 }
 
 #[test]
+fn resident_weight_bf16_linear_matches_cpu_and_caches_by_name() {
+    // The transformer's per-step path: a source-reference ResidentWeight
+    // uploaded once (raw bf16 bytes, keyed by name) and reused. Verify the
+    // raw-bytes path matches a CPU reference over the SAME bf16-rounded weights,
+    // and that a second call hits the name cache (no new upload).
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for resident-weight linear test: {error}");
+            return;
+        }
+    };
+    if !gpu.arch_caps.has_wmma_w32() {
+        eprintln!("skip: needs wave32 WMMA");
+        return;
+    }
+    let (rows, in_features, out_features) = (5usize, 64usize, 24usize);
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 19.0) - 9.0) / 9.0 * scale)
+            .collect()
+    };
+    let input = CpuTensor {
+        shape: vec![rows, in_features],
+        data: fill(rows * in_features, 2.0, 1.0),
+    };
+    let weight_f32 = fill(out_features * in_features, 4.0, 0.5);
+    let weight = ResidentWeight::from_bf16_parts(
+        "test.weight",
+        vec![out_features, in_features],
+        &weight_f32,
+    );
+    // Reference uses the weight AS the GPU sees it: bf16-rounded back to f32.
+    let bf16_round = |v: f32| f32::from_bits((((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) >> 16) as u32) << 16);
+    let wq: Vec<f32> = weight_f32.iter().map(|&v| bf16_round(v)).collect();
+    let mut cpu = vec![0.0f32; rows * out_features];
+    for r in 0..rows {
+        for o in 0..out_features {
+            let mut acc = 0.0f32;
+            for k in 0..in_features {
+                acc += input.data[r * in_features + k] * wq[o * in_features + k];
+            }
+            cpu[r * out_features + o] = acc;
+        }
+    }
+
+    let mut cache = RocmWeightCache::default();
+    let hip = linear_resident_weight_hip_on_gpu(&mut gpu, &mut cache, &input, &weight, None).unwrap();
+    // second call: same result, served from the name cache.
+    let hip2 =
+        linear_resident_weight_hip_on_gpu(&mut gpu, &mut cache, &input, &weight, None).unwrap();
+
+    assert_eq!(hip.shape, vec![rows, out_features]);
+    assert_eq!(hip.data, hip2.data, "cached second call must be identical");
+    let max_rel = hip
+        .data
+        .iter()
+        .zip(&cpu)
+        .map(|(a, b)| (a - b).abs() / (b.abs().max(1.0)))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rel <= 3e-2,
+        "resident bf16 linear vs cpu max rel error {max_rel} too large; hip={:?} cpu={:?}",
+        hip.data,
+        cpu
+    );
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
