@@ -398,8 +398,96 @@ where
             }
         }
 
+        // Dense TP — RowShard cuts the INNER (k / reduction) axis, so it is a
+        // per-row STRIDED gather (PB-1c): rank r owns, of every one of the `m`
+        // rows, the byte sub-range [r·rb/tp,(r+1)·rb/tp) where rb = row_bytes.
+        // A row-major block-quant tensor stores each row as a run of contiguous
+        // group-blocks, so this cut is quant-clean AS LONG AS rb/tp lands on a
+        // group boundary — enforced upstream by `validate_manifest` (k %(tp·group)
+        // == 0). Here we require the weaker byte-level `rb % tp == 0`; the
+        // group-alignment guarantee is the manifest's. The gathered per-rank blob
+        // is a valid row-major [m, k/tp] quant tensor the GEMV kernel consumes as-is.
+        if let ShardPolicy::RowShard { .. } = &entry.policy {
+            if devices.len() > 1 {
+                let tp = devices.len();
+                let rows = *entry.logical_shape.first().unwrap_or(&0);
+                let inner: usize = entry.logical_shape.iter().skip(1).product();
+                if rows == 0 || inner == 0 || inner % tp != 0 {
+                    return Err(FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: *devices.first().unwrap_or(&0),
+                        reason: format!("RowShard: inner dim {inner} not divisible by Tp {tp}"),
+                    });
+                }
+                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: *devices.first().unwrap_or(&0),
+                    reason: format!("source read failed: {e}"),
+                })?;
+                if bytes.len() % rows != 0 {
+                    return Err(FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: *devices.first().unwrap_or(&0),
+                        reason: format!(
+                            "RowShard: blob {} bytes not a whole number of {rows} rows",
+                            bytes.len()
+                        ),
+                    });
+                }
+                let row_bytes = bytes.len() / rows;
+                if row_bytes % tp != 0 {
+                    return Err(FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: *devices.first().unwrap_or(&0),
+                        reason: format!(
+                            "RowShard: row {row_bytes} bytes not divisible by Tp {tp} \
+                             (k not group-aligned for this shard)"
+                        ),
+                    });
+                }
+                let sub = row_bytes / tp;
+                // Sharded logical shape: the LAST dim (k) becomes k/tp.
+                let mut shape = entry.logical_shape.clone();
+                if let Some(last) = shape.last_mut() {
+                    *last /= tp;
+                }
+                for (rank, &dev) in devices.iter().enumerate() {
+                    // Gather rank r's k-slice out of every row.
+                    let mut blob = Vec::with_capacity(rows * sub);
+                    for row in 0..rows {
+                        let base = row * row_bytes + rank * sub;
+                        blob.extend_from_slice(&bytes[base..base + sub]);
+                    }
+                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                    })?;
+                    let mut tensor = gpu.upload_raw(&blob, &shape).map_err(|e| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("upload_raw failed: {e}"),
+                    })?;
+                    tensor.dtype = dtype;
+                    store.insert(
+                        &entry.name,
+                        entry.layer,
+                        dev,
+                        WeightHandle::Resident(tensor),
+                    );
+                }
+                continue;
+            }
+        }
+
         // Remaining dense TP slices across a real (≥2) group are not implemented
-        // yet (PB-1b/1c) — refuse rather than mis-place. A size-1 group degenerates
+        // yet (PB-1b) — refuse rather than mis-place. A size-1 group degenerates
         // to a whole-tensor upload and is fine.
         if is_dense_tp_slice(&entry.policy) && devices.len() > 1 {
             return Err(FulfillError {
@@ -407,8 +495,8 @@ where
                 layer: entry.layer,
                 device: *devices.first().unwrap_or(&0),
                 reason: format!(
-                    "dense TP slicing (Row/FusedQkv/Head/Vocab, or non-axis-0 Column) \
-                     is not yet implemented (PB-1b/1c); group size {} > 1",
+                    "dense TP slicing (FusedQkv/Head/Vocab, or non-axis-0 Column) \
+                     is not yet implemented (PB-1b); group size {} > 1",
                     devices.len()
                 ),
             });

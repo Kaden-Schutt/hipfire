@@ -217,6 +217,59 @@ fn check_column_shard_tp2(label: &str, gpus: &Gpus) {
     println!("[{label}] OK — ColumnShard Tp-2 contiguous halves byte-verified on 2 ranks");
 }
 
+/// PB-1c byte-oracle: a `RowShard { axis: 1 }` weight on a Tp-2 mesh cuts the
+/// inner (k) dim — a per-row STRIDED gather. Rank r owns, of every one of the
+/// `m` rows, its half of the row bytes; the gathered blob is row-major [m, k/2].
+fn check_row_shard_tp2(label: &str, gpus: &Gpus) {
+    const M: usize = 8; // rows (output dim, kept whole)
+    const K: usize = 16; // inner dim (sharded)
+    let entry = WeightEntry::layer(
+        "wo",
+        0,
+        vec![M, K],
+        DType::F16,
+        ShardPolicy::RowShard { axis: 1 },
+    );
+    let bytes: Vec<u8> = (0..(M * K) as u32).map(|x| x as u8).collect();
+    let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+    let store = fulfill_manifest(&[entry.clone()], &mesh, N_LAYERS, gpus, |_| {
+        Ok((bytes.clone(), DType::F16))
+    })
+    .unwrap_or_else(|e| panic!("[{label}] fulfill_manifest(RowShard) failed: {e}"));
+
+    let devs = placement_devices(&entry, &mesh, N_LAYERS);
+    assert_eq!(devs.len(), 2, "[{label}] expected Tp-2 placement");
+    let row_bytes = K; // 1 byte/elem for the oracle
+    let sub = row_bytes / 2;
+    for (rank, &dev) in devs.iter().enumerate() {
+        // Expected: rank r's k-half gathered from every row.
+        let mut expected = Vec::new();
+        for row in 0..M {
+            let base = row * row_bytes + rank * sub;
+            expected.extend_from_slice(&bytes[base..base + sub]);
+        }
+        match store
+            .get("wo", Some(0), dev)
+            .unwrap_or_else(|| panic!("[{label}] wo missing on device {dev}"))
+        {
+            WeightHandle::Resident(t) => {
+                assert_eq!(
+                    t.shape,
+                    vec![M, K / 2],
+                    "[{label}] rank {rank} shape not k-sharded"
+                );
+                let got = readback(gpus, dev, t);
+                assert_eq!(
+                    got, expected,
+                    "[{label}] rank {rank} (dev {dev}) strided k-gather mismatch"
+                );
+            }
+            _ => panic!("[{label}] wo should be Resident, not Alias"),
+        }
+    }
+    println!("[{label}] OK — RowShard Tp-2 strided k-gather byte-verified on 2 ranks");
+}
+
 /// Validate the §6 transactional rollback: a source that fails partway must
 /// leave `fulfill_manifest` returning `Err` (naming the failing tensor) with the
 /// already-uploaded cells freed. We can't observe the free directly, but the run
@@ -317,23 +370,32 @@ fn main() {
     check("single-1x1", &DeviceMesh::single(), &gpus);
     check_rollback("rollback-1x1", &gpus);
 
-    // Deferred-refusal: a dense TP shard on a Tp>1 mesh must Err (even though
-    // we don't have a real 2-rank Tp Gpus, fulfill refuses before any upload).
+    // Deferred-refusal: a not-yet-implemented dense TP shard (FusedQkv, PB-1b)
+    // on a Tp>1 mesh must Err before any upload. (Column PB-1a + Row PB-1c are
+    // now implemented and checked below on the emulated 2-rank Gpus.)
     {
         let tp2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
         let m = vec![WeightEntry::layer(
-            "wo",
+            "wq",
             0,
-            vec![8, 64],
+            vec![64, 8],
             DType::F16,
-            ShardPolicy::RowShard { axis: 1 },
+            ShardPolicy::FusedQkv {
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 8,
+                layout: FusedQkvLayout::Qkv,
+            },
         )];
         let r = fulfill_manifest(&m, &tp2, N_LAYERS, &gpus, |e| {
             Ok((synth_bytes(e), DType::Raw))
         });
-        assert!(r.is_err(), "dense TP shard on Tp-2 must be refused");
+        assert!(
+            r.is_err(),
+            "unimplemented dense TP shard on Tp-2 must be refused"
+        );
         println!(
-            "refusal: dense TP shard on Tp-2 → Err ({})",
+            "refusal: FusedQkv TP shard on Tp-2 → Err ({})",
             r.err().unwrap()
         );
     }
@@ -350,6 +412,8 @@ fn main() {
             check_ep("ep-2-emulated", &gpus2);
             // Same 2 ranks, Tp axis: ColumnShard contiguous-half slicing (PB-1a).
             check_column_shard_tp2("tp-2-column-emulated", &gpus2);
+            // Same 2 ranks, Tp axis: RowShard strided k-gather slicing (PB-1c).
+            check_row_shard_tp2("tp-2-row-emulated", &gpus2);
         }
         Err(e) => {
             println!("pp-2-emulated: SKIPPED (could not bring up 2-rank Gpus: {e})");
