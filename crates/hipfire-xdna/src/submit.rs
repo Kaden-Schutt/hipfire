@@ -164,6 +164,18 @@ pub struct CreateBo {
     pub handle: u32,  // out
 }
 
+/// struct amdxdna_drm_va_tbl (header only; `va_entries[]` is empty for the dma-buf path).
+/// Passed via `CreateBo.vaddr` with `bo_type = AMDXDNA_BO_SHMEM` to import an external
+/// dma-buf: a valid `dmabuf_fd` (>= 0) selects the driver's prime-import path, and
+/// `num_entries` must be 0. (The driver distinguishes this from a plain SHMEM alloc by
+/// `vaddr != 0`.)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct VaTbl {
+    pub dmabuf_fd: i32,
+    pub num_entries: u32,
+}
+
 /// struct amdxdna_drm_get_bo_info
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
