@@ -9,12 +9,17 @@ The benchmark toggles only `HIPFIRE_QKVZA_SPLIT_TAIL` and runs the production
 
 Common setup:
 
-- GPU: gfx1100 / W7900, ROCm 7.2
+- GPU: ROCm device 0, `gfx1100` / AMD Radeon Pro W7900, ROCm 7.2
 - Prompt prefill tokens: `4096`
 - Prefill runs per mode: `3`
 - Generation tokens: `1` (smoke only; results below are prefill results)
 - KV mode: `q8`
 - DPM warmup: `2s`
+
+Hardware evidence is recorded in `system_info.txt` from `rocm-smi` and
+`rocminfo`. The test host has two `gfx1100` W7900-class GPUs; these benchmark
+runs used `GPU_ID=0` / `HIP_VISIBLE_DEVICES=0`, mapped to the AMD Radeon Pro
+W7900 device.
 
 ## Median Summary
 
@@ -37,3 +42,4 @@ Files:
 
 - `summary.tsv`: median off/on throughput and delta by model.
 - `raw_prefill.tsv`: per-run raw prefill timings used to compute the medians.
+- `system_info.txt`: ROCm device inventory for the benchmark host.
