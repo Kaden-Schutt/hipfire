@@ -2,9 +2,11 @@
 
 > Revised after a 3-reviewer adversarial pass (correctness, completeness, phasing). Findings integrated; two reviewer claims rejected with evidence (noted inline); the "maximal transparency" ambition kept but made reachable via explicit prerequisite phases.
 
+> ⚠️ **PIVOT (2026-07-06) — READ `## PIVOT` BELOW FIRST.** The master merge (`5b95cbd3`, 519 commits) landed master's new `dense_forward`→`execute_steps` dense spine (commit `2a41f98f`) and **reverted** this branch's `3a3c60e5` (qwen2 → `run_layer_program_mesh`). The plan's central §1 thesis — "ONE executor = `run_layer_program(mesh, gpus, …)`" on the `SuperOp`/`ForwardBindings` path — is **superseded**: the real universal chokepoint is `execute_steps` (63 call sites vs `run_layer_program`'s 7). The new spine is **`execute_steps(mesh, gpus, …)`**. Sections §0a/§0b(crate)/§4(loader)/§5/§6 and the mesh-tree/manifest/safety design **remain valid**; §1, §3's SuperOp framing, and the phase table are re-sequenced in `## PIVOT`. Everything below the PIVOT section is the original design record, kept for provenance.
+
 ## IMPLEMENTATION STATUS (2026-07-05, branch `feature/device-mesh`, 26 commits, all green)
 
-**The entire pure-logic / declarative / planning layer is DONE + unit-tested; two hardware-touching pieces are GPU-validated; zero workspace regression.** Handover for the next session: `.agent-progress/device-mesh-HANDOVER.md`. Detailed commit map: `.agent-progress/device-mesh-status.md`.
+**The entire pure-logic / declarative / planning layer is DONE + unit-tested; two hardware-touching pieces are GPU-validated; zero workspace regression.** Handover for the next session: `.agent-progress/device-mesh-HANDOVER.md`. Detailed commit map: `.agent-progress/device-mesh-status.md`. **(Status below predates the 2026-07-06 pivot; the placement/loader/safety half stands, the executor half is re-homed onto `execute_steps` — see `## PIVOT`.)**
 
 - ✅ **Phase 0** — `hipfire-hardware` leaf crate (breaks dispatch→runtime cycle); `group:&[usize]` on collectives. **Coherence-gate GPU-validated.**
 - ◐ **Phase 0b** — DeviceMesh (full accessors: coords/`group_along`/`stage_for_layer`/`band_xfer`/`CollectiveHint`); EP executor mesh-driven (**`ep_decode_parity` anchor PASS on 35B-A3B**); `resolve_mesh`. *Remaining (REINSTATED 2026-07-06):* the single+EP signature merge into ONE `run_layer_program(mesh, gpus, bindings: &mut [B], program)` — plan §1's north star. The earlier "NOT pursued (N1-shape)" decision is **RETRACTED** (drifted from §1); the union-struct concern is dissolved (ctx built inside; partials/residual_dim behind `ForwardBindings`; `run_moe` vs `run_moe_ep` = internal `mesh.has_axis(Ep)` branch). See phase0.md "DECISION (RETRACTED)".
@@ -17,6 +19,58 @@
 **REMAINING = the GPU-execution half, each its own coherence/oracle-gated PR (multi-session):** Phase 1b (PP executor loop + `BandXfer` wiring + PP byte-exact oracle) · 1c (llama-PP walking skeleton) · 2-GPU (`fulfill_manifest` upload) · 3 (`WeightStore`/`StateStore` + `ModelParallel` + `ArchDispatch` — hoist `EpArch`/`LoadedModel` out of the daemon example binary) · 4 (qwen2 `ForwardBindings` reach) · 5/5a/5b (live head-axis TP + DeltaNet head-shard + `s_ef_residual`; emulation heterogeneity `HIPFIRE_EMULATE_ARCHS/_VRAM`; ragged/mixed-arch per-arch `LoweredForward`) · 6 (Tier-2 slot-binding, optional) · 7 (initiate spec-decode/VL/TP follow-up tracks).
 
 **Base note:** branched off `feature/parallel-expansion` (has `HIPFIRE_EMULATE_GPUS`, which Phase-1b/5a validation uses). `fulfill_manifest` is the natural next unit — it is now just the GPU execution of `plan_manifest`.
+
+---
+
+## PIVOT (2026-07-06) — the executor is `execute_steps(mesh, gpus)`, and it is the ONLY spine
+
+### What the master merge revealed
+The 519-commit master merge (`5b95cbd3`) invalidated the plan's executor assumption. A 4-agent read-only sweep of the post-merge worktree established the ground truth:
+
+- Master shipped **`dense_forward`** (`crates/hipfire-runtime/src/arch_spec.rs:131`, commit `2a41f98f`): a shared dense-decode driver that builds a transient `Vec<Step>` per layer and feeds **`execute_steps(gpu: &mut Gpu, ctx, steps)`** (`crates/hipfire-dispatch/src/pipeline/steps.rs:600`). **llama** (`llama.rs:3460`) and **qwen2** (`qwen2.rs:1927`) now route through it. The merge **reverted `3a3c60e5`** (which had wired qwen2 → `run_layer_program_mesh`).
+- There are now **two independent decode spines with no shared code** — parallel op vocabularies:
+
+  | Spine | Op IR | Driver | Arches | Call sites |
+  |---|---|---|---|---|
+  | **A — dense** | `Step` | `dense_forward` → `execute_steps(&mut Gpu)` | llama, qwen2 (+ qwen35 & cohere2moe call `execute_steps` directly) | **63** |
+  | **B — superop** | `SuperOp` | `run_layer_program[_mesh]` via `ForwardBindings` | deepseek4, minimax, lfm2moe | **7** |
+
+- The device-mesh work built its whole executor (`run_layer_program_mesh`, `superop.rs:457`) on **Spine B**. Master made **Spine A** the dense default. `execute_steps` is the true chokepoint — even Spine B's prefill and `run_layer_program` bottom out in it. **The mesh belongs at `execute_steps`.**
+
+### The new thesis (supersedes §1)
+> **Exactly ONE executor: `execute_steps(mesh: &DeviceMesh, gpus: &mut Gpus, ctx, steps)`.** Replace the `gpu: &mut Gpu` parameter with `(mesh, gpus)` and execute the fan-out transparently inside. The `Step` IR is the single lowering for **all arches and all axes**; the `SuperOp`/`ForwardBindings`/`run_layer_program*` substrate is **retired for parallelism** and its one novel piece (the EP-MoE all-reduce lifecycle) is migrated into a `Step`.
+
+**Decisions locked (2026-07-06):**
+- **Grand-unify** — MoE/EP folds into `execute_steps` too. The "live" EP path (`run_layer_program_mesh` EP branch serving deepseek4/minimax) is **this branch's own phase-2 feature work**, not a production contract — free to refactor/retire. One spine, no exceptions.
+- **Big-bang signature change** — flip `execute_steps(&mut Gpu → mesh, gpus)` across all 63 sites at once (every caller passes `DeviceMesh::single()` + the 1-device `Gpus`), then add the sharding. Same for the forward drivers that hold a `&mut Gpu` (`dense_forward`, qwen35 `forward_from_x_gpu`, cohere2moe `decode_step_body`, `superop::prefill_forward`).
+
+### The three axes decompose to three homes (the original plan conflated them — that was the error)
+- **PP (inter-layer)** → lives **above** `execute_steps`, at the driver level. This is exactly what `forward_scratch_band(layer_range)` + `Gpus::boundary_copy` already do, **bit-exact** (`llama.rs:4205`, validated `max|Δ|=0`). Generalize that pattern into `dense_forward`; `mesh.stage_for_layer(L)` picks each stage's layer range. **KEEP.**
+- **TP (intra-op)** → lives **inside** `execute_steps`. A `Gemv`/`GemvResidual`/`Attend`/`FusedQkv` step shards across the `Tp` group and all-reduces. **The manifest `ShardPolicy` (Column/Row/HeadSharded/FusedQKV) is exactly the per-Step shard rule** — single source of truth, already built. This is the "replace `gpu` with the mesh" core. **NEW.**
+- **EP (intra-MoE)** → add **`Step::Moe`** (absorb `run_moe_ep`/`ep_add_into_residual` + the `Ep`-group all-reduce), so MoE expresses in the `Step` IR and `execute_steps(mesh)` does the expert-shard + reduce over the `Ep` group. Completes the unification; retires `run_layer_program_mesh`/`ep.rs`. DeltaNet needs **`Step::Recurrent`/`Step::Conv`** too for qwen35 to join the one spine. **REWORK (novel logic migrates) + NEW.**
+
+### Keep / rework / orphan (from the built-pieces audit)
+- **KEEP (spine-agnostic, all validated):** `hipfire-hardware` (`DeviceMesh`/`Gpus`/collectives/`boundary_copy`, `lib.rs`), `weight_manifest`/`plan_manifest`, `fulfill_manifest`/`WeightStore` (`weight_store.rs`), `tp_shard` (`ShardConfig`/head-ranges), `forward_scratch_band` (the PP driver pattern). These feed `execute_steps`'s per-rank `Gpu` fields — unchanged direction.
+- **REWORK → `Step::Moe` dispatch:** `run_moe_ep`/`ep_add_into_residual` + EP all-reduce lifecycle (`superop.rs:352-533`). The one genuinely novel parallelism kernel; migrate it, don't lose it.
+- **ORPHAN (retired by the pivot):** `run_layer_program_mesh` as a top-level executor (its 1×1 arm is already dead post-revert), the `run_layer_program_ep` shim (`ep.rs`), and reliance on `ForwardBindings`/`LayerProgram`/`SuperOp` for parallelism. *(The `SuperOp` substrate also underpins the pre-existing `HIPFIRE_FORWARD_LOWERED` single-GPU experiment; deleting it outright is a separate call — the pivot just stops routing parallelism through it.)*
+
+### Why the 1×1 degeneration is free and byte-identical (the safety anchor)
+`execute_steps(DeviceMesh::single(), gpus)` → dispatch straight to `gpus.devices[0]`, exactly as today. Proven mechanics: `Gpus::single` (`lib.rs:195`) moves the `Gpu` in verbatim (`active_stream: None`); the single-mesh path must **never** call `ensure_rank_streams` (`superop.rs:437`, the `None→Some` flip that silently switches hot-path memset sync→async — CLAUDE.md trap); `group_along(kind, [])` returns the singleton `vec![0]` and `all_reduce_sum_f32*` short-circuit `Ok(())` at `len()==1`. Net: zero collectives, zero stream change, **output byte-identical to pre-mesh** (already demonstrated on qwen2, md5 LOWERED=0==1, coherence 11/11 at `3a3c60e5` before the revert).
+
+### Re-sequenced phases (supersede the phase table below)
+Loader/placement half (Phases 0–2 manifest/`fulfill_manifest`) is DONE and unchanged. The executor half re-sequences to:
+
+| Phase | Content | Validation |
+|---|---|---|
+| **P-A** *(mechanical, byte-identical)* | Big-bang flip `execute_steps(&mut Gpu) → execute_steps(mesh: &DeviceMesh, gpus: &mut Gpus, …)` across all 63 sites + the forward drivers (`dense_forward`, qwen35 `forward_from_x_gpu`, cohere2moe `decode_step_body`, `prefill_forward`) that hold `&mut Gpu`. Every caller passes `DeviceMesh::single()`. Internally degenerate to `gpus.devices[0]`, **no `ensure_rank_streams`**. Threads the mesh to the chokepoint, zero behavior change. | `HIPFIRE_FORWARD_LOWERED`-style committed-token md5 A/B == today, per arch; `coherence-gate.sh` |
+| **P-B** *(TP inside `execute_steps`)* | Per-`Step` shard rule keyed by manifest `ShardPolicy`: `Gemv` Column/Row + all-reduce over `Tp` group; `Attend`/`FusedQkv` head-shard (`tp_shard` `q_head_range`/`kv_head_range`). `single()` = identity. First-ever live row/col TP. | `HIPFIRE_EMULATE_GPUS=2` TP + real 2-GPU; TP=1-vs-TP=2 logit parity (FP32, `HIPFIRE_DETERMINISTIC=1`) |
+| **P-C** *(PP at the driver)* | Generalize `forward_scratch_band` + `boundary_copy` into `dense_forward`; `mesh.stage_for_layer` drives per-stage layer ranges; band-boundary residual copy. (llama already bit-exact; generalize + serve-reach.) | PP oracle (hand-band `=0` vs generic `=1`) + coherence, emulated + HW |
+| **P-D** *(EP/MoE into the `Step` IR)* | Add `Step::Moe` (absorb `run_moe_ep`/`ep_add_into_residual` + `Ep` all-reduce); migrate deepseek4/minimax/lfm2moe/qwen35-MoE FFN from `SuperOp` onto `Step`; retire `run_layer_program_mesh`/`ep.rs`. | `serve-multiturn-gate.sh` green for all MoE arches; EP emulated + HW |
+| **P-E** *(complete the unification)* | `Step::Recurrent`/`Step::Conv` for qwen35 DeltaNet → its bespoke forward joins `execute_steps`; DeltaNet head-shard (`HeadSharded` + co-sharded S-matrix/conv state + wire `s_ef_residual`, qwen35.rs:1091). Then compose (5a/5b heterogeneity/ragged/mixed-arch) unchanged from the original plan. | DeltaNet TP coherence + PP determinism oracle |
+
+`ModelParallel`/`ArchDispatch` daemon rehome (old §5 / Phase 3) and the composed/ragged/mixed-arch work (5a/5b) carry forward unchanged — they sit *above* the executor and don't care whether it's `Step`- or `SuperOp`-based.
+
+---
 
 ## Context
 
@@ -65,6 +119,8 @@ The daemon `pp>1 && tp>1` refusal (daemon.rs:1861) is **lifted only in Phase 5b*
 The naive split (single-GPU `run_layer_program` in dispatch, parallel executor in runtime) concedes the "one executor" premise — two `run_*` in two crates — because the EP/PP arms need `Gpus`/collectives, which sit in runtime, and dispatch→runtime would cycle. **Fix the crate graph instead of the executor:** extract `multi_gpu.rs` (`Gpus` + `boundary_copy`/`all_reduce`/`enable_peer_all`/`init_*`/device-resolution) into a new **leaf crate `hipfire-hardware`** (deps: `hip-bridge` + `rdna-compute` only — RCCL is already a leaf in `hip-bridge`). The *only* coupling to break is 5 `crate::config::get()` reads in `multi_gpu.rs` (`tp_use_rccl`, `devices`, `emulate_gpus`, `allow_mixed_arch`, `uniform_vram_tolerance_gb`) — pass them in as an explicit `DeviceResolveOpts` param, which also removes a hidden global from the hardware layer. Then **`hipfire-dispatch` depends on `hipfire-hardware`** and hosts the whole executor.
 
 ### 1. Exactly ONE executor — `run_layer_program(mesh, gpus, lowered, bindings)`
+> **SUPERSEDED by `## PIVOT` (2026-07-06):** the one executor is `execute_steps(mesh, gpus)` on the `Step` IR, not `run_layer_program` on `SuperOp`. The 1×1-identity and collective-hint reasoning below is correct and carries over verbatim to `execute_steps`; only the IR/function name changes. Read for the mesh-degeneration argument, not the entry point.
+
 There is **no `ParallelMode` enum and no `run_layer_program_parallel`**. Single-GPU is a **1×1 `DeviceMesh`**: a singleton TP-group (all-reduce over one buffer = identity) and one stage (BandXfer never fires), so the *same* executor runs it with all collective hints `None` — a per-op branch that is not taken, byte-identical to today's single-GPU output. PP is N×1, EP/TP is 1×N, stacked is N×M — all the *same* function; the mesh is the only thing that changes. The executor lives in **hipfire-dispatch** (enabled by the Phase-0 `hipfire-hardware` extraction), is generic over `B: ForwardBindings`, and takes `&mut Gpus` + the mesh from hardware. **The arch is transparent to device count** (Tier 1) — it declares a `LayerProgram` + implements `ForwardBindings`, and calls one executor; whether it runs on 1 GPU or a 2×2 mesh is never visible to it. The 1×1 arm **must leave `devices[0]`'s stream state untouched** — it never calls the EP-only `ensure_rank_streams` (which flips `active_stream None→Some` and silently switches the hot-path memset sync→async, per CLAUDE.md); only the ≥1×N arms touch streams. (`Gpus::single` — multi_gpu.rs:156 — already models the 1-device set with no RCCL/peer state; it consumes the `Gpu` by value, so the daemon owns its `Gpu` inside a `Gpus` for the process lifetime — a mechanical Phase-0b refactor, zero runtime cost.)
 
 Sync lives at two scopes because it genuinely does in the code:
@@ -118,6 +174,8 @@ This is what makes the design *engine-level* at the daemon layer, not just the e
 ---
 
 ## Phased roadmap (each phase = its own no-regression, gated PR)
+
+> **SUPERSEDED for the executor half by `## PIVOT` phases P-A…P-E (2026-07-06).** Phases 0/0b/1a/1b below described building the `run_layer_program`/`SuperOp` mesh executor — that spine is retired. The loader/manifest content (Phase 2), safety (§6 lands), heterogeneity emulation (5a), and composed/ragged (5b) are unchanged and still apply. Cross-reference the PIVOT table for the current executor sequence.
 
 | Phase | Content | Validation |
 |---|---|---|

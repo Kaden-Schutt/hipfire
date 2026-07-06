@@ -1,16 +1,25 @@
 # Device-mesh — HANDOVER for the next session
 
-**Read this first, then set a *single-phase* goal** (not the whole 8-phase plan — that's a
-multi-week, one-PR-per-phase effort by design; a session-scoped `/goal` on all 8 phases
-loops forever). Suggested next goal: `/goal implement device-mesh Phase 2 fulfill_manifest`.
+> ⚠️ **PIVOT (2026-07-06) — the executor plan changed. Read the plan's `## PIVOT` section BEFORE
+> setting a goal.** The master merge made `execute_steps` (63 call sites) the dense spine and reverted
+> our qwen2→`run_layer_program_mesh` wiring. The new ONE executor is **`execute_steps(mesh, gpus)`** on
+> the `Step` IR — NOT `run_layer_program` on `SuperOp`. The loader/placement half (below, "What's DONE")
+> is all still valid and done; the *executor* half re-sequences to phases **P-A…P-E**. **Suggested next
+> goal:** `/goal device-mesh P-A: big-bang execute_steps(&mut Gpu → mesh, gpus) signature flip, byte-identical`.
+> Full reconciliation + keep/rework/orphan in the plan `## PIVOT` and the git-tracked note
+> `.agent-memory/notes/device-mesh-pivot-execute-steps-spine.md` (`scripts/mem.sh recall execute_steps mesh pivot`).
+
+**Set a *single-phase* goal** (not the whole roadmap — that's a multi-week, one-PR-per-phase effort by
+design; a session-scoped `/goal` on all phases loops forever).
 
 ## Where things are
 - **Branch:** `feature/device-mesh` (worktree `.claude/worktrees/feature+device-mesh`),
   off `feature/parallel-expansion` (which carries `HIPFIRE_EMULATE_GPUS` — the single-card
-  multi-rank harness that Phase-1b/5a validation depends on). 26 commits, tree clean,
+  multi-rank harness that P-B/P-C/5a validation depends on). Tree clean,
   workspace builds with 0 errors, all no-GPU tests green (0 failures).
-- **Plan (updated with status):** `docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md`
-  — the top "IMPLEMENTATION STATUS" section is authoritative.
+- **Plan:** `docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md`
+  — the **`## PIVOT` section is authoritative** (the older "IMPLEMENTATION STATUS" + §1 + phase table
+  are marked SUPERSEDED inline but kept for the mesh-tree / manifest / safety design record).
 - **Commit map:** `.agent-progress/device-mesh-status.md`.
 
 ## What's DONE (pure layer + 2 GPU-validated integrations)
@@ -68,34 +77,32 @@ gpu, w, cfg, layer_range, pos, kv, scratch)` (range-parameterized layer loop) + 
 a REAL banded PP forward — stage0 embed+band(0..14)/dev0 → `boundary_copy` → stage1 band(14..28)+head
 /dev1 — **logit-IDENTICAL to bespoke (max |Δ|=0)**. Full pipeline-parallel LOAD + EXECUTE, mesh-driven.
 
-## The NEXT unit — pick ONE:
-**Option A: serve-reach — the `ModelParallel`/`ArchDispatch` daemon hoist (Phase 3).** All the pieces
-(store load + banded forward) are proven in an *example*; now hoist them into the daemon so `serve`
-can actually run PP. This is the god-struct refactor (`EpArch`/`LoadedModel`/`load_model_pp` guard at
-`daemon.rs:4843`) → `ModelParallel{gpus, mesh, weights: WeightStore, state}` + `Box<dyn ArchDispatch>`.
-Highest-value, highest-risk; the documented EP-rehome blocker.
+## The NEXT unit — the executor half now sequences P-A → P-E (plan `## PIVOT`)
 
-**Option B: real 2-GPU HW validation** — run `llama_store_pp` on hiptrx (4× gfx1201) or hipx
-(gfx1151+gfx1010) with real distinct devices (drop the emulation); confirms `boundary_copy` peer path
-+ per-stage kv on genuine multi-GPU (emulation aliases device 0).
+**START HERE — P-A (mechanical, byte-identical):** big-bang flip
+`execute_steps(gpu: &mut Gpu, …)` → `execute_steps(mesh: &DeviceMesh, gpus: &mut Gpus, …)`
+(`crates/hipfire-dispatch/src/pipeline/steps.rs:600`) across **all 63 call sites** + the forward
+drivers that hold `&mut Gpu` (`dense_forward` `arch_spec.rs:131`, qwen35 `forward_from_x_gpu`,
+cohere2moe `decode_step_body`, `superop::prefill_forward`). Every caller passes `DeviceMesh::single()`.
+Internally degenerate to `gpus.devices[0]`, **never call `ensure_rank_streams`** (the memset sync→async
+trap). Validate: per-arch committed-token md5 A/B == pre-flip (`HIPFIRE_FORWARD_LOWERED`-style) +
+`coherence-gate.sh`. This threads the mesh to the chokepoint with zero behavior change — the safe
+foundation everything else builds on. Then: **P-B** TP-in-execute_steps (per-`Step` `ShardPolicy` shard +
+`Tp` all-reduce), **P-C** PP-at-driver (generalize `forward_scratch_band`+`boundary_copy` into
+`dense_forward`), **P-D** `Step::Moe` + EP fold (retire `run_layer_program_mesh`/`ep.rs`), **P-E**
+`Step::Recurrent`/`Conv` + DeltaNet head-shard.
 
-**Option C: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study,
-`qwen35.rs:2876-2945`). **Option D: store→forward for a MoE arch** (deepseek4/minimax EP-forward parity).
-
-**Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage — DeltaNet loader study;
-per-`LayerType` weight sets, `qwen35.rs:2876-2945`).
-
-**Option C: extend store→forward to a second arch** (deepseek4/minimax MoE) — reuse the ds4/minimax
-`ExpertSharded` manifest + a source closure, assemble from the store, EP-forward parity.
-
-**Option B: qwen35 `weight_manifest`** (finish Phase-2 arch coverage). Pure-CPU like the ds4/qwen35
-work just done, but needs DeltaNet loader study: per-`LayerType` weight sets (LinearAttention fused
-`in_proj_qkv`/`in_proj_z`/`in_proj_a`/`in_proj_b` + `A_log`/`dt_bias`/`conv1d`/`norm` vs FullAttention
-gated QKV), dense-vs-MoE variants. FusedQkv/HeadSharded policies for the DeltaNet head axis. Study
-`qwen35.rs:2876-2945` (the per-layer-type loader) + `LayerType`.
-
-**Option C: dense-TP slice (Phase 5 placement).** Greenfield quant-blob row-gather; only worth it
-alongside the live-TP forward (Phase 5-dense).
+**Still-valid parallel/later units (loader half, unblocked, do anytime):**
+- **qwen35 `weight_manifest`** — finishes Phase-2 arch coverage; pure-CPU DeltaNet loader study
+  (`qwen35.rs:2876-2945`, per-`LayerType` weight sets: LinearAttention fused
+  `in_proj_qkv`/`in_proj_z`/`in_proj_a`/`in_proj_b` + `A_log`/`dt_bias`/`conv1d`/`norm` vs FullAttention
+  gated QKV; dense-vs-MoE variants). Feeds P-E.
+- **real 2-GPU HW validation** — run `llama_store_pp` on hiptrx (4× gfx1201) / hipx (gfx1151+gfx1010)
+  with distinct devices (emulation aliases device 0); confirms `boundary_copy` peer path. Validates P-C.
+- **`ModelParallel`/`ArchDispatch` daemon hoist (serve-reach)** — sits *above* the executor, carries
+  forward unchanged from the old Phase 3. The god-struct refactor (`EpArch`/`LoadedModel`/`load_model_pp`
+  guard `daemon.rs:4843`) → `ModelParallel{gpus, mesh, weights: WeightStore, state}` + `Box<dyn ArchDispatch>`.
+  Only needed once an axis is serve-reachable (after P-C/P-D land a real forward).
 
 ## GOTCHAS (bit me this session)
 - **GPU lock goes stale** (`/tmp/hipfire-gpu.lock`, noclobber variant). Verify dead (dead pid
@@ -110,7 +117,9 @@ alongside the live-TP forward (Phase 5-dense).
   emulation feature until that lands; rebase once it merges.
 
 ## Engineering decisions recorded (don't re-litigate)
-- The literal single-GPU+EP one-signature merge was NOT done (N1-rejected "unified contract"
-  shape; both executors mesh-aware in `hipfire-dispatch` is the unification). See status ledger.
-- `CollectiveHint` is DERIVED from `ShardPolicy` (single source of truth), not hand-written.
-- Mesh is named-axis-primary; the `Dimension` tree is the raggedness (mixed-arch) extension.
+- ~~The literal single-GPU+EP one-signature merge was NOT done~~ **— SUPERSEDED by the 2026-07-06 pivot.**
+  The one-executor merge IS the plan again, but onto `execute_steps(mesh, gpus)` (the 63-site `Step` spine),
+  NOT `run_layer_program`/`SuperOp`. bjoern locked: grand-unify all arches+axes into `Step`, big-bang flip.
+- `CollectiveHint` is DERIVED from `ShardPolicy` (single source of truth), not hand-written. **(Still holds —
+  now emitted per-`Step` in `execute_steps`, keyed by the manifest policy.)**
+- Mesh is named-axis-primary; the `Dimension` tree is the raggedness (mixed-arch) extension. **(Unchanged.)**
