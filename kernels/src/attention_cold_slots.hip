@@ -17,6 +17,31 @@
 #define CHD 256       // head_dim
 #define CPL 8         // CHD / 32 elements per lane
 
+// Read this lane's CPL elements of slot `s` for one operand, per its layout:
+//   0 = SLOT-major  f32  : element (s,d) at slot_base + s*CHD + (d within lane)
+//   1 = CHANNEL-major f16 : element (s,d) at ch_base + (d)*sstride + s
+//                           (the kvarn_dequant_tile output for a [CHD × n_slots] tile)
+//   2 = SLOT-major  f16  : element (s,d) at slot_base + s*CHD + (d within lane)
+//                           (kvarn_dequant_tile output for a per-slot [n_slots × CHD] V tile)
+__device__ __forceinline__ void cold_read_slot(
+    const void* __restrict__ P, int layout,
+    long long slot_base, long long ch_base, int s, int sstride, float* out
+) {
+    if (layout == 0) {
+        const float* p = (const float*)P + slot_base + (long long)s * CHD;
+        #pragma unroll
+        for (int i = 0; i < CPL; ++i) out[i] = p[i];
+    } else if (layout == 2) {
+        const __half* p = (const __half*)P + slot_base + (long long)s * CHD;
+        #pragma unroll
+        for (int i = 0; i < CPL; ++i) out[i] = __half2float(p[i]);
+    } else { // 1: channel-major f16
+        const __half* p = (const __half*)P + ch_base + s;
+        #pragma unroll
+        for (int i = 0; i < CPL; ++i) out[i] = __half2float(p[(long long)i * sstride]);
+    }
+}
+
 __launch_bounds__(32)
 extern "C" __global__ void attention_cold_slots(
     const float* __restrict__ Q,   // [n_heads * 256]
@@ -26,14 +51,12 @@ extern "C" __global__ void attention_cold_slots(
     float*       __restrict__ M_OUT, // [n_heads] flash max (or null) — for tier merge
     float*       __restrict__ L_OUT, // [n_heads] flash denom (or null)
     int n_heads, int n_kv_heads, int n_slots, float scale,
-    // K/V memory layout per kv-head. 0 = SLOT-major: [n_kv_heads × slot_stride × 256],
-    // element (s,d) at (kv*slot_stride+s)*256 + d (contiguous head vec per slot).
-    // 1 = CHANNEL-major __half: [n_kv_heads × 256 × slot_stride], element (s,d) at
-    // kv*256*slot_stride + d*slot_stride + s — the kvarn_dequant_tile output layout
-    // (which emits f16), so the cold tier reads straight off its dequantized 4-bit
-    // records with no transpose and no f32 widening. K/V are reinterpreted as
-    // const __half* in this mode (Q stays f32). slot-major (0) keeps K/V f32.
-    int kv_layout,
+    // Independent K and V memory layouts (see `cold_read_slot`): 0 = slot-major
+    // f32, 1 = channel-major f16 (per-channel kvarn_dequant_tile output), 2 =
+    // slot-major f16 (per-slot V kvarn_dequant_tile output). K is typically 1
+    // (per-channel var-norm), V either 1 (per-channel) or 2 (per-slot). The hot
+    // tier passes 0/0 (raw f32 ring).
+    int k_layout, int v_layout,
     // Per-kv-head slot row stride. Attend over the first `n_slots` slots but index
     // with this stride (= the padded tile width n_slots_padded), so an odd valid
     // count can read an even-padded KVarN tile without the pad slot polluting the
@@ -67,21 +90,8 @@ extern "C" __global__ void attention_cold_slots(
     const long long ch_base   = (long long)kv * CHD * sstride + lane * CPL * (long long)sstride; // channel-major
     for (int s = 0; s < n_slots; ++s) {
         float kk[CPL], vv[CPL];
-        if (kv_layout == 0) {
-            const float* k = K + slot_base + (long long)s * CHD;
-            const float* v = V + slot_base + (long long)s * CHD;
-            #pragma unroll
-            for (int i = 0; i < CPL; ++i) { kk[i] = k[i]; vv[i] = v[i]; }
-        } else {
-            // channel-major f16: dim (lane*CPL+i) of slot s is at ch_base + i*sstride + s.
-            const __half* k = (const __half*)K + ch_base + s;
-            const __half* v = (const __half*)V + ch_base + s;
-            #pragma unroll
-            for (int i = 0; i < CPL; ++i) {
-                kk[i] = __half2float(k[(long long)i * sstride]);
-                vv[i] = __half2float(v[(long long)i * sstride]);
-            }
-        }
+        cold_read_slot(K, k_layout, slot_base, ch_base, s, sstride, kk);
+        cold_read_slot(V, v_layout, slot_base, ch_base, s, sstride, vv);
         float d = 0.0f;
         #pragma unroll
         for (int i = 0; i < CPL; ++i) d += q[i] * kk[i];

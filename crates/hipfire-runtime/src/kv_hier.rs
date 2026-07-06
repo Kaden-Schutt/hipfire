@@ -86,6 +86,7 @@ pub struct ColdSegmentGpu {
     pub bits: usize,        // K quant bits per code (4 or 2) — for the dequant unpack
     pub v_rec_bytes: usize, // V record stride (may differ from K when v_bits != bits)
     pub v_bits: usize,      // V quant bits per code
+    pub v_perslot: bool,    // V tile is slot-major [n_slots × HD] (per-token quant)
 }
 
 /// Reusable read scratch (lazily sized to the largest cold segment seen).
@@ -123,6 +124,9 @@ pub struct HierKvState {
     pub cold_v_qmax: f32,
     /// Bits per cold V code (`HIPFIRE_KV_COLD_V_BITS`, defaults to `cold_bits`).
     pub cold_v_bits: usize,
+    /// Store cold V per-slot (token axis) instead of per-channel — V's natural
+    /// quant axis (`HIPFIRE_KV_COLD_V_PERSLOT=1`, default off).
+    pub cold_v_perslot: bool,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub hot_k: Vec<GpuTensor>, // [n_layers] slot-major [nkv × hot_budget × HD] f32
@@ -193,6 +197,8 @@ impl HierKvState {
             .unwrap_or(cold_bits)
             .clamp(1, 4);
         let cold_v_qmax = ((1u32 << cold_v_bits) - 1) as f32;
+        let cold_v_perslot =
+            std::env::var("HIPFIRE_KV_COLD_V_PERSLOT").ok().as_deref() == Some("1");
         let mut hot_k = Vec::with_capacity(n_layers);
         let mut hot_v = Vec::with_capacity(n_layers);
         let mut attn_mass = Vec::with_capacity(n_layers);
@@ -215,6 +221,7 @@ impl HierKvState {
             cold_bits: cold_bits as usize,
             cold_v_qmax,
             cold_v_bits: cold_v_bits as usize,
+            cold_v_perslot,
             n_heads,
             n_kv_heads,
             hot_k,
@@ -354,15 +361,22 @@ impl HierKvState {
             self.position_local,
             self.cold_qmax,
             self.cold_v_qmax,
-            false, // per-slot V not yet wired through the GPU cold-read kernel (#2)
+            self.cold_v_perslot,
         );
         let n_slots = cold.n_slots;
         let bits = self.cold_bits;
         let v_bits = self.cold_v_bits;
+        let v_perslot = self.cold_v_perslot;
         // K and V may pack at different bit widths → separate record strides.
         // Each rec_bytes is padded up to a multiple of 4 for the f32-view upload.
+        // Per-slot V transposes the tile to [n_slots × HD], so its record geometry
+        // (per-row scale metadata) differs from the K [HD × n_slots] layout.
         let k_padded = kvarn_record_bytes_bits(HD, n_slots, bits).div_ceil(4) * 4;
-        let v_padded = kvarn_record_bytes_bits(HD, n_slots, v_bits).div_ceil(4) * 4;
+        let v_padded = if v_perslot {
+            kvarn_record_bytes_bits(n_slots, HD, v_bits).div_ceil(4) * 4
+        } else {
+            kvarn_record_bytes_bits(HD, n_slots, v_bits).div_ceil(4) * 4
+        };
         let mut krecs = vec![0u8; nkv * k_padded];
         let mut vrecs = vec![0u8; nkv * v_padded];
         for h in 0..nkv {
@@ -382,6 +396,7 @@ impl HierKvState {
             bits,
             v_rec_bytes: v_padded,
             v_bits,
+            v_perslot,
         });
         self.migrated[layer] += mb;
 
@@ -518,7 +533,8 @@ impl HierKvState {
             nkv,
             self.hot_count[layer],
             scale,
-            0,
+            0, // k_layout: hot ring is slot-major f32
+            0, // v_layout: hot ring is slot-major f32
             self.hot_budget,
             mass,
         )?;
@@ -534,12 +550,20 @@ impl HierKvState {
                 seg.rec_bytes,
                 seg.bits,
             )?;
+            // Per-slot V is a [n_slots × HD] tile (r=slot, c=channel) → swapped
+            // r/c vs the K [HD × n_slots] tile; the dequant output is then
+            // slot-major f16, read with v_layout=2 below.
+            let (v_r, v_c) = if seg.v_perslot {
+                (seg.n_slots, HD)
+            } else {
+                (HD, seg.n_slots)
+            };
             gpu.kvarn_dequant_tile(
                 &seg.v_recs,
                 &scr.deq_v,
                 nkv,
-                HD,
-                seg.n_slots,
+                v_r,
+                v_c,
                 seg.v_rec_bytes,
                 seg.v_bits,
             )?;
@@ -554,7 +578,8 @@ impl HierKvState {
                 nkv,
                 seg.n_valid,
                 scale,
-                1,
+                1, // k_layout: per-channel var-norm dequant → channel-major f16
+                if seg.v_perslot { 2 } else { 1 }, // v_layout: 2=slot-major f16 (per-slot V)
                 seg.n_slots,
                 None, // cold tier: no mass accumulation
             )?;
