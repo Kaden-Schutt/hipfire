@@ -290,16 +290,36 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   driver — run each layer on its `Pp` stage, `boundary_copy` the residual between stages. Generalize the pattern INTO
   `dense_forward` (mirror how P-B pulled TP into `execute_steps`). **NO executor change** (each stage runs its band via
   the same single-device `execute_steps`; PP = device selection + boundary copy; PP is EXACT → oracle bar max|Δ|=**0**).
-- **State (from 3-file recon):** `dense_forward` (arch_spec.rs:131) is single-GPU only, used by ALL dense arches. PP is
-  hand-coded ONLY in qwen35 (`forward_scratch_layers_multi`/`forward_prefill_batch_multi`, `load_qwen35_pp` arch 5/6).
-  Primitives proven bit-exact: `forward_scratch_band(range)`+`forward_scratch_head` (llama.rs), `Gpus::boundary_copy`/
-  `wait_boundary`/`device_for_layer` (multi_gpu.rs:307/373/284), `mesh.stage_for_layer(l,n)`/`band_xfer_after`
-  (hipfire-hardware/mesh.rs:158/181), `fulfill_manifest` PP placement (`Pin{Embed|Output}`+banding, `llama_store_pp`
-  max|Δ|=0). `resolve_mesh`→`rect([(Pp,pp)])`.
-- **Increments:** PC-1 arch-generic `dense_forward_pp<A:DenseArch>(gpus,mesh,…)` bands per-layer Steps by
-  `stage_for_layer`+boundary_copy → PP oracle (generic == hand-band == single-device, max|Δ|=0, analog
-  tp_full_model_parity); PC-2 decode parity (analog tp_decode_parity); PC-3 daemon serve for dense llama (`PpModel`/
-  `load_model_pp`+`generate_pp`, analog PB-TP5). Needs a generic per-device `DenseScratchSet` (analog `Qwen35ScratchSet`).
+- **REFRAME→REVIEW→REVERT 2026-07-06.** bjoern challenged "why above execute_steps? doesn't the manifest make PP
+  transparent in dispatch?" → I reframed the plan to move PP INTO the executor (a whole-model `run_layer_program`). A
+  **4-agent review team** (architecture/feasibility/simplicity/correctness) UNANIMOUSLY rejected it; bjoern reverted to
+  the driver-owned loop. **The killer facts:** (1) dense llama attention is IMPERATIVE (`forward_scratch_band`), NOT
+  Step-lowered — there is no whole-model Step program to feed a `run_layer_program` (`Step::` appears once in llama.rs).
+  (2) `execute_steps_tp` rejects `tp<=1` (steps.rs:715) + `execute_steps_mesh` debug_asserts n_devices==1 (steps.rs:657)
+  → a pure-Pp mesh can call NEITHER as the inner op; "PP wraps TP" is unreachable till N×M. (3) `run_layer_program` is
+  the RETIRED Spine-B/ForwardBindings symbol (superop.rs:417). (4) contradicts the locked "three homes" + reverses
+  P-A/P-B "defer the hoist" + is the N1 bounce (rejected 3 rounds). (5) whole-model program → self-referential
+  WeightRef/Step lifetime (`WeightRef` not Clone). **RESOLUTION:** transparency = manifest placement + `DenseArch` trait
+  boundary (arch never names a device) → INDEPENDENT of loop location; the shared generic `dense_forward` driver is the
+  correct home (the locked altitude). Executor-transparent PP → P-5b, gated on real N×M + multi-GPU HW.
+- **State (recon + review):** `dense_forward` (arch_spec.rs:131) is the arch-generic shared driver (llama+qwen2 route
+  through it), single-GPU today. PP hand-coded ONLY in qwen35 (`forward_scratch_layers_multi` qwen35.rs:14367,
+  `load_qwen35_pp` arch 5/6). Primitives proven bit-exact: `forward_scratch_band`/`_head`/`_embed` (llama.rs:4209/4525/
+  3142), `Gpus::boundary_copy`/`wait_boundary`/`device_for_layer` (**hipfire-hardware/src/lib.rs:357/423/334** — NOT
+  multi_gpu.rs, that's a re-export; active_stream NOT required, sync host-stage path), `mesh.stage_for_layer(l,n)`==
+  `Gpus.device_for_layer` by construction (both uniform_split_counts), per-band KV `new_gpu_q8_multi`(llama.rs:7270)+
+  `alloc_kv_per_layer_multi`(8246) ALREADY EXISTS, `fulfill_manifest` PP placement (`llama_store_pp` max|Δ|=**0**).
+  s_ef_residual divergence is DeltaNet-Q8-state-only (qwen35.rs:5648), N/A to dense llama → =0 REACHABLE.
+- **Increments (reverted, imperative driver loop):** PC-0 fix the BROKEN oracle — `llama_store_pp`+`llama_store_load`
+  don't compile at HEAD (missing `LlamaWeights.lm_head_aliases_embd`, E0063; add to no-gpu-ci). PC-1 make the SHARED
+  `dense_forward` PP-aware via the imperative `forward_scratch_band` stage loop + `boundary_copy` (mirror qwen35
+  14388-14396); `DenseArch` gains a per-stage weights+scratch view (the one real trait change; model on
+  `Qwen35ScratchSet`); size-1 group inner op = single-device `execute_steps` (NEVER `_tp`/`_mesh`); =0 oracle vs
+  single-device on real qwen3-0.6b-llama emulated Pp-2. PC-2 decode + MULTI-TOKEN prefill (band copy `n_rows*dim*4`, the
+  real gap — oracle only proves 1-tok pos0), banded `_multi` KV. PC-3 daemon serve (`PpModel`/`load_model_pp`/
+  `generate_pp`, mirror PB-TP5). **Constraints:** Q8/FP32 KV only (NO asym); `active_stream=None` regime (debug_assert);
+  =0 is SAME-ARCH scoped (emulation aliases to dev0 → proves banding logic NOT transport/residency; real 2-GPU same-arch
+  =0 gate is a separate HW exit; mixed-arch is coherence-only); assert banding single-source-of-truth.
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
