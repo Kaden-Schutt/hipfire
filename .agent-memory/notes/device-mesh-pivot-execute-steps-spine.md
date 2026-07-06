@@ -240,7 +240,28 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   Gemv col/row (PB-TP1), RmsnormAutomatic + manifest-derived collectives (PB-TP2), SiluMul/full FFN (PB-TP3),
   ResidualAdd (PB-TP4a), **native-quant MQ4G256 FFN (PB-TP4-quant, no executor change)**, **head-parallel Step::Attend
   (PB-TP4b)**. A whole attn+FFN layer = the mechanical concatenation of the two proven per-rank Step lists.
-- **PB-TP4c REMAINING (the capstone — all primitives now PROVEN):** assemble `dense_forward_tp<A:DenseArch>(gpus,
+- **PB-TP4c DONE + validated (THE CAPSTONE)** — full-model tensor-parallel forward == single-GPU, in two increments:
+  - **(A) `874d6452`** `examples/tp_execute_steps_quant_layer_parity.rs`: a WHOLE real layer-0 (attn+FFN, qk-norm,
+    Q8 KV, MQ4G256) through the store→forward bridge + `execute_steps_tp` == single-device, max|Δ|=**1.79e-7**.
+    Proves the real bridge (`fulfill_manifest` shards real quant weights via an HFQ raw-bytes source closure) + the
+    full 16-op per-rank layer Step list (mirrors `dense_forward`; row wo/down split to Gemv→AllReduceOut→ResidualAdd).
+    Reference runs the SAME Steps one-at-a-time via `execute_steps(&[s])` (a lone step never fuses) → op-for-op match.
+  - **(B) `c33bb926`** `examples/tp_full_model_parity.rs`: the WHOLE 28-layer qwen3-0.6b-llama.mq4 runs Tp-2 (embed
+    rank0+broadcast → 28 sharded layers via `execute_steps_tp` → final norm + lm_head rank0 → logits) vs production
+    `llama::forward_scratch`: **argmax IDENTICAL (33450)**, logit max|Δ|=**4.2e-4** on max|logit|=19.2. The unfused TP
+    forward reproduces the fused production forward. `fulfill_manifest` shards ALL layers; replicated norms uploaded
+    per rank; residual `x` stays replicated (all-reduce + replicated ResidualAdd/Rmsnorm keep it synced) so embed +
+    final need no sharding. Single position (pos 0); multi-key attn under TP = PB-TP4b, q/k/o/ffn sharding = incr A.
+  - **STATUS: the store→forward bridge + `dense_forward_tp` are PROVEN end-to-end on a real model.** Both live as
+    examples (validated concepts); promoting the layer-step builder + Tp dispatch into a lib `dense_forward_tp<A>` +
+    the bridge into a reusable `assemble_sharded_layers(store)` is a clean follow-up (the borrow pattern is worked out
+    — per-rank WeightRefs built inline from `resident_l(store,name,l,dev)`; `WeightRef` isn't Clone; `leak` for the
+    `&WeightRef` the Step holds, or keep a per-rank Vec that outlives the Step list). No lib change landed this session.
+- **PB-TP5 NEXT (daemon serve) — RAISE THE EP-vs-TP FORK WITH BJOERN FIRST.** `resolve_mesh` (config.rs:150) hard-wires
+  the `tp` knob to the `Ep` axis; no way to express real row/col TP. Recommended: disentangle at the daemon load path
+  (`load_model_ep` vs a new `load_model_tp`) + give `resolve_mesh` an explicit axis. Then TP5 = `load_model_tp` + serve
+  + `tp_decode_parity` (FNV token-stream vs single-GPU, mirror `ep_decode_parity`).
+- **(historical) PB-TP4c REMAINING (the capstone — all primitives now PROVEN):** assemble `dense_forward_tp<A:DenseArch>(gpus,
   mesh, ...)` mirroring `dense_forward` (arch_spec.rs:132) but emitting per-rank Step lists (row `GemvResidual` → split
   Gemv→AllReduceOut→ResidualAdd per PB-TP4a) + the store→forward bridge: `fulfill_manifest(llama weight_manifest @
   arch.rs:98, Tp-2)` gives native-quant per-rank buffers in a `WeightStore`; assemble per-rank `DenseLayer{WeightRef}`
