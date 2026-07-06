@@ -119,9 +119,23 @@ EP path = the working template — `run_layer_program_mesh` EP arm `superop.rs:4
   `all_reduce_sum_f32_peer` per row-parallel op, cross-layer residual, hidden kept replicated (no inter-layer
   broadcast). Example `tp_forward_parity`: 4-layer TP == host F32 ref, max|Δ|=1.2e-7, ranks bit-identical. **This is
   the production-callable TP executor pattern `dense_forward` adopts** (the FFN half). Preconds: caller sets
-  per-device `active_stream` + `enable_peer_all`. **REMAINING to daemon-served TP:** attention head-parallel layer
-  (Column head-split QKV + Row o_proj all-reduce — same machinery, `nh%tp==0`), wiring `tp_ffn_forward`'s pattern
-  into the REAL llama `forward_scratch_layers` with `&mut Gpus`, + daemon `load_model_tp`/serve (PB-2/3/5).
+  per-device `active_stream` + `enable_peer_all`.
+- **PB-3 ATTENTION HEAD-PARALLEL VALIDATED** (`d5e63c8b`) — `tp_attn_parity` example proves a WHOLE TP transformer
+  layer (attn+FFN) == single-device on emulated Tp-2 (gfx1151), max|Δ|=1.19e-7 (same level as FFN proof). New
+  mechanism = the attention block: Column head-split QKV (`ShardPolicy::ColumnShard{axis:0}` on wq/wk/wv → rank owns
+  q_head_range/kv_head_range), per-rank RoPE + `kv_cache_write` + `attention_f32` on owned heads, Row `wo`
+  (`RowShard{axis:1}`) → partial → `all_reduce_sum_f32_peer` → attention residual, then the proven FFN block. KEY
+  correctness fact: head-parallel is EXACT (not approximate) — RoPE is per-head, and clean GQA split keeps each rank's
+  Q heads mapped entirely onto its OWN kv heads (n_heads/n_kv_heads ratio preserved per rank), so a rank's local
+  `[max_seq, kv_dim/tp]` `attention_f32` == the head-slice of the full-cache attention (verified against attention.hip:
+  `t*n_kv_heads*head_dim + kv_h*head_dim`, kv_h=h/(nh/nkv)). Cache layout confirmed `[max_seq, kv_dim]` position-major.
+  Reference computed with the SAME GPU kernels (not host) so RoPE/softmax/GQA conventions match by construction. The
+  single-device reference SKIP-guards on `init_uniform(TP,TP)` (n_layers>=n_devices). **REMAINING to daemon-served TP:**
+  wire this proven pattern into the REAL llama `forward_scratch_layers` with `&mut Gpus` (PB-4-full), + daemon
+  `load_model_tp`/serve (PB-2/5). llama layer op map (from Explore): separate wq/wk/wv (`LayerWeights` @ llama.rs:688,
+  fusion is a kernel choice not storage), `weight_gemv_prerotated` for MQ quant (rotate_x_for_mq once + 3 prerotated
+  GEMVs), `rope_f32`, `kv_cache_write` (7-tier quant ladder via `llama_kv_write_attend` @ llama.rs:3185), `attention_f32`,
+  `weight_gemv_residual` (fused wo·attn + x). NO `forward_scratch_tp`/`load_weights_tp` exist yet (planned names only).
 - **Earlier REMAINING (production INTEGRATION):** PB-2 resolve_mesh real Tp axis —
   **FORK: `tp` knob maps to `Ep` (config.rs:155) for MoE; disentangle EP-vs-TP intent at the daemon load path
   (`load_model_ep` vs new `load_model_tp`)** — recommended default, ripples into daemon. PB-3 store→forward bridge
