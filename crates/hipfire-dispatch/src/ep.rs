@@ -32,28 +32,12 @@
 //! driver loops layers (advancing each rank's per-layer binding state) the same
 //! way the single-GPU lowered driver loops `run_layer_program`.
 
-use crate::context::DispatchCtx;
-use crate::pipeline::superop::{dispatch_super_op, ForwardBindings, LayerProgram, SuperOpKind};
+use crate::pipeline::superop::{ForwardBindings, LayerProgram};
 use crate::types::DispatchError;
-use hip_bridge::{DeviceBuffer, HipError};
-use hipfire_hardware::{DeviceMesh, DimKind, Gpus};
+use hipfire_hardware::{DeviceMesh, Gpus};
 use rdna_compute::GpuTensor;
 
-fn hip_err(e: HipError) -> DispatchError {
-    DispatchError::Hip(e.to_string())
-}
-
-/// Ensure every device owns an `active_stream` (the stream the EP collectives
-/// and per-rank work run on). Idempotent; safe to call before each layer.
-pub fn ensure_rank_streams(gpus: &mut Gpus) -> Result<(), DispatchError> {
-    for dev in gpus.devices.iter_mut() {
-        dev.bind_thread().map_err(hip_err)?;
-        if dev.active_stream.is_none() {
-            dev.active_stream = Some(dev.hip.stream_create().map_err(hip_err)?);
-        }
-    }
-    Ok(())
-}
+pub use crate::pipeline::superop::ensure_rank_streams;
 
 /// Execute one lowered layer program across `gpus.devices.len()` EP ranks.
 ///
@@ -76,95 +60,10 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
     program: &LayerProgram,
     residual_dim: usize,
 ) -> Result<(), DispatchError> {
-    let n = gpus.devices.len();
-    assert_eq!(
-        bindings.len(),
-        n,
-        "run_layer_program_ep: bindings.len() != n_ranks"
+    debug_assert_eq!(
+        partials[0].numel(),
+        residual_dim,
+        "ep shim: residual_dim mismatch"
     );
-    assert_eq!(
-        partials.len(),
-        n,
-        "run_layer_program_ep: partials.len() != n_ranks"
-    );
-
-    for op in program {
-        if matches!(op.kind, SuperOpKind::Moe) {
-            // 1. Zero each rank's routed partial on its own stream.
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                let stream = gpus.devices[r]
-                    .active_stream
-                    .as_ref()
-                    .ok_or_else(|| DispatchError::Hip(format!(
-                        "run_layer_program_ep: device {r} has no active_stream (call ensure_rank_streams)"
-                    )))?;
-                gpus.devices[r]
-                    .hip
-                    .memset_async(&partials[r].buf, 0, residual_dim * 4, stream)
-                    .map_err(hip_err)?;
-            }
-
-            // 2. Each rank computes its owned-expert routed partial (+ shared on
-            //    rank 0 via skip_shared=false; ranks>0 skip the shared down).
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                let ctx = DispatchCtx::new(&gpus.devices[r]);
-                bindings[r].run_moe_ep(
-                    &mut gpus.devices[r],
-                    &ctx,
-                    &op.binding,
-                    &partials[r],
-                    /* skip_shared = */ r != 0,
-                )?;
-            }
-
-            // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
-            //    Decode stays on RCCL: its tiny per-token reduce is already fast
-            //    (NOT the bottleneck — measured 51.4 RCCL vs 48.0 peer-direct on
-            //    MiniMax 62-layer decode), peer-direct's per-layer wait_boundary
-            //    host-sync only adds overhead, and RCCL preserves qwen35's
-            //    validated byte-identical decode. Peer-direct is the win for
-            //    PREFILL (large batched reduce), where RCCL is ~40 ms/call —
-            //    that path uses all_reduce_sum_f32_peer directly. Opt decode into
-            //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
-            let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            // EP all-reduce group comes from the mesh's `Ep` axis (the ranks
-            // sharing this device's other coords). For the current 1×N EP mesh
-            // that is all ranks → byte-identical to the previous 0..n. Composed
-            // meshes (2×2, per-stage Ep groups) are Phase 5b: this single-group
-            // reduce asserts one Ep group spanning all ranks.
-            let group = mesh.group_along(DimKind::Ep, &mesh.coord_of(0));
-            debug_assert_eq!(
-                group.len(),
-                refs.len(),
-                "run_layer_program_ep: single Ep-group (1×N) only; composed/multi-group EP is Phase 5b",
-            );
-            static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let use_peer = *PEER_DECODE.get_or_init(|| {
-                std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
-            });
-            if use_peer {
-                gpus.all_reduce_sum_f32_peer(&group, &refs, residual_dim)
-                    .map_err(hip_err)?;
-            } else {
-                gpus.all_reduce_sum_f32(&group, &refs, residual_dim)
-                    .map_err(hip_err)?;
-            }
-
-            // 4. Each rank adds the reduced partial into its residual stream.
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
-            }
-        } else {
-            // Replicated op — every rank runs it unchanged on full weights.
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                let ctx = DispatchCtx::new(&gpus.devices[r]);
-                dispatch_super_op(&mut gpus.devices[r], &ctx, op, &mut bindings[r])?;
-            }
-        }
-    }
-    Ok(())
+    crate::pipeline::superop::run_layer_program_mesh(mesh, gpus, bindings, partials, program)
 }

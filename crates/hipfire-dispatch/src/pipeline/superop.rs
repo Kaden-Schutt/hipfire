@@ -36,10 +36,12 @@
 //! (default off) in later steps, validated byte-identical via the
 //! `HIPFIRE_FORWARD_ORACLE` dual-run.
 
-use crate::context::DispatchCtx;
-use crate::types::{KernelKey, PipelineOp};
 use super::steps::{match_fused_prefix, step_op_kind, Step};
+use crate::context::DispatchCtx;
 use crate::types::DispatchError;
+use crate::types::{KernelKey, PipelineOp};
+use hip_bridge::DeviceBuffer;
+use hipfire_hardware::{DeviceMesh, DimKind, Gpus};
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Index into the model's per-layer weight table (resolved at lower time, stable
@@ -75,9 +77,13 @@ pub enum ActFlavor {
 pub enum RopeFlavor {
     None,
     /// Standard rotate-half (most archs). `theta` = rope base.
-    HalfRotate { theta: f32 },
+    HalfRotate {
+        theta: f32,
+    },
     /// Interleaved full-dim RoPE (e.g. cohere2moe).
-    Interleaved { theta: f32 },
+    Interleaved {
+        theta: f32,
+    },
 }
 
 /// Attention-block flavor — everything that distinguishes one arch's attention
@@ -186,7 +192,10 @@ pub struct LoweredForward {
 
 impl LoweredForward {
     pub fn new(weight_gen: u64) -> Self {
-        Self { layers: Vec::new(), weight_gen }
+        Self {
+            layers: Vec::new(),
+            weight_gen,
+        }
     }
 }
 
@@ -274,14 +283,55 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
 /// inside the impl (the "Fallback") — so there is NO `UnsupportedVariant`
 /// catch-all on the executor; the match is total over `SuperOpKind`.
 pub trait ForwardBindings {
-    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_residual_gemv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_norm(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_attend(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_moe(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_recurrent(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_conv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_escape(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding, kind: EscapeKind) -> Result<(), DispatchError>;
+    fn run_proj(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_residual_gemv(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_norm(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_attend(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_recurrent(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_conv(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_escape(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+        kind: EscapeKind,
+    ) -> Result<(), DispatchError>;
 
     // ── Expert-parallel (Ship 6 substrate-EP) hooks ─────────────────────────
     // Default to unsupported; only EP-target MoE arches (qwen3.6-A3B, MiniMax,
@@ -372,11 +422,137 @@ pub fn run_layer_program<B: ForwardBindings>(
     Ok(())
 }
 
+// ── Merged mesh executor (device-mesh plan §1) ─────────────────────────────
+
+fn hip_err(e: hip_bridge::HipError) -> DispatchError {
+    DispatchError::Hip(e.to_string())
+}
+
+/// Ensure every device owns an `active_stream` (the stream the EP collectives
+/// and per-rank work run on). Idempotent; safe to call before each layer.
+pub fn ensure_rank_streams(gpus: &mut Gpus) -> Result<(), DispatchError> {
+    for dev in gpus.devices.iter_mut() {
+        dev.bind_thread().map_err(hip_err)?;
+        if dev.active_stream.is_none() {
+            dev.active_stream = Some(dev.hip.stream_create().map_err(hip_err)?);
+        }
+    }
+    Ok(())
+}
+
+/// True iff a `Moe` op on this mesh runs the EP reduce path (vs the replicated
+/// single-GPU `run_moe`). Sole cross-device branch of the merged executor.
+pub(crate) fn moe_is_ep(mesh: &DeviceMesh) -> bool {
+    mesh.has_axis(DimKind::Ep)
+}
+
+/// The ONE executor (device-mesh plan §1). Single-GPU = 1×1 mesh + 1-elem
+/// `bindings` + empty `partials`; EP = 1×N Ep mesh + N-elem slices. `Moe`
+/// branches on the Ep axis; all other ops run replicated per rank. `ctx` is
+/// built per rank inside; `residual_dim` is derived from `partials[0]`.
+pub fn run_layer_program_mesh<B: ForwardBindings>(
+    mesh: &DeviceMesh,
+    gpus: &mut Gpus,
+    bindings: &mut [B],
+    partials: &[GpuTensor],
+    program: &LayerProgram,
+) -> Result<(), DispatchError> {
+    let n = bindings.len();
+    debug_assert_eq!(
+        gpus.devices.len(),
+        n,
+        "run_layer_program_mesh: gpus/bindings length mismatch"
+    );
+    let ep = moe_is_ep(mesh);
+    if ep {
+        assert_eq!(
+            partials.len(),
+            n,
+            "run_layer_program_mesh: EP needs one partial per rank"
+        );
+    }
+    for op in program {
+        if ep && matches!(op.kind, SuperOpKind::Moe) {
+            let residual_dim = partials[0].numel();
+            // 1. zero each rank's partial on its stream
+            for r in 0..n {
+                gpus.devices[r].bind_thread().map_err(hip_err)?;
+                let stream = gpus.devices[r].active_stream.as_ref().ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "run_layer_program_mesh: device {r} has no active_stream (call ensure_rank_streams)"))
+                })?;
+                gpus.devices[r]
+                    .hip
+                    .memset_async(&partials[r].buf, 0, residual_dim * 4, stream)
+                    .map_err(hip_err)?;
+            }
+            // 2. owned-expert partial (+ shared on rank 0)
+            for r in 0..n {
+                gpus.devices[r].bind_thread().map_err(hip_err)?;
+                let ctx = DispatchCtx::new(&gpus.devices[r]);
+                bindings[r].run_moe_ep(
+                    &mut gpus.devices[r],
+                    &ctx,
+                    &op.binding,
+                    &partials[r],
+                    r != 0,
+                )?;
+            }
+            // 3. all-reduce over the Ep group
+            let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+            let group = mesh.group_along(DimKind::Ep, &mesh.coord_of(0));
+            debug_assert_eq!(group.len(), refs.len(),
+                "run_layer_program_mesh: single Ep-group (1×N) only; composed/multi-group EP is Phase 5b");
+            static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_peer = *PEER_DECODE.get_or_init(|| {
+                std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
+            });
+            if use_peer {
+                gpus.all_reduce_sum_f32_peer(&group, &refs, residual_dim)
+                    .map_err(hip_err)?;
+            } else {
+                gpus.all_reduce_sum_f32(&group, &refs, residual_dim)
+                    .map_err(hip_err)?;
+            }
+            // 4. add reduced partial into each rank's residual
+            for r in 0..n {
+                gpus.devices[r].bind_thread().map_err(hip_err)?;
+                bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+            }
+        } else {
+            for r in 0..n {
+                gpus.devices[r].bind_thread().map_err(hip_err)?;
+                let ctx = DispatchCtx::new(&gpus.devices[r]);
+                dispatch_super_op(&mut gpus.devices[r], &ctx, op, &mut bindings[r])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use hipfire_hardware::{DeviceMesh, DimKind};
+    #[test]
+    fn moe_branch_is_ep_only_with_ep_axis() {
+        assert!(!moe_is_ep(&DeviceMesh::single())); // single-GPU
+        assert!(!moe_is_ep(&DeviceMesh::rect(&[(DimKind::Pp, 2)]))); // PP-only
+        assert!(moe_is_ep(&DeviceMesh::rect(&[(DimKind::Ep, 4)]))); // EP
+        assert!(moe_is_ep(&DeviceMesh::rect(&[
+            (DimKind::Pp, 2),
+            (DimKind::Ep, 2)
+        ])));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fk() -> KernelKey { KernelKey::FusedQkvHfq4G256 }
+    fn fk() -> KernelKey {
+        KernelKey::FusedQkvHfq4G256
+    }
 
     #[test]
     fn lower_walk_collapses_fused_and_passes_through_unfused() {
@@ -384,7 +560,13 @@ mod tests {
         // step 5 unfused GemvResidual→ResidualGemv.
         let prog = lower_walk(
             6,
-            |i| if i == 5 { SuperOpKind::ResidualGemv } else { SuperOpKind::Proj },
+            |i| {
+                if i == 5 {
+                    SuperOpKind::ResidualGemv
+                } else {
+                    SuperOpKind::Proj
+                }
+            },
             |pos| if pos == 0 { Some((fk(), 4)) } else { None },
         );
         assert_eq!(prog.len(), 3);
@@ -405,9 +587,17 @@ mod tests {
 
     #[test]
     fn lower_walk_single_cluster_spans_to_end() {
-        let prog = lower_walk(4, |_| SuperOpKind::Proj, |pos| {
-            if pos == 0 { Some((fk(), 4)) } else { None }
-        });
+        let prog = lower_walk(
+            4,
+            |_| SuperOpKind::Proj,
+            |pos| {
+                if pos == 0 {
+                    Some((fk(), 4))
+                } else {
+                    None
+                }
+            },
+        );
         assert_eq!(prog.len(), 1);
         assert_eq!(prog[0].binding.key, Some(fk()));
     }
