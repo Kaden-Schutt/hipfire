@@ -3397,6 +3397,36 @@ impl Gpu {
                 };
                 if use_mmq {
                     let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    // RDNA3 dGPU opt-in: qkv/z are large aligned projections
+                    // where the MMQ set path is profitable, while beta/alpha
+                    // are tiny LA tails that waste most of a 128-row MMQ tile.
+                    // Keep this off by default and do not widen it to gfx12 or
+                    // gfx10; their MMQ/dot2 tradeoffs and source families differ.
+                    static QKVZA_SPLIT_TAIL: OnceLock<bool> = OnceLock::new();
+                    let split_tail = *QKVZA_SPLIT_TAIL.get_or_init(|| {
+                        std::env::var("HIPFIRE_QKVZA_SPLIT_TAIL").ok().as_deref() == Some("1")
+                    });
+                    if split_tail
+                        && self.arch_caps.is_rdna3_dgpu()
+                        && qkv_m % 128 == 0
+                        && z_m % 128 == 0
+                    {
+                        let r1 = self
+                            .gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
+                        let r2 = if r1.is_ok() {
+                            self.gemm_hfq4g256_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size)
+                        } else {
+                            Ok(())
+                        };
+                        let r3 = if r2.is_ok() {
+                            self.gemm_gate_up_hfq4g256_dot2(
+                                a_beta, a_alpha, x, y_beta, y_alpha, beta_m, alpha_m, k, batch_size,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        return r1.and(r2).and(r3);
+                    }
                     let r1 =
                         self.gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
                     let r2 = if r1.is_ok() {
