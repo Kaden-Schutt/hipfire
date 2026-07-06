@@ -796,6 +796,34 @@ fn minimax_moe_block(
 }
 
 /// Per-layer execution context for the lowered decode path (rebuilt each layer).
+/// minimax's per-rank adapter for [`Gpus::ep_moe_allreduce`]'s phase-tagged
+/// closure. minimax has NO shared expert, so the WHOLE MoE output is routed:
+///
+/// - `RunOwned`: owned routed experts → the zeroed `partial`,
+/// - `AddResidual`: `state.h` (the replicated attention residual) `+=` the
+///   all-reduced routed sum.
+///
+/// Same two operations as the retired `MinimaxBindings::{run_moe_ep,
+/// ep_add_into_residual}` — byte-identical, just off the SuperOp trait.
+fn minimax_ep_moe_rank(
+    cfg: &MiniMaxConfig,
+    layer: &MiniMaxLayerWeights,
+    state: &MiniMaxState,
+    gpu: &mut Gpu,
+    l: usize,
+    partial: &GpuTensor,
+    phase: hipfire_runtime::multi_gpu::EpMoePhase,
+) -> Result<(), hip_bridge::HipError> {
+    use hipfire_runtime::multi_gpu::EpMoePhase;
+    match phase {
+        EpMoePhase::RunOwned => minimax_moe_block(gpu, cfg, layer, state, l, Some(partial))
+            .map_err(|s| hip_bridge::HipError::new(0, &s)),
+        EpMoePhase::AddResidual => gpu
+            .add_inplace_f32(&state.h, partial)
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string())),
+    }
+}
+
 struct MinimaxBindings<'a> {
     cfg: &'a MiniMaxConfig,
     layer: &'a MiniMaxLayerWeights,
@@ -1398,20 +1426,41 @@ pub fn forward_ep(
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd).
     let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
     let t_layers = std::time::Instant::now();
-    let program = minimax_lower_program();
+    let group: Vec<usize> = (0..n).collect();
     let n_layers = weights_per_rank[0].layers.len();
     for l in 0..n_layers {
-        let mut binds: Vec<MinimaxBindings> = Vec::with_capacity(n);
+        // Attend replicated: every rank holds full weights + full KV → the
+        // per-rank attention is a deterministic function of replicated inputs
+        // and stays bit-identical across ranks (the only EP divergence is Moe).
         for r in 0..n {
-            binds.push(MinimaxBindings {
+            gpus.devices[r]
+                .bind_thread()
+                .map_err(|e| format!("forward_ep attn bind {r} L{l}: {e:?}"))?;
+            minimax_attn_block(
+                &mut gpus.devices[r],
                 cfg,
-                layer: &weights_per_rank[r].layers[l],
-                state: &state_per_rank[r],
+                &weights_per_rank[r].layers[l],
+                &state_per_rank[r],
                 l,
-            });
+            )
+            .map_err(|e| format!("forward_ep attn L{l} r{r}: {e}"))?;
         }
-        hipfire_runtime::ep::run_layer_program_ep(&hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(hipfire_runtime::multi_gpu::DimKind::Ep, partials.len())]), gpus, binds.as_mut_slice(), partials, &program, hidden)
-            .map_err(|e| format!("forward_ep run_layer_program_ep L{l}: {e}"))?;
+        // Moe all-reduce EP: each rank runs its owned routed experts into a
+        // partial (minimax has no shared expert → whole MoE is routed), the
+        // partials all-reduce over the Ep group, and each rank folds the reduced
+        // sum into its replicated attention residual `state.h`.
+        gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
+            minimax_ep_moe_rank(
+                cfg,
+                &weights_per_rank[r].layers[l],
+                &state_per_rank[r],
+                gpu,
+                l,
+                partial,
+                phase,
+            )
+        })
+        .map_err(|e| format!("forward_ep ep_moe_allreduce L{l}: {e}"))?;
     }
 
     // 3. Final norm + lm_head on rank 0 → state_per_rank[0].logits.
