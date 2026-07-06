@@ -95,3 +95,21 @@ reworks these signatures anyway. Local plan detail: `docs/superpowers/plans/2026
 (per-Step ShardPolicy shard + Tp all-reduce); this is where the daemon `Gpus::single` hoist finally lands (the
 mesh-only P-A deliberately left it undone). `execute_steps_mesh` currently degenerates to the single gpu — flip its
 debug_assert to real multi-device handling there.
+
+## P-B IN PROGRESS 2026-07-06 — dense-TP weight slicing DONE (PB-1a/1c); executor + serve remain
+Plan: `docs/superpowers/plans/2026-07-06-P-B-tensor-parallel.md`. Full TP-infra inventory done (recall it: the 5
+seams are fulfill_manifest slicing, execute_steps_mesh body, resolve_mesh Tp axis, store→forward bridge, daemon serve;
+EP path = the working template — `run_layer_program_mesh` EP arm `superop.rs:457`, qwen35 `forward_prefill_batch_ep`).
+- **PB-1a ColumnShard** (`58eecd64`) + **PB-1c RowShard** (`62c4f267`) LANDED in `weight_store.rs::fulfill_into`,
+  byte-oracle-validated on emulated Tp-2 (`fulfill_manifest_probe`). Column = contiguous output-row split
+  (format-agnostic, `m%tp==0`); Row = strided per-row k-gather (`rb%tp==0`, group-alignment is validate_manifest's).
+  Covers the REAL llama/qwen dense manifest (separate Column wq/wk/wv + Row o_proj/down + Replicate/Pin/Tied).
+- **PB-1b (FusedQkv/HeadSharded/VocabShard) DEFERRED** — emitted by NO current manifest (would be speculative);
+  stays a clean `Err`. Implement when a manifest needs it.
+- **REMAINING (all large/structural, some forked):** PB-2 resolve_mesh real Tp axis — **FORK: `tp` knob currently
+  maps to the `Ep` axis (config.rs:155) for MoE serving; disentangling EP-vs-TP intent ripples into the daemon load
+  path** (needs bjoern's steer, like the P-A mesh-only call). PB-3 store→forward bridge (hand per-rank sharded
+  WeightRef into DenseLayer; sharded m/k). PB-4 execute_steps_mesh TP body + the `&mut Gpu→&mut Gpus` promotion
+  (core; mirror the EP arm — per-rank sharded GEMV + `all_reduce_sum_f32_peer` after RowShard via
+  `collective_for_policy`). PB-5 daemon `load_model_tp` + serve (mirror `load_model_ep`/`forward_ep`) + `tp_decode_parity`
+  harness (FNV parity vs single-GPU, FP32+DETERMINISTIC). Validate throughout with `HIPFIRE_EMULATE_GPUS=2`.
