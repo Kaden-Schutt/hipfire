@@ -273,7 +273,24 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   (rank0) → argmax → feed back. Mirrors `ep_decode_parity` (which is ALSO a standalone example, separate from EP's
   daemon `generate_ep`). **The dense-TP forward + serve algorithm is fully proven; `build_layer_steps` is the reusable
   per-layer TP body a real `generate_tp` drives.**
-- **PB-TP5 REMAINING (daemon productionization) — `load_model_tp` + `generate_tp` + `LoadedModel.tp`.** Large mechanical
+- **PB-TP5 DAEMON INTEGRATION DONE + validated (`6b71b132`)** — dense-TP now SERVES through the daemon. New
+  `hipfire_runtime::tp_serve::TpModel` (reusable form of tp_decode_parity: `forward_token(tok,pos)` + `logits()`;
+  disjoint-field borrows split `self.gpus` mut from `self.ranks/store`). `LoadedModel.tp: Option<TpModel>` (a field
+  distinct from `ep`; only `skeleton()` needed `tp:None` — the 15 other ctors spread `..skeleton()`; unload drops it).
+  `load_model_tp` real (host tokenizer/chat-template/rec-sampling → `TpModel::load`; eos in the generic
+  `deepseek4_eos_tok` slot). Daemon `generate_tp` (ChatFrame render → per-token prefill → `sampler::sample_cpu` decode →
+  stream token/done events; eos/terminator/stop/max_tokens), dispatched `if m.tp.is_some()` before ep/arch. **Validated
+  live gfx1151 emulated Tp-2:** `load {tp:2}` + generate → coherent stream + done event, and the tp=2 token stream is
+  **BYTE-IDENTICAL to a tp=1 single-GPU serve** of the same prompt. Investigation used 3 parallel Explore subagents
+  (LoadedModel ctors, generate protocol, load-path fields). **Lean scope:** llama-family qk-norm (arch 0/1), MQ4G256,
+  Q8 KV, stateless per request (pos 0), per-token prefill; no spec/PFlash/eviction/grammar/tools, no multi-turn KV reuse.
+  **P-B (tensor-parallel, TP1→TP5) is COMPLETE end-to-end: forward primitives → real-model parity → serve loop → daemon.**
+- **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
+  drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
+  layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
+  daemon (load routes on the raw `tp`/`ep` knobs) — wire it if mesh-driven load lands. Then P-C (PP-at-driver), P-D
+  (Step::Moe/EP fold retiring run_layer_program_mesh), P-E (Step::Recurrent/Conv + DeltaNet head-shard).
+- **(historical) PB-TP5 REMAINING (daemon productionization) — `load_model_tp` + `generate_tp` + `LoadedModel.tp`.** Large mechanical
   wiring (mirror the EP integration): (1) a `TpState` in hipfire-loader { `Gpus`, `WeightStore`, per-rank RankState
   (scratch+KV+norms), config, eos } ; (2) `LoadedModel.tp: Option<TpState>` — ripples `tp: None` to every LoadedModel
   constructor ; (3) `load_model_tp` builds the served model (tokenizer, chat-template/eos, recommended sampling, the
