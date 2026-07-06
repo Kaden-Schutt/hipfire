@@ -168,8 +168,16 @@ fn flow_match_euler_step_uses_model_output_as_velocity() {
         .step(&mut latents, &[0.25, -0.5], 0, &mut state)
         .unwrap();
 
-    assert_eq!(schedule.sigmas, vec![1.0, 0.0, 0.0]);
-    assert_eq!(latents.data, vec![0.75, -0.5]);
+    // Pre-shift sigmas are linspace(1, 1/num_train, steps): the last model-eval
+    // sigma is 1/1000 = 0.001 (never 0), with a terminal 0 appended. Step 0 dt =
+    // 0.001 - 1.0 = -0.999, and latent += velocity * dt.
+    assert_eq!(schedule.sigmas.len(), 3);
+    assert!((schedule.sigmas[0] - 1.0).abs() < 1e-6);
+    assert!((schedule.sigmas[1] - 0.001).abs() < 1e-5 && schedule.sigmas[1] > 0.0);
+    assert_eq!(schedule.sigmas[2], 0.0);
+    let dt = schedule.sigmas[1] - schedule.sigmas[0];
+    assert!((latents.data[0] - (1.0 + 0.25 * dt)).abs() < 1e-6);
+    assert!((latents.data[1] - (-1.0 + -0.5 * dt)).abs() < 1e-6);
 }
 
 fn flow_match_base_schedule_for_refine() -> DiffusionSchedule {

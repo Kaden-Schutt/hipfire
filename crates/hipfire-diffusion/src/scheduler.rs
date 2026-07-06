@@ -363,12 +363,19 @@ impl DiffusionSchedule {
         } else {
             None
         };
+        // diffusers FlowMatchEulerDiscreteScheduler spaces the pre-shift sigmas as
+        // linspace(1, 1/num_train_timesteps, steps) -- the last MODEL-EVALUATION
+        // sigma is 1/num_train_timesteps (~0.001), NOT 0; the terminal 0 is only
+        // appended afterwards. Ending the ramp at 0 makes the model be evaluated
+        // at timestep 0, where a flow-match DiT's velocity is ill-defined; the
+        // step's dt is also 0, so `latent += velocity * 0` becomes 0 * inf = NaN.
+        let sigma_min_frac = 1.0 / train_timesteps as f32;
         let mut sigmas = Vec::with_capacity(steps + 1);
         for idx in 0..steps {
             let frac = if steps == 1 {
                 1.0
             } else {
-                1.0 - idx as f32 / (steps - 1) as f32
+                1.0 - (idx as f32 / (steps - 1) as f32) * (1.0 - sigma_min_frac)
             };
             let sigma = match dynamic_mu {
                 // Exponential time shift; frac == 0 -> sigma 0 (1/frac -> inf).
@@ -1313,15 +1320,21 @@ mod flow_match_dynamic_tests {
         let base =
             DiffusionSchedule::flow_match_euler_with_image_seq_len(&dynamic_config(), 3, Some(256))
                 .unwrap();
+        // Pre-shift sigmas are linspace(1, 1/num_train_timesteps, steps), so for
+        // steps=3 the mid frac is 1 - 0.5*(1 - 1/1000), not exactly 0.5.
+        let mid_frac = 1.0 - 0.5 * (1.0 - 1.0 / 1000.0);
         let e = 0.5f32.exp();
-        let expected_mid = e / (e + 1.0);
+        let expected_mid = e / (e + (1.0 / mid_frac - 1.0));
         assert!(
             (base.sigmas[1] - expected_mid).abs() < 1e-4,
             "mid sigma {} != {expected_mid}",
             base.sigmas[1]
         );
         assert!((base.sigmas[0] - 1.0).abs() < 1e-4);
+        // The terminal sigma (appended after the ramp) is 0, but the last
+        // MODEL-EVALUATION sigma must be > 0 (never evaluate the DiT at t=0).
         assert_eq!(*base.sigmas.last().unwrap(), 0.0);
+        assert!(base.sigmas[base.sigmas.len() - 2] > 0.0);
         // Higher resolution -> larger mu -> larger mid sigma.
         let big = DiffusionSchedule::flow_match_euler_with_image_seq_len(
             &dynamic_config(),
@@ -1342,7 +1355,9 @@ mod flow_match_dynamic_tests {
         let mut config = dynamic_config();
         config.use_dynamic_shifting = Some(false);
         let sched = DiffusionSchedule::flow_match_euler(&config, 3).unwrap();
-        // shift 1.0, no dynamic shifting -> sigma == frac (linear schedule).
-        assert!((sched.sigmas[1] - 0.5).abs() < 1e-6);
+        // shift 1.0, no dynamic shifting -> sigma == frac (linear schedule). The
+        // ramp is linspace(1, 1/num_train, 3), so the mid frac is 1-0.5*(1-1/1000).
+        let mid = 1.0 - 0.5 * (1.0 - 1.0 / 1000.0);
+        assert!((sched.sigmas[1] - mid).abs() < 1e-6);
     }
 }
