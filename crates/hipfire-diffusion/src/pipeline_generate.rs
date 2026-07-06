@@ -9,6 +9,49 @@
 
 use super::*;
 
+/// Debug: print summary stats for a `[batch, seq, hidden]` conditioning tensor
+/// (or any tensor) — mean/std/min/max, finite fraction, and per-token L2 norm
+/// spread. Used by the HIPFIRE_DUMP_COND hook to spot dead/constant/NaN text
+/// conditioning that would make the denoiser emit structured noise.
+fn dump_conditioning_stats(label: &str, t: &CpuTensor) {
+    let n = t.data.len().max(1);
+    let finite = t.data.iter().filter(|v| v.is_finite()).count();
+    let mean = t.data.iter().copied().map(|v| v as f64).sum::<f64>() / n as f64;
+    let var =
+        t.data.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+    let min = t.data.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = t.data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // Per-token L2 norm over the last (hidden) dim.
+    let hidden = *t.shape.last().unwrap_or(&n).max(&1);
+    let mut norms = Vec::new();
+    let mut zero_rows = 0usize;
+    for row in t.data.chunks(hidden) {
+        let l2 = (row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>()).sqrt();
+        if l2 == 0.0 {
+            zero_rows += 1;
+        }
+        norms.push(l2);
+    }
+    let (nmin, nmax, nmean) = if norms.is_empty() {
+        (0.0, 0.0, 0.0)
+    } else {
+        let s: f64 = norms.iter().sum();
+        (
+            norms.iter().copied().fold(f64::INFINITY, f64::min),
+            norms.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            s / norms.len() as f64,
+        )
+    };
+    eprintln!(
+        "[cond] {label}: shape={:?} mean={mean:+.5} std={:.5} min={min:+.3} max={max:+.3} \
+         finite={finite}/{n} | per-token L2 mean={nmean:.3} min={nmin:.3} max={nmax:.3} \
+         zero_rows={zero_rows}/{}",
+        t.shape,
+        var.sqrt(),
+        norms.len()
+    );
+}
+
 impl DiffusionPipeline {
     pub fn generate_batch(
         &self,
@@ -76,6 +119,26 @@ impl DiffusionPipeline {
                     "diffusion HFQ does not contain usable native text conditioning".to_string(),
                 )
             })?;
+        // Debug hook: HIPFIRE_DUMP_COND prints stats for the text conditioning
+        // tensors fed to the denoiser. A dead/constant/NaN conditioning tensor
+        // makes the denoiser produce structured noise. Also reports whether the
+        // positive and negative streams are (nearly) identical, which would mean
+        // CFG has nothing to steer with.
+        if std::env::var("HIPFIRE_DUMP_COND").is_ok_and(|v| !v.is_empty()) {
+            dump_conditioning_stats("positive", positive_embeddings);
+            dump_conditioning_stats("negative", negative_embeddings);
+            if positive_embeddings.shape == negative_embeddings.shape {
+                let n = positive_embeddings.data.len().max(1);
+                let mad: f64 = positive_embeddings
+                    .data
+                    .iter()
+                    .zip(&negative_embeddings.data)
+                    .map(|(a, b)| (a - b).abs() as f64)
+                    .sum::<f64>()
+                    / n as f64;
+                eprintln!("[cond] pos-vs-neg mean|Δ|={mad:.6} (near 0 => CFG has nothing to steer)");
+            }
+        }
         let _primary_positive_embeddings = plan
             .conditioning
             .prompt_embeddings
@@ -219,6 +282,26 @@ impl DiffusionPipeline {
                     "diffusion HFQ does not contain usable native text conditioning".to_string(),
                 )
             })?;
+        // Debug hook: HIPFIRE_DUMP_COND prints stats for the text conditioning
+        // tensors fed to the denoiser. A dead/constant/NaN conditioning tensor
+        // makes the denoiser produce structured noise. Also reports whether the
+        // positive and negative streams are (nearly) identical, which would mean
+        // CFG has nothing to steer with.
+        if std::env::var("HIPFIRE_DUMP_COND").is_ok_and(|v| !v.is_empty()) {
+            dump_conditioning_stats("positive", positive_embeddings);
+            dump_conditioning_stats("negative", negative_embeddings);
+            if positive_embeddings.shape == negative_embeddings.shape {
+                let n = positive_embeddings.data.len().max(1);
+                let mad: f64 = positive_embeddings
+                    .data
+                    .iter()
+                    .zip(&negative_embeddings.data)
+                    .map(|(a, b)| (a - b).abs() as f64)
+                    .sum::<f64>()
+                    / n as f64;
+                eprintln!("[cond] pos-vs-neg mean|Δ|={mad:.6} (near 0 => CFG has nothing to steer)");
+            }
+        }
         let _primary_positive_embeddings = plan
             .conditioning
             .prompt_embeddings
