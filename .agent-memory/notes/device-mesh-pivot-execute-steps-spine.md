@@ -144,3 +144,35 @@ EP path = the working template — `run_layer_program_mesh` EP arm `superop.rs:4
   head-parallel — Column-sharding qkv `[nh·hd,d]` by equal rows == head-split when `nh%tp==0`, then attention on
   owned heads + Row o_proj all-reduce. PB-5 daemon `load_model_tp` + serve + real-model `tp_decode_parity` (FNV vs
   single-GPU, FP32+DETERMINISTIC). This is the multi-session capstone; the hard primitives are done + validated.
+
+## DIRECTION LOCKED 2026-07-06 — bjoern chose GRAND-UNIFY (TP inside execute_steps), not a parallel forward
+Asked bjoern how PB-4-full should reach real-model TP logit parity; offered (a) standalone F32 tp_llama_forward
+parity, (b) mirror EP serve path into load_model_tp now, (c) TP inside execute_steps (Step IR) now. **He picked (c)**
+— the pivot's endgame: the ONE dense executor (`execute_steps`) becomes TP; no parallel forward, no SuperOp spine.
+Sub-plan (local, gitignored): `docs/superpowers/plans/2026-07-06-P-B-tp-in-execute-steps.md`. Renamed remaining P-B
+work to **PB-TP1..PB-TP5**.
+
+**Key IR facts (steps.rs):** `Step<'a>` carries whole-model borrows (`Gemv{w:&WeightRef, input, out:&GpuTensor}`,
+`GemvResidual`, `RmsnormAutomatic`, `Attend`, `Rope`, `QkNorm`, `BiasAdd`) → a single `&[Step]` can't be sharded in
+place; each rank needs its OWN sharded weight+buffers → the TP executor takes **per-rank Step lists** (lock-step).
+`WeightRef{buf,dtype,m,k,row_stride,rotation,awq_scale}` is a plain borrow struct (build F32 directly, row_stride=0).
+GEMV family `run_auto` dispatches F32 via `RotationPlan::None`→`gemv_f32`. **The Step IR has NO activation (silu) op**
+— silu is fused into gate-up kernels, so a full FFN needs a new step or the fused path (later increment). hipfire-dispatch
+already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (ep.rs/superop.rs) — the EP
+`run_layer_program_mesh` (superop.rs:457) is the exact precedent (per-rank bindings + collective on `SuperOpKind::Moe`).
+
+- **PB-TP1 DONE + validated** (`27002c55`) — `execute_steps_tp(mesh, gpus: &mut Gpus, per_rank_steps: &[Vec<Step>],
+  collectives: &[TpCollective])` in steps.rs (re-exported from `pipeline`). Runs each Step on every rank of
+  `group_along(Tp)` (bind_thread + `launch_op`, no fusion), then for `TpCollective::AllReduceOut{dim}` syncs each
+  rank's stream + `all_reduce_sum_f32_peer` over the row-parallel step's `out` bufs (extracted via `tp_step_out_buf`).
+  Column Gemv → sharded output feeds next step; Row Gemv → partial summed in place. Residual add must be a SEPARATE
+  post-collective step (row-parallel GemvResidual would sum residual tp×). Example `tp_execute_steps_parity`: column→row
+  GEMV pair routed THROUGH the executor == single-device on emulated Tp-2 (gfx1151), max|Δ|=1.21e-8; dispatch lib 172/0.
+  NEW `execute_steps_tp` entry, NOT a signature change to `execute_steps_mesh` (P-A kept `&mut Gpu` for 40+ sites);
+  unify once proven. Additive/off-path (only the example calls it). Uses `_peer` all-reduce; per-rank `DispatchCtx`.
+- **PB-TP2..5 REMAINING:** TP2 = derive per_rank_steps+collectives from a sharded `WeightStore`+`ShardPolicy`
+  (`collective_for_policy`), add replicated `RmsnormAutomatic` + attention Steps (Rope/Attend on owned heads, from PB-3).
+  TP3 = close the silu gap (new Step or fused gate-up) → whole TP transformer layer through the executor. TP4 = wire
+  `dense_forward` to emit per-rank sharded Steps when `mesh` Tp>1; thread `&mut Gpus`; real llama forward TP; full-model
+  logit parity (FP32+DETERMINISTIC). TP5 = daemon `load_model_tp`+serve AFTER the EP-vs-TP intent fork (config.rs:155
+  `tp`→Ep) + `tp_decode_parity`. **RAISE THE EP-vs-TP FORK with bjoern before TP5/daemon work** (his standing ask).
