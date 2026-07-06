@@ -242,46 +242,69 @@ $(printf 'Fold the EP MoE branch into ONE mesh-driven executor core; single Ep-g
 
 ## STEP 2 — Migrate all call sites onto the merged entry; delete the shim + old signature
 
-The substantive, wider-ripple step: single-GPU forwards must hand the executor a `&mut Gpus`, so single-GPU models own `Gpus::single` from load. Migrate one arch at a time, each its own byte-exact-gated commit, so a reviewer can reject one arch without blocking the others.
+The substantive step, split so the one wide edit is **byte-neutral and isolated** from the behavior-bearing ones. **2.0** swaps device ownership to `Gpus::single` inside `fn main()` with no signature changes anywhere (coherence-gated, bit-identical). **2.1–2.5** then thread `&mut Gpus` through one arch at a time, each `FORWARD_LOWERED` md5-gated, so a reviewer can reject one arch without blocking the others.
 
-### Task 2.0: Thread `Gpus` ownership for single-GPU models (daemon)
+### Task 2.0: Byte-neutral `Gpus::single` ownership swap in `fn main()` (daemon)
+
+**Concrete boundary (verified 2026-07-06):** both `let mut gpu = rdna_compute::Gpu::init()` sites (daemon.rs:1421 and 1452) are inside **`fn main()` (daemon.rs:1391–3132)**. That scope holds **~59** of the file's `gpu` references; the other ~268 are `gpu:` **parameters in other functions** and DO NOT change in this task. **This task edits ONLY `fn main()`.**
+
+**Byte-neutral contract:** NO function signature changes anywhere. Every forward/helper called from `main()` keeps its `&mut Gpu` parameter and is fed `&mut gpus.devices[0]`. No `&mut Gpus` is threaded yet (that is per-arch, 2.1–2.5). Behavior is bit-identical — this task only moves *where the device is owned*, not how the forward runs.
 
 **Files:**
-- Modify: `crates/hipfire-runtime/examples/daemon.rs` (single-GPU model load → hold `Gpus::single(gpu)`; forward call path passes `&mut Gpus`). Do NOT rustfmt this file.
+- Modify: `crates/hipfire-runtime/examples/daemon.rs`, `fn main()` scope only (1391–3132). **Do NOT rustfmt this file.**
 
 **Interfaces:**
-- Consumes: `Gpus::single(gpu: Gpu) -> Gpus` (hardware, `multi_gpu.rs:156`).
-- Produces: single-GPU model state owns a `Gpus` (one device); the lowered-forward call receives `&mut Gpus`.
+- Consumes: `Gpus::single(gpu: Gpu) -> Gpus` (`hipfire_hardware` / `multi_gpu.rs:156`); `gpus.devices: Vec<Gpu>`.
+- Produces: `main()` owns `gpus: Gpus` (one device); every other function is untouched.
 
-- [ ] **Step 1: Locate the single-GPU device-ownership + forward call chain**
+- [ ] **Step 1: Confirm the scope**
 
-Run: `nix develop -c bash -c 'grep -n "Gpu\b\|forward_scratch\|generate" crates/hipfire-runtime/examples/daemon.rs | grep -iE "let .*gpu|\.forward|device" | head -40'`
-Record: where the single-GPU model's `Gpu` is stored, and the call chain from the generate loop down to each arch's lowered driver. (This is the load-bearing trace; capture the exact fields/functions before editing.)
+Run: `nix develop -c bash -c "awk 'NR>=1391 && NR<3133' crates/hipfire-runtime/examples/daemon.rs | grep -c '\bgpu\b'"`
+Expected: ~59. Read the two init sites (1421, 1452) and note every `main()`-local use of `gpu` (the forwards/helpers it passes `&mut gpu` to). Do not edit yet.
 
-- [ ] **Step 2: Change single-GPU model state to hold `Gpus::single`**
+- [ ] **Step 2: Swap ownership, byte-neutral**
 
-Replace the model's owned `gpu: Gpu` with `gpus: Gpus` built via `Gpus::single(gpu)` at load. At every downstream single-device use, replace `&mut gpu` with `&mut gpus.devices[0]`, and hand `&mut gpus` to the lowered driver. (Mechanical `gpu → gpus.devices[0]` for non-executor ops; `&mut gpus` for the executor call.)
+At both init sites, wrap the initialized `Gpu` in `Gpus::single` (it takes `Gpu` by value — keep the existing init error handling, then wrap the `Ok` value):
+```rust
+// was: let mut gpu = match rdna_compute::Gpu::init() { Ok(g) => g, Err(e) => ... };
+let mut gpus = hipfire_hardware::Gpus::single(match rdna_compute::Gpu::init() {
+    Ok(g) => g,
+    Err(e) => /* unchanged error arm */,
+});
+```
+Then, **within `fn main()` only**, rewrite each remaining use: `&mut gpu` → `&mut gpus.devices[0]`, `&gpu` → `&gpus.devices[0]`. Do NOT touch any `gpu:` parameter in other functions. Do NOT introduce any `&mut gpus` argument (no callee accepts one until 2.1).
 
-- [ ] **Step 3: Build the workspace**
+- [ ] **Step 3: Build**
 
 Run: `nix develop -c cargo build --release -p hipfire-runtime --example daemon`
-Expected: compiles (arch drivers still take `&mut Gpu` until Task 2.1+; this task only changes ownership + prepares `&mut Gpus` at the call boundary — if a driver isn't migrated yet, pass `&mut gpus.devices[0]` to keep it compiling).
+Expected: compiles. (All callees still take `&mut Gpu`, now fed `&mut gpus.devices[0]`.)
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Coherence gate (the byte-neutral regression net)**
+
+Run: `nix develop -c ./scripts/coherence-gate.sh`
+Expected: clean across the matrix (fluent, no panic / zero-tokens / timeout). No `FORWARD_LOWERED` md5 A/B here — the forward is unchanged, so coherence is the correctness net for the ownership move.
+
+- [ ] **Step 5: Commit** (do NOT rustfmt daemon.rs)
 
 ```bash
 git add crates/hipfire-runtime/examples/daemon.rs
-git commit -m "refactor(daemon): single-GPU models own Gpus::single (executor merge prep)
+git commit -m "refactor(daemon): fn main() owns Gpus::single (byte-neutral executor-merge prep)
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```
+
+**BLOCKED escalation:** if a `gpus.devices[0]` reborrow conflicts with another live borrow of `gpus` in `main()` (should not happen in 2.0 — nothing takes `&mut gpus` yet), STOP and report. Do not paper over it with `.clone()` or `unsafe`.
 
 ### Task 2.1–2.5: Per-arch single-GPU driver migration (repeat for each arch)
 
 Do this **once per arch**, in this order (simplest dense first): **qwen2** (`qwen2.rs:1380`), **lfm2moe** (`forward.rs:696`), **minimax** (`forward.rs:754`), **deepseek4** (`forward.rs:2153`), **qwen35** (`qwen35.rs:13061`). Each is one commit with its own byte-exact gate.
 
 **Files (per arch):**
-- Modify: the arch's lowered driver function — change its parameter from `gpu: &mut Gpu` to `gpus: &mut Gpus` (or add `gpus`), and rewrite the call site.
+- Modify: the arch's lowered driver function (e.g. qwen2 `forward_step_after_x_lowered`, qwen35 `forward_scratch_layers_lowered`, ds4/minimax `decode_step_body_lowered`, lfm2moe `decode_step_layers_and_head_lowered`) — rewrite the `run_layer_program` call.
+- Modify: the call chain from `main()` down to that driver — the arch's public forward entry (`qwen2::forward_step` / `llama::forward_scratch` / `<arch>::forward::decode_step` / `forward_prefill_batch`) and any intermediate wrapper — threading `&mut Gpus`.
+- Modify: `daemon.rs` `fn main()` — this arch's forward call site switches `&mut gpus.devices[0]` → `&mut gpus`. (Do NOT rustfmt daemon.rs or the fmt-debt arch `forward.rs`/`qwen35.rs`.)
+
+**Threading rule:** each fn on the chain from `main()` to the lowered driver changes its `gpu: &mut Gpu` param to `gpus: &mut Gpus`; its OTHER internal `&mut Gpu` helper calls (attention, norms, kv) are fed `&mut gpus.devices[0]`; only the executor call gets the whole `gpus`. This must land atomically (signature + all its callers) or the crate won't build.
 
 **Interfaces:**
 - Consumes: `run_layer_program_mesh` (Task 1), `DeviceMesh::single()`, `std::slice::from_mut`.
