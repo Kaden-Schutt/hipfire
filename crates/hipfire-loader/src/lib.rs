@@ -277,6 +277,10 @@ pub struct LoadedModel {
     pub pp_scratch_set: Option<Qwen35ScratchSet>,
     pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
+    /// Dense tensor-parallel served model (PB-TP5, the `Tp` axis). Distinct from
+    /// `ep` (expert-parallel, `Ep` axis): dense row/col sharding of a llama-family
+    /// model. When `Some`, the daemon serves via `generate_tp`.
+    pub tp: Option<hipfire_runtime::tp_serve::TpModel>,
     // Shared arch state
     pub state: Option<ModelState>,
     pub kv_cache: Option<llama::KvCache>,
@@ -365,6 +369,7 @@ impl LoadedModel {
             arch_id,
             pp: 1,
             ep: None,
+            tp: None,
             pp_gpus: None,
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
@@ -1291,16 +1296,35 @@ pub fn load_model_ep(path: &str, max_seq: usize, ep: usize) -> Result<LoadedMode
 /// `LlamaWeights` from a `WeightStore`, per-rank scratch/KV, a `Gpus`-threaded
 /// decode loop, and `tp_decode_parity` — is **PB-TP5** and not yet done, so this
 /// returns a clear error rather than silently falling back to single-GPU.
-pub fn load_model_tp(path: &str, _max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
-    let arch = HfqFile::open(Path::new(path))
-        .map(|h| h.arch_id)
-        .unwrap_or(u32::MAX);
-    Err(format!(
-        "tensor-parallel serving (tp={tp}, arch_id={arch}) is not yet wired — PB-TP5. The TP \
-         forward is validated (execute_steps_tp + store→forward bridge == single-GPU logits; \
-         see the tp_full_model_parity example). Use `ep` for expert-parallel MoE (arch 9/10), \
-         or load single-GPU (tp=1) meanwhile."
-    ))
+pub fn load_model_tp(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    // Host-side metadata BEFORE GPU allocation (chat template + recommended
+    // sampling), matching the ds4/minimax EP loaders.
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let arch_id = hfq.arch_id;
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+    drop(hfq); // TpModel::load reopens; free this handle before GPU work.
+
+    let tp_model = hipfire_runtime::tp_serve::TpModel::load(path, tp, max_seq)?;
+    let eos_tok = tp_model.eos_token();
+
+    Ok(LoadedModel {
+        tp: Some(tp_model),
+        deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (TP state is in `tp`, not `state`)
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
+    })
 }
 
 fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
@@ -1545,6 +1569,13 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
 // ─── Unload ───────────────────────────────────────────────────────────
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    // Dense-TP unload (PB-TP5): the `TpModel` owns its own `Gpus` + `WeightStore`
+    // + per-rank buffers; dropping it tears down the device contexts (reclaiming
+    // all rank VRAM), like the EP path's final `drop(gpus)`. The daemon's single
+    // `gpu` is untouched (unused for tp>1).
+    if let Some(tp) = m.tp.take() {
+        drop(tp);
+    }
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
     // per-rank weight / state / partial. Free per-rank weights → state → partials

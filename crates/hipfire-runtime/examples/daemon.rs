@@ -2369,10 +2369,10 @@ fn main() {
                 // tensors live on Gpus instead. Refuse cleanly per snapshot
                 // review patch f253472. A pp>1 prefill bench is out of scope
                 // for v1.
-                if m.pp > 1 || m.ep.is_some() {
+                if m.pp > 1 || m.ep.is_some() || m.tp.is_some() {
                     let _ = writeln!(
                         stdout,
-                        r#"{{"type":"error","message":"bench_prefill requires a single-GPU model (pp=1, non-EP); multi-GPU/EP bench not implemented"}}"#
+                        r#"{{"type":"error","message":"bench_prefill requires a single-GPU model (pp=1, non-EP/TP); multi-GPU/EP/TP bench not implemented"}}"#
                     );
                     let _ = stdout.flush();
                     continue;
@@ -2660,6 +2660,137 @@ struct EpSampling {
     top_p: f32,
     top_k: Option<u32>,
     min_p: Option<f32>,
+}
+
+/// Dense tensor-parallel serve (PB-TP5). Serves a llama-family model sharded
+/// across the `Tp` axis via `m.tp` (a `TpModel`): ChatFrame-render the prompt,
+/// prefill it token-by-token through the tensor-parallel forward, then greedy-or-
+/// sampled decode. Each request starts at pos 0 (stateless — no multi-turn KV
+/// reuse). Lean by design: no spec-decode / PFlash / eviction / grammar / tools;
+/// the TP forward is `execute_steps_tp` over the store→forward bridge (validated
+/// argmax-exact vs single-GPU in `tp_decode_parity`).
+#[allow(clippy::too_many_arguments)]
+fn generate_tp(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    stop: &[String],
+) {
+    use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
+    use hipfire_runtime::sampler::{self, SamplerConfig};
+    let t0 = std::time::Instant::now();
+
+    // Disjoint field borrows: `m.tokenizer` (read) + `m.tp` (mut) are distinct fields.
+    let tokenizer = m.tokenizer.as_ref().expect("tp serve: tokenizer");
+    let frame = ChatFrame {
+        tokenizer,
+        system: system_prompt,
+        user: prompt,
+        assistant_prefix: AssistantPrefix::Plain,
+        raw: false,
+    }
+    .build();
+    let prefill_n = frame.len();
+    let tp = m.tp.as_mut().expect("tp serve: TpModel");
+    let eos = tp.eos_token();
+
+    macro_rules! fail {
+        ($e:expr) => {{
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":{}}}"#,
+                id,
+                serde_json::to_string(&format!("tp serve: {}", $e)).unwrap_or_default()
+            );
+            let _ = stdout.flush();
+            return;
+        }};
+    }
+
+    // Prefill (per token — no batched prefill yet).
+    for (pos, &tok) in frame.iter().enumerate() {
+        if let Err(e) = tp.forward_token(tok, pos) {
+            fail!(e);
+        }
+    }
+    let t_prefill = std::time::Instant::now();
+    let prefill_ms = t_prefill.duration_since(t0).as_secs_f64() * 1000.0;
+
+    let cfg = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty: 1.0,
+        repeat_window: 0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p,
+    };
+    let mut logits = match tp.logits() {
+        Ok(l) => l,
+        Err(e) => fail!(e),
+    };
+    let mut history: Vec<u32> = Vec::new();
+    let mut next = sampler::sample_cpu(&mut logits, &history, &cfg);
+    let mut generated = 0usize;
+    let mut pos = prefill_n;
+    loop {
+        if next == eos || tokenizer.is_terminator(next) {
+            break;
+        }
+        let text = tokenizer.decode(&[next]);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":{}}}"#,
+            id,
+            serde_json::to_string(&text).unwrap_or_default()
+        );
+        let _ = stdout.flush();
+        history.push(next);
+        generated += 1;
+        if generated >= max_tokens {
+            break;
+        }
+        if !stop.is_empty() {
+            let suffix = tokenizer.decode(&history);
+            if stop
+                .iter()
+                .any(|s| !s.is_empty() && suffix.ends_with(s.as_str()))
+            {
+                break;
+            }
+        }
+        if let Err(e) = tp.forward_token(next, pos) {
+            fail!(e);
+        }
+        pos += 1;
+        logits = match tp.logits() {
+            Ok(l) => l,
+            Err(e) => fail!(e),
+        };
+        next = sampler::sample_cpu(&mut logits, &history, &cfg);
+    }
+
+    let decode_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    let decode_tok_s = if decode_ms > 0.0 {
+        generated as f64 / (decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"decode_tok_s":{:.1}}}"#,
+        id, generated, decode_tok_s, prefill_n, prefill_ms, decode_tok_s
+    );
+    let _ = stdout.flush();
 }
 
 fn generate_ep(
@@ -6545,6 +6676,25 @@ fn generate(
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // Dense tensor-parallel (PB-TP5): route to generate_tp BEFORE any arch
+    // short-circuit / EP. TP mode holds its model in `m.tp` (a TpModel over its
+    // own Gpus); the single-GPU arch fields are None.
+    if m.tp.is_some() {
+        generate_tp(
+            m,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            max_tokens,
+            stop,
+        );
+        return;
+    }
     // Expert-parallel (task #26): route to generate_ep BEFORE any arch
     // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
