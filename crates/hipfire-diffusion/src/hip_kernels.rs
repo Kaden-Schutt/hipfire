@@ -1424,3 +1424,49 @@ extern "C" __global__ void diffusion_rope_qwen_f32(
     output[imag_idx] = real * s + imag * c;
 }
 "#;
+
+pub(crate) const DIFFUSION_ADALN_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// adaLN modulate: out[b,s,c] = in[b,s,c]*(1+scale[b,c]) + shift[b,c]. scale/shift
+// are [batch, width], broadcast over seq.
+extern "C" __global__ void diffusion_modulate_3d_f32(
+    const float* input,
+    const float* shift,
+    const float* scale,
+    float* output,
+    int total,
+    int seq,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int c = idx % width;
+    int token = idx / width;
+    int b = token / seq;
+    int mod_base = b * width + c;
+    output[idx] = input[idx] * (1.0f + scale[mod_base]) + shift[mod_base];
+}
+
+// Gated residual: out[b,s,c] = residual[b,s,c] + update[b,s,c]*gate[b,c].
+extern "C" __global__ void diffusion_gated_residual_3d_f32(
+    const float* residual,
+    const float* update,
+    const float* gate,
+    float* output,
+    int total,
+    int seq,
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int c = idx % width;
+    int token = idx / width;
+    int b = token / seq;
+    output[idx] = residual[idx] + update[idx] * gate[b * width + c];
+}
+"#;

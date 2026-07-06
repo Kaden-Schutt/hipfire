@@ -4068,6 +4068,98 @@ fn two_input_gate_resident(
     Ok(output)
 }
 
+/// Device-resident adaLN modulate: `out = input*(1+scale) + shift`, with
+/// `shift`/`scale` resident `[batch, width]` broadcast over seq.
+#[allow(dead_code)]
+pub(crate) fn modulate_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    input: &hipfire_rdna::GpuTensor,
+    shift: &hipfire_rdna::GpuTensor,
+    scale: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, seq, width] = resident_dims3(&input.shape, "modulate input")?;
+    if shift.shape.as_slice() != [batch, width] || scale.shape.as_slice() != [batch, width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "modulate shift/scale shapes {:?}/{:?} != [{batch}, {width}]",
+            shift.shape, scale.shape
+        )));
+    }
+    let total = checked_shape_elements("modulate output", &input.shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &input.shape)?;
+    if total == 0 {
+        return Ok(output);
+    }
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(input.buf.as_ptr());
+    kernargs.push_ptr(shift.buf.as_ptr());
+    kernargs.push_ptr(scale.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("modulate total", total)?);
+    kernargs.push_i32(i32_kernel_dim("modulate seq", seq)?);
+    kernargs.push_i32(i32_kernel_dim("modulate width", width)?);
+    kernargs.pad_to(16);
+    let grid = [((total as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_modulate_3d_f32",
+        DIFFUSION_ADALN_HIP_SRC,
+        "diffusion_modulate_3d_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
+/// Device-resident gated residual: `out = residual + update*gate`, `gate`
+/// resident `[batch, width]` broadcast over seq.
+#[allow(dead_code)]
+pub(crate) fn gated_residual_3d_resident(
+    gpu: &mut hipfire_rdna::Gpu,
+    residual: &hipfire_rdna::GpuTensor,
+    update: &hipfire_rdna::GpuTensor,
+    gate: &hipfire_rdna::GpuTensor,
+) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+    let [batch, seq, width] = resident_dims3(&residual.shape, "gated residual")?;
+    if update.shape != residual.shape || gate.shape.as_slice() != [batch, width] {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "gated residual shape mismatch residual/update/gate {:?}/{:?}/{:?}",
+            residual.shape, update.shape, gate.shape
+        )));
+    }
+    let total = checked_shape_elements("gated residual output", &residual.shape)?;
+    gpu.bind_thread()
+        .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let output = alloc_resident_f32(gpu, &residual.shape)?;
+    if total == 0 {
+        return Ok(output);
+    }
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(residual.buf.as_ptr());
+    kernargs.push_ptr(update.buf.as_ptr());
+    kernargs.push_ptr(gate.buf.as_ptr());
+    kernargs.push_ptr(output.buf.as_ptr());
+    kernargs.push_i32(i32_kernel_dim("gated residual total", total)?);
+    kernargs.push_i32(i32_kernel_dim("gated residual seq", seq)?);
+    kernargs.push_i32(i32_kernel_dim("gated residual width", width)?);
+    kernargs.pad_to(16);
+    let grid = [((total as u32).saturating_add(255)) / 256, 1, 1];
+    ensure_and_launch_diffusion_kernel(
+        gpu,
+        "diffusion_gated_residual_3d_f32",
+        DIFFUSION_ADALN_HIP_SRC,
+        "diffusion_gated_residual_3d_f32",
+        grid,
+        [256, 1, 1],
+        0,
+        &mut kernargs,
+    )?;
+    Ok(output)
+}
+
 /// Device-resident Qwen interleaved RoPE over `[batch, seq, heads*head_dim]`.
 /// `cos`/`sin` are `[seq, head_dim/2]` frequency tables (resident-cached by
 /// pointer, stable across steps). Keeps the activation on-device.

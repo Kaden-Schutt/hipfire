@@ -1811,6 +1811,64 @@ fn rope_qwen_resident_matches_cpu_reference() {
 }
 
 #[test]
+fn resident_adaln_modulate_and_gated_residual_match_cpu() {
+    let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("skip: ROCm GPU unavailable for adaLN resident test: {error}");
+            return;
+        }
+    };
+    let (batch, seq, width) = (2usize, 3, 8);
+    let fill = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|k| (((k as f32 + seed) % 11.0) - 5.0) / 5.0 * scale)
+            .collect()
+    };
+    let x = CpuTensor { shape: vec![batch, seq, width], data: fill(batch * seq * width, 1.0, 1.0) };
+    let upd = CpuTensor { shape: vec![batch, seq, width], data: fill(batch * seq * width, 9.0, 1.0) };
+    let shift = CpuTensor { shape: vec![batch, width], data: fill(batch * width, 3.0, 0.5) };
+    let scale = CpuTensor { shape: vec![batch, width], data: fill(batch * width, 5.0, 0.5) };
+    let gate = CpuTensor { shape: vec![batch, width], data: fill(batch * width, 7.0, 0.5) };
+
+    let mut mod_cpu = vec![0.0f32; batch * seq * width];
+    let mut gr_cpu = vec![0.0f32; batch * seq * width];
+    for b in 0..batch {
+        for s in 0..seq {
+            let tb = (b * seq + s) * width;
+            for c in 0..width {
+                let mb = b * width + c;
+                mod_cpu[tb + c] = x.data[tb + c] * (1.0 + scale.data[mb]) + shift.data[mb];
+                gr_cpu[tb + c] = x.data[tb + c] + upd.data[tb + c] * gate.data[mb];
+            }
+        }
+    }
+
+    let x_g = gpu.upload_f32(&x.data, &x.shape).unwrap();
+    let upd_g = gpu.upload_f32(&upd.data, &upd.shape).unwrap();
+    let shift_g = gpu.upload_f32(&shift.data, &shift.shape).unwrap();
+    let scale_g = gpu.upload_f32(&scale.data, &scale.shape).unwrap();
+    let gate_g = gpu.upload_f32(&gate.data, &gate.shape).unwrap();
+
+    let m = modulate_3d_resident(&mut gpu, &x_g, &shift_g, &scale_g).unwrap();
+    let m_h = download_resident(&mut gpu, &m).unwrap();
+    free_resident(&mut gpu, m).unwrap();
+    let g = gated_residual_3d_resident(&mut gpu, &x_g, &upd_g, &gate_g).unwrap();
+    let g_h = download_resident(&mut gpu, &g).unwrap();
+    free_resident(&mut gpu, g).unwrap();
+    for t in [x_g, upd_g, shift_g, scale_g, gate_g] {
+        free_resident(&mut gpu, t).unwrap();
+    }
+
+    for (h, c) in m_h.data.iter().zip(&mod_cpu) {
+        assert!((h - c).abs() <= 1e-5, "modulate {h} vs {c}");
+    }
+    for (h, c) in g_h.data.iter().zip(&gr_cpu) {
+        assert!((h - c).abs() <= 1e-5, "gated residual {h} vs {c}");
+    }
+}
+
+#[test]
 fn hip_tensor_add_matches_cpu_reference_when_gpu_is_available() {
     let mut gpu = match hipfire_rdna::Gpu::init_with_device(0) {
         Ok(gpu) => gpu,
