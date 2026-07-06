@@ -1,0 +1,7 @@
+seq	mode	run	prefill_ms	prefill_tok_s
+1	off	1	515.3	7949.3
+1	off	2	513.6	7974.7
+1	off	3	512.5	7992.1
+2	on	1	489.0	8376.9
+2	on	2	485.2	8441.4
+2	on	3	487.4	8403.4

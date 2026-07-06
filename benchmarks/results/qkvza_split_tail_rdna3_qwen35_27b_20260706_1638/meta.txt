@@ -1,0 +1,33 @@
+git_head=83585b88a3e7d8e613943646e9f7f57eda06b32f
+git_branch=master
+date=2026-07-06T16:34:08+08:00
+exe=./target/release/examples/bench_qwen35_mq4
+model=/home/husrcf/.hipfire/models/qwen3.5-27b.mq4
+gpu_id=0
+prefill=4096
+prefill_runs=3
+gen=1
+warmup=0
+kv_mode=q8
+dpm_warmup_secs=2
+timeout_secs=360
+mode_sequence=off on
+
+git_status:
+?? benchmarks/results/qkvza_split_tail_rdna3_20260706_131840/
+?? benchmarks/results/qkvza_split_tail_rdna3_qwen35_08b_20260706_162111/
+?? benchmarks/results/qkvza_split_tail_rdna3_qwen35_27b_20260706_1638/
+?? benchmarks/results/qkvza_split_tail_rdna3_qwen35_4b_20260706_1635/
+
+rocm_smi:
+
+
+======================================== ROCm System Management Interface ========================================
+================================================== Concise Info ==================================================
+Device  Node  IDs              Temp    Power  Partitions          SCLK  MCLK   Fan    Perf  PwrCap  VRAM%  GPU%  
+[3m              (DID,     GUID)  (Edge)  (Avg)  (Mem, Compute, ID)                                                 [0m
+==================================================================================================================
+0       1     0x7448,   61205  39.0°C  12.0W  N/A, N/A, 0         0Mhz  96Mhz  20.0%  auto  241.0W  0%     0%    
+1       2     0x744a,   35059  30.0°C  12.0W  N/A, N/A, 0         0Mhz  96Mhz  20.0%  auto  241.0W  0%     0%    
+==================================================================================================================
+============================================== End of ROCm SMI Log ===============================================
