@@ -6,51 +6,44 @@ an async `submit` hides the whole NPU GEMM behind concurrent host work). This do
 go/no-go for actually building the split — grounded in the measured numbers, not the peak
 spec — so we don't build a complex hot-path feature for a marginal win.
 
-## The aggregate-win arithmetic
+## The aggregate-win arithmetic — MEASURED
 
-Running the NPU and GPU concurrently on the same prefill adds the NPU's throughput on top
-of the GPU's: `speedup = 1 + NPU / GPU`, i.e. the NPU contributes a `NPU / (GPU + NPU)`
-share of the combined work.
+Running the NPU and GPU concurrently adds the NPU's throughput on top of the GPU's:
+`speedup = 1 + NPU / GPU`. The **real** NPU rate is ~1.9 TOPS (feed-bound, flat across
+batch — r6/README). The GPU rate is now measured too (`gpu_w4a4_lowbatch_bench`,
+`gemm_iu4_i32_wmma_lds`, the tuned LDS kernel; K=512, N=4096; W4A4 ≈ W4A8 within ~1.05× on
+gfx1151):
 
-The **real, measured** NPU rate is ~1.9 TOPS (feed-bound, flat across batch — see
-r6/README). The GPU rate is the lever, and it depends heavily on batch:
-
-| GPU W4A8 rate (regime) | NPU share = win |
-|---|---|
-| ~50 TOPS (large-batch, tuned — `reference_gfx1151_iu4_gemm_tuning`) | **+3.7%** |
-| ~25 TOPS | +7.1% |
-| ~10 TOPS | **+16%** |
-| ~5 TOPS | +28% |
+| tokens (B) | GPU W4A4 TOPS | NPU share = concurrent-split win |
+|---|---|---|
+| 64   | 6.76  | **+21.9%** |
+| 128  | 18.35 | +9.4% |
+| 256  | 24.81 | +7.1% |
+| 512  | 28.09 | +6.3% |
+| 768  | 32.65 | +5.5% |
+| 2048 | 38.15 | +4.7% |
+| 4096 | 32.95 | +5.5% |
 
 The original "+40%" hope assumed the NPU could hit ~its ~56-TOPS *peak* ≈ the GPU. It
-can't: the real NPU GEMM is objectfifo-per-slab-overhead-bound at ~1.9. So **at the batch
-sizes where prefill throughput actually matters (large batch, GPU ~50), the split is only
-~+4%.**
+can't (objectfifo per-slab ceiling → 1.9). And the GPU ramps to 24–38 TOPS by B≥256 — so
+across the realistic interactive range (256–768 tokens) **the split adds only ~5–7%**, and
+it only reaches double digits (+22%) at trivially short prompts (≤64 tokens, where the GPU
+sits at 6.8 TOPS, badly under-utilized).
 
-## The one place it could matter: low batch
+## Go/no-go — RESOLVED: don't build (except a ≤128-token niche)
 
-The NPU is flat ~1.9 TOPS at *every* batch (weight-bandwidth-bound). The GPU, by contrast,
-is *underutilized* at low batch — small M can't fill the WMMA pipeline, so its effective
-W4A8 rate drops well below 50. That's the one regime where the NPU's fixed 1.9 is a
-non-trivial share (rows 3–4 above). And low batch = interactive / single-request prefill,
-which is latency-sensitive.
+The measurement settles it. The concurrent split's win is **marginal (~5–7%) across the
+range that matters** and only meaningful (+9–22%) below ~128 tokens. That does **not**
+justify a hot-path feature (an N-split at the dispatch seam + async join + a GPU that must
+never regress). The NPU offload *works* and is proven net-positive — but the ceiling on the
+NPU GEMM (1.9 TOPS) makes it too small a slice of a 25–38-TOPS GPU to matter for real
+prefill.
 
-So the split's real value proposition is narrow and specific: **shave interactive
-single-request prefill latency by running the NPU alongside an under-utilized GPU.** Not a
-bulk-throughput play.
-
-## Go/no-go — the missing measurement
-
-The decision hinges on one number we don't have: **the GPU's W4A8 GEMM rate at low batch
-(M≈256–768, K/N of a real model)**. There is no standalone GPU W4A8 microbench today; it
-would need a HIP harness on the (locked) GPU.
-
-- If GPU low-batch ≳ 30 TOPS → NPU adds <6% → **not worth the hot-path complexity.**
-- If GPU low-batch ≈ 10–15 TOPS → NPU adds ~12–16% of interactive prefill → **worth it**,
-  as a latency feature gated to low batch.
-
-Recommended first step before any wiring: add that GPU microbench (or read it off an
-existing prefill trace) and put a real number in the table above.
+**Recommendation: do not build the split now.** The R6 work stands as a validated,
+documented capability (`NpuGemmMp` + benches + this analysis). Revisit only if a concrete
+product targets sub-128-token interactive prefill latency specifically, or if a future NPU
+kernel breaks the per-slab ceiling (bigger effective tile / different feed) and lifts the
+1.9-TOPS floor materially.
 
 ## Implementation sketch (only if green)
 
@@ -68,12 +61,13 @@ issues a quantized prefill linear `C[M,N] = A[M,K]·W[K,N]`:
 4. **Gate.** Flag + a batch/shape predicate (only fire at low batch where it wins). Default
    off; the NPU path must never regress the GPU-only critical path.
 
-## Honest recommendation
+## Honest recommendation — measured, resolved
 
 The concurrency mechanism is proven and the primitive is production-ready — the NPU offload
-*works* and is a net positive. But the **aggregate win is modest (~4% at throughput batch,
-maybe ~12–16% for interactive prefill if the GPU is as underutilized at low batch as
-expected).** Build the split only if (a) the low-batch GPU measurement confirms a
-double-digit win and (b) interactive prefill latency is a real target. Otherwise the R6
-work stands as a validated, documented capability (`NpuGemmMp` + benches) to revisit when a
-concrete workload justifies the hot-path integration — nothing is lost by waiting.
+*works* and is net positive. But the go/no-go measurement (`gpu_w4a4_lowbatch_bench`) settled
+the ROI: **the split adds only ~5–7% across the realistic interactive range (256–768
+tokens), reaching double digits only below ~128 tokens.** That does not justify the hot-path
+complexity. **Recommendation: do not build the split now.** The R6 work stands as a
+validated, documented capability (`NpuGemmMp` + benches + this analysis) — revisit only for
+a specific sub-128-token latency product, or if a future NPU kernel lifts the 1.9-TOPS
+per-slab ceiling materially. Nothing is lost by waiting.
