@@ -285,6 +285,21 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   (LoadedModel ctors, generate protocol, load-path fields). **Lean scope:** llama-family qk-norm (arch 0/1), MQ4G256,
   Q8 KV, stateless per request (pos 0), per-token prefill; no spec/PFlash/eviction/grammar/tools, no multi-turn KV reuse.
   **P-B (tensor-parallel, TP1→TP5) is COMPLETE end-to-end: forward primitives → real-model parity → serve loop → daemon.**
+## P-C STARTED 2026-07-06 — PP at the `dense_forward` driver (plan committed)
+- Sub-plan: `docs/superpowers/plans/2026-07-06-P-C-pp-at-driver.md`. **Thesis:** PP lives ABOVE `execute_steps`, at the
+  driver — run each layer on its `Pp` stage, `boundary_copy` the residual between stages. Generalize the pattern INTO
+  `dense_forward` (mirror how P-B pulled TP into `execute_steps`). **NO executor change** (each stage runs its band via
+  the same single-device `execute_steps`; PP = device selection + boundary copy; PP is EXACT → oracle bar max|Δ|=**0**).
+- **State (from 3-file recon):** `dense_forward` (arch_spec.rs:131) is single-GPU only, used by ALL dense arches. PP is
+  hand-coded ONLY in qwen35 (`forward_scratch_layers_multi`/`forward_prefill_batch_multi`, `load_qwen35_pp` arch 5/6).
+  Primitives proven bit-exact: `forward_scratch_band(range)`+`forward_scratch_head` (llama.rs), `Gpus::boundary_copy`/
+  `wait_boundary`/`device_for_layer` (multi_gpu.rs:307/373/284), `mesh.stage_for_layer(l,n)`/`band_xfer_after`
+  (hipfire-hardware/mesh.rs:158/181), `fulfill_manifest` PP placement (`Pin{Embed|Output}`+banding, `llama_store_pp`
+  max|Δ|=0). `resolve_mesh`→`rect([(Pp,pp)])`.
+- **Increments:** PC-1 arch-generic `dense_forward_pp<A:DenseArch>(gpus,mesh,…)` bands per-layer Steps by
+  `stage_for_layer`+boundary_copy → PP oracle (generic == hand-band == single-device, max|Δ|=0, analog
+  tp_full_model_parity); PC-2 decode parity (analog tp_decode_parity); PC-3 daemon serve for dense llama (`PpModel`/
+  `load_model_pp`+`generate_pp`, analog PB-TP5). Needs a generic per-device `DenseScratchSet` (analog `Qwen35ScratchSet`).
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
