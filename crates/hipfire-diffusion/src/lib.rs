@@ -1305,8 +1305,19 @@ impl NativeDiffusionRuntime {
         let (Some(tokenizer), Some(_)) = (&self.krea2_tokenizer, &self.text_conditioner) else {
             return Ok(None);
         };
-        let token_ids = tokenizer.encode(prompt);
-        self.krea2_conditioning_from_token_ids(&token_ids, runtime_context)
+        // Krea2 conditions on the Qwen-Image chat template, not the bare prompt:
+        // a system instruction + user turn, then an assistant suffix. The encoder
+        // runs over the whole template (the system prefix gives context) and the
+        // first `drop_prefix` (system) tokens are dropped from the conditioning.
+        // Matches pipeline_krea2.get_text_hidden_states (prefix_idx = 34). We tap
+        // the same real tokens without the fixed-length middle padding: the DiT
+        // attends to exactly these tokens and their positions already run 0..n.
+        const PREFIX: &str = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n";
+        const SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+        let drop_prefix = tokenizer.encode(PREFIX).len();
+        let mut token_ids = tokenizer.encode(&format!("{PREFIX}{prompt}"));
+        token_ids.extend(tokenizer.encode(SUFFIX));
+        self.krea2_conditioning_from_token_ids(&token_ids, drop_prefix, runtime_context)
     }
 
     /// Krea2 conditioning for a tokenized prompt (`None` for non-Krea2 runtimes).
@@ -1317,11 +1328,12 @@ impl NativeDiffusionRuntime {
     fn krea2_conditioning_from_token_ids(
         &self,
         token_ids: &[u32],
+        drop_prefix: usize,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<Option<CpuTensor>> {
         match &self.text_conditioner {
             Some(conditioner) => conditioner
-                .conditioning_from_token_ids(token_ids, runtime_context)
+                .conditioning_from_token_ids(token_ids, drop_prefix, runtime_context)
                 .map(Some),
             None => Ok(None),
         }

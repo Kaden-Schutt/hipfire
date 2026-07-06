@@ -4038,6 +4038,34 @@ impl NativeQwen3TextEncoder {
 /// `[1, seq, text_hidden]` conditioning the DiT denoiser's `txt_in` consumes.
 /// This is the object the pipeline drives for a `Krea2Pipeline` (tokenize ->
 /// this -> external-conditioning seam -> denoiser).
+/// Drop the first `drop` tokens from an encoder layer, accepting either
+/// `[seq, hidden]` or `[1, seq, hidden]`. Batch is assumed 1 (single prompt),
+/// so the leading `drop * hidden` values are simply removed.
+pub(crate) fn drop_leading_tokens(layer: &CpuTensor, drop: usize) -> DiffusionResult<CpuTensor> {
+    let (leading, seq, hidden) = match layer.shape.as_slice() {
+        [seq, hidden] => (None, *seq, *hidden),
+        [1, seq, hidden] => (Some(1usize), *seq, *hidden),
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "Krea2 encoder layer must be [seq, hidden] or [1, seq, hidden], got {other:?}"
+            )))
+        }
+    };
+    if drop >= seq {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "Krea2 conditioning prefix drop {drop} >= sequence length {seq}"
+        )));
+    }
+    let shape = match leading {
+        Some(b) => vec![b, seq - drop, hidden],
+        None => vec![seq - drop, hidden],
+    };
+    Ok(CpuTensor {
+        shape,
+        data: layer.data[drop * hidden..].to_vec(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct Krea2TextConditioner {
@@ -4080,15 +4108,28 @@ impl Krea2TextConditioner {
         }))
     }
 
-    /// Encode already-tokenized prompt ids into DiT conditioning.
+    /// Encode already-tokenized prompt ids into DiT conditioning. `drop_prefix`
+    /// tokens are removed from the front of every captured layer BEFORE fusion:
+    /// the Krea2 text path wraps the prompt in a chat template whose system
+    /// prefix (34 tokens) provides encoder context but is dropped from the
+    /// conditioning (`get_text_hidden_states` slices `[:, prefix_idx:]`).
     pub(crate) fn conditioning_from_token_ids(
         &self,
         token_ids: &[u32],
+        drop_prefix: usize,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        let layers = self
+        let raw_layers = self
             .encoder
             .encode(token_ids, &self.select_layers, runtime_context)?;
+        let layers = if drop_prefix > 0 {
+            raw_layers
+                .iter()
+                .map(|layer| drop_leading_tokens(layer, drop_prefix))
+                .collect::<DiffusionResult<Vec<_>>>()?
+        } else {
+            raw_layers
+        };
         // Parity-debug: dump the selected encoder hidden states + the fused
         // conditioning when HIPFIRE_DIFFUSION_DUMP_DIR is set.
         for (index, layer) in layers.iter().enumerate() {
