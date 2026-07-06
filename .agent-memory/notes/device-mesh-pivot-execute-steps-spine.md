@@ -340,6 +340,23 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
 - **P-C follow-ups (deferred):** real-HW per-stage weight banding (VRAM win; emulation loads whole weights on the output
   stage) + a real 2-GPU same-arch =0 gate (emulation can't prove transport/residency); batched prefill (per-token now);
   executor-transparent PP / N×M compose → P-5b. Then P-D (Step::Moe/EP fold), P-E (DeltaNet head-shard).
+
+## P-D STARTED 2026-07-06 — fold EP-MoE into Step::Moe (plan; additive-first)
+- Plan: `docs/superpowers/plans/2026-07-06-P-D-ep-fold-step-moe.md`. The locked grand-unify (bjoern 2026-07-06): retire
+  `run_layer_program_ep` for parallelism, migrate the EP MoE all-reduce into a `Step::Moe` on a per-rank executor
+  `execute_steps_ep` (sibling of P-B's `execute_steps_tp`). **Recon (subagent):** EP is LIVE (ds4/minimax multi-GPU serve
+  via `run_layer_program_ep` ep.rs:73, default-on HIPFIRE_FORWARD_LOWERED). MoE forward is IMPERATIVE (`run_moe_ep`/
+  `ep_add_into_residual` callbacks, ds4 forward.rs:2114 / minimax 825) → `Step::Moe` is a big-block variant like
+  `Step::Attend` (design fields FROM ds4 run_moe_ep, don't invent). Per-rank sharded borrows = P-B's per-rank Step lists.
+  **Verdict: legitimate (locked, proven P-B template), NOT N1 — BUT a 2-3 day rewrite of LIVE multi-GPU EP serve for
+  maintainability (no new functionality), validatable only on emulated EP-2 (no 2-GPU HW).**
+- **Increments (additive-first, live EP stays default until proven byte-identical):** P-D-0 `Step::Moe` variant +
+  `execute_steps_ep` skeleton (zero-risk, not on any live path; build+dispatch-tests+dense-coherence green). P-D-1 ds4
+  `forward_ep` builds per-rank `Step::Moe`, route via `execute_steps_ep` GATED behind `HIPFIRE_EP_STEP=1` (default OFF) →
+  validate `ep_decode_parity` byte-identical vs `run_layer_program_ep`. P-D-2 minimax. P-D-3 flip default + delete
+  `run_layer_program_ep` + the 2 ForwardBindings EP methods (keep the trait for the lowered single-GPU path).
+- **Honest flag raised to bjoern:** P-C's follow-ups (batched prefill, real-HW banding) are lower-risk/higher-observable-
+  value than a live-EP rewrite; offered the redirect. Awaiting "proceed all P-D items" vs redirect before the P-D-1 flip.
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
