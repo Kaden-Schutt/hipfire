@@ -9,7 +9,8 @@
 //! the CPU/NPU-shared staging buffer the heterogeneous handoff needs.
 
 use crate::Gpu;
-use hip_bridge::{HipError, HipResult};
+use hip_bridge::{DeviceBuffer, HipError, HipResult, ImportedBuffer};
+use hipfire_gpu_types::{DType, GpuTensor};
 use std::os::fd::RawFd;
 
 const fn iowr(nr: u32, size: u32) -> libc::c_ulong {
@@ -179,5 +180,54 @@ impl Gpu {
             len: bytes,
             dmabuf_fd: ph.fd,
         })
+    }
+
+    /// Import an external dma-buf (e.g. [`SharedGttBuffer::dmabuf_fd`], or one exported by the
+    /// NPU) as a NATIVE GPU tensor — a GPU compute kernel operates on the shared pages
+    /// directly (zero-copy), via HIP external-memory import (`hipImportExternalMemory`).
+    /// `bytes` is the exported buffer's byte size; `shape`/`dtype` are metadata. Verified on
+    /// ROCm-7.14/gfx1151. This is the GPU-side mirror of the NPU's `import_dmabuf` — the two
+    /// complete the three-engine (GPU/NPU/CPU) native-import triangle over one dma-buf.
+    pub fn import_dmabuf(
+        &self,
+        fd: RawFd,
+        bytes: usize,
+        shape: &[usize],
+        dtype: DType,
+    ) -> HipResult<ImportedTensor> {
+        self.bind_thread()?;
+        let buf = self.hip.import_dmabuf(fd, bytes)?;
+        Ok(ImportedTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+}
+
+/// A GPU tensor backed by an imported dma-buf (via HIP external-memory). Owns the imported
+/// external-memory object; drop frees the mapping + destroys it. A kernel runs on it through
+/// [`Self::view`].
+pub struct ImportedTensor {
+    buf: ImportedBuffer,
+    shape: Vec<usize>,
+    dtype: DType,
+}
+
+impl ImportedTensor {
+    /// A non-owning [`GpuTensor`] view for kernel dispatch. Valid only while `self` is alive;
+    /// do NOT `free_tensor` it — the memory is owned by the imported dma-buf.
+    pub fn view(&self) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(self.buf.as_ptr(), self.buf.size()) },
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    pub fn byte_size(&self) -> usize {
+        self.buf.size()
     }
 }

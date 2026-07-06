@@ -22,7 +22,7 @@ pub use dispatch::{
     MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;
-pub use gtt_share::SharedGttBuffer;
+pub use gtt_share::{ImportedTensor, SharedGttBuffer};
 pub use kernels::GEMV_SRC;
 // Re-export the result/error types of `Gpu`'s public methods so downstream
 // crates (e.g. hipfire-train) can name them without depending on hip-bridge.

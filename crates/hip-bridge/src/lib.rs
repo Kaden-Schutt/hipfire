@@ -26,7 +26,8 @@ pub use error::{
 };
 pub use ffi::launch_counters;
 pub use ffi::{
-    Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, HostBuffer, Module, Stream,
+    Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, HostBuffer, ImportedBuffer,
+    Module, Stream,
 };
 pub use kernarg::{KernArg, KernargBlob};
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};

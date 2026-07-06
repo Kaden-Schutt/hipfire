@@ -113,6 +113,47 @@ type HipGraphExec = *mut c_void;
 type HipHostMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32;
 type HipHostFreeFn = unsafe extern "C" fn(*mut c_void) -> u32;
 
+// External-memory interop (dma-buf import) — CUDA-compat API; optional symbols. Lets the
+// GPU import an amdgpu GTT dma-buf as a native device pointer (the correct zero-copy
+// heterogeneous handoff, verified working on ROCm-7.14/gfx1151).
+type HipImportExtMemFn =
+    unsafe extern "C" fn(*mut *mut c_void, *const HipExternalMemoryHandleDesc) -> u32;
+type HipExtMemGetMappedFn =
+    unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const HipExternalMemoryBufferDesc) -> u32;
+type HipDestroyExtMemFn = unsafe extern "C" fn(*mut c_void) -> u32;
+
+const HIP_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HipExtMemWin32 {
+    handle: *mut c_void,
+    name: *const c_void,
+}
+#[repr(C)]
+union HipExtMemHandleUnion {
+    fd: c_int,
+    win32: HipExtMemWin32,
+    nv_sci_buf: *const c_void,
+}
+/// `hipExternalMemoryHandleDesc` (ABI-matched: enum + union{fd,…} + size + flags + reserved[16]).
+#[repr(C)]
+struct HipExternalMemoryHandleDesc {
+    type_: c_uint,
+    handle: HipExtMemHandleUnion,
+    size: u64,
+    flags: c_uint,
+    reserved: [c_uint; 16],
+}
+/// `hipExternalMemoryBufferDesc`.
+#[repr(C)]
+struct HipExternalMemoryBufferDesc {
+    offset: u64,
+    size: u64,
+    flags: c_uint,
+    reserved: [c_uint; 16],
+}
+
 const HIP_SUCCESS: u32 = 0;
 /// `hipDeviceAttributeIntegrated` in HIP's cuda-compatible attribute block.
 const HIP_DEVICE_ATTRIBUTE_INTEGRATED: c_int = 16;
@@ -226,6 +267,9 @@ pub struct HipRuntime {
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
+    fn_import_external_memory: Option<HipImportExtMemFn>,
+    fn_external_memory_get_mapped_buffer: Option<HipExtMemGetMappedFn>,
+    fn_destroy_external_memory: Option<HipDestroyExtMemFn>,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -550,6 +594,21 @@ impl HipRuntime {
                     "hipMemGetInfo",
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
                 ),
+                fn_import_external_memory: load_optional_fn!(
+                    lib,
+                    "hipImportExternalMemory",
+                    HipImportExtMemFn
+                ),
+                fn_external_memory_get_mapped_buffer: load_optional_fn!(
+                    lib,
+                    "hipExternalMemoryGetMappedBuffer",
+                    HipExtMemGetMappedFn
+                ),
+                fn_destroy_external_memory: load_optional_fn!(
+                    lib,
+                    "hipDestroyExternalMemory",
+                    HipDestroyExtMemFn
+                ),
                 _lib: lib,
             }
         };
@@ -787,6 +846,52 @@ impl HipRuntime {
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
+    }
+
+    /// Import an external dma-buf (e.g. an amdgpu GTT BO exported via `PRIME_HANDLE_TO_FD`)
+    /// as a native GPU device pointer, via the HIP external-memory API
+    /// (`hipImportExternalMemory` OpaqueFd → `hipExternalMemoryGetMappedBuffer`). A GPU
+    /// compute kernel then operates on the *same physical pages* as the exporting engine
+    /// (the NPU/CPU) — the zero-copy heterogeneous handoff (verified on ROCm-7.14/gfx1151).
+    /// The returned [`ImportedBuffer`] owns the external-memory object; drop frees the
+    /// mapping and destroys it. `size` must be the exported buffer's byte size.
+    pub fn import_dmabuf(&self, fd: i32, size: usize) -> HipResult<ImportedBuffer> {
+        let import = self
+            .fn_import_external_memory
+            .ok_or_else(|| HipError::new(0, "hipImportExternalMemory not in loaded HIP runtime"))?;
+        let get_mapped = self.fn_external_memory_get_mapped_buffer.ok_or_else(|| {
+            HipError::new(
+                0,
+                "hipExternalMemoryGetMappedBuffer not in loaded HIP runtime",
+            )
+        })?;
+        let destroy = self.fn_destroy_external_memory.ok_or_else(|| {
+            HipError::new(0, "hipDestroyExternalMemory not in loaded HIP runtime")
+        })?;
+
+        let mut ext: *mut c_void = ptr::null_mut();
+        let mut hd: HipExternalMemoryHandleDesc = unsafe { std::mem::zeroed() };
+        hd.type_ = HIP_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+        hd.handle.fd = fd;
+        hd.size = size as u64;
+        let code = unsafe { import(&mut ext, &hd) };
+        self.check(code, "hipImportExternalMemory")?;
+
+        let mut mapped: *mut c_void = ptr::null_mut();
+        let mut bd: HipExternalMemoryBufferDesc = unsafe { std::mem::zeroed() };
+        bd.size = size as u64;
+        let code = unsafe { get_mapped(&mut mapped, ext, &bd) };
+        if code != HIP_SUCCESS {
+            unsafe { destroy(ext) };
+            self.check(code, "hipExternalMemoryGetMappedBuffer")?;
+        }
+        Ok(ImportedBuffer {
+            ptr: mapped,
+            size,
+            ext_mem: ext,
+            fn_free: self.fn_free,
+            fn_destroy: destroy,
+        })
     }
 
     /// Copy host data into GPU buffer at a byte offset.
@@ -1457,6 +1562,40 @@ impl Stream {
     /// stream pointer to `ncclAllReduce`.
     pub fn raw_ptr(&self) -> *mut c_void {
         self.0
+    }
+}
+
+/// A GPU device pointer backed by an imported external dma-buf (via the HIP external-memory
+/// API — see [`HipRuntime::import_dmabuf`]). Owns the `hipExternalMemory_t`; drop frees the
+/// mapping and destroys the object. Use [`Self::as_ptr`] for kernel dispatch.
+pub struct ImportedBuffer {
+    ptr: *mut c_void,
+    size: usize,
+    ext_mem: *mut c_void,
+    fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
+    fn_destroy: HipDestroyExtMemFn,
+}
+
+// The pages are shared physical memory; the handle is an owned import.
+unsafe impl Send for ImportedBuffer {}
+
+impl ImportedBuffer {
+    /// The GPU device pointer (kernels compute on it directly).
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for ImportedBuffer {
+    fn drop(&mut self) {
+        // Free the mapped buffer, then destroy the external-memory object (CUDA/HIP order).
+        unsafe {
+            (self.fn_free)(self.ptr);
+            (self.fn_destroy)(self.ext_mem);
+        }
     }
 }
 
