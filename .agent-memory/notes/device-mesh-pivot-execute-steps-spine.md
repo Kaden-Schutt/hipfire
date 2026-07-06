@@ -265,7 +265,26 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   across N GPUs; arch picks the axis" (MoE→EP, dense→TP). `load_model_tp` is a RESERVED stub returning a clear "PB-TP5
   not yet wired" error (dense TP forward is validated by the examples; only the SERVE loop is unbuilt). CLI forwards
   `HIPFIRE_EP`→params.ep. No behavior change for existing EP/single-GPU. config tests 4/4.
-- **PB-TP5 NEXT (the dense-TP serve loop) — fill in `load_model_tp`.** Now that the axis is disentangled: build a served
+- **PB-TP5 SERVE LOOP DONE + validated (`c2ae0b8f`)** — `examples/tp_decode_parity.rs`: dense-TP prefill + greedy
+  decode == single-GPU `forward_scratch`, **argmax-exact**. prompt "The capital of France is" + 24 steps on emulated
+  Tp-2 (gfx1151, HIPFIRE_DETERMINISTIC=1): ref_fnv==tp_fnv (`0a73e4975b94d4b7`), first_div=None, identical text. This
+  is the REAL serve algorithm (growing per-rank KV → multi-key attention head-parallel under TP, not the pos-0 case).
+  Per token: embed(rank0)+broadcast → 28 sharded layers via execute_steps_tp (KV write at pos) → final norm+lm_head
+  (rank0) → argmax → feed back. Mirrors `ep_decode_parity` (which is ALSO a standalone example, separate from EP's
+  daemon `generate_ep`). **The dense-TP forward + serve algorithm is fully proven; `build_layer_steps` is the reusable
+  per-layer TP body a real `generate_tp` drives.**
+- **PB-TP5 REMAINING (daemon productionization) — `load_model_tp` + `generate_tp` + `LoadedModel.tp`.** Large mechanical
+  wiring (mirror the EP integration): (1) a `TpState` in hipfire-loader { `Gpus`, `WeightStore`, per-rank RankState
+  (scratch+KV+norms), config, eos } ; (2) `LoadedModel.tp: Option<TpState>` — ripples `tp: None` to every LoadedModel
+  constructor ; (3) `load_model_tp` builds the served model (tokenizer, chat-template/eos, recommended sampling, the
+  fulfilled store) instead of the current stub ; (4) `generate_tp` in daemon.rs mirroring `generate_ep` (daemon.rs:2665,
+  ~600L: ChatFrame render → prefill → decode loop [the tp_decode_parity algorithm] → stream JSON text events → sampling
+  [temp/top_p, not just greedy] → stop/max_tokens/think-mode) ; (5) dispatch `if m.tp.is_some() { generate_tp(...);
+  return; }` at daemon.rs:6552 (beside the `m.ep.is_some()` arm) ; (6) unload path for TpState. Validate with a LIVE
+  daemon serve (not just a parity example): `hipfire serve --tp 2` on a dense llama HFQ under HIPFIRE_EMULATE_GPUS=2,
+  then a chat request; token stream should match single-GPU serve. Leaner than generate_ep (standard llama chat, no MoE
+  LCP/expert specifics). This is its own focused session — the daemon is a big critical file and needs live-serve testing.
+- **(historical) PB-TP5 NEXT (the dense-TP serve loop) — fill in `load_model_tp`.** Now that the axis is disentangled: build a served
   `LoadedModel` for dense TP — per-rank sharded `LlamaWeights` from a `WeightStore` (the store→forward bridge, validated
   in `tp_full_model_parity`), per-rank scratch/KV, a `&mut Gpus`-threaded decode loop reusing the validated per-layer
   Step lists, embed(rank0+broadcast) + final norm/lm_head(rank0). Then `tp_decode_parity` (FNV token-stream vs
