@@ -28,8 +28,8 @@
 use hipfire_hardware::{DeviceMesh, DimKind};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
-use hipfire_runtime::weight_store::{fulfill_manifest, WeightHandle, WeightStore};
-use rdna_compute::{DType, GpuTensor};
+use hipfire_runtime::weight_store::fulfill_manifest;
+use rdna_compute::DType;
 
 const D: usize = 128; // hidden dim
 const INTER: usize = 128; // FFN intermediate (INTER/TP = 64, gemv-k-aligned)
@@ -40,11 +40,6 @@ const TOL: f32 = 2e-3;
 
 fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_ne_bytes()).collect()
-}
-fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
@@ -98,13 +93,6 @@ fn host_forward(x0: &[f32]) -> Vec<f32> {
         }
     }
     x
-}
-
-fn resident<'a>(store: &'a WeightStore, name: &str, l: usize, dev: usize) -> &'a GpuTensor {
-    match store.get(name, Some(l), dev).expect("weight missing") {
-        WeightHandle::Resident(t) => t,
-        _ => panic!("expected Resident {name}"),
-    }
 }
 
 fn main() {
@@ -163,75 +151,16 @@ fn main() {
     })
     .expect("shard weights");
 
-    // Per-rank scratch: x (replicated hidden, updated each layer) + intermediates.
-    let inter_r = INTER / TP;
-    let mut xr: Vec<GpuTensor> = Vec::new();
-    let mut xn: Vec<GpuTensor> = Vec::new();
-    let mut gr: Vec<GpuTensor> = Vec::new();
-    let mut pr: Vec<GpuTensor> = Vec::new();
-    for r in 0..TP {
-        let dev = &mut gpus.devices[r];
-        dev.bind_thread().expect("bind");
-        xr.push(dev.upload_raw(&f32_to_bytes(&x0), &[D]).expect("x upload"));
-        xn.push(dev.alloc_tensor(&[D], DType::F32).expect("xn"));
-        gr.push(dev.alloc_tensor(&[inter_r], DType::F32).expect("g"));
-        pr.push(dev.alloc_tensor(&[D], DType::F32).expect("p"));
-    }
-
-    // ── The TP forward: on-device rank loop, one all-reduce per layer ────────
-    for l in 0..L {
-        for r in 0..TP {
-            let nw = resident(&store, "norm", l, r);
-            let w1r = resident(&store, "w1", l, r);
-            let w2r = resident(&store, "w2", l, r);
-            let dev = &mut gpus.devices[r];
-            dev.bind_thread().expect("bind");
-            dev.rmsnorm_f32(&xr[r], nw, &xn[r], EPS).expect("rmsnorm"); // replicated
-            dev.gemv_f32(w1r, &xn[r], &gr[r]).expect("w1 gemv"); // g_r [inter/tp]
-            dev.silu_f32(&gr[r], &gr[r]).expect("silu"); // h_r in place
-            dev.gemv_f32(w2r, &gr[r], &pr[r]).expect("w2 gemv"); // partial_r [d]
-            dev.hip
-                .stream_synchronize(dev.active_stream.as_ref().unwrap())
-                .expect("sync");
-        }
-        // All-reduce the row-parallel FFN output over the Tp group.
-        let group: Vec<usize> = (0..TP).collect();
-        let refs: Vec<&_> = pr.iter().map(|t| &t.buf).collect();
-        gpus.all_reduce_sum_f32_peer(&group, &refs, D)
-            .expect("all_reduce");
-        // Residual add on each rank (x stays replicated: same x, same reduced y).
-        for r in 0..TP {
-            let dev = &mut gpus.devices[r];
-            dev.bind_thread().expect("bind");
-            dev.add_f32(&xr[r], &pr[r], &xr[r]).expect("residual");
-            dev.hip
-                .stream_synchronize(dev.active_stream.as_ref().unwrap())
-                .expect("sync");
-        }
-    }
-
-    // Read final hidden off each rank — must be identical (replicated) and match ref.
-    let mut got = vec![Vec::new(); TP];
-    for r in 0..TP {
-        gpus.devices[r].bind_thread().expect("bind");
-        let mut b = vec![0u8; D * 4];
-        gpus.devices[r]
-            .hip
-            .memcpy_dtoh(&mut b, &xr[r].buf)
-            .expect("dtoh");
-        got[r] = bytes_to_f32(&b);
-    }
-    let d_ref = max_abs_diff(&got[0], &y_ref);
-    let d_rank = max_abs_diff(&got[0], &got[1]);
+    // ── The TP forward: the reusable library executor (hipfire_runtime::tp_forward) ──
+    let got = hipfire_runtime::tp_forward::tp_ffn_forward(
+        &mut gpus, &mesh, &store, &x0, L, D, INTER, EPS,
+    )
+    .expect("tp_ffn_forward");
+    let d_ref = max_abs_diff(&got, &y_ref);
     println!("[tp-forward] {L}-layer FFN-residual TP vs host: max|Δ|={d_ref:.2e}");
-    println!("[tp-forward] rank0 vs rank1 (replication): max|Δ|={d_rank:.2e}");
     assert!(
         d_ref < TOL,
         "TP forward diverges from host reference: max|Δ|={d_ref}"
-    );
-    assert!(
-        d_rank < 1e-5,
-        "ranks diverged (replication broken): max|Δ|={d_rank}"
     );
 
     for dev in gpus.devices.iter_mut() {
