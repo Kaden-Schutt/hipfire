@@ -200,8 +200,10 @@ impl NativeTransformerDenoiserIo {
         }
 
         // Krea2 final adaLN: RMSNorm weight + a [2, hidden] scale/shift table.
-        let krea_final_norm_weight =
-            optional_tensor(hfq, "transformer/tensors/final_layer.norm.weight")?;
+        let krea_final_norm_weight = rms_gain_plus_one_opt(optional_tensor(
+            hfq,
+            "transformer/tensors/final_layer.norm.weight",
+        )?);
         let krea_final_scale_shift =
             optional_tensor(hfq, "transformer/tensors/final_layer.scale_shift_table")?;
         if let Some(table) = krea_final_scale_shift.as_ref() {
@@ -223,7 +225,10 @@ impl NativeTransformerDenoiserIo {
         }
 
         // Krea2 two-layer text-input projection (`txt_in.norm`/`linear_1`/`linear_2`).
-        let krea_txt_norm_weight = optional_tensor(hfq, "transformer/tensors/txt_in.norm.weight")?;
+        let krea_txt_norm_weight = rms_gain_plus_one_opt(optional_tensor(
+            hfq,
+            "transformer/tensors/txt_in.norm.weight",
+        )?);
         let krea_txt_linear1_weight =
             optional_tensor(hfq, "transformer/tensors/txt_in.linear_1.weight")?;
         let (krea_txt_linear1_bias, krea_txt_linear2_weight, krea_txt_linear2_bias) =
@@ -805,6 +810,23 @@ pub(crate) struct TransformerAttentionStreamProjection {
     out_bias: Option<CpuTensor>,
 }
 
+/// Krea2 (Qwen3.5 lineage) RMSNorm stores the gain as an offset from 1: the
+/// effective scale is `1 + weight` (the Gemma / Qwen3.5 convention where the
+/// affine is zero-initialized), unlike Qwen-Image which uses a plain `weight`.
+/// Bake the +1 into the loaded gain so the shared plain-weight `rms_norm`
+/// applies the correct scale. Skipping this multiplies by a ~0-centred (often
+/// negative) gain, collapsing the residual stream into noise.
+pub(crate) fn rms_gain_plus_one(mut weight: CpuTensor) -> CpuTensor {
+    for v in &mut weight.data {
+        *v += 1.0;
+    }
+    weight
+}
+
+pub(crate) fn rms_gain_plus_one_opt(weight: Option<CpuTensor>) -> Option<CpuTensor> {
+    weight.map(rms_gain_plus_one)
+}
+
 #[allow(dead_code)]
 impl TransformerAttentionStreamProjection {
     #[allow(clippy::too_many_arguments)]
@@ -826,6 +848,7 @@ impl TransformerAttentionStreamProjection {
         expected_hidden_width: Option<usize>,
         expected_inner_width: Option<usize>,
         expected_head_dim: Option<usize>,
+        gemma_gain: bool,
     ) -> DiffusionResult<Option<Self>> {
         if hfq.find_tensor_info(q_weight_entry).is_none() {
             if required {
@@ -844,8 +867,16 @@ impl TransformerAttentionStreamProjection {
             k_bias: optional_tensor(hfq, k_bias_entry)?,
             v_weight: ResidentWeight::from_hfq(hfq, v_weight_entry)?,
             v_bias: optional_tensor(hfq, v_bias_entry)?,
-            norm_q_weight: optional_tensor(hfq, norm_q_entry)?,
-            norm_k_weight: optional_tensor(hfq, norm_k_entry)?,
+            norm_q_weight: if gemma_gain {
+                rms_gain_plus_one_opt(optional_tensor(hfq, norm_q_entry)?)
+            } else {
+                optional_tensor(hfq, norm_q_entry)?
+            },
+            norm_k_weight: if gemma_gain {
+                rms_gain_plus_one_opt(optional_tensor(hfq, norm_k_entry)?)
+            } else {
+                optional_tensor(hfq, norm_k_entry)?
+            },
             out_weight: ResidentWeight::from_hfq(hfq, out_weight_entry)?,
             out_bias: optional_tensor(hfq, out_bias_entry)?,
         };
@@ -1235,6 +1266,8 @@ impl NativeTransformerAttentionProjection {
             None,
             None,
             None,
+            // Krea2 uses (1+weight) QK-norm; Qwen-Image uses plain weight.
+            matches!(family, TransformerDenoiserFamily::Krea2),
         )?
         .ok_or_else(|| {
             DiffusionError::InvalidMetadata(format!(
@@ -1266,6 +1299,8 @@ impl NativeTransformerAttentionProjection {
             Some(hidden_width),
             Some(inner_width),
             Some(head_dim),
+            // The add_* text stream exists only for Qwen-Image (plain QK-norm).
+            false,
         )?;
 
         // Krea2 single-stream attention carries a sigmoid output gate; QwenImage
@@ -1327,6 +1362,8 @@ impl NativeTransformerAttentionProjection {
             None,
             None,
             None,
+            // text_fusion is Krea2-only: (1+weight) QK-norm.
+            true,
         )?
         .ok_or_else(|| {
             DiffusionError::InvalidMetadata(format!("attention stream {attn_prefix:?} is missing"))
@@ -2089,14 +2126,14 @@ impl NativeTransformerBlock {
         let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
         let (norm1_weight, norm2_weight) = match family {
             TransformerDenoiserFamily::Krea2 => (
-                Some(cpu_tensor_from_hfq(
+                Some(rms_gain_plus_one(cpu_tensor_from_hfq(
                     hfq,
                     &format!("{block_prefix}.norm1.weight"),
-                )?),
-                Some(cpu_tensor_from_hfq(
+                )?)),
+                Some(rms_gain_plus_one(cpu_tensor_from_hfq(
                     hfq,
                     &format!("{block_prefix}.norm2.weight"),
-                )?),
+                )?)),
             ),
             TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
                 (None, None)
@@ -2385,8 +2422,14 @@ impl NativeTextFusionBlock {
         heads: usize,
     ) -> DiffusionResult<Self> {
         Ok(Self {
-            norm1_weight: cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.norm1.weight"))?,
-            norm2_weight: cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.norm2.weight"))?,
+            norm1_weight: rms_gain_plus_one(cpu_tensor_from_hfq(
+                hfq,
+                &format!("{block_prefix}.norm1.weight"),
+            )?),
+            norm2_weight: rms_gain_plus_one(cpu_tensor_from_hfq(
+                hfq,
+                &format!("{block_prefix}.norm2.weight"),
+            )?),
             attention: NativeTransformerAttentionProjection::single_stream_from_prefix(
                 hfq,
                 &format!("{block_prefix}.attn"),
