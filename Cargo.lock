@@ -402,6 +402,7 @@ version = "0.2.1"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-hardware",
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
