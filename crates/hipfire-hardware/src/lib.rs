@@ -805,6 +805,22 @@ impl Gpus {
         }
         Ok(())
     }
+
+    /// Ensure every device has an `active_stream` — the FIFO stream the EP
+    /// collective enqueues its per-rank work on. Idempotent (no-op if already
+    /// set). The EP forward (`ep_moe_allreduce` + the per-rank attn/moe blocks)
+    /// requires this; call it once after the ranks are constructed and before
+    /// the first EP forward. Single-GPU / PP paths must NOT call it (they leave
+    /// `active_stream = None` so memset stays synchronous).
+    pub fn ensure_rank_streams(&mut self) -> HipResult<()> {
+        for dev in self.devices.iter_mut() {
+            dev.bind_thread()?;
+            if dev.active_stream.is_none() {
+                dev.active_stream = Some(dev.hip.stream_create()?);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Which half of the EP MoE lifecycle an `ep_moe_allreduce` closure call is

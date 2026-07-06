@@ -1447,7 +1447,9 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
         .gpus_mut()
         .enable_peer_all()
         .map_err(|e| format!("enable_peer_all: {e:?}"))?;
-    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+    staging
+        .gpus_mut()
+        .ensure_rank_streams()
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
     let (gpus, weights, state, partials) = staging.into_parts();
@@ -1562,7 +1564,9 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         .gpus_mut()
         .enable_peer_all()
         .map_err(|e| format!("enable_peer_all: {e:?}"))?;
-    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+    staging
+        .gpus_mut()
+        .ensure_rank_streams()
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
     let (gpus, weights, state, partials) = staging.into_parts();

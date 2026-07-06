@@ -7,7 +7,6 @@
 // The dispatch layer selects the correct kernel based on quant format,
 // arch capabilities, and feature flags — all resolved at init time.
 
-pub mod ep;
 pub mod context;
 pub mod families;
 pub mod ops;

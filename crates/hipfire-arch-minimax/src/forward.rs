@@ -28,11 +28,6 @@
 //! kept OUTSIDE the captured region (token_id is baked into its kernarg).
 
 use crate::minimax::{MiniMaxConfig, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights};
-use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::superop::{
-    self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
-};
-use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
     weight_gemv_residual,
@@ -222,14 +217,6 @@ fn decode_step_body(
             unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
         gpu.memcpy_htod_auto(&state.pos_buf, pos_bytes)
             .map_err(|e| format!("minimax: htod pos: {e:?}"))?;
-    }
-
-    // #397 Ship 6 — forward-as-pipeline. HIPFIRE_FORWARD_LOWERED=1 routes the
-    // per-layer decode through the super-op executor (run_layer_program). Skipped
-    // when capturing (oracle dumper needs the hand path). Default off (opt-in)
-    // until hipx byte-parity validated (minimax only fits on hipx).
-    if minimax_forward_lowered_enabled() && capture.is_none() {
-        return decode_step_body_lowered(cfg, weights, state, gpu, position);
     }
 
     for (l, layer) in weights.layers.iter().enumerate() {
@@ -824,183 +811,6 @@ fn minimax_ep_moe_rank(
     }
 }
 
-struct MinimaxBindings<'a> {
-    cfg: &'a MiniMaxConfig,
-    layer: &'a MiniMaxLayerWeights,
-    state: &'a MiniMaxState,
-    l: usize,
-}
-
-impl<'a> ForwardBindings for MinimaxBindings<'a> {
-    fn run_attend(
-        &mut self,
-        gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-    ) -> Result<(), DispatchError> {
-        minimax_attn_block(gpu, self.cfg, self.layer, self.state, self.l)
-            .map_err(DispatchError::Hip)
-    }
-    fn run_moe(
-        &mut self,
-        gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-    ) -> Result<(), DispatchError> {
-        minimax_moe_block(gpu, self.cfg, self.layer, self.state, self.l, None)
-            .map_err(DispatchError::Hip)
-    }
-    fn run_moe_ep(
-        &mut self,
-        gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-        routed_out: &GpuTensor,
-        _skip_shared: bool,
-    ) -> Result<(), DispatchError> {
-        // MiniMax has no shared expert → the entire MoE output is routed, so the
-        // whole block redirects into `routed_out` (zeroed by the EP executor);
-        // `state.h` (the replicated attention residual) is added after all-reduce
-        // via ep_add_into_residual. `skip_shared` is irrelevant (no shared expert).
-        minimax_moe_block(
-            gpu,
-            self.cfg,
-            self.layer,
-            self.state,
-            self.l,
-            Some(routed_out),
-        )
-        .map_err(DispatchError::Hip)
-    }
-    fn ep_add_into_residual(
-        &mut self,
-        gpu: &mut Gpu,
-        partial: &GpuTensor,
-    ) -> Result<(), DispatchError> {
-        gpu.add_inplace_f32(&self.state.h, partial)
-            .map_err(|e| DispatchError::Hip(e.to_string()))
-    }
-    fn run_proj(
-        &mut self,
-        _gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("minimax has no Proj super-op".into()))
-    }
-    fn run_residual_gemv(
-        &mut self,
-        _gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip(
-            "minimax has no ResidualGemv super-op".into(),
-        ))
-    }
-    fn run_norm(
-        &mut self,
-        _gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("minimax has no Norm super-op".into()))
-    }
-    fn run_conv(
-        &mut self,
-        _gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip("minimax has no Conv super-op".into()))
-    }
-    fn run_recurrent(
-        &mut self,
-        _gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip(
-            "minimax has no Recurrent super-op".into(),
-        ))
-    }
-    fn run_escape(
-        &mut self,
-        _gpu: &mut Gpu,
-        _ctx: &DispatchCtx,
-        _op: &OpBinding,
-        kind: superop::EscapeKind,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::Hip(format!(
-            "minimax has no Escape super-op ({kind:?})"
-        )))
-    }
-}
-
-#[inline]
-fn mm_superop(kind: SuperOpKind) -> SuperOp {
-    SuperOp {
-        kind,
-        binding: OpBinding {
-            key: None,
-            weights: Vec::new(),
-            scratch: Vec::new(),
-            flavor: OpFlavor::None,
-        },
-    }
-}
-
-/// MiniMax has ONE layer shape (all layers Attn+MoE) → the same 2-op program for
-/// every layer. Pure → unit-testable.
-fn minimax_lower_program() -> superop::LayerProgram {
-    vec![
-        mm_superop(SuperOpKind::Attend),
-        mm_superop(SuperOpKind::Moe),
-    ]
-}
-
-/// Cached HIPFIRE_FORWARD_LOWERED toggle for minimax. #397 Ship 6: the minimax
-/// lowered decode is **DEFAULT ON** as of 2026-06-07 — hipx/gfx1151 byte-parity
-/// validated (lowered == hand token-text md5 2a46c35e… on the mq2-lloyd tier,
-/// "Paris is the capital of France."). Escape hatch: `HIPFIRE_FORWARD_LOWERED=0`
-/// forces the legacy hand loop (still present in decode_step_body).
-fn minimax_forward_lowered_enabled() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
-}
-
-/// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Pos scalar is
-/// already staged by the caller (decode_step_body). Behaviorally equivalent to
-/// the hand loop (validated via FORWARD_LOWERED=0-vs-=1 token-text md5 on hipx).
-fn decode_step_body_lowered(
-    cfg: &MiniMaxConfig,
-    weights: &MiniMaxWeights,
-    state: &mut MiniMaxState,
-    gpu: &mut Gpu,
-    position: u32,
-) -> Result<(), String> {
-    let eps = cfg.rms_norm_eps;
-    let seq_len = position as usize + 1;
-    let ctx = DispatchCtx::new(gpu);
-    let program = minimax_lower_program();
-    for (l, layer) in weights.layers.iter().enumerate() {
-        let mut bind = MinimaxBindings {
-            cfg,
-            layer,
-            state,
-            l,
-        };
-        superop::run_layer_program(gpu, &ctx, &program, &mut bind)
-            .map_err(|e| format!("minimax L{l}: lowered run_layer_program: {e}"))?;
-    }
-    state.n_tokens = seq_len;
-    gpu.rmsnorm_f32(&state.h, &weights.final_norm, &state.final_norm_buf, eps)
-        .map_err(|e| format!("minimax: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("minimax: lm_head: {e}"))
-}
-
 /// True iff every layer's expert gate_up + down dtypes have batched kernels, so
 /// `forward_batch` won't `Err` partway through a pass. Pre-check this before
 /// enabling batched prefill: unsupported tiers (MQ3-Lloyd, HFQ6-gate_up) then
@@ -1502,17 +1312,4 @@ pub fn forward_ep(
         s.n_tokens = position as usize + 1;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod ship6_lower_tests {
-    use super::*;
-    use superop::SuperOpKind::{Attend, Moe};
-
-    // #397 Ship 6 — minimax is one variant (every layer Attn+MoE).
-    #[test]
-    fn minimax_program_is_attend_then_moe() {
-        let kinds: Vec<_> = minimax_lower_program().iter().map(|o| o.kind).collect();
-        assert_eq!(kinds, vec![Attend, Moe]);
-    }
 }

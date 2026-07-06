@@ -165,7 +165,7 @@ fn main() {
     }
     let peer = gpus.enable_peer_all().expect("enable_peer_all");
     eprintln!("  peer_access_enabled={peer}");
-    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).expect("ensure_rank_streams");
+    gpus.ensure_rank_streams().expect("ensure_rank_streams");
 
     let argmax = |v: &[f32]| -> u32 {
         let mut bi = 0u32;

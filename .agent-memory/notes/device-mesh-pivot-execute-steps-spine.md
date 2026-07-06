@@ -407,6 +407,27 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   ONLY EP — daemon EP dispatch is arch10→minimax else→ds4, NO ep_serve_qwen35) + `ep_decode_parity`, steps.rs
   `match_fused_prefix`/`step_op_kind`, pipeline/mod.rs superop decl, incidental import trims (loader/llama/pp_serve/
   arch_spec/mesh). KEEP daemon EP serve + clean forward_ep + ep_deepseek4/ep_minimax examples + Step IR.
+- **P-D STEP 3 DONE 2026-07-07 — SuperOp SUBSTRATE FULLY DELETED (net −2958 LOC, 15 files).** Recon map via subagent
+  (Explore); executed surgically (grep-verified boundaries, agent line numbers were approximate). **Relocated first (the
+  lynchpin):** `ensure_rank_streams` (was `superop.rs`, needed by the KEPT loader EP serve + ep examples) → `Gpus::
+  ensure_rank_streams()` method in hipfire-hardware; repointed loader×2 + both examples. **Deleted whole files:**
+  `hipfire-dispatch/src/pipeline/superop.rs` (616L), `hipfire-dispatch/src/ep.rs` (69L shim), `hipfire-runtime/src/ep.rs`
+  (5L re-export), `hipfire-runtime/examples/ep_decode_parity.rs` (450L, was the ONLY qwen35 EP caller). **Per-arch lowered
+  deletion** (guard in decode_step_body + `*Bindings`+`impl ForwardBindings` + `*_superop`/`*_lower_program`/
+  `decode_step_body_lowered`/`*_forward_lowered_enabled` + `ship6_lower_tests` + superop import trims): lfm2moe (−299),
+  ds4 (−238, KEEP forward_ep/mtp_forward_ep/ds4_ep_moe_rank/ds4_attn_block/ds4_moe_block_core), minimax (−203, KEEP
+  forward_ep/minimax_ep_moe_rank), qwen35 (−1094: op-code substrate + `forward_ep`+`forward_prefill_batch_ep`
+  example-only EP + 4 `lowered_*` shape tests; KEPT the `*_via_execute_steps` helpers — those are Step IR, NOT superop;
+  KEPT `set_ep_expert_shard`/`current_ep_expert_shard` EP-load helpers). qwen2 was already superop-free (dense_forward).
+  Removed 3 mod decls (`pub mod superop;` pipeline/mod.rs, `pub mod ep;` dispatch+runtime lib.rs). **KEY: hand-written
+  `decode_step_body` is now the SOLE single-GPU path (lowered was default-on; green baseline proved hand==lowered
+  byte-identical so deletion is pure). Daemon/loader EP serve UNCHANGED (routes through the clean forward_ep).**
+  **VALIDATED:** workspace `--all-targets --locked` clean (23.7s); ALL lib tests pass (0 failed); ds4 EP-2 FNV
+  `0x0c04faf471f9c016`+MTP ACCEPT & minimax EP-2 FNV `0x31ede7c1d1cf140e` STILL byte-identical post-deletion; qwen35
+  single-GPU coherence-gate.sh (running/PENDING at time of note). **No fmt: the remaining rustfmt hunks in touched files
+  are PRE-EXISTING debt in untouched regions (my edits are fmt-clean); rustfmt would reformat them → violates surgical
+  rule.** P-D COMPLETE (SuperOp gone, EP clean, single-GPU hand-sole). Next: P-E (Step::Recurrent/Conv + DeltaNet
+  head-shard) per the phase plan, OR the deferred TP/PP polish.
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
