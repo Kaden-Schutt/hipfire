@@ -1631,6 +1631,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-build-info",
  "hipfire-daemon-adapter",
+ "hipfire-daemon-protocol",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-hneurons",

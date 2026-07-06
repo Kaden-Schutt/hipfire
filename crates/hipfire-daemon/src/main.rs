@@ -69,6 +69,7 @@ use dummy::{
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
 use generate::*;
 use generate_vl::{decode_vl_frames, generate_vl, generate_vl_dots_ocr, generate_vl_gemma3};
+use hipfire_daemon_protocol::DaemonRequest;
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_serving_core::lfm2_prefill;
 use hipfire_serving_core::{
@@ -2668,8 +2669,25 @@ fn main() {
             None
         };
 
-        match msg_type {
-            "model_registry" => {
+        let request: DaemonRequest = match serde_json::from_value(msg.clone()) {
+            Ok(request) => request,
+            Err(e) => {
+                // Unknown "type" tag, or a known tag whose payload the typed
+                // contract rejects. Build the envelope through serde_json
+                // (emit_error_with_id) so the error text can't corrupt the
+                // JSONL stream.
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                emit_error_with_id(
+                    &mut stdout,
+                    id,
+                    format!("unsupported or malformed request '{msg_type}': {e}"),
+                );
+                continue;
+            }
+        };
+
+        match request {
+            DaemonRequest::ModelRegistry => {
                 let _ = serde_json::to_writer(
                     &mut stdout,
                     &serde_json::json!({
@@ -2680,7 +2698,7 @@ fn main() {
                 let _ = writeln!(stdout);
                 let _ = stdout.flush();
             }
-            "load" => {
+            DaemonRequest::Load(_) => {
                 // A steer session is process-global and outlives the model it was
                 // captured/applied against; drop it before swapping models so a
                 // stale apply can't perturb the freshly-loaded one.
@@ -3406,7 +3424,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "generate" => {
+            DaemonRequest::Generate(_) => {
                 // Explicit per-request raw-prompt override (optional `"raw"`
                 // bool). Absent → None → auto default (raw iff no chat_template).
                 // Always set, so it resets every request (no cross-request leak).
@@ -4061,7 +4079,7 @@ fn main() {
                 }
             }
 
-            "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
+            DaemonRequest::GenerateBatchPrefill => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
                     if dummy_model.is_none() {
@@ -4185,7 +4203,7 @@ fn main() {
                 }
             },
 
-            "prefix_hash_preflight" => match validate_prefix_hash_preflight(&msg) {
+            DaemonRequest::PrefixHashPreflight => match validate_prefix_hash_preflight(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
                     match activate_model_worker(
@@ -4252,7 +4270,7 @@ fn main() {
                 }
             },
 
-            "generate_batch_decode_step" => match validate_generate_batch_decode(&msg) {
+            DaemonRequest::GenerateBatchDecodeStep => match validate_generate_batch_decode(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
                     match activate_model_worker(
@@ -4299,7 +4317,7 @@ fn main() {
                 }
             },
 
-            "release_sessions" => {
+            DaemonRequest::ReleaseSessions => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("release");
                 let target_worker_id = message_worker_id(&msg);
                 if dummy_model.is_none() {
@@ -4379,7 +4397,7 @@ fn main() {
                 }
             }
 
-            "reserve_session_state" => {
+            DaemonRequest::ReserveSessionState => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("reserve");
                 let target_worker_id = message_worker_id(&msg);
                 generic_state_arena.purge_expired();
@@ -4482,7 +4500,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "describe_state" => {
+            DaemonRequest::DescribeState => {
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4526,7 +4544,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "release_session_state_reservation" | "release_state" => {
+            DaemonRequest::ReleaseState => {
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4565,7 +4583,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "worker_status" | "list_workers" => {
+            DaemonRequest::WorkerStatus => {
                 let status = resident_worker_status_json(
                     &active_worker_id,
                     model.as_ref(),
@@ -4575,7 +4593,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "inventory" => {
+            DaemonRequest::Inventory => {
                 let inventory = daemon_accelerator_inventory(&mut gpu);
                 let mut payload = serde_json::to_value(inventory)
                     .unwrap_or_else(|_| serde_json::json!({"source": "daemon", "devices": []}));
@@ -4584,7 +4602,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "reset" => {
+            DaemonRequest::Reset => {
                 let target_worker_id = message_worker_id(&msg);
                 if dummy_model.is_none() {
                     match activate_model_worker(
@@ -4769,7 +4787,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "unload" => {
+            DaemonRequest::Unload => {
                 // PFlash drafter goes FIRST: its weights/scratch/KV
                 // tensors are released via Gpu::free_tensor, which only
                 // queues into the GPU pool. The actual hipFree happens
@@ -4804,7 +4822,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "unload_worker" => {
+            DaemonRequest::UnloadWorker => {
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4842,7 +4860,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "ping" => {
+            DaemonRequest::Ping => {
                 let _ = writeln!(stdout, r#"{{"type":"pong"}}"#);
                 let _ = stdout.flush();
             }
@@ -4852,7 +4870,7 @@ fn main() {
             // daemon-internal — only the request + the resulting path/summary cross
             // JSONL. Single-GPU qwen3.5-family bf16 only (capture fires at the
             // bf16 chokepoints); additive and gated, never on the decode hot path.
-            "collect" => {
+            DaemonRequest::Collect(_) => {
                 // Parse fields directly from the JSON message (the daemon is the
                 // server side; the typed CollectRequest contract lives in
                 // hipfire-daemon-protocol for clients). Field names must match.
@@ -5006,7 +5024,7 @@ fn main() {
             // it through one forward path → ≈0 on a healthy run; the guard that
             // catches the historical two-binary drift. build_ref/score (with the
             // .kldref container) land next.
-            "kld_eval" => {
+            DaemonRequest::KldEval(_) => {
                 let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
                 let corpus = msg.get("corpus").and_then(|v| v.as_str()).map(String::from);
                 let ref_path = msg
@@ -5434,7 +5452,7 @@ fn main() {
             // capture→derive→apply→score through the daemon's correct inference +
             // templating instead of a reimplemented harness. See
             // docs/plans/2026-06-30-steer-daemon-pivot.md.
-            "steer_begin_capture" => {
+            DaemonRequest::SteerBeginCapture(_) => {
                 let num_layers = msg
                     .get("num_layers")
                     .and_then(|v| v.as_u64())
@@ -5460,7 +5478,7 @@ fn main() {
             // its last-prompt-token residuals into the capture means. Prefill-only:
             // a decoded token's forward would overwrite the residual the hook just
             // recorded (the `collect` arm is prefill-only for the same reason).
-            "steer_capture" => {
+            DaemonRequest::SteerCapture(_) => {
                 let system = msg
                     .get("system")
                     .and_then(|v| v.as_str())
@@ -5542,7 +5560,7 @@ fn main() {
             // End the capture session and return the per-block means as a
             // num_layers × hidden f32 matrix (the client derives directions from
             // the +/- means it collected).
-            "steer_finish_capture" => match hipfire_steer::finish_capture() {
+            DaemonRequest::SteerFinishCapture => match hipfire_steer::finish_capture() {
                 Some(means) => {
                     let resp = serde_json::json!({
                         "type": "steer_captured",
@@ -5560,7 +5578,7 @@ fn main() {
 
             // Begin an apply session: steer (additive) or ablate (projective) each
             // block in [layer_start, layer_end) along the per-block `directions`.
-            "steer_begin_apply" => {
+            DaemonRequest::SteerBeginApply(_) => {
                 let directions: Option<Vec<Vec<f32>>> = msg
                     .get("directions")
                     .and_then(|v| v.as_array())
@@ -5616,7 +5634,7 @@ fn main() {
             }
 
             // Tear down any active steer session (back to the base model).
-            "steer_clear" => {
+            DaemonRequest::SteerClear => {
                 hipfire_steer::clear();
                 let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
                 let _ = stdout.flush();
@@ -5628,7 +5646,7 @@ fn main() {
             // is scaled by `gain` in the FFN forward (prefill + decode); every
             // other neuron by 1.0. `gain == 1.0` or an empty set clears the
             // session — the identity control point of the dose-response sweep.
-            "hneuron_intervene" => {
+            DaemonRequest::HneuronIntervene(_) => {
                 let gain = msg.get("gain").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
                 let indices: Vec<usize> = msg
                     .get("indices")
@@ -5701,7 +5719,7 @@ fn main() {
             // source fp16 weights:
             //   [u32 n_layers][u32 intermediate][f32 × n_layers*intermediate].
             // Cached in `cett_colnorms` and reused for every `cett_capture`.
-            "cett_load_colnorms" => {
+            DaemonRequest::CettLoadColnorms(_) => {
                 let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(
                         &mut stdout,
@@ -5769,7 +5787,7 @@ fn main() {
             // llama forward and return the per-layer mean-over-response-tokens
             // CETT feature (`[n_layers][intermediate]`). Requires a resident
             // llama backend (arch 10) and a prior `cett_load_colnorms`.
-            "cett_capture" => {
+            DaemonRequest::CettCapture(_) => {
                 let system = msg
                     .get("system")
                     .and_then(|v| v.as_str())
@@ -5988,7 +6006,7 @@ fn main() {
             // remove adapters, and list — all without reload. The abliteration
             // directions materialized by `lora_export`/the harness become a portable
             // adapter served here. See docs/plans/2026-06-30-abliteration-lora.md.
-            "lora_load" => {
+            DaemonRequest::LoraLoad(_) => {
                 let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(&mut stdout, "", "lora_load: missing 'path'".to_string());
                     continue;
@@ -6039,7 +6057,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "lora_set_scale" => {
+            DaemonRequest::LoraSetScale(_) => {
                 let id = msg.get("id").and_then(|v| v.as_str()).map(String::from);
                 let scale = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
                 let (Some(id), Some(scale)) = (id, scale) else {
@@ -6062,7 +6080,7 @@ fn main() {
                 }
             }
 
-            "lora_unload" => {
+            DaemonRequest::LoraUnload(_) => {
                 let Some(id) = msg.get("id").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(&mut stdout, "", "lora_unload: missing 'id'".to_string());
                     continue;
@@ -6079,13 +6097,13 @@ fn main() {
                 }
             }
 
-            "lora_clear" => {
+            DaemonRequest::LoraClear => {
                 hipfire_steer::clear();
                 let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
                 let _ = stdout.flush();
             }
 
-            "lora_list" => {
+            DaemonRequest::LoraList => {
                 let adapters: Vec<_> = hipfire_steer::loaded_adapters()
                     .into_iter()
                     .map(|(id, scale)| serde_json::json!({ "id": id, "scale": scale }))
@@ -6101,7 +6119,7 @@ fn main() {
             // (teacher/student split, docs/plans/2026-06-19-training-via-daemon-forward.md).
             // Output is JSONL, one line per chunk; the trainer's daemon-label
             // loader converts it to the v2 label cache.
-            "pflash_labels" => {
+            DaemonRequest::PflashLabels(_) => {
                 let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
                 else {
                     emit_error_with_id(
@@ -6274,7 +6292,7 @@ fn main() {
             // resident target (teacher/student split). STEP 1: plumbing only —
             // validates args + the hipfire-train link; the loop wiring lands in
             // step 3. See docs/plans/2026-06-19-train-as-daemon-op.md.
-            "train_drafter" => {
+            DaemonRequest::TrainDrafter => {
                 let arch = msg
                     .get("arch")
                     .and_then(|v| v.as_str())
@@ -6468,7 +6486,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "diag" => {
+            DaemonRequest::Diag => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
                 let has_model = model.is_some();
@@ -6547,7 +6565,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "bench_prefill" => {
+            DaemonRequest::BenchPrefill(_) => {
                 // Synthetic prefill benchmark — measures forward_prefill_batch on N
                 // deterministic tokens from a zeroed state. Used by `hipfire bench`
                 // to produce canonical pp128/pp512/pp1024 numbers that don't depend
@@ -6813,7 +6831,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "profile" => {
+            DaemonRequest::Profile => {
                 // Precompile kernels for common configurations so we have something to profile.
                 // If a model is loaded its kernels are already compiled; this fills in the rest.
                 // Cover all KV modes × weight formats × head_dims to catch all kernel variants.
@@ -6836,13 +6854,14 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            _ => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","message":"unknown type: {}"}}"#,
-                    msg_type
+            DaemonRequest::Abort(_) | DaemonRequest::ForceAnswer(_) => {
+                emit_error_with_id(
+                    &mut stdout,
+                    msg.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    format!(
+                        "{msg_type} is handled on the control channel, not the request channel"
+                    ),
                 );
-                let _ = stdout.flush();
             }
         }
     }
