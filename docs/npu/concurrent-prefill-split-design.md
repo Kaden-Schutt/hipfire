@@ -67,7 +67,30 @@ The concurrency mechanism is proven and the primitive is production-ready — th
 *works* and is net positive. But the go/no-go measurement (`gpu_w4a4_lowbatch_bench`) settled
 the ROI: **the split adds only ~5–7% across the realistic interactive range (256–768
 tokens), reaching double digits only below ~128 tokens.** That does not justify the hot-path
-complexity. **Recommendation: do not build the split now.** The R6 work stands as a
+complexity. **Recommendation: do not build the *throughput* split now.** The R6 work stands as a
 validated, documented capability (`NpuGemmMp` + benches + this analysis) — revisit only for
 a specific sub-128-token latency product, or if a future NPU kernel lifts the 1.9-TOPS
 per-slab ceiling materially. Nothing is lost by waiting.
+
+## Still worth investigating (this verdict is throughput-framed only)
+
+The "don't build" above rejects one specific thing — splitting a single prefill GEMM for
+*throughput*. It does **not** close the NPU. Three angles the throughput lens misses:
+
+1. **Power / battery — the NPU's real edge on a laptop.** The NPU is far more perf/**watt**
+   than the iGPU. On battery, running inference (or part of it) on the low-power NPU — even
+   at 1.9 TOPS — instead of the power-hungry GPU could materially extend battery life. This
+   whole analysis measured *throughput*, never *power*. Next step: measure NPU vs GPU power
+   at equal work (`amd_pmf` `power_mw` sensor / `xrt-smi` for the NPU vs `rocm-smi` for the
+   GPU) and reframe the value as Wh/token, not TOPS. A modest-throughput NPU that sips power
+   is a genuine win for a plugged-out laptop.
+2. **Draft model on the NPU (speculative decode).** Instead of splitting one GEMM, run the
+   *whole* small draft-model forward on the NPU while the GPU does the target-model verify —
+   a clean concurrent split at the **model** level. It frees the GPU, and the draft's
+   small-batch decode is exactly the NPU's regime. A much better NPU fit than the prefill
+   GEMM split, and the concurrency mechanism (`submit`/`wait`) is already proven.
+3. **NPU prefill more broadly** — offloading whole layers/experts, or prefill for a
+   secondary/background request, rather than co-splitting the foreground GEMM.
+
+These reframe NPU value away from raw prefill throughput and are **not** ruled out by the
+split ROI above.
