@@ -15,8 +15,9 @@ use hipfire_diffusion::DiffusionHipRuntimeOptions;
 use hipfire_diffusion::{
     calibrate_diffusion_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
     resize_rgb_batch_to_cover_nearest, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
-    DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
-    DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule, RgbImageBatch,
+    DiffusionError, DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline,
+    DiffusionProgress, DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule,
+    RgbImageBatch,
 };
 use hipfire_diffusion_coexist::{import_diffusers_to_hfq, DiffusersImportOptions};
 use serde::Serialize;
@@ -239,6 +240,11 @@ pub struct DiffusionTxt2ImgArgs {
     /// Output PNG file for one image, or output directory for batches
     #[arg(long, short)]
     pub output: PathBuf,
+    /// Directory to write a per-step preview PNG (step_00.png, step_01.png, ...)
+    /// by decoding the intermediate latent after each denoise pass. Useful for a
+    /// webui progress strip; adds one VAE decode per step. Single-image runs only.
+    #[arg(long)]
+    pub preview_dir: Option<PathBuf>,
     /// Output image width in pixels
     #[arg(long, default_value_t = 512)]
     pub width: u32,
@@ -740,6 +746,41 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         generate_mrflow_txt2img(&pipeline, request, &args, preset, runtime_options)?
     } else if args.enable_hr {
         generate_highres_txt2img(&pipeline, request, &args, runtime_options)?
+    } else if let Some(preview_dir) = args.preview_dir.clone() {
+        // Per-pass previews: decode preview_latents after each denoise step and
+        // write step_NN.png. Mirrors the webui hook (DiffusionProgress carries
+        // the intermediate latent; the pipeline decodes it to a PNG). Batches
+        // would collide on one file per step, so restrict to single-image runs.
+        if batch_images != 1 {
+            anyhow::bail!("--preview-dir is only supported for single-image runs (batch size 1)");
+        }
+        fs::create_dir_all(&preview_dir)?;
+        let mut timing = step_timing_progress("txt2img", batch_images);
+        let mut progress = |progress: DiffusionProgress| -> DiffusionResult<()> {
+            if let Some(latents) = progress.preview_latents.as_ref() {
+                let step = progress.completed_steps;
+                let b64 = pipeline.decode_preview_latents_png_base64_with_runtime_options(
+                    latents,
+                    runtime_options,
+                )?;
+                let bytes = decode_base64_png(&b64).map_err(|e| {
+                    DiffusionError::InvalidRequest(format!("preview PNG decode failed: {e}"))
+                })?;
+                let path = preview_dir.join(format!("step_{step:02}.png"));
+                fs::write(&path, bytes).map_err(|e| {
+                    DiffusionError::InvalidRequest(format!(
+                        "failed to write preview {}: {e}",
+                        path.display()
+                    ))
+                })?;
+            }
+            timing(progress)
+        };
+        pipeline.generate_batch_with_progress_and_runtime_options(
+            request,
+            runtime_options,
+            &mut progress,
+        )?
     } else {
         let mut progress = step_timing_progress("txt2img", batch_images);
         pipeline.generate_batch_with_progress_and_runtime_options(
