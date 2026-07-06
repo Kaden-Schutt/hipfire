@@ -1211,6 +1211,13 @@ pub const ENV_HIPFIRE_DUMMY_PREFILL_DELAY_MS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-serving-core/src/dummy.rs:126",
 };
 
+/// `HIPFIRE_DUMP_COND` — Debug hook: HIPFIRE_DUMP_COND prints stats for the text conditioning
+pub const ENV_HIPFIRE_DUMP_COND: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DUMP_COND",
+    description: "Debug hook: HIPFIRE_DUMP_COND prints stats for the text conditioning",
+    source: "crates/hipfire-diffusion/src/pipeline_generate.rs:290",
+};
+
 /// `HIPFIRE_DUMP_HIDDEN` — DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
 pub const ENV_HIPFIRE_DUMP_HIDDEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN",
@@ -1369,7 +1376,7 @@ pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CTX: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EXPERIMENTAL_BUDGET_ALERT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EXPERIMENTAL_BUDGET_ALERT",
     description: "cache so the model \"sees\" them as part of its own trajectory,",
-    source: "crates/hipfire-daemon/src/main.rs:3761",
+    source: "crates/hipfire-daemon/src/main.rs:3760",
 };
 
 /// `HIPFIRE_FILES_STATE_MAX` — Parses "HIPFIRE_FILES_STATE_MAX" with fallback defaults
@@ -2647,7 +2654,7 @@ pub const ENV_HIPFIRE_PFLASH_SCORE_LAYER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_DFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3052",
+    source: "crates/hipfire-daemon/src/main.rs:3051",
 };
 
 /// `HIPFIRE_PP_LAYERS` — Runtime variable controlling pp layers in hipfire
@@ -2668,7 +2675,7 @@ pub const ENV_HIPFIRE_PP_PARITY_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_PFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_PFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3070",
+    source: "crates/hipfire-daemon/src/main.rs:3069",
 };
 
 /// `HIPFIRE_PREFILL_ALPHA` — Runtime variable controlling prefill alpha in hipfire
@@ -4033,6 +4040,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DTOH_DUMP,
     ENV_HIPFIRE_DUMMY_GENERATE_DELAY_MS,
     ENV_HIPFIRE_DUMMY_PREFILL_DELAY_MS,
+    ENV_HIPFIRE_DUMP_COND,
     ENV_HIPFIRE_DUMP_HIDDEN,
     ENV_HIPFIRE_DUMP_HIDDEN_ALL,
     ENV_HIPFIRE_DUMP_HIDDEN_ALLLAYERS,

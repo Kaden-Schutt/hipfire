@@ -2652,12 +2652,11 @@ fn main() {
         let msg: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","message":"invalid JSON: {}"}}"#,
-                    e
-                );
-                let _ = stdout.flush();
+                // Build the envelope through serde_json: the parse-error text is
+                // not JSON-safe (serde messages can carry quotes/newlines and
+                // echo offending input), so raw interpolation would emit a
+                // malformed line and corrupt the JSONL stream.
+                emit_error_with_id(&mut stdout, "", format!("invalid JSON: {e}"));
                 continue;
             }
         };
