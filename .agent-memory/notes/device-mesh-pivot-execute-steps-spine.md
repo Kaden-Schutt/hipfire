@@ -324,6 +324,22 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   `generate_pp`, mirror PB-TP5). **Constraints:** Q8/FP32 KV only (NO asym); `active_stream=None` regime (debug_assert);
   =0 is SAME-ARCH scoped (emulation aliases to dev0 → proves banding logic NOT transport/residency; real 2-GPU same-arch
   =0 gate is a separate HW exit; mixed-arch is coherence-only); assert banding single-source-of-truth.
+- **PC-1/2/3 ALL DONE + validated (emulated Pp-2, gfx1151).** `hipfire_runtime::pp_serve::PpModel` (the PP analog of
+  TpModel; NO executor change — bands `forward_scratch_band` + `Gpus::boundary_copy`, `active_stream=None`):
+  - **PC-1 (`6a7ac9dd`)** `pp_full_model_parity`: PpModel banded forward == single-device `forward_scratch`, **max|Δ|=0**
+    (exact — reuses the identical forward kernels; only the F32 residual byte-copy differs).
+  - **PC-2 (`a3e59d40`)** `pp_decode_parity`: prefill+decode token stream == single-GPU (FNV `0a73e497…`, first_div=None,
+    == the TP FNV). **BUG the multi-position test caught (masked by the pos-0-only oracle):** `forward_scratch_band` reads
+    `scratch.pos_buf` for RoPE+attention but only `forward_scratch_embed` (stage0) sets it → downstream stages RoPE'd at
+    a STALE pos (0) → fine at pos0, garbage at pos>0. Fix: `forward_token` memcpy's pos into EVERY downstream stage's
+    pos_buf. (Exactly the multi-token gap the review flagged.)
+  - **PC-3 (`44edf2d6`)** daemon serve: `LoadedModel.pp_dense` + `load_model_pp` (dense llama arch 0/1, pp>1) +
+    **`generate_tp` REFACTORED → generic `generate_dense<M: DenseServed>`** (one serve loop, `DenseServed` trait impl'd by
+    TpModel + PpModel — both axes share it). Live `load {pp:2}` == pp=1 single-GPU byte-identical; TP=2 serve via
+    generate_dense = no regression. **P-C (pipeline-parallel) SERVES end-to-end.**
+- **P-C follow-ups (deferred):** real-HW per-stage weight banding (VRAM win; emulation loads whole weights on the output
+  stage) + a real 2-GPU same-arch =0 gate (emulation can't prove transport/residency); batched prefill (per-token now);
+  executor-transparent PP / N×M compose → P-5b. Then P-D (Step::Moe/EP fold), P-E (DeltaNet head-shard).
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
