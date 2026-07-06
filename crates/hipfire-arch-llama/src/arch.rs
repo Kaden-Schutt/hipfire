@@ -19,7 +19,7 @@ use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use hipfire_runtime::weight_manifest::{
-    FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+    PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
 };
 use rdna_compute::DType;
 use rdna_compute::Gpu;
@@ -92,9 +92,9 @@ impl Architecture for Llama {
 
     /// Dense (GQA) weight manifest (device-mesh Phase 2): the standard
     /// Megatron placement, transcribed from the llama layout. Attention Q/K/V
-    /// is column-parallel with GQA head structure declared (`FusedQkv`), O is
-    /// row-parallel; FFN gate/up column-parallel, down row-parallel; norms
-    /// replicated; embed pinned to stage 0; lm_head pinned to the output stage.
+    /// are three separate column-parallel projections, O is row-parallel; FFN
+    /// gate/up column-parallel, down row-parallel; norms replicated; embed
+    /// pinned to stage 0; lm_head pinned to the output stage.
     fn weight_manifest(cfg: &Self::Config) -> Vec<WeightEntry> {
         use ShardPolicy::*;
         let (d, ff, hd) = (cfg.dim, cfg.hidden_dim, cfg.head_dim);
@@ -107,19 +107,20 @@ impl Architecture for Llama {
             Pin(PinTarget::Embed),
         ));
         for l in 0..cfg.n_layers {
-            // Q/K/V: separate column-parallel projections with GQA head structure
-            // declared so the engine head-shards them correctly.
+            // Q/K/V are three SEPARATE projections in llama, not a packed
+            // fused tensor — so each is a plain column-parallel shard on its
+            // output dim, matching wk/wv below. `FusedQkv` is only for an
+            // actually-fused Q|K|V tensor (there is nothing to cut at K/V
+            // boundaries here). Phase-5 refinement: upgrade all three to a
+            // head-aware policy carrying the GQA q/kv head counts so
+            // `validate_manifest` enforces per-head (not just per-dim)
+            // divisibility.
             m.push(WeightEntry::layer(
                 "wq",
                 l,
                 vec![nh * hd, d],
                 DType::F16,
-                FusedQkv {
-                    q_heads: nh,
-                    kv_heads: nkv,
-                    head_dim: hd,
-                    layout: FusedQkvLayout::Qkv,
-                },
+                ColumnShard { axis: 0 },
             ));
             m.push(WeightEntry::layer(
                 "wk",
