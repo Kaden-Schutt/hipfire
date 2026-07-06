@@ -2499,7 +2499,7 @@ fn main() {
                         max_think_tokens: vl_max_think_tokens,
                     };
                     if is_dots_ocr {
-                        generate_vl_dots_ocr(m, &mut gpus.devices[0], &mut stdout, &params);
+                        generate_vl_dots_ocr(m, &mut gpus, &mut stdout, &params);
                     } else {
                         generate_vl(m, &mut gpus.devices[0], &mut stdout, &params);
                     }
@@ -2927,7 +2927,7 @@ fn main() {
                     let state = m.qwen2_state.as_mut().unwrap();
                     let mut ok = true;
                     for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpus.devices[0], weights, config, state, tok).is_err() {
+                        if qwen2::forward_step(&mut gpus, weights, config, state, tok).is_err() {
                             ok = false;
                             break;
                         }
@@ -8449,7 +8449,6 @@ fn generate_multi(
 
 #[allow(clippy::too_many_arguments)]
 fn generate(m: &mut LoadedModel, gpus: &mut Gpus, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
-    let gpu = &mut gpus.devices[0];
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -8490,7 +8489,7 @@ fn generate(m: &mut LoadedModel, gpus: &mut Gpus, drafter_gpu: Option<&mut rdna_
         let _ = stop; // hunt3 M-F: not wired for arch_id=7 (qwen2 bring-up)
         generate_qwen2(
             m,
-            gpu,
+            gpus,
             stdout,
             id,
             prompt,
@@ -8503,6 +8502,7 @@ fn generate(m: &mut LoadedModel, gpus: &mut Gpus, drafter_gpu: Option<&mut rdna_
         );
         return;
     }
+    let gpu = &mut gpus.devices[0];
     if m.arch_id == 9 {
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
         // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
@@ -12650,7 +12650,7 @@ fn generate_minimax(
 /// llama path uses.
 fn generate_qwen2(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpus: &mut Gpus,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -12723,7 +12723,7 @@ fn generate_qwen2(
     // logits in state.logits — these are the predictions for the
     // first generated token.
     for &tok in &prompt_ids {
-        if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
+        if let Err(e) = qwen2::forward_step(gpus, weights, cfg, state, tok) {
             emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
             let _ = stdout.flush();
             return;
@@ -12739,7 +12739,7 @@ fn generate_qwen2(
     let mut generated_count: usize = 0;
     let eos_set: &[u32] = &cfg.eos_token_ids;
     let decode_t0 = Instant::now();
-    let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
+    let mut next_tok = match gpus.devices[0].argmax_f32(&state.logits, cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
             emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
@@ -12772,7 +12772,7 @@ fn generate_qwen2(
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
-        match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
+        match qwen2::forward_step_greedy(gpus, weights, cfg, state, next_tok) {
             Ok(t) => next_tok = t,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
@@ -13381,7 +13381,7 @@ fn generate_vl(
 /// side is Qwen2; the decode state reuses `m.qwen2_state`.
 fn generate_vl_dots_ocr(
     m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
+    gpus: &mut Gpus,
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
@@ -13465,7 +13465,7 @@ fn generate_vl_dots_ocr(
 
     // 4. Vision encoder → merged visual tokens.
     let patch_cols = img.patches.len() / n_patches;
-    let patches_gpu = match gpu.upload_f32(&img.patches, &[n_patches, patch_cols]) {
+    let patches_gpu = match gpus.devices[0].upload_f32(&img.patches, &[n_patches, patch_cols]) {
         Ok(t) => t,
         Err(e) => {
             write_error(stdout, id, &format!("dots.ocr patch upload failed: {e:?}"));
@@ -13473,7 +13473,7 @@ fn generate_vl_dots_ocr(
         }
     };
     let merged_gpu = match dots_ocr::vision_forward(
-        gpu,
+        &mut gpus.devices[0],
         &weights.vision,
         &config.vision,
         &patches_gpu,
@@ -13482,7 +13482,7 @@ fn generate_vl_dots_ocr(
     ) {
         Ok(t) => t,
         Err(e) => {
-            let _ = gpu.free_tensor(patches_gpu);
+            let _ = gpus.devices[0].free_tensor(patches_gpu);
             write_error(
                 stdout,
                 id,
@@ -13491,11 +13491,11 @@ fn generate_vl_dots_ocr(
             return;
         }
     };
-    let _ = gpu.free_tensor(patches_gpu);
-    let merged = match gpu.download_f32(&merged_gpu) {
+    let _ = gpus.devices[0].free_tensor(patches_gpu);
+    let merged = match gpus.devices[0].download_f32(&merged_gpu) {
         Ok(v) => v,
         Err(e) => {
-            let _ = gpu.free_tensor(merged_gpu);
+            let _ = gpus.devices[0].free_tensor(merged_gpu);
             write_error(
                 stdout,
                 id,
@@ -13504,7 +13504,7 @@ fn generate_vl_dots_ocr(
             return;
         }
     };
-    let _ = gpu.free_tensor(merged_gpu);
+    let _ = gpus.devices[0].free_tensor(merged_gpu);
     // Hard guard: merger output count MUST equal the imgpad-slot count, or
     // the splice silently corrupts the text context (PRD §"Vision token splicing").
     if merged.len() != n_visual * dim {
@@ -13526,7 +13526,7 @@ fn generate_vl_dots_ocr(
     state.reset();
     let t_prefill = Instant::now();
     let mut embeds = vec![0f32; prompt_ids.len() * dim];
-    let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
+    let emb_scratch = match gpus.devices[0].alloc_tensor(&[dim], rdna_compute::DType::F32) {
         Ok(t) => t,
         Err(e) => {
             write_error(
@@ -13547,12 +13547,12 @@ fn generate_vl_dots_ocr(
         } else {
             // dots.ocr text weights are Q8_0 (q8.hfq).
             if let Err(e) =
-                gpu.embedding_lookup_q8(&weights.text.token_embd, &emb_scratch, token, dim)
+                gpus.devices[0].embedding_lookup_q8(&weights.text.token_embd, &emb_scratch, token, dim)
             {
                 embed_err = Some(format!("embedding lookup: {e:?}"));
                 break;
             }
-            match gpu.download_f32(&emb_scratch) {
+            match gpus.devices[0].download_f32(&emb_scratch) {
                 Ok(row) => embeds[pos * dim..(pos + 1) * dim].copy_from_slice(&row),
                 Err(e) => {
                     embed_err = Some(format!("embedding download: {e:?}"));
@@ -13561,7 +13561,7 @@ fn generate_vl_dots_ocr(
             }
         }
     }
-    let _ = gpu.free_tensor(emb_scratch);
+    let _ = gpus.devices[0].free_tensor(emb_scratch);
     if let Some(e) = embed_err {
         write_error(
             stdout,
@@ -13571,7 +13571,7 @@ fn generate_vl_dots_ocr(
         return;
     }
     if let Err(e) =
-        qwen2::forward_prefill_batch_embeds(gpu, &weights.text, text_cfg, state, &embeds)
+        qwen2::forward_prefill_batch_embeds(&mut gpus.devices[0], &weights.text, text_cfg, state, &embeds)
     {
         write_error(
             stdout,
@@ -13589,7 +13589,7 @@ fn generate_vl_dots_ocr(
     } else {
         text_cfg.eos_token_ids.clone()
     };
-    let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
+    let mut next = match gpus.devices[0].argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
             write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
@@ -13633,7 +13633,7 @@ fn generate_vl_dots_ocr(
             emitted_bytes += valid_len;
         }
 
-        match qwen2::forward_step_greedy(gpu, &weights.text, text_cfg, state, next) {
+        match qwen2::forward_step_greedy(gpus, &weights.text, text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
                 write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));

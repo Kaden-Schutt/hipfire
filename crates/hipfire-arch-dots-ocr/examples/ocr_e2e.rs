@@ -31,6 +31,7 @@ use std::time::Instant;
 use hipfire_arch_dots_ocr::{dots_ocr, image as preprocess};
 use hipfire_arch_qwen2::qwen2::{self, Qwen2State, Qwen2Weights};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{profile, Gpu};
 
@@ -114,13 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("tokenizer load failed: {e:?}"))?;
 
     // 4. GPU init.
-    let mut gpu = Gpu::init()?;
+    let mut gpus = Gpus::single(Gpu::init()?, 0);
 
     // 5. Vision pipeline: load weights → preprocess image → forward → download.
     eprintln!("\n[vision] loading weights...");
     let t = Instant::now();
-    let vis_weights = dots_ocr::load_vision_weights(&hfq, &dots_cfg.vision, &mut gpu)?;
-    gpu.hip.device_synchronize()?;
+    let vis_weights = dots_ocr::load_vision_weights(&hfq, &dots_cfg.vision, &mut gpus.devices[0])?;
+    gpus.devices[0].hip.device_synchronize()?;
     eprintln!("[vision] weights loaded in {:.1}s", t.elapsed().as_secs_f32());
 
     let img = preprocess::preprocess_image(&args.image)?;
@@ -132,29 +133,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "vision n_visual_tokens={n_visual_tokens} != prompt n_imgpad={n_imgpad} — \
          image grid does not match the captured prompt");
 
-    let patches_gpu = gpu.upload_f32(&img.patches,
+    let patches_gpu = gpus.devices[0].upload_f32(&img.patches,
         &[n_patches, img.patches.len() / n_patches])?;
     eprintln!("[vision] running encoder...");
     let t = Instant::now();
-    let merged_gpu = dots_ocr::vision_forward(&mut gpu, &vis_weights, &dots_cfg.vision,
+    let merged_gpu = dots_ocr::vision_forward(&mut gpus.devices[0], &vis_weights, &dots_cfg.vision,
         &patches_gpu, img.grid_h, img.grid_w)?;
-    gpu.free_tensor(patches_gpu)?;
-    gpu.hip.device_synchronize()?;
+    gpus.devices[0].free_tensor(patches_gpu)?;
+    gpus.devices[0].hip.device_synchronize()?;
     eprintln!("[vision] encoder done in {:.1}s", t.elapsed().as_secs_f32());
-    let merged: Vec<f32> = gpu.download_f32(&merged_gpu)?;
-    gpu.free_tensor(merged_gpu)?;
-    vis_weights.free_gpu(&mut gpu);
+    let merged: Vec<f32> = gpus.devices[0].download_f32(&merged_gpu)?;
+    gpus.devices[0].free_tensor(merged_gpu)?;
+    vis_weights.free_gpu(&mut gpus.devices[0]);
     assert_eq!(merged.len(), n_visual_tokens * text_cfg.hidden_size);
 
     // 6. Load text weights.
     eprintln!("\n[text] loading weights...");
     let t = Instant::now();
-    let text_weights = Qwen2Weights::load(&mut hfq, &text_cfg, &mut gpu)
+    let text_weights = Qwen2Weights::load(&mut hfq, &text_cfg, &mut gpus.devices[0])
         .map_err(|e| format!("text weight load failed: {e}"))?;
-    gpu.hip.device_synchronize()?;
+    gpus.devices[0].hip.device_synchronize()?;
     eprintln!("[text] weights loaded in {:.1}s", t.elapsed().as_secs_f32());
 
-    let mut text_state = Qwen2State::new_with_max_seq(&mut gpu, &text_cfg, max_seq)
+    let mut text_state = Qwen2State::new_with_max_seq(&mut gpus.devices[0], &text_cfg, max_seq)
         .map_err(|e| format!("text state alloc failed: {e:?}"))?;
 
     // 7. Prefill: splice merger output at IMGPAD positions.
@@ -173,19 +174,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 embeds[pos*dim..(pos+1)*dim].copy_from_slice(&merged[visual_idx*dim..(visual_idx+1)*dim]);
                 visual_idx += 1;
             } else {
-                let row = qwen2::embed_token_row(&mut gpu, &text_weights, &text_cfg, &mut text_state, token)?;
+                let row = qwen2::embed_token_row(&mut gpus.devices[0], &text_weights, &text_cfg, &mut text_state, token)?;
                 embeds[pos*dim..(pos+1)*dim].copy_from_slice(&row);
             }
         }
-        qwen2::forward_prefill_batch_embeds(&mut gpu, &text_weights, &text_cfg, &mut text_state, &embeds)?;
+        qwen2::forward_prefill_batch_embeds(&mut gpus.devices[0], &text_weights, &text_cfg, &mut text_state, &embeds)?;
     } else {
         for (pos, &token) in prompt_ids.iter().enumerate() {
             if token == dots_ocr::IMGPAD_ID {
                 let emb = &merged[visual_idx * dim..(visual_idx + 1) * dim];
-                qwen2::forward_step_with_embed(&mut gpu, &text_weights, &text_cfg, &mut text_state, emb)?;
+                qwen2::forward_step_with_embed(&mut gpus, &text_weights, &text_cfg, &mut text_state, emb)?;
                 visual_idx += 1;
             } else {
-                qwen2::forward_step(&mut gpu, &text_weights, &text_cfg, &mut text_state, token)?;
+                qwen2::forward_step(&mut gpus, &text_weights, &text_cfg, &mut text_state, token)?;
             }
             if pos > 0 && pos % 500 == 0 {
                 let so_far = t.elapsed().as_secs_f32();
@@ -204,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n[generate] greedy, max_tokens={}, eos={}", args.max_tokens, text_cfg.eos_token_id);
     let t = Instant::now();
     let mut output_ids: Vec<u32> = Vec::with_capacity(args.max_tokens);
-    let mut next = gpu.argmax_f32(&text_state.logits, text_cfg.vocab_size)?;
+    let mut next = gpus.devices[0].argmax_f32(&text_state.logits, text_cfg.vocab_size)?;
     let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
         vec![text_cfg.eos_token_id]
     } else {
@@ -244,7 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 per_step / 1000.0, 1_000_000.0 / per_step);
         }
 
-        next = qwen2::forward_step_greedy(&mut gpu, &text_weights, &text_cfg, &mut text_state, next)?;
+        next = qwen2::forward_step_greedy(&mut gpus, &text_weights, &text_cfg, &mut text_state, next)?;
         if step > 0 && step % 200 == 0 {
             let so_far = t.elapsed().as_secs_f32();
             eprintln!("  [generate] step {step}  {:.1}s  ({:.1} tok/s)",
@@ -260,6 +261,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{decoded}");
 
     eprintln!("\n[done] total: prefill {:.1}s + gen {:.1}s", prefill_s, gen_s);
-    text_weights.free_gpu(&mut gpu);
+    text_weights.free_gpu(&mut gpus.devices[0]);
     Ok(())
 }

@@ -36,6 +36,7 @@ use hipfire_dispatch::pipeline::superop::{
     self, EscapeKind, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_runtime::multi_gpu::{DeviceMesh, Gpus};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -524,8 +525,12 @@ fn load_weight_tensor(
             let buf = gpu.upload_raw(&data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
+        13 => {
+            let buf = gpu.upload_raw(&data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
         qt => panic!("qwen2: unsupported weight quant_type {qt} for {name}. \
-                     This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
+                     This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128), 13 (MQ4G256)}}. \
                      Extend load_weight_tensor or wait for the Transformer-extraction PR \
                      to pick up qwen35's full quant_type matrix."),
     }
@@ -715,16 +720,17 @@ impl Qwen2State {
 /// - KV quantisation (cache is F32; see Qwen2State doc for rationale).
 /// - Sampling (caller picks argmax or top-p).
 pub fn forward_step(
-    gpu: &mut Gpu,
+    gpus: &mut Gpus,
     weights: &Qwen2Weights,
     cfg: &Qwen2Config,
     state: &mut Qwen2State,
     token: u32,
 ) -> HipResult<()> {
-    let pos = forward_step_prelude(gpu, state)?;
+    let pos = forward_step_prelude(&mut gpus.devices[0], state)?;
 
     // Embedding lookup → state.x.
     let dim = cfg.hidden_size;
+    let gpu = &mut gpus.devices[0];
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
@@ -733,7 +739,7 @@ pub fn forward_step(
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
     }
 
-    forward_step_after_x(gpu, weights, cfg, state, pos)
+    forward_step_after_x(gpus, weights, cfg, state, pos)
 }
 
 /// Variant of [`forward_step`] that consumes a pre-built F32 embedding row
@@ -745,7 +751,7 @@ pub fn forward_step(
 /// (one row of the merger output). It is uploaded directly into `state.x.buf`,
 /// after which the layer loop runs identically to [`forward_step`].
 pub fn forward_step_with_embed(
-    gpu: &mut Gpu,
+    gpus: &mut Gpus,
     weights: &Qwen2Weights,
     cfg: &Qwen2Config,
     state: &mut Qwen2State,
@@ -762,12 +768,13 @@ pub fn forward_step_with_embed(
             ),
         ));
     }
-    let pos = forward_step_prelude(gpu, state)?;
+    let pos = forward_step_prelude(&mut gpus.devices[0], state)?;
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(embedding.as_ptr() as *const u8, embedding.len() * 4)
     };
+    let gpu = &mut gpus.devices[0];
     gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
-    forward_step_after_x(gpu, weights, cfg, state, pos)
+    forward_step_after_x(gpus, weights, cfg, state, pos)
 }
 
 /// Embed one token to a host F32 row (`hidden_size`) for batched-prefill
@@ -811,7 +818,7 @@ fn forward_step_prelude(gpu: &mut Gpu, state: &Qwen2State) -> HipResult<usize> {
 /// Assumes `state.x` already holds the embedding for `pos` and `state.pos_buf`
 /// has been uploaded.
 fn forward_step_after_x(
-    gpu: &mut Gpu,
+    gpus: &mut Gpus,
     weights: &Qwen2Weights,
     cfg: &Qwen2Config,
     state: &mut Qwen2State,
@@ -821,9 +828,10 @@ fn forward_step_after_x(
     // per-layer decode through the super-op executor (run_layer_program). Default
     // off until fleet byte-parity validated on gfx1100 + gfx1201.
     if qwen2_forward_lowered_enabled() {
-        return forward_step_after_x_lowered(gpu, weights, cfg, state, pos);
+        return forward_step_after_x_lowered(gpus, weights, cfg, state, pos);
     }
 
+    let gpu = &mut gpus.devices[0];
     let n_heads = cfg.num_attention_heads;
     let n_kv_heads = cfg.num_key_value_heads;
     let head_dim = cfg.head_dim;
@@ -967,14 +975,14 @@ fn forward_step_after_x(
 /// Convenience: run [`forward_step`] then greedy-argmax the logits.
 /// Returns the next token id.
 pub fn forward_step_greedy(
-    gpu: &mut Gpu,
+    gpus: &mut Gpus,
     weights: &Qwen2Weights,
     cfg: &Qwen2Config,
     state: &mut Qwen2State,
     token: u32,
 ) -> HipResult<u32> {
-    forward_step(gpu, weights, cfg, state, token)?;
-    gpu.argmax_f32(&state.logits, cfg.vocab_size)
+    forward_step(gpus, weights, cfg, state, token)?;
+    gpus.devices[0].argmax_f32(&state.logits, cfg.vocab_size)
 }
 
 /// Batched prefill over a pre-built `[batch × dim]` embedding matrix
@@ -1367,23 +1375,23 @@ fn qwen2_forward_lowered_enabled() -> bool {
 /// `forward_step_with_embed` funnel through `forward_step_after_x`, so both
 /// entry points are covered.
 fn forward_step_after_x_lowered(
-    gpu: &mut Gpu,
+    gpus: &mut Gpus,
     weights: &Qwen2Weights,
     cfg: &Qwen2Config,
     state: &mut Qwen2State,
     pos: usize,
 ) -> HipResult<()> {
-    let ctx = DispatchCtx::new(gpu);
+    let ctx = DispatchCtx::new(&gpus.devices[0]);
     let program = qwen2_lower_program();
     for (l, layer) in weights.layers.iter().enumerate() {
         let mut bind = Qwen2Bindings { cfg, layer, state, l, seq_len: pos + 1 };
-        superop::run_layer_program(gpu, &ctx, &program, &mut bind)
+        superop::run_layer_program_mesh(&DeviceMesh::single(), gpus, std::slice::from_mut(&mut bind), &[], &program)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
     // Final RMSNorm + lm_head (outside layer loop).
-    gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
+    gpus.devices[0].rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(gpu, &ctx, &[
+    execute_steps(&mut gpus.devices[0], &ctx, &[
         Step::Gemv { w: &wr_out, input: GemvInput::Raw(&state.tmp), out: &state.logits },
     ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     state.next_pos = pos + 1;
