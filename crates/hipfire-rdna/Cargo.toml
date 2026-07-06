@@ -12,6 +12,10 @@ deltanet = []
 hip-bridge = { path = "../hip-bridge" }
 hipfire-gpu-types = { path = "../hipfire-gpu-types" }
 hipfire-primitives = { path = "../hipfire-primitives" }
+libc.workspace = true
 
 [dev-dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }
+# For the GPU↔NPU shared-dma-buf round-trip example only (Gpu::alloc_shared_gtt →
+# NpuGemmMp::attach). Dev-only: production hipfire-rdna does NOT depend on the NPU crate.
+hipfire-xdna = { path = "../hipfire-xdna" }
