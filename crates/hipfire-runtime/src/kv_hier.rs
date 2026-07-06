@@ -354,6 +354,7 @@ impl HierKvState {
             self.position_local,
             self.cold_qmax,
             self.cold_v_qmax,
+            false, // per-slot V not yet wired through the GPU cold-read kernel (#2)
         );
         let n_slots = cold.n_slots;
         let bits = self.cold_bits;
