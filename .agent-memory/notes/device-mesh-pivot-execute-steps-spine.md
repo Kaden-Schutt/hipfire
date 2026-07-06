@@ -424,10 +424,14 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   byte-identical so deletion is pure). Daemon/loader EP serve UNCHANGED (routes through the clean forward_ep).**
   **VALIDATED:** workspace `--all-targets --locked` clean (23.7s); ALL lib tests pass (0 failed); ds4 EP-2 FNV
   `0x0c04faf471f9c016`+MTP ACCEPT & minimax EP-2 FNV `0x31ede7c1d1cf140e` STILL byte-identical post-deletion; qwen35
-  single-GPU coherence-gate.sh (running/PENDING at time of note). **No fmt: the remaining rustfmt hunks in touched files
-  are PRE-EXISTING debt in untouched regions (my edits are fmt-clean); rustfmt would reformat them → violates surgical
-  rule.** P-D COMPLETE (SuperOp gone, EP clean, single-GPU hand-sole). Next: P-E (Step::Recurrent/Conv + DeltaNet
-  head-shard) per the phase plan, OR the deferred TP/PP polish.
+  single-GPU `coherence-gate.sh` PASSED (no hard errors, all 8 rows 9b/27b/4b × mq4/mq3/mq3-lloyd/mq6 fluent on the
+  hand-written sole path). pflash perf-stage FAILS but that's the KNOWN environmental gfx1100-baseline-on-gfx1151 mismatch
+  (uniform ~2x drift across ALL 12 rows = wrong-GPU baseline; lowered→hand is perf-neutral/faster since it DROPS per-op
+  dispatch overhead — NOT a regression). **No fmt: the remaining rustfmt hunks in touched files are PRE-EXISTING debt in
+  untouched regions (my edits are fmt-clean); rustfmt would reformat them → violates surgical rule.** **P-D COMPLETE @
+  commit 38def37a** (SuperOp gone, EP clean, single-GPU hand-sole). Commits: 8783d35c(ds4 EP)/3cbbfc29(minimax EP)/
+  38def37a(deletion). Next: P-E (Step::Recurrent/Conv + DeltaNet head-shard) per the phase plan, OR the deferred TP/PP
+  polish (PB-TP5 daemon `generate_tp`, batched prefill, real-HW multi-GPU checks).
 - **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
   drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
   layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
