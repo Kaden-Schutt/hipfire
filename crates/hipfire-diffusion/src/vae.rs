@@ -1303,16 +1303,48 @@ impl WanImageDecoder {
     }
 
     pub(crate) fn decode(&self, latent: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let dbg = std::env::var("HIPFIRE_DEBUG_VAE_STAGES").is_ok_and(|v| !v.is_empty());
+        let report = |name: &str, t: &CpuTensor| {
+            if !dbg {
+                return;
+            }
+            // mean |horizontal neighbor diff| over the last dim (smoothness proxy).
+            let (h, w) = match t.shape.as_slice() {
+                [_, _, h, w] => (*h, *w),
+                _ => (1, t.data.len()),
+            };
+            let mut acc = 0.0f64;
+            let mut n = 0usize;
+            let stride = t.data.len() / (h.max(1));
+            let _ = stride;
+            for row in t.data.chunks(w.max(1)) {
+                for pair in row.windows(2) {
+                    acc += (pair[0] - pair[1]).abs() as f64;
+                    n += 1;
+                }
+            }
+            eprintln!(
+                "[vae] {name}: shape={:?} smoothness(|dx|)={:.4}",
+                t.shape,
+                acc / n.max(1) as f64
+            );
+        };
         let mut hidden = wan_causal_conv2d(latent, &self.conv_in_weight, Some(&self.conv_in_bias))?;
+        report("conv_in", &hidden);
         hidden = self.mid_resnet0.forward(&hidden)?;
+        report("mid_resnet0", &hidden);
         hidden = self.mid_attention.forward(&hidden)?;
+        report("mid_attention", &hidden);
         hidden = self.mid_resnet1.forward(&hidden)?;
-        for up_block in &self.up_blocks {
+        report("mid_resnet1", &hidden);
+        for (bi, up_block) in self.up_blocks.iter().enumerate() {
             for resnet in &up_block.resnets {
                 hidden = resnet.forward(&hidden)?;
             }
+            report(&format!("up_block{bi}_resnets"), &hidden);
             if let Some(upsampler) = &up_block.upsampler {
                 hidden = upsampler.forward(&hidden)?;
+                report(&format!("up_block{bi}_upsample"), &hidden);
             }
         }
         hidden = wan_silu(&wan_rms_norm_nchw(
