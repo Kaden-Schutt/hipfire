@@ -58,6 +58,34 @@ fn quantize_w_oq8(w: &[f32], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
     (q, s)
 }
 
+// Per-group (256) symmetric signed-int4 quant, packed 2 nibbles/byte
+// (byte = even_k | odd_k<<4). Returns (packed [M*K/2], scales f32 [M*ng]).
+fn quantize_w_oq4(w: &[f32], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    let ng = k / GROUP;
+    let mut packed = vec![0u8; m * k / 2];
+    let mut s = vec![0f32; m * ng];
+    for row in 0..m {
+        for g in 0..ng {
+            let base = row * k + g * GROUP;
+            let mut amax = 0f32;
+            for i in 0..GROUP {
+                amax = amax.max(w[base + i].abs());
+            }
+            let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+            s[row * ng + g] = scale;
+            let inv = 1.0 / scale;
+            let mut i = 0;
+            while i < GROUP {
+                let q0 = (w[base + i] * inv).round().clamp(-7.0, 7.0) as i32;
+                let q1 = (w[base + i + 1] * inv).round().clamp(-7.0, 7.0) as i32;
+                packed[(base + i) / 2] = ((q0 & 0xf) | ((q1 & 0xf) << 4)) as u8;
+                i += 2;
+            }
+        }
+    }
+    (packed, s)
+}
+
 fn time_kernel<F: FnMut(&mut Gpu)>(gpu: &mut Gpu, warmup: usize, iters: usize, mut f: F) -> f64 {
     for _ in 0..warmup {
         f(gpu);
@@ -127,10 +155,30 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
         });
         oq8_tiled.push(((mb, nb), s));
     }
+    // ---- register-tiled W4A8 (int4 weight → int8 unpack × int8 activation) ----
+    let (wq4, ws4) = quantize_w_oq4(&w, m, k);
+    let w_i4 = gpu.upload_raw(&wq4, &[m * k / 2]).unwrap();
+    let w4_scales = gpu.upload_f32(&ws4, &[m * ng]).unwrap();
+    let y_w4a8 = gpu.alloc_tensor(&[b, m], DType::F32).unwrap();
+    let mut w4a8_tiled = Vec::new();
+    for &(mb, nb) in &[(2usize, 2usize), (2, 4)] {
+        let s = time_kernel(gpu, 3, 15, |g| {
+            g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
+            g.gemm_oq4a8_tiled_wmma(&w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, mb, nb)
+                .unwrap();
+        });
+        w4a8_tiled.push(((mb, nb), s));
+    }
+
     // validate the 2x4 oq8-tiled config numerics (the fastest, at the 255-VGPR
     // edge); reuses the sampled f32 reference below via y_oq8.
     gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
     gpu.gemm_oq8_tiled_wmma(&w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, 2, 4)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    // W4A8 2x4 numerics into its own reference-checked buffer.
+    gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
+    gpu.gemm_oq4a8_tiled_wmma(&w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, 2, 4)
         .unwrap();
     gpu.device_synchronize().unwrap();
 
@@ -158,6 +206,7 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
         .unwrap();
     gpu.device_synchronize().unwrap();
     let tiled_rmse = rel_rmse_of(&gpu.download_f32(&y_tiled).unwrap());
+    let w4a8_rmse = rel_rmse_of(&gpu.download_f32(&y_w4a8).unwrap());
 
     let flops = 2.0 * m as f64 * k as f64 * b as f64;
     let tf = |s: f64| flops / s / 1e12;
@@ -192,8 +241,22 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
             bf16_s / *s,
         );
     }
+    for ((mb, nb), s) in &w4a8_tiled {
+        let acc = if (*mb, *nb) == (2, 4) {
+            format!(", relRMSE {w4a8_rmse:.4}")
+        } else {
+            String::new()
+        };
+        println!(
+            "                                 | w4a8-tiled {mb}x{nb} {:>5.2} TF/s ({:>4.2}x vs naive{acc})",
+            tf(*s),
+            bf16_s / *s,
+        );
+    }
 
-    for t in [w_bf16, x_f32, y_bf16, y_tiled, w_i8, w_scales, xq_i8, xs, y_oq8] {
+    for t in [
+        w_bf16, x_f32, y_bf16, y_tiled, w_i8, w_scales, xq_i8, xs, y_oq8, w_i4, w4_scales, y_w4a8,
+    ] {
         let _ = gpu.free_tensor(t);
     }
 }

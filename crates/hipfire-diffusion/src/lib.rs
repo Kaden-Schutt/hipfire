@@ -192,6 +192,10 @@ struct RocmWeightCache {
     /// FWHT rotation — plain oq8, matching gemm_oq8_tiled_wmma). Halves the
     /// resident weight footprint vs the bf16 cache.
     named_oq8: std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
+    /// W4A8 load-time quant: per HFQ tensor **name**, the (packed signed-int4
+    /// weight [M*K/2], per-group f32 scales [M*K/256]) pair for the tiled oq4a8
+    /// GEMM. Quarter the bf16 footprint; the int8 activation keeps precision.
+    named_w4a8: std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
     /// Active activation precision for the resident linear path this step (the
     /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
     linear_precision: LinearPrecision,
@@ -432,6 +436,78 @@ impl RocmWeightCache {
             .get(&weight.name)
             .expect("named oq8 weight just inserted");
         Ok((w_i8.buf.as_ptr(), w_scales.buf.as_ptr(), ng))
+    }
+
+    /// Load-time W4A8: return `(packed-int4 weight ptr, f32 scale ptr, n_groups)`
+    /// for a resident linear weight `[out, in]` (`in % 256 == 0`), built once by
+    /// decoding the bf16 source and per-group (256) symmetric int4 quantizing it,
+    /// packed two nibbles/byte (byte = even_k | odd_k<<4) to match
+    /// gemm_oq4a8_tiled_wmma. Quarter the bf16 footprint.
+    fn resident_w4a8(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        weight: &ResidentWeight,
+    ) -> DiffusionResult<(*mut std::ffi::c_void, *mut std::ffi::c_void, usize)> {
+        const GROUP: usize = 256;
+        let (m, k) = match weight.shape.as_slice() {
+            [out, inf] => (*out, *inf),
+            other => {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "resident_w4a8 needs a 2-D [out, in] weight, got {other:?}"
+                )))
+            }
+        };
+        if k % GROUP != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "resident_w4a8: in_features {k} must be a multiple of {GROUP}"
+            )));
+        }
+        let ng = k / GROUP;
+        if !self.named_w4a8.contains_key(&weight.name) {
+            let cpu = weight.decode()?;
+            if cpu.data.len() != m * k {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "resident_w4a8: weight {:?} decoded to {} elems, expected {}",
+                    weight.name,
+                    cpu.data.len(),
+                    m * k
+                )));
+            }
+            let mut packed = vec![0u8; m * k / 2];
+            let mut scales = vec![0f32; m * ng];
+            for row in 0..m {
+                for g in 0..ng {
+                    let base = row * k + g * GROUP;
+                    let mut amax = 0f32;
+                    for i in 0..GROUP {
+                        amax = amax.max(cpu.data[base + i].abs());
+                    }
+                    // int4 range is [-7, 7] (symmetric, 8 unused).
+                    let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                    scales[row * ng + g] = scale;
+                    let inv = 1.0 / scale;
+                    let mut i = 0;
+                    while i < GROUP {
+                        let q0 = (cpu.data[base + i] * inv).round().clamp(-7.0, 7.0) as i32;
+                        let q1 = (cpu.data[base + i + 1] * inv).round().clamp(-7.0, 7.0) as i32;
+                        packed[(base + i) / 2] = ((q0 & 0xf) | ((q1 & 0xf) << 4)) as u8;
+                        i += 2;
+                    }
+                }
+            }
+            let w_i4 = gpu
+                .upload_raw(&packed, &[m * k / 2])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let w_scales = gpu
+                .upload_f32(&scales, &[m * ng])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            self.named_w4a8.insert(weight.name.clone(), (w_i4, w_scales));
+        }
+        let (w_i4, w_scales) = self
+            .named_w4a8
+            .get(&weight.name)
+            .expect("named w4a8 weight just inserted");
+        Ok((w_i4.buf.as_ptr(), w_scales.buf.as_ptr(), ng))
     }
 
     /// Return the raw device pointer to an F16 copy of `tensor`, converting the

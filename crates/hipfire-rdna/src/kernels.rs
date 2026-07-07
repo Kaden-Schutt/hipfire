@@ -3898,6 +3898,12 @@ pub const GEMM_BF16_TILED_WMMA_SRC: &str =
 pub const GEMM_OQ8_TILED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq8_tiled_wmma.hip");
 
+/// Register-tiled, zero-LDS Opus-Quant W4A8 GEMM (gfx1103/RDNA3): packed
+/// signed-int4 weight unpacked to int8 in-register × dynamic-int8 activation on
+/// iu8 WMMA. MB×NB subtiles. See `kernels/src/gemm_oq4a8_tiled_wmma.hip`.
+pub const GEMM_OQ4A8_TILED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4a8_tiled_wmma.hip");
+
 /// Generic kernel library: WMMA BF16 × BF16 → BF16 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. F32 accumulation
 /// (`v_wmma_f32_16x16x16_bf16`) with a BF16 round on store. See

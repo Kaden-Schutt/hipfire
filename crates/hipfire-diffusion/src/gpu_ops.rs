@@ -2186,15 +2186,69 @@ pub(crate) fn linear_resident_weight_resident(
         return Ok(output);
     }
     let prof = profile::enabled();
-    // W8A8 (oq8) path: quantize the weight once at load to int8 + per-group f32
-    // scales, dynamic-int8 quantize the activation, and run the register-tiled
-    // oq8 GEMM — ~2x the tiled bf16 kernel on the DiT FFN shapes and ~half the
-    // resident weight footprint. gfx1151 keeps its own m128 bf16 path; requires
-    // 256-aligned in_features. Opt in with HIPFIRE_DIFFUSION_OQ8=1.
-    let use_oq8 = gpu.arch != "gfx1151"
-        && in_features % 256 == 0
+    // W4A8 (oq4a8) path: int4 weight (¼ bf16 footprint) unpacked to int8 ×
+    // dynamic-int8 activation — the fastest tier on the DiT shapes (~7.5x naive,
+    // ~1.5x oq8) since it halves weight traffic again. Opt in with
+    // HIPFIRE_DIFFUSION_W4A8=1; takes precedence over oq8.
+    let quant_ok = gpu.arch != "gfx1151" && in_features % 256 == 0;
+    let use_w4a8 =
+        quant_ok && std::env::var("HIPFIRE_DIFFUSION_W4A8").ok().as_deref() == Some("1");
+    // W8A8 (oq8) path: int8 weight (½ bf16 footprint) × dynamic-int8 activation,
+    // register-tiled oq8 GEMM. Opt in with HIPFIRE_DIFFUSION_OQ8=1.
+    let use_oq8 = quant_ok
+        && !use_w4a8
         && std::env::var("HIPFIRE_DIFFUSION_OQ8").ok().as_deref() == Some("1");
-    if use_oq8 {
+    if use_w4a8 {
+        const GROUP: usize = 256;
+        let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let (w_i4_ptr, w_scales_ptr, ng) = cache.resident_w4a8(gpu, weight)?;
+        let w_i4_bytes = out_features
+            .checked_mul(in_features)
+            .map(|v| v / 2)
+            .ok_or_else(|| DiffusionError::InvalidMetadata("w4a8 weight size overflows".into()))?;
+        if let Some(start) = prep_start {
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::PREP_NS, start.elapsed().as_nanos() as u64);
+            profile::add(&profile::PREP_BYTES, w_i4_bytes as u64);
+        }
+        let w_i4_view = hipfire_rdna::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_i4_ptr, w_i4_bytes) },
+            shape: vec![w_i4_bytes],
+            dtype: hipfire_rdna::DType::Raw,
+        };
+        let w_scales_view = hipfire_rdna::GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(w_scales_ptr, out_features * ng * 4)
+            },
+            shape: vec![out_features * ng],
+            dtype: hipfire_rdna::DType::F32,
+        };
+        let xq = gpu
+            .alloc_tensor(&[total], hipfire_rdna::DType::Raw)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        let xs = gpu
+            .alloc_tensor(&[rows * ng], hipfire_rdna::DType::F32)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        gpu.quantize_act_oq8(input, &xq, &xs, rows, in_features, GROUP)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
+        gpu.gemm_oq4a8_tiled_wmma(
+            &w_i4_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows, GROUP,
+            2, 4,
+        )
+        .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        if let Some(start) = gemm_start {
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::GEMM_NS, start.elapsed().as_nanos() as u64);
+            let flops = (out_features as u64)
+                .saturating_mul(in_features as u64)
+                .saturating_mul(rows as u64)
+                .saturating_mul(2);
+            profile::add(&profile::GEMM_FLOPS, flops);
+        }
+        free_resident(gpu, xq)?;
+        free_resident(gpu, xs)?;
+    } else if use_oq8 {
         const GROUP: usize = 256;
         let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
         let (w_i8_ptr, w_scales_ptr, ng) = cache.resident_oq8(gpu, weight)?;

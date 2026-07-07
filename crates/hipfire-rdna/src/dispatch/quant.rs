@@ -202,6 +202,70 @@ impl Gpu {
         }
     }
 
+    /// Register-tiled Opus-Quant W4A8 GEMM: packed signed-int4 weight (`W`
+    /// [M,K/2], scales `Ws` [M,K/group]) unpacked to int8 × dynamic-int8
+    /// activation (`X` [B,K] int8, `Xs` [B,K/group]) on iu8 WMMA → `Y` f32 [B,M].
+    /// `(mb, nb)` ∈ {(2,2),(4,2),(2,4)}. Half the weight footprint of oq8.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4a8_tiled_wmma(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "gemm_oq4a8_tiled_wmma: K must be a multiple of group");
+        assert_eq!(group % 16, 0, "gemm_oq4a8_tiled_wmma: group must be a multiple of 16");
+        let kname = match (mb, nb) {
+            (2, 2) => "gemm_oq4a8_tiled_wmma_2x2",
+            (4, 2) => "gemm_oq4a8_tiled_wmma_4x2",
+            (2, 4) => "gemm_oq4a8_tiled_wmma_2x4",
+            _ => panic!("gemm_oq4a8_tiled_wmma: unsupported tiling {mb}x{nb}"),
+        };
+        self.ensure_kernel(kname, kernels::GEMM_OQ4A8_TILED_WMMA_SRC, kname)?;
+        let wp = w_i4.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let func = &self.functions[kname];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W8A8 dynamic int8 activation quantizer (f32 → signed int8 +
     /// per-group f32 scales). `xq_i8` is [B,K] int8; `xs` is [B,K/group] f32.
     pub fn quantize_act_oq8(
