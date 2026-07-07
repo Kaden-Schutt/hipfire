@@ -10,7 +10,7 @@
 //! arch-independent form that ships everywhere. The GPU loaders consume an
 //! arch *combined* layout (split nibbles + split f32 scales + interleaved decode
 //! records); [`oq4_pack_arch_combined`] performs that transform. The
-//! `hipfire optimize`/`oq4_repack` tool applies it ahead of load and stamps the
+//! `hipfire optimize` tool applies it ahead of load and stamps the
 //! result as [`OQ4_ARCH_PACKED_QT`] (`Oq4G256ArchPacked`), which loaders then
 //! upload verbatim.
 //!

@@ -12,6 +12,9 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
 * [`hipfire optimize`↴](#hipfire-optimize)
+* [`hipfire model`↴](#hipfire-model)
+* [`hipfire model compose`↴](#hipfire-model-compose)
+* [`hipfire model decompose`↴](#hipfire-model-decompose)
 * [`hipfire lock`↴](#hipfire-lock)
 * [`hipfire lock acquire`↴](#hipfire-lock-acquire)
 * [`hipfire lock release`↴](#hipfire-lock-release)
@@ -55,6 +58,7 @@ hipfire LLM inference CLI
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `optimize` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+* `model` — Compose/decompose .hfq packaging: bundle a base + role/feature sidecars into one container, or split a bundle back into its component files
 * `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
 * `detect` — Run observational coherence detectors over a captured token stream
 * `diffusion` — Import and inspect diffusion models stored as .hfq artifacts
@@ -148,7 +152,49 @@ Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 
 ###### **Arguments:**
 
-* `<ARGS>` — Arguments forwarded to the oq4_repack runner
+* `<ARGS>` — Arguments forwarded to the optimize runner
+
+
+
+## `hipfire model`
+
+Compose/decompose .hfq packaging: bundle a base + role/feature sidecars into one container, or split a bundle back into its component files
+
+**Usage:** `hipfire model <COMMAND>`
+
+###### **Subcommands:**
+
+* `compose` — Merge a base `.hfq` and its role/feature sidecars into one bundled container (records a provenance manifest so `decompose` is lossless)
+* `decompose` — Split a bundled `.hfq` back into its base + sidecar files
+
+
+
+## `hipfire model compose`
+
+Merge a base `.hfq` and its role/feature sidecars into one bundled container (records a provenance manifest so `decompose` is lossless)
+
+**Usage:** `hipfire model compose [OPTIONS] <INPUTS> <INPUTS>...`
+
+###### **Arguments:**
+
+* `<INPUTS>` — Base container first, then one or more sidecars (file paths or model aliases)
+
+###### **Options:**
+
+* `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token (e.g. `Model.mq4.hfq` + `Model.mtp.hfq` -> `Model.mtp.mq4.hfq`)
+
+
+
+## `hipfire model decompose`
+
+Split a bundled `.hfq` back into its base + sidecar files
+
+**Usage:** `hipfire model decompose <BUNDLE> <OUTPUT_DIR>`
+
+###### **Arguments:**
+
+* `<BUNDLE>` — Bundle container to split (file path or model alias)
+* `<OUTPUT_DIR>` — Directory to write the reconstructed component files into
 
 
 

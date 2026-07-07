@@ -119,12 +119,12 @@ The positional model accepts a local name, shorthand, alias, or path.
 (Alias: `hipfire repack`.)
 
 Build runner:
-  cargo build --release -p hipfire-runtime --example oq4_repack"#;
+  cargo build --release -p hipfire-runtime --example optimize"#;
 
 #[derive(Debug, Args)]
 #[command(disable_help_flag = true, trailing_var_arg = true)]
 pub struct OptimizeArgs {
-    /// Arguments forwarded to the oq4_repack runner
+    /// Arguments forwarded to the optimize runner
     #[arg(allow_hyphen_values = true)]
     pub args: Vec<OsString>,
 }
@@ -167,9 +167,9 @@ pub fn run_optimize(args: OptimizeArgs) -> anyhow::Result<()> {
         Runner::optimize(),
         resolve_forwarded_model_args(args.args, true),
         "HIPFIRE_OPTIMIZE_BIN",
-        "oq4_repack",
+        "optimize",
         OPTIMIZE_HELP,
-        "cargo build --release -p hipfire-runtime --example oq4_repack",
+        "cargo build --release -p hipfire-runtime --example optimize",
     )
 }
 
@@ -306,8 +306,8 @@ impl Runner {
 
     fn optimize() -> Self {
         Self {
-            release_name: "oq4_repack",
-            debug_name: Some("oq4_repack"),
+            release_name: "optimize",
+            debug_name: Some("optimize"),
             is_example: true,
         }
     }

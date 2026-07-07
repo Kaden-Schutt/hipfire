@@ -179,7 +179,7 @@ pub fn first_hfq_tensor<'a>(hfq: &HfqFile, names: &[&'a str]) -> Result<&'a str,
 
 // OQ4 arch-combined repack moved to `hipfire_runtime::hfq::oq4_pack_arch_combined`
 // (the single source of truth shared by the llama/qwen35/nemotron qt=34 loaders and
-// the oq4_repack tool). nemotron already depends on hipfire_runtime.
+// the `hipfire optimize` tool). nemotron already depends on hipfire_runtime.
 
 /// Load one linear weight as a `LinearWeight` (quantized when 4-bit/Q8, else an
 /// F32 upload). `m`=out rows, `k`=in cols. The nemotron HFQ has no awq sidecars,

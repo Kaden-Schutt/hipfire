@@ -190,6 +190,26 @@ pub fn hfq_has_bf16_weights(hfq: &HfqFile) -> bool {
     hfq.tensors().iter().any(|t| t.quant_type == 16)
 }
 
+/// Log a one-line notice when the model carries canonical OQ4 weights
+/// (quant_type 34) that the loader repacks into the arch-combined device layout
+/// on EVERY load. `hipfire optimize` prebakes that layout (34 -> 37) so later
+/// loads upload verbatim with no per-load repack. Index-level scan only — no GPU
+/// work; called once per load from both the single-GPU and pipeline-parallel
+/// load paths.
+fn warn_if_unoptimized(path: &str, hfq: &HfqFile) {
+    let canonical_oq4 = hfq
+        .tensors()
+        .iter()
+        .filter(|t| t.quant_type == hipfire_runtime::hfq::OQ4_CANONICAL_QT)
+        .count();
+    if canonical_oq4 > 0 {
+        eprintln!(
+            "[optimize] '{path}' has {canonical_oq4} canonical OQ4 tensor(s) repacked per load; \
+             run `hipfire optimize {path}` to prebake the arch-optimal layout and skip the per-load repack"
+        );
+    }
+}
+
 /// True only when the model is *predominantly* BF16 (a full-precision artifact),
 /// not merely a quantized model that keeps a few small tensors (norms) at BF16.
 /// Decided on the 2-D weight tensors (the matmul projections): a full BF16 model
@@ -436,21 +456,7 @@ pub fn load_model(
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let max_seq = cap_gemma3_stopgap_max_seq(max_seq, hfq.arch_id, &kv_mode);
     let model_memory = hfq_model_memory(path, &hfq);
-    // Optimization notice: canonical OQ4 weights (quant_type 34) are repacked
-    // into the arch-combined device layout on EVERY load. `hipfire optimize`
-    // prebakes that layout (34 -> 37) so later loads upload verbatim with no
-    // per-load repack. Index-level scan only — no GPU work, once per load.
-    let canonical_oq4 = hfq
-        .tensors()
-        .iter()
-        .filter(|t| t.quant_type == hipfire_runtime::hfq::OQ4_CANONICAL_QT)
-        .count();
-    if canonical_oq4 > 0 {
-        eprintln!(
-            "[optimize] '{path}' has {canonical_oq4} canonical OQ4 tensor(s) repacked per load; \
-             run `hipfire optimize {path}` to prebake the arch-optimal layout and skip the per-load repack"
-        );
-    }
+    warn_if_unoptimized(path, &hfq);
     // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
     // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
@@ -2692,6 +2698,7 @@ pub fn load_model_pp(
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let model_memory = hfq_model_memory(path, &hfq);
+    warn_if_unoptimized(path, &hfq);
     // Whether ANY tensor is BF16 — used to keep the DeltaNet *state* at FP32
     // (the recurrent state's cumulative-error sensitivity; orthogonal to KV).
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
