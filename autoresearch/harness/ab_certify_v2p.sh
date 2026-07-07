@@ -25,6 +25,7 @@ CARD_BRANCH="loop/card${CARD}"
 # index of the GPU under test (e.g. gfx1151 = HIP dev 1 = DRM card1, but its worktree is sw_card2).
 # SCLK env override lets the caller point the gate at the ACTUAL device's clock node.
 SCLK="${SCLK:-/sys/class/drm/card${CARD}/device/pp_dpm_sclk}"
+ORACLE="${ORACLE:-$MAIN/autoresearch/harness/oracle_profile.sh}"   # persistent (NOT /tmp); env-overridable
 KSRC="kernels/src/${KERNEL}.hip"
 LEDGER="$MAIN/autoresearch/ledger/swarm_${ARCH}_${KERNEL}.jsonl"
 cd "$WT" || { echo "{\"label\":\"$LABEL\",\"error\":\"no worktree $WT\"}"; exit 1; }
@@ -123,7 +124,7 @@ fi
 #      not a bare scalar — this is what stops it flying blind under the 5-run permutation budget) ----
 BP="null"; VP="null"
 if [ "$VERDICT" != "BASELINE_BUILD_FAIL" ] && [ "$VERDICT" != "VARIANT_BUILD_FAIL" ]; then
-  rp(){ cp "$1" "$DB"; HIPFIRE_REPO="$WT" bash /tmp/oracle_profile.sh "$ARCH" "$DEV" "$CARD" "$MODEL" 24 2>/dev/null | tail -1; }
+  rp(){ cp "$1" "$DB"; HIPFIRE_REPO="$WT" bash "$ORACLE" "$ARCH" "$DEV" "$CARD" "$MODEL" 24 2>/dev/null | tail -1; }
   BPC="/tmp/baseprof_${ARCH}_$(echo "$KERNEL" | tr / _)"   # base profiled ONCE per kernel, cached + reused across its variants
   [ -s "$BPC" ] || rp /tmp/v2_base_$ID > "$BPC"
   BP=$(cat "$BPC"); VP=$(rp /tmp/v2_var_$ID)

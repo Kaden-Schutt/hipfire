@@ -15,7 +15,7 @@ Runaway prevention (defense in depth):
   3. every `certify` is bounds-checked HERE: exhausted-kernel / over-budget / off-target
      submissions are REFUSED (exit 3), not merely discouraged. Codex can't go crazy.
 """
-import argparse, json, os, sqlite3, sys, time, glob
+import argparse, json, os, sqlite3, sys, time, glob, subprocess
 
 REPO = os.environ.get("AR_REPO") or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STATE = os.path.join(REPO, "autoresearch", "state")
@@ -24,6 +24,28 @@ DB = os.path.join(STATE, "ar.db")
 K_DEFAULT = 5           # consecutive DEAD/INCONCLUSIVE per kernel => EXHAUSTED (matches driver_v3)
 CAND_WALL = 3.0         # BOD wall_pct threshold to be a candidate kernel (matches driver_v3)
 DEAD_VERDICTS = {"DEAD", "INCONCLUSIVE", "LOSS", "NOISE"}
+
+# --- Remote process control (the loop runs on a GPU box; this tool drives it over ssh) ------------
+# Host is config, NOT hardcoded (contributor-generic): pass --host or set AR_SSH_HOST. Remote paths
+# are the driver's deployed location + the repo checkout on the box.
+SSH_HOST = os.environ.get("AR_SSH_HOST")            # None => remote ops require --host
+REMOTE_REPO = os.environ.get("AR_REMOTE_REPO", "~/hipfire")
+# PERSISTENT box-side harness (NOT /tmp — survives reboot). Deployed copies of autoresearch/harness/.
+REMOTE_DRIVER = os.environ.get("AR_REMOTE_DRIVER", "~/hipfire/autoresearch/harness/v2/driver_v3.sh")
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=5"]
+
+def _ssh(cmd, host):
+    """Run a shell command on the GPU box; returns (rc, stdout, stderr). Liveness/launch/kill only."""
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, host, cmd], capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception as e:
+        return 255, "", str(e)
+
+def _alive(pid, host):
+    if not pid: return "no-pid"
+    _, out, _ = _ssh(f"kill -0 {pid} 2>/dev/null && echo LIVE || echo DEAD", host)
+    return out or "unreachable"
 
 def db():
     os.makedirs(STATE, exist_ok=True)
@@ -43,7 +65,19 @@ def db():
     return c
 
 def ingest(a):
-    """Pull the committed jsonl ledger + BOD snapshots into SQLite (idempotent by (arch,kernel,lever,ts))."""
+    """Pull the jsonl ledger + BOD snapshots into SQLite (idempotent). With --host, first rsync the
+    REMOTE box ledger + bod snapshots down (the loop runs there; the DB is local) so the DB isn't blind."""
+    host = getattr(a, "host", None) or SSH_HOST
+    if host:
+        os.makedirs(LEDGER, exist_ok=True)
+        # pull ONLY the ledger (the durable verdict record written on the box); bod snapshots are
+        # already local+committed, so we don't rsync state/ (would clobber committed bod/queues).
+        try:
+            subprocess.run(["rsync", "-az", "-e", "ssh " + " ".join(SSH_OPTS),
+                            f"{host}:{REMOTE_REPO}/autoresearch/ledger/", LEDGER + "/"],
+                           capture_output=True, text=True, timeout=120)
+        except Exception as e:
+            print(json.dumps({"warn": f"rsync ledger from {host} failed: {e}"}))
     c = db(); n = 0
     for f in glob.glob(os.path.join(LEDGER, "swarm_*.jsonl")):
         base = os.path.basename(f)[len("swarm_"):-len(".jsonl")]
@@ -169,46 +203,97 @@ def cmd_status(a):
     tot = c.execute("SELECT COUNT(*) n,SUM(verdict='WIN') w FROM attempts").fetchone()
     print(f"# ar status  ({tot['n']} attempts banked, {tot['w'] or 0} wins, archs: {_arches(c)})")
     if not runs: print("  no running loops."); return 0
+    host = a.host or SSH_HOST
     for r in runs:
         left = (r["started"] + r["ttl"] - int(time.time())) if r["ttl"] else None
-        print(f"  run {r['id']} arch={r['arch']} card={r['card']} calls={r['calls']}/{r['budget']} "
-              f"ttl_left={left}s pid={r['pid']}")
+        live = _alive(r["pid"], host) if host else "no-host"   # LIVE via real ssh kill -0, not a stale field
+        print(f"  run {r['id']} arch={r['arch']} card={r['card']} pid={r['pid']} [{live}] "
+              f"calls={r['calls']}/{r['budget']} ttl_left={left}s")
     return 0
 
 def cmd_start(a):
-    """operator-only. Records a bounded run; the actual driver_v3 launch is done by the caller with
-    these env params (kept explicit so nothing hardcodes model/arch)."""
+    """operator-only. LAUNCHES driver_v3 on the GPU box over ssh, captures the REAL pid, records a
+    bounded run. --adopt-pid N adopts an already-running loop (records it) instead of launching."""
+    host = a.host or SSH_HOST
+    if not host: print(json.dumps({"error": "no host — pass --host or set AR_SSH_HOST"})); return 2
     c = db(); rid = f"{a.arch}-c{a.card}-{int(time.time())}"
+    baseline = a.baseline or f"loop_baseline_{a.arch}"
+    prompt = a.prompt or f"~/hipfire/autoresearch/harness/loop_round_prompt_{a.arch}.txt"
+    if a.adopt_pid:
+        if _alive(a.adopt_pid, host) != "LIVE":
+            print(json.dumps({"error": f"adopt pid {a.adopt_pid} not LIVE on {host}"})); return 1
+        pid, note = a.adopt_pid, f"adopted running loop pid={a.adopt_pid}"
+    else:
+        pidf = f"/tmp/loop_driver_{a.arch}.pid"; out_f = f"/tmp/loop_driver_{a.arch}.out"
+        env = (f"ARCH={a.arch} BASELINE_REF={baseline} CARDS={a.card} PROMPT={prompt} "
+               f"ROLLOVER={a.rollover} K={a.K}")
+        # Pattern A: `env .. setsid nohup .. & echo $!`. setsid detaches into a new session so ssh
+        # RETURNS IMMEDIATELY (a channel-hang here previously timed out the client while the driver
+        # kept running => orphan runaway). setsid exec-replaces (not pgroup leader) so $! IS the real
+        # driver pid; also stamped to a pidfile so a launch is recoverable even if pid capture fails.
+        launch = (f"env {env} setsid nohup bash {a.driver} {a.cap} >{out_f} 2>&1 </dev/null "
+                  f"& p=$!; echo $p > {pidf}; echo $p")
+        rc, out, err = _ssh(launch, host)
+        try: pid = int(out.strip().split()[-1])
+        except (ValueError, IndexError): pid = None
+        if not pid or _alive(pid, host) != "LIVE":
+            # tear down any orphan we may have spawned before failing (no silent runaway)
+            if pid: _ssh(f"kill {pid} 2>/dev/null; true", host)
+            print(json.dumps({"error": "launch failed / driver not LIVE", "stdout": out, "stderr": err})); return 1
+        note = f"launched driver_v3 pid={pid} on {host} (cap={a.cap}, self-terminates on exhaustion)"
     c.execute("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-              (rid, a.arch, a.model, a.card, "running", int(time.time()), None, a.budget, 0, a.ttl, None))
+              (rid, a.arch, a.model, a.card, "running", int(time.time()), None, a.budget, 0, a.ttl, pid))
     c.commit()
-    print(json.dumps({"run": rid, "budget": a.budget, "ttl": a.ttl,
-          "launch": f"AR_RUN={rid} ARCH={a.arch} MODEL={a.model} K={a.K} BOD={STATE}/bod_{a.arch}.json "
-                    f"bash autoresearch/harness/v2/driver_v3.sh   # (bounded; self-terminates on exhaustion)"}))
+    print(json.dumps({"run": rid, "pid": pid, "host": host, "budget": a.budget, "ttl": a.ttl, "note": note}))
     return 0
 
 def cmd_stop(a):
+    """Actually KILLS the remote driver pid + its codex round over ssh, then flips the DB flag."""
+    c = db(); host = a.host or SSH_HOST
+    runs = c.execute("SELECT * FROM runs WHERE status='running'" + (" AND id=?" if a.run else ""),
+                     (a.run,) if a.run else ()).fetchall()
+    killed = []
+    for r in runs:
+        if host and r["pid"]:
+            _ssh(f"kill {r['pid']} 2>/dev/null; pkill -f '[c]odex exec --dangerously' 2>/dev/null; true", host)
+        killed.append({"run": r["id"], "pid": r["pid"], "after": _alive(r["pid"], host) if host and r["pid"] else "?"})
+    c.execute("UPDATE runs SET status='stopped',stopped=? WHERE status='running'" + (" AND id=?" if a.run else ""),
+              (int(time.time()), a.run) if a.run else (int(time.time()),)); c.commit()
+    print(json.dumps({"stopped": killed or "none running", "note": "remote driver+codex signalled; DB flag flipped"}))
+    return 0
+
+def cmd_purge(a):
+    """Drop stale run rows (e.g. pid=None phantoms from before remote-pid capture)."""
     c = db()
-    q = "UPDATE runs SET status='stopped',stopped=? WHERE status='running'" + (" AND id=?" if a.run else "")
-    c.execute(q, (int(time.time()), a.run) if a.run else (int(time.time()),)); c.commit()
-    print(json.dumps({"stopped": a.run or "all running", "note": "teardown codex/certify/daemons for this card separately"}))
+    if a.pidless:
+        n = c.execute("DELETE FROM runs WHERE pid IS NULL").rowcount
+    elif a.run:
+        n = c.execute("DELETE FROM runs WHERE id=?", (a.run,)).rowcount
+    else:
+        n = c.execute("DELETE FROM runs WHERE status='stopped'").rowcount
+    c.commit(); print(json.dumps({"purged_runs": n}))
     return 0
 
 def main():
     p = argparse.ArgumentParser(prog="hipfire_ar", description="autoresearch supervisor over driver_v3")
     p.add_argument("--K", type=int, default=K_DEFAULT); sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("ingest")
+    s = sub.add_parser("ingest"); s.add_argument("--host", default=None)   # --host: rsync remote ledger first
     for name in ("bod",):
         s = sub.add_parser(name); s.add_argument("--arch", required=True); s.add_argument("--json", action="store_true")
     s = sub.add_parser("why"); s.add_argument("kernel"); s.add_argument("--arch", required=True); s.add_argument("--json", action="store_true")
     s = sub.add_parser("certify"); s.add_argument("--arch", required=True); s.add_argument("--kernel", required=True); s.add_argument("--label", default="?")
-    sub.add_parser("status")
+    s = sub.add_parser("status"); s.add_argument("--host", default=None)
     s = sub.add_parser("start"); s.add_argument("--arch", required=True); s.add_argument("--model", required=True)
     s.add_argument("--card", type=int, default=0); s.add_argument("--budget", type=int, default=40); s.add_argument("--ttl", type=int, default=7200)
-    s = sub.add_parser("stop"); s.add_argument("--run", default=None)
+    s.add_argument("--cap", type=int, default=30); s.add_argument("--host", default=None)
+    s.add_argument("--baseline", default=None); s.add_argument("--prompt", default=None)
+    s.add_argument("--rollover", default="~/hipfire/autoresearch/harness/noop_rollover.sh")
+    s.add_argument("--driver", default=REMOTE_DRIVER); s.add_argument("--adopt-pid", type=int, default=None, dest="adopt_pid")
+    s = sub.add_parser("stop"); s.add_argument("--run", default=None); s.add_argument("--host", default=None)
+    s = sub.add_parser("purge"); s.add_argument("--run", default=None); s.add_argument("--pidless", action="store_true")
     a = p.parse_args()
     fn = {"ingest": ingest, "bod": cmd_bod, "why": cmd_why, "certify": cmd_certify,
-          "status": cmd_status, "start": cmd_start, "stop": cmd_stop}[a.cmd]
+          "status": cmd_status, "start": cmd_start, "stop": cmd_stop, "purge": cmd_purge}[a.cmd]
     sys.exit(fn(a) or 0)
 
 if __name__ == "__main__":

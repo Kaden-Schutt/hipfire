@@ -33,7 +33,7 @@ echo "[rollover_stack] arch=$ARCH card=$CARD stack=$NW wins  tip=${TIP:0:8}  bas
 [ "${NW:-0}" -gt 0 ] || { echo "[rollover_stack] nothing to roll over"; exit 0; }
 [ "$TIP" != "$BREF" ] || { echo "[rollover_stack] tip==base"; exit 0; }
 
-BASED="/tmp/v2b_base_c$CARD"
+BASED="${PREBUILT_BASE:-/tmp/v2b_base_c$CARD}"   # persistent cache path (env); --promote rebuilds THIS
 [ -s "$BASED" ] || { echo "[rollover_stack] FATAL: no baseline daemon cache $BASED (build+cache the baseline first)" >&2; exit 1; }
 
 # ---- build STACK daemon from the DETACHED tip SHA ----

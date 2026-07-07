@@ -145,3 +145,4 @@ autoresearch/state/exhaustion_*.json
 autoresearch/state/baseline_folded_*.txt
 autoresearch/state/baseline_manifest_*.txt
 autoresearch/state/run_*.json
+autoresearch/state/cache/
