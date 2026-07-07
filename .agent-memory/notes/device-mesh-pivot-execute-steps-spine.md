@@ -459,11 +459,19 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
       `conversation_tokens` without entering the KV → next-turn LCP over an unwritten slot (#462 mirror skew, the COMMON
       truncation case). Return `materialized` (pushed after each successful forward_token), not `history`.** Batched suffix
       prefill stays deferred to item **D** (needs cache-attention; B+D compose). Validated: `tp_multiturn_parity`
-      (cache-hit suffix == full prefill, argmax-exact max|Δ|=2.5e-1) + `tp_prefill/decode_parity` (cold path unchanged, all
-      green). **ENV-BLOCKED (pre-existing, box-wide, NOT B — reproduces on main checkout):** daemon load fails `os error 2`
-      for every model (`strace`: `openat("")` in `load_model`, upstream of generate) ⇒ `coherence-gate.sh` + live multi-turn
-      smoke deferred until box daemon-load recovers. FOLLOWUP: does the single-GPU generate loop share the same
-      history-vs-materialized bake skew? (dense path now correct independently). Spec/plan: local
+      (cache-hit suffix == full prefill, argmax-exact max|Δ|=2.5e-1) + `tp_prefill/decode_parity` (cold path unchanged) +
+      **`coherence-gate.sh` PASS** (single-GPU serve fluent; pflash perf-stage fail = known gfx1100-baseline-vs-gfx1151 HW
+      mismatch, untouched path) + **live dense-TP daemon multi-turn smoke PASS** (emulated tp=2: real cache HIT
+      `lcp==prior_len`, turn-2 recalls a fact from history; tp=2 byte-identical to single-GPU on coherent prompts). **TRAP
+      (cost ~real debugging): the daemon "os error 2 box-wide load failure" was a HARNESS BUG, not a daemon bug — the load
+      message key is `model` NOT `path` (`daemon.rs:914` `msg.get("model").unwrap_or("")` → `HfqFile::open("")` → os error 2);
+      the generate live-turn key is `prompt` NOT the `messages` array (`daemon.rs:1616` `unwrap_or("Hello")`, `messages` =
+      PRIOR history only). Both my initial smoke AND the implementer's used the wrong keys ⇒ phantom "env blocker". Also: the
+      0.6B model goes degenerate (Arabic attractor) on open-ended "remember my name" prompts — IDENTICAL on single-GPU
+      (untouched) ⇒ model+prompt artifact, use factual/code prompts.** FOLLOWUP (checked): single-GPU dflash bake uses the
+      spec-committed tail (KV-safe, can only undercount) so does NOT share the dense overcount skew — dense fix was a real
+      new-gap close. Separate pre-existing latent: EP/minimax path (`daemon.rs:3725`) overcounts by one on stop-sequence
+      exits (push-before-forward) — file separately. Spec/plan: local
       `docs/superpowers/{specs,plans}/2026-07-07-dense-multiturn-kv-reuse*.md`.
     - **C** *(next)* — `resolve_mesh` daemon wiring (load still routes on raw `tp`/`ep` knobs).
     - **D** — >256 cross-chunk batched prefill (needs the flash `forward_prefill_batch` cache-attention).
