@@ -18,10 +18,10 @@
 //! `docs/plans/2026-06-19-arch-roster-feature-matrix.md`.
 
 use hip_bridge::HipResult;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{EmbeddingFormat, WeightTensor};
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;
 
@@ -506,6 +506,22 @@ fn load_weight_tensor(
                 k,
             )
         }
+        // OqPlusCompact: OQ+ magnitude-tiered (int4 bulk + sparse int8 outliers),
+        // stored compactly on disk (130 + 2·N_out B/group). Expand to the same
+        // Oq8G256 combined layout as arm 33/35 — int4 bulk sign-extended into int8
+        // with the outliers overlaid — so it reads through the OQ8 gemm/gemv path.
+        // Matches the minimax `oqplus_compact_to_moe_oq8_blocks` decoder (dense
+        // combined layout here vs the indexed-MoE block layout there). The `+`
+        // AWQ smoothing sidecar is attached generically below (Oq8G256 carries it).
+        36 => {
+            let combined = oqplus_compact_to_oq8_combined(&data, m, k);
+            weight_tensor(
+                gpu.upload_raw(&combined, &[combined.len()])?,
+                DType::Oq8G256,
+                m,
+                k,
+            )
+        }
         37 => {
             assert_eq!(
                 data.len(),
@@ -531,7 +547,7 @@ fn load_weight_tensor(
             let dtype = hipfire_runtime::quant::dtype_for_quant_type(qt, k).unwrap_or_else(|| {
                 panic!(
                     "gemma3: unsupported linear quant_type {qt} for {name}; \
-                     transform arms handle 16 (BF16), 33/34/35/37 (OP4/OP8); \
+                     transform arms handle 16 (BF16), 33/34/35/36/37 (OP4/OP8/OQ+C); \
                      all pure formats come from hipfire_runtime::quant::dtype_for_quant_type."
                 )
             });
@@ -619,6 +635,56 @@ fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
                 let byte = data[src + 2 + i];
                 combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
                 combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+            }
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let so = m * k + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    combined
+}
+
+/// Expand an on-disk `OqPlusCompact` (qt=36) tensor into the Oq8G256 combined
+/// layout (`[m*k int8 weights | m*ng f32 scales]`, same as [`oq4_to_oq8_combined`]
+/// / [`oq8_combined`]). Each group is `[f16 scale | 128 int4 nibbles |
+/// N_out × (u8 idx, i8 val)]` = 130 + 2·N_out bytes; the int4 bulk is
+/// sign-extended into int8 and the sparse int8 outliers overlaid. `N_out` is
+/// uniform per tensor (fixed w8_frac), derived from the block stride — mirrors
+/// minimax's `oqplus_compact_to_moe_oq8_blocks`.
+fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    assert_eq!(k % GROUP, 0, "OQ+C requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let n_groups = m * ng;
+    assert!(
+        n_groups > 0 && !data.is_empty() && data.len() % n_groups == 0,
+        "OQ+C weight byte length {} not divisible by n_groups {n_groups} (M={m} K={k})",
+        data.len()
+    );
+    let block_bytes = data.len() / n_groups;
+    assert!(
+        block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
+        "OQ+C block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
+    );
+    let n_out = (block_bytes - 130) / 2;
+    let mut combined = vec![0u8; m * k + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let blk = r * ng + g;
+            let src = blk * block_bytes;
+            let dst = r * k + g * GROUP;
+            // int4 bulk → int8 (buffer read as signed char downstream).
+            for i in 0..128 {
+                let byte = data[src + 2 + i];
+                combined[dst + 2 * i] = sext4(byte & 0xf) as u8;
+                combined[dst + 2 * i + 1] = sext4(byte >> 4) as u8;
+            }
+            // Overlay the sparse int8 outliers.
+            let tbl = src + 130;
+            for s in 0..n_out {
+                let idx = data[tbl + 2 * s] as usize;
+                let val = data[tbl + 2 * s + 1];
+                combined[dst + idx] = val;
             }
             let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
             let so = m * k + (r * ng + g) * 4;
