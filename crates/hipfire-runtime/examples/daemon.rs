@@ -2798,6 +2798,11 @@ fn generate_dense<M: DenseServed>(
         Err(e) => fail!(e),
     };
     let mut history: Vec<u32> = Vec::new();
+    // Tokens actually materialized into the KV (each pushed right after its
+    // forward_token). On a max_tokens/stop break the last emitted token is in
+    // `history` but was NOT forwarded, so returning `history` would over-count
+    // conversation_tokens by one vs the dense KV (a #462-class mirror skew).
+    let mut materialized: Vec<u32> = Vec::new();
     let mut next = sampler::sample_cpu(&mut logits, &history, &cfg);
     let mut generated = 0usize;
     let mut pos = start_pos + prefill_n;
@@ -2830,6 +2835,7 @@ fn generate_dense<M: DenseServed>(
         if let Err(e) = model.forward_token(next, pos) {
             fail!(e);
         }
+        materialized.push(next);
         pos += 1;
         logits = match model.logits() {
             Ok(l) => l,
@@ -2850,7 +2856,7 @@ fn generate_dense<M: DenseServed>(
         id, generated, decode_tok_s, prefill_n, prefill_ms, decode_tok_s
     );
     let _ = stdout.flush();
-    Some(history)
+    Some(materialized)
 }
 
 fn generate_ep(
