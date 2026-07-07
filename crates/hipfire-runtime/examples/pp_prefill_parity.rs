@@ -15,6 +15,7 @@
 //! Run: HIPFIRE_EMULATE_GPUS=2 HIPFIRE_DETERMINISTIC=1 \
 //!   cargo run -p hipfire-runtime --release --example pp_prefill_parity -- --model model.mq4
 
+use hipfire_hardware::{DeviceMesh, DimKind};
 use hipfire_runtime::llama::{self, KvCache, LlamaConfig};
 use hipfire_runtime::pp_serve::PpModel;
 
@@ -85,7 +86,8 @@ fn main() {
     };
 
     // ── PP path: PpModel batched prefill. ──
-    let mut model = match PpModel::load(&model_path, pp, MAX_SEQ) {
+    let mesh = DeviceMesh::rect(&[(DimKind::Pp, pp)]);
+    let mut model = match PpModel::load(&model_path, &mesh, MAX_SEQ) {
         Ok(m) => m,
         Err(e) => {
             println!("pp_prefill_parity: SKIPPED (PpModel::load: {e})");

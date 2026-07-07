@@ -16,6 +16,7 @@
 //! Run: HIP_VISIBLE_DEVICES=0 HIPFIRE_DETERMINISTIC=1 \
 //!   cargo run -p hipfire-runtime --release --example pp_full_model_parity [model.mq4] [token] [pp]
 
+use hipfire_hardware::{DeviceMesh, DimKind};
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig};
 use hipfire_runtime::pp_serve::PpModel;
 
@@ -60,7 +61,8 @@ fn main() {
     let argmax_ref = llama::argmax(&logits_ref);
 
     // ── PP path: PpModel banded forward across `pp` stages. ──
-    let mut model = match PpModel::load(model_path, pp, MAX_SEQ) {
+    let mesh = DeviceMesh::rect(&[(DimKind::Pp, pp)]);
+    let mut model = match PpModel::load(model_path, &mesh, MAX_SEQ) {
         Ok(m) => m,
         Err(e) => {
             println!("pp_full_model_parity: SKIPPED (PpModel::load: {e})");

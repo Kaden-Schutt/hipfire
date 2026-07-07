@@ -13,6 +13,7 @@
 //! Run: HIPFIRE_EMULATE_GPUS=2 HIPFIRE_DETERMINISTIC=1 \
 //!   cargo run -p hipfire-runtime --release --example tp_multiturn_parity -- --model model.mq4
 
+use hipfire_hardware::{DeviceMesh, DimKind};
 use hipfire_runtime::llama;
 use hipfire_runtime::tp_serve::TpModel;
 
@@ -44,10 +45,11 @@ fn main() {
     std::env::set_var("HIPFIRE_EMULATE_GPUS", "2");
 
     let full: Vec<u32> = PREFIX.iter().chain(SUFFIX.iter()).copied().collect();
+    let mesh = DeviceMesh::rect(&[(DimKind::Tp, TP)]);
 
     // ── Cold: one TpModel, prefill the WHOLE sequence at once. ──
     let cold_logits: Vec<f32> = {
-        let mut m = match TpModel::load(&model_path, TP, MAX_SEQ) {
+        let mut m = match TpModel::load(&model_path, &mesh, MAX_SEQ) {
             Ok(m) => m,
             Err(e) => {
                 println!("tp_multiturn_parity: SKIPPED (TpModel::load: {e})");
@@ -61,7 +63,7 @@ fn main() {
     // ── Reuse: a second TpModel, prefill PREFIX, then per-token SUFFIX at
     // pos = PREFIX.len()+i (the daemon cache-hit path). ──
     let reuse_logits: Vec<f32> = {
-        let mut m = TpModel::load(&model_path, TP, MAX_SEQ).expect("load reuse");
+        let mut m = TpModel::load(&model_path, &mesh, MAX_SEQ).expect("load reuse");
         m.prefill(PREFIX).expect("prefix prefill");
         for (i, &t) in SUFFIX.iter().enumerate() {
             m.forward_token(t, PREFIX.len() + i)
