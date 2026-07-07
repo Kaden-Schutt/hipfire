@@ -26,7 +26,6 @@ fn qwen35_requires(tensor: &str) -> CapReq {
     default_requires(transformer_role(tensor))
 }
 
-/// Lean identity marker for the Qwen3.5 dense offline spec.
 /// Config keys the vision (`vl`) sidecar owns in a Qwen3.5(-VL) checkpoint.
 /// hipfire only *parses* `vision_config`, but the token-id fields must travel
 /// with the vision sidecar too so a vision-less base never advertises them.
@@ -51,6 +50,7 @@ fn qwen35_sidecar_config_keys(role: &str) -> &'static [&'static str] {
     }
 }
 
+/// Lean identity marker for the Qwen3.5 dense offline spec.
 pub struct Qwen35Spec;
 impl Arch for Qwen35Spec {
     fn id(&self) -> ArchId {
