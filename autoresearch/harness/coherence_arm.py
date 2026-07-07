@@ -38,18 +38,23 @@ def _gram3_density(toks):
     c = Counter(grams)
     return sum(v for v in c.values() if v > 1) / len(grams)
 
-def detect_attractor(token_ids):
+def detect_attractor(token_ids, min_len=24):
     """Tiered attractor detection on TOKEN-IDS. Returns (is_attractor: bool, reason: str).
 
     Tiers (the DFlash-gate calibration, on token-ids):
       first-128: unique-ratio < 0.15 OR max single-token freq > 0.50   (single-token loop early)
       last-128 : unique-ratio < 0.30 OR max single-token freq > 0.50   (block loop late)
       full 2nd-half: 3-gram repetition density > 0.50                  (structural loop)
-    An empty stream is a failure (the generate produced nothing visible).
+    An empty stream is a failure. A SHORT stream (< min_len tokens) is NOT judged: the ratios are
+    calibrated for 128-token windows, so a valid short answer ("42", "Paris", a one-line function)
+    trivially trips maxfreq (a 1-token answer has maxfreq=1.0). Only outputs long enough to sustain a
+    real loop are scored. (Found live: short battery answers false-positived without this floor.)
     """
     n = len(token_ids)
     if n == 0:
         return True, "empty"
+    if n < min_len:
+        return False, "short-ok"
     first, last, half = token_ids[:128], token_ids[-128:], token_ids[n // 2:]
     if first and (_uniq(first) < 0.15 or _maxfreq(first) > 0.50):
         return True, "first128"

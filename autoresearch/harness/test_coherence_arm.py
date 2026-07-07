@@ -16,6 +16,13 @@ def test_clean_stream_passes():
     is_a, reason = ca.detect_attractor(toks)
     assert not is_a and reason == "ok"
 
+def test_short_answer_not_attractor():
+    # a 1-word answer ("42") has maxfreq=1.0 but is NOT a loop — the min-length floor (found live)
+    assert ca.detect_attractor(["42"]) == (False, "short-ok")
+    assert ca.detect_attractor(["Paris"]) == (False, "short-ok")
+    assert ca.detect_attractor([5] * 10) == (False, "short-ok")   # 10 repeats, below floor -> not judged
+    assert ca.detect_attractor([5] * 40)[0]                       # 40 repeats, above floor -> attractor
+
 def test_first128_single_token_loop():
     toks = [7] * 130  # one token repeated → uniq≈0.008 < 0.15, maxfreq≈1.0 > 0.50
     is_a, reason = ca.detect_attractor(toks)
