@@ -438,9 +438,15 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
     parity); TP new `Step::Gemm` through `execute_steps_tp` (argmax parity, Q8-KV-vs-F32 Δ=0.85). Single-batch ≤256 +
     per-token fallback. Caught+fixed a latent `rotation.rs` batched-rotate bug (single-row on `n×k`).
   - ⏭ **NEXT deferred items (unblocked on this gfx1151 box), recommended order:**
-    - **A** *(cheap, HIGHEST value)* — tighten `tp_prefill_parity` to a numeric bound (all-Q8-KV ref OR all-`n`-position,
-      ~1e-3). The batched-prefill feature's own #1 follow-up; hardens what just shipped (the one spot a TP precision
-      regression slips past greedy argmax).
+    - ✅ **A** — DONE 2026-07-07 `feature/device-mesh` `91e99955`. `tp_prefill_parity` now asserts a numeric bound, not
+      just greedy argmax. Swapped the reference `llama::prefill_forward` (F32 in-batch attn) → `forward_prefill_batch`
+      (the Q8-KV `attention_flash_q8_0_batched_masked` path the TP side uses), so both read the same Q8 KV.
+      **Triangulated (emulated Tp-2, gfx1151, DETERMINISTIC=1):** F32-in-batch-vs-Q8-flash single-GPU max|Δ|≈**0.88**
+      (⇒ the old doc-comment's "a bit above 4.2e-4" was fiction — never asserted); Q8-flash single-GPU-vs-TP
+      max|Δ|≈**0.20** (4× tighter). **TRAP: the note's "~1e-3" target was the *decode* number (`tp_full_model_parity`
+      4.2e-4 = single pos, one-entry KV); prefill compounds Q8-KV rounding over 103 pos × 28 layers → 0.20 is the real
+      floor, not a bug** (argmax matches " Also"; TP delta < attention-mode delta). Bound = `4.0e-1` (2× observed, churn
+      headroom); a real sharding/all-reduce break lands near/above 0.88 and trips it.
     - **B** *(next substantive polish)* — **multi-turn KV reuse** (serve is stateless per request → reuse KV across turns);
       #462-sensitive daemon reset/checkpoint/abort state machine.
     - **C** — `resolve_mesh` daemon wiring (load still routes on raw `tp`/`ep` knobs).
