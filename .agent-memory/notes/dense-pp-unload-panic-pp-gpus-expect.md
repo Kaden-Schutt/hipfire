@@ -42,14 +42,19 @@ This is NOT a pre-existing qwen35-only issue. It's the composition of two device
 informational `pp` scalar at :1355 (mesh-through-loader) + the dense-PP `pp_dense` arm (P-C). Together
 they route a dense-PP unload into the qwen35-PP arm.
 
-## Candidate fix (NOT applied)
-Prefer: add `return;` after the `m.pp_dense.take()` drop at :1633 (mirror the EP arm at :1704) — a dense
-`PpModel` drop fully tears down its own `Gpus`/scratch/KV, so nothing else is owed. Alternative: guard
-`if m.pp > 1 && m.pp_gpus.is_some()` (equivalently `&& m.pp_dense.is_none()`). The `return` is the
-cleanest and matches the EP/TP arm intent.
+## Fix (applied 2026-07-07)
+`return;` after the `m.pp_dense.take()` drop (mirror the EP arm) — a dense `PpModel` drop fully tears
+down its own `Gpus`/scratch/KV, so nothing else is owed, and returning restores the invariant :1708's
+`.expect()` assumes (by the time control reaches `if m.pp > 1`, `pp>1` again genuinely means qwen35-PP).
+Chosen over the guard `if m.pp > 1 && m.pp_gpus.is_some()` because it *removes* the ambiguity rather than
+checking around it (define-the-error-out-of-existence).
 
-## Status
-Traced from code, **not reproduced live**. Confirm: load a dense llama `pp:2` under
-`HIPFIRE_EMULATE_GPUS=2`, then unload / switch models — the daemon should crash at :1708 today. Then
-apply the `return` fix + add a dense-PP unload regression check (load→unload→reload). Link
-[[device-mesh-pivot-execute-steps-spine]].
+## Status — REPRODUCED + FIXED + VALIDATED (2026-07-07)
+- Repro: `crates/hipfire-runtime/examples/pp_unload_reload.rs` drives the LOADER path (`load_model_pp` →
+  `unload_model`, emulated Pp-2). **Pre-fix: panics `crates/hipfire-loader/src/lib.rs:1708:34: pp>1 must
+  carry pp_gpus` (EXIT 101)** — observed on gfx1151, exactly as traced.
+- **Post-fix: `PASS: dense-PP load->unload->reload->unload, no panic` (EXIT 0)** — the reload proves the
+  first unload freed cleanly. `cargo build --release --workspace --all-targets --locked` green.
+- `pp_unload_reload` is the committed regression check (build-time in no-GPU CI; run under
+  `HIPFIRE_EMULATE_GPUS=2` on a GPU box — it panics pre-fix, passes post-fix). Link
+  [[device-mesh-pivot-execute-steps-spine]].

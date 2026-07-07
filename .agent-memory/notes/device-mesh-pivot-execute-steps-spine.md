@@ -575,10 +575,11 @@ that was the retracted misprediction.
   :6810 (`m.pp_dense.is_some()`), reset guard :2393. Validated live (PB-TP5 6b71b132, PC-3 44edf2d6).
 - `tp_prefill_parity`'s old doc-comment ("~4.2e-4 / a bit above 1e-3") was FICTION (never asserted) — the
   real prefill floor is ~0.20 Q8-flash-vs-TP (item A, 91e99955). Doc/code drift; fixed in item A.
-- `hipfire-loader/src/lib.rs:1708` dense-PP unload panic (`pp_gpus.expect`) — FILED
-  [[dense-pp-unload-panic-pp-gpus-expect]]. NOT pre-existing/qwen35-only as first framed: the
-  informational `pp` scalar (:1355, mesh-through-loader) + the non-returning `pp_dense` unload arm
-  (:1633) fall through into the qwen35-PP teardown (:1707). Fix = `return` after the pp_dense drop.
+- `hipfire-loader/src/lib.rs:1708` dense-PP unload panic (`pp_gpus.expect`) — **FIXED 2026-07-07**
+  [[dense-pp-unload-panic-pp-gpus-expect]]. Was NOT pre-existing/qwen35-only: the informational `pp`
+  scalar (:1355, mesh-through-loader) + the non-returning `pp_dense` unload arm (:1633) fell through into
+  the qwen35-PP teardown (:1707). Fix = `return` after the pp_dense drop (mirror EP arm); repro+regression
+  `examples/pp_unload_reload.rs` (panic→PASS, emulated Pp-2).
 - `.agent-progress/device-mesh-HANDOVER.md` is PRE-PIVOT (2026-07-05) and stale — THIS spine note supersedes it.
 - The prior global MEMORY.md device-mesh line was stale ("P-A DONE / P-B START"); refreshed 2026-07-07.
 

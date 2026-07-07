@@ -1632,6 +1632,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // dropping it tears down the stage device contexts. Daemon `gpu` untouched.
     if let Some(pp) = m.pp_dense.take() {
         drop(pp);
+        // Return here (like the EP arm below): a dense-PP model owns its entire
+        // mesh (Gpus + per-stage scratch/KV) inside the PpModel, so dropping it
+        // is the whole teardown. Without this return a dense-PP unload falls
+        // through into the qwen35-PP `if m.pp > 1` arm — true because
+        // load_model_pp sets an informational `pp>=2` — and panics at
+        // `m.pp_gpus.expect(...)` (dense PP leaves `pp_gpus`/`state` None). See
+        // .agent-memory/notes/dense-pp-unload-panic-pp-gpus-expect.md.
+        let _ = gpu;
+        return;
     }
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
