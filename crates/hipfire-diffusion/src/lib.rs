@@ -1173,8 +1173,8 @@ use quant_decode::*;
 mod quant_encode;
 pub use quant_encode::{
     open_calib_sidecar, oq4_arch_combined_len, pack_oq4_arch_combined, quantize_diffusion_hfq,
-    quantize_diffusion_hfq_plain, DiffusionQuantFormat, DiffusionQuantizeSummary, HessianSidecar,
-    PlainOpusPolicy, PlainQuantizeSummary,
+    opus_quant_token, quantize_diffusion_hfq_plain, DiffusionQuantFormat, DiffusionQuantizeSummary,
+    HessianSidecar, PlainOpusPolicy, PlainQuantizeSummary,
 };
 
 mod quant_calib;

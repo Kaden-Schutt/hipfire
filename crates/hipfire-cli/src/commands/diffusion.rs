@@ -3,6 +3,7 @@
 
 use std::cell::Cell;
 use std::fs;
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -148,12 +149,19 @@ pub struct DiffusionQuantizeArgs {
     /// Output quantized .hfq artifact path
     #[arg(long, short)]
     pub output: PathBuf,
-    /// Quant format: q8, q4, q4k, q4+ (data-free) or oq4/oq4++/oq8 (Opus, calibrated)
+    /// Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), or oq4p/oq8p/oq4.25
+    /// (plain, loaded directly by the tiled Opus kernels)
     #[arg(long, default_value = "q8")]
     pub format: String,
     /// Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ
     #[arg(long)]
     pub calib: Option<PathBuf>,
+    /// For plain-Opus mixed precision: fraction (0.0–1.0) of quantized parameters
+    /// to place at int8 (highest fan-in first), the rest int4. Overrides the
+    /// format to mixed; achieved average ≈ 4 + 4·fraction bits. The output name is
+    /// rewritten to the achieved `oq<avg>` token.
+    #[arg(long)]
+    pub mix_fraction: Option<f32>,
 }
 
 #[derive(Debug, Args)]
@@ -593,12 +601,43 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rewrite the output filename so it carries the achieved `oq<avg>` token: replace
+/// the requested format token if it appears in the name, else insert the token
+/// before the `.hfq` extension.
+fn rewrite_output_token(output: &Path, requested_format: &str, token: &str) -> PathBuf {
+    let Some(fname) = output.file_name().and_then(|f| f.to_str()) else {
+        return output.to_path_buf();
+    };
+    if !requested_format.is_empty() && fname.contains(requested_format) {
+        return output.with_file_name(fname.replacen(requested_format, token, 1));
+    }
+    let newf = match fname.strip_suffix(".hfq") {
+        Some(stem) => format!("{stem}.{token}.hfq"),
+        None => format!("{fname}.{token}"),
+    };
+    output.with_file_name(newf)
+}
+
 fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
     // Plain (unrotated) Opus W4A8/W8A8 + mixed — the artifact the tiled
     // gemm_opus_tiled_wmma kernels load directly (no runtime requant).
-    if let Some(policy) = hipfire_diffusion::PlainOpusPolicy::parse(&args.format) {
+    let plain_policy = match args.mix_fraction {
+        Some(f) => Some(hipfire_diffusion::PlainOpusPolicy::with_fraction(f)),
+        None => hipfire_diffusion::PlainOpusPolicy::parse(&args.format),
+    };
+    if let Some(policy) = plain_policy {
         let summary =
             hipfire_diffusion::quantize_diffusion_hfq_plain(&args.source, &args.output, policy)?;
+        // The canonical name is computed from the ACHIEVED average, not the
+        // request. Rewrite the output filename's oq* token (or insert one) and
+        // rename the file so the artifact name reflects what it actually is.
+        let token = hipfire_diffusion::opus_quant_token(summary.avg_bits);
+        let final_output = rewrite_output_token(&args.output, &args.format, &token);
+        if final_output != args.output {
+            std::fs::rename(&args.output, &final_output).with_context(|| {
+                format!("rename {:?} -> {:?}", args.output, final_output)
+            })?;
+        }
         let ratio = if summary.output_bytes > 0 {
             summary.source_bytes as f64 / summary.output_bytes as f64
         } else {
@@ -608,8 +647,9 @@ fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "source": args.source,
-                "output": args.output,
-                "format": args.format,
+                "output": final_output,
+                "requested_format": args.format,
+                "quant_token": token,
                 "w4_tensors": summary.w4_tensors,
                 "w8_tensors": summary.w8_tensors,
                 "copied_tensors": summary.copied_tensors,

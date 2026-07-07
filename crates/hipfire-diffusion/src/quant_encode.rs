@@ -530,9 +530,11 @@ pub enum PlainOpusPolicy {
     AllW4,
     /// Every resident linear → int8 (W8A8).
     AllW8,
-    /// Mixed (≈oq4.25): int8 for the sensitive linears (first + last block and
-    /// every FF down-projection), int4 elsewhere.
-    Mixed,
+    /// Mixed: `oq8_fraction = None` uses the data-free heuristic (int8 for the
+    /// first+last block and every FF down-projection — highest fan-in); `Some(f)`
+    /// promotes the highest-fan-in resident linears to int8 until ~`f` of the
+    /// quantized parameters are int8 (achieved average ≈ `4 + 4·f` bits).
+    Mixed { oq8_fraction: Option<f32> },
 }
 
 impl PlainOpusPolicy {
@@ -540,17 +542,26 @@ impl PlainOpusPolicy {
         match s {
             "oq4p" | "oq4-plain" => Some(Self::AllW4),
             "oq8p" | "oq8-plain" => Some(Self::AllW8),
-            "oq4.25" | "oq4-mixed" => Some(Self::Mixed),
+            "oq4.25" | "oq4-mixed" | "mixed" => Some(Self::Mixed { oq8_fraction: None }),
             _ => None,
         }
     }
-    fn label(self) -> &'static str {
-        match self {
-            Self::AllW4 => "oq4",
-            Self::AllW8 => "oq8",
-            Self::Mixed => "oq4.25",
-        }
+    /// Override the int8 fraction (from `--mix-fraction`); forces Mixed.
+    pub fn with_fraction(f: f32) -> Self {
+        Self::Mixed { oq8_fraction: Some(f.clamp(0.0, 1.0)) }
     }
+}
+
+/// The canonical Opus quant token for an achieved average bit-width: `oq4`/`oq8`
+/// for pure runs, `oq<avg>` (2 dp, trailing zeros trimmed) for mixed — the name
+/// is computed from what the quantizer actually produced, not what was requested.
+pub fn opus_quant_token(avg_bits: f64) -> String {
+    if (avg_bits - avg_bits.round()).abs() < 0.005 {
+        return format!("oq{}", avg_bits.round() as i64);
+    }
+    let s = format!("{avg_bits:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    format!("oq{s}")
 }
 
 /// The transformer_blocks.N.* suffixes that load via `linear_resident_weight_resident`
@@ -586,30 +597,64 @@ fn transformer_block_index(name: &str) -> Option<usize> {
     rest[..end].parse().ok()
 }
 
-/// Decide the on-disk width for a tensor: `Some(4|8)` to quantize, `None` to copy.
-fn plain_plan(name: &str, shape: &[u32], policy: PlainOpusPolicy, last_block: usize) -> Option<u8> {
-    if shape.len() != 2 || shape[1] % 256 != 0 {
-        return None;
-    }
-    if !name.starts_with("transformer/tensors/transformer_blocks.") {
-        return None;
-    }
-    if !RESIDENT_LINEAR_SUFFIXES.iter().any(|s| name.ends_with(s)) {
-        return None;
-    }
-    Some(match policy {
-        PlainOpusPolicy::AllW4 => 4,
-        PlainOpusPolicy::AllW8 => 8,
-        PlainOpusPolicy::Mixed => {
-            let blk = transformer_block_index(name).unwrap_or(usize::MAX);
-            let is_down = name.ends_with(".ff.down.weight") || name.ends_with(".net.2.weight");
-            if blk == 0 || blk == last_block || is_down {
-                8
-            } else {
-                4
+/// Is `name` a 256-aligned resident DiT linear (safe to store as plain OQ*)?
+fn is_resident_linear(name: &str, shape: &[u32]) -> bool {
+    shape.len() == 2
+        && shape[1] % 256 == 0
+        && name.starts_with("transformer/tensors/transformer_blocks.")
+        && RESIDENT_LINEAR_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// One quantizable-tensor candidate (index into the source tensor list).
+struct QuantCandidate {
+    idx: usize,
+    params: u128,
+    fan_in: u32,
+    boundary: bool,
+    is_down: bool,
+}
+
+/// Choose which quantizable tensors go to int8 (the rest int4), returning the set
+/// of source-tensor indices. `AllW4`/`AllW8` are trivial; `Mixed{None}` uses the
+/// data-free heuristic (first/last block + FF down); `Mixed{Some(f)}` promotes the
+/// highest-fan-in linears (down-projs first — most error-sensitive per bit) until
+/// ~`f` of the quantized parameters are int8.
+fn select_int8(
+    cands: &[QuantCandidate],
+    policy: PlainOpusPolicy,
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    match policy {
+        PlainOpusPolicy::AllW4 => HashSet::new(),
+        PlainOpusPolicy::AllW8 => cands.iter().map(|c| c.idx).collect(),
+        PlainOpusPolicy::Mixed { oq8_fraction: None } => cands
+            .iter()
+            .filter(|c| c.boundary || c.is_down)
+            .map(|c| c.idx)
+            .collect(),
+        PlainOpusPolicy::Mixed { oq8_fraction: Some(f) } => {
+            let total: u128 = cands.iter().map(|c| c.params).sum();
+            let target = (total as f64 * f as f64) as u128;
+            // Rank by fan-in desc (down-projs first), boundary blocks as tiebreak.
+            let mut order: Vec<&QuantCandidate> = cands.iter().collect();
+            order.sort_by(|a, b| {
+                b.fan_in
+                    .cmp(&a.fan_in)
+                    .then(b.boundary.cmp(&a.boundary))
+                    .then(a.idx.cmp(&b.idx))
+            });
+            let mut acc: u128 = 0;
+            let mut set = HashSet::new();
+            for c in order {
+                if acc >= target {
+                    break;
+                }
+                set.insert(c.idx);
+                acc += c.params;
             }
+            set
         }
-    })
+    }
 }
 
 /// Summary of a plain-Opus quantization run.
@@ -645,13 +690,40 @@ pub fn quantize_diffusion_hfq_plain(
         source_bytes: std::fs::metadata(source)?.len(),
         ..Default::default()
     };
+
+    // Pre-pass: collect quantizable candidates and choose the int8 set (per policy
+    // / fraction) before building the index — the width decision is not per-tensor
+    // local when a global bit budget is in play.
+    let candidates: Vec<QuantCandidate> = infos
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| is_resident_linear(&t.name, &t.shape))
+        .map(|(idx, t)| {
+            let blk = transformer_block_index(&t.name).unwrap_or(usize::MAX);
+            QuantCandidate {
+                idx,
+                params: (t.shape[0] as u128) * (t.shape[1] as u128),
+                fan_in: t.shape[1],
+                boundary: blk == 0 || blk == last_block,
+                is_down: t.name.ends_with(".ff.down.weight")
+                    || t.name.ends_with(".net.2.weight"),
+            }
+        })
+        .collect();
+    let int8_set = select_int8(&candidates, policy);
+    let quant_idx: std::collections::HashSet<usize> = candidates.iter().map(|c| c.idx).collect();
+
     // Per-entry plan + declared payload length (needed up front for the index).
     let mut entries: Vec<HfqStreamEntry> = Vec::with_capacity(infos.len());
     let mut plans: Vec<Option<u8>> = Vec::with_capacity(infos.len());
     let mut quant_bits_total: u128 = 0;
     let mut quant_elems_total: u128 = 0;
-    for t in &infos {
-        let bits = plain_plan(&t.name, &t.shape, policy, last_block);
+    for (i, t) in infos.iter().enumerate() {
+        let bits = if quant_idx.contains(&i) {
+            Some(if int8_set.contains(&i) { 8u8 } else { 4u8 })
+        } else {
+            None
+        };
         plans.push(bits);
         let (quant_type, data_len) = match bits {
             Some(w) => {
@@ -693,7 +765,9 @@ pub fn quantize_diffusion_hfq_plain(
         0.0
     };
 
-    let metadata_json = rewrite_weight_format(&hfq.metadata_json, policy.label());
+    // The weight_format label reflects the achieved average, not the request.
+    let token = opus_quant_token(summary.avg_bits);
+    let metadata_json = rewrite_weight_format(&hfq.metadata_json, &token);
     write_hfqm_package_streaming(output, hfq.arch_id, &metadata_json, &entries, |i, w| {
         let name = &infos[i].name;
         let (_info, bytes) = hfq
