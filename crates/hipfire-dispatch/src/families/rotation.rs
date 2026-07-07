@@ -99,16 +99,20 @@ impl RotationFamily {
                 (false, true) => {
                     self.registry.resolve(KernelKey::RotateMqBatched, ctx, None)
                         .map_err(he)?;
-                    gpu.rotate_x_mq(params.x, params.x_rot, params.k)
+                    // Batched rotate-only: rotate ALL `batch_size` rows (grid.y =
+                    // batch), not just row 0. The single-row `rotate_x_mq` here left
+                    // rows 1..n un-rotated, corrupting batched Step::Gemm prefill.
+                    gpu.rotate_x_mq_batched(params.x, params.x_rot, params.k, params.batch_size)
                 }
                 (true, true) => {
                     self.registry.resolve(KernelKey::RotateMqAwqBatched, ctx, None)
                         .map_err(he)?;
-                    gpu.rotate_x_mq_awq(
+                    gpu.rotate_x_mq_awq_batched(
                         params.x,
                         params.awq_scale.unwrap(),
                         params.x_rot,
                         params.k,
+                        params.batch_size,
                     )
                 }
             },

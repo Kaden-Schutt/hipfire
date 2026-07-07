@@ -2701,6 +2701,9 @@ impl DenseServed for hipfire_runtime::tp_serve::TpModel {
     fn eos_token(&self) -> u32 {
         hipfire_runtime::tp_serve::TpModel::eos_token(self)
     }
+    fn prefill(&mut self, tokens: &[u32]) -> Result<(), String> {
+        hipfire_runtime::tp_serve::TpModel::prefill(self, tokens)
+    }
 }
 impl DenseServed for hipfire_runtime::pp_serve::PpModel {
     fn forward_token(&mut self, t: u32, p: usize) -> Result<(), String> {

@@ -15,8 +15,9 @@
 //! `examples/tp_decode_parity.rs`).
 //!
 //! Scope: llama-family dense (arch_id 0/1), Q8 KV, MQ4G256 weights, single-axis
-//! `Tp` mesh. Prefill is per-token (no batched prefill yet); each request starts
-//! at pos 0 (stateless — no multi-turn KV reuse).
+//! `Tp` mesh. Prefill is batched (`prefill`, single-batch ≤256; >256 falls back
+//! to the per-token loop); each request starts at pos 0 (stateless — no
+//! multi-turn KV reuse).
 
 use crate::hfq::HfqFile;
 use crate::llama::{self, KvCache, LlamaConfig, LlamaWeights};
@@ -373,6 +374,414 @@ impl TpModel {
                 &self.collectives,
             )
             .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Batched tensor-parallel prefill: run the whole prompt in ONE batched
+    /// forward, sharded head/inter-parallel across the `Tp` group, so every
+    /// rank's KV is filled for positions `0..n` and the last-position residual
+    /// lands in `ranks[0].x` for [`logits`] (unchanged). Decode resumes at
+    /// `pos = n`. The batched analog of [`forward_token`].
+    ///
+    /// The GEMMs (`Step::Gemm`), attention (batched `Step::Attend`, which writes
+    /// its `n` keys to the Q8 KV cache internally), SiLU-mul and residual adds run
+    /// through [`execute_steps_tp`] — the two row-parallel projections (`wo`,
+    /// `w_down`) carry an `AllReduceOut{n*d}` collective. The three ops that have
+    /// no batched `Step` form (the *plain* pre-GEMM rmsnorm — `Step::Gemm` rotates
+    /// its input itself, unlike decode's pre-rotating `RmsnormAutomatic` — plus
+    /// per-head qk-norm and RoPE) run as direct per-rank batched-kernel calls
+    /// between the executor segments, identical to `prefill_forward_band`. The
+    /// residual `x` stays replicated across ranks (embed→broadcast is the only
+    /// cross-rank move; all-reduces + replicated norms/residuals keep it in sync).
+    ///
+    /// Single-batch only: `n > PREFILL_MAX_BATCH` (256) falls back to the
+    /// per-token loop (no cross-chunk prefill in this cut).
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<(), String> {
+        let n = tokens.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if n > crate::llama::PREFILL_MAX_BATCH {
+            for (pos, &t) in tokens.iter().enumerate() {
+                self.forward_token(t, pos)?;
+            }
+            return Ok(());
+        }
+        if n > self.phys_cap {
+            return Err(format!("prefill n {n} > max_seq {}", self.phys_cap));
+        }
+        let (d, hd) = (self.d, self.config.head_dim);
+        let (hpr, kvpr, q_dim_r, kv_dim_r, inter_r) = (
+            self.hpr,
+            self.kvpr,
+            self.q_dim_r,
+            self.kv_dim_r,
+            self.inter_r,
+        );
+        let (eps, theta, phys_cap) = (
+            self.config.norm_eps,
+            self.config.rope_freq_base,
+            self.phys_cap,
+        );
+        let n_layers = self.config.n_layers;
+        let mq = DType::MQ4G256;
+        // Largest INPUT dim any batched MQ4G256 Gemm sees on a rank (col ops k=d;
+        // row wo k=q_dim/tp; row down k=inter/tp). The Step::Gemm MQ4G256 arm
+        // aliases the persistent `gpu.scratch.mq_x_rot` for the FWHT rotation and
+        // does NOT grow it (gemv.rs:416), so for a batched prefill it writes
+        // `n × k` F32 into a buffer sized for B=1 decode → grow it first.
+        let max_k = d.max(q_dim_r).max(inter_r);
+
+        // Per-rank batched buffers, allocated fresh for this prefill (freed at end),
+        // mirroring `prefill_forward`'s alloc-per-call. `x` is the replicated
+        // residual [n×d]; the rest are on-rank shards.
+        struct PfBuf {
+            x: GpuTensor,
+            tmp: GpuTensor,
+            q: GpuTensor,
+            k: GpuTensor,
+            v: GpuTensor,
+            attn: GpuTensor,
+            o: GpuTensor,
+            gate: GpuTensor,
+            up: GpuTensor,
+            hidden: GpuTensor,
+            fo: GpuTensor,
+            positions: GpuTensor,
+        }
+        let pos_bytes: Vec<u8> = (0..n as i32).flat_map(|p| p.to_ne_bytes()).collect();
+        let mut pbs: Vec<PfBuf> = Vec::with_capacity(self.tp);
+        for &dev in &self.group {
+            let g = &mut self.gpus.devices[dev];
+            g.bind_thread().map_err(herr)?;
+            // Grow mq_x_rot to hold `n × max_k` F32 (finding #2). ensure_mq_signs
+            // first so the sign tables + (default 32768) buffer exist, then replace
+            // the buffer if it is too small (bigger is fine for later decode).
+            g.ensure_mq_signs().map_err(herr)?;
+            let need = n * max_k;
+            let have = g
+                .scratch
+                .mq_x_rot
+                .as_ref()
+                .map(|t| t.buf.size() / 4)
+                .unwrap_or(0);
+            if have < need {
+                let newbuf = g.alloc_tensor(&[need], DType::F32).map_err(herr)?;
+                if let Some(old) = g.scratch.mq_x_rot.replace(newbuf) {
+                    g.free_tensor(old).map_err(herr)?;
+                }
+            }
+            let positions = g.alloc_tensor(&[n], DType::F32).map_err(herr)?;
+            g.hip
+                .memcpy_htod(&positions.buf, &pos_bytes)
+                .map_err(herr)?;
+            pbs.push(PfBuf {
+                x: g.alloc_tensor(&[n, d], DType::F32).map_err(herr)?,
+                tmp: g.alloc_tensor(&[n, d], DType::F32).map_err(herr)?,
+                q: g.alloc_tensor(&[n, q_dim_r], DType::F32).map_err(herr)?,
+                k: g.alloc_tensor(&[n, kv_dim_r], DType::F32).map_err(herr)?,
+                v: g.alloc_tensor(&[n, kv_dim_r], DType::F32).map_err(herr)?,
+                attn: g.alloc_tensor(&[n, q_dim_r], DType::F32).map_err(herr)?,
+                o: g.alloc_tensor(&[n, d], DType::F32).map_err(herr)?,
+                gate: g.alloc_tensor(&[n, inter_r], DType::F32).map_err(herr)?,
+                up: g.alloc_tensor(&[n, inter_r], DType::F32).map_err(herr)?,
+                hidden: g.alloc_tensor(&[n, inter_r], DType::F32).map_err(herr)?,
+                fo: g.alloc_tensor(&[n, d], DType::F32).map_err(herr)?,
+                positions,
+            });
+        }
+
+        // Batch-embed the n tokens on rank 0 into [n×d], then broadcast the
+        // replicated hidden to every rank (mirror forward_token's embed+broadcast
+        // but [n×d] instead of [d]).
+        {
+            let dev0 = self.group[0];
+            let g = &mut self.gpus.devices[dev0];
+            g.bind_thread().map_err(herr)?;
+            let x_single = g.alloc_tensor(&[d], DType::F32).map_err(herr)?;
+            for (i, &token) in tokens.iter().enumerate() {
+                llama::embedding_lookup_dispatch(
+                    g,
+                    self.weights.embd_format,
+                    &self.weights.token_embd,
+                    &x_single,
+                    token,
+                    d,
+                )
+                .map_err(herr)?;
+                g.hip
+                    .memcpy_dtod_at(&pbs[0].x.buf, i * d * 4, &x_single.buf, 0, d * 4)
+                    .map_err(herr)?;
+            }
+            g.free_tensor(x_single).map_err(herr)?;
+            g.hip
+                .stream_synchronize(g.active_stream.as_ref().unwrap())
+                .map_err(herr)?;
+        }
+        let x0 = self.gpus.devices[self.group[0]]
+            .download_f32(&pbs[0].x)
+            .map_err(herr)?;
+        let x0b: Vec<u8> = x0.iter().flat_map(|f| f.to_ne_bytes()).collect();
+        for (r, &dev) in self.group.iter().enumerate() {
+            if r == 0 {
+                continue;
+            }
+            let g = &mut self.gpus.devices[dev];
+            g.bind_thread().map_err(herr)?;
+            g.hip.memcpy_htod(&pbs[r].x.buf, &x0b).map_err(herr)?;
+        }
+
+        // Per-layer TP forward. Manual per-rank rmsnorm/qknorm/rope calls run on
+        // each device's active_stream (same stream as the executor's GEMMs → no
+        // extra sync needed); execute_steps_tp handles the two all-reduces.
+        for l in 0..n_layers {
+            // (1) attn rmsnorm (replicated, plain — feeds Step::Gemm which rotates).
+            for (r, &dev) in self.group.iter().enumerate() {
+                let g = &mut self.gpus.devices[dev];
+                g.bind_thread().map_err(herr)?;
+                g.rmsnorm_batched(&pbs[r].x, &self.ranks[r].norms[l].0, &pbs[r].tmp, n, d, eps)
+                    .map_err(herr)?;
+            }
+            // (2) column QKV projections via execute_steps_tp.
+            {
+                let store = &self.store;
+                let group = &self.group;
+                let w: Vec<[WeightRef; 3]> = (0..self.tp)
+                    .map(|r| {
+                        let dv = group[r];
+                        [
+                            wref(resident_l(store, "wq", l, dv), mq, q_dim_r, d),
+                            wref(resident_l(store, "wk", l, dv), mq, kv_dim_r, d),
+                            wref(resident_l(store, "wv", l, dv), mq, kv_dim_r, d),
+                        ]
+                    })
+                    .collect();
+                let steps: Vec<Vec<Step>> = (0..self.tp)
+                    .map(|r| {
+                        let p = &pbs[r];
+                        vec![
+                            Step::Gemm {
+                                w: &w[r][0],
+                                x: &p.tmp,
+                                y: &p.q,
+                                batch: n,
+                            },
+                            Step::Gemm {
+                                w: &w[r][1],
+                                x: &p.tmp,
+                                y: &p.k,
+                                batch: n,
+                            },
+                            Step::Gemm {
+                                w: &w[r][2],
+                                x: &p.tmp,
+                                y: &p.v,
+                                batch: n,
+                            },
+                        ]
+                    })
+                    .collect();
+                let coll = [TpCollective::None, TpCollective::None, TpCollective::None];
+                execute_steps_tp(&self.mesh, &mut self.gpus, &steps, &coll)
+                    .map_err(|e| e.to_string())?;
+            }
+            // (3) qk-norm + RoPE on this rank's owned heads (per-rank, batched).
+            for (r, &dev) in self.group.iter().enumerate() {
+                let g = &mut self.gpus.devices[dev];
+                g.bind_thread().map_err(herr)?;
+                let (_, _, qn, kn) = &self.ranks[r].norms[l];
+                g.rmsnorm_batched(&pbs[r].q, qn, &pbs[r].q, n * hpr, hd, eps)
+                    .map_err(herr)?;
+                g.rmsnorm_batched(&pbs[r].k, kn, &pbs[r].k, n * kvpr, hd, eps)
+                    .map_err(herr)?;
+                g.rope_batched_f32(
+                    &pbs[r].q,
+                    &pbs[r].k,
+                    &pbs[r].positions,
+                    hpr,
+                    kvpr,
+                    hd,
+                    theta,
+                    n,
+                )
+                .map_err(herr)?;
+            }
+            // (4) batched attention (writes n keys to Q8 KV internally) + row wo
+            //     (partial [n×d]) → AllReduceOut → replicated residual add.
+            {
+                let store = &self.store;
+                let group = &self.group;
+                let ranks = &self.ranks;
+                let wo: Vec<WeightRef> = (0..self.tp)
+                    .map(|r| wref(resident_l(store, "wo", l, group[r]), mq, d, q_dim_r))
+                    .collect();
+                let steps: Vec<Vec<Step>> = (0..self.tp)
+                    .map(|r| {
+                        let p = &pbs[r];
+                        let s = &ranks[r];
+                        let plan = KvTierPlan::derive(KvTierInputs {
+                            pos: 0,
+                            batch_size: n,
+                            ..s.kv.tier_inputs()
+                        })
+                        .expect("batched Q8 KV plan");
+                        vec![
+                            Step::Attend {
+                                plan,
+                                io: AttnParams {
+                                    q: &p.q,
+                                    k: &p.k,
+                                    v: &p.v,
+                                    k_cache: &s.kv.k_gpu[l],
+                                    v_cache: &s.kv.v_gpu[l],
+                                    k_scales: None,
+                                    v_scales: None,
+                                    pos_buf: &s.pos_buf,
+                                    pos: 0,
+                                    positions: Some(&p.positions),
+                                    n_heads: hpr,
+                                    n_kv_heads: kvpr,
+                                    head_dim: hd,
+                                    physical_cap: phys_cap,
+                                    batch_size: n,
+                                    max_ctx_len: n,
+                                    flash_partials: None,
+                                    givens_cos: None,
+                                    givens_sin: None,
+                                    tree_bias: None,
+                                    block_start: 0,
+                                    block_cols: 0,
+                                    output: &p.attn,
+                                },
+                            },
+                            Step::Gemm {
+                                w: &wo[r],
+                                x: &p.attn,
+                                y: &p.o,
+                                batch: n,
+                            },
+                            Step::ResidualAdd {
+                                x: &p.x,
+                                y: &p.o,
+                                dim: d,
+                            },
+                        ]
+                    })
+                    .collect();
+                let coll = [
+                    TpCollective::None,
+                    TpCollective::AllReduceOut { dim: n * d },
+                    TpCollective::None,
+                ];
+                execute_steps_tp(&self.mesh, &mut self.gpus, &steps, &coll)
+                    .map_err(|e| e.to_string())?;
+            }
+            // (5) ffn rmsnorm (replicated, plain).
+            for (r, &dev) in self.group.iter().enumerate() {
+                let g = &mut self.gpus.devices[dev];
+                g.bind_thread().map_err(herr)?;
+                g.rmsnorm_batched(&pbs[r].x, &self.ranks[r].norms[l].1, &pbs[r].tmp, n, d, eps)
+                    .map_err(herr)?;
+            }
+            // (6) column gate/up + SiLU-mul + row down (partial) → AllReduceOut →
+            //     replicated residual add.
+            {
+                let store = &self.store;
+                let group = &self.group;
+                let w: Vec<[WeightRef; 3]> = (0..self.tp)
+                    .map(|r| {
+                        let dv = group[r];
+                        [
+                            wref(resident_l(store, "ffn_gate", l, dv), mq, inter_r, d),
+                            wref(resident_l(store, "ffn_up", l, dv), mq, inter_r, d),
+                            wref(resident_l(store, "ffn_down", l, dv), mq, d, inter_r),
+                        ]
+                    })
+                    .collect();
+                let steps: Vec<Vec<Step>> = (0..self.tp)
+                    .map(|r| {
+                        let p = &pbs[r];
+                        vec![
+                            Step::Gemm {
+                                w: &w[r][0],
+                                x: &p.tmp,
+                                y: &p.gate,
+                                batch: n,
+                            },
+                            Step::Gemm {
+                                w: &w[r][1],
+                                x: &p.tmp,
+                                y: &p.up,
+                                batch: n,
+                            },
+                            Step::SiluMul {
+                                gate: &p.gate,
+                                up: &p.up,
+                                out: &p.hidden,
+                            },
+                            Step::Gemm {
+                                w: &w[r][2],
+                                x: &p.hidden,
+                                y: &p.fo,
+                                batch: n,
+                            },
+                            Step::ResidualAdd {
+                                x: &p.x,
+                                y: &p.fo,
+                                dim: d,
+                            },
+                        ]
+                    })
+                    .collect();
+                let coll = [
+                    TpCollective::None,
+                    TpCollective::None,
+                    TpCollective::None,
+                    TpCollective::AllReduceOut { dim: n * d },
+                    TpCollective::None,
+                ];
+                execute_steps_tp(&self.mesh, &mut self.gpus, &steps, &coll)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Logits handoff: copy the LAST-position row of rank 0's [n×d] residual
+        // into rank 0's decode `x` (the buffer `logits()` reads). Then free the
+        // per-rank batched buffers.
+        {
+            let dev0 = self.group[0];
+            let g = &mut self.gpus.devices[dev0];
+            g.bind_thread().map_err(herr)?;
+            g.hip
+                .memcpy_dtod_at(
+                    &self.ranks[0].x.buf,
+                    0,
+                    &pbs[0].x.buf,
+                    (n - 1) * d * 4,
+                    d * 4,
+                )
+                .map_err(herr)?;
+        }
+        for (r, b) in pbs.into_iter().enumerate() {
+            let g = &mut self.gpus.devices[self.group[r]];
+            g.bind_thread().map_err(herr)?;
+            for t in [
+                b.x,
+                b.tmp,
+                b.q,
+                b.k,
+                b.v,
+                b.attn,
+                b.o,
+                b.gate,
+                b.up,
+                b.hidden,
+                b.fo,
+                b.positions,
+            ] {
+                g.free_tensor(t).map_err(herr)?;
+            }
         }
         Ok(())
     }
