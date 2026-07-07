@@ -6,6 +6,7 @@
 //! paged-expert residency, and the `moe_ffn_decode` / `moe_ffn_decode_impl`
 //! dispatch. On the decode hot path.
 
+use super::prefill_batch::*;
 use super::*;
 
 // ─── MoE FFN (decode, batch=1) ──────────────────────────────────────────

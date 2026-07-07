@@ -7,6 +7,7 @@
 //! (`prefill_moe_ffn_body_batched`) and full-attention layer body
 //! (`run_fa_layer_body`). On the prefill hot path.
 
+use super::prefill_batch::*;
 use super::*;
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
