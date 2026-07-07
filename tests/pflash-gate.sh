@@ -220,7 +220,7 @@ if [ ! -x "$EXE" ]; then
 else
     for src in \
         crates/hipfire-arch-qwen35/src/pflash.rs \
-        crates/hipfire-arch-qwen35/src/qwen35.rs \
+        crates/hipfire-arch-qwen35/src/qwen35/*.rs \
         crates/hipfire-runtime/src/llama.rs \
         crates/hipfire-runtime/src/hfq.rs \
         crates/hipfire-runtime/src/tokenizer.rs \

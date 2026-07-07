@@ -473,7 +473,7 @@ else
     # Post-0.1.20 modular topology: forward-pass + multi-GPU sources are
     # split across hipfire-runtime (KvCache, Gpus, daemon) and
     # hipfire-arch-qwen35 (qwen35 forward, prefill batch). Watch both.
-    for src in crates/hipfire-arch-qwen35/src/qwen35.rs \
+    for src in crates/hipfire-arch-qwen35/src/qwen35/*.rs \
                crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/multi_gpu.rs \
                crates/hipfire-daemon/src/main.rs \
