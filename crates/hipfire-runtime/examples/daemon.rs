@@ -4267,6 +4267,12 @@ fn generate_dflash(
         pflash_done_field,
     );
     let _ = stdout.flush();
+    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
+    let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
+    eprintln!(
+        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows)",
+        run.generated, run.spec_cycles
+    );
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -5466,6 +5472,11 @@ fn generate_qwen35_mtp(
         finish_reason,
     );
     let _ = stdout.flush();
+    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
+    let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
+    eprintln!(
+        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({generated} tok, {cycles} windows)"
+    );
 }
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
@@ -10008,6 +10019,15 @@ fn generate_deepseek4_spec(
     } else {
         "stop"
     };
+    // τ = mean tokens committed per verify window (the spec speedup factor).
+    let tau = if run.spec_cycles > 0 {
+        run.spec_accepted as f64 / run.spec_cycles as f64
+    } else {
+        0.0
+    };
+    // Which drafter actually ran (dspark vs the in-trunk mtp — both reach this
+    // function). Reported so a fall-through or a mis-selected drafter is visible.
+    let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
     let done_envelope = serde_json::json!({
         "type": "done",
         "id": id,
@@ -10019,12 +10039,19 @@ fn generate_deepseek4_spec(
         "prefill_ms": (run.prefill_s * 1000.0) as u128,
         "total_ms": (run.total_s * 1000.0) as u128,
         "finish_reason": finish_reason,
+        "drafter": drafter,
+        "tau": tau,
         "spec_k": spec_k,
         "spec_windows": run.spec_cycles,
         "spec_accept_pct": accept_pct,
     });
     let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
+    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
+    eprintln!(
+        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={tok_s:.1} decode ({} tok, {} windows, accept={accept_pct:.0}%)",
+        run.generated, run.spec_cycles
+    );
 }
 
 fn generate_deepseek4(
@@ -10684,9 +10711,14 @@ fn generate_deepseek4(
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
         "finish_reason": finish_reason,
+        "drafter": "ar",
     });
     let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
+    // Per-request debug summary: this request ran autoregressive (no drafter),
+    // e.g. spec disabled or a temp path the loaded drafter can't verify. Making
+    // the AR fall-through visible is the point — a "stall" is often just AR.
+    eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
 }
 
 fn generate_lfm2moe(

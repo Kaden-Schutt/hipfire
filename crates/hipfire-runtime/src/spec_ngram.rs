@@ -183,6 +183,10 @@ impl<D: BlockDrafter> ChainSpeculator<D> {
 }
 
 impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
+    fn name(&self) -> &'static str {
+        "ngram"
+    }
+
     fn prefill(
         &mut self,
         gpu: &mut Gpu,

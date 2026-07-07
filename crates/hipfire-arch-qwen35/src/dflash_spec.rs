@@ -233,6 +233,10 @@ impl DflashSpeculator {
 }
 
 impl Speculator for DflashSpeculator {
+    fn name(&self) -> &'static str {
+        "dflash"
+    }
+
     fn prefill(
         &mut self,
         gpu: &mut Gpu,
