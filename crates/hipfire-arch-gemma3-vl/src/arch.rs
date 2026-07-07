@@ -17,11 +17,11 @@ use hipfire_arch_gemma3::{
     embed_token, forward_prefill_batch, forward_step, forward_step_with_embed, Gemma3Config,
     Gemma3State,
 };
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     decode_loop, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::config::Gemma3VlConfig;
 use crate::loader::Gemma3VlWeights;
@@ -34,6 +34,10 @@ pub struct Gemma3VlBackend {
     pub vl_cfg: Gemma3VlConfig,
     pub weights: Gemma3VlWeights,
     pub state: Gemma3State,
+    /// Vision-tower precision (min stored bits) + source identity, for
+    /// precision-monotone vision-cache reuse. See [`crate::loader::LoadedVl`].
+    pub vision_tier: u16,
+    pub vision_source_id: String,
 }
 
 impl Gemma3VlBackend {
@@ -42,12 +46,16 @@ impl Gemma3VlBackend {
         vl_cfg: Gemma3VlConfig,
         weights: Gemma3VlWeights,
         state: Gemma3State,
+        vision_tier: u16,
+        vision_source_id: String,
     ) -> Self {
         Self {
             text_cfg,
             vl_cfg,
             weights,
             state,
+            vision_tier,
+            vision_source_id,
         }
     }
 

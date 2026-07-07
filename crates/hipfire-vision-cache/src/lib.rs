@@ -15,12 +15,19 @@
 //! daemon hashes the submitted image bytes, probes here, and on a miss encodes
 //! and inserts.
 //!
-//! ## Key (128-bit composite)
-//! - `ns_hash = xxh64(namespace)` — the namespace is the vision-config / arch
-//!   identity (arch id + tower/projector config). Folding it into the key means
-//!   embeddings from different models/towers can **never alias**.
+//! ## Key (128-bit composite) + precision tier
+//! - `ns_hash = xxh64(namespace)` — the namespace is the vision-tower **source**
+//!   identity + config (the caller uses the pre-quant `source_hfq` path). Folding
+//!   it into the key means embeddings from different towers **never alias**, while
+//!   quant *variants of one base* share (their embeddings differ only by
+//!   near-lossless precision).
 //! - `img_hash = xxh64(submitted image bytes)` — the pre-decode bytes, so the
 //!   hash is computed at submission, before any preprocessing.
+//! - Each entry also carries a **precision tier** (the vision-tower bit-width that
+//!   produced it). Reuse is directional: a caller consumes an entry only if
+//!   `stored_tier >= its own tier`, and an insert never downgrades a
+//!   higher-tier entry — so a lower-precision variant rides a higher-precision
+//!   embedding, but never the reverse. See [`FORMAT_VERSION`].
 //!
 //! ## Value
 //! [`CachedEmbedding`] — the `mm_tokens × text_hidden` post-projector rows
@@ -55,9 +62,16 @@ use twox_hash::XxHash64;
 const VROW_MAGIC: &[u8; 4] = b"HFVC";
 /// Magic for the manifest file: "HipFire Vision Manifest".
 const MANIFEST_MAGIC: &[u8; 4] = b"HFVM";
-const FORMAT_VERSION: u32 = 1;
-/// `magic(4) + version(4) + ns(8) + img(8) + rows(4) + cols(4) + payload_hash(8) + payload_len(8)`.
-const VROW_HEADER_LEN: usize = 48;
+/// v2 adds a `precision_tier` field (the vision-tower precision that produced
+/// the embedding). Higher = more precise (bf16=16, Q8=8, …). A reader consumes
+/// an entry only when `stored_tier >= its own tier`, so a lower-precision model
+/// rides a higher-precision embedding (strict improvement) but never the reverse.
+/// v1 entries lack the tier and are ignored (rebuilt cold; they are also
+/// orphaned by the source-identity namespace change).
+const FORMAT_VERSION: u32 = 2;
+/// `magic(4) + version(4) + ns(8) + img(8) + rows(4) + cols(4) + payload_hash(8)
+/// + payload_len(8) + tier(2)`.
+const VROW_HEADER_LEN: usize = 50;
 
 /// `xxh64` of `bytes` with the given seed.
 fn xxh64_seeded(seed: u64, bytes: &[u8]) -> u64 {
@@ -147,6 +161,9 @@ struct Entry {
     last_access: u64,
     n_rows: u32,
     n_cols: u32,
+    /// Vision-tower precision that produced this embedding (higher = more
+    /// precise). Gates cross-precision reuse; see [`FORMAT_VERSION`].
+    tier: u16,
 }
 
 #[derive(Default)]
@@ -194,10 +211,15 @@ impl VisionCache {
         Ok(cache)
     }
 
-    /// Look up by key. Returns the cached rows on a hit, `None` on a miss.
-    pub fn get(&self, key: &CacheKey) -> io::Result<Option<CachedEmbedding>> {
+    /// Look up by key, accepting an entry only if it was produced at
+    /// `>= min_tier` precision (precision-monotone reuse: a lower-precision
+    /// caller may consume a higher-precision embedding, never the reverse). A
+    /// present-but-lower-tier entry is reported as a miss so the caller
+    /// recomputes at its own tier and [`insert`](Self::insert) upgrades it. Pass
+    /// `min_tier = 0` to accept any entry (tier-agnostic).
+    pub fn get(&self, key: &CacheKey, min_tier: u16) -> io::Result<Option<CachedEmbedding>> {
         let mut guard = self.inner.lock().unwrap();
-        let present = guard.entries.contains_key(key);
+        let present = guard.entries.get(key).is_some_and(|e| e.tier >= min_tier);
         if !present {
             drop(guard);
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -231,21 +253,30 @@ impl VisionCache {
         }
     }
 
-    /// Convenience: hash `namespace` + `image_bytes` and look up.
+    /// Convenience: hash `namespace` + `image_bytes` and look up at `min_tier`.
     pub fn get_with(
         &self,
         namespace: &str,
         image_bytes: &[u8],
+        min_tier: u16,
     ) -> io::Result<Option<CachedEmbedding>> {
-        self.get(&CacheKey::new(namespace, image_bytes))
+        self.get(&CacheKey::new(namespace, image_bytes), min_tier)
     }
 
-    /// Insert (or replace) the rows for `key`, then evict LRU entries until the
-    /// store is within budget. The just-inserted entry is never evicted, and at
-    /// least one entry is always retained.
-    pub fn insert(&self, key: &CacheKey, embedding: &CachedEmbedding) -> io::Result<()> {
+    /// Insert the rows for `key` at precision `tier`, then evict LRU entries
+    /// until within budget. **Precision-monotone:** if an entry already exists
+    /// at a strictly higher tier it is kept (no downgrade) and this is a no-op;
+    /// otherwise the entry is written/upgraded to `tier`. The just-inserted entry
+    /// is never evicted, and at least one entry is always retained.
+    pub fn insert(&self, key: &CacheKey, embedding: &CachedEmbedding, tier: u16) -> io::Result<()> {
+        // Don't overwrite a higher-precision embedding with a lower one.
+        if let Some(existing) = self.inner.lock().unwrap().entries.get(key) {
+            if existing.tier > tier {
+                return Ok(());
+            }
+        }
         let size_bytes = embedding.payload_len();
-        self.write_payload(key, embedding)?;
+        self.write_payload(key, embedding, tier)?;
 
         let mut guard = self.inner.lock().unwrap();
         if let Some(old) = guard.entries.remove(key) {
@@ -261,6 +292,7 @@ impl VisionCache {
                 last_access: access,
                 n_rows: embedding.n_rows as u32,
                 n_cols: embedding.n_cols as u32,
+                tier,
             },
         );
         self.evict_to_budget(&mut guard, Some(*key))?;
@@ -268,14 +300,15 @@ impl VisionCache {
         Ok(())
     }
 
-    /// Convenience: hash `namespace` + `image_bytes` and insert.
+    /// Convenience: hash `namespace` + `image_bytes` and insert at `tier`.
     pub fn insert_with(
         &self,
         namespace: &str,
         image_bytes: &[u8],
         embedding: &CachedEmbedding,
+        tier: u16,
     ) -> io::Result<()> {
-        self.insert(&CacheKey::new(namespace, image_bytes), embedding)
+        self.insert(&CacheKey::new(namespace, image_bytes), embedding, tier)
     }
 
     /// Number of live entries.
@@ -339,7 +372,12 @@ impl VisionCache {
     }
 
     /// Write a payload file atomically (tmp + rename).
-    fn write_payload(&self, key: &CacheKey, embedding: &CachedEmbedding) -> io::Result<()> {
+    fn write_payload(
+        &self,
+        key: &CacheKey,
+        embedding: &CachedEmbedding,
+        tier: u16,
+    ) -> io::Result<()> {
         let mut payload = Vec::with_capacity(embedding.data.len() * 4);
         for v in &embedding.data {
             payload.extend_from_slice(&v.to_le_bytes());
@@ -355,6 +393,7 @@ impl VisionCache {
         buf.extend_from_slice(&(embedding.n_cols as u32).to_le_bytes());
         buf.extend_from_slice(&payload_hash.to_le_bytes());
         buf.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&tier.to_le_bytes());
         buf.extend_from_slice(&payload);
 
         let final_path = self.dir.join(key.file_name());
@@ -384,7 +423,9 @@ impl VisionCache {
         if f.read_exact(&mut header).is_err() {
             return Ok(None);
         }
-        if &header[0..4] != VROW_MAGIC {
+        if &header[0..4] != VROW_MAGIC
+            || u32::from_le_bytes(header[4..8].try_into().unwrap()) != FORMAT_VERSION
+        {
             return Ok(None);
         }
         let n_rows = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
@@ -428,6 +469,7 @@ impl VisionCache {
             buf.extend_from_slice(&e.last_access.to_le_bytes());
             buf.extend_from_slice(&e.n_rows.to_le_bytes());
             buf.extend_from_slice(&e.n_cols.to_le_bytes());
+            buf.extend_from_slice(&e.tier.to_le_bytes());
         }
         let final_path = self.dir.join("manifest");
         let tmp_path = self.dir.join("manifest.tmp");
@@ -449,7 +491,12 @@ impl VisionCache {
 /// (the caller then rebuilds by scanning payload headers).
 fn read_manifest(path: &Path) -> Option<Inner> {
     let bytes = fs::read(path).ok()?;
-    if bytes.len() < 32 || &bytes[0..4] != MANIFEST_MAGIC {
+    // Version-gate: a v1 manifest (no per-entry tier) is dropped so the cache
+    // rebuilds cold from v2 `.vrow` headers.
+    if bytes.len() < 32
+        || &bytes[0..4] != MANIFEST_MAGIC
+        || u32::from_le_bytes(bytes[4..8].try_into().ok()?) != FORMAT_VERSION
+    {
         return None;
     }
     let access_counter = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
@@ -460,7 +507,7 @@ fn read_manifest(path: &Path) -> Option<Inner> {
     };
     let mut off = 32;
     for _ in 0..entry_count {
-        if off + 40 > bytes.len() {
+        if off + 42 > bytes.len() {
             return None;
         }
         let ns_hash = u64::from_le_bytes(bytes[off..off + 8].try_into().ok()?);
@@ -469,6 +516,7 @@ fn read_manifest(path: &Path) -> Option<Inner> {
         let last_access = u64::from_le_bytes(bytes[off + 24..off + 32].try_into().ok()?);
         let n_rows = u32::from_le_bytes(bytes[off + 32..off + 36].try_into().ok()?);
         let n_cols = u32::from_le_bytes(bytes[off + 36..off + 40].try_into().ok()?);
+        let tier = u16::from_le_bytes(bytes[off + 40..off + 42].try_into().ok()?);
         inner.total_bytes += size_bytes;
         inner.entries.insert(
             CacheKey { ns_hash, img_hash },
@@ -477,9 +525,10 @@ fn read_manifest(path: &Path) -> Option<Inner> {
                 last_access,
                 n_rows,
                 n_cols,
+                tier,
             },
         );
-        off += 40;
+        off += 42;
     }
     Some(inner)
 }
@@ -498,14 +547,18 @@ fn rebuild_index(dir: &Path) -> io::Result<Inner> {
             Err(_) => continue,
         };
         let mut header = [0u8; VROW_HEADER_LEN];
-        if f.read_exact(&mut header).is_err() || &header[0..4] != VROW_MAGIC {
-            continue;
+        if f.read_exact(&mut header).is_err()
+            || &header[0..4] != VROW_MAGIC
+            || u32::from_le_bytes(header[4..8].try_into().unwrap()) != FORMAT_VERSION
+        {
+            continue; // absent/corrupt or a pre-tier v1 entry: ignore
         }
         let ns_hash = u64::from_le_bytes(header[8..16].try_into().unwrap());
         let img_hash = u64::from_le_bytes(header[16..24].try_into().unwrap());
         let n_rows = u32::from_le_bytes(header[24..28].try_into().unwrap());
         let n_cols = u32::from_le_bytes(header[28..32].try_into().unwrap());
         let payload_len = u64::from_le_bytes(header[40..48].try_into().unwrap());
+        let tier = u16::from_le_bytes(header[48..50].try_into().unwrap());
         inner.access_counter += 1;
         let access = inner.access_counter;
         inner.total_bytes += payload_len;
@@ -516,6 +569,7 @@ fn rebuild_index(dir: &Path) -> io::Result<Inner> {
                 last_access: access,
                 n_rows,
                 n_cols,
+                tier,
             },
         );
     }
@@ -544,6 +598,11 @@ mod tests {
         assert_ne!(a, diff_bytes, "different image bytes must not alias");
     }
 
+    // Tier-agnostic tests below use tier 8 on insert and min_tier 0 on get
+    // (accept any), preserving the pre-tier semantics; the precision-monotone
+    // gate has its own test.
+    const T8: u16 = 8;
+
     #[test]
     fn roundtrip_is_byte_exact() {
         let dir = tempdir().unwrap();
@@ -553,8 +612,8 @@ mod tests {
         for (i, v) in e.data.iter_mut().enumerate() {
             *v = (i as f32) * 0.5 - 1.25;
         }
-        cache.insert(&key, &e).unwrap();
-        let got = cache.get(&key).unwrap().expect("hit");
+        cache.insert(&key, &e, T8).unwrap();
+        let got = cache.get(&key, 0).unwrap().expect("hit");
         assert_eq!(got, e, "round-trip must be byte-exact f32");
     }
 
@@ -569,7 +628,7 @@ mod tests {
         let image = b"\x89PNG-pretend-image-bytes";
 
         // Miss path: encode, then insert.
-        assert!(cache.get_with(ns, image).unwrap().is_none());
+        assert!(cache.get_with(ns, image, 0).unwrap().is_none());
         let encoded = {
             let mut e = emb(256, 8, 0.0);
             for (i, v) in e.data.iter_mut().enumerate() {
@@ -577,10 +636,10 @@ mod tests {
             }
             e
         };
-        cache.insert_with(ns, image, &encoded).unwrap();
+        cache.insert_with(ns, image, &encoded, T8).unwrap();
 
         // Hit path: must equal what the miss produced.
-        let hit = cache.get_with(ns, image).unwrap().expect("hit");
+        let hit = cache.get_with(ns, image, 0).unwrap().expect("hit");
         assert_eq!(hit, encoded, "cache hit must equal the encoded miss output");
 
         let s = cache.stats();
@@ -588,12 +647,65 @@ mod tests {
         assert_eq!(s.misses, 1);
     }
 
+    /// Precision-monotone reuse is directional: a lower-precision reader may
+    /// consume a higher-precision entry, but a higher-precision reader treats a
+    /// lower-precision entry as a miss, and a lower-precision insert never
+    /// downgrades a higher-precision entry.
+    #[test]
+    fn precision_monotone_reuse_is_directional() {
+        let dir = tempdir().unwrap();
+        let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
+        let key = CacheKey::new("medgemma-bf16-src", b"scan.png");
+        let bf16 = 16u16;
+        let q8 = 8u16;
+
+        // A bf16 (tier 16) embedding is stored.
+        let hi = emb(4, 4, 1.0);
+        cache.insert(&key, &hi, bf16).unwrap();
+
+        // Q8 reader (needs >= 8) rides the bf16 entry: hit.
+        assert!(
+            cache.get(&key, q8).unwrap().is_some(),
+            "lower-precision reader must consume the higher-precision entry"
+        );
+        // bf16 reader (needs >= 16) also hits its own tier.
+        assert!(cache.get(&key, bf16).unwrap().is_some());
+
+        // A Q8 insert must NOT downgrade the stored bf16 entry.
+        let lo = emb(4, 4, 2.0);
+        cache.insert(&key, &lo, q8).unwrap();
+        let got = cache
+            .get(&key, bf16)
+            .unwrap()
+            .expect("bf16 entry preserved");
+        assert!(
+            got.data.iter().all(|&v| v == 1.0),
+            "downgrade must be refused; bf16 payload preserved"
+        );
+
+        // Now the reverse: only a Q8 entry exists for a different image.
+        let key2 = CacheKey::new("medgemma-bf16-src", b"other.png");
+        cache.insert(&key2, &emb(4, 4, 3.0), q8).unwrap();
+        // A bf16 reader (needs >= 16) must MISS the Q8 entry (no downgrade read).
+        assert!(
+            cache.get(&key2, bf16).unwrap().is_none(),
+            "higher-precision reader must not consume a lower-precision entry"
+        );
+        // A bf16 insert then UPGRADES it in place.
+        cache.insert(&key2, &emb(4, 4, 4.0), bf16).unwrap();
+        assert!(
+            cache.get(&key2, bf16).unwrap().is_some(),
+            "upgraded to bf16"
+        );
+        assert_eq!(cache.len(), 2, "upgrade replaces in place, no duplicate");
+    }
+
     #[test]
     fn miss_on_unknown_key() {
         let dir = tempdir().unwrap();
         let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
         assert!(cache
-            .get(&CacheKey::new("ns", b"never-inserted"))
+            .get(&CacheKey::new("ns", b"never-inserted"), 0)
             .unwrap()
             .is_none());
         assert_eq!(cache.stats().misses, 1);
@@ -607,20 +719,20 @@ mod tests {
         let cache = VisionCache::open(dir.path(), 900).unwrap();
         for i in 0..5u32 {
             let key = CacheKey::new("ns", &i.to_le_bytes());
-            cache.insert(&key, &emb(10, 10, i as f32)).unwrap();
+            cache.insert(&key, &emb(10, 10, i as f32), T8).unwrap();
         }
         assert!(cache.total_bytes() <= 900, "budget must hold after inserts");
         assert!(cache.len() <= 2);
         // The most-recently inserted (i=4) must survive.
         let newest = CacheKey::new("ns", &4u32.to_le_bytes());
         assert!(
-            cache.get(&newest).unwrap().is_some(),
+            cache.get(&newest, 0).unwrap().is_some(),
             "newest must be retained"
         );
         // The oldest (i=0) must have been evicted.
         let oldest = CacheKey::new("ns", &0u32.to_le_bytes());
         assert!(
-            cache.get(&oldest).unwrap().is_none(),
+            cache.get(&oldest, 0).unwrap().is_none(),
             "oldest must be evicted"
         );
     }
@@ -632,19 +744,19 @@ mod tests {
         let cache = VisionCache::open(dir.path(), 900).unwrap();
         let k0 = CacheKey::new("ns", b"0");
         let k1 = CacheKey::new("ns", b"1");
-        cache.insert(&k0, &emb(10, 10, 0.0)).unwrap();
-        cache.insert(&k1, &emb(10, 10, 1.0)).unwrap();
+        cache.insert(&k0, &emb(10, 10, 0.0), T8).unwrap();
+        cache.insert(&k1, &emb(10, 10, 1.0), T8).unwrap();
         // Touch k0 so it becomes most-recently-used.
-        assert!(cache.get(&k0).unwrap().is_some());
+        assert!(cache.get(&k0, 0).unwrap().is_some());
         // Insert a third → must evict k1 (untouched), not k0 (just read).
         let k2 = CacheKey::new("ns", b"2");
-        cache.insert(&k2, &emb(10, 10, 2.0)).unwrap();
+        cache.insert(&k2, &emb(10, 10, 2.0), T8).unwrap();
         assert!(
-            cache.get(&k0).unwrap().is_some(),
+            cache.get(&k0, 0).unwrap().is_some(),
             "recently-read entry must survive"
         );
         assert!(
-            cache.get(&k1).unwrap().is_none(),
+            cache.get(&k1, 0).unwrap().is_none(),
             "untouched LRU entry must be evicted"
         );
     }
@@ -656,14 +768,16 @@ mod tests {
         let e = emb(16, 16, std::f32::consts::PI);
         {
             let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
-            cache.insert(&key, &e).unwrap();
+            cache.insert(&key, &e, T8).unwrap();
             assert_eq!(cache.total_bytes(), e.payload_len());
         }
-        // Reopen the same dir: entry + budget accounting survive.
+        // Reopen the same dir: entry + budget accounting + tier survive.
         let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.total_bytes(), e.payload_len());
-        assert_eq!(cache.get(&key).unwrap().expect("hit"), e);
+        assert_eq!(cache.get(&key, 0).unwrap().expect("hit"), e);
+        // Tier survived the manifest round-trip: a >tier reader misses.
+        assert!(cache.get(&key, 9).unwrap().is_none(), "tier persisted");
     }
 
     #[test]
@@ -673,12 +787,17 @@ mod tests {
         let e = emb(8, 8, 1.0);
         {
             let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
-            cache.insert(&key, &e).unwrap();
+            cache.insert(&key, &e, T8).unwrap();
         }
         fs::remove_file(dir.path().join("manifest")).unwrap();
         let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
         assert_eq!(cache.len(), 1, "index rebuilt from .vrow headers");
-        assert_eq!(cache.get(&key).unwrap().expect("hit"), e);
+        assert_eq!(cache.get(&key, 0).unwrap().expect("hit"), e);
+        // Tier recovered from the .vrow header: a >tier reader misses.
+        assert!(
+            cache.get(&key, 9).unwrap().is_none(),
+            "tier rebuilt from header"
+        );
     }
 
     #[test]
@@ -687,13 +806,13 @@ mod tests {
         let key = CacheKey::new("ns", b"corrupt");
         let e = emb(8, 8, 2.0);
         let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
-        cache.insert(&key, &e).unwrap();
+        cache.insert(&key, &e, T8).unwrap();
         // Truncate the payload file mid-data.
         let path = dir.path().join(key.file_name());
         let f = OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len((VROW_HEADER_LEN + 8) as u64).unwrap();
         // A corrupt entry reads as a miss and is dropped, no panic.
-        assert!(cache.get(&key).unwrap().is_none());
+        assert!(cache.get(&key, 0).unwrap().is_none());
         assert_eq!(cache.len(), 0, "corrupt entry dropped");
         assert_eq!(cache.stats().corrupt, 1);
     }
@@ -703,11 +822,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = VisionCache::open(dir.path(), 1 << 30).unwrap();
         let key = CacheKey::new("ns", b"replace");
-        cache.insert(&key, &emb(4, 4, 1.0)).unwrap();
-        cache.insert(&key, &emb(4, 4, 9.0)).unwrap();
+        cache.insert(&key, &emb(4, 4, 1.0), T8).unwrap();
+        cache.insert(&key, &emb(4, 4, 9.0), T8).unwrap();
         assert_eq!(cache.len(), 1, "re-insert must not duplicate");
         assert_eq!(cache.total_bytes(), emb(4, 4, 0.0).payload_len());
-        let got = cache.get(&key).unwrap().expect("hit");
+        let got = cache.get(&key, 0).unwrap().expect("hit");
         assert!(got.data.iter().all(|&v| v == 9.0), "value replaced");
     }
 }

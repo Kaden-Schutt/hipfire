@@ -1070,11 +1070,20 @@ pub fn load_model(
             text_cfg,
             vl_cfg,
             weights,
+            vision_tier,
+            vision_source_id,
         } = load_vl(&mut hfq, gpu)?;
         let state =
             Gemma3State::new_with_max_seq(gpu, &text_cfg, max_seq, kv_mode_g3, kvarn_bits_g3)
                 .map_err(|e| format!("gemma3-vl: Gemma3State::new_with_max_seq failed: {e:?}"))?;
-        let backend = Gemma3VlBackend::new(text_cfg, vl_cfg, weights, state);
+        let backend = Gemma3VlBackend::new(
+            text_cfg,
+            vl_cfg,
+            weights,
+            state,
+            vision_tier,
+            vision_source_id,
+        );
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));

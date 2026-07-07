@@ -1097,13 +1097,27 @@ pub fn generate_vl_gemma3(
     let n_images = frames.len();
 
     // Vision-embedding cache (Goal 1): key = xxh64(frame bytes) namespaced by the
-    // model + vision-config identity, so cached projected rows never alias across
-    // models/towers. A hit skips SigLIP + projector entirely for that frame.
+    // vision-tower *source* identity + vision-config, so cached projected rows
+    // never alias across different towers but ARE shared across quant variants of
+    // one base (their embeddings differ only by near-lossless precision). The
+    // per-entry precision tier makes that sharing directional (see below). A hit
+    // skips SigLIP + projector entirely for that frame.
     let cache = open_vision_cache();
+    // Vision-tower precision of THIS model; a cached entry is reused only if it
+    // was produced at >= this precision (lower-precision variants ride a
+    // higher-precision embedding; never the reverse).
+    let vision_tier = backend.vision_tier;
     let namespace = {
         let vc = &backend.vl_cfg;
+        // Prefer the pre-quant source identity so `-vlbf16` and `-vloq8+` of one
+        // base share; fall back to the loaded file path when absent.
+        let src = if backend.vision_source_id.is_empty() {
+            model_path.as_str()
+        } else {
+            backend.vision_source_id.as_str()
+        };
         format!(
-            "{model_path}|gemma3vl|img{}|p{}|mm{}|th{}",
+            "{src}|gemma3vl|img{}|p{}|mm{}|th{}",
             vc.vision.image_size, vc.vision.patch_size, vc.mm_tokens_per_image, vc.text_hidden_size
         )
     };
@@ -1116,7 +1130,7 @@ pub fn generate_vl_gemma3(
             .map(|_| hipfire_vision_cache::CacheKey::new(&namespace, frame.as_slice()));
         // Probe: on a hit, splice the cached rows and skip the encode.
         if let (Some(c), Some(k)) = (cache.as_ref(), key.as_ref()) {
-            match c.get(k) {
+            match c.get(k, vision_tier) {
                 Ok(Some(emb)) => {
                     img_embeds.extend_from_slice(&emb.data);
                     hits += 1;
@@ -1136,7 +1150,7 @@ pub fn generate_vl_gemma3(
         };
         if let (Some(c), Some(k)) = (cache.as_ref(), key.as_ref()) {
             let emb = hipfire_vision_cache::CachedEmbedding::new(mm, th, rows.clone());
-            if let Err(e) = c.insert(k, &emb) {
+            if let Err(e) = c.insert(k, &emb, vision_tier) {
                 eprintln!("[gemma3-vl] vision cache insert failed: {e}");
             }
         }

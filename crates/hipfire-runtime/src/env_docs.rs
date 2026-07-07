@@ -395,7 +395,7 @@ pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_BUDGET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_BUDGET",
     description: "Runtime variable controlling DDTree budget in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:3432",
+    source: "crates/hipfire-serving-core/src/load.rs:3441",
 };
 
 /// `HIPFIRE_DDTREE_FORCE_SLOW` — HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when
@@ -451,7 +451,7 @@ pub const ENV_HIPFIRE_DDTREE_TAPE_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DDTREE_TOPK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DDTREE_TOPK",
     description: "Runtime variable controlling DDTree topk in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:3504",
+    source: "crates/hipfire-serving-core/src/load.rs:3513",
 };
 
 /// `HIPFIRE_DDTREE_TREE_LA` — Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected
@@ -480,6 +480,20 @@ pub const ENV_HIPFIRE_DEBUG_PREFIX_BOUNDARIES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEBUG_PREFIX_BOUNDARIES",
     description: "Runtime variable controlling debug prefix boundaries in hipfire",
     source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:639",
+};
+
+/// `HIPFIRE_DEBUG_VAE_DUMP` — Runtime variable controlling debug vae dump in hipfire
+pub const ENV_HIPFIRE_DEBUG_VAE_DUMP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DEBUG_VAE_DUMP",
+    description: "Runtime variable controlling debug vae dump in hipfire",
+    source: "crates/hipfire-diffusion/src/vae.rs:1388",
+};
+
+/// `HIPFIRE_DEBUG_VAE_STAGES` — Runtime variable controlling debug vae stages in hipfire
+pub const ENV_HIPFIRE_DEBUG_VAE_STAGES: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DEBUG_VAE_STAGES",
+    description: "Runtime variable controlling debug vae stages in hipfire",
+    source: "crates/hipfire-diffusion/src/vae.rs:1319",
 };
 
 /// `HIPFIRE_DEEPSEEK4_ATTN` — main model's final_norm_and_head head-HC reduction. Without
@@ -752,7 +766,7 @@ pub const ENV_HIPFIRE_DEEPSEEK4_POST_SCALE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEEPSEEK4_PP_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEEPSEEK4_PP_BATCH",
     description: "on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell):",
-    source: "crates/hipfire-serving-core/src/load.rs:1280",
+    source: "crates/hipfire-serving-core/src/load.rs:1289",
 };
 
 /// `HIPFIRE_DEEPSEEK4_Q8_4W` — Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis
@@ -1074,7 +1088,7 @@ pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIR",
     description: "Runtime variable controlling dir in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1199",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1213",
 };
 
 /// `HIPFIRE_DN_STATE_EF` — Runtime variable controlling dn state ef in hipfire
@@ -1152,7 +1166,7 @@ pub const ENV_HIPFIRE_DRAFT_SUBPHASE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK",
     description: "Disabled when set to 0",
-    source: "crates/hipfire-serving-core/src/load.rs:3271",
+    source: "crates/hipfire-serving-core/src/load.rs:3280",
 };
 
 /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` — Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today)
@@ -1218,6 +1232,13 @@ pub const ENV_HIPFIRE_DUMP_COND: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/pipeline_generate.rs:290",
 };
 
+/// `HIPFIRE_DUMP_GATE` — Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate
+pub const ENV_HIPFIRE_DUMP_GATE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DUMP_GATE",
+    description: "Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate",
+    source: "crates/hipfire-diffusion/src/transformer.rs:1545",
+};
+
 /// `HIPFIRE_DUMP_HIDDEN` — DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
 pub const ENV_HIPFIRE_DUMP_HIDDEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN",
@@ -1265,6 +1286,13 @@ pub const ENV_HIPFIRE_DUMP_REQUEST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_REQUEST",
     description: "a strace. Off by default — gigantic for typical agent prompts",
     source: "crates/hipfire-server/src/routes/chat.rs:85",
+};
+
+/// `HIPFIRE_DUMP_VELOCITY` — Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model
+pub const ENV_HIPFIRE_DUMP_VELOCITY: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DUMP_VELOCITY",
+    description: "Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model",
+    source: "crates/hipfire-diffusion/src/denoise.rs:453",
 };
 
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL
@@ -1910,7 +1938,7 @@ pub const ENV_HIPFIRE_KV_MIGRATE_BATCH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KV_MODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_MODE",
     description: "Runtime variable controlling KV mode in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:2667",
+    source: "crates/hipfire-serving-core/src/load.rs:2676",
 };
 
 /// `HIPFIRE_KV_PHYSICAL_CAP` — Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults
@@ -2675,7 +2703,7 @@ pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_LAYERS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_LAYERS",
     description: "Runtime variable controlling pp layers in hipfire",
-    source: "crates/hipfire-serving-core/src/load.rs:2718",
+    source: "crates/hipfire-serving-core/src/load.rs:2727",
 };
 
 /// `HIPFIRE_PP_PARITY_MODEL` — Runtime variable controlling pp parity model in hipfire
@@ -3175,7 +3203,7 @@ pub const ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD",
     description: "conf_threshold ladder: env > 0.1 default (source's sweep-tuned default)",
-    source: "crates/hipfire-serving-core/src/load.rs:3334",
+    source: "crates/hipfire-serving-core/src/load.rs:3343",
 };
 
 /// `HIPFIRE_RDNA2_VARIANT` — Runtime variable controlling rdna2 variant in hipfire
@@ -3544,6 +3572,13 @@ pub const ENV_HIPFIRE_TARGET_ARCH: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/src/dispatch/mod.rs:722",
 };
 
+/// `HIPFIRE_TEST_LATENT` — Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump
+pub const ENV_HIPFIRE_TEST_LATENT: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_TEST_LATENT",
+    description: "Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump",
+    source: "crates/hipfire-diffusion/src/tests/vae.rs:216",
+};
+
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
 pub const ENV_HIPFIRE_TIER_RATIO: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TIER_RATIO",
@@ -3639,21 +3674,21 @@ pub const ENV_HIPFIRE_VERIFY_GRAPH_TREE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_VISION_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE",
     description: "Disabled when set to 0",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1195",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1209",
 };
 
 /// `HIPFIRE_VISION_CACHE_DIR` — Runtime variable controlling vision cache dir in hipfire
 pub const ENV_HIPFIRE_VISION_CACHE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE_DIR",
     description: "Runtime variable controlling vision cache dir in hipfire",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1198",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1212",
 };
 
 /// `HIPFIRE_VISION_CACHE_MAX_BYTES` — Parses "HIPFIRE_VISION_CACHE_MAX_BYTES" with fallback defaults
 pub const ENV_HIPFIRE_VISION_CACHE_MAX_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_VISION_CACHE_MAX_BYTES",
     description: "Parses \"HIPFIRE_VISION_CACHE_MAX_BYTES\" with fallback defaults",
-    source: "crates/hipfire-serving-core/src/generate_vl.rs:1207",
+    source: "crates/hipfire-serving-core/src/generate_vl.rs:1221",
 };
 
 /// `HIPFIRE_VISION_DUMP` — Selects behavior from recognized values
@@ -3950,6 +3985,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DEBUG_CHAT,
     ENV_HIPFIRE_DEBUG_PREFILL_ELIGIBLE,
     ENV_HIPFIRE_DEBUG_PREFIX_BOUNDARIES,
+    ENV_HIPFIRE_DEBUG_VAE_DUMP,
+    ENV_HIPFIRE_DEBUG_VAE_STAGES,
     ENV_HIPFIRE_DEEPSEEK4_ATTN,
     ENV_HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT,
     ENV_HIPFIRE_DEEPSEEK4_ATTN_PER_POS,
@@ -4055,6 +4092,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DUMMY_GENERATE_DELAY_MS,
     ENV_HIPFIRE_DUMMY_PREFILL_DELAY_MS,
     ENV_HIPFIRE_DUMP_COND,
+    ENV_HIPFIRE_DUMP_GATE,
     ENV_HIPFIRE_DUMP_HIDDEN,
     ENV_HIPFIRE_DUMP_HIDDEN_ALL,
     ENV_HIPFIRE_DUMP_HIDDEN_ALLLAYERS,
@@ -4062,6 +4100,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DUMP_HIDDEN_POS,
     ENV_HIPFIRE_DUMP_LATENT,
     ENV_HIPFIRE_DUMP_REQUEST,
+    ENV_HIPFIRE_DUMP_VELOCITY,
     ENV_HIPFIRE_EMIT_TOKEN_IDS,
     ENV_HIPFIRE_EP_DECODE_TIMING,
     ENV_HIPFIRE_EP_DUMP_IDX,
@@ -4385,6 +4424,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_STATE,
     ENV_HIPFIRE_STEER_DUMP,
     ENV_HIPFIRE_TARGET_ARCH,
+    ENV_HIPFIRE_TEST_LATENT,
     ENV_HIPFIRE_TIER_RATIO,
     ENV_HIPFIRE_TINYQUANT_FAMILIES,
     ENV_HIPFIRE_TINYQUANT_RECORD,

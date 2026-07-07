@@ -57,7 +57,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_CONV1D_TREE_GFX1151` | Environment toggle value controls runtime behavior | `crates/hipfire-rdna/examples/bench_conv1d_tree_gfx1151.rs:59` |
 | `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `crates/hipfire-daemon-adapter/src/lib.rs:1229` |
 | `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `crates/hipfire-serving-core/src/session.rs:1445` |
-| `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `crates/hipfire-serving-core/src/load.rs:3432` |
+| `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `crates/hipfire-serving-core/src/load.rs:3441` |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `crates/hipfire-arch-qwen35/src/speculative.rs:11025` |
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:2545` |
 | `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `crates/hipfire-arch-qwen35/src/speculative.rs:11064` |
@@ -65,11 +65,13 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:11589` |
 | `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` | Runtime variable controlling DDTree path c verify graph in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:219` |
 | `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:11044` |
-| `HIPFIRE_DDTREE_TOPK` | Runtime variable controlling DDTree topk in hipfire | `crates/hipfire-serving-core/src/load.rs:3504` |
+| `HIPFIRE_DDTREE_TOPK` | Runtime variable controlling DDTree topk in hipfire | `crates/hipfire-serving-core/src/load.rs:3513` |
 | `HIPFIRE_DDTREE_TREE_LA` | Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected | `crates/hipfire-arch-qwen35/src/speculative.rs:10906` |
 | `HIPFIRE_DEBUG_CHAT` | Enabled when set to 1 | `crates/hipfire-server/src/routes/chat.rs:112` |
 | `HIPFIRE_DEBUG_PREFILL_ELIGIBLE` | Environment toggle value controls runtime behavior | `crates/hipfire-arch-qwen35/src/qwen35.rs:13904` |
 | `HIPFIRE_DEBUG_PREFIX_BOUNDARIES` | Runtime variable controlling debug prefix boundaries in hipfire | `crates/hipfire-serving-core/src/qwen35_prefill.rs:639` |
+| `HIPFIRE_DEBUG_VAE_DUMP` | Runtime variable controlling debug vae dump in hipfire | `crates/hipfire-diffusion/src/vae.rs:1388` |
+| `HIPFIRE_DEBUG_VAE_STAGES` | Runtime variable controlling debug vae stages in hipfire | `crates/hipfire-diffusion/src/vae.rs:1319` |
 | `HIPFIRE_DEEPSEEK4_ATTN` | main model's final_norm_and_head head-HC reduction. Without | `crates/hipfire-arch-deepseek4/src/forward.rs:73` |
 | `HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT` | DEBUG: in-kernel bisect (HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT=1) | `crates/hipfire-arch-deepseek4/src/forward.rs:6224` |
 | `HIPFIRE_DEEPSEEK4_ATTN_PER_POS` | DEBUG: HIPFIRE_DEEPSEEK4_ATTN_PER_POS=1 substitutes a per-position loop | `crates/hipfire-arch-deepseek4/src/forward.rs:6157` |
@@ -108,7 +110,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` | Runtime variable controlling deepseek4 MTP head hc in hipfire | `crates/hipfire-arch-deepseek4/src/forward.rs:86` |
 | `HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD` | 3. Batched MTP fill — single pass through the MTP layer for all | `crates/hipfire-arch-deepseek4/src/forward.rs:9012` |
 | `HIPFIRE_DEEPSEEK4_POST_SCALE` | Runtime variable controlling deepseek4 post scale in hipfire | `crates/hipfire-arch-deepseek4/src/forward.rs:8359` |
-| `HIPFIRE_DEEPSEEK4_PP_BATCH` | on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell): | `crates/hipfire-serving-core/src/load.rs:1280` |
+| `HIPFIRE_DEEPSEEK4_PP_BATCH` | on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell): | `crates/hipfire-serving-core/src/load.rs:1289` |
 | `HIPFIRE_DEEPSEEK4_Q8_4W` | Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis | `crates/hipfire-arch-deepseek4/src/forward.rs:296` |
 | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | bench_q8_wmma_variants. Opt-out via HIPFIRE_DEEPSEEK4_Q8_WMMA=0 | `crates/hipfire-arch-deepseek4/src/forward.rs:246` |
 | `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` | Runtime variable controlling deepseek4 route scale in hipfire | `crates/hipfire-arch-deepseek4/src/forward.rs:7476` |
@@ -154,7 +156,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DIFFUSION_CPU_REFERENCE` | Runtime variable controlling diffusion cpu reference in hipfire | `crates/hipfire-diffusion/src/lib.rs:127` |
 | `HIPFIRE_DIFFUSION_DUMP_DIR` | Runtime variable controlling diffusion dump dir in hipfire | `crates/hipfire-diffusion/src/lib.rs:656` |
 | `HIPFIRE_DIFFUSION_LAYER_RUNG` | Selects behavior from recognized values | `crates/hipfire-diffusion/src/denoise.rs:289` |
-| `HIPFIRE_DIR` | Runtime variable controlling dir in hipfire | `crates/hipfire-serving-core/src/generate_vl.rs:1199` |
+| `HIPFIRE_DIR` | Runtime variable controlling dir in hipfire | `crates/hipfire-serving-core/src/generate_vl.rs:1213` |
 | `HIPFIRE_DN_STATE_EF` | Runtime variable controlling dn state ef in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:1432` |
 | `HIPFIRE_DN_STATE_FP32_BELOW` | Used to configure runtime execution by explicitly setting "HIPFIRE_DN_STATE_FP32_BELOW" | `crates/hipfire-arch-qwen35/src/qwen35.rs:30430` |
 | `HIPFIRE_DOT2_GEMV` | Interprets "HIPFIRE_DOT2_GEMV" from environment to select behavior | `crates/hipfire-rdna/src/feature_flags.rs:192` |
@@ -165,7 +167,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DRAFT_F16` | Enabled by default; set to 0 to disable | `crates/hipfire-runtime/src/config.rs:75` |
 | `HIPFIRE_DRAFT_GEMM_DUMP` | Enabled when set to 1 | `crates/hipfire-runtime/src/config.rs:76` |
 | `HIPFIRE_DRAFT_SUBPHASE` | Enabled when set to 1 | `crates/hipfire-runtime/src/config.rs:77` |
-| `HIPFIRE_DSPARK` | Disabled when set to 0 | `crates/hipfire-serving-core/src/load.rs:3271` |
+| `HIPFIRE_DSPARK` | Disabled when set to 0 | `crates/hipfire-serving-core/src/load.rs:3280` |
 | `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today) | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:1426` |
 | `HIPFIRE_DSPARK_HFQ4_WMMA` | Runtime variable controlling dspark hfQ4 wmma in hipfire | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:463` |
 | `HIPFIRE_DSPARK_PROFILE` | Runtime variable controlling dspark profile in hipfire | `crates/hipfire-specdecode-dspark/src/dspark_core.rs:25` |
@@ -175,6 +177,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DUMMY_GENERATE_DELAY_MS` | Parses "HIPFIRE_DUMMY_GENERATE_DELAY_MS" with fallback defaults | `crates/hipfire-serving-core/src/dummy.rs:137` |
 | `HIPFIRE_DUMMY_PREFILL_DELAY_MS` | Parses "HIPFIRE_DUMMY_PREFILL_DELAY_MS" with fallback defaults | `crates/hipfire-serving-core/src/dummy.rs:126` |
 | `HIPFIRE_DUMP_COND` | Debug hook: HIPFIRE_DUMP_COND prints stats for the text conditioning | `crates/hipfire-diffusion/src/pipeline_generate.rs:290` |
+| `HIPFIRE_DUMP_GATE` | Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate | `crates/hipfire-diffusion/src/transformer.rs:1545` |
 | `HIPFIRE_DUMP_HIDDEN` | DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN) | `crates/hipfire-dispatch/src/pipeline/mod.rs:386` |
 | `HIPFIRE_DUMP_HIDDEN_ALL` | Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row for a | `crates/hipfire-arch-qwen35/src/qwen35.rs:16839` |
 | `HIPFIRE_DUMP_HIDDEN_ALLLAYERS` | - HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1: capture EVERY layer to per-layer | `crates/hipfire-arch-qwen35/src/qwen35.rs:16846` |
@@ -182,6 +185,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_DUMP_HIDDEN_POS` | Runtime variable controlling dump hidden pos in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:16878` |
 | `HIPFIRE_DUMP_LATENT` | Debug hook: when HIPFIRE_DUMP_LATENT names a path, write the final latent | `crates/hipfire-diffusion/src/lib.rs:1139` |
 | `HIPFIRE_DUMP_REQUEST` | a strace. Off by default — gigantic for typical agent prompts | `crates/hipfire-server/src/routes/chat.rs:85` |
+| `HIPFIRE_DUMP_VELOCITY` | Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model | `crates/hipfire-diffusion/src/denoise.rs:453` |
 | `HIPFIRE_EMIT_TOKEN_IDS` | or "\" in it would corrupt the line, breaking the client's JSONL | `crates/hipfire-serving-core/src/events.rs:111` |
 | `HIPFIRE_EP_DECODE_TIMING` | 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd) | `crates/hipfire-arch-minimax/src/forward.rs:1697` |
 | `HIPFIRE_EP_DUMP_IDX` | top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable | `crates/hipfire-arch-deepseek4/src/forward.rs:2432` |
@@ -273,7 +277,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_KV_IDLE_KEEP` | Runtime variable controlling KV idle keep in hipfire | `crates/hipfire-serving-core/src/qwen35_prefill.rs:139` |
 | `HIPFIRE_KV_IMPORTANCE` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:179` |
 | `HIPFIRE_KV_MIGRATE_BATCH` | Cold-tier compaction knobs. fold_m=1 disables the m:1 merge (cold = pure | `crates/hipfire-runtime/src/kv_hier.rs:160` |
-| `HIPFIRE_KV_MODE` | Runtime variable controlling KV mode in hipfire | `crates/hipfire-serving-core/src/load.rs:2667` |
+| `HIPFIRE_KV_MODE` | Runtime variable controlling KV mode in hipfire | `crates/hipfire-serving-core/src/load.rs:2676` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults | `crates/hipfire-serving-core/src/load.rs:625` |
 | `HIPFIRE_KV_POS_LOCAL` | Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default, | `crates/hipfire-runtime/src/kv_hier.rs:181` |
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | Runtime variable controlling lfm2 capture postmixer in hipfire | `crates/hipfire-arch-lfm2moe/src/forward.rs:1154` |
@@ -382,7 +386,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_PFLASH_REPORT_TRAIN` | Runtime variable controlling pflash report train in hipfire | `crates/hipfire-train/examples/ssm_drafter_train.rs:115` |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | Parses "HIPFIRE_PFLASH_SCORE_LAYER" with fallback defaults | `crates/hipfire-arch-qwen35/src/pflash.rs:1082` |
 | `HIPFIRE_PP_DFLASH` | Environment toggle value controls runtime behavior | `crates/hipfire-daemon/src/main.rs:3069` |
-| `HIPFIRE_PP_LAYERS` | Runtime variable controlling pp layers in hipfire | `crates/hipfire-serving-core/src/load.rs:2718` |
+| `HIPFIRE_PP_LAYERS` | Runtime variable controlling pp layers in hipfire | `crates/hipfire-serving-core/src/load.rs:2727` |
 | `HIPFIRE_PP_PARITY_MODEL` | Runtime variable controlling pp parity model in hipfire | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:197` |
 | `HIPFIRE_PP_PFLASH` | Environment toggle value controls runtime behavior | `crates/hipfire-daemon/src/main.rs:3087` |
 | `HIPFIRE_PREFILL_ALPHA` | Runtime variable controlling prefill alpha in hipfire | `crates/hipfire-arch-qwen35/src/pflash.rs:125` |
@@ -452,7 +456,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_QWEN35_STAGE_TRACE` | Runtime variable controlling qwen35 stage trace in hipfire | `crates/hipfire-arch-qwen35/src/qwen35.rs:14325` |
 | `HIPFIRE_QWEN35_XDNA1_INSTR` | Runtime variable controlling qwen35 xdna1 instr in hipfire | `crates/hipfire-npu/src/lib.rs:76` |
 | `HIPFIRE_QWEN35_XDNA1_XCLBIN` | Runtime variable controlling qwen35 xdna1 xclbin in hipfire | `crates/hipfire-npu/src/lib.rs:73` |
-| `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | conf_threshold ladder: env > 0.1 default (source's sweep-tuned default) | `crates/hipfire-serving-core/src/load.rs:3334` |
+| `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | conf_threshold ladder: env > 0.1 default (source's sweep-tuned default) | `crates/hipfire-serving-core/src/load.rs:3343` |
 | `HIPFIRE_RDNA2_VARIANT` | Runtime variable controlling rdna2 variant in hipfire | `crates/hipfire-rdna/src/feature_flags.rs:313` |
 | `HIPFIRE_RECOVER_MODE` | HIPFIRE_RECOVER_MODE=lora+norms → LoRA + layernorms (default, more capacity) | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:158` |
 | `HIPFIRE_RECOVER_NOISE` | KVarN+CASK: tail queries read merged cold keys strictly in their past). 0 = | `crates/hipfire-train/examples/recovery_generalization_supra50m.rs:157` |
@@ -505,6 +509,7 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_STATE` | Interprets "HIPFIRE_STATE" from environment to select behavior | `crates/hipfire-runtime/examples/greedy_dump_top5.rs:266` |
 | `HIPFIRE_STEER_DUMP` | refusal scorer actually sees — the qualitative companion to the numeric report | `crates/hipfire-steer/src/driver.rs:227` |
 | `HIPFIRE_TARGET_ARCH` | Runtime variable controlling target arch in hipfire | `crates/hipfire-rdna/src/dispatch/mod.rs:722` |
+| `HIPFIRE_TEST_LATENT` | Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump | `crates/hipfire-diffusion/src/tests/vae.rs:216` |
 | `HIPFIRE_TIER_RATIO` | Runtime variable controlling tier ratio in hipfire | `crates/hipfire-quantize/src/main.rs:5217` |
 | `HIPFIRE_TINYQUANT_FAMILIES` | Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES") | `crates/hipfire-eval/src/executor_tinyquant.rs:370` |
 | `HIPFIRE_TINYQUANT_RECORD` | Optional comma-separated family allowlist ("HIPFIRE_TINYQUANT_FAMILIES") | `crates/hipfire-eval/src/executor_tinyquant.rs:364` |
@@ -518,9 +523,9 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `HIPFIRE_VERIFY_GRAPH` | Runtime variable controlling verify graph in hipfire | `crates/hipfire-arch-qwen35/src/speculative.rs:6200` |
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the | `crates/hipfire-arch-qwen35/src/speculative.rs:6215` |
 | `HIPFIRE_VERIFY_GRAPH_TREE` | Enabled when set to 1 | `crates/hipfire-arch-qwen35/src/speculative.rs:6190` |
-| `HIPFIRE_VISION_CACHE` | Disabled when set to 0 | `crates/hipfire-serving-core/src/generate_vl.rs:1195` |
-| `HIPFIRE_VISION_CACHE_DIR` | Runtime variable controlling vision cache dir in hipfire | `crates/hipfire-serving-core/src/generate_vl.rs:1198` |
-| `HIPFIRE_VISION_CACHE_MAX_BYTES` | Parses "HIPFIRE_VISION_CACHE_MAX_BYTES" with fallback defaults | `crates/hipfire-serving-core/src/generate_vl.rs:1207` |
+| `HIPFIRE_VISION_CACHE` | Disabled when set to 0 | `crates/hipfire-serving-core/src/generate_vl.rs:1209` |
+| `HIPFIRE_VISION_CACHE_DIR` | Runtime variable controlling vision cache dir in hipfire | `crates/hipfire-serving-core/src/generate_vl.rs:1212` |
+| `HIPFIRE_VISION_CACHE_MAX_BYTES` | Parses "HIPFIRE_VISION_CACHE_MAX_BYTES" with fallback defaults | `crates/hipfire-serving-core/src/generate_vl.rs:1221` |
 | `HIPFIRE_VISION_DUMP` | Selects behavior from recognized values | `crates/hipfire-arch-gemma3-vl/src/forward.rs:44` |
 | `HIPFIRE_VISION_PROFILE` | Optional per-category timing (HIPFIRE_VISION_PROFILE=1): device-sync around | `crates/hipfire-arch-gemma3-vl/src/forward.rs:140` |
 | `HIPFIRE_VL_DUMP_DIR` | little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR | `crates/hipfire-runtime/examples/infer.rs:171` |
@@ -554,6 +559,6 @@ Generated automatically from source and inline comments by `hipfire gen-env-docs
 | `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `crates/hipfire-rdna/src/compiler.rs:228` |
 | `USE_SAMPLE` | Enabled when set to 1 | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:138` |
 
-- Total env vars: **549**
-- `HIPFIRE_*` vars: **503**
+- Total env vars: **554**
+- `HIPFIRE_*` vars: **508**
 - non-`HIPFIRE_*` vars: **46**
