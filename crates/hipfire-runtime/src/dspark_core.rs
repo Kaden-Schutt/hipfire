@@ -1046,6 +1046,10 @@ pub struct DsparkDrafter {
 }
 
 impl MtpDrafter for DsparkDrafter {
+    fn name(&self) -> &'static str {
+        "dspark"
+    }
+
     fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,
