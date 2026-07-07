@@ -2722,8 +2722,10 @@ impl DenseServed for hipfire_runtime::pp_serve::PpModel {
 
 /// Dense multi-GPU serve (PB-TP5 / P-C). Serves a llama-family model over ANY
 /// parallelism axis (`TpModel` or `PpModel` via [`DenseServed`]): ChatFrame-render
-/// the prompt, prefill it token-by-token, then greedy-or-sampled decode. Each
-/// request starts at pos 0 (stateless — no multi-turn KV reuse). Lean by design:
+/// the prompt, prefill it token-by-token, then greedy-or-sampled decode. Prefills
+/// `prefill_tokens` at `[start_pos..]` (cache miss ⇒ start_pos 0, batched; cache
+/// hit ⇒ per-token suffix over the cached KV prefix) and returns the generated
+/// token ids for the caller's `conversation_tokens` bake. Lean by design:
 /// no spec-decode / PFlash / eviction / grammar / tools. Validated argmax-exact vs
 /// single-GPU (`tp_decode_parity` / `pp_decode_parity`).
 #[allow(clippy::too_many_arguments)]
@@ -2732,28 +2734,18 @@ fn generate_dense<M: DenseServed>(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     stdout: &mut std::io::Stdout,
     id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
+    prefill_tokens: &[u32],
+    start_pos: usize,
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
     min_p: Option<f32>,
     max_tokens: usize,
     stop: &[String],
-) {
-    use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
+) -> Option<Vec<u32>> {
     use hipfire_runtime::sampler::{self, SamplerConfig};
     let t0 = std::time::Instant::now();
-
-    let frame = ChatFrame {
-        tokenizer,
-        system: system_prompt,
-        user: prompt,
-        assistant_prefix: AssistantPrefix::Plain,
-        raw: false,
-    }
-    .build();
-    let prefill_n = frame.len();
+    let prefill_n = prefill_tokens.len();
     let eos = model.eos_token();
 
     macro_rules! fail {
@@ -2765,12 +2757,26 @@ fn generate_dense<M: DenseServed>(
                 serde_json::to_string(&format!("dense serve: {}", $e)).unwrap_or_default()
             );
             let _ = stdout.flush();
-            return;
+            return None;
         }};
     }
 
-    // Prefill (batched when the model supports it; default = per token).
-    if let Err(e) = model.prefill(&frame) {
+    // Prefill. Cache miss (start_pos==0): batched fast path. Cache hit
+    // (start_pos>0): per-token suffix over the cached KV prefix [0..start_pos]
+    // — forward_token attends over the retained prefix, so this is exact.
+    let prefill_res = if start_pos == 0 {
+        model.prefill(prefill_tokens)
+    } else {
+        let mut r = Ok(());
+        for (i, &t) in prefill_tokens.iter().enumerate() {
+            if let Err(e) = model.forward_token(t, start_pos + i) {
+                r = Err(e);
+                break;
+            }
+        }
+        r
+    };
+    if let Err(e) = prefill_res {
         fail!(e);
     }
     let t_prefill = std::time::Instant::now();
@@ -2794,7 +2800,7 @@ fn generate_dense<M: DenseServed>(
     let mut history: Vec<u32> = Vec::new();
     let mut next = sampler::sample_cpu(&mut logits, &history, &cfg);
     let mut generated = 0usize;
-    let mut pos = prefill_n;
+    let mut pos = start_pos + prefill_n;
     loop {
         if next == eos || tokenizer.is_terminator(next) {
             break;
@@ -2844,6 +2850,7 @@ fn generate_dense<M: DenseServed>(
         id, generated, decode_tok_s, prefill_n, prefill_ms, decode_tok_s
     );
     let _ = stdout.flush();
+    Some(history)
 }
 
 fn generate_ep(
@@ -6734,21 +6741,98 @@ fn generate(
     // `m.pp_dense` (PpModel) over its own Gpus; the single-GPU arch fields are None.
     // Disjoint field borrows: `m.tokenizer` (read) + the model field (mut).
     if m.tp.is_some() {
+        // Multi-turn KV reuse at parity with the single-GPU llama path: LCP the
+        // rendered conversation vs conversation_tokens; pure-KV ⇒ no DeltaNet
+        // checkpoints, cold-prefill on divergence (empty ckpts + resume off).
+        let hist: &[hipfire_runtime::prompt_frame::Message] = messages_history.unwrap_or(&[]);
+        let cache_disabled =
+            std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
         let tok = m.tokenizer.as_ref().expect("dense serve: tokenizer");
+        let plan = plan_prompt_cache(
+            tok,
+            &mut m.asst_turn_cache,
+            &m.conversation_tokens,
+            m.eviction.is_none(),
+            system_prompt,
+            prompt,
+            assistant_prefix,
+            hist,
+            cache_disabled,
+            &[],
+            false,
+        );
+        let rendered = plan.rendered;
+        let new_tokens = plan.new_tokens;
+        let start_pos = plan.start_pos;
         let model = m.tp.as_mut().expect("dense serve: TpModel");
-        generate_dense(
-            model, tok, stdout, id, prompt, system_prompt, temp, top_p, top_k, min_p, max_tokens,
+        let gen = generate_dense(
+            model,
+            tok,
+            stdout,
+            id,
+            &new_tokens,
+            start_pos,
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            max_tokens,
             stop,
         );
+        match gen {
+            Some(g) => {
+                let mut v = rendered;
+                v.extend_from_slice(&g);
+                m.conversation_tokens = v;
+            }
+            None => m.conversation_tokens.clear(),
+        }
         return;
     }
     if m.pp_dense.is_some() {
+        let hist: &[hipfire_runtime::prompt_frame::Message] = messages_history.unwrap_or(&[]);
+        let cache_disabled =
+            std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
         let tok = m.tokenizer.as_ref().expect("dense serve: tokenizer");
+        let plan = plan_prompt_cache(
+            tok,
+            &mut m.asst_turn_cache,
+            &m.conversation_tokens,
+            m.eviction.is_none(),
+            system_prompt,
+            prompt,
+            assistant_prefix,
+            hist,
+            cache_disabled,
+            &[],
+            false,
+        );
+        let rendered = plan.rendered;
+        let new_tokens = plan.new_tokens;
+        let start_pos = plan.start_pos;
         let model = m.pp_dense.as_mut().expect("dense serve: PpModel");
-        generate_dense(
-            model, tok, stdout, id, prompt, system_prompt, temp, top_p, top_k, min_p, max_tokens,
+        let gen = generate_dense(
+            model,
+            tok,
+            stdout,
+            id,
+            &new_tokens,
+            start_pos,
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            max_tokens,
             stop,
         );
+        match gen {
+            Some(g) => {
+                let mut v = rendered;
+                v.extend_from_slice(&g);
+                m.conversation_tokens = v;
+            }
+            None => m.conversation_tokens.clear(),
+        }
         return;
     }
     // Expert-parallel (task #26): route to generate_ep BEFORE any arch
