@@ -3957,9 +3957,18 @@ pub(crate) fn scaled_dot_product_attention_resident(
     // that, fall back to the naive kernel.
     const FLASH_MAX_HEAD_DIM: usize = 512;
     if head_dim <= FLASH_MAX_HEAD_DIM {
+        // Register-tiled Q-tile flash streams K/V once per FLASH_Q_TILE=8 queries
+        // (vs once per query), cutting the dominant redundant K/V traffic ~8x and
+        // adding ILP. Opt out with HIPFIRE_DIFFUSION_ATTN_QTILE=0.
+        const Q_TILE: usize = 8;
+        // The qtile kernel hard-codes FLASH_NP=4 (head_dim 128) so its per-query
+        // register arrays are statically indexed and stay in VGPRs.
+        let use_qtile = head_dim == 128
+            && std::env::var("HIPFIRE_DIFFUSION_ATTN_QTILE").ok().as_deref() != Some("0");
+        let queries_per_wave = if use_qtile { Q_TILE } else { 1 };
         let waves = batch
             .checked_mul(heads)
-            .and_then(|v| v.checked_mul(q_seq))
+            .and_then(|v| v.checked_mul(q_seq.div_ceil(queries_per_wave)))
             .ok_or_else(|| {
                 DiffusionError::InvalidMetadata("SDPA wave count overflows".to_string())
             })?;
@@ -3978,11 +3987,22 @@ pub(crate) fn scaled_dot_product_attention_resident(
         kernargs.pad_to(16);
         let blocks = waves.div_ceil(WAVES_PER_BLOCK);
         let grid = [i32_kernel_dim("flash grid", blocks)? as u32, 1, 1];
+        let (kname, src) = if use_qtile {
+            (
+                "diffusion_flash_attention_qtile_f32",
+                DIFFUSION_FLASH_ATTENTION_QTILE_HIP_SRC,
+            )
+        } else {
+            (
+                "diffusion_flash_attention_f32",
+                DIFFUSION_FLASH_ATTENTION_HIP_SRC,
+            )
+        };
         ensure_and_launch_diffusion_kernel(
             gpu,
-            "diffusion_flash_attention_f32",
-            DIFFUSION_FLASH_ATTENTION_HIP_SRC,
-            "diffusion_flash_attention_f32",
+            kname,
+            src,
+            kname,
             grid,
             [(WAVES_PER_BLOCK * 32) as u32, 1, 1],
             0,

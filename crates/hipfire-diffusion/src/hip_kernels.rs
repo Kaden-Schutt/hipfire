@@ -1216,6 +1216,107 @@ extern "C" __global__ void diffusion_flash_attention_f32(
 }
 "#;
 
+// Register-tiled flash attention: each wave owns a tile of FLASH_Q_TILE queries
+// of one (batch, head) and streams K/V once for the whole tile (each K/V element
+// loaded once and reused across all FLASH_Q_TILE queries), instead of one wave
+// per query re-reading all of K/V. Cuts the dominant redundant K/V traffic by
+// FLASH_Q_TILE and runs FLASH_Q_TILE independent online-softmax chains for ILP.
+// Zero LDS. Same online-softmax math and output layout as the 1-query kernel.
+//
+// FLASH_NP (channels/lane) is compile-time so the per-query register arrays are
+// statically indexed and stay in VGPRs (a runtime channel count spills them to
+// scratch and erases the win). FLASH_NP=4 ⇒ head_dim=128; the dispatch only
+// selects this kernel when head_dim == FLASH_NP*32.
+pub(crate) const DIFFUSION_FLASH_ATTENTION_QTILE_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+#define FLASH_NP 4          // channels per lane (head_dim = FLASH_NP * 32 = 128)
+#define FLASH_Q_TILE 8
+
+extern "C" __global__ void diffusion_flash_attention_qtile_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* output,
+    int batch,
+    int q_seq,
+    int k_seq,
+    int hidden,
+    int heads,
+    int head_dim
+) {
+    int lane = threadIdx.x & 31;
+    int wave = threadIdx.x >> 5;
+    int waves_per_block = blockDim.x >> 5;
+    int gid = blockIdx.x * waves_per_block + wave;
+    int q_tiles = (q_seq + FLASH_Q_TILE - 1) / FLASH_Q_TILE;
+    int total = batch * heads * q_tiles;
+    if (gid >= total) {
+        return;
+    }
+    int qtile = gid % q_tiles;
+    int t = gid / q_tiles;
+    int head = t % heads;
+    int b = t / heads;
+    int head_off = head * head_dim;
+    int q0 = qtile * FLASH_Q_TILE;
+    float scale = rsqrtf((float)head_dim);
+
+    float qreg[FLASH_Q_TILE][FLASH_NP];
+    float acc[FLASH_Q_TILE][FLASH_NP];
+    float m[FLASH_Q_TILE];
+    float l[FLASH_Q_TILE];
+    #pragma unroll
+    for (int qt = 0; qt < FLASH_Q_TILE; ++qt) {
+        int qi = q0 + qt;
+        int qq = (qi < q_seq) ? qi : (q_seq - 1);
+        long qbase = ((long)(b * q_seq + qq) * hidden) + head_off + lane;
+        #pragma unroll
+        for (int j = 0; j < FLASH_NP; ++j) {
+            qreg[qt][j] = q[qbase + j * 32];
+            acc[qt][j] = 0.0f;
+        }
+        m[qt] = -INFINITY;
+        l[qt] = 0.0f;
+    }
+
+    for (int ki = 0; ki < k_seq; ++ki) {
+        long kbase = ((long)(b * k_seq + ki) * hidden) + head_off + lane;
+        float kreg[FLASH_NP];
+        float vreg[FLASH_NP];
+        #pragma unroll
+        for (int j = 0; j < FLASH_NP; ++j) {
+            kreg[j] = k[kbase + j * 32];
+            vreg[j] = v[kbase + j * 32];
+        }
+        #pragma unroll
+        for (int qt = 0; qt < FLASH_Q_TILE; ++qt) {
+            float part = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < FLASH_NP; ++j) part += qreg[qt][j] * kreg[j];
+            for (int off = 16; off > 0; off >>= 1) part += __shfl_down(part, off);
+            float s = __shfl(part, 0) * scale;
+            float new_m = fmaxf(m[qt], s);
+            float corr = expf(m[qt] - new_m);
+            float p = expf(s - new_m);
+            l[qt] = l[qt] * corr + p;
+            #pragma unroll
+            for (int j = 0; j < FLASH_NP; ++j) acc[qt][j] = acc[qt][j] * corr + p * vreg[j];
+            m[qt] = new_m;
+        }
+    }
+    #pragma unroll
+    for (int qt = 0; qt < FLASH_Q_TILE; ++qt) {
+        int qi = q0 + qt;
+        if (qi >= q_seq) continue;
+        long qbase = ((long)(b * q_seq + qi) * hidden) + head_off + lane;
+        float inv = (l[qt] > 0.0f) ? (1.0f / l[qt]) : 0.0f;
+        #pragma unroll
+        for (int j = 0; j < FLASH_NP; ++j) output[qbase + j * 32] = acc[qt][j] * inv;
+    }
+}
+"#;
+
 pub(crate) const DIFFUSION_SDPA_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
