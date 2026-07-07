@@ -655,6 +655,20 @@ enum ImageSource<'a> {
     Base64(&'a str),
 }
 
+/// Per-request sampler seed (the initial GPU `rng_state` + the CPU-fallback RNG reset).
+/// The daemon processes requests SERIALLY over the stdio JSON-lines loop, so a process-global set
+/// at request-parse and read at each generate loop's `rng_state` init is race-free and avoids
+/// threading a `seed` param through every generate*() signature. Default `0x13579BDF` preserves the
+/// prior hardcoded behavior when a request omits `seed`; the autoresearch coherence arm sends a
+/// seed-SET (varying this) to sample distinct temp>0 trajectories for the paired rate test.
+static REQUEST_SEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x13579BDF);
+fn set_request_seed(s: u32) {
+    REQUEST_SEED.store(s, std::sync::atomic::Ordering::Relaxed);
+}
+fn request_seed() -> u32 {
+    REQUEST_SEED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct GenerateVLParams<'a> {
     id: &'a str,
     prompt: &'a str,
@@ -1791,6 +1805,15 @@ fn main() {
                     .get("top_p")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_top_p) as f32;
+                // Optional per-request sampler seed (initial GPU rng_state + CPU-fallback reset).
+                // Omitted -> the prior fixed 0x13579BDF. The autoresearch coherence arm sends a
+                // seed-SET to draw distinct temp>0 trajectories for the paired base/variant rate test.
+                set_request_seed(
+                    msg.get("seed")
+                        .and_then(|v| v.as_u64())
+                        .map(|s| s as u32)
+                        .unwrap_or(0x13579BDF),
+                );
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -6238,7 +6261,7 @@ fn generate_multi(
     // ngram scope: generated tokens only (matches pp=1).
     let ngram_scope_start = m.conversation_tokens.len();
 
-    let mut rng_state: u32 = 0x13579BDFu32;
+    let mut rng_state: u32 = request_seed();
 
     let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
         .into_iter()
@@ -6845,7 +6868,7 @@ fn generate(
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed());
     // Expert-parallel (task #26): route to generate_ep BEFORE any arch
     // short-circuit (generate_qwen2/_deepseek4/...), since EP mode leaves the
     // single-GPU arch fields (q35_*/deepseek4_*) None — the per-arch paths
@@ -8580,7 +8603,7 @@ fn generate(
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
         let vocab_size = config.vocab_size;
-        let mut rng_state: u32 = 0x13579BDFu32;
+        let mut rng_state: u32 = request_seed();
         // Effective penalty window = request `repeat_window` (default 128),
         // bounded by the GPU repeat_buf capacity (2048). The buffer is sized
         // large so presence/frequency penalties CAN use a wider window when a
@@ -12417,7 +12440,7 @@ fn generate_vl(
     // draws from this global; without the per-request reset it carried RNG state
     // across requests (and across earlier text-path requests) → cross-request
     // nondeterminism. Matches the GPU path's u32 (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed());
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
