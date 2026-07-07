@@ -108,8 +108,18 @@ def build_config(args):
         "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
         "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
-        "mode": args.mode, "port": args.port,
+        "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
+        "prompts_file": getattr(args, "prompts_file", None),
     }
+
+
+def load_prompt_battery(prompts_file):
+    """Return [(genre, prompt), ...] from a --prompts-file JSON, else the built-in GENRE_BATTERY."""
+    if not prompts_file:
+        return list(GENRE_BATTERY)
+    import json
+    rows = json.load(open(prompts_file))
+    return [(r.get("genre", "prose"), r["prompt"]) for r in rows]
 
 
 def show_config(cfg):
@@ -117,6 +127,7 @@ def show_config(cfg):
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
     print(f"  kv_mode       : {cfg['kv']}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
+    print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {cfg['thinking_cap_tokens']} tok (CONCRETE cap)")
     print(f"  max_tokens     : {cfg['max_tokens']}  ({'>cap, model can answer' if cfg['max_tokens'] > cfg['thinking_cap_tokens'] or cfg['thinking_cap_tokens']==0 else 'WARNING: <= think cap -> empty/think-only risk'})")
     print("  sampling (what IS set):")
@@ -205,6 +216,8 @@ def send(cfg, messages):
     body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
             "stream": True, "stream_options": {"include_usage": True}}
     body.update(cfg["sampling"])
+    if cfg.get("seed") is not None:
+        body["seed"] = cfg["seed"]
     t0 = time.time(); ttft = None; think = []; ans = []; tools = []
     usage = {}; timings = {}; finish = None
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
@@ -273,15 +286,16 @@ def turn_line(i, r, recall=""):
 
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
-    print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} ###", flush=True)
+    print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
+    battery = load_prompt_battery(cfg.get("prompts_file"))
     if cfg["mode"] == "battery":
-        for genre, prompt in GENRE_BATTERY:
+        for genre, prompt in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
             rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
     elif cfg["mode"] == "chain":
         messages = []
-        for genre, prompt in GENRE_BATTERY:
+        for genre, prompt in battery:
             messages.append({"role": "user", "content": prompt})
             r = send(cfg, messages)
             messages.append({"role": "assistant", "content": r["assistant_content"]})
@@ -328,6 +342,12 @@ def main():
     ap.add_argument("--out", default=None, help="write per-turn json")
     ap.add_argument("--show-config", action="store_true", help="resolve+print config, do NOT run")
     ap.add_argument("--no-spawn", action="store_true", help="connect to an already-running serve")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="per-request sampler seed (sent in the body -> daemon initial rng_state). The "
+                         "certify's coherence arm invokes with a seed-SET (one seed per call) for the rate test.")
+    ap.add_argument("--prompts-file", default=None,
+                    help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
+                         "(e.g. battery + the coherence_prompts_<arch> guard set).")
     args = ap.parse_args()
     cfg = build_config(args); cfg["max_seq"] = args.max_seq
     show_config(cfg)
