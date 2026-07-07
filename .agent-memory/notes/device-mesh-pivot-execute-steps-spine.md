@@ -447,9 +447,25 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
       4.2e-4 = single pos, one-entry KV); prefill compounds Q8-KV rounding over 103 pos × 28 layers → 0.20 is the real
       floor, not a bug** (argmax matches " Also"; TP delta < attention-mode delta). Bound = `4.0e-1` (2× observed, churn
       headroom); a real sharding/all-reduce break lands near/above 0.88 and trips it.
-    - **B** *(next substantive polish)* — **multi-turn KV reuse** (serve is stateless per request → reuse KV across turns);
-      #462-sensitive daemon reset/checkpoint/abort state machine.
-    - **C** — `resolve_mesh` daemon wiring (load still routes on raw `tp`/`ep` knobs).
+    - ✅ **B** — DONE 2026-07-07 `feature/device-mesh` (`7b50839a` + fix `25f9046f`, SDD; primitive test `c573326f`). Dense
+      TP/PP multi-turn KV reuse. **KEY FINDING: the single-GPU path ALREADY reused KV** (`conversation_tokens` +
+      `plan_prompt_cache` LCP); the dense `generate_dense` path DROPPED `messages_history` entirely (single-shot, pos-0
+      every request). Fix: both dense arms (`m.tp`/`m.pp_dense`) route through the SAME proven `plan_prompt_cache(&[], false)`
+      (empty ckpts + resume off ⇒ single-GPU-**llama** behavior: strict-extension→reuse, divergence→cold-prefill);
+      `generate_dense` is plan-driven (miss→batched `prefill`, hit→per-token `forward_token` suffix over the retained KV
+      prefix) and returns `Option<Vec<u32>>` (`None`→caller clears `conversation_tokens`). **Pure-KV is positional ⇒ no
+      #462 recurrent bleed; LCP reuses only the matching prefix.** **TRAP fixed in review (25f9046f): the decode loop
+      breaks on max_tokens/stop AFTER `history.push` but BEFORE `forward_token`, so the last emitted token was baked into
+      `conversation_tokens` without entering the KV → next-turn LCP over an unwritten slot (#462 mirror skew, the COMMON
+      truncation case). Return `materialized` (pushed after each successful forward_token), not `history`.** Batched suffix
+      prefill stays deferred to item **D** (needs cache-attention; B+D compose). Validated: `tp_multiturn_parity`
+      (cache-hit suffix == full prefill, argmax-exact max|Δ|=2.5e-1) + `tp_prefill/decode_parity` (cold path unchanged, all
+      green). **ENV-BLOCKED (pre-existing, box-wide, NOT B — reproduces on main checkout):** daemon load fails `os error 2`
+      for every model (`strace`: `openat("")` in `load_model`, upstream of generate) ⇒ `coherence-gate.sh` + live multi-turn
+      smoke deferred until box daemon-load recovers. FOLLOWUP: does the single-GPU generate loop share the same
+      history-vs-materialized bake skew? (dense path now correct independently). Spec/plan: local
+      `docs/superpowers/{specs,plans}/2026-07-07-dense-multiturn-kv-reuse*.md`.
+    - **C** *(next)* — `resolve_mesh` daemon wiring (load still routes on raw `tp`/`ep` knobs).
     - **D** — >256 cross-chunk batched prefill (needs the flash `forward_prefill_batch` cache-attention).
     - **E** *(small/low-value here)* — drop redundant rank0 whole-`LlamaWeights` (dead VRAM); revert/doc the `mq_x_rot`
       prefill VRAM growth; AWQ-batched rotate coverage.
