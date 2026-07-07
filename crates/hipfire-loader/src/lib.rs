@@ -26,7 +26,7 @@ use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
-use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind, Gpus};
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
@@ -1280,11 +1280,11 @@ impl Drop for MinimaxEpStaging {
 /// (`HIPFIRE_EP_FAIL_RANK`) fires AFTER a rank's constructor returns `Ok`, so it
 /// tests the completed-rank cleanup path (which IS fixed), not this inner window.
 /// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
-pub fn load_model_ep(path: &str, max_seq: usize, ep: usize) -> Result<LoadedModel, String> {
+pub fn load_model_ep(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, ep),
-        10 => load_model_ep_minimax(path, max_seq, ep),
+        9 => load_model_ep_ds4(path, max_seq, mesh),
+        10 => load_model_ep_minimax(path, max_seq, mesh),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
@@ -1302,7 +1302,7 @@ pub fn load_model_ep(path: &str, max_seq: usize, ep: usize) -> Result<LoadedMode
 /// `LlamaWeights` from a `WeightStore`, per-rank scratch/KV, a `Gpus`-threaded
 /// decode loop, and `tp_decode_parity` — is **PB-TP5** and not yet done, so this
 /// returns a clear error rather than silently falling back to single-GPU.
-pub fn load_model_tp(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+pub fn load_model_tp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
     // Host-side metadata BEFORE GPU allocation (chat template + recommended
     // sampling), matching the ds4/minimax EP loaders.
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
@@ -1313,7 +1313,7 @@ pub fn load_model_tp(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     let rec = hfq.recommended_sampling();
     drop(hfq); // TpModel::load reopens; free this handle before GPU work.
 
-    let tp_model = hipfire_runtime::tp_serve::TpModel::load(path, tp, max_seq)?;
+    let tp_model = hipfire_runtime::tp_serve::TpModel::load(path, mesh, max_seq)?;
     let eos_tok = tp_model.eos_token();
 
     Ok(LoadedModel {
@@ -1339,7 +1339,7 @@ pub fn load_model_tp(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
 /// path (`load_qwen35_pp`); this is the arch-generic driver-owned loop for
 /// llama-family models. Served via the daemon's `generate_pp` (the shared
 /// `generate_dense` loop).
-pub fn load_model_pp(path: &str, max_seq: usize, pp: usize) -> Result<LoadedModel, String> {
+pub fn load_model_pp(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let arch_id = hfq.arch_id;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -1348,11 +1348,11 @@ pub fn load_model_pp(path: &str, max_seq: usize, pp: usize) -> Result<LoadedMode
     let rec = hfq.recommended_sampling();
     drop(hfq); // PpModel::load reopens; free this handle before GPU work.
 
-    let pp_model = hipfire_runtime::pp_serve::PpModel::load(path, pp, max_seq)?;
+    let pp_model = hipfire_runtime::pp_serve::PpModel::load(path, mesh, max_seq)?;
     let eos_tok = pp_model.eos_token();
 
     Ok(LoadedModel {
-        pp, // requested degree (informational; PP state lives in pp_dense)
+        pp: mesh.size_of(DimKind::Pp), // requested degree (informational; PP state lives in pp_dense)
         pp_dense: Some(pp_model),
         deepseek4_eos_tok: eos_tok, // reuse the generic eos carrier (PP state is in `pp_dense`)
         rec_temperature: rec.and_then(|r| r.temperature),
@@ -1369,7 +1369,7 @@ pub fn load_model_pp(path: &str, max_seq: usize, pp: usize) -> Result<LoadedMode
     })
 }
 
-fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -1392,17 +1392,18 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     let chat_template = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
+    let ep = mesh.size_of(DimKind::Ep);
     let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+        Gpus::from_mesh(mesh, config.num_hidden_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
     let n = gpus.devices.len();
-    if n != tp {
+    if n != ep {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "from_mesh gave {n} devices, expected ep={ep} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
-    eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
+    eprintln!("[loader] EP load: ep={ep} arch=ds4 experts={n_exp} (rank r owns e%{ep}==r)");
     let shard = ShardConfig::new(
-        tp,
+        ep,
         /*tp_kv_replicate=*/ true,
         n_exp,
         ExpertAssign::Stride,
@@ -1488,7 +1489,11 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     })
 }
 
-fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+fn load_model_ep_minimax(
+    path: &str,
+    max_seq: usize,
+    mesh: &DeviceMesh,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -1511,17 +1516,18 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     let chat_template = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
+    let ep = mesh.size_of(DimKind::Ep);
     let gpus =
-        Gpus::init_tp(tp, config.num_hidden_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+        Gpus::from_mesh(mesh, config.num_hidden_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
     let n = gpus.devices.len();
-    if n != tp {
+    if n != ep {
         return Err(format!(
-            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+            "from_mesh gave {n} devices, expected ep={ep} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
         ));
     }
-    eprintln!("[loader] EP load: tp={tp} arch=minimax experts={n_exp} (rank r owns e%{tp}==r)");
+    eprintln!("[loader] EP load: ep={ep} arch=minimax experts={n_exp} (rank r owns e%{ep}==r)");
     let shard = ShardConfig::new(
-        tp,
+        ep,
         /*tp_kv_replicate=*/ true,
         n_exp,
         ExpertAssign::Stride,

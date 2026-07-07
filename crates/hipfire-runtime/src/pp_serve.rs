@@ -31,6 +31,7 @@
 use crate::hfq::HfqFile;
 use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights, PrefillScratch};
 use crate::multi_gpu::Gpus;
+use hipfire_hardware::{DeviceMesh, DimKind};
 use rdna_compute::{DType, GpuTensor};
 use std::ops::Range;
 
@@ -65,9 +66,12 @@ impl PpModel {
     }
 
     /// Load a dense llama-family HFQ pipeline-parallel across `pp` stages.
-    pub fn load(path: &str, pp: usize, max_seq: usize) -> Result<Self, String> {
+    pub fn load(path: &str, mesh: &DeviceMesh, max_seq: usize) -> Result<Self, String> {
+        let pp = mesh.size_of(DimKind::Pp);
         if pp < 2 {
-            return Err(format!("PpModel::load needs pp>=2 (got {pp})"));
+            return Err(format!(
+                "PpModel::load needs a Pp axis with size>=2 (got {pp})"
+            ));
         }
         let hfq = HfqFile::open(std::path::Path::new(path)).map_err(|e| format!("{e}"))?;
         if !matches!(hfq.arch_id, 0 | 1) {
@@ -82,8 +86,7 @@ impl PpModel {
 
         // `init_uniform` bands layers across stages (layer_to_device via
         // uniform_split_counts — the same split `mesh.stage_for_layer` uses).
-        let mut gpus =
-            Gpus::init_uniform(pp, n_layers).map_err(|e| format!("init_uniform: {e:?}"))?;
+        let mut gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
         // Peer access for the cross-stage boundary copy. NB: NO ensure_rank_streams
         // / active_stream — stages stay on the sync memset + sync boundary path.
         gpus.enable_peer_all()

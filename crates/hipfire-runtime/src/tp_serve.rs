@@ -96,9 +96,12 @@ impl TpModel {
     }
 
     /// Load a dense llama-family HFQ tensor-parallel across `tp` ranks.
-    pub fn load(path: &str, tp: usize, max_seq: usize) -> Result<Self, String> {
+    pub fn load(path: &str, mesh: &DeviceMesh, max_seq: usize) -> Result<Self, String> {
+        let tp = mesh.size_of(DimKind::Tp);
         if tp < 2 {
-            return Err(format!("TpModel::load needs tp>=2 (got {tp})"));
+            return Err(format!(
+                "TpModel::load needs a Tp axis with size>=2 (got {tp})"
+            ));
         }
         let hfq = HfqFile::open(std::path::Path::new(path)).map_err(|e| format!("{e}"))?;
         if !matches!(hfq.arch_id, 0 | 1) {
@@ -140,8 +143,7 @@ impl TpModel {
             }
         }
 
-        let mut gpus =
-            Gpus::init_uniform(tp, n_layers).map_err(|e| format!("init_uniform: {e:?}"))?;
+        let mut gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
         gpus.enable_peer_all()
             .map_err(|e| format!("enable_peer_all: {e:?}"))?;
         for dev in gpus.devices.iter_mut() {
@@ -163,9 +165,9 @@ impl TpModel {
         let qkv_rot = dtype_rotation_plan(weights.layers[0].wq.gpu_dtype);
         let ffn_rot = dtype_rotation_plan(weights.layers[0].w_gate.gpu_dtype);
 
-        // Store→forward bridge: shard every layer's quant weights.
-        let mesh = DeviceMesh::rect(&[(DimKind::Tp, tp)]);
-        let store = build_store(&hfq, &config, &mesh, &gpus)?;
+        // Store→forward bridge: shard every layer's quant weights (uses the
+        // caller-provided mesh — no internal reconstruction).
+        let store = build_store(&hfq, &config, mesh, &gpus)?;
 
         // Per-layer replicated norm CPU copies (download once from rank 0).
         let norms_cpu: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..n_layers)
@@ -230,7 +232,7 @@ impl TpModel {
 
         Ok(TpModel {
             gpus,
-            mesh,
+            mesh: mesh.clone(),
             group,
             tp,
             config,
