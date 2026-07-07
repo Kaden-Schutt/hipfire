@@ -2924,6 +2924,8 @@ impl NativeTransformerDenoiser {
                 if crate::gpu_ops::profile::enabled() {
                     use crate::gpu_ops::profile;
                     let prep = profile::take(&profile::PREP_NS) as f64 / 1e6;
+                    let prep_read = profile::take(&profile::PREP_READ_NS) as f64 / 1e6;
+                    let prep_quant = profile::take(&profile::PREP_QUANT_NS) as f64 / 1e6;
                     let gemm = profile::take(&profile::GEMM_NS) as f64 / 1e6;
                     let attn = profile::take(&profile::ATTN_NS) as f64 / 1e6;
                     let bytes = profile::take(&profile::PREP_BYTES);
@@ -2938,9 +2940,11 @@ impl NativeTransformerDenoiser {
                     };
                     let gib = (bytes as f64) / (1024.0 * 1024.0 * 1024.0);
                     eprintln!(
-                        "[profile] DiT block-stack step: prep={:.1}ms ({:.1}%) gemm={:.1}ms ({:.1}%) attn={:.1}ms ({:.1}%) | cache {}hit/{}miss, prep-read={:.2}GiB, gemm={:.2} TFLOP/s effective",
+                        "[profile] DiT block-stack step: prep={:.1}ms ({:.1}%) [read={:.1}ms quant={:.1}ms] gemm={:.1}ms ({:.1}%) attn={:.1}ms ({:.1}%) | cache {}hit/{}miss, prep-read={:.2}GiB, gemm={:.2} TFLOP/s effective",
                         prep,
                         100.0 * prep / total.max(1e-9),
+                        prep_read,
+                        prep_quant,
                         gemm,
                         100.0 * gemm / total.max(1e-9),
                         attn,

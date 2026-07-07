@@ -22,6 +22,8 @@ pub(crate) mod profile {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     pub static PREP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_QUANT_NS: AtomicU64 = AtomicU64::new(0);
     pub static GEMM_NS: AtomicU64 = AtomicU64::new(0);
     pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_BYTES: AtomicU64 = AtomicU64::new(0);

@@ -236,6 +236,84 @@ impl RocmWeightCache {
     }
 }
 
+#[inline(always)]
+fn bf16_byte_to_f32(lo: u8, hi: u8) -> f32 {
+    f32::from_bits((u16::from_le_bytes([lo, hi]) as u32) << 16)
+}
+
+/// Parallel per-group (256) symmetric int8 quant of a row-major `[m, k]` weight,
+/// reading values via `val(row_byte_base, elem)`. Returns (int8-as-u8 `[m*k]`,
+/// f32 scales `[m*ng]`). Rows are independent, so this fans out over rows with
+/// rayon — the load-time hot path for W8A8.
+fn quantize_oq8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
+where
+    F: Fn(usize, usize) -> f32 + Sync,
+{
+    use rayon::prelude::*;
+    const GROUP: usize = 256;
+    let mut q = vec![0u8; m * k];
+    let mut scales = vec![0f32; m * ng];
+    q.par_chunks_mut(k)
+        .zip(scales.par_chunks_mut(ng))
+        .enumerate()
+        .for_each(|(row, (qrow, srow))| {
+            let row_base = row * k * elem_stride;
+            for g in 0..ng {
+                let goff = g * GROUP;
+                let mut amax = 0f32;
+                for i in 0..GROUP {
+                    amax = amax.max(val(row_base, goff + i).abs());
+                }
+                let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                srow[g] = scale;
+                let inv = 1.0 / scale;
+                for i in 0..GROUP {
+                    let v = (val(row_base, goff + i) * inv).round().clamp(-127.0, 127.0);
+                    qrow[goff + i] = (v as i8) as u8;
+                }
+            }
+        });
+    (q, scales)
+}
+
+/// Parallel per-group (256) symmetric int4 quant, packed two nibbles/byte
+/// (byte = even_k | odd_k<<4). Returns (packed `[m*k/2]`, f32 scales `[m*ng]`).
+/// The load-time hot path for W4A8.
+fn quantize_w4a8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
+where
+    F: Fn(usize, usize) -> f32 + Sync,
+{
+    use rayon::prelude::*;
+    const GROUP: usize = 256;
+    let mut packed = vec![0u8; m * k / 2];
+    let mut scales = vec![0f32; m * ng];
+    packed
+        .par_chunks_mut(k / 2)
+        .zip(scales.par_chunks_mut(ng))
+        .enumerate()
+        .for_each(|(row, (prow, srow))| {
+            let row_base = row * k * elem_stride;
+            for g in 0..ng {
+                let goff = g * GROUP;
+                let mut amax = 0f32;
+                for i in 0..GROUP {
+                    amax = amax.max(val(row_base, goff + i).abs());
+                }
+                let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                srow[g] = scale;
+                let inv = 1.0 / scale;
+                let mut i = 0;
+                while i < GROUP {
+                    let q0 = (val(row_base, goff + i) * inv).round().clamp(-7.0, 7.0) as i32;
+                    let q1 = (val(row_base, goff + i + 1) * inv).round().clamp(-7.0, 7.0) as i32;
+                    prow[(goff + i) / 2] = ((q0 & 0xf) | ((q1 & 0xf) << 4)) as u8;
+                    i += 2;
+                }
+            }
+        });
+    (packed, scales)
+}
+
 impl RocmWeightCache {
     /// Return the raw device pointer for `tensor`, uploading it once on first use.
     fn resident_ptr(
@@ -393,36 +471,35 @@ impl RocmWeightCache {
         }
         let ng = k / GROUP;
         if !self.named_oq8.contains_key(&weight.name) {
-            // Decode source (bf16 or otherwise) to f32, then per-group symmetric
-            // int8 with per-group f32 scale = max(|w|)/127.
-            let cpu = weight.decode()?;
-            if cpu.data.len() != m * k {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "resident_oq8: weight {:?} decoded to {} elems, expected {}",
-                    weight.name,
-                    cpu.data.len(),
-                    m * k
-                )));
-            }
-            let mut q = vec![0i8; m * k];
-            let mut scales = vec![0f32; m * ng];
-            for row in 0..m {
-                for g in 0..ng {
-                    let base = row * k + g * GROUP;
-                    let mut amax = 0f32;
-                    for i in 0..GROUP {
-                        amax = amax.max(cpu.data[base + i].abs());
-                    }
-                    let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                    scales[row * ng + g] = scale;
-                    let inv = 1.0 / scale;
-                    for i in 0..GROUP {
-                        let v = (cpu.data[base + i] * inv).round().clamp(-127.0, 127.0);
-                        q[base + i] = v as i8;
-                    }
+            // Fuse decode + per-group symmetric int8 quant and fan out over rows
+            // with rayon (the bf16 fast path reads values straight from the
+            // packed bytes, skipping the transient full-f32 decode).
+            let (q_bytes, scales) = if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 {
+                let bytes = weight.read_bytes()?;
+                if bytes.len() != m * k * 2 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_oq8: weight {:?} has {} bytes, expected {}",
+                        weight.name,
+                        bytes.len(),
+                        m * k * 2
+                    )));
                 }
-            }
-            let q_bytes: Vec<u8> = q.iter().map(|&v| v as u8).collect();
+                quantize_oq8_rows(m, k, ng, 2, |row_base, elem| {
+                    let b = row_base + elem * 2;
+                    bf16_byte_to_f32(bytes[b], bytes[b + 1])
+                })
+            } else {
+                let cpu = weight.decode()?;
+                if cpu.data.len() != m * k {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_oq8: weight {:?} decoded to {} elems, expected {}",
+                        weight.name,
+                        cpu.data.len(),
+                        m * k
+                    )));
+                }
+                quantize_oq8_rows(m, k, ng, 1, |row_base, elem| cpu.data[row_base + elem])
+            };
             let w_i8 = gpu
                 .upload_raw(&q_bytes, &[m * k])
                 .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
@@ -464,37 +541,49 @@ impl RocmWeightCache {
         }
         let ng = k / GROUP;
         if !self.named_w4a8.contains_key(&weight.name) {
-            let cpu = weight.decode()?;
-            if cpu.data.len() != m * k {
-                return Err(DiffusionError::InvalidMetadata(format!(
-                    "resident_w4a8: weight {:?} decoded to {} elems, expected {}",
-                    weight.name,
-                    cpu.data.len(),
-                    m * k
-                )));
-            }
-            let mut packed = vec![0u8; m * k / 2];
-            let mut scales = vec![0f32; m * ng];
-            for row in 0..m {
-                for g in 0..ng {
-                    let base = row * k + g * GROUP;
-                    let mut amax = 0f32;
-                    for i in 0..GROUP {
-                        amax = amax.max(cpu.data[base + i].abs());
-                    }
-                    // int4 range is [-7, 7] (symmetric, 8 unused).
-                    let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
-                    scales[row * ng + g] = scale;
-                    let inv = 1.0 / scale;
-                    let mut i = 0;
-                    while i < GROUP {
-                        let q0 = (cpu.data[base + i] * inv).round().clamp(-7.0, 7.0) as i32;
-                        let q1 = (cpu.data[base + i + 1] * inv).round().clamp(-7.0, 7.0) as i32;
-                        packed[(base + i) / 2] = ((q0 & 0xf) | ((q1 & 0xf) << 4)) as u8;
-                        i += 2;
-                    }
+            // Fuse decode + per-group int4 quant, fanned out over rows with rayon.
+            let (packed, scales) = if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 {
+                let prof = crate::gpu_ops::profile::enabled();
+                let t0 = std::time::Instant::now();
+                let bytes = weight.read_bytes()?;
+                if prof {
+                    crate::gpu_ops::profile::add(
+                        &crate::gpu_ops::profile::PREP_READ_NS,
+                        t0.elapsed().as_nanos() as u64,
+                    );
                 }
-            }
+                if bytes.len() != m * k * 2 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_w4a8: weight {:?} has {} bytes, expected {}",
+                        weight.name,
+                        bytes.len(),
+                        m * k * 2
+                    )));
+                }
+                let t1 = std::time::Instant::now();
+                let out = quantize_w4a8_rows(m, k, ng, 2, |row_base, elem| {
+                    let b = row_base + elem * 2;
+                    bf16_byte_to_f32(bytes[b], bytes[b + 1])
+                });
+                if prof {
+                    crate::gpu_ops::profile::add(
+                        &crate::gpu_ops::profile::PREP_QUANT_NS,
+                        t1.elapsed().as_nanos() as u64,
+                    );
+                }
+                out
+            } else {
+                let cpu = weight.decode()?;
+                if cpu.data.len() != m * k {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_w4a8: weight {:?} decoded to {} elems, expected {}",
+                        weight.name,
+                        cpu.data.len(),
+                        m * k
+                    )));
+                }
+                quantize_w4a8_rows(m, k, ng, 1, |row_base, elem| cpu.data[row_base + elem])
+            };
             let w_i4 = gpu
                 .upload_raw(&packed, &[m * k / 2])
                 .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
