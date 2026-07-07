@@ -1233,6 +1233,12 @@ pub(crate) struct WanUpBlock {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct WanImageDecoder {
+    // post_quant_conv (z_dim -> z_dim, 1x1x1) applied to the denormalized latent
+    // before the decoder proper, matching AutoencoderKLQwenImage._decode
+    // (`x = self.post_quant_conv(z)`). Skipping it leaves a per-channel colour
+    // cast / streaking in the output.
+    post_quant_conv_weight: Option<CpuTensor>,
+    post_quant_conv_bias: Option<CpuTensor>,
     conv_in_weight: CpuTensor,
     conv_in_bias: CpuTensor,
     mid_resnet0: WanResnetBlock,
@@ -1286,7 +1292,14 @@ impl WanImageDecoder {
                 WanUpsample::from_hfq(hfq, &format!("{prefix}.up_blocks.{ub}.upsamplers.0"))?;
             up_blocks.push(WanUpBlock { resnets, upsampler });
         }
+        // post_quant_conv is a VAE-level tensor (sibling of `decoder`), not under
+        // the decoder prefix.
+        let post_quant_conv_weight =
+            optional_tensor(hfq, "vae/tensors/post_quant_conv.weight")?;
+        let post_quant_conv_bias = optional_tensor(hfq, "vae/tensors/post_quant_conv.bias")?;
         Ok(Some(Self {
+            post_quant_conv_weight,
+            post_quant_conv_bias,
             conv_in_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.weight"))?,
             conv_in_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.bias"))?,
             mid_resnet0: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.0"))?,
@@ -1304,7 +1317,19 @@ impl WanImageDecoder {
 
     pub(crate) fn decode(&self, latent: &CpuTensor) -> DiffusionResult<CpuTensor> {
         let dbg = std::env::var("HIPFIRE_DEBUG_VAE_STAGES").is_ok_and(|v| !v.is_empty());
+        let dump_dir = std::env::var("HIPFIRE_DEBUG_VAE_DUMP").ok().filter(|v| !v.is_empty());
         let report = |name: &str, t: &CpuTensor| {
+            if let Some(dir) = &dump_dir {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
+                for d in &t.shape {
+                    bytes.extend_from_slice(&(*d as u32).to_le_bytes());
+                }
+                for v in &t.data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let _ = std::fs::write(format!("{dir}/stage_{name}.bin"), &bytes);
+            }
             if !dbg {
                 return;
             }
@@ -1329,7 +1354,50 @@ impl WanImageDecoder {
                 acc / n.max(1) as f64
             );
         };
+        if let Ok(dir) = std::env::var("HIPFIRE_DEBUG_VAE_DUMP") {
+            if !dir.is_empty() {
+                let dump = |name: &str, t: &CpuTensor| {
+                    let mut bytes = Vec::with_capacity(4 + t.shape.len() * 4 + t.data.len() * 4);
+                    bytes.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
+                    for d in &t.shape {
+                        bytes.extend_from_slice(&(*d as u32).to_le_bytes());
+                    }
+                    for v in &t.data {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let _ = std::fs::write(format!("{dir}/{name}.bin"), &bytes);
+                };
+                dump("conv_in_input", latent);
+                dump(
+                    "conv_in_weight",
+                    &CpuTensor {
+                        shape: self.conv_in_weight.shape.clone(),
+                        data: self.conv_in_weight.data.clone(),
+                    },
+                );
+            }
+        }
+        // post_quant_conv (1x1x1 channel-mix) on the denormalized latent, before
+        // conv_in -- matches AutoencoderKLQwenImage._decode's `post_quant_conv(z)`.
+        let post_quant = match &self.post_quant_conv_weight {
+            Some(w) => Some(wan_causal_conv2d(latent, w, self.post_quant_conv_bias.as_ref())?),
+            None => None,
+        };
+        let latent = post_quant.as_ref().unwrap_or(latent);
         let mut hidden = wan_causal_conv2d(latent, &self.conv_in_weight, Some(&self.conv_in_bias))?;
+        if let Ok(dir) = std::env::var("HIPFIRE_DEBUG_VAE_DUMP") {
+            if !dir.is_empty() {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(hidden.shape.len() as u32).to_le_bytes());
+                for d in &hidden.shape {
+                    bytes.extend_from_slice(&(*d as u32).to_le_bytes());
+                }
+                for v in &hidden.data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let _ = std::fs::write(format!("{dir}/conv_in_output.bin"), &bytes);
+            }
+        }
         report("conv_in", &hidden);
         hidden = self.mid_resnet0.forward(&hidden)?;
         report("mid_resnet0", &hidden);
@@ -1352,7 +1420,10 @@ impl WanImageDecoder {
             &self.norm_out_gamma,
             Self::EPS,
         )?);
-        wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))
+        report("norm_out", &hidden);
+        let out = wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))?;
+        report("conv_out", &out);
+        Ok(out)
     }
 }
 

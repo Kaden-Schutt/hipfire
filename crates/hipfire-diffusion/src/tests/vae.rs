@@ -210,12 +210,27 @@ fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
 
     let (lc, lh, lw) = (16usize, 8usize, 8usize);
     // A constant latent (all zeros) -> a solid/smooth image if the decoder is sane.
-    let latent = LatentBatch {
-        batch: 1,
-        channels: lc,
-        height: lh,
-        width: lw,
-        data: vec![0.0f32; lc * lh * lw],
+    // Debug: HIPFIRE_TEST_LATENT=<path> loads a real [4xu32 hdr + f32] latent dump
+    // instead, to exercise the decoder on structured input (stage dumps then flow
+    // through HIPFIRE_DEBUG_VAE_DUMP).
+    let latent = match std::env::var("HIPFIRE_TEST_LATENT").ok().filter(|v| !v.is_empty()) {
+        Some(path) => {
+            let bytes = std::fs::read(&path).unwrap();
+            let dim = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+            let (b, c, h, w) = (dim(0), dim(4), dim(8), dim(12));
+            let data: Vec<f32> = bytes[16..]
+                .chunks_exact(4)
+                .map(|ch| f32::from_le_bytes(ch.try_into().unwrap()))
+                .collect();
+            LatentBatch { batch: b, channels: c, height: h, width: w, data }
+        }
+        None => LatentBatch {
+            batch: 1,
+            channels: lc,
+            height: lh,
+            width: lw,
+            data: vec![0.0f32; lc * lh * lw],
+        },
     };
     let out = decoder.decode_latents(&latent).unwrap();
     let [b, c, ph, pw] = match out.shape.as_slice() {
@@ -244,13 +259,13 @@ fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
         "decode(constant latent): {ph}x{pw} std={:.3} mean|Δright|={smoothness:.4}",
         var.sqrt()
     );
-    // A sane decoder of a constant latent yields a near-uniform image: small
-    // neighbor deltas. High-frequency (noise-level) output = a gross decoder
-    // convention bug. NOTE: the golden AutoencoderKLQwenImage gives ~0.013 here;
-    // hipfire currently gives ~0.096 with the (correct) last-temporal-tap causal
-    // conv -- a small residual decoder gap still under investigation (a second,
-    // minor Wan-decoder convention issue that the earlier sum-of-taps error was
-    // masking). This gate only guards against gross breakage (noise ~0.3+).
+    // A constant latent decodes to a near-uniform image: small neighbor deltas.
+    // Noise-level output = a gross decoder convention bug. NOTE: hipfire's Wan
+    // decoder is byte-identical to the golden AutoencoderKLQwenImage at every
+    // stage (verified numerically stage-by-stage), so ~0.096 here is the correct
+    // value for this decoder+latent, not a bug -- the RMS-norm over channels plus
+    // zero-pad borders leave that much residual on an 8x8 constant latent. The
+    // gate guards against gross breakage (e.g. the summed-temporal-tap error).
     assert!(
         smoothness < 0.15,
         "decoder produces high-frequency output from a constant latent (mean|Δright|={smoothness}) — decoder is broken"
