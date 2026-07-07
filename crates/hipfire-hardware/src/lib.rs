@@ -256,6 +256,35 @@ impl Gpus {
         })
     }
 
+    /// Build a `Gpus` from a resolved single-axis [`DeviceMesh`], delegating to
+    /// the existing per-axis primitive so the resulting layer layout is
+    /// byte-identical to the pre-mesh loader paths:
+    /// - `Ep` axis → [`init_tp`] (every device runs every layer, MoE experts sharded)
+    /// - `Tp` axis → [`init_uniform`] (matches today's `TpModel::load`; TP bands are
+    ///   vestigial but preserved)
+    /// - `Pp` axis → [`init_uniform`] (uniform layer bands across stages)
+    ///
+    /// Only invoked for multi-device meshes on the loader path. A single-device
+    /// (1×1) mesh never reaches here — the daemon's single-GPU branch keeps its
+    /// bare `Gpu` + `load_model`. Precedence `Ep > Tp > Pp` matches the daemon
+    /// routing chain; the daemon guarantees at most one axis is >1, so the order
+    /// only fixes a convention.
+    pub fn from_mesh(mesh: &DeviceMesh, n_layers: usize) -> HipResult<Self> {
+        if mesh.has_axis(DimKind::Ep) {
+            Self::init_tp(mesh.size_of(DimKind::Ep), n_layers)
+        } else if mesh.has_axis(DimKind::Tp) {
+            Self::init_uniform(mesh.size_of(DimKind::Tp), n_layers)
+        } else if mesh.has_axis(DimKind::Pp) {
+            Self::init_uniform(mesh.size_of(DimKind::Pp), n_layers)
+        } else {
+            Err(HipError::new(
+                0,
+                "from_mesh: single-device (1×1) mesh has no multi-device axis; \
+                 use Gpus::single / load_model for the single-GPU path",
+            ))
+        }
+    }
+
     /// Bidirectional `hipDeviceEnablePeerAccess` between every pair of
     /// devices. Returns `Ok(true)` if every leg succeeded; `Ok(false)` if
     /// any pair reports `hipDeviceCanAccessPeer = 0` or
