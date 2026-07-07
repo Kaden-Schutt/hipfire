@@ -523,3 +523,64 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   `dense_forward` to emit per-rank sharded Steps when `mesh` Tp>1; thread `&mut Gpus`; real llama forward TP; full-model
   logit parity (FP32+DETERMINISTIC). TP5 = daemon `load_model_tp`+serve AFTER the EP-vs-TP intent fork (config.rs:155
   `tp`→Ep) + `tp_decode_parity`. **RAISE THE EP-vs-TP FORK with bjoern before TP5/daemon work** (his standing ask).
+
+## COURSE CORRECTION + DIRECTION AGREED 2026-07-07 — DECOMPOSE into Steps is the target; P-D primitive = DEFERRED decomposition (NOT a "federation")
+Triggered by a review of this branch vs the north star. bjoern challenged the "Step::Moe died → federation" read; on re-analysis he is right. Recorded here as the current direction + an error log. Carve-out note: [[moe-deltanet-decompose-into-steps]].
+
+**AGREED DIRECTION:** compose MoE/DeltaNet/attention out of SEPARATE fine-grained Steps, splitting WHAT
+(ordered ops + operands) from HOW/WHERE (device/rank/shard/collective — owned by mesh + manifest). The
+arch never names a device/rank/collective. **`Step::Attend` (PB-TP4b) already proves the pattern**
+(attention decomposed + head-parallel-transparent, KV placed by manifest). MoE + DeltaNet follow it.
+
+**Why the monolithic reading was a strawman:** a single `Step::Moe` "absorbing run_moe_ep", AND the
+`ep_moe_allreduce` primitive+closure, BOTH hide how/where in the arch → both FAIL the split's purpose.
+Only the decomposition (Route → grouped-GEMM → SiluMul → grouped-down+combine, placement via manifest,
+Ep all-reduce via executor) honors it. So under the north star's OWN principle the composition was
+always the target; "Step::Moe doesn't fit" answered a strawman it never should have posed.
+
+**ERROR LOG (mine, retracted):**
+1. CONFLATION — ds4 `run_moe_ep` "ignores the OpBinding, dispatches via `self.state`" (forward.rs:2114)
+   evidences a MONOLITHIC HAND-BLOCK never decomposed, NOT MoE being intrinsically un-step-able. The
+   P-D "SuperOp mistake → primitive" record, the prior MEMORY.md line, and the (now-deleted) note all
+   generalized "ds4's current code" into "MoE's nature." WRONG.
+2. "Federation is the correct end-state / ratify it" — overstated; it's the CURRENT state from a
+   shortcut, not an inevitability.
+3. "DeltaNet resists Step-ification like MoE / is even harder" — WRONG DIRECTION. DeltaNet has NO
+   data-dependent routing → its recurrent scan is a fixed-shape big-block op like `Step::Attend`;
+   `Step::Recurrent`/`Conv` + manifest state co-shard fit. Its real cost is CORRECTNESS DEBT
+   (s_ef_residual drop, Q8 stochastic determinism, greenfield dn_value_head_range, la_to_device), owed
+   regardless of Step-vs-primitive.
+4. Root: the plan wording ("P-D = Add `Step::Moe` (absorb run_moe_ep)") invited the monolithic read.
+   Corrected inline in `docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md`.
+
+**GROUNDING (verified 2026-07-07):** MoE decomposition is WRAP+refactor, not greenfield — kernels exist:
+`deepseek4_moe_topk_bias_aware[_batched]` (route), `gemm_*_moe_grouped_*` (gate/up + down, per
+arch/dtype), `moe_down_combine_grouped_k8` (combine). `Step::Attend` already carries a `positions`
+index-tensor operand → precedent for `Step::GroupedGemm{w_experts, offsets, x, y}`; step COUNT stays
+fixed (one grouped-GEMM over a fixed expert count) → no data-dependent control flow. `ExpertSharded`
+stays arch-specific but in the MANIFEST (how/where) — consistent with the split.
+
+**P-D STATUS RE-LABELED:** the `ep_moe_allreduce` primitive is **DEFERRED decomposition**, kept as an
+INTERIM (it can drive the arch body inside a decomposed executor during migration, then retire —
+additive). NOT the intended end-state.
+
+**P-E RE-SCOPED:** decompose qwen35 DeltaNet into `Step::Recurrent`/`Step::Conv` + projection Gemvs,
+state co-sharded via a manifest `StateEntry` (mirror `Step::Attend`). Pay the correctness debt FIRST
+(fix `s_ef_residual`; FP32+DETERMINISTIC harness). Do NOT build a DeltaNet primitive by analogy to EP —
+that was the retracted misprediction.
+
+**OUTSTANDING FACTUAL INCONSISTENCIES / TODOs surfaced by the review:**
+- The verification subagent claimed `LoadedModel.tp`/`.pp_dense` are "currently unused in the daemon
+  path" — **WRONG.** They ARE served: `generate_dense` dispatch at daemon.rs:6761 (`m.tp.is_some()`) /
+  :6810 (`m.pp_dense.is_some()`), reset guard :2393. Validated live (PB-TP5 6b71b132, PC-3 44edf2d6).
+- `tp_prefill_parity`'s old doc-comment ("~4.2e-4 / a bit above 1e-3") was FICTION (never asserted) — the
+  real prefill floor is ~0.20 Q8-flash-vs-TP (item A, 91e99955). Doc/code drift; fixed in item A.
+- `hipfire-loader/src/lib.rs:1702` pp>1 unload panic — pre-existing, orthogonal to dense PpModel/TpModel;
+  STILL needs its own note (unfiled).
+- `.agent-progress/device-mesh-HANDOVER.md` is PRE-PIVOT (2026-07-05) and stale — THIS spine note supersedes it.
+- The prior global MEMORY.md device-mesh line was stale ("P-A DONE / P-B START"); refreshed 2026-07-07.
+
+**The one structural unification still worth doing (unchanged):** daemon god-struct →
+`ModelParallel` + `ArchDispatch` (old Phase 3) — the ~20-`Option` `LoadedModel` + the #462 state-bleed
+surface. NOT single-IR purity (decomposition delivers transparency without a god-object collapse; the
+two are independent).
