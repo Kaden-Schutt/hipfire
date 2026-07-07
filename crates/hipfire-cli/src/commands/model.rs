@@ -4,12 +4,41 @@
 //! Native `.hfq`->`.hfq` manipulation (no tensor-byte transform); the heavy
 //! lifting lives in `hipfire_runtime::hfq_compose`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
-use hipfire_runtime::hfq_compose::{compose_hfq, decompose_hfq_auto, sidecar_tag_from_filename};
+use hipfire_arch_api::ArchId;
+use hipfire_runtime::hfq::HfqPackage;
+use hipfire_runtime::hfq_compose::{
+    compose_hfq_with_config_keys, decompose_hfq_auto_with_config_keys, sidecar_tag_from_filename,
+    RoleConfigKeys, KNOWN_ROLES,
+};
 
 use crate::model::find_model;
+
+/// Build the `role -> owned config-key` map for a container's arch by consulting
+/// the arch registry (`Arch::sidecar_config_keys`). Empty when the arch isn't
+/// registered or declares no sidecar-specific config — which reproduces the
+/// pre-partition compose/decompose behavior.
+fn role_config_keys_for(path: &Path) -> RoleConfigKeys {
+    let Ok(pkg) = HfqPackage::open(path) else {
+        return RoleConfigKeys::new();
+    };
+    let Some(arch) = hipfire_archs::registry().get(ArchId(pkg.arch_id as u16)) else {
+        return RoleConfigKeys::new();
+    };
+    let mut map = RoleConfigKeys::new();
+    for role in KNOWN_ROLES {
+        let keys = arch.base.sidecar_config_keys(role);
+        if !keys.is_empty() {
+            map.insert(
+                role.to_string(),
+                keys.iter().map(|s| s.to_string()).collect(),
+            );
+        }
+    }
+    map
+}
 
 #[derive(Debug, Args)]
 pub struct ModelArgs {
@@ -118,14 +147,18 @@ fn run_compose(a: ComposeArgs) -> anyhow::Result<()> {
         .map(|s| resolve(s))
         .collect::<anyhow::Result<_>>()?;
     let out = a.output.unwrap_or_else(|| default_bundle_path(&inputs));
-    let written = compose_hfq(&inputs, &out)?;
+    // Arch owns which config keys belong to each sidecar; the base (first input)
+    // determines the arch.
+    let role_keys = role_config_keys_for(&inputs[0]);
+    let written = compose_hfq_with_config_keys(&inputs, &out, &role_keys)?;
     println!("composed {} inputs -> {}", inputs.len(), written.display());
     Ok(())
 }
 
 fn run_decompose(a: DecomposeArgs) -> anyhow::Result<()> {
     let bundle = resolve(&a.bundle)?;
-    let written = decompose_hfq_auto(&bundle, &a.output_dir, a.infer)?;
+    let role_keys = role_config_keys_for(&bundle);
+    let written = decompose_hfq_auto_with_config_keys(&bundle, &a.output_dir, a.infer, &role_keys)?;
     println!(
         "decomposed{} {} -> {} file(s) in {}",
         if a.infer { " (heuristic)" } else { "" },

@@ -95,6 +95,18 @@ pub trait Arch: Sync + 'static {
     fn id(&self) -> ArchId;
     /// Human family name for logs/errors, e.g. `"llama"`, `"nemotron-h"`.
     fn family(&self) -> &'static str;
+
+    /// Config JSON keys that belong to a sidecar `role` (e.g. `"vl"`, `"mtp"`)
+    /// rather than the base model. When a bundle is split (`hipfire model
+    /// decompose`), these keys move OUT of the base config and INTO the role
+    /// sidecar; compose moves them back. This is what keeps a decomposed base
+    /// from advertising a feature whose tensors were carved into a sidecar
+    /// (e.g. a `vision_config` with no vision tensors). Role vocabulary matches
+    /// the compose role tags; unknown roles and arches that carry no
+    /// sidecar-specific config return `&[]` (the default).
+    fn sidecar_config_keys(&self, _role: &str) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 // ---------------------------------------------------------------------------

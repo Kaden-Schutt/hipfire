@@ -35,10 +35,16 @@ pub const HFQM_COMPOSE_KEY: &str = "hipfire_compose";
 /// Format tag stamped into the manifest (versioned for forward compatibility).
 pub const HFQM_COMPOSE_FORMAT: &str = "hipfire.hfqm.compose.v1";
 
+/// Injected `role -> owned config-key list` map. Supplied by a caller that can
+/// see the arch registry (`Arch::sidecar_config_keys`); this crate stays
+/// arch-agnostic. Empty (the default) reproduces the pre-partition behavior:
+/// no config keys move on compose/decompose.
+pub type RoleConfigKeys = std::collections::BTreeMap<String, Vec<String>>;
+
 /// Known role/feature tokens used to label a sidecar component. Purely
 /// cosmetic (the exact reconstruction uses `filename`/`metadata_json`); this
 /// only produces a friendly `tag` in the manifest.
-const KNOWN_ROLES: &[&str] = &[
+pub const KNOWN_ROLES: &[&str] = &[
     "mtp", "dflash", "triattn", "vl", "calib", "hessian", "jinja",
 ];
 
@@ -107,11 +113,27 @@ fn file_name_string(path: &Path) -> io::Result<String> {
 }
 
 /// Merge a base container (first input) and its role/feature sidecars into a
-/// single bundled `.hfq` written to `out`. The base's `arch_id` becomes the
-/// bundle's; every sidecar must share that `arch_id` or use
-/// [`HFQM_ARCH_NON_WEIGHT_PACKAGE`]. Tensor names must be unique across all
-/// inputs. Returns the written bundle path.
+/// single bundled `.hfq` written to `out`. See [`compose_hfq_with_config_keys`];
+/// this passes an empty [`RoleConfigKeys`] (no config-key merge).
 pub fn compose_hfq(inputs: &[PathBuf], out: &Path) -> io::Result<PathBuf> {
+    compose_hfq_with_config_keys(inputs, out, &RoleConfigKeys::new())
+}
+
+/// As [`compose_hfq`], but additionally merges each role sidecar's owned config
+/// keys (per `role_keys`, keyed by the component's role tag) UP into the
+/// bundle's top-level config — so the composed whole bundle advertises every
+/// feature whose tensors it contains (e.g. `vision_config` travels up from the
+/// `vl` sidecar). This is the inverse of the decompose-time move; together they
+/// keep config claims and tensor presence consistent across a round trip.
+///
+/// The base's `arch_id` becomes the bundle's; every sidecar must share that
+/// `arch_id` or use [`HFQM_ARCH_NON_WEIGHT_PACKAGE`]. Tensor names must be
+/// unique across all inputs. Returns the written bundle path.
+pub fn compose_hfq_with_config_keys(
+    inputs: &[PathBuf],
+    out: &Path,
+    role_keys: &RoleConfigKeys,
+) -> io::Result<PathBuf> {
     if inputs.len() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -182,6 +204,25 @@ pub fn compose_hfq(inputs: &[PathBuf], out: &Path) -> io::Result<PathBuf> {
         Ok(v @ serde_json::Value::Object(_)) => v,
         _ => serde_json::Value::Object(serde_json::Map::new()),
     };
+    // Lift each sidecar's owned config keys into the bundle's top-level config
+    // so the whole bundle advertises the features it actually contains.
+    if let serde_json::Value::Object(bundle_obj) = &mut bundle_meta {
+        for comp in components.iter().skip(1) {
+            let Some(keys) = role_keys.get(&comp.tag) else {
+                continue;
+            };
+            let Ok(serde_json::Value::Object(comp_obj)) =
+                serde_json::from_str::<serde_json::Value>(&comp.metadata_json)
+            else {
+                continue;
+            };
+            for k in keys {
+                if let Some(v) = comp_obj.get(k) {
+                    bundle_obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
     let manifest = ComposeManifest {
         format: HFQM_COMPOSE_FORMAT.to_string(),
         components,
@@ -385,6 +426,18 @@ fn strip_role_groups(fname: &str, roles: &[String]) -> String {
 /// inferring roles from tensor names alone ([`roles_from_tensor_names`]).
 /// Errors only if neither the filename nor the tensor names reveal any role.
 pub fn decompose_hfq_infer(bundle: &Path, out_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    decompose_hfq_infer_with_config_keys(bundle, out_dir, &RoleConfigKeys::new())
+}
+
+/// As [`decompose_hfq_infer`], but moves each split-off role's owned config
+/// keys (per `role_keys`) OUT of the base metadata and INTO that role's
+/// sidecar, so the reconstructed base never advertises a feature whose tensors
+/// were carved away (e.g. a `vision_config` left behind with no vision tensors).
+pub fn decompose_hfq_infer_with_config_keys(
+    bundle: &Path,
+    out_dir: &Path,
+    role_keys: &RoleConfigKeys,
+) -> io::Result<Vec<PathBuf>> {
     let pkg = HfqPackage::open(bundle)
         .map_err(|e| io::Error::new(e.kind(), format!("opening {}: {e}", bundle.display())))?;
     let mut roles = role_tags_from_filename(bundle);
@@ -451,23 +504,53 @@ pub fn decompose_hfq_infer(bundle: &Path, out_dir: &Path) -> io::Result<Vec<Path
         .unwrap_or(base_stem);
 
     std::fs::create_dir_all(out_dir)?;
+
+    // Move each split-off role's owned config keys out of the base metadata and
+    // stash them per role, so the base no longer advertises carved-away features
+    // and each sidecar carries its own config.
+    let mut base_obj = match serde_json::from_str::<serde_json::Value>(&pkg.metadata_json) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let mut moved: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for (role, _) in &role_tensors {
+        if let Some(keys) = role_keys.get(role) {
+            let dst = moved.entry(role.clone()).or_default();
+            for k in keys {
+                if let Some(v) = base_obj.remove(k) {
+                    dst.insert(k.clone(), v);
+                }
+            }
+        }
+    }
+    let base_meta_json = serde_json::to_string(&serde_json::Value::Object(base_obj))
+        .unwrap_or_else(|_| pkg.metadata_json.clone());
+
     let mut written = Vec::new();
     if !base_names.is_empty() {
         written.push(write_component(
             &pkg,
             &out_dir.join(&base_fname),
             pkg.arch_id,
-            &pkg.metadata_json,
+            &base_meta_json,
             &base_names,
         )?);
     }
     for (role, names) in &role_tensors {
-        let side_meta = serde_json::json!({
-            "role": role,
-            "arch_id": pkg.arch_id,
-            "hipfire_infer": "heuristic.v1",
-        })
-        .to_string();
+        let mut side_obj = serde_json::Map::new();
+        side_obj.insert("role".to_string(), serde_json::Value::String(role.clone()));
+        side_obj.insert("arch_id".to_string(), serde_json::json!(pkg.arch_id));
+        side_obj.insert(
+            "hipfire_infer".to_string(),
+            serde_json::Value::String("heuristic.v1".to_string()),
+        );
+        if let Some(mv) = moved.get(role) {
+            for (k, v) in mv {
+                side_obj.insert(k.clone(), v.clone());
+            }
+        }
+        let side_meta = serde_json::Value::Object(side_obj).to_string();
         written.push(write_component(
             &pkg,
             &out_dir.join(format!("{family_stem}.{role}.hfq")),
@@ -479,10 +562,23 @@ pub fn decompose_hfq_infer(bundle: &Path, out_dir: &Path) -> io::Result<Vec<Path
     Ok(written)
 }
 
-/// Decompose a bundle, preferring the lossless manifest path. Falls back to
-/// [`decompose_hfq_infer`] only when `infer` is set and the bundle has no
-/// manifest; otherwise a manifest-less bundle is an error.
+/// Decompose a bundle, preferring the lossless manifest path. See
+/// [`decompose_hfq_auto_with_config_keys`]; this passes an empty
+/// [`RoleConfigKeys`] (no config-key move on the heuristic path).
 pub fn decompose_hfq_auto(bundle: &Path, out_dir: &Path, infer: bool) -> io::Result<Vec<PathBuf>> {
+    decompose_hfq_auto_with_config_keys(bundle, out_dir, infer, &RoleConfigKeys::new())
+}
+
+/// As [`decompose_hfq_auto`], threading `role_keys` into the heuristic path so a
+/// carved base drops the config keys its split-off sidecars now own. The lossless
+/// manifest path is unaffected: it reproduces each component's stored metadata
+/// verbatim, which is already role-consistent by construction.
+pub fn decompose_hfq_auto_with_config_keys(
+    bundle: &Path,
+    out_dir: &Path,
+    infer: bool,
+    role_keys: &RoleConfigKeys,
+) -> io::Result<Vec<PathBuf>> {
     let has_manifest = HfqPackage::open(bundle)
         .ok()
         .and_then(|pkg| serde_json::from_str::<serde_json::Value>(&pkg.metadata_json).ok())
@@ -491,7 +587,7 @@ pub fn decompose_hfq_auto(bundle: &Path, out_dir: &Path, infer: bool) -> io::Res
     if has_manifest {
         decompose_hfq(bundle, out_dir)
     } else if infer {
-        decompose_hfq_infer(bundle, out_dir)
+        decompose_hfq_infer_with_config_keys(bundle, out_dir, role_keys)
     } else {
         decompose_hfq(bundle, out_dir) // reuses the clear "no manifest" error
     }
@@ -704,6 +800,71 @@ mod tests {
         write_hfqm_package_mem(&plain, 5, "{}", &[mem_tensor("a", vec![1])]).unwrap();
         let err = decompose_hfq(&plain, &dir.join("out")).unwrap_err();
         assert!(err.to_string().contains("no hipfire_compose manifest"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn role_config_keys_move_out_of_base_and_compose_restores() {
+        let dir = scratch_dir();
+        // A VL monolith: metadata advertises `vision_config`, and it holds a
+        // vision tensor (so infer carves a `vl` sidecar).
+        let bundle = dir.join("Model.mq4.hfq");
+        write_hfqm_package_mem(
+            &bundle,
+            5,
+            r#"{"arch_id":5,"vision_config":{"depth":2},"text_only_field":true}"#,
+            &[
+                mem_tensor("model.embed.weight", vec![1, 2, 3, 4]),
+                mem_tensor("model.vision.patch_embed.weight", vec![9, 8, 7]),
+            ],
+        )
+        .unwrap();
+
+        let mut keys = RoleConfigKeys::new();
+        keys.insert("vl".to_string(), vec!["vision_config".to_string()]);
+
+        let out = dir.join("out");
+        let written = decompose_hfq_infer_with_config_keys(&bundle, &out, &keys).unwrap();
+        assert_eq!(written.len(), 2);
+
+        // Base no longer advertises vision_config, but keeps its other config.
+        let base = HfqPackage::open(&out.join("Model.mq4.hfq")).unwrap();
+        assert!(!base.metadata_json.contains("vision_config"));
+        assert!(base.metadata_json.contains("text_only_field"));
+        // The vl sidecar now owns vision_config.
+        let vl = HfqPackage::open(&out.join("Model.vl.hfq")).unwrap();
+        assert!(vl.metadata_json.contains("vision_config"));
+
+        // Recompose base + vl → vision_config travels back to the bundle top level.
+        let rebundled = dir.join("Rebundled.vl.mq4.hfq");
+        compose_hfq_with_config_keys(
+            &[out.join("Model.mq4.hfq"), out.join("Model.vl.hfq")],
+            &rebundled,
+            &keys,
+        )
+        .unwrap();
+        assert!(HfqPackage::open(&rebundled)
+            .unwrap()
+            .metadata_json
+            .contains("vision_config"));
+
+        // But swap the vl sidecar out (compose base + a non-vl sidecar): the
+        // bundle must NOT regain vision_config — no vision tensors, no claim.
+        let mtp = dir.join("Model.mtp.hfq");
+        write_hfqm_package_mem(
+            &mtp,
+            5,
+            r#"{"role":"mtp"}"#,
+            &[mem_tensor("model.mtp.w", vec![4])],
+        )
+        .unwrap();
+        let swapped = dir.join("Swapped.mtp.mq4.hfq");
+        compose_hfq_with_config_keys(&[out.join("Model.mq4.hfq"), mtp], &swapped, &keys).unwrap();
+        assert!(!HfqPackage::open(&swapped)
+            .unwrap()
+            .metadata_json
+            .contains("vision_config"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

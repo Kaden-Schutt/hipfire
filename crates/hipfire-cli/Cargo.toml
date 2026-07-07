@@ -24,6 +24,8 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-diffusion = { path = "../hipfire-diffusion" }
 hipfire-diffusion-coexist = { path = "../hipfire-diffusion-coexist" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-archs = { path = "../hipfire-archs" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-server = { path = "../hipfire-server" }

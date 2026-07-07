@@ -1548,6 +1548,8 @@ dependencies = [
  "clap",
  "clap-markdown",
  "clap_mangen",
+ "hipfire-arch-api",
+ "hipfire-archs",
  "hipfire-build-info",
  "hipfire-config",
  "hipfire-daemon-adapter",

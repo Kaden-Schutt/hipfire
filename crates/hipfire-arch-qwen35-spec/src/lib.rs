@@ -27,6 +27,30 @@ fn qwen35_requires(tensor: &str) -> CapReq {
 }
 
 /// Lean identity marker for the Qwen3.5 dense offline spec.
+/// Config keys the vision (`vl`) sidecar owns in a Qwen3.5(-VL) checkpoint.
+/// hipfire only *parses* `vision_config`, but the token-id fields must travel
+/// with the vision sidecar too so a vision-less base never advertises them.
+const QWEN35_VL_CONFIG_KEYS: &[&str] = &[
+    "vision_config",
+    "image_token_id",
+    "video_token_id",
+    "vision_start_token_id",
+    "vision_end_token_id",
+];
+
+/// Config keys the multi-token-prediction (`mtp`) sidecar owns.
+const QWEN35_MTP_CONFIG_KEYS: &[&str] = &["num_nextn_predict_layers"];
+
+/// Shared role->config-keys mapping for both dense (arch 5) and MoE (arch 6)
+/// Qwen3.5, which cover the VL and MTP variants on the same ids.
+fn qwen35_sidecar_config_keys(role: &str) -> &'static [&'static str] {
+    match role {
+        "vl" => QWEN35_VL_CONFIG_KEYS,
+        "mtp" => QWEN35_MTP_CONFIG_KEYS,
+        _ => &[],
+    }
+}
+
 pub struct Qwen35Spec;
 impl Arch for Qwen35Spec {
     fn id(&self) -> ArchId {
@@ -34,6 +58,9 @@ impl Arch for Qwen35Spec {
     }
     fn family(&self) -> &'static str {
         "qwen3.5"
+    }
+    fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
+        qwen35_sidecar_config_keys(role)
     }
 }
 impl Ingest for Qwen35Spec {
@@ -56,6 +83,9 @@ impl Arch for Qwen35MoeSpec {
     }
     fn family(&self) -> &'static str {
         "qwen3.5-moe"
+    }
+    fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
+        qwen35_sidecar_config_keys(role)
     }
 }
 impl Ingest for Qwen35MoeSpec {
@@ -416,6 +446,28 @@ mod tests {
         assert!(reg.get(QWEN35_ARCH_ID).unwrap().caps.ingest.is_some());
         assert_eq!(reg.get(QWEN35_MOE_ARCH_ID).unwrap().family, "qwen3.5-moe");
         assert!(reg.get(QWEN35_MOE_ARCH_ID).unwrap().caps.ingest.is_some());
+    }
+
+    #[test]
+    fn vl_and_mtp_sidecars_own_their_config_keys() {
+        let reg = ArchRegistry::build();
+        let dense = reg.get(QWEN35_ARCH_ID).unwrap();
+        assert!(dense
+            .base
+            .sidecar_config_keys("vl")
+            .contains(&"vision_config"));
+        assert!(dense
+            .base
+            .sidecar_config_keys("mtp")
+            .contains(&"num_nextn_predict_layers"));
+        assert!(dense.base.sidecar_config_keys("triattn").is_empty());
+        // MoE (arch 6) covers the VL variant on the same id.
+        assert!(reg
+            .get(QWEN35_MOE_ARCH_ID)
+            .unwrap()
+            .base
+            .sidecar_config_keys("vl")
+            .contains(&"vision_config"));
     }
 
     #[test]
