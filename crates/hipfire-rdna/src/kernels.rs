@@ -3886,6 +3886,18 @@ pub const GEMM_F16_X_F16_WMMA_SRC: &str =
 pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_x_bf16_wmma.hip");
 
+/// Register-tiled, zero-LDS BF16×BF16→F32 WMMA GEMM (gfx1103/RDNA3). MB×NB
+/// output subtiles per wave for ILP + frag reuse. See
+/// `kernels/src/gemm_bf16_tiled_wmma.hip`.
+pub const GEMM_BF16_TILED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma.hip");
+
+/// Register-tiled, zero-LDS Opus-Quant W8A8 GEMM (gfx1103/RDNA3): int8
+/// generalization of the tiled bf16 kernel + per-group rescale. MB×NB subtiles
+/// per wave. See `kernels/src/gemm_oq8_tiled_wmma.hip`.
+pub const GEMM_OQ8_TILED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq8_tiled_wmma.hip");
+
 /// Generic kernel library: WMMA BF16 × BF16 → BF16 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. F32 accumulation
 /// (`v_wmma_f32_16x16x16_bf16`) with a BF16 round on store. See

@@ -1531,7 +1531,19 @@ impl NativeTransformerAttentionProjection {
             free_resident(gpu, k)?;
             k = k_rot;
         }
+        let attn_start = if crate::gpu_ops::profile::enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let attention = scaled_dot_product_attention_resident(gpu, &q, &k, &v, self.heads)?;
+        if let Some(start) = attn_start {
+            let _ = gpu.hip.device_synchronize();
+            crate::gpu_ops::profile::add(
+                &crate::gpu_ops::profile::ATTN_NS,
+                start.elapsed().as_nanos() as u64,
+            );
+        }
         free_resident(gpu, q)?;
         free_resident(gpu, k)?;
         free_resident(gpu, v)?;
@@ -2909,6 +2921,36 @@ impl NativeTransformerDenoiser {
                 }
                 let out = download_resident(gpu, &resident)?;
                 free_resident(gpu, resident)?;
+                if crate::gpu_ops::profile::enabled() {
+                    use crate::gpu_ops::profile;
+                    let prep = profile::take(&profile::PREP_NS) as f64 / 1e6;
+                    let gemm = profile::take(&profile::GEMM_NS) as f64 / 1e6;
+                    let attn = profile::take(&profile::ATTN_NS) as f64 / 1e6;
+                    let bytes = profile::take(&profile::PREP_BYTES);
+                    let flops = profile::take(&profile::GEMM_FLOPS);
+                    let miss = profile::take(&profile::CACHE_MISS);
+                    let hit = profile::take(&profile::CACHE_HIT);
+                    let total = prep + gemm + attn;
+                    let tflops = if gemm > 0.0 {
+                        (flops as f64) / (gemm / 1e3) / 1e12
+                    } else {
+                        0.0
+                    };
+                    let gib = (bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+                    eprintln!(
+                        "[profile] DiT block-stack step: prep={:.1}ms ({:.1}%) gemm={:.1}ms ({:.1}%) attn={:.1}ms ({:.1}%) | cache {}hit/{}miss, prep-read={:.2}GiB, gemm={:.2} TFLOP/s effective",
+                        prep,
+                        100.0 * prep / total.max(1e-9),
+                        gemm,
+                        100.0 * gemm / total.max(1e-9),
+                        attn,
+                        100.0 * attn / total.max(1e-9),
+                        hit,
+                        miss,
+                        gib,
+                        tflops,
+                    );
+                }
                 Ok(out)
             })?;
         } else {

@@ -10,6 +10,38 @@
 
 use super::*;
 
+/// Lightweight, env-gated phase profiler for the resident DiT hot path.
+///
+/// Enable with `HIPFIRE_PROFILE=1`. When on, the resident linear and attention
+/// paths `device_synchronize()` around each phase and accumulate wall time into
+/// per-phase counters, which the block-stack loop prints and resets per step.
+/// The syncs serialize the otherwise-async launches, so absolute numbers run a
+/// bit slower than a normal step — read the *relative* breakdown (weight-prep
+/// vs GEMM vs attention), which is what informs the w4a8/w8a8 kernel work.
+pub(crate) mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static PREP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static GEMM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static GEMM_FLOPS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_MISS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_HIT: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        std::env::var("HIPFIRE_PROFILE").map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    pub fn add(counter: &AtomicU64, v: u64) {
+        counter.fetch_add(v, Ordering::Relaxed);
+    }
+
+    pub fn take(counter: &AtomicU64) -> u64 {
+        counter.swap(0, Ordering::Relaxed)
+    }
+}
+
 pub(crate) fn ensure_and_launch_diffusion_kernel(
     gpu: &mut hipfire_rdna::Gpu,
     module_name: &str,
@@ -2153,25 +2185,115 @@ pub(crate) fn linear_resident_weight_resident(
     if output_elements == 0 {
         return Ok(output);
     }
+    let prof = profile::enabled();
+    // W8A8 (oq8) path: quantize the weight once at load to int8 + per-group f32
+    // scales, dynamic-int8 quantize the activation, and run the register-tiled
+    // oq8 GEMM — ~2x the tiled bf16 kernel on the DiT FFN shapes and ~half the
+    // resident weight footprint. gfx1151 keeps its own m128 bf16 path; requires
+    // 256-aligned in_features. Opt in with HIPFIRE_DIFFUSION_OQ8=1.
+    let use_oq8 = gpu.arch != "gfx1151"
+        && in_features % 256 == 0
+        && std::env::var("HIPFIRE_DIFFUSION_OQ8").ok().as_deref() == Some("1");
+    if use_oq8 {
+        const GROUP: usize = 256;
+        let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
+        let (w_i8_ptr, w_scales_ptr, ng) = cache.resident_oq8(gpu, weight)?;
+        let w_i8_bytes = out_features
+            .checked_mul(in_features)
+            .ok_or_else(|| DiffusionError::InvalidMetadata("oq8 weight size overflows".into()))?;
+        if let Some(start) = prep_start {
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::PREP_NS, start.elapsed().as_nanos() as u64);
+            profile::add(&profile::PREP_BYTES, w_i8_bytes as u64);
+        }
+        let w_i8_view = hipfire_rdna::GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(w_i8_ptr, w_i8_bytes) },
+            shape: vec![w_i8_bytes],
+            dtype: hipfire_rdna::DType::Raw,
+        };
+        let w_scales_view = hipfire_rdna::GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(w_scales_ptr, out_features * ng * 4)
+            },
+            shape: vec![out_features * ng],
+            dtype: hipfire_rdna::DType::F32,
+        };
+        let xq = gpu
+            .alloc_tensor(&[total], hipfire_rdna::DType::Raw)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        let xs = gpu
+            .alloc_tensor(&[rows * ng], hipfire_rdna::DType::F32)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        gpu.quantize_act_oq8(input, &xq, &xs, rows, in_features, GROUP)
+            .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
+        gpu.gemm_oq8_tiled_wmma(
+            &w_i8_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows, GROUP,
+            2, 4,
+        )
+        .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+        if let Some(start) = gemm_start {
+            let _ = gpu.hip.device_synchronize();
+            profile::add(&profile::GEMM_NS, start.elapsed().as_nanos() as u64);
+            let flops = (out_features as u64)
+                .saturating_mul(in_features as u64)
+                .saturating_mul(rows as u64)
+                .saturating_mul(2);
+            profile::add(&profile::GEMM_FLOPS, flops);
+        }
+        free_resident(gpu, xq)?;
+        free_resident(gpu, xs)?;
+    } else {
+    let prep_start = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let weight_ptr = cache.resident_bf16_named(gpu, weight)?;
     let weight_bytes = out_features
         .checked_mul(in_features)
         .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
         .ok_or_else(|| DiffusionError::InvalidMetadata("linear weight size overflows".to_string()))?;
+    if let Some(start) = prep_start {
+        // Sync so a cache-miss upload is fully attributed to weight-prep.
+        let _ = gpu.hip.device_synchronize();
+        profile::add(&profile::PREP_NS, start.elapsed().as_nanos() as u64);
+        profile::add(&profile::PREP_BYTES, weight_bytes as u64);
+    }
     let weight_view = hipfire_rdna::GpuTensor {
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(weight_ptr, weight_bytes) },
         shape: vec![out_features, in_features],
         dtype: hipfire_rdna::DType::BF16,
     };
-    gpu.gemm_bf16_x_bf16_wmma(
-        &weight_view,
-        input,
-        &output,
-        out_features,
-        in_features,
-        rows,
-    )
-    .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    let gemm_start = if prof {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    // Register-tiled 4x4 WMMA is ~2.4x the naive one-tile-per-wave kernel on the
+    // dense DiT shapes (gfx1103). gfx1151 keeps its own m128 LDS path inside
+    // gemm_bf16_x_bf16_wmma, so only route the tiled kernel off gfx1151. Opt out
+    // with HIPFIRE_DIFFUSION_TILED_GEMM=0.
+    let use_tiled = gpu.arch != "gfx1151"
+        && std::env::var("HIPFIRE_DIFFUSION_TILED_GEMM").ok().as_deref() != Some("0");
+    if use_tiled {
+        gpu.gemm_bf16_tiled_wmma(&weight_view, input, &output, out_features, in_features, rows, 4, 4)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    } else {
+        gpu.gemm_bf16_x_bf16_wmma(&weight_view, input, &output, out_features, in_features, rows)
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+    }
+    if let Some(start) = gemm_start {
+        let _ = gpu.hip.device_synchronize();
+        profile::add(&profile::GEMM_NS, start.elapsed().as_nanos() as u64);
+        // 2 FLOPs per MAC.
+        let flops = (out_features as u64)
+            .saturating_mul(in_features as u64)
+            .saturating_mul(rows as u64)
+            .saturating_mul(2);
+        profile::add(&profile::GEMM_FLOPS, flops);
+    }
+    }
     if let Some(bias) = bias {
         let bias_ptr = cache.resident_ptr(gpu, bias)?;
         let mut bias_args = hip_bridge::KernargBlob::new();

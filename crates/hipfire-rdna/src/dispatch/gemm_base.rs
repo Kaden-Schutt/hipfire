@@ -714,6 +714,56 @@ impl Gpu {
         }
         result
     }
+
+    /// Register-tiled, zero-LDS BF16×BF16→F32 WMMA GEMM. Same I/O contract as
+    /// `gemm_bf16_x_bf16_wmma` (A[M,K] BF16, X[B,K] F32 staged to BF16, Y[B,M]
+    /// F32) but each wave computes an MB×NB grid of 16×16 output subtiles with
+    /// MB×NB independent accumulators — ILP hides the WMMA latency the baseline's
+    /// single dependent chain cannot. `(mb, nb)` selects the compiled tiling
+    /// entrypoint: (2,2), (4,2) or (4,4).
+    pub fn gemm_bf16_tiled_wmma(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(a_bf16.dtype, DType::BF16, "gemm_bf16_tiled_wmma: weights BF16");
+        let kname = match (mb, nb) {
+            (2, 2) => "gemm_bf16_tiled_wmma_2x2",
+            (4, 2) => "gemm_bf16_tiled_wmma_4x2",
+            (4, 4) => "gemm_bf16_tiled_wmma_4x4",
+            _ => panic!("gemm_bf16_tiled_wmma: unsupported tiling {mb}x{nb}"),
+        };
+        self.ensure_kernel(kname, kernels::GEMM_BF16_TILED_WMMA_SRC, kname)?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_kernargs(
+            kname,
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Register-tiled F32 batched GEMM. Y[batch, M] = A[M,K] @ x[batch,K]^T.
     /// Each block holds BATCH_TILE=8 accumulators in registers and
     /// reuses each loaded weight element across them — amortizing

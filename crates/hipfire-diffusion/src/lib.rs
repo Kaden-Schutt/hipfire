@@ -186,6 +186,12 @@ struct RocmWeightCache {
     /// oq4 arch-combined device buffers, for the W4A* schedule rungs. Keyed the
     /// same way; built once by quantize_oq4g256 → pack_oq4_arch_combined → upload.
     oq4_entries: std::collections::HashMap<(usize, usize), hipfire_rdna::GpuTensor>,
+    /// W8A8 load-time quant: per HFQ tensor **name**, the (int8 weight [M*K],
+    /// per-group f32 scales [M*K/256]) pair for the tiled oq8 GEMM. Built once by
+    /// decoding the bf16 source and per-group symmetric int8 quantizing it (no
+    /// FWHT rotation — plain oq8, matching gemm_oq8_tiled_wmma). Halves the
+    /// resident weight footprint vs the bf16 cache.
+    named_oq8: std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
     /// Active activation precision for the resident linear path this step (the
     /// per-STEP schedule). Used directly unless the per-LAYER policy overrides.
     linear_precision: LinearPrecision,
@@ -300,6 +306,14 @@ impl RocmWeightCache {
         gpu: &mut hipfire_rdna::Gpu,
         weight: &ResidentWeight,
     ) -> DiffusionResult<*mut std::ffi::c_void> {
+        if crate::gpu_ops::profile::enabled() {
+            let counter = if self.named_bf16.contains_key(&weight.name) {
+                &crate::gpu_ops::profile::CACHE_HIT
+            } else {
+                &crate::gpu_ops::profile::CACHE_MISS
+            };
+            crate::gpu_ops::profile::add(counter, 1);
+        }
         if !self.named_bf16.contains_key(&weight.name) {
             let n: usize = weight.shape.iter().product();
             let bf16 = if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 {
@@ -345,6 +359,79 @@ impl RocmWeightCache {
             .expect("named bf16 weight just inserted")
             .buf
             .as_ptr())
+    }
+
+    /// Load-time W8A8: return `(int8 weight ptr, f32 scale ptr, n_groups)` for a
+    /// resident linear weight `[out, in]` (`in % 256 == 0`), building it once by
+    /// decoding the bf16 source to f32 and per-group (256) symmetric int8
+    /// quantizing it — plain oq8, no FWHT rotation, matching the layout
+    /// `gemm_oq8_tiled_wmma` expects (W int8 [M*K], Ws f32 [M*n_groups]). The
+    /// int8 + scale buffers stay resident (≈ half the bf16 footprint) and are
+    /// reused across every step.
+    fn resident_oq8(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        weight: &ResidentWeight,
+    ) -> DiffusionResult<(*mut std::ffi::c_void, *mut std::ffi::c_void, usize)> {
+        const GROUP: usize = 256;
+        let (m, k) = match weight.shape.as_slice() {
+            [out, inf] => (*out, *inf),
+            other => {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "resident_oq8 needs a 2-D [out, in] weight, got {other:?}"
+                )))
+            }
+        };
+        if k % GROUP != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "resident_oq8: in_features {k} must be a multiple of {GROUP}"
+            )));
+        }
+        let ng = k / GROUP;
+        if !self.named_oq8.contains_key(&weight.name) {
+            // Decode source (bf16 or otherwise) to f32, then per-group symmetric
+            // int8 with per-group f32 scale = max(|w|)/127.
+            let cpu = weight.decode()?;
+            if cpu.data.len() != m * k {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "resident_oq8: weight {:?} decoded to {} elems, expected {}",
+                    weight.name,
+                    cpu.data.len(),
+                    m * k
+                )));
+            }
+            let mut q = vec![0i8; m * k];
+            let mut scales = vec![0f32; m * ng];
+            for row in 0..m {
+                for g in 0..ng {
+                    let base = row * k + g * GROUP;
+                    let mut amax = 0f32;
+                    for i in 0..GROUP {
+                        amax = amax.max(cpu.data[base + i].abs());
+                    }
+                    let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                    scales[row * ng + g] = scale;
+                    let inv = 1.0 / scale;
+                    for i in 0..GROUP {
+                        let v = (cpu.data[base + i] * inv).round().clamp(-127.0, 127.0);
+                        q[base + i] = v as i8;
+                    }
+                }
+            }
+            let q_bytes: Vec<u8> = q.iter().map(|&v| v as u8).collect();
+            let w_i8 = gpu
+                .upload_raw(&q_bytes, &[m * k])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let w_scales = gpu
+                .upload_f32(&scales, &[m * ng])
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            self.named_oq8.insert(weight.name.clone(), (w_i8, w_scales));
+        }
+        let (w_i8, w_scales) = self
+            .named_oq8
+            .get(&weight.name)
+            .expect("named oq8 weight just inserted");
+        Ok((w_i8.buf.as_ptr(), w_scales.buf.as_ptr(), ng))
     }
 
     /// Return the raw device pointer to an F16 copy of `tensor`, converting the
