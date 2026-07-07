@@ -36,6 +36,15 @@ pub enum Step<'a> {
         residual: &'a GpuTensor,
         out: &'a GpuTensor,
     },
+    /// Batched (B>1) GEMM: `y[batch×m] = W · x[batch×k]`. Prefill-only; decode
+    /// uses `Gemv`. Column-parallel use: `y=[batch×m]` on-rank shard. Row-parallel
+    /// use: `y=[batch×dim]` partial → `AllReduceOut` → `ResidualAdd` (never fused).
+    Gemm {
+        w: &'a WeightRef<'a>,
+        x: &'a GpuTensor,
+        y: &'a GpuTensor,
+        batch: usize,
+    },
     /// Fused rmsnorm + optional FWHT rotation. The `rotation` field is derived
     /// by the caller via `dtype_rotation_plan(w.dtype)`. `out` holds the
     /// ready-to-use activation (FWHT-rotated for FwhtG256, plain-normed for None).
@@ -107,6 +116,9 @@ pub enum Step<'a> {
 fn op_kind(step: &Step) -> PipelineOp {
     match step {
         Step::Gemv { .. } => PipelineOp::Gemv,
+        // Reuses the Gemv tag: op_kind only feeds the fused-decode prefix table,
+        // which the prefill-only Gemm step never enters.
+        Step::Gemm { .. } => PipelineOp::Gemv,
         Step::GemvResidual { .. } => PipelineOp::GemvResidual,
         Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
         Step::Attend { .. } => PipelineOp::Attend,
@@ -679,6 +691,7 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
     match step {
         Step::Gemv { out, .. } => Some(&out.buf),
         Step::GemvResidual { out, .. } => Some(&out.buf),
+        Step::Gemm { y, .. } => Some(&y.buf),
         _ => None,
     }
 }
@@ -788,6 +801,45 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         } => {
             let gemv = GEMV.get_or_init(GemvFamily::new);
             gemv.run_auto(ctx, gpu, w, x, out)
+        }
+        Step::Gemm { w, x, y, batch } => {
+            // Batched (B>1) GEMM. Mirrors runtime `weight_gemm` (llama.rs:1444)
+            // per-dtype against a `WeightRef`; the batched kernels live in
+            // rdna-compute (same ones `weight_gemm` calls). Prefill-only — no
+            // fused-decode entry hits this.
+            let hip_err = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+            match w.dtype {
+                DType::HFQ4G256 => gpu
+                    .gemm_hfq4g256(w.buf, x, y, w.m, w.k, *batch)
+                    .map_err(hip_err),
+                DType::HFQ4G128 => gpu
+                    .gemm_hfq4g128(w.buf, x, y, w.m, w.k, *batch)
+                    .map_err(hip_err),
+                // MQ4G256 = HFQ4G256 layout + an AWQ-aware FWHT rotation of x.
+                // FWHT-rotate all `batch` activation columns once (the dispatch
+                // twin of runtime `rotate_x_mq_batched_for` — `rotate` runs
+                // `ensure_mq_signs` internally via prepare_rotation_scratch), then
+                // feed the same INT4-G256 batched WMMA kernel weight_gemm uses.
+                DType::MQ4G256 => {
+                    let gemv = GEMV.get_or_init(GemvFamily::new);
+                    let h = gemv.rotate(
+                        ctx,
+                        gpu,
+                        w,
+                        x,
+                        &RotateInputs {
+                            batch_size: *batch,
+                            ..Default::default()
+                        },
+                    )?;
+                    let x_rot = h.into_buf();
+                    gpu.gemm_hfq4g256_batched_lmhead(w.buf, &x_rot, y, w.m, w.k, *batch)
+                        .map_err(hip_err)
+                }
+                other => Err(DispatchError::Hip(format!(
+                    "Step::Gemm: dtype {other:?} not wired (add its weight_gemm arm)"
+                ))),
+            }
         }
         Step::Gemv {
             w,
