@@ -6,13 +6,20 @@
 //! prompt through `TpModel::prefill` (batched embed→broadcast, per-rank batched
 //! GEMMs via `Step::Gemm` through `execute_steps_tp`, batched `Step::Attend`
 //! writing the Q8 KV internally, two `AllReduceOut` collectives per layer) and
-//! assert the last-position logits match single-GPU `llama::prefill_forward`.
+//! assert the last-position logits match single-GPU `llama::forward_prefill_batch`.
 //!
-//! Both sides use MQ4G256 WMMA GEMMs; the TP attention reads the Q8 KV cache
-//! (batched flash) while the single-GPU reference does F32 in-batch causal
-//! attention, so the argmax must be identical while `max|Δ|` sits a bit above the
-//! all-Q8 `tp_full_model_parity` (4.2e-4). The greedy argmax is the invariant
-//! that matters.
+//! Both sides use MQ4G256 WMMA GEMMs AND read the same Q8 KV cache via batched
+//! flash: the reference is single-GPU `llama::forward_prefill_batch` (the Q8-KV
+//! `attention_flash_q8_0_batched_masked` path), NOT the F32-in-batch
+//! `prefill_forward`. Reading the same Q8 KV removes the attention-mode
+//! systematic bias — measured at max|Δ|≈0.88 between the F32-in-batch and Q8-flash
+//! single-GPU references on this prompt — so the residual delta is only GEMM
+//! sharding + per-layer all-reduce summation order + Q8-KV rounding compounded
+//! over all prefill positions × layers. On qwen3-0.6b Tp-2 that lands at
+//! max|Δ|≈0.20 (~1.3% of the ~15 peak logit), asserted below as a numeric bound —
+//! NOT just the greedy argmax. (The decode-time `tp_full_model_parity` 4.2e-4 is
+//! a single position with a one-entry KV; prefix compounding over 103 positions
+//! and 28 layers is why this is larger, not a TP bug.)
 //!
 //! Emulated Tp-2 (gfx1151).
 //!
@@ -70,7 +77,8 @@ fn main() {
         toks.len()
     );
 
-    // ── Reference: single-GPU batched prefill (last-position logits). Scoped so
+    // ── Reference: single-GPU batched prefill reading the Q8 KV cache (same
+    // batched-flash attention the TP path uses), last-position logits. Scoped so
     // its Gpu drops before TpModel brings up the emulated Gpus. ──
     let ref_logits: Vec<f32> = {
         let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
@@ -85,7 +93,12 @@ fn main() {
             MAX_SEQ,
         )
         .unwrap();
-        llama::prefill_forward(&mut gpu, &weights, &config, &toks, &mut kv).expect("ref prefill")
+        let scratch = llama::ForwardScratch::new(&mut gpu, &config).unwrap();
+        llama::forward_prefill_batch(
+            &mut gpu, &weights, &config, &toks, 0, &mut kv, &scratch, None,
+        )
+        .expect("ref prefill (Q8-KV batched flash)");
+        gpu.download_f32(&scratch.logits).unwrap()
     };
 
     // ── TP path: TpModel batched prefill. ──
@@ -113,21 +126,42 @@ fn main() {
         .zip(&tp_logits)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
+    let ref_mag = ref_logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
 
     println!(
-        "[tp-prefill] toks={} ref_argmax={ref_argmax} tp_argmax={tp_argmax} max|Δ|={max_delta:.3e}",
+        "[tp-prefill] toks={} ref_argmax={ref_argmax} tp_argmax={tp_argmax} \
+         max|Δ|={max_delta:.3e} (ref max|logit|={ref_mag:.3e})",
         toks.len()
     );
     eprintln!("ref next-token: {:?}", tokenizer.decode(&[ref_argmax]));
     eprintln!(" tp next-token: {:?}", tokenizer.decode(&[tp_argmax]));
 
+    // Greedy invariant: same next token.
     assert_eq!(
         ref_argmax, tp_argmax,
-        "TP batched prefill argmax diverged from single-GPU prefill_forward: \
+        "TP batched prefill argmax diverged from single-GPU forward_prefill_batch: \
          tp={tp_argmax} ref={ref_argmax} (max|Δ|={max_delta:.3e})"
     );
+
+    // Numeric bound: with both sides reading the same Q8 KV cache, the only
+    // remaining divergence is GEMM sharding + all-reduce summation order + Q8-KV
+    // rounding, compounded over all prefill positions × 28 layers. Measured
+    // max|Δ|≈0.20 on qwen3-0.6b Tp-2 (deterministic under HIPFIRE_DETERMINISTIC=1);
+    // the bound sits at 2× that with headroom for kernel/model churn. This is the
+    // regression that greedy argmax cannot see: a sharding/all-reduce bug that
+    // perturbs the logits without flipping the last-position argmax (the
+    // attention-mode difference alone is ≈0.88, so a real TP break lands well
+    // above this bound).
+    const MAX_DELTA_TOL: f32 = 4.0e-1;
+    assert!(
+        max_delta < MAX_DELTA_TOL,
+        "TP batched prefill last-position logits diverged from single-GPU \
+         forward_prefill_batch beyond tolerance: max|Δ|={max_delta:.3e} >= {MAX_DELTA_TOL:.1e} \
+         (ref max|logit|={ref_mag:.3e})"
+    );
     println!(
-        "tp_prefill_parity: dense TP batched prefill last-position logits argmax == single-GPU \
-         prefill_forward (max|Δ|={max_delta:.3e}) — PC-5 validated"
+        "tp_prefill_parity: dense TP batched prefill last-position logits == single-GPU \
+         forward_prefill_batch (argmax match + max|Δ|={max_delta:.3e} < {MAX_DELTA_TOL:.1e}) \
+         — PC-5 validated"
     );
 }
