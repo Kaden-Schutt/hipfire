@@ -348,6 +348,21 @@ fn role_tags_from_filename(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Roles inferred from the bundle's *tensor names* alone, for legacy bundles
+/// whose filename carries no role dot-groups. Restricted to the model-feature
+/// roles that leave an unambiguous tensor-name fingerprint; the calibration
+/// roles (`calib`/`hessian`/`imatrix`) are mutually indistinguishable by tensor
+/// name (see [`role_matches`]) and so are only inferable from the filename.
+/// Returns the matching roles in a stable order (matching partition precedence).
+fn roles_from_tensor_names(pkg: &HfqPackage) -> Vec<String> {
+    const TENSOR_INFERABLE_ROLES: &[&str] = &["mtp", "dflash", "triattn", "vl"];
+    TENSOR_INFERABLE_ROLES
+        .iter()
+        .filter(|role| pkg.entries().iter().any(|e| role_matches(role, &e.name)))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Bundle filename with the given role dot-groups removed (case-insensitive):
 /// `Model.mtp.vl.mq4.hfq` + `[mtp, vl]` -> `Model.mq4.hfq`.
 fn strip_role_groups(fname: &str, roles: &[String]) -> String {
@@ -365,16 +380,24 @@ fn strip_role_groups(fname: &str, roles: &[String]) -> String {
 /// (first role wins); the remainder become the base. This is LOSSY — output
 /// files are not guaranteed byte-identical to any original sidecars (metadata
 /// and per-sidecar `arch_id` are synthesized), unlike manifest-based decompose.
-/// Errors if the filename declares no roles or no tensors match any role.
+///
+/// Legacy bundles whose filename carries no role dot-groups fall back to
+/// inferring roles from tensor names alone ([`roles_from_tensor_names`]).
+/// Errors only if neither the filename nor the tensor names reveal any role.
 pub fn decompose_hfq_infer(bundle: &Path, out_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let pkg = HfqPackage::open(bundle)
         .map_err(|e| io::Error::new(e.kind(), format!("opening {}: {e}", bundle.display())))?;
-    let roles = role_tags_from_filename(bundle);
+    let mut roles = role_tags_from_filename(bundle);
+    if roles.is_empty() {
+        // Legacy bundle: no role dot-groups in the filename. Recover the split
+        // from tensor-name fingerprints instead.
+        roles = roles_from_tensor_names(&pkg);
+    }
     if roles.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} declares no role features in its filename; heuristic decompose needs role dot-groups (e.g. .mtp.vl) or a composed bundle with a {HFQM_COMPOSE_KEY} manifest",
+                "{} has no role features in its filename and no role-tagged tensors (mtp/dflash/triattn/vl); heuristic decompose needs role dot-groups (e.g. .mtp.vl), tensor-name role fingerprints, or a composed bundle with a {HFQM_COMPOSE_KEY} manifest",
                 bundle.display()
             ),
         ));
@@ -534,12 +557,46 @@ mod tests {
     }
 
     #[test]
-    fn infer_errors_when_filename_declares_no_roles() {
+    fn infer_errors_when_no_roles_in_filename_or_tensors() {
         let dir = scratch_dir();
         let bundle = dir.join("Model.mq4.hfq"); // no role dot-groups
+                                                // Tensor names carry no role fingerprint either, so nothing to split.
         write_hfqm_package_mem(&bundle, 5, "{}", &[mem_tensor("a", vec![1])]).unwrap();
         let err = decompose_hfq_infer(&bundle, &dir.join("out")).unwrap_err();
-        assert!(err.to_string().contains("declares no role features"));
+        assert!(err.to_string().contains("no role-tagged tensors"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn infer_splits_legacy_bundle_by_tensor_names() {
+        let dir = scratch_dir();
+        // Legacy bundle: plain filename, NO role dot-groups and NO manifest,
+        // but a vision tensor betrays a `vl` sidecar hiding inside.
+        let bundle = dir.join("Model.mq4.hfq");
+        write_hfqm_package_mem(
+            &bundle,
+            5,
+            r#"{"arch_id":5}"#,
+            &[
+                mem_tensor("model.embed.weight", vec![1, 2, 3, 4]),
+                mem_tensor("model.vision.patch_embed.weight", vec![9, 8, 7]),
+            ],
+        )
+        .unwrap();
+
+        // Filename declares no roles, so the split is recovered from tensor names.
+        let out = dir.join("out");
+        let written = decompose_hfq_infer(&bundle, &out).unwrap();
+        assert_eq!(written.len(), 2);
+        // Base keeps the original (unstripped) filename; the vl tensor is carved
+        // out into `<family>.vl.hfq`.
+        let base = HfqPackage::open(&out.join("Model.mq4.hfq")).unwrap();
+        assert!(base.entry("model.embed.weight").is_some());
+        assert!(base.entry("model.vision.patch_embed.weight").is_none());
+        let vl = HfqPackage::open(&out.join("Model.vl.hfq")).unwrap();
+        assert!(vl.entry("model.vision.patch_embed.weight").is_some());
+        assert!(vl.entry("model.embed.weight").is_none());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

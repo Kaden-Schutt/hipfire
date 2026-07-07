@@ -46,9 +46,10 @@ pub struct DecomposeArgs {
     /// Directory to write the reconstructed component files into.
     output_dir: PathBuf,
     /// Heuristically split a bundle that has no `hipfire_compose` manifest,
-    /// using the filename's role dot-groups + tensor-name prefixes. Lossy:
-    /// output files are not byte-identical to any originals. Bundles that DO
-    /// carry a manifest still take the exact, lossless path.
+    /// using the filename's role dot-groups + tensor-name prefixes. Legacy
+    /// bundles with a plain filename fall back to inferring roles from tensor
+    /// names alone. Lossy: output files are not byte-identical to any originals.
+    /// Bundles that DO carry a manifest still take the exact, lossless path.
     #[arg(long)]
     infer: bool,
 }
