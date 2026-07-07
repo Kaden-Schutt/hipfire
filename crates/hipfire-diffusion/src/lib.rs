@@ -247,7 +247,7 @@ impl RocmWeightCache {
 }
 
 #[inline(always)]
-fn bf16_byte_to_f32(lo: u8, hi: u8) -> f32 {
+pub(crate) fn bf16_byte_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits((u16::from_le_bytes([lo, hi]) as u32) << 16)
 }
 
@@ -255,7 +255,7 @@ fn bf16_byte_to_f32(lo: u8, hi: u8) -> f32 {
 /// reading values via `val(row_byte_base, elem)`. Returns (int8-as-u8 `[m*k]`,
 /// f32 scales `[m*ng]`). Rows are independent, so this fans out over rows with
 /// rayon — the load-time hot path for W8A8.
-fn quantize_oq8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
+pub(crate) fn quantize_oq8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
 where
     F: Fn(usize, usize) -> f32 + Sync,
 {
@@ -289,7 +289,7 @@ where
 /// Parallel per-group (256) symmetric int4 quant, packed two nibbles/byte
 /// (byte = even_k | odd_k<<4). Returns (packed `[m*k/2]`, f32 scales `[m*ng]`).
 /// The load-time hot path for W4A8.
-fn quantize_w4a8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
+pub(crate) fn quantize_w4a8_rows<F>(m: usize, k: usize, ng: usize, elem_stride: usize, val: F) -> (Vec<u8>, Vec<f32>)
 where
     F: Fn(usize, usize) -> f32 + Sync,
 {
@@ -1173,7 +1173,8 @@ use quant_decode::*;
 mod quant_encode;
 pub use quant_encode::{
     open_calib_sidecar, oq4_arch_combined_len, pack_oq4_arch_combined, quantize_diffusion_hfq,
-    DiffusionQuantFormat, DiffusionQuantizeSummary, HessianSidecar,
+    quantize_diffusion_hfq_plain, DiffusionQuantFormat, DiffusionQuantizeSummary, HessianSidecar,
+    PlainOpusPolicy, PlainQuantizeSummary,
 };
 
 mod quant_calib;

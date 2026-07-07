@@ -594,9 +594,36 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
 }
 
 fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
+    // Plain (unrotated) Opus W4A8/W8A8 + mixed — the artifact the tiled
+    // gemm_opus_tiled_wmma kernels load directly (no runtime requant).
+    if let Some(policy) = hipfire_diffusion::PlainOpusPolicy::parse(&args.format) {
+        let summary =
+            hipfire_diffusion::quantize_diffusion_hfq_plain(&args.source, &args.output, policy)?;
+        let ratio = if summary.output_bytes > 0 {
+            summary.source_bytes as f64 / summary.output_bytes as f64
+        } else {
+            0.0
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": args.source,
+                "output": args.output,
+                "format": args.format,
+                "w4_tensors": summary.w4_tensors,
+                "w8_tensors": summary.w8_tensors,
+                "copied_tensors": summary.copied_tensors,
+                "avg_bits": (summary.avg_bits * 100.0).round() / 100.0,
+                "source_bytes": summary.source_bytes,
+                "output_bytes": summary.output_bytes,
+                "compression_ratio": (ratio * 100.0).round() / 100.0,
+            }))?
+        );
+        return Ok(());
+    }
     let format = DiffusionQuantFormat::parse(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4++, oq8",
+            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4++, oq8, oq4p, oq8p, oq4.25",
             args.format
         )
     })?;

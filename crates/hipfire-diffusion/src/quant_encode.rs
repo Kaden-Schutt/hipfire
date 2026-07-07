@@ -15,7 +15,9 @@ use hipfire_quantize::codecs::{quantize_oq4g256, quantize_oq8g256};
 use hipfire_quantize::gen_fwht_signs;
 pub use hipfire_quantize::hessian_io::HessianSidecar;
 use hipfire_quantize::ldlq::oq4_ldlq_pack;
-use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+use hipfire_runtime::hfq::{
+    write_hfqm_package_mem, write_hfqm_package_streaming, HfqFile, HfqMemTensor, HfqStreamEntry,
+};
 use std::path::Path;
 
 /// Quantization formats this tool can emit. Both round-trip bit-exactly with the
@@ -511,4 +513,216 @@ fn rewrite_weight_format(metadata_json: &str, label: &str) -> String {
         }
         Err(_) => metadata_json.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plain (unrotated) Opus W4A8 / W8A8 on-disk quantizer — the artifact the tiled
+// gemm_opus_tiled_wmma kernels consume directly (no runtime requant, no FWHT).
+// Streams one tensor at a time (memory-safe on unified-memory boxes) and marks
+// each quantized linear with QT_DIFFUSION_TENSOR_OQ4_PLAIN / _OQ8_PLAIN so the
+// loader routes it to the w4/w8 kernel. Supports per-tensor mixed precision.
+// ---------------------------------------------------------------------------
+
+/// Plain on-disk quantization policy for the resident DiT linears.
+#[derive(Clone, Copy, Debug)]
+pub enum PlainOpusPolicy {
+    /// Every resident linear → int4 (W4A8).
+    AllW4,
+    /// Every resident linear → int8 (W8A8).
+    AllW8,
+    /// Mixed (≈oq4.25): int8 for the sensitive linears (first + last block and
+    /// every FF down-projection), int4 elsewhere.
+    Mixed,
+}
+
+impl PlainOpusPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "oq4p" | "oq4-plain" => Some(Self::AllW4),
+            "oq8p" | "oq8-plain" => Some(Self::AllW8),
+            "oq4.25" | "oq4-mixed" => Some(Self::Mixed),
+            _ => None,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::AllW4 => "oq4",
+            Self::AllW8 => "oq8",
+            Self::Mixed => "oq4.25",
+        }
+    }
+}
+
+/// The transformer_blocks.N.* suffixes that load via `linear_resident_weight_resident`
+/// (attention q/k/v/out/gate + the joint-attention text stream + the FF linears).
+/// Only these are safe to store as plain OQ*: other 2D weights (img_mod/txt_mod)
+/// load via `cpu_tensor_from_hfq` and must stay in a decodable format.
+const RESIDENT_LINEAR_SUFFIXES: &[&str] = &[
+    // Attention projections (both streams).
+    ".to_q.weight",
+    ".to_k.weight",
+    ".to_v.weight",
+    ".to_out.0.weight",
+    ".to_gate.weight",
+    ".add_q_proj.weight",
+    ".add_k_proj.weight",
+    ".add_v_proj.weight",
+    ".to_add_out.weight",
+    // Krea2 gated FFN (the bulk of the DiT params) — transformer.rs loads these
+    // as ResidentWeight.
+    ".ff.up.weight",
+    ".ff.gate.weight",
+    ".ff.down.weight",
+    // QwenImage-family FFN naming.
+    ".net.0.proj.weight",
+    ".net.2.weight",
+];
+
+fn transformer_block_index(name: &str) -> Option<usize> {
+    let tag = "transformer_blocks.";
+    let start = name.find(tag)? + tag.len();
+    let rest = &name[start..];
+    let end = rest.find('.')?;
+    rest[..end].parse().ok()
+}
+
+/// Decide the on-disk width for a tensor: `Some(4|8)` to quantize, `None` to copy.
+fn plain_plan(name: &str, shape: &[u32], policy: PlainOpusPolicy, last_block: usize) -> Option<u8> {
+    if shape.len() != 2 || shape[1] % 256 != 0 {
+        return None;
+    }
+    if !name.starts_with("transformer/tensors/transformer_blocks.") {
+        return None;
+    }
+    if !RESIDENT_LINEAR_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return None;
+    }
+    Some(match policy {
+        PlainOpusPolicy::AllW4 => 4,
+        PlainOpusPolicy::AllW8 => 8,
+        PlainOpusPolicy::Mixed => {
+            let blk = transformer_block_index(name).unwrap_or(usize::MAX);
+            let is_down = name.ends_with(".ff.down.weight") || name.ends_with(".net.2.weight");
+            if blk == 0 || blk == last_block || is_down {
+                8
+            } else {
+                4
+            }
+        }
+    })
+}
+
+/// Summary of a plain-Opus quantization run.
+#[derive(Default, Debug)]
+pub struct PlainQuantizeSummary {
+    pub w4_tensors: usize,
+    pub w8_tensors: usize,
+    pub copied_tensors: usize,
+    pub source_bytes: u64,
+    pub output_bytes: u64,
+    pub avg_bits: f64,
+}
+
+/// Re-encode the resident DiT linears of `source` into plain (unrotated) Opus
+/// W4A8/W8A8 blobs (`[packed | f32 per-group scales]`), copying every other entry
+/// verbatim, and stream the result to `output`. One tensor is resident in RAM at
+/// a time. The loader consumes these with zero runtime requant.
+pub fn quantize_diffusion_hfq_plain(
+    source: &Path,
+    output: &Path,
+    policy: PlainOpusPolicy,
+) -> anyhow::Result<PlainQuantizeSummary> {
+    const GROUP: usize = 256;
+    let hfq = HfqFile::open(source)?;
+    let infos = hfq.tensors().to_vec();
+    let last_block = infos
+        .iter()
+        .filter_map(|t| transformer_block_index(&t.name))
+        .max()
+        .unwrap_or(0);
+
+    let mut summary = PlainQuantizeSummary {
+        source_bytes: std::fs::metadata(source)?.len(),
+        ..Default::default()
+    };
+    // Per-entry plan + declared payload length (needed up front for the index).
+    let mut entries: Vec<HfqStreamEntry> = Vec::with_capacity(infos.len());
+    let mut plans: Vec<Option<u8>> = Vec::with_capacity(infos.len());
+    let mut quant_bits_total: u128 = 0;
+    let mut quant_elems_total: u128 = 0;
+    for t in &infos {
+        let bits = plain_plan(&t.name, &t.shape, policy, last_block);
+        plans.push(bits);
+        let (quant_type, data_len) = match bits {
+            Some(w) => {
+                let m = t.shape[0] as usize;
+                let k = t.shape[1] as usize;
+                let ng = k / GROUP;
+                let packed = if w == 4 { m * k / 2 } else { m * k };
+                let len = (packed + ng * m * 4) as u64;
+                if w == 4 {
+                    summary.w4_tensors += 1;
+                } else {
+                    summary.w8_tensors += 1;
+                }
+                quant_bits_total += (w as u128) * (m as u128) * (k as u128);
+                quant_elems_total += (m as u128) * (k as u128);
+                let qt = if w == 4 {
+                    QT_DIFFUSION_TENSOR_OQ4_PLAIN
+                } else {
+                    QT_DIFFUSION_TENSOR_OQ8_PLAIN
+                };
+                (qt, len)
+            }
+            None => {
+                summary.copied_tensors += 1;
+                (t.quant_type, t.data_size as u64)
+            }
+        };
+        entries.push(HfqStreamEntry {
+            name: t.name.clone(),
+            quant_type,
+            shape: t.shape.clone(),
+            group_size: if bits.is_some() { GROUP as u32 } else { t.group_size },
+            data_len,
+        });
+    }
+    summary.avg_bits = if quant_elems_total > 0 {
+        quant_bits_total as f64 / quant_elems_total as f64
+    } else {
+        0.0
+    };
+
+    let metadata_json = rewrite_weight_format(&hfq.metadata_json, policy.label());
+    write_hfqm_package_streaming(output, hfq.arch_id, &metadata_json, &entries, |i, w| {
+        let name = &infos[i].name;
+        let (_info, bytes) = hfq
+            .tensor_data_vec(name)
+            .ok_or_else(|| std::io::Error::other(format!("tensor {name:?} vanished")))?;
+        match plans[i] {
+            None => w.write_all(&bytes),
+            Some(width) => {
+                let m = infos[i].shape[0] as usize;
+                let k = infos[i].shape[1] as usize;
+                let ng = k / GROUP;
+                // Source is bf16 (2 bytes/elem); read values straight from bytes.
+                let read = |row_base: usize, elem: usize| -> f32 {
+                    let b = row_base + elem * 2;
+                    crate::bf16_byte_to_f32(bytes[b], bytes[b + 1])
+                };
+                let (packed, scales) = if width == 4 {
+                    crate::quantize_w4a8_rows(m, k, ng, 2, read)
+                } else {
+                    crate::quantize_oq8_rows(m, k, ng, 2, read)
+                };
+                w.write_all(&packed)?;
+                for s in &scales {
+                    w.write_all(&s.to_le_bytes())?;
+                }
+                Ok(())
+            }
+        }
+    })?;
+    summary.output_bytes = std::fs::metadata(output)?.len();
+    Ok(summary)
 }
