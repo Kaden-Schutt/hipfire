@@ -12,9 +12,9 @@
 //! for bring-up (18 MB download, trivial); norm + projection run on GPU.
 
 use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::quant::f16_to_f32;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::quant::{dequant_oq8g256, dequant_q8f16, f16_to_f32};
 
 use crate::config::Gemma3VlConfig;
 
@@ -81,7 +81,11 @@ fn read_f32(hfq: &HfqFile, name: &str) -> Vec<f32> {
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
-        qt => panic!("gemma3-vl: expected F16/F32/BF16 for {name}, got qt={qt}"),
+        // Quantized projector (`.vloq8+`): mm_input_projection is Oq8G256 (qt=35,
+        // group 256); Q8F16 (qt=3) mirrors the vision tower. Dequant to f32.
+        3 => dequant_q8f16(&data, info.shape.iter().product::<u32>() as usize),
+        35 => dequant_oq8g256(&data, info.shape.iter().product::<u32>() as usize),
+        qt => panic!("gemma3-vl: expected F16/F32/BF16/Q8F16/Oq8G256 for {name}, got qt={qt}"),
     }
 }
 

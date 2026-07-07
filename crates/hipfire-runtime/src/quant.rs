@@ -38,6 +38,35 @@ pub fn dequant_q8f16(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize an HFQ Oq8G256 (int8, f16-scale, group 256) block tensor to f32.
+/// Block: 2 bytes (f16 scale) + 256 bytes (256 x int8) = 258 bytes / 256 weights.
+/// Oq8G256 requires K % 256 == 0, so flat groups of 256 never cross a row.
+pub fn dequant_oq8g256(data: &[u8], n: usize) -> Vec<f32> {
+    let block_size = 256;
+    let nblocks = (n + block_size - 1) / block_size;
+    let mut out = vec![0.0f32; n];
+
+    for b in 0..nblocks {
+        let block_offset = b * 258; // 2 + 256 bytes per block
+        if block_offset + 258 > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([
+            data[block_offset],
+            data[block_offset + 1],
+        ]));
+
+        for j in 0..256 {
+            let idx = b * block_size + j;
+            if idx < n {
+                let val = data[block_offset + 2 + j] as i8;
+                out[idx] = val as f32 * scale;
+            }
+        }
+    }
+    out
+}
+
 // f16↔f32 conversions are now the canonical implementations in the shared
 // `hipfire-primitives` leaf (they were byte-identical copies). Re-exported here
 // so the ~20 arch/loader call sites importing `hipfire_runtime::quant::*` stay

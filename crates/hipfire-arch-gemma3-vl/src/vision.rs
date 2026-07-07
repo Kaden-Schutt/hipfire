@@ -15,9 +15,9 @@
 //! The forward lives in `forward.rs` (next phase); this file is weights only.
 
 use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::quant::f16_to_f32;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::quant::{dequant_oq8g256, dequant_q8f16, f16_to_f32};
 
 use crate::config::SigLipConfig;
 
@@ -80,8 +80,9 @@ impl SigLipWeights {
 
 // ─── loader ─────────────────────────────────────────────────────────────────
 
-/// Read a tensor to a host F32 vector (F16/F32/BF16 source). Vision towers ship
-/// at source precision (the quantizer leaves them un-quantized).
+/// Read a tensor to a host F32 vector. Handles float sources (F16/F32/BF16) and
+/// dequantizes a quantized vision tower back to f32 (`hfq --vision-quant`, e.g.
+/// `.vloq8+`: Q8F16 qt=3, Oq8G256 qt=35).
 fn read_f32(hfq: &HfqFile, name: &str) -> Vec<f32> {
     // tensor_data_vec (pread) not tensor_data (mmap): on UMA APUs the loader
     // drops the mmap, so the mmap accessor returns None.
@@ -101,7 +102,14 @@ fn read_f32(hfq: &HfqFile, name: &str) -> Vec<f32> {
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
-        qt => panic!("gemma3-vl: expected F16/F32/BF16 for {name}, got qt={qt}"),
+        // Quantized vision tower (`hfq --vision-quant`, e.g. `.vloq8+`): Q8F16
+        // (qt=3, group 32) matrix weights + position embedding, Oq8G256 (qt=35,
+        // group 256) for the wider projections. Dequant to f32 here so the rest
+        // of the tower stays float (matrix weights are re-narrowed to bf16 by
+        // `load_gpu_bf16`); `n` = element count from the tensor's shape.
+        3 => dequant_q8f16(&data, info.shape.iter().product::<u32>() as usize),
+        35 => dequant_oq8g256(&data, info.shape.iter().product::<u32>() as usize),
+        qt => panic!("gemma3-vl: expected F16/F32/BF16/Q8F16/Oq8G256 for {name}, got qt={qt}"),
     }
 }
 
