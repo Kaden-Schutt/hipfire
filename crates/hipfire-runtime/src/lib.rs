@@ -30,6 +30,7 @@ pub mod env_docs;
 pub mod eos_filter;
 pub mod ep;
 pub mod hfq;
+pub mod hfq_compose;
 pub mod hfq_modules;
 pub mod host_profile;
 pub mod kld_eval;

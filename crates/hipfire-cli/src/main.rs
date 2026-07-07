@@ -33,6 +33,9 @@ enum Command {
     /// Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
     #[command(alias = "repack")]
     Optimize(commands::forward::OptimizeArgs),
+    /// Compose/decompose .hfq packaging: bundle a base + role/feature sidecars
+    /// into one container, or split a bundle back into its component files.
+    Model(commands::model::ModelArgs),
     /// GPU resource lock for multi-agent coordination (acquire/release/status)
     #[command(alias = "gpu-lock")]
     Lock(commands::lock::LockArgs),
@@ -188,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         Command::HostProfile(args) => commands::forward::run_host_profile(args),
         Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
         Command::Optimize(args) => commands::forward::run_optimize(args),
+        Command::Model(args) => commands::model::run(args),
         Command::Lock(args) => commands::lock::run(args),
         Command::Detect(args) => commands::detect::run(args),
         Command::Diffusion(args) => commands::diffusion::run(args),
