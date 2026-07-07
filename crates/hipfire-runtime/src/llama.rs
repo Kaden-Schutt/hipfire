@@ -1492,6 +1492,294 @@ pub fn weight_gemm(
     }
 }
 
+/// Batched-prefill temporaries, allocated once per prefill call and reused
+/// across the band's layers. All buffers are [batch × width] F32.
+pub struct PrefillScratch {
+    pub tmp_batch: GpuTensor,
+    pub q_batch: GpuTensor,
+    pub k_batch: GpuTensor,
+    pub v_batch: GpuTensor,
+    pub attn_out_batch: GpuTensor,
+    pub o_batch: GpuTensor,
+    pub gate_batch: GpuTensor,
+    pub up_batch: GpuTensor,
+    pub ffn_hidden_batch: GpuTensor,
+    pub ffn_out_batch: GpuTensor,
+    pub q_slice: GpuTensor,
+    pub k_slice: GpuTensor,
+    pub v_slice: GpuTensor,
+    pub attn_slice: GpuTensor,
+    pub pos_buf: hip_bridge::DeviceBuffer,
+}
+
+impl PrefillScratch {
+    pub fn alloc(gpu: &mut Gpu, config: &LlamaConfig, batch: usize) -> HipResult<Self> {
+        let dim = config.dim;
+        let n_heads = config.n_heads;
+        let n_kv_heads = config.n_kv_heads;
+        let head_dim = config.head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let q_dim = n_heads * head_dim;
+
+        // Batched buffers [batch × width] — alloc order mirrors original 1515-1524
+        let tmp_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+        let q_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+        let k_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+        let v_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+        let attn_out_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+        let o_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+        let gate_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+        let up_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+        let ffn_hidden_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+        let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+
+        // Per-position scratch — alloc order mirrors original 1549-1553
+        let q_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+        let k_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+        let v_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+        let attn_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+        let pos_buf = gpu.hip.malloc(4)?;
+
+        Ok(Self {
+            tmp_batch,
+            q_batch,
+            k_batch,
+            v_batch,
+            attn_out_batch,
+            o_batch,
+            gate_batch,
+            up_batch,
+            ffn_hidden_batch,
+            ffn_out_batch,
+            q_slice,
+            k_slice,
+            v_slice,
+            attn_slice,
+            pos_buf,
+        })
+    }
+
+    pub fn free(self, gpu: &mut Gpu) -> HipResult<()> {
+        // Free order mirrors prefill_forward original lines 1699-1703, then 1721-1730
+        gpu.free_tensor(self.q_slice)?;
+        gpu.free_tensor(self.k_slice)?;
+        gpu.free_tensor(self.v_slice)?;
+        gpu.free_tensor(self.attn_slice)?;
+        gpu.hip.free(self.pos_buf)?;
+        gpu.free_tensor(self.tmp_batch)?;
+        gpu.free_tensor(self.q_batch)?;
+        gpu.free_tensor(self.k_batch)?;
+        gpu.free_tensor(self.v_batch)?;
+        gpu.free_tensor(self.attn_out_batch)?;
+        gpu.free_tensor(self.o_batch)?;
+        gpu.free_tensor(self.gate_batch)?;
+        gpu.free_tensor(self.up_batch)?;
+        gpu.free_tensor(self.ffn_hidden_batch)?;
+        gpu.free_tensor(self.ffn_out_batch)?;
+        Ok(())
+    }
+}
+
+/// Run layers `layers` of a batched prefill over `x_batch` [batch×dim] in place,
+/// writing this band's KV. `positions` is a [batch] i32 tensor of physical
+/// positions (0..batch for a from-scratch prefill). Mirrors `prefill_forward`'s
+/// layer loop exactly; the ONLY generalizations are `layers` (was 0..n_layers)
+/// and `positions` (was the hardcoded 0..batch pos_array).
+pub fn prefill_forward_band(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    x_batch: &GpuTensor,
+    layers: std::ops::Range<usize>,
+    kv_cache: &mut KvCache,
+    positions: &GpuTensor,
+    scratch: &PrefillScratch,
+    batch: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    for layer_idx in layers {
+        let layer = &weights.layers[layer_idx];
+
+        gpu.rmsnorm_batched(
+            x_batch,
+            &layer.attn_norm,
+            &scratch.tmp_batch,
+            batch,
+            dim,
+            config.norm_eps,
+        )?;
+
+        // Batched QKV projections
+        weight_gemm(gpu, &layer.wq, &scratch.tmp_batch, &scratch.q_batch, batch)?;
+        weight_gemm(gpu, &layer.wk, &scratch.tmp_batch, &scratch.k_batch, batch)?;
+        weight_gemm(gpu, &layer.wv, &scratch.tmp_batch, &scratch.v_batch, batch)?;
+
+        // QK norm (per-position, per-head)
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(
+                    &scratch.q_batch,
+                    qn,
+                    &scratch.q_batch,
+                    batch * n_heads,
+                    head_dim,
+                    config.norm_eps,
+                )?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(
+                    &scratch.k_batch,
+                    kn,
+                    &scratch.k_batch,
+                    batch * n_kv_heads,
+                    head_dim,
+                    config.norm_eps,
+                )?;
+            }
+        }
+
+        // Batched RoPE: all positions in one kernel launch
+        gpu.rope_batched_f32(
+            &scratch.q_batch,
+            &scratch.k_batch,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            config.rope_freq_base,
+            batch,
+        )?;
+
+        // Batched KV cache write: all positions in 2 kernel launches (K + V)
+        if kv_cache.quantized && kv_cache.quant_q8 {
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.k_gpu[layer_idx],
+                &scratch.k_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                batch,
+            )?;
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.v_gpu[layer_idx],
+                &scratch.v_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                batch,
+            )?;
+        } else {
+            for i in 0..batch {
+                let pos_i32 = i as i32;
+                gpu.hip
+                    .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.k_slice.buf,
+                    0,
+                    &scratch.k_batch.buf,
+                    i * kv_dim * 4,
+                    kv_dim * 4,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.v_slice.buf,
+                    0,
+                    &scratch.v_batch.buf,
+                    i * kv_dim * 4,
+                    kv_dim * 4,
+                )?;
+                gpu.kv_cache_write(
+                    &kv_cache.k_gpu[layer_idx],
+                    &scratch.k_slice,
+                    &scratch.pos_buf,
+                    kv_dim,
+                )?;
+                gpu.kv_cache_write(
+                    &kv_cache.v_gpu[layer_idx],
+                    &scratch.v_slice,
+                    &scratch.pos_buf,
+                    kv_dim,
+                )?;
+            }
+        }
+
+        // Batched causal attention: one kernel launch for all positions
+        gpu.attention_causal_batched(
+            &scratch.q_batch,
+            &scratch.k_batch,
+            &scratch.v_batch,
+            &scratch.attn_out_batch,
+            batch,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )?;
+
+        // Batched output projection
+        weight_gemm(
+            gpu,
+            &layer.wo,
+            &scratch.attn_out_batch,
+            &scratch.o_batch,
+            batch,
+        )?;
+
+        // Batched residual add: x_batch += o_batch
+        gpu.add_inplace_f32(x_batch, &scratch.o_batch)?;
+
+        // Batched FFN norm
+        gpu.rmsnorm_batched(
+            x_batch,
+            &layer.ffn_norm,
+            &scratch.tmp_batch,
+            batch,
+            dim,
+            config.norm_eps,
+        )?;
+
+        // Batched FFN projections
+        weight_gemm(
+            gpu,
+            &layer.w_gate,
+            &scratch.tmp_batch,
+            &scratch.gate_batch,
+            batch,
+        )?;
+        weight_gemm(
+            gpu,
+            &layer.w_up,
+            &scratch.tmp_batch,
+            &scratch.up_batch,
+            batch,
+        )?;
+
+        // Batched SiLU * mul
+        gpu.silu_mul_f32(
+            &scratch.gate_batch,
+            &scratch.up_batch,
+            &scratch.ffn_hidden_batch,
+        )?;
+
+        // Batched down projection
+        weight_gemm(
+            gpu,
+            &layer.w_down,
+            &scratch.ffn_hidden_batch,
+            &scratch.ffn_out_batch,
+            batch,
+        )?;
+
+        // Batched residual
+        gpu.add_inplace_f32(x_batch, &scratch.ffn_out_batch)?;
+    }
+
+    Ok(())
+}
+
 /// Batched prefill: process all prompt tokens in one forward pass.
 /// Returns logits for the LAST position only.
 /// KV cache is filled for all positions.
@@ -1504,24 +1792,11 @@ pub fn prefill_forward(
 ) -> HipResult<Vec<f32>> {
     let batch = tokens.len();
     let dim = config.dim;
-    let n_heads = config.n_heads;
-    let n_kv_heads = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_dim = n_kv_heads * head_dim;
-    let q_dim = n_heads * head_dim;
 
-    // Allocate batched buffers: [batch × dim]
+    let scratch = PrefillScratch::alloc(gpu, config, batch)?;
+
+    // x_batch: main hidden state [batch × dim]
     let x_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
-    let tmp_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
-    let q_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
-    let k_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
-    let v_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
-    let attn_out_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
-    let o_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
-    let gate_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
-    let up_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
-    let ffn_hidden_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
-    let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
 
     // Embedding: lookup each token individually into the batch buffer
     let x_single = gpu.alloc_tensor(&[dim], DType::F32)?;
@@ -1542,165 +1817,20 @@ pub fn prefill_forward(
     // Position array for batched RoPE: [0, 1, 2, ..., batch-1]
     let pos_data: Vec<i32> = (0..batch as i32).collect();
     let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let pos_array = gpu.alloc_tensor(&[batch], DType::F32)?; // i32 same size as f32
-    gpu.hip.memcpy_htod(&pos_array.buf, &pos_bytes)?;
+    let positions = gpu.alloc_tensor(&[batch], DType::F32)?; // i32 same size as f32
+    gpu.hip.memcpy_htod(&positions.buf, &pos_bytes)?;
 
-    // Per-position scratch buffers (reused across all layers)
-    let q_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-    let k_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
-    let v_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
-    let attn_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-    let pos_buf = gpu.hip.malloc(4)?;
-
-    // Layer loop
-    for layer_idx in 0..config.n_layers {
-        let layer = &weights.layers[layer_idx];
-
-        // Batched RMSNorm: each row of x_batch independently
-        for i in 0..batch {
-            // We need per-row norm — use the batched rmsnorm with batch=batch
-            // Actually, rmsnorm_batched already handles this if we set batch=batch, n=dim
-        }
-        gpu.rmsnorm_batched(
-            &x_batch,
-            &layer.attn_norm,
-            &tmp_batch,
-            batch,
-            dim,
-            config.norm_eps,
-        )?;
-
-        // Batched QKV projections
-        weight_gemm(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
-        weight_gemm(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
-        weight_gemm(gpu, &layer.wv, &tmp_batch, &v_batch, batch)?;
-
-        // QK norm (per-position, per-head)
-        if config.has_qk_norm {
-            if let Some(ref qn) = layer.q_norm {
-                gpu.rmsnorm_batched(
-                    &q_batch,
-                    qn,
-                    &q_batch,
-                    batch * n_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-            if let Some(ref kn) = layer.k_norm {
-                gpu.rmsnorm_batched(
-                    &k_batch,
-                    kn,
-                    &k_batch,
-                    batch * n_kv_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-        }
-
-        // Batched RoPE: all positions in one kernel launch
-        gpu.rope_batched_f32(
-            &q_batch,
-            &k_batch,
-            &pos_array,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-            batch,
-        )?;
-
-        // Batched KV cache write: all positions in 2 kernel launches (K + V)
-        if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8_0_batched(
-                &kv_cache.k_gpu[layer_idx],
-                &k_batch,
-                &pos_array,
-                n_kv_heads,
-                head_dim,
-                batch,
-            )?;
-            gpu.kv_cache_write_q8_0_batched(
-                &kv_cache.v_gpu[layer_idx],
-                &v_batch,
-                &pos_array,
-                n_kv_heads,
-                head_dim,
-                batch,
-            )?;
-        } else {
-            for i in 0..batch {
-                let pos_i32 = i as i32;
-                gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
-                gpu.hip.memcpy_dtod_at(
-                    &k_slice.buf,
-                    0,
-                    &k_batch.buf,
-                    i * kv_dim * 4,
-                    kv_dim * 4,
-                )?;
-                gpu.hip.memcpy_dtod_at(
-                    &v_slice.buf,
-                    0,
-                    &v_batch.buf,
-                    i * kv_dim * 4,
-                    kv_dim * 4,
-                )?;
-                gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, kv_dim)?;
-                gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, kv_dim)?;
-            }
-        }
-
-        // Batched causal attention: one kernel launch for all positions
-        gpu.attention_causal_batched(
-            &q_batch,
-            &k_batch,
-            &v_batch,
-            &attn_out_batch,
-            batch,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-        )?;
-
-        // Batched output projection
-        weight_gemm(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
-
-        // Batched residual add: x_batch += o_batch
-        gpu.add_inplace_f32(&x_batch, &o_batch)?;
-
-        // Batched FFN norm
-        gpu.rmsnorm_batched(
-            &x_batch,
-            &layer.ffn_norm,
-            &tmp_batch,
-            batch,
-            dim,
-            config.norm_eps,
-        )?;
-
-        // Batched FFN projections
-        weight_gemm(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
-        weight_gemm(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
-
-        // Batched SiLU * mul
-        gpu.silu_mul_f32(&gate_batch, &up_batch, &ffn_hidden_batch)?;
-
-        // Batched down projection
-        weight_gemm(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
-
-        // Batched residual
-        gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
-    }
-
-    // Free per-position scratch
-    gpu.free_tensor(pos_array)?;
-    gpu.free_tensor(q_slice)?;
-    gpu.free_tensor(k_slice)?;
-    gpu.free_tensor(v_slice)?;
-    gpu.free_tensor(attn_slice)?;
-    gpu.hip.free(pos_buf)?;
+    prefill_forward_band(
+        gpu,
+        weights,
+        config,
+        &x_batch,
+        0..config.n_layers,
+        kv_cache,
+        &positions,
+        &scratch,
+        batch,
+    )?;
 
     // Final norm + output projection for LAST position only
     let last_off = (batch - 1) * dim * 4;
@@ -1716,18 +1846,9 @@ pub fn prefill_forward(
 
     let logits_data = gpu.download_f32(&logits)?;
 
-    // Free all batched buffers
+    scratch.free(gpu)?;
     gpu.free_tensor(x_batch)?;
-    gpu.free_tensor(tmp_batch)?;
-    gpu.free_tensor(q_batch)?;
-    gpu.free_tensor(k_batch)?;
-    gpu.free_tensor(v_batch)?;
-    gpu.free_tensor(attn_out_batch)?;
-    gpu.free_tensor(o_batch)?;
-    gpu.free_tensor(gate_batch)?;
-    gpu.free_tensor(up_batch)?;
-    gpu.free_tensor(ffn_hidden_batch)?;
-    gpu.free_tensor(ffn_out_batch)?;
+    gpu.free_tensor(positions)?;
     gpu.free_tensor(x_last)?;
     gpu.free_tensor(tmp)?;
     gpu.free_tensor(logits)?;
