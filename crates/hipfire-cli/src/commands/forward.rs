@@ -98,31 +98,32 @@ pub struct CollectArtifactsArgs {
     pub args: Vec<OsString>,
 }
 
-const REPACK_HELP: &str = r#"hipfire repack - reshuffle a .hfq into an arch-optimal weight layout
+const OPTIMIZE_HELP: &str = r#"hipfire optimize - reshuffle a .hfq into an arch-optimal weight layout
 
 Takes a canonical (general, portable) .hfq and writes an arch-tagged
 <model>.<arch>.hfq whose weights are pre-packed into the device layout that
 arch's kernels want — so the model loads with no per-load repack. The canonical
 file is the source of truth and is never modified.
 
-Currently repacks Opus W4A4 (op4 / op4-4) tensors into the combined interleaved-decode
+Currently optimizes Opus W4A4 (oq4) tensors into the combined interleaved-decode
 layout (quant_type 34 -> 37). Other tensors are copied through.
 
 Usage:
-  hipfire repack <model.hfq> [--arch <gfx>] [-o <out.hfq>]
+  hipfire optimize <model.hfq> [--arch <gfx>] [-o <out.hfq>]
 
   --arch defaults to the live GPU (probed read-only). Default output is
   <model>.<arch>.hfq beside the input, e.g.
-    qwen3.5-0.8b-op4.hfq -> qwen3.5-0.8b-op4.gfx1103.hfq
+    qwen3.5-0.8b-oq4.hfq -> qwen3.5-0.8b-oq4.gfx1103.hfq
 
 The positional model accepts a local name, shorthand, alias, or path.
+(Alias: `hipfire repack`.)
 
 Build runner:
   cargo build --release -p hipfire-runtime --example oq4_repack"#;
 
 #[derive(Debug, Args)]
 #[command(disable_help_flag = true, trailing_var_arg = true)]
-pub struct RepackArgs {
+pub struct OptimizeArgs {
     /// Arguments forwarded to the oq4_repack runner
     #[arg(allow_hyphen_values = true)]
     pub args: Vec<OsString>,
@@ -161,13 +162,13 @@ pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
     )
 }
 
-pub fn run_repack(args: RepackArgs) -> anyhow::Result<()> {
+pub fn run_optimize(args: OptimizeArgs) -> anyhow::Result<()> {
     run_forwarded(
-        Runner::repack(),
+        Runner::optimize(),
         resolve_forwarded_model_args(args.args, true),
-        "HIPFIRE_REPACK_BIN",
+        "HIPFIRE_OPTIMIZE_BIN",
         "oq4_repack",
-        REPACK_HELP,
+        OPTIMIZE_HELP,
         "cargo build --release -p hipfire-runtime --example oq4_repack",
     )
 }
@@ -303,7 +304,7 @@ impl Runner {
         }
     }
 
-    fn repack() -> Self {
+    fn optimize() -> Self {
         Self {
             release_name: "oq4_repack",
             debug_name: Some("oq4_repack"),

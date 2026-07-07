@@ -231,9 +231,9 @@ the A4/A8 activation error and extra activation-quantization launch.
 | `--ldlq` | Enable the second `+`: full-Hessian error-feedback packing. Requires `--hessian`. |
 | `--arch-id <id>` | Override the architecture id stamped in the `.hfq` header. |
 
-After producing a portable OQ4 artifact, use `hipfire repack` to pre-pack it for
-a specific GPU architecture:
+After producing a portable OQ4 artifact, use `hipfire optimize` to pre-pack it
+for a specific GPU architecture (the `repack` alias is still accepted):
 
 ```bash
-hipfire repack ~/.hipfire/models/Qwen3.5-9B.oq4++.hfq --arch gfx1103
+hipfire optimize ~/.hipfire/models/Qwen3.5-9B.oq4++.hfq --arch gfx1103
 ```

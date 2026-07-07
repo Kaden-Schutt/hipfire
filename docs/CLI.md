@@ -11,11 +11,13 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
-* [`hipfire repack`↴](#hipfire-repack)
+* [`hipfire optimize`↴](#hipfire-optimize)
 * [`hipfire lock`↴](#hipfire-lock)
 * [`hipfire lock acquire`↴](#hipfire-lock-acquire)
 * [`hipfire lock release`↴](#hipfire-lock-release)
 * [`hipfire lock status`↴](#hipfire-lock-status)
+* [`hipfire lock kill`↴](#hipfire-lock-kill)
+* [`hipfire lock run`↴](#hipfire-lock-run)
 * [`hipfire detect`↴](#hipfire-detect)
 * [`hipfire diffusion`↴](#hipfire-diffusion)
 * [`hipfire diffusion import`↴](#hipfire-diffusion-import)
@@ -52,7 +54,7 @@ hipfire LLM inference CLI
 * `eval` — Run the quant admission/model evaluation harness
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
-* `repack` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+* `optimize` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 * `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
 * `detect` — Run observational coherence detectors over a captured token stream
 * `diffusion` — Import and inspect diffusion models stored as .hfq artifacts
@@ -138,11 +140,11 @@ Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one m
 
 
 
-## `hipfire repack`
+## `hipfire optimize`
 
 Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 
-**Usage:** `hipfire repack [ARGS]...`
+**Usage:** `hipfire optimize [ARGS]...`
 
 ###### **Arguments:**
 
@@ -161,6 +163,8 @@ GPU resource lock for multi-agent coordination (acquire/release/status)
 * `acquire` — Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
 * `release` — Release the GPU lock (SIGTERM the holder recorded in the lockfile)
 * `status` — Print lock status: "gpu is free" or "gpu BUSY: <holder>"
+* `kill` — Forcibly free the lock by signalling its recorded holder — and, for a `run`-held lock, the whole workload process group. SIGTERM by default; `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free or if the recorded holder is already gone
+* `run` — Acquire the lock, run `command` under it, release on exit — the scoped form. The lock lives exactly as long as this process (killing it drops the flock via the kernel); no detached holder or watched pid. Exit code is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`
 
 
 
@@ -199,6 +203,40 @@ Release the GPU lock (SIGTERM the holder recorded in the lockfile)
 Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 **Usage:** `hipfire lock status`
+
+
+
+## `hipfire lock kill`
+
+Forcibly free the lock by signalling its recorded holder — and, for a `run`-held lock, the whole workload process group. SIGTERM by default; `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free or if the recorded holder is already gone
+
+**Usage:** `hipfire lock kill [OPTIONS]`
+
+###### **Options:**
+
+* `-f`, `--force` — Escalate to SIGKILL instead of SIGTERM
+
+
+
+## `hipfire lock run`
+
+Acquire the lock, run `command` under it, release on exit — the scoped form. The lock lives exactly as long as this process (killing it drops the flock via the kernel); no detached holder or watched pid. Exit code is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`
+
+**Usage:** `hipfire lock run [OPTIONS] <LABEL> -- <COMMAND>...`
+
+###### **Arguments:**
+
+* `<LABEL>` — Human label recorded in the lockfile (who/what holds it)
+* `<COMMAND>` — The command (and args) to run under the lock — everything after `--`
+
+###### **Options:**
+
+* `--timeout-secs <TIMEOUT_SECS>` — Hard cap in seconds to wait for a busy lock; 0 = wait forever
+
+  Default value: `1800`
+* `--poll-secs <POLL_SECS>` — Cadence of "busy" messages while waiting, in seconds
+
+  Default value: `5`
 
 
 
@@ -365,6 +403,7 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 * `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched generation, or use --batch-size with one prompt
 * `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text. Omit for empty negatives, pass once to reuse, or repeat per prompt
 * `-o`, `--output <OUTPUT>` — Output PNG file for one image, or output directory for batches
+* `--preview-dir <PREVIEW_DIR>` — Directory to write a per-step preview PNG (step_00.png, step_01.png, ...) by decoding the intermediate latent after each denoise pass. Useful for a webui progress strip; adds one VAE decode per step. Single-image runs only
 * `--width <WIDTH>` — Output image width in pixels
 
   Default value: `512`
@@ -402,6 +441,22 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 
   Default value: `0.75`
 * `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id ROCm device to generate on. Omit to auto-detect (a single GPU is used silently; the first of several with a warning). The CPU reference oracle is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable
+* `--mrflow <MRFLOW>` — Enable MrFlow staged sampling: a fast low-resolution pass, pixel-space super-resolution, re-encode, and a short direct-sigma refine. --width and --height are the final resolution; the low-res pass runs at those divided by the upscale factor. Flow-match backbones only (FLUX / Qwen-Image / Z-Image / Krea-2). Overrides --enable-hr
+
+  Possible values:
+  - `zit-9plus1`:
+    Z-Image Turbo, 9 low-res + 1 refine, sigma 0.11, no CFG (paper demo)
+  - `krea2-12plus1`:
+    Krea-2 base, 12 low-res + 1 refine, sigma 0.12, cfg 4.0
+  - `krea2-20plus1`:
+    Krea-2 base, 20 low-res + 1 refine, sigma 0.15, cfg 4.0
+  - `krea2-turbo-8plus1`:
+    Krea-2 Turbo, 8 low-res + 1 refine, sigma 0.11, no CFG
+
+* `--mrflow-refine-sigma <MRFLOW_REFINE_SIGMA>` — Override the MrFlow refine start sigma (preset default). Larger values (0.16-0.20) can improve text-heavy generations
+* `--mrflow-upscale <MRFLOW_UPSCALE>` — Override the MrFlow pixel-space upscale factor (preset default 2.0)
+* `--mrflow-shifted` — Use the flow-match shifted interior refine schedule (only affects refine passes with more than one step)
+* `--mrflow-sr <MRFLOW_SR>` — RealESRGAN RRDBNet super-resolution .hfq (from `hipfire-coexistence`) for the MrFlow Stage-2 upscale. Without it, Stage 2 falls back to a plain cover-resize (much softer output)
 
 
 

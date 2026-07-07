@@ -234,8 +234,8 @@ attention families included. Layer composition is described by `hipfire-mixer`
 `quantize`, `config` (global/per-model), `eval`, `sidecar-gen`, `detect` (token
 coherence), `diffusion` (import/inspect diffusion `.hfq`), `admin`,
 `lock {acquire,release,status}` (GPU/NPU/CPU resource mutex), `host-profile`
-(bandwidth/capability profiling), `collect-artifacts` (Hessian/imatrix), `repack`
-(arch-optimal weight layout), plus config/doc/schema generators.
+(bandwidth/capability profiling), `collect-artifacts` (Hessian/imatrix), `optimize`
+(arch-optimal weight layout; `repack` alias), plus config/doc/schema generators.
 
 ### Quantization, evaluation, evidence
 
