@@ -189,12 +189,16 @@ Merge a base `.hfq` and its role/feature sidecars into one bundled container (re
 
 Split a bundled `.hfq` back into its base + sidecar files
 
-**Usage:** `hipfire model decompose <BUNDLE> <OUTPUT_DIR>`
+**Usage:** `hipfire model decompose [OPTIONS] <BUNDLE> <OUTPUT_DIR>`
 
 ###### **Arguments:**
 
 * `<BUNDLE>` — Bundle container to split (file path or model alias)
 * `<OUTPUT_DIR>` — Directory to write the reconstructed component files into
+
+###### **Options:**
+
+* `--infer` — Heuristically split a bundle that has no `hipfire_compose` manifest, using the filename's role dot-groups + tensor-name prefixes. Lossy: output files are not byte-identical to any originals. Bundles that DO carry a manifest still take the exact, lossless path
 
 
 

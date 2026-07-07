@@ -264,41 +264,214 @@ pub fn decompose_hfq(bundle: &Path, out_dir: &Path) -> io::Result<Vec<PathBuf>> 
     std::fs::create_dir_all(out_dir)?;
     let mut written = Vec::with_capacity(manifest.components.len());
     for comp in &manifest.components {
-        let out_path = out_dir.join(&comp.filename);
-        let mut stream_entries = Vec::with_capacity(comp.tensors.len());
-        for name in &comp.tensors {
-            let e = pkg.entry(name).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "manifest references tensor {name:?} absent from bundle {}",
-                        bundle.display()
-                    ),
-                )
-            })?;
-            stream_entries.push(HfqStreamEntry {
-                name: e.name.clone(),
-                quant_type: e.quant_type,
-                shape: e.shape.clone(),
-                group_size: e.group_size,
-                data_len: e.data_size as u64,
-            });
-        }
-        write_hfqm_package_streaming(
-            &out_path,
+        written.push(write_component(
+            &pkg,
+            &out_dir.join(&comp.filename),
             comp.arch_id,
             &comp.metadata_json,
-            &stream_entries,
-            |i, w| {
-                let data = pkg
-                    .blob_data(&comp.tensors[i])
-                    .expect("tensor validated present above");
-                w.write_all(data)
-            },
-        )?;
-        written.push(out_path);
+            &comp.tensors,
+        )?);
     }
     Ok(written)
+}
+
+/// Write one component `.hfq` (`tensor_names` pulled verbatim from `pkg`) with
+/// the given `arch_id` and metadata. Shared by manifest-based and heuristic
+/// decompose. Streams one tensor at a time out of the source mmap.
+fn write_component(
+    pkg: &HfqPackage,
+    out_path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    tensor_names: &[String],
+) -> io::Result<PathBuf> {
+    let mut stream_entries = Vec::with_capacity(tensor_names.len());
+    for name in tensor_names {
+        let e = pkg.entry(name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor {name:?} absent from bundle"),
+            )
+        })?;
+        stream_entries.push(HfqStreamEntry {
+            name: e.name.clone(),
+            quant_type: e.quant_type,
+            shape: e.shape.clone(),
+            group_size: e.group_size,
+            data_len: e.data_size as u64,
+        });
+    }
+    write_hfqm_package_streaming(out_path, arch_id, metadata_json, &stream_entries, |i, w| {
+        let data = pkg
+            .blob_data(&tensor_names[i])
+            .expect("tensor validated present above");
+        w.write_all(data)
+    })?;
+    Ok(out_path.to_path_buf())
+}
+
+/// True if `tensor_name` looks like it belongs to `role` (best-effort prefix
+/// match used only by [`decompose_hfq_infer`]).
+fn role_matches(role: &str, tensor_name: &str) -> bool {
+    let n = tensor_name.to_ascii_lowercase();
+    match role {
+        "mtp" => n.contains("mtp"),
+        "dflash" => n.contains("dflash") || n.contains("draft"),
+        "triattn" => n.contains("triattn"),
+        "vl" => [
+            "vision",
+            "visual",
+            "siglip",
+            "mm_projector",
+            "multi_modal_projector",
+        ]
+        .iter()
+        .any(|p| n.contains(p)),
+        "calib" | "hessian" => {
+            n.contains("calib") || n.contains("hessian") || n.contains("imatrix")
+        }
+        _ => false,
+    }
+}
+
+/// All known role tokens present in a bundle filename's dot-groups, in order
+/// (e.g. `Model.mtp.vl.mq4.hfq` -> `["mtp", "vl"]`).
+fn role_tags_from_filename(path: &Path) -> Vec<String> {
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = fname.strip_suffix(".hfq").unwrap_or(&fname).to_string();
+    stem.split('.')
+        .filter(|seg| KNOWN_ROLES.contains(seg))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Bundle filename with the given role dot-groups removed (case-insensitive):
+/// `Model.mtp.vl.mq4.hfq` + `[mtp, vl]` -> `Model.mq4.hfq`.
+fn strip_role_groups(fname: &str, roles: &[String]) -> String {
+    let stem = fname.strip_suffix(".hfq").unwrap_or(fname);
+    let kept: Vec<&str> = stem
+        .split('.')
+        .filter(|seg| !roles.iter().any(|r| r.eq_ignore_ascii_case(seg)))
+        .collect();
+    format!("{}.hfq", kept.join("."))
+}
+
+/// Best-effort split of a bundle that has NO [`HFQM_COMPOSE_KEY`] manifest,
+/// driven by the role dot-groups in the bundle filename plus tensor-name prefix
+/// matching ([`role_matches`]). Each declared role claims its matching tensors
+/// (first role wins); the remainder become the base. This is LOSSY — output
+/// files are not guaranteed byte-identical to any original sidecars (metadata
+/// and per-sidecar `arch_id` are synthesized), unlike manifest-based decompose.
+/// Errors if the filename declares no roles or no tensors match any role.
+pub fn decompose_hfq_infer(bundle: &Path, out_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let pkg = HfqPackage::open(bundle)
+        .map_err(|e| io::Error::new(e.kind(), format!("opening {}: {e}", bundle.display())))?;
+    let roles = role_tags_from_filename(bundle);
+    if roles.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} declares no role features in its filename; heuristic decompose needs role dot-groups (e.g. .mtp.vl) or a composed bundle with a {HFQM_COMPOSE_KEY} manifest",
+                bundle.display()
+            ),
+        ));
+    }
+
+    // Partition tensors: each declared role claims its matching, still-unclaimed
+    // tensors (first role wins); everything left is the base.
+    let mut claimed = vec![false; pkg.entries().len()];
+    let mut role_tensors: Vec<(String, Vec<String>)> = Vec::new();
+    for role in &roles {
+        let mut names = Vec::new();
+        for (i, e) in pkg.entries().iter().enumerate() {
+            if !claimed[i] && role_matches(role, &e.name) {
+                claimed[i] = true;
+                names.push(e.name.clone());
+            }
+        }
+        if !names.is_empty() {
+            role_tensors.push((role.clone(), names));
+        }
+    }
+    if role_tensors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "no tensors in {} matched any declared role (mtp/dflash/triattn/vl/calib); cannot infer a split",
+                bundle.display()
+            ),
+        ));
+    }
+    let base_names: Vec<String> = pkg
+        .entries()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !claimed[*i])
+        .map(|(_, e)| e.name.clone())
+        .collect();
+
+    let bundle_fname = bundle
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "bundle.hfq".to_string());
+    let base_fname = strip_role_groups(&bundle_fname, &roles);
+    let base_stem = base_fname.strip_suffix(".hfq").unwrap_or(&base_fname);
+    // Sidecars are `<family>.<role>.hfq`, where family drops the quant token (the
+    // base stem's last dot-group) — matching the compose naming (base
+    // `Model.mq4.hfq` + `Model.mtp.hfq` <-> `Model.mtp.mq4.hfq`).
+    let family_stem = base_stem
+        .rsplit_once('.')
+        .map(|(head, _)| head)
+        .unwrap_or(base_stem);
+
+    std::fs::create_dir_all(out_dir)?;
+    let mut written = Vec::new();
+    if !base_names.is_empty() {
+        written.push(write_component(
+            &pkg,
+            &out_dir.join(&base_fname),
+            pkg.arch_id,
+            &pkg.metadata_json,
+            &base_names,
+        )?);
+    }
+    for (role, names) in &role_tensors {
+        let side_meta = serde_json::json!({
+            "role": role,
+            "arch_id": pkg.arch_id,
+            "hipfire_infer": "heuristic.v1",
+        })
+        .to_string();
+        written.push(write_component(
+            &pkg,
+            &out_dir.join(format!("{family_stem}.{role}.hfq")),
+            pkg.arch_id,
+            &side_meta,
+            names,
+        )?);
+    }
+    Ok(written)
+}
+
+/// Decompose a bundle, preferring the lossless manifest path. Falls back to
+/// [`decompose_hfq_infer`] only when `infer` is set and the bundle has no
+/// manifest; otherwise a manifest-less bundle is an error.
+pub fn decompose_hfq_auto(bundle: &Path, out_dir: &Path, infer: bool) -> io::Result<Vec<PathBuf>> {
+    let has_manifest = HfqPackage::open(bundle)
+        .ok()
+        .and_then(|pkg| serde_json::from_str::<serde_json::Value>(&pkg.metadata_json).ok())
+        .map(|v| v.get(HFQM_COMPOSE_KEY).is_some())
+        .unwrap_or(false);
+    if has_manifest {
+        decompose_hfq(bundle, out_dir)
+    } else if infer {
+        decompose_hfq_infer(bundle, out_dir)
+    } else {
+        decompose_hfq(bundle, out_dir) // reuses the clear "no manifest" error
+    }
 }
 
 #[cfg(test)]
@@ -324,6 +497,50 @@ mod tests {
             group_size: 0,
             data,
         }
+    }
+
+    #[test]
+    fn infer_splits_manifestless_bundle_by_filename_roles() {
+        let dir = scratch_dir();
+        // A bundle with NO hipfire_compose manifest, name declaring `.mtp`.
+        let bundle = dir.join("Model.mtp.mq4.hfq");
+        write_hfqm_package_mem(
+            &bundle,
+            5,
+            r#"{"arch_id":5}"#,
+            &[
+                mem_tensor("model.embed.weight", vec![1, 2, 3, 4]),
+                mem_tensor("model.mtp.head.weight", vec![9, 8, 7]),
+            ],
+        )
+        .unwrap();
+
+        // Without --infer, a manifest-less bundle is a hard error.
+        assert!(decompose_hfq(&bundle, &dir.join("no")).is_err());
+
+        // --infer splits on the `.mtp` filename role + tensor-name prefix.
+        let out = dir.join("out");
+        let written = decompose_hfq_infer(&bundle, &out).unwrap();
+        assert_eq!(written.len(), 2);
+        let base = HfqPackage::open(&out.join("Model.mq4.hfq")).unwrap();
+        assert!(base.entry("model.embed.weight").is_some());
+        assert!(base.entry("model.mtp.head.weight").is_none());
+        let mtp = HfqPackage::open(&out.join("Model.mtp.hfq")).unwrap();
+        assert!(mtp.entry("model.mtp.head.weight").is_some());
+        assert!(mtp.entry("model.embed.weight").is_none());
+        assert!(mtp.metadata_json.contains("heuristic.v1"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn infer_errors_when_filename_declares_no_roles() {
+        let dir = scratch_dir();
+        let bundle = dir.join("Model.mq4.hfq"); // no role dot-groups
+        write_hfqm_package_mem(&bundle, 5, "{}", &[mem_tensor("a", vec![1])]).unwrap();
+        let err = decompose_hfq_infer(&bundle, &dir.join("out")).unwrap_err();
+        assert!(err.to_string().contains("declares no role features"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

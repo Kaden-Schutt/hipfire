@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use hipfire_runtime::hfq_compose::{compose_hfq, decompose_hfq, sidecar_tag_from_filename};
+use hipfire_runtime::hfq_compose::{compose_hfq, decompose_hfq_auto, sidecar_tag_from_filename};
 
 use crate::model::find_model;
 
@@ -45,6 +45,12 @@ pub struct DecomposeArgs {
     bundle: String,
     /// Directory to write the reconstructed component files into.
     output_dir: PathBuf,
+    /// Heuristically split a bundle that has no `hipfire_compose` manifest,
+    /// using the filename's role dot-groups + tensor-name prefixes. Lossy:
+    /// output files are not byte-identical to any originals. Bundles that DO
+    /// carry a manifest still take the exact, lossless path.
+    #[arg(long)]
+    infer: bool,
 }
 
 pub fn run(args: ModelArgs) -> anyhow::Result<()> {
@@ -118,9 +124,10 @@ fn run_compose(a: ComposeArgs) -> anyhow::Result<()> {
 
 fn run_decompose(a: DecomposeArgs) -> anyhow::Result<()> {
     let bundle = resolve(&a.bundle)?;
-    let written = decompose_hfq(&bundle, &a.output_dir)?;
+    let written = decompose_hfq_auto(&bundle, &a.output_dir, a.infer)?;
     println!(
-        "decomposed {} -> {} file(s) in {}",
+        "decomposed{} {} -> {} file(s) in {}",
+        if a.infer { " (heuristic)" } else { "" },
         bundle.display(),
         written.len(),
         a.output_dir.display()
