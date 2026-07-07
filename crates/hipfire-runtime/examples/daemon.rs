@@ -46,6 +46,7 @@ use std::path::Path;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Instant;
 
+use hipfire_hardware::DimKind;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel, ModelState};
 use hipfire_runtime::spec::{
     ClientEvent, EvictRetain, FinishSummary, PrefillOutcome, SpecEmit, StopReason,
@@ -1300,13 +1301,24 @@ fn main() {
                     && hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
                         .map(|h| matches!(h.arch_id, 0 | 1))
                         .unwrap_or(false);
-                let loaded = if ep > 1 {
-                    hipfire_loader::load_model_ep(path, max_seq, ep)
-                } else if tp > 1 {
-                    hipfire_loader::load_model_tp(path, max_seq, tp)
+                // One mesh from the (already remapped + guarded) scalars. The
+                // remap forces ep/tp mutually exclusive and the guard rejects
+                // (ep|tp)>1 with pp>1, so at most one axis is >1 here — routing
+                // is byte-identical to the old ep>1 / tp>1 / pp chain.
+                // emulate=None is load-bearing: passing Some(_) would auto-promote
+                // a plain serve on a HIPFIRE_EMULATE_GPUS box into EP-2.
+                let mesh = hipfire_runtime::config::resolve_mesh(pp, tp, ep, None);
+                let loaded = if mesh.has_axis(DimKind::Ep) {
+                    hipfire_loader::load_model_ep(path, max_seq, &mesh)
+                } else if mesh.has_axis(DimKind::Tp) {
+                    hipfire_loader::load_model_tp(path, max_seq, &mesh)
                 } else if dense_llama_pp {
-                    hipfire_loader::load_model_pp(path, max_seq, pp)
+                    hipfire_loader::load_model_pp(path, max_seq, &mesh)
                 } else {
+                    // NOT single-GPU only: this arm still carries qwen35 (arch 5/6)
+                    // pp>1 pipeline-parallel serving, which stays scalar-driven.
+                    // MUST forward the raw `pp` scalar verbatim (mesh is not the
+                    // source of truth for qwen35 PP — see carriers.rs:228/230).
                     hipfire_loader::load_model(
                         path,
                         max_seq,
