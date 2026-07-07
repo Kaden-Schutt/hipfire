@@ -19,7 +19,9 @@
 
 use hip_bridge::HipResult;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
-use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
+use hipfire_runtime::hfq::{
+    load_awq_scale, oq4_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{EmbeddingFormat, WeightTensor};
 
@@ -232,15 +234,6 @@ fn load_lm_head(
                 k,
             )
         }
-        34 => {
-            let combined = oq4_pack_arch_combined(&data, m, k);
-            weight_tensor(
-                gpu.upload_raw(&combined, &[combined.len()])?,
-                DType::Oq4G256,
-                m,
-                k,
-            )
-        }
         35 => {
             let combined = oq8_combined(&data, m, k);
             weight_tensor(
@@ -250,13 +243,11 @@ fn load_lm_head(
                 k,
             )
         }
-        37 => {
-            assert_eq!(
-                data.len(),
-                oq4_arch_combined_len(m, k),
-                "gemma3: OP4 arch-packed lm_head has invalid byte length"
-            );
-            weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Oq4G256, m, k)
+        // OQ4 canonical (34) / arch-packed (37) via the shared decision helper.
+        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            let (bytes, gpu_dtype) = oq4_arch_load(info.quant_type, &data, m, k)
+                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+            weight_tensor(gpu.upload_raw(&bytes, &[bytes.len()])?, gpu_dtype, m, k)
         }
         1 => {
             // Promote F16 → F32 on host (see doc above), unless the tied embed
@@ -488,15 +479,6 @@ fn load_weight_tensor(
                 k,
             )
         }
-        34 => {
-            let combined = oq4_pack_arch_combined(&data, m, k);
-            weight_tensor(
-                gpu.upload_raw(&combined, &[combined.len()])?,
-                DType::Oq4G256,
-                m,
-                k,
-            )
-        }
         35 => {
             let combined = oq8_combined(&data, m, k);
             weight_tensor(
@@ -522,13 +504,12 @@ fn load_weight_tensor(
                 k,
             )
         }
-        37 => {
-            assert_eq!(
-                data.len(),
-                oq4_arch_combined_len(m, k),
-                "gemma3: OP4 arch-packed tensor {name} has invalid byte length"
-            );
-            weight_tensor(gpu.upload_raw(&data, &[data.len()])?, DType::Oq4G256, m, k)
+        // OQ4 canonical (34, repack at load) / arch-packed (37, verbatim) — both
+        // delegate to the shared `oq4_arch_load` (single source of truth).
+        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            let (bytes, gpu_dtype) = oq4_arch_load(info.quant_type, &data, m, k)
+                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+            weight_tensor(gpu.upload_raw(&bytes, &[bytes.len()])?, gpu_dtype, m, k)
         }
         // bf16 stays bf16 on GPU (the gemm/gemv families dispatch a bf16 path,
         // same as the gemma3-vl bf16 vision tower) — no F32 promotion needed. The
@@ -567,48 +548,6 @@ fn sext4(nib: u8) -> i8 {
     } else {
         v
     }
-}
-
-fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
-    let ng = k / 256;
-    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
-}
-
-fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
-    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
-    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
-        .block_bytes()
-        .unwrap();
-    const ILB: usize = 132;
-    assert_eq!(k % GROUP, 0, "OP4 requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let packed_bytes = m * (k / 2);
-    let scales_bytes = m * ng * 4;
-    let expect = m * ng * BLOCK;
-    assert_eq!(
-        data.len(),
-        expect,
-        "OP4 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
-        data.len()
-    );
-    let mut out = vec![0u8; packed_bytes + scales_bytes + m * ng * ILB];
-    let scales_base = packed_bytes;
-    let il_base = packed_bytes + scales_bytes;
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let nib_dst = r * (k / 2) + g * (GROUP / 2);
-            out[nib_dst..nib_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let scale_dst = scales_base + (r * ng + g) * 4;
-            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
-            let il_dst = il_base + (r * ng + g) * ILB;
-            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
-            out[il_dst + 4..il_dst + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
-        }
-    }
-    out
 }
 
 fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {

@@ -477,46 +477,16 @@ pub fn quantize_diffusion_hfq(
 /// [interleaved m*ng*132]`. The W4A16 GEMM reads the first two regions; the
 /// interleaved tail is for decode GEMVs (kept for layout parity).
 /// Byte length of [`pack_oq4_arch_combined`]'s output for an `[m, k]` matrix.
+/// Thin re-export of the single source of truth in `hipfire_runtime::oq4_arch`.
 pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
-    let ng = k / 256;
-    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
+    hipfire_runtime::hfq::oq4_arch_combined_len(m, k)
 }
 
+/// Repack canonical on-disk OQ4 into the arch combined device layout. Thin
+/// wrapper over the single source of truth in `hipfire_runtime::oq4_arch`, kept
+/// under this name for the diffusion encode/upload path and its public re-export.
 pub fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    use crate::quant_decode::f16_bits_to_f32;
-    const GROUP: usize = 256;
-    const BLOCK: usize = 130;
-    const ILB: usize = 4 + 128;
-    assert_eq!(
-        k % GROUP,
-        0,
-        "oq4 arch pack requires K % 256 == 0 (got K={k})"
-    );
-    let ng = k / GROUP;
-    let packed_bytes = m * (k / 2);
-    let scales_bytes = m * ng * 4;
-    let il_bytes = m * ng * ILB;
-    assert_eq!(
-        data.len(),
-        m * ng * BLOCK,
-        "oq4 weight byte length mismatch"
-    );
-    let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
-    let il_base = packed_bytes + scales_bytes;
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let scale = f16_bits_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let dst = r * (k / 2) + g * (GROUP / 2);
-            combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-            let so = packed_bytes + (r * ng + g) * 4;
-            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-            let io = il_base + (r * ng + g) * ILB;
-            combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
-            combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
-        }
-    }
-    combined
+    hipfire_runtime::hfq::oq4_pack_arch_combined(data, m, k)
 }
 
 /// Open a `.calib.hfq` sidecar for use as the `calib` argument to

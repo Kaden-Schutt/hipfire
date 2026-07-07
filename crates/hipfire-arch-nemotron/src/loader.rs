@@ -132,9 +132,9 @@ pub fn load_nemotron_weights(
 // ── HFQ (quantized) loading ──────────────────────────────────────────────────
 
 use crate::weight::{EmbeddingTable, LinearWeight};
+use hipfire_rdna::{DType, Gpu};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weights::WeightTensor;
-use hipfire_rdna::{DType, Gpu};
 
 /// quant_type byte → quantized linear `DType` (None ⇒ stored as a plain
 /// precision, handle via `dequant_qt`). See `qt_name` in hipfire-quantize.
@@ -196,12 +196,7 @@ pub fn load_linear_hfq(
     // that needs the arch-combined repack; qt=37 is already arch-packed. Both
     // dispatch as `DType::Oq4G256` (gemv via the shared dispatch, batched prefill
     // via `hipfire_runtime::weights::weight_gemm`). Mirrors the hfq.rs LLaMA loader.
-    if qt == 34 || qt == 37 {
-        let packed = if qt == 34 {
-            hipfire_runtime::hfq::oq4_pack_arch_combined(&data, m, k)
-        } else {
-            data
-        };
+    if let Some((packed, gpu_dtype)) = hipfire_runtime::hfq::oq4_arch_load(qt, &data, m, k) {
         let buf = gpu
             .upload_raw(&packed, &[packed.len()])
             .map_err(|e| format!("nemotron hfq oq4 upload {name}: {e:?}"))?;
@@ -210,7 +205,7 @@ pub fn load_linear_hfq(
         let awq_scale = hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k);
         return Ok(LinearWeight::Quant(Box::new(WeightTensor {
             buf,
-            gpu_dtype: DType::Oq4G256,
+            gpu_dtype,
             m,
             k,
             row_stride: 0,

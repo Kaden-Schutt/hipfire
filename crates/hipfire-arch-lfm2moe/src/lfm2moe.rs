@@ -15,11 +15,11 @@
 //! minimax convention). lm_head is tied to embed_tokens.
 
 use crate::config::{Lfm2MoeConfig, MixerKind};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::hfq::{oq4_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT};
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::WeightTensor;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
 
@@ -144,16 +144,11 @@ fn load_wt_with_awq(
 }
 
 const OQ_PLUS_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusG256.code();
-const OQ4_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256.code();
 const OQ8_QT: u8 = hipfire_runtime::quant::QuantType::Oq8G256.code();
 const OQ_PLUS_COMPACT_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusCompact.code();
-const OQ4_ARCH_PACKED_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256ArchPacked.code();
 const OQ_GROUP: usize = 256;
-
-fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
-    let ng = k / OQ_GROUP;
-    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
-}
+// OQ4 canonical (34) / arch-packed (37) codes + transform come from the shared
+// `hipfire_runtime::oq4_arch` (imported above).
 
 fn sext4(nib: u8) -> i8 {
     let v = (nib & 0x0f) as i8;
@@ -162,46 +157,6 @@ fn sext4(nib: u8) -> i8 {
     } else {
         v
     }
-}
-
-fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
-    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
-        .block_bytes()
-        .unwrap();
-    const INTERLEAVED_BLOCK: usize = 132; // [f32 scale][128 nibbles]
-    if k % OQ_GROUP != 0 {
-        return Err(format!("OQ4G256 requires K % 256 == 0 (got K={k})"));
-    }
-    let ng = k / OQ_GROUP;
-    let expect = m * ng * BLOCK;
-    if data.len() != expect {
-        return Err(format!(
-            "OQ4G256 byte length {} != M*ng*130 = {expect} (M={m} K={k})",
-            data.len()
-        ));
-    }
-    let packed_bytes = m * (k / 2);
-    let scales_bytes = m * ng * 4;
-    let il_base = packed_bytes + scales_bytes;
-    let mut out = vec![0u8; oq4_arch_combined_len(m, k)];
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let split_dst = r * (k / 2) + g * (OQ_GROUP / 2);
-            out[split_dst..split_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-
-            let scale_dst = packed_bytes + (r * ng + g) * 4;
-            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
-
-            let il_dst = il_base + (r * ng + g) * INTERLEAVED_BLOCK;
-            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
-            out[il_dst + 4..il_dst + INTERLEAVED_BLOCK]
-                .copy_from_slice(&data[src + 2..src + BLOCK]);
-        }
-    }
-    Ok(out)
 }
 
 fn expand_oq_plus_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
@@ -356,14 +311,12 @@ fn wt_from_raw(
                 k,
             )
         }
-        OQ4_QT => {
-            return upload_wt_raw(
-                gpu,
-                &pack_oq4_arch_combined(data, m, k)?,
-                DType::Oq4G256,
-                m,
-                k,
-            )
+        // OQ4 canonical (34, repack) / arch-packed (37, verbatim) via the shared
+        // decision helper (single source of truth).
+        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            let (bytes, dtype) = oq4_arch_load(qt, data, m, k)
+                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+            return upload_wt_raw(gpu, &bytes, dtype, m, k);
         }
         OQ8_QT => return upload_wt_raw(gpu, &pack_oq8(data, m, k)?, DType::Oq8G256, m, k),
         OQ_PLUS_COMPACT_QT => {
@@ -374,16 +327,6 @@ fn wt_from_raw(
                 m,
                 k,
             )
-        }
-        OQ4_ARCH_PACKED_QT => {
-            let expect = oq4_arch_combined_len(m, k);
-            if data.len() != expect {
-                return Err(format!(
-                    "OQ4 arch-packed byte length {} != combined len {expect} (M={m} K={k})",
-                    data.len()
-                ));
-            }
-            return upload_wt_raw(gpu, data, DType::Oq4G256, m, k);
         }
         _ => {}
     }
@@ -1033,21 +976,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oq4_pack_combined_preserves_split_and_interleaved_regions() {
-        let mut data = vec![0u8; 130];
-        data[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
-        for i in 0..128 {
-            data[2 + i] = i as u8;
-        }
-
-        let packed = pack_oq4_arch_combined(&data, 1, 256).unwrap();
-        assert_eq!(packed.len(), oq4_arch_combined_len(1, 256));
-        assert_eq!(&packed[0..128], &data[2..130]);
-        assert_eq!(&packed[128..132], &1.0f32.to_le_bytes());
-        assert_eq!(&packed[132..136], &1.0f32.to_le_bytes());
-        assert_eq!(&packed[136..264], &data[2..130]);
-    }
+    // The OQ4 arch-pack transform is now single-sourced + golden-tested in
+    // `hipfire_runtime::oq4_arch` (`pack_matches_golden_layout`).
 
     #[test]
     fn oqplus_expands_signed_nibbles_to_oq8_layout() {

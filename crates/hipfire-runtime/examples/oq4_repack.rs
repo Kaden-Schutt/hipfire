@@ -47,15 +47,12 @@
 //! Usage:
 //!   oq4_repack <in.hfq> [-o <out.hfq>] [--arch <gfx>]
 //!
-//! With no `-o`, the output is `<stem>-packed.hfq` beside the input.
+//! With no `-o`, the output is `<stem>.<arch>.hfq` beside the input.
 
 use std::path::PathBuf;
 
-use hipfire_arch_qwen35::qwen35::{oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT};
+use hipfire_arch_qwen35::qwen35::{oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT};
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
-
-/// Canonical (general, portable) on-disk OP4 quant_type.
-const CANONICAL_OQ4_QT: u8 = 34;
 
 /// Best-effort live GPU arch probe (e.g. "gfx1103"). Read-only
 /// `hipGetDeviceProperties` on device 0 — no GPU lock, no compute context, so it
@@ -171,7 +168,7 @@ fn main() {
             .tensor_data_vec(&info.name)
             .unwrap_or_else(|| panic!("tensor data not found: {}", info.name));
 
-        if info.quant_type == CANONICAL_OQ4_QT {
+        if info.quant_type == OQ4_CANONICAL_QT {
             // OP4 weight matrices are stored [m, k] = [out, in].
             assert_eq!(
                 info.shape.len(),
@@ -207,7 +204,7 @@ fn main() {
 
     if repacked == 0 {
         eprintln!(
-            "warning: no OP4 (quant_type {CANONICAL_OQ4_QT}) tensors found in {} — nothing to repack",
+            "warning: no OQ4 (quant_type {OQ4_CANONICAL_QT}) tensors found in {} — nothing to repack",
             input.display()
         );
     }
@@ -220,7 +217,7 @@ fn main() {
     );
 
     eprintln!(
-            "oq4_repack: {} -> {}\n  repacked {repacked} OP4 tensor(s) (qt {CANONICAL_OQ4_QT} -> {OQ4_ARCH_PACKED_QT}), copied {copied} other(s)\n  OP4 weight bytes {canon_bytes} -> {packed_bytes} on disk (combined layout incl. interleaved decode region)",
+            "oq4_repack: {} -> {}\n  repacked {repacked} OQ4 tensor(s) (qt {OQ4_CANONICAL_QT} -> {OQ4_ARCH_PACKED_QT}), copied {copied} other(s)\n  OQ4 weight bytes {canon_bytes} -> {packed_bytes} on disk (combined layout incl. interleaved decode region)",
         input.display(),
         output.display()
     );

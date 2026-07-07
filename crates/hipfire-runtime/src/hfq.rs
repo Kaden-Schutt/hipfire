@@ -10,12 +10,20 @@ use crate::quant::f16_to_f32;
 use crate::weights::{EmbeddingFormat, LayerWeights, WeightTensor};
 use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
-use memmap2::Mmap;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+// The OQ4 arch-packing transform now lives in `crate::oq4_arch` (single source
+// of truth). Re-exported here so the historical `hipfire_runtime::hfq::{...}`
+// paths (qwen35 re-export, nemotron, the optimize tool) keep resolving.
+pub use crate::oq4_arch::{
+    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT,
+    OQ4_CANONICAL_QT,
+};
 
 pub const HFQM_MAGIC: &[u8; 4] = b"HFQM";
 pub const HFQM_VERSION: u32 = 1;
@@ -1328,57 +1336,6 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
 }
 
 /// Load a weight tensor (quantized or F16) onto GPU.
-/// Byte length of the OQ4 arch combined device layout for an `[m, k]` matrix:
-/// `[split nibbles m*(k/2)] [split f32 scales m*ng] [interleaved m*ng*132]`.
-pub fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
-    let ng = k / 256;
-    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
-}
-
-/// Repack canonical on-disk OQ4 (quant_type 34: `[f16 scale][128 nibbles]` per
-/// 256-group, row-contiguous) into the arch combined device layout uploaded by the
-/// loader. SINGLE source of truth for that transform — the qt=34 load paths (llama,
-/// nemotron, qwen35) and the `oq4_repack` tool all call it, so they cannot drift.
-///
-/// Output layout (`[m, k]`, `ng = k/256`):
-///   `[split nibbles m*(k/2)]` — prefill MMQ/f16 (`sub_offset 0`)
-///   `[split f32 scales m*ng]` — prefill weight-scale region (`sub_offset m*(k/2)`)
-///   `[interleaved m*ng*132]`  — decode GEMVs: per group `[f32 scale][128 nibbles]`
-///                               contiguous → one coalesced stream (mq4-style).
-pub fn oq4_pack_arch_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    const GROUP: usize = 256;
-    const BLOCK: usize = 130; // 2 (f16 scale) + 128 nibbles
-    const ILB: usize = 4 + 128; // [f32 scale][128 nibbles]
-    assert_eq!(k % GROUP, 0, "OQ4G256 requires K % 256 == 0 (got K={k})");
-    let ng = k / GROUP;
-    let packed_bytes = m * (k / 2);
-    let scales_bytes = m * ng * 4;
-    let il_bytes = m * ng * ILB;
-    let expect = m * ng * BLOCK;
-    assert_eq!(
-        data.len(),
-        expect,
-        "OQ4G256 weight byte length {} != M*ng*130 = {expect} (M={m} K={k})",
-        data.len()
-    );
-    let mut combined = vec![0u8; packed_bytes + scales_bytes + il_bytes];
-    let il_base = packed_bytes + scales_bytes;
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let dst = r * (k / 2) + g * (GROUP / 2);
-            combined[dst..dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-            let so = packed_bytes + (r * ng + g) * 4;
-            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
-            let io = il_base + (r * ng + g) * ILB;
-            combined[io..io + 4].copy_from_slice(&scale.to_le_bytes());
-            combined[io + 4..io + ILB].copy_from_slice(&data[src + 2..src + BLOCK]);
-        }
-    }
-    combined
-}
-
 fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &Gpu,
@@ -1775,34 +1732,21 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
-        34 => {
-            // Oq4G256 — Opus Quant symmetric W4 (int4 per-256-group, FWHT-256
-            // rotated). Canonical on-disk form `[f16 scale][128 nibbles]`/group;
-            // repack to the arch combined device layout the shared Oq4 GEMV
-            // (`weight_gemv` Oq4G256 arm) and batched GEMM consume. K must be % 256
-            // (non-divisible linears, e.g. down_proj k=1408, stay BF16). This wires
-            // oq4 into the dense-llama path — incl. SpinQuant-R1 `.hfq` (`--rotate`),
-            // whose per-group FWHT is exactly the activation rotation this GEMV
-            // applies. Mirrors the qwen35 / nemotron oq4 loaders.
-            let combined = oq4_pack_arch_combined(data, m, k);
-            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+        // Oq4G256 (34, canonical) / Oq4G256ArchPacked (37, pre-packed) — Opus Quant
+        // symmetric W4 (int4 per-256-group, FWHT-256 rotated). The shared
+        // `oq4_arch_load` repacks the canonical form into the arch combined device
+        // layout the Oq4 GEMV (`weight_gemv` Oq4G256 arm) and batched GEMM consume,
+        // or borrows the pre-packed layout verbatim (zero-copy). K must be % 256
+        // (non-divisible linears, e.g. down_proj k=1408, stay BF16). This wires oq4
+        // into the dense-llama path — incl. SpinQuant-R1 `.hfq` (`--rotate`), whose
+        // per-group FWHT is exactly the activation rotation this GEMV applies.
+        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            let (bytes, gpu_dtype) = oq4_arch_load(info.quant_type, data, m, k)
+                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::Oq4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        37 => {
-            // Oq4G256ArchPacked — the on-disk data IS already the arch combined
-            // device layout (produced by the `oq4_repack` tool); upload verbatim.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Oq4G256,
+                gpu_dtype,
                 m,
                 k,
                 row_stride: 0,

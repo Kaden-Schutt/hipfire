@@ -2429,26 +2429,19 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
     }
 }
 
-/// Load weight tensor from raw bytes + quant_type (no name lookup needed).
-///
-/// On-disk quant_type for the arch-packed OQ4 layout produced by the
-/// `oq4_repack` tool. The canonical/general OQ4 form is quant_type 34
-/// (`[f16 scale][128 nibbles]`/group, portable across every arch); 37 means the
-/// tensor data is ALREADY the arch combined device layout from
-/// [`oq4_pack_arch_combined`], so the loader uploads it verbatim with no
-/// transform. The quant_type code IS the layout version: any future change to
-/// the combined layout takes a NEW code, so a stale arch-packed artifact refuses
-/// via the loader's catch-all (honest capability gap) instead of reading as
-/// garbage. The decoded `WeightTensor` is identical to the qt=34 path
-/// (`DType::Oq4G256`) — only the on-disk parse differs.
-pub const OQ4_ARCH_PACKED_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256ArchPacked.code();
-
-// The OQ4 arch-combined repack is the SINGLE source of truth in
-// `hipfire_runtime::hfq` (the qt=34 llama/nemotron/qwen35 loaders and the
-// `oq4_repack` tool all call it). Re-exported here to preserve the historical
-// `hipfire_arch_qwen35::qwen35::{oq4_pack_arch_combined, oq4_arch_combined_len}`
-// path (e.g. the oq4_repack example) without keeping a second copy.
-pub use hipfire_runtime::hfq::{oq4_arch_combined_len, oq4_pack_arch_combined};
+// OQ4 arch-packing is the SINGLE source of truth in `hipfire_runtime::oq4_arch`
+// (re-exported through `hipfire_runtime::hfq`): every qt=34 loader and the
+// offline optimize tool call it. Re-exported here — including the canonical (34)
+// / arch-packed (37) quant-type codes and the `oq4_arch_load` decision helper —
+// to preserve the historical `hipfire_arch_qwen35::qwen35::{...}` paths without
+// keeping a second copy. Canonical (34) repacks at load; arch-packed (37) is the
+// combined layout already and uploads verbatim. The quant-type code IS the
+// layout version: a future layout change takes a NEW code, so a stale artifact
+// refuses via the loader's catch-all rather than reading as garbage.
+pub use hipfire_runtime::hfq::{
+    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, OQ4_ARCH_PACKED_QT,
+    OQ4_CANONICAL_QT,
+};
 
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
 /// in `hipfire-arch-qwen2::qwen2::load_weight_tensor` inlines a subset
@@ -2876,56 +2869,25 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
-        34 => {
-            // Opus Quant W4A4 (OQ4G256, quant_type id 34 — the eval-plan's reserved
-            // "Opus Quant" slot; 32=MQ+, 33=OQ+/Opus Plus stay reserved for those).
-            // On-disk: [f16 scale][128 nibbles] per
-            // 256-group, row-contiguous (codec `quantize_oq4g256`). Repack to the
-            // kernel layout in ONE buffer — packed nibbles [M,K/2] followed by
-            // per-group f32 scales [M,K/256] — so the forward derives the
-            // weight-scale pointer via `GpuTensor::sub_offset(M*K/2, ..)` and feeds
-            // the existing `gemm_oq4_grouped_wmma` with no extra WeightTensor field.
-            // Activations are quantized to int4 at runtime (`quantize_act_oq4`);
-            // weights are already FWHT-rotated offline, so the forward FWHT-rotates
-            // x to match (shared mq_rotate_x path). AWQ smooth, when present, is
-            // applied to x by the wrapper via the awq_scale sidecar.
-            // Repack the canonical on-disk form to the arch combined device
-            // layout (see `oq4_pack_arch_combined` for the layout doc). The
-            // `oq4_repack` tool can do this transform ahead-of-time and store it
-            // as quant_type 37 (uploaded verbatim below) — same bytes, no per-load
-            // repack. Prefill (MMQ/f16) reads the split region (sub_offset 0);
-            // decode GEMVs read the interleaved region. The +~0.25 GB dual-layout
-            // is the cost while decode is migrated; collapse to interleaved-only
-            // once prefill is moved too. See gemv_oq4_interleaved.
-            let combined = oq4_pack_arch_combined(data, m, k);
-            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            // Opus Quant W4A4 (OQ4G256). Canonical (34) on-disk `[f16 scale][128
+            // nibbles]`/256-group repacks to the arch combined device layout — packed
+            // nibbles [M,K/2] + per-group f32 scales [M,K/256] + interleaved decode
+            // records — so the forward derives the weight-scale pointer via
+            // `GpuTensor::sub_offset(M*K/2, ..)` and feeds `gemm_oq4_grouped_wmma`.
+            // Arch-packed (37, `hipfire optimize` output) IS that layout already and
+            // uploads verbatim (zero-copy) after a length check. Prefill (MMQ/f16)
+            // reads the split region (sub_offset 0); decode GEMVs read the interleaved
+            // region. Activations quantize to int4 at runtime (`quantize_act_oq4`);
+            // weights are FWHT-rotated offline so the forward FWHT-rotates x to match
+            // (shared mq_rotate_x path). AWQ smooth, when present, is applied to x by
+            // the wrapper via the awq_scale sidecar.
+            let (bytes, gpu_dtype) = oq4_arch_load(quant_type, data, m, k)
+                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::Oq4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        37 => {
-            // Arch-packed OQ4 (`oq4_repack` output): the on-disk data IS the arch
-            // combined device layout already, so upload it verbatim — no per-load
-            // transform. Byte-identical to the qt=34 result; the quant_type code
-            // is the layout version (a future layout change takes a new code, so a
-            // stale artifact refuses via the catch-all rather than reading garbage).
-            let expect = oq4_arch_combined_len(m, k);
-            assert_eq!(
-                data.len(),
-                expect,
-                "OQ4 arch-packed byte length {} != combined len {expect} (M={m} K={k})",
-                data.len()
-            );
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Oq4G256,
+                gpu_dtype,
                 m,
                 k,
                 row_stride: 0,
