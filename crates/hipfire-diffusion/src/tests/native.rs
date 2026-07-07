@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,6 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
 
 #[test]
 fn native_runtime_metadata_support_reports_runtime_boundaries() {
@@ -451,7 +451,11 @@ fn native_transformer_timestep_embedding_loads_krea_mod_projection() {
     let output = embedding
         .forward_with_runtime_context(&[0.0], &mut runtime_context)
         .unwrap();
-    let expected = [silu(1.0) + 0.25, -0.5];
+    // Krea2 time_embed uses tanh-GELU (not SiLU), and the modulation projection
+    // is applied to gelu(temb). Mirror `transformer::gelu_tanh` exactly.
+    let gelu_tanh =
+        |x: f32| 0.5 * x * (1.0 + (0.797_884_560_8_f32 * (x + 0.044715 * x * x * x)).tanh());
+    let expected = [gelu_tanh(1.0) + 0.25, -0.5];
     assert_eq!(output.shape, vec![1, 2]);
     assert!((output.data[0] - expected[0]).abs() < 1e-6);
     assert!((output.data[1] - expected[1]).abs() < 1e-6);
@@ -461,9 +465,9 @@ fn native_transformer_timestep_embedding_loads_krea_mod_projection() {
         .unwrap();
     assert_eq!(modulation.shape, vec![1, 3]);
     let expected_modulation = [
-        expected[0],
-        expected[1] + 1.0,
-        expected[0] + expected[1] - 1.0,
+        gelu_tanh(expected[0]),
+        gelu_tanh(expected[1]) + 1.0,
+        gelu_tanh(expected[0]) + gelu_tanh(expected[1]) - 1.0,
     ];
     for (actual, expected) in modulation.data.iter().zip(expected_modulation) {
         assert!((actual - expected).abs() < 1e-6);
