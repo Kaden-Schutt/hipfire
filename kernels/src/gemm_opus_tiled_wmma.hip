@@ -2,20 +2,23 @@
 // Copyright (c) 2026 hipfire contributors
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Opus-Quant W4A8, register-tiled: 4-bit weight × 8-bit activation. gfx1103
-// (RDNA3) wave32, ZERO LDS. The weight is stored packed signed-int4 (¼ the bf16
-// footprint, ½ of oq8), unpacked to int8 in-register, and multiplied by the
-// dynamic-int8 activation on v_wmma_i32_16x16x16_iu8 — so the compute matches
-// the tiled oq8 kernel (int8 WMMA) while halving weight-memory traffic again.
-// Keeps int8 activation precision (unlike W4A4), which matters for diffusion.
+// Opus-Quant tiled GEMM, unified W4A8 / W8A8. gfx1103 (RDNA3) wave32, ZERO LDS.
 //
-//   W : [M, K/2] packed signed int4  (byte = k_even | k_odd<<4, two's-comp)
-//   Ws: [M, K/G] f32  per-group weight scales
-//   X : [B, K]   signed int8          Xs: [B, K/G] f32  per-group act scales
-//   Y : [B, M] f32
+// The Opus codec is designed so a single kernel processes both W4A8 and W8A8:
+// the activation is always dynamic int8 and the inner product always runs on
+// v_wmma_i32_16x16x16_iu8, so the *only* difference between the two is how the
+// weight fragment is fetched — int8 loaded directly (W8), or packed int4
+// unpacked to int8 in-register (W4). WBITS (compile-time 8 or 4) selects that
+// fetch; every branch on it folds away, so w8/w4 are the same kernel body. This
+// makes mixed-precision artifacts (e.g. oq4.25) trivial: the loader routes each
+// tensor to the w4 or w8 entrypoint by quant_type, sharing one implementation.
+//
+//   W8: W int8 [M,K]            row stride K bytes,  group off = g*group + kt*16
+//   W4: W packed int4 [M,K/2]   row stride K/2,      group off = g*group/2 + kt*8
+//   Ws: [M, K/group] f32   X: int8 [B,K]   Xs: [B,K/group] f32   Y: f32 [B,M]
 //   Y[b,m] = Σ_g sw[m,g]·sx[b,g] · Σ_{k∈g} qw[m,k]·qx[b,k]
-// Requires K % group == 0 and group % 16 == 0. MB×NB 16×16 output subtiles per
-// wave (independent int32 group accumulators → ILP, fragment reuse).
+// MB×NB 16×16 output subtiles per wave; independent int32 group accumulators
+// (ILP) rescaled into f32. Requires K % group == 0, group % 16 == 0.
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -24,21 +27,24 @@ typedef int32_t __attribute__((ext_vector_type(4))) int32x4_t;
 typedef int32_t __attribute__((ext_vector_type(8))) int32x8_t;
 typedef float   __attribute__((ext_vector_type(8))) float8_t;
 
-// Unpack 16 packed signed-int4 (8 bytes) into 16 signed int8 packed as int32x4,
-// preserving K order (byte b -> low nibble = even k, high nibble = odd k). Each
-// nibble is sign-extended: v = (nib ^ 8) - 8.
-static __device__ __forceinline__ int32x4_t unpack_i4x16_to_i8(const uint8_t* p) {
-    const uint32_t lo = *(const uint32_t*)(p + 0); // bytes 0..3 -> int8 0..7
-    const uint32_t hi = *(const uint32_t*)(p + 4); // bytes 4..7 -> int8 8..15
+static __device__ __forceinline__ int32x4_t opus_load_i8x16(const uint8_t* p) {
+    return *(const int32x4_t*)p; // 16 int8 = one int32x4
+}
+
+// Unpack 16 packed signed-int4 (8 bytes) → 16 signed int8 as int32x4, K order
+// preserved (low nibble = even k). Each nibble sign-extended: (nib^8)-8.
+static __device__ __forceinline__ int32x4_t opus_unpack_i4x16(const uint8_t* p) {
+    const uint32_t lo = *(const uint32_t*)(p + 0);
+    const uint32_t hi = *(const uint32_t*)(p + 4);
     int32x4_t out;
     #pragma unroll
     for (int w = 0; w < 4; ++w) {
         const uint32_t src = (w < 2) ? lo : hi;
-        const int byte0 = (w & 1) ? 2 : 0;         // two source bytes -> one int32 (4 int8)
+        const int byte0 = (w & 1) ? 2 : 0;
         const uint32_t b0 = (src >> (byte0 * 8)) & 0xff;
         const uint32_t b1 = (src >> ((byte0 + 1) * 8)) & 0xff;
-        const int s0 = (int)((b0 & 0xf) ^ 0x8) - 8; // even k
-        const int s1 = (int)((b0 >> 4) ^ 0x8) - 8;  // odd  k
+        const int s0 = (int)((b0 & 0xf) ^ 0x8) - 8;
+        const int s1 = (int)((b0 >> 4) ^ 0x8) - 8;
         const int s2 = (int)((b1 & 0xf) ^ 0x8) - 8;
         const int s3 = (int)((b1 >> 4) ^ 0x8) - 8;
         out[w] = (s0 & 0xff) | ((s1 & 0xff) << 8) | ((s2 & 0xff) << 16) | ((s3 & 0xff) << 24);
@@ -46,7 +52,7 @@ static __device__ __forceinline__ int32x4_t unpack_i4x16_to_i8(const uint8_t* p)
     return out;
 }
 
-#define DEFINE_TILED_OQ4A8_GEMM(NAME, TILE_MB, TILE_NB, MINWAVES)               \
+#define DEFINE_OPUS_TILED_GEMM(NAME, WBITS, TILE_MB, TILE_NB, MINWAVES)         \
 __launch_bounds__(32, MINWAVES)                                                \
 extern "C" __global__ void NAME(                                               \
     const uint8_t* __restrict__ W, const float* __restrict__ Ws,               \
@@ -59,7 +65,7 @@ extern "C" __global__ void NAME(                                               \
     const int row_start   = blockIdx.x * (16 * TILE_MB);                      \
     const int batch_start = blockIdx.y * (16 * TILE_NB);                      \
     if (row_start >= M || batch_start >= B) return;                          \
-    const int wstride = K / 2;                                                \
+    const int wstride = ((WBITS) == 8) ? K : (K / 2);                        \
     const int n_groups = K / group;                                          \
     const int tiles_per_group = group / 16;                                  \
     const uint8_t* w_row[TILE_MB];                                            \
@@ -87,17 +93,20 @@ extern "C" __global__ void NAME(                                               \
             _Pragma("unroll")                                                 \
             for (int ni = 0; ni < TILE_NB; ++ni)                              \
                 iacc[mi][ni] = {0,0,0,0,0,0,0,0};                             \
-        const int g_wbyte = g * (group / 2);                                 \
-        const int g_off = g * group;                                         \
+        const int g_elem = g * group;                                        \
         for (int kt = 0; kt < tiles_per_group; ++kt) {                       \
+            /* weight fetch — the ONLY W4/W8 difference (WBITS folds) */      \
+            const int woff = ((WBITS) == 8) ? (g_elem + kt * 16)             \
+                                            : (g_elem / 2 + kt * 8);          \
             int32x4_t a_frag[TILE_MB];                                       \
             int32x4_t x_frag[TILE_NB];                                       \
             _Pragma("unroll")                                                 \
             for (int mi = 0; mi < TILE_MB; ++mi)                              \
-                a_frag[mi] = unpack_i4x16_to_i8(w_row[mi] + g_wbyte + kt * 8);\
+                a_frag[mi] = ((WBITS) == 8) ? opus_load_i8x16(w_row[mi] + woff) \
+                                            : opus_unpack_i4x16(w_row[mi] + woff); \
             _Pragma("unroll")                                                 \
             for (int ni = 0; ni < TILE_NB; ++ni)                              \
-                x_frag[ni] = *(const int32x4_t*)(x_row[ni] + g_off + kt * 16);\
+                x_frag[ni] = *(const int32x4_t*)(x_row[ni] + g_elem + kt * 16); \
             _Pragma("unroll")                                                 \
             for (int mi = 0; mi < TILE_MB; ++mi)                              \
                 _Pragma("unroll")                                             \
@@ -136,6 +145,8 @@ extern "C" __global__ void NAME(                                               \
     }                                                                         \
 }
 
-DEFINE_TILED_OQ4A8_GEMM(gemm_oq4a8_tiled_wmma_2x2, 2, 2, 4)
-DEFINE_TILED_OQ4A8_GEMM(gemm_oq4a8_tiled_wmma_4x2, 4, 2, 2)
-DEFINE_TILED_OQ4A8_GEMM(gemm_oq4a8_tiled_wmma_2x4, 2, 4, 2)
+// W8A8 (weight int8 loaded directly) and W4A8 (weight int4 unpacked) — one body.
+DEFINE_OPUS_TILED_GEMM(gemm_opus_w8a8_tiled_wmma_2x2, 8, 2, 2, 4)
+DEFINE_OPUS_TILED_GEMM(gemm_opus_w8a8_tiled_wmma_2x4, 8, 2, 4, 2)
+DEFINE_OPUS_TILED_GEMM(gemm_opus_w4a8_tiled_wmma_2x2, 4, 2, 2, 4)
+DEFINE_OPUS_TILED_GEMM(gemm_opus_w4a8_tiled_wmma_2x4, 4, 2, 4, 2)

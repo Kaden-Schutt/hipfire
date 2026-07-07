@@ -147,10 +147,10 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
 
     // ---- register-tiled oq8 (w8a8: tiling win + int8 footprint) ----
     let mut oq8_tiled = Vec::new();
-    for &(mb, nb) in &[(2usize, 2usize), (4, 2), (2, 4)] {
+    for &(mb, nb) in &[(2usize, 2usize), (2, 4)] {
         let s = time_kernel(gpu, 3, 15, |g| {
             g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-            g.gemm_oq8_tiled_wmma(&w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, mb, nb)
+            g.gemm_opus_tiled_wmma(8, &w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, mb, nb)
                 .unwrap();
         });
         oq8_tiled.push(((mb, nb), s));
@@ -164,7 +164,7 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
     for &(mb, nb) in &[(2usize, 2usize), (2, 4)] {
         let s = time_kernel(gpu, 3, 15, |g| {
             g.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-            g.gemm_oq4a8_tiled_wmma(&w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, mb, nb)
+            g.gemm_opus_tiled_wmma(4, &w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, mb, nb)
                 .unwrap();
         });
         w4a8_tiled.push(((mb, nb), s));
@@ -173,12 +173,12 @@ fn bench_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize) {
     // validate the 2x4 oq8-tiled config numerics (the fastest, at the 255-VGPR
     // edge); reuses the sampled f32 reference below via y_oq8.
     gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-    gpu.gemm_oq8_tiled_wmma(&w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, 2, 4)
+    gpu.gemm_opus_tiled_wmma(8, &w_i8, &w_scales, &xq_i8, &xs, &y_oq8, m, k, b, GROUP, 2, 4)
         .unwrap();
     gpu.device_synchronize().unwrap();
     // W4A8 2x4 numerics into its own reference-checked buffer.
     gpu.quantize_act_oq8(&x_f32, &xq_i8, &xs, b, k, GROUP).unwrap();
-    gpu.gemm_oq4a8_tiled_wmma(&w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, 2, 4)
+    gpu.gemm_opus_tiled_wmma(4, &w_i4, &w4_scales, &xq_i8, &xs, &y_w4a8, m, k, b, GROUP, 2, 4)
         .unwrap();
     gpu.device_synchronize().unwrap();
 

@@ -2192,14 +2192,20 @@ pub(crate) fn linear_resident_weight_resident(
     // dynamic-int8 activation — the fastest tier on the DiT shapes (~7.5x naive,
     // ~1.5x oq8) since it halves weight traffic again. Opt in with
     // HIPFIRE_DIFFUSION_W4A8=1; takes precedence over oq8.
+    // On-disk pre-quantized tensors (mixed-precision / oq4 / oq8 artifacts) carry
+    // their precision in quant_type and route to the matching tiled kernel
+    // unconditionally — there is no bf16 to fall back to. Otherwise the env flags
+    // opt bf16-on-disk weights into load-time quant (off gfx1151).
+    let ondisk_w4a8 = weight.quant_type == QT_DIFFUSION_TENSOR_OQ4_PLAIN;
+    let ondisk_oq8 = weight.quant_type == QT_DIFFUSION_TENSOR_OQ8_PLAIN;
     let quant_ok = gpu.arch != "gfx1151" && in_features % 256 == 0;
-    let use_w4a8 =
-        quant_ok && std::env::var("HIPFIRE_DIFFUSION_W4A8").ok().as_deref() == Some("1");
+    let use_w4a8 = ondisk_w4a8
+        || (quant_ok && std::env::var("HIPFIRE_DIFFUSION_W4A8").ok().as_deref() == Some("1"));
     // W8A8 (oq8) path: int8 weight (½ bf16 footprint) × dynamic-int8 activation,
     // register-tiled oq8 GEMM. Opt in with HIPFIRE_DIFFUSION_OQ8=1.
-    let use_oq8 = quant_ok
-        && !use_w4a8
-        && std::env::var("HIPFIRE_DIFFUSION_OQ8").ok().as_deref() == Some("1");
+    let use_oq8 = !use_w4a8
+        && (ondisk_oq8
+            || (quant_ok && std::env::var("HIPFIRE_DIFFUSION_OQ8").ok().as_deref() == Some("1")));
     if use_w4a8 {
         const GROUP: usize = 256;
         let prep_start = if prof { Some(std::time::Instant::now()) } else { None };
@@ -2234,9 +2240,9 @@ pub(crate) fn linear_resident_weight_resident(
         gpu.quantize_act_oq8(input, &xq, &xs, rows, in_features, GROUP)
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
-        gpu.gemm_oq4a8_tiled_wmma(
-            &w_i4_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows, GROUP,
-            2, 4,
+        gpu.gemm_opus_tiled_wmma(
+            4, &w_i4_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows,
+            GROUP, 2, 4,
         )
         .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         if let Some(start) = gemm_start {
@@ -2283,9 +2289,9 @@ pub(crate) fn linear_resident_weight_resident(
         gpu.quantize_act_oq8(input, &xq, &xs, rows, in_features, GROUP)
             .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         let gemm_start = if prof { Some(std::time::Instant::now()) } else { None };
-        gpu.gemm_oq8_tiled_wmma(
-            &w_i8_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows, GROUP,
-            2, 4,
+        gpu.gemm_opus_tiled_wmma(
+            8, &w_i8_view, &w_scales_view, &xq, &xs, &output, out_features, in_features, rows,
+            GROUP, 2, 4,
         )
         .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
         if let Some(start) = gemm_start {

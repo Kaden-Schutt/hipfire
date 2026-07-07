@@ -39,6 +39,16 @@ pub const QT_DIFFUSION_TENSOR_HFQ6_G256: u8 = 8;
 pub const QT_DIFFUSION_TENSOR_OQ4_G256: u8 = 9;
 /// Opus Quant 8-bit, 256-group, FWHT-rotated (258 B/block: f16 scale + 256 i8).
 pub const QT_DIFFUSION_TENSOR_OQ8_G256: u8 = 10;
+/// Plain (unrotated) Opus Quant W4A8: a resident linear `[M, K]` stored as one
+/// blob `[packed signed-int4 M*K/2 | f32 per-group scales M*(K/256)]`, exactly
+/// what `resident_w4a8` produces at load. Consumed directly by
+/// `gemm_opus_tiled_wmma` — no FWHT rotation, no runtime requant.
+pub const QT_DIFFUSION_TENSOR_OQ4_PLAIN: u8 = 11;
+/// Plain (unrotated) Opus Quant W8A8: `[M, K]` as `[int8 M*K | f32 scales
+/// M*(K/256)]`, consumed by `gemm_opus_tiled_wmma`. Pairs with OQ4_PLAIN for
+/// mixed-precision (e.g. oq4.25) artifacts — the loader routes each tensor to
+/// its kernel by `quant_type`, so per-layer precision needs no extra plumbing.
+pub const QT_DIFFUSION_TENSOR_OQ8_PLAIN: u8 = 12;
 pub const QT_DIFFUSION_TENSOR_BF16: u8 = 16;
 
 mod metadata;
@@ -189,7 +199,7 @@ struct RocmWeightCache {
     /// W8A8 load-time quant: per HFQ tensor **name**, the (int8 weight [M*K],
     /// per-group f32 scales [M*K/256]) pair for the tiled oq8 GEMM. Built once by
     /// decoding the bf16 source and per-group symmetric int8 quantizing it (no
-    /// FWHT rotation — plain oq8, matching gemm_oq8_tiled_wmma). Halves the
+    /// FWHT rotation — plain oq8, matching gemm_opus_tiled_wmma). Halves the
     /// resident weight footprint vs the bf16 cache.
     named_oq8: std::collections::HashMap<String, (hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)>,
     /// W4A8 load-time quant: per HFQ tensor **name**, the (packed signed-int4
@@ -447,7 +457,7 @@ impl RocmWeightCache {
     /// resident linear weight `[out, in]` (`in % 256 == 0`), building it once by
     /// decoding the bf16 source to f32 and per-group (256) symmetric int8
     /// quantizing it — plain oq8, no FWHT rotation, matching the layout
-    /// `gemm_oq8_tiled_wmma` expects (W int8 [M*K], Ws f32 [M*n_groups]). The
+    /// `gemm_opus_tiled_wmma` expects (W int8 [M*K], Ws f32 [M*n_groups]). The
     /// int8 + scale buffers stay resident (≈ half the bf16 footprint) and are
     /// reused across every step.
     fn resident_oq8(
@@ -471,6 +481,32 @@ impl RocmWeightCache {
         }
         let ng = k / GROUP;
         if !self.named_oq8.contains_key(&weight.name) {
+            // Already-quantized on disk: blob is [int8 M*K | f32 scales M*ng].
+            if weight.quant_type == QT_DIFFUSION_TENSOR_OQ8_PLAIN {
+                let blob = weight.read_bytes()?;
+                let packed_len = m * k;
+                if blob.len() != packed_len + m * ng * 4 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_oq8: oq8-plain {:?} has {} bytes, expected {}",
+                        weight.name,
+                        blob.len(),
+                        packed_len + m * ng * 4
+                    )));
+                }
+                let scales: Vec<f32> = blob[packed_len..]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let w_i8 = gpu
+                    .upload_raw(&blob[..packed_len], &[packed_len])
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                let w_scales = gpu
+                    .upload_f32(&scales, &[m * ng])
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                self.named_oq8.insert(weight.name.clone(), (w_i8, w_scales));
+                let (w_i8, w_scales) = self.named_oq8.get(&weight.name).unwrap();
+                return Ok((w_i8.buf.as_ptr(), w_scales.buf.as_ptr(), ng));
+            }
             // Fuse decode + per-group symmetric int8 quant and fan out over rows
             // with rayon (the bf16 fast path reads values straight from the
             // packed bytes, skipping the transient full-f32 decode).
@@ -519,7 +555,7 @@ impl RocmWeightCache {
     /// for a resident linear weight `[out, in]` (`in % 256 == 0`), built once by
     /// decoding the bf16 source and per-group (256) symmetric int4 quantizing it,
     /// packed two nibbles/byte (byte = even_k | odd_k<<4) to match
-    /// gemm_oq4a8_tiled_wmma. Quarter the bf16 footprint.
+    /// gemm_opus_tiled_wmma. Quarter the bf16 footprint.
     fn resident_w4a8(
         &mut self,
         gpu: &mut hipfire_rdna::Gpu,
@@ -541,6 +577,34 @@ impl RocmWeightCache {
         }
         let ng = k / GROUP;
         if !self.named_w4a8.contains_key(&weight.name) {
+            // Already-quantized on disk (mixed-precision / oq4 artifact): the blob
+            // is [packed int4 M*K/2 | f32 scales M*ng] — upload directly, no
+            // read-of-bf16 and no requant. This is the load-time win.
+            if weight.quant_type == QT_DIFFUSION_TENSOR_OQ4_PLAIN {
+                let blob = weight.read_bytes()?;
+                let packed_len = m * k / 2;
+                if blob.len() != packed_len + m * ng * 4 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "resident_w4a8: oq4-plain {:?} has {} bytes, expected {}",
+                        weight.name,
+                        blob.len(),
+                        packed_len + m * ng * 4
+                    )));
+                }
+                let scales: Vec<f32> = blob[packed_len..]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let w_i4 = gpu
+                    .upload_raw(&blob[..packed_len], &[packed_len])
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                let w_scales = gpu
+                    .upload_f32(&scales, &[m * ng])
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                self.named_w4a8.insert(weight.name.clone(), (w_i4, w_scales));
+                let (w_i4, w_scales) = self.named_w4a8.get(&weight.name).unwrap();
+                return Ok((w_i4.buf.as_ptr(), w_scales.buf.as_ptr(), ng));
+            }
             // Fuse decode + per-group int4 quant, fanned out over rows with rayon.
             let (packed, scales) = if weight.quant_type == QT_DIFFUSION_TENSOR_BF16 {
                 let prof = crate::gpu_ops::profile::enabled();

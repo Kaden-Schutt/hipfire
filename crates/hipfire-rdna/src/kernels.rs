@@ -3892,17 +3892,12 @@ pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
 pub const GEMM_BF16_TILED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_tiled_wmma.hip");
 
-/// Register-tiled, zero-LDS Opus-Quant W8A8 GEMM (gfx1103/RDNA3): int8
-/// generalization of the tiled bf16 kernel + per-group rescale. MB×NB subtiles
-/// per wave. See `kernels/src/gemm_oq8_tiled_wmma.hip`.
-pub const GEMM_OQ8_TILED_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_oq8_tiled_wmma.hip");
-
-/// Register-tiled, zero-LDS Opus-Quant W4A8 GEMM (gfx1103/RDNA3): packed
-/// signed-int4 weight unpacked to int8 in-register × dynamic-int8 activation on
-/// iu8 WMMA. MB×NB subtiles. See `kernels/src/gemm_oq4a8_tiled_wmma.hip`.
-pub const GEMM_OQ4A8_TILED_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_oq4a8_tiled_wmma.hip");
+/// Register-tiled, zero-LDS unified Opus-Quant W4A8 / W8A8 GEMM (gfx1103/RDNA3):
+/// dynamic-int8 activation × iu8 WMMA, weight fetched as int8 (W8) or unpacked
+/// from packed int4 (W4) — the only per-format difference. MB×NB subtiles. See
+/// `kernels/src/gemm_opus_tiled_wmma.hip`.
+pub const GEMM_OPUS_TILED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_opus_tiled_wmma.hip");
 
 /// Generic kernel library: WMMA BF16 × BF16 → BF16 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. F32 accumulation
