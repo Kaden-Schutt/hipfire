@@ -132,3 +132,33 @@ def certify(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
     verdict = cv.decide(parity_ok=True, coherence_ok=True, perf_verdict=pv)
     return cv.make_row(arch, kernel, lever, verdict, parity=p_detail, perf_delta=delta, perf_f=f,
                        coherence=c_detail, base_ref=base_ref, seeds=len(seeds))
+
+
+def _main():
+    """Measurement entry point: given two ALREADY-BUILT daemon binaries, run the three-arm gate and
+    print the verdict row JSON. The bash wrapper (ab_certify_serve.sh) builds the daemons + owns the
+    git/B_a/ledger mechanics; this owns the serve-path measurement. Keeps the GPU seam in serve_runner."""
+    import argparse
+    from serve_runner import LiveServeRunner
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arch", required=True)
+    ap.add_argument("--dev", type=int, required=True)
+    ap.add_argument("--kernel", required=True)
+    ap.add_argument("--label", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--base-daemon", required=True, dest="base_daemon")
+    ap.add_argument("--var-daemon", required=True, dest="var_daemon")
+    ap.add_argument("--base-ref", default="?", dest="base_ref")
+    ap.add_argument("--seeds", type=int, default=12)
+    ap.add_argument("--kv", default="q8")
+    ap.add_argument("--prompts-file", default=None, dest="prompts_file")
+    a = ap.parse_args()
+    runner = LiveServeRunner(a.model, a.arch, a.dev, prompts_file=a.prompts_file, kv=a.kv)
+    row = certify(runner, arch=a.arch, kernel=a.kernel, lever=a.label,
+                  base_daemon=a.base_daemon, var_daemon=a.var_daemon,
+                  base_ref=a.base_ref, seeds=list(range(a.seeds)))
+    print(json.dumps(row))
+
+
+if __name__ == "__main__":
+    _main()

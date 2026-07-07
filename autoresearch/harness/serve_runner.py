@@ -58,10 +58,12 @@ class LiveServeRunner(abc.ServeRunner):
         os.environ["HIPFIRE_DAEMON_BIN"] = cfg["_daemon_bin"]
         os.environ["HIP_VISIBLE_DEVICES"] = str(self.dev)
         if det:
+            # Parity runs the DETERMINISTIC production-adjacent path: q8 + error-feedback (q8_ef) +
+            # HIPFIRE_DETERMINISTIC (pins the WMMA reduction order). NOT fp32 — fp32 is not a prod/prof
+            # path, so parity on it would test a path that doesn't exist in production. q8_ef makes the
+            # Q8 DeltaNet state deterministic (error-feedback), so parity is on the real Q8 path.
             os.environ["HIPFIRE_DETERMINISTIC"] = "1"
-            # FLEET-TODO(1): also select FP32 DeltaNet state here (memory: "byte-parity MUST use FP32
-            # state + HIPFIRE_DETERMINISTIC=1"). Confirm the exact selector on the box before trusting
-            # parity — Q8 stochastic rounding would false-PARITY_FAIL baseline against itself.
+            os.environ["HIPFIRE_DN_STATE_EF"] = "1"
         else:
             os.environ.pop("HIPFIRE_DETERMINISTIC", None)
         home = os.path.expanduser(f"~/.cache/serve_runner_{self.arch}")
@@ -89,22 +91,23 @@ class LiveServeRunner(abc.ServeRunner):
 
     # --- ARM: coherence (Q8 registry temp>0, seed-SET × battery, same session=chain) ---
     def coherence_gens(self, daemon, seeds):
-        gens = []
-        for seed in seeds:
-            cfg = _cfg(self.model, daemon, "registry", self.kv, self.port_base + 1, seed=seed,
-                       prompts_file=self.prompts_file, mode="chain", max_tokens=4096)
-            def go(c, _seed=seed):
-                out, messages = [], []
+        # ONE serve for the WHOLE seed-set (not a serve per seed — that was 2*N model-loads/certify).
+        cfg = _cfg(self.model, daemon, "registry", self.kv, self.port_base + 1,
+                   prompts_file=self.prompts_file, mode="chain", max_tokens=4096)
+        def go(c):
+            out = []
+            for seed in seeds:
+                c["seed"] = seed
+                messages = []
                 for genre, prompt in sh.load_prompt_battery(self.prompts_file):
                     messages.append({"role": "user", "content": prompt})
                     r = sh.send(c, messages)
                     messages.append({"role": "assistant", "content": r.get("assistant_content", "")})
-                    out.append({"prompt_id": genre, "genre": genre, "seed": _seed,
+                    out.append({"prompt_id": genre, "genre": genre, "seed": seed,
                                 "text": r.get("assistant_content", ""), "token_ids": _toks_proxy(r),
                                 "finish": r.get("finish"), "empty": r.get("empty"), "tool_calls": []})
-                return out
-            gens.extend(self._run_on_serve(cfg, det=False, gen_fn=go))
-        return gens
+            return out
+        return self._run_on_serve(cfg, det=False, gen_fn=go)
 
     # --- ARM: perf (Q8, interleaved warmed prompt) ---
     def perf_durations(self, daemon):
