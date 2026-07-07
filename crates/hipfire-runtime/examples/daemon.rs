@@ -2681,6 +2681,15 @@ trait DenseServed {
     fn forward_token(&mut self, token: u32, pos: usize) -> Result<(), String>;
     fn logits(&mut self) -> Result<Vec<f32>, String>;
     fn eos_token(&self) -> u32;
+    /// Prefill the whole prompt. Default = per-token loop (back-compat / >256 fallback).
+    /// Postcondition: KV filled for positions 0..tokens.len(); `logits()` returns the
+    /// last position; decode resumes at pos = tokens.len().
+    fn prefill(&mut self, tokens: &[u32]) -> Result<(), String> {
+        for (pos, &t) in tokens.iter().enumerate() {
+            self.forward_token(t, pos)?;
+        }
+        Ok(())
+    }
 }
 impl DenseServed for hipfire_runtime::tp_serve::TpModel {
     fn forward_token(&mut self, t: u32, p: usize) -> Result<(), String> {
@@ -2754,11 +2763,9 @@ fn generate_dense<M: DenseServed>(
         }};
     }
 
-    // Prefill (per token — no batched prefill yet).
-    for (pos, &tok) in frame.iter().enumerate() {
-        if let Err(e) = model.forward_token(tok, pos) {
-            fail!(e);
-        }
+    // Prefill (batched when the model supports it; default = per token).
+    if let Err(e) = model.prefill(&frame) {
+        fail!(e);
     }
     let t_prefill = std::time::Instant::now();
     let prefill_ms = t_prefill.duration_since(t0).as_secs_f64() * 1000.0;
