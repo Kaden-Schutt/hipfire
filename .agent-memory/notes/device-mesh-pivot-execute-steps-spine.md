@@ -432,11 +432,24 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
   commit 38def37a** (SuperOp gone, EP clean, single-GPU hand-sole). Commits: 8783d35c(ds4 EP)/3cbbfc29(minimax EP)/
   38def37a(deletion). Next: P-E (Step::Recurrent/Conv + DeltaNet head-shard) per the phase plan, OR the deferred TP/PP
   polish (PB-TP5 daemon `generate_tp`, batched prefill, real-HW multi-GPU checks).
-- **Future TP polish (not blocking):** batched prefill (currently per-token); multi-turn KV reuse (currently stateless);
-  drop the redundant whole-`LlamaWeights` on rank0 (only embed/output_norm/lm_head + norms are used — the rank0 quant
-  layers are dead VRAM); real-hardware unload leak-check (emulated drop is fine); `resolve_mesh` isn't yet called by the
-  daemon (load routes on the raw `tp`/`ep` knobs) — wire it if mesh-driven load lands. Then P-C (PP-at-driver), P-D
-  (Step::Moe/EP fold retiring run_layer_program_mesh), P-E (Step::Recurrent/Conv + DeltaNet head-shard).
+- **Future TP polish — STATUS 2026-07-07 (P-C + P-D done; batched prefill done):**
+  - ✅ **batched prefill** — DONE 2026-07-07, `feature/device-mesh` `10184aa0..fc5d846e` (6 commits, SDD), note
+    [[tp-pp-batched-prefill]]. `DenseServed::prefill` seam (default per-token); PP banded `prefill_forward_band` (byte-exact
+    parity); TP new `Step::Gemm` through `execute_steps_tp` (argmax parity, Q8-KV-vs-F32 Δ=0.85). Single-batch ≤256 +
+    per-token fallback. Caught+fixed a latent `rotation.rs` batched-rotate bug (single-row on `n×k`).
+  - ⏭ **NEXT deferred items (unblocked on this gfx1151 box), recommended order:**
+    - **A** *(cheap, HIGHEST value)* — tighten `tp_prefill_parity` to a numeric bound (all-Q8-KV ref OR all-`n`-position,
+      ~1e-3). The batched-prefill feature's own #1 follow-up; hardens what just shipped (the one spot a TP precision
+      regression slips past greedy argmax).
+    - **B** *(next substantive polish)* — **multi-turn KV reuse** (serve is stateless per request → reuse KV across turns);
+      #462-sensitive daemon reset/checkpoint/abort state machine.
+    - **C** — `resolve_mesh` daemon wiring (load still routes on raw `tp`/`ep` knobs).
+    - **D** — >256 cross-chunk batched prefill (needs the flash `forward_prefill_batch` cache-attention).
+    - **E** *(small/low-value here)* — drop redundant rank0 whole-`LlamaWeights` (dead VRAM); revert/doc the `mq_x_rot`
+      prefill VRAM growth; AWQ-batched rotate coverage.
+  - 🚫 **HW-BLOCKED (need hipx/hiptrx 2-GPU):** real-hardware unload leak-check + a real 2-GPU same-arch =0 gate. Also the
+    pre-existing `hipfire-loader/src/lib.rs:1702` pp>1 unload panic (orthogonal to dense PpModel/TpModel — file separately).
+  - 🎯 **Big phase item after polish: P-E — Step::Recurrent/Conv + DeltaNet head-shard** (the last arch into the one spine).
 - **(historical) PB-TP5 REMAINING (daemon productionization) — `load_model_tp` + `generate_tp` + `LoadedModel.tp`.** Large mechanical
   wiring (mirror the EP integration): (1) a `TpState` in hipfire-loader { `Gpus`, `WeightStore`, per-rank RankState
   (scratch+KV+norms), config, eos } ; (2) `LoadedModel.tp: Option<TpState>` — ripples `tp: None` to every LoadedModel
