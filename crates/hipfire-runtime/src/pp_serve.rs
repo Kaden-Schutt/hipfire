@@ -29,8 +29,9 @@
 //! output stage; real-HW per-stage weight banding (VRAM win) is a follow-up.
 
 use crate::hfq::HfqFile;
-use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights, PrefillScratch};
 use crate::multi_gpu::Gpus;
+use rdna_compute::{DType, GpuTensor};
 use std::ops::Range;
 
 /// A dense llama model loaded pipeline-parallel across `pp` stages.
@@ -213,6 +214,157 @@ impl PpModel {
                 &self.scratch[s],
             )
             .map_err(herr)?;
+        }
+        Ok(())
+    }
+
+    /// Batched pipeline-parallel prefill: run the whole prompt in ONE batched
+    /// forward per stage (banded over layers), handing the `[n×dim]` residual
+    /// across each stage seam via `boundary_copy` — the batched analog of
+    /// [`forward_token`]. Fills every stage's KV for positions `0..n` and leaves
+    /// the last-position residual in `scratch[pp-1].x` so [`logits`] (unchanged)
+    /// returns the last-position logits. Decode resumes at `pos = n`.
+    ///
+    /// Single-batch only: `n > PREFILL_MAX_BATCH` (256) falls back to the
+    /// per-token loop (no cross-chunk prefill in this cut).
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<(), String> {
+        let n = tokens.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if n > crate::llama::PREFILL_MAX_BATCH {
+            // >256: keep today's per-token behaviour (no cross-chunk in this cut).
+            for (pos, &t) in tokens.iter().enumerate() {
+                self.forward_token(t, pos)?;
+            }
+            return Ok(());
+        }
+        if n > self.max_seq {
+            return Err(format!("prefill n {n} > max_seq {}", self.max_seq));
+        }
+        let dim = self.dim;
+
+        // positions = [0, 1, ..., n-1] i32. Same for EVERY stage (PP bands layers,
+        // not positions); each stage gets its own device copy. i32 packed into an
+        // f32-typed tensor (same byte width), mirroring `prefill_forward`.
+        let pos_bytes: Vec<u8> = (0..n as i32).flat_map(|p| p.to_ne_bytes()).collect();
+
+        // Keep each stage's scratch + residual batch alive across the stage loop
+        // (the seam `boundary_copy` reads the previous stage's `x_batch`); freed
+        // after the last stage, alloc-per-call like `prefill_forward`.
+        let mut scratches: Vec<PrefillScratch> = Vec::with_capacity(self.pp);
+        let mut x_batches: Vec<GpuTensor> = Vec::with_capacity(self.pp);
+
+        // ── Stage 0: embed the batch on device 0, then run its band. ──
+        {
+            let g = &mut self.gpus.devices[0];
+            g.bind_thread().map_err(herr)?;
+            let scratch0 = PrefillScratch::alloc(g, &self.config, n).map_err(herr)?;
+            let x_batch0 = g.alloc_tensor(&[n, dim], DType::F32).map_err(herr)?;
+            // Embedding: lookup each token into the batch buffer (mirror prefill_forward).
+            let x_single = g.alloc_tensor(&[dim], DType::F32).map_err(herr)?;
+            for (i, &token) in tokens.iter().enumerate() {
+                llama::embedding_lookup_dispatch(
+                    g,
+                    self.weights.embd_format,
+                    &self.weights.token_embd,
+                    &x_single,
+                    token,
+                    dim,
+                )
+                .map_err(herr)?;
+                g.hip
+                    .memcpy_dtod_at(&x_batch0.buf, i * dim * 4, &x_single.buf, 0, dim * 4)
+                    .map_err(herr)?;
+            }
+            g.free_tensor(x_single).map_err(herr)?;
+            let positions = g.alloc_tensor(&[n], DType::F32).map_err(herr)?;
+            g.hip
+                .memcpy_htod(&positions.buf, &pos_bytes)
+                .map_err(herr)?;
+            llama::prefill_forward_band(
+                g,
+                &self.weights,
+                &self.config,
+                &x_batch0,
+                self.bands[0].clone(),
+                &mut self.kv[0],
+                &positions,
+                &scratch0,
+                n,
+            )
+            .map_err(herr)?;
+            g.free_tensor(positions).map_err(herr)?;
+            scratches.push(scratch0);
+            x_batches.push(x_batch0);
+        }
+
+        // ── Stages 1..pp: boundary-copy the residual batch from the previous
+        //    stage, then run this stage's band. ──
+        for s in 1..self.pp {
+            // Allocate this stage's buffers first (needs the device mutably), then
+            // drop that borrow before the `&self.gpus` boundary_copy.
+            let (scratch_s, x_batch_s, positions) = {
+                let g = &mut self.gpus.devices[s];
+                g.bind_thread().map_err(herr)?;
+                let scratch_s = PrefillScratch::alloc(g, &self.config, n).map_err(herr)?;
+                let x_batch_s = g.alloc_tensor(&[n, dim], DType::F32).map_err(herr)?;
+                let positions = g.alloc_tensor(&[n], DType::F32).map_err(herr)?;
+                g.hip
+                    .memcpy_htod(&positions.buf, &pos_bytes)
+                    .map_err(herr)?;
+                (scratch_s, x_batch_s, positions)
+            };
+            let evt = self
+                .gpus
+                .boundary_copy(s - 1, s, &x_batches[s - 1].buf, &x_batch_s.buf, n * dim * 4)
+                .map_err(herr)?;
+            self.gpus.wait_boundary(evt).map_err(herr)?;
+            {
+                let g = &mut self.gpus.devices[s];
+                g.bind_thread().map_err(herr)?;
+                llama::prefill_forward_band(
+                    g,
+                    &self.weights,
+                    &self.config,
+                    &x_batch_s,
+                    self.bands[s].clone(),
+                    &mut self.kv[s],
+                    &positions,
+                    &scratch_s,
+                    n,
+                )
+                .map_err(herr)?;
+                g.free_tensor(positions).map_err(herr)?;
+            }
+            scratches.push(scratch_s);
+            x_batches.push(x_batch_s);
+        }
+
+        // ── Logits handoff: copy the LAST-position row of the last stage's
+        //    residual into `scratch[last].x` — the buffer `logits()` (final norm
+        //    + lm_head) reads. ──
+        let last = self.pp - 1;
+        {
+            let g = &mut self.gpus.devices[last];
+            g.bind_thread().map_err(herr)?;
+            g.hip
+                .memcpy_dtod_at(
+                    &self.scratch[last].x.buf,
+                    0,
+                    &x_batches[last].buf,
+                    (n - 1) * dim * 4,
+                    dim * 4,
+                )
+                .map_err(herr)?;
+        }
+
+        // ── Free per-stage scratch + residual batch. ──
+        for (s, (sc, xb)) in scratches.into_iter().zip(x_batches).enumerate() {
+            let g = &mut self.gpus.devices[s];
+            g.bind_thread().map_err(herr)?;
+            sc.free(g).map_err(herr)?;
+            g.free_tensor(xb).map_err(herr)?;
         }
         Ok(())
     }

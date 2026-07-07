@@ -2712,6 +2712,9 @@ impl DenseServed for hipfire_runtime::pp_serve::PpModel {
     fn eos_token(&self) -> u32 {
         hipfire_runtime::pp_serve::PpModel::eos_token(self)
     }
+    fn prefill(&mut self, tokens: &[u32]) -> Result<(), String> {
+        hipfire_runtime::pp_serve::PpModel::prefill(self, tokens)
+    }
 }
 
 /// Dense multi-GPU serve (PB-TP5 / P-C). Serves a llama-family model over ANY

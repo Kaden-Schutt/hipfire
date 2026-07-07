@@ -330,6 +330,11 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
 
+# Batched pipeline-parallel prefill parity — llama-family only, no arch/deltanet
+# features (mirrors auto-discovered pp_decode_parity).
+[[example]]
+name = "pp_prefill_parity"
+
 # build_kld_ref needs no GPU / arch features — it just orchestrates
 # llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
 [[example]]
