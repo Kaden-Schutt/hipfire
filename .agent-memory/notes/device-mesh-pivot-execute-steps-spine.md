@@ -473,7 +473,26 @@ already depends on hipfire-hardware and uses `Gpus`+`all_reduce_sum_f32_peer` (e
       new-gap close. Separate pre-existing latent: EP/minimax path (`daemon.rs:3725`) overcounts by one on stop-sequence
       exits (push-before-forward) — file separately. Spec/plan: local
       `docs/superpowers/{specs,plans}/2026-07-07-dense-multiturn-kv-reuse*.md`.
-    - **C** *(next)* — `resolve_mesh` daemon wiring (load still routes on raw `tp`/`ep` knobs).
+    - ✅ **C** — DONE 2026-07-08 `feature/device-mesh` `01234a93..df93a87a` (3 commits `c49de293`/`faf93ff3`/`df93a87a`, SDD).
+      **FULL mesh-drive of qwen35-PP load** (routing + degree off the mesh; qwen35 was the last scalar-driven load path).
+      **KEY DESIGN (revised by a 3-agent adversarial pre-review):** ragged `HIPFIRE_PP_LAYERS` bands are model-specific
+      load-time data → carried on **`LoadCtx.pp_bands: Option<&'a [usize]>`, NOT on `DeviceMesh`** (mesh stays purely
+      topological — `resolve_mesh`/`from_mesh`/`stage_for_layer`/mesh.rs + the 2 example callers all UNTOUCHED). The first
+      draft put bands on the mesh; the review rejected it (topology smell: re-encodes `n_layers`, breaks
+      `stage_for_layer(n_layers)` contract + `Eq`-means-placement; AND a real bug — the daemon builds one shared mesh
+      before arch routing, so a banded mesh would flow into the dense arm where `from_mesh`/`PpModel` map uniformly →
+      lying metadata). LoadCtx-carried bands dissolve all of it. **Shape:** pure `config::parse_pp_layers(env, pp)` helper
+      (unit-tested: empty/None→uniform, len!=pp→Err, unparseable→Err); `load_model` takes `&DeviceMesh` (replaces `pp`
+      scalar) + `pp_bands`, `ctx.pp=mesh.size_of(Pp)`; qwen35 carrier reads `ctx.pp_bands` (`Some`→`init_layers` VRAM-gate
+      OFF / `None`→`init_uniform` gate ON — **preserved bit-for-bit**, the load-bearing constraint); daemon edge parses in
+      the qwen35 arm ONLY (`pp>1 && !dense_llama_pp`), `dense_llama_pp` now on `mesh.has_axis(Pp)`. Validation split:
+      `len==pp` at daemon edge (emit `{"type":"error"}`+`continue`, non-fatal), `sum==n_layers` in carrier (needs config).
+      **Uniform path byte-identical; dense/EP/TP untouched.** Gates: build + no-gpu-ci PASS; coherence-gate no-hard-errors;
+      emulated qwen35 PP-2 (qwen3.5-0.8b, 24L) B1 uniform / B2 ragged `10,14`→init_layers / B3a wrong-len→error-no-panic /
+      B3b empty→uniform ALL PASS. Whole-branch review (opus) = **READY** (6/6 correctness props confirmed; no
+      Critical/Important). **Follow-up (non-blocking):** `parse_pp_layers` accepts a `0` band (byte-identical to pre-change
+      — no `>0` guard existed; harden with `count>0` if ragged PP graduates to real 2-GPU HW). Spec/plan (gitignored
+      local): `docs/superpowers/{specs,plans}/2026-07-08-mesh-driven-qwen35-pp-load*.md`.
     - **D** — >256 cross-chunk batched prefill (needs the flash `forward_prefill_batch` cache-attention).
     - **E** *(small/low-value here)* — drop redundant rank0 whole-`LlamaWeights` (dead VRAM); revert/doc the `mq_x_rot`
       prefill VRAM growth; AWQ-batched rotate coverage.
