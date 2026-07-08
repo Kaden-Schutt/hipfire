@@ -7,15 +7,17 @@ reusing serve_harness's spawn + send machinery so measurement goes through the r
 raw-daemon voodoo). It runs ONE model on a per-arm serve (env differs per arm) and returns the
 generation dicts the orchestrator consumes.
 
-  STATUS: parity + coherence + perf arms VALIDATED live on gfx1151 (null-variant certify:
-  parity byte-exact PASS, coherence base-vs-base PASS, perf +0.46%/f=0.461 ~tied). Remaining fleet
-  item:
-    - token-ids over HTTP (the OpenAI stream returns TEXT; until the daemon emits token-ids the
-      attractor detector runs on a WORD proxy — gap #17's calibration caveat applies). Marked
-      `FLEET-TODO(2)` below.
-  RESOLVED: parity determinism is q8_ef + HIPFIRE_DETERMINISTIC (NOT fp32 — fp32 isn't a prod/prof
-  path); perf is rocprof pinned-clock kernel-DURATION under profile_standard (gap #4) — the HTTP
-  kernel_decode_tok_s proxy it replaced showed a +3% sequential-thermal artifact on a null variant.
+  ARM PATHS (deliberate, per Kaden):
+    - PARITY   = RAW DAEMON short single greedy, REAL committed token-ids (HIPFIRE_EMIT_TOKEN_IDS).
+                 Daemon voodoo is allowed ONLY here — a short, no-thinking greedy run is reproducible,
+                 so token-id-exact value-preservation works (serve-path byte-exact does NOT: the
+                 thinking trace is non-deterministic). Mirrors the original ab_certify_v2p parity gate.
+    - COHERENCE= the REAL serve path (hipfire serve, thinking ON, sampled). NO voodoo. This is the
+                 primary correctness gate + the user path. FLEET-TODO(2): the OpenAI stream returns
+                 TEXT, so the attractor detector runs on a WORD proxy until token-ids are on HTTP.
+    - PERF     = rocprof pinned-clock kernel-DURATION (profile_standard, gap #4). A timing measurement,
+                 not an output test — the tok_s HTTP proxy it replaced showed a +3% thermal artifact.
+  VALIDATED live on gfx1151 (null variant): perf ~tied/DEAD, wrapper build+commit+advance+ledger.
 """
 import os, sys, re, glob, csv as _csvmod, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
@@ -86,19 +88,39 @@ class LiveServeRunner(abc.ServeRunner):
         finally:
             sh._kill_serve()
 
-    # --- ARM: parity (q8_ef + HIPFIRE_DETERMINISTIC greedy, battery — byte-exact text vs B_a) ---
+    # --- ARM: parity (RAW DAEMON, short single greedy, token-id EXACT) ---
+    # Value-preservation check ONLY. Daemon voodoo is permitted HERE (and only here): a SHORT greedy
+    # run with a PLAIN prompt (no chatml -> no thinking) emits token-ids that ARE reproducible, unlike
+    # the serve path whose long thinking trace diverges on Q8 FP-atomic noise. Mirrors the original
+    # ab_certify_v2p parity gate. (JIT .hsaco cache is source-hash gated per compiler.rs, so the
+    # variant daemon recompiles its OWN kernel — no base/var reuse collision.) Coherence stays on the
+    # real serve path; perf is a rocprof timing measurement. No voodoo anywhere else.
+    PARITY_PROMPTS = [
+        ("p1", "Write a detailed paragraph about the history and future of computing."),
+        ("p2", "List the steps to reverse a singly linked list, then give the time complexity."),
+    ]
+
     def parity_gens(self, daemon):
-        cfg = _cfg(self.model, daemon, "greedy", self.kv, self.port_base,
-                   prompts_file=self.prompts_file, mode="battery")
-        def go(c):
-            gens = []
-            for genre, prompt in sh.load_prompt_battery(self.prompts_file):
-                r = sh.send(c, [{"role": "user", "content": prompt}])
-                gens.append({"prompt_id": genre, "genre": genre, "seed": 0,
-                             "text": r.get("assistant_content", ""), "token_ids": _toks_proxy(r),
-                             "finish": r.get("finish"), "empty": r.get("empty"), "tool_calls": []})
-            return gens
-        return self._run_on_serve(cfg, det=True, gen_fn=go)
+        import json as _json
+        req = '{"type":"load","model":"%s","params":{"max_seq":2048,"kv_mode":"%s"}}\n' % (self.model, self.kv)
+        for pid, pr in self.PARITY_PROMPTS:
+            req += '{"type":"generate","id":"%s","prompt":"%s","temperature":0.0,"max_tokens":48}\n' % (pid, pr)
+        req += '{"type":"unload"}\n'
+        env = dict(os.environ, HIP_VISIBLE_DEVICES=str(self.dev), HIPFIRE_EMIT_TOKEN_IDS="1",
+                   HIPFIRE_DETERMINISTIC="1", HIPFIRE_DN_STATE_EF="1")
+        r = subprocess.run(daemon, input=req, shell=True, capture_output=True, text=True, env=env)
+        ids = {pid: [] for pid, _ in self.PARITY_PROMPTS}
+        for line in r.stdout.splitlines():
+            if '"committed"' not in line:
+                continue
+            try:
+                d = _json.loads(line)
+            except Exception:
+                continue
+            rid, tid = d.get("id"), d.get("tok_id")
+            if rid in ids and tid is not None:
+                ids[rid].append(tid)
+        return [{"prompt_id": pid, "token_ids": ids[pid], "text": ""} for pid, _ in self.PARITY_PROMPTS]
 
     # --- ARM: coherence (Q8 registry temp>0, seed-SET × battery, same session=chain) ---
     def coherence_gens(self, daemon, seeds):

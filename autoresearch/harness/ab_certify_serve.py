@@ -8,15 +8,14 @@ serve_harness against it — is behind a `ServeRunner` seam (dependency-injected
 orchestration (arm assembly, parity short-circuit, coherence hard-gate, B_a advancement, ledger row)
 is unit-testable no-GPU with a mock runner. The real runner is a thin adapter (built next).
 
-Measurement layout (serve-default gate):
-  PERF      : rocprof pinned-clock kernel-DURATION (profile_standard) -> MWU. Cheap filter (no gain
-              -> DEAD, stop before the expensive coherence arm).
-  COHERENCE : the PRIMARY correctness gate. Q8 serve, thinking ON, registry temp>0, multiturn
-              seed-SET + semantic validators -> McNemar paired rate test. This IS the user path.
-  PARITY    : SECONDARY, opt-in (parity_check). Greedy self-reproducible-prefix diagnostic; byte-exact
-              is overly ambitious on a sampled thinking run (Q8 isn't run-to-run deterministic), so it
-              never gates.
-Order: perf (filter) -> coherence (gate the winner). WIN = a real perf gain that STAYS coherent.
+Measurement layout:
+  PARITY    : value-preservation. RAW DAEMON short single greedy, token-id EXACT. Daemon voodoo is
+              permitted ONLY here — a plain-prompt no-thinking <=48-tok greedy run IS reproducible
+              (the serve path's thinking trace is not). A value change -> PARITY_FAIL. Cheapest, first.
+  PERF      : rocprof pinned-clock kernel-DURATION (profile_standard) -> MWU. Filter (no gain -> DEAD).
+  COHERENCE : the PRIMARY correctness gate on the REAL user path — SERVE, thinking ON, sampled,
+              multiturn seed-SET + semantic validators -> McNemar. NO voodoo here.
+Order: parity -> perf -> coherence. WIN = value-preserving AND faster AND stays coherent.
 """
 import sys, os, json
 sys.path.insert(0, os.path.dirname(__file__))
@@ -53,50 +52,25 @@ def _gen_fails(gen, expect):
 
 # ---------- ARM: parity (FP32-det greedy, byte-exact text) ----------
 
-def _common_prefix(a, b):
-    n = 0
-    for x, y in zip(a, b):
-        if x == y:
-            n += 1
-        else:
-            break
-    return a[:n]
-
-
-def parity_result(base_a, base_b, var_gens):
-    """Value-preserving iff the variant AGREES with B_a on B_a's own SELF-REPRODUCIBLE prefix.
-
-    Byte-exact text is too strict here: the Q8 "deterministic" path (q8_ef + HIPFIRE_DETERMINISTIC)
-    is NOT fully run-to-run reproducible — a long greedy trace diverges on FP-atomic / stochastic-
-    rounding noise, so two runs of the SAME baseline differ (found live: a byte-identical null variant
-    PARITY_FAILed). So we take base_a vs base_b as the baseline's self-consistent prefix and require
-    the variant to match only THAT: a value-changing kernel flips an early logit (inside the stable
-    prefix), while late Q8 noise falls outside it. A prompt whose baseline isn't self-reproducible at
-    all (stable prefix empty) can't certify parity -> counted as unstable (reported, not a pass)."""
-    amap = {g["prompt_id"]: g for g in base_a}
-    bmap = {g["prompt_id"]: g for g in base_b}
-    mismatches, unstable = [], []
+def parity_result(base_gens, var_gens):
+    """Value-preserving iff the variant's committed TOKEN-IDS equal the baseline's on every parity
+    prompt. Runs on the RAW-DAEMON short greedy path (serve_runner.parity_gens): a plain-prompt,
+    no-thinking, <=48-token greedy run IS reproducible, so exact token-id comparison is valid and a
+    value-changing kernel flips a token -> PARITY_FAIL. (Serve-path byte-exact was the mistake — its
+    thinking trace is non-deterministic; raw-daemon short is the permitted value-preservation voodoo.)
+    Empty baseline ids = the daemon produced nothing (infra), not a pass."""
+    bmap = {g["prompt_id"]: (g.get("token_ids") or []) for g in base_gens}
+    mismatches, empty = [], []
     for vg in var_gens:
         pid = vg["prompt_id"]
-        ga, gb = amap.get(pid), bmap.get(pid)
-        if ga is None or gb is None:
+        b = bmap.get(pid, [])
+        v = vg.get("token_ids") or []
+        if not b:
+            empty.append(pid)
+        elif b != v:
             mismatches.append(pid)
-            continue
-        ta, tb, tv = ga.get("text", ""), gb.get("text", ""), vg.get("text", "")
-        if ta == tb:
-            # baseline fully self-reproducible -> require EXACT equality (a variant that stops earlier
-            # or runs longer is a value change even if it shares a prefix).
-            if tv != ta:
-                mismatches.append(pid)
-        else:
-            stable = _common_prefix(ta, tb)
-            if not stable:
-                unstable.append(pid)      # baseline diverges from itself immediately — no signal
-            elif tv[:len(stable)] != stable:
-                mismatches.append(pid)    # variant diverges inside the baseline's stable region
-    ok = len(mismatches) == 0 and len(unstable) < len(var_gens)  # need at least one certifiable prompt
-    return (ok, {"stable_prefix_exact": len(mismatches) == 0, "mismatches": mismatches,
-                 "unstable_prompts": unstable})
+    ok = len(mismatches) == 0 and len(empty) < len(var_gens)
+    return (ok, {"token_id_exact": len(mismatches) == 0, "mismatches": mismatches, "empty": empty})
 
 
 # ---------- ARM: coherence (Q8 seed-set, paired McNemar rate test) ----------
@@ -152,37 +126,35 @@ class ServeRunner:
 
 
 def certify(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
-            seeds, expects=None, parity_check=False):
-    """Serve-default gate for `var_daemon` vs `base_daemon` (= B_a). Returns the ledger row.
+            seeds, expects=None):
+    """Gate for `var_daemon` vs `base_daemon` (= B_a). Returns the ledger row. Three gates, in order:
 
-    PRIMARY correctness = COHERENCE on the real user path: thinking ON, sampled (registry temp>0),
-    multiturn seed-SET + semantic validators. A value change that MATTERS shows up here (attractor,
-    wrong answer, degraded vs baseline). PERF = rocprof pinned-clock kernel-duration.
+      1. PARITY  — value-preservation. RAW-DAEMON short greedy, token-id EXACT (daemon voodoo, allowed
+                   ONLY here: short+no-thinking IS reproducible). A value change -> PARITY_FAIL.
+      2. PERF    — rocprof pinned-clock kernel-duration. No gain -> DEAD (don't spend coherence).
+      3. COHERENCE — the real user path: SERVE, thinking ON, sampled, multiturn seed-SET + validators.
+                   A perf-winner that breaks output -> COHERENCE_FAIL. NO voodoo here.
 
-    Byte-exact PARITY is NOT the primary gate: on a sampled thinking run it's overly ambitious (the Q8
-    path isn't run-to-run deterministic, so even a byte-identical variant diverges). It's an OPT-IN
-    secondary diagnostic (`parity_check`), reported not gated.
+    WIN = value-preserving AND faster AND stays coherent. Parity is cheapest so it goes first; coherence
+    is the most expensive so it only runs on parity-clean perf-winners."""
+    # 1. PARITY (raw-daemon short greedy token-id exact) — short-circuit a value change.
+    p_ok, p_detail = parity_result(runner.parity_gens(base_daemon), runner.parity_gens(var_daemon))
+    if not p_ok:
+        return cv.make_row(arch, kernel, lever, "PARITY_FAIL", parity=p_detail, base_ref=base_ref)
 
-    Order = perf first (cheap filter: no gain -> DEAD, stop), then coherence (gate the perf-winner —
-    a fast-but-broken kernel is caught here). WIN iff a real perf gain that STAYS coherent."""
-    # 1. PERF (cheap filter) — rocprof kernel-duration. No gain -> not a win; don't spend coherence.
+    # 2. PERF (rocprof) — filter.
     pv, f, delta = perf_result(runner.perf_durations(base_daemon), runner.perf_durations(var_daemon),
                                runner.clocks(base_daemon), runner.clocks(var_daemon))
     if pv != "WIN":
-        return cv.make_row(arch, kernel, lever, pv, perf_delta=delta, perf_f=f, base_ref=base_ref)
+        return cv.make_row(arch, kernel, lever, pv, parity=p_detail, perf_delta=delta, perf_f=f,
+                           base_ref=base_ref)
 
-    # 2. COHERENCE (PRIMARY gate) — serve defaults; a perf-winner must stay coherent to bank.
+    # 3. COHERENCE (serve, sampled — PRIMARY correctness gate) — a perf-winner must stay coherent.
     c_ok, c_detail = coherence_result(runner.coherence_gens(base_daemon, seeds),
                                       runner.coherence_gens(var_daemon, seeds), expects=expects)
     verdict = "WIN" if c_ok else "COHERENCE_FAIL"
-
-    # 3. PARITY (SECONDARY, opt-in, NON-gating) — greedy self-reproducible-prefix diagnostic.
-    p_detail = None
-    if parity_check:
-        ba, bb = runner.parity_gens(base_daemon), runner.parity_gens(base_daemon)
-        _, p_detail = parity_result(ba, bb, runner.parity_gens(var_daemon))
-    return cv.make_row(arch, kernel, lever, verdict, coherence=c_detail, perf_delta=delta,
-                       perf_f=f, parity=p_detail, base_ref=base_ref, seeds=len(seeds))
+    return cv.make_row(arch, kernel, lever, verdict, parity=p_detail, coherence=c_detail,
+                       perf_delta=delta, perf_f=f, base_ref=base_ref, seeds=len(seeds))
 
 
 def load_expects(prompts_file):
