@@ -1294,13 +1294,6 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                // Dense llama-family (arch 0/1) + pp>1 → the P-C driver-owned PP
-                // path (PpModel). qwen35 (5/6) keeps its hand-coded multi-path via
-                // load_model below.
-                let dense_llama_pp = pp > 1
-                    && hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
-                        .map(|h| matches!(h.arch_id, 0 | 1))
-                        .unwrap_or(false);
                 // One mesh from the (already remapped + guarded) scalars. The
                 // remap forces ep/tp mutually exclusive and the guard rejects
                 // (ep|tp)>1 with pp>1, so at most one axis is >1 here — routing
@@ -1308,6 +1301,35 @@ fn main() {
                 // emulate=None is load-bearing: passing Some(_) would auto-promote
                 // a plain serve on a HIPFIRE_EMULATE_GPUS box into EP-2.
                 let mesh = hipfire_runtime::config::resolve_mesh(pp, tp, ep, None);
+                // Dense llama-family (arch 0/1) + Pp axis → the P-C driver-owned
+                // PP path (PpModel). qwen35 (5/6) keeps its hand-coded multi-path
+                // via load_model below.
+                let dense_llama_pp = mesh.has_axis(DimKind::Pp)
+                    && hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
+                        .map(|h| matches!(h.arch_id, 0 | 1))
+                        .unwrap_or(false);
+                // Ragged PP bands (qwen35 arm only): parse + length-validate at
+                // the edge. EP/TP are excluded by the earlier mutual-exclusion
+                // guard, and dense llama-PP ignores HIPFIRE_PP_LAYERS (uniform).
+                let pp_bands: Option<Vec<usize>> = if pp > 1 && !dense_llama_pp {
+                    match hipfire_runtime::config::parse_pp_layers(
+                        std::env::var("HIPFIRE_PP_LAYERS").ok(),
+                        pp,
+                    ) {
+                        Ok(bands) => bands,
+                        Err(msg) => {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","message":"{}"}}"#,
+                                msg
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let loaded = if mesh.has_axis(DimKind::Ep) {
                     hipfire_loader::load_model_ep(path, max_seq, &mesh)
                 } else if mesh.has_axis(DimKind::Tp) {
@@ -1316,9 +1338,9 @@ fn main() {
                     hipfire_loader::load_model_pp(path, max_seq, &mesh)
                 } else {
                     // NOT single-GPU only: this arm still carries qwen35 (arch 5/6)
-                    // pp>1 pipeline-parallel serving, which stays scalar-driven.
-                    // MUST forward the raw `pp` scalar verbatim (mesh is not the
-                    // source of truth for qwen35 PP — see carriers.rs:228/230).
+                    // pp>1 pipeline-parallel serving. qwen35 PP: mesh carries pp
+                    // via size_of(Pp); pp_bands carries the ragged HIPFIRE_PP_LAYERS
+                    // split, parsed + length-validated at the edge above.
                     hipfire_loader::load_model(
                         path,
                         max_seq,
@@ -1328,7 +1350,7 @@ fn main() {
                         state_quant_override.as_deref(),
                         &cask,
                         &mesh,
-                        None,
+                        pp_bands.as_deref(),
                         spec_cfg,
                         &mut gpu,
                     )
