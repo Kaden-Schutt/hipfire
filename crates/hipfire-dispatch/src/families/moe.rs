@@ -799,7 +799,46 @@ pub struct MoeExpertRef<'a> {
 
 // ── Step-IR launch helpers ────────────────────────────────
 
+use crate::pipeline::MoeActivationVariant;
 use crate::pipeline::ScoreActKind;
+
+/// Per-arch SwiGLU + FWHT rotate of the gate/up MoE intermediate.
+///
+/// - `MinimaxFused`: one fused kernel writes `rot_out` directly.
+///   `awq_scale = None` → `gpu.fused_silu_mul_rotate_mq_batched` (gemv.rs:2500).
+///   `awq_scale = Some(s)` → `gpu.fused_silu_mul_rotate_mq_awq_batched` (gemv.rs:2640).
+/// - `Ds4ClampRotate`: two kernels.
+///   1. `gpu.deepseek4_silu_mul_clamp_f32_batched(gate, up, gate, inter, k_top, swiglu_limit)`
+///      (norm.rs:3977) — silu·mul·clamp in-place into `gate`.
+///   2. `gpu.rotate_x_mq_batched(gate, rot_out, inter, k_top)`
+///      (gemv.rs:2822) — FWHT-rotate the clamped `gate` into `rot_out`.
+pub fn launch_moe_activation(
+    gpu: &mut rdna_compute::Gpu,
+    variant: &MoeActivationVariant<'_>,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    rot_out: &GpuTensor,
+    inter: usize,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    match variant {
+        MoeActivationVariant::MinimaxFused { awq_scale: None } => gpu
+            .fused_silu_mul_rotate_mq_batched(gate, up, rot_out, inter, k_top)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        MoeActivationVariant::MinimaxFused {
+            awq_scale: Some(awq),
+        } => gpu
+            .fused_silu_mul_rotate_mq_awq_batched(gate, up, awq, rot_out, inter, k_top)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        MoeActivationVariant::Ds4ClampRotate { swiglu_limit } => {
+            gpu.deepseek4_silu_mul_clamp_f32_batched(gate, up, gate, inter, k_top, *swiglu_limit)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.rotate_x_mq_batched(gate, rot_out, inter, k_top)
+                .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+    }
+}
+
 /// In-place score activation before routing. Thin wrapper over the arch's
 /// sigmoid / sqrt_softplus kernels (rdna-compute norm.rs:1643 / 3828).
 /// `Sigmoid` requires the `deltanet` feature (same gate as `gpu.sigmoid_f32`).

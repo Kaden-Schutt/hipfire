@@ -13,8 +13,9 @@ use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::moe::{
     launch_grouped_down, launch_grouped_gate_up, launch_indexed_down, launch_indexed_down_residual,
-    launch_indexed_gate_up, launch_moe_combine, launch_moe_combine_grouped, launch_moe_route,
-    launch_moe_scatter, launch_moe_unscatter, launch_score_activation, MoeExpertRef,
+    launch_indexed_gate_up, launch_moe_activation, launch_moe_combine, launch_moe_combine_grouped,
+    launch_moe_route, launch_moe_scatter, launch_moe_unscatter, launch_score_activation,
+    MoeExpertRef,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -45,6 +46,15 @@ pub enum ScoreActKind {
     Sigmoid,
     /// Sqrt-softplus activation (deepseek4 routing).
     SqrtSoftplus,
+}
+
+/// Per-arch SwiGLU activation + FWHT rotate variant for [`Step::MoeActivation`].
+pub enum MoeActivationVariant<'a> {
+    /// minimax: fused silu·mul + block-diagonal FWHT rotate in ONE kernel.
+    /// `awq_scale` is `None` for the shipped MoE experts (MQ2L/MQ3L, no per-weight AWQ).
+    MinimaxFused { awq_scale: Option<&'a GpuTensor> },
+    /// ds4: silu·mul·CLAMP (in-place into `gate`) then a SEPARATE FWHT rotate. Two kernels.
+    Ds4ClampRotate { swiglu_limit: f32 },
 }
 
 pub enum MoeProj<'a> {
@@ -269,6 +279,18 @@ pub enum Step<'a> {
         scores: &'a GpuTensor,
         kind: ScoreActKind,
     },
+    /// SwiGLU activation + FWHT re-rotate of the gate/up intermediate, per-arch.
+    /// Reads `gate`, `up` `[k_top × inter]`; writes `rot_out` `[k_top × inter]`
+    /// consumed by the down Step. `tp_step_out_buf` returns `None` (intermediate,
+    /// not an EP partial). Block-diagonal per-256 → shards trivially under D2b.
+    MoeActivation {
+        variant: MoeActivationVariant<'a>,
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        rot_out: &'a GpuTensor,
+        inter: usize,
+        k_top: usize,
+    },
     // ── Note (Task 6): ds4 `hc_ffn_mix` is intentionally NOT a Step variant ──
     // The ds4 MoE tail mixes the EP all-reduced `ffn_out` partial into
     // `residual_streams` via `hc_mix_4stream` + `memcpy_dtod_auto`. Its two view
@@ -305,6 +327,8 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::MoeUnscatter { .. } => PipelineOp::MoeUnscatter,
         // Elementwise pre-op before MoeRoute; tag is irrelevant to fusion.
         Step::ScoreActivation { .. } => PipelineOp::RmsnormAutomatic,
+        // SwiGLU + FWHT rotate intermediate; not fusible.
+        Step::MoeActivation { .. } => PipelineOp::RmsnormAutomatic,
     }
 }
 
@@ -906,6 +930,8 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         Step::MoeScatter { .. } | Step::GroupedMoeGemm { .. } | Step::MoeUnscatter { .. } => None,
         // Score activation is a pre-routing elementwise op; no EP partial.
         Step::ScoreActivation { .. } => None,
+        // MoeActivation is an intermediate (not an EP partial).
+        Step::MoeActivation { .. } => None,
         _ => None,
     }
 }
@@ -1556,6 +1582,14 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             *m_total,
         ),
         Step::ScoreActivation { scores, kind } => launch_score_activation(gpu, scores, *kind),
+        Step::MoeActivation {
+            variant,
+            gate,
+            up,
+            rot_out,
+            inter,
+            k_top,
+        } => launch_moe_activation(gpu, variant, gate, up, rot_out, *inter, *k_top),
     }
 }
 
