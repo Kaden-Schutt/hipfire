@@ -252,6 +252,15 @@ pub enum Step<'a> {
         k_top: usize,
         m_total: usize,
     },
+    // ── Note (Task 6): ds4 `hc_ffn_mix` is intentionally NOT a Step variant ──
+    // The ds4 MoE tail mixes the EP all-reduced `ffn_out` partial into
+    // `residual_streams` via `hc_mix_4stream` + `memcpy_dtod_auto`. Its two view
+    // operands (`comb_view`, `post_view`) are ephemeral `GpuTensor` values computed
+    // at call time via `sub_offset` on `state.hc_c`; they have no stable backing
+    // storage to borrow `&'a GpuTensor` from inside a Step.
+    // Task 8's `forward_ep` calls `crate::families::moe::launch_hc_ffn_mix`
+    // directly after `execute_steps_parallel` returns and the EP all-reduce
+    // completes. minimax's MoE tail (`add_inplace_f32`) reuses `Step::ResidualAdd`.
 }
 
 /// Op-kind for fusion matching. Total over Step variants.

@@ -1373,6 +1373,49 @@ pub fn launch_moe_combine_grouped(
     .map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
+// ── ds4 MoE tail launch helper (Task 6) ─────────────────────────────────────
+
+/// ds4 MoE tail: mixes the EP all-reduced `ffn_out` partial into `residual_streams`.
+///
+/// This is an **arch-owned tail hook**, NOT a `Step` variant. The two view
+/// operands (`comb_view = hc_c.sub_offset(8, 16)` and
+/// `post_view = hc_c.sub_offset(4, 4)`) are ephemeral `GpuTensor` values with
+/// no stable backing storage; they cannot be `&'a GpuTensor` borrows in a Step
+/// (see the note at the end of the `Step` enum). Task 8's `forward_ep` calls
+/// this helper directly after `execute_steps_parallel` returns.
+///
+/// Reproduces exactly the `hc_mix_4stream` + `memcpy_dtod_auto` sequence from
+/// `hipfire-arch-deepseek4::forward::hc_ffn_mix` (forward.rs:3747–3759).
+///
+/// # Arguments
+/// - `streams`     — `state.residual_streams`: `[4, hidden]` HC stream bank.
+/// - `hc_c`        — `state.hc_c`: parent buffer; `post_view` and `comb_view`
+///                   are derived via `sub_offset` using the fixed offsets from
+///                   `hc_ffn_mix` (post @ elem 4 len 4; comb @ elem 8 len 16).
+/// - `ffn_out`     — `state.ffn_out`: `[hidden]` MoE partial (already all-reduced).
+/// - `streams_out` — `state.q`: `[4, hidden]` scratch for the kernel output.
+/// - `hidden`      — `cfg.hidden_size`.
+/// - `hc_bytes`    — `cfg.hc_mult * cfg.hidden_size * 4` (byte count for D2D copy).
+pub fn launch_hc_ffn_mix(
+    gpu: &mut rdna_compute::Gpu,
+    streams: &GpuTensor,
+    hc_c: &GpuTensor,
+    ffn_out: &GpuTensor,
+    streams_out: &GpuTensor,
+    hidden: usize,
+    hc_bytes: usize,
+) -> Result<(), DispatchError> {
+    // Reproduce exactly the sub_offset layout from hc_ffn_mix (forward.rs:3743-3744).
+    // post_view → [4] fp32 per-stream scale   (hc_c elems [4..8]).
+    // comb_view → [4, 4] fp32 Sinkhorn matrix (hc_c elems [8..24]).
+    let post_view = hc_c.sub_offset(4, 4);
+    let comb_view = hc_c.sub_offset(8, 16);
+    gpu.hc_mix_4stream(streams, &comb_view, &post_view, ffn_out, streams_out, hidden as i32)
+        .map_err(|e| DispatchError::Hip(format!("hc_mix_4stream (ffn tail): {e:?}")))?;
+    gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, hc_bytes)
+        .map_err(|e| DispatchError::Hip(format!("hc_ffn_mix d2d streams←streams_out: {e:?}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
