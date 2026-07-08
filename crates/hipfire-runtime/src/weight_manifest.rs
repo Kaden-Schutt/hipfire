@@ -192,24 +192,28 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                     ));
                 }
             }
-            ShardPolicy::ExpertTensorSharded { .. } => {
+            ShardPolicy::ExpertTensorSharded { inner, .. } => {
                 // Expert intermediate dim must be divisible by Tp and the
                 // resulting slice must be a multiple of 256 (the quant group
                 // size for MQ2G256/MQ3G256 experts).
                 // logical_shape: [n_experts, 2*inter, hidden] (gate‖up) or
-                // [n_experts, hidden, inter] (down); inter is axis 1 (for
-                // gate/up, 2*inter halved below) or axis 2 (down).
-                // We gate on axis-1 as the "inter" dim (either 2*inter for
-                // gate‖up or hidden for down — both must split cleanly, but
-                // only the inner sharding dimension matters; we conservatively
-                // check axis 1 which is always the sharded axis in MoE blobs).
-                let d = e.logical_shape.get(1).copied().unwrap_or(0);
+                // [n_experts, hidden, inter] (down).
+                // Gate/up (ColumnShard): sharded dim is axis-1 (2*inter).
+                // Down (RowShard): sharded dim is axis-2 (inter).
+                let (axis, kind_name) = match inner.as_ref() {
+                    ShardPolicy::ColumnShard { .. } => (1, "ColumnShard (2*inter)"),
+                    ShardPolicy::RowShard { .. } => (2, "RowShard (inter)"),
+                    _ => (1, "inner"),
+                };
+                let d = e.logical_shape.get(axis).copied().unwrap_or(0);
                 if tp > 1 && !(d % tp == 0 && (d / tp) % 256 == 0) {
                     return Err(format!(
-                        "{}: ExpertTensorSharded axis-1 dim {d} \
-                         (inter or 2·inter) not divisible by Tp={tp} \
+                        "{}: ExpertTensorSharded {} dim {d} (axis {}) \
+                         not divisible by Tp={tp} \
                          or slice {} not a multiple of 256",
                         ctx(),
+                        kind_name,
+                        axis,
                         d / tp
                     ));
                 }
