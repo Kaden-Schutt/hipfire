@@ -1191,8 +1191,8 @@ fn minimax_ep_moe_step(
 ) -> Result<(), String> {
     use hipfire_dispatch::families::moe::{launch_indexed_gate_up, MoeExpertRef};
     use hipfire_dispatch::pipeline::{
-        execute_steps_parallel, moe_step_predown_enabled, GemvInput, MoeActivationVariant, MoeProj,
-        ScoreActKind, Step, StepCollective,
+        execute_steps_parallel, GemvInput, MoeActivationVariant, MoeProj, ScoreActKind, Step,
+        StepCollective,
     };
     let n = gpus.devices.len();
     let hidden = cfg.hidden_size;
@@ -1200,9 +1200,7 @@ fn minimax_ep_moe_step(
     let n_exp = cfg.num_local_experts;
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
-    let predown = moe_step_predown_enabled();
-
-    // Gate_up-dtype refs needed when the decomposed pre-down Step path is ON.
+    // Gate_up-dtype refs needed for the decomposed pre-down Step path.
     // Built here (before Phase-1 borrows gpus mutably) so they outlive the step vecs.
     let gu_refs: Vec<MoeExpertRef> = (0..n)
         .map(|r| {
@@ -1242,50 +1240,6 @@ fn minimax_ep_moe_step(
         .map_err(|e| format!("moe-step L{l} r{r}: ffn rotate: {e:?}"))?;
         weight_gemv(gpu, &layer.router, &s.ffn_tmp, &s.router_logits)
             .map_err(|e| format!("moe-step L{l} r{r}: router: {e}"))?;
-        if !predown {
-            gpu.sigmoid_f32(&s.router_logits)
-                .map_err(|e| format!("moe-step L{l} r{r}: sigmoid: {e:?}"))?;
-            gpu.deepseek4_moe_topk_bias_aware_f32(
-                &s.router_logits,
-                &layer.routing_bias,
-                &s.topk_indices,
-                &s.topk_weights,
-                n_exp as i32,
-                k_top as i32,
-                1.0,
-            )
-            .map_err(|e| format!("moe-step L{l} r{r}: topk: {e:?}"))?;
-            let gu_ref = MoeExpertRef {
-                gate_up_ptrs: &layer.expert_gate_up_ptrs,
-                down_ptrs: &layer.expert_down_ptrs,
-                dummy_gate_up: layer.dummy_gate_up.as_ref(),
-                dtype: layer.experts[0].gate_up.gpu_dtype,
-                n_experts: n_exp,
-                expert_m: inter,
-                expert_k: hidden,
-                owned: &[],
-            };
-            launch_indexed_gate_up(
-                gpu,
-                &gu_ref,
-                &s.topk_indices,
-                &s.ffn_x_rot,
-                &s.gate_batch,
-                &s.up_batch,
-                k_top,
-            )
-            .map_err(|e| format!("moe-step L{l} r{r}: gate_up: {e:?}"))?;
-            fused_silu_mul_rotate_mq_batched_for(
-                gpu,
-                &layer.experts[0].down,
-                &s.gate_batch,
-                &s.up_batch,
-                &s.rot_batch,
-                inter,
-                k_top,
-            )
-            .map_err(|e| format!("moe-step L{l} r{r}: silu_mul_rotate: {e:?}"))?;
-        }
     }
 
     // ── Phase 2: (optional pre-down prefix +) down + EP all-reduce ──────────
@@ -1319,46 +1273,42 @@ fn minimax_ep_moe_step(
             .map(|r| {
                 let s = &state_per_rank[r];
                 let layer = &weights_per_rank[r].layers[l];
-                let mut rank_steps: Vec<Step> = if predown {
-                    vec![
-                        Step::ScoreActivation {
-                            scores: &s.router_logits,
-                            kind: ScoreActKind::Sigmoid,
+                let mut rank_steps: Vec<Step> = vec![
+                    Step::ScoreActivation {
+                        scores: &s.router_logits,
+                        kind: ScoreActKind::Sigmoid,
+                    },
+                    Step::MoeRoute {
+                        scores: &s.router_logits,
+                        gate_bias: &layer.routing_bias,
+                        topk_indices: &s.topk_indices,
+                        topk_weights: &s.topk_weights,
+                        k: k_top,
+                        n_experts: n_exp,
+                        route_scale: 1.0,
+                    },
+                    Step::IndexedMoeGemv {
+                        experts: &gu_refs[r],
+                        which: MoeProj::GateUp {
+                            up_out: &s.up_batch,
                         },
-                        Step::MoeRoute {
-                            scores: &s.router_logits,
-                            gate_bias: &layer.routing_bias,
-                            topk_indices: &s.topk_indices,
-                            topk_weights: &s.topk_weights,
-                            k: k_top,
-                            n_experts: n_exp,
-                            route_scale: 1.0,
+                        topk_indices: &s.topk_indices,
+                        input: GemvInput::Prerotated(&s.ffn_x_rot),
+                        out: &s.gate_batch,
+                        k_top,
+                        batch_size: 1,
+                    },
+                    Step::MoeActivation {
+                        variant: MoeActivationVariant::MinimaxFused {
+                            awq_scale: layer.experts[0].down.awq_scale.as_ref(),
                         },
-                        Step::IndexedMoeGemv {
-                            experts: &gu_refs[r],
-                            which: MoeProj::GateUp {
-                                up_out: &s.up_batch,
-                            },
-                            topk_indices: &s.topk_indices,
-                            input: GemvInput::Prerotated(&s.ffn_x_rot),
-                            out: &s.gate_batch,
-                            k_top,
-                            batch_size: 1,
-                        },
-                        Step::MoeActivation {
-                            variant: MoeActivationVariant::MinimaxFused {
-                                awq_scale: layer.experts[0].down.awq_scale.as_ref(),
-                            },
-                            gate: &s.gate_batch,
-                            up: &s.up_batch,
-                            rot_out: &s.rot_batch,
-                            inter,
-                            k_top,
-                        },
-                    ]
-                } else {
-                    vec![]
-                };
+                        gate: &s.gate_batch,
+                        up: &s.up_batch,
+                        rot_out: &s.rot_batch,
+                        inter,
+                        k_top,
+                    },
+                ];
                 rank_steps.push(Step::IndexedMoeGemv {
                     experts: &expert_refs[r],
                     which: MoeProj::DownResidual {
@@ -1373,22 +1323,17 @@ fn minimax_ep_moe_step(
                 rank_steps
             })
             .collect();
-        let mut colls: Vec<StepCollective> = Vec::new();
-        let mut zbefore: Vec<bool> = Vec::new();
-        if predown {
-            colls.extend([
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-            ]);
-            zbefore.extend([false, false, false, false]);
-        }
-        colls.push(StepCollective::AllReduce {
-            kind: hipfire_runtime::multi_gpu::DimKind::Ep,
-            dim: hidden,
-        });
-        zbefore.push(true);
+        let colls: Vec<StepCollective> = vec![
+            StepCollective::None,
+            StepCollective::None,
+            StepCollective::None,
+            StepCollective::None,
+            StepCollective::AllReduce {
+                kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                dim: hidden,
+            },
+        ];
+        let zbefore: Vec<bool> = vec![false, false, false, false, true];
         (steps, colls, zbefore)
     } else {
         // Non-Lloyd down (MQ4G256/HFQ4G256/MQ6G256/HFQ6G256): expanded path
@@ -1399,46 +1344,42 @@ fn minimax_ep_moe_step(
             .map(|r| {
                 let s = &state_per_rank[r];
                 let layer = &weights_per_rank[r].layers[l];
-                let mut rank_steps: Vec<Step> = if predown {
-                    vec![
-                        Step::ScoreActivation {
-                            scores: &s.router_logits,
-                            kind: ScoreActKind::Sigmoid,
+                let mut rank_steps: Vec<Step> = vec![
+                    Step::ScoreActivation {
+                        scores: &s.router_logits,
+                        kind: ScoreActKind::Sigmoid,
+                    },
+                    Step::MoeRoute {
+                        scores: &s.router_logits,
+                        gate_bias: &layer.routing_bias,
+                        topk_indices: &s.topk_indices,
+                        topk_weights: &s.topk_weights,
+                        k: k_top,
+                        n_experts: n_exp,
+                        route_scale: 1.0,
+                    },
+                    Step::IndexedMoeGemv {
+                        experts: &gu_refs[r],
+                        which: MoeProj::GateUp {
+                            up_out: &s.up_batch,
                         },
-                        Step::MoeRoute {
-                            scores: &s.router_logits,
-                            gate_bias: &layer.routing_bias,
-                            topk_indices: &s.topk_indices,
-                            topk_weights: &s.topk_weights,
-                            k: k_top,
-                            n_experts: n_exp,
-                            route_scale: 1.0,
+                        topk_indices: &s.topk_indices,
+                        input: GemvInput::Prerotated(&s.ffn_x_rot),
+                        out: &s.gate_batch,
+                        k_top,
+                        batch_size: 1,
+                    },
+                    Step::MoeActivation {
+                        variant: MoeActivationVariant::MinimaxFused {
+                            awq_scale: layer.experts[0].down.awq_scale.as_ref(),
                         },
-                        Step::IndexedMoeGemv {
-                            experts: &gu_refs[r],
-                            which: MoeProj::GateUp {
-                                up_out: &s.up_batch,
-                            },
-                            topk_indices: &s.topk_indices,
-                            input: GemvInput::Prerotated(&s.ffn_x_rot),
-                            out: &s.gate_batch,
-                            k_top,
-                            batch_size: 1,
-                        },
-                        Step::MoeActivation {
-                            variant: MoeActivationVariant::MinimaxFused {
-                                awq_scale: layer.experts[0].down.awq_scale.as_ref(),
-                            },
-                            gate: &s.gate_batch,
-                            up: &s.up_batch,
-                            rot_out: &s.rot_batch,
-                            inter,
-                            k_top,
-                        },
-                    ]
-                } else {
-                    vec![]
-                };
+                        gate: &s.gate_batch,
+                        up: &s.up_batch,
+                        rot_out: &s.rot_batch,
+                        inter,
+                        k_top,
+                    },
+                ];
                 rank_steps.extend([
                     Step::IndexedMoeGemv {
                         experts: &expert_refs[r],
@@ -1462,25 +1403,18 @@ fn minimax_ep_moe_step(
                 rank_steps
             })
             .collect();
-        let mut colls: Vec<StepCollective> = Vec::new();
-        let mut zbefore: Vec<bool> = Vec::new();
-        if predown {
-            colls.extend([
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-            ]);
-            zbefore.extend([false, false, false, false]);
-        }
-        colls.extend([
+        let colls: Vec<StepCollective> = vec![
+            StepCollective::None,
+            StepCollective::None,
+            StepCollective::None,
+            StepCollective::None,
             StepCollective::None,
             StepCollective::AllReduce {
                 kind: hipfire_runtime::multi_gpu::DimKind::Ep,
                 dim: hidden,
             },
-        ]);
-        zbefore.extend([false, true]);
+        ];
+        let zbefore: Vec<bool> = vec![false, false, false, false, false, true];
         (steps, colls, zbefore)
     };
     execute_steps_parallel(mesh, gpus, &per_rank_steps, &collectives, &zero_before)

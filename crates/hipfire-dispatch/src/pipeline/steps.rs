@@ -51,7 +51,8 @@ pub enum ScoreActKind {
 /// Per-arch SwiGLU activation + FWHT rotate variant for [`Step::MoeActivation`].
 pub enum MoeActivationVariant<'a> {
     /// minimax: fused silu·mul + block-diagonal FWHT rotate in ONE kernel.
-    /// `awq_scale` is `None` for the shipped MoE experts (MQ2L/MQ3L, no per-weight AWQ).
+    /// `awq_scale`: `Some` → uses the AWQ-scaled kernel; `None` → plain kernel.
+    /// The shipped M2.7.mq2 carries AWQ on its down weights and passes `Some`.
     MinimaxFused { awq_scale: Option<&'a GpuTensor> },
     /// ds4: silu·mul·CLAMP (in-place into `gate`) then a SEPARATE FWHT rotate. Two kernels.
     Ds4ClampRotate { swiglu_limit: f32 },

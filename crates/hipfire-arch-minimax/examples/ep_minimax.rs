@@ -45,7 +45,6 @@ fn fnv1a_bytes(data: &[u8]) -> u64 {
 fn main() {
     use hipfire_arch_minimax::forward;
     use hipfire_arch_minimax::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
-    use hipfire_dispatch::pipeline::set_moe_step_predown_override;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::multi_gpu::Gpus;
     use hipfire_runtime::tokenizer::Tokenizer;
@@ -162,12 +161,8 @@ fn main() {
         bi
     };
 
-    // ── A/B harness: D2a decode pre-down decomposition toggle ───────────────
-    // Task-1 baseline: toggle is inert (arch ignores it until Task 4).
-    // fnv_on = fnv_off by construction; second run wired at Task 4.
     let prompt_fingerprint = fnv1a_bytes(prompt.as_bytes());
     eprintln!("prompt fnv1a_bytes: 0x{prompt_fingerprint:016x}  max: {max}  tp: {tp}");
-    set_moe_step_predown_override(Some(false));
 
     // ── EP prefill (per-token) + greedy decode ──────────────────────────────
     eprintln!("\nprompt {:?} → {} tokens", prompt, prompt_ids.len());
@@ -246,75 +241,8 @@ fn main() {
         tok.decode(&gen)
     );
     eprintln!("gen ids: {:?}", &gen[..gen.len().min(40)]);
-    let fnv_off = fnv1a(&gen);
-
-    // ── Second run (ON path): fresh state, decomposed pre-down Steps ────────
-    // Re-create state and partials from scratch to avoid any state bleed (#462).
-    eprintln!("\n[Task-4 A/B] running second pass with decomposed pre-down Steps ON...");
-    set_moe_step_predown_override(Some(true));
-    let mut state_per_rank_on: Vec<MiniMaxState> = Vec::with_capacity(n);
-    let mut partials_on: Vec<GpuTensor> = Vec::with_capacity(n);
-    for r in 0..n {
-        gpus.devices[r].bind_thread().expect("bind on");
-        state_per_rank_on.push(
-            MiniMaxState::new_with_max_seq(&mut gpus.devices[r], &cfg, max_seq).expect("state on"),
-        );
-        partials_on.push(
-            gpus.devices[r]
-                .zeros(&[cfg.hidden_size], DType::F32)
-                .expect("partial on"),
-        );
-    }
-    // Prefill
-    for (pos, &t) in prompt_ids.iter().enumerate() {
-        forward::forward_ep(
-            &mut gpus,
-            &weights_per_rank,
-            &cfg,
-            &mut state_per_rank_on,
-            &partials_on,
-            t,
-            pos as u32,
-        )
-        .expect("forward_ep prefill on");
-    }
-    gpus.devices[0].bind_thread().expect("bind0 on");
-    let mut logits_on = gpus.devices[0]
-        .download_f32(&state_per_rank_on[0].logits)
-        .expect("dl on");
-    let mut gen_on: Vec<u32> = Vec::new();
-    let mut pos_on = prompt_ids.len();
-    for step in 0..max {
-        let next = argmax(&logits_on);
-        gen_on.push(next);
-        if matches!(next, 200020 | 151643 | 151645 | 2) {
-            break;
-        }
-        forward::forward_ep(
-            &mut gpus,
-            &weights_per_rank,
-            &cfg,
-            &mut state_per_rank_on,
-            &partials_on,
-            next,
-            pos_on as u32,
-        )
-        .expect("forward_ep decode on");
-        gpus.devices[0].bind_thread().expect("bind0 on");
-        logits_on = gpus.devices[0]
-            .download_f32(&state_per_rank_on[0].logits)
-            .expect("dl on");
-        pos_on += 1;
-        let _ = step;
-    }
-    let fnv_on = fnv1a(&gen_on);
-
-    set_moe_step_predown_override(None);
-    eprintln!("gen FNV off: 0x{fnv_off:016x}  on: 0x{fnv_on:016x}");
+    let fnv = fnv1a(&gen);
+    eprintln!("gen FNV: 0x{fnv:016x}");
     const MINIMAX_EP2_FNV: u64 = 0x887c2e7717e9c3bf;
-    assert_eq!(
-        fnv_off, MINIMAX_EP2_FNV,
-        "baseline drifted from pinned D1 hash"
-    );
-    assert_eq!(fnv_on, fnv_off, "decomposed pre-down is NOT byte-identical");
+    assert_eq!(fnv, MINIMAX_EP2_FNV, "output drifted from pinned D2a hash");
 }

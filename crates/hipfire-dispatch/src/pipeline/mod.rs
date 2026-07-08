@@ -16,9 +16,6 @@ pub use steps::{
     GemvInput, MoeActivationVariant, MoeProj, ScoreActKind, Step, StepCollective, TpCollective,
 };
 
-mod moe_step_toggle;
-pub use moe_step_toggle::{moe_step_predown_enabled, set_moe_step_predown_override};
-
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
 }
