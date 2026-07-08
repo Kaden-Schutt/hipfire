@@ -78,7 +78,11 @@ while [ "$round" -lt "$SAFETY_CAP" ]; do
   round=$((round+1))
   echo "===== ROUND $round START $(date -u '+%F %T') =====" >> "$LOG"
   DIGEST=$(python3 "$TRIO/gen_digest.py" "$EXH" "$BOD" "$CAND_WALL" "$K" "$FOLDED" 2>/dev/null)
-  timeout 3600 codex exec --dangerously-bypass-approvals-and-sandbox -C "$HOME/hipfire" \
+  # codex reads kernels/src from ITS OWN worktree (this worker's advancing baseline) — NOT $HOME/hipfire
+  # main, which may be an old/foreign checkout. First CARDS slot = this worker's build worktree.
+  CODEX_CWD="${CODEX_CWD:-$MAIN/.aw/sw_card$(set -- $CARDS; echo "$1")}"
+  [ -d "$CODEX_CWD/kernels/src" ] || CODEX_CWD="$MAIN"
+  timeout 3600 codex exec --dangerously-bypass-approvals-and-sandbox -C "$CODEX_CWD" \
     "ROUND $round of a SELF-EXHAUSTING autoresearch loop (adaptive certify + branch wins). ${DIGEST} $(cat "$PROMPT")" \
     >> "$LOG" 2>&1
   echo "===== ROUND $round END rc=$? $(date -u '+%F %T') =====" >> "$LOG"
