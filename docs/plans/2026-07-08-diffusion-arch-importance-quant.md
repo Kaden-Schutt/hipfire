@@ -107,14 +107,20 @@ The real, smaller A2 change:
 - **Legacy `0x3046_4944`**: single-sourced as `ARCH_ID_DIFFUSION_LEGACY`; still recognized by
   `is_diffusion_arch`; untouched containers load/route exactly as before.
 
-### 3.4 Quant importance through shared `allocate()` (the payoff)
+### 3.4 Quant importance in the mixed-precision selector (the payoff) — REFRAMED
 
-With the family known (from id or topology), `encode_opus_tensor()` consults the registry
-`Ingest` for that arch and calls the shared `allocate(imp, req, k, &DIFFUSION_MENU)` instead of the
-flat conv/linear heuristic. Conv still resolves to oq8 via `requires()` (random-access / no valid
-grouped codec) — the special case falls out of the shared mechanism. Gated behind
-`--arch-importance` (env `HIPFIRE_DIFFUSION_ARCH_IMPORTANCE`); default = today's flat rule until
-validated.
+Upstream landed a mixed-precision plain-Opus quantizer (`quantize_diffusion_hfq_plain`,
+`PlainOpusPolicy::Mixed{oq8_fraction}`, `--mix-fraction`, achieved-average naming) with a **global
+bit budget**: `select_int8()` picks which linears become int8 (rest int4) until ~`f` of the params
+are int8. So the budget mechanism already exists — the remaining lever is *which* tensors win the
+int8 promotion, previously a fan-in/down-proj heuristic.
+
+P2 makes that selection **arch-importance-driven** (this is the concrete home for the "importance
+decides bitwidth" idea): `tensor_importance(arch_id, name)` resolves the container's arch `Ingest`
+from the header id (fallback: shared `mmdit_role` prior), and under `--arch-importance` the
+`Mixed{Some(f)}` ranking promotes the highest-importance tensors first (embedders/attention/
+modulation/output over the FFN bulk) instead of highest fan-in. Same budget, different selection.
+Default stays the fan-in heuristic until Krea2 validation (equal-fraction quality) flips it.
 
 ### 3.5 Optional unified `calib x arch -> bits` (last, opt-in, both paths)
 
@@ -132,9 +138,13 @@ per-tensor scalar `s`, combine as `target_bits(imp) * g(s)` (bounded), select co
   stamps per-family ids via `diffusion_arch_id_for_metadata`; `is_diffusion_hfq` also accepts a
   diffusion header id; `HFQ_ARCH_DIFFUSION` single-sourced to `ARCH_ID_DIFFUSION_LEGACY`; legacy
   containers unchanged.
-- **P2 — importance through `allocate()` (the original goal).** Route diffusion Opus through the
-  shared `allocate()` behind `--arch-importance`; refine the role taxonomy against real tensor names;
-  validate Krea2 size/quality; flip default per-family when green.
+- **P2 — importance-driven mixed-precision selection (core DONE, validation pending).** Reframed onto
+  the merged mix-fraction framework (3.4): `select_int8` gains a `by_importance` ranking driven by the
+  arch `Ingest` prior, behind CLI `--arch-importance`; `tensor_importance` resolves the family from
+  the header id. Unit-tested (salient tensors win the int8 promotion over high-fan-in bulk at equal
+  budget). REMAINING: refine `mmdit_role` against real Krea2/Qwen-Image tensor names; GPU validation —
+  import Krea2, encode at a fixed `--mix-fraction` with/without `--arch-importance`, compare a
+  denoise/coherence check at equal size; flip default when green.
 - **P3 — `calib x arch` unified policy.** Shared `target_bits_calibrated`, opt-in, validated on
   tiny-quant-gate (LLM) + Krea2 (diffusion). Later: more families, per-channel/mixed-width.
 

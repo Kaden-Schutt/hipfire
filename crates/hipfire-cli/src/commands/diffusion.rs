@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
+use anyhow::Context;
 use std::cell::Cell;
 use std::fs;
-use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -162,6 +162,12 @@ pub struct DiffusionQuantizeArgs {
     /// rewritten to the achieved `oq<avg>` token.
     #[arg(long)]
     pub mix_fraction: Option<f32>,
+    /// Rank the int8 promotion by the arch's structural importance prior
+    /// (embedders/attention/modulation/output over the FFN bulk) instead of the
+    /// default highest-fan-in heuristic. Same bit budget; different tensor
+    /// selection. Only affects `--mix-fraction` (plain-Opus mixed).
+    #[arg(long)]
+    pub arch_importance: bool,
 }
 
 #[derive(Debug, Args)]
@@ -626,17 +632,20 @@ fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
         None => hipfire_diffusion::PlainOpusPolicy::parse(&args.format),
     };
     if let Some(policy) = plain_policy {
-        let summary =
-            hipfire_diffusion::quantize_diffusion_hfq_plain(&args.source, &args.output, policy)?;
+        let summary = hipfire_diffusion::quantize_diffusion_hfq_plain(
+            &args.source,
+            &args.output,
+            policy,
+            args.arch_importance,
+        )?;
         // The canonical name is computed from the ACHIEVED average, not the
         // request. Rewrite the output filename's oq* token (or insert one) and
         // rename the file so the artifact name reflects what it actually is.
         let token = hipfire_diffusion::opus_quant_token(summary.avg_bits);
         let final_output = rewrite_output_token(&args.output, &args.format, &token);
         if final_output != args.output {
-            std::fs::rename(&args.output, &final_output).with_context(|| {
-                format!("rename {:?} -> {:?}", args.output, final_output)
-            })?;
+            std::fs::rename(&args.output, &final_output)
+                .with_context(|| format!("rename {:?} -> {:?}", args.output, final_output))?;
         }
         let ratio = if summary.output_bytes > 0 {
             summary.source_bytes as f64 / summary.output_bytes as f64

@@ -548,7 +548,9 @@ impl PlainOpusPolicy {
     }
     /// Override the int8 fraction (from `--mix-fraction`); forces Mixed.
     pub fn with_fraction(f: f32) -> Self {
-        Self::Mixed { oq8_fraction: Some(f.clamp(0.0, 1.0)) }
+        Self::Mixed {
+            oq8_fraction: Some(f.clamp(0.0, 1.0)),
+        }
     }
 }
 
@@ -612,16 +614,41 @@ struct QuantCandidate {
     fan_in: u32,
     boundary: bool,
     is_down: bool,
+    /// Arch structural-saliency prior in `[0,255]` (higher = protect harder),
+    /// used to rank the int8 promotion when `--arch-importance` is set.
+    importance: u8,
+}
+
+/// Structural importance prior for one tensor. Prefers the container's own arch
+/// `Ingest` (the arch owns its importance policy); falls back to the shared MMDiT
+/// classifier for legacy/unknown-family diffusion containers.
+fn tensor_importance(arch_id: u32, name: &str) -> u8 {
+    use hipfire_arch_api::{default_importance, mmdit_role, ArchId};
+    if let Ok(id) = u16::try_from(arch_id) {
+        if let Some(ingest) = hipfire_archs::registry()
+            .get(ArchId(id))
+            .and_then(|a| a.caps.ingest)
+        {
+            return ingest.importance(name);
+        }
+    }
+    default_importance(mmdit_role(name))
 }
 
 /// Choose which quantizable tensors go to int8 (the rest int4), returning the set
 /// of source-tensor indices. `AllW4`/`AllW8` are trivial; `Mixed{None}` uses the
 /// data-free heuristic (first/last block + FF down); `Mixed{Some(f)}` promotes the
-/// highest-fan-in linears (down-projs first — most error-sensitive per bit) until
-/// ~`f` of the quantized parameters are int8.
+/// top-ranked linears until ~`f` of the quantized parameters are int8.
+///
+/// `by_importance` selects the ranking for the fraction budget: when set, promote
+/// the highest arch-importance tensors first (the arch's structural saliency
+/// prior — embedders/attention/modulation/output over the FFN bulk); otherwise
+/// the default highest-fan-in / down-proj-first heuristic. The budget (`f`) is
+/// identical either way — only *which* tensors win the int8 promotion changes.
 fn select_int8(
     cands: &[QuantCandidate],
     policy: PlainOpusPolicy,
+    by_importance: bool,
 ) -> std::collections::HashSet<usize> {
     use std::collections::HashSet;
     match policy {
@@ -632,17 +659,29 @@ fn select_int8(
             .filter(|c| c.boundary || c.is_down)
             .map(|c| c.idx)
             .collect(),
-        PlainOpusPolicy::Mixed { oq8_fraction: Some(f) } => {
+        PlainOpusPolicy::Mixed {
+            oq8_fraction: Some(f),
+        } => {
             let total: u128 = cands.iter().map(|c| c.params).sum();
             let target = (total as f64 * f as f64) as u128;
-            // Rank by fan-in desc (down-projs first), boundary blocks as tiebreak.
             let mut order: Vec<&QuantCandidate> = cands.iter().collect();
-            order.sort_by(|a, b| {
-                b.fan_in
-                    .cmp(&a.fan_in)
-                    .then(b.boundary.cmp(&a.boundary))
-                    .then(a.idx.cmp(&b.idx))
-            });
+            if by_importance {
+                // Rank by arch importance desc, fan-in as the tiebreak.
+                order.sort_by(|a, b| {
+                    b.importance
+                        .cmp(&a.importance)
+                        .then(b.fan_in.cmp(&a.fan_in))
+                        .then(a.idx.cmp(&b.idx))
+                });
+            } else {
+                // Default: fan-in desc (down-projs first), boundary as tiebreak.
+                order.sort_by(|a, b| {
+                    b.fan_in
+                        .cmp(&a.fan_in)
+                        .then(b.boundary.cmp(&a.boundary))
+                        .then(a.idx.cmp(&b.idx))
+                });
+            }
             let mut acc: u128 = 0;
             let mut set = HashSet::new();
             for c in order {
@@ -654,6 +693,39 @@ fn select_int8(
             }
             set
         }
+    }
+}
+
+#[cfg(test)]
+mod select_int8_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn cand(idx: usize, params: u128, fan_in: u32, importance: u8) -> QuantCandidate {
+        QuantCandidate {
+            idx,
+            params,
+            fan_in,
+            boundary: false,
+            is_down: false,
+            importance,
+        }
+    }
+
+    #[test]
+    fn importance_mode_promotes_salient_over_high_fan_in() {
+        // Two equal-size candidates; a 0.5 budget promotes exactly one to int8.
+        // idx 0: low importance (FFN bulk) but high fan-in.
+        // idx 1: high importance (attention/output) but low fan-in.
+        let cands = vec![cand(0, 1000, 4096, 128), cand(1, 1000, 512, 255)];
+        let policy = PlainOpusPolicy::Mixed {
+            oq8_fraction: Some(0.5),
+        };
+        // Default fan-in ranking promotes the high-fan-in bulk tensor.
+        assert_eq!(select_int8(&cands, policy, false), HashSet::from([0]));
+        // Arch-importance ranking promotes the salient tensor instead — same
+        // budget, different selection.
+        assert_eq!(select_int8(&cands, policy, true), HashSet::from([1]));
     }
 }
 
@@ -676,6 +748,7 @@ pub fn quantize_diffusion_hfq_plain(
     source: &Path,
     output: &Path,
     policy: PlainOpusPolicy,
+    by_importance: bool,
 ) -> anyhow::Result<PlainQuantizeSummary> {
     const GROUP: usize = 256;
     let hfq = HfqFile::open(source)?;
@@ -705,12 +778,12 @@ pub fn quantize_diffusion_hfq_plain(
                 params: (t.shape[0] as u128) * (t.shape[1] as u128),
                 fan_in: t.shape[1],
                 boundary: blk == 0 || blk == last_block,
-                is_down: t.name.ends_with(".ff.down.weight")
-                    || t.name.ends_with(".net.2.weight"),
+                is_down: t.name.ends_with(".ff.down.weight") || t.name.ends_with(".net.2.weight"),
+                importance: tensor_importance(hfq.arch_id, &t.name),
             }
         })
         .collect();
-    let int8_set = select_int8(&candidates, policy);
+    let int8_set = select_int8(&candidates, policy, by_importance);
     let quant_idx: std::collections::HashSet<usize> = candidates.iter().map(|c| c.idx).collect();
 
     // Per-entry plan + declared payload length (needed up front for the index).
@@ -755,7 +828,11 @@ pub fn quantize_diffusion_hfq_plain(
             name: t.name.clone(),
             quant_type,
             shape: t.shape.clone(),
-            group_size: if bits.is_some() { GROUP as u32 } else { t.group_size },
+            group_size: if bits.is_some() {
+                GROUP as u32
+            } else {
+                t.group_size
+            },
             data_len,
         });
     }
