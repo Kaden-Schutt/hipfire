@@ -867,7 +867,7 @@ pub enum EpMoePhase {
 /// `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` selects the RCCL-free peer-direct
 /// all-reduce for the EP MoE collective (no librccl dependency). Cached for
 /// process lifetime.
-fn ep_peer_allreduce_decode() -> bool {
+pub fn ep_peer_allreduce_decode() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1"))
 }

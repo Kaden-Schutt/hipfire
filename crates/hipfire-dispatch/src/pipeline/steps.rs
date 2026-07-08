@@ -677,12 +677,28 @@ pub fn execute_steps_mesh(
 
 /// Collective to inject after a step ran on every rank of the `Tp` group.
 /// Keyed by step index in the per-rank step lists (see [`execute_steps_tp`]).
+#[derive(Debug)]
 pub enum TpCollective {
     /// Column-parallel (or replicated) step — output stays on-rank, no collective.
     None,
     /// Row-parallel step — each rank produced a partial `out` of length `dim`;
     /// sum them in place across the `Tp` group so every rank holds the whole.
     AllReduceOut { dim: usize },
+}
+
+/// Axis-keyed collective to inject after a step in [`execute_steps_parallel`].
+/// Replaces the TP-specific `TpCollective` with a generic form that covers both
+/// Tp (dense row-parallel) and Ep (MoE expert-parallel) all-reduces.
+#[derive(Debug)]
+pub enum StepCollective {
+    /// No collective — column-parallel / replicated steps leave output on-rank.
+    None,
+    /// All-reduce the step's partial output over the `kind` group.
+    /// `dim` is the element count (f32) of the partial buffer on each rank.
+    AllReduce {
+        kind: hipfire_hardware::DimKind,
+        dim: usize,
+    },
 }
 
 /// The `out` buffer of a step that can be row-parallel (the only kind that needs
@@ -694,6 +710,183 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         Step::Gemm { y, .. } => Some(&y.buf),
         _ => None,
     }
+}
+
+/// Pure-logic validation for [`execute_steps_parallel`] arg lengths.
+/// Separated into its own fn so it is testable without a GPU.
+/// Returns `n_steps` (= `per_rank_steps[0].len()`) on success.
+fn validate_parallel_args(
+    group_size: usize,
+    per_rank_steps: &[Vec<Step>],
+    collectives: &[StepCollective],
+    zero_before: &[bool],
+) -> Result<usize, DispatchError> {
+    if per_rank_steps.len() != group_size {
+        return Err(DispatchError::Hip(format!(
+            "execute_steps_parallel: {} step lists for group of {group_size}",
+            per_rank_steps.len()
+        )));
+    }
+    let n_steps = per_rank_steps[0].len();
+    for (r, s) in per_rank_steps.iter().enumerate() {
+        if s.len() != n_steps {
+            return Err(DispatchError::Hip(format!(
+                "execute_steps_parallel: rank {r} has {} steps, rank 0 has {n_steps} (must be lock-step)",
+                s.len()
+            )));
+        }
+    }
+    if collectives.len() != n_steps {
+        return Err(DispatchError::Hip(format!(
+            "execute_steps_parallel: {} collectives for {n_steps} steps",
+            collectives.len()
+        )));
+    }
+    if zero_before.len() != n_steps {
+        return Err(DispatchError::Hip(format!(
+            "execute_steps_parallel: {} zero_before flags for {n_steps} steps",
+            zero_before.len()
+        )));
+    }
+    Ok(n_steps)
+}
+
+/// Axis-keyed parallel Step executor (P-D foundation). The generic form of
+/// [`execute_steps_tp`]: runs `per_rank_steps` lock-step across the mesh group
+/// for `collectives[i].kind`, injects an axis-keyed all-reduce for
+/// `StepCollective::AllReduce` steps, and optionally zeroes the step's output
+/// buffer before running it (required for EP accumulation into a partial).
+///
+/// **`zero_before[i]`** — when true, `memset_async` the step's output buffer to 0
+/// before launching step `i` on each rank. The element count is taken from the
+/// paired `AllReduce { dim }` collective. Mirror of `ep_moe_allreduce`
+/// (lib.rs:799-811): same 4-bytes-per-elem, same `active_stream` requirement.
+///
+/// **Collective choice** is keyed on the collective's `kind`:
+/// - `DimKind::Tp` → always `all_reduce_sum_f32_peer` (RCCL not required on Tp path).
+/// - `DimKind::Ep` → `ep_peer_allreduce_decode()` ? `_peer` : `_rccl`
+///   (mirrors `ep_moe_allreduce` lib.rs:823-826).
+///
+/// The group is resolved via `mesh.group_along(kind, coord_of(0))` — identical
+/// to the TP path, so byte-identical results are guaranteed for Tp collectives.
+///
+/// Preconditions: each rank in the group has `active_stream` set and peer access
+/// enabled (`ensure_rank_streams` + `enable_peer_all`).
+pub fn execute_steps_parallel(
+    mesh: &DeviceMesh,
+    gpus: &mut hipfire_hardware::Gpus,
+    per_rank_steps: &[Vec<Step>],
+    collectives: &[StepCollective],
+    zero_before: &[bool],
+) -> Result<(), DispatchError> {
+    // Determine the parallelism axis from the first AllReduce collective, or
+    // fall back to Tp (all-None collectives remain on the Tp group for compat).
+    let kind = collectives
+        .iter()
+        .find_map(|c| {
+            if let StepCollective::AllReduce { kind, .. } = c {
+                Some(*kind)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(hipfire_hardware::DimKind::Tp);
+
+    let group = mesh.group_along(kind, &mesh.coord_of(0));
+    let group_size = group.len();
+
+    if group_size <= 1 {
+        return Err(DispatchError::Hip(format!(
+            "execute_steps_parallel: {kind:?} group size {group_size} — needs >1 ranks"
+        )));
+    }
+    let n_steps = validate_parallel_args(group_size, per_rank_steps, collectives, zero_before)?;
+
+    let hip_err = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+
+    for i in 0..n_steps {
+        // Optional pre-zero of each rank's output buffer (EP accumulation pattern).
+        // Mirrors ep_moe_allreduce lib.rs:799-811 exactly: memset_async, dim*4 bytes.
+        if zero_before[i] {
+            let dim = match &collectives[i] {
+                StepCollective::AllReduce { dim, .. } => *dim,
+                StepCollective::None => {
+                    return Err(DispatchError::Hip(format!(
+                        "execute_steps_parallel: zero_before[{i}] is true but collective is None (no dim)"
+                    )));
+                }
+            };
+            for (r, &dev) in group.iter().enumerate() {
+                gpus.devices[dev].bind_thread().map_err(hip_err)?;
+                let stream = gpus.devices[dev].active_stream.as_ref().ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_parallel: device {dev} has no active_stream for zero_before"
+                    ))
+                })?;
+                let buf = tp_step_out_buf(&per_rank_steps[r][i]).ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_parallel: step {i} zero_before=true but has no out buffer"
+                    ))
+                })?;
+                gpus.devices[dev]
+                    .hip
+                    .memset_async(buf, 0, dim * 4, stream)
+                    .map_err(hip_err)?;
+            }
+        }
+
+        // Run step i on every rank (each with its own sharded weights/buffers).
+        for (r, &dev) in group.iter().enumerate() {
+            gpus.devices[dev].bind_thread().map_err(hip_err)?;
+            let ctx = DispatchCtx::new(&gpus.devices[dev]);
+            launch_op(&mut gpus.devices[dev], &ctx, &per_rank_steps[r][i])?;
+        }
+
+        // Collective: all-reduce the partial outputs over the axis group.
+        if let StepCollective::AllReduce {
+            kind: coll_kind,
+            dim,
+        } = &collectives[i]
+        {
+            for &dev in &group {
+                let g = &gpus.devices[dev];
+                g.bind_thread().map_err(hip_err)?;
+                let stream = g.active_stream.as_ref().ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_parallel: device {dev} has no active_stream"
+                    ))
+                })?;
+                g.hip.stream_synchronize(stream).map_err(hip_err)?;
+            }
+            let mut refs: Vec<&hip_bridge::DeviceBuffer> = Vec::with_capacity(group_size);
+            for (r, _) in group.iter().enumerate() {
+                let buf = tp_step_out_buf(&per_rank_steps[r][i]).ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_parallel: step {i} marked AllReduce but has no out buffer"
+                    ))
+                })?;
+                refs.push(buf);
+            }
+            // Peer/RCCL choice: Tp always uses peer (RCCL not installed on Tp path);
+            // Ep branches on HIPFIRE_EP_PEER_ALLREDUCE_DECODE. Mirrors lib.rs:823-826.
+            match coll_kind {
+                hipfire_hardware::DimKind::Tp => {
+                    gpus.all_reduce_sum_f32_peer(&group, &refs, *dim)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
+                _ => {
+                    if hipfire_hardware::ep_peer_allreduce_decode() {
+                        gpus.all_reduce_sum_f32_peer(&group, &refs, *dim)
+                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    } else {
+                        gpus.all_reduce_sum_f32(&group, &refs, *dim)
+                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Tensor-parallel executor (P-B grand-unify, PB-TP1). The `Tp>1` counterpart of
@@ -718,76 +911,29 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
 /// Preconditions the caller owns: each device in the `Tp` group has an
 /// `active_stream` set and peer access enabled (`ensure_rank_streams` +
 /// `enable_peer_all`).
+///
+/// **Wrapper:** delegates to [`execute_steps_parallel`] with `zero_before` all-false
+/// and `TpCollective` mapped to `StepCollective`. Byte-identical to the prior
+/// monolithic implementation for all existing TP callers/examples.
 pub fn execute_steps_tp(
     mesh: &DeviceMesh,
     gpus: &mut hipfire_hardware::Gpus,
     per_rank_steps: &[Vec<Step>],
     collectives: &[TpCollective],
 ) -> Result<(), DispatchError> {
-    let group = mesh.group_along(hipfire_hardware::DimKind::Tp, &mesh.coord_of(0));
-    let tp = group.len();
-    if tp <= 1 {
-        return Err(DispatchError::Hip(format!(
-            "execute_steps_tp: Tp group size {tp} — needs a Tp>1 mesh"
-        )));
-    }
-    if per_rank_steps.len() != tp {
-        return Err(DispatchError::Hip(format!(
-            "execute_steps_tp: {} step lists for a Tp group of {tp}",
-            per_rank_steps.len()
-        )));
-    }
-    let n_steps = per_rank_steps[0].len();
-    for (r, s) in per_rank_steps.iter().enumerate() {
-        if s.len() != n_steps {
-            return Err(DispatchError::Hip(format!(
-                "execute_steps_tp: rank {r} has {} steps, rank 0 has {n_steps} (must be lock-step)",
-                s.len()
-            )));
-        }
-    }
-    if collectives.len() != n_steps {
-        return Err(DispatchError::Hip(format!(
-            "execute_steps_tp: {} collectives for {n_steps} steps",
-            collectives.len()
-        )));
-    }
-
-    let hip_err = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
-
-    for i in 0..n_steps {
-        // Run step i on every rank (each with its own sharded weights/buffers).
-        for (r, &dev) in group.iter().enumerate() {
-            gpus.devices[dev].bind_thread().map_err(hip_err)?;
-            let ctx = DispatchCtx::new(&gpus.devices[dev]);
-            launch_op(&mut gpus.devices[dev], &ctx, &per_rank_steps[r][i])?;
-        }
-        // Row-parallel step → all-reduce its partial outputs over the Tp group.
-        if let TpCollective::AllReduceOut { dim } = collectives[i] {
-            for &dev in &group {
-                let g = &gpus.devices[dev];
-                g.bind_thread().map_err(hip_err)?;
-                let stream = g.active_stream.as_ref().ok_or_else(|| {
-                    DispatchError::Hip(format!(
-                        "execute_steps_tp: device {dev} has no active_stream"
-                    ))
-                })?;
-                g.hip.stream_synchronize(stream).map_err(hip_err)?;
-            }
-            let mut refs: Vec<&hip_bridge::DeviceBuffer> = Vec::with_capacity(tp);
-            for (r, _) in group.iter().enumerate() {
-                let buf = tp_step_out_buf(&per_rank_steps[r][i]).ok_or_else(|| {
-                    DispatchError::Hip(format!(
-                        "execute_steps_tp: step {i} marked row-parallel but has no out buffer"
-                    ))
-                })?;
-                refs.push(buf);
-            }
-            gpus.all_reduce_sum_f32_peer(&group, &refs, dim)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        }
-    }
-    Ok(())
+    let n_steps = per_rank_steps.first().map(|v| v.len()).unwrap_or(0);
+    let collectives2: Vec<StepCollective> = collectives
+        .iter()
+        .map(|c| match c {
+            TpCollective::AllReduceOut { dim } => StepCollective::AllReduce {
+                kind: hipfire_hardware::DimKind::Tp,
+                dim: *dim,
+            },
+            TpCollective::None => StepCollective::None,
+        })
+        .collect();
+    let zero_before = vec![false; n_steps];
+    execute_steps_parallel(mesh, gpus, per_rank_steps, &collectives2, &zero_before)
 }
 
 /// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
@@ -1598,6 +1744,74 @@ mod tests {
         assert!(
             keys.contains(&KernelKey::FusedGateUpQ8_0),
             "FusedGateUpQ8_0 missing from FUSED_TABLE"
+        );
+    }
+
+    /// Pure-logic test: TpCollective→StepCollective wrapper mapping and
+    /// the three validate_parallel_args length-mismatch guards.
+    /// No GPU needed — only enum construction and the pure validator are exercised.
+    #[test]
+    fn parallel_arg_length_guards() {
+        use hipfire_hardware::DimKind;
+
+        // --- mapping test: execute_steps_tp wrapper logic ---
+        // AllReduceOut{dim:8} must map to AllReduce{kind:Tp, dim:8}
+        let tp_colls = vec![TpCollective::None, TpCollective::AllReduceOut { dim: 8 }];
+        let mapped: Vec<StepCollective> = tp_colls
+            .iter()
+            .map(|c| match c {
+                TpCollective::AllReduceOut { dim } => StepCollective::AllReduce {
+                    kind: DimKind::Tp,
+                    dim: *dim,
+                },
+                TpCollective::None => StepCollective::None,
+            })
+            .collect();
+        // First element: None → None
+        assert!(matches!(mapped[0], StepCollective::None));
+        // Second element: AllReduceOut{8} → AllReduce{Tp, 8}
+        match &mapped[1] {
+            StepCollective::AllReduce { kind, dim } => {
+                assert!(matches!(kind, DimKind::Tp), "expected Tp, got {kind:?}");
+                assert_eq!(*dim, 8);
+            }
+            other => panic!("expected AllReduce, got {other:?}"),
+        }
+
+        // --- guard 1: per_rank_steps.len() != group_size ---
+        // group=2, but only 1 step list supplied
+        let group_size = 2usize;
+        let steps_1: Vec<Vec<Step<'_>>> = vec![vec![]]; // len=1, mismatch
+        let colls_0: Vec<StepCollective> = vec![];
+        let zb_0: Vec<bool> = vec![];
+        let e = super::validate_parallel_args(group_size, &steps_1, &colls_0, &zb_0)
+            .expect_err("should fail: per_rank_steps.len()==1 != group_size==2");
+        assert!(
+            matches!(&e, DispatchError::Hip(msg) if msg.contains("step lists")),
+            "unexpected error: {e:?}"
+        );
+
+        // --- guard 2: collectives.len() != n_steps ---
+        // group=2, 2 step lists each with n_steps=0, but 1 collective supplied
+        let steps_2: Vec<Vec<Step<'_>>> = vec![vec![], vec![]]; // 2 ranks, n_steps=0
+        let colls_1 = vec![StepCollective::None]; // len=1, mismatch with n_steps=0
+        let zb_0: Vec<bool> = vec![];
+        let e = super::validate_parallel_args(group_size, &steps_2, &colls_1, &zb_0)
+            .expect_err("should fail: collectives.len()==1 != n_steps==0");
+        assert!(
+            matches!(&e, DispatchError::Hip(msg) if msg.contains("collectives")),
+            "unexpected error: {e:?}"
+        );
+
+        // --- guard 3: zero_before.len() != n_steps ---
+        // group=2, 2 step lists with n_steps=0, 0 collectives, but zero_before has 1 elem
+        let colls_0: Vec<StepCollective> = vec![]; // len=0 matches n_steps=0
+        let zb_1 = vec![false]; // len=1, mismatch with n_steps=0
+        let e = super::validate_parallel_args(group_size, &steps_2, &colls_0, &zb_1)
+            .expect_err("should fail: zero_before.len()==1 != n_steps==0");
+        assert!(
+            matches!(&e, DispatchError::Hip(msg) if msg.contains("zero_before")),
+            "unexpected error: {e:?}"
         );
     }
 }
