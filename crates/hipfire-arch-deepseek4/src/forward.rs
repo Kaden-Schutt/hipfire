@@ -2102,6 +2102,514 @@ fn ds4_ep_moe_rank(
     }
 }
 
+// ───────────────── P-D decompose D1: ds4 forward_ep step arm (Task 8) ────────
+//
+// Byte-identical replacement for the `ep_moe_allreduce` + `ds4_ep_moe_rank`
+// primitive: it runs the exact same per-rank kernels in the same order, but
+// drives the routed-expert down-projection + EP all-reduce through the
+// axis-keyed `execute_steps_parallel` executor instead of the hand-rolled
+// zero→run→reduce→add primitive. Gated behind `HIPFIRE_MOE_STEP` (default OFF;
+// the primitive arm stays default). Mirrors minimax's `minimax_ep_moe_step`,
+// with two ds4-specific extras: a replicated SHARED expert (`ffn_stub`, into
+// `state.ffn_out`) that runs BEFORE the routed experts, and the `hc_ffn_mix`
+// tail (via `launch_hc_ffn_mix`) that folds the assembled `ffn_out` into the
+// HC residual streams AFTER the all-reduce.
+
+/// Parity-harness override for the `HIPFIRE_MOE_STEP` gate: `-1` = env-driven
+/// (default), `0` = force primitive arm, `1` = force decomposed arm. Lets a
+/// single-process parity harness A/B both arms after ONE model load (the env
+/// read below is `OnceLock`-cached, so it can't be flipped mid-process).
+static MOE_STEP_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Force the decomposed (`Some(true)`) or primitive (`Some(false)`) EP MoE arm,
+/// or restore env-driven behavior (`None`). Test/parity hook only.
+pub fn set_ds4_moe_step_override(v: Option<bool>) {
+    let code = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    MOE_STEP_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `HIPFIRE_MOE_STEP=1` routes the ds4 EP MoE routed down-projection +
+/// all-reduce through the decomposed `execute_steps_parallel` Step path (P-D
+/// milestone) instead of the `ep_moe_allreduce` primitive. Default OFF; the
+/// primitive arm stays the default. Env read is cached for process lifetime;
+/// the parity override wins when set. Shares the SAME env gate as minimax.
+fn ds4_moe_step_enabled() -> bool {
+    match MOE_STEP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *F.get_or_init(|| std::env::var("HIPFIRE_MOE_STEP").as_deref() == Ok("1"))
+        }
+    }
+}
+
+/// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` (default 2.2) — same read `ffn_routed` uses.
+fn ds4_route_scale() -> f32 {
+    use std::sync::OnceLock;
+    static ROUTE_SCALE: OnceLock<f32> = OnceLock::new();
+    *ROUTE_SCALE.get_or_init(|| {
+        std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2.2)
+    })
+}
+
+/// Lazy-alloc the routed-MoE decode scratch shared by the bias-aware and hash
+/// pre-down paths (mirrors the lazy allocs in `ffn_routed` / `ffn_hash_routed`).
+fn ds4_alloc_moe_scratch(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    let k_top = cfg.num_experts_per_tok;
+    let im = cfg.moe_intermediate_size;
+    if state.moe_topk_indices.is_none() {
+        state.moe_topk_indices = Some(
+            gpu.alloc_tensor(&[k_top], DType::F32)
+                .map_err(|e| format!("alloc moe_topk_indices: {e:?}"))?,
+        );
+    }
+    if state.moe_topk_weights.is_none() {
+        state.moe_topk_weights = Some(
+            gpu.alloc_tensor(&[k_top], DType::F32)
+                .map_err(|e| format!("alloc moe_topk_weights: {e:?}"))?,
+        );
+    }
+    if state.moe_gate_batch.is_none() {
+        state.moe_gate_batch = Some(
+            gpu.alloc_tensor(&[k_top, im], DType::F32)
+                .map_err(|e| format!("alloc moe_gate_batch: {e:?}"))?,
+        );
+    }
+    if state.moe_up_batch.is_none() {
+        state.moe_up_batch = Some(
+            gpu.alloc_tensor(&[k_top, im], DType::F32)
+                .map_err(|e| format!("alloc moe_up_batch: {e:?}"))?,
+        );
+    }
+    if state.moe_rot_batch.is_none() {
+        state.moe_rot_batch = Some(
+            gpu.alloc_tensor(&[k_top, im], DType::F32)
+                .map_err(|e| format!("alloc moe_rot_batch: {e:?}"))?,
+        );
+    }
+    if state.moe_down_expert_outputs.is_none() {
+        state.moe_down_expert_outputs = Some(
+            gpu.alloc_tensor(&[k_top, cfg.hidden_size], DType::F32)
+                .map_err(|e| format!("alloc moe_down_expert_outputs: {e:?}"))?,
+        );
+    }
+    Ok(())
+}
+
+/// Indexed gate_up → batched silu·mul·clamp → batched FWHT rotate. The pre-down
+/// tail shared verbatim by the bias-aware and hash routing paths (identical to
+/// `run_moe_decode_bias_aware` steps 2-3 and `ffn_hash_routed` gate_up/silu/rot).
+fn ds4_moe_gate_up_silu_rotate(
+    cfg: &DeepseekV4Config,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let im = cfg.moe_intermediate_size;
+    let k_top = cfg.num_experts_per_tok;
+    let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
+    let topk_idx = state.moe_topk_indices.as_ref().unwrap();
+    let gate_batch = state.moe_gate_batch.as_ref().unwrap();
+    let up_batch = state.moe_up_batch.as_ref().unwrap();
+    let rot_batch = state.moe_rot_batch.as_ref().unwrap();
+    let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
+    gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+        gate_up_ptrs,
+        topk_idx,
+        ffn_x_rot,
+        gate_batch,
+        up_batch,
+        2 * im,
+        cfg.hidden_size,
+        k_top,
+    )
+    .map_err(|e| format!("moe-step L{layer_idx}: gate_up: {e:?}"))?;
+    gpu.deepseek4_silu_mul_clamp_f32_batched(
+        gate_batch,
+        up_batch,
+        gate_batch,
+        im,
+        k_top,
+        cfg.swiglu_limit,
+    )
+    .map_err(|e| format!("moe-step L{layer_idx}: silu_mul_clamp: {e:?}"))?;
+    gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
+        .map_err(|e| format!("moe-step L{layer_idx}: rotate: {e:?}"))?;
+    Ok(())
+}
+
+/// Bias-aware routed pre-down (non-hash layers): mirrors `ffn_routed` up to but
+/// NOT including the down+combine. Returns `true` if routed experts dispatched,
+/// `false` if the layer is shared-only (MoE off or expert blobs absent).
+fn ds4_bias_pre_down(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<bool, String> {
+    if !env_cache::moe_on() {
+        return Ok(false);
+    }
+    let layer = weights.resolve_layer(layer_idx);
+    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
+        return Ok(false);
+    }
+    // Router: unbiased scores on-device (bias-aware top-K folds bias + route_scale).
+    moe_route(cfg, weights, state, gpu, layer_idx)?;
+    ds4_alloc_moe_scratch(cfg, state, gpu)?;
+    let route_scale = ds4_route_scale();
+    {
+        let layer = weights.resolve_layer(layer_idx);
+        let scores = state.router_scores.as_ref().unwrap();
+        let bias = layer
+            .gate_bias
+            .as_ref()
+            .ok_or_else(|| format!("moe-step l{layer_idx}: gate_bias missing"))?;
+        let topk_idx = state.moe_topk_indices.as_ref().unwrap();
+        let topk_w = state.moe_topk_weights.as_ref().unwrap();
+        gpu.deepseek4_moe_topk_bias_aware_f32(
+            scores,
+            bias,
+            topk_idx,
+            topk_w,
+            cfg.n_routed_experts as i32,
+            cfg.num_experts_per_tok as i32,
+            route_scale,
+        )
+        .map_err(|e| format!("moe-step l{layer_idx}: topk: {e:?}"))?;
+    }
+    let layer = weights.resolve_layer(layer_idx);
+    ds4_moe_gate_up_silu_rotate(cfg, layer, state, gpu, layer_idx)?;
+    Ok(true)
+}
+
+/// Hash-routed pre-down (layers < `num_hash_layers`): mirrors `ffn_hash_routed`
+/// up to but NOT including the down. Returns `true` if routed experts
+/// dispatched, `false` if shared-only (MoE off / no blobs / no tid2eid).
+fn ds4_hash_pre_down(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<bool, String> {
+    if !env_cache::moe_on() {
+        return Ok(false);
+    }
+    let layer = weights.resolve_layer(layer_idx);
+    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
+        return Ok(false);
+    }
+    if layer.tid2eid_host.is_empty() {
+        return Ok(false);
+    }
+    moe_route(cfg, weights, state, gpu, layer_idx)?;
+    let k = cfg.num_experts_per_tok;
+    let n_exp = cfg.n_routed_experts;
+    let layer = weights.resolve_layer(layer_idx);
+    let row = (token_id as usize) * k;
+    if row + k > layer.tid2eid_host.len() {
+        return Err(format!(
+            "moe-step hash l{layer_idx}: token_id {token_id} out of tid2eid range ({} entries)",
+            layer.tid2eid_host.len()
+        ));
+    }
+    ds4_alloc_moe_scratch(cfg, state, gpu)?;
+    let route_scale = ds4_route_scale();
+    let layer = weights.resolve_layer(layer_idx);
+    {
+        let topk_idx = state.moe_topk_indices.as_ref().unwrap();
+        let topk_w = state.moe_topk_weights.as_ref().unwrap();
+        let scores = state.router_scores.as_ref().unwrap();
+        if let Some(tid2eid_dev) = layer.tid2eid_dev.as_ref() {
+            if let Some(token_id_buf) = state.token_id_buf.as_ref() {
+                gpu.hash_router_normalize_f32_buf(
+                    tid2eid_dev,
+                    scores,
+                    token_id_buf,
+                    topk_idx,
+                    topk_w,
+                    n_exp as i32,
+                    k as i32,
+                    route_scale,
+                )
+                .map_err(|e| format!("moe-step hash l{layer_idx}: router_buf: {e:?}"))?;
+            } else {
+                gpu.hash_router_normalize_f32(
+                    tid2eid_dev,
+                    scores,
+                    topk_idx,
+                    topk_w,
+                    token_id as i32,
+                    n_exp as i32,
+                    k as i32,
+                    route_scale,
+                )
+                .map_err(|e| format!("moe-step hash l{layer_idx}: router: {e:?}"))?;
+            }
+        } else {
+            // Fallback: d2h + host gather + h2d (mirrors ffn_hash_routed).
+            let scores_host = gpu
+                .download_f32(scores)
+                .map_err(|e| format!("moe-step hash l{layer_idx}: d2h scores: {e:?}"))?;
+            let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k]
+                .iter()
+                .map(|&i| i.min((n_exp - 1) as u32))
+                .collect();
+            let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
+                Some(w) => w,
+                None => return Ok(false),
+            };
+            let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
+            let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
+            gpu.memcpy_htod_auto(&topk_idx.buf, &idx_bytes)
+                .map_err(|e| format!("moe-step hash l{layer_idx}: htod idx: {e:?}"))?;
+            let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale).collect();
+            let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
+            gpu.memcpy_htod_auto(&topk_w.buf, &w_bytes)
+                .map_err(|e| format!("moe-step hash l{layer_idx}: htod w: {e:?}"))?;
+        }
+    }
+    let layer = weights.resolve_layer(layer_idx);
+    ds4_moe_gate_up_silu_rotate(cfg, layer, state, gpu, layer_idx)?;
+    Ok(true)
+}
+
+/// Per-rank ds4 pre-down (shared expert + routed pre-down): mirrors
+/// `ds4_moe_block_core(.., Some(partial), do_mix=false)` MINUS the routed
+/// down+combine (deferred to the executor). Returns `true` if routed experts
+/// will contribute a partial for this layer.
+fn ds4_ep_pre_down(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+    skip_ffn: bool,
+) -> Result<bool, String> {
+    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
+    if skip_ffn {
+        if state.ffn_out.is_none() {
+            state.ffn_out = Some(
+                gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+                    .map_err(|e| format!("alloc ffn_out: {e:?}"))?,
+            );
+        }
+        let ffn_out = state.ffn_out.as_ref().unwrap();
+        gpu.hip
+            .memset(&ffn_out.buf, 0, ffn_out.byte_size())
+            .map_err(|e| format!("memset ffn_out: {e:?}"))?;
+        return Ok(false);
+    }
+    // Shared expert (replicated on every rank) → state.ffn_out; also produces
+    // ffn_x_rot for the routed pre-down and moe_route.
+    ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+    if layer_idx < cfg.num_hash_layers {
+        ds4_hash_pre_down(cfg, weights, state, gpu, layer_idx, token_id)
+    } else {
+        ds4_bias_pre_down(cfg, weights, state, gpu, layer_idx)
+    }
+}
+
+/// Decomposed EP MoE for ONE layer — the `HIPFIRE_MOE_STEP` arm of `forward_ep`.
+///
+/// - **Phase 1** (per rank, direct arch kernels): `mhc_pre` → shared expert
+///   (`ffn_stub`, replicated into `state.ffn_out`) → routed pre-down (route →
+///   bias-aware/hash select → indexed gate_up → batched silu·mul·clamp → FWHT
+///   rotate). No bit-identical Step twin exists for the fused HC / silu-rotate
+///   kernels, so they stay direct — the SAME calls the primitive makes.
+/// - **Phase 2** (routed down + EP all-reduce via `execute_steps_parallel`):
+///   non-hash layers use the EXPANDED path (`IndexedMoeGemv{DownExpanded}` →
+///   `MoeCombine`, `zero_before` the EP partial), hash layers use the
+///   residual-fused path (`IndexedMoeGemv{DownResidual}`, `zero_before`), then a
+///   single `AllReduce{Ep}` over the routed partial (mirrors the primitive
+///   deterministic combine + `ep_moe_allreduce` sum).
+/// - **Phase 3** (tail): `ffn_out += all_reduced_partial` (→ shared + routed),
+///   then `launch_hc_ffn_mix` folds `ffn_out` into `residual_streams`. This
+///   replaces the primitive's `EpMoePhase::AddResidual`.
+#[allow(clippy::too_many_arguments)]
+fn ds4_ep_moe_step(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
+    l: usize,
+    token: u32,
+    skip_ffn: bool,
+) -> Result<(), String> {
+    use hipfire_dispatch::families::moe::{launch_hc_ffn_mix, MoeExpertRef};
+    use hipfire_dispatch::pipeline::{
+        execute_steps_parallel, GemvInput, MoeProj, Step, StepCollective,
+    };
+    let n = gpus.devices.len();
+    let hidden = cfg.hidden_size;
+    let inter = cfg.moe_intermediate_size;
+    let n_exp = cfg.n_routed_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let is_hash = l < cfg.num_hash_layers;
+
+    // ── Phase 1: per-rank shared expert + routed pre-down (direct kernels) ──
+    let mut routed = false;
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("moe-step bind {r} L{l}: {e:?}"))?;
+        // Routed-ness is a deterministic function of the (replicated) layer
+        // weights + token, so it is identical across ranks.
+        routed = ds4_ep_pre_down(
+            cfg,
+            &weights_per_rank[r],
+            &mut state_per_rank[r],
+            &mut gpus.devices[r],
+            l,
+            token,
+            skip_ffn,
+        )
+        .map_err(|e| format!("moe-step pre-down L{l} r{r}: {e}"))?;
+    }
+
+    // ── Phase 2: routed down + EP all-reduce via execute_steps_parallel ──
+    // When the layer is shared-only (no routed experts), the primitive would
+    // all-reduce a zeroed partial and add zero — a no-op — so we skip the
+    // executor entirely and go straight to the tail (byte-identical: x+0==x).
+    if routed {
+        let expert_refs: Vec<MoeExpertRef> = (0..n)
+            .map(|r| {
+                let layer = weights_per_rank[r].resolve_layer(l);
+                MoeExpertRef {
+                    gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
+                    down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
+                    dummy_gate_up: None,
+                    // ds4 routed experts are MQ2-Lloyd (the primitive hardcodes
+                    // this down kernel); byte-identity requires the same dtype.
+                    dtype: DType::MQ2G256Lloyd,
+                    n_experts: n_exp,
+                    expert_m: inter,
+                    expert_k: hidden,
+                    owned: &[],
+                }
+            })
+            .collect();
+        let (per_rank_steps, collectives, zero_before): (
+            Vec<Vec<Step>>,
+            Vec<StepCollective>,
+            Vec<bool>,
+        ) = if is_hash {
+            // Hash layers: residual-fused down (down + weighted-combine) writes
+            // the EP partial directly — mirrors ffn_hash_routed's down kernel.
+            let steps = (0..n)
+                .map(|r| {
+                    vec![Step::IndexedMoeGemv {
+                        experts: &expert_refs[r],
+                        which: MoeProj::DownResidual {
+                            topk_weights: state_per_rank[r].moe_topk_weights.as_ref().unwrap(),
+                        },
+                        topk_indices: state_per_rank[r].moe_topk_indices.as_ref().unwrap(),
+                        input: GemvInput::Prerotated(
+                            state_per_rank[r].moe_rot_batch.as_ref().unwrap(),
+                        ),
+                        out: &partials[r],
+                        k_top,
+                        batch_size: 1,
+                    }]
+                })
+                .collect();
+            (
+                steps,
+                vec![StepCollective::AllReduce {
+                    kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                    dim: hidden,
+                }],
+                vec![true],
+            )
+        } else {
+            // Non-hash layers: EXPANDED down (per-expert outputs) + a separate
+            // weighted MoeCombine into the pre-zeroed EP partial — mirrors the
+            // deterministic run_moe_decode_bias_aware down+combine.
+            let steps = (0..n)
+                .map(|r| {
+                    let s = &state_per_rank[r];
+                    vec![
+                        Step::IndexedMoeGemv {
+                            experts: &expert_refs[r],
+                            which: MoeProj::DownExpanded,
+                            topk_indices: s.moe_topk_indices.as_ref().unwrap(),
+                            input: GemvInput::Prerotated(s.moe_rot_batch.as_ref().unwrap()),
+                            out: s.moe_down_expert_outputs.as_ref().unwrap(),
+                            k_top,
+                            batch_size: 1,
+                        },
+                        Step::MoeCombine {
+                            down_out: s.moe_down_expert_outputs.as_ref().unwrap(),
+                            topk_weights: s.moe_topk_weights.as_ref().unwrap(),
+                            out: &partials[r],
+                            k: k_top,
+                            hidden,
+                            batch_size: 1,
+                            inverse_perm: None,
+                        },
+                    ]
+                })
+                .collect();
+            (
+                steps,
+                vec![
+                    StepCollective::None,
+                    StepCollective::AllReduce {
+                        kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                        dim: hidden,
+                    },
+                ],
+                vec![false, true],
+            )
+        };
+        execute_steps_parallel(mesh, gpus, &per_rank_steps, &collectives, &zero_before)
+            .map_err(|e| format!("moe-step L{l}: execute_steps_parallel: {e:?}"))?;
+    }
+
+    // ── Phase 3: ffn_out += routed partial, then hc_ffn_mix tail ──
+    let hc_bytes = cfg.hc_mult * cfg.hidden_size * 4;
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("moe-step tail bind {r} L{l}: {e:?}"))?;
+        let s = &state_per_rank[r];
+        let gpu = &mut gpus.devices[r];
+        let ffn_out = s
+            .ffn_out
+            .as_ref()
+            .ok_or_else(|| format!("moe-step L{l} r{r}: ffn_out unset"))?;
+        if routed {
+            gpu.add_inplace_f32(ffn_out, &partials[r])
+                .map_err(|e| format!("moe-step L{l} r{r}: add residual: {e:?}"))?;
+        }
+        let streams = s.residual_streams.as_ref().unwrap();
+        let hc_c = s.hc_c.as_ref().unwrap();
+        let streams_out = s.q.as_ref().unwrap();
+        launch_hc_ffn_mix(gpu, streams, hc_c, ffn_out, streams_out, hidden, hc_bytes)
+            .map_err(|e| format!("moe-step L{l} r{r}: hc_ffn_mix: {e:?}"))?;
+    }
+    Ok(())
+}
+
 // ───────────────────────── Ship 6 substrate-EP (DeepSeek-V4) ─────────────────
 //
 // Mirror of the qwen35 / MiniMax EP wiring. DeepSeek packs all routed experts
@@ -2186,6 +2694,16 @@ pub fn forward_ep(
         .unwrap_or(false);
     let t_layers = std::time::Instant::now();
     let group: Vec<usize> = (0..n).collect();
+    // Two arms: the decomposed Step executor (HIPFIRE_MOE_STEP, P-D milestone)
+    // or the `ep_moe_allreduce` primitive (default). Both byte-identical.
+    let moe_step = ds4_moe_step_enabled();
+    // Topological EP mesh for the decomposed arm: a single Ep axis of `n` ranks
+    // → `group_along(Ep)` == `group`. Bands/ragged layout stay off the mesh
+    // (mesh is topological), matching the loader's EP mesh.
+    let ep_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+        hipfire_runtime::multi_gpu::DimKind::Ep,
+        n,
+    )]);
     for l in 0..cfg.num_hidden_layers {
         // Attend replicated: every rank holds full MLA weights + full KV, so the
         // per-rank attention is a deterministic function of replicated inputs
@@ -2207,20 +2725,35 @@ pub fn forward_ep(
         // Moe all-reduce EP: each rank runs its owned routed experts (+ the
         // replicated shared expert) into a partial, the partials all-reduce over
         // the Ep group, and each rank folds the reduced routed sum into residual.
-        gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
-            ds4_ep_moe_rank(
+        if moe_step {
+            ds4_ep_moe_step(
+                gpus,
+                weights_per_rank,
                 cfg,
-                &weights_per_rank[r],
-                &mut state_per_rank[r],
-                gpu,
+                state_per_rank,
+                partials,
+                &ep_mesh,
                 l,
                 token,
                 skip_ffn,
-                partial,
-                phase,
             )
-        })
-        .map_err(|e| format!("ds4 forward_ep ep_moe_allreduce L{l}: {e}"))?;
+            .map_err(|e| format!("ds4 forward_ep moe-step L{l}: {e}"))?;
+        } else {
+            gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
+                ds4_ep_moe_rank(
+                    cfg,
+                    &weights_per_rank[r],
+                    &mut state_per_rank[r],
+                    gpu,
+                    l,
+                    token,
+                    skip_ffn,
+                    partial,
+                    phase,
+                )
+            })
+            .map_err(|e| format!("ds4 forward_ep ep_moe_allreduce L{l}: {e}"))?;
+        }
         if dump_pos_hit {
             for r in 0..n {
                 gpus.devices[r]
@@ -10301,4 +10834,3 @@ mod tests {
         assert!((wts[1] - 0.0).abs() < 1e-6);
     }
 }
-
