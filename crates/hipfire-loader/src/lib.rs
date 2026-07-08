@@ -910,7 +910,8 @@ pub fn load_model(
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
-    pp: usize,
+    mesh: &DeviceMesh,
+    pp_bands: Option<&[usize]>,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
@@ -1009,8 +1010,8 @@ pub fn load_model(
         kv_adaptive_override,
         state_quant_override,
         cask,
-        pp,
-        pp_bands: None,
+        pp: mesh.size_of(DimKind::Pp),
+        pp_bands,
         spec,
         gpu,
     };

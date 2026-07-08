@@ -203,21 +203,8 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
-    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        Some(spec) => {
-            let counts: Result<Vec<usize>, _> =
-                spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
-            let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
-            if counts.len() != pp {
-                return Err(format!(
-                    "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
-                    counts.len(),
-                    pp
-                ));
-            }
+    let mut gpus = match ctx.pp_bands {
+        Some(counts) => {
             let sum: usize = counts.iter().sum();
             if sum != config.n_layers {
                 return Err(format!(
@@ -225,7 +212,7 @@ fn load_qwen35_pp(
                     sum, config.n_layers
                 ));
             }
-            hipfire_runtime::multi_gpu::Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
+            hipfire_runtime::multi_gpu::Gpus::init_layers(counts).map_err(|e| format!("{e}"))?
         }
         None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
             .map_err(|e| format!("{e}"))?,

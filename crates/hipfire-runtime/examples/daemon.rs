@@ -1327,7 +1327,8 @@ fn main() {
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
-                        pp,
+                        &mesh,
+                        None,
                         spec_cfg,
                         &mut gpu,
                     )
