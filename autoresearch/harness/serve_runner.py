@@ -7,15 +7,15 @@ reusing serve_harness's spawn + send machinery so measurement goes through the r
 raw-daemon voodoo). It runs ONE model on a per-arm serve (env differs per arm) and returns the
 generation dicts the orchestrator consumes.
 
-  STATUS: GPU-UNTESTED SCAFFOLD. The orchestration + arm logic it feeds is fully tested; THIS file
-  is the plumbing and MUST be validated on a fleet box. Three items need fleet confirmation before
-  it's trustworthy — each marked `FLEET-TODO` below:
-    1. FP32-DeltaNet-state selector for the parity serve (only HIPFIRE_DETERMINISTIC=1 is confirmed).
-    2. token-ids over HTTP (the OpenAI stream returns TEXT; until the daemon emits token-ids the
-       attractor detector runs on a WORD proxy — gap #17's calibration caveat applies).
-    3. rocprof pinned-clock kernel-DURATION for the perf PRIMARY (gap #4). This scaffold uses the
-       HTTP kernel_decode_tok_s counter as an interim; the pinned-clock duration is a separate
-       rocprof path (oracle_profile-style) to wire as the primary discriminator.
+  STATUS: parity + coherence + perf arms VALIDATED live on gfx1151 (null-variant certify:
+  parity byte-exact PASS, coherence base-vs-base PASS, perf +0.46%/f=0.461 ~tied). Remaining fleet
+  item:
+    - token-ids over HTTP (the OpenAI stream returns TEXT; until the daemon emits token-ids the
+      attractor detector runs on a WORD proxy — gap #17's calibration caveat applies). Marked
+      `FLEET-TODO(2)` below.
+  RESOLVED: parity determinism is q8_ef + HIPFIRE_DETERMINISTIC (NOT fp32 — fp32 isn't a prod/prof
+  path); perf is rocprof pinned-clock kernel-DURATION under profile_standard (gap #4) — the HTTP
+  kernel_decode_tok_s proxy it replaced showed a +3% sequential-thermal artifact on a null variant.
 """
 import os, sys, re, glob, csv as _csvmod, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
@@ -86,7 +86,7 @@ class LiveServeRunner(abc.ServeRunner):
         finally:
             sh._kill_serve()
 
-    # --- ARM: parity (FP32-det greedy, battery) ---
+    # --- ARM: parity (q8_ef + HIPFIRE_DETERMINISTIC greedy, battery — byte-exact text vs B_a) ---
     def parity_gens(self, daemon):
         cfg = _cfg(self.model, daemon, "greedy", self.kv, self.port_base,
                    prompts_file=self.prompts_file, mode="battery")

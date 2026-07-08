@@ -8,10 +8,10 @@ serve_harness against it — is behind a `ServeRunner` seam (dependency-injected
 orchestration (arm assembly, parity short-circuit, coherence hard-gate, B_a advancement, ledger row)
 is unit-testable no-GPU with a mock runner. The real runner is a thin adapter (built next).
 
-Measurement layout (v2 spec):
-  PARITY    : FP32-det serve, greedy, battery -> byte-exact text vs B_a (+ Q8 tolerance, when wired)
+Measurement layout (v2 spec, as validated on gfx1151):
+  PARITY    : q8_ef + HIPFIRE_DETERMINISTIC serve, greedy, battery -> byte-exact text vs B_a
   COHERENCE : Q8 serve, registry temp>0, seed-SET over battery+guards -> McNemar paired rate test
-  PERF      : Q8 serve, interleaved kernel-duration on one warmed prompt -> MWU + clock-VOID
+  PERF      : rocprof pinned-clock kernel-DURATION (profile_standard) -> MWU (clock pinned, no VOID)
 Verdict precedence: PARITY (short-circuit) -> COHERENCE (hard gate) -> PERF.
 """
 import sys, os, json
@@ -84,7 +84,7 @@ def coherence_result(base_gens, var_gens, expects=None, alpha=0.05):
     return (not worse, {"pass": not worse, "b": b, "c": c, "p": p, "seeds": seeds, "trials": len(pairs)})
 
 
-# ---------- ARM: perf (Q8 interleaved kernel-duration) ----------
+# ---------- ARM: perf (rocprof pinned-clock kernel-duration) ----------
 
 def perf_result(base_dur_ms, var_dur_ms, base_clk=None, var_clk=None):
     """Kernel-DURATION samples (lower=better) -> orient -> MWU + clock-VOID. Returns (verdict,f,delta%).
@@ -130,7 +130,7 @@ def certify(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
         return cv.make_row(arch, kernel, lever, "COHERENCE_FAIL",
                            parity=p_detail, coherence=c_detail, base_ref=base_ref, seeds=len(seeds))
 
-    # 3. PERF (Q8 interleaved kernel-duration)
+    # 3. PERF (rocprof pinned-clock kernel-duration)
     pv, f, delta = perf_result(runner.perf_durations(base_daemon), runner.perf_durations(var_daemon),
                                runner.clocks(base_daemon), runner.clocks(var_daemon))
     verdict = cv.decide(parity_ok=True, coherence_ok=True, perf_verdict=pv)
