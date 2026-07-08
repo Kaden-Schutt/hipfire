@@ -1089,7 +1089,8 @@ pub fn launch_moe_scatter(
 
 /// Grouped gate||up GEMM (Path 2 prefill): one launch covers all expert tokens
 /// sorted by `sorted_slot_index`. Dispatches per `experts.dtype`:
-/// - MQ2G256Lloyd → `gemm_mq2g256_lloyd_moe_grouped_wmma_k2` (Base variant)
+/// - MQ2G256Lloyd → arch-selected variant via `dispatch_grouped_lloyd`
+///   (matches `run_moe_prefill_bias_aware`: `Lloyd4w` on gfx11+/gfx12+, `Base` otherwise)
 /// - MQ3G256Lloyd → `gemm_mq3g256_lloyd_moe_grouped_wmma`
 /// - MQ4G256/HFQ4G256 → `gemm_hfq4g256_moe_grouped_wmma_k2`
 /// - MQ6G256/HFQ6G256 → `gemm_hfq6g256_moe_grouped_wmma`
@@ -1114,8 +1115,36 @@ pub fn launch_grouped_gate_up(
     let x_row_div = k_top;
     let rows = batch_size;
     match experts.dtype {
-        DType::MQ2G256Lloyd => gpu
-            .gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+        DType::MQ2G256Lloyd => {
+            // Route through the same variant-selection logic as
+            // `run_moe_prefill_bias_aware` so the kernel chosen here can never
+            // drift from production (Lloyd4w on gfx11+/gfx12+ by default).
+            let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+            let lloyd_4w_base = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            };
+            let n32 = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+            let cnd = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
+            let eightw = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
+            let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+            let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+            // Alignment check mirrors production: (2*im)%64==0 && hidden%256==0 → m%64==0 && k%256==0.
+            let use_lloyd_4w = lloyd_4w_base.unwrap_or(arch_4w) && m % 64 == 0 && k % 256 == 0;
+            let use_mmqload = use_lloyd_4w && mmqload_env;
+            let use_nosync = use_mmqload && nosync_env;
+            let variant = crate::pipeline::select_grouped_lloyd_variant(
+                use_lloyd_4w,
+                n32,
+                cnd,
+                eightw,
+                use_mmqload,
+                use_nosync,
+            );
+            crate::pipeline::dispatch_grouped_lloyd(
+                gpu,
+                variant,
                 experts.gate_up_ptrs,
                 expert_tile_ids,
                 sorted_slot_index,
@@ -1127,7 +1156,7 @@ pub fn launch_grouped_gate_up(
                 m_total,
                 rows,
             )
-            .map_err(|e| DispatchError::Hip(e.to_string())),
+        }
         DType::MQ3G256Lloyd => gpu
             .gemm_mq3g256_lloyd_moe_grouped_wmma(
                 experts.gate_up_ptrs,
@@ -1200,8 +1229,36 @@ pub fn launch_grouped_down(
     let x_row_div = 1;
     let rows = batch_size * k_top;
     match experts.dtype {
-        DType::MQ2G256Lloyd => gpu
-            .gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+        DType::MQ2G256Lloyd => {
+            // Route through the same variant-selection logic as
+            // `run_moe_prefill_bias_aware` so the kernel chosen here can never
+            // drift from production (Lloyd4w on gfx11+/gfx12+ by default).
+            let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+            let lloyd_4w_base = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            };
+            let n32 = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+            let cnd = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
+            let eightw = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
+            let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+            let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+            // Alignment check mirrors production: hidden%64==0 && im%256==0 → m%64==0 && k%256==0.
+            let use_lloyd_4w = lloyd_4w_base.unwrap_or(arch_4w) && m % 64 == 0 && k % 256 == 0;
+            let use_mmqload = use_lloyd_4w && mmqload_env;
+            let use_nosync = use_mmqload && nosync_env;
+            let variant = crate::pipeline::select_grouped_lloyd_variant(
+                use_lloyd_4w,
+                n32,
+                cnd,
+                eightw,
+                use_mmqload,
+                use_nosync,
+            );
+            crate::pipeline::dispatch_grouped_lloyd(
+                gpu,
+                variant,
                 experts.down_ptrs,
                 expert_tile_ids,
                 sorted_slot_index,
@@ -1213,7 +1270,7 @@ pub fn launch_grouped_down(
                 m_total,
                 rows,
             )
-            .map_err(|e| DispatchError::Hip(e.to_string())),
+        }
         DType::MQ3G256Lloyd => gpu
             .gemm_mq3g256_lloyd_moe_grouped_wmma(
                 experts.down_ptrs,

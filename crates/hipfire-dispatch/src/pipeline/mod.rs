@@ -1579,7 +1579,7 @@ pub fn run_moe_decode_bias_aware(
 /// MQ2-Lloyd grouped-GEMM kernel variant (deepseek4 research levers; default
 /// `Lloyd4w` on gfx11+, `Base` otherwise). Selected once per gate_up/down call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum GroupedLloydVariant {
+pub(crate) enum GroupedLloydVariant {
     N32,
     Cnd,
     EightW,
@@ -1592,7 +1592,7 @@ enum GroupedLloydVariant {
 /// Mirror of `ffn_batched`'s grouped-GEMM if/else-if ladder (priority order:
 /// n32 > cnd > 8w > nosync > mmqload > 4w > base). `n32`/`cnd`/`eightw` apply
 /// only on the 4w path; `use_nosync` ⊂ `use_mmqload` ⊂ `use_lloyd_4w`.
-fn select_grouped_lloyd_variant(
+pub(crate) fn select_grouped_lloyd_variant(
     use_lloyd_4w: bool,
     n32: bool,
     cnd: bool,
@@ -1622,7 +1622,7 @@ fn select_grouped_lloyd_variant(
 /// this is called identically for gate_up (m=2*im, k=hidden, x_row_div=k_top,
 /// rows=B) and down (m=hidden, k=im, x_row_div=1, rows=B*k_top).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_grouped_lloyd(
+pub(crate) fn dispatch_grouped_lloyd(
     gpu: &mut Gpu,
     variant: GroupedLloydVariant,
     ptrs: &GpuTensor,
