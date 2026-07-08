@@ -97,13 +97,28 @@ def test_certify_full_win():
                      base_daemon="base", var_daemon="var", base_ref="5f101504", seeds=_seeds())
     assert row["verdict"] == "WIN" and row["perf_delta"] < 0 and row["base_ref"] == "5f101504"
 
-def test_certify_parity_short_circuits():
-    r = MockRunner(
-        parity={"base": [_gen("c", text="X")], "var": [_gen("c", text="DIFFERENT")]},   # value-changed
-        coherence={"base": [], "var": []}, durations={"base": [], "var": []})
-    row = ab.certify(r, arch="gfx1151", kernel="attn", lever="bad", base_daemon="base",
+def test_certify_no_perf_gain_is_dead_before_coherence():
+    # perf is the cheap filter: no gain -> DEAD, and coherence never runs (empty lists would crash it).
+    r = MockRunner(parity={}, coherence={"base": [], "var": []},
+                   durations={"base": [10.0] * 8, "var": [10.0] * 8})   # tied -> not a win
+    row = ab.certify(r, arch="gfx1151", kernel="attn", lever="noop", base_daemon="base",
                      var_daemon="var", base_ref="s", seeds=_seeds())
-    assert row["verdict"] == "PARITY_FAIL"   # never touched coherence/perf (empty lists would crash if it had)
+    assert row["verdict"] in ("DEAD", "INCONCLUSIVE")
+
+def test_certify_parity_is_opt_in_nongating():
+    # A variant whose GREEDY output DIFFERS from baseline but is faster + coherent still WINS — parity
+    # is a secondary diagnostic, never a gate (byte-exact is overly ambitious on a sampled thinking run).
+    r = MockRunner(
+        parity={"base": [_gen("c", text="Xstable")], "var": [_gen("c", text="Ydiffer")]},  # greedy differs
+        coherence={"base": [_gen("c", seed=s) for s in range(8)],
+                   "var": [_gen("c", seed=s) for s in range(8)]},                            # both clean
+        durations={"base": [10.0] * 8, "var": [8.0] * 8})                                    # faster
+    row = ab.certify(r, arch="gfx1151", kernel="attn", lever="reassoc", base_daemon="base",
+                     var_daemon="var", base_ref="s", seeds=_seeds())
+    assert row["verdict"] == "WIN" and row["parity"] is None            # default: parity not even run
+    row2 = ab.certify(r, arch="gfx1151", kernel="attn", lever="reassoc", base_daemon="base",
+                      var_daemon="var", base_ref="s", seeds=_seeds(), parity_check=True)
+    assert row2["verdict"] == "WIN" and row2["parity"]["mismatches"]    # reported, but STILL a WIN
 
 def test_certify_coherence_beats_perf_win():
     # variant is FASTER but breaks coherence -> COHERENCE_FAIL, not WIN

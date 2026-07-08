@@ -8,12 +8,15 @@ serve_harness against it — is behind a `ServeRunner` seam (dependency-injected
 orchestration (arm assembly, parity short-circuit, coherence hard-gate, B_a advancement, ledger row)
 is unit-testable no-GPU with a mock runner. The real runner is a thin adapter (built next).
 
-Measurement layout (v2 spec, as validated on gfx1151):
-  PARITY    : q8_ef + HIPFIRE_DETERMINISTIC serve, greedy, battery -> variant matches B_a's SELF-
-              reproducible prefix (base run 2x; the Q8 path isn't fully run-to-run deterministic)
-  COHERENCE : Q8 serve, registry temp>0, seed-SET over battery+guards -> McNemar paired rate test
-  PERF      : rocprof pinned-clock kernel-DURATION (profile_standard) -> MWU (clock pinned, no VOID)
-Verdict precedence: PARITY (short-circuit) -> COHERENCE (hard gate) -> PERF.
+Measurement layout (serve-default gate):
+  PERF      : rocprof pinned-clock kernel-DURATION (profile_standard) -> MWU. Cheap filter (no gain
+              -> DEAD, stop before the expensive coherence arm).
+  COHERENCE : the PRIMARY correctness gate. Q8 serve, thinking ON, registry temp>0, multiturn
+              seed-SET + semantic validators -> McNemar paired rate test. This IS the user path.
+  PARITY    : SECONDARY, opt-in (parity_check). Greedy self-reproducible-prefix diagnostic; byte-exact
+              is overly ambitious on a sampled thinking run (Q8 isn't run-to-run deterministic), so it
+              never gates.
+Order: perf (filter) -> coherence (gate the winner). WIN = a real perf gain that STAYS coherent.
 """
 import sys, os, json
 sys.path.insert(0, os.path.dirname(__file__))
@@ -149,32 +152,37 @@ class ServeRunner:
 
 
 def certify(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
-            seeds, expects=None):
-    """Run the full three-arm gate for `var_daemon` vs `base_daemon` (= B_a). Returns the ledger row
-    (and verdict). Short-circuits: parity first (cheap FP32-det), then coherence (hard gate), then
-    perf. Only a WIN should advance B_a (caller checks certify_verdict.is_bankable)."""
-    # 1. PARITY (q8_ef+det greedy) — short-circuit on fail. Run the baseline TWICE to establish its
-    #    self-reproducible prefix (the Q8 path isn't fully run-to-run deterministic), then require the
-    #    variant to agree on that prefix.
-    base_a = runner.parity_gens(base_daemon)
-    base_b = runner.parity_gens(base_daemon)
-    p_ok, p_detail = parity_result(base_a, base_b, runner.parity_gens(var_daemon))
-    if not p_ok:
-        return cv.make_row(arch, kernel, lever, "PARITY_FAIL", parity=p_detail, base_ref=base_ref)
+            seeds, expects=None, parity_check=False):
+    """Serve-default gate for `var_daemon` vs `base_daemon` (= B_a). Returns the ledger row.
 
-    # 2. COHERENCE (Q8 seed-set) — hard gate
-    c_ok, c_detail = coherence_result(runner.coherence_gens(base_daemon, seeds),
-                                      runner.coherence_gens(var_daemon, seeds), expects=expects)
-    if not c_ok:
-        return cv.make_row(arch, kernel, lever, "COHERENCE_FAIL",
-                           parity=p_detail, coherence=c_detail, base_ref=base_ref, seeds=len(seeds))
+    PRIMARY correctness = COHERENCE on the real user path: thinking ON, sampled (registry temp>0),
+    multiturn seed-SET + semantic validators. A value change that MATTERS shows up here (attractor,
+    wrong answer, degraded vs baseline). PERF = rocprof pinned-clock kernel-duration.
 
-    # 3. PERF (rocprof pinned-clock kernel-duration)
+    Byte-exact PARITY is NOT the primary gate: on a sampled thinking run it's overly ambitious (the Q8
+    path isn't run-to-run deterministic, so even a byte-identical variant diverges). It's an OPT-IN
+    secondary diagnostic (`parity_check`), reported not gated.
+
+    Order = perf first (cheap filter: no gain -> DEAD, stop), then coherence (gate the perf-winner —
+    a fast-but-broken kernel is caught here). WIN iff a real perf gain that STAYS coherent."""
+    # 1. PERF (cheap filter) — rocprof kernel-duration. No gain -> not a win; don't spend coherence.
     pv, f, delta = perf_result(runner.perf_durations(base_daemon), runner.perf_durations(var_daemon),
                                runner.clocks(base_daemon), runner.clocks(var_daemon))
-    verdict = cv.decide(parity_ok=True, coherence_ok=True, perf_verdict=pv)
-    return cv.make_row(arch, kernel, lever, verdict, parity=p_detail, perf_delta=delta, perf_f=f,
-                       coherence=c_detail, base_ref=base_ref, seeds=len(seeds))
+    if pv != "WIN":
+        return cv.make_row(arch, kernel, lever, pv, perf_delta=delta, perf_f=f, base_ref=base_ref)
+
+    # 2. COHERENCE (PRIMARY gate) — serve defaults; a perf-winner must stay coherent to bank.
+    c_ok, c_detail = coherence_result(runner.coherence_gens(base_daemon, seeds),
+                                      runner.coherence_gens(var_daemon, seeds), expects=expects)
+    verdict = "WIN" if c_ok else "COHERENCE_FAIL"
+
+    # 3. PARITY (SECONDARY, opt-in, NON-gating) — greedy self-reproducible-prefix diagnostic.
+    p_detail = None
+    if parity_check:
+        ba, bb = runner.parity_gens(base_daemon), runner.parity_gens(base_daemon)
+        _, p_detail = parity_result(ba, bb, runner.parity_gens(var_daemon))
+    return cv.make_row(arch, kernel, lever, verdict, coherence=c_detail, perf_delta=delta,
+                       perf_f=f, parity=p_detail, base_ref=base_ref, seeds=len(seeds))
 
 
 def load_expects(prompts_file):
