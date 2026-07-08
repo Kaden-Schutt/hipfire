@@ -14,7 +14,7 @@ use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::moe::{
     launch_grouped_down, launch_grouped_gate_up, launch_indexed_down, launch_indexed_down_residual,
     launch_indexed_gate_up, launch_moe_combine, launch_moe_combine_grouped, launch_moe_route,
-    launch_moe_scatter, launch_moe_unscatter, MoeExpertRef,
+    launch_moe_scatter, launch_moe_unscatter, launch_score_activation, MoeExpertRef,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -37,6 +37,16 @@ pub enum GemvInput<'a> {
 ///   weighted combine into the kernel and writes directly into the EP partial. Used
 ///   by MQ2L (minimax self-combining path) and MQ3L (the only down path for MQ3L).
 ///   Calling [`Step::MoeCombine`] after `DownResidual` would double-accumulate.
+/// Score activation kind for in-place MoE routing pre-op.
+/// Applied to the raw router logits before [`Step::MoeRoute`].
+#[derive(Clone, Copy, Debug)]
+pub enum ScoreActKind {
+    /// Sigmoid activation (minimax routing).
+    Sigmoid,
+    /// Sqrt-softplus activation (deepseek4 routing).
+    SqrtSoftplus,
+}
+
 pub enum MoeProj<'a> {
     /// Gate+up projection: writes gate_batch (= step `out`) + up_batch (= `up_out`).
     /// Requires FWHT-pre-rotated input. `topk_weights` not needed here.
@@ -252,6 +262,13 @@ pub enum Step<'a> {
         k_top: usize,
         m_total: usize,
     },
+    /// In-place score activation before MoE routing: sigmoid (minimax) or
+    /// sqrt_softplus (ds4). Feeds the (already-activated) scores to `MoeRoute`.
+    /// `tp_step_out_buf` returns `None`.
+    ScoreActivation {
+        scores: &'a GpuTensor,
+        kind: ScoreActKind,
+    },
     // ── Note (Task 6): ds4 `hc_ffn_mix` is intentionally NOT a Step variant ──
     // The ds4 MoE tail mixes the EP all-reduced `ffn_out` partial into
     // `residual_streams` via `hc_mix_4stream` + `memcpy_dtod_auto`. Its two view
@@ -286,6 +303,8 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::MoeScatter { .. } => PipelineOp::MoeScatter,
         Step::GroupedMoeGemm { .. } => PipelineOp::GroupedMoeGemm,
         Step::MoeUnscatter { .. } => PipelineOp::MoeUnscatter,
+        // Elementwise pre-op before MoeRoute; tag is irrelevant to fusion.
+        Step::ScoreActivation { .. } => PipelineOp::RmsnormAutomatic,
     }
 }
 
@@ -885,6 +904,8 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         } => Some(&out.buf),
         // Prefill grouped ops: intermediates, never EP partials.
         Step::MoeScatter { .. } | Step::GroupedMoeGemm { .. } | Step::MoeUnscatter { .. } => None,
+        // Score activation is a pre-routing elementwise op; no EP partial.
+        Step::ScoreActivation { .. } => None,
         _ => None,
     }
 }
@@ -1534,6 +1555,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             *k_top,
             *m_total,
         ),
+        Step::ScoreActivation { scores, kind } => launch_score_activation(gpu, scores, *kind),
     }
 }
 

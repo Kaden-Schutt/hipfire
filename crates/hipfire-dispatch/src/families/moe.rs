@@ -799,6 +799,35 @@ pub struct MoeExpertRef<'a> {
 
 // ── Step-IR launch helpers ────────────────────────────────
 
+use crate::pipeline::ScoreActKind;
+/// In-place score activation before routing. Thin wrapper over the arch's
+/// sigmoid / sqrt_softplus kernels (rdna-compute norm.rs:1643 / 3828).
+/// `Sigmoid` requires the `deltanet` feature (same gate as `gpu.sigmoid_f32`).
+pub fn launch_score_activation(
+    gpu: &mut rdna_compute::Gpu,
+    scores: &GpuTensor,
+    kind: ScoreActKind,
+) -> Result<(), DispatchError> {
+    match kind {
+        ScoreActKind::Sigmoid => {
+            #[cfg(feature = "deltanet")]
+            return gpu
+                .sigmoid_f32(scores)
+                .map_err(|e| DispatchError::Hip(e.to_string()));
+            #[cfg(not(feature = "deltanet"))]
+            return Err(DispatchError::UnsupportedVariant {
+                family: "score_activation",
+                variant: "sigmoid-requires-deltanet",
+                arch: "",
+                quant: "",
+            });
+        }
+        ScoreActKind::SqrtSoftplus => gpu
+            .sqrt_softplus_f32(scores)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+    }
+}
+
 /// Bias-aware top-K routing: select on `scores + gate_bias`, weight on the
 /// unbiased `scores`, normalize, fold in `route_scale` — all in one launch.
 /// Thin wrapper over `gpu.deepseek4_moe_topk_bias_aware_f32`.
@@ -1410,8 +1439,15 @@ pub fn launch_hc_ffn_mix(
     // comb_view → [4, 4] fp32 Sinkhorn matrix (hc_c elems [8..24]).
     let post_view = hc_c.sub_offset(4, 4);
     let comb_view = hc_c.sub_offset(8, 16);
-    gpu.hc_mix_4stream(streams, &comb_view, &post_view, ffn_out, streams_out, hidden as i32)
-        .map_err(|e| DispatchError::Hip(format!("hc_mix_4stream (ffn tail): {e:?}")))?;
+    gpu.hc_mix_4stream(
+        streams,
+        &comb_view,
+        &post_view,
+        ffn_out,
+        streams_out,
+        hidden as i32,
+    )
+    .map_err(|e| DispatchError::Hip(format!("hc_mix_4stream (ffn tail): {e:?}")))?;
     gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, hc_bytes)
         .map_err(|e| DispatchError::Hip(format!("hc_ffn_mix d2d streams←streams_out: {e:?}")))
 }

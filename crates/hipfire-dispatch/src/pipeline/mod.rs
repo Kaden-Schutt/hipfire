@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 pub(crate) mod steps;
 pub use steps::{
     execute_steps, execute_steps_mesh, execute_steps_parallel, execute_steps_tp, FusedPattern,
-    GemvInput, MoeProj, Step, StepCollective, TpCollective,
+    GemvInput, MoeProj, ScoreActKind, Step, StepCollective, TpCollective,
 };
 
 mod moe_step_toggle;
