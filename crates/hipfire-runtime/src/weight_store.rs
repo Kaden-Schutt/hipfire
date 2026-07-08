@@ -193,6 +193,82 @@ fn expert_compact_blob(bytes: &[u8], n_experts: usize, owned: &[usize]) -> Resul
     Ok(out)
 }
 
+/// Slice a gate‖up expert blob `[2·inter, hidden]` for tensor-parallel rank `rank` of `tp`.
+///
+/// Layout: row-major, each row = `hidden/256` self-contained blocks of `block_bytes`.
+/// Returns the paired slice `[2·(inter/tp), hidden]`: gate rows
+/// `[rank·inter/tp .. (rank+1)·inter/tp)` followed immediately by up rows
+/// `[inter + rank·inter/tp .. inter + (rank+1)·inter/tp)`.
+/// Two contiguous byte-range copies — no dequant.
+///
+/// Errors if `inter % tp != 0` or `(inter/tp) % 256 != 0`.
+pub fn expert_tp_column_pair(
+    expert_blob: &[u8],
+    inter: usize,
+    hidden: usize,
+    block_bytes: usize,
+    rank: usize,
+    tp: usize,
+) -> Result<Vec<u8>, String> {
+    if inter % tp != 0 {
+        return Err(format!(
+            "expert_tp_column_pair: inter {inter} not divisible by tp {tp}"
+        ));
+    }
+    let slice = inter / tp;
+    if slice % 256 != 0 {
+        return Err(format!(
+            "expert_tp_column_pair: inter/tp={slice} not divisible by group size 256"
+        ));
+    }
+    let row_bytes = (hidden / 256) * block_bytes;
+    let gate_start = rank * slice * row_bytes;
+    let gate_end = gate_start + slice * row_bytes;
+    let up_start = (inter + rank * slice) * row_bytes;
+    let up_end = up_start + slice * row_bytes;
+    let mut out = Vec::with_capacity(2 * slice * row_bytes);
+    out.extend_from_slice(&expert_blob[gate_start..gate_end]);
+    out.extend_from_slice(&expert_blob[up_start..up_end]);
+    Ok(out)
+}
+
+/// Slice a down expert blob `[hidden, inter]` for tensor-parallel rank `rank` of `tp`.
+///
+/// Layout: row-major, each row = `inter/256` self-contained blocks of `block_bytes`.
+/// Returns `[hidden, inter/tp]`: for each of `hidden` rows the block sub-range
+/// `[rank·(inter/tp)/256 .. (rank+1)·(inter/tp)/256)`. Per-row strided gather —
+/// no dequant.
+///
+/// Errors if `inter % tp != 0` or `(inter/tp) % 256 != 0`.
+pub fn expert_tp_row_gather(
+    expert_blob: &[u8],
+    hidden: usize,
+    inter: usize,
+    block_bytes: usize,
+    rank: usize,
+    tp: usize,
+) -> Result<Vec<u8>, String> {
+    if inter % tp != 0 {
+        return Err(format!(
+            "expert_tp_row_gather: inter {inter} not divisible by tp {tp}"
+        ));
+    }
+    let slice = inter / tp;
+    if slice % 256 != 0 {
+        return Err(format!(
+            "expert_tp_row_gather: inter/tp={slice} not divisible by group size 256"
+        ));
+    }
+    let row_bytes = (inter / 256) * block_bytes;
+    let sub = (slice / 256) * block_bytes;
+    let mut out = Vec::with_capacity(hidden * sub);
+    for row in 0..hidden {
+        let base = row * row_bytes + rank * sub;
+        out.extend_from_slice(&expert_blob[base..base + sub]);
+    }
+    Ok(out)
+}
+
 /// Execute a weight manifest against a mesh: for each entry, compute its
 /// placement (via the pure [`placement_devices`]) and upload the tensor's bytes
 /// (from `source`) to every device it lands on, recording the result in a
@@ -606,6 +682,44 @@ mod tests {
         ));
         assert!(s.get("wo", Some(0), 2).is_none());
         assert!(s.get("wo", Some(2), 0).is_none());
+    }
+
+    #[cfg(test)]
+    mod tp_slice_tests {
+        use super::*;
+        // block_bytes=4 toy; inter=512 (2 groups of 256), hidden=256 (1 group), tp=2.
+        // gate‖up blob: [2*inter=1024 rows, hidden=256] → 1 block/row → 1024 blocks × 4B.
+        fn synth(nrows: usize, blocks_per_row: usize, bb: usize) -> Vec<u8> {
+            (0..nrows * blocks_per_row)
+                .flat_map(|b| (b as u32).to_le_bytes()[..bb].to_vec())
+                .collect()
+        }
+        #[test]
+        fn column_pair_takes_gate_then_up_halves() {
+            let (inter, hidden, bb) = (512usize, 256usize, 4usize);
+            let blob = synth(2 * inter, hidden / 256, bb); // 1024 rows, 1 block/row
+            let r0 = expert_tp_column_pair(&blob, inter, hidden, bb, 0, 2).unwrap();
+            // rank0 = gate rows [0..256) ++ up rows [512..768); 512 rows × 4B
+            assert_eq!(r0.len(), 2 * (inter / 2) * (hidden / 256) * bb);
+            assert_eq!(&r0[0..4], &0u32.to_le_bytes()); // gate row 0
+            assert_eq!(&r0[256 * 4..256 * 4 + 4], &512u32.to_le_bytes()); // first up row = global row 512
+        }
+        #[test]
+        fn row_gather_takes_group_subrange_per_row() {
+            let (hidden, inter, bb) = (3usize, 512usize, 4usize);
+            let blob = synth(hidden, inter / 256, bb); // 3 rows, 2 blocks/row
+            let r1 = expert_tp_row_gather(&blob, hidden, inter, bb, 1, 2).unwrap();
+            assert_eq!(r1.len(), hidden * (inter / 2 / 256) * bb); // 3 rows × 1 block × 4B
+                                                                   // row 0's rank-1 block is global block index 1
+            assert_eq!(&r1[0..4], &1u32.to_le_bytes());
+            // row 1's rank-1 block is global block index 3
+            assert_eq!(&r1[4..8], &3u32.to_le_bytes());
+        }
+        #[test]
+        fn rejects_unaligned() {
+            assert!(expert_tp_column_pair(&[0u8; 16], 300, 256, 4, 0, 2).is_err());
+            // 300/2 not %256
+        }
     }
 
     // The dense-TP refusal path is checkable without a GPU: a row-shard on a
