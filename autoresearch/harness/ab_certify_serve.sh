@@ -25,9 +25,12 @@ export HOME_ORIG="$HOME"; export HOME="$WT/.swhome"; mkdir -p "$HOME"
 export CARGO_TARGET_DIR="$WT/target"; export PATH="$HOME_ORIG/.bun/bin:$PATH"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME_ORIG/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME_ORIG/.cargo}"
 
-# B_a = the agent's ADVANCING baseline = loop/cardN tip (carries its banked wins). The variant is
+# B_a = the agent's ADVANCING baseline = loop/<arch> tip (carries its banked wins). The variant is
 # B_a's kernels with THIS kernel swapped; the gate measures variant-vs-B_a; a WIN advances B_a.
-BASE_REF="loop/card${CARD}"
+# Branch is ARCH-keyed (loop/gfx1151), NOT card-slot: "card2" is gfx1201 on hiptrx but gfx1030 on
+# hipx — the shared branch namespace must be globally unambiguous. sw_card${CARD} is just the local
+# build worktree; the branch it tracks is loop/${ARCH}.
+BASE_REF="loop/${ARCH}"
 BASE_SHA=$(git rev-parse --short "$BASE_REF" 2>/dev/null || echo "${ARCH}-base")
 KSRC="kernels/src/${KERNEL}.hip"
 BA_DAEMON="$CACHE/base_${ARCH}_c${CARD}"
@@ -55,6 +58,11 @@ cp "$DB" "$VAR_DAEMON"
 git checkout "$BASE_REF" -- kernels/src/ 2>/dev/null; git clean -fdq kernels/src/ 2>/dev/null
 
 # --- three-arm gate via serve_harness (GPU-lock serialized) ---
+# TEST SEAM (off in production): CERTSERVE_STUB_ROW injects a verdict row instead of running the GPU
+# gate — validates the build + WIN-commit + advance-B_a + ledger mechanics deterministically.
+if [ -n "${CERTSERVE_STUB_ROW:-}" ]; then
+  ROW="$CERTSERVE_STUB_ROW"
+else
 GPULK="$MAIN/scripts/gpu-lock.sh"; [ -f "$GPULK" ] && { set +u; . "$GPULK"; gpu_acquire "certserve_${ARCH}_c${CARD}_${LABEL}" >/dev/null 2>&1; set -u; }
 # The gate spawns `hipfire serve`, which resolves ~/.hipfire/models via HOME — restore the REAL
 # home here (the build above needs HOME=swhome; the serve needs the real one, else the model symlink
@@ -64,6 +72,7 @@ ROW=$(HOME="$HOME_ORIG" HIP_VISIBLE_DEVICES=$DEV python3 "$HARN/ab_certify_serve
         --base-daemon "$BA_DAEMON" --var-daemon "$VAR_DAEMON" --base-ref "$BASE_SHA" \
         --seeds "$SEEDS" --kv "$KV" $PF_ARG 2>"/tmp/certserve_c${CARD}.err")
 [ -f "$GPULK" ] && { set +u; gpu_release >/dev/null 2>&1; set -u; }
+fi
 [ -n "$ROW" ] || ROW="{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"INCONCLUSIVE\",\"error\":\"gate produced no row (see /tmp/certserve_c${CARD}.err)\"}"
 VERDICT=$(printf '%s' "$ROW" | python3 -c "import json,sys;print(json.load(sys.stdin).get('verdict','?'))" 2>/dev/null || echo "?")
 

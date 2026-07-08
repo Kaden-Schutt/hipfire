@@ -25,12 +25,30 @@ class MockRunner(ab.ServeRunner):
 
 # ---- arm units ----
 
-def test_parity_byte_exact():
+def test_parity_stable_prefix():
+    # baseline self-reproducible (base_a == base_b) -> stable prefix is the whole text
     base = [_gen("code", text="X"), _gen("reason", text="Y")]
     same = [_gen("code", text="X"), _gen("reason", text="Y")]
     diff = [_gen("code", text="X"), _gen("reason", text="Y2")]
-    assert ab.parity_result(base, same)[0]
-    assert not ab.parity_result(base, diff)[0]
+    assert ab.parity_result(base, base, same)[0]         # variant matches -> PASS
+    assert not ab.parity_result(base, base, diff)[0]     # variant diverges in stable region -> FAIL
+
+def test_parity_tolerates_late_q8_noise():
+    # baseline diverges from ITSELF after "answer: 42" (Q8 noise in the long tail) -> stable prefix
+    # is only the reproducible head. A variant that agrees on that head PASSES despite a different tail.
+    base_a = [_gen("reason", text="answer: 42 because six sevens")]
+    base_b = [_gen("reason", text="answer: 42 since 6 times 7")]      # diverges after "answer: 42 "
+    var_ok = [_gen("reason", text="answer: 42 blah blah different tail")]
+    var_bad = [_gen("reason", text="answer: 41 because six sevens")]  # diverges INSIDE the stable head
+    assert ab.parity_result(base_a, base_b, var_ok)[0]
+    assert not ab.parity_result(base_a, base_b, var_bad)[0]
+
+def test_parity_unstable_baseline_not_a_pass():
+    # baseline can't reproduce even the first char -> no signal -> not a silent PASS
+    base_a = [_gen("reason", text="AXY")]
+    base_b = [_gen("reason", text="BXY")]
+    var = [_gen("reason", text="AXY")]
+    assert not ab.parity_result(base_a, base_b, var)[0]
 
 def test_gen_fails_detects():
     assert ab._gen_fails(_gen("p", toks=_ATTR), {})[0]          # attractor

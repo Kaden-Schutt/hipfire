@@ -9,7 +9,8 @@ orchestration (arm assembly, parity short-circuit, coherence hard-gate, B_a adva
 is unit-testable no-GPU with a mock runner. The real runner is a thin adapter (built next).
 
 Measurement layout (v2 spec, as validated on gfx1151):
-  PARITY    : q8_ef + HIPFIRE_DETERMINISTIC serve, greedy, battery -> byte-exact text vs B_a
+  PARITY    : q8_ef + HIPFIRE_DETERMINISTIC serve, greedy, battery -> variant matches B_a's SELF-
+              reproducible prefix (base run 2x; the Q8 path isn't fully run-to-run deterministic)
   COHERENCE : Q8 serve, registry temp>0, seed-SET over battery+guards -> McNemar paired rate test
   PERF      : rocprof pinned-clock kernel-DURATION (profile_standard) -> MWU (clock pinned, no VOID)
 Verdict precedence: PARITY (short-circuit) -> COHERENCE (hard gate) -> PERF.
@@ -49,16 +50,50 @@ def _gen_fails(gen, expect):
 
 # ---------- ARM: parity (FP32-det greedy, byte-exact text) ----------
 
-def parity_result(base_gens, var_gens):
-    """base_gens/var_gens: per-prompt deterministic (greedy) generations, aligned by prompt_id.
-    Value-preserving iff the variant's text is byte-identical to B_a's on every prompt."""
-    bmap = {g["prompt_id"]: g for g in base_gens}
-    mismatches = []
+def _common_prefix(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x == y:
+            n += 1
+        else:
+            break
+    return a[:n]
+
+
+def parity_result(base_a, base_b, var_gens):
+    """Value-preserving iff the variant AGREES with B_a on B_a's own SELF-REPRODUCIBLE prefix.
+
+    Byte-exact text is too strict here: the Q8 "deterministic" path (q8_ef + HIPFIRE_DETERMINISTIC)
+    is NOT fully run-to-run reproducible — a long greedy trace diverges on FP-atomic / stochastic-
+    rounding noise, so two runs of the SAME baseline differ (found live: a byte-identical null variant
+    PARITY_FAILed). So we take base_a vs base_b as the baseline's self-consistent prefix and require
+    the variant to match only THAT: a value-changing kernel flips an early logit (inside the stable
+    prefix), while late Q8 noise falls outside it. A prompt whose baseline isn't self-reproducible at
+    all (stable prefix empty) can't certify parity -> counted as unstable (reported, not a pass)."""
+    amap = {g["prompt_id"]: g for g in base_a}
+    bmap = {g["prompt_id"]: g for g in base_b}
+    mismatches, unstable = [], []
     for vg in var_gens:
-        bg = bmap.get(vg["prompt_id"])
-        if bg is None or bg.get("text", None) != vg.get("text", None):
-            mismatches.append(vg["prompt_id"])
-    return (len(mismatches) == 0, {"fp32_exact": len(mismatches) == 0, "mismatches": mismatches})
+        pid = vg["prompt_id"]
+        ga, gb = amap.get(pid), bmap.get(pid)
+        if ga is None or gb is None:
+            mismatches.append(pid)
+            continue
+        ta, tb, tv = ga.get("text", ""), gb.get("text", ""), vg.get("text", "")
+        if ta == tb:
+            # baseline fully self-reproducible -> require EXACT equality (a variant that stops earlier
+            # or runs longer is a value change even if it shares a prefix).
+            if tv != ta:
+                mismatches.append(pid)
+        else:
+            stable = _common_prefix(ta, tb)
+            if not stable:
+                unstable.append(pid)      # baseline diverges from itself immediately — no signal
+            elif tv[:len(stable)] != stable:
+                mismatches.append(pid)    # variant diverges inside the baseline's stable region
+    ok = len(mismatches) == 0 and len(unstable) < len(var_gens)  # need at least one certifiable prompt
+    return (ok, {"stable_prefix_exact": len(mismatches) == 0, "mismatches": mismatches,
+                 "unstable_prompts": unstable})
 
 
 # ---------- ARM: coherence (Q8 seed-set, paired McNemar rate test) ----------
@@ -118,8 +153,12 @@ def certify(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
     """Run the full three-arm gate for `var_daemon` vs `base_daemon` (= B_a). Returns the ledger row
     (and verdict). Short-circuits: parity first (cheap FP32-det), then coherence (hard gate), then
     perf. Only a WIN should advance B_a (caller checks certify_verdict.is_bankable)."""
-    # 1. PARITY (FP32-det greedy) — short-circuit on fail
-    p_ok, p_detail = parity_result(runner.parity_gens(base_daemon), runner.parity_gens(var_daemon))
+    # 1. PARITY (q8_ef+det greedy) — short-circuit on fail. Run the baseline TWICE to establish its
+    #    self-reproducible prefix (the Q8 path isn't fully run-to-run deterministic), then require the
+    #    variant to agree on that prefix.
+    base_a = runner.parity_gens(base_daemon)
+    base_b = runner.parity_gens(base_daemon)
+    p_ok, p_detail = parity_result(base_a, base_b, runner.parity_gens(var_daemon))
     if not p_ok:
         return cv.make_row(arch, kernel, lever, "PARITY_FAIL", parity=p_detail, base_ref=base_ref)
 
