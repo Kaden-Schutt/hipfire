@@ -50,16 +50,22 @@ PROMPT="${PROMPT:-$HARN/loop_round_prompt_$ARCH.txt}"
 ROLLOVER="${ROLLOVER:-$HARN/noop_rollover.sh}"
 [ -f "$EXH" ] || echo "{}" > "$EXH"
 [ -f "$LOOP_PROGRESS" ] || : > "$LOOP_PROGRESS"
+# Loop branch resolver. LOOP_BRANCH overrides with an ARCH-keyed name (e.g. loop/gfx1151) — the shared
+# branch namespace must be globally unambiguous ("card2" = gfx1201 on hiptrx but gfx1030 on hipx). Only
+# valid single-card. Default (unset) = legacy per-card loop/card<N> (the multi-card gfx1201 campaign is
+# untouched). The certify wrapper (ab_certify_serve.sh) resets to loop/$ARCH, so set LOOP_BRANCH to match.
+lb() { [ -n "${LOOP_BRANCH:-}" ] && echo "$LOOP_BRANCH" || echo "loop/card$1"; }
 # ---- CREATE-OR-RESUME the per-card loop branch (never force-reset an existing branch) ----
 for c in $CARDS; do
   wt="$MAIN/.aw/sw_card$c"
   [ -d "$wt" ] || { echo "  [driver] WARN no worktree $wt (skip card $c)" >> "$LOG"; continue; }
-  if git -C "$wt" rev-parse --verify -q "loop/card$c" >/dev/null; then
-    git -C "$wt" checkout -q "loop/card$c" 2>/dev/null            # RESUME — keep accumulated wins
+  lbr="$(lb "$c")"
+  if git -C "$wt" rev-parse --verify -q "$lbr" >/dev/null; then
+    git -C "$wt" checkout -q "$lbr" 2>/dev/null            # RESUME — keep accumulated wins
   else
-    git -C "$wt" checkout -q -B "loop/card$c" "$BASELINE_REF" 2>/dev/null   # CREATE once from baseline
+    git -C "$wt" checkout -q -B "$lbr" "$BASELINE_REF" 2>/dev/null   # CREATE once from baseline
   fi
-  git -C "$wt" branch -f "loop/card${c}_recovered" "loop/card$c" 2>/dev/null # gc-proof safety branch
+  git -C "$wt" branch -f "${lbr}_recovered" "$lbr" 2>/dev/null # gc-proof safety branch
 done
 round=$(grep -oE 'R[0-9]+c' "$LOOP_PROGRESS" 2>/dev/null | grep -oE '[0-9]+' | awk '$1<100000{if($1>m)m=$1} END{print m+0}')
 echo "===== DRIVER v3 [$ARCH] (self-exhausting, K=$K, cards='$CARDS') resuming after round $round $(date -u '+%F %T') =====" >> "$LOG"
@@ -79,7 +85,7 @@ while [ "$round" -lt "$SAFETY_CAP" ]; do
   # update per-kernel exhaustion counters from this round's verdicts (ARCH selects the ledger glob)
   python3 "$TRIO/update_exhaustion.py" "$EXH" "$round" "$MAIN" "$ARCH" >> "$LOG" 2>&1
   # keep the gc-proof safety branch current after any banked win this round
-  for c in $CARDS; do git -C "$MAIN/.aw/sw_card$c" branch -f "loop/card${c}_recovered" "loop/card$c" 2>/dev/null; done
+  for c in $CARDS; do lbr="$(lb "$c")"; git -C "$MAIN/.aw/sw_card$c" branch -f "${lbr}_recovered" "$lbr" 2>/dev/null; done
   # in-loop rollover checkpoint (gap-gated inside the rollover script; point at a noop to skip)
   RDRY=$(cat /tmp/rollover_dryrun 2>/dev/null || echo 0)
   echo "  [driver] rollover check (round $round, dry=$RDRY, script=$ROLLOVER)" >> "$LOG"
