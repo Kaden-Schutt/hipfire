@@ -757,6 +757,300 @@ impl KernelFamily for MoeFamily {
     }
 }
 
+// ── Placement-agnostic expert reference ──────────────────
+
+/// Placement-agnostic view over an arch's MoE expert weight pointer tables.
+/// All fields are borrowed from arch-owned layer structs; no data is copied.
+///
+/// Passed to the Step-IR launch helpers below so `execute_steps` arms can
+/// dispatch the right kernel without importing any arch crate or matching on
+/// arch-internal types.
+///
+/// **Field naming:** `expert_m` = intermediate dimension (inter); gate_up
+/// writes `2 * expert_m` (fused gate||up), down reads `expert_m`.
+/// `expert_k` = hidden dimension; gate_up reads `expert_k`, down writes
+/// `expert_k`.
+///
+/// **Dropped from the brief:** `dummy_down` — no arch allocates a dummy down
+/// buffer; only `dummy_gate_up` exists (minimax.rs:405, ds4 arch.rs:337).
+pub struct MoeExpertRef<'a> {
+    /// `[n_experts]` u64 device-pointer table; each entry points to one
+    /// expert's fused gate||up weight buffer `[2·expert_m, expert_k]`.
+    pub gate_up_ptrs: &'a GpuTensor,
+    /// `[n_experts]` u64 device-pointer table; each entry points to one
+    /// expert's down weight buffer `[expert_k, expert_m]`.
+    pub down_ptrs: &'a GpuTensor,
+    /// EP-shard dummy gate_up buffer (zeroed). Non-owned expert slots in
+    /// `gate_up_ptrs` point here so SwiGLU(0,0)=0 → zero contribution. Must
+    /// outlive `gate_up_ptrs`. `None` for single-GPU / fully-owned shards.
+    pub dummy_gate_up: Option<&'a GpuTensor>,
+    /// Expert weight dtype (uniform: gate_up and down share the same tier).
+    pub dtype: DType,
+    /// Total logical expert count for this layer.
+    pub n_experts: usize,
+    /// Intermediate dimension: gate_up writes `2 * expert_m`; down reads `expert_m`.
+    pub expert_m: usize,
+    /// Hidden dimension: gate_up reads `expert_k`; down writes `expert_k`.
+    pub expert_k: usize,
+    /// Locally-owned expert indices for EP context. Empty slice = all owned
+    /// (single-GPU or non-EP path).
+    pub owned: &'a [usize],
+}
+
+// ── Step-IR launch helpers ────────────────────────────────
+
+/// Bias-aware top-K routing: select on `scores + gate_bias`, weight on the
+/// unbiased `scores`, normalize, fold in `route_scale` — all in one launch.
+/// Thin wrapper over `gpu.deepseek4_moe_topk_bias_aware_f32`.
+pub fn launch_moe_route(
+    gpu: &mut rdna_compute::Gpu,
+    scores: &GpuTensor,
+    gate_bias: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    n_exp: usize,
+    k_top: usize,
+    route_scale: f32,
+) -> Result<(), DispatchError> {
+    gpu.deepseek4_moe_topk_bias_aware_f32(
+        scores,
+        gate_bias,
+        topk_indices,
+        topk_weights,
+        n_exp as i32,
+        k_top as i32,
+        route_scale,
+    )
+    .map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
+/// Indexed gate||up GEMV for the top-K selected experts (single token,
+/// decode). Dispatches per `experts.dtype` to the exact kernel the arch
+/// calls today:
+/// - MQ4G256/HFQ4G256 → `gemv_hfq4g256_moe_gate_up_k8_indexed`
+/// - MQ6G256/HFQ6G256 → `gemv_hfq6g256_moe_gate_up_k8_indexed`
+/// - MQ2G256Lloyd      → `deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed`
+/// - MQ3G256Lloyd      → `deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed`
+///
+/// Requires FWHT-pre-rotated `x_rot`. Output: `gate_batch` and `up_batch`
+/// each `[k_top × expert_m]` f32. Call `fused_silu_mul_rotate_mq_batched_for`
+/// (arch-side) between this and [`launch_indexed_down`].
+#[allow(clippy::too_many_arguments)]
+pub fn launch_indexed_gate_up(
+    gpu: &mut rdna_compute::Gpu,
+    experts: &MoeExpertRef<'_>,
+    topk_indices: &GpuTensor,
+    x_rot: &GpuTensor,
+    gate_batch: &GpuTensor,
+    up_batch: &GpuTensor,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    let m = 2 * experts.expert_m; // fused gate||up rows
+    let k = experts.expert_k;
+    match experts.dtype {
+        DType::MQ4G256 | DType::HFQ4G256 => gpu
+            .gemv_hfq4g256_moe_gate_up_k8_indexed(
+                experts.gate_up_ptrs,
+                topk_indices,
+                x_rot,
+                gate_batch,
+                up_batch,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ6G256 | DType::HFQ6G256 => gpu
+            .gemv_hfq6g256_moe_gate_up_k8_indexed(
+                experts.gate_up_ptrs,
+                topk_indices,
+                x_rot,
+                gate_batch,
+                up_batch,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ2G256Lloyd => gpu
+            .deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+                experts.gate_up_ptrs,
+                topk_indices,
+                x_rot,
+                gate_batch,
+                up_batch,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ3G256Lloyd => gpu
+            .deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
+                experts.gate_up_ptrs,
+                topk_indices,
+                x_rot,
+                gate_batch,
+                up_batch,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        other => Err(DispatchError::Hip(format!(
+            "launch_indexed_gate_up: unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+/// Indexed down GEMV — **expanded path**: writes per-expert outputs to
+/// `down_expanded` `[batch_size × k_top × expert_k]` with no atomic
+/// accumulation. A separate [`launch_moe_combine`] call folds them with
+/// `topk_weights` into `ffn_out`.
+///
+/// Dispatches per `experts.dtype`:
+/// - MQ4G256/HFQ4G256 → `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`
+/// - MQ6G256/HFQ6G256 → `gemv_hfq6g256_moe_down_k8_indexed_batched_expanded`
+/// - MQ2G256Lloyd      → `deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4`
+///
+/// **MQ3G256Lloyd is not supported here**: no `*_mq3*_moe_down_expanded_k4`
+/// kernel exists. Use [`launch_indexed_down_residual`] instead for MQ3-Lloyd
+/// (and optionally MQ2-Lloyd when the atomic self-combining path is preferred,
+/// e.g. minimax forward.rs:767-778).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_indexed_down(
+    gpu: &mut rdna_compute::Gpu,
+    experts: &MoeExpertRef<'_>,
+    topk_indices: &GpuTensor,
+    rot_batch: &GpuTensor,
+    down_expanded: &GpuTensor,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), DispatchError> {
+    let m = experts.expert_k; // down output = hidden
+    let k = experts.expert_m; // down input  = inter
+    match experts.dtype {
+        DType::MQ4G256 | DType::HFQ4G256 => gpu
+            .gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                experts.down_ptrs,
+                topk_indices,
+                rot_batch,
+                down_expanded,
+                m,
+                k,
+                k_top,
+                batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ6G256 | DType::HFQ6G256 => gpu
+            .gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                experts.down_ptrs,
+                topk_indices,
+                rot_batch,
+                down_expanded,
+                m,
+                k,
+                k_top,
+                batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ2G256Lloyd => gpu
+            .deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+                experts.down_ptrs,
+                topk_indices,
+                rot_batch,
+                down_expanded,
+                m,
+                k,
+                k_top,
+                batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        other => Err(DispatchError::Hip(format!(
+            "launch_indexed_down: no expanded-k4 kernel for dtype {other:?}; \
+             use launch_indexed_down_residual for Lloyd residual path"
+        ))),
+    }
+}
+
+/// Indexed down GEMV — **residual-scaled path** (atomic accumulate + combine
+/// in one launch). Writes *directly into `ffn_out`*; no separate combine
+/// step is needed. Used by minimax for MQ2-Lloyd and MQ3-Lloyd experts
+/// (forward.rs:754-778).
+///
+/// Dispatches per `experts.dtype`:
+/// - MQ2G256Lloyd → `deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed`
+/// - MQ3G256Lloyd → `deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed`
+///
+/// This is a 5th helper beyond the brief's four: added because MQ3-Lloyd
+/// has no `_expanded_k4` kernel, so [`launch_indexed_down`] cannot serve it.
+/// Calling [`launch_moe_combine`] after this would double-accumulate.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_indexed_down_residual(
+    gpu: &mut rdna_compute::Gpu,
+    experts: &MoeExpertRef<'_>,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    rot_batch: &GpuTensor,
+    ffn_out: &GpuTensor,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    let m = experts.expert_k; // down output = hidden
+    let k = experts.expert_m; // down input  = inter
+    match experts.dtype {
+        DType::MQ2G256Lloyd => gpu
+            .deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+                experts.down_ptrs,
+                topk_indices,
+                topk_weights,
+                rot_batch,
+                ffn_out,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ3G256Lloyd => gpu
+            .deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
+                experts.down_ptrs,
+                topk_indices,
+                topk_weights,
+                rot_batch,
+                ffn_out,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        other => Err(DispatchError::Hip(format!(
+            "launch_indexed_down_residual: unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+/// Weighted combine of per-expert expanded down outputs into `ffn_out`.
+/// Thin wrapper over `gpu.moe_down_combine_k8_batched`. Call after
+/// [`launch_indexed_down`] (the expanded path). Do NOT call after
+/// [`launch_indexed_down_residual`] — that path already accumulates.
+pub fn launch_moe_combine(
+    gpu: &mut rdna_compute::Gpu,
+    down_expanded: &GpuTensor,
+    topk_weights: &GpuTensor,
+    ffn_out: &GpuTensor,
+    hidden: usize,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), DispatchError> {
+    gpu.moe_down_combine_k8_batched(
+        down_expanded,
+        topk_weights,
+        ffn_out,
+        hidden,
+        k_top,
+        batch_size,
+    )
+    .map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
