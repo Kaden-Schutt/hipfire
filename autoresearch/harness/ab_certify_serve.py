@@ -157,6 +157,19 @@ def certify(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
                        perf_delta=delta, perf_f=f, base_ref=base_ref, seeds=len(seeds))
 
 
+def certify_coherence(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
+                      seeds, expects=None):
+    """Coherence-ONLY gate — the ROLLOVER pass. The per-round screen (ab_certify_v2p) already enforced
+    parity + perf on each win; at FOLD time we run the SERVE coherence pass (thinking ON, sampled,
+    multiturn seed-SET + validators) ONCE on the composed stack (loop/<arch>) vs trunk. Returns
+    COHERENT / COHERENCE_FAIL. This is the ONLY place the serve/CLI path is used."""
+    c_ok, c_detail = coherence_result(runner.coherence_gens(base_daemon, seeds),
+                                      runner.coherence_gens(var_daemon, seeds), expects=expects)
+    verdict = "COHERENT" if c_ok else "COHERENCE_FAIL"
+    return cv.make_row(arch, kernel, lever, verdict, coherence=c_detail, base_ref=base_ref,
+                       seeds=len(seeds))
+
+
 def load_expects(prompts_file):
     """Per-genre validator params from a --prompts-file: {genre: expect_dict}. A prompt's `expect`
     field (e.g. {"number": 42}, {"sentences": 1}) drives run_validators so the coherence arm catches
@@ -188,13 +201,16 @@ def _main():
     ap.add_argument("--seeds", type=int, default=12)
     ap.add_argument("--kv", default="q8")
     ap.add_argument("--prompts-file", default=None, dest="prompts_file")
+    ap.add_argument("--mode", default="full", choices=["full", "coherence"],
+                    help="full = parity+perf+coherence (per-round); coherence = serve coherence only (rollover)")
     a = ap.parse_args()
     runner = LiveServeRunner(a.model, a.arch, a.dev, prompts_file=a.prompts_file, kv=a.kv,
                              kernel=a.kernel, card=a.card)
-    row = certify(runner, arch=a.arch, kernel=a.kernel, lever=a.label,
-                  base_daemon=a.base_daemon, var_daemon=a.var_daemon,
-                  base_ref=a.base_ref, seeds=list(range(a.seeds)),
-                  expects=load_expects(a.prompts_file))
+    fn = certify_coherence if a.mode == "coherence" else certify
+    row = fn(runner, arch=a.arch, kernel=a.kernel, lever=a.label,
+             base_daemon=a.base_daemon, var_daemon=a.var_daemon,
+             base_ref=a.base_ref, seeds=list(range(a.seeds)),
+             expects=load_expects(a.prompts_file))
     print(json.dumps(row))
 
 

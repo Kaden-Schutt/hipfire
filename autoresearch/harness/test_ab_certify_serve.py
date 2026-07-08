@@ -120,6 +120,22 @@ def test_certify_coherence_beats_perf_win():
     assert row["verdict"] == "COHERENCE_FAIL"
 
 
+def test_certify_coherence_only_rollover_mode():
+    # rollover gate: coherence-only on composed-vs-trunk. Clean -> COHERENT; attractor -> COHERENCE_FAIL.
+    clean = MockRunner(parity={}, durations={},
+                       coherence={"trunk": [_gen("c", seed=s) for s in range(8)],
+                                  "comp": [_gen("c", seed=s) for s in range(8)]})
+    assert ab.certify_coherence(clean, arch="gfx1151", kernel="COMPOSED", lever="rollover",
+                                base_daemon="trunk", var_daemon="comp", base_ref="trunk",
+                                seeds=_seeds())["verdict"] == "COHERENT"
+    broken = MockRunner(parity={}, durations={},
+                        coherence={"trunk": [_gen("c", seed=s) for s in range(10)],
+                                   "comp": [_gen("c", seed=s, toks=_ATTR) for s in range(10)]})
+    assert ab.certify_coherence(broken, arch="gfx1151", kernel="COMPOSED", lever="rollover",
+                                base_daemon="trunk", var_daemon="comp", base_ref="trunk",
+                                seeds=_seeds(10))["verdict"] == "COHERENCE_FAIL"
+
+
 def test_load_expects_from_prompts_file():
     import json, tempfile
     rows = [{"genre": "reason", "prompt": "6*7?", "expect": {"number": 42}},
