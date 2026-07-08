@@ -55,6 +55,7 @@ fn main() {
     let mut tp: usize = 4;
     let mut no_bos = false;
     let mut mtp = false;
+    let mut no_dspark = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -82,6 +83,10 @@ fn main() {
                 mtp = true;
                 i += 1;
             }
+            "--no-dspark" => {
+                no_dspark = true;
+                i += 1;
+            }
             other => {
                 eprintln!("unknown arg {other}");
                 std::process::exit(1);
@@ -92,7 +97,11 @@ fn main() {
 
     // ── config + tokenizer (per-rank loads reopen the file) ─────────────────
     let hfq0 = HfqFile::open(&model).expect("open model");
-    let cfg = DeepseekV4::config_from_hfq(&hfq0).expect("config");
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq0).expect("config");
+    if no_dspark {
+        cfg.load_dspark = false;
+        eprintln!("  --no-dspark: DSpark sidecar skipped (D2a A/B baseline mode)");
+    }
     let tok = Tokenizer::from_hfq_metadata(&hfq0.metadata_json).expect("tokenizer");
     let n_exp = cfg.n_routed_experts;
     eprintln!(
@@ -357,8 +366,13 @@ fn main() {
     let fnv_on = fnv_off;
     set_moe_step_predown_override(None);
     eprintln!("gen FNV off: 0x{fnv_off:016x}  on: 0x{fnv_on:016x}");
-    const DS4_EP2_FNV: u64 = 0x316e0aa1a5a818b2;
-    assert_eq!(fnv_off, DS4_EP2_FNV, "baseline drifted from pinned D1 hash");
+    // on-box EP-2 baseline (--no-dspark), OFF==ON anchor for D2a;
+    // historical deleted-harness numbers do not reproduce here.
+    const DS4_EP2_FNV: u64 = 0x6c0f2f000f1d398f;
+    assert_eq!(
+        fnv_off, DS4_EP2_FNV,
+        "baseline drifted from pinned D2a hash"
+    );
     assert_eq!(fnv_on, fnv_off, "decomposed pre-down is NOT byte-identical");
 
     // MTP-EP accept check: the draft predicted the token AFTER t0; the decode
