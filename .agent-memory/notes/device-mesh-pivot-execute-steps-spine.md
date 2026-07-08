@@ -606,3 +606,52 @@ that was the retracted misprediction.
 `ModelParallel` + `ArchDispatch` (old Phase 3) — the ~20-`Option` `LoadedModel` + the #462 state-bleed
 surface. NOT single-IR purity (decomposition delivers transparency without a god-object collapse; the
 two are independent).
+
+## UPSTREAM MERGE 2026-07-08 — merged upstream/master (DSpark + ddtree, 155 commits) @ merge commit `1df219dd`
+
+Branch now **0 behind / 153 ahead** of `upstream/master` (Kaden-Schutt `45cb5abf`). **TRAP for next
+time:** `origin` = fivetide is a STALE MIRROR (155 behind upstream). Fetch/merge against the `upstream`
+remote, not `origin`. Merge-base was `d44f89e7`.
+
+**What upstream added:** dominantly DSpark (DeepSeek-V4-style multi-stage draft-module spec-decode, ported
+to deepseek4 + qwen3/qwen35) + ddtree GPU-residency/tree-verify (SWOR, temp>0 distribution-exact). New
+modules `dspark_core`/`dspark_block_controller`/`dflash_generic`; new kernels (`dspark_*.hip`,
+`ddtree_*.hip`, `chain_accept_spec.hip`, `batched_categorical_sample.hip`). ~+23k/−2k LOC. **Zero** of it
+touches TP/PP/EP or the SuperOp subsystem.
+
+**Resolution (3-agent static research, high confidence): KEEP our SuperOp/EP deletion.** No upstream
+feature depends on it — every live `ep::`/`SuperOp` reference in upstream is pre-existing base-era EP
+forward-path code (`ep.rs`/`superop.rs` byte-unchanged across all 155 commits); DSpark/ddtree is
+orthogonal and references none of it.
+
+Conflicts resolved (2 textual):
+- `hipfire-runtime/src/lib.rs`: kept upstream's 3 dspark mods (ungated, matching upstream's own
+  placement), dropped `pub mod ep;`.
+- `hipfire-arch-qwen35/src/qwen35.rs`: took OUR deletion side — dropped upstream's ~1094-line SuperOp
+  lowering block (`q35_superop`/`lower_variant`/`LayerProgram`).
+
+**The load-bearing non-textual break (no conflict marker — would've silently shipped broken):**
+`hipfire-runtime/src/llama.rs` auto-merge TANGLED our PP-band primitive `forward_scratch_band(layer_range)`
+with upstream's new `forward_scratch_compute_capture` (DFlash hidden-capture). The two share a near-identical
+per-layer loop, so git mis-aligned braces: `band` got a 1-line stub body (ignored `layer_range`, wrongly ran
+the head), and `compute_capture` inherited an undefined `layer_range` ref AND lost its final norm+lm_head.
+Reconstructed BOTH verbatim from their authoritative sides (band from HEAD — per-layer logic proven ==base
+by diff; capture from upstream). `forward_scratch_compute` (= band+head) was intact.
+
+`LoadCtx`: upstream folded dspark cfg into `SpecLoadCfg` (`ddtree_budget`/`ddtree_topk`/`dspark`/
+`dspark_conf_threshold`) — auto-merged clean. Fixed 3 upstream examples missing our `pp_bands` field + 1
+example calling `load_model` with the pre-mesh arg list (needs `&mesh` + `pp_bands`).
+
+Cleanup (same session, folded into the follow-up commit): removed dead `q35_op`/`Q35Variant`/`variant_of`
+SuperOp stub + its `#397 Ship 6` doc header in qwen35.rs; retargeted 5 stale
+`hipfire_runtime::ep::{run_layer_program_ep, ensure_rank_streams}` doc links in deepseek4/minimax
+`forward.rs` → `Gpus::{ep_moe_allreduce, ensure_rank_streams}`.
+
+**Validation:** `cargo check --workspace --all-targets` (default incl. deltanet) 0 errors; daemon
+`--features deltanet` clean; `cargo test --lib --workspace` 966 pass/0 fail; `coherence-gate.sh` coherence
+PASS (no hard errors, qwen3.5 matrix); llama-arch `coherence_probe` OK 0/0 (covers the pure-llama
+`forward_scratch_compute` path). pflash perf-stage FAIL = known gfx1100-baseline-vs-gfx1151 artifact
+(uniform ~2× incl untouched AR baseline rows), NOT the merge.
+
+**Worktree gotcha:** `core.hooksPath` = `.git/hooks` (no pre-commit) → the pre-commit gate never fires
+here; run gates manually.

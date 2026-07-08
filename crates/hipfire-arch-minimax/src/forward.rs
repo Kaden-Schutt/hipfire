@@ -1186,9 +1186,9 @@ pub fn forward_batch(
 /// Mirror of qwen35::forward_ep: every rank holds full replicated weights /
 /// state / KV EXCEPT MoE experts (sharded at load). Embeds + stages pos per
 /// rank, runs each layer's 2-op program (Attend replicated, Moe all-reduce-EP'd)
-/// via [`hipfire_runtime::ep::run_layer_program_ep`], then final norm + lm_head
+/// via [`hipfire_runtime::multi_gpu::Gpus::ep_moe_allreduce`], then final norm + lm_head
 /// on rank 0 → `state_per_rank[0].logits`. Every device must have an
-/// `active_stream` ([`hipfire_runtime::ep::ensure_rank_streams`]); peer access
+/// `active_stream` ([`hipfire_runtime::multi_gpu::Gpus::ensure_rank_streams`]); peer access
 /// enabled for the fast peer-direct all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep(

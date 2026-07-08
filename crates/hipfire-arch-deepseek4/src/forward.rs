@@ -2123,9 +2123,9 @@ fn ds4_ep_moe_rank(
 /// `gpus.devices.len()` ranks: every rank replicates embed / positions /
 /// token-id / residual-stream init and the per-layer `[Attend, Moe]` program
 /// (Attend replicated, Moe all-reduce-EP'd) via
-/// [`hipfire_runtime::ep::run_layer_program_ep`], then final norm + head run on
+/// [`hipfire_runtime::multi_gpu::Gpus::ep_moe_allreduce`], then final norm + head run on
 /// rank 0 → `state_per_rank[0].logits` (caller downloads). Every device must
-/// have an `active_stream` ([`hipfire_runtime::ep::ensure_rank_streams`]); peer
+/// have an `active_stream` ([`hipfire_runtime::multi_gpu::Gpus::ensure_rank_streams`]); peer
 /// access enabled for the fast peer-direct all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep(
@@ -2827,7 +2827,7 @@ fn mtp_head(
 /// residual stream (replicated; the chaining input) — it MUST be a buffer
 /// DISTINCT from `state_per_rank[r].residual_streams` (pre-FFN reads `h_n` then
 /// overwrites `residual_streams`). Every device needs an `active_stream`
-/// ([`hipfire_runtime::ep::ensure_rank_streams`]) + peer access for the
+/// ([`hipfire_runtime::multi_gpu::Gpus::ensure_rank_streams`]) + peer access for the
 /// all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn mtp_forward_ep(

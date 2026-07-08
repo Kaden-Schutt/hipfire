@@ -13213,67 +13213,6 @@ fn kv_cache_attention_dispatch(
         .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
-//
-// `HIPFIRE_FORWARD_LOWERED=1` routes the single-GPU decode layer loop through
-// the dispatch substrate's `run_layer_program` executor (one pre-resolved
-// `LayerProgram` of coarse super-ops per layer) instead of the hand-written
-// arms in `forward_scratch_layers`. The hand arms are left UNTOUCHED, so the
-// default (flag off) is byte-identical to master by construction; the lowered
-// path is validated byte-identical via the external committed-token md5 gate
-// (`FORWARD_LOWERED=0` vs `=1`, same prompt) on the fleet before the default is
-// flipped per arch. See [[project_ship6_forward_pipeline_design_2026_06_07]].
-//
-// The super-op handlers call the SAME helper fns the hand path uses
-// (`qkv/qkvza/gate_up_via_execute_steps`, `kv_cache_attention_dispatch`,
-// `moe_ffn_dispatch`, `weight_gemv_swiglu_residual`) plus the inline attend/
-// recurrent/gated-norm fragments. DIAG dumps / trace_finite / hidden_rb are
-// output-neutral and omitted here (hidden_rb engages only the hand path).
-// ─────────────────────────────────────────────────────────────────────────
-
-/// qwen35-local super-op opcodes, encoded into `OpBinding.weights[0].0`. The
-/// `SuperOpKind` routes to the `ForwardBindings` method; the opcode disambiguates
-/// *which* op of that kind within the layer (qkv vs gate_up, wo vs down, …).
-mod q35_op {
-    // Proj
-    pub const PROJ_QKV: u32 = 0;
-    pub const PROJ_QKVZA: u32 = 1;
-    pub const PROJ_GATE_UP: u32 = 2;
-    // Attend
-    pub const ATTEND_FULL: u32 = 0;
-    pub const ATTEND_DN_PREP: u32 = 1;
-    // ResidualGemv
-    pub const RESID_WO: u32 = 0;
-    pub const RESID_DOWN_SWIGLU: u32 = 1;
-    // Norm
-    pub const NORM_GATED: u32 = 0;
-    // Recurrent
-    pub const RECUR_GDN: u32 = 0;
-    // Moe
-    pub const MOE_FFN: u32 = 0;
-}
-
-/// The four qwen35 decoder-layer shapes. Derived from the `LayerWeights`
-/// discriminant; kept as a plain enum so `lower_variant` is pure (no GpuTensor)
-/// and unit-testable without a GPU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Q35Variant {
-    DeltaNet,
-    FullAttn,
-    DeltaNetMoe,
-    FullAttnMoe,
-}
-
-fn variant_of(layer: &LayerWeights) -> Q35Variant {
-    match layer {
-        LayerWeights::DeltaNet(_) => Q35Variant::DeltaNet,
-        LayerWeights::FullAttn(_) => Q35Variant::FullAttn,
-        LayerWeights::DeltaNetMoe(_) => Q35Variant::DeltaNetMoe,
-        LayerWeights::FullAttnMoe(_) => Q35Variant::FullAttnMoe,
-    }
-}
-
 /// Multi-GPU layer-loop dispatcher (Stage 5 of multi-GPU pp migration #58).
 /// Mirrors `forward_scratch_layers` but routes per-layer work to
 /// `gpus.devices[gpus.device_for_layer(i)]` and copies the residual
