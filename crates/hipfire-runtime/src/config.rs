@@ -173,6 +173,30 @@ pub fn resolve_mesh(pp: usize, tp: usize, ep: usize, emulate_gpus: Option<usize>
     }
 }
 
+/// Parse + length-validate the `HIPFIRE_PP_LAYERS` ragged-band spec at the load
+/// edge. `raw` is the raw env value (`std::env::var(..).ok()`). Empty / absent →
+/// `Ok(None)` (uniform banding). A comma list of `pp` counts → `Ok(Some(..))`.
+/// The sum-vs-`n_layers` check is deferred to the carrier (which knows the
+/// model config); this only enforces the shape (`len == pp`).
+pub fn parse_pp_layers(raw: Option<String>, pp: usize) -> Result<Option<Vec<usize>>, String> {
+    let Some(spec) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let counts: Vec<usize> = spec
+        .split(',')
+        .map(|s| s.trim().parse::<usize>())
+        .collect::<Result<Vec<usize>, _>>()
+        .map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
+    if counts.len() != pp {
+        return Err(format!(
+            "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
+            counts.len(),
+            pp
+        ));
+    }
+    Ok(Some(counts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{resolve_mesh, RuntimeConfig};
@@ -256,5 +280,32 @@ mod tests {
         assert_eq!(super::resolve_parallelism(1, 1, 4, Some(2)), (1, 1, 4));
         // No emulate -> unchanged.
         assert_eq!(super::resolve_parallelism(1, 1, 1, None), (1, 1, 1));
+    }
+
+    #[test]
+    fn parse_pp_layers_none_and_empty_are_uniform() {
+        assert_eq!(super::parse_pp_layers(None, 2), Ok(None));
+        assert_eq!(super::parse_pp_layers(Some(String::new()), 2), Ok(None));
+    }
+
+    #[test]
+    fn parse_pp_layers_valid_split() {
+        assert_eq!(
+            super::parse_pp_layers(Some("2, 5, 3".to_string()), 3),
+            Ok(Some(vec![2, 5, 3]))
+        );
+    }
+
+    #[test]
+    fn parse_pp_layers_len_mismatch_errors() {
+        let err = super::parse_pp_layers(Some("2,5".to_string()), 3).unwrap_err();
+        assert!(err.contains("has 2 entries"), "got: {err}");
+        assert!(err.contains("expected pp=3"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_pp_layers_unparseable_errors() {
+        let err = super::parse_pp_layers(Some("2,x,3".to_string()), 3).unwrap_err();
+        assert!(err.contains("HIPFIRE_PP_LAYERS parse"), "got: {err}");
     }
 }

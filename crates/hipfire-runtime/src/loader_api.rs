@@ -66,6 +66,11 @@ pub struct LoadCtx<'a> {
     pub state_quant_override: Option<&'a str>,
     pub cask: &'a CaskConfig,
     pub pp: usize,
+    /// Explicit per-stage PP layer bands from `HIPFIRE_PP_LAYERS`, parsed +
+    /// length-validated at the daemon edge. `Some` → ragged (`init_layers`,
+    /// VRAM-delta gate OFF); `None` → uniform (`init_uniform`, gate ON). Only
+    /// ever set on the qwen35 PP path.
+    pub pp_bands: Option<&'a [usize]>,
     pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
 }

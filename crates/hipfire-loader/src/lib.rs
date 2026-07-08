@@ -1010,6 +1010,7 @@ pub fn load_model(
         state_quant_override,
         cask,
         pp,
+        pp_bands: None,
         spec,
         gpu,
     };
