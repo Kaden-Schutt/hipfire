@@ -48,10 +48,11 @@ def _toks_proxy(gen_result):
 
 class LiveServeRunner(abc.ServeRunner):
     def __init__(self, model, arch, dev, port_base=11540, prompts_file=None,
-                 warmed_prompt="Explain hash maps briefly.", n_perf=8, kv="q8"):
+                 warmed_prompt="Explain hash maps briefly.", n_perf=8, kv="q8", coh_max_tokens=4096):
         self.model, self.arch, self.dev = model, arch, dev
         self.port_base, self.prompts_file = port_base, prompts_file
         self.warmed_prompt, self.n_perf, self.kv = warmed_prompt, n_perf, kv
+        self.coh_max_tokens = int(os.environ.get("SR_COH_MAX_TOKENS", coh_max_tokens))
 
     # --- serve lifecycle: one serve per (daemon, arm-env); killed after use ---
     def _run_on_serve(self, cfg, det, gen_fn):
@@ -93,7 +94,7 @@ class LiveServeRunner(abc.ServeRunner):
     def coherence_gens(self, daemon, seeds):
         # ONE serve for the WHOLE seed-set (not a serve per seed — that was 2*N model-loads/certify).
         cfg = _cfg(self.model, daemon, "registry", self.kv, self.port_base + 1,
-                   prompts_file=self.prompts_file, mode="chain", max_tokens=4096)
+                   prompts_file=self.prompts_file, mode="chain", max_tokens=self.coh_max_tokens)
         def go(c):
             out = []
             for seed in seeds:

@@ -14,7 +14,7 @@ Measurement layout (v2 spec):
   PERF      : Q8 serve, interleaved kernel-duration on one warmed prompt -> MWU + clock-VOID
 Verdict precedence: PARITY (short-circuit) -> COHERENCE (hard gate) -> PERF.
 """
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(__file__))
 import coherence_arm as ca
 import perf as perf_mod

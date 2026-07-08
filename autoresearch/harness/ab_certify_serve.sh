@@ -52,12 +52,15 @@ cp "$DB" "$VAR_DAEMON"
 git checkout "$BASE_REF" -- kernels/src/ 2>/dev/null; git clean -fdq kernels/src/ 2>/dev/null
 
 # --- three-arm gate via serve_harness (GPU-lock serialized) ---
-GPULK="$MAIN/scripts/gpu-lock.sh"; [ -f "$GPULK" ] && { . "$GPULK"; gpu_acquire "certserve_${ARCH}_c${CARD}_${LABEL}" >/dev/null 2>&1; }
-ROW=$(HIP_VISIBLE_DEVICES=$DEV python3 "$HARN/ab_certify_serve.py" \
+GPULK="$MAIN/scripts/gpu-lock.sh"; [ -f "$GPULK" ] && { set +u; . "$GPULK"; gpu_acquire "certserve_${ARCH}_c${CARD}_${LABEL}" >/dev/null 2>&1; set -u; }
+# The gate spawns `hipfire serve`, which resolves ~/.hipfire/models via HOME — restore the REAL
+# home here (the build above needs HOME=swhome; the serve needs the real one, else the model symlink
+# points into swhome and the serve fails to spawn).
+ROW=$(HOME="$HOME_ORIG" HIP_VISIBLE_DEVICES=$DEV python3 "$HARN/ab_certify_serve.py" \
         --arch "$ARCH" --dev "$DEV" --kernel "$KERNEL" --label "$LABEL" --model "$MODEL" \
         --base-daemon "$BA_DAEMON" --var-daemon "$VAR_DAEMON" --base-ref "$BASE_SHA" \
         --seeds "$SEEDS" --kv "$KV" $PF_ARG 2>"/tmp/certserve_c${CARD}.err")
-[ -f "$GPULK" ] && gpu_release >/dev/null 2>&1
+[ -f "$GPULK" ] && { set +u; gpu_release >/dev/null 2>&1; set -u; }
 [ -n "$ROW" ] || ROW="{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"INCONCLUSIVE\",\"error\":\"gate produced no row (see /tmp/certserve_c${CARD}.err)\"}"
 VERDICT=$(printf '%s' "$ROW" | python3 -c "import json,sys;print(json.load(sys.stdin).get('verdict','?'))" 2>/dev/null || echo "?")
 
