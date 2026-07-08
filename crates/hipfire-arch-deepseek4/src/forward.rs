@@ -2053,101 +2053,6 @@ fn ds4_moe_block_core(
     Ok(())
 }
 
-/// ds4's per-rank adapter for [`Gpus::ep_moe_allreduce`]'s phase-tagged closure.
-///
-/// - `RunOwned`: shared expert (`ffn_stub`, replicated into `state.ffn_out`) +
-///   owned routed experts → the zeroed `partial`; the HC mix is DEFERRED.
-/// - `AddResidual`: `ffn_out += all_reduced_partial` (→ shared + routed), then
-///   the deferred `hc_ffn_mix` folds it into `residual_streams`.
-///
-/// Same two operations as the retired `Deepseek4Bindings::{run_moe_ep,
-/// ep_add_into_residual}` — byte-identical, just off the SuperOp trait.
-#[allow(clippy::too_many_arguments)]
-fn ds4_ep_moe_rank(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    token_id: u32,
-    skip_ffn: bool,
-    partial: &GpuTensor,
-    phase: hipfire_runtime::multi_gpu::EpMoePhase,
-) -> Result<(), hip_bridge::HipError> {
-    use hipfire_runtime::multi_gpu::EpMoePhase;
-    match phase {
-        EpMoePhase::RunOwned => ds4_moe_block_core(
-            cfg,
-            weights,
-            state,
-            gpu,
-            layer_idx,
-            token_id,
-            skip_ffn,
-            Some(partial),
-            /*do_mix=*/ false,
-        )
-        .map_err(|s| hip_bridge::HipError::new(0, &s)),
-        EpMoePhase::AddResidual => {
-            {
-                let ffn_out = state.ffn_out.as_ref().ok_or_else(|| {
-                    hip_bridge::HipError::new(0, "ds4 ep_add_into_residual: ffn_out unset")
-                })?;
-                gpu.add_inplace_f32(ffn_out, partial)
-                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            }
-            hc_ffn_mix(cfg, weights, state, gpu, layer_idx)
-                .map_err(|s| hip_bridge::HipError::new(0, &s))
-        }
-    }
-}
-
-// ───────────────── P-D decompose D1: ds4 forward_ep step arm (Task 8) ────────
-//
-// Byte-identical replacement for the `ep_moe_allreduce` + `ds4_ep_moe_rank`
-// primitive: it runs the exact same per-rank kernels in the same order, but
-// drives the routed-expert down-projection + EP all-reduce through the
-// axis-keyed `execute_steps_parallel` executor instead of the hand-rolled
-// zero→run→reduce→add primitive. Gated behind `HIPFIRE_MOE_STEP` (default OFF;
-// the primitive arm stays default). Mirrors minimax's `minimax_ep_moe_step`,
-// with two ds4-specific extras: a replicated SHARED expert (`ffn_stub`, into
-// `state.ffn_out`) that runs BEFORE the routed experts, and the `hc_ffn_mix`
-// tail (via `launch_hc_ffn_mix`) that folds the assembled `ffn_out` into the
-// HC residual streams AFTER the all-reduce.
-
-/// Parity-harness override for the `HIPFIRE_MOE_STEP` gate: `-1` = env-driven
-/// (default), `0` = force primitive arm, `1` = force decomposed arm. Lets a
-/// single-process parity harness A/B both arms after ONE model load (the env
-/// read below is `OnceLock`-cached, so it can't be flipped mid-process).
-static MOE_STEP_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-
-/// Force the decomposed (`Some(true)`) or primitive (`Some(false)`) EP MoE arm,
-/// or restore env-driven behavior (`None`). Test/parity hook only.
-pub fn set_ds4_moe_step_override(v: Option<bool>) {
-    let code = match v {
-        None => -1,
-        Some(false) => 0,
-        Some(true) => 1,
-    };
-    MOE_STEP_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `HIPFIRE_MOE_STEP=1` routes the ds4 EP MoE routed down-projection +
-/// all-reduce through the decomposed `execute_steps_parallel` Step path (P-D
-/// milestone) instead of the `ep_moe_allreduce` primitive. Default OFF; the
-/// primitive arm stays the default. Env read is cached for process lifetime;
-/// the parity override wins when set. Shares the SAME env gate as minimax.
-fn ds4_moe_step_enabled() -> bool {
-    match MOE_STEP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *F.get_or_init(|| std::env::var("HIPFIRE_MOE_STEP").as_deref() == Ok("1"))
-        }
-    }
-}
-
 /// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` (default 2.2) — same read `ffn_routed` uses.
 fn ds4_route_scale() -> f32 {
     use std::sync::OnceLock;
@@ -2427,22 +2332,21 @@ fn ds4_ep_pre_down(
     }
 }
 
-/// Decomposed EP MoE for ONE layer — the `HIPFIRE_MOE_STEP` arm of `forward_ep`.
+/// Decomposed EP MoE for ONE layer — the sole EP path in `forward_ep` and
+/// `mtp_forward_ep`.
 ///
 /// - **Phase 1** (per rank, direct arch kernels): `mhc_pre` → shared expert
 ///   (`ffn_stub`, replicated into `state.ffn_out`) → routed pre-down (route →
 ///   bias-aware/hash select → indexed gate_up → batched silu·mul·clamp → FWHT
 ///   rotate). No bit-identical Step twin exists for the fused HC / silu-rotate
-///   kernels, so they stay direct — the SAME calls the primitive makes.
+///   kernels, so they stay as direct arch kernel calls.
 /// - **Phase 2** (routed down + EP all-reduce via `execute_steps_parallel`):
 ///   non-hash layers use the EXPANDED path (`IndexedMoeGemv{DownExpanded}` →
 ///   `MoeCombine`, `zero_before` the EP partial), hash layers use the
 ///   residual-fused path (`IndexedMoeGemv{DownResidual}`, `zero_before`), then a
-///   single `AllReduce{Ep}` over the routed partial (mirrors the primitive
-///   deterministic combine + `ep_moe_allreduce` sum).
+///   single `AllReduce{Ep}` over the routed partial.
 /// - **Phase 3** (tail): `ffn_out += all_reduced_partial` (→ shared + routed),
-///   then `launch_hc_ffn_mix` folds `ffn_out` into `residual_streams`. This
-///   replaces the primitive's `EpMoePhase::AddResidual`.
+///   then `launch_hc_ffn_mix` folds `ffn_out` into `residual_streams`.
 #[allow(clippy::too_many_arguments)]
 fn ds4_ep_moe_step(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
@@ -2630,11 +2534,11 @@ fn ds4_ep_moe_step(
 /// Mirror of `decode_step` + `decode_step_body_lowered`, fanned across
 /// `gpus.devices.len()` ranks: every rank replicates embed / positions /
 /// token-id / residual-stream init and the per-layer `[Attend, Moe]` program
-/// (Attend replicated, Moe all-reduce-EP'd) via
-/// [`hipfire_runtime::multi_gpu::Gpus::ep_moe_allreduce`], then final norm + head run on
-/// rank 0 → `state_per_rank[0].logits` (caller downloads). Every device must
-/// have an `active_stream` ([`hipfire_runtime::multi_gpu::Gpus::ensure_rank_streams`]); peer
-/// access enabled for the fast peer-direct all-reduce.
+/// (Attend replicated, Moe all-reduce-EP'd) via [`ds4_ep_moe_step`], then
+/// final norm + head run on rank 0 → `state_per_rank[0].logits` (caller
+/// downloads). Every device must have an `active_stream`
+/// ([`hipfire_runtime::multi_gpu::Gpus::ensure_rank_streams`]); peer access enabled for
+/// the fast peer-direct all-reduce.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_ep(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
@@ -2693,13 +2597,8 @@ pub fn forward_ep(
         })
         .unwrap_or(false);
     let t_layers = std::time::Instant::now();
-    let group: Vec<usize> = (0..n).collect();
-    // Two arms: the decomposed Step executor (HIPFIRE_MOE_STEP, P-D milestone)
-    // or the `ep_moe_allreduce` primitive (default). Both byte-identical.
-    let moe_step = ds4_moe_step_enabled();
-    // Topological EP mesh for the decomposed arm: a single Ep axis of `n` ranks
-    // → `group_along(Ep)` == `group`. Bands/ragged layout stay off the mesh
-    // (mesh is topological), matching the loader's EP mesh.
+    // Topological EP mesh: a single Ep axis of `n` ranks → `group_along(Ep)` ==
+    // all ranks. Bands/ragged layout stay off the mesh (mesh is topological).
     let ep_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
         hipfire_runtime::multi_gpu::DimKind::Ep,
         n,
@@ -2725,35 +2624,18 @@ pub fn forward_ep(
         // Moe all-reduce EP: each rank runs its owned routed experts (+ the
         // replicated shared expert) into a partial, the partials all-reduce over
         // the Ep group, and each rank folds the reduced routed sum into residual.
-        if moe_step {
-            ds4_ep_moe_step(
-                gpus,
-                weights_per_rank,
-                cfg,
-                state_per_rank,
-                partials,
-                &ep_mesh,
-                l,
-                token,
-                skip_ffn,
-            )
-            .map_err(|e| format!("ds4 forward_ep moe-step L{l}: {e}"))?;
-        } else {
-            gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
-                ds4_ep_moe_rank(
-                    cfg,
-                    &weights_per_rank[r],
-                    &mut state_per_rank[r],
-                    gpu,
-                    l,
-                    token,
-                    skip_ffn,
-                    partial,
-                    phase,
-                )
-            })
-            .map_err(|e| format!("ds4 forward_ep ep_moe_allreduce L{l}: {e}"))?;
-        }
+        ds4_ep_moe_step(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            &ep_mesh,
+            l,
+            token,
+            skip_ffn,
+        )
+        .map_err(|e| format!("ds4 forward_ep moe-step L{l}: {e}"))?;
         if dump_pos_hit {
             for r in 0..n {
                 gpus.devices[r]
@@ -3408,26 +3290,26 @@ pub fn mtp_forward_ep(
         )?;
     }
 
-    // 2. MTP-layer FFN via the EP executor: a single [Moe] program at
-    //    layer_idx = mtp_layer_idx. run_moe_ep = mhc_pre(ffn) + shared ffn_stub
-    //    + routed ffn_routed→partial; the executor all-reduces the partial;
-    //    ep_add_into_residual = ffn_out += partial, then hc_ffn_mix.
+    // 2. MTP-layer FFN via the decomposed EP executor: mhc_pre(ffn) + shared
+    //    ffn_stub + routed experts → partial → all-reduce → ffn_out += partial
+    //    → hc_ffn_mix (all inside ds4_ep_moe_step).
     {
-        let group: Vec<usize> = (0..n).collect();
-        gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
-            ds4_ep_moe_rank(
-                cfg,
-                &weights_per_rank[r],
-                &mut state_per_rank[r],
-                gpu,
-                mtp_layer_idx,
-                next_token,
-                /*skip_ffn=*/ false,
-                partial,
-                phase,
-            )
-        })
-        .map_err(|e| format!("mtp_forward_ep ep_moe_allreduce: {e}"))?;
+        let ep_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+            hipfire_runtime::multi_gpu::DimKind::Ep,
+            n,
+        )]);
+        ds4_ep_moe_step(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            &ep_mesh,
+            mtp_layer_idx,
+            next_token,
+            /*skip_ffn=*/ false,
+        )
+        .map_err(|e| format!("mtp_forward_ep moe-step: {e}"))?;
     }
 
     // 3. Per-rank capture (residual_streams → mtp_last_hidden), replicated.

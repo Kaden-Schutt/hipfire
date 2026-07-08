@@ -139,10 +139,6 @@ name = "daemon"
 required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
 
 [[example]]
-name = "moe_step_ep_parity"
-required-features = ["arch-deepseek4"]
-
-[[example]]
 name = "hfq_split"
 required-features = []
 

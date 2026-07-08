@@ -936,13 +936,12 @@ fn validate_parallel_args(
 ///
 /// **`zero_before[i]`** — when true, `memset_async` the step's output buffer to 0
 /// before launching step `i` on each rank. The element count is taken from the
-/// paired `AllReduce { dim }` collective. Mirror of `ep_moe_allreduce`
-/// (lib.rs:799-811): same 4-bytes-per-elem, same `active_stream` requirement.
+/// paired `AllReduce { dim }` collective. Same 4-bytes-per-elem, same
+/// `active_stream` requirement as the EP accumulation pattern.
 ///
 /// **Collective choice** is keyed on the collective's `kind`:
 /// - `DimKind::Tp` → always `all_reduce_sum_f32_peer` (RCCL not required on Tp path).
-/// - `DimKind::Ep` → `ep_peer_allreduce_decode()` ? `_peer` : `_rccl`
-///   (mirrors `ep_moe_allreduce` lib.rs:823-826).
+/// - `DimKind::Ep` → `ep_peer_allreduce_decode()` ? `_peer` : `_rccl`.
 ///
 /// The group is resolved via `mesh.group_along(kind, coord_of(0))` — identical
 /// to the TP path, so byte-identical results are guaranteed for Tp collectives.
@@ -982,8 +981,8 @@ pub fn execute_steps_parallel(
     let hip_err = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
 
     for i in 0..n_steps {
-        // Optional pre-zero of each rank's output buffer (EP accumulation pattern).
-        // Mirrors ep_moe_allreduce lib.rs:799-811 exactly: memset_async, dim*4 bytes.
+        // Optional pre-zero of each rank's output buffer (EP accumulation pattern):
+        // memset_async, dim*4 bytes, on the rank's active_stream.
         if zero_before[i] {
             let dim = match &collectives[i] {
                 StepCollective::AllReduce { dim, .. } => *dim,
