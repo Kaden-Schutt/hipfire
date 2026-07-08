@@ -34,6 +34,16 @@ impl Pipeline {
     }
 }
 
+/// Opt-in: fuse the HFQ4G256 (MQ4) MoE down GEMV + K_TOP weighted-combine +
+/// residual add into a single `gemv_hfq4g256_moe_down_k8_indexed_fused_acc`
+/// launch, replacing the two-kernel expanded-down + `moe_down_combine_k8_batched`
+/// composition. Default OFF — only `HIPFIRE_MOE_DOWN_FUSED=1` enables it, so the
+/// default dispatch path is byte-for-byte unchanged. Cached once per process.
+fn moe_down_fused_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("HIPFIRE_MOE_DOWN_FUSED").as_deref() == Ok("1"))
+}
+
 pub struct LinearParams<'a> {
     pub x: &'a GpuTensor,
     pub y: &'a GpuTensor,
@@ -511,6 +521,13 @@ pub fn run_moe_decode(
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
 
+    // Opt-in HFQ4G256 (MQ4) fused down: set true when the single-launch
+    // `gemv_hfq4g256_moe_down_k8_indexed_fused_acc` runs so the shared
+    // `moe_down_combine_k8_batched` below is skipped (the fused kernel already
+    // wrote the weighted result into `out_target`). Default OFF ⇒ stays false ⇒
+    // byte-identical two-kernel path.
+    let mut mq4_down_fused = false;
+
     {
         // ── Routed-expert dispatch via device-indexed merged kernels ──────────
         //
@@ -786,6 +803,25 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
+        } else if p.dtypes.routed_down == DType::MQ4G256 && moe_down_fused_enabled() {
+            // Opt-in fused MQ4 down: GEMV + K_TOP weighted-combine + residual
+            // add in ONE capture-safe launch, accumulating directly into
+            // `out_target`. Skips both the expanded [N×K_TOP×M] write and the
+            // shared `moe_down_combine_k8_batched` (guarded by `mq4_down_fused`
+            // below). Only the uniform HFQ4G256 path reaches here (mixed/paro/
+            // Lloyd/MQ5/MQ6/MFP4 are handled above and are untouched).
+            hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_fused_acc(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+            mq4_down_fused = true;
         } else {
             hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
@@ -820,7 +856,7 @@ pub fn run_moe_decode(
             p.dtypes.routed_down,
             DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
         );
-    if !routed_down_self_combines {
+    if !routed_down_self_combines && !mq4_down_fused {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,
@@ -2570,7 +2606,29 @@ pub fn run_moe_prefill(
         // Path 1: atomic-free expanded GEMV write + combine.
         // MQ6 only reaches here on archs where it's admitted without WMMA
         // (gfx12 via env override); the Gpu method exists.
+        // Opt-in HFQ4G256 (MQ4) fused down: when the guarded arm below fires it
+        // runs the single-launch fused kernel into `out_target` and the shared
+        // combine is skipped (via `mq4_down_fused`). Default OFF ⇒ byte-identical
+        // two-kernel path; only uniform MQ4 is affected (MQ5/MQ6/MFP4/Paro arms
+        // are untouched).
+        let mut mq4_down_fused = false;
         let down_result = match p.dtypes.routed_down {
+            DType::MQ4G256 if moe_down_fused_enabled() => {
+                // GEMV + K_TOP weighted-combine + residual add in ONE
+                // capture-safe launch, accumulating directly into out_target.
+                mq4_down_fused = true;
+                hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_fused_acc(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.rot_batch,
+                    out_target,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                ))
+            }
             DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
                 p.topk_indices,
@@ -2631,14 +2689,16 @@ pub fn run_moe_prefill(
             }
         };
         down_result?;
-        hip!(gpu.moe_down_combine_k8_batched(
-            p.down_expanded,
-            p.topk_weights,
-            out_target,
-            down_m,
-            k_top,
-            n,
-        ))?;
+        if !mq4_down_fused {
+            hip!(gpu.moe_down_combine_k8_batched(
+                p.down_expanded,
+                p.topk_weights,
+                out_target,
+                down_m,
+                k_top,
+                n,
+            ))?;
+        }
     }
 
     Ok(())

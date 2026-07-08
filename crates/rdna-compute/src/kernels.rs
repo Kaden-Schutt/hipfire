@@ -1314,6 +1314,18 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate + residual
+/// add in a single kernel. Replaces the two-launch
+/// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` (writes an
+/// [N × K_TOP × M] expanded buffer) FOLLOWED BY `moe_down_combine_k8_batched`
+/// (weighted-sums the K_TOP slots into x_residual). Each block owns one
+/// (token, row), loops all K_TOP experts internally, and does a single
+/// race-free `x_residual[token][row] += Σ_k weight[k]·down_k(row)` — no
+/// expanded intermediate materialized, no atomicAdd. Wave32-only (RDNA);
+/// opt-in via `HIPFIRE_MOE_DOWN_FUSED=1`.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
 /// with `MOE_DOWN_COMBINE_K8_BATCHED_SRC` for the K_TOP fold. Closes the
