@@ -25,12 +25,14 @@ use hipfire_arch_deepseek4_spec as _;
 use hipfire_arch_dots_ocr_spec as _;
 use hipfire_arch_gemma3_spec as _;
 use hipfire_arch_gemma3_vl_spec as _;
+use hipfire_arch_krea2_spec as _;
 use hipfire_arch_lfm2moe_spec as _;
 use hipfire_arch_llama_spec as _;
 use hipfire_arch_minimax_spec as _;
 use hipfire_arch_nemotron_spec as _;
 use hipfire_arch_qwen2_spec as _;
 use hipfire_arch_qwen35_spec as _;
+use hipfire_arch_qwenimage_spec as _;
 use hipfire_arch_zaya_spec as _;
 
 #[cfg(test)]

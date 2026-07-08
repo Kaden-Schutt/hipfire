@@ -1315,6 +1315,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-krea2-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-lfm2moe"
 version = "0.1.0"
 dependencies = [
@@ -1457,6 +1464,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwenimage-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-specs"
 version = "0.3.0"
 dependencies = [
@@ -1465,12 +1479,14 @@ dependencies = [
  "hipfire-arch-dots-ocr-spec",
  "hipfire-arch-gemma3-spec",
  "hipfire-arch-gemma3-vl-spec",
+ "hipfire-arch-krea2-spec",
  "hipfire-arch-lfm2moe-spec",
  "hipfire-arch-llama-spec",
  "hipfire-arch-minimax-spec",
  "hipfire-arch-nemotron-spec",
  "hipfire-arch-qwen2-spec",
  "hipfire-arch-qwen35-spec",
+ "hipfire-arch-qwenimage-spec",
  "hipfire-arch-zaya-spec",
 ]
 

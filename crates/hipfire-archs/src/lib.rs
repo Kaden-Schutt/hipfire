@@ -107,8 +107,9 @@ mod tests {
         // it moves over; a mismatch means either a dropped registration or an
         // untracked addition. Ids: 0 llama, 1 qwen2/3, 5 qwen3.5, 6 qwen3.5-moe,
         // 8 dots-ocr, 9 deepseek4, 10 minimax, 11 lfm2, 12 gemma3, 13 gemma3-vl,
-        // 14 nemotron-h, 15 mamba2, 16 zaya, 0xFF template.
-        let expected: BTreeSet<u16> = [0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0xFF]
+        // 14 nemotron-h, 15 mamba2, 16 zaya, 17 krea2 (diffusion),
+        // 18 qwen-image (diffusion), 0xFF template.
+        let expected: BTreeSet<u16> = [0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 0xFF]
             .into_iter()
             .collect();
         assert_eq!(

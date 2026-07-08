@@ -41,8 +41,8 @@
 
 pub mod ingest;
 pub use ingest::{
-    allocate, default_importance, default_precision_class, default_requires, target_bits,
-    transformer_role, CapReq, CodecCaps, Ingest, PrecisionClass, TensorRole,
+    allocate, default_importance, default_precision_class, default_requires, mmdit_role,
+    target_bits, transformer_role, CapReq, CodecCaps, Ingest, PrecisionClass, TensorRole,
 };
 
 pub mod toy;
@@ -75,6 +75,13 @@ pub const ARCH_ID_GEMMA3_VL: u32 = 13;
 pub const ARCH_ID_NEMOTRON_H: u32 = 14;
 pub const ARCH_ID_MAMBA2: u32 = 15;
 pub const ARCH_ID_ZAYA: u32 = 16;
+// Diffusion denoiser families (image/video MMDiT). First-class arch ids: the
+// container header carries these instead of the legacy generic-diffusion marker.
+pub const ARCH_ID_KREA2: u32 = 17;
+pub const ARCH_ID_QWEN_IMAGE: u32 = 18;
+/// Legacy generic-diffusion container marker (ASCII-ish "DIF0"), pre-A2. Still
+/// recognized as diffusion for backward compat; never written for new containers.
+pub const ARCH_ID_DIFFUSION_LEGACY: u32 = 0x3046_4944;
 // Speculative-decode drafter sidecar ids (NOT loadable base architectures — a
 // `.hfq` header carries one of these only when the file is a draft sidecar
 // discovered next to a base target). DFlash draft = 20 and the Qwen3.5 MTP head
@@ -141,6 +148,15 @@ pub trait ToyModel: Sync + 'static {
     fn fixture(&self, seed: u64) -> ToyFixture;
 }
 
+/// The arch is a diffusion (image/video) denoiser rather than a text LM. Presence
+/// of this capability is how routing tells diffusion containers apart from language
+/// models — a data-driven replacement for the legacy magic `arch_id` constant, so
+/// diffusion families can share the small-integer id space with LLMs.
+pub trait Diffusion: Sync + 'static {
+    /// Stable denoiser family tag, e.g. `"krea2-mmdit"`, `"qwen-image-mmdit"`.
+    fn denoiser_family(&self) -> &'static str;
+}
+
 /// Per-arch capability table: `Some(&dyn Cap)` iff the arch declared it. Built at
 /// registry construction from the arch's `register_arch!` list.
 pub struct Caps {
@@ -148,6 +164,7 @@ pub struct Caps {
     pub spec_decode_chain: Option<&'static dyn SpecDecodeChain>,
     pub toy_model: Option<&'static dyn ToyModel>,
     pub ingest: Option<&'static dyn Ingest>,
+    pub diffusion: Option<&'static dyn Diffusion>,
 }
 
 impl Caps {
@@ -158,6 +175,7 @@ impl Caps {
             spec_decode_chain: None,
             toy_model: None,
             ingest: None,
+            diffusion: None,
         }
     }
 
@@ -182,6 +200,7 @@ impl Caps {
         merge_field!(spec_decode_chain);
         merge_field!(toy_model);
         merge_field!(ingest);
+        merge_field!(diffusion);
     }
 }
 
@@ -245,6 +264,19 @@ impl ArchRegistry {
         self.archs.iter().find(|a| a.id == id)
     }
 
+    /// True if `id` is a registered diffusion denoiser arch (declares the
+    /// [`Diffusion`] capability). Routing uses this instead of a magic id.
+    pub fn is_diffusion(&self, id: ArchId) -> bool {
+        self.get(id).is_some_and(|a| a.caps.diffusion.is_some())
+    }
+
+    /// The denoiser family tag for `id`, if it is a registered diffusion arch.
+    pub fn diffusion_family(&self, id: ArchId) -> Option<&'static str> {
+        self.get(id)
+            .and_then(|a| a.caps.diffusion)
+            .map(|d| d.denoiser_family())
+    }
+
     /// Iterate every registered arch (used by the completeness gate).
     pub fn iter(&self) -> impl Iterator<Item = &RegisteredArch> {
         self.archs.iter()
@@ -278,6 +310,9 @@ macro_rules! __set_cap {
     };
     ($caps:ident, $inst:expr, Ingest) => {
         $caps.ingest = ::core::option::Option::Some($inst as &'static dyn $crate::Ingest);
+    };
+    ($caps:ident, $inst:expr, Diffusion) => {
+        $caps.diffusion = ::core::option::Option::Some($inst as &'static dyn $crate::Diffusion);
     };
     ($caps:ident, $inst:expr, $other:ident) => {
         ::core::compile_error!(::core::concat!(

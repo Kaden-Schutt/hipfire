@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-qwenimage-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the Qwen-Image diffusion denoiser (arch_id 18): identity + diffusion modality marker + Ingest quant-policy, no runtime/kernel deps."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

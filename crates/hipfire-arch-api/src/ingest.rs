@@ -221,6 +221,55 @@ pub fn transformer_role(name: &str) -> TensorRole {
     }
 }
 
+/// Name→role classifier for MMDiT diffusion denoisers (Krea2 / Qwen-Image and
+/// kin), mapping DiT module names onto the shared [`TensorRole`] taxonomy so the
+/// standard importance/precision curves apply. Checked most-specific first.
+/// Diffusion has no gather-indexed tables, so a diffusion family's
+/// `Ingest::requires` returns `NONE`; this classifier only drives importance and
+/// precision class.
+pub fn mmdit_role(name: &str) -> TensorRole {
+    // Output projection (writes back to latent/pixel space). Checked before the
+    // norm case, since `norm_out.linear` matches both.
+    if name.contains("proj_out")
+        || name.contains("final_layer.linear")
+        || name.contains("norm_out.linear")
+    {
+        TensorRole::LmHead
+    // Patch / time / text embedders — entry points, tiny, high leverage.
+    } else if name.contains("img_in")
+        || name.contains("txt_in")
+        || name.contains("time_in")
+        || name.contains("time_text_embed")
+        || name.contains("context_embedder")
+        || name.contains("_embed")
+    {
+        TensorRole::Embed
+    // AdaLN / modulation that conditions each block, plus the attn output gate.
+    } else if name.contains(".img_mod.")
+        || name.contains(".txt_mod.")
+        || name.contains(".modulation.")
+        || name.contains("attn.to_gate")
+        || name.contains("norm1.linear")
+        || name.contains("norm1_context.linear")
+    {
+        TensorRole::ResidualWriter
+    // Joint / cross attention projections (q/k/v/out + the text-stream adds).
+    } else if name.contains(".attn.") || name.contains("attention") {
+        TensorRole::AttnProj
+    // Block feed-forward (image + text streams).
+    } else if name.contains("_mlp.")
+        || name.contains(".mlp.")
+        || name.contains(".ff.")
+        || name.contains(".ff_context.")
+    {
+        TensorRole::Mlp
+    } else if name.contains("norm") {
+        TensorRole::Norm
+    } else {
+        TensorRole::Other
+    }
+}
+
 /// Default importance prior for a role: protect the gather tables, attention,
 /// residual writers, norms and routers at high precision; compress the FFN/expert
 /// bulk. A structural prior only — the quantizer refines the actual bits later.
