@@ -1200,8 +1200,13 @@ fn minimax_ep_moe_step(
     let n_exp = cfg.num_local_experts;
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
+    // TP-of-experts: inter_local = inter / tp. When tp==1 (no Tp axis),
+    // size_of returns 0, max(1) gives 1, inter_local == inter → byte-identical.
+    let tp = mesh.size_of(hipfire_runtime::multi_gpu::DimKind::Tp).max(1);
+    let inter_local = inter / tp;
     // Gate_up-dtype refs needed for the decomposed pre-down Step path.
     // Built here (before Phase-1 borrows gpus mutably) so they outlive the step vecs.
+    // expert_m uses inter_local (the per-rank intermediate dim under TP).
     let gu_refs: Vec<MoeExpertRef> = (0..n)
         .map(|r| {
             let layer = &weights_per_rank[r].layers[l];
@@ -1211,7 +1216,7 @@ fn minimax_ep_moe_step(
                 dummy_gate_up: layer.dummy_gate_up.as_ref(),
                 dtype: layer.experts[0].gate_up.gpu_dtype,
                 n_experts: n_exp,
-                expert_m: inter,
+                expert_m: inter_local,
                 expert_k: hidden,
                 owned: &[],
             }
@@ -1255,7 +1260,7 @@ fn minimax_ep_moe_step(
                 dummy_gate_up: layer.dummy_gate_up.as_ref(),
                 dtype: layer.experts[0].down.gpu_dtype,
                 n_experts: n_exp,
-                expert_m: inter,
+                expert_m: inter_local,
                 expert_k: hidden,
                 owned: &[],
             }
@@ -1305,7 +1310,7 @@ fn minimax_ep_moe_step(
                         gate: &s.gate_batch,
                         up: &s.up_batch,
                         rot_out: &s.rot_batch,
-                        inter,
+                        inter: inter_local,
                         k_top,
                     },
                 ];
@@ -1323,13 +1328,19 @@ fn minimax_ep_moe_step(
                 rank_steps
             })
             .collect();
+        // AllReduce kind: Tp when there is a Tp axis (TP-of-experts), Ep otherwise.
+        let ar_kind = if tp > 1 {
+            hipfire_runtime::multi_gpu::DimKind::Tp
+        } else {
+            hipfire_runtime::multi_gpu::DimKind::Ep
+        };
         let colls: Vec<StepCollective> = vec![
             StepCollective::None,
             StepCollective::None,
             StepCollective::None,
             StepCollective::None,
             StepCollective::AllReduce {
-                kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                kind: ar_kind,
                 dim: hidden,
             },
         ];
@@ -1376,7 +1387,7 @@ fn minimax_ep_moe_step(
                         gate: &s.gate_batch,
                         up: &s.up_batch,
                         rot_out: &s.rot_batch,
-                        inter,
+                        inter: inter_local,
                         k_top,
                     },
                 ];
@@ -1403,6 +1414,12 @@ fn minimax_ep_moe_step(
                 rank_steps
             })
             .collect();
+        // AllReduce kind: Tp when there is a Tp axis (TP-of-experts), Ep otherwise.
+        let ar_kind = if tp > 1 {
+            hipfire_runtime::multi_gpu::DimKind::Tp
+        } else {
+            hipfire_runtime::multi_gpu::DimKind::Ep
+        };
         let colls: Vec<StepCollective> = vec![
             StepCollective::None,
             StepCollective::None,
@@ -1410,7 +1427,7 @@ fn minimax_ep_moe_step(
             StepCollective::None,
             StepCollective::None,
             StepCollective::AllReduce {
-                kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                kind: ar_kind,
                 dim: hidden,
             },
         ];
@@ -1491,6 +1508,7 @@ pub fn forward_ep(
         hipfire_runtime::multi_gpu::DimKind::Ep,
         n,
     )]);
+    // NOTE: pass ep_mesh here. For TP-of-experts use `forward_tp` which passes a Tp mesh.
     let n_layers = weights_per_rank[0].layers.len();
     for l in 0..n_layers {
         // Attend replicated: every rank holds full weights + full KV → the
@@ -1559,6 +1577,129 @@ pub fn forward_ep(
             "EP-DECODE-TIMING: layers(host)={layers_ms:.2} ms  final-sync(gpu)={:.2} ms",
             t_sync.elapsed().as_secs_f64() * 1000.0,
         );
+    }
+    for s in state_per_rank.iter_mut() {
+        s.n_tokens = position as usize + 1;
+    }
+    Ok(())
+}
+
+/// TP-of-experts replicated N-rank decode forward for ONE token.
+///
+/// Every rank holds ALL experts but with column/row-sliced weight matrices
+/// (loaded via `MiniMaxWeights::load(.., tp_slice=Some(TpExpertSlice{tp,rank}))`).
+/// Each rank computes a partial output from its `inter/tp` intermediate slice;
+/// the partials all-reduce over the Tp group, and each rank folds the full result
+/// into its residual `state.h`. Attention is fully replicated (identical to `forward_ep`).
+///
+/// This function is parallel to `forward_ep`; the only structural difference is the
+/// mesh axis (`DimKind::Tp` instead of `DimKind::Ep`), which drives `minimax_ep_moe_step`
+/// to use `inter_local = inter/tp` and emit `AllReduce{Tp}`.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_tp(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[MiniMaxWeights],
+    cfg: &MiniMaxConfig,
+    state_per_rank: &mut [MiniMaxState],
+    partials: &[GpuTensor],
+    token: u32,
+    position: u32,
+) -> Result<(), String> {
+    let n = gpus.devices.len();
+    assert_eq!(
+        weights_per_rank.len(),
+        n,
+        "forward_tp: weights_per_rank len"
+    );
+    assert_eq!(state_per_rank.len(), n, "forward_tp: state_per_rank len");
+    assert_eq!(partials.len(), n, "forward_tp: partials len");
+    let hidden = cfg.hidden_size;
+    let eps = cfg.rms_norm_eps;
+
+    // 1. Embed + stage pos per rank (replicated, deterministic).
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("forward_tp bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .embedding_lookup_q8(
+                &weights_per_rank[r].embed,
+                &state_per_rank[r].h,
+                token,
+                hidden,
+            )
+            .map_err(|e| format!("forward_tp embed {r}: {e:?}"))?;
+        state_per_rank[r].pos_host[0] = position as i32;
+        let pos_bytes = unsafe {
+            std::slice::from_raw_parts(state_per_rank[r].pos_host.as_ptr() as *const u8, 4)
+        };
+        gpus.devices[r]
+            .memcpy_htod_auto(&state_per_rank[r].pos_buf, pos_bytes)
+            .map_err(|e| format!("forward_tp pos {r}: {e:?}"))?;
+    }
+
+    // 2. Per-layer TP program (Attend replicated; MoE all-reduce-Tp'd).
+    let t_layers = std::time::Instant::now();
+    // Topological Tp mesh: a single Tp axis of `n` ranks → `group_along(Tp)` == all ranks.
+    // `minimax_ep_moe_step` sees DimKind::Tp → tp=n, inter_local=inter/n.
+    let tp_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+        hipfire_runtime::multi_gpu::DimKind::Tp,
+        n,
+    )]);
+    let n_layers = weights_per_rank[0].layers.len();
+    for l in 0..n_layers {
+        // Attend replicated (identical to forward_ep).
+        for r in 0..n {
+            gpus.devices[r]
+                .bind_thread()
+                .map_err(|e| format!("forward_tp attn bind {r} L{l}: {e:?}"))?;
+            minimax_attn_block(
+                &mut gpus.devices[r],
+                cfg,
+                &weights_per_rank[r].layers[l],
+                &state_per_rank[r],
+                l,
+            )
+            .map_err(|e| format!("forward_tp attn L{l} r{r}: {e}"))?;
+        }
+        // MoE all-reduce Tp: each rank holds all experts with sliced inter/tp weights.
+        // minimax_ep_moe_step dispatches AllReduce{Tp} because mesh has DimKind::Tp.
+        minimax_ep_moe_step(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            &tp_mesh,
+            l,
+        )
+        .map_err(|e| format!("forward_tp moe-step L{l}: {e}"))?;
+    }
+
+    // 3. Final norm + lm_head on rank 0 → state_per_rank[0].logits.
+    {
+        gpus.devices[0]
+            .bind_thread()
+            .map_err(|e| format!("forward_tp bind0: {e:?}"))?;
+        let w = &weights_per_rank[0];
+        let s = &state_per_rank[0];
+        let gpu = &mut gpus.devices[0];
+        gpu.rmsnorm_f32(&s.h, &w.final_norm, &s.final_norm_buf, eps)
+            .map_err(|e| format!("forward_tp final norm: {e:?}"))?;
+        weight_gemv(gpu, &w.lm_head, &s.final_norm_buf, &s.logits)
+            .map_err(|e| format!("forward_tp lm_head: {e}"))?;
+    }
+
+    let _layers_ms = t_layers.elapsed().as_secs_f64() * 1000.0;
+    // 4. Sync every rank.
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("forward_tp sync bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .hip
+            .device_synchronize()
+            .map_err(|e| format!("forward_tp sync {r}: {e:?}"))?;
     }
     for s in state_per_rank.iter_mut() {
         s.n_tokens = position as usize + 1;

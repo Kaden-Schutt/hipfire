@@ -380,6 +380,21 @@ fn wt_from_raw(
     })
 }
 
+/// Bytes per packed-quant block (256 elements) for a given quant_type byte.
+/// Used for TP-of-experts slicing (`expert_tp_column_pair`/`expert_tp_row_gather`).
+/// Only the Lloyd variants used in M2.7.mq2 are currently supported; others
+/// return an error so TP slicing fails fast rather than corrupting data.
+fn block_bytes_for_qt(qt: u8) -> Result<usize, String> {
+    match qt {
+        19 => Ok(72),  // MQ2G256Lloyd (confirmed: weight_store.rs)
+        20 => Ok(112), // MQ3G256Lloyd (confirmed: weight_store.rs)
+        other => Err(format!(
+            "minimax TP-expert-slice: quant_type {other} not supported for column/row slicing \
+             (only MQ2G256Lloyd/MQ3G256Lloyd implemented)"
+        )),
+    }
+}
+
 // ──────────────────────────── Weights ────────────────────────────
 
 /// Per-layer GPU-resident weights.
@@ -428,11 +443,19 @@ impl MiniMaxWeights {
     /// pointers point at a shared zeroed gate_up buffer (→ 0 contribution). The
     /// non-expert weights (embed / lm_head / attention / norms) are always loaded
     /// in full (replicated per rank). `shard = None` loads everything (single-GPU).
+    ///
+    /// `tp_slice = Some(TpExpertSlice { tp, rank })` enables **TP-of-experts**:
+    /// every rank owns ALL experts but each expert's weight matrix is column/row-split.
+    /// gate‖up: column split `[2·inter, hidden]` → `[2·inter/tp, hidden]` (via
+    /// `weight_store::expert_tp_column_pair`). down: row gather `[hidden, inter]` →
+    /// `[hidden, inter/tp]` (via `weight_store::expert_tp_row_gather`). Mutually
+    /// exclusive with EP `shard` (which sub-sets which experts are loaded).
     pub fn load(
         hfq: &mut HfqFile,
         cfg: &MiniMaxConfig,
         gpu: &mut Gpu,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+        tp_slice: Option<hipfire_runtime::tp_shard::TpExpertSlice>,
     ) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
@@ -449,6 +472,13 @@ impl MiniMaxWeights {
         if cfg.reap_keep.is_some() && shard.is_some() {
             return Err("minimax: REAP keep-map + EP sharding are mutually exclusive".into());
         }
+        // TP-of-experts and EP sharding are also mutually exclusive.
+        if tp_slice.is_some() && shard.is_some() {
+            return Err("minimax: TP expert slice + EP sharding are mutually exclusive".into());
+        }
+        // inter_local: intermediate dim per TP rank. Under TP this is inter/tp;
+        // under no TP it equals inter (tp=1, inter_local==inter → byte-identical).
+        let inter_local = tp_slice.map(|ts| ts.inter_local(inter)).unwrap_or(inter);
 
         // Globals.
         let (_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
@@ -563,8 +593,12 @@ impl MiniMaxWeights {
             // tiny oracle: gfx1151 cosine unchanged).
             let mut gu_combined: Vec<u8> = Vec::new();
             let mut dn_combined: Vec<u8> = Vec::new();
-            let mut gu_stride = 0usize;
-            let mut dn_stride = 0usize;
+            let mut gu_stride = 0usize; // raw per-expert blob size (for validation only)
+            let mut dn_stride = 0usize; // raw per-expert blob size (for validation only)
+                                        // Packed per-expert size in the combined blob (equals raw stride when no
+                                        // TP slicing; equals sliced size when tp_slice is Some).
+            let mut gu_packed_stride = 0usize;
+            let mut dn_packed_stride = 0usize;
             let mut qt_gu = 0u8;
             let mut qt_dn = 0u8;
             // EP shard: only upload rank-owned experts into the compact blob.
@@ -619,9 +653,39 @@ impl MiniMaxWeights {
                     let route = if shard.is_some() { e } else { slot };
                     local_of_global[route] = n_owned;
                     n_owned += 1;
-                    gu_combined.extend_from_slice(&w1);
-                    gu_combined.extend_from_slice(&w3);
-                    dn_combined.extend_from_slice(&w2);
+                    if let Some(ts) = tp_slice {
+                        // TP-of-experts: slice this expert's gate‖up blob (column
+                        // split) and down blob (row gather) to rank-local inter/tp.
+                        let bb_gu = block_bytes_for_qt(qt_gu)?;
+                        let bb_dn = block_bytes_for_qt(qt_dn)?;
+                        // gate‖up raw blob for this expert: w1‖w3 concatenated.
+                        let mut raw_gu = Vec::with_capacity(w1.len() + w3.len());
+                        raw_gu.extend_from_slice(&w1);
+                        raw_gu.extend_from_slice(&w3);
+                        let sliced_gu = hipfire_runtime::weight_store::expert_tp_column_pair(
+                            &raw_gu, inter, hidden, bb_gu, ts.rank, ts.tp,
+                        )
+                        .map_err(|e2| format!("minimax L{l}E{e}: TP column slice gate_up: {e2}"))?;
+                        let sliced_dn = hipfire_runtime::weight_store::expert_tp_row_gather(
+                            &w2, hidden, inter, bb_dn, ts.rank, ts.tp,
+                        )
+                        .map_err(|e2| format!("minimax L{l}E{e}: TP row gather down: {e2}"))?;
+                        // Record the sliced per-expert size for the pointer table.
+                        if n_owned == 1 {
+                            gu_packed_stride = sliced_gu.len();
+                            dn_packed_stride = sliced_dn.len();
+                        }
+                        gu_combined.extend_from_slice(&sliced_gu);
+                        dn_combined.extend_from_slice(&sliced_dn);
+                    } else {
+                        if n_owned == 1 {
+                            gu_packed_stride = gu_stride;
+                            dn_packed_stride = dn_stride;
+                        }
+                        gu_combined.extend_from_slice(&w1);
+                        gu_combined.extend_from_slice(&w3);
+                        dn_combined.extend_from_slice(&w2);
+                    }
                 }
                 // Non-owned: w1/w3/w2 read from the file (for stride validation)
                 // then dropped — never uploaded. That is the EP memory win.
@@ -634,9 +698,10 @@ impl MiniMaxWeights {
             // (the forward's rotate_x_mq / silu_mul_rotate / dtype dispatch read
             // those + the AWQ scale, never the buffer's full extent — per-expert
             // data is reached through the pointer table below).
-            let mut gate_up = wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter, hidden)
+            // Under TP: inter_local = inter/tp, so gate_up m=2*inter_local, down k=inter_local.
+            let mut gate_up = wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter_local, hidden)
                 .map_err(|e2| format!("minimax: pack gate_up L{l}: {e2}"))?;
-            let mut down = wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter)
+            let mut down = wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter_local)
                 .map_err(|e2| format!("minimax: pack down L{l}: {e2}"))?;
             drop(gu_combined);
             drop(dn_combined);
@@ -675,7 +740,7 @@ impl MiniMaxWeights {
             // must thread it into the layer struct.
             let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
                 let z = gpu
-                    .zeros(&[gu_stride / 4], DType::F32)
+                    .zeros(&[gu_packed_stride / 4], DType::F32)
                     .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
                 Some(z)
             } else {
@@ -688,7 +753,7 @@ impl MiniMaxWeights {
             let gu_bytes: Vec<u8> = (0..n_exp)
                 .flat_map(|e| {
                     let ptr = if owns(e) {
-                        gu_base + (local_of_global[e] * gu_stride) as u64
+                        gu_base + (local_of_global[e] * gu_packed_stride) as u64
                     } else {
                         dummy_gu
                     };
@@ -698,7 +763,7 @@ impl MiniMaxWeights {
             let dn_bytes: Vec<u8> = (0..n_exp)
                 .flat_map(|e| {
                     let ptr = if owns(e) {
-                        dn_base + (local_of_global[e] * dn_stride) as u64
+                        dn_base + (local_of_global[e] * dn_packed_stride) as u64
                     } else {
                         dn_base // rot input is 0 for non-owned ⇒ output 0 regardless
                     };
@@ -1049,7 +1114,6 @@ impl MiniMaxState {
     pub fn reset(&mut self) {
         self.n_tokens = 0;
     }
-
 }
 
 // ──────────────── ModelSource (safetensors) load helpers ────────────────

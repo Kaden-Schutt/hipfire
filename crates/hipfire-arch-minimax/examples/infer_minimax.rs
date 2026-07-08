@@ -60,7 +60,7 @@ fn main() {
     );
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let t_load = std::time::Instant::now();
-    let weights = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpu, None).expect("weights");
+    let weights = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpu, None, None).expect("weights");
     eprintln!("loaded weights in {:.1}s", t_load.elapsed().as_secs_f64());
 
     let prompt_ids = tok.encode(&prompt);

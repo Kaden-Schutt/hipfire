@@ -749,7 +749,8 @@ fn finish_qwen35_load(
                 match hipfire_runtime::hfq::HfqFile::open(&p) {
                     Ok(mut sidecar) => {
                         sidecar.drop_mmap();
-                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu) {
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
+                        {
                             Ok(Some((dspark_weights, assets))) => {
                                 let block = dspark_weights.cfg.block_size;
                                 // Reduced-vocab drafters (ORNITH) ship a compressed
@@ -795,7 +796,9 @@ fn finish_qwen35_load(
                                         ))
                                     }
                                     Err(e) => {
-                                        eprintln!("  qwen35: DSpark body build failed: {e} — AR/other");
+                                        eprintln!(
+                                            "  qwen35: DSpark body build failed: {e} — AR/other"
+                                        );
                                         None
                                     }
                                 }
@@ -1647,7 +1650,7 @@ fn load_model_ep_minimax(
             .map_err(|e| format!("bind {r}: {e:?}"))?;
         let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
         let dev = &mut staging.gpus_mut().devices[r];
-        let w = minimax::MiniMaxWeights::load(&mut h, &config, dev, Some((&shard, r)))
+        let w = minimax::MiniMaxWeights::load(&mut h, &config, dev, Some((&shard, r)), None)
             .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
         staging.weights.push(w);
         if fail_rank == Some(r) {

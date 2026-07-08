@@ -119,8 +119,14 @@ fn main() {
         gpus.devices[r].bind_thread().expect("bind");
         let mut hfq = HfqFile::open(&model).expect("reopen model");
         let t = std::time::Instant::now();
-        let w = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpus.devices[r], Some((&shard, r)))
-            .expect("shard-aware load");
+        let w = MiniMaxWeights::load(
+            &mut hfq,
+            &cfg,
+            &mut gpus.devices[r],
+            Some((&shard, r)),
+            None,
+        )
+        .expect("shard-aware load");
         eprintln!(
             "  [rank {r}] loaded owned shard in {:.1}s",
             t.elapsed().as_secs_f64()
