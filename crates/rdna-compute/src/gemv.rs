@@ -5816,16 +5816,37 @@ impl Gpu {
                 ((m as u32) + 1) / 2,
             )
         } else {
-            self.ensure_kernel(
-                "gemv_hfq4g256_moe_gate_up_indexed",
-                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
-                "gemv_hfq4g256_moe_gate_up_k8_indexed",
-            )?;
-            (
-                "gemv_hfq4g256_moe_gate_up_k8_indexed",
-                [32u32, 1, 1],
-                m as u32,
-            )
+            // Opt-in NUM_ROWS=2 register row-tile (HIPFIRE_MOE_GATE_UP_FUSED=1):
+            // ceil(M/2) blocks, each owning 2 output rows sharing this expert's x.
+            // Token-id exact vs base (per-row math unchanged). Grid divisor here
+            // MUST match the kernel's MOE_GATE_UP_NUM_ROWS.
+            use std::sync::OnceLock;
+            static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
+            let fused = *GATE_UP_FUSED
+                .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
+            if fused {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_rowtile",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
+                    [32u32, 1, 1],
+                    ((m as u32) + 1) / 2,
+                )
+            } else {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed",
+                    [32u32, 1, 1],
+                    m as u32,
+                )
+            }
         };
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
