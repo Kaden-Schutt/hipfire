@@ -99,6 +99,33 @@ def test_certify_coherence_beats_perf_win():
     assert row["verdict"] == "COHERENCE_FAIL"
 
 
+def test_load_expects_from_prompts_file():
+    import json, tempfile
+    rows = [{"genre": "reason", "prompt": "6*7?", "expect": {"number": 42}},
+            {"genre": "code", "prompt": "fib"},                       # no expect -> not in map
+            {"genre": "factual", "prompt": "cap?", "expect": {"sentences": 1}}]
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(rows, f); f.close()
+    assert ab.load_expects(f.name) == {"reason": {"number": 42}, "factual": {"sentences": 1}}
+    assert ab.load_expects(None) == {}
+
+
+def test_certify_threads_expects_catches_fluent_but_wrong():
+    # A variant that is parity-clean, attractor-free, AND faster — but ANSWERS WRONG. It must be
+    # rejected COHERENCE_FAIL once expects are threaded (#2), and (contrast) would WIN without them.
+    base_par = [_gen("reason", genre="reason", text="42")]
+    var_par = [_gen("reason", genre="reason", text="42")]                       # byte-exact -> parity PASS
+    base_coh = [_gen("reason", seed=s, genre="reason", text="the answer is 42") for s in range(8)]
+    var_coh = [_gen("reason", seed=s, genre="reason", text="the answer is 41") for s in range(8)]  # WRONG
+    r = MockRunner(parity={"B": base_par, "V": var_par},
+                   coherence={"B": base_coh, "V": var_coh},
+                   durations={"B": [10.0] * 8, "V": [5.0] * 8})                 # variant is FASTER
+    kw = dict(arch="gfx1151", kernel="k", lever="wrong_answer",
+              base_daemon="B", var_daemon="V", base_ref="r", seeds=_seeds(8))
+    assert ab.certify(r, expects={"reason": {"number": 42}}, **kw)["verdict"] == "COHERENCE_FAIL"
+    assert ab.certify(r, expects=None, **kw)["verdict"] == "WIN"                # the hole #2 closes
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

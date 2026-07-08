@@ -138,6 +138,18 @@ def certify(runner, *, arch, kernel, lever, base_daemon, var_daemon, base_ref,
                        coherence=c_detail, base_ref=base_ref, seeds=len(seeds))
 
 
+def load_expects(prompts_file):
+    """Per-genre validator params from a --prompts-file: {genre: expect_dict}. A prompt's `expect`
+    field (e.g. {"number": 42}, {"sentences": 1}) drives run_validators so the coherence arm catches
+    fluent-but-WRONG output, not just attractors. Genres with no `expect` get no semantic validator
+    (attractor/empty/runaway still apply). Without this the live gate ran with expects=None -> a
+    confidently-wrong answer passed coherence."""
+    if not prompts_file:
+        return {}
+    rows = json.load(open(prompts_file))
+    return {r.get("genre", "prose"): r.get("expect", {}) for r in rows if r.get("expect")}
+
+
 def _main():
     """Measurement entry point: given two ALREADY-BUILT daemon binaries, run the three-arm gate and
     print the verdict row JSON. The bash wrapper (ab_certify_serve.sh) builds the daemons + owns the
@@ -162,7 +174,8 @@ def _main():
                              kernel=a.kernel, card=a.card)
     row = certify(runner, arch=a.arch, kernel=a.kernel, lever=a.label,
                   base_daemon=a.base_daemon, var_daemon=a.var_daemon,
-                  base_ref=a.base_ref, seeds=list(range(a.seeds)))
+                  base_ref=a.base_ref, seeds=list(range(a.seeds)),
+                  expects=load_expects(a.prompts_file))
     print(json.dumps(row))
 
 

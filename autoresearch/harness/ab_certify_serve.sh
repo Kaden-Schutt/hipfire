@@ -14,7 +14,10 @@ WT="${WT_OVERRIDE:-$MAIN/.aw/sw_card${CARD}}"
 STATE="$MAIN/autoresearch/state"; CACHE="$STATE/cache"; HARN="$MAIN/autoresearch/harness"
 LEDGER="$MAIN/autoresearch/ledger/swarm_${ARCH}_${KERNEL}.jsonl"
 SEEDS="${SEEDS:-12}"; KV="${KV:-q8}"
-PF_ARG=""; [ -n "${PROMPTS_FILE:-}" ] && PF_ARG="--prompts-file $PROMPTS_FILE"
+# default to the committed guard set (carries per-genre `expect` -> the coherence arm runs semantic
+# validators, catching fluent-but-wrong output, not just attractors). Override with PROMPTS_FILE.
+PROMPTS_FILE="${PROMPTS_FILE:-$HARN/guards/coherence_guard.json}"
+PF_ARG="--prompts-file $PROMPTS_FILE"
 mkdir -p "$CACHE"
 cd "$WT" 2>/dev/null || { echo "{\"label\":\"$LABEL\",\"verdict\":\"BUILD_FAIL\",\"error\":\"no worktree $WT\"}"; exit 0; }
 # per-worker isolated build home (parallel builds must not share kernels/src + target)

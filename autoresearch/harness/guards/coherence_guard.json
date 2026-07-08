@@ -1,0 +1,7 @@
+[
+  {"genre": "reason", "prompt": "What is 6 times 7? Reply with only the number.", "expect": {"number": 42}},
+  {"genre": "reason", "prompt": "A box has 3 rows of 8 apples. How many apples in total? Reply with only the number.", "expect": {"number": 24}},
+  {"genre": "reason", "prompt": "What is 100 minus 37? Reply with only the number.", "expect": {"number": 63}},
+  {"genre": "reason", "prompt": "If a train travels 60 km in 2 hours, what is its speed in km/h? Reply with only the number.", "expect": {"number": 30}},
+  {"genre": "code", "prompt": "Write a Python function fib(n) that returns the nth Fibonacci number (fib(0)=0, fib(1)=1). Reply with only a Python code block.", "expect": {}}
+]
