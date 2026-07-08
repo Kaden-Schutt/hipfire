@@ -27,9 +27,19 @@ fn fnv1a(ids: &[u32]) -> u64 {
     h
 }
 
+fn fnv1a_bytes(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn main() {
     use hipfire_arch_deepseek4::forward;
     use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
+    use hipfire_dispatch::pipeline::set_moe_step_predown_override;
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::multi_gpu::Gpus;
@@ -198,6 +208,13 @@ fn main() {
             .join(" ")
     };
 
+    // ── A/B harness: D2a decode pre-down decomposition toggle ───────────────
+    // Task-1 baseline: toggle is inert (arch ignores it until Task 4).
+    // fnv_on = fnv_off by construction; second run wired at Task 4.
+    let prompt_fingerprint = fnv1a_bytes(prompt.as_bytes());
+    eprintln!("prompt fnv1a_bytes: 0x{prompt_fingerprint:016x}  max: {max}  tp: {tp}");
+    set_moe_step_predown_override(Some(false));
+
     // ── EP prefill (per-token) + greedy decode ──────────────────────────────
     eprintln!(
         "\nprompt {:?} → {} tokens (bos-prepended={})",
@@ -335,7 +352,14 @@ fn main() {
         tok.decode(&gen)
     );
     eprintln!("gen ids: {:?}", &gen[..gen.len().min(40)]);
-    eprintln!("gen FNV: 0x{:016x}", fnv1a(&gen));
+    let fnv_off = fnv1a(&gen);
+    // Task-1: toggle inert → ON == OFF. Second run (with fresh state) wired at Task 4.
+    let fnv_on = fnv_off;
+    set_moe_step_predown_override(None);
+    eprintln!("gen FNV off: 0x{fnv_off:016x}  on: 0x{fnv_on:016x}");
+    const DS4_EP2_FNV: u64 = 0x316e0aa1a5a818b2;
+    assert_eq!(fnv_off, DS4_EP2_FNV, "baseline drifted from pinned D1 hash");
+    assert_eq!(fnv_on, fnv_off, "decomposed pre-down is NOT byte-identical");
 
     // MTP-EP accept check: the draft predicted the token AFTER t0; the decode
     // loop's gen[1] IS that true token. A match = spec-decode accept.
