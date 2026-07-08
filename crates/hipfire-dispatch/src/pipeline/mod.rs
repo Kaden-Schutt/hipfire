@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 
 pub(crate) mod steps;
 pub use steps::{
-    execute_steps, execute_steps_mesh, execute_steps_tp, FusedPattern, GemvInput, Step,
-    TpCollective,
+    execute_steps, execute_steps_mesh, execute_steps_parallel, execute_steps_tp, FusedPattern,
+    GemvInput, MoeProj, Step, StepCollective, TpCollective,
 };
 
 pub struct Pipeline {

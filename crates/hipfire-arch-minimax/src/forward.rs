@@ -1182,6 +1182,198 @@ pub fn forward_batch(
 // into the per-rank partial. Attention (Q8 KV) is replicated; only the MoE
 // routed sum crosses ranks (peer-direct all-reduce).
 
+/// Parity-harness override for the `HIPFIRE_MOE_STEP` gate: `-1` = env-driven
+/// (default), `0` = force primitive arm, `1` = force decomposed arm. Lets a
+/// single-process parity harness A/B both arms after ONE 79 GB model load
+/// (the env read below is `OnceLock`-cached, so it can't be flipped mid-process).
+static MOE_STEP_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Force the decomposed (`Some(true)`) or primitive (`Some(false)`) EP MoE arm,
+/// or restore env-driven behavior (`None`). Test/parity hook only.
+pub fn set_minimax_moe_step_override(v: Option<bool>) {
+    let code = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    MOE_STEP_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `HIPFIRE_MOE_STEP=1` routes the minimax EP MoE down-projection + all-reduce
+/// through the decomposed `execute_steps_parallel` Step path (P-D milestone)
+/// instead of the `ep_moe_allreduce` primitive. Default OFF; the primitive arm
+/// stays the default until ds4 also proves out (Task 9 retires the primitive).
+/// Env read is cached for process lifetime; the parity override wins when set.
+fn minimax_moe_step_enabled() -> bool {
+    match MOE_STEP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *F.get_or_init(|| std::env::var("HIPFIRE_MOE_STEP").as_deref() == Ok("1"))
+        }
+    }
+}
+
+/// Decomposed EP MoE for ONE layer — the `HIPFIRE_MOE_STEP` arm of `forward_ep`.
+///
+/// Byte-identical replacement for the `ep_moe_allreduce` + `minimax_ep_moe_rank`
+/// primitive: it runs the exact same per-rank kernels in the same order, but
+/// drives the down-projection + EP all-reduce through the axis-keyed
+/// [`execute_steps_parallel`] executor instead of the hand-rolled
+/// zero→run→reduce→add primitive.
+///
+/// - **Phase 1** (pre-down): rmsnorm → input FWHT → router GEMV → sigmoid →
+///   bias-aware top-K → indexed gate/up → fused silu*mul+FWHT-rotate. These have
+///   no bit-identical Step twin (fused rmsnorm+rotate / fused silu+rotate /
+///   sigmoid), so they stay direct arch kernels — the SAME calls the primitive's
+///   `minimax_moe_block` makes, producing `rot_batch` / `topk_*` per rank.
+/// - **Phase 2** (down + reduce): a single-Step per-rank list whose
+///   [`Step::IndexedMoeGemv`] `DownResidual` writes the weighted-combine directly
+///   into the per-rank EP `partial`. The executor `zero_before`-memsets that
+///   partial (mirrors the primitive memset), runs the down kernel, then
+///   all-reduces over the `Ep` group (peer-direct under
+///   `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1`).
+/// - **Phase 3** (residual fold): `state.h += partial` per rank — mirrors the
+///   primitive's `AddResidual`.
+///
+/// Preconditions match the primitive: every rank has an `active_stream`
+/// (`ensure_rank_streams`) and peer access enabled. `mesh` must carry an `Ep`
+/// axis whose `group_along(Ep)` equals the EP device group.
+#[allow(clippy::too_many_arguments)]
+fn minimax_ep_moe_step(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[MiniMaxWeights],
+    cfg: &MiniMaxConfig,
+    state_per_rank: &[MiniMaxState],
+    partials: &[GpuTensor],
+    mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
+    l: usize,
+) -> Result<(), String> {
+    use hipfire_dispatch::families::moe::{launch_indexed_gate_up, MoeExpertRef};
+    use hipfire_dispatch::pipeline::{
+        execute_steps_parallel, GemvInput, MoeProj, Step, StepCollective,
+    };
+    let n = gpus.devices.len();
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let n_exp = cfg.num_local_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let eps = cfg.rms_norm_eps;
+
+    // ── Phase 1: per-rank pre-down MoE compute (direct arch kernels) ──
+    for r in 0..n {
+        let layer = &weights_per_rank[r].layers[l];
+        let s = &state_per_rank[r];
+        let gpu = &mut gpus.devices[r];
+        gpu.bind_thread()
+            .map_err(|e| format!("moe-step bind {r} L{l}: {e:?}"))?;
+        gpu.rmsnorm_f32(&s.h, &layer.ffn_norm, &s.ffn_tmp, eps)
+            .map_err(|e| format!("moe-step L{l} r{r}: ffn rmsnorm: {e:?}"))?;
+        rotate_x_mq_for(
+            gpu,
+            &layer.experts[0].gate_up,
+            &s.ffn_tmp,
+            &s.ffn_x_rot,
+            hidden,
+        )
+        .map_err(|e| format!("moe-step L{l} r{r}: ffn rotate: {e:?}"))?;
+        weight_gemv(gpu, &layer.router, &s.ffn_tmp, &s.router_logits)
+            .map_err(|e| format!("moe-step L{l} r{r}: router: {e}"))?;
+        gpu.sigmoid_f32(&s.router_logits)
+            .map_err(|e| format!("moe-step L{l} r{r}: sigmoid: {e:?}"))?;
+        gpu.deepseek4_moe_topk_bias_aware_f32(
+            &s.router_logits,
+            &layer.routing_bias,
+            &s.topk_indices,
+            &s.topk_weights,
+            n_exp as i32,
+            k_top as i32,
+            1.0,
+        )
+        .map_err(|e| format!("moe-step L{l} r{r}: topk: {e:?}"))?;
+        let gu_ref = MoeExpertRef {
+            gate_up_ptrs: &layer.expert_gate_up_ptrs,
+            down_ptrs: &layer.expert_down_ptrs,
+            dummy_gate_up: layer.dummy_gate_up.as_ref(),
+            dtype: layer.experts[0].gate_up.gpu_dtype,
+            n_experts: n_exp,
+            expert_m: inter,
+            expert_k: hidden,
+            owned: &[],
+        };
+        launch_indexed_gate_up(
+            gpu,
+            &gu_ref,
+            &s.topk_indices,
+            &s.ffn_x_rot,
+            &s.gate_batch,
+            &s.up_batch,
+            k_top,
+        )
+        .map_err(|e| format!("moe-step L{l} r{r}: gate_up: {e:?}"))?;
+        fused_silu_mul_rotate_mq_batched_for(
+            gpu,
+            &layer.experts[0].down,
+            &s.gate_batch,
+            &s.up_batch,
+            &s.rot_batch,
+            inter,
+            k_top,
+        )
+        .map_err(|e| format!("moe-step L{l} r{r}: silu_mul_rotate: {e:?}"))?;
+    }
+
+    // ── Phase 2: down + EP all-reduce via execute_steps_parallel ──
+    let expert_refs: Vec<MoeExpertRef> = (0..n)
+        .map(|r| {
+            let layer = &weights_per_rank[r].layers[l];
+            MoeExpertRef {
+                gate_up_ptrs: &layer.expert_gate_up_ptrs,
+                down_ptrs: &layer.expert_down_ptrs,
+                dummy_gate_up: layer.dummy_gate_up.as_ref(),
+                dtype: layer.experts[0].down.gpu_dtype,
+                n_experts: n_exp,
+                expert_m: inter,
+                expert_k: hidden,
+                owned: &[],
+            }
+        })
+        .collect();
+    let per_rank_steps: Vec<Vec<Step>> = (0..n)
+        .map(|r| {
+            vec![Step::IndexedMoeGemv {
+                experts: &expert_refs[r],
+                which: MoeProj::DownResidual {
+                    topk_weights: &state_per_rank[r].topk_weights,
+                },
+                topk_indices: &state_per_rank[r].topk_indices,
+                input: GemvInput::Prerotated(&state_per_rank[r].rot_batch),
+                out: &partials[r],
+                k_top,
+                batch_size: 1,
+            }]
+        })
+        .collect();
+    let collectives = vec![StepCollective::AllReduce {
+        kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+        dim: hidden,
+    }];
+    let zero_before = vec![true];
+    execute_steps_parallel(mesh, gpus, &per_rank_steps, &collectives, &zero_before)
+        .map_err(|e| format!("moe-step L{l}: execute_steps_parallel: {e:?}"))?;
+
+    // ── Phase 3: fold the all-reduced partial into each rank's residual ──
+    for r in 0..n {
+        let gpu = &mut gpus.devices[r];
+        gpu.bind_thread()
+            .map_err(|e| format!("moe-step add bind {r} L{l}: {e:?}"))?;
+        gpu.add_inplace_f32(&state_per_rank[r].h, &partials[r])
+            .map_err(|e| format!("moe-step L{l} r{r}: add residual: {e:?}"))?;
+    }
+    Ok(())
+}
+
 /// EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token.
 /// Mirror of qwen35::forward_ep: every rank holds full replicated weights /
 /// state / KV EXCEPT MoE experts (sharded at load). Embeds + stages pos per
@@ -1237,6 +1429,14 @@ pub fn forward_ep(
     let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
     let t_layers = std::time::Instant::now();
     let group: Vec<usize> = (0..n).collect();
+    // Topological EP mesh for the decomposed (HIPFIRE_MOE_STEP) arm: a single
+    // Ep axis of `n` ranks → `group_along(Ep)` == `group`. Bands/ragged layout
+    // stay off the mesh (mesh is topological), matching the loader's EP mesh.
+    let ep_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+        hipfire_runtime::multi_gpu::DimKind::Ep,
+        n,
+    )]);
+    let moe_step = minimax_moe_step_enabled();
     let n_layers = weights_per_rank[0].layers.len();
     for l in 0..n_layers {
         // Attend replicated: every rank holds full weights + full KV → the
@@ -1258,19 +1458,34 @@ pub fn forward_ep(
         // Moe all-reduce EP: each rank runs its owned routed experts into a
         // partial (minimax has no shared expert → whole MoE is routed), the
         // partials all-reduce over the Ep group, and each rank folds the reduced
-        // sum into its replicated attention residual `state.h`.
-        gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
-            minimax_ep_moe_rank(
+        // sum into its replicated attention residual `state.h`. Two arms: the
+        // decomposed Step executor (HIPFIRE_MOE_STEP, P-D milestone) or the
+        // `ep_moe_allreduce` primitive (default). Both are byte-identical.
+        if moe_step {
+            minimax_ep_moe_step(
+                gpus,
+                weights_per_rank,
                 cfg,
-                &weights_per_rank[r].layers[l],
-                &state_per_rank[r],
-                gpu,
+                state_per_rank,
+                partials,
+                &ep_mesh,
                 l,
-                partial,
-                phase,
             )
-        })
-        .map_err(|e| format!("forward_ep ep_moe_allreduce L{l}: {e}"))?;
+            .map_err(|e| format!("forward_ep moe-step L{l}: {e}"))?;
+        } else {
+            gpus.ep_moe_allreduce(&group, partials, hidden, |gpu, r, partial, phase| {
+                minimax_ep_moe_rank(
+                    cfg,
+                    &weights_per_rank[r].layers[l],
+                    &state_per_rank[r],
+                    gpu,
+                    l,
+                    partial,
+                    phase,
+                )
+            })
+            .map_err(|e| format!("forward_ep ep_moe_allreduce L{l}: {e}"))?;
+        }
     }
 
     // 3. Final norm + lm_head on rank 0 → state_per_rank[0].logits.
