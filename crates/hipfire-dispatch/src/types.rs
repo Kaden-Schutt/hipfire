@@ -33,6 +33,17 @@ pub enum PipelineOp {
     /// Covers GateUp, DownExpanded, and DownResidual shapes — all three return this tag
     /// so fusion matching treats them uniformly (none participate in any fused pattern).
     IndexedMoeGemv,
+    /// Scatter+histogram for grouped-GEMM prefill (Step-IR [`crate::pipeline::steps::Step::MoeScatter`]).
+    /// Builds sorted_slot_index / expert_tile_ids / inverse_perm from topk_indices.
+    /// Not fusible.
+    MoeScatter,
+    /// Grouped-WMMA expert GEMM (Step-IR [`crate::pipeline::steps::Step::GroupedMoeGemm`]).
+    /// Covers both gate_up and down projections (distinguished by `which: MoeProj`).
+    /// Not fusible.
+    GroupedMoeGemm,
+    /// Unscatter grouped gate_up result into gate_batch + up_batch
+    /// (Step-IR [`crate::pipeline::steps::Step::MoeUnscatter`]). Not fusible.
+    MoeUnscatter,
     /// Fused rmsnorm + optional rotation (MQ-weight producer step).
     /// rotation=FwhtG256 → rmsnorm + FWHT. rotation=None → rmsnorm only.
     RmsnormAutomatic,

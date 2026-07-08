@@ -12,8 +12,9 @@ use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::moe::{
-    launch_indexed_down, launch_indexed_down_residual, launch_indexed_gate_up, launch_moe_combine,
-    launch_moe_route, MoeExpertRef,
+    launch_grouped_down, launch_grouped_gate_up, launch_indexed_down, launch_indexed_down_residual,
+    launch_indexed_gate_up, launch_moe_combine, launch_moe_combine_grouped, launch_moe_route,
+    launch_moe_scatter, launch_moe_unscatter, MoeExpertRef,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -177,8 +178,14 @@ pub enum Step<'a> {
         batch_size: usize,
     },
     /// Weighted combine of per-expert expanded down outputs into the EP partial.
-    /// Delegates to [`launch_moe_combine`]. Call after [`Step::IndexedMoeGemv`] with
-    /// `which = DownExpanded` — do NOT call after `DownResidual` (double-accumulate).
+    /// Delegates to [`launch_moe_combine`] (decode) or [`launch_moe_combine_grouped`]
+    /// (prefill grouped path, when `inverse_perm` is `Some`).
+    ///
+    /// - `inverse_perm = None` → `moe_down_combine_k8_batched` (decode).
+    ///   Call after [`Step::IndexedMoeGemv`] with `which = DownExpanded`.
+    ///   Do NOT call after `DownResidual` (double-accumulate).
+    /// - `inverse_perm = Some(&perm)` → `moe_down_combine_grouped_k8` (prefill Path 2).
+    ///   Call after [`Step::GroupedMoeGemm`] with `which = DownExpanded`.
     ///
     /// `out` is the pre-zeroed EP partial (accumulate semantics); the executor
     /// zeroes it via `zero_before` before this step runs. `tp_step_out_buf` returns
@@ -190,6 +197,60 @@ pub enum Step<'a> {
         k: usize,
         hidden: usize,
         batch_size: usize,
+        /// Grouped-path inverse permutation produced by [`Step::MoeScatter`].
+        /// `Some` → prefill grouped combine (`moe_down_combine_grouped_k8`).
+        /// `None` → decode expanded combine (`moe_down_combine_k8_batched`).
+        inverse_perm: Option<&'a GpuTensor>,
+    },
+    /// Scatter+histogram for grouped-GEMM prefill (Path 2). Builds
+    /// `sorted_slot_index`, `expert_tile_ids`, and `inverse_perm` from
+    /// `topk_indices`. Delegates to [`launch_moe_scatter`].
+    /// Must run before [`Step::GroupedMoeGemm`]. `tp_step_out_buf` returns `None`.
+    MoeScatter {
+        topk_indices: &'a GpuTensor,
+        expert_token_counts: &'a GpuTensor,
+        expert_offsets: &'a GpuTensor,
+        sorted_slot_index: &'a GpuTensor,
+        expert_tile_ids: &'a GpuTensor,
+        inverse_perm: &'a GpuTensor,
+        total_slots: usize,
+        n_experts: usize,
+        m_total_max: usize,
+        block_m: usize,
+    },
+    /// Grouped-WMMA expert GEMM for prefill (Path 2). One launch covers all
+    /// expert tokens sorted by `sorted_slot_index`. `which` distinguishes:
+    /// - `GateUp`: `m = 2·expert_m`, `x_row_div = k_top`, `rows = batch_size`.
+    ///   Writes fused gate||up output to `y` (y_gate_up_grouped).
+    ///   `up_out` in `MoeProj::GateUp` is unused by the grouped kernel (output is `y`).
+    /// - `DownExpanded`: `m = expert_k`, `x_row_div = 1`, `rows = batch*k_top`.
+    ///   Writes down output to `y` (y_down_grouped) for [`Step::MoeCombine`].
+    ///
+    /// `tp_step_out_buf` returns `None` — `y` is an intermediate, not an EP partial.
+    GroupedMoeGemm {
+        experts: &'a MoeExpertRef<'a>,
+        which: MoeProj<'a>,
+        sorted_slot_index: &'a GpuTensor,
+        expert_tile_ids: &'a GpuTensor,
+        /// For `GateUp`: x_rot_batch; for `DownExpanded`: rot_batch.
+        x: &'a GpuTensor,
+        /// For `GateUp`: y_gate_up_grouped; for `DownExpanded`: y_down_grouped.
+        y: &'a GpuTensor,
+        m_total: usize,
+        batch_size: usize,
+        k_top: usize,
+    },
+    /// Unscatter grouped gate_up result: `y_grouped → gate_batch + up_batch`.
+    /// Delegates to [`launch_moe_unscatter`]. Call after [`Step::GroupedMoeGemm`]
+    /// with `which = GateUp`. `tp_step_out_buf` returns `None`.
+    MoeUnscatter {
+        y_grouped: &'a GpuTensor,
+        sorted_slot_index: &'a GpuTensor,
+        gate_batch: &'a GpuTensor,
+        up_batch: &'a GpuTensor,
+        mi: usize,
+        k_top: usize,
+        m_total: usize,
     },
 }
 
@@ -212,6 +273,10 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::MoeRoute { .. } => PipelineOp::MoeRoute,
         Step::IndexedMoeGemv { .. } => PipelineOp::IndexedMoeGemv,
         Step::MoeCombine { .. } => PipelineOp::MoeCombine,
+        // MoE prefill grouped ops (Task 5). Not fusible.
+        Step::MoeScatter { .. } => PipelineOp::MoeScatter,
+        Step::GroupedMoeGemm { .. } => PipelineOp::GroupedMoeGemm,
+        Step::MoeUnscatter { .. } => PipelineOp::MoeUnscatter,
     }
 }
 
@@ -809,6 +874,8 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
             out,
             ..
         } => Some(&out.buf),
+        // Prefill grouped ops: intermediates, never EP partials.
+        Step::MoeScatter { .. } | Step::GroupedMoeGemm { .. } | Step::MoeUnscatter { .. } => None,
         _ => None,
     }
 }
@@ -1357,7 +1424,108 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             k,
             hidden,
             batch_size,
-        } => launch_moe_combine(gpu, down_out, topk_weights, out, *hidden, *k, *batch_size),
+            inverse_perm,
+        } => match inverse_perm {
+            Some(perm) => {
+                // Prefill grouped path: moe_down_combine_grouped_k8.
+                launch_moe_combine_grouped(
+                    gpu,
+                    down_out,
+                    perm,
+                    topk_weights,
+                    out,
+                    *hidden,
+                    *k,
+                    *batch_size,
+                )
+            }
+            None => {
+                // Decode expanded path: moe_down_combine_k8_batched.
+                launch_moe_combine(gpu, down_out, topk_weights, out, *hidden, *k, *batch_size)
+            }
+        },
+        // ── MoE prefill grouped ops (Task 5) ───────────────────────────────
+        Step::MoeScatter {
+            topk_indices,
+            expert_token_counts,
+            expert_offsets,
+            sorted_slot_index,
+            expert_tile_ids,
+            inverse_perm,
+            total_slots,
+            n_experts,
+            m_total_max,
+            block_m,
+        } => launch_moe_scatter(
+            gpu,
+            topk_indices,
+            expert_token_counts,
+            expert_offsets,
+            sorted_slot_index,
+            expert_tile_ids,
+            inverse_perm,
+            *total_slots,
+            *n_experts,
+            *m_total_max,
+            *block_m,
+        ),
+        Step::GroupedMoeGemm {
+            experts,
+            which,
+            sorted_slot_index,
+            expert_tile_ids,
+            x,
+            y,
+            m_total,
+            batch_size,
+            k_top,
+        } => match which {
+            MoeProj::GateUp { .. } => launch_grouped_gate_up(
+                gpu,
+                experts,
+                sorted_slot_index,
+                expert_tile_ids,
+                x,
+                y,
+                *m_total,
+                *k_top,
+                *batch_size,
+            ),
+            MoeProj::DownExpanded => launch_grouped_down(
+                gpu,
+                experts,
+                sorted_slot_index,
+                expert_tile_ids,
+                x,
+                y,
+                *m_total,
+                *k_top,
+                *batch_size,
+            ),
+            MoeProj::DownResidual { .. } => Err(DispatchError::Hip(
+                "GroupedMoeGemm: DownResidual is not a valid grouped projection; \
+                 use DownExpanded + MoeCombine(inverse_perm=Some) for grouped down"
+                    .to_string(),
+            )),
+        },
+        Step::MoeUnscatter {
+            y_grouped,
+            sorted_slot_index,
+            gate_batch,
+            up_batch,
+            mi,
+            k_top,
+            m_total,
+        } => launch_moe_unscatter(
+            gpu,
+            y_grouped,
+            sorted_slot_index,
+            gate_batch,
+            up_batch,
+            *mi,
+            *k_top,
+            *m_total,
+        ),
     }
 }
 

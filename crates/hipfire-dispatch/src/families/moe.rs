@@ -1051,6 +1051,271 @@ pub fn launch_moe_combine(
     .map_err(|e| DispatchError::Hip(e.to_string()))
 }
 
+// ── Prefill grouped-GEMM launch helpers (Task 5) ─────────────────────────────
+
+/// Scatter+histogram for grouped-GEMM prefill.
+/// Thin wrapper over `gpu.moe_scatter_fused_k8`.
+/// Produces `sorted_slot_index`, `expert_tile_ids`, and `inverse_perm` from
+/// `topk_indices`; also fills the histogram (`expert_token_counts`) and the
+/// exclusive-scan offsets (`expert_offsets`). Must run before the grouped GEMMs.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_moe_scatter(
+    gpu: &mut rdna_compute::Gpu,
+    topk_indices: &GpuTensor,
+    expert_token_counts: &GpuTensor,
+    expert_offsets: &GpuTensor,
+    sorted_slot_index: &GpuTensor,
+    expert_tile_ids: &GpuTensor,
+    inverse_perm: &GpuTensor,
+    total_slots: usize,
+    n_experts: usize,
+    m_total_max: usize,
+    block_m: usize,
+) -> Result<(), DispatchError> {
+    gpu.moe_scatter_fused_k8(
+        topk_indices,
+        expert_token_counts,
+        expert_offsets,
+        sorted_slot_index,
+        expert_tile_ids,
+        inverse_perm,
+        total_slots,
+        n_experts,
+        m_total_max,
+        block_m,
+    )
+    .map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
+/// Grouped gate||up GEMM (Path 2 prefill): one launch covers all expert tokens
+/// sorted by `sorted_slot_index`. Dispatches per `experts.dtype`:
+/// - MQ2G256Lloyd → `gemm_mq2g256_lloyd_moe_grouped_wmma_k2` (Base variant)
+/// - MQ3G256Lloyd → `gemm_mq3g256_lloyd_moe_grouped_wmma`
+/// - MQ4G256/HFQ4G256 → `gemm_hfq4g256_moe_grouped_wmma_k2`
+/// - MQ6G256/HFQ6G256 → `gemm_hfq6g256_moe_grouped_wmma`
+///
+/// Dims: `m = 2 * experts.expert_m`, `k = experts.expert_k`,
+/// `x_row_div = k_top` (gate_up slots = N·k_top, divided by k_top → N rows of x),
+/// `rows = batch_size` (number of input tokens).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_grouped_gate_up(
+    gpu: &mut rdna_compute::Gpu,
+    experts: &MoeExpertRef<'_>,
+    sorted_slot_index: &GpuTensor,
+    expert_tile_ids: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m_total: usize,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), DispatchError> {
+    let m = 2 * experts.expert_m; // fused gate||up rows
+    let k = experts.expert_k;
+    let x_row_div = k_top;
+    let rows = batch_size;
+    match experts.dtype {
+        DType::MQ2G256Lloyd => gpu
+            .gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                experts.gate_up_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ3G256Lloyd => gpu
+            .gemm_mq3g256_lloyd_moe_grouped_wmma(
+                experts.gate_up_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ4G256 | DType::HFQ4G256 => gpu
+            .gemm_hfq4g256_moe_grouped_wmma_k2(
+                experts.gate_up_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ6G256 | DType::HFQ6G256 => gpu
+            .gemm_hfq6g256_moe_grouped_wmma(
+                experts.gate_up_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        other => Err(DispatchError::Hip(format!(
+            "launch_grouped_gate_up: unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+/// Grouped down GEMM (Path 2 prefill): one launch covers all expert tokens
+/// sorted by `sorted_slot_index`. Dispatches per `experts.dtype` (same
+/// kernels as gate_up, different dims).
+///
+/// Dims: `m = experts.expert_k` (hidden), `k = experts.expert_m` (inter),
+/// `x_row_div = 1` (every row of rot_batch is a distinct slot),
+/// `rows = batch_size * k_top`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_grouped_down(
+    gpu: &mut rdna_compute::Gpu,
+    experts: &MoeExpertRef<'_>,
+    sorted_slot_index: &GpuTensor,
+    expert_tile_ids: &GpuTensor,
+    x: &GpuTensor, // rot_batch [batch*k_top × inter]
+    y: &GpuTensor, // y_down_grouped [m_total × hidden]
+    m_total: usize,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), DispatchError> {
+    let m = experts.expert_k; // down output = hidden
+    let k = experts.expert_m; // down input  = inter
+    let x_row_div = 1;
+    let rows = batch_size * k_top;
+    match experts.dtype {
+        DType::MQ2G256Lloyd => gpu
+            .gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                experts.down_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ3G256Lloyd => gpu
+            .gemm_mq3g256_lloyd_moe_grouped_wmma(
+                experts.down_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ4G256 | DType::HFQ4G256 => gpu
+            .gemm_hfq4g256_moe_grouped_wmma_k2(
+                experts.down_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        DType::MQ6G256 | DType::HFQ6G256 => gpu
+            .gemm_hfq6g256_moe_grouped_wmma(
+                experts.down_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        other => Err(DispatchError::Hip(format!(
+            "launch_grouped_down: unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+/// Unscatter grouped gate_up result: `y_grouped → gate_batch + up_batch`.
+/// Thin wrapper over `gpu.moe_gate_up_unscatter_k8`.
+/// Call after [`launch_grouped_gate_up`] (before SwiGLU+rotate).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_moe_unscatter(
+    gpu: &mut rdna_compute::Gpu,
+    y_grouped: &GpuTensor,
+    sorted_slot_index: &GpuTensor,
+    gate_batch: &GpuTensor,
+    up_batch: &GpuTensor,
+    mi: usize,
+    k_top: usize,
+    m_total: usize,
+) -> Result<(), DispatchError> {
+    gpu.moe_gate_up_unscatter_k8(
+        y_grouped,
+        sorted_slot_index,
+        gate_batch,
+        up_batch,
+        mi,
+        k_top,
+        m_total,
+    )
+    .map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
+/// Weighted combine for the grouped prefill down path. Reads `y_down_grouped`
+/// via `inverse_perm` and accumulates into `out` (the EP partial or `x_batch`).
+/// Thin wrapper over `gpu.moe_down_combine_grouped_k8`.
+/// Call after [`launch_grouped_down`]; do NOT call [`launch_moe_combine`]
+/// (the decode path) after a grouped down — the combine kernels differ.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_moe_combine_grouped(
+    gpu: &mut rdna_compute::Gpu,
+    y_down_grouped: &GpuTensor,
+    inverse_perm: &GpuTensor,
+    topk_weights: &GpuTensor,
+    out: &GpuTensor,
+    hidden: usize,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), DispatchError> {
+    gpu.moe_down_combine_grouped_k8(
+        y_down_grouped,
+        inverse_perm,
+        topk_weights,
+        out,
+        hidden,
+        k_top,
+        batch_size,
+    )
+    .map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
