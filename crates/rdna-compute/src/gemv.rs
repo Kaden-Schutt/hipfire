@@ -6464,10 +6464,10 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "gemv_hfq4g256_moe_down_k8_indexed_fused_acc",
-            // NUM_ROWS=4 register row-tiling: each block owns 4 output rows (reuses the
-            // per-expert X across them) -> ceil(M/4) blocks in x. Must match the kernel's
-            // MOE_DOWN_FUSED_NUM_ROWS (4).
-            [((m + 3) / 4) as u32, batch_size as u32, 1],
+            // NUM_ROWS=2 register row-tiling: each block owns 2 output rows (reuses the
+            // per-expert X across them) -> ceil(M/2) blocks in x. Must match the kernel's
+            // MOE_DOWN_FUSED_NUM_ROWS (2 — swept optimum for wave32 gfx1201, +3.5%).
+            [((m + 1) / 2) as u32, batch_size as u32, 1],
             [32, 1, 1],
             0,
             &mut params,

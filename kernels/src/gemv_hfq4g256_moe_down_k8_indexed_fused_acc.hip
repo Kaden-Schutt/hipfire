@@ -42,8 +42,13 @@
 //
 // Grid: (ceil(M/NUM_ROWS), N). Block = 32 threads (one warp).
 
+// NUM_ROWS row-tile width. ZINC uses 4 (wave64); hipfire is wave32, so register
+// pressure per row is effectively 2x and the optimum shifts down. Measured sweep
+// on R9700/gfx1201 a3b mq4r decode (interleaved, ±0.1%): N=1 -0.2%, N=2 +3.5%
+// (VGPR 64), N=4 +1.4% (VGPR ~80), N=8 -9.5% (VGPR 96, occupancy crash). N=2 is
+// the reuse-vs-occupancy optimum. Grid divisor in gemv.rs must match.
 #ifndef MOE_DOWN_FUSED_NUM_ROWS
-#define MOE_DOWN_FUSED_NUM_ROWS 4
+#define MOE_DOWN_FUSED_NUM_ROWS 2
 #endif
 
 __launch_bounds__(32, 16)
