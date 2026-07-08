@@ -19,9 +19,53 @@ use std::path::Path;
 
 pub const DIFFUSION_ARTIFACT_KIND: &str = "diffusion";
 pub const DIFFUSION_SCHEMA_VERSION: u32 = 1;
-/// Reserved arch_id for HFQ diffusion containers. The value is ASCII-ish
-/// "DIF0", outside the existing small integer LLM architecture ids.
-pub const HFQ_ARCH_DIFFUSION: u32 = 0x3046_4944;
+/// Legacy generic-diffusion arch_id (ASCII-ish "DIF0"). Retained for backward
+/// compatibility with pre-A2 containers; new containers are stamped with a
+/// per-family id (see [`diffusion_arch_id_for_metadata`]). Single-sourced from
+/// the arch-api id table.
+pub const HFQ_ARCH_DIFFUSION: u32 = hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY;
+
+/// The first-class diffusion `arch_id` to stamp into a container header, from its
+/// denoiser transformer `class_name` in `metadata_json`. Falls back to the legacy
+/// generic id for families without a dedicated arch id, so unknown/new pipelines
+/// still write a valid (routable) diffusion container.
+pub fn diffusion_arch_id_for_metadata(metadata_json: &str) -> u32 {
+    if metadata_json.contains("Krea2Transformer2DModel") {
+        hipfire_arch_api::ARCH_ID_KREA2
+    } else if metadata_json.contains("QwenImageTransformer2DModel") {
+        hipfire_arch_api::ARCH_ID_QWEN_IMAGE
+    } else {
+        HFQ_ARCH_DIFFUSION
+    }
+}
+
+#[cfg(test)]
+mod diffusion_arch_id_tests {
+    use super::*;
+
+    #[test]
+    fn maps_family_class_name_to_arch_id() {
+        assert_eq!(
+            diffusion_arch_id_for_metadata(
+                r#"{"components":[{"class_name":"Krea2Transformer2DModel"}]}"#
+            ),
+            hipfire_arch_api::ARCH_ID_KREA2
+        );
+        assert_eq!(
+            diffusion_arch_id_for_metadata(r#"{"class_name":"QwenImageTransformer2DModel"}"#),
+            hipfire_arch_api::ARCH_ID_QWEN_IMAGE
+        );
+        // Unknown/other pipelines fall back to the legacy generic id.
+        assert_eq!(
+            diffusion_arch_id_for_metadata(r#"{"class_name":"FluxTransformer2DModel"}"#),
+            HFQ_ARCH_DIFFUSION
+        );
+        // The stamped ids are all recognized as diffusion by the registry predicate.
+        assert!(hipfire_archs::is_diffusion_arch(
+            hipfire_arch_api::ARCH_ID_KREA2
+        ));
+    }
+}
 
 pub const QT_DIFFUSION_JSON: u8 = 240;
 pub const QT_DIFFUSION_TOKENIZER: u8 = 241;
@@ -909,8 +953,8 @@ pub struct DiffusionHfqInspection {
 }
 
 mod batch;
-pub use batch::*;
 pub(crate) use batch::DenoiseLatentsOutput;
+pub use batch::*;
 
 mod denoise;
 pub use denoise::*;
@@ -1076,13 +1120,14 @@ impl ResidentWeight {
     pub(crate) fn read_bytes(&self) -> DiffusionResult<Vec<u8>> {
         use std::os::unix::fs::FileExt;
         let file = std::fs::File::open(&self.path).map_err(|err| {
-            DiffusionError::Io(format!("open {:?} for weight {:?}: {err}", self.path, self.name))
+            DiffusionError::Io(format!(
+                "open {:?} for weight {:?}: {err}",
+                self.path, self.name
+            ))
         })?;
         let mut buf = vec![0u8; self.data_size];
         file.read_exact_at(&mut buf, self.data_offset as u64)
-            .map_err(|err| {
-                DiffusionError::Io(format!("read weight {:?}: {err}", self.name))
-            })?;
+            .map_err(|err| DiffusionError::Io(format!("read weight {:?}: {err}", self.name)))?;
         Ok(buf)
     }
 
@@ -1456,7 +1501,12 @@ fn decode_to_rgb8_with_runtime_context(
     if let Ok(path) = std::env::var("HIPFIRE_DUMP_LATENT") {
         if !path.is_empty() {
             let mut bytes = Vec::with_capacity(16 + latents.data.len() * 4);
-            for dim in [latents.batch, latents.channels, latents.height, latents.width] {
+            for dim in [
+                latents.batch,
+                latents.channels,
+                latents.height,
+                latents.width,
+            ] {
                 bytes.extend_from_slice(&(dim as u32).to_le_bytes());
             }
             for v in &latents.data {
@@ -2306,9 +2356,9 @@ mod vae;
 pub use vae::*;
 
 mod superres;
+pub use superres::DiffusionSuperResModel;
 #[allow(unused_imports)]
 use superres::*;
-pub use superres::DiffusionSuperResModel;
 
 /// Domain-separation salts so VAE-encode Gaussian noise does not alias the
 /// initial-latent noise stream (which seeds the request seed directly) or other
@@ -3262,9 +3312,9 @@ impl ClipEncoderLayer {
 
 mod cpu_ops;
 pub(crate) use cpu_ops::*;
-mod pipeline_preflight;
 mod pipeline_generate;
 mod pipeline_plan;
+mod pipeline_preflight;
 // CpuTensor + the pure CPU-reference tensor ops now live in the hipfire-cpu
 // backend crate; re-export them so this crate's ~1,300 CpuTensor references and
 // the ops' call sites resolve unchanged.
@@ -3303,7 +3353,17 @@ pub fn inspect_hfq_with_runtime_support(
 }
 
 pub fn is_diffusion_hfq(path: impl AsRef<Path>) -> bool {
-    inspect_hfq(path).is_ok()
+    let path = path.as_ref();
+    // Primary signal: the container's diffusion metadata parses.
+    if inspect_hfq(path).is_ok() {
+        return true;
+    }
+    // Secondary signal: a registered diffusion arch id in the header (covers a
+    // container whose metadata is absent/stripped but whose header identifies the
+    // family). Index-only open keeps this cheap.
+    HfqFile::open_index_only(path)
+        .map(|f| hipfire_archs::is_diffusion_arch(f.arch_id))
+        .unwrap_or(false)
 }
 
 pub fn parse_diffusion_metadata(metadata_json: &str) -> DiffusionResult<DiffusionHfqMetadata> {
@@ -3790,7 +3850,8 @@ fn validate_img2img_request(
         }
     }
     if let Some(refine) = request.refine_sigma.as_ref() {
-        if !refine.first_sigma.is_finite() || !(0.0 < refine.first_sigma && refine.first_sigma < 1.0)
+        if !refine.first_sigma.is_finite()
+            || !(0.0 < refine.first_sigma && refine.first_sigma < 1.0)
         {
             return Err(DiffusionError::InvalidRequest(format!(
                 "refine_sigma.first_sigma {} must be in (0, 1)",

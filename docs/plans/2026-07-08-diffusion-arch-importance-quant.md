@@ -86,16 +86,26 @@ Topology->family detection (currently `config.rs`) is factored into a pure class
 quantizer (to choose the id to stamp) and the loader-compat path (to recover family from a legacy
 DIF0 container).
 
-### 3.3 Writer / detection / routing (the A2 core)
+### 3.3 Writer / detection (the A2 core) — CORRECTED
 
-- **Writer** (diffusion quant + coexist import): stamp `arch_id_for_family(detected_family)` instead
-  of `HFQ_ARCH_DIFFUSION`. Unknown family -> keep legacy id (safe).
-- **Detection/load**: read header `arch_id`; if it's a registered diffusion id, dispatch to the
-  diffusion pipeline and know the family directly. If it's legacy `0x3046_4944`, run topology
-  detection (existing path) — full backward compat.
-- **Server/coexist routing**: replace the `arch_id == HFQ_ARCH_DIFFUSION` checks
-  (`health.rs`, `sdapi.rs`, `server/lib.rs`, `diffusion-coexist/lib.rs`) with
-  `is_diffusion_arch(arch_id)`. Behaviorally identical for legacy containers, correct for new ones.
+**Correction (verified in code):** routing is **metadata-based, not id-based**. `is_diffusion_hfq`
+-> `inspect_hfq` keys on `artifact_kind == "diffusion"` + schema/class_name; the load fork is
+`sdapi.rs:406 inspect_hfq(&path).is_ok()`. There is **no `arch_id == HFQ_ARCH_DIFFUSION` routing
+check** — every `HFQ_ARCH_DIFFUSION` use is a writer (coexist import + test helpers). So there is
+nothing to migrate on the routing side, and legacy compat is automatic (metadata unchanged).
+
+The real, smaller A2 change:
+- **Writer** (coexist import `write_import_entries_to_hfq`): stamp
+  `diffusion_arch_id_for_metadata(metadata_json)` — the per-family id from the transformer
+  `class_name` (Krea2 -> 17, Qwen-Image -> 18), else the legacy id. `quantize_diffusion_hfq` already
+  preserves `hfq.arch_id`, so quant carries the stamp through.
+- **Detection (hardened)**: `is_diffusion_hfq` keeps metadata as the primary signal and adds a
+  secondary one — a registered diffusion `arch_id` in the header (via `hipfire_archs::is_diffusion_arch`,
+  index-only read). Covers a container whose metadata is stripped but whose header identifies the family.
+- **Family-from-id**: `ArchRegistry::diffusion_family(id)` gives P2 a clean `header_id -> family ->
+  Ingest` path.
+- **Legacy `0x3046_4944`**: single-sourced as `ARCH_ID_DIFFUSION_LEGACY`; still recognized by
+  `is_diffusion_arch`; untouched containers load/route exactly as before.
 
 ### 3.4 Quant importance through shared `allocate()` (the payoff)
 
@@ -117,9 +127,11 @@ per-tensor scalar `s`, combine as `target_bits(imp) * g(s)` (bounded), select co
 - **P0 — registry membership, nothing routes yet.** Add the `Diffusion` capability + modality
   helpers to `hipfire-arch-api`; reserve Krea2/QwenImage ids; create the two `-spec` crates with
   `Ingest` role maps; force-link. Unit-test registry resolution + role map. No writer/routing change.
-- **P1 — writer + detection + routing + legacy compat.** Stamp per-family ids on new writes; add
-  `is_diffusion_arch`; migrate the server/coexist/loader checks; topology fallback for legacy DIF0.
-  Prove: a freshly-quantized Krea2 loads/serves by id; an existing DIF0 container still loads/serves.
+- **P1 — writer + hardened detection (DONE).** Routing turned out to be metadata-based (see 3.3),
+  so no routing migration exists. Delivered: `hipfire_archs::is_diffusion_arch`; coexist import
+  stamps per-family ids via `diffusion_arch_id_for_metadata`; `is_diffusion_hfq` also accepts a
+  diffusion header id; `HFQ_ARCH_DIFFUSION` single-sourced to `ARCH_ID_DIFFUSION_LEGACY`; legacy
+  containers unchanged.
 - **P2 — importance through `allocate()` (the original goal).** Route diffusion Opus through the
   shared `allocate()` behind `--arch-importance`; refine the role taxonomy against real tensor names;
   validate Krea2 size/quality; flip default per-family when green.

@@ -15,12 +15,12 @@
 //! (the pipeline reads them); this crate consumes them to emit `.hfq` artifacts.
 
 use hipfire_diffusion::{
-    inspect_hfq, DiffusionBatchMetadata, DiffusionComponentMetadata, DiffusionHfqMetadata,
-    DiffusionModelSummary, DiffusionPipelineMetadata, DiffusionQuantizationMetadata,
-    DiffusionTensorRole, DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND,
-    DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION, QT_DIFFUSION_JSON, QT_DIFFUSION_SOURCE_WEIGHTS,
-    QT_DIFFUSION_TENSOR_BF16, QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32,
-    QT_DIFFUSION_TOKENIZER,
+    diffusion_arch_id_for_metadata, inspect_hfq, DiffusionBatchMetadata,
+    DiffusionComponentMetadata, DiffusionHfqMetadata, DiffusionModelSummary,
+    DiffusionPipelineMetadata, DiffusionQuantizationMetadata, DiffusionTensorRole,
+    DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND, DIFFUSION_SCHEMA_VERSION,
+    QT_DIFFUSION_JSON, QT_DIFFUSION_SOURCE_WEIGHTS, QT_DIFFUSION_TENSOR_BF16,
+    QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32, QT_DIFFUSION_TOKENIZER,
 };
 use hipfire_runtime::hfq::{write_hfqm_package_streaming, HfqStreamEntry};
 use serde_json::{json, Value};
@@ -1317,7 +1317,9 @@ fn write_import_entries_to_hfq(
         .collect::<anyhow::Result<Vec<_>>>()?;
     write_hfqm_package_streaming(
         output,
-        HFQ_ARCH_DIFFUSION,
+        // Stamp the first-class per-family diffusion arch id (falls back to the
+        // legacy generic id for families without a dedicated id).
+        diffusion_arch_id_for_metadata(metadata_json),
         metadata_json,
         &stream_entries,
         |i, writer| write_import_entry_payload(&entries[i], writer),

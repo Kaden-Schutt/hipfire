@@ -1716,6 +1716,8 @@ dependencies = [
  "anyhow",
  "base64",
  "hip-bridge",
+ "hipfire-arch-api",
+ "hipfire-archs",
  "hipfire-cpu",
  "hipfire-diffusion-coexist",
  "hipfire-model",

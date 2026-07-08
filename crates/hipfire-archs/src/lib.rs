@@ -44,9 +44,33 @@ pub fn registry() -> &'static ArchRegistry {
     REGISTRY.get_or_init(ArchRegistry::build)
 }
 
+/// True if `arch_id` (an on-disk `u32` header value) denotes a diffusion
+/// container: the legacy generic-diffusion marker
+/// ([`hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY`]) or any registered per-family
+/// diffusion arch (declares the `Diffusion` capability). Routing/detection uses
+/// this instead of a magic constant.
+pub fn is_diffusion_arch(arch_id: u32) -> bool {
+    arch_id == hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY
+        || u16::try_from(arch_id)
+            .ok()
+            .is_some_and(|id| registry().is_diffusion(ArchId(id)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_diffusion_arch_covers_legacy_and_per_family() {
+        assert!(is_diffusion_arch(
+            hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY
+        ));
+        assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_KREA2));
+        assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_QWEN_IMAGE));
+        // A text LM arch is not diffusion.
+        assert!(!is_diffusion_arch(hipfire_arch_api::ARCH_ID_QWEN35_DENSE));
+        assert!(!is_diffusion_arch(999));
+    }
 
     #[test]
     fn bundle_merges_template_spec_and_serving() {
