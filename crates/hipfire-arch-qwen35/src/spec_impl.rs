@@ -18,7 +18,8 @@
 
 use crate::qwen35::{self, DeltaNetState};
 use crate::speculative::{
-    apply_topp_trunc, sample_categorical, verify_dflash_block, xorshift_next_unit,
+    apply_topp_trunc, download_hidden_block, sample_categorical,
+    scatter_hidden_block_to_interleaved, verify_dflash_block, xorshift_next_unit,
     DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
@@ -126,17 +127,28 @@ impl SpecTarget for ModelSlot {
         // max_n = block_size covers the largest verify block (b <= block_size).
         let verify_scratch = VerifyScratch::new(gpu, block_size, dim, vocab, hidden_k)
             .map_err(|e| format!("Qwen35SpecScratch VerifyScratch: {e}"))?;
-        // num_extract = 0 ⇒ no hidden buffers; the forward's hidden extraction is
-        // a no-op and the ring is never read.
-        let hidden_rb = HiddenStateRingBuffer::new(
+        // num_extract = 0 (every non-DSpark path) ⇒ no hidden buffers; the forward's
+        // hidden extraction is a no-op and the ring is never read (byte-identical to
+        // the pre-DSpark behaviour). num_extract > 0 (a DSpark drafter configured
+        // `dspark_extract_layers`) ⇒ the ring captures the per-position residual
+        // hidden at those layers during `verify_block_capture_gpu`.
+        let num_extract = self.dspark_extract_layers.len();
+        let mut hidden_rb = HiddenStateRingBuffer::new(
             gpu,
             self.config.n_layers,
-            0,
+            num_extract,
             dim,
             self.ctx_capacity(),
             block_size,
         )
         .map_err(|e| format!("Qwen35SpecScratch HiddenStateRingBuffer: {e}"))?;
+        // `HiddenStateRingBuffer::new` fills `extract_layers` with the evenly-spaced
+        // `dflash_extract_layer_ids` default; DSpark needs the EXACT sidecar layer
+        // ids. Per-layer buffer sizing depends only on the COUNT (num_extract, which
+        // already matches), so overwriting the ids after construction is safe.
+        if num_extract > 0 {
+            hidden_rb.extract_layers = self.dspark_extract_layers.clone();
+        }
         let target_snap = DeltaNetSnapshot::new_for(gpu, &self.dn_state)
             .map_err(|e| format!("Qwen35SpecScratch DeltaNetSnapshot: {e}"))?;
         // F16 backups for s_ef_residual (empty when error-feedback is off).
@@ -162,6 +174,7 @@ impl SpecTarget for ModelSlot {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Plain target advance, chunked at PREFILL_MAX_BATCH with abort checks
         // between chunks. No hidden extraction — only KV + recurrent state move.
@@ -211,6 +224,7 @@ impl SpecTarget for ModelSlot {
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         let s = scratch
             .as_any_mut()
@@ -376,5 +390,268 @@ impl SpecTarget for ModelSlot {
 
     fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
         Some(&mut self.kv_cache)
+    }
+
+    // ── DSpark hidden-capture hooks ─────────────────────────────────────────
+    //
+    // These ride the SAME DeltaNet snapshot/rewind machinery `verify_block` uses;
+    // the only addition is arming the `Qwen35SpecScratch` hidden ring (built with
+    // `num_extract = dspark_extract_layers.len()` by `new_spec_scratch`) and moving
+    // the captured rows GPU→GPU into the caller's buffer. Empty extract layers ⇒
+    // the ring is a no-op and these are never reached (the drafter routes here only
+    // after `set_dflash_extract_layers`).
+
+    fn dflash_extract_layers(&self) -> Option<&[usize]> {
+        if self.dspark_extract_layers.is_empty() {
+            None
+        } else {
+            Some(&self.dspark_extract_layers)
+        }
+    }
+
+    fn set_dflash_extract_layers(&mut self, layers: Vec<usize>) {
+        self.dspark_extract_layers = layers;
+    }
+
+    /// Greedy verify + GPU-resident hidden capture. Mirrors [`verify_block`]
+    /// exactly (snapshot recurrent + s_ef, then `verify_dflash_block`), then
+    /// scatters the per-position extract-layer hidden the verify just wrote into
+    /// the scratch ring straight into the caller-owned `hidden_gpu` (GPU→GPU).
+    fn verify_block_capture_gpu(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen35SpecScratch>()
+            .ok_or("verify_block_capture_gpu: scratch is not Qwen35SpecScratch")?;
+        // SAME snapshot CONTRACT as verify_block: save the pre-verify recurrent
+        // state AND s_ef residual FIRST, so commit_prefix can rewind a partial.
+        s.target_snap
+            .save_from(&self.dn_state, gpu)
+            .map_err(|e| e.to_string())?;
+        save_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
+        let out = verify_dflash_block(
+            gpu,
+            self,
+            block,
+            position,
+            &mut s.hidden_rb,
+            None,  // gdn_tape: rewind by replay in commit_prefix, no tape
+            false, // greedy: GPU argmax, no full-logit D2H
+            &s.verify_scratch,
+        )
+        .map_err(|e| e.to_string())?;
+        // The verify forward advanced the ring head by block.len(); the most recent
+        // block.len() rows are exactly this window's captures. `scatter_...` reads
+        // the last `block.len()` rows relative to the current head (so it is correct
+        // whether the freshly-built ring's head started at 0 or accumulated), into
+        // the caller's interleaved `[block.len() × num_extract × dim]` buffer.
+        let captured = !s.hidden_rb.extract_layers.is_empty();
+        if captured {
+            scatter_hidden_block_to_interleaved(
+                gpu,
+                &s.hidden_rb,
+                hidden_gpu,
+                0,
+                block.len(),
+                block.len(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok((out.argmax_per_pos, captured))
+    }
+
+    /// Sampled (temp>0) twin of [`verify_block_capture_gpu`]. Mirrors
+    /// [`verify_block_sampled`]'s draw path, then applies the identical hidden
+    /// scatter. Returns per-position SAMPLED tokens + whether hidden was captured.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_block_sampled_capture_gpu(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        // qwen35 DFlash's sampled verify runs the per-position draw path, which
+        // does not implement the CACTUS boost — ignored here (deepseek4-only).
+        _cactus_delta: f32,
+        rng_state: &mut u64,
+        hidden_gpu: &GpuTensor,
+    ) -> Result<(Vec<u32>, bool), String> {
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen35SpecScratch>()
+            .ok_or("verify_block_sampled_capture_gpu: scratch is not Qwen35SpecScratch")?;
+        // SAME snapshot CONTRACT as verify_block_sampled.
+        s.target_snap
+            .save_from(&self.dn_state, gpu)
+            .map_err(|e| e.to_string())?;
+        save_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
+        // Sampled verify: leave the per-position logits on-GPU in
+        // verify_scratch.logits (want_full_logits=false), softmax+nucleus on-device,
+        // then draw categorically on the host — mirroring verify_block_sampled.
+        let _ = verify_dflash_block(
+            gpu,
+            self,
+            block,
+            position,
+            &mut s.hidden_rb,
+            None,
+            false,
+            &s.verify_scratch,
+        )
+        .map_err(|e| e.to_string())?;
+        let vocab = self.config.vocab_size;
+        let b = block.len();
+        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
+        let logits_batch = s.verify_scratch.logits.sub_offset(0, b * vocab);
+        let probs_gpu = gpu
+            .alloc_tensor(&[b * vocab], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let tau_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        let z_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        gpu.softmax_temp_topp_batched_into_f32(
+            &logits_batch,
+            &probs_gpu,
+            &tau_gpu,
+            &z_gpu,
+            vocab,
+            b,
+            temp,
+            top_p_eff,
+            top_k,
+            0.0, // min_p: routed to AR by dispatch, never set on this path
+        )
+        .map_err(|e| e.to_string())?;
+        let host_probs = gpu.download_f32(&probs_gpu).map_err(|e| e.to_string())?;
+        let tau = gpu.download_f32(&tau_gpu).map_err(|e| e.to_string())?;
+        let z = gpu.download_f32(&z_gpu).map_err(|e| e.to_string())?;
+        let _ = gpu.free_tensor(probs_gpu);
+        let _ = gpu.free_tensor(tau_gpu);
+        let _ = gpu.free_tensor(z_gpu);
+        let mut picks = Vec::with_capacity(b);
+        for i in 0..b {
+            let mut row = host_probs[i * vocab..(i + 1) * vocab].to_vec();
+            apply_topp_trunc(&mut row, tau[i], z[i]);
+            let u = xorshift_next_unit(rng_state);
+            picks.push(sample_categorical(&row, u));
+        }
+        // Same GPU→GPU hidden scatter as the greedy variant.
+        let captured = !s.hidden_rb.extract_layers.is_empty();
+        if captured {
+            scatter_hidden_block_to_interleaved(
+                gpu,
+                &s.hidden_rb,
+                hidden_gpu,
+                0,
+                block.len(),
+                block.len(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok((picks, captured))
+    }
+
+    /// DSpark bootstrap: capture the seed's residual hidden at `layers` WITHOUT
+    /// permanently advancing the RECURRENT DeltaNet state (the #462 crux). The
+    /// seed is committed later by `verify_block` + `commit_prefix` (it is
+    /// `verify_tokens[0]`), not by this capture — so snapshot recurrent + s_ef,
+    /// run a 1-token capture-armed forward, download the row, then restore. The KV
+    /// write at `position` is harmless (verify rewrites the same slot with the same
+    /// seed); only the recurrent state needs the snapshot/restore.
+    fn capture_seed_main_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        seed: u32,
+        position: usize,
+        layers: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        // Remember the extract layers so the per-window `new_spec_scratch` (called
+        // AFTER this bootstrap in the initial window, and every steady-state window)
+        // builds a ring that captures at exactly these ids.
+        self.dspark_extract_layers = layers.to_vec();
+        let dim = self.config.dim;
+        let num_extract = layers.len();
+
+        // Snapshot the recurrent state + s_ef residual BEFORE the forward advances
+        // them irreversibly.
+        let mut snap = DeltaNetSnapshot::new_for(gpu, &self.dn_state)
+            .map_err(|e| format!("capture_seed_main_hidden snapshot: {e:?}"))?;
+        snap.save_from(&self.dn_state, gpu)
+            .map_err(|e| format!("capture_seed_main_hidden save recurrent: {e:?}"))?;
+        let mut s_ef_snap = Vec::with_capacity(self.dn_state.s_ef_residual.len());
+        for t in &self.dn_state.s_ef_residual {
+            s_ef_snap.push(
+                gpu.alloc_tensor(&t.shape, DType::F16)
+                    .map_err(|e| format!("capture_seed_main_hidden s_ef alloc: {e:?}"))?,
+            );
+        }
+        save_s_ef(&s_ef_snap, &self.dn_state, gpu)?;
+
+        // Temp 1-slot ring capturing at EXACTLY `layers` (override the evenly-spaced
+        // default `new` computes; buffer sizing depends only on the count).
+        let mut ring = HiddenStateRingBuffer::new(
+            gpu,
+            self.config.n_layers,
+            num_extract,
+            dim,
+            1, // max_positions: the single seed slot
+            1, // max_batch: single-token forward
+        )
+        .map_err(|e| format!("capture_seed_main_hidden ring: {e:?}"))?;
+        ring.extract_layers = layers.to_vec();
+
+        // 1-token capture-armed forward at `position` (hidden_rb Some arms the
+        // per-extract-layer hidden capture; same proven call as
+        // `seed_target_hidden_from_prompt`).
+        let host_result = qwen35::forward_prefill_batch(
+            gpu,
+            &self.weights,
+            &self.config,
+            &[seed],
+            position,
+            &mut self.kv_cache,
+            &mut self.dn_state,
+            &self.scratch,
+            Some(&mut ring),
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| format!("capture_seed_main_hidden forward: {e:?}"))
+        .and_then(|()| {
+            // b = 1 ⇒ yields [1 × num_extract × dim] = the concatenated main_hidden.
+            download_hidden_block(gpu, &ring, 1)
+                .map_err(|e| format!("capture_seed_main_hidden download: {e:?}"))
+        });
+
+        // Restore recurrent + s_ef to pre-capture (undo the irreversible advance),
+        // regardless of whether the forward/download succeeded, before freeing.
+        let restore_result = snap
+            .restore_to(&mut self.dn_state, gpu)
+            .map_err(|e| format!("capture_seed_main_hidden restore recurrent: {e:?}"))
+            .and_then(|()| restore_s_ef(&s_ef_snap, &self.dn_state, gpu));
+
+        // Free the temp snapshot, s_ef backup, and ring buffers on every path.
+        snap.free_gpu(gpu);
+        for t in s_ef_snap {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in ring.layer_bufs {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in ring.staging_bufs {
+            let _ = gpu.free_tensor(t);
+        }
+
+        restore_result?;
+        host_result
     }
 }

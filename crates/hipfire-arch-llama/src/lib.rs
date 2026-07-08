@@ -49,6 +49,8 @@
 
 pub mod arch;
 pub mod carrier;
+/// DSpark qwen3-8B drafter sidecar loader.
+pub mod dspark_body;
 /// LLaMA-family implementation of the arch-generic speculative-decode seam.
 pub mod spec_impl;
 

@@ -108,17 +108,6 @@ fn run_spec_gemm_key(
     })
 }
 
-fn dflash_q8_lmhead_wmma_enabled_from_env() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => true,
-    })
-}
-
 fn dflash_gemm_q8_lmhead(
     gpu: &mut Gpu,
     w_out: &llama::WeightTensor,
@@ -126,7 +115,7 @@ fn dflash_gemm_q8_lmhead(
     y: &GpuTensor,
     n: usize,
 ) -> HipResult<()> {
-    if dflash_q8_lmhead_wmma_enabled_from_env() {
+    if gpu.flags.dflash_q8_lmhead_wmma {
         // #397 Ship 5.3: GemmQ8_0BatchedChunked routes to the identical
         // gpu.gemm_q8_0_batched_chunked the prior direct call used.
         return run_spec_gemm_key(
@@ -419,19 +408,6 @@ pub fn reset_seed_oracle_stats() {
     SEED_ORACLE_ACCEPT_LEN_SUM.store(0, Ordering::Relaxed);
 }
 
-/// Parse HIPFIRE_DDTREE_LOGW_CUTOFF. Positive value X means "stop tree
-/// expansion when next candidate's cumulative logw < -X". 0.0 / unset /
-/// unparseable disables (= expand all the way to `budget`).
-fn ddtree_logw_cutoff() -> f32 {
-    match std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-    {
-        Some(x) if x > 0.0 => -x,
-        _ => f32::NEG_INFINITY,
-    }
-}
-
 /// DDTree meta-verifier pruner telemetry: per-cycle tree-size histogram.
 /// `cycle_count` = cycles observed; `total_nodes` = sum of tree.num_nodes()
 /// across cycles; `max_nodes` / `min_nodes` = range observed.
@@ -546,6 +522,13 @@ pub struct ModelSlot {
     pub dn_state: DeltaNetState,
     pub scratch: Qwen35Scratch,
     pub slot_config: ModelSlotConfig,
+    /// DSpark (EAGLE-3) residual-hidden extract-layer ids. Empty for every
+    /// non-DSpark path (AR / n-gram / DFlash / MTP), which keeps `new_spec_scratch`
+    /// building a `num_extract = 0` no-op hidden ring — byte-identical to the
+    /// pre-DSpark behaviour. A DSpark drafter populates this via
+    /// `set_dflash_extract_layers` / `capture_seed_main_hidden` so the per-window
+    /// verify captures hidden at exactly the sidecar's layer ids.
+    pub dspark_extract_layers: Vec<usize>,
 }
 
 impl ModelSlot {
@@ -581,6 +564,7 @@ impl ModelSlot {
             dn_state,
             scratch,
             slot_config: ModelSlotConfig::default(),
+            dspark_extract_layers: Vec::new(),
         })
     }
 
@@ -709,6 +693,7 @@ impl ModelSlot {
             dn_state,
             scratch,
             slot_config,
+            dspark_extract_layers: Vec::new(),
         })
     }
 
@@ -1316,81 +1301,6 @@ impl GdnTape {
         Ok(())
     }
 
-    /// Slow-path companion to `replay_gdn` (Task #101 slow-path-kill, 2026-04-23).
-    ///
-    /// When the committed tree path diverges from the linearization order
-    /// (`spine_accept = false` in `spec_step_ddtree_batched`), the per-tree-
-    /// node qkv / alpha / beta innovations captured during tree verify at
-    /// positions `[0..big_n]` need to be rearranged so that linear replay
-    /// position `i+1` holds the values for accepted tree node
-    /// `accepted_node_indices[i]`. Position 0 (seed) is already correct and
-    /// stays put; positions 1..=accept_len are gathered from their
-    /// tree-linearization slots.
-    ///
-    /// Uses `kv_compact_gather` (a generic slot-indexed row-gather kernel)
-    /// via `gather_scratch` as staging, then memcpys back to the tape's
-    /// own storage. The caller uploads `gather_indices_dev` with:
-    ///   indices[0] = 0                              (seed stays at 0)
-    ///   indices[i+1] = accepted_node_indices[i] + 1 (tree node → tape row)
-    /// for `i ∈ [0, accept_len)`.
-    pub fn gather_accepted(
-        &self,
-        gpu: &mut Gpu,
-        gather_indices_dev: &GpuTensor,
-        gather_scratch: &GpuTensor,
-        n_positions: usize,
-    ) -> HipResult<()> {
-        let qkv_row_bytes = self.qkv_dim * 4;
-        let alpha_row_bytes = self.n_v_heads * 4;
-        for layer in 0..self.qkv_bufs.len() {
-            // qkv
-            gpu.kv_compact_gather(
-                &self.qkv_bufs[layer],
-                gather_scratch,
-                gather_indices_dev,
-                qkv_row_bytes,
-                n_positions,
-            )?;
-            gpu.hip.memcpy_dtod_at(
-                &self.qkv_bufs[layer].buf,
-                0,
-                &gather_scratch.buf,
-                0,
-                n_positions * qkv_row_bytes,
-            )?;
-            // alpha
-            gpu.kv_compact_gather(
-                &self.alpha_bufs[layer],
-                gather_scratch,
-                gather_indices_dev,
-                alpha_row_bytes,
-                n_positions,
-            )?;
-            gpu.hip.memcpy_dtod_at(
-                &self.alpha_bufs[layer].buf,
-                0,
-                &gather_scratch.buf,
-                0,
-                n_positions * alpha_row_bytes,
-            )?;
-            // beta
-            gpu.kv_compact_gather(
-                &self.beta_bufs[layer],
-                gather_scratch,
-                gather_indices_dev,
-                alpha_row_bytes,
-                n_positions,
-            )?;
-            gpu.hip.memcpy_dtod_at(
-                &self.beta_bufs[layer].buf,
-                0,
-                &gather_scratch.buf,
-                0,
-                n_positions * alpha_row_bytes,
-            )?;
-        }
-        Ok(())
-    }
 }
 
 impl DeltaNetTape {
@@ -1480,104 +1390,25 @@ pub struct DdtreeScratch {
     /// cycle via `memcpy_htod` before calling `verify_dflash_block_tree`.
     /// Allocated as Raw bytes (4 × max_n) since there's no i32 DType.
     pub parent_indices: GpuTensor,
-    /// Slow-path gather scratch (Task #101 slow-path-kill, 2026-04-23).
-    /// When the committed tree path diverges from the rank-0 linearization
-    /// (`spine_accept = false`), we need to rearrange already-computed
-    /// per-position state into committed-chain order instead of paying a
-    /// full re-verify forward. Three buffers:
-    ///  - `kv_gather_indices`: [max_n] i32 device buf holding absolute KV
-    ///    slot indices `[start_pos + 0, start_pos + 1 + accepted[0], ...]`
-    ///    that `kv_compact_gather` reads to select K/V rows per layer.
-    ///  - `kv_gather_scratch_k` / `_v`: per-layer gather destination + memcpy
-    ///    staging, sized to hold `max_n × widest_k_bpp` / `widest_v_bpp`
-    ///    bytes for the KV quant modes this model may use.
-    pub kv_gather_indices: GpuTensor,
-    pub kv_gather_scratch_k: GpuTensor,
-    pub kv_gather_scratch_v: GpuTensor,
-    /// Separately: the GdnTape also needs a gather-then-copy-back staging
-    /// buffer for qkv/alpha/beta bufs. Sized to the widest tape row
-    /// (`qkv_dim * 4` bytes) × `max_n`. Reused across all LA layers.
-    pub tape_gather_scratch: GpuTensor,
-    /// Path B per-FA-layer pre-RoPE K capture (slow-path-kill, WIP).
-    /// One F32 tensor of `[max_n × n_kv_heads × head_dim]` per FullAttention
-    /// layer in `config.layer_types`. Tree verify memcpy_dtods K into the
-    /// matching slot BEFORE the RoPE kernel rotates K in-place. Slow path
-    /// then re-RoPEs with committed positions instead of linearization
-    /// positions. Empty Vec when Path B isn't wired (default today).
-    pub pre_rope_k: Vec<GpuTensor>,
 }
 
 impl DdtreeScratch {
     /// Allocate for a worst-case tree of `max_budget` non-root nodes.
-    ///
-    /// `n_kv_heads` / `head_dim` come from the target's Qwen35Config and
-    /// size the KV-gather staging buffers for the widest-possible quant
-    /// mode (Q8, asym2/3/4 all ≤ Q8 bpp in bytes-per-position on K;
-    /// V is always Q8 for the asym* modes).
-    ///
-    /// `qkv_dim` is the per-position GdnTape qkv row width (k_dim × 2 +
-    /// v_dim) — see `GdnTape::new_for_config`.
-    pub fn new(
-        gpu: &mut Gpu,
-        max_budget: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        qkv_dim: usize,
-        n_fa_layers: usize,
-    ) -> HipResult<Self> {
+    pub fn new(gpu: &mut Gpu, max_budget: usize) -> HipResult<Self> {
         let max_n = 1 + max_budget;
         let attn_bias = gpu.alloc_tensor(&[max_n * max_n], rdna_compute::DType::F32)?;
         let parent_indices = gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
-        // Path B per-FA-layer pre-RoPE K capture. Sized once at session
-        // init. Empty on n_fa_layers=0 → capture is a no-op even if the
-        // env gate is set (slow-path-kill won't have data to consume).
-        let mut pre_rope_k: Vec<GpuTensor> = Vec::with_capacity(n_fa_layers);
-        for _ in 0..n_fa_layers {
-            pre_rope_k.push(
-                gpu.alloc_tensor(&[max_n * n_kv_heads * head_dim], rdna_compute::DType::F32)?,
-            );
-        }
-
-        // Widest bytes-per-position across KV quant modes we might run under.
-        // Mirrors TriAttention's `widest_bpp` sizing (see triattn.rs:784).
-        let q8_bpp = n_kv_heads * (head_dim / 32) * 34;
-        let asym3_k_bpp = n_kv_heads * (4 + (head_dim * 3) / 8);
-        let asym4_k_bpp = n_kv_heads * (4 + head_dim / 2);
-        let asym2_k_bpp = n_kv_heads * (4 + head_dim / 4);
-        let widest_k_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp).max(asym2_k_bpp);
-        let widest_v_bpp = q8_bpp;
-
-        let kv_gather_indices = gpu.alloc_tensor(&[max_n * 4], rdna_compute::DType::Raw)?;
-        // Raw byte buffers sized to hold `max_n` full K / V rows.
-        let kv_gather_scratch_k =
-            gpu.alloc_tensor(&[(max_n * widest_k_bpp + 3) / 4], rdna_compute::DType::F32)?;
-        let kv_gather_scratch_v =
-            gpu.alloc_tensor(&[(max_n * widest_v_bpp + 3) / 4], rdna_compute::DType::F32)?;
-        // Tape rows are F32 projections, so sized in F32 elements directly.
-        let tape_gather_scratch = gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?;
 
         Ok(Self {
             max_n,
             attn_bias,
             parent_indices,
-            kv_gather_indices,
-            kv_gather_scratch_k,
-            kv_gather_scratch_v,
-            tape_gather_scratch,
-            pre_rope_k,
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.attn_bias);
         let _ = gpu.free_tensor(self.parent_indices);
-        let _ = gpu.free_tensor(self.kv_gather_indices);
-        let _ = gpu.free_tensor(self.kv_gather_scratch_k);
-        let _ = gpu.free_tensor(self.kv_gather_scratch_v);
-        let _ = gpu.free_tensor(self.tape_gather_scratch);
-        for t in self.pre_rope_k {
-            let _ = gpu.free_tensor(t);
-        }
     }
 }
 
@@ -2314,6 +2145,7 @@ pub fn verify_dflash_block(
         want_full_logits,
         None,
         verify_scratch,
+        false, // chain path always needs argmax
     )
 }
 
@@ -2339,6 +2171,11 @@ pub fn verify_dflash_block_tree(
     want_full_logits: bool,
     tree_verify: qwen35::TreeVerifyCtx<'_>,
     verify_scratch: &VerifyScratch,
+    // D9: when the caller will use the SWOR walk (which derives accepted
+    // indices from the 68-byte walk-result D2H, not from argmax_per_pos),
+    // skip the big_n × 4 byte argmax download entirely — the returned
+    // argmax_per_pos will be empty. Pass `false` for the greedy path.
+    skip_argmax_d2h: bool,
 ) -> HipResult<DflashVerifyOutput> {
     verify_dflash_block_inner(
         gpu,
@@ -2350,6 +2187,7 @@ pub fn verify_dflash_block_tree(
         want_full_logits,
         Some(tree_verify),
         verify_scratch,
+        skip_argmax_d2h,
     )
 }
 
@@ -2363,6 +2201,9 @@ fn verify_dflash_block_inner(
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
     verify_scratch: &VerifyScratch,
+    // D9: skip the big_n × 4 argmax D2H when the caller will use SWOR walk
+    // (which gets accepted indices from the 68-byte walk-result D2H instead).
+    skip_argmax_d2h: bool,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -2644,10 +2485,23 @@ fn verify_dflash_block_inner(
     // multiple batch rows targeting the same cache slot — the async write
     // order lets a subsequent attention kernel read a partially-committed
     // slot. Fix TODO: either serialize within-kernel per-slot, or ensure
-    // the "winning" sibling's write happens last. Cost ~3–5 ms per cycle
-    // until fixed.
+    // the "winning" sibling's write happens last.
+    //
+    // D16: narrowed from device_synchronize() (full device drain, ~3–5 ms
+    // on PCIe, ~50–200 µs on UMA) to stream_synchronize (scoped to the
+    // active stream only). Semantically identical on hipfire's single-stream
+    // setup, but does not stall work enqueued on other streams. The ordering
+    // guarantee — all prior KV writes complete before the next attention
+    // kernel reads the slot — is preserved because all ops ride the same
+    // stream. Caller (spec_step_ddtree_batched) ensures active_stream is
+    // Some before reaching here; the fallback keeps the old full drain for
+    // the rare path where it isn't set.
     if batch_result.is_ok() && tree_verify.is_some() {
-        gpu.hip.device_synchronize()?;
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        } else {
+            gpu.hip.device_synchronize()?;
+        }
     }
     batch_result?;
 
@@ -2685,6 +2539,14 @@ fn verify_dflash_block_inner(
                 argmax_per_pos.push(argmax_u32(row));
             }
             logits_per_pos = host_logits;
+        } else if skip_argmax_d2h {
+            // D9: SWOR verify path — the accept walk uses the 68-byte walk-result
+            // D2H (D13), NOT argmax_per_pos. Skip this D2H entirely; argmax_per_pos
+            // stays empty. Still enqueue the GPU argmax kernel so verify_scratch.argmax
+            // is populated if some other consumer ever needs it (none currently).
+            let argmax_buf = verify_scratch.argmax.sub_offset(0, b);
+            gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, b)?;
+            // argmax_per_pos intentionally left empty — caller must not read it.
         } else {
             // GPU-side batched argmax. Writes B i32 indices; we download just
             // 4*B bytes instead of the full B×vocab logits. Saves ~15 MB of
@@ -3074,11 +2936,7 @@ pub fn spec_step_dflash(
     // vs host sequential sum can differ at the last ULP and rarely flip a
     // borderline `u*p_d <= p_t` accept) — validated coherent across genres
     // (no attractors), so default-on. Greedy path (temp==0) is never affected.
-    static FAST_SAMPLE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fast_sample_active = use_temp_sampling
-        && *FAST_SAMPLE_ENV.get_or_init(|| {
-            std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0")
-        });
+    let fast_sample_active = use_temp_sampling && gpu.flags.dflash_fast_sample;
     let draft_ffn_graph_env = std::env::var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
@@ -3087,6 +2945,15 @@ pub fn spec_step_dflash(
         use_temp_sampling,
         draft_ffn_graph_env.as_deref(),
     );
+
+    // C8: device tensors kept alive from draft-sample through verify-accept.
+    // Only populated when fast_sample_active AND the batched GEMM path runs.
+    // Otherwise stays None and the host accept loop falls back to draft_softmaxes.
+    let mut c8_draft_probs_dev: Option<GpuTensor> = None;
+    let mut c8_draft_tau_dev: Option<GpuTensor> = None;
+    let mut c8_draft_z_dev: Option<GpuTensor> = None;
+    let mut c8_draft_tokens_dev: Option<GpuTensor> = None;
+    let mut c8_draft_p_at_token_dev: Option<GpuTensor> = None;
 
     if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
@@ -3152,10 +3019,7 @@ pub fn spec_step_dflash(
         // on this diagnostic path — callers using it don't expect FlashCASK.
         let effective_ctx_len = match ctx_slice {
             Some(n) => n.min(position),
-            None => draft_scratch
-                .target_hidden_abs_positions
-                .len()
-                .min(position),
+            None => draft_scratch.thlog.abs_positions().len().min(position),
         };
         let ctx_start = position - effective_ctx_len;
         let co = target.kv_cache.compact_offset as i32;
@@ -3167,7 +3031,7 @@ pub fn spec_step_dflash(
             (ctx_start as i32..(position + b) as i32).collect()
         } else {
             let mut v = Vec::with_capacity(effective_ctx_len + b);
-            let th_abs = &draft_scratch.target_hidden_abs_positions;
+            let th_abs = draft_scratch.thlog.abs_positions();
             let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
             v.extend_from_slice(&th_abs[start_idx..]);
             for p in 0..b {
@@ -3345,24 +3209,19 @@ pub fn spec_step_dflash(
             }
 
             if use_temp_sampling && fast_sample_active {
-                // FAST_SAMPLE: GPU softmax → download probs (same D2H size as
-                // logits). Host RNG/sample math is byte-for-byte the same calls
-                // as the default arm below — only the softmax `exp` work moved
-                // off-host. Distribution-parity, not byte-parity (see flag doc).
-                let probs_gpu = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
-                // top_p nucleus: when active, the GPU kernel additionally emits
-                // per-row tau_cut/Z so the host can apply the SAME nucleus cut as
-                // the target side (parity + acceptance efficiency). When
-                // inactive, fall back to the plain softmax (tau_cut/Z absent →
-                // truncation identity).
-                let (host_tau, host_z) = if topp_active {
-                    let tau_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
-                    let z_gpu = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                // C8 GPU-sample path: softmax stays device-resident; only
+                // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
+                // draft_probs_dev is kept alive in c8_draft_probs_dev until
+                // chain_accept_spec_f32 consumes it after verify.
+                let probs_dev = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
+                let (tau_dev, z_dev) = if topp_active {
+                    let tau_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
                     gpu.softmax_temp_topp_batched_into_f32(
                         &logits_batch,
-                        &probs_gpu,
-                        &tau_gpu,
-                        &z_gpu,
+                        &probs_dev,
+                        &tau_d,
+                        &z_d,
                         vocab,
                         batch,
                         temp,
@@ -3370,36 +3229,67 @@ pub fn spec_step_dflash(
                         top_k,
                         0.0, // min_p: DFlash min_p parity is the follow-up; off here
                     )?;
-                    let tau = gpu.download_f32(&tau_gpu)?;
-                    let z = gpu.download_f32(&z_gpu)?;
-                    let _ = gpu.free_tensor(tau_gpu);
-                    let _ = gpu.free_tensor(z_gpu);
-                    (Some(tau), Some(z))
+                    (tau_d, z_d)
                 } else {
                     gpu.softmax_temp_batched_into_f32(
                         &logits_batch,
-                        &probs_gpu,
+                        &probs_dev,
                         vocab,
                         batch,
                         temp,
                     )?;
-                    (None, None)
+                    // topp inactive: kernel expects tau=0 (no truncation) and z=1
+                    // (inv_z=1 → eff_prob returns p unchanged). Use zeros() for tau
+                    // (0.0 bit-pattern = 0x00000000) and fill_f32 for z.
+                    let tau_d = gpu.zeros(&[batch], rdna_compute::DType::F32)?;
+                    let z_d = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                    gpu.fill_f32(&z_d, 1.0f32)?;
+                    (tau_d, z_d)
                 };
-                let host_probs = gpu.download_f32(&probs_gpu)?;
-                let _ = gpu.free_tensor(probs_gpu);
-                debug_assert_eq!(host_probs.len(), batch * vocab);
-                draft_softmaxes.reserve(batch);
-                for i in 0..batch {
-                    let mut probs = host_probs[i * vocab..(i + 1) * vocab].to_vec();
-                    if let (Some(tau), Some(z)) = (&host_tau, &host_z) {
-                        apply_topp_trunc(&mut probs, tau[i], z[i]);
-                    }
-                    let u = xorshift_next_unit(rng_state);
-                    let t = sample_categorical(&probs, u);
-                    draft_probs_at_drafted.push(probs[t as usize]);
-                    drafted.push(t);
-                    draft_softmaxes.push(probs);
+                // GPU categorical sample per row: writes draft_tokens + draft_p_at_token.
+                let tok_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?; // i32 via f32 slot
+                let pat_dev = gpu.alloc_tensor(&[batch], rdna_compute::DType::F32)?;
+                let seed_u32 = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
+                gpu.batched_categorical_sample_f32(
+                    &probs_dev,
+                    &tau_dev,
+                    &z_dev,
+                    &tok_dev,
+                    &pat_dev,
+                    vocab,
+                    batch,
+                    seed_u32,
+                )?;
+                // Download only tokens + probs: batch×8 bytes total.
+                let mut raw_tok = vec![0i32; batch];
+                {
+                    let bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            raw_tok.as_mut_ptr() as *mut u8,
+                            batch * 4,
+                        )
+                    };
+                    gpu.hip.memcpy_dtoh(bytes, &tok_dev.buf)?;
                 }
+                let raw_pat = gpu.download_f32(&pat_dev)?;
+                // Keep pat_dev alive on device for chain_accept_spec_f32.
+                for i in 0..batch {
+                    drafted.push(raw_tok[i] as u32);
+                    draft_probs_at_drafted.push(raw_pat[i]);
+                }
+                // Advance host rng_state by batch steps to maintain entropy across
+                // cycles (GPU uses its own LCG; host state must change per cycle).
+                for _ in 0..batch {
+                    xorshift_next_unit(rng_state);
+                }
+                // Stash device tensors for chain_accept_spec_f32 in verify step.
+                c8_draft_probs_dev = Some(probs_dev);
+                c8_draft_tau_dev = Some(tau_dev);
+                c8_draft_z_dev = Some(z_dev);
+                c8_draft_tokens_dev = Some(tok_dev);
+                c8_draft_p_at_token_dev = Some(pat_dev);
+                // draft_probs_at_drafted populated above; draft_softmaxes NOT
+                // populated (not needed when GPU accept kernel runs).
             } else if use_temp_sampling {
                 // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
                 let host_logits = gpu.download_f32(&logits_batch)?;
@@ -3612,146 +3502,215 @@ pub fn spec_step_dflash(
     let mut accept_len = 0usize;
     let bonus_token;
     if use_temp_sampling {
-        debug_assert_eq!(draft_softmaxes.len(), b - 1);
-        // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
-        // all B rows and download the probs. The accept loop below then reads
-        // `target_probs` from this buffer instead of calling the host
-        // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
-        // distribution-parity probs. The verify logits are still resident in
-        // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
-        // and only ran GPU-argmax afterwards, which does not overwrite it).
-        // On the fast path, GPU per-row target softmax (+ optional nucleus
-        // tau_cut/Z when topp_active) for all b rows.
-        let mut fast_tgt_tau: Option<Vec<f32>> = None;
-        let mut fast_tgt_z: Option<Vec<f32>> = None;
-        let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+        // When the GPU sampling path ran on the draft side AND we have the
+        // required device tensors, run chain_accept_spec_f32 for the full
+        // accept loop (C8b: eliminates the ~9 MB target probs D2H + host loop).
+        // Otherwise fall through to the host loop (PLD, fallback per-row path).
+        let gpu_accept = fast_sample_active
+            && c8_draft_probs_dev.is_some()
+            && c8_draft_tokens_dev.is_some()
+            && c8_draft_p_at_token_dev.is_some();
+
+        if gpu_accept {
+            // ── C8 GPU accept path ──────────────────────────────────────────
+            // verify_scratch.logits[0..b*vocab] contains the target logits for
+            // all b positions (b = draft_batch + 1; last row = bonus position).
+            // Softmax them into tgt_probs_dev (kept device-resident).
             let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-            let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-            if topp_active {
-                let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-                let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+            let tgt_probs_dev = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+            let (tau_t_dev, z_t_dev) = if topp_active {
+                let tau_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
                 gpu.softmax_temp_topp_batched_into_f32(
                     &logits_batch,
-                    &probs_gpu,
-                    &tau_gpu,
-                    &z_gpu,
+                    &tgt_probs_dev,
+                    &tau_t,
+                    &z_t,
                     vocab,
                     b,
                     temp,
                     top_p,
                     top_k,
-                    0.0, // min_p: DFlash min_p parity is the follow-up; off here
+                    0.0,
                 )?;
-                fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
-                fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
-                let _ = gpu.free_tensor(tau_gpu);
-                let _ = gpu.free_tensor(z_gpu);
+                (tau_t, z_t)
             } else {
-                gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
-            }
-            let host = gpu.download_f32(&probs_gpu)?;
-            let _ = gpu.free_tensor(probs_gpu);
-            debug_assert_eq!(host.len(), b * vocab);
-            Some(host)
-        } else {
-            // Non-fast path: the host full-vocab logits from verify are the
-            // softmax input. Bound here so the fast path never touches the
-            // (now-empty) `logits_per_pos`.
-            debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
-            None
-        };
-        let tgt_logits = &verify_out.logits_per_pos;
-        let mut target_probs = Vec::with_capacity(vocab);
-        let mut rejected_bonus: Option<u32> = None;
-        // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5) relaxes the
-        // Leviathan acceptance ratio by a KL-bounded bump √(2δ·q·(1−q)),
-        // trading controlled divergence from the verifier for higher τ.
-        // δ==0 reduces to vanilla SpS. Paper's strongest setting is δ=1.0.
-        let use_cactus = cactus_delta > 0.0;
-        for i in 0..b - 1 {
-            if let Some(fast) = &fast_tgt_probs {
-                target_probs.clear();
-                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                // top_p nucleus, IDENTICAL cut to the draft side (GPU tau/Z).
-                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
-                }
-            } else {
-                softmax_temp_into(
-                    &tgt_logits[i * vocab..(i + 1) * vocab],
-                    temp,
-                    &mut target_probs,
-                );
-                // Non-fast temp arm: host nucleus so top_p holds here too.
-                if topp_active {
-                    apply_host_nucleus(&mut target_probs, top_p);
-                }
-            }
-            let t = block[i + 1] as usize;
-            let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
-            let p_t = target_probs[t];
-            // Bumped acceptance probability: γ* = min(p_t + √(2·δ·p_t·(1−p_t)), 1).
-            // When δ==0 → γ* = p_t (standard Leviathan & Chen 2023).
-            let accept_prob = if use_cactus {
-                let bump = (2.0 * cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
-                (p_t + bump).min(1.0)
-            } else {
-                p_t
+                gpu.softmax_temp_batched_into_f32(&logits_batch, &tgt_probs_dev, vocab, b, temp)?;
+                let tau_t = gpu.zeros(&[b], rdna_compute::DType::F32)?;
+                let z_t = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                gpu.fill_f32(&z_t, 1.0f32)?;
+                (tau_t, z_t)
             };
-            let u = xorshift_next_unit(rng_state);
-            if u * p_d <= accept_prob {
-                accept_len += 1;
+
+            let dft_probs_dev = c8_draft_probs_dev.as_ref().unwrap();
+            let dft_tok_dev = c8_draft_tokens_dev.as_ref().unwrap();
+            let dft_pat_dev = c8_draft_p_at_token_dev.as_ref().unwrap();
+            let tau_d_dev = c8_draft_tau_dev.as_ref().unwrap();
+            let z_d_dev = c8_draft_z_dev.as_ref().unwrap();
+
+            let out_dev = gpu.alloc_tensor(&[4], rdna_compute::DType::F32)?; // 4×i32 via f32 slot
+            // kernel's b parameter = number of draft comparison positions = b-1
+            let draft_b = b - 1;
+            let rng_seed = (*rng_state >> 32) as u32 ^ (*rng_state as u32);
+            gpu.chain_accept_spec_f32(
+                &tgt_probs_dev,
+                dft_probs_dev,
+                dft_tok_dev,
+                dft_pat_dev,
+                &tau_t_dev,
+                &z_t_dev,
+                tau_d_dev,
+                z_d_dev,
+                &out_dev,
+                draft_b,
+                vocab,
+                rng_seed,
+                cactus_delta,
+            )?;
+
+            // Download 16 bytes: {accept_len, bonus_token, rejected_at, new_rng}
+            let mut out_raw = [0i32; 4];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(out_raw.as_mut_ptr() as *mut u8, 16)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &out_dev.buf)?;
+            }
+            accept_len = out_raw[0] as usize;
+            bonus_token = out_raw[1] as u32;
+            // Advance host rng_state once so future cycles seed differently.
+            // GPU consumed its own LCG draws; host state just needs to change.
+            xorshift_next_unit(rng_state);
+
+            let _ = gpu.free_tensor(out_dev);
+            let _ = gpu.free_tensor(tgt_probs_dev);
+            let _ = gpu.free_tensor(tau_t_dev);
+            let _ = gpu.free_tensor(z_t_dev);
+        } else {
+            // ── Host accept path (PLD / fallback per-row) ──────────────────
+            debug_assert_eq!(draft_softmaxes.len(), b - 1);
+            // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
+            // all B rows and download the probs. The accept loop below then reads
+            // `target_probs` from this buffer instead of calling the host
+            // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
+            // distribution-parity probs. The verify logits are still resident in
+            // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
+            // and only ran GPU-argmax afterwards, which does not overwrite it).
+            let mut fast_tgt_tau: Option<Vec<f32>> = None;
+            let mut fast_tgt_z: Option<Vec<f32>> = None;
+            let fast_tgt_probs: Option<Vec<f32>> = if fast_sample_active {
+                let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+                let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+                if topp_active {
+                    let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                    let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+                    gpu.softmax_temp_topp_batched_into_f32(
+                        &logits_batch,
+                        &probs_gpu,
+                        &tau_gpu,
+                        &z_gpu,
+                        vocab,
+                        b,
+                        temp,
+                        top_p,
+                        top_k,
+                        0.0,
+                    )?;
+                    fast_tgt_tau = Some(gpu.download_f32(&tau_gpu)?);
+                    fast_tgt_z = Some(gpu.download_f32(&z_gpu)?);
+                    let _ = gpu.free_tensor(tau_gpu);
+                    let _ = gpu.free_tensor(z_gpu);
+                } else {
+                    gpu.softmax_temp_batched_into_f32(&logits_batch, &probs_gpu, vocab, b, temp)?;
+                }
+                let host = gpu.download_f32(&probs_gpu)?;
+                let _ = gpu.free_tensor(probs_gpu);
+                debug_assert_eq!(host.len(), b * vocab);
+                Some(host)
             } else {
-                // Rejected — sample bonus from the CACTUS-revised target h
-                // (§2.3, Theorem 2), not raw q. h is built in-place over
-                // target_probs (loop breaks right after, so no reuse):
-                //   h(t)   = γ*
-                //   h(i≠t) = (1−γ*)/(1−q(t)) · q(i)
-                if use_cactus {
-                    let qn = p_t.clamp(0.0, 1.0);
-                    let gamma_star = accept_prob;
-                    if qn >= 1.0 - 1e-6 {
-                        // Degenerate: q is (near) one-hot on t; h is one-hot on t too.
-                        for v in target_probs.iter_mut() {
-                            *v = 0.0;
-                        }
-                        target_probs[t] = 1.0;
-                    } else {
-                        let scale = (1.0 - gamma_star) / (1.0 - qn);
-                        for (j, v) in target_probs.iter_mut().enumerate() {
-                            *v = if j == t { gamma_star } else { scale * *v };
-                        }
+                debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
+                None
+            };
+            let tgt_logits = &verify_out.logits_per_pos;
+            let mut target_probs = Vec::with_capacity(vocab);
+            let mut rejected_bonus: Option<u32> = None;
+            // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5).
+            let use_cactus = cactus_delta > 0.0;
+            for i in 0..b - 1 {
+                if let Some(fast) = &fast_tgt_probs {
+                    target_probs.clear();
+                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                    }
+                } else {
+                    softmax_temp_into(
+                        &tgt_logits[i * vocab..(i + 1) * vocab],
+                        temp,
+                        &mut target_probs,
+                    );
+                    if topp_active {
+                        apply_host_nucleus(&mut target_probs, top_p);
                     }
                 }
-                let u2 = xorshift_next_unit(rng_state);
-                rejected_bonus = Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
-                break;
-            }
-        }
-        bonus_token = if let Some(b) = rejected_bonus {
-            b
-        } else {
-            // All accepted: sample from target_softmax at position B-1.
-            let i = b - 1;
-            if let Some(fast) = &fast_tgt_probs {
-                target_probs.clear();
-                target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                    apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                let t = block[i + 1] as usize;
+                let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
+                let p_t = target_probs[t];
+                let accept_prob = if use_cactus {
+                    let bump = (2.0 * cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
+                    (p_t + bump).min(1.0)
+                } else {
+                    p_t
+                };
+                let u = xorshift_next_unit(rng_state);
+                if u * p_d <= accept_prob {
+                    accept_len += 1;
+                } else {
+                    if use_cactus {
+                        let qn = p_t.clamp(0.0, 1.0);
+                        let gamma_star = accept_prob;
+                        if qn >= 1.0 - 1e-6 {
+                            for v in target_probs.iter_mut() {
+                                *v = 0.0;
+                            }
+                            target_probs[t] = 1.0;
+                        } else {
+                            let scale = (1.0 - gamma_star) / (1.0 - qn);
+                            for (j, v) in target_probs.iter_mut().enumerate() {
+                                *v = if j == t { gamma_star } else { scale * *v };
+                            }
+                        }
+                    }
+                    let u2 = xorshift_next_unit(rng_state);
+                    rejected_bonus =
+                        Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
+                    break;
                 }
+            }
+            bonus_token = if let Some(b) = rejected_bonus {
+                b
             } else {
-                softmax_temp_into(
-                    &tgt_logits[i * vocab..(i + 1) * vocab],
-                    temp,
-                    &mut target_probs,
-                );
-                if topp_active {
-                    apply_host_nucleus(&mut target_probs, top_p);
+                let i = b - 1;
+                if let Some(fast) = &fast_tgt_probs {
+                    target_probs.clear();
+                    target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
+                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
+                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
+                    }
+                } else {
+                    softmax_temp_into(
+                        &tgt_logits[i * vocab..(i + 1) * vocab],
+                        temp,
+                        &mut target_probs,
+                    );
+                    if topp_active {
+                        apply_host_nucleus(&mut target_probs, top_p);
+                    }
                 }
-            }
-            let u = xorshift_next_unit(rng_state);
-            sample_categorical(&target_probs, u)
-        };
+                let u = xorshift_next_unit(rng_state);
+                sample_categorical(&target_probs, u)
+            };
+        }
     } else {
         // Greedy path. If RP or n-gram-block is active, re-derive argmax per
         // row after applying penalties to the full target logits (requires
@@ -3826,6 +3785,13 @@ pub fn spec_step_dflash(
             );
         }
     }
+
+    // Free C8 device tensors now that accept is resolved.
+    if let Some(t) = c8_draft_probs_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_tau_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_z_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_tokens_dev { let _ = gpu.free_tensor(t); }
+    if let Some(t) = c8_draft_p_at_token_dev { let _ = gpu.free_tensor(t); }
 
     // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────
     // Three position-based proxies for the next cycle's `seed_token`
@@ -3949,18 +3915,14 @@ pub fn spec_step_dflash(
         )?;
         // Keep draft_forward's incremental-upload tracker in sync so any future
         // ctx_slice=Some call in the same session doesn't try to re-upload what
-        // GPU already has; and so the assertion-in-draft path stays coherent.
-        draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
-        // Track the absolute positions of the rows we just appended. These are
-        // the logical positions `position..position+rows_to_keep` plus the
-        // current target KV compact_offset (zero pre-eviction; non-zero after).
-        // Used by the next cycle's `positions_k` construction.
+        // GPU already has, and track the absolute positions of the appended
+        // rows (logical `position..position+rows_to_keep` plus the current
+        // target KV compact_offset — zero pre-eviction, non-zero after) for the
+        // next cycle's `positions_k` construction.
         let co = target.kv_cache.compact_offset as i32;
-        for p in 0..rows_to_keep {
-            draft_scratch
-                .target_hidden_abs_positions
-                .push(position as i32 + p as i32 + co);
-        }
+        draft_scratch
+            .thlog
+            .append_committed(position, rows_to_keep, co);
     }
 
     if phase_on {
@@ -4289,19 +4251,116 @@ fn run_dflash_draft_for_logits(
 /// Returns `(top_tokens, top_log_probs)` each of size `(b-1) * k` in
 /// row-major order (same convention as `ddtree::topk_from_logits`).
 #[allow(clippy::too_many_arguments)]
+/// Upload an `i32` slice as a device buffer (no I32 DType — raw bytes; kernels
+/// read it as `int*`).
+fn upload_i32(gpu: &Gpu, data: &[i32]) -> HipResult<GpuTensor> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
+    gpu.upload_raw(bytes, &[data.len()])
+}
+
+/// Run the fused on-device SWOR tree-verify walk and return the CPU-shaped
+/// `(accepted_node_indices, bonus_token)`. Builds the device metadata
+/// (slot→depth, draw-ordered candidates, child-of-candidate adjacency), launches
+/// `ddtree_swor_walk_f32` against the device-resident target + draft logits, and
+/// reads back only the tiny result. No full-vocab work on the host.
+#[allow(clippy::too_many_arguments)]
+fn swor_walk_gpu(
+    gpu: &mut Gpu,
+    tree: &hipfire_runtime::ddtree::DdTree,
+    target_logits: &GpuTensor,
+    draft_logits: &GpuTensor,
+    pos_cands: &[u32],
+    num_pos: usize,
+    k: usize,
+    vocab: usize,
+    temp: f32,
+    seed: u64,
+) -> HipResult<(Vec<usize>, u32)> {
+    let n_slots = 1 + tree.nodes.len();
+    let mut slot_depth = vec![0i32; n_slots];
+    for s in 1..n_slots {
+        slot_depth[s] = tree.nodes[s - 1].depth as i32;
+    }
+    let mut child_of_cand = vec![-1i32; n_slots * k];
+    for s in 0..n_slots {
+        let depth = slot_depth[s] as usize;
+        if depth >= num_pos {
+            continue;
+        }
+        for r in 0..k {
+            let token = pos_cands[depth * k + r];
+            if let Some(&ci) = tree.child_maps[s].get(&token) {
+                child_of_cand[s * k + r] = ci as i32;
+            }
+        }
+    }
+    let pos_cands_i32: Vec<i32> = pos_cands.iter().map(|&t| t as i32).collect();
+    let t_pcand = upload_i32(gpu, &pos_cands_i32)?;
+    let t_depth = upload_i32(gpu, &slot_depth)?;
+    let t_child = upload_i32(gpu, &child_of_cand)?;
+    let t_pres = gpu.alloc_tensor(&[vocab], rdna_compute::DType::F32)?;
+    let t_qpos = gpu.alloc_tensor(&[vocab], rdna_compute::DType::F32)?;
+    let t_out = gpu.alloc_tensor(&[2 + num_pos], rdna_compute::DType::F32)?;
+    gpu.ddtree_swor_walk_f32(
+        target_logits,
+        draft_logits,
+        &t_pcand,
+        &t_depth,
+        &t_child,
+        &t_pres,
+        &t_qpos,
+        &t_out,
+        temp,
+        k,
+        vocab,
+        n_slots,
+        num_pos,
+        seed,
+    )?;
+    let raw = gpu.download_f32(&t_out)?;
+    let _ = gpu.free_tensor(t_pcand);
+    let _ = gpu.free_tensor(t_depth);
+    let _ = gpu.free_tensor(t_child);
+    let _ = gpu.free_tensor(t_pres);
+    let _ = gpu.free_tensor(t_qpos);
+    let _ = gpu.free_tensor(t_out);
+    let accept_len = (raw[0].to_bits() as i32).max(0) as usize;
+    let bonus = raw[1].to_bits() as u32;
+    let mut accepted = Vec::with_capacity(accept_len);
+    for i in 0..accept_len {
+        accepted.push((raw[2 + i].to_bits() as i32) as usize);
+    }
+    Ok((accepted, bonus))
+}
+
 fn run_dflash_draft_for_topk_gpu(
     gpu: &mut Gpu,
     target: &ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
     draft_scratch: &mut DflashScratch,
-    target_hidden_host: &[f32],
+    // Stage 1b: `None` = GPU-resident path (scratch.target_hidden already
+    // populated via D2D scatter; thlog tracks the live rows). `Some(slice)`
+    // = ctx_slice diagnostic path (host shadow, always full H2D upload).
+    target_hidden_host: Option<&[f32]>,
     position: usize,
     seed_token: u32,
     ctx_slice: Option<usize>,
     b: usize,
     k: usize,
-) -> HipResult<(Vec<u32>, Vec<f32>)> {
+    // `Some((temp, rng))` ⇒ draw the `k` children per position WITHOUT replacement
+    // from the draft softmax at `temp` (Gumbel-top-k = exact SWOR sampling), and
+    // return their TRUE per-position log-probs. This makes the tree's candidates
+    // genuine draft samples, which is what the q-exploiting SWOR verify needs to
+    // be distribution-exact. `None` ⇒ the default deterministic GPU top-k.
+    sample: Option<(f32, &mut u64)>,
+) -> HipResult<(Vec<u32>, Vec<f32>, Option<GpuTensor>)> {
+    // The 3rd return is the draft logits kept ON DEVICE (`[batch·vocab]`),
+    // populated only in `sample` mode — the fused GPU SWOR walk softmaxes them
+    // for its residual, so they must NOT be freed here. `None` on the top-k path;
+    // the SWOR caller frees the tensor after the walk.
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
@@ -4333,22 +4392,45 @@ fn run_dflash_draft_for_topk_gpu(
             _ => panic!("ddtree draft: unsupported target embedding format"),
         }
     }
-    let effective_ctx_len = match ctx_slice {
-        Some(n) => n.min(position),
-        None => position,
-    };
-    let ctx_start = position - effective_ctx_len;
-    let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
-    let positions_k: Vec<i32> = (ctx_start as i32..(position + b) as i32).collect();
-    let th_offset = ctx_start * ne * h;
-    let th_slice: &[f32] = &target_hidden_host[th_offset..];
+    // Stage 1b: positions and hidden-source depend on whether we are using the
+    // GPU-resident path (target_hidden_host=None) or the ctx_slice host path.
+    let (positions_q, positions_k, th_arg, effective_ctx_len) =
+        if let Some(host_slice) = target_hidden_host {
+            // ctx_slice diagnostic path: host shadow, simple contiguous positions.
+            let effective_ctx_len = match ctx_slice {
+                Some(n) => n.min(position),
+                None => position,
+            };
+            let ctx_start = position - effective_ctx_len;
+            let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+            let positions_k: Vec<i32> = (ctx_start as i32..(position + b) as i32).collect();
+            let th_offset = ctx_start * ne * h;
+            (positions_q, positions_k, Some(&host_slice[th_offset..]), effective_ctx_len)
+        } else {
+            // GPU-resident path: scratch.target_hidden already contains all rows
+            // via D2D scatter (Stage 1); thlog tracks uploaded_rows + abs_positions.
+            // Mirror the chain path (spec_step_dflash ~line 3157): use thlog's
+            // eviction-aware abs_positions for k-positions, pass None to skip H2D.
+            let effective_ctx_len = draft_scratch.thlog.abs_positions().len().min(position);
+            let ctx_start = position - effective_ctx_len;
+            let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+            let th_abs = draft_scratch.thlog.abs_positions();
+            let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
+            let mut positions_k: Vec<i32> = Vec::with_capacity(effective_ctx_len + b);
+            positions_k.extend_from_slice(&th_abs[start_idx..]);
+            for p in 0..b {
+                positions_k.push(position as i32 + p as i32);
+            }
+            let _ = ctx_start; // not used in this branch
+            (positions_q, positions_k, None, effective_ctx_len)
+        };
 
     dflash::draft_forward(
         gpu,
         draft_weights,
         draft_cfg,
         None,
-        Some(th_slice),
+        th_arg,
         &positions_q,
         &positions_k,
         b,
@@ -4470,6 +4552,39 @@ fn run_dflash_draft_for_topk_gpu(
         return Err(e);
     }
 
+    // Step 5a: Gumbel-top-k SWOR sampling (q-exploiting verify). Download the
+    // draft logits and, per position, draw k tokens WITHOUT replacement from
+    // softmax(logits/temp) via the Gumbel-top-k trick (top-k by `logit/temp +
+    // Gumbel(0,1)` is an exact size-k SWOR sample), returning each token's TRUE
+    // per-position log-prob `log_softmax(logits/temp)[token]`. The candidates are
+    // then genuine draft samples — the precondition the SWOR verify needs.
+    if let Some((temp, rng)) = sample {
+        // Device-side Gumbel-top-k SWOR sampling: NO [B×vocab] D2H. Draw the k
+        // draw-ordered candidates per position + their true log-q on the GPU; only
+        // B×k come back for the CPU tree build. `logits_batch` stays resident for
+        // the fused SWOR walk (returned below).
+        let seed = *rng;
+        xorshift_next_unit(rng);
+        let idx_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
+        let logp_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
+        gpu.ddtree_gumbel_topk_batched_f32(
+            &logits_batch,
+            &idx_gpu,
+            &logp_gpu,
+            vocab,
+            k,
+            batch,
+            temp,
+            seed,
+        )?;
+        let idx_host = gpu.download_f32(&idx_gpu)?;
+        let top_log_probs = gpu.download_f32(&logp_gpu)?;
+        let _ = gpu.free_tensor(idx_gpu);
+        let _ = gpu.free_tensor(logp_gpu);
+        let top_tokens: Vec<u32> = idx_host.iter().map(|f| f.to_bits()).collect();
+        return Ok((top_tokens, top_log_probs, Some(logits_batch)));
+    }
+
     // Step 5: GPU top-K + log-sum-exp. Writes [batch × k] indices + log-probs.
     let topk_idx_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
     let topk_val_gpu = gpu.alloc_tensor(&[batch * k], rdna_compute::DType::F32)?;
@@ -4501,7 +4616,7 @@ fn run_dflash_draft_for_topk_gpu(
     let _ = gpu.free_tensor(topk_val_gpu);
 
     let top_tokens: Vec<u32> = idx_host.into_iter().map(|x| x as u32).collect();
-    Ok((top_tokens, val_host))
+    Ok((top_tokens, val_host, None))
 }
 
 /// Enumerate all root-to-leaf paths in a DdTree. Returns paths as Vec<Vec<usize>>
@@ -4615,13 +4730,14 @@ pub fn spec_step_ddtree(
     // heap expansion when the next candidate's cumulative log-probability
     // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
     // unset) preserves the fixed-budget behaviour.
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_bounded(
         &top_tokens,
         &top_log_probs,
         b - 1,
         tree_topk,
+        0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
-        ddtree_logw_cutoff(),
+        gpu.flags.ddtree_logw_cutoff_value(),
     );
     record_ddtree_meta_nodes(tree.num_nodes());
 
@@ -4882,21 +4998,35 @@ pub fn spec_step_ddtree_batched(
     ctx_slice: Option<usize>,
     tree_budget: usize,
     tree_topk: usize,
+    // Temperature for the verify-side acceptance. temp == 0 → greedy argmax
+    // walk (follow_verified_tree); temp > 0 → distribution-preserving naive
+    // tree sampling (sample_verified_tree), which needs the full per-slot
+    // target logits and consumes `rng_state` (xorshift, shared with the linear
+    // DFlash sampler convention).
+    temp: f32,
+    rng_state: &mut u64,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let vocab = target.config.vocab_size;
     let h = draft_cfg.hidden;
     let ne = draft_cfg.num_extract();
     assert!(b >= 2, "spec_step_ddtree_batched: block_size must be ≥ 2");
-    assert_eq!(
-        target_hidden_host.len(),
-        position * ne * h,
-        "target_hidden_host size mismatches position"
-    );
+    // Stage 1b: target_hidden_host is no longer maintained in the GPU-resident
+    // default path (ctx_slice=None). The length-invariant assert is removed
+    // to avoid false failures. The ctx_slice=Some path still uses the host Vec.
     assert!(
         tree_topk >= 1 && tree_topk <= vocab,
         "tree_topk must be in [1, vocab]"
     );
+
+    // D16: ensure active_stream is set before any work so memset_async and
+    // the stream-scoped sync in verify_dflash_block_inner have a non-null
+    // stream to ride on. Mirrors the identical setup in spec_step_dflash
+    // (~line 2968) — da2753e pattern.
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
     // Unused in the batched path (no per-path DFS), kept in signature for
     // API compatibility with `spec_step_ddtree` so callers can switch by
     // flipping a single fn pointer.
@@ -4910,23 +5040,50 @@ pub fn spec_step_ddtree_batched(
     let debug_tm = std::env::var("DDTREE_TIMING").is_ok();
     let t_all = std::time::Instant::now();
 
+    // Verify-scheme selector. SWOR (q-exploiting Sequoia/SpecTr, distribution-
+    // exact) is the ONLY temp>0 verify path — the naive-sampling fallback
+    // (HIPFIRE_DDTREE_VERIFY=naive) was removed in D8 because it required
+    // a ~37 MB/cycle full-logits D2H and SWOR is strictly superior.
+    // temp=0 → greedy argmax walk; temp>0 → on-GPU SWOR.
+    let use_swor = temp > 0.0;
+
     // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
     // Keeps logits on device; returns only (b-1) × k indices + log-probs
     // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
-    // with an on-device top-K (~µs) plus a ~480 byte D2H.
-    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
+    // with an on-device top-K (~µs) plus a ~480 byte D2H. SWOR mode instead
+    // Gumbel-top-k samples the children (download + CPU sample).
+    //
+    // Stage 1b: Pass `None` as target_hidden_host in the default production
+    // path (ctx_slice=None) so draft_forward skips the H2D upload — the
+    // GPU-resident scratch.target_hidden is already populated by the previous
+    // cycle's D2D scatter (or the prefill scatter). The ctx_slice diagnostic
+    // path (Some(n)) still uses the CPU host shadow.
+    let th_host_arg: Option<&[f32]> = if ctx_slice.is_none() {
+        None // GPU-resident: scratch.target_hidden populated via D2D scatter
+    } else {
+        Some(target_hidden_host.as_slice())
+    };
+    let (top_tokens, top_log_probs, draft_logits_dev) = run_dflash_draft_for_topk_gpu(
         gpu,
         target,
         draft_weights,
         draft_cfg,
         draft_scratch,
-        target_hidden_host,
+        th_host_arg,
         position,
         seed_token,
         ctx_slice,
         b,
         tree_topk,
+        if use_swor {
+            Some((temp, &mut *rng_state))
+        } else {
+            None
+        },
     )?;
+    // SWOR verify needs the draw-ordered candidates per position; `top_tokens` is
+    // already in Gumbel-draw order (rank 0 = first drawn) in sample mode.
+    let swor_pos_cands = top_tokens.clone();
 
     let t_draft = t_all.elapsed();
     let t_topk = t_draft; // fused with draft now
@@ -4936,13 +5093,14 @@ pub fn spec_step_ddtree_batched(
     // heap expansion when the next candidate's cumulative log-probability
     // drops below -cutoff. Per-cycle dynamic budget. Disabled (= 0.0 or
     // unset) preserves the fixed-budget behaviour.
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
+    let tree = hipfire_runtime::ddtree::build_ddtree_tree_bounded(
         &top_tokens,
         &top_log_probs,
         b - 1,
         tree_topk,
+        0, // min_nodes=0: pure-cutoff DDTree build
         tree_budget,
-        ddtree_logw_cutoff(),
+        gpu.flags.ddtree_logw_cutoff_value(),
     );
     record_ddtree_meta_nodes(tree.num_nodes());
 
@@ -4964,8 +5122,19 @@ pub fn spec_step_ddtree_batched(
         )?;
         let logits0 = gpu.download_f32(&target.scratch.logits)?;
         let bonus = argmax_u32(&logits0);
-        let hidden_block = download_hidden_block(gpu, hidden_rb, 1)?;
-        target_hidden_host.extend_from_slice(&hidden_block[..ne * h]);
+        // D2D scatter 1 row into draft_scratch.target_hidden, then keep
+        // target_hidden_host length-consistent for the next cycle's assert.
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            1,
+            1,
+        )?;
+        let co = target.kv_cache.compact_offset as i32;
+        draft_scratch.thlog.append_committed(position, 1, co);
+        // Stage 1b: no CPU download needed — GPU buffer is authoritative.
         return Ok(SpecStepResult {
             accepted: 0,
             bonus_token: bonus,
@@ -4975,51 +5144,85 @@ pub fn spec_step_ddtree_batched(
     }
 
     // ── 4. Linearize the tree into (tokens, positions, mask_host, parents) ─
+    //
+    // mask_host is computed here for the HIPFIRE_DDTREE_ASSERT_MASK=1 dual-
+    // path check (byte-equality proof vs GPU build). In normal operation it
+    // is not uploaded — the GPU kernel (step 5) rebuilds it on-device.
     let (verify_tokens, verify_positions, mask_host, parent_host) =
         hipfire_runtime::ddtree::linearize_tree_with_parents(&tree, seed_token, position as u32);
     let big_n = verify_tokens.len();
     debug_assert_eq!(big_n, 1 + tree.num_nodes());
     debug_assert_eq!(parent_host.len(), big_n);
 
-    // ── 5. Upload mask to GPU into the persistent bias scratch ───────────
-    //
-    // Reuses `scratch.attn_bias` (sized for max_budget at init time), so
-    // per cycle we only pay for the htod of the current cycle's mask. The
-    // FA kernel reads at `row * block_cols + col` with block_cols = big_n;
-    // unused tail space in the buffer is never accessed.
     assert!(
         big_n <= scratch.max_n,
         "tree big_n {} exceeds scratch.max_n {} (increase DdtreeScratch size)",
         big_n,
         scratch.max_n,
     );
-    {
-        let mask_bytes = unsafe {
-            std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4)
-        };
-        gpu.hip.memcpy_htod(&scratch.attn_bias.buf, mask_bytes)?;
-    }
 
-    // ── 5b. Upload parent_indices for tree-aware LA kernels ──────────────
+    // ── 5. Upload parent_indices; build attn_bias mask on-GPU (Stage 3a) ─
     //
-    // ON BY DEFAULT as of 2026-04-24 — Task #101 Phase 3d validation bench
-    // (3-run medians on 27B MQ4 asym3 b12-k2, commit 4a3f2b3):
-    //   code:     110.0 → 119.1 tok/s (+8.3 %)   τ 6.80 → 7.30 (+7 %)
-    //   prose:     52.3 →  57.8 tok/s (+10.5 %)  τ 3.00 → 3.52 (+17 %)
-    //   instruct:  42.1 →  47.4 tok/s (+12.6 %)  τ 2.02 → 2.47 (+22 %)
-    // Coherence-gate-dflash passes on all 4 tests. Mechanism: tree-aware
-    // LA kernels read parent_indices to walk ancestor chains correctly at
-    // topk>1, so the fast-tape path fires on 90 %+ of cycles instead of
-    // the slow-path re-verify that used to trigger on sibling pollution.
+    // D5: parent_indices H2D (244 B, stays — needed for tree-aware LA and
+    // for the mask kernel itself).  D4 (attn_bias H2D, ~15 KB/cycle) is
+    // eliminated: instead of uploading mask_host we launch
+    // ddtree_build_attn_mask_f32 which walks the parent chain per-thread
+    // and writes scratch.attn_bias directly on-device.
     //
-    // Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected.
-    let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() != Some("0");
-    if use_tree_la {
+    // parent_indices is always uploaded (needed both by the mask kernel and,
+    // when ddtree_tree_la=true, by the tree-aware GDN kernels).
+    let use_tree_la = gpu.flags.ddtree_tree_la;
+    {
         let parent_bytes = unsafe {
             std::slice::from_raw_parts(parent_host.as_ptr() as *const u8, parent_host.len() * 4)
         };
         gpu.hip
             .memcpy_htod(&scratch.parent_indices.buf, parent_bytes)?;
+    }
+
+    // Build attn_bias on GPU from the now-resident parent_indices. The sub-
+    // offset view is used by the FA kernel (step 7) to bound-check big_n²
+    // reads.  The kernel writes exactly big_n² floats at the head of
+    // scratch.attn_bias; tail is never read by the FA kernel.
+    gpu.ddtree_build_attn_mask_f32(&scratch.parent_indices, &scratch.attn_bias, big_n)?;
+
+    // ── 5b. Byte-equality assert (HIPFIRE_DDTREE_ASSERT_MASK=1) ──────────
+    //
+    // Dual-path proof: download the GPU mask and compare byte-for-byte with
+    // the host mask_host computed by linearize_tree_with_parents above.
+    // Off by default (costs one D2H per cycle).
+    if std::env::var("HIPFIRE_DDTREE_ASSERT_MASK").ok().as_deref() == Some("1") {
+        // Synchronize so the kernel has finished writing before the D2H.
+        gpu.hip.device_synchronize()?;
+        let n_floats = big_n * big_n;
+        let mut gpu_mask = vec![0.0f32; n_floats];
+        let gpu_mask_bytes = unsafe {
+            std::slice::from_raw_parts_mut(gpu_mask.as_mut_ptr() as *mut u8, n_floats * 4)
+        };
+        gpu.hip
+            .memcpy_dtoh(gpu_mask_bytes, &scratch.attn_bias.buf)?;
+        // mask_host is big_n*big_n; gpu_mask is big_n*big_n.
+        assert_eq!(
+            mask_host.len(),
+            n_floats,
+            "ASSERT_MASK: mask_host.len() mismatch"
+        );
+        for idx in 0..n_floats {
+            let h = mask_host[idx].to_bits();
+            let g = gpu_mask[idx].to_bits();
+            assert_eq!(
+                h, g,
+                "ASSERT_MASK: mismatch at flat index {idx} (row={}, col={}): host={:08x} gpu={:08x}",
+                idx / big_n,
+                idx % big_n,
+                h,
+                g,
+            );
+        }
+        eprintln!(
+            "[DDTREE_ASSERT_MASK] big_n={big_n} mask byte-identical ({} floats)",
+            n_floats
+        );
     }
 
     // ── 6. Snapshot pre-seed target state ─────────────────────────────────
@@ -5049,24 +5252,6 @@ pub fn spec_step_ddtree_batched(
     // Parent-indices sub-view sized to big_n (one i32 per slot; stored as
     // 4 × big_n raw bytes). Only populated when HIPFIRE_DDTREE_TREE_LA=1.
     let parent_view = scratch.parent_indices.sub_offset(0, big_n * 4);
-    // Path B (slow-path-kill, work-in-progress): when enabled, supply the
-    // per-FA-layer pre-RoPE K capture scratch so tree verify can dump K
-    // BEFORE rope_partial_interleaved mutates it. Slow path then gathers
-    // accepted rows out of the scratch, re-RoPEs with committed phases,
-    // and quant-writes to the committed kv slots — no full re-verify
-    // forward. CONSUMER NOT YET WIRED: capture is currently a no-op
-    // overhead until the slow-path branch is replaced. Keep gated until
-    // the eyeball-tested smoke (see PRD trap surface) passes.
-    let pre_rope_capture = if std::env::var("HIPFIRE_DDTREE_PATH_B_CAPTURE")
-        .ok()
-        .as_deref()
-        == Some("1")
-        && !scratch.pre_rope_k.is_empty()
-    {
-        Some(scratch.pre_rope_k.as_slice())
-    } else {
-        None
-    };
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
         attn_bias: &attn_bias_view,
@@ -5075,9 +5260,13 @@ pub fn spec_step_ddtree_batched(
         } else {
             None
         },
-        pre_rope_k_capture: pre_rope_capture,
     };
     let t_pre_verify = t_all.elapsed();
+    // D8: `want_full_logits` was `temp > 0.0 && !use_swor` (the naive path,
+    // gated by HIPFIRE_DDTREE_VERIFY=naive). Since use_swor is now the only
+    // temp>0 path (the naive flag and its ~37 MB/cycle D2H have been removed),
+    // want_full_logits is permanently false. Greedy: GPU-argmax + tiny D2H.
+    // SWOR: no host logits needed; verify_scratch.logits stays device-resident.
     let verify_out = verify_dflash_block_tree(
         gpu,
         target,
@@ -5085,16 +5274,50 @@ pub fn spec_step_ddtree_batched(
         position,
         hidden_rb,
         Some(gdn_tape),
-        false,
+        false, // want_full_logits: always false; D8 naive path removed
         ctx,
         verify_scratch,
+        use_swor, // D9: SWOR uses 68-byte walk result, not argmax_per_pos
     )?;
-    let posterior = verify_out.argmax_per_pos;
     let t_post_verify = t_all.elapsed();
 
-    // ── 8. Greedy walk: longest accepted path + bonus ─────────────────────
-    let (accepted_node_indices, bonus_token) =
-        hipfire_runtime::ddtree::follow_verified_tree(&tree, &posterior);
+    // ── 8. Accept walk: longest accepted path + bonus ─────────────────────
+    // temp=0 → greedy argmax walk (follow_verified_tree).
+    // temp>0 → q-exploiting Sequoia/SpecTr SWOR walk (use_swor, distribution-
+    //   exact). The naive-sampling fallback (HIPFIRE_DDTREE_VERIFY=naive) has
+    //   been removed (D8): it required a ~37 MB/cycle full-logits D2H and is
+    //   superseded by SWOR which achieves the same distribution-preservation
+    //   on-device. All paths return the same (accepted_node_indices, bonus_token)
+    //   shape; step 10's divergent-path commit handles non-linear accepted paths.
+    let (accepted_node_indices, bonus_token) = if use_swor {
+        // Fully on-device fused SWOR walk: target logits from verify scratch,
+        // draft logits kept on device — no full-vocab host work, no q D2H.
+        let target_dev = verify_scratch.logits.sub_offset(0, big_n * vocab);
+        let draft_dev = draft_logits_dev
+            .as_ref()
+            .expect("use_swor ⇒ draft kept its device logits");
+        let seed = *rng_state;
+        xorshift_next_unit(rng_state);
+        swor_walk_gpu(
+            gpu,
+            &tree,
+            &target_dev,
+            draft_dev,
+            &swor_pos_cands,
+            b - 1,
+            tree_topk,
+            vocab,
+            temp,
+            seed,
+        )?
+    } else {
+        // Greedy (temp=0): follow argmax at each tree node.
+        hipfire_runtime::ddtree::follow_verified_tree(&tree, &verify_out.argmax_per_pos)
+    };
+    // The kept draft logits are no longer needed once the walk has run.
+    if let Some(t) = draft_logits_dev {
+        let _ = gpu.free_tensor(t);
+    }
     let accept_len = accepted_node_indices.len();
 
     // ── 9. Build committed + drafted sequences ────────────────────────────
@@ -5171,237 +5394,10 @@ pub fn spec_step_ddtree_batched(
             accept_len + 1,
         )?;
         hidden_rows_written = big_n;
-    } else if std::env::var("HIPFIRE_DDTREE_PATH_B_CAPTURE")
-        .ok()
-        .as_deref()
-        == Some("1")
-        && !scratch.pre_rope_k.is_empty()
-    {
-        // Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full
-        // re-verify with a gather + per-commit RoPE + quant-write chain
-        // that operates on the pre-RoPE K captured during tree verify
-        // (qwen35.rs:3486 — Phase 1 capture). Plus the existing tape
-        // gather scaffolding from ecbc49d.
-        //
-        // Path A failed because gathered K carried stale RoPE phase. Path
-        // B fixes that by re-applying RoPE for the COMMITTED slot phases
-        // before quant-writing back to the cache.
-        //
-        // CORRECTNESS-CRITICAL: the dflash coherence battery
-        // (scripts/coherence-gate-dflash.sh) is the ONLY barrier between
-        // a Path B regression and a corrupted-output release. Token
-        // attractors here look like +τ/+tok-s wins on stat gates. Run
-        // the eyeball check before trusting any result.
-        let n_positions = accept_len + 1;
-        let kv = &mut target.kv_cache;
-        let n_kv_heads = kv.n_kv_heads;
-        let head_dim = kv.head_dim;
-        let kv_dim = n_kv_heads * head_dim;
-
-        // ── (a) Tape gather (qkv/alpha/beta innovations into committed order)
-        let tape_idx_host: Vec<i32> = std::iter::once(0i32)
-            .chain(accepted_node_indices.iter().map(|&i| (i + 1) as i32))
-            .collect();
-        let tape_idx_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(tape_idx_host.as_ptr() as *const u8, n_positions * 4)
-        };
-        gpu.hip
-            .memcpy_htod(&scratch.parent_indices.buf, tape_idx_bytes)?;
-        gdn_tape.gather_accepted(
-            gpu,
-            &scratch.parent_indices,
-            &scratch.tape_gather_scratch,
-            n_positions,
-        )?;
-
-        // ── (b) Per-FA-layer K rotate + V gather + quant-write
-        //
-        // For K: gather pre-RoPE K rows (captured BEFORE the original
-        // rope_partial in qwen35.rs:3486) by accepted indices into a
-        // contiguous F32 buffer, apply RoPE with COMMITTED positions
-        // [start_pos, start_pos+1, ...], then quant-write to KV cache at
-        // those committed slots. The Q half of rope_partial is throwaway —
-        // we feed verify_scratch.prefill_batch's fa_q_batch as a scratch
-        // and ignore the rotated Q.
-        //
-        // For V: V doesn't carry a position-dependent rotation, so a
-        // pure byte gather (raced slot → committed slot) is correct. Same
-        // pattern Path A used.
-        let pbs = verify_scratch
-            .prefill_batch
-            .as_ref()
-            .expect("Path B requires VerifyScratch.prefill_batch (set during DdtreeScratch init)");
-
-        // Tree-verify K source indices (one per accepted committed slot, in
-        // pre-RoPE K scratch which has positions [0..big_n] in tree-
-        // linearization order, so 0 = seed slot, i+1 = tree node i).
-        let k_src_idx_host: Vec<i32> = std::iter::once(0i32)
-            .chain(accepted_node_indices.iter().map(|&i| (i + 1) as i32))
-            .collect();
-        let k_src_idx_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(k_src_idx_host.as_ptr() as *const u8, n_positions * 4)
-        };
-        // Reuse parent_indices buffer for the K gather indices (it was
-        // already used for the tape gather above; re-upload now).
-        gpu.hip
-            .memcpy_htod(&scratch.parent_indices.buf, k_src_idx_bytes)?;
-
-        // Committed slot positions for RoPE + KV write: [start_pos+0..start_pos+accept_len].
-        let pos_host: Vec<i32> = (0..n_positions).map(|i| (position + i) as i32).collect();
-        let pos_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, n_positions * 4) };
-        gpu.hip
-            .memcpy_htod(&scratch.kv_gather_indices.buf, pos_bytes)?;
-
-        // Absolute KV slots for V gather: [position+0, position+1+acc[0], ...]
-        // (V is the same as Path A: byte gather from raced slots to committed).
-        let v_src_abs_host: Vec<i32> = std::iter::once(position as i32)
-            .chain(
-                accepted_node_indices
-                    .iter()
-                    .map(|&i| (position + 1 + i) as i32),
-            )
-            .collect();
-        let v_src_abs_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(v_src_abs_host.as_ptr() as *const u8, n_positions * 4)
-        };
-        // Park the V indices in the tape_gather_scratch's first 4×n bytes —
-        // tape gather is done; the buffer is free until next cycle. (Avoids
-        // adding yet another tiny i32 buffer to DdtreeScratch.)
-        gpu.hip
-            .memcpy_htod(&scratch.tape_gather_scratch.buf, v_src_abs_bytes)?;
-
-        let v_bpp = n_kv_heads * (head_dim / 32) * 34; // Q8 V (all asym* modes use Q8 V)
-
-        let n_rot = (target.config.head_dim as f32 * target.config.partial_rotary_factor) as usize;
-
-        for (fa_idx, layer_idx) in target
-            .config
-            .layer_types
-            .iter()
-            .enumerate()
-            .filter_map(|(li, lt)| {
-                if *lt == qwen35::LayerType::FullAttention {
-                    Some(li)
-                } else {
-                    None
-                }
-            })
-            .enumerate()
-        {
-            // 1. Gather pre-RoPE K rows by k_src_idx into pbs.fa_k_batch.
-            //    Each row is n_kv_heads * head_dim F32 = kv_dim*4 bytes.
-            gpu.kv_compact_gather(
-                &scratch.pre_rope_k[fa_idx],
-                &pbs.fa_k_batch,
-                &scratch.parent_indices,
-                kv_dim * 4,
-                n_positions,
-            )?;
-
-            // 2. Apply RoPE in-place to gathered K with committed positions.
-            //    Q is throwaway — fa_q_batch is large enough.
-            gpu.rope_partial_interleaved_f32_batched(
-                &pbs.fa_q_batch,
-                &pbs.fa_k_batch,
-                &scratch.kv_gather_indices,
-                target.config.n_heads,
-                target.config.n_kv_heads,
-                target.config.head_dim,
-                n_rot,
-                target.config.rope_theta,
-                n_positions,
-                // pos_offset=0: tree-mode re-rotation uses committed gather indices
-                // as positions directly (no compact_offset overlay). Unchanged behavior.
-                0,
-            )?;
-
-            // 3. V gather via the existing kv_compact_gather pattern.
-            gpu.kv_compact_gather(
-                &kv.v_gpu[layer_idx],
-                &scratch.kv_gather_scratch_v,
-                &scratch.tape_gather_scratch,
-                v_bpp,
-                n_positions,
-            )?;
-
-            // 4. Quant-write K (rotated, in pbs.fa_k_batch) + V (gathered,
-            //    in scratch.kv_gather_scratch_v) to the committed KV slots.
-            //    All asym* and q8 KV variants supported. F16 unquantized
-            //    isn't on the batched path so we panic here — see the
-            //    fa_batched_ok gate in qwen35.rs:3081.
-            match kv.k_tier() {
-                KTier::Asym3 { .. } => {
-                    let ct = kv.givens_cos.as_ref().expect("asym3 requires Givens cos");
-                    let st = kv.givens_sin.as_ref().expect("asym3 requires Givens sin");
-                    // The batched K writer expects a contiguous K source of
-                    // [n × n_kv_heads × head_dim] F32 — pbs.fa_k_batch is
-                    // exactly that. We give it the REAL kv.v_gpu as the V
-                    // dst (so writer indices stay in-bounds for absolute slot
-                    // numbers). The V values it writes are garbage (sourced
-                    // from pbs.fa_v_batch, leftover from the last FA layer)
-                    // but we OVERWRITE every committed V slot below from a
-                    // proper gather of the raced-but-correctly-quantized V
-                    // values. So the garbage V write is a transient no-op.
-                    gpu.kv_cache_write_asym3_batched(
-                        &kv.k_gpu[layer_idx],
-                        &kv.v_gpu[layer_idx],
-                        &pbs.fa_k_batch,
-                        &pbs.fa_v_batch,
-                        &scratch.kv_gather_indices,
-                        ct,
-                        st,
-                        n_kv_heads,
-                        head_dim,
-                        n_positions,
-                    )?;
-                    // V byte-gather: read pre-quantized V from raced slots
-                    // [position+0, position+1+acc[0], ...] into a contiguous
-                    // scratch, then memcpy scratch → kv.v_gpu at committed
-                    // slots [position..position+accept_len]. Using a scratch
-                    // intermediate avoids same-slot src=dst memcpys (which
-                    // are HIP UB) when the accept chain happens to hit the
-                    // rank-0 prefix early.
-                    gpu.kv_compact_gather(
-                        &kv.v_gpu[layer_idx],
-                        &scratch.kv_gather_scratch_v,
-                        &scratch.tape_gather_scratch,
-                        v_bpp,
-                        n_positions,
-                    )?;
-                    gpu.hip.memcpy_dtod_at(
-                        &kv.v_gpu[layer_idx].buf,
-                        position * v_bpp,
-                        &scratch.kv_gather_scratch_v.buf,
-                        0,
-                        n_positions * v_bpp,
-                    )?;
-                }
-                other => {
-                    // TODO: asym4 / asym2 / q8 paths — same pattern as asym3
-                    // but with the matching kv_cache_write_*_batched call.
-                    // For initial Phase 2 prototype, panic so we notice if a
-                    // non-asym3 model accidentally enables Path B.
-                    panic!("Path B Phase 2 only supports asym3 KV today (got {other:?})");
-                }
-            }
-        }
-
-        // ── (c) Replay GDN tape on the committed-order tape.
-        target_snap.restore_to(&mut target.dn_state, gpu)?;
-        gdn_tape.replay_gdn(
-            gpu,
-            &target.weights,
-            &target.config,
-            &mut target.dn_state,
-            n_positions,
-        )?;
-        hidden_rows_written = big_n;
     } else {
-        // Default slow path: re-verify the committed prefix to get a
-        // linear-order tape AND correctly RoPE'd K written to committed
-        // slots. ~40-50 ms cost on 27B. Path B kill is opt-in via
-        // HIPFIRE_DDTREE_PATH_B_CAPTURE=1.
+        // Slow path (non-spine accept): re-verify the committed prefix to
+        // get a linear-order tape AND correctly RoPE'd K written to committed
+        // slots. ~40-50 ms cost on 27B.
         let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         let _tape_verify = verify_dflash_block(
@@ -5425,15 +5421,33 @@ pub fn spec_step_ddtree_batched(
         hidden_rows_written = tape_block.len();
     }
 
-    // ── 11. Append (1 + accept_len) hidden rows to target_hidden_host ────
-    // Default slow path's 2nd verify wrote accept_len+1 rows in committed
-    // order → first N rows are correct. Fast path: rank-0 chain == linear
-    // prefix → first N rows still correct. Path A slow path keeps tree-
-    // verify's big_n rows in linearization order → CPU-gather committed
-    // rows out of the block.
-    let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
+    // ── 11. D2D-scatter committed rows into draft_scratch.target_hidden ─
+    // Mirror the chain path (spec_step_dflash ~line 3911): scatter only the
+    // accept_len+1 committed rows directly from hidden_rb into the GPU-resident
+    // draft_scratch.target_hidden buffer, then call thlog.append_committed so
+    // the next cycle's draft_forward sees prev==l and skips the H2D upload.
+    // We still download the same rows to CPU to maintain the target_hidden_host
+    // length invariant (checked at cycle entry, line 4992-4995).
+    //
+    // Fast-tape: hidden_rb holds big_n rows in linearization order; the first
+    // rows_to_keep are the committed prefix (spine_accept == true guarantees
+    // linear order). Pass block_size=big_n so scatter aligns to ring origin.
+    //
+    // Slow-tape: the 2nd verify (above) wrote exactly accept_len+1 rows in
+    // committed order to hidden_rb. Pass block_size=rows_to_keep.
+    //
+    // CPU-gather branch (hidden_rows_written==big_n && !fast_tape_ok): reachable
+    // only via HIPFIRE_DDTREE_FORCE_SLOW=1 on a topk-1 (linear) tree whose whole
+    // chain is accepted, where the slow path writes big_n linear rows. Every
+    // other case takes the GPU-resident scatter (else) below.
+    let rows_to_keep = accept_len + 1;
     let row_stride = ne * h;
     if hidden_rows_written == big_n && !fast_tape_ok {
+        // CPU-gather from the big_n-row block. The host download is kept here
+        // because this branch gathers via host indices — it would need a
+        // separate D2D gather kernel to go fully GPU-resident. The CPU path
+        // (target_hidden_host) is the only consumer.
+        let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
         target_hidden_host.extend_from_slice(&hidden_block[0..row_stride]);
         for i in 0..accept_len {
             let src_row = accepted_node_indices[i] + 1;
@@ -5441,8 +5455,26 @@ pub fn spec_step_ddtree_batched(
             target_hidden_host.extend_from_slice(&hidden_block[src_start..src_start + row_stride]);
         }
     } else {
-        let rows_to_keep = accept_len + 1;
-        target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * row_stride]);
+        // Fast-tape: block_size=big_n, n_rows=rows_to_keep (take committed prefix).
+        // Slow-tape: block_size=rows_to_keep=hidden_rows_written (linear order).
+        let block_size = hidden_rows_written; // big_n for fast, rows_to_keep for slow
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            block_size,
+            rows_to_keep,
+        )?;
+        let co = target.kv_cache.compact_offset as i32;
+        draft_scratch
+            .thlog
+            .append_committed(position, rows_to_keep, co);
+        // Stage 1b: GPU buffer (scratch.target_hidden) is now authoritative —
+        // the D2D scatter above populated it. No CPU download needed; the
+        // next cycle's draft_forward receives None and skips H2D entirely.
+        // target_hidden_host is intentionally NOT updated (it's unused in the
+        // GPU-resident path).
     }
 
     if debug_tm {
@@ -5462,460 +5494,6 @@ pub fn spec_step_ddtree_batched(
     Ok(SpecStepResult {
         accepted: accept_len,
         bonus_token,
-        drafted,
-        committed,
-    })
-}
-
-/// Auxiliary DeltaNet snapshots that Path C Phase 2 needs but Phase 1
-/// does not. Pre-allocated by the caller (one of each at session start)
-/// and re-used across cycles. Pass `Some(...)` to enable Phase 2 (Step 2
-/// + Step 3 of the PRD); pass `None` for Phase 1 behavior.
-///
-/// - `parent_pre_snap`: the DN state at "after position + accepted_main −
-///   1", i.e. immediately before the branch's parent is forwarded. Saved
-///   by the orchestrator, restored before the branch FA forward.
-/// - `main_end_snap`: the DN state at "after position + accepted_main",
-///   i.e. the main path's final committed state. Saved before the branch
-///   FA forward. Restored on branch reject so callers see the same
-///   `target.dn_state` they would have under Phase 1.
-#[cfg(feature = "deltanet")]
-pub struct Phase2Snapshots<'a> {
-    pub parent_pre_snap: &'a mut DeltaNetSnapshot,
-    pub main_end_snap: &'a mut DeltaNetSnapshot,
-}
-
-/// Path C — main-path-first lazy FA-only re-verify (PRD orchestrator).
-///
-/// PRD: `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
-///
-/// **Phase 1** (`path_c_phase2 = None`): runs Step 1 only — linear verify
-/// on the DDTree's greedy main chain, no branches. Output is bit-exact
-/// with calling [`verify_dflash_block`] directly on the same chain (by
-/// construction — the only forward run IS that linear verify).
-///
-/// **Phase 2** (`path_c_phase2 = Some(...)`): adds Steps 2+3 — at most
-/// **one** lazy branch FA-only re-verify per cycle (the candidate sibling
-/// at fork depth = `accepted_main` whose first token equals the main
-/// verify's bonus). On branch accept the commit is extended by the
-/// accepted branch tokens; on reject behavior matches Phase 1.
-///
-/// **No KV backup buffers needed**. Phase 2 lets the branch FA forward
-/// freely overwrite KV slots past the main path's accept boundary
-/// (`position + accepted_main + 1` onwards). Stale branch K/V written
-/// past the new commit boundary is tolerated by the same mechanism that
-/// makes [`spec_step_dflash`]'s rejected-tail K/V tolerable: the next
-/// decode cycle's verify starts at the new commit boundary and overwrites
-/// every slot it will subsequently read. See `spec_step_dflash` ~line
-/// 3097 for the original write-up of this invariant.
-///
-/// Signature mirrors [`spec_step_ddtree_batched`] for drop-in dispatch
-/// from the daemon, minus the `post_seed_snap` and `scratch` arguments
-/// (this function uses `target_snap` + `path_c_phase2` snapshots instead).
-#[cfg(feature = "deltanet")]
-pub fn spec_step_ddtree_path_c(
-    gpu: &mut Gpu,
-    target: &mut ModelSlot,
-    draft_weights: &DflashWeights,
-    draft_cfg: &DflashConfig,
-    draft_scratch: &mut DflashScratch,
-    hidden_rb: &mut HiddenStateRingBuffer,
-    target_hidden_host: &mut Vec<f32>,
-    target_snap: &mut DeltaNetSnapshot,
-    gdn_tape: &mut GdnTape,
-    verify_scratch: &VerifyScratch,
-    position: usize,
-    seed_token: u32,
-    ctx_slice: Option<usize>,
-    tree_budget: usize,
-    tree_topk: usize,
-    path_c_phase2: Option<Phase2Snapshots<'_>>,
-) -> HipResult<SpecStepResult> {
-    let b = draft_cfg.block_size;
-    let vocab = target.config.vocab_size;
-    let h = draft_cfg.hidden;
-    let ne = draft_cfg.num_extract();
-    assert!(b >= 2, "spec_step_ddtree_path_c: block_size must be ≥ 2");
-    assert_eq!(
-        target_hidden_host.len(),
-        position * ne * h,
-        "target_hidden_host size mismatches position"
-    );
-    assert!(
-        tree_topk >= 1 && tree_topk <= vocab,
-        "tree_topk must be in [1, vocab]"
-    );
-
-    // ── 1+2. GPU-resident draft + per-row top-K (identical to batched path) ──
-    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
-        gpu,
-        target,
-        draft_weights,
-        draft_cfg,
-        draft_scratch,
-        target_hidden_host,
-        position,
-        seed_token,
-        ctx_slice,
-        b,
-        tree_topk,
-    )?;
-
-    // ── 3. Build the DDTree ───────────────────────────────────────────────
-    let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(
-        &top_tokens,
-        &top_log_probs,
-        b - 1,
-        tree_topk,
-        tree_budget,
-        ddtree_logw_cutoff(),
-    );
-    record_ddtree_meta_nodes(tree.num_nodes());
-
-    // ── 3b. Empty-tree shortcut (matches spec_step_ddtree_batched). Also
-    //       handles the degenerate case where build returned a tree with no
-    //       direct root child (would imply main_path is empty too).
-    let main_path: Vec<usize> = if tree.nodes.is_empty() {
-        Vec::new()
-    } else {
-        hipfire_runtime::ddtree::select_main_path(&tree)
-    };
-    if main_path.is_empty() {
-        target_snap.save_from(&target.dn_state, gpu)?;
-        qwen35::forward_scratch_with_hidden(
-            gpu,
-            &target.weights,
-            &target.config,
-            seed_token,
-            position,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            hidden_rb,
-        )?;
-        let logits0 = gpu.download_f32(&target.scratch.logits)?;
-        let bonus = argmax_u32(&logits0);
-        let hidden_block = download_hidden_block(gpu, hidden_rb, 1)?;
-        target_hidden_host.extend_from_slice(&hidden_block[..ne * h]);
-        return Ok(SpecStepResult {
-            accepted: 0,
-            bonus_token: bonus,
-            drafted: vec![seed_token],
-            committed: vec![seed_token, bonus],
-        });
-    }
-
-    // ── 4. Build the main-path verify chain: [seed, main_path tokens…] ───
-    let mut verify_tokens: Vec<u32> = Vec::with_capacity(1 + main_path.len());
-    verify_tokens.push(seed_token);
-    for &ni in &main_path {
-        verify_tokens.push(tree.nodes[ni].token);
-    }
-
-    // ── 5. Snapshot pre-seed target DN state for tape replay below. ──────
-    target_snap.save_from(&target.dn_state, gpu)?;
-
-    // ── 6. Linear verify on the main chain. No tree mask, no linearization
-    //       phase poisoning — RoPE phases match committed slots exactly.
-    //       This is the entire "Step 1" of the PRD's three-step pattern.
-    let main_verify_out = verify_dflash_block(
-        gpu,
-        target,
-        &verify_tokens,
-        position,
-        hidden_rb,
-        Some(gdn_tape),
-        false,
-        verify_scratch,
-    )?;
-    let main_posterior = main_verify_out.argmax_per_pos;
-    debug_assert_eq!(main_posterior.len(), 1 + main_path.len());
-
-    // ── 7. Greedy walk on the main chain (see Phase 1 doc-comment). ──────
-    let mut accepted_main: usize = 0;
-    for j in 0..main_path.len() {
-        let drafted_tok = tree.nodes[main_path[j]].token;
-        if main_posterior[j] == drafted_tok {
-            accepted_main = j + 1;
-        } else {
-            break;
-        }
-    }
-    let bonus_token = main_posterior[accepted_main];
-
-    // ── 8. Drive DN state to "main-end" via tape replay. Same as Phase 1.
-    target_snap.restore_to(&mut target.dn_state, gpu)?;
-    gdn_tape.replay_gdn(
-        gpu,
-        &target.weights,
-        &target.config,
-        &mut target.dn_state,
-        accepted_main + 1,
-    )?;
-
-    // ── 9. Download main verify's hidden rows. download_hidden_block
-    //       reads the LAST `n` rows from the ring; after main verify's
-    //       writes those last `n` rows ARE the main chain's hidden states.
-    //       Branch verify (if any) will overwrite this region of the ring,
-    //       so we must download main rows BEFORE running it.
-    let main_chain_len = 1 + main_path.len();
-    let main_hidden_block = download_hidden_block(gpu, hidden_rb, main_chain_len)?;
-    let row_stride = ne * h;
-
-    // ── 10. Phase 2: lazy branch FA-only re-verify. At most one branch
-    //        per cycle is structurally able to accept (PRD §"Architecture
-    //        /Step 2"): the candidate is the sibling at fork depth =
-    //        `accepted_main` whose first token equals `bonus_token`. All
-    //        other branches' first tokens are guaranteed to mismatch the
-    //        target's posterior at their fork depth (because main verify
-    //        accepted main_path's child there, OR rejected with a posterior
-    //        != any siblings' tokens). So one candidate at most.
-    let mut accepted_branch_indices: Vec<usize> = Vec::new();
-    let mut effective_bonus = bonus_token;
-    let mut branch_hidden_block: Option<Vec<f32>> = None;
-    // Diagnostic counters keyed by HIPFIRE_DDTREE_PATH_C_VERBOSE=1. Tracks
-    // the funnel: how often does the tree even contain a sibling at the
-    // right fork depth, how often does its first token match the main
-    // verify's bonus, and how often does the branch FA forward then accept
-    // ≥1 of its tokens. Lets us tell a "draft has no useful siblings"
-    // signal apart from "draft has them but target rejects" signal.
-    thread_local! {
-        static PATH_C_TOTAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static PATH_C_PHASE2: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static PATH_C_HAS_FORK_SIBLING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static PATH_C_CANDIDATE_FOUND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static PATH_C_BRANCH_ACCEPTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static PATH_C_BRANCH_TOKENS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    PATH_C_TOTAL.with(|c| c.set(c.get() + 1));
-    let verbose = std::env::var("HIPFIRE_DDTREE_PATH_C_VERBOSE")
-        .ok()
-        .as_deref()
-        == Some("1");
-    let mut diag_phase2 = false;
-    let mut diag_fork_sibling = false;
-    let mut diag_candidate = false;
-    let mut diag_accept_branch: usize = 0;
-    if let Some(snaps) = path_c_phase2 {
-        diag_phase2 = true;
-        PATH_C_PHASE2.with(|c| c.set(c.get() + 1));
-        // Save the main-end DN state so we can roll back on branch reject.
-        snaps.main_end_snap.save_from(&target.dn_state, gpu)?;
-
-        // Find the unique candidate branch.
-        let branches =
-            hipfire_runtime::ddtree::enumerate_branches(&tree, &main_path, accepted_main);
-        diag_fork_sibling = branches
-            .iter()
-            .any(|b| b.fork_depth as usize == accepted_main);
-        if diag_fork_sibling {
-            PATH_C_HAS_FORK_SIBLING.with(|c| c.set(c.get() + 1));
-        }
-        let candidate = branches.into_iter().find(|b| {
-            b.fork_depth as usize == accepted_main
-                && tree
-                    .nodes
-                    .get(b.chain[0])
-                    .map(|n| n.token == bonus_token)
-                    .unwrap_or(false)
-        });
-        diag_candidate = candidate.is_some();
-        if diag_candidate {
-            PATH_C_CANDIDATE_FOUND.with(|c| c.set(c.get() + 1));
-        }
-
-        if let Some(branch) = candidate {
-            // Step 2.1: restore DN to the branch parent's pre-state.
-            target_snap.restore_to(&mut target.dn_state, gpu)?;
-            if accepted_main > 0 {
-                gdn_tape.replay_gdn(
-                    gpu,
-                    &target.weights,
-                    &target.config,
-                    &mut target.dn_state,
-                    accepted_main,
-                )?;
-            }
-            // Save it: we'll restore here again on accept to replay
-            // branch tape rows into the correct intermediate state.
-            snaps.parent_pre_snap.save_from(&target.dn_state, gpu)?;
-
-            // Step 2.2: run the branch FA forward. start_pos =
-            // position + accepted_main is the parent's absolute slot;
-            // forwarding [parent_tok, c0, c1, ...] there has the model
-            // see committed RoPE phases (no linearization-slot phase
-            // poisoning) and a freshly-restored DN state for LA layers.
-            //
-            // We pass `Some(gdn_tape)`: branch innovations are captured
-            // into tape rows [0..1+chain.len()], CLOBBERING main verify's
-            // captures. That's safe — main tape was already replayed in
-            // step 8 to drive DN to main-end, we don't need it anymore.
-            let parent_tok = if accepted_main == 0 {
-                seed_token
-            } else {
-                tree.nodes[main_path[accepted_main - 1]].token
-            };
-            let mut branch_chain_tokens: Vec<u32> = Vec::with_capacity(1 + branch.chain.len());
-            branch_chain_tokens.push(parent_tok);
-            for &ni in &branch.chain {
-                branch_chain_tokens.push(tree.nodes[ni].token);
-            }
-            let branch_start_pos = position + accepted_main;
-            let branch_verify_out = verify_dflash_block(
-                gpu,
-                target,
-                &branch_chain_tokens,
-                branch_start_pos,
-                hidden_rb,
-                Some(gdn_tape),
-                false,
-                verify_scratch,
-            )?;
-            let branch_posterior = branch_verify_out.argmax_per_pos;
-            debug_assert_eq!(branch_posterior.len(), 1 + branch.chain.len());
-
-            // Step 2.3: greedy walk on the branch.
-            //   branch_posterior[j] = target's predict at branch_start_pos+j+1
-            //   given prefix [parent, c0, ..., c_{j-1}]. Accept c_j iff
-            //   branch_posterior[j] == c_j.tok.
-            let mut accepted_branch: usize = 0;
-            for j in 0..branch.chain.len() {
-                let drafted_tok = tree.nodes[branch.chain[j]].token;
-                if branch_posterior[j] == drafted_tok {
-                    accepted_branch = j + 1;
-                } else {
-                    break;
-                }
-            }
-
-            diag_accept_branch = accepted_branch;
-            if accepted_branch > 0 {
-                PATH_C_BRANCH_ACCEPTED.with(|c| c.set(c.get() + 1));
-                PATH_C_BRANCH_TOKENS.with(|c| c.set(c.get() + accepted_branch as u32));
-            }
-
-            if accepted_branch == 0 {
-                // Branch reject: restore main-end DN state. KV writes the
-                // branch did at slots > position+accepted_main are stale
-                // but tolerated (next cycle overwrites — see fn doc-comment).
-                snaps.main_end_snap.restore_to(&mut target.dn_state, gpu)?;
-            } else {
-                // Branch accept: extend commit by accepted_branch tokens.
-                // Step 3: drive DN state to "after position + accepted_main +
-                // accepted_branch" via tape replay on the branch tape we
-                // just captured (rows [0..1+accepted_branch]).
-                snaps
-                    .parent_pre_snap
-                    .restore_to(&mut target.dn_state, gpu)?;
-                gdn_tape.replay_gdn(
-                    gpu,
-                    &target.weights,
-                    &target.config,
-                    &mut target.dn_state,
-                    1 + accepted_branch,
-                )?;
-
-                // Branch hidden rows (1 + chain.len() rows for [parent,
-                // c0..c_{chain.len()-1}]). Download now while they're the
-                // most-recent ring writes; we'll skip parent's row at index 0
-                // (it's a duplicate of the corresponding main verify row).
-                let bb = download_hidden_block(gpu, hidden_rb, 1 + branch.chain.len())?;
-                branch_hidden_block = Some(bb);
-
-                // Update the bonus token to the branch's predict-after-last-
-                // accepted slot (= branch_posterior[accepted_branch] —
-                // same off-by-one convention as the main greedy walk).
-                effective_bonus = branch_posterior[accepted_branch];
-
-                // Capture which branch nodes we accepted so we can build
-                // the final committed/drafted lists once we're out of the
-                // Phase 2 block (where the borrow on `branch.chain` ends).
-                accepted_branch_indices.extend_from_slice(&branch.chain[..accepted_branch]);
-            }
-        }
-    }
-
-    // ── 11. Build committed + drafted sequences. Includes any accepted
-    //        branch tokens (empty when Phase 2 is off, no candidate, or
-    //        candidate rejected).
-    let total_accepted = accepted_main + accepted_branch_indices.len();
-    let mut committed: Vec<u32> = Vec::with_capacity(total_accepted + 2);
-    committed.push(seed_token);
-    for j in 0..accepted_main {
-        committed.push(tree.nodes[main_path[j]].token);
-    }
-    for &ni in &accepted_branch_indices {
-        committed.push(tree.nodes[ni].token);
-    }
-    committed.push(effective_bonus);
-
-    let mut drafted: Vec<u32> =
-        Vec::with_capacity(1 + main_path.len() + accepted_branch_indices.len());
-    drafted.push(seed_token);
-    for &ni in &main_path {
-        drafted.push(tree.nodes[ni].token);
-    }
-    for &ni in &accepted_branch_indices {
-        drafted.push(tree.nodes[ni].token);
-    }
-
-    // ── 12. Append accepted hidden rows to target_hidden_host. Same row
-    //        accounting as spec_step_dflash: keep `1 + accepted_count`
-    //        rows (seed + accepted committed); the bonus-token row is
-    //        deliberately NOT appended because its hidden was captured at
-    //        a wrong-token slot (will materialize correctly on next cycle's
-    //        verify). See spec_step_dflash §"step 9" comment block.
-    let main_rows_to_keep = accepted_main + 1; // seed + accepted main
-    target_hidden_host.extend_from_slice(&main_hidden_block[..main_rows_to_keep * row_stride]);
-    if let Some(bb) = &branch_hidden_block {
-        // Branch block layout: row 0 = parent (duplicate), rows
-        // [1..1+accepted_branch] = c_0 .. c_{accepted_branch-1}.
-        let start = row_stride;
-        let end = (1 + accepted_branch_indices.len()) * row_stride;
-        target_hidden_host.extend_from_slice(&bb[start..end]);
-    }
-
-    if verbose {
-        let total = PATH_C_TOTAL.with(|c| c.get());
-        let p2 = PATH_C_PHASE2.with(|c| c.get());
-        let fs = PATH_C_HAS_FORK_SIBLING.with(|c| c.get());
-        let cf = PATH_C_CANDIDATE_FOUND.with(|c| c.get());
-        let ba = PATH_C_BRANCH_ACCEPTED.with(|c| c.get());
-        let bt = PATH_C_BRANCH_TOKENS.with(|c| c.get());
-        let mean_branch = if ba > 0 { bt as f32 / ba as f32 } else { 0.0 };
-        let cand_rate = if p2 > 0 {
-            100.0 * cf as f32 / p2 as f32
-        } else {
-            0.0
-        };
-        let accept_rate = if cf > 0 {
-            100.0 * ba as f32 / cf as f32
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[path-c] cycle: phase2={} acc_main={} fork_sibling={} candidate={} accept_branch={} \
-             | cumul: cycles={} phase2={} fork_sib={} cand={} ({:.1}% of phase2) \
-             accept={} ({:.1}% of cand) mean_branch_tok={:.2}",
-            diag_phase2,
-            accepted_main,
-            diag_fork_sibling,
-            diag_candidate,
-            diag_accept_branch,
-            total,
-            p2,
-            fs,
-            cf,
-            cand_rate,
-            ba,
-            accept_rate,
-            mean_branch,
-        );
-    }
-
-    Ok(SpecStepResult {
-        accepted: total_accepted,
-        bonus_token: effective_bonus,
         drafted,
         committed,
     })
@@ -6160,13 +5738,14 @@ pub fn seed_target_hidden_suffix_abortable(
 /// at eviction cadence (~once per β decoded tokens) so the PCIe round-trip
 /// is amortized — perf impact is small relative to the τ recovery.
 ///
-/// Post-conditions:
-/// - `draft_scratch.target_hidden_abs_positions` has exactly `budget` entries,
-///   each pulled from `retain_mask[i]` of the pre-eviction abs_positions.
+/// Post-conditions (all via `draft_scratch.thlog.rebuild_after_eviction`):
+/// - `thlog.abs_positions()` has exactly `budget` entries, each pulled from
+///   `retain_mask[i]` of the pre-eviction abs_positions.
 /// - `draft_scratch.target_hidden` GPU slots [0..budget) hold the retained
 ///   rows in ascending source order.
-/// - `draft_scratch.uploaded_target_hidden_rows = budget` so the next
-///   draft_forward sees the compacted layout as already-uploaded.
+/// - `thlog.uploaded_rows() == budget` so the next draft_forward sees the
+///   compacted layout as already-uploaded (and the projection cache is
+///   invalidated).
 pub fn apply_eviction_retain_to_draft(
     gpu: &mut rdna_compute::Gpu,
     draft_scratch: &mut dflash::DflashScratch,
@@ -6201,7 +5780,8 @@ pub fn apply_eviction_retain_to_draft(
         compacted.extend_from_slice(row);
         new_abs.push(
             *draft_scratch
-                .target_hidden_abs_positions
+                .thlog
+                .abs_positions()
                 .get(s)
                 .expect("retain_mask index out of range for abs_positions"),
         );
@@ -6211,12 +5791,12 @@ pub fn apply_eviction_retain_to_draft(
         unsafe { std::slice::from_raw_parts(compacted.as_ptr() as *const u8, dst_bytes) };
     gpu.hip
         .memcpy_htod(&draft_scratch.target_hidden.buf, compacted_bytes)?;
-    draft_scratch.target_hidden_abs_positions = new_abs;
-    draft_scratch.uploaded_target_hidden_rows = budget;
-    // The per-layer k_ctx/v_ctx projection cache is indexed by the
-    // pre-eviction row layout. After compaction it's stale — rebuild on
-    // the next draft_forward. One slow cycle per eviction is fine.
-    draft_scratch.invalidate_draft_ctx_cache();
+    // Replace the row layout with the compacted positions and invalidate the
+    // per-layer k_ctx/v_ctx projection cache (indexed by the pre-eviction row
+    // layout, now stale — rebuilt on the next draft_forward; one slow cycle per
+    // eviction is fine). `rebuild_after_eviction` sets the upload watermark to
+    // `new_abs.len()` (== budget) so the two cursors can't desync.
+    draft_scratch.thlog.rebuild_after_eviction(new_abs);
     Ok(())
 }
 

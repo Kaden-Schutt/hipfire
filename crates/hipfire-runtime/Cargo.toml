@@ -403,6 +403,13 @@ required-features = []
 name = "imatrix_collect"
 required-features = []
 
+# C8 GPU sampler kernel validation — distribution-parity gate for
+# batched_categorical_sample_f32 and chain_accept_spec_f32.
+# No model load; uses synthetic logits on GPU.  Requires a live GPU.
+[[example]]
+name = "c8_sampler_validate"
+required-features = []
+
 # ─── Tier 1 calibration binaries (foundation scaffolds, 2026-05-19) ────
 #
 # `collect_imatrix` and `collect_hessian` are the hipfire-native

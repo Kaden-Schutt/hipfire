@@ -470,6 +470,121 @@ impl DflashWeights {
     }
 }
 
+// ─── target_hidden bookkeeping ───────────────────────────────────────────────
+
+/// Encapsulated cursors describing how much of the draft's `target_hidden`
+/// context is live on GPU. Three quantities that MUST move together:
+///
+/// - `uploaded_rows` — rows of `target_hidden` already uploaded H2D (the
+///   delta-upload watermark `draft_forward` reads/advances);
+/// - `abs_positions` — the absolute (pre-compaction) position of every
+///   populated row; its length is always exactly `uploaded_rows`;
+/// - `proj_cached_rows` — rows whose per-layer `k_ctx`/`v_ctx` projection is
+///   cached (`≤ uploaded_rows`).
+///
+/// The fields are PRIVATE (this is a submodule), so the only ways to mutate
+/// them are the invariant-preserving operations below — `seed_prompt`,
+/// `append_committed`, `rebuild_after_eviction`, `reset`, plus the two
+/// `draft_forward`-owned watermarks `mark_uploaded` / `mark_proj_cached`.
+/// A caller can no longer set `uploaded_rows` without `abs_positions` staying
+/// consistent (the desync that bit the generic DFlash path in 89856eab and
+/// the #462 class): that error is now defined out of existence — it does not
+/// compile.
+mod target_hidden_log {
+    /// See module-level intent. Construct via [`TargetHiddenLog::new`].
+    #[derive(Default)]
+    pub struct TargetHiddenLog {
+        uploaded_rows: usize,
+        abs_positions: Vec<i32>,
+        proj_cached_rows: usize,
+    }
+
+    impl TargetHiddenLog {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        // ── reads ────────────────────────────────────────────────────────
+        /// Rows of `target_hidden` already uploaded to GPU (delta watermark).
+        pub fn uploaded_rows(&self) -> usize {
+            self.uploaded_rows
+        }
+        /// Absolute (pre-compaction) position of each populated row;
+        /// `len() == uploaded_rows`.
+        pub fn abs_positions(&self) -> &[i32] {
+            &self.abs_positions
+        }
+        /// Rows whose per-layer k_ctx/v_ctx projection is cached.
+        pub fn proj_cached_rows(&self) -> usize {
+            self.proj_cached_rows
+        }
+
+        // ── invariant-preserving mutations ────────────────────────────────
+        /// New-prompt / session boundary: forget all GPU-resident rows.
+        pub fn reset(&mut self) {
+            self.uploaded_rows = 0;
+            self.abs_positions.clear();
+            self.proj_cached_rows = 0;
+        }
+
+        /// Prompt-prefill seed: `rows` contiguous rows `[0..rows)` are live on
+        /// GPU at contiguous absolute positions.
+        pub fn seed_prompt(&mut self, rows: usize) {
+            self.uploaded_rows = rows;
+            self.abs_positions = (0..rows as i32).collect();
+        }
+
+        /// Divergent-render resume: drop the projection cache back to a
+        /// checkpoint position so the next `draft_forward` re-projects from it.
+        pub fn set_resume_checkpoint(&mut self, ckpt: usize) {
+            self.proj_cached_rows = ckpt;
+        }
+
+        /// Post-commit append: `n` newly committed rows starting at logical
+        /// `base_pos` (with the target KV `compact_offset`) become live. After
+        /// this, `uploaded_rows == base_pos + n` and `abs_positions` has one
+        /// entry per committed row.
+        pub fn append_committed(&mut self, base_pos: usize, n: usize, compact_offset: i32) {
+            debug_assert_eq!(
+                self.abs_positions.len(),
+                base_pos,
+                "append_committed: abs_positions out of sync with base_pos"
+            );
+            self.uploaded_rows = base_pos + n;
+            for p in 0..n {
+                self.abs_positions
+                    .push(base_pos as i32 + p as i32 + compact_offset);
+            }
+        }
+
+        /// Post-eviction rebuild: `new_abs` is the compacted absolute-position
+        /// list (one entry per retained row). Replaces the row layout and
+        /// invalidates the projection cache (row indices shifted).
+        pub fn rebuild_after_eviction(&mut self, new_abs: Vec<i32>) {
+            self.uploaded_rows = new_abs.len();
+            self.abs_positions = new_abs;
+            self.proj_cached_rows = 0;
+        }
+
+        /// Invalidate only the per-layer projection cache (eviction mirror that
+        /// keeps the uploaded rows but shifts their indices).
+        pub fn invalidate_proj_cache(&mut self) {
+            self.proj_cached_rows = 0;
+        }
+
+        /// `draft_forward`-owned: record that `l` rows are now uploaded H2D.
+        pub fn mark_uploaded(&mut self, l: usize) {
+            self.uploaded_rows = l;
+        }
+
+        /// `draft_forward`-owned: record that `l` rows are now projection-cached.
+        pub fn mark_proj_cached(&mut self, l: usize) {
+            self.proj_cached_rows = l;
+        }
+    }
+}
+pub use target_hidden_log::TargetHiddenLog;
+
 // ─── Scratch ───────────────────────────────────────────────────────────────
 
 /// Activation buffers for one forward pass. Sized for up to
@@ -512,27 +627,13 @@ pub struct DflashScratch {
     // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
     pub mq_x_rot: Option<GpuTensor>,
 
-    // Incremental-upload tracker for `target_hidden`. On each draft_forward
-    // call, the caller passes `target_hidden_host` with `l` total rows. If
-    // `uploaded_target_hidden_rows` ≤ l and the caller indicates we can
-    // stream-append (ctx_slice == None in spec_step_dflash), we upload only
-    // the tail [uploaded..l) rows instead of re-sending the full cumulative
-    // context. Drops per-cycle H2D from ~90 MB (full ctx at 1100 tokens ×
-    // 5 layers × 4096 × 4 B) to (accept+1) × 5 × 4096 × 4 B ≈ 700 KB —
-    // saves ~3–5 ms per cycle on mid-length math prompts.
-    //
-    // Set to 0 by `reset_upload_tracking` (called at new-prompt boundary).
-    // draft_forward updates it after each partial upload.
-    pub uploaded_target_hidden_rows: usize,
-
-    /// Absolute (pre-compaction) position of every populated row of
-    /// `target_hidden` on GPU. Length always equals the number of valid rows.
-    /// Used by `spec_step_dflash` to build non-contiguous `positions_k` when
-    /// a TriAttention eviction has compacted `target_hidden` out of order.
-    /// Seeded during prompt ingestion and updated on every cycle commit and
-    /// every eviction mirror. Empty on the ctx_slice=Some path (caller
-    /// manages positions explicitly for that diagnostic mode).
-    pub target_hidden_abs_positions: Vec<i32>,
+    // Encapsulated `target_hidden` cursors: uploaded-row watermark, per-row
+    // absolute positions, and projection-cache extent. The delta-upload
+    // tracker drops per-cycle H2D from ~90 MB (full ctx at 1100 tokens × 5
+    // layers × 4096 × 4 B) to ~700 KB. See `TargetHiddenLog` for the
+    // invariant-preserving API (seed_prompt / append_committed /
+    // rebuild_after_eviction / reset); raw poking is no longer possible.
+    pub thlog: TargetHiddenLog,
 
     /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj,
     /// K additionally post-RMSNorm-via-k_norm, both pre-RoPE). Filled
@@ -549,21 +650,12 @@ pub struct DflashScratch {
     /// its DFlash-on-ggml writeup; this is our equivalent.
     ///
     /// Shapes: each entry is `[max_ctx, kv_dim]` f32.
+    /// The valid extent of these caches (rows `[0..thlog.proj_cached_rows())`
+    /// have finished fc + hidden_norm projection, per-layer wk/wv GEMMs, and
+    /// k_norm; still pre-RoPE). Tracked by `thlog` so it stays consistent with
+    /// the upload watermark.
     pub k_ctx_cached: Vec<GpuTensor>,
     pub v_ctx_cached: Vec<GpuTensor>,
-
-    /// Number of rows valid in `target_hidden_proj`, `k_ctx_cached[*]`, and
-    /// `v_ctx_cached[*]`. Rows `[0..draft_ctx_cached_rows)` have finished
-    /// all of (a) fc + hidden_norm projection into target_hidden_proj,
-    /// (b) per-layer wk/wv GEMMs, (c) per-layer k_norm. They are still
-    /// pre-RoPE — RoPE applies to the full concatenated k_cat each cycle
-    /// (cheap; memory-bound on tiny kv_dim tensors).
-    ///
-    /// Reset to 0 on `reset_upload_tracking` (new prompt) and on
-    /// eviction via `invalidate_draft_ctx_cache`. Next cycle after a
-    /// reset rebuilds the full prefix in one shot — same cost as a
-    /// pre-cache cycle, but amortized thereafter.
-    pub draft_ctx_cached_rows: usize,
 
     /// Per-layer, per-B graph cache for the fixed-shape FFN tail inside
     /// `draft_forward_opts`. The attention/context part depends on `ctx_len`;
@@ -671,11 +763,9 @@ impl DflashScratch {
             positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
 
             mq_x_rot,
-            uploaded_target_hidden_rows: 0,
-            target_hidden_abs_positions: Vec::new(),
+            thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,
-            draft_ctx_cached_rows: 0,
             draft_ffn_graphs,
             draft_ffn_warmed_up,
         })
@@ -687,9 +777,7 @@ impl DflashScratch {
     /// skip required rows. Also clears the draft-ctx projection cache so
     /// the first draft_forward after reset does a full rebuild.
     pub fn reset_upload_tracking(&mut self) {
-        self.uploaded_target_hidden_rows = 0;
-        self.target_hidden_abs_positions.clear();
-        self.draft_ctx_cached_rows = 0;
+        self.thlog.reset();
     }
 
     /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
@@ -701,7 +789,7 @@ impl DflashScratch {
     /// complexity; the rebuild cost is bounded by one slow cycle per
     /// eviction which is rare relative to total cycles.
     pub fn invalidate_draft_ctx_cache(&mut self) {
-        self.draft_ctx_cached_rows = 0;
+        self.thlog.invalidate_proj_cache();
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -1178,12 +1266,12 @@ pub fn draft_forward_opts(
         // every cycle (last N rows shift) — for them, force full upload.
         let row_f32 = ne * h;
         let expected_full_len = l * row_f32;
-        let prev = scratch.uploaded_target_hidden_rows;
+        let prev = scratch.thlog.uploaded_rows();
         // Full-upload conditions: first call, reset flagged, caller shrank
         // the context, or the slice length suggests ctx_slice (unusual l).
         if prev == 0 || prev > l || th_slice.len() != expected_full_len {
             upload_slice_f32(gpu, &scratch.target_hidden, th_slice)?;
-            scratch.uploaded_target_hidden_rows = l;
+            scratch.thlog.mark_uploaded(l);
         } else if prev < l {
             // Delta-upload: rows [prev..l) need to land at byte offset
             // prev * row_f32 * 4 of scratch.target_hidden.
@@ -1193,7 +1281,7 @@ pub fn draft_forward_opts(
                 unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 4) };
             gpu.hip
                 .memcpy_htod_offset(&scratch.target_hidden.buf, dst_byte_off, src_bytes)?;
-            scratch.uploaded_target_hidden_rows = l;
+            scratch.thlog.mark_uploaded(l);
         }
         // prev == l: nothing new to upload (wouldn't happen in practice
         // since caller always appends, but harmless).
@@ -1220,7 +1308,7 @@ pub fn draft_forward_opts(
     //
     // Dispatch on fc weight dtype: F32 → gemm_f32_batched (legacy),
     // MQ4 → FWHT-rotate target_hidden then gemm_hfq4g256.
-    let cached_rows = scratch.draft_ctx_cached_rows;
+    let cached_rows = scratch.thlog.proj_cached_rows();
     let delta = l.saturating_sub(cached_rows);
     if delta > 0 {
         let src_offset_elems = cached_rows * ne * h;
@@ -1549,7 +1637,7 @@ pub fn draft_forward_opts(
     // All rows [0..l) of target_hidden_proj and every layer's
     // k_ctx_cached / v_ctx_cached now contain finalized per-layer
     // projections. Next call's delta starts from here.
-    scratch.draft_ctx_cached_rows = l;
+    scratch.thlog.mark_proj_cached(l);
 
     Ok(())
 }

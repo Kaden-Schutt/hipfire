@@ -108,6 +108,14 @@ pub struct DeepseekV4Config {
     /// populated at load time from the sidecar.
     #[serde(skip)]
     pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
+
+    /// Whether to load the DSpark 3-stage drafter sidecar (`<stem>-dspark.<ext>`)
+    /// during `load_weights`. Set by the loader from the `speculation` selector
+    /// (`dspark`/`auto` → true, any other mechanism → false) so a 3×MoE sidecar
+    /// is not paged into VRAM when DSpark won't run. Defaults to `true` for a
+    /// directly-driven daemon (no CLI selector). Not (de)serialized.
+    #[serde(skip)]
+    pub load_dspark: bool,
 }
 
 /// Raw upstream JSON shape — only the fields we read. Used to drive
@@ -223,6 +231,7 @@ impl DeepseekV4Config {
             num_nextn_predict_layers: raw.num_nextn_predict_layers,
             num_hash_layers: raw.num_hash_layers,
             reap_keep: None,
+            load_dspark: true,
         };
         // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
         // 256→144) by partial-loading this full quant. Read BEFORE the
@@ -240,6 +249,100 @@ impl DeepseekV4Config {
             config.reap_keep = Some(std::sync::Arc::new(plan));
         }
         Ok(config)
+    }
+}
+
+/// DSpark draft-module config, parsed from the DSpark sidecar HFQ's metadata
+/// (the released DeepSeek-V4-Flash-DSpark `config.json` carries these `dspark_*`
+/// keys). Absent on the trunk and on plain MTP sidecars — `from_metadata_json`
+/// returns `None` when `dspark_block_size` is missing, so non-DSpark files are
+/// unaffected. The number of MTP stages is NOT taken from config (the released
+/// config reports `num_nextn_predict_layers=1` even though the shipped DSpark
+/// checkpoint has 3 `mtp.{0,1,2}` stages) — the loader probes the tensor index
+/// instead. See docs/design/2026-06-28-dspark-deepseek4-forward-spec.md.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsparkConfig {
+    /// Draft block width (slots predicted per step). V4-Flash: 5.
+    pub block_size: usize,
+    /// Target residual-stream layers whose HC-mean-pooled hidden states are
+    /// concatenated and fed through `main_proj`. V4-Flash: [40, 41, 42].
+    pub target_layer_ids: Vec<usize>,
+    /// Low-rank dim of the vanilla Markov bias head. V4-Flash: 256.
+    pub markov_rank: usize,
+    /// Token id used to fill draft block slots 1.. (slot 0 = real token).
+    pub noise_token_id: u32,
+}
+
+impl DsparkConfig {
+    /// Parse from an HFQ `metadata_json` (the outer
+    /// `{"architecture":.., "config":{..}}` envelope). Returns `None` when the
+    /// `config` wrapper or `dspark_block_size` is absent (i.e. not a DSpark
+    /// sidecar), so callers can treat `None` as "plain MTP / no DSpark".
+    pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
+        let wrapper: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+        let cfg = wrapper.get("config")?;
+        let block_size = cfg.get("dspark_block_size")?.as_u64()? as usize;
+        if block_size == 0 {
+            return None;
+        }
+        let target_layer_ids = cfg
+            .get("dspark_target_layer_ids")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as usize))
+            .collect::<Vec<_>>();
+        let markov_rank = cfg.get("dspark_markov_rank")?.as_u64()? as usize;
+        let noise_token_id = cfg.get("dspark_noise_token_id")?.as_u64()? as u32;
+        Some(Self {
+            block_size,
+            target_layer_ids,
+            markov_rank,
+            noise_token_id,
+        })
+    }
+}
+
+/// GPU-resident weights for the DSpark 3-stage draft module. Loaded from
+/// the separate `<stem>-dspark.<ext>` sidecar (arch_id=9), additive to the
+/// trunk's single-stage `DeepseekV4Weights::mtp_layer` — they coexist.
+///
+/// Each `stages[s]` is a full `DeepseekV4LayerWeights` carrying that stage's
+/// dense attention + FFN + HC + routed experts under the `mtp.{s}` prefix.
+/// DSpark stages have NO enorm/hnorm/e_proj/h_proj (those are MTP-only); the
+/// last stage additionally stores the head-HC mix (`mtp_hc_head_*`) and the
+/// final norm (`mtp_final_norm`) in its layer fields.
+///
+/// The DSpark-specific globals (`main_proj`/`main_norm` from stage 0,
+/// `markov_w1`/`markov_w2`/`confidence_proj` from the last stage) live
+/// directly on this struct.
+pub struct DsparkWeights {
+    pub cfg: DsparkConfig,
+    pub stages: Vec<DeepseekV4LayerWeights>,
+    pub main_proj: Option<rdna_compute::GpuTensor>,
+    pub main_norm: Option<rdna_compute::GpuTensor>,
+    pub markov_w1: Option<rdna_compute::GpuTensor>,
+    pub markov_w2: Option<rdna_compute::GpuTensor>,
+    pub confidence_proj: Option<rdna_compute::GpuTensor>,
+}
+
+impl DsparkWeights {
+    /// Release every GPU buffer the DSpark module owns. Frees the DSpark
+    /// globals then drains each stage via `DeepseekV4LayerWeights::free_gpu`
+    /// (which reclaims the per-stage hc_head + final-norm fields too).
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.main_proj);
+        free_opt(gpu, &mut self.main_norm);
+        free_opt(gpu, &mut self.markov_w1);
+        free_opt(gpu, &mut self.markov_w2);
+        free_opt(gpu, &mut self.confidence_proj);
+        for stage in self.stages.drain(..) {
+            stage.free_gpu(gpu);
+        }
     }
 }
 
@@ -291,6 +394,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         num_nextn_predict_layers: raw.num_nextn_predict_layers,
         num_hash_layers: raw.num_hash_layers,
         reap_keep: None,
+        load_dspark: true,
     })
 }
 
@@ -453,6 +557,79 @@ pub struct DeepseekV4LayerWeights {
 }
 
 impl DeepseekV4LayerWeights {
+    /// Shallow-clone this layer: all `Option<GpuTensor>` fields are
+    /// non-owning aliases of the same device buffers; CPU-side vecs and
+    /// scalar fields are cheap-copied. Used by `Deepseek4DsparkBody` to
+    /// hold references into the bundle's DSpark stage weights without
+    /// taking ownership.
+    pub fn shallow_clone(&self) -> Self {
+        fn sc(t: &Option<rdna_compute::GpuTensor>) -> Option<rdna_compute::GpuTensor> {
+            t.as_ref().map(|t| t.shallow_clone())
+        }
+        Self {
+            compress_ratio: self.compress_ratio,
+            attn_norm: sc(&self.attn_norm),
+            ffn_norm: sc(&self.ffn_norm),
+            q_norm: sc(&self.q_norm),
+            kv_norm: sc(&self.kv_norm),
+            attn_sink: sc(&self.attn_sink),
+            wq_a: sc(&self.wq_a),
+            wq_b: sc(&self.wq_b),
+            wkv: sc(&self.wkv),
+            wo_a: sc(&self.wo_a),
+            wo_b: sc(&self.wo_b),
+            compressor_wkv: sc(&self.compressor_wkv),
+            compressor_wgate: sc(&self.compressor_wgate),
+            compressor_norm: sc(&self.compressor_norm),
+            compressor_ape: sc(&self.compressor_ape),
+            compressor_wkv_f16: sc(&self.compressor_wkv_f16),
+            compressor_wgate_f16: sc(&self.compressor_wgate_f16),
+            indexer_wq_b: sc(&self.indexer_wq_b),
+            indexer_weights_proj: sc(&self.indexer_weights_proj),
+            indexer_compressor_wkv: sc(&self.indexer_compressor_wkv),
+            indexer_compressor_wgate: sc(&self.indexer_compressor_wgate),
+            indexer_compressor_wkv_f16: sc(&self.indexer_compressor_wkv_f16),
+            indexer_compressor_wgate_f16: sc(&self.indexer_compressor_wgate_f16),
+            indexer_compressor_norm: sc(&self.indexer_compressor_norm),
+            indexer_compressor_ape: sc(&self.indexer_compressor_ape),
+            mtp_enorm: sc(&self.mtp_enorm),
+            mtp_hnorm: sc(&self.mtp_hnorm),
+            mtp_e_proj: sc(&self.mtp_e_proj),
+            mtp_h_proj: sc(&self.mtp_h_proj),
+            mtp_final_norm: sc(&self.mtp_final_norm),
+            mtp_hc_head_fn: sc(&self.mtp_hc_head_fn),
+            mtp_hc_head_base: sc(&self.mtp_hc_head_base),
+            mtp_hc_head_scale: self.mtp_hc_head_scale,
+            hc_attn_base: sc(&self.hc_attn_base),
+            hc_attn_fn: sc(&self.hc_attn_fn),
+            hc_attn_scale: sc(&self.hc_attn_scale),
+            hc_ffn_base: sc(&self.hc_ffn_base),
+            hc_ffn_fn: sc(&self.hc_ffn_fn),
+            hc_ffn_scale: sc(&self.hc_ffn_scale),
+            gate_weight: sc(&self.gate_weight),
+            gate_bias: sc(&self.gate_bias),
+            gate_bias_host: self.gate_bias_host.clone(),
+            tid2eid_host: self.tid2eid_host.clone(),
+            tid2eid_dev: sc(&self.tid2eid_dev),
+            shared_w1: sc(&self.shared_w1),
+            shared_w2: sc(&self.shared_w2),
+            shared_w3: sc(&self.shared_w3),
+            expert_w1_blob: sc(&self.expert_w1_blob),
+            expert_w2_blob: sc(&self.expert_w2_blob),
+            expert_w3_blob: sc(&self.expert_w3_blob),
+            expert_w1_ptrs: sc(&self.expert_w1_ptrs),
+            expert_w2_ptrs: sc(&self.expert_w2_ptrs),
+            expert_w3_ptrs: sc(&self.expert_w3_ptrs),
+            expert_w1_stride: self.expert_w1_stride,
+            expert_w2_stride: self.expert_w2_stride,
+            expert_w3_stride: self.expert_w3_stride,
+            expert_gate_up_blob: sc(&self.expert_gate_up_blob),
+            expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
+            expert_gate_up_stride: self.expert_gate_up_stride,
+            expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
+        }
+    }
+
     pub fn new_empty(compress_ratio: u32) -> Self {
         DeepseekV4LayerWeights {
             compress_ratio,
@@ -616,6 +793,10 @@ pub struct DeepseekV4Weights {
     /// `input_proj` conditioning on the base model's hidden state.
     /// `None` at scaffold stage; populated when Phase 5 ships.
     pub mtp_layer: Option<DeepseekV4LayerWeights>,
+    /// Optional DSpark 3-stage draft module, loaded from the
+    /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
+    /// present. `None` when no DSpark sidecar exists (silent no-op).
+    pub dspark: Option<DsparkWeights>,
     pub _scaffold: (),
 }
 
@@ -649,6 +830,9 @@ impl DeepseekV4Weights {
         }
         if let Some(mtp) = self.mtp_layer.take() {
             mtp.free_gpu(gpu);
+        }
+        if let Some(d) = self.dspark.take() {
+            d.free_gpu(gpu);
         }
     }
 
@@ -1016,6 +1200,54 @@ pub struct DeepseekV4State {
     pub head_x_f16: Option<rdna_compute::GpuTensor>,
     pub head_logits_batch: Option<rdna_compute::GpuTensor>,
 
+    // ── DSpark draft-module state (lazy; only allocated when the DSpark
+    //    drafter is loaded and `dspark_forward` runs). ────────────────
+    /// Per-stage committed main_kv SWA ring `[n_kv, head_dim, window]`.
+    /// One ring per DSpark stage (each stage attends over its own
+    /// running main_kv history). Lazily allocated on first
+    /// `dspark_forward` call; `dspark_swa_k[s] == None` until then.
+    pub dspark_swa_k: Vec<Option<rdna_compute::GpuTensor>>,
+    /// Dedicated block-scratch (`max_batch >= block_size`) for the DSpark
+    /// 3-stage chain. Allocated once and reused across decode steps.
+    pub dspark_pbs: Option<crate::forward::PrefillBatchScratch>,
+    /// `main_x = main_norm(main_proj(main_hidden))` `[hidden]` — computed
+    /// once per `dspark_forward` (forward_embed) and shared by all stages.
+    pub dspark_main_x: Option<rdna_compute::GpuTensor>,
+    /// Bidirectional staging buffer `[block, head_dim, stage_w]` for the
+    /// per-stage attention. Constant-sized (block/head_dim/win are model
+    /// constants) and fully overwritten every stage by `dspark_stage_kv`
+    /// (including the zeroed tail), so it is allocated once and reused across
+    /// decode steps rather than per `dspark_forward` call — which leaked it on
+    /// any early `?` before the success-path free.
+    pub dspark_staged: Option<rdna_compute::GpuTensor>,
+
+    // ── DSpark target-hidden capture (gated; populated by the batched
+    //    trunk forward when `dspark_capture_active` is set). ───────────
+    /// When false (default) the capture block in `forward_prefill_batch_chunk`
+    /// is a byte-for-byte no-op. Set true only by the DSpark drafter path
+    /// before a prefill whose target-layer hidden states it needs.
+    pub dspark_capture_active: bool,
+    /// Trunk layer indices whose post-FFN HC-mean-pooled hidden state is
+    /// captured (e.g. `[40, 41, 42]`). The capture slot for a layer is its
+    /// index within this Vec.
+    pub dspark_target_layers: Vec<usize>,
+    /// Capture buffer `[max_batch, n_target_layers, hidden]` F32. Lazily
+    /// allocated inside the capture block (needs `pbs.max_batch`).
+    pub dspark_caps: Option<rdna_compute::GpuTensor>,
+    /// `[max_batch, hc_mult=4]` F32 filled with `0.25` — the mean-pool
+    /// weight vector fed to `hc_input_map_4stream_batched`. Lazy.
+    pub dspark_cap_ones: Option<rdna_compute::GpuTensor>,
+    /// Assembled `[n_target_layers * hidden]` main-hidden vector, the
+    /// concatenation of the captured per-target-layer slots for one batch
+    /// position. Reused across `dspark_assemble_main_hidden` calls.
+    pub dspark_main_hidden: Option<rdna_compute::GpuTensor>,
+    /// Trunk-sized PrefillBatchScratch used by the generic `DsparkDrafter`
+    /// to run the bootstrap (1-token capture) and verify (K+1 token trunk
+    /// prefill) forwards. Separate from `dspark_pbs` (which is body-owned
+    /// and sized to the DSpark block, not the trunk verify window).
+    /// Lazily allocated by `capture_seed_main_hidden` / `new_spec_scratch`.
+    pub dspark_verify_pbs: Option<crate::forward::PrefillBatchScratch>,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -1111,6 +1343,16 @@ impl DeepseekV4State {
             head_norm_batch: None,
             head_x_f16: None,
             head_logits_batch: None,
+            dspark_swa_k: Vec::new(),
+            dspark_pbs: None,
+            dspark_main_x: None,
+            dspark_staged: None,
+            dspark_capture_active: false,
+            dspark_target_layers: Vec::new(),
+            dspark_caps: None,
+            dspark_cap_ones: None,
+            dspark_main_hidden: None,
+            dspark_verify_pbs: None,
             n_tokens: 0,
             _scaffold: (),
         })
@@ -1316,6 +1558,23 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.wo_a_out_rot);
         free_opt(gpu, &mut self.head_hc_pre);
         free_opt(gpu, &mut self.head_hc_out);
+        // DSpark draft-module state.
+        for ring in self.dspark_swa_k.drain(..) {
+            if let Some(t) = ring {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.dspark_main_x);
+        free_opt(gpu, &mut self.dspark_staged);
+        free_opt(gpu, &mut self.dspark_caps);
+        free_opt(gpu, &mut self.dspark_cap_ones);
+        free_opt(gpu, &mut self.dspark_main_hidden);
+        if let Some(pbs) = self.dspark_pbs.take() {
+            pbs.free_gpu(gpu);
+        }
+        if let Some(pbs) = self.dspark_verify_pbs.take() {
+            pbs.free_gpu(gpu);
+        }
     }
 }
 
@@ -1364,6 +1623,28 @@ mod tests {
         assert_eq!(raw.index_topk, 512);
         assert_eq!(raw.sliding_window, 128);
         assert_eq!(raw.compress_ratios.len(), 8);
+    }
+
+    #[test]
+    fn parses_dspark_config_and_skips_non_dspark() {
+        // DSpark sidecar metadata envelope (subset of the real config keys).
+        let dspark_meta = r#"{"architecture":"deepseek_v4","config":{
+            "dspark_block_size":5,
+            "dspark_target_layer_ids":[40,41,42],
+            "dspark_markov_rank":256,
+            "dspark_noise_token_id":128799}}"#;
+        let c = DsparkConfig::from_metadata_json(dspark_meta)
+            .expect("DSpark sidecar metadata must parse");
+        assert_eq!(c.block_size, 5);
+        assert_eq!(c.target_layer_ids, vec![40, 41, 42]);
+        assert_eq!(c.markov_rank, 256);
+        assert_eq!(c.noise_token_id, 128799);
+
+        // A trunk / plain-MTP metadata envelope (no dspark_* keys) → None.
+        let plain_meta = r#"{"architecture":"deepseek_v4","config":{"hidden_size":4096}}"#;
+        assert!(DsparkConfig::from_metadata_json(plain_meta).is_none());
+        // Missing config wrapper → None (not a panic).
+        assert!(DsparkConfig::from_metadata_json("{}").is_none());
     }
 
     /// Verify the parser handles the actual released DeepSeek V4 config.json

@@ -35,13 +35,19 @@ for the persistent config keys.
 
 | Flag | Purpose |
 |---|---|
-| `--spec <m>` | Mechanism selector: `off` / `auto` / `ngram` / `dflash` / `mtp`. |
+| `--spec <m>` | Mechanism selector: `off` / `auto` / `ngram` / `dflash` / `mtp` / `dspark`. |
 | `-md, --model-draft <path>` | DFlash draft model path. Implies `--spec dflash` unless `--spec` is also given. |
 | `--draft-max, --draft <N>` | Draft window of the active mechanism (n-gram K / MTP k). |
+| `--dspark-conf-threshold <f>` | DSpark confidence-truncation cutoff `0..1` (qwen3 + deepseek4). Unset = per-arch default (qwen3 `0.1`, deepseek4 `0.3`). |
+
+`dspark` uses the model's `<stem>-dspark.<ext>` draft-module sidecar (a small dense
+drafter) if present. Its draft block size is picked per request by a default-on
+τ-adaptive controller (disable with `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`).
 
 ```bash
 hipfire run qwen3.5:9b --spec ngram "Repeat verbatim: ..."   # model-free, byte-identical to AR
 hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq "..."  # draft-model DFlash
+hipfire run qwen3-8b --spec dspark "Write an LRU cache"       # DSpark draft-module sidecar
 ```
 
 ## Configuration

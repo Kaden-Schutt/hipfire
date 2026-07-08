@@ -15085,6 +15085,86 @@ impl Gpu {
         result
     }
 
+    /// K2-pipelined WMMA GEMM: F16 weight × pre-converted F16 input → F32 output.
+    ///
+    /// Like `gemm_f16_batched_lmhead` (RDNA3 arm) but takes a caller-owned F16
+    /// `x_f16` buffer instead of an F32 `x` that goes through `ensure_fp16_x`.
+    /// This avoids polluting the shared `fp16_x_source_ptr` cache, which is
+    /// critical when DSpark's `run_heads` runs immediately before the trunk's
+    /// verify pass (both use `ensure_fp16_x` — cache poisoning by DSpark would
+    /// force 36-layer × 2+ reconversions per verify window, +18ms regression).
+    ///
+    /// Pre-zeros `y` so the residual `+=` in `gemm_mw16_residual_wmma` collapses
+    /// to `=` semantics (same as `gemm_f16_batched_lmhead`).
+    /// Requires `has_wmma_w32()` (RDNA3/RDNA3.5). Falls back to
+    /// `gemm_f16_x_f16_wmma` on non-WMMA arches (should not occur in practice).
+    ///
+    /// K must be a multiple of 32 (K2 loop step).
+    pub fn gemm_mw16_residual_wmma_f16x(
+        &mut self,
+        w_f16: &GpuTensor,
+        x_f16: &GpuTensor, // [batch_size, k] F16, caller-owned
+        y: &GpuTensor,     // [batch_size, m] F32, output
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Pre-zero Y: gemm_mw16_residual_wmma does Y += acc.
+        match self.active_stream.as_ref() {
+            Some(stream) => self
+                .hip
+                .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        // Ensure kernel is compiled.
+        self.ensure_kernel(
+            "gemm_mw16_residual_wmma",
+            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
+            "gemm_mw16_residual_wmma",
+        )?;
+        let wp = w_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let ni = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        let rows = ((m + 15) / 16) as u32;
+        let batches = ((batch_size + 15) / 16) as u32;
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_mw16_residual_wmma",
+            [rows, batches, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(ni);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// WMMA lm_head fast path for DFlash. Computes y = A @ x at batch>1 via
     /// the residual-WMMA kernel on pre-zeroed y — 8-10× faster than the
     /// scalar `gemm_hfq4g256` on 9B lm_head (batch=16, vocab=248K, k=2560).

@@ -8,7 +8,7 @@ This document is the single canonical reference for every environment variable h
 
 | Layer | Count | Notes |
 |---|---|---|
-| `HIPFIRE_*` env vars | 118 | 14 plumbed through TUI, 45 mentioned in some doc, 59 silent |
+| `HIPFIRE_*` env vars | 116 | 14 plumbed through TUI, 46 mentioned in some doc, 56 silent |
 | Non-`HIPFIRE_*` project env vars | 21 | Test/example/diag scaffolding. Should be renamed `HIPFIRE_*` for consistency. |
 | `config.json` schema (`HipfireConfig`) | ~40 keys | Validated by `validateConfigValue()` in `cli/index.ts`. Some keys map 1:1 to env vars set at daemon spawn. |
 | `per_model_config.json` overrides | same surface | Sparse overrides on top of the base config, applied per model tag. |
@@ -59,19 +59,21 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2126` |
 | `HIPFIRE_ATTN_FLASH` | ATTN | — | `cli/index.ts:797` |
 | `HIPFIRE_BLOB_FORCE` | GRAPH-DIAG | "" (set to "1" to enable) | `crates/rdna-compute/src/dispatch.rs:652` |
+| `HIPFIRE_CACHE_CKPT_INTERVAL` | DFLASH-CKPT | 2048 (min 256) | `crates/hipfire-arch-qwen35/src/dflash_spec.rs:build_dflash_speculator` |
+| `HIPFIRE_CACHE_CKPT_MAX` | DFLASH-CKPT | 8 (min 1) | `crates/hipfire-arch-qwen35/src/dflash_spec.rs:build_dflash_speculator` |
 | `HIPFIRE_CALIB_PROFILE` | DIAG-DUMP | — | `crates/hipfire-runtime/examples/triattn_validate.rs:32` |
 | `HIPFIRE_CHATML` | PROMPT-FRAME | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/probe_argmax_agreement.rs:43` |
 | `HIPFIRE_DDTREE_BUDGET` | DDTREE-RESEARCH | — | `crates/hipfire-runtime/examples/daemon.rs:1702` |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | DDTREE-RESEARCH | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/speculative.rs:4073` |
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | DDTREE-RESEARCH | — | `crates/hipfire-arch-qwen35/src/speculative.rs:86` |
 | `HIPFIRE_DDTREE_PATH_B_CAPTURE` | DDTREE-RESEARCH | — | `crates/hipfire-arch-qwen35/src/speculative.rs:4011` |
-| `HIPFIRE_DDTREE_PATH_C` | DDTREE-RESEARCH | — | `crates/hipfire-runtime/examples/daemon.rs:2095` |
-| `HIPFIRE_DDTREE_PATH_C_VERBOSE` | DDTREE-RESEARCH | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/speculative.rs:4566` |
 | `HIPFIRE_DDTREE_TAPE_DUMP` | DDTREE-RESEARCH | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/speculative.rs:4090` |
 | `HIPFIRE_DDTREE_TOPK` | DDTREE-RESEARCH | — | `crates/hipfire-runtime/examples/daemon.rs:1774` |
 | `HIPFIRE_DDTREE_TREE_LA` | DDTREE-RESEARCH | — | `crates/hipfire-arch-qwen35/src/speculative.rs:3968` |
+| `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DRAFT/SPEC | env tier of the DSpark conf ladder; unset → deepseek4 default 0.3 | `crates/hipfire-arch-deepseek4/src/dspark_speculator.rs:206` |
 | `HIPFIRE_DETERMINISTIC` | MISC-USER | "" (set to "1" to enable) | `crates/rdna-compute/src/dispatch.rs:7380` |
 | `HIPFIRE_DEVICES` | MULTI-GPU | — | `crates/hipfire-runtime/src/multi_gpu.rs:351` |
+| `HIPFIRE_DFLASH_CKPT_RESUME` | DFLASH-CKPT | on (`0` disables; also off when CASK eviction active) | `crates/hipfire-arch-qwen35/src/dflash_spec.rs:build_dflash_speculator` |
 | `HIPFIRE_DFLASH_DRAFT` | DFLASH-USER | — | `cli/index.ts:479` |
 | `HIPFIRE_DFLASH_LOOP_BREAK` | DFLASH-SAFETYNET | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:732` |
 | `HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS` | DFLASH-SAFETYNET | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:750` |
@@ -86,6 +88,11 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_DRAFT_F16` | DRAFT/SPEC | — | `crates/hipfire-runtime/src/dflash.rs:193` |
 | `HIPFIRE_DRAFT_GEMM_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hipfire-runtime/src/dflash.rs:571` |
 | `HIPFIRE_DRAFT_SUBPHASE` | DRAFT/SPEC | "" (set to "1" to enable) | `crates/hipfire-runtime/src/dflash.rs:805` |
+| `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | DRAFT/SPEC | on (`0` disables the τ-adaptive block controller → fixed draft block) | `crates/hipfire-runtime/src/dspark_core.rs:build_dspark_speculator` |
+| `HIPFIRE_DSPARK_HFQ4_WMMA` | DSPARK-KERNEL | on (`0` disables the HFQ4 WMMA drafter GEMM path) | `crates/hipfire-runtime/src/dspark_core.rs:459` |
+| `HIPFIRE_DSPARK_PROFILE` | PERF-DIAG | "" (set to "1" for per-window phase timing) | `crates/hipfire-runtime/src/dspark_core.rs:DsparkProfiler::new` |
+| `HIPFIRE_DSPARK_Q8_4W` | DSPARK-KERNEL | on (`0` disables the Q8 WMMA 4-wide path) | `crates/hipfire-runtime/src/dspark_core.rs:391` |
+| `HIPFIRE_DSPARK_Q8_WMMA` | DSPARK-KERNEL | on (`0` disables the Q8 WMMA drafter GEMM path) | `crates/hipfire-runtime/src/dspark_core.rs:383` |
 | `HIPFIRE_DTOH_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hip-bridge/src/ffi.rs:594` |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | MISC-USER | — | `cli/index.ts:808` |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | ATTN | — | `crates/hipfire-arch-qwen35/src/qwen35.rs:2750` |
@@ -150,6 +157,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | EXAMPLE | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/daemon.rs:719` |
 | `HIPFIRE_QA_KV_MODES` | TEST-HARNESS | — | `crates/hipfire-runtime/examples/test_inferenceQA.rs:606` |
 | `HIPFIRE_QUANT_THREADS` | LIB | — | `crates/hipfire-quantize/src/main.rs:2053` |
+| `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | DRAFT/SPEC | env tier of the DSpark conf ladder; unset → qwen3 default 0.1 | `crates/hipfire-loader/src/carriers.rs:675` |
 | `HIPFIRE_RDNA2_VARIANT` | KERNEL-SELECTOR | — | `cli/index.ts:2593` |
 | `HIPFIRE_REPLAY_GRAPH` | GRAPH-DIAG | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/speculative.rs:630` |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/dispatch.rs:690` |
@@ -299,19 +307,34 @@ Per-draft-model behavior knobs.
 - `HIPFIRE_SPEC_PHASES=1` — emit per-phase spec-decode timing JSON.
 - `HIPFIRE_SAMPLE_COMPARE=1` — compare sample tokens against a reference path (development only).
 
-### `DDTREE-RESEARCH` (9)
+### `DDTREE-RESEARCH` (7)
 
-DDTree (tree-mode spec-decode) research surface. Per `findings/path-d-vs-path-c.md` and CLAUDE.md memory entries, **Path D and tree-mode pipelining are empirically dominated** across all tested model regimes. These vars are research artifacts; most can be retired.
+DDTree (tree-mode spec-decode) research surface. Per `findings/path-d-vs-path-c.md` and CLAUDE.md memory entries, **Path D and tree-mode pipelining are empirically dominated** across all tested model regimes. These vars are research artifacts; most can be retired. (`HIPFIRE_DDTREE_BUDGET`/`_TOPK`/`_VERIFY`/`_TREE_LA`/`_LOGW_CUTOFF` are now resolved through `rdna_compute::FeatureFlags` and read via `gpu.flags`.)
 
-- `HIPFIRE_DDTREE_BUDGET` — tree-search budget.
+- `HIPFIRE_DDTREE_BUDGET` — tree-search budget (0/unset ⇒ chain mode).
 - `HIPFIRE_DDTREE_TOPK` — top-K branching factor.
-- `HIPFIRE_DDTREE_PATH_C` — Path C phase selector (`phase1`/`phase2`).
-- `HIPFIRE_DDTREE_PATH_C_VERBOSE=1` — verbose Path C tracing.
+- `HIPFIRE_DDTREE_VERIFY` — temp>0 verify scheme: `swor` (default) or `naive`.
 - `HIPFIRE_DDTREE_PATH_B_CAPTURE` — Path B capture flag.
 - `HIPFIRE_DDTREE_TAPE_DUMP=1` — dump verify tape JSON.
 - `HIPFIRE_DDTREE_LOGW_CUTOFF` — log-weight cutoff threshold.
 - `HIPFIRE_DDTREE_FORCE_SLOW=1` — force slow-path verify (gather-based; structurally inferior per memory).
-- `HIPFIRE_DDTREE_TREE_LA` — linear-attention tree mode flag.
+- `HIPFIRE_DDTREE_TREE_LA` — linear-attention tree mode flag (default on).
+
+### `DFLASH-CKPT` (3)
+
+DeltaNet divergent-render checkpoint ring (qwen3.5/3.6 DFlash). Because the
+DeltaNet recurrent state can't be sliced to an arbitrary prefix like attention
+KV, multi-turn prompt-cache reuse on a *divergent* turn rewinds to the nearest
+checkpoint ≤ the divergence point and replays only the suffix instead of
+re-prefilling cold. Resolved once at speculator-build time (`build_dflash_speculator`).
+
+- `HIPFIRE_DFLASH_CKPT_RESUME` — master switch for the checkpoint ring + divergent
+  resume (default on; `0` disables). Also force-disabled when FlashCASK eviction
+  is active (eviction reorders state, so position-keyed snapshots can't be trusted).
+- `HIPFIRE_CACHE_CKPT_INTERVAL` — snapshot cadence in positions (default 2048,
+  floored at 256). Smaller ⇒ finer resume granularity, more snapshots.
+- `HIPFIRE_CACHE_CKPT_MAX` — checkpoint ring capacity (default 8, floored at 1).
+  Bounds snapshot VRAM; oldest entries drop when exceeded.
 
 ### `NGRAM-DETECTOR` (2)
 
@@ -516,7 +539,7 @@ Kernel-selectors, MMQ tuning, NGram detector, GraphMoE, KV physical cap. Power-u
 ### Retire candidates (~15-20)
 
 Likely-dead research artifacts:
-- `HIPFIRE_DDTREE_*` cluster (9 vars) — Path D empirically dominated, see CLAUDE.md memory
+- `HIPFIRE_DDTREE_*` cluster (7 vars) — Path D empirically dominated, see CLAUDE.md memory
 - `HIPFIRE_DFLASH_SEED_ORACLE` — Phase B oracle research, scrapped
 - `HIPFIRE_DDTREE_PATH_B_CAPTURE` — same Path D track
 - `HIPFIRE_DRAFT_SUBPHASE`, `HIPFIRE_DRAFT_GEMM_DUMP` — diag dumps tied to deprecated work

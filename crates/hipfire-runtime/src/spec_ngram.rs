@@ -203,7 +203,7 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         // new suffix (hit → no reset, from prefill_start). The target owns the
         // chunked/abortable forward; we only need its KV + recurrent state moved.
         let start = if cache_hit { prefill_start } else { 0 };
-        let adv = target.spec_advance(gpu, prefill_tokens, start, !cache_hit, abort)?;
+        let adv = target.spec_advance(gpu, prefill_tokens, start, !cache_hit, abort, None)?;
         let first_token = match adv {
             SpecAdvance::Aborted => return Ok(PrefillOutcome::Aborted),
             SpecAdvance::Ready { last_argmax } => last_argmax,
@@ -221,6 +221,7 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         seed: u32,
         emitted: &[u32],
         _grammar: Option<&mut dyn SpecGrammar>,
+        _temp: f32, // n-gram verify is greedy-only
     ) -> Result<SpecStep, String> {
         // Propose the draft (pure CPU) BEFORE borrowing scratch.
         let draft = self.drafter.propose(emitted, seed, self.block_size - 1);
@@ -246,7 +247,9 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         // Verify: target snapshots its pre-state into `scratch`, runs the block,
         // leaves state advanced by b. Greedy → per-position argmax; sampled →
         // per-position sample at temp/(top_k,top_p) (faithful for a point-mass
-        // n-gram draft via the same accept-prefix below).
+        // n-gram draft via the same accept-prefix below). The trailing `None`
+        // hidden_out sink is the DFlash hidden-capture arg the n-gram path never
+        // uses.
         let picks = if sampled {
             target.verify_block_sampled(
                 gpu,
@@ -259,7 +262,7 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
                 &mut rng_state,
             )?
         } else {
-            target.verify_block(gpu, &block, position, scratch)?
+            target.verify_block(gpu, &block, position, scratch, None)?
         };
 
         // Shared accept-prefix (eos=None: EOS handled downstream by the daemon

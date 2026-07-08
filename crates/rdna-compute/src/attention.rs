@@ -33,6 +33,80 @@ fn wmma_fa_min_batch() -> usize {
 }
 
 impl Gpu {
+    /// DSpark bidirectional staging assembly (on-GPU; replaces a host
+    /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
+    ///
+    /// Builds `staged[block, head_dim, stage_w]` from the committed main_kv
+    /// ring (`ring`, layout `[n_kv=1, head_dim, win]`) and the per-block KV
+    /// (`block_kv`, `[block, kv_dim]`, `kv_dim == head_dim`). All `block` rows
+    /// are identical (bidirectional); columns `>= n_committed+block` are zeroed.
+    /// Runs on `active_stream` so it pipelines with the rest of the stage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_stage_kv(
+        &mut self,
+        ring: &GpuTensor,
+        block_kv: &GpuTensor,
+        staged: &GpuTensor,
+        win: usize,
+        kv_dim: usize,
+        head_dim: usize,
+        n_committed: usize,
+        block: usize,
+        stage_w: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "dspark_stage_kv",
+            kernels::DSPARK_STAGE_KV_SRC,
+            "dspark_stage_kv",
+        )?;
+
+        let ring_ptr = ring.buf.as_ptr();
+        let bkv_ptr = block_kv.buf.as_ptr();
+        let st_ptr = staged.buf.as_ptr();
+        let win_i = win as i32;
+        let kvd = kv_dim as i32;
+        let hd = head_dim as i32;
+        let nc = n_committed as i32;
+        let blk = block as i32;
+        let sw = stage_w as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ring_ptr as *const _ as *mut c_void,
+            &bkv_ptr as *const _ as *mut c_void,
+            &st_ptr as *const _ as *mut c_void,
+            &win_i as *const _ as *mut c_void,
+            &kvd as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
+            &blk as *const _ as *mut c_void,
+            &sw as *const _ as *mut c_void,
+        ];
+
+        let threads = 256u32;
+        let grid_x = ((head_dim as u32) + threads - 1) / threads;
+        self.launch_maybe_blob(
+            "dspark_stage_kv",
+            [grid_x, block as u32, 1],
+            [threads, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ring_ptr);
+                b.push_ptr(bkv_ptr);
+                b.push_ptr(st_ptr);
+                b.push_i32(win_i);
+                b.push_i32(kvd);
+                b.push_i32(hd);
+                b.push_i32(nc);
+                b.push_i32(blk);
+                b.push_i32(sw);
+                b
+            },
+        )
+    }
+
     /// accs_count: [n_layers * n_heads * n_bands] u64 sample counters.
     /// All accs_* buffers persist across calls; the kernel ADDS into them.
     ///

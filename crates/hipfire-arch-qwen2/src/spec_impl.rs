@@ -95,6 +95,7 @@ impl SpecTarget for Qwen2Bundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Pure attention: "reset" rewinds the position cursor; the per-token
         // prefill then overwrites KV at the absolute positions it writes.
@@ -123,6 +124,7 @@ impl SpecTarget for Qwen2Bundle {
         block: &[u32],
         position: usize,
         _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         // Block-parallel verify (default): one batched layer loop writes the
         // block's K/V to the F32 cache at absolute positions [position..) then

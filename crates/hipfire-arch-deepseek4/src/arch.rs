@@ -16,7 +16,8 @@
 //! the tests.
 
 use crate::deepseek4::{
-    DeepseekV4Config, DeepseekV4LayerWeights, DeepseekV4State, DeepseekV4Weights,
+    DeepseekV4Config, DeepseekV4LayerWeights, DeepseekV4State, DeepseekV4Weights, DsparkConfig,
+    DsparkWeights,
 };
 use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
@@ -627,6 +628,7 @@ impl DeepseekV4 {
             hc_head_scale: 1.0, // overwritten at load time
             layers,
             mtp_layer: None, // skipped by quantize per `mtp.` prefix; Phase 5 work.
+            dspark: None,    // DSpark sidecar discovered+loaded in load_weights_inner.
             _scaffold: (),
         })
     }
@@ -1612,7 +1614,306 @@ impl DeepseekV4 {
             }
         }
 
+        // ── DSpark 3-stage drafter sidecar discovery ─────────────────────
+        // Additive to the single-stage MTP load above. Mirrors the `-mtp`
+        // addon resolution but for a `<stem>-dspark.<ext>` sidecar holding the
+        // `mtp.{0,1,2}.*` DSpark stages (arch_id=9). Gated by `config.load_dspark`,
+        // which the loader sets from the `speculation` selector (`dspark`/`auto`
+        // → true, any other mechanism → false) so the 3×MoE sidecar is not paged
+        // into VRAM when DSpark won't run. A missing sidecar is a silent no-op
+        // (`weights.dspark` stays None).
+        if cfg.load_dspark {
+            let base = hfq.path();
+            let dspark_path: Option<std::path::PathBuf> =
+                match (base.parent(), base.file_stem(), base.extension()) {
+                    (Some(parent), Some(file_stem), Some(ext)) => Some(parent.join(format!(
+                        "{}-dspark.{}",
+                        file_stem.to_string_lossy(),
+                        ext.to_string_lossy()
+                    ))),
+                    _ => None,
+                };
+            if let Some(p) = dspark_path.filter(|c| c.exists()) {
+                eprintln!("deepseek4: opening DSpark sidecar HFQ {p:?}");
+                let mut dspark_hfq = HfqFile::open(&p).map_err(|e| {
+                    format!("deepseek4: failed to open DSpark sidecar {p:?}: {e:?}")
+                })?;
+                dspark_hfq.drop_mmap();
+                weights.dspark = Self::load_dspark(&dspark_hfq, gpu, cfg)?;
+            }
+        }
+
         Ok(weights)
+    }
+
+    /// Load the dense per-stage tensors of one DSpark stage under `prefix`
+    /// (`mtp.{s}`). Mirrors the single-stage MTP dense block but parameterized
+    /// on the prefix and WITHOUT the MTP-only enorm/hnorm/e_proj/h_proj (those
+    /// are absent on DSpark stages — their layer fields stay None). The
+    /// per-stage hc_head / final-norm and the routed experts are loaded by the
+    /// caller (`load_dspark`).
+    fn load_dspark_stage_dense(
+        source: &HfqFile,
+        gpu: &mut Gpu,
+        prefix: &str,
+        layer: &mut DeepseekV4LayerWeights,
+    ) -> Result<(), String> {
+        // Norms (F16 on disk → F32 on GPU).
+        layer.attn_norm = Some(Self::upload_global_f16_as_f32(
+            source,
+            gpu,
+            &format!("{prefix}.attn_norm.weight"),
+        )?);
+        layer.ffn_norm = Some(Self::upload_global_f16_as_f32(
+            source,
+            gpu,
+            &format!("{prefix}.ffn_norm.weight"),
+        )?);
+        layer.q_norm = Some(Self::upload_global_f16_as_f32(
+            source,
+            gpu,
+            &format!("{prefix}.attn.q_norm.weight"),
+        )?);
+        layer.kv_norm = Some(Self::upload_global_f16_as_f32(
+            source,
+            gpu,
+            &format!("{prefix}.attn.kv_norm.weight"),
+        )?);
+        layer.attn_sink = Some(Self::upload_global_f16_as_f32(
+            source,
+            gpu,
+            &format!("{prefix}.attn.attn_sink"),
+        )?);
+
+        // Attention LoRA + KV joint (MQ-family / Q8F16 / F16).
+        layer.wq_a = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wq_a.weight"),
+        )?);
+        layer.wq_b = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wq_b.weight"),
+        )?);
+        layer.wkv = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wkv.weight"),
+        )?);
+        layer.wo_a = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wo_a.weight"),
+        )?);
+        layer.wo_b = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.attn.wo_b.weight"),
+        )?);
+
+        // HC blocks (raw F16 matrices for the hc_* kernels).
+        layer.hc_attn_base = Some(Self::upload_global_raw(
+            source,
+            gpu,
+            &format!("{prefix}.hc_attn_base"),
+        )?);
+        layer.hc_attn_fn = Some(Self::upload_global_raw(
+            source,
+            gpu,
+            &format!("{prefix}.hc_attn_fn"),
+        )?);
+        layer.hc_attn_scale = Some(Self::upload_global_raw(
+            source,
+            gpu,
+            &format!("{prefix}.hc_attn_scale"),
+        )?);
+        layer.hc_ffn_base = Some(Self::upload_global_raw(
+            source,
+            gpu,
+            &format!("{prefix}.hc_ffn_base"),
+        )?);
+        layer.hc_ffn_fn = Some(Self::upload_global_raw(
+            source,
+            gpu,
+            &format!("{prefix}.hc_ffn_fn"),
+        )?);
+        layer.hc_ffn_scale = Some(Self::upload_global_raw(
+            source,
+            gpu,
+            &format!("{prefix}.hc_ffn_scale"),
+        )?);
+
+        // FFN router (score-routed; gate weight + bias, bias host-cached).
+        layer.gate_weight = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.gate.weight"),
+        )?);
+        let bias_gpu =
+            Self::upload_global_f16_as_f32(source, gpu, &format!("{prefix}.ffn.gate.bias"))?;
+        layer.gate_bias_host = gpu
+            .download_f32(&bias_gpu)
+            .map_err(|e| format!("d2h dspark {prefix} gate_bias: {e:?}"))?;
+        layer.gate_bias = Some(bias_gpu);
+
+        // Shared expert.
+        layer.shared_w1 = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.shared_experts.w1.weight"),
+        )?);
+        layer.shared_w2 = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.shared_experts.w2.weight"),
+        )?);
+        layer.shared_w3 = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("{prefix}.ffn.shared_experts.w3.weight"),
+        )?);
+
+        Ok(())
+    }
+
+    /// Load the full DSpark 3-stage drafter from an already-opened sidecar
+    /// `source`. Returns `None` when the sidecar carries no DSpark config
+    /// (`DsparkConfig::from_metadata_json` absent). Probes the stage count by
+    /// walking `mtp.{N}.attn_norm.weight` until absent, builds one
+    /// `DeepseekV4LayerWeights` per stage (dense + routed experts), and on the
+    /// LAST stage additionally loads the head-HC mix + final norm. The DSpark
+    /// globals (`main_proj`/`main_norm` from stage 0, `markov_*` /
+    /// `confidence_proj` from the last stage) are loaded after the stages.
+    pub fn load_dspark(
+        source: &HfqFile,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+    ) -> Result<Option<DsparkWeights>, String> {
+        let dspark_cfg = match DsparkConfig::from_metadata_json(&source.metadata_json) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Guard: every target layer must index a real trunk layer. An
+        // out-of-range id never matches in the capture hook
+        // (`forward_prefill_batch_chunk`), so its capture slot stays
+        // stale/zero, `main_hidden` degrades, and draft quality silently
+        // collapses (acceptance craters; output stays greedy-correct). Fail
+        // loud at load instead of shipping a lobotomized drafter.
+        if let Some(&bad) = dspark_cfg
+            .target_layer_ids
+            .iter()
+            .find(|&&l| l >= cfg.num_hidden_layers)
+        {
+            return Err(format!(
+                "deepseek4: DSpark target_layer_id {bad} >= num_hidden_layers {} (sidecar/trunk mismatch)",
+                cfg.num_hidden_layers
+            ));
+        }
+
+        // Probe stage count: `mtp.{N}.attn_norm.weight` until absent.
+        let mut n_stages = 0usize;
+        while source
+            .find_tensor_info(&format!("mtp.{n_stages}.attn_norm.weight"))
+            .is_some()
+        {
+            n_stages += 1;
+        }
+        if n_stages == 0 {
+            return Err("deepseek4: DSpark config present but no mtp.{N} stages found".into());
+        }
+        eprintln!("deepseek4: DSpark drafter present — uploading {n_stages} stages");
+
+        let last = n_stages - 1;
+        let mut stages: Vec<DeepseekV4LayerWeights> = Vec::with_capacity(n_stages);
+        for s in 0..n_stages {
+            let prefix = format!("mtp.{s}");
+            let mut layer = DeepseekV4LayerWeights::new_empty(0);
+            Self::load_dspark_stage_dense(source, gpu, &prefix, &mut layer)?;
+            Self::upload_layer_routed_experts(
+                source,
+                gpu,
+                &prefix,
+                cfg.n_routed_experts,
+                &mut layer,
+                None,
+                None,
+            )?;
+            if s == last {
+                // Last stage carries the head-HC mix + final norm.
+                layer.mtp_hc_head_fn = Some(Self::upload_global_raw(
+                    source,
+                    gpu,
+                    &format!("{prefix}.hc_head_fn"),
+                )?);
+                layer.mtp_hc_head_base = Some(Self::upload_global_raw(
+                    source,
+                    gpu,
+                    &format!("{prefix}.hc_head_base"),
+                )?);
+                {
+                    let scale_name = format!("{prefix}.hc_head_scale");
+                    let (info, bytes) = source
+                        .tensor_data_pread(&scale_name)
+                        .ok_or_else(|| format!("deepseek4: {scale_name} missing"))?;
+                    if info.shape != vec![1] {
+                        return Err(format!(
+                            "deepseek4: {scale_name} unexpected shape {:?}",
+                            info.shape
+                        ));
+                    }
+                    layer.mtp_hc_head_scale =
+                        hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
+                            bytes[0], bytes[1],
+                        ]));
+                }
+                layer.mtp_final_norm = Some(Self::upload_global_f16_as_f32(
+                    source,
+                    gpu,
+                    &format!("{prefix}.norm.weight"),
+                )?);
+            }
+            stages.push(layer);
+        }
+
+        // DSpark globals. main_proj/main_norm live on stage 0; the Markov
+        // head + confidence head live on the last stage.
+        let main_proj = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            "mtp.0.main_proj.weight",
+        )?);
+        let main_norm = Some(Self::upload_global_f16_as_f32(
+            source,
+            gpu,
+            "mtp.0.main_norm.weight",
+        )?);
+        let markov_w1 = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("mtp.{last}.markov_head.markov_w1.weight"),
+        )?);
+        let markov_w2 = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("mtp.{last}.markov_head.markov_w2.weight"),
+        )?);
+        let confidence_proj = Some(Self::upload_quant_or_f16(
+            source,
+            gpu,
+            &format!("mtp.{last}.confidence_head.proj.weight"),
+        )?);
+
+        Ok(Some(DsparkWeights {
+            cfg: dspark_cfg,
+            stages,
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+        }))
     }
 }
 
@@ -1982,6 +2283,7 @@ impl DeepseekV4 {
             hc_head_scale: 1.0,
             layers,
             mtp_layer: None,
+            dspark: None,
             _scaffold: (),
         };
 

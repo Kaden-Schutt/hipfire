@@ -333,8 +333,7 @@ fn main() {
         prompt_tokens.len(),
     )
     .expect("seed scatter");
-    draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-    draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
+    draft_scratch.thlog.seed_prompt(prompt_tokens.len());
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
     eprintln!(

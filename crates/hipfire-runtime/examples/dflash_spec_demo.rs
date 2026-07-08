@@ -177,14 +177,6 @@ fn main() {
                                     // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
                                     // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
     let mut ddtree_batched: bool = false;
-    // --ddtree-path-c={phase1|phase2}: dispatch through `spec_step_ddtree_path_c`
-    // (PRD docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd).
-    //   phase1 = main-path-first linear verify only (bit-exact gate vs
-    //            verify_dflash_block on the same chain).
-    //   phase2 = phase1 + lazy branch FA-only re-verify on the unique
-    //            structurally-acceptable candidate (Steps 2+3).
-    // Implies --ddtree (and uses --ddtree-budget / --ddtree-topk).
-    let mut ddtree_path_c_phase: Option<String> = None;
     // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
     // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
     // Default ON (2026-04-17): bare prompts send the model off-distribution.
@@ -385,19 +377,6 @@ fn main() {
                 ddtree_batched = true;
                 ddtree_enabled = true; // implies --ddtree
                 i += 1;
-            }
-            "--ddtree-path-c" => {
-                let phase = args[i + 1].clone();
-                if phase != "phase1" && phase != "phase2" {
-                    eprintln!(
-                        "--ddtree-path-c expects 'phase1' or 'phase2' (got: {})",
-                        phase
-                    );
-                    std::process::exit(2);
-                }
-                ddtree_path_c_phase = Some(phase);
-                ddtree_enabled = true; // implies --ddtree
-                i += 2;
             }
             "--chatml" => {
                 chatml = true;
@@ -712,12 +691,6 @@ fn main() {
     // DeltaNetSnapshot is cheap (~100 MB on 9B) and unused if --ddtree is off.
     let mut post_seed_snap =
         DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("post-seed snap");
-    // Path C Phase 2 auxiliary snapshots. Allocated unconditionally, used
-    // only when --ddtree-path-c=phase2. See speculative::Phase2Snapshots.
-    let mut path_c_parent_pre_snap =
-        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("path-c parent-pre snap");
-    let mut path_c_main_end_snap =
-        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("path-c main-end snap");
     // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
     // positions, allocated once and reused every spec step. Enables the
     // rollback path to replay GDN recurrence without re-running the target.
@@ -738,30 +711,9 @@ fn main() {
     // avoids the per-cycle malloc+htod+free churn that dominated early wall-
     // clock numbers. Also allocated for non-ddtree runs (cheap, small) so
     // callers can switch strategies at runtime without reinit.
-    // KV-gather + tape-gather scratch are sized here too (slow-path-kill,
-    // 2026-04-23). Widths come from the target config: FA K/V row byte
-    // counts depend on n_kv_heads × head_dim × quant, and the GdnTape's
-    // qkv_dim = 2*k_dim + v_dim on the LA side.
-    let ddtree_qkv_dim = {
-        let kd = target.config.linear_num_key_heads * target.config.linear_key_head_dim;
-        let vd = target.config.linear_num_value_heads * target.config.linear_value_head_dim;
-        kd * 2 + vd
-    };
-    let ddtree_n_fa_layers = target
-        .config
-        .layer_types
-        .iter()
-        .filter(|t| **t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
-        .count();
-    let ddtree_scratch = hipfire_arch_qwen35::speculative::DdtreeScratch::new(
-        &mut gpu,
-        ddtree_budget,
-        target.config.n_kv_heads,
-        target.config.head_dim,
-        ddtree_qkv_dim,
-        ddtree_n_fa_layers,
-    )
-    .expect("alloc ddtree scratch");
+    let ddtree_scratch =
+        hipfire_arch_qwen35::speculative::DdtreeScratch::new(&mut gpu, ddtree_budget)
+            .expect("alloc ddtree scratch");
     // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
     // rotation scratch, argmax buf). Sized to max_n = max(block_size,
     // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
@@ -1062,11 +1014,10 @@ fn main() {
             prompt_tokens.len(), // n_rows:     keep all of them
         )
         .expect("seed scatter");
-        draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-        // Seed per-row absolute positions for the draft's cross-attention RoPE.
-        // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
-        // stay byte-identical to the old contiguous-range behaviour.
-        draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
+        // Seed the upload watermark + per-row absolute positions for the
+        // draft's cross-attention RoPE. Pre-eviction these match [0..prompt_len)
+        // exactly, so FlashCASK-free runs stay byte-identical.
+        draft_scratch.thlog.seed_prompt(prompt_tokens.len());
         let prefill_secs = t2.elapsed().as_secs_f64();
         let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
         eprintln!(
@@ -1279,10 +1230,16 @@ fn main() {
         let mut pld_accepted: usize = 0;
 
         if ddtree_enabled {
-            if temp > 0.0 {
+            if temp > 0.0 && !ddtree_batched {
                 eprintln!(
-                    "WARNING: --ddtree with temp>0 falls back to greedy on the verify side for \
-                this spike (rejection-sampling integration is deferred)."
+                    "WARNING: --ddtree (non-batched) with temp>0 falls back to greedy on \
+                the verify side. Use --ddtree-batched for distribution-preserving naive tree sampling."
+                );
+            }
+            if temp > 0.0 && ddtree_batched {
+                eprintln!(
+                    "temp>0 + --ddtree-batched: distribution-preserving naive tree sampling \
+                (sample target, accept drafted child it lands on)."
                 );
             }
             if pld_enabled {
@@ -1633,35 +1590,7 @@ fn main() {
                 pld_hits += 1;
             }
             let step = if ddtree_enabled {
-                if let Some(phase) = ddtree_path_c_phase.as_deref() {
-                    let phase2_snaps = if phase == "phase2" {
-                        Some(speculative::Phase2Snapshots {
-                            parent_pre_snap: &mut path_c_parent_pre_snap,
-                            main_end_snap: &mut path_c_main_end_snap,
-                        })
-                    } else {
-                        None
-                    };
-                    speculative::spec_step_ddtree_path_c(
-                        &mut gpu,
-                        &mut target,
-                        &draft_weights,
-                        &draft_cfg,
-                        &mut draft_scratch,
-                        &mut hidden_rb,
-                        &mut target_hidden_host,
-                        &mut target_snap,
-                        &mut gdn_tape,
-                        &verify_scratch,
-                        position,
-                        seed_token,
-                        ctx_slice,
-                        ddtree_budget,
-                        ddtree_topk,
-                        phase2_snaps,
-                    )
-                    .expect("ddtree-path-c spec step")
-                } else if ddtree_batched {
+                if ddtree_batched {
                     speculative::spec_step_ddtree_batched(
                         &mut gpu,
                         &mut target,
@@ -1680,6 +1609,8 @@ fn main() {
                         ctx_slice,
                         ddtree_budget,
                         ddtree_topk,
+                        runtime_temp,
+                        &mut rng_state,
                     )
                     .expect("ddtree-batched spec step")
                 } else {
@@ -1720,7 +1651,7 @@ fn main() {
                     if no_tape { None } else { Some(&mut gdn_tape) },
                     runtime_temp,
                     1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
-                    0, // top_k: demo has no top-k CLI; 0 = disabled
+                    0,       // top_k: demo has no top-k CLI; 0 = disabled
                     &mut rng_state,
                     block_override,
                     ngram_cache.as_ref(),

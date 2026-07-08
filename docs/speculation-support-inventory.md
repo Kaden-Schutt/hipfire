@@ -1,8 +1,8 @@
 # Speculation Support Inventory (per architecture)
 
 **Status:** living document — updated while the n-gram seam work proceeds.
-**Last updated:** 2026-06-23
-**Branch:** `feature/speculator-abstraction`
+**Last updated:** 2026-06-27
+**Branch:** `feature/speculator-ddtree`
 **Scope:** what speculative-decode mechanism each model architecture supports in
 hipfire today, plus — for arches with no native drafter — what (if anything)
 exists upstream. Compiled from a per-architecture audit (one agent per arch crate
@@ -21,7 +21,10 @@ exists upstream. Compiled from a per-architecture audit (one agent per arch crat
 - **MTP** — learned multi-token-prediction head shipped *with* the model weights
   (DeepSeek-V3/V4, Qwen3.5/3.6 style).
 - **DFlash** — hipfire's block-diffusion drafter (published technique, arXiv
-  2602.06036 / Z Lab). Currently qwen35-specific (`crates/hipfire-arch-qwen35/src/dflash_spec.rs`).
+  2602.06036 / Z Lab). Qwen35-specific bespoke path
+  (`crates/hipfire-arch-qwen35/src/dflash_spec.rs`); also available for any
+  dense-attention target (LLaMA / plain Qwen3, arch 0/1) via the target-generic
+  chain speculator (`crates/hipfire-runtime/src/dflash_generic.rs`).
 - **SpecTarget verify seam** — arch-generic verify interface
   (`SpecTarget`/`Speculator`, shared `accept_greedy_prefix`). An arch's
   `spec_impl.rs` plugs in as the verify target. Sequential `verify_block`
@@ -34,7 +37,7 @@ exists upstream. Compiled from a per-architecture audit (one agent per arch crat
 |---|---|---|---|---|---|
 | qwen35 | 5/6 | Qwen3.5/3.6 (DeltaNet hybrid) | DFlash + MTP + n-gram + SpecTarget verify | ✅ DFlash (default greedy) + MTP head | ✅ DFlash & n-gram default-wired; MTP gated `HIPFIRE_QWEN35_MTP=1` |
 | deepseek4 | 9 | DeepSeek-V4 (MLA+MoE) | MTP + SpecTarget verify | ✅ MTP head (ships in weights) | ✅ auto at temp=0 if MTP weights present (spec_k=2, greedy-only) |
-| llama | 0/1 | Llama/Mistral/Qwen3 dense | n-gram + SpecTarget verify | ❌ (model-free n-gram only) | ✅ n-gram opt-in `HIPFIRE_NGRAM_DRAFT=1` |
+| llama | 0/1 | Llama/Mistral/Qwen3 dense | DFlash (block-diffusion, z-lab-style draft) + n-gram + SpecTarget verify | ✅ DFlash via external arch_id=20 HFQ draft (see below) | ✅ DFlash auto if `params.draft` is set to an arch_id=20 HFQ; n-gram opt-in `HIPFIRE_NGRAM_DRAFT=1` |
 | qwen2 | 7 | Qwen2/2.5, VibeThinker | n-gram + SpecTarget verify (block-parallel) | ❌ (model-free n-gram only) | ✅ n-gram opt-in |
 | qwen35-vl | 5 | Qwen3.5/3.6-VL | none (VL path is AR, CPU-sampled) | ❌ | ❌ (text backbone *is* qwen35 — reusable) |
 | minimax | 10 | MiniMax-M2 (MoE) | n-gram + SpecTarget verify | ❌ (model-free n-gram only) | ✅ n-gram opt-in `HIPFIRE_NGRAM_DRAFT=1` |
@@ -43,7 +46,8 @@ exists upstream. Compiled from a per-architecture audit (one agent per arch crat
 | dots-ocr | 8 | rednote dots.ocr (Qwen2-1.5B decoder) | n-gram + SpecTarget verify (VL decode-phase) | ❌ (model-free n-gram only) | ✅ n-gram opt-in (image-conditioned prefill unchanged) |
 
 **Has real speculation today:** qwen35 (DFlash + MTP), deepseek4 (MTP),
-llama/qwen2 (model-free n-gram only). Everything else is plain autoregressive.
+llama/qwen3 (DFlash via generic chain speculator + n-gram), qwen2 (n-gram).
+Everything else is plain autoregressive.
 
 ## Per-arch detail
 
@@ -65,14 +69,35 @@ llama/qwen2 (model-free n-gram only). Everything else is plain autoregressive.
   n-gram primitives intentionally return `Err`).
 - Upstream: DeepSeek-V3/V4 ship 1 MTP module in public weights (`num_nextn_predict_layers=1`).
 
-### llama (arch 0/1) & qwen2 (arch 7)
-- Both implement `SpecTarget` and route to `generate_dflash`→`generate_spec` when
-  `m.speculator.is_some()` (daemon arm: qwen2 at `daemon.rs:5836`, the template
-  for the work below).
-- qwen2's verify is block-parallel (`forward_verify_block_batched`,
-  `attention_decode_batched_history`); llama's is `verify_block_argmax`.
-- Both: model-free n-gram only, opt-in. **Ceiling:** unbatched MQ4G256/HFQ4
+### llama (arch 0/1, LLaMA / Mistral / plain Qwen3 dense)
+- **DFlash** (block-diffusion, z-lab-style): target-generic chain speculator
+  (`crates/hipfire-runtime/src/dflash_generic.rs`). Requires an external
+  arch_id=20 HFQ draft produced by `dflash_convert` from a z-lab `-DFlash`
+  safetensors checkpoint. Supplied via the daemon `load` message `params.draft`
+  field (path to the `.hfq` file). Auto-wired in `LlamaCarrier::load` when
+  `draft_path` is set to a valid arch_id=20 HFQ.
+  - **DDTree tree-SWOR** (shipped default): one tree-masked target forward per
+    cycle; lossless / token-identical to AR at temp 0, distribution-exact at
+    temp>0. Knobs: `HIPFIRE_DDTREE_BUDGET` (default 8), `HIPFIRE_DDTREE_TOPK`
+    (default 2).
+  - **Greedy chain** (`HIPFIRE_DFLASH_TREE=0` to opt out of the tree arm):
+    lossless / token-identical to AR; temp>0 uses SpecInfer NAIVE sampling
+    (distribution-exact).
+  - **Empirical note (gfx1151):** break-even acceptance τ ≈ 2.5–3; the win is
+    drafter-acceptance-bound. Batched GEMMs at B=1 limit verify-side gains.
+- **n-gram**: opt-in `HIPFIRE_NGRAM_DRAFT=1`. **Ceiling:** unbatched MQ4G256/HFQ4
   projection GEMMs mean spec doesn't beat AR on every workload yet.
+- Verify is `verify_block_argmax` (sequential); `verify_block_logits` and
+  `verify_tree_logits` implemented for the DFlash chain and tree arms.
+- Daemon wired: `generate_dflash`→`generate_spec` when `m.speculator.is_some()`.
+
+### qwen2 (arch 7, Qwen2/2.5, VibeThinker)
+- Implements `SpecTarget` and routes to `generate_dflash`→`generate_spec` when
+  `m.speculator.is_some()` (daemon arm at `daemon.rs:5836`, the template).
+- Verify is block-parallel (`forward_verify_block_batched`,
+  `attention_decode_batched_history`).
+- **n-gram only** (opt-in `HIPFIRE_NGRAM_DRAFT=1`). **Ceiling:** unbatched
+  MQ4G256/HFQ4 projection GEMMs mean spec doesn't beat AR on every workload yet.
 
 ## Models missing a native drafter — what exists upstream
 

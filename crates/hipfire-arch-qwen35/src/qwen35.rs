@@ -128,21 +128,6 @@ pub struct TreeVerifyCtx<'a> {
     /// use tree-aware kernels that read parent state from the per-layer
     /// s_tape scratch in `PrefillBatchScratch`.
     pub parent_indices: Option<&'a GpuTensor>,
-    /// Per-FA-layer F32 scratch buffers for capturing K BEFORE RoPE is
-    /// applied. Used by Path B slow-path-kill: on the slow path, the
-    /// speculative caller gathers accepted K rows out of these scratches,
-    /// re-runs RoPE with COMMITTED slot phases (instead of the
-    /// linearization phases the in-cache K carries), and re-quants to
-    /// the committed kv_cache slots — avoiding a full re-verify forward
-    /// while preserving RoPE phase correctness.
-    ///
-    /// Slice length must equal the number of FullAttention layers in
-    /// `config.layer_types`; each entry is a `[max_n × n_kv_heads × head_dim]`
-    /// F32 tensor (max_n = 1 + tree budget). When `None`, capture is
-    /// skipped (zero overhead). When `Some`, every tree-verify FA layer
-    /// memcpy_dtod's its `pbs.fa_k_batch` (post-norm, pre-RoPE) into the
-    /// scratch BEFORE the rope kernel mutates it.
-    pub pre_rope_k_capture: Option<&'a [GpuTensor]>,
 }
 
 #[derive(Debug, Clone)]
@@ -7975,7 +7960,6 @@ pub(crate) struct PrefillBandCtx<'a> {
     pub layer_end: usize,
     pub delta_layer_offset: usize,
     pub kv_layer_offset: usize,
-    pub fa_layer_offset: usize,
     pub is_first_band: bool,
     pub is_last_band: bool,
     /// Per-device asym{2,3,4} givens replicas. When `Some`, the chunk's
@@ -8330,10 +8314,6 @@ fn forward_prefill_chunk(
     // (band==None) seeds zeros — original behavior.
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
-    // Path B: per-FA-layer counter, drives the index into
-    // tree_verify.pre_rope_k_capture[]. Increments alongside each
-    // FullAttention layer iteration regardless of MoE/non-MoE variant.
-    let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
     let ctx = DispatchCtx::new(gpu); // hoisted — arch-constant, safe to reuse per-layer
 
     for layer_idx in layer_start..layer_end {
@@ -9602,30 +9582,6 @@ fn forward_prefill_chunk(
                     }
                 }
 
-                // Path B pre-RoPE K capture (slow-path-kill, WIP).
-                // The next line mutates pbs.fa_k_batch in place — capture
-                // BEFORE so the slow path has the unrotated K available
-                // and can apply RoPE for the COMMITTED slot phases instead
-                // of these linearization-slot phases. Capture is None
-                // unless the env gate + the per-FA-layer scratch are both
-                // wired through TreeVerifyCtx.
-                if let Some(slots) = tree_verify.as_ref().and_then(|c| c.pre_rope_k_capture) {
-                    if let Some(slot) = slots.get(fa_layer_idx) {
-                        let kv_dim = config.n_kv_heads * config.head_dim;
-                        let n_bytes = n * kv_dim * 4;
-                        // Use _auto so the memcpy is recorded onto the
-                        // active stream when one exists (matches the
-                        // existing GdnTape capture pattern at line ~3193).
-                        // Plain gpu.hip.memcpy_dtod_at runs on the null
-                        // stream and sync-blocks pending async kernels,
-                        // changing kernel-launch order in ways that
-                        // perturb DDTree's ksplit-atomic nondeterminism
-                        // — output diverges even though no data is
-                        // actually changed.
-                        gpu.memcpy_dtod_at_auto(&slot.buf, 0, &pbs.fa_k_batch.buf, 0, n_bytes)?;
-                    }
-                }
-
                 // 5. Batched partial-interleaved RoPE (per-row positions).
                 // pos_offset = compact_offset so new Q/K rotate at ABSOLUTE phase
                 // after eviction (cached keys are absolute-phased); pbs.positions
@@ -10123,7 +10079,6 @@ fn forward_prefill_chunk(
                 // Silence unused warning if kv_dim ends up shadowed.
                 let _ = kv_dim;
                 kv_layer_idx += 1;
-                fa_layer_idx += 1;
             }
 
             (LayerWeights::FullAttn(_layer), LayerType::FullAttention) => {
@@ -10169,7 +10124,6 @@ fn forward_prefill_chunk(
                 }
 
                 kv_layer_idx += 1;
-                fa_layer_idx += 1;
             }
 
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
@@ -11163,15 +11117,6 @@ fn forward_prefill_chunk(
                         }
                     }
                 }
-                // Path B pre-RoPE K capture (MoE FA variant). See same
-                // block in the FullAttn branch for rationale.
-                if let Some(slots) = tree_verify.as_ref().and_then(|c| c.pre_rope_k_capture) {
-                    if let Some(slot) = slots.get(fa_layer_idx) {
-                        let kv_dim = config.n_kv_heads * config.head_dim;
-                        let n_bytes = n * kv_dim * 4;
-                        gpu.memcpy_dtod_at_auto(&slot.buf, 0, &pbs.fa_k_batch.buf, 0, n_bytes)?;
-                    }
-                }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 // pos_offset = compact_offset (absolute RoPE phase post-eviction);
                 // pbs.positions stays physical for the KV-write. 0 when no compaction.
@@ -11374,7 +11319,6 @@ fn forward_prefill_chunk(
                 let _ = kv_dim;
                 let _ = q_dim;
                 kv_layer_idx += 1;
-                fa_layer_idx += 1;
             }
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),
@@ -14948,7 +14892,6 @@ pub fn forward_prefill_batch_multi(
                     layer_end: band_layer_end,
                     delta_layer_offset: delta_off_per_band[b],
                     kv_layer_offset: fa_off_per_band[b],
-                    fa_layer_offset: fa_off_per_band[b],
                     is_first_band: b == 0,
                     is_last_band: b + 1 == n_bands,
                     givens_cos,

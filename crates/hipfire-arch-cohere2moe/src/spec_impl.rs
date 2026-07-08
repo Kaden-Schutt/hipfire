@@ -110,6 +110,7 @@ impl SpecTarget for Cohere2MoeBundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Pure attention: "reset" clears KV and rewinds the position cursor;
         // the per-token decode_step then overwrites KV at the absolute positions.
@@ -185,6 +186,7 @@ impl SpecTarget for Cohere2MoeBundle {
         block: &[u32],
         position: usize,
         _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         // Sequential verify: `decode_step(block[i])` at absolute position
         // `position + i` predicts the token AFTER block[i] — exactly

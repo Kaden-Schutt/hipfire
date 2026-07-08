@@ -3331,6 +3331,19 @@ pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
 pub const EMBEDDING_Q8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_q8_batched.hip");
 
+/// Batched F16 embedding: copies N rows of an F16 table into `[N × dim]` F32,
+/// reading token ids from a device buffer. Keeps the DSpark markov head chain
+/// GPU-resident (no per-slot D2H+H2D). The F16→F32 widening is exact, so this
+/// is byte-identical to the host `f16_to_f32` fallback it replaces.
+pub const EMBEDDING_F16_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_f16_batched.hip");
+
+/// DSpark bidirectional staging assembly. Builds the per-stage attention
+/// key/value buffer `staged[block, head_dim, stage_w]` on-GPU from the
+/// committed main_kv ring + the block KV, replacing a host d2h+assemble+h2d
+/// that forced 2 stream syncs per stage (3 stages → ~6 syncs/window).
+pub const DSPARK_STAGE_KV_SRC: &str = include_str!("../../../kernels/src/dspark_stage_kv.hip");
+
 /// HFQ4-G128 embedding lookup: dequantize one row from HFQ4-G128 table to F32.
 pub const EMBEDDING_HFQ4G128_SRC: &str =
     include_str!("../../../kernels/src/embedding_hfq4g128.hip");
@@ -3377,6 +3390,20 @@ pub const MAX_PROB_SRC: &str = include_str!("../../../kernels/src/max_prob.hip")
 /// GPU argmax: find index of maximum value.
 pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 
+/// C8 Kernel 0: batched categorical sampler (one block per row).
+/// Takes probs[batch*vocab] already softmax'd, tau_cut[batch], z[batch] from
+/// softmax_temp_topp_batched_f32; outputs tokens[batch] (i32) and
+/// prob_at_token[batch] (f32).  D2H: batch*8 bytes instead of batch*vocab*4.
+pub const BATCHED_CATEGORICAL_SAMPLE_SRC: &str =
+    include_str!("../../../kernels/src/batched_categorical_sample.hip");
+
+/// C8 Kernel 1: on-GPU chain rejection-sampling accept.
+/// Fused accept loop for the chain spec-decode temp>0 path.  Takes
+/// tgt_probs[b*vocab], dft_probs[b*vocab], draft_tokens[b], draft_p_at_token[b],
+/// tau/z arrays for both sides, rng_seed, cactus_delta; outputs
+/// {accept_len, bonus_token, rejected_at, new_rng} in a 16-byte int[4].
+pub const CHAIN_ACCEPT_SPEC_SRC: &str = include_str!("../../../kernels/src/chain_accept_spec.hip");
+
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
@@ -3389,6 +3416,29 @@ pub const ARGMAX_TOKEN_CHAIN_SRC: &str =
 /// Device-side greedy MTP accept prefix scan over verify argmaxes and draft
 /// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
 pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");
+
+/// Fused on-GPU sample+accept for DSpark temp>0 verify. Over resident target
+/// logits `[n × vocab]` (batched lm-head), replays the single-block
+/// `sample_top_p` draw per position, threads xorshift32 RNG, and lazily
+/// early-exits on the first mismatch vs `draft[pos+1]` — replacing the
+/// per-position `sample_top_p_pf` host loop (one 8-byte D2H/position) with one
+/// launch + one `(n+1)×4`-byte D2H. Byte-identical token sequence to the
+/// per-position single-block sampler.
+pub const DSPARK_SAMPLE_ACCEPT_LAZY_SRC: &str =
+    include_str!("../../../kernels/src/dspark_sample_accept_lazy.hip");
+
+pub const DDTREE_SWOR_WALK_SRC: &str = include_str!("../../../kernels/src/ddtree_swor_walk.hip");
+
+pub const DDTREE_GUMBEL_TOPK_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/ddtree_gumbel_topk_batched.hip");
+
+/// Stage 3a: on-GPU ddtree attention-mask builder. Reads `parent_indices`
+/// (already device-resident from H2D) and writes the `attn_bias[big_n ×
+/// big_n]` f32 mask in-place, eliminating the ~15 KB H2D per cycle (D4).
+/// Grid: [big_n,1,1]. Block: [big_n,1,1]. Each thread i walks the parent
+/// chain upward, setting 0.0 for ancestor slots and -INF elsewhere.
+pub const DDTREE_BUILD_ATTN_MASK_SRC: &str =
+    include_str!("../../../kernels/src/ddtree_build_attn_mask.hip");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)

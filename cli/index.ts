@@ -266,11 +266,25 @@ export interface HipfireConfig {
   //             and keep their own heuristics (e.g. dflash's A3B gate). DEFAULT.
   //   "dflash"/"mtp"/"ngram" → force exactly that mechanism (bypass the
   //             heuristics; warn if its prerequisite — a draft model / MTP
-  //             weights — is missing, then fall back to AR).
+  //             weights / a deepseek4 `-dspark` sidecar — is missing, then fall
+  //             back to AR).
+  //   "dspark" → deepseek4 DSpark 3-stage draft module (the `-dspark` sidecar).
+  //             Under "auto" it auto-wins over the in-trunk MTP when the sidecar
+  //             is present; `mtp` forces the lighter in-trunk MTP instead.
   // The selector is lowered CLI-side into the per-mechanism load params, so the
   // daemon needs no selector of its own. Default "auto" + the legacy defaults
   // (dflash_mode=off, mtp_mode=auto, ngram_mode=off) reproduces prior behavior.
-  speculation: "off" | "auto" | "ngram" | "dflash" | "mtp";
+  speculation: "off" | "auto" | "ngram" | "dflash" | "mtp" | "dspark";
+  // DSpark confidence-truncation threshold. The draft block is cut to its
+  // confident prefix (first slot where sigmoid(confidence) < this) before the
+  // heavy trunk verify. Applies to BOTH DSpark arches (qwen3 + deepseek4).
+  //
+  // `null` = unset ⇒ each arch's tuned carrier default applies (qwen3 0.1,
+  // deepseek4 0.3); a number OVERRIDES that default. Forwarded as a load param
+  // ONLY when non-null, so an unset CLI never shadows the per-arch default
+  // (env HIPFIRE_{QWEN3,DEEPSEEK4}_DSPARK_CONF_THRESHOLD still wins in the
+  // loader). Consulted only when speculation runs dspark.
+  dspark_conf_threshold: number | null;
 
   // ── Model-free n-gram speculative decode ──────────────────
   // n-gram is model-free (no draft weights): it proposes tokens from the
@@ -284,6 +298,10 @@ export interface HipfireConfig {
   ngram_mode: "off" | "on" | "auto";
   ngram_k: number;         // draft window K (2–32). Higher = more parallelism.
   ngram_min_count: number; // min n-gram match count to propose (1–10).
+  // DFlash/DDTree draft tree (used when speculation runs dflash). Mirrors the
+  // ngram knobs as CLI-forwarded draft settings, env-wins-else-param in the loader.
+  ddtree_budget: number;   // max verify-tree nodes (0–64). 0 = chain DFlash (no tree).
+  ddtree_topk: number;     // per-position branching width (1–8).
 
   // ── Chat-template overrides ───────────────────────────────────────────
   // Lift the two env-only chat-template knobs (HIPFIRE_CHAT_TEMPLATE_FILE,
@@ -403,9 +421,14 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // Unified speculation selector. "auto" + the legacy mode defaults reproduces
   // prior behavior (dflash off, mtp auto, n-gram off).
   speculation: "auto",
+  // Unset by default: the per-arch carrier default applies (qwen3 0.1,
+  // deepseek4 0.3). A user value (config or --dspark-conf-threshold) overrides.
+  dspark_conf_threshold: null,
   ngram_mode: "off",
   ngram_k: 12,
   ngram_min_count: 2,
+  ddtree_budget: 0,
+  ddtree_topk: 4,
   // Chat-template overrides. Empty/true = engine defaults (no env projected).
   chat_template: "",
   default_chatml: true,
@@ -482,10 +505,13 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     case "mtp_mode": return ["off", "on", "auto"].includes(value);
     case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
-    case "speculation": return ["off", "auto", "ngram", "dflash", "mtp"].includes(value);
+    case "speculation": return ["off", "auto", "ngram", "dflash", "mtp", "dspark"].includes(value);
+    case "dspark_conf_threshold": return value === null || (typeof value === "number" && value >= 0 && value <= 1);
     case "ngram_mode": return ["off", "on", "auto"].includes(value);
     case "ngram_k": return typeof value === "number" && Number.isInteger(value) && value >= 2 && value <= 32;
     case "ngram_min_count": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
+    case "ddtree_budget": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 64;
+    case "ddtree_topk": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 8;
     // chat_template: empty (unset) OR a path that exists + is readable. Tilde
     // is expanded for the existence check so `~/templates/x.j2` validates.
     case "chat_template": {
@@ -564,6 +590,7 @@ const PER_MODEL_KEYS = [
   "prefill_sparse_threshold",
   "mtp_mode", "mtp_k",
   "speculation", "ngram_mode", "ngram_k", "ngram_min_count",
+  "ddtree_budget", "ddtree_topk",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -901,19 +928,28 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   const speculation = (process.env.HIPFIRE_SPECULATION || resolved.speculation || "auto").toLowerCase();
   let effDflashMode: "on" | "off" | "auto" = resolved.dflash_mode;
   let effMtpMode = resolved.mtp_mode; // "off" | "on" | "auto"
+  // DSpark (deepseek4 `-dspark` sidecar) effective mode: "on" forces it, "off"
+  // skips load+build, "auto" lets the loader load-if-sidecar and prefer it over
+  // the in-trunk MTP. Lowered to params.dspark_mode → SpecLoadCfg.dspark.
+  let effDsparkMode: "on" | "off" | "auto" = "auto";
   // n-gram enable: env (HIPFIRE_NGRAM_DRAFT) wins; else the selector + ngram_mode.
   let ngramOn: boolean;
   switch (speculation) {
-    case "off":    effDflashMode = "off"; effMtpMode = "off"; ngramOn = false; break;
-    case "dflash": effDflashMode = "on";  effMtpMode = "off"; ngramOn = false; break;
-    case "mtp":    effDflashMode = "off"; effMtpMode = "on";  ngramOn = false; break;
-    case "ngram":  effDflashMode = "off"; effMtpMode = "off"; ngramOn = true;  break;
+    case "off":    effDflashMode = "off"; effMtpMode = "off"; effDsparkMode = "off"; ngramOn = false; break;
+    case "dflash": effDflashMode = "on";  effMtpMode = "off"; effDsparkMode = "off"; ngramOn = false; break;
+    // `mtp` forces the in-trunk MTP head → DSpark off even if a sidecar exists
+    // (the old HIPFIRE_DEEPSEEK4_DSPARK=0 A/B path).
+    case "mtp":    effDflashMode = "off"; effMtpMode = "on";  effDsparkMode = "off"; ngramOn = false; break;
+    case "ngram":  effDflashMode = "off"; effMtpMode = "off"; effDsparkMode = "off"; ngramOn = true;  break;
+    case "dspark": effDflashMode = "off"; effMtpMode = "off"; effDsparkMode = "on";  ngramOn = false; break;
     case "auto":
     default:
       // n-gram joins the auto cascade only when explicitly enabled (it loses on
       // prose). `ngram_mode=auto` is last-resort: the daemon's cascade reaches
       // n-gram only after dflash+mtp are unavailable, so "on" and "auto" both
       // emit ngram_draft=true here and the cascade order does the gating.
+      // DSpark stays "auto": the loader builds it iff the sidecar is present,
+      // where it auto-wins over the in-trunk MTP (preserves prior default-on).
       ngramOn = resolved.ngram_mode === "on" || resolved.ngram_mode === "auto";
       break;
   }
@@ -1013,11 +1049,29 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // selector, leaving MTP un-gated when speculation forced another mechanism).
   params.mtp_mode = effMtpMode;
   params.mtp_k = (draftMaxEnv && effMtpMode !== "off") ? draftMaxEnv : resolved.mtp_k;
+  // DSpark (deepseek4): the selector → load-gate. The loader maps on→force,
+  // off→skip load+build, auto→load-if-sidecar. Threshold rides as a load param
+  // (env HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD still wins in the speculator).
+  params.dspark_mode = effDsparkMode;
+  // Forward ONLY when explicitly set (config or --dspark-conf-threshold). Unset
+  // (null) ⇒ omit, so the loader's per-arch carrier default applies (qwen3 0.1,
+  // deepseek4 0.3) instead of a global CLI default clobbering it.
+  if (resolved.dspark_conf_threshold !== null && resolved.dspark_conf_threshold !== undefined) {
+    params.dspark_conf_threshold = resolved.dspark_conf_threshold;
+  }
   // n-gram: byte-identical-to-AR model-free drafter. ngram_draft is the
   // per-load enable the loader reads (env HIPFIRE_NGRAM_DRAFT still wins there).
   params.ngram_draft = ngramOn;
   params.ngram_k = (draftMaxEnv && ngramOn) ? draftMaxEnv : resolved.ngram_k;
   params.ngram_min_count = resolved.ngram_min_count;
+
+  // DFlash ddtree tree shape (the dflash mechanism's draft window). Mirrors
+  // mtp_k/ngram_k: --draft-max overrides the budget when dflash runs, else the
+  // resolved config. budget=0 → chain-mode DFlash (no tree); >0 → SWOR ddtree.
+  if (effDflashMode !== "off") {
+    params.ddtree_budget = draftMaxEnv ? draftMaxEnv : resolved.ddtree_budget;
+    params.ddtree_topk = resolved.ddtree_topk;
+  }
 
   // Forced-mechanism prerequisite check: `--spec dflash` (or speculation=dflash)
   // with no draft model resolvable is a no-op that would silently fall through
@@ -6758,8 +6812,13 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     speculation: {
       label: "speculation",
-      desc: "Speculative decode selector (canonical). off = AR; auto = cascade dflash>mtp>ngram gated by the legacy mode knobs; dflash/mtp/ngram = force one.",
-      options: ["off", "auto", "ngram", "dflash", "mtp"],
+      desc: "Speculative decode selector (canonical). off = AR; auto = cascade dflash>mtp>ngram gated by the legacy mode knobs; dflash/mtp/ngram/dspark = force one. dspark = deepseek4 DSpark sidecar (auto-wins over mtp when present).",
+      options: ["off", "auto", "ngram", "dflash", "mtp", "dspark"],
+    },
+    dspark_conf_threshold: {
+      label: "dspark_conf_threshold",
+      desc: "DSpark confidence-truncation cutoff (qwen3 + deepseek4). Draft block is cut to the prefix where sigmoid(confidence) >= this before verify. Unset = per-arch tuned default (qwen3 0.1, deepseek4 0.3); lower keeps more drafts (higher accept), higher truncates harder. Sweep-tuned: qwen3 optimum ~0.1.",
+      range: [0, 1], step: 0.05,
     },
     ngram_mode: {
       label: "ngram_mode",
@@ -6775,6 +6834,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "ngram_min_count",
       desc: "Minimum n-gram match count before the drafter proposes a continuation (1-10).",
       range: [1, 10], step: 1,
+    },
+    ddtree_budget: {
+      label: "ddtree_budget",
+      desc: "DFlash verify-tree node budget (0-64). 0 = chain DFlash (no tree); >0 = SWOR ddtree. More breadth raises acceptance but costs more verify per cycle.",
+      range: [0, 64], step: 1,
+    },
+    ddtree_topk: {
+      label: "ddtree_topk",
+      desc: "DFlash ddtree per-position branching width (1-8). Wider catches the target token at deeper draft ranks; pairs with ddtree_budget.",
+      range: [1, 8], step: 1,
     },
     chat_template: {
       label: "chat_template",
@@ -7508,6 +7577,17 @@ if (cmd === "help" && rest.length > 0 && !rest[0].startsWith("-")) {
   rest = ["--help"];
 }
 
+// `--ddtree`: opt into DDTree tree-verify speculation. The default is linear
+// chain DFlash — tree-verify raises acceptance (τ) but costs more per cycle and
+// net-loses to chain on every drafter measured (the DFlash drafter's
+// independent per-position marginals give a tree branch no joint to exploit).
+// Global flag: strip it here and set the env that every spawned daemon inherits
+// (engine reads HIPFIRE_DFLASH_TREE; budget/topk keep their defaults of 8/2
+// unless HIPFIRE_DDTREE_BUDGET/_TOPK are set).
+if (takeFlag(rest, "--ddtree")) {
+  process.env.HIPFIRE_DFLASH_TREE = "1";
+}
+
 try {
 switch (cmd) {
   case "serve": {
@@ -7672,9 +7752,10 @@ switch (cmd) {
     const modelDraftVal = takeFlagValue(rest, "--model-draft", { allowDashValue: true }) ?? takeFlagValue(rest, "-md", { allowDashValue: true });
     const draftMaxVal = takeFlagValue(rest, "--draft-max") ?? takeFlagValue(rest, "--draft");
     const specVal = takeFlagValue(rest, "--spec") ?? takeFlagValue(rest, "--speculation");
+    const dsparkConfVal = takeFlagValue(rest, "--dspark-conf-threshold");
     const model = rest[0];
     if (wantHelp || !model) {
-      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --spec <m>               Speculative decode: off|auto|ngram|dflash|mtp (default auto)\n  -md, --model-draft <p>   DFlash draft model path (implies --spec dflash)\n  --draft-max, --draft <N> Draft window for the active mechanism (n-gram K / MTP k)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:9b --spec ngram \"Repeat this verbatim: ...\"\n  hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq \"Refactor this\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"");
+      console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  -t, --temp <float>       Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  -n, --max-tokens <int>   Max tokens to generate (default 4096)\n  --kv-mode <m>            KV cache mode for this load (auto|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|turbo...)\n  --spec <m>               Speculative decode: off|auto|ngram|dflash|mtp|dspark (default auto)\n  -md, --model-draft <p>   DFlash draft model path (implies --spec dflash)\n  --draft-max, --draft <N> Draft window for the active mechanism (n-gram K / MTP k)\n  --dspark-conf-threshold <f> DSpark confidence-truncation cutoff 0-1 (qwen3 + deepseek4; unset = per-arch default qwen3 0.1 / deepseek4 0.3)\n  -j, --json               Emit {content,tokens,tok_s} instead of streamed text\n  --no-stream              Buffer the full response, print it once at the end\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nFlags may appear in any position (before or after the model).\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b -t 0.7 -n 256 \"Write a poem\"\n  hipfire run qwen3.5:9b --kv-mode q8 --json \"List 3 primes\"\n  hipfire run qwen3.5:9b --spec ngram \"Repeat this verbatim: ...\"\n  hipfire run qwen3.5:27b -md qwen3.5-27b-dflash-mq4.hfq \"Refactor this\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"");
       process.exit(wantHelp ? 0 : EXIT.USAGE);
     }
     // Validate --kv-mode against the same allowlist config validation uses.
@@ -7684,17 +7765,29 @@ switch (cmd) {
     }
     // Validate numeric value-flags (takeFlagValue already rejected dangling /
     // dash-looking values; here we enforce numeric-ness).
-    for (const [name, val] of [["--temp", tempVal], ["--top-p", topPVal], ["--repeat-penalty", repeatPenaltyVal], ["--max-tokens", maxTokensVal], ["--draft-max", draftMaxVal]] as const) {
+    for (const [name, val] of [["--temp", tempVal], ["--top-p", topPVal], ["--repeat-penalty", repeatPenaltyVal], ["--max-tokens", maxTokensVal], ["--draft-max", draftMaxVal], ["--dspark-conf-threshold", dsparkConfVal]] as const) {
       if (val !== null && isNaN(Number(val))) { console.error(`Error: ${name} requires a number, got '${val}'`); process.exit(1); }
     }
     // Speculation flags lower into env. Ladder is env > flag, so a flag only
     // fills a var the shell did NOT already export (an exported env wins).
     if (specVal !== null) {
-      if (!["off", "auto", "ngram", "dflash", "mtp"].includes(specVal)) {
-        console.error(`Error: invalid --spec '${specVal}'. Valid: off, auto, ngram, dflash, mtp`);
+      if (!["off", "auto", "ngram", "dflash", "mtp", "dspark"].includes(specVal)) {
+        console.error(`Error: invalid --spec '${specVal}'. Valid: off, auto, ngram, dflash, mtp, dspark`);
         process.exit(1);
       }
       if (process.env.HIPFIRE_SPECULATION === undefined) process.env.HIPFIRE_SPECULATION = specVal;
+    }
+    // DSpark confidence-truncation cutoff lowers into the speculator's env (top
+    // of ladder), matching the other --spec flags. Range 0-1. Set BOTH arches'
+    // env vars — the flag applies to whichever DSpark arch loads (qwen3 or
+    // deepseek4); each carrier reads only its own. (Previously only the
+    // deepseek4 var was set, so `--dspark-conf-threshold` silently no-op'd on
+    // qwen3.)
+    if (dsparkConfVal !== null) {
+      const t = Number(dsparkConfVal);
+      if (t < 0 || t > 1) { console.error(`Error: --dspark-conf-threshold must be in [0,1], got '${dsparkConfVal}'`); process.exit(1); }
+      if (process.env.HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD === undefined) process.env.HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD = String(t);
+      if (process.env.HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD === undefined) process.env.HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD = String(t);
     }
     if (modelDraftVal !== null) {
       if (process.env.HIPFIRE_DFLASH_DRAFT === undefined) process.env.HIPFIRE_DFLASH_DRAFT = modelDraftVal;

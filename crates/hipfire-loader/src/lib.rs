@@ -727,14 +727,113 @@ fn finish_qwen35_load(
         None
     };
 
-    // ── DFlash ─────────────────────────────────────────────────────
-    let dflash = if let Some(dp) = ctx.draft_path {
+    // ── DSpark sidecar (wins over DFlash/MTP/n-gram) ───────────────
+    // The drafter is a dense-qwen3 body (llama crate); it drives the qwen35
+    // ModelSlot target via the SpecTarget DSpark capture hooks. Discovered as
+    // `<stem>-dspark.<ext>` next to the trunk, independent of ctx.draft_path.
+    let dspark_speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if ctx.spec.dspark
+        != Some(false)
+    {
+        let base = std::path::Path::new(ctx.path);
+        let sidecar_path = match (base.parent(), base.file_stem(), base.extension()) {
+            (Some(parent), Some(stem), Some(ext)) => Some(parent.join(format!(
+                "{}-dspark.{}",
+                stem.to_string_lossy(),
+                ext.to_string_lossy()
+            ))),
+            _ => None,
+        };
+        match sidecar_path.filter(|p| p.exists()) {
+            Some(p) => {
+                eprintln!("  qwen35: opening DSpark sidecar HFQ {p:?}");
+                match hipfire_runtime::hfq::HfqFile::open(&p) {
+                    Ok(mut sidecar) => {
+                        sidecar.drop_mmap();
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu) {
+                            Ok(Some((dspark_weights, assets))) => {
+                                let block = dspark_weights.cfg.block_size;
+                                // Reduced-vocab drafters (ORNITH) ship a compressed
+                                // lm_head; run_heads reads vocab from lm_head.shape[0].
+                                let vocab = if dspark_weights.cfg.draft_vocab_size > 0 {
+                                    dspark_weights.cfg.draft_vocab_size
+                                } else {
+                                    assets.config.vocab_size
+                                };
+                                let stage_norm = assets.weights.output_norm.shallow_clone();
+                                // upload_raw sets dtype=Raw; the data is F16.
+                                let mut lm_head = assets.weights.output.buf.shallow_clone();
+                                lm_head.dtype = rdna_compute::DType::F16;
+                                lm_head.shape = vec![vocab];
+                                let conf_threshold =
+                                    std::env::var("HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD")
+                                        .ok()
+                                        .and_then(|s| s.parse().ok())
+                                        .or(ctx.spec.dspark_conf_threshold)
+                                        .unwrap_or(0.1f32);
+                                eprintln!(
+                                    "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
+                                    block,
+                                    dspark_weights.cfg.target_layer_ids,
+                                    vocab,
+                                    conf_threshold
+                                );
+                                match hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+                                    assets,
+                                    &dspark_weights.cfg,
+                                    ctx.gpu,
+                                ) {
+                                    Ok(body) => {
+                                        Some(hipfire_runtime::dspark_core::build_dspark_speculator(
+                                            body,
+                                            dspark_weights,
+                                            stage_norm,
+                                            lm_head,
+                                            block,
+                                            physical_cap,
+                                            conf_threshold,
+                                            true, // sampled verify (temp>0) supported
+                                        ))
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  qwen35: DSpark body build failed: {e} — AR/other");
+                                        None
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                eprintln!("  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping");
+                                None
+                            }
+                            Err(e) => {
+                                eprintln!("  qwen35: WARNING DSpark sidecar load failed: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  qwen35: WARNING cannot open DSpark sidecar {p:?}: {e}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // ── DFlash (skipped when a DSpark sidecar won) ─────────────────
+    let dflash = if dspark_speculator.is_some() {
+        None
+    } else if let Some(dp) = ctx.draft_path {
         match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
             dp,
             physical_cap,
             config,
             dn_state,
             ctx.gpu,
+            ctx.spec.ddtree_budget,
+            ctx.spec.ddtree_topk,
         ) {
             Ok(s) => {
                 eprintln!(
@@ -761,6 +860,7 @@ fn finish_qwen35_load(
     // here — not in build_speculator — because this is the only site with a
     // `&mut Gpu` to free on decline, and the head allocates GPU buffers.
     let mtp = if dflash.is_none()
+        && dspark_speculator.is_none()
         && eviction.is_none()
         && matches!(arch_id, 5 | 6)
         && std::env::var("HIPFIRE_QWEN35_MTP").ok().as_deref() == Some("1")
@@ -804,14 +904,17 @@ fn finish_qwen35_load(
     // it is still available for the struct literal below; `config`/`dn_state` are
     // borrowed only for the n-gram arm's scratch construction (snapshot copied to
     // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
-    let speculator = crate::spec_build::build_speculator(
-        arch_id,
-        dflash,
-        mtp,
-        eviction.is_none(),
-        physical_cap,
-        ctx.spec,
-    );
+    // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
+    let speculator = dspark_speculator.or_else(|| {
+        crate::spec_build::build_speculator(
+            arch_id,
+            dflash,
+            mtp,
+            eviction.is_none(),
+            physical_cap,
+            ctx.spec,
+        )
+    });
 
     // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
     //

@@ -33,11 +33,11 @@ use hipfire_arch_qwen35::speculative;
 // Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
 // it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
 use hipfire_arch_qwen35::Qwen35Bundle;
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{currently_in_think, extract_tool_calls_from_text};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -1018,6 +1018,36 @@ fn main() {
                         .and_then(|p| p.get("ngram_min_count"))
                         .and_then(|v| v.as_u64())
                         .map(|c| c as u32),
+                    // DDTree draft tuning — same load-param mechanism as ngram_k:
+                    // CLI `--ddtree-budget` / `--ddtree-topk` → these load params,
+                    // env-wins-else-param in the loader.
+                    ddtree_budget: msg
+                        .get("params")
+                        .and_then(|p| p.get("ddtree_budget"))
+                        .and_then(|v| v.as_u64())
+                        .map(|b| b as usize),
+                    ddtree_topk: msg
+                        .get("params")
+                        .and_then(|p| p.get("ddtree_topk"))
+                        .and_then(|v| v.as_u64())
+                        .map(|k| k as usize),
+                    // DSpark draft module: the CLI lowers `speculation` into a
+                    // `dspark_mode` string. off→Some(false) (skip load+build),
+                    // on→Some(true) (force), auto/absent→None (load-if-sidecar).
+                    dspark: msg
+                        .get("params")
+                        .and_then(|p| p.get("dspark_mode"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| match s {
+                            "on" => Some(true),
+                            "off" => Some(false),
+                            _ => None, // "auto" → loader default
+                        }),
+                    dspark_conf_threshold: msg
+                        .get("params")
+                        .and_then(|p| p.get("dspark_conf_threshold"))
+                        .and_then(|v| v.as_f64())
+                        .map(|t| t as f32),
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
@@ -1428,8 +1458,10 @@ fn main() {
                         m.mtp_k = mtp_k;
                         // Detect whether MTP weights are present in the loaded
                         // model. Used by mtp_mode=auto to decide whether to
-                        // enable spec-decode at generate time. Two sources:
+                        // enable spec-decode at generate time. Three sources:
                         //   - DeepSeek V4: the trunk's bundled `mtp_layer`.
+                        //   - DeepSeek V4: a DSpark sidecar (either counts for auto
+                        //     mode; the loader picks whichever applies).
                         //   - Qwen3.5/3.6: a native MTP (NextN) head loaded by
                         //     the loader (`qwen35_mtp_head`, set from a bundled
                         //     `.mq4-mtp` trailer or a `.mtp` sidecar). The loader
@@ -1438,8 +1470,8 @@ fn main() {
                         //     it back to false for a qwen35 model.
                         let ds4_mtp = m
                             .deepseek4()
-                            .and_then(|b| b.weights.mtp_layer.as_ref())
-                            .is_some();
+                            .map(|b| b.weights.mtp_layer.is_some() || b.weights.dspark.is_some())
+                            .unwrap_or(false);
                         m.mtp_weights_present =
                             ds4_mtp || m.qwen35_mtp_head.is_some() || m.mtp_weights_present;
 
@@ -1824,6 +1856,15 @@ fn main() {
                     .get("top_p")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_top_p) as f32;
+                // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
+                // default = lossless/distribution-preserving. >0 is deliberately lossy
+                // (higher acceptance τ, KL-bounded distortion) and applies only to a
+                // CACTUS-capable sampled verify (deepseek4 DSpark / qwen35 DFlash);
+                // other drafters ignore it. Never a default.
+                let cactus_delta = msg
+                    .get("cactus_delta")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -2160,6 +2201,18 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
+                    // Did the request explicitly set a non-temperature sampling
+                    // control? (gates temp>0 spec routing — see generate()).
+                    let user_explicit_sampling = [
+                        "top_p",
+                        "top_k",
+                        "min_p",
+                        "repeat_penalty",
+                        "presence_penalty",
+                        "frequency_penalty",
+                    ]
+                    .iter()
+                    .any(|k| msg.get(*k).is_some());
                     generate(
                         m,
                         &mut gpu,
@@ -2168,10 +2221,12 @@ fn main() {
                         id,
                         prompt,
                         system,
+                        user_explicit_sampling,
                         temp,
                         top_p,
                         top_k,
                         min_p,
+                        cactus_delta,
                         max_tokens,
                         repeat_penalty,
                         repeat_window,
@@ -4115,21 +4170,23 @@ fn generate_dflash(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
     // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
-    // historical DFlash posture). >0 → lossless rejection-sampling inside
-    // spec_step_dflash (full-vocab softmax on BOTH draft + target, so the
-    // committed-token distribution exactly equals the target's own temp-T
-    // sampling). All four sampling args (temp/top_p/top_k/cactus_delta) are
-    // threaded through `Speculator::set_sampling` into `DflashSpeculator::step`
-    // (see the set_sampling call below). NOTE: min_p is NOT plumbed — the sampled
-    // DFlash path truncates by (top_k,top_p) only; a min_p-constrained temp>0
-    // request routes to AR instead (gated at the routing site).
+    // historical DFlash posture). >0 → distribution-preserving spec decode via
+    // one of two verify mechanisms inside `DflashSpeculator::step`, picked by how
+    // the drafter loaded:
+    //   * ddtree mode — SWOR tree-verify, fed the `temp` arg directly; honors
+    //     temperature ONLY (the caller routes an explicit top_p/top_k/min_p to AR).
+    //   * chain mode — lossless rejection sampling (full-vocab softmax on BOTH
+    //     draft + target), fed the top_p/top_k/cactus args below via
+    //     `Speculator::set_sampling` (see the set_sampling call). Honors
+    //     temp+top_p+top_k; min_p is NOT plumbed (a min_p request routes to AR).
     temp: f32,
-    // Nucleus (top_p) cutoff, threaded into spec_step_dflash's sampled path and
-    // applied IDENTICALLY to both draft + target softmaxes (lossless == AR at
-    // this top_p via the target truncation). 1.0 (>= 0.999) disables it.
+    // Nucleus (top_p) cutoff for the chain rejection-sampling path, applied
+    // IDENTICALLY to both draft + target softmaxes (lossless == AR at this top_p).
+    // 1.0 (>= 0.999) disables it. Ignored by the ddtree SWOR arm.
     top_p: f32,
-    // Top-k cutoff (request/card recipe, e.g. qwen3.6 top_k=20), applied to both
-    // draft + target softmax rows on the sampled path. 0 = disabled (top_p-only).
+    // Top-k cutoff (request/card recipe, e.g. qwen3.6 top_k=20) for the chain
+    // sampled path, applied to both draft + target softmax rows. 0 = disabled.
+    // Ignored by the ddtree SWOR arm.
     top_k: usize,
     // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
     // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
@@ -4354,6 +4411,7 @@ fn generate_dflash(
             think_mode: ThinkMode::NonThink,
             decoded_vocab: None,
         },
+        temp,
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
@@ -4495,6 +4553,10 @@ fn generate_spec(
     resume_from: Option<usize>,
     max_tokens: usize,
     emit_req: SpecEmitRequest,
+    // Request sampling temperature. >0 only reaches here for speculators that
+    // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR); greedy
+    // drafters ignore it. The daemon's routing gate enforces that invariant.
+    temp: f32,
 ) -> Option<SpecRun> {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
@@ -4798,8 +4860,8 @@ fn generate_spec(
     }
     let first_token_is_eos = first_begin.stop.is_some();
 
-    // (The DFlash RNG cell and the `HIPFIRE_DDTREE_PATH_C` chain-vs-tree-vs-path_c
-    // resolution that used to live here are now resolved once at build time and
+    // (The DFlash RNG cell and the chain-vs-tree resolution that used to live
+    // here are now resolved once at build time and
     // owned inside the speculator — see `build_dflash_speculator`.)
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
@@ -4838,14 +4900,22 @@ fn generate_spec(
             break;
         }
 
-        // One acceptance window. The speculator owns chain-vs-tree-vs-path_c
-        // dispatch internally; the daemon just hands it the borrowed target and
+        // One acceptance window. The speculator owns chain-vs-tree dispatch
+        // internally; the daemon just hands it the borrowed target and
         // the prior committed tokens (drafter repeat / n-gram context). The
         // in-step grammar mask comes from the emitter: qwen35 returns `None`
         // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let step = match spec.step(gpu, slot, position, seed_token, &emitted, emit.grammar()) {
+        let step = match spec.step(
+            gpu,
+            slot,
+            position,
+            seed_token,
+            &emitted,
+            emit.grammar(),
+            temp,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(
@@ -4934,7 +5004,8 @@ fn generate_spec(
         // re-entry guard (e.g. MAX_EOS_SUPPRESS) so forcing always terminates.
         if !forced_after.is_empty() {
             for ft in std::mem::take(&mut forced_after) {
-                if let Err(e) = slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id))
+                if let Err(e) =
+                    slot.spec_advance(gpu, &[ft], position, false, &|| check_abort(id), None)
                 {
                     let _ = writeln!(
                         stdout,
@@ -5274,6 +5345,7 @@ fn generate_qwen35_mtp(
         dn_state,
         scratch,
         slot_config: ModelSlotConfig::default(),
+        dspark_extract_layers: Vec::new(),
     };
 
     // Helper closure analog: every early return must put the bundle back. We
@@ -6752,10 +6824,17 @@ fn generate(
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
+    // Whether the request EXPLICITLY set a non-temperature sampling control
+    // (top_p/top_k/min_p/penalties). Gates temp>0 spec routing: explicit controls
+    // force the AR sampler (the SWOR spec verify can only honor temperature).
+    user_explicit_sampling: bool,
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
     min_p: Option<f32>,
+    // CACTUS acceptance-boost δ (0 = lossless). Request opt-in; applies only to a
+    // CACTUS-capable sampled verify (deepseek4 DSpark / qwen35 DFlash).
+    cactus_delta: f32,
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
@@ -6960,10 +7039,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -7019,7 +7098,16 @@ fn generate(
                       // unified `generate_spec`; the AR sampler path (temp>0) and the
                       // no-speculator fallback stay in the bespoke `generate_deepseek4` (T5
                       // deletes the latter's now-redundant spec loop).
-        let spec_mode = deepseek4_spec_requested(m) && temp <= 1e-6;
+                      // Route to the DSpark/MTP spec loop for greedy OR — now un-gated — for
+                      // temp>0 when the loaded speculator can sample its verify. DSpark
+                      // signals this via `requires_greedy()==false` (its sampled verify is the
+                      // "chain" kind, NOT the ddtree-SWOR flavour that `supports_temp_verify()`
+                      // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
+                      // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
+                      // was hardcoded greedy-only (temp>0 → AR).
+        let spec_temp_ok =
+            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
+        let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(
                 m,
@@ -7029,6 +7117,10 @@ fn generate(
                 prompt,
                 system_prompt,
                 max_tokens,
+                temp,
+                top_p,
+                top_k.map(|k| k as usize).unwrap_or(0),
+                cactus_delta,
                 think_mode,
                 tools,
                 messages_history,
@@ -7077,10 +7169,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -7142,10 +7234,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -7205,10 +7297,10 @@ fn generate(
             tools,
             messages_history,
             stop,
-            temp,  // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
+            temp, // greedy-only n-gram drafter: gate above only reaches here at temp<=1e-6 (temp>0 → AR path below); honored if a sampling-capable drafter is ever loaded
             top_p, // nucleus cutoff — active only for a sampling-capable drafter
             top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff
-            0.0_f32, // cactus_delta: lossless serve path
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         return;
     }
@@ -7388,39 +7480,87 @@ fn generate(
     // opt out to the simpler AR path (e.g. to avoid spec-decode) with
     // `HIPFIRE_DFLASH_CHAT=0`.
     let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
-    // Sampled (temp>0) spec-decode routing. The #477-merge re-wire threads the
-    // request's temp/top_p/top_k/cactus through `Speculator::set_sampling` (in
-    // `generate_dflash`) into `DflashSpeculator::step`, so DFlash decodes temp>0
-    // via lossless rejection sampling — identical (top_k,top_p) nucleus on draft +
-    // target → lossless == AR-at-(top_k,top_p) — NOT silently greedy. The routing
-    // is a SPLIT that preserves EACH parent's validated behavior:
-    //   * qwen3.5/3.6 (arch 5/6): spec-graph's sampled gate — greedy OR
-    //     (fast_sample_on AND no min_p) → DFlash. Reproduces spec-graph's shipped
-    //     default-on sampled-DFlash (1dc8dd0f/6f2663e3) exactly.
-    //   * llama (arch 0/1): #477's greedy-only posture — temp>0 → AR. spec-graph
-    //     never ran llama-DFlash, so this merge does NOT invent an unvalidated
-    //     sampled-llama path; a follow-up can widen it once gate-validated.
-    // min_p stays unimplemented on the sampled DFlash path (top_p/top_k only), so
-    // a min_p-constrained temp>0 request still routes to AR (the qwen clause's
-    // `!dflash_min_p_present`).
+    // ── temp>0 DFlash spec routing — composes two distribution-preserving verifies ──
+    // The qwen35 DflashSpeculator carries BOTH temp>0 mechanisms, picked by how it
+    // LOADED (not per-request); both preserve the target distribution, differing only
+    // in which sampling controls they can honor (and in τ):
+    //   * ddtree mode (`supports_temp_verify`): SWOR tree-verify, fed `temp` directly
+    //     (#483). Distribution-exact but honors TEMPERATURE ONLY — it samples
+    //     softmax(logits/temp), so it cannot honor an explicit top_p/top_k/min_p/
+    //     penalty. Highest τ (multi-candidate tree).
+    //   * chain mode (`!ddtree`, `!requires_greedy`): master's lossless rejection
+    //     sampling via `set_sampling`, honoring temp + top_p + top_k (== AR at that
+    //     nucleus). Reproduces spec-graph's shipped default-on sampled-DFlash.
+    // Routing therefore PREFERS ddtree-SWOR for a bare-temperature request; an explicit
+    // sampling control SWOR can't honor falls to AR (ddtree mode) or is honored by
+    // chain rejection sampling (chain mode). A greedy-only drafter (MTP/n-gram) keeps
+    // temp>0 on AR. min_p is unimplemented on both spec paths (a min_p request → AR).
+    // Opt out of temp>0 spec entirely: HIPFIRE_DFLASH_TEMP_SPEC=0.
     let fast_sample_on = std::env::var("HIPFIRE_DFLASH_FAST_SAMPLE").ok().as_deref() != Some("0");
     let dflash_min_p_present = min_p.map(|p| p > 0.0).unwrap_or(false);
-    // Does the loaded drafter sample FAITHFULLY? `m.speculator` on a qwen35 arch
-    // may be a DflashSpeculator (lossless rejection sampling → requires_greedy
-    // false), but it may equally be a greedy-only MtpSpeculator or n-gram
-    // ChainSpeculator (requires_greedy true) — `build_speculator` picks by what
-    // loaded. Gating the temp>0 route on `!requires_greedy()` is what stops a
-    // sampled request from being routed into a greedy-only drafter and silently
-    // decoded greedy (the set_sampling call there would be a no-op). A greedy-only
-    // drafter at temp>0 falls through to AR (faithful) instead.
-    let spec_can_sample = m.speculator.as_ref().map(|s| !s.requires_greedy()).unwrap_or(false);
-    // qwen35/36: spec-graph sampled routing — greedy always; temp>0 only when the
-    // drafter samples (DflashSpeculator) AND fast-sample is on AND no min_p.
+    let temp_spec_env_off = std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let supports_temp_swor = m
+        .speculator
+        .as_ref()
+        .is_some_and(|s| s.supports_temp_verify());
+    // ddtree-SWOR: distribution-exact but temperature-only — engage only for a bare-
+    // temperature request (an explicit control it can't honor falls to AR below). A
+    // *defaulted* top_p (model recommendation) stays advisory.
+    let ddtree_swor_route =
+        temp > 1e-6 && supports_temp_swor && !user_explicit_sampling && !temp_spec_env_off;
+    // chain rejection sampling (master): honors temp+top_p+top_k. `!requires_greedy()`
+    // stops a sampled request from routing into a greedy-only drafter (MTP/n-gram) and
+    // being silently decoded greedy. Gate on `!supports_temp_swor` so a ddtree-mode
+    // drafter never takes this arm — its `step()` dispatches to the temp-only SWOR
+    // verify, which would silently drop top_p/top_k. `!supports_temp_swor` is exactly
+    // chain mode (no ddtree configured).
+    let spec_can_sample = m
+        .speculator
+        .as_ref()
+        .map(|s| !s.requires_greedy())
+        .unwrap_or(false);
+    let chain_sample_route = temp > 1e-6
+        && !supports_temp_swor
+        && spec_can_sample
+        && fast_sample_on
+        && !dflash_min_p_present
+        && !temp_spec_env_off;
+    // qwen3.5/3.6: greedy always; temp>0 via ddtree-SWOR or chain rejection sampling.
     let qwen_dflash_route = (m.arch_id == 5 || m.arch_id == 6)
-        && (temp <= 1e-6 || (spec_can_sample && fast_sample_on && !dflash_min_p_present));
-    // llama: #477 greedy-only DFlash (temp>0 falls through to AR — spec-graph
-    // never ran llama-DFlash, so no unvalidated sampled-llama path here).
-    let llama_dflash_route = (m.arch_id == 0 || m.arch_id == 1) && temp <= 1e-6;
+        && (temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
+    // llama (arch 0/1): #483 built + validated dense DFlash with ddtree tree-SWOR, so
+    // temp>0 engages ddtree-SWOR here (bare temp). DSpark (qwen3) adds a validated
+    // sampled-llama CHAIN path — its fused sample_top_p_pf verify honors
+    // temp+top_p+top_k and beats AR at temp>0 — so `chain_sample_route` now engages
+    // llama temp>0 too. (Non-DSpark chain-mode llama has no such path and stays on
+    // AR via `spec_can_sample`/`supports_temp_swor` gating.)
+    let llama_dflash_route = (m.arch_id == 0 || m.arch_id == 1)
+        && (temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
+    // Operator visibility: a temp>0 request on a DFlash-capable arch that did NOT
+    // qualify for spec silently runs AR (correct, but slower). Name the reason.
+    if temp > 1e-6
+        && m.speculator.is_some()
+        && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
+        && !qwen_dflash_route
+        && !llama_dflash_route
+        && !budgeted_thinking_needs_ar
+        && !force_ar_chat
+    {
+        let reason = if temp_spec_env_off {
+            "HIPFIRE_DFLASH_TEMP_SPEC=0"
+        } else if supports_temp_swor && user_explicit_sampling {
+            "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
+        } else if dflash_min_p_present {
+            "request set min_p (sampled DFlash honors top_p/top_k only); AR applies it"
+        } else if !spec_can_sample {
+            "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
+        } else {
+            "ddtree SWOR verify not active (needs ddtree_budget>0)"
+        };
+        eprintln!(
+            "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
+        );
+    }
     if m.speculator.is_some()
         && !budgeted_thinking_needs_ar
         && !force_ar_chat
@@ -7482,11 +7622,11 @@ fn generate(
             dflash_alpha,
             tools,
             messages_history,
-            stop,    // hunt3 M-F: thread user stop sequences into the default DFlash path
-            temp,    // request-resolved temp (0.0 greedy / >0 lossless rejection-sampling)
-            top_p,   // nucleus cutoff: honored on the sampled DFlash path
-            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (recipe → folded into tau)
-            0.0_f32, // cactus_delta: lossless (distribution-preserving) on the serve path
+            stop,  // hunt3 M-F: thread user stop sequences into the default DFlash path
+            temp, // request-resolved temp: ddtree mode → SWOR (temp-only); chain mode → lossless rejection-sampling
+            top_p, // nucleus cutoff: honored on the chain sampled path (ignored by the ddtree SWOR arm)
+            top_k.map(|k| k as usize).unwrap_or(0), // top-k cutoff (chain path; recipe → folded into tau)
+            cactus_delta, // request opt-in (0.0 default = lossless); ds4 DSpark / qwen35 DFlash only
         );
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume. top_p IS now applied to the spec sampling (nucleus on both
@@ -10044,6 +10184,7 @@ fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
 /// the `Deepseek4Bundle` target (via `spec_target_guard`), and `Deepseek4Emit`.
 /// Greedy-only — the dispatch routes here only at `temp <= 1e-6`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn generate_deepseek4_spec(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -10052,6 +10193,12 @@ fn generate_deepseek4_spec(
     prompt: &str,
     system_prompt: Option<&str>,
     max_tokens: usize,
+    // Sampling: temp<=1e-6 → greedy (argmax-accept, byte-identical to before);
+    // temp>0 → DSpark sampled verify. cactus_delta is the opt-in acceptance boost.
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    cactus_delta: f32,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -10166,6 +10313,13 @@ fn generate_deepseek4_spec(
             None
         };
 
+    // Configure the speculator's sampling before the loop — mirrors generate_dflash's
+    // set_sampling before generate_spec. Greedy (temp<=1e-6) leaves it at argmax-accept
+    // (byte-identical to the prior hardcoded-greedy path); temp>0 drives the DSpark
+    // sampled verify, and cactus_delta>0 applies the opt-in acceptance boost.
+    if let Some(spec) = m.speculator.as_mut() {
+        spec.set_sampling(temp, top_p, top_k, cactus_delta);
+    }
     let prompt_tokens_total = prompt_ids.len();
     let run = match generate_spec(
         m,
@@ -10187,6 +10341,7 @@ fn generate_deepseek4_spec(
             think_mode,
             decoded_vocab,
         },
+        temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
@@ -13552,7 +13707,7 @@ fn run_dots_ocr_ngram_loop(
         if position.saturating_add(block_size) >= ctx_capacity {
             break;
         }
-        let step = match spec.step(gpu, bundle, position, seed_token, &emitted, None) {
+        let step = match spec.step(gpu, bundle, position, seed_token, &emitted, None, 0.0) {
             Ok(s) => s,
             Err(e) => {
                 write_error(stdout, id, &format!("dots.ocr spec_step: {e}"));

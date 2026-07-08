@@ -520,7 +520,7 @@ impl Carrier for LlamaCarrier {
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         // ── source-varying seam: yields a LlamaBundle ──
-        let bundle = match src {
+        let mut bundle = match src {
             ModelSource::Hfq(hfq) => {
                 hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?
             }
@@ -561,22 +561,222 @@ impl Carrier for LlamaCarrier {
                     weights,
                     scratch,
                     kv,
+                    dflash_extract_layers: Vec::new(),
+                    dspark_weights: None,
+                    dspark_assets: None,
                 }
             }
         };
 
+        // ── DSpark sidecar discovery ──────────────────────────────────────────
+        // When a `<stem>-dspark.<ext>` sidecar exists alongside the main model
+        // and speculation is not explicitly disabled (`ctx.spec.dspark != Some(false)`),
+        // load the Qwen3-8B drafter body + DSpark globals into the bundle.
+        //
+        // The speculator BUILD arm (Task 10) reads bundle.dspark_weights +
+        // bundle.dspark_assets to wire the DsparkDrafter into the serve path.
+        // This block only does the load — no speculator is built here.
+        if ctx.spec.dspark != Some(false) {
+            let base_path = std::path::Path::new(ctx.path);
+            let dspark_path: Option<std::path::PathBuf> = match (
+                base_path.parent(),
+                base_path.file_stem(),
+                base_path.extension(),
+            ) {
+                (Some(parent), Some(stem), Some(ext)) => Some(parent.join(format!(
+                    "{}-dspark.{}",
+                    stem.to_string_lossy(),
+                    ext.to_string_lossy()
+                ))),
+                _ => None,
+            };
+            if let Some(p) = dspark_path.filter(|p| p.exists()) {
+                eprintln!("llama: opening DSpark sidecar HFQ {p:?}");
+                match hipfire_runtime::hfq::HfqFile::open(&p) {
+                    Ok(mut sidecar) => {
+                        sidecar.drop_mmap();
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
+                        {
+                            Ok(Some((dspark_weights, dspark_assets))) => {
+                                eprintln!(
+                                    "  llama: DSpark sidecar loaded (block_size={}, target_layers={:?})",
+                                    dspark_weights.cfg.block_size,
+                                    dspark_weights.cfg.target_layer_ids,
+                                );
+                                bundle.dspark_weights = Some(dspark_weights);
+                                bundle.dspark_assets = Some(dspark_assets);
+                            }
+                            Ok(None) => {
+                                eprintln!(
+                                    "  llama: DSpark sidecar {p:?} has no dspark_* metadata — skipping"
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("  llama: WARNING DSpark sidecar load failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  llama: WARNING cannot open DSpark sidecar {p:?}: {e}");
+                    }
+                }
+            } else if ctx.spec.dspark == Some(true) {
+                // Forced `--spec dspark` but the sidecar file is absent → we would
+                // silently run AR. Warn (auto/`None` stays quiet — a missing sidecar
+                // is the expected no-op there).
+                eprintln!(
+                    "  llama: WARNING `--spec dspark` requested but no `-dspark` sidecar found \
+                     (expected `<stem>-dspark.<ext>` next to the model) — falling back to AR/other drafter"
+                );
+            }
+        }
+
         // ── single shared tail ──
-        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). llama has
-        // no DFlash draft and no eviction by default; the arm builds its verify
-        // scratch lazily on first prefill, so only ctx_capacity is needed here.
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        // Precedence (arch_id=0/1): DSpark > DFlash > n-gram.
+        //
+        // DSpark sidecar speculator: present when the `-dspark` sidecar was loaded
+        // (bundle.dspark_weights.is_some()) AND speculation is not explicitly disabled.
+        // Consumes the assets from the bundle (moves them into the speculator body).
+        //
+        // If no DSpark sidecar is available, fall through to:
+        // - DFlash generic speculator (arch_id=20 draft).
+        // - Opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1).
+        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if bundle
+            .dspark_weights
+            .is_some()
+            && ctx.spec.dspark != Some(false)
+        {
+            let dspark_weights = bundle.dspark_weights.take().unwrap();
+            let assets = bundle.dspark_assets.take().unwrap();
+            let block = dspark_weights.cfg.block_size;
+            let vocab = assets.config.vocab_size;
+
+            // stage_norm = drafter's final `norm.weight` (output_norm in the sidecar).
+            // Shallow-clone so the LlamaWeights (assets) owns the primary GpuTensor;
+            // the speculator holds an alias that is freed before the weights on unload.
+            let stage_norm = assets.weights.output_norm.shallow_clone();
+
+            // lm_head fix: assets.weights.output.buf.dtype == Raw (upload_raw always
+            // sets Raw), but the actual data layout is F16.  run_heads dispatches on
+            // GpuTensor.dtype, so we shallow_clone and fix the dtype + shape here.
+            // (The parity harness does the same at qwen3_dspark_parity.rs:215-217.)
+            let mut lm_head = assets.weights.output.buf.shallow_clone();
+            lm_head.dtype = rdna_compute::DType::F16;
+            lm_head.shape = vec![vocab];
+
+            // conf_threshold ladder: env > CLI arg > 0.1
+            // Default 0.1 (sweep-tuned): 0.5 over-truncates (1.46/7 proposed);
+            // 0.1 proposes ~6.94/7, +16.6% prose tok/s / +7.1% code tok/s.
+            let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or(ctx.spec.dspark_conf_threshold)
+                .unwrap_or(0.1f32);
+
+            eprintln!(
+                "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
+                block, conf_threshold
+            );
+            let body = hipfire_arch_llama::dspark_body::build_qwen3_dspark_body(
+                assets,
+                &dspark_weights.cfg,
+                ctx.gpu,
+            )
+            .map_err(|e| format!("llama DSpark body build failed: {e}"))?;
+            Some(hipfire_runtime::dspark_core::build_dspark_speculator(
+                body,
+                dspark_weights,
+                stage_norm,
+                lm_head,
+                block,
+                ctx.max_seq,
+                conf_threshold,
+                // temp>0 sampled verify ENABLED: with lazy prefix sampling (only ~τ
+                // lm_heads/window) qwen3 DSpark at temp>0 beats AR by ~+24% (29.6 vs
+                // 23.8 tok/s on gfx1151 code) and stays distribution-identical to AR
+                // (fused sample_top_p_pf, honors temp+top_p+top_k). The daemon routes
+                // temp>0 llama through the chain path (requires_greedy()==false).
+                true,
+            ))
+        } else if let Some(dp) = ctx.draft_path {
+            // Peek at the draft's arch_id without consuming the path; the builder
+            // opens it again internally.
+            match hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(dp)) {
+                Ok(draft_hfq) if draft_hfq.arch_id == 20 => {
+                    // Parse DflashConfig to validate the cross-attention concat invariant
+                    // (review finding L4): the drafter's hidden must equal the target dim.
+                    let draft_cfg = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
+                        .ok_or_else(|| {
+                            format!(
+                                "DFlash draft '{}' has arch_id=20 but missing or malformed \
+                                 'dflash' metadata block",
+                                dp
+                            )
+                        })?;
+                    if bundle.config.dim != draft_cfg.hidden {
+                        return Err(format!(
+                            "DFlash draft '{}' hidden={} != target dim={} \
+                                 (cross-attention concat invariant L4: drafter hidden \
+                                 must equal target residual dim)",
+                            dp, draft_cfg.hidden, bundle.config.dim
+                        ));
+                    }
+                    // Drop the peek handle before the builder reopens it.
+                    drop(draft_hfq);
+                    let spec = hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
+                        ctx.gpu,
+                        dp,
+                        &mut bundle,
+                        ctx.max_seq,
+                    )
+                    .map_err(|e| format!("DFlash generic speculator build failed: {e}"))?;
+                    eprintln!(
+                        "  DFlash generic speculator loaded for arch {} target: {}",
+                        meta.arch_id, dp
+                    );
+                    Some(spec)
+                }
+                // Not a DFlash draft or unreadable — log why and fall through to n-gram.
+                Err(e) => {
+                    eprintln!(
+                        "  [hipfire] draft '{}' unreadable ({e}); DFlash speculator not built, falling back to n-gram",
+                        dp
+                    );
+                    crate::spec_build::build_speculator(
+                        meta.arch_id,
+                        None,
+                        None,
+                        true,
+                        ctx.max_seq,
+                        ctx.spec,
+                    )
+                }
+                Ok(draft_hfq) => {
+                    eprintln!(
+                        "  [hipfire] draft '{}' is arch_id={} (not 20 / DFlash); DFlash speculator not built, falling back to n-gram",
+                        dp, draft_hfq.arch_id
+                    );
+                    crate::spec_build::build_speculator(
+                        meta.arch_id,
+                        None,
+                        None,
+                        true,
+                        ctx.max_seq,
+                        ctx.spec,
+                    )
+                }
+            }
+        } else {
+            // No draft configured: opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1) or None.
+            crate::spec_build::build_speculator(
+                meta.arch_id,
+                None,
+                None,
+                true,
+                ctx.max_seq,
+                ctx.spec,
+            )
+        };
         Ok(LoadedModel {
             state: Some(ModelState::Llama(bundle)),
             speculator,
@@ -712,18 +912,24 @@ impl Carrier for Deepseek4Carrier {
         // ── source-varying seam: (config, weights) only ──
         // NOTE: the Dir/safetensors arm is UNVALIDATED — no deepseek_v4
         // checkpoint was available locally to verify load fidelity. Reviewer-ask.
+        // DSpark sidecar load gate: `speculation=dspark`/`auto` load the 3×MoE
+        // sidecar; any other mechanism (`Some(false)`) skips it so it never pages
+        // into VRAM. `None` (auto / directly-driven daemon) keeps default-on.
+        let load_dspark = ctx.spec.dspark != Some(false);
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
-                let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+                let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+                config.load_dspark = load_dspark;
                 let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(
                     &mut hfq, &config, ctx.gpu,
                 )?;
                 (config, weights)
             }
             ModelSource::Dir(source) => {
-                let config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
+                let mut config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
                     "deepseek4: failed to parse config from safetensors".to_string()
                 })?;
+                config.load_dspark = load_dspark;
                 let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(
                     &source, &config, ctx.gpu,
                 )?;
@@ -742,30 +948,65 @@ impl Carrier for Deepseek4Carrier {
         // per-request spec gate (mtp_mode / HIPFIRE_DEEPSEEK4_SPEC_DECODE / temp<=eps) stays in
         // the generate path (T4 routing) — here we only build the capability. Undriven until T4:
         // the daemon's arch_id==9 branch still uses the bespoke generate_deepseek4 loop.
-        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> =
-            if weights.mtp_layer.is_some() {
-                // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
-                // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-                let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .or_else(|| {
-                        std::env::var("HIPFIRE_MTP_K")
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                    })
-                    .unwrap_or(2);
-                let ctx_capacity = config.max_position_embeddings;
-                eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
-                Some(
-                    hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator(
-                        max_n,
-                        ctx_capacity,
-                    ),
+        // DSpark draft module (the `-dspark` sidecar) wins over the in-trunk MTP
+        // layer when present. Built when the sidecar loaded AND the `speculation`
+        // selector did not pick another mechanism (`ctx.spec.dspark != Some(false)`;
+        // `None` = auto keeps the default-on behaviour). The threshold is the
+        // CLI-forwarded `--dspark-conf-threshold` (env still wins in the builder).
+        // `--spec dspark` (forced) but the sidecar was absent → we silently ran
+        // AR before. Warn on the forced case only (auto/`None` legitimately falls
+        // back without a sidecar and must stay quiet).
+        if ctx.spec.dspark == Some(true) && weights.dspark.is_none() {
+            eprintln!(
+                "  deepseek4: WARNING `--spec dspark` requested but no `-dspark` sidecar was \
+                 loaded (expected `<stem>-dspark.<ext>` next to the model) — falling back to MTP/AR"
+            );
+        }
+        let dspark_enabled = weights.dspark.is_some() && ctx.spec.dspark != Some(false);
+        let speculator: Option<Box<dyn hipfire_runtime::spec::Speculator>> = if dspark_enabled {
+            let block = weights.dspark.as_ref().unwrap().cfg.block_size;
+            let ctx_capacity = config.max_position_embeddings;
+            eprintln!("  deepseek4 DSpark speculator enabled (sidecar, block={block})");
+            Some(
+                hipfire_arch_deepseek4::dspark_speculator::build_deepseek4_dspark_speculator(
+                    &config,
+                    &weights,
+                    block,
+                    ctx_capacity,
+                    ctx.spec.dspark_conf_threshold,
+                    // temp>0 sampled verify ENABLED in serving. The earlier "loses to
+                    // AR → gate off" reasoning was a fixed-block measurement artifact;
+                    // comprehensive temp=1.0 tests with the τ-adaptive block-depth
+                    // controller show ds4 DSpark temp>0 BEATS AR, and the opt-in CACTUS
+                    // acceptance-boost (request `cactus_delta`) adds more on top.
+                    // Distribution-preserving at cactus_delta=0 (the default).
+                    true,
                 )
-            } else {
-                None
-            };
+                .map_err(|e| format!("deepseek4 DSpark speculator build failed: {e}"))?,
+            )
+        } else if weights.mtp_layer.is_some() {
+            // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
+            // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
+            let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| {
+                    std::env::var("HIPFIRE_MTP_K")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                })
+                .unwrap_or(2);
+            let ctx_capacity = config.max_position_embeddings;
+            eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
+            Some(
+                hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator(
+                    max_n,
+                    ctx_capacity,
+                ),
+            )
+        } else {
+            None
+        };
         Ok(LoadedModel {
             state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
                 config,

@@ -157,6 +157,7 @@ impl SpecTarget for Lfm2MoeBundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Plain target advance: feed each token at its absolute position. `reset`
         // zeroes the conv-states + token count first (cache-miss prefill); on a
@@ -188,6 +189,7 @@ impl SpecTarget for Lfm2MoeBundle {
         block: &[u32],
         position: usize,
         scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         let s = scratch
             .as_any_mut()

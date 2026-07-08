@@ -289,27 +289,7 @@ fn main() {
 
     // DdtreeScratch for the tree mask + parent_indices buffers.
     // Max budget = n_verify - 1 (everything except root).
-    let qkv_dim = {
-        let cfg = &target.config;
-        let k_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
-        let v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
-        k_dim * 2 + v_dim
-    };
-    let n_fa_layers = target
-        .config
-        .layer_types
-        .iter()
-        .filter(|t| matches!(t, hipfire_arch_qwen35::qwen35::LayerType::FullAttention))
-        .count();
-    let ddtree_scratch = DdtreeScratch::new(
-        &mut gpu,
-        n_verify - 1,
-        target.config.n_kv_heads,
-        target.config.head_dim,
-        qkv_dim,
-        n_fa_layers,
-    )
-    .expect("alloc DdtreeScratch");
+    let ddtree_scratch = DdtreeScratch::new(&mut gpu, n_verify - 1).expect("alloc DdtreeScratch");
 
     let mut compose_state = MtpComposeTreeState::new(&mut gpu, &target, &head, b, mtp_k)
         .expect("alloc MtpComposeTreeState");
@@ -339,8 +319,7 @@ fn main() {
         prompt_tokens.len(),
     )
     .expect("seed scatter");
-    draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-    draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
+    draft_scratch.thlog.seed_prompt(prompt_tokens.len());
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
     eprintln!(

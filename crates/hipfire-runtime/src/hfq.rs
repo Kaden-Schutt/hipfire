@@ -1033,7 +1033,7 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
 }
 
 /// Load a weight tensor (quantized or F16) onto GPU.
-fn load_weight_tensor(
+pub(crate) fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &Gpu,
     name: &str,
@@ -1086,6 +1086,61 @@ fn load_weight_tensor(
     // sidecars if added later. Routed through `DType::supports_awq_sidecar`
     // so future widening is a single helper edit, not a scattered
     // per-loader hunt. See dispatch.rs for the allow-list rationale.
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        wt.awq_scale = load_awq_scale(hfq, gpu, &st_name, k);
+    }
+    Ok(wt)
+}
+
+/// Pread-safe variant of [`load_weight_tensor`]: uses `tensor_data_vec` so it
+/// works after `drop_mmap()`. Signature matches the `HfqBackend::read_proj`
+/// function-pointer type. Used by sidecar loaders that call `drop_mmap()`
+/// before loading (e.g. the DSpark qwen3 sidecar loader on UMA).
+pub fn load_weight_tensor_pread(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    candidates: fn(&str) -> Vec<String>,
+) -> HipResult<WeightTensor> {
+    let st_name = candidates(name)
+        .into_iter()
+        .find(|c| hfq.find_tensor_info(c).is_some())
+        .ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
+    let (info, data) = hfq
+        .tensor_data_vec(&st_name)
+        .ok_or_else(|| HipError::new(0, &format!("tensor not found: {st_name}")))?;
+
+    let mut wt = match info.quant_type {
+        1 => {
+            // F16 — host-decode to F32 for the F32 GEMV path.
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            Ok::<WeightTensor, HipError>(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        other => match raw_codec(other) {
+            Some(c) => decode_raw_codec(gpu, c, &data, m, k, &st_name),
+            None => Err(HipError::new(
+                0,
+                &format!("unsupported quant_type {other} for weight {st_name}"),
+            )),
+        },
+    }?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         wt.awq_scale = load_awq_scale(hfq, gpu, &st_name, k);
     }
@@ -1266,7 +1321,7 @@ pub fn load_weights_hfq(
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
 /// no DeltaNet). `q_out_dim`/`kv_dim` are passed in so the caller reuses the
 /// exact dims it already computes.
-pub(crate) fn load_layer<B: WeightBackend>(
+pub fn load_layer<B: WeightBackend>(
     b: &mut B,
     config: &crate::llama::LlamaConfig,
     q_out_dim: usize,

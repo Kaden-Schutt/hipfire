@@ -247,16 +247,13 @@ pub fn spec_step_dflash_mtp(
     }
 
     // Positions (no eviction support — this is a v1 path, no FlashCASK).
-    let effective_ctx_len = draft_scratch
-        .target_hidden_abs_positions
-        .len()
-        .min(position);
+    let effective_ctx_len = draft_scratch.thlog.abs_positions().len().min(position);
     let co = target.kv_cache.compact_offset as i32;
     let positions_q: Vec<i32> =
         ((position as i32 + co)..(position as i32 + b as i32 + co)).collect();
     let positions_k: Vec<i32> = {
         let mut v = Vec::with_capacity(effective_ctx_len + b);
-        let th_abs = &draft_scratch.target_hidden_abs_positions;
+        let th_abs = draft_scratch.thlog.abs_positions();
         let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
         v.extend_from_slice(&th_abs[start_idx..]);
         for p in 0..b {
@@ -569,13 +566,10 @@ pub fn spec_step_dflash_mtp(
         n_verify,
         rows_to_keep,
     )?;
-    draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
     let co = target.kv_cache.compact_offset as i32;
-    for p in 0..rows_to_keep {
-        draft_scratch
-            .target_hidden_abs_positions
-            .push(position as i32 + p as i32 + co);
-    }
+    draft_scratch
+        .thlog
+        .append_committed(position, rows_to_keep, co);
 
     // ── 8. Rollback trunk DN state + replay accepted committed tokens ────
     target_snap.restore_to(&mut target.dn_state, gpu)?;
@@ -838,16 +832,13 @@ pub fn spec_step_dflash_mtp_tree(
         }
     }
 
-    let effective_ctx_len = draft_scratch
-        .target_hidden_abs_positions
-        .len()
-        .min(position);
+    let effective_ctx_len = draft_scratch.thlog.abs_positions().len().min(position);
     let co = target.kv_cache.compact_offset as i32;
     let positions_q: Vec<i32> =
         ((position as i32 + co)..(position as i32 + b as i32 + co)).collect();
     let positions_k: Vec<i32> = {
         let mut v = Vec::with_capacity(effective_ctx_len + b);
-        let th_abs = &draft_scratch.target_hidden_abs_positions;
+        let th_abs = draft_scratch.thlog.abs_positions();
         let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
         v.extend_from_slice(&th_abs[start_idx..]);
         for p in 0..b {
@@ -1128,7 +1119,7 @@ pub fn spec_step_dflash_mtp_tree(
         gpu.hip
             .memcpy_htod(&ddtree_scratch.attn_bias.buf, mask_bytes)?;
     }
-    let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() != Some("0");
+    let use_tree_la = gpu.flags.ddtree_tree_la;
     if use_tree_la {
         let parent_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -1165,7 +1156,6 @@ pub fn spec_step_dflash_mtp_tree(
         } else {
             None
         },
-        pre_rope_k_capture: None,
     };
 
     let verify_out: DflashVerifyOutput = speculative::verify_dflash_block_tree(
@@ -1178,6 +1168,7 @@ pub fn spec_step_dflash_mtp_tree(
         false, // greedy / temp=0
         ctx,
         verify_scratch,
+        false, // greedy path: argmax_per_pos is used by follow_verified_tree
     )?;
 
     let posterior = &verify_out.argmax_per_pos;
@@ -1268,12 +1259,9 @@ pub fn spec_step_dflash_mtp_tree(
         n_total,
         rows_to_keep,
     )?;
-    draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
-    for p in 0..rows_to_keep {
-        draft_scratch
-            .target_hidden_abs_positions
-            .push(position as i32 + p as i32 + co);
-    }
+    draft_scratch
+        .thlog
+        .append_committed(position, rows_to_keep, co);
 
     // ── 9. Rollback trunk DN state + replay accepted committed tokens ────
     //

@@ -27,7 +27,11 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
+#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+__launch_bounds__(32, 8)
+#else
 __launch_bounds__(32, 2)
+#endif
 extern "C" __global__ void gemm_qkv_hfq4g256_wmma(
     const char*    __restrict__ A_q,
     const char*    __restrict__ A_k,

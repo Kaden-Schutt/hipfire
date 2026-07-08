@@ -144,6 +144,12 @@ impl SpecTargetGuard for Qwen35SlotGuard<'_> {
 ///    spec-decode with no draft model. Opt-in until validated.
 /// 3. Otherwise `None` (AR-only).
 ///
+/// **Note (arch_id 0/1 — llama/qwen3):** `LlamaCarrier::load` handles the
+/// DSpark sidecar arm BEFORE calling this function.  The precedence for llama
+/// is: **DSpark > DFlash > n-gram**.  If a `-dspark` sidecar was loaded the
+/// carrier returns early with the `DsparkDrafter` speculator and never calls
+/// `build_speculator`.
+///
 /// The n-gram arm is arch-typeless: it builds its target-side verify scratch
 /// lazily on first `prefill` via `SpecTarget::new_spec_scratch`, so this fn needs
 /// only `arch_id`, the drafter env, and the target's `ctx_capacity`. `arch_id`

@@ -72,6 +72,7 @@ impl SpecTarget for MiniMaxBundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Pure attention: "reset" rewinds the position cursor; the per-token
         // prefill then overwrites KV at the absolute positions it writes.
@@ -114,6 +115,7 @@ impl SpecTarget for MiniMaxBundle {
         block: &[u32],
         position: usize,
         _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         // Sequential verify: `decode_step(block[i])` predicts the token AFTER
         // block[i] (with block[0..i] already in the KV cache), which is exactly

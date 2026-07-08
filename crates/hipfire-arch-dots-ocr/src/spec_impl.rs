@@ -111,6 +111,7 @@ impl SpecTarget for DotsOcrBundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         if reset {
             self.state.reset();
@@ -142,6 +143,7 @@ impl SpecTarget for DotsOcrBundle {
         block: &[u32],
         position: usize,
         _scratch: &mut dyn SpecScratch,
+        _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
         // Block-parallel verify via the F32-KV batched-decode-with-history
         // kernel in the qwen2 crate. dots.ocr's decoder IS Qwen2 so this

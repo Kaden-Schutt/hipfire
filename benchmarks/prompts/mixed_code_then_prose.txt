@@ -1,0 +1,1 @@
+Write a Python function to reverse a singly linked list. Then, in the same response after the code, write a short whimsical Borgesian paragraph about the linked list dreaming.

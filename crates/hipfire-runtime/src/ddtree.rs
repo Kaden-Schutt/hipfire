@@ -42,6 +42,14 @@ pub struct DdNode {
     /// Index in `DdTree.nodes` of this node's parent, or -1 if parent == root.
     /// Note: -1 here is the "root is parent" sentinel, NOT "no parent".
     pub parent_index: i32,
+    /// Cumulative draft log-probability of the path root→this node (sum of the
+    /// per-depth conditional log-probs along the path). The conditional draft
+    /// prob of this node given its parent is `exp(logw − parent.logw)` (with
+    /// `parent.logw = 0` when the parent is the root). Not needed by the
+    /// distribution-preserving `sample_verified_tree` (which samples the target,
+    /// not the draft), but kept as cheap metadata for diagnostics and any
+    /// future draft-conditional (typical-acceptance / CACTUS-style) variant.
+    pub logw: f32,
 }
 
 /// A speculative-verification tree.
@@ -181,6 +189,40 @@ pub fn build_ddtree_tree_with_cutoff(
     budget: usize,
     logw_cutoff: f32,
 ) -> DdTree {
+    // Thin wrapper: no floor (min_nodes=0), budget is the ceiling.
+    build_ddtree_tree_bounded(
+        top_tokens,
+        top_log_probs,
+        depth,
+        topk,
+        0,
+        budget,
+        logw_cutoff,
+    )
+}
+
+/// Best-first DDTree build with a node-count band `[min_nodes, max_nodes]`.
+///
+/// The `logw_cutoff` (meta-verifier pruner) is the *shape* control — it shrinks
+/// the tree on confident steps — but its raw node count swings with the step's
+/// distribution (a near-chain when peaked, near-full when flat). This bands it:
+/// expand the most-likely nodes *ignoring* the cutoff until `min_nodes` are
+/// placed (a floor, so the verify is never wastefully tiny), then let the cutoff
+/// prune, and stop at `max_nodes` (the ceiling, so verify cost is capped). The
+/// result is always in `[min(min_nodes, reachable), max_nodes]`, with the cutoff
+/// steering depth-vs-breadth within the band. `min_nodes=0` ⇒ pure cutoff
+/// (the historical `build_ddtree_tree_with_cutoff`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_ddtree_tree_bounded(
+    top_tokens: &[u32],
+    top_log_probs: &[f32],
+    depth: usize,
+    topk: usize,
+    min_nodes: usize,
+    max_nodes: usize,
+    logw_cutoff: f32,
+) -> DdTree {
+    let budget = max_nodes;
     // Early out: no draft positions or no budget → root-only tree.
     if budget == 0 || depth == 0 {
         return DdTree {
@@ -232,7 +274,9 @@ pub fn build_ddtree_tree_with_cutoff(
         // also below. Bail early to shrink the tree for high-confidence
         // cycles — verify cost saved ∝ nodes-pruned, acceptance loss ≈ 0
         // (those nodes' target-accept probability is bounded by exp(logw)).
-        if entry.logw < logw_cutoff {
+        // The `min_nodes` floor delays the cutoff: always place at least that
+        // many highest-probability nodes first, so the band's lower bound holds.
+        if nodes.len() >= min_nodes && entry.logw < logw_cutoff {
             break;
         }
         let HeapEntry {
@@ -252,6 +296,7 @@ pub fn build_ddtree_tree_with_cutoff(
             token,
             depth: d as u32,
             parent_index,
+            logw,
         });
         child_maps.push(HashMap::new());
         // Register this node as a child of its parent by its draft token.
@@ -363,147 +408,505 @@ pub fn follow_verified_tree(tree: &DdTree, posterior: &[u32]) -> (Vec<usize>, u3
     (accepted, next_token)
 }
 
-/// Return the **greedy main path** through the tree as a list of node
-/// indices: the chain that starts at the root and at each step descends
-/// to its highest-cumulative-log-prob child.
+/// SpecInfer NAIVE-sampling acceptance for a LINEAR (chain) DFlash block —
+/// distribution-EXACT at any temperature.
 ///
-/// The implementation exploits an invariant of `build_ddtree_tree_with_cutoff`:
-/// nodes are pushed into `tree.nodes` in heap-pop order (strictly
-/// descending cumulative logw, push_order tie-breaking). For any given
-/// parent slot, the child with the *lowest* index in `nodes` was popped
-/// earliest and therefore has the highest cumulative logw among that
-/// parent's children. Walking from root and always picking the
-/// smallest-indexed child yields the greedy main path. See
-/// `deeper_tree_maintains_heap_order` for a worked example.
+/// `logits_per_pos` is the target's full per-position logits, row-major
+/// `[(depth + 1) × vocab]`, where `depth = drafts.len()`: row `i` is the
+/// target distribution at block position `i` (the prediction after the prefix
+/// `[seed, drafts[0..i]]`). `drafts[i]` is the draft's token at position `i`.
 ///
-/// Returns the chain of node indices in root-to-leaf order. The
-/// linearization slot of `chain[i]` (matching `linearize_tree`'s output)
-/// is `chain[i] + 1`. An empty tree returns an empty chain.
+/// At each position `i` draw `x_i ~ softmax(logits_i / temp)` (the argmax when
+/// `temp <= 0`). Accept the longest prefix where `drafts[i] == x_i`; the first
+/// mismatch's `x_i` is the bonus. If every draft is accepted, the bonus is the
+/// target draw at the final row `depth`. Because every emitted token (the
+/// accepted drafts AND the bonus) is a genuine draw from the target
+/// distribution, the output marginal equals `softmax(logits/temp)` EXACTLY — no
+/// rejection ratio, no dependence on the draft probabilities (the draft only
+/// affects HOW MANY target draws get reused, i.e. acceptance length, not WHAT is
+/// emitted). The biased `min(1, p/q)` rejection rule is NOT used (and is only
+/// justified for top-k trees, not this chain).
 ///
-/// Used by Path C (main-path-first lazy verify): the caller forwards the
-/// main chain as a flat linear verify (committed RoPE phases, no
-/// linearization-slot phase poisoning, no GDN drift), then if a position
-/// is rejected, lazily re-verifies any sibling branch at that depth
-/// from a tape-restored DeltaNet snapshot. See
-/// `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+/// At `temp <= 0` this reduces EXACTLY to greedy accept (`accept_greedy_prefix`
+/// against the per-position argmax): each draw is the row argmax, so the
+/// accepted prefix and bonus are the target's own greedy continuation.
 ///
-/// Cost: O(depth × N) linear scan. Tree sizes in production are small
-/// (paper budget ≈ 22, hipfire default ≈ 16) so this is negligible vs
-/// the verify forward.
-pub fn select_main_path(tree: &DdTree) -> Vec<usize> {
-    let mut chain: Vec<usize> = Vec::new();
-    // -1 is the sentinel `DdNode::parent_index` value for direct children
-    // of the root (matches `build_ddtree_tree_with_cutoff`'s seeding).
-    let mut current_parent: i32 = -1;
-    loop {
-        let next = tree
-            .nodes
-            .iter()
-            .enumerate()
-            .find(|(_, n)| n.parent_index == current_parent)
-            .map(|(i, _)| i);
-        match next {
-            Some(idx) => {
-                chain.push(idx);
-                current_parent = idx as i32;
-            }
-            None => break,
-        }
-    }
-    chain
-}
-
-/// A branch off the main path: the smallest-indexed-child chain that
-/// descends from a non-main sibling of one of the main-path nodes (or a
-/// non-main root child). Produced by [`enumerate_branches`] for Path C
-/// Phase 2's lazy FA-only re-verify.
-#[derive(Debug, Clone)]
-pub struct DdBranch {
-    /// Tree depth of the parent (= the fork point). `0` means the branch
-    /// forks off the root (seed); `k > 0` means the parent is
-    /// `main_path[k-1]`, which sits at tree depth `k`.
-    ///
-    /// Matches the PRD's "branches off at depth `d`" convention: the
-    /// branch spans depths `[fork_depth + 1, ..., fork_depth + chain.len()]`.
-    /// Chain element `chain[i]` would land at absolute position
-    /// `start_pos + fork_depth + i` if accepted (where `start_pos` is the
-    /// position `main_path[0]` would commit to).
-    pub fork_depth: u32,
-    /// Greedy chain of tree node indices in root-to-leaf order. `chain[0]`
-    /// is the forking sibling (a non-main child of the parent at depth
-    /// `fork_depth`); subsequent entries descend by smallest-indexed-child,
-    /// matching [`select_main_path`]'s greedy rule. Always non-empty.
-    pub chain: Vec<usize>,
-}
-
-/// Enumerate the branches of `tree` that need lazy FA-only re-verify
-/// against an already-committed `main_path` of which the first
-/// `accepted_main` nodes were accepted by the target.
-///
-/// A branch is eligible iff its fork depth `d` satisfies `d ≤ accepted_main`
-/// (PRD §"Architecture / Step 2"): the branch's parent must itself be on
-/// the accepted main-path prefix (or be root), so the caller has a valid
-/// DeltaNet snapshot to restore from before the branch's FA forward.
-///
-/// The output is in fork-depth-then-heap order (shallowest forks first;
-/// within a fork depth, in `tree.nodes` order). For each branch, the
-/// `chain` follows the smallest-indexed-child rule at every step — same
-/// convention as [`select_main_path`] — so chains are deterministic
-/// and consistent with the rest of the linearization.
-///
-/// `accepted_main` is bounded above by `main_path.len()`; passing a
-/// larger value is treated as full acceptance.
-pub fn enumerate_branches(
-    tree: &DdTree,
-    main_path: &[usize],
-    accepted_main: usize,
-) -> Vec<DdBranch> {
-    let mut branches: Vec<DdBranch> = Vec::new();
-    let max_d = accepted_main.min(main_path.len());
-
-    for d in 0..=max_d {
-        // Parent tree index in DdNode::parent_index convention: `-1` for
-        // root (d == 0), `main_path[d-1]` otherwise (a node at depth d).
-        let parent_tree_idx: i32 = if d == 0 { -1 } else { main_path[d - 1] as i32 };
-        // The main-path child at depth d+1 (if any) is the one to skip;
-        // every other child of `parent_tree_idx` is a branch root.
-        let main_child: Option<usize> = main_path.get(d).copied();
-
-        for (node_idx, node) in tree.nodes.iter().enumerate() {
-            if node.parent_index != parent_tree_idx {
-                continue;
-            }
-            if Some(node_idx) == main_child {
-                continue;
-            }
-            // Greedy descent: at each step take the smallest-indexed child,
-            // which by `build_ddtree_tree_with_cutoff`'s heap-pop invariant
-            // is the highest-cumulative-logw child of the current node.
-            let mut chain = vec![node_idx];
-            let mut current_parent: i32 = node_idx as i32;
-            loop {
-                let next = tree
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, n)| n.parent_index == current_parent)
-                    .map(|(i, _)| i);
-                match next {
-                    Some(idx) => {
-                        chain.push(idx);
-                        current_parent = idx as i32;
-                    }
-                    None => break,
+/// Returns `(accepted, bonus)`: `accepted` is the number of accepted drafts
+/// (`0..=depth`) and `bonus` is the target draw at the divergence position.
+/// Threads the SAME `rng_state` (xorshift, bit-compatible with the qwen35 spec
+/// sampler) so the sampler is deterministic given a seed.
+pub fn naive_sample_chain(
+    logits_per_pos: &[f32],
+    drafts: &[u32],
+    vocab: usize,
+    temp: f32,
+    rng_state: &mut u64,
+) -> (usize, u32) {
+    let depth = drafts.len();
+    debug_assert_eq!(logits_per_pos.len(), (depth + 1) * vocab);
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+    for i in 0..=depth {
+        let row = &logits_per_pos[i * vocab..(i + 1) * vocab];
+        let x: u32 = if temp > 0.0 {
+            softmax_temp_into(row, temp, &mut p);
+            let u = xorshift_unit(rng_state);
+            sample_unnormalized(&p, u)
+        } else {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (t, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = t;
                 }
             }
-            branches.push(DdBranch {
-                fork_depth: d as u32,
-                chain,
-            });
+            bi as u32
+        };
+        // At the final row there is no draft to match — `x` is always the bonus.
+        if i == depth || drafts[i] != x {
+            return (i, x);
         }
     }
+    unreachable!("naive_sample_chain loop always returns at i == depth");
+}
 
-    branches
+/// Per-position draft distributions + draw-ordered SWOR candidates for the
+/// q-exploiting tree-SWOR verify ([`sample_verified_tree_swor`]).
+///
+/// Given `draft_logits` (`num_pos × vocab`, row-major — the per-draft-position
+/// logits the drafter produced), this returns:
+/// - `draft_q` (`num_pos × vocab`): the full `softmax(logits_pos / temp)` per
+///   position (the residual distribution `swor_step` corrects against);
+/// - `pos_cands` (`num_pos × k`): `k` tokens drawn WITHOUT replacement from each
+///   position's `draft_q`, IN DRAW ORDER (the proposal sequence the verbatim
+///   SWOR step expects).
+///
+/// The candidates are drawn by the same sequential SWOR scheme the
+/// `swor_preserves_target_distribution` test validates — a host mirror of the
+/// device Gumbel-top-k sampler's distribution (top-k of `logit/temp + Gumbel`
+/// over a category equals a SWOR draw from `softmax(logit/temp)`). Because every
+/// emitted token in `sample_verified_tree_swor` is drawn from the (residual)
+/// TARGET, `pos_cands`/`draft_q` only change WHICH target draws get reused
+/// (acceptance), never WHAT is emitted — so the output marginal stays
+/// distribution-exact regardless of how candidates were sampled.
+///
+/// Uses the same `xorshift_unit` RNG stream as the accept walk, advancing
+/// `rng_state` in place.
+pub fn swor_draft_candidates(
+    draft_logits: &[f32],
+    num_pos: usize,
+    vocab: usize,
+    k: usize,
+    temp: f32,
+    rng_state: &mut u64,
+) -> (Vec<f32>, Vec<u32>) {
+    debug_assert_eq!(draft_logits.len(), num_pos * vocab);
+    let mut draft_q: Vec<f32> = Vec::with_capacity(num_pos * vocab);
+    let mut pos_cands: Vec<u32> = Vec::with_capacity(num_pos * k);
+    let mut q: Vec<f32> = Vec::with_capacity(vocab);
+    for pos in 0..num_pos {
+        let row = &draft_logits[pos * vocab..(pos + 1) * vocab];
+        softmax_temp_into(row, temp.max(1e-4), &mut q);
+        draft_q.extend_from_slice(&q);
+        // Sequential SWOR draw of k tokens from q (residual renormalize each step).
+        let mut qr = q.clone();
+        for _ in 0..k {
+            let s: f32 = qr.iter().sum();
+            if s <= 0.0 {
+                // Degenerate residual: pad with token 0 (never matches a real
+                // child once q is exhausted; SWOR residual still corrects).
+                pos_cands.push(0);
+                continue;
+            }
+            let u = xorshift_unit(rng_state) * s;
+            let mut acc = 0.0f32;
+            let mut pick = qr.len() - 1;
+            for (i, &v) in qr.iter().enumerate() {
+                acc += v;
+                if u < acc {
+                    pick = i;
+                    break;
+                }
+            }
+            pos_cands.push(pick as u32);
+            qr[pick] = 0.0; // without replacement
+        }
+    }
+    (draft_q, pos_cands)
+}
+
+/// Xorshift64* → uniform [0, 1). Bit-compatible with the qwen35 spec sampler's
+/// RNG (`speculative::xorshift_next_unit`) so the tree accept walk is
+/// deterministic given a seed and consistent with the linear DFlash path.
+#[inline]
+fn xorshift_unit(state: &mut u64) -> f32 {
+    let mut s = *state;
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    *state = s;
+    ((s >> 40) as f32) * (1.0 / 16_777_216.0)
+}
+
+/// Temperature softmax of one logits row into `out`.
+fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(logits.len());
+    let inv_t = 1.0 / temp;
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits {
+        let s = v * inv_t;
+        if s > max {
+            max = s;
+        }
+    }
+    let mut sum = 0.0f32;
+    for &v in logits {
+        let e = (v * inv_t - max).exp();
+        out.push(e);
+        sum += e;
+    }
+    let inv = 1.0 / sum;
+    for p in out.iter_mut() {
+        *p *= inv;
+    }
+}
+
+/// Sample an index from a possibly sub-normalized weight vector (the residual
+/// target after rejection subtractions sums to < 1). Falls back to argmax if
+/// total positive mass is ≤ 0.
+fn sample_unnormalized(w: &[f32], u: f32) -> u32 {
+    let mut sum = 0.0f32;
+    for &x in w {
+        if x > 0.0 {
+            sum += x;
+        }
+    }
+    if sum <= 0.0 {
+        let mut bi = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &x) in w.iter().enumerate() {
+            if x > bv {
+                bv = x;
+                bi = i;
+            }
+        }
+        return bi as u32;
+    }
+    let target = u * sum;
+    let mut acc = 0.0f32;
+    for (i, &x) in w.iter().enumerate() {
+        if x > 0.0 {
+            acc += x;
+            if target < acc {
+                return i as u32;
+            }
+        }
+    }
+    (w.len() - 1) as u32
+}
+
+/// Phase-0 instrumentation: append one JSON-lines record describing this cycle's
+/// tree as a per-slot REDUCED categorical `{child_1..child_k, TAIL}` over both the
+/// target `p` (softmax of the verify logits at `temp`) and the draft conditional
+/// `q` (`exp(node.logw − parent.logw)`). Children are the only reusable tokens, so
+/// accept decisions only ever involve this small support — collapsing all non-child
+/// tokens into one TAIL bucket is exact for accept-length simulation and needs no
+/// full-vocab draft logits. Consumed by the `ddtree_pq_sim` example to A/B
+/// greedy/naive/WR/SWOR acceptance offline (see the q-exploiting-verify plan).
+///
+/// Record shape (one line):
+/// `{"cycle":C,"slots":[{"s":S,"argmax_child":CS,"p_tail":PT,"q_tail":QT,
+///    "children":[[child_slot,q,p],...]},...]}`
+/// where `child_slot = child_node_index + 1`, `argmax_child` = the child slot whose
+/// token is the global argmax of `p` at that slot (or `-1` if the argmax is a
+/// non-child / tail token).
+pub fn dump_pq_jsonl(
+    path: &str,
+    tree: &DdTree,
+    logits_per_pos: &[f32],
+    vocab: usize,
+    temp: f32,
+    cycle: u64,
+) {
+    use std::io::Write;
+    let n_slots = 1 + tree.nodes.len();
+    if logits_per_pos.len() != n_slots * vocab {
+        return; // only valid on the temp>0 full-logits path
+    }
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+    let mut out = String::new();
+    out.push_str(&format!("{{\"cycle\":{cycle},\"slots\":["));
+    for s in 0..n_slots {
+        let row = &logits_per_pos[s * vocab..(s + 1) * vocab];
+        softmax_temp_into(row, if temp > 0.0 { temp } else { 1.0 }, &mut p);
+        let argmax_tok = {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+        let parent_logw = if s == 0 { 0.0 } else { tree.nodes[s - 1].logw };
+        let mut children: Vec<(usize, f32, f32)> = Vec::new();
+        let mut p_children = 0.0f32;
+        let mut q_children = 0.0f32;
+        let mut argmax_child: i64 = -1;
+        for (&token, &child_idx) in tree.child_maps[s].iter() {
+            let q = (tree.nodes[child_idx].logw - parent_logw)
+                .exp()
+                .clamp(0.0, 1.0);
+            let pt = p[token as usize];
+            p_children += pt;
+            q_children += q;
+            if token == argmax_tok {
+                argmax_child = (child_idx + 1) as i64;
+            }
+            children.push((child_idx + 1, q, pt));
+        }
+        children.sort_unstable_by_key(|&(cs, _, _)| cs);
+        let p_tail = (1.0 - p_children).max(0.0);
+        let q_tail = (1.0 - q_children).max(0.0);
+        if s > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"s\":{s},\"argmax_child\":{argmax_child},\"p_tail\":{p_tail:.6},\"q_tail\":{q_tail:.6},\"children\":["
+        ));
+        for (i, (cs, q, pt)) in children.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("[{cs},{q:.6},{pt:.6}]"));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(out.as_bytes());
+    }
+}
+
+/// Distribution-preserving tree verify — the temp>0 acceptance rule, replacing
+/// `follow_verified_tree`'s greedy argmax walk.
+///
+/// This is SpecInfer's "naive sampling" tree verification: at each slot, draw a
+/// token `x` from the **target** distribution (softmax of the verify logits at
+/// `temp`); if `x` matches one of the drafted children, accept that child and
+/// descend; otherwise `x` is the bonus and the walk stops. Because every emitted
+/// token is drawn directly from the target, the output distribution is preserved
+/// EXACTLY at any temperature — no rejection ratio, no dependence on the draft
+/// probabilities (the tree only affects *how many* target draws get reused, i.e.
+/// acceptance length, not WHAT is emitted). Acceptance length rises with the
+/// target mass the tree covers, so wider trees (more siblings / the banded
+/// `MINNODES` floor) raise τ here — the regime the greedy verify could not.
+///
+/// `logits_per_pos` is the target's full logits, row-major `[(1+N) × vocab]`,
+/// row `s` = the target distribution at tree slot `s` (slot 0 = root/seed,
+/// slot `i+1` = `nodes[i]`).
+///
+/// At `temp → 0` the target draw is its argmax, so this reduces EXACTLY to
+/// `follow_verified_tree` (descend the child whose token is the argmax, else the
+/// argmax is the bonus). Returns `(accepted_node_indices, bonus_token)`, same
+/// shape as `follow_verified_tree`.
+pub fn sample_verified_tree(
+    tree: &DdTree,
+    logits_per_pos: &[f32],
+    vocab: usize,
+    temp: f32,
+    rng_state: &mut u64,
+) -> (Vec<usize>, u32) {
+    let n_slots = 1 + tree.nodes.len();
+    debug_assert_eq!(logits_per_pos.len(), n_slots * vocab);
+
+    let mut accepted: Vec<usize> = Vec::new();
+    let mut current_slot: usize = 0; // root
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+
+    loop {
+        let row = &logits_per_pos[current_slot * vocab..(current_slot + 1) * vocab];
+        // Draw the target's token at this slot (argmax when greedy).
+        let x: u32 = if temp > 0.0 {
+            softmax_temp_into(row, temp, &mut p);
+            let u = xorshift_unit(rng_state);
+            sample_unnormalized(&p, u)
+        } else {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+
+        // Accept iff the target's draw matches a drafted child; else x is the bonus.
+        match tree.child_maps[current_slot].get(&x) {
+            Some(&child_idx) => {
+                accepted.push(child_idx);
+                current_slot = child_idx + 1;
+            }
+            None => return (accepted, x),
+        }
+    }
+}
+
+/// One position's VERBATIM recursive without-replacement speculative-sampling
+/// step (SpecTr / Sequoia / SpecInfer §A). Given the target distribution `p_s`
+/// (full vocab), the full draft distribution `q_pos` (full vocab), and the draft's
+/// `cands` drawn from `q_pos` WITHOUT replacement IN DRAW ORDER, emits one token
+/// distributed EXACTLY as `p_s` while accepting a candidate when possible.
+///
+/// For draw `j` (0-indexed), `Z = 1 − Σ_{i<j} q(c_i)` is the remaining draft mass
+/// and the residual draft distribution is `q_j(t) = q_pos(t)/Z` for `t` not yet
+/// drawn. Accept `c_j` w.p. `min(1, p_j(c_j)/q_j(c_j))`; on rejection set
+/// `p_{j+1} = normalize(relu(p_j − q_j))` (full-vocab) and continue; if all `k`
+/// reject, draw the token from the final residual `p_{k+1}`. Returns
+/// `(Some(accepted_token), _)` or `(None, residual_token)`.
+fn swor_step(
+    p_s: &mut [f32],
+    q_pos: &[f32],
+    cands: &[u32],
+    rng_state: &mut u64,
+) -> (Option<u32>, u32) {
+    let vocab = p_s.len();
+    let mut drawn: Vec<u32> = Vec::with_capacity(cands.len());
+    let mut drawn_q_sum = 0.0f32;
+    for &c in cands {
+        let ct = c as usize;
+        if ct >= vocab {
+            continue;
+        }
+        let z = (1.0 - drawn_q_sum).max(1e-9);
+        let qjc = (q_pos[ct] / z).clamp(0.0, 1.0);
+        let ratio = if qjc > 0.0 {
+            (p_s[ct] / qjc).min(1.0)
+        } else {
+            0.0
+        };
+        let u = xorshift_unit(rng_state);
+        if p_s[ct] > 0.0 && u < ratio {
+            return (Some(c), c);
+        }
+        // Reject: p_{j+1} = normalize(relu(p_j − q_j)), q_j(t)=q_pos[t]/z for t∉drawn.
+        for (t, pv) in p_s.iter_mut().enumerate() {
+            if drawn.iter().any(|&d| d as usize == t) {
+                continue;
+            }
+            *pv = (*pv - q_pos[t] / z).max(0.0);
+        }
+        let s: f32 = p_s.iter().sum();
+        if s > 0.0 {
+            for pv in p_s.iter_mut() {
+                *pv /= s;
+            }
+        }
+        drawn.push(c);
+        drawn_q_sum += q_pos[ct];
+    }
+    // All candidates rejected: draw from the final residual target.
+    let u = xorshift_unit(rng_state);
+    (None, sample_unnormalized(p_s, u))
+}
+
+/// q-EXPLOITING tree verify — VERBATIM recursive without-replacement speculative
+/// sampling (SpecTr / Sequoia / SpecInfer), distribution-EXACT.
+///
+/// Unlike naive sampling (which ignores `q`), at each tree node this runs the
+/// full recursive SWOR step ([`swor_step`]) over the node's draft proposals —
+/// the `k` tokens the draft sampled WITHOUT replacement from that position's
+/// distribution, in draw order — accepting one when the rejection ratio clears.
+/// Because every emitted token is drawn from the (residual) TARGET, the output
+/// distribution is preserved EXACTLY at any temperature; `q` only changes WHICH
+/// target draws get reused (acceptance), not WHAT is emitted. (Validated by the
+/// `swor_preserves_target_distribution` Monte-Carlo test.)
+///
+/// Inputs: `target_logits` `[(1+N)·vocab]` (per verify slot); `draft_q`
+/// `[num_pos·vocab]` the full draft softmax per draft position; `pos_cands`
+/// `[num_pos·k]` the draft's draw-ordered samples per position. A node at tree
+/// depth `d` draws from position `d` (root = position 0). On accept the walk
+/// descends the matching tree child; an accepted-but-pruned candidate (not in the
+/// tree) is emitted as the final token. Reduces to `follow_verified_tree` at
+/// `temp→0`. Returns the same `(accepted_node_indices, bonus_token)` shape.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_verified_tree_swor(
+    tree: &DdTree,
+    target_logits: &[f32],
+    draft_q: &[f32],
+    pos_cands: &[u32],
+    num_pos: usize,
+    k: usize,
+    vocab: usize,
+    temp: f32,
+    rng_state: &mut u64,
+) -> (Vec<usize>, u32) {
+    let n_slots = 1 + tree.nodes.len();
+    debug_assert_eq!(target_logits.len(), n_slots * vocab);
+
+    // Greedy (temp≤0): delegate to the argmax walk (exact follow_verified_tree).
+    if temp <= 0.0 {
+        let argmax: Vec<u32> = (0..n_slots)
+            .map(|s| {
+                let row = &target_logits[s * vocab..(s + 1) * vocab];
+                let mut bi = 0usize;
+                let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in row.iter().enumerate() {
+                    if v > bv {
+                        bv = v;
+                        bi = i;
+                    }
+                }
+                bi as u32
+            })
+            .collect();
+        return follow_verified_tree(tree, &argmax);
+    }
+
+    let mut accepted: Vec<usize> = Vec::new();
+    let mut current_slot: usize = 0;
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+
+    loop {
+        // Draft position generating this node's children = the node's tree depth
+        // (root depth 0). Past the last draft position there are no children.
+        let depth = if current_slot == 0 {
+            0
+        } else {
+            tree.nodes[current_slot - 1].depth as usize
+        };
+        let row = &target_logits[current_slot * vocab..(current_slot + 1) * vocab];
+        softmax_temp_into(row, temp, &mut p);
+        if depth >= num_pos {
+            // Leaf: no draft proposals → emit a target draw.
+            let u = xorshift_unit(rng_state);
+            return (accepted, sample_unnormalized(&p, u));
+        }
+
+        let q_pos = &draft_q[depth * vocab..(depth + 1) * vocab];
+        let cands = &pos_cands[depth * k..depth * k + k];
+        let (acc_tok, emit) = swor_step(&mut p, q_pos, cands, rng_state);
+        match acc_tok {
+            Some(c) => match tree.child_maps[current_slot].get(&c) {
+                Some(&child_idx) => {
+                    accepted.push(child_idx);
+                    current_slot = child_idx + 1;
+                }
+                // Accepted a candidate the budget pruned from the tree — emit it.
+                None => return (accepted, c),
+            },
+            None => return (accepted, emit),
+        }
+    }
 }
 
 /// Linearize a DDTree into a verify-ready `(tokens, positions, mask_block)`
@@ -747,11 +1150,588 @@ pub fn topk_from_logits(
 mod tests {
     use super::*;
 
+    // Argmax of one logits row (test helper).
+    fn row_argmax(row: &[f32]) -> u32 {
+        let mut bi = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &v) in row.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        bi as u32
+    }
+
+    // A small depth-2, top-2 tree over an 8-token vocab.
+    fn small_tree() -> DdTree {
+        let depth = 2usize;
+        let topk = 2usize;
+        // depth0 tokens {1,2}, depth1 tokens {3,4}; arbitrary normalized log-probs.
+        let top_tokens = [1u32, 2, 3, 4];
+        let p = [0.6f32, 0.4, 0.7, 0.3];
+        let top_log_probs: Vec<f32> = p.iter().map(|x| x.ln()).collect();
+        build_ddtree_tree_bounded(
+            &top_tokens,
+            &top_log_probs,
+            depth,
+            topk,
+            0,
+            16,
+            f32::NEG_INFINITY,
+        )
+    }
+
+    #[test]
+    fn sample_temp0_matches_follow_verified_tree() {
+        let tree = small_tree();
+        let vocab = 8usize;
+        let n = 1 + tree.nodes.len();
+        // Build logits whose per-slot argmax is the slot's highest-prob child
+        // token where one exists (else token 0) — exercises real descent.
+        let mut logits = vec![0.0f32; n * vocab];
+        for s in 0..n {
+            let pref = tree.child_maps[s]
+                .values()
+                .copied()
+                .min()
+                .map(|ci| tree.nodes[ci].token)
+                .unwrap_or(0);
+            logits[s * vocab + pref as usize] = 10.0;
+        }
+        let argmax: Vec<u32> = (0..n)
+            .map(|s| row_argmax(&logits[s * vocab..(s + 1) * vocab]))
+            .collect();
+        let (acc_g, bonus_g) = follow_verified_tree(&tree, &argmax);
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        let (acc_s, bonus_s) = sample_verified_tree(&tree, &logits, vocab, 0.0, &mut rng);
+        assert_eq!(acc_g, acc_s, "accepted path diverged at temp=0");
+        assert_eq!(bonus_g, bonus_s, "bonus diverged at temp=0");
+    }
+
+    // ── Chain naive-sampling (linear DFlash temp>0) ─────────────────────────
+
+    #[test]
+    fn naive_sample_chain_temp0_is_argmax() {
+        // temp <= 0 ⇒ each position's draw is the row argmax, so the accept walk
+        // is identical to greedy accept_greedy_prefix against the argmax. Here the
+        // draft matches the argmax at position 0 (token 2) but not position 1
+        // (argmax 4 ≠ draft 1) ⇒ accept 1, bonus = argmax at pos 1 = 4.
+        let vocab = 6usize;
+        let drafts = [2u32, 1];
+        let mut logits = vec![0.0f32; (drafts.len() + 1) * vocab];
+        logits[0 * vocab + 2] = 10.0; // pos 0 argmax = 2 (== draft 0 ⇒ accept)
+        logits[1 * vocab + 4] = 10.0; // pos 1 argmax = 4 (!= draft 1 ⇒ stop)
+        logits[2 * vocab + 5] = 10.0; // pos 2 argmax = 5 (unused)
+        let mut rng = 0x1u64;
+        let (accepted, bonus) = naive_sample_chain(&logits, &drafts, vocab, 0.0, &mut rng);
+        assert_eq!(accepted, 1);
+        assert_eq!(bonus, 4);
+
+        // Full accept: both drafts equal the argmax ⇒ accept 2, bonus = argmax at
+        // the final row (pos 2) = 5.
+        let drafts_full = [2u32, 4];
+        let (acc_f, bonus_f) = naive_sample_chain(&logits, &drafts_full, vocab, 0.0, &mut rng);
+        assert_eq!(acc_f, 2);
+        assert_eq!(bonus_f, 5);
+    }
+
+    #[test]
+    fn naive_sample_chain_preserves_target_distribution() {
+        // Monte-Carlo distribution fidelity exercising the ACTUAL shipped RNG path
+        // (xorshift_unit + softmax_temp_into + sample_unnormalized) — per memory,
+        // the RNG is the thing that silently reintroduces bias, so the test must
+        // run the real sampler, not an injected host sampler.
+        //
+        // Setup: a depth-1 chain (one draft) whose draft token is NOT the target
+        // mode, so the position-0 emitted token (accept ? draft : bonus) is purely
+        // a target draw. Its marginal must equal softmax(logits_0 / temp) EXACTLY
+        // within MC noise, at every temperature.
+        let vocab = 6usize;
+        // Distinct, non-degenerate target logits per temperature scaling.
+        let logits0 = [2.0f32, 0.5, -1.0, 1.2, 0.0, 0.8];
+        // Draft token 4 (a middling-prob token), deliberately != most argmaxes.
+        let draft = 4u32;
+        let mut full = vec![0.0f32; 2 * vocab];
+        full[..vocab].copy_from_slice(&logits0);
+        // Row 1 (bonus-on-full-accept) — arbitrary; only reached when draft accepted.
+        full[vocab..].copy_from_slice(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        for &temp in &[0.5f32, 0.7, 1.0, 1.5] {
+            // Reference marginal: softmax(logits0 / temp).
+            let target = softmax_temp(&logits0, temp);
+
+            let n_runs = 200_000u32;
+            let mut hist = vec![0u64; vocab];
+            let mut rng = 0xC0FFEE_1234_5678_u64 ^ ((temp.to_bits() as u64) << 8);
+            for _ in 0..n_runs {
+                let (accepted, bonus) = naive_sample_chain(&full, &[draft], vocab, temp, &mut rng);
+                // Position-0 emitted token = accepted draft (if accept) else bonus.
+                let emitted = if accepted >= 1 { draft } else { bonus };
+                hist[emitted as usize] += 1;
+            }
+            let mut tv = 0.0f64;
+            for t in 0..vocab {
+                let emp = hist[t] as f64 / n_runs as f64;
+                tv += (emp - target[t] as f64).abs();
+            }
+            tv *= 0.5;
+            assert!(
+                tv < 0.01,
+                "naive chain sampling must preserve the target distribution at temp={temp}; TV={tv:.4} hist={hist:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_temp_pos_preserves_target_distribution() {
+        // Depth-1, top-2 tree: root children = tokens {0,1}; target mode (token 2)
+        // is NOT in the tree, so it can only surface via the bonus. Naive-sampling
+        // tree verify draws from the target, so the FIRST emitted token's marginal
+        // must equal the target p EXACTLY (within MC noise) — incl. the uncovered
+        // mode at token 2.
+        let vocab = 3usize;
+        let top_tokens = [0u32, 1];
+        let q = [0.5f32, 0.3];
+        let top_log_probs: Vec<f32> = q.iter().map(|x| x.ln()).collect();
+        let tree =
+            build_ddtree_tree_bounded(&top_tokens, &top_log_probs, 1, 2, 0, 2, f32::NEG_INFINITY);
+        assert_eq!(tree.nodes.len(), 2);
+        let n = 1 + tree.nodes.len();
+
+        // Target p at the root (slot 0). Other slots (leaves) only feed bonuses
+        // after acceptance; uniform is fine.
+        let p = [0.2f32, 0.3, 0.5];
+        let mut logits = vec![0.0f32; n * vocab];
+        for (t, &pt) in p.iter().enumerate() {
+            logits[t] = pt.ln(); // slot 0 = ln(p) → softmax(temp=1) = p
+        }
+
+        let n_runs = 400_000u32;
+        let mut hist = [0u64; 3];
+        let mut rng = 0xdead_beef_cafe_0001u64;
+        for _ in 0..n_runs {
+            let (accepted, bonus) = sample_verified_tree(&tree, &logits, vocab, 1.0, &mut rng);
+            let first = if let Some(&ni) = accepted.first() {
+                tree.nodes[ni].token
+            } else {
+                bonus
+            };
+            hist[first as usize] += 1;
+        }
+        let mut tv = 0.0f64;
+        for t in 0..3 {
+            let emp = hist[t] as f64 / n_runs as f64;
+            tv += (emp - p[t] as f64).abs();
+        }
+        tv *= 0.5;
+        assert!(
+            tv < 0.01,
+            "naive-sampling tree verify should preserve the target distribution; TV={tv:.4} hist={hist:?}"
+        );
+    }
+
+    // softmax(logits / temp) — the per-slot target the walk must reproduce.
+    fn softmax_temp(logits: &[f32], temp: f32) -> Vec<f32> {
+        let inv = 1.0 / temp;
+        let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut e: Vec<f32> = logits.iter().map(|&v| ((v - m) * inv).exp()).collect();
+        let s: f32 = e.iter().sum();
+        for x in e.iter_mut() {
+            *x /= s;
+        }
+        e
+    }
+
+    #[test]
+    fn swor_temp0_matches_follow_verified_tree() {
+        // The q-exploiting SWOR walk must reduce to the greedy argmax walk at
+        // temp→0 (same safety guarantee as naive sampling).
+        let tree = small_tree();
+        let vocab = 8usize;
+        let n = 1 + tree.nodes.len();
+        let mut logits = vec![0.0f32; n * vocab];
+        for s in 0..n {
+            let pref = tree.child_maps[s]
+                .values()
+                .copied()
+                .min()
+                .map(|ci| tree.nodes[ci].token)
+                .unwrap_or(0);
+            logits[s * vocab + pref as usize] = 10.0;
+        }
+        let argmax: Vec<u32> = (0..n)
+            .map(|s| row_argmax(&logits[s * vocab..(s + 1) * vocab]))
+            .collect();
+        let (acc_g, bonus_g) = follow_verified_tree(&tree, &argmax);
+        let mut rng = 0x2222_3333_4444_5555u64;
+        // temp≤0 delegates to greedy before touching draft_q/pos_cands → empty ok.
+        let (acc_s, bonus_s) =
+            sample_verified_tree_swor(&tree, &logits, &[], &[], 0, 0, vocab, 0.0, &mut rng);
+        assert_eq!(acc_g, acc_s, "SWOR accepted path diverged at temp=0");
+        assert_eq!(bonus_g, bonus_s, "SWOR bonus diverged at temp=0");
+    }
+
+    // Sample k tokens WITHOUT replacement from `q` (sequential), returning draw
+    // order — the proposal sequence the verbatim SWOR step expects.
+    fn swor_sample(q: &[f32], k: usize, rng: &mut u64) -> Vec<u32> {
+        let mut qr = q.to_vec();
+        let mut out = Vec::with_capacity(k);
+        for _ in 0..k {
+            let s: f32 = qr.iter().sum();
+            if s <= 0.0 {
+                break;
+            }
+            let u = xorshift_unit(rng) * s;
+            let mut acc = 0.0f32;
+            let mut pick = qr.len() - 1;
+            for (i, &v) in qr.iter().enumerate() {
+                acc += v;
+                if u < acc {
+                    pick = i;
+                    break;
+                }
+            }
+            out.push(pick as u32);
+            qr[pick] = 0.0; // without replacement
+        }
+        out
+    }
+
+    #[test]
+    fn swor_preserves_target_distribution() {
+        // VERBATIM distribution-fidelity proof: draw the candidates WITHOUT
+        // replacement from the draft q (as the real Gumbel-top-k path does), run
+        // the exact SWOR step, and confirm the emitted token's marginal equals the
+        // TARGET p — at several temperatures and for k < vocab (so some target mass
+        // is never proposed and must surface via the residual). This is the check
+        // that was missing from the approximate implementation.
+        let vocab = 6usize;
+        // A target and a DISTINCT draft (so q is genuinely exploited / corrected).
+        let p = [0.30f32, 0.05, 0.20, 0.10, 0.25, 0.10];
+        let q = [0.10f32, 0.40, 0.05, 0.20, 0.05, 0.20];
+        for &k in &[2usize, 3, 4] {
+            let n_runs = 600_000u32;
+            let mut hist = vec![0u64; vocab];
+            let mut rng = 0x5eed_1234_abcd_0007u64 ^ (k as u64);
+            for _ in 0..n_runs {
+                let cands = swor_sample(&q, k, &mut rng);
+                let mut p_work = p.to_vec();
+                let (_acc, emit) = swor_step(&mut p_work, &q, &cands, &mut rng);
+                hist[emit as usize] += 1;
+            }
+            let tv: f64 = (0..vocab)
+                .map(|t| (hist[t] as f64 / n_runs as f64 - p[t] as f64).abs())
+                .sum::<f64>()
+                * 0.5;
+            assert!(
+                tv < 0.01,
+                "verbatim SWOR must preserve the target distribution; k={k} TV={tv:.4} hist={hist:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_tree_swor_emit_marginal_is_target() {
+        // END-TO-END dense tree-SWOR distribution gate: the EXACT CPU pipeline
+        // `GenericDflashSpeculator::step_tree` runs at temp>0 —
+        //   topk_from_logits → build_ddtree_tree_bounded → swor_draft_candidates
+        //   → sample_verified_tree_swor
+        // — through the REAL xorshift RNG stream. The first emitted token (the
+        // first accepted child's token, or the bonus when nothing is accepted at
+        // slot 0) must be marginally distributed as softmax(target_logits_0/temp),
+        // proving the dense tree-SWOR verify is distribution-exact independent of
+        // the draft q. This is the mandatory guard the task requires: the win must
+        // be on the tok/s axis WITHOUT moving the output distribution.
+        let vocab = 8usize;
+        let depth = 2usize; // 2 draft positions (block_size 3)
+        let topk = 2usize;
+
+        // Draft logits per position (DISTINCT from target so q is genuinely
+        // exploited). Row 0 builds the seed's children; row 1 the depth-2 layer.
+        let draft_logits: Vec<f32> = vec![
+            // pos 0
+            0.4, -1.2, 1.1, 0.0, 0.7, -0.3, 0.2, -0.6, // pos 1
+            -0.5, 1.3, -0.2, 0.6, -1.0, 0.2, 0.9, -0.4,
+        ];
+        // Target logits per linearized slot. Slot 0 (the seed) is the one whose
+        // emit marginal we measure; give it a mode (token 6) the tree's top-2
+        // children at position 0 do NOT cover, so the mode can only surface via
+        // the residual/bonus — the strongest distribution-fidelity stress.
+        let target_logits0 = [0.3f32, -1.0, 0.5, 0.1, -0.4, 0.2, 1.4, -0.7];
+
+        for &temp in &[0.5f32, 0.7, 1.0, 1.5] {
+            // Reference marginal: softmax(target_logits0 / temp).
+            let target = softmax_temp(&target_logits0, temp);
+
+            let n_runs = 400_000u32;
+            let mut hist = vec![0u64; vocab];
+            let mut rng = 0x7ec0_dded_1234_0001u64 ^ ((temp.to_bits() as u64) << 9);
+            for _ in 0..n_runs {
+                // Build the tree exactly as step_tree does (deterministic; no RNG).
+                let (top_tokens, top_log_probs) =
+                    topk_from_logits(&draft_logits, depth, vocab, topk);
+                let tree = build_ddtree_tree_bounded(
+                    &top_tokens,
+                    &top_log_probs,
+                    depth,
+                    topk,
+                    0,
+                    8,
+                    f32::NEG_INFINITY,
+                );
+                let big_n = 1 + tree.nodes.len();
+                // Per-slot target logits: slot 0 is the measured row; the rest are
+                // arbitrary (only reached after acceptance, which doesn't change
+                // slot 0's emit marginal). Fill them uniform.
+                let mut logits = vec![0.0f32; big_n * vocab];
+                logits[..vocab].copy_from_slice(&target_logits0);
+
+                let (draft_q, pos_cands) =
+                    swor_draft_candidates(&draft_logits, depth, vocab, topk, temp, &mut rng);
+                let (accepted, bonus) = sample_verified_tree_swor(
+                    &tree, &logits, &draft_q, &pos_cands, depth, topk, vocab, temp, &mut rng,
+                );
+                // Slot-0 emitted token = first accepted child's token, else bonus.
+                let emitted = match accepted.first() {
+                    Some(&ni) => tree.nodes[ni].token,
+                    None => bonus,
+                };
+                hist[emitted as usize] += 1;
+            }
+            let tv: f64 = (0..vocab)
+                .map(|t| (hist[t] as f64 / n_runs as f64 - target[t] as f64).abs())
+                .sum::<f64>()
+                * 0.5;
+            assert!(
+                tv < 0.01,
+                "dense tree-SWOR emit marginal must equal the target at temp={temp}; \
+                 TV={tv:.4} hist={hist:?}"
+            );
+        }
+    }
+
+    // Exact CPU mirror of the device Gumbel-top-k sampler's per-element RNG
+    // (`kernels/src/ddtree_gumbel_topk_batched.hip`): murmur3 fmix32 of (seed,b,i).
+    // Keep in sync with the kernel — this is the regression net for that RNG.
+    fn murmur3_unit(seed: u32, b: u32, i: u32) -> f32 {
+        let mut h = i.wrapping_mul(0x9E3779B1) ^ b.wrapping_mul(0x85EBCA77) ^ seed;
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7FEB352D);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x846CA68B);
+        h ^= h >> 16;
+        (h >> 8) as f32 * (1.0 / 16_777_216.0)
+    }
+
+    // Mirror of the device Gumbel-top-k SWOR sampler: draw k tokens WITHOUT
+    // replacement from softmax(logits/temp) by top-k of `logit/temp + Gumbel`.
+    fn gumbel_topk_murmur3(logits: &[f32], k: usize, temp: f32, seed: u32, b: u32) -> Vec<u32> {
+        let inv_t = 1.0 / temp.max(1e-4);
+        let mut scored: Vec<(f32, u32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let mut u = murmur3_unit(seed, b, i as u32);
+                if u <= 1e-7 {
+                    u = 1e-7;
+                }
+                if u >= 1.0 {
+                    u = 0.9999999;
+                }
+                let g = -(-(u.ln())).ln();
+                (v * inv_t + g, i as u32)
+            })
+            .collect();
+        scored.sort_by(|a, c| c.0.partial_cmp(&a.0).unwrap());
+        scored.iter().take(k).map(|&(_, t)| t).collect()
+    }
+
+    #[test]
+    fn gumbel_swor_composition_preserves_target_distribution() {
+        // THE end-to-end gate the prior tests missed: candidates come from the
+        // ACTUAL murmur3 Gumbel sampler (not an exact host SWOR draw), fed into the
+        // exact swor_step. The emitted marginal must STILL equal the target — this
+        // is the only test that would catch a weak/biased draft sampler (which
+        // keeps rank-0 correct but biases the without-replacement joint, the
+        // recurring over-acceptance trap). Several temps × k, distinct p≠q.
+        let vocab = 6usize;
+        let plog = [0.4f32, -1.2, 1.1, 0.0, 0.7, -0.3]; // target logits (≠ draft)
+        let qlog = [-0.5f32, 1.3, -0.2, 0.6, -1.0, 0.2]; // draft logits
+        for &temp in &[0.5f32, 0.7, 1.0, 1.5] {
+            let inv_t = 1.0 / temp;
+            // target p at this temp.
+            let mut p = vec![0f32; vocab];
+            {
+                let m = plog.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut s = 0.0;
+                for (t, &v) in plog.iter().enumerate() {
+                    p[t] = ((v - m) * inv_t).exp();
+                    s += p[t];
+                }
+                for x in p.iter_mut() {
+                    *x /= s;
+                }
+            }
+            // full draft q at this temp (what swor_step's residual uses).
+            let mut q = vec![0f32; vocab];
+            {
+                let m = qlog.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut s = 0.0;
+                for (t, &v) in qlog.iter().enumerate() {
+                    q[t] = ((v - m) * inv_t).exp();
+                    s += q[t];
+                }
+                for x in q.iter_mut() {
+                    *x /= s;
+                }
+            }
+            for &k in &[2usize, 3, 4] {
+                let n_runs = 400_000u32;
+                let mut hist = vec![0u64; vocab];
+                let mut vrng = 0x1357_9bdf_2468_ace0u64 ^ ((k as u64) << 8);
+                for run in 0..n_runs {
+                    let cands = gumbel_topk_murmur3(&qlog, k, temp, run.wrapping_add(1), 0);
+                    let mut p_work = p.clone();
+                    let (_acc, emit) = swor_step(&mut p_work, &q, &cands, &mut vrng);
+                    hist[emit as usize] += 1;
+                }
+                let tv: f64 = (0..vocab)
+                    .map(|t| (hist[t] as f64 / n_runs as f64 - p[t] as f64).abs())
+                    .sum::<f64>()
+                    * 0.5;
+                assert!(
+                    tv < 0.01,
+                    "Gumbel→SWOR composition must preserve the target; temp={temp} k={k} TV={tv:.4} hist={hist:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sample_first_token_marginal_exact_across_temperatures() {
+        // The first emitted token is always a draw from the ROOT target (whether
+        // it lands on a drafted child or becomes the bonus), so its marginal must
+        // equal softmax(root_logits / temp) EXACTLY at every temperature, for any
+        // tree shape. This is the core "distribution-exact at any temperature"
+        // invariant.
+        let vocab = 5usize;
+        // Tree covers tokens {1,3} at the root; tokens {0,2,4} reach only via bonus.
+        let top_tokens = [1u32, 3];
+        let q = [0.55f32, 0.30];
+        let lp: Vec<f32> = q.iter().map(|x| x.ln()).collect();
+        let tree = build_ddtree_tree_bounded(&top_tokens, &lp, 1, 2, 0, 2, f32::NEG_INFINITY);
+        let n = 1 + tree.nodes.len();
+
+        // Arbitrary (non-uniform) root logits; leaf rows unused for first token.
+        let root_logits = [0.4f32, -1.2, 2.1, 0.0, -0.5];
+        let mut logits = vec![0.0f32; n * vocab];
+        logits[..vocab].copy_from_slice(&root_logits);
+
+        let mut rng = 0x0123_4567_89ab_cdefu64;
+        for &temp in &[0.3f32, 0.7, 1.0, 1.5] {
+            let want = softmax_temp(&root_logits, temp);
+            let n_runs = 600_000u32;
+            let mut hist = vec![0u64; vocab];
+            for _ in 0..n_runs {
+                let (accepted, bonus) = sample_verified_tree(&tree, &logits, vocab, temp, &mut rng);
+                let first = accepted
+                    .first()
+                    .map(|&ni| tree.nodes[ni].token)
+                    .unwrap_or(bonus);
+                hist[first as usize] += 1;
+            }
+            let tv: f64 = (0..vocab)
+                .map(|t| (hist[t] as f64 / n_runs as f64 - want[t] as f64).abs())
+                .sum::<f64>()
+                * 0.5;
+            assert!(
+                tv < 0.01,
+                "first-token marginal must equal softmax(root/temp); temp={temp} TV={tv:.4} hist={hist:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_second_token_conditional_exact() {
+        // After the walk descends an accepted child, the NEXT emitted token is a
+        // draw from that child slot's target. Depth-1 tree → each child is a leaf,
+        // so conditioned on accepting child token 0 (slot 1), the second token is
+        // the bonus drawn from softmax(slot1_logits / temp). This proves the
+        // descended-slot conditional draw is exact (i.e. the full sequence is
+        // autoregressive sampling from the target).
+        let vocab = 4usize;
+        let top_tokens = [0u32, 1];
+        let q = [0.6f32, 0.3];
+        let lp: Vec<f32> = q.iter().map(|x| x.ln()).collect();
+        let tree = build_ddtree_tree_bounded(&top_tokens, &lp, 1, 2, 0, 2, f32::NEG_INFINITY);
+        // child token 0 is node 0 → slot 1.
+        let slot_of_child0 = tree.child_maps[0][&0] + 1;
+        let n = 1 + tree.nodes.len();
+
+        let root_logits = [1.5f32, 0.2, -0.3, -2.0]; // token 0 likely → frequent descent
+        let slot1_logits = [-0.5f32, 0.8, 1.2, 0.1]; // the conditional target after token 0
+        let mut logits = vec![0.0f32; n * vocab];
+        logits[..vocab].copy_from_slice(&root_logits);
+        logits[slot_of_child0 * vocab..(slot_of_child0 + 1) * vocab].copy_from_slice(&slot1_logits);
+
+        let temp = 0.7f32;
+        let want = softmax_temp(&slot1_logits, temp);
+        let mut rng = 0xfeed_face_0000_1111u64;
+        let mut hist = vec![0u64; vocab];
+        let mut conditioned = 0u64;
+        for _ in 0..2_000_000u32 {
+            let (accepted, bonus) = sample_verified_tree(&tree, &logits, vocab, temp, &mut rng);
+            // Condition on x0 == token 0 (accepted child 0); then x1 = bonus.
+            if accepted.first().map(|&ni| tree.nodes[ni].token) == Some(0) {
+                conditioned += 1;
+                hist[bonus as usize] += 1;
+            }
+        }
+        assert!(
+            conditioned > 100_000,
+            "too few descents to estimate ({conditioned})"
+        );
+        let tv: f64 = (0..vocab)
+            .map(|t| (hist[t] as f64 / conditioned as f64 - want[t] as f64).abs())
+            .sum::<f64>()
+            * 0.5;
+        assert!(
+            tv < 0.01,
+            "second-token | x0=0 must equal softmax(slot1/temp); TV={tv:.4} hist={hist:?} n={conditioned}"
+        );
+    }
+
     #[test]
     fn empty_tree_has_root_only_visibility() {
         let t = build_ddtree_tree(&[], &[], 0, 0, 0);
         assert_eq!(t.nodes.len(), 0);
         assert_eq!(t.visibility, vec![vec![true]]);
+    }
+
+    #[test]
+    fn bounded_keeps_node_count_in_band() {
+        let (depth, topk) = (4usize, 3usize);
+        // Peaked and flat distributions — raw cutoff would swing the count, but
+        // the band must clamp both to [4, 16] at every cutoff.
+        for probs in [[0.90f32, 0.06, 0.04], [0.40, 0.32, 0.28]] {
+            let mut toks = Vec::new();
+            let mut lp = Vec::new();
+            for d in 0..depth {
+                for r in 0..topk {
+                    toks.push((d * 10 + r) as u32);
+                    lp.push(probs[r].ln());
+                }
+            }
+            for cut in [f32::NEG_INFINITY, -4.0, -3.0, -2.0] {
+                let t = build_ddtree_tree_bounded(&toks, &lp, depth, topk, 4, 16, cut);
+                let n = t.num_nodes();
+                assert!(
+                    (4..=16).contains(&n),
+                    "node count {n} out of [4,16] (cut={cut})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -943,222 +1923,5 @@ mod tests {
         assert_eq!(toks, vec![0, 1, 3, 2]);
         assert!((logps[0] - (-0.44)).abs() < 0.02);
         assert!((logps[1] - (-1.44)).abs() < 0.02);
-    }
-
-    #[test]
-    fn select_main_path_empty_tree_is_empty() {
-        let t = build_ddtree_tree(&[], &[], 0, 0, 0);
-        assert_eq!(select_main_path(&t), Vec::<usize>::new());
-    }
-
-    #[test]
-    fn select_main_path_single_node_returns_that_node() {
-        // depth=1, top=1, budget=1 → one-node tree.
-        let t = build_ddtree_tree(&[7], &[-0.1], 1, 1, 1);
-        assert_eq!(select_main_path(&t), vec![0]);
-    }
-
-    #[test]
-    fn select_main_path_picks_first_child_at_each_depth() {
-        // Re-uses `deeper_tree_maintains_heap_order`'s tree:
-        // nodes[0] = 10 (root child, best)
-        // nodes[1] = 30 under nodes[0] (best chain extension)
-        // nodes[2] = 20 (alternative root child)
-        // nodes[3] = 30 under nodes[2] (best ext of alt branch)
-        //
-        // Greedy main path = follow root → 10 → 30 = [0, 1].
-        let tokens = vec![10, 20, 30, 40];
-        let logps = vec![-0.1, -1.0, -0.2, -1.5];
-        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 4);
-        assert_eq!(select_main_path(&t), vec![0, 1]);
-    }
-
-    #[test]
-    fn select_main_path_handles_chain_only_tree() {
-        // Force a depth-3 chain by giving every alternative very low prob.
-        // depth=3, topk=1, budget=3 → linear chain of 3 nodes.
-        let tokens = vec![10, 20, 30];
-        let logps = vec![-0.1, -0.1, -0.1];
-        let t = build_ddtree_tree(&tokens, &logps, 3, 1, 3);
-        assert_eq!(t.nodes.len(), 3);
-        // Each node is its predecessor's only child → main path is the
-        // full chain.
-        assert_eq!(select_main_path(&t), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn select_main_path_consistent_with_linearization() {
-        // The main-path tokens, when read off via `tree.nodes[i].token`,
-        // must equal the slot[i+1] tokens in `linearize_tree`'s output
-        // for those slots. This guarantees the caller can swap a tree
-        // verify for a linear verify on the main chain without resequencing.
-        let tokens = vec![10, 20, 30, 40, 50, 60];
-        let logps = vec![-0.1, -1.0, -0.2, -1.5, -0.3, -2.0];
-        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 6);
-        let main = select_main_path(&t);
-        let (lin_tokens, _pos, _mask) = linearize_tree(&t, /*seed=*/ 1, 0);
-        for &idx in &main {
-            assert_eq!(t.nodes[idx].token, lin_tokens[idx + 1]);
-        }
-    }
-
-    #[test]
-    fn enumerate_branches_empty_tree_returns_empty() {
-        let t = build_ddtree_tree(&[], &[], 0, 0, 0);
-        assert!(enumerate_branches(&t, &[], 0).is_empty());
-    }
-
-    #[test]
-    fn enumerate_branches_zero_accepted_yields_only_root_siblings() {
-        // Same 4-node tree as deeper_tree_maintains_heap_order:
-        //   nodes[0] = 10 (main path step 1)
-        //   nodes[1] = 30 under nodes[0] (main path step 2)
-        //   nodes[2] = 20 (alt root child — branch sibling)
-        //   nodes[3] = 30 under nodes[2] (extends the alt branch)
-        let tokens = vec![10, 20, 30, 40];
-        let logps = vec![-0.1, -1.0, -0.2, -1.5];
-        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 4);
-        let main = select_main_path(&t);
-        assert_eq!(main, vec![0, 1]);
-
-        let bs = enumerate_branches(&t, &main, 0);
-        // accepted_main=0 → only forks at depth 0 (root). Sibling = nodes[2]
-        // with greedy descent extending into nodes[3].
-        assert_eq!(bs.len(), 1);
-        assert_eq!(bs[0].fork_depth, 0);
-        assert_eq!(bs[0].chain, vec![2, 3]);
-    }
-
-    #[test]
-    fn enumerate_branches_full_accept_includes_terminal_siblings() {
-        // Build a tree where main_path[1] (last main node) has a sibling
-        // (= a non-main child of main_path[0]). With full accept, that
-        // terminal sibling should appear as a fork at depth 1.
-        // Construction: depth=2, topk=2, budget=5 with logps tuned so
-        // nodes[0]=A, nodes[1]=A's best child (main path 0,1), nodes[2]=
-        // alt root child, nodes[3]=A's second child (= sibling of main 1),
-        // nodes[4]=alt-root-child's child.
-        let tokens = vec![10, 20, 30, 40];
-        let logps = vec![
-            -0.1, -1.0, // depth 1: top-2
-            -0.2, -0.5, // depth 2: top-2 (close so alt sibling expands)
-        ];
-        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 5);
-        let main = select_main_path(&t);
-        // Main path = [0, 1]: nodes[0]=10 → nodes[1]=30
-        assert_eq!(main, vec![0, 1]);
-
-        let bs = enumerate_branches(&t, &main, main.len());
-        // Forks expected:
-        //   - fork_depth=0: nodes[2] (alt root child = 20)
-        //   - fork_depth=1: nodes[1]'s parent is nodes[0]; sibling of main_path[1]
-        //     under nodes[0] = a 4th node if budget permits. With heap order:
-        //     pop (d1 r0)=10 logw=-0.1 → push (d1 r1) logw=-1, (d2 r0 of 10) logw=-0.3
-        //     pop (d2 r0 of 10)=30 logw=-0.3 → push (d2 r1 of 10)=40 logw=-0.6
-        //     pop (d2 r1 of 10)=40 logw=-0.6 → no further push (d=2 max)
-        //     pop (d1 r1)=20 logw=-1 → push (d2 r0 of 20)=30 logw=-1.2
-        //     pop (d2 r0 of 20)=30 logw=-1.2
-        //   So nodes order: [10@d1, 30@d2 child-of-10, 40@d2 child-of-10, 20@d1, 30@d2 child-of-20]
-        // Branches: fork_depth=0 → chain starting at nodes[3]=20, descend to nodes[4]=30
-        //           fork_depth=1 → chain = [nodes[2]=40] (no further descent)
-        assert_eq!(bs.len(), 2);
-        // Sort by fork_depth for deterministic check.
-        let mut by_depth: Vec<_> = bs.iter().collect();
-        by_depth.sort_by_key(|b| b.fork_depth);
-        assert_eq!(by_depth[0].fork_depth, 0);
-        assert_eq!(by_depth[0].chain, vec![3, 4]);
-        assert_eq!(by_depth[1].fork_depth, 1);
-        assert_eq!(by_depth[1].chain, vec![2]);
-    }
-
-    #[test]
-    fn enumerate_branches_chain_only_tree_has_no_branches() {
-        // Pure spine: every node is the only child of its predecessor.
-        let tokens = vec![10, 20, 30];
-        let logps = vec![-0.1, -0.1, -0.1];
-        let t = build_ddtree_tree(&tokens, &logps, 3, 1, 3);
-        let main = select_main_path(&t);
-        assert_eq!(main, vec![0, 1, 2]);
-        assert!(enumerate_branches(&t, &main, main.len()).is_empty());
-    }
-
-    #[test]
-    fn enumerate_branches_partial_accept_caps_eligible_depth() {
-        // Reuse full-accept tree; with accepted_main=1 only fork_depth ∈ [0, 1]
-        // are eligible — same as full accept here because main path has
-        // length 2 and its full accept also yields fork_depth ∈ [0, 1].
-        // To distinguish, build a 3-deep main path tree and accept just 1.
-        let tokens = vec![1, 2, 3, 4, 5, 6];
-        let logps = vec![-0.1, -1.0, -0.1, -1.0, -0.1, -1.0];
-        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 8);
-        let main = select_main_path(&t);
-        assert!(main.len() >= 2, "test fixture needs main path ≥ 2");
-
-        let bs_zero = enumerate_branches(&t, &main, 0);
-        let bs_one = enumerate_branches(&t, &main, 1);
-        // accepted_main=0 ⇒ only depth-0 forks; accepted_main=1 ⇒ depths 0 + 1.
-        // → bs_one ⊇ bs_zero, and bs_one has at least one fork at depth 1
-        //   (sibling of main_path[1] under main_path[0]) iff the tree has one.
-        assert!(bs_one.len() >= bs_zero.len());
-        assert!(bs_zero.iter().all(|b| b.fork_depth == 0));
-        assert!(bs_one.iter().all(|b| b.fork_depth <= 1));
-    }
-
-    #[test]
-    fn enumerate_branches_chains_descend_smallest_index_first() {
-        // Property: each chain follows the smallest-indexed child rule
-        // (i.e. greedy / select_main_path-consistent). For every branch,
-        // verify chain[i+1] is the smallest-index node whose parent_index
-        // equals chain[i].
-        let tokens = vec![10, 20, 30, 40, 50, 60];
-        let logps = vec![-0.1, -0.5, -0.2, -0.6, -0.3, -0.7];
-        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 8);
-        let main = select_main_path(&t);
-        let bs = enumerate_branches(&t, &main, main.len());
-        for branch in &bs {
-            assert!(!branch.chain.is_empty());
-            for win in branch.chain.windows(2) {
-                let parent = win[0] as i32;
-                let child = win[1];
-                let expected = t
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, n)| n.parent_index == parent)
-                    .map(|(i, _)| i)
-                    .expect("chain step must have at least one descendant");
-                assert_eq!(child, expected);
-            }
-            // chain[0]'s parent must be at fork_depth (root if 0, else main_path[fork_depth-1]).
-            let expected_parent: i32 = if branch.fork_depth == 0 {
-                -1
-            } else {
-                main[branch.fork_depth as usize - 1] as i32
-            };
-            assert_eq!(t.nodes[branch.chain[0]].parent_index, expected_parent);
-        }
-    }
-
-    #[test]
-    fn select_main_path_strict_descent_in_depth() {
-        // Main-path nodes must form a parent-chain: each successor's
-        // parent_index must equal its predecessor's tree index, and
-        // depth strictly increases by 1 along the chain.
-        let tokens = vec![10, 20, 30, 40, 50, 60];
-        let logps = vec![-0.1, -1.0, -0.2, -1.5, -0.3, -2.0];
-        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 6);
-        let main = select_main_path(&t);
-        if main.is_empty() {
-            return;
-        }
-        // First node of main path is a direct root child.
-        assert_eq!(t.nodes[main[0]].parent_index, -1);
-        assert_eq!(t.nodes[main[0]].depth, 1);
-        for w in main.windows(2) {
-            let parent = w[0];
-            let child = w[1];
-            assert_eq!(t.nodes[child].parent_index, parent as i32);
-            assert_eq!(t.nodes[child].depth, t.nodes[parent].depth + 1);
-        }
     }
 }
