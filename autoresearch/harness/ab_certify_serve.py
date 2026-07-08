@@ -89,6 +89,10 @@ def coherence_result(base_gens, var_gens, expects=None, alpha=0.05):
 def perf_result(base_dur_ms, var_dur_ms, base_clk=None, var_clk=None):
     """Kernel-DURATION samples (lower=better) -> orient -> MWU + clock-VOID. Returns (verdict,f,delta%).
     delta% is reported on the ORIGINAL duration (negative = faster) for the ledger."""
+    if not base_dur_ms or not var_dur_ms:
+        # profiling produced no samples (e.g. rocprof/GPU hiccup) — do NOT fake a DEAD/0.0; the
+        # kernel-name match or the trace failed, so the perf arm is UNRESOLVED, not a no-op.
+        return ("INCONCLUSIVE", 0.5, 0.0)
     b = perf_mod.orient_lower_is_better(base_dur_ms)
     v = perf_mod.orient_lower_is_better(var_dur_ms)
     verdict, f, _ = perf_mod.resolve(b, v, base_clk, var_clk)
@@ -143,6 +147,7 @@ def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", required=True)
     ap.add_argument("--dev", type=int, required=True)
+    ap.add_argument("--card", type=int, default=None)
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--label", required=True)
     ap.add_argument("--model", required=True)
@@ -153,7 +158,8 @@ def _main():
     ap.add_argument("--kv", default="q8")
     ap.add_argument("--prompts-file", default=None, dest="prompts_file")
     a = ap.parse_args()
-    runner = LiveServeRunner(a.model, a.arch, a.dev, prompts_file=a.prompts_file, kv=a.kv)
+    runner = LiveServeRunner(a.model, a.arch, a.dev, prompts_file=a.prompts_file, kv=a.kv,
+                             kernel=a.kernel, card=a.card)
     row = certify(runner, arch=a.arch, kernel=a.kernel, lever=a.label,
                   base_daemon=a.base_daemon, var_daemon=a.var_daemon,
                   base_ref=a.base_ref, seeds=list(range(a.seeds)))

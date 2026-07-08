@@ -17,10 +17,17 @@ generation dicts the orchestrator consumes.
        HTTP kernel_decode_tok_s counter as an interim; the pinned-clock duration is a separate
        rocprof path (oracle_profile-style) to wire as the primary discriminator.
 """
-import os, sys, re
+import os, sys, re, glob, csv as _csvmod, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 import serve_harness as sh
 import ab_certify_serve as abc
+
+
+def _col(hdr, want):
+    for k in hdr:
+        if k and k.strip().lower() == want:
+            return k
+    return None
 
 
 def _cfg(model, daemon_bin, sampling, kv, port, seed=None, prompts_file=None,
@@ -48,11 +55,14 @@ def _toks_proxy(gen_result):
 
 class LiveServeRunner(abc.ServeRunner):
     def __init__(self, model, arch, dev, port_base=11540, prompts_file=None,
-                 warmed_prompt="Explain hash maps briefly.", n_perf=8, kv="q8", coh_max_tokens=4096):
+                 warmed_prompt="Explain hash maps briefly.", n_perf=8, kv="q8", coh_max_tokens=4096,
+                 kernel=None, card=None):
         self.model, self.arch, self.dev = model, arch, dev
         self.port_base, self.prompts_file = port_base, prompts_file
         self.warmed_prompt, self.n_perf, self.kv = warmed_prompt, n_perf, kv
         self.coh_max_tokens = int(os.environ.get("SR_COH_MAX_TOKENS", coh_max_tokens))
+        self.kernel = kernel      # target kernel (for the rocprof perf arm)
+        self.card = card if card is not None else dev  # DRM card for the perf-level pin
 
     # --- serve lifecycle: one serve per (daemon, arm-env); killed after use ---
     def _run_on_serve(self, cfg, det, gen_fn):
@@ -110,20 +120,64 @@ class LiveServeRunner(abc.ServeRunner):
             return out
         return self._run_on_serve(cfg, det=False, gen_fn=go)
 
-    # --- ARM: perf (Q8, interleaved warmed prompt) ---
+    # --- ARM: perf (rocprof pinned-clock kernel DURATION — the gap #4 fix) ---
+    # Measure the TARGET kernel's per-dispatch duration under profile_standard (clock PINNED, so no
+    # thermal/DPM drift — the sequential base-then-var thermal artifact that made a null variant look
+    # +3% slower). Low-variance, arch-general, no 2-serve memory problem. This is NOT "daemon voodoo":
+    # coherence/parity go through serve (output behavior); perf is a kernel-TIMING measurement, and
+    # rocprof kernel-trace is the right tool for that. One trace = one per-dispatch sample per decode
+    # token, so a single run yields many pinned-clock samples.
     def perf_durations(self, daemon):
-        cfg = _cfg(self.model, daemon, "greedy", self.kv, self.port_base + 2, max_tokens=128)
-        def go(c):
-            durs = []
-            for _ in range(self.n_perf + 1):  # +1 throwaway warmup for this shape
-                r = sh.send(c, [{"role": "user", "content": self.warmed_prompt}])
-                # FLEET-TODO(3): use rocprof pinned-clock kernel DURATION as the primary. Interim:
-                # invert kernel_decode_tok_s (now forwarded over HTTP) into a per-token "duration".
-                tps = r.get("kernel_decode_tok_s") or r.get("decode_tok_s")
-                if tps:
-                    durs.append(1000.0 / tps)  # ms/token proxy (lower=better)
-            return durs[1:]  # drop the warmup
-        return self._run_on_serve(cfg, det=False, gen_fn=go)
+        if not self.kernel:
+            return []
+        if not os.path.exists(daemon):
+            print(f"[perf] MISSING daemon binary: {daemon}", file=sys.stderr, flush=True)
+            return []
+        pl = f"/sys/class/drm/card{self.card}/device/power_dpm_force_performance_level"
+        reqf = f"/tmp/perf_req_{self.arch}_c{self.card}.jsonl"
+        outdir = f"/tmp/perf_kt_{self.arch}_c{self.card}"
+        open(reqf, "w").write(
+            f'{{"type":"load","model":"{self.model}","params":{{"max_seq":2048,"kv_mode":"{self.kv}"}}}}\n'
+            f'{{"type":"generate","id":"r","prompt":"Explain how a hash map resolves collisions, in two sentences.","temperature":0.0,"max_tokens":32}}\n'
+            f'{{"type":"unload"}}\n')
+
+        def run(cmd):
+            subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           env=dict(os.environ, HIP_VISIBLE_DEVICES=str(self.dev)))
+        # Free the GPU first: a lingering serve-daemon holding HVD keeps rocprof's daemon from
+        # initializing HIP. Kill by EXACT comm (-x) — a -f cmdline match would also hit the gate's
+        # own python process (its argv carries the daemon paths).
+        run(f"pkill -9 -x daemon 2>/dev/null; pkill -9 -x {os.path.basename(daemon)[:15]} 2>/dev/null; sleep 2")
+        run(f"{daemon} < {reqf} >/dev/null 2>&1")                       # warm (JIT) at auto
+        run(f"echo profile_standard | sudo -n tee {pl} >/dev/null")     # PIN the clock
+        run(f"rm -rf {outdir}; mkdir -p {outdir}")
+        run(f"timeout 400 /opt/rocm/bin/rocprofv3 --kernel-trace -f csv -d {outdir} "
+            f"-- bash -c '{daemon} < {reqf} >/dev/null 2>&1' >/dev/null 2>&1")
+        run(f"echo auto | sudo -n tee {pl} >/dev/null")                 # restore
+        # parse per-dispatch (end-start) for the target kernel (fuzzy leading-token match: rocprof
+        # reports the RUNTIME symbol, which can diverge from the source-file name).
+        fs = sorted(glob.glob(f"{outdir}/**/*kernel_trace*.csv", recursive=True) or
+                    glob.glob(f"{outdir}/**/*.csv", recursive=True))
+        durs = []
+        if fs:
+            rows = list(_csvmod.DictReader(open(fs[0])))
+            if rows:
+                h = list(rows[0]); kn = _col(h, 'kernel_name'); st = _col(h, 'start_timestamp'); en = _col(h, 'end_timestamp')
+                kt = self.kernel.split("_")
+                for r in rows:
+                    name = re.sub(r'\(.*', '', (r.get(kn, '') or '')).strip()
+                    rt = name.split("_"); n = 0
+                    for a, b in zip(kt, rt):
+                        if a == b: n += 1
+                        else: break
+                    if name == self.kernel or name.startswith(self.kernel) or self.kernel.startswith(name):
+                        n = 999
+                    if n >= 4:
+                        try: durs.append(int(r[en]) - int(r[st]))
+                        except Exception: pass
+        print(f"[perf] daemon={os.path.basename(daemon)} trace_files={len(fs)} rows={len(rows) if fs else 0} "
+              f"durs={len(durs)}", file=sys.stderr, flush=True)
+        return durs
 
     def clocks(self, daemon):
-        return []  # FLEET-TODO: sample pp_dpm_sclk of the arch's DRM card during the perf arm
+        return []  # profile_standard PINS the clock, so a separate clock-VOID is unnecessary here

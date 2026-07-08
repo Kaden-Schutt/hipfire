@@ -28,7 +28,7 @@ BASE_REF="loop/card${CARD}"
 BASE_SHA=$(git rev-parse --short "$BASE_REF" 2>/dev/null || echo "${ARCH}-base")
 KSRC="kernels/src/${KERNEL}.hip"
 BA_DAEMON="$CACHE/base_${ARCH}_c${CARD}"
-VAR_DAEMON="/tmp/var_serve_c${CARD}"
+VAR_DAEMON="$CACHE/var_${ARCH}_c${CARD}"   # persistent (NOT /tmp — it must survive all 3 arms; /tmp got cleaned mid-certify)
 DB="target/release/examples/daemon"
 build(){ cargo build --release --example daemon --features deltanet -p hipfire-runtime 2>&1 \
          | grep -qiE "^error|error\[" && return 1; return 0; }
@@ -57,7 +57,7 @@ GPULK="$MAIN/scripts/gpu-lock.sh"; [ -f "$GPULK" ] && { set +u; . "$GPULK"; gpu_
 # home here (the build above needs HOME=swhome; the serve needs the real one, else the model symlink
 # points into swhome and the serve fails to spawn).
 ROW=$(HOME="$HOME_ORIG" HIP_VISIBLE_DEVICES=$DEV python3 "$HARN/ab_certify_serve.py" \
-        --arch "$ARCH" --dev "$DEV" --kernel "$KERNEL" --label "$LABEL" --model "$MODEL" \
+        --arch "$ARCH" --dev "$DEV" --card "${DRM_CARD:-$DEV}" --kernel "$KERNEL" --label "$LABEL" --model "$MODEL" \
         --base-daemon "$BA_DAEMON" --var-daemon "$VAR_DAEMON" --base-ref "$BASE_SHA" \
         --seeds "$SEEDS" --kv "$KV" $PF_ARG 2>"/tmp/certserve_c${CARD}.err")
 [ -f "$GPULK" ] && { set +u; gpu_release >/dev/null 2>&1; set -u; }
