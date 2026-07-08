@@ -1163,11 +1163,17 @@ pub fn forward_batch(
 ///   no bit-identical Step twin (fused rmsnorm+rotate / fused silu+rotate /
 ///   sigmoid), so they stay direct arch kernels, producing `rot_batch` /
 ///   `topk_*` per rank.
-/// - **Phase 2** (down + reduce): a single-Step per-rank list whose
-///   [`Step::IndexedMoeGemv`] `DownResidual` writes the weighted-combine directly
-///   into the per-rank EP `partial`. The executor `zero_before`-memsets that
-///   partial, runs the down kernel, then all-reduces over the `Ep` group
-///   (peer-direct under `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1`).
+/// - **Phase 2** (down + reduce): two code paths keyed on expert DOWN dtype:
+///   - **Lloyd down** (MQ2G256Lloyd / MQ3G256Lloyd): a single `DownResidual` Step
+///     writes the weighted-combine directly into the per-rank EP partial
+///     (`zero_before=true`), then `AllReduce{Ep}`. Matches the shipped M2.7.mq2
+///     path (down=MQ3L) — byte-identical.
+///   - **Non-Lloyd down** (MQ4G256/HFQ4G256/MQ6G256/HFQ6G256): `DownExpanded`
+///     writes per-expert outputs to `down_expanded` (`zero_before=false`), then
+///     `MoeCombine{inverse_perm: None}` folds with `topk_weights` into the
+///     pre-zeroed EP partial (`zero_before=true`), then `AllReduce{Ep}`. Mirrors
+///     `minimax_moe_block`'s `batched_expanded + combine` path and the ds4
+///     non-hash pattern.
 /// - **Phase 3** (residual fold): `state.h += partial` per rank.
 ///
 /// Preconditions: every rank has an `active_stream` (`ensure_rank_streams`) and
@@ -1258,6 +1264,9 @@ fn minimax_ep_moe_step(
     }
 
     // ── Phase 2: down + EP all-reduce via execute_steps_parallel ──
+    // Key on the expert DOWN dtype (same across ranks — same recipe).
+    let ddt = weights_per_rank[0].layers[l].experts[0].down.gpu_dtype;
+    let is_lloyd_down = matches!(ddt, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd);
     let expert_refs: Vec<MoeExpertRef> = (0..n)
         .map(|r| {
             let layer = &weights_per_rank[r].layers[l];
@@ -1273,26 +1282,79 @@ fn minimax_ep_moe_step(
             }
         })
         .collect();
-    let per_rank_steps: Vec<Vec<Step>> = (0..n)
-        .map(|r| {
-            vec![Step::IndexedMoeGemv {
-                experts: &expert_refs[r],
-                which: MoeProj::DownResidual {
-                    topk_weights: &state_per_rank[r].topk_weights,
+    let (per_rank_steps, collectives, zero_before): (
+        Vec<Vec<Step>>,
+        Vec<StepCollective>,
+        Vec<bool>,
+    ) = if is_lloyd_down {
+        // Lloyd down (MQ2G256Lloyd / MQ3G256Lloyd): residual-fused single Step
+        // writes the weighted-combine directly into the EP partial.
+        // This is the SHIPPED path (M2.7.mq2 down=MQ3L) — must stay byte-identical.
+        let steps = (0..n)
+            .map(|r| {
+                vec![Step::IndexedMoeGemv {
+                    experts: &expert_refs[r],
+                    which: MoeProj::DownResidual {
+                        topk_weights: &state_per_rank[r].topk_weights,
+                    },
+                    topk_indices: &state_per_rank[r].topk_indices,
+                    input: GemvInput::Prerotated(&state_per_rank[r].rot_batch),
+                    out: &partials[r],
+                    k_top,
+                    batch_size: 1,
+                }]
+            })
+            .collect();
+        (
+            steps,
+            vec![StepCollective::AllReduce {
+                kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                dim: hidden,
+            }],
+            vec![true],
+        )
+    } else {
+        // Non-Lloyd down (MQ4G256/HFQ4G256/MQ6G256/HFQ6G256): expanded path
+        // mirrors minimax_moe_block's batched_expanded + combine and ds4's
+        // non-hash arm. DownExpanded writes per-expert outputs into down_expanded;
+        // MoeCombine folds with topk_weights into the pre-zeroed EP partial.
+        let steps = (0..n)
+            .map(|r| {
+                let s = &state_per_rank[r];
+                vec![
+                    Step::IndexedMoeGemv {
+                        experts: &expert_refs[r],
+                        which: MoeProj::DownExpanded,
+                        topk_indices: &s.topk_indices,
+                        input: GemvInput::Prerotated(&s.rot_batch),
+                        out: &s.down_expanded,
+                        k_top,
+                        batch_size: 1,
+                    },
+                    Step::MoeCombine {
+                        down_out: &s.down_expanded,
+                        topk_weights: &s.topk_weights,
+                        out: &partials[r],
+                        k: k_top,
+                        hidden,
+                        batch_size: 1,
+                        inverse_perm: None,
+                    },
+                ]
+            })
+            .collect();
+        (
+            steps,
+            vec![
+                StepCollective::None,
+                StepCollective::AllReduce {
+                    kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                    dim: hidden,
                 },
-                topk_indices: &state_per_rank[r].topk_indices,
-                input: GemvInput::Prerotated(&state_per_rank[r].rot_batch),
-                out: &partials[r],
-                k_top,
-                batch_size: 1,
-            }]
-        })
-        .collect();
-    let collectives = vec![StepCollective::AllReduce {
-        kind: hipfire_runtime::multi_gpu::DimKind::Ep,
-        dim: hidden,
-    }];
-    let zero_before = vec![true];
+            ],
+            vec![false, true],
+        )
+    };
     execute_steps_parallel(mesh, gpus, &per_rank_steps, &collectives, &zero_before)
         .map_err(|e| format!("moe-step L{l}: execute_steps_parallel: {e:?}"))?;
 
