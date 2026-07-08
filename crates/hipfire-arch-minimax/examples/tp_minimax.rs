@@ -61,6 +61,7 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
     let mut max: usize = 32;
+    let mut selfcheck_tp1 = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -75,6 +76,11 @@ fn main() {
             "--max" => {
                 max = argv[i + 1].parse().expect("--max");
                 i += 2;
+            }
+            // THROWAWAY diagnostic: run tp=1 twice to measure atomic-add nondeterminism floor.
+            "--selfcheck-tp1" => {
+                selfcheck_tp1 = true;
+                i += 1;
             }
             other => {
                 eprintln!("unknown arg {other}");
@@ -127,8 +133,9 @@ fn main() {
         // Prefill via single-GPU decode_step.
         let mut logits = Vec::new();
         for (pos, &t) in prompt_ids.iter().enumerate() {
-            logits = forward::decode_step(&cfg, &w, &mut state, &mut gpus1.devices[0], t, pos as u32)
-                .expect("decode_step prefill tp1");
+            logits =
+                forward::decode_step(&cfg, &w, &mut state, &mut gpus1.devices[0], t, pos as u32)
+                    .expect("decode_step prefill tp1");
         }
 
         let mut tokens = Vec::new();
@@ -141,14 +148,105 @@ fn main() {
             if matches!(next, 200020 | 151643 | 151645 | 2) {
                 break;
             }
-            logits = forward::decode_step(&cfg, &w, &mut state, &mut gpus1.devices[0], next, pos as u32)
-                .expect("decode_step tp1");
+            logits = forward::decode_step(
+                &cfg,
+                &w,
+                &mut state,
+                &mut gpus1.devices[0],
+                next,
+                pos as u32,
+            )
+            .expect("decode_step tp1");
             all_logits.push(logits.clone());
             pos += 1;
         }
         eprintln!("  tp=1 generated {} tokens", tokens.len());
         tp1_tokens = tokens;
         tp1_logits_all = all_logits;
+
+        // ── THROWAWAY: selfcheck-tp1 — run tp=1 a SECOND time with fresh state,
+        // same weights, to measure the atomic-add nondeterminism floor.
+        // Reports tp1-vs-tp1 max|Δ| and top-5 logit magnitudes, then exits.
+        if selfcheck_tp1 {
+            eprintln!("\n=== selfcheck-tp1: second tp=1 pass (nondeterminism floor) ===");
+            let mut state2 = MiniMaxState::new_with_max_seq(&mut gpus1.devices[0], &cfg, max_seq)
+                .expect("state tp1 second pass");
+            let mut logits2 = Vec::new();
+            for (pos, &t) in prompt_ids.iter().enumerate() {
+                logits2 = forward::decode_step(
+                    &cfg,
+                    &w,
+                    &mut state2,
+                    &mut gpus1.devices[0],
+                    t,
+                    pos as u32,
+                )
+                .expect("decode_step prefill tp1 second pass");
+            }
+            let mut tokens2 = Vec::new();
+            let mut all_logits2: Vec<Vec<f32>> = Vec::new();
+            let mut pos2 = prompt_ids.len();
+            all_logits2.push(logits2.clone());
+            for _step in 0..max {
+                let next2 = argmax(&logits2);
+                tokens2.push(next2);
+                if matches!(next2, 200020 | 151643 | 151645 | 2) {
+                    break;
+                }
+                logits2 = forward::decode_step(
+                    &cfg,
+                    &w,
+                    &mut state2,
+                    &mut gpus1.devices[0],
+                    next2,
+                    pos2 as u32,
+                )
+                .expect("decode_step tp1 second pass");
+                all_logits2.push(logits2.clone());
+                pos2 += 1;
+            }
+            eprintln!("  tp1-pass2 generated {} tokens", tokens2.len());
+
+            // Compare pass1 vs pass2.
+            let n_steps2 = tp1_tokens.len().min(tokens2.len());
+            let mut argmax_ok2 = true;
+            let mut max_logit_delta_tp1: f32 = 0.0;
+            for step in 0..n_steps2 {
+                if tp1_tokens[step] != tokens2[step] {
+                    eprintln!(
+                        "  ARGMAX MISMATCH (tp1 vs tp1) step {step}: pass1={} pass2={}",
+                        tp1_tokens[step], tokens2[step]
+                    );
+                    argmax_ok2 = false;
+                }
+                if step < tp1_logits_all.len() && step < all_logits2.len() {
+                    let l1 = &tp1_logits_all[step];
+                    let l2 = &all_logits2[step];
+                    let delta = l1
+                        .iter()
+                        .zip(l2.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    if delta > max_logit_delta_tp1 {
+                        max_logit_delta_tp1 = delta;
+                    }
+                }
+            }
+            // Report top-5 logit magnitudes at step 0 for scale context.
+            if let Some(l0) = tp1_logits_all.first() {
+                let mut top5: Vec<f32> = l0.iter().map(|x| x.abs()).collect();
+                top5.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let top5: Vec<f32> = top5.into_iter().take(5).collect();
+                eprintln!("  logit magnitude scale (step 0 top-5 |logit|): {top5:.2?}");
+                let argmax_logit = l0[argmax(l0) as usize];
+                eprintln!("  argmax logit value at step 0: {argmax_logit:.4}");
+            }
+            eprintln!("  tp1-vs-tp1 argmax-exact: {argmax_ok2}");
+            eprintln!("  tp1-vs-tp1 logit max|Δ|: {max_logit_delta_tp1:.4e}");
+            eprintln!("\nSELFCHECK-TP1 DONE — compare to tp1-vs-tp2 max|Δ| to classify nondeterminism source");
+            return;
+        }
+
         // Explicitly free GPU memory before tp=2 load. free_gpu returns memory to the
         // per-Gpu pool but does NOT call hipFree — drain_pool does the actual hipFree
         // so the HIP allocator can reclaim the memory for the tp=2 run on the same device.
@@ -284,30 +382,49 @@ fn main() {
 
     eprintln!("  argmax-exact: {argmax_ok}");
     eprintln!("  logit max|Δ|: {max_logit_delta:.2e}");
-    eprintln!(
-        "  tp=1 generation:\n{}",
-        tok.decode(&tp1_tokens)
-    );
-    eprintln!(
-        "  tp=2 generation:\n{}",
-        tok.decode(&tp2_tokens)
-    );
+    // Report logit magnitude scale at step 0 for context.
+    if let Some(l0) = tp1_logits_all.first() {
+        let mut top5: Vec<f32> = l0.iter().map(|x| x.abs()).collect();
+        top5.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let top5: Vec<f32> = top5.into_iter().take(5).collect();
+        eprintln!("  logit magnitude scale (step 0 top-5 |logit|): {top5:.2?}");
+        eprintln!(
+            "  argmax logit value at step 0: {:.4}",
+            l0[argmax(l0) as usize]
+        );
+    }
+    eprintln!("  tp=1 generation:\n{}", tok.decode(&tp1_tokens));
+    eprintln!("  tp=2 generation:\n{}", tok.decode(&tp2_tokens));
 
     assert!(
         argmax_ok,
         "PARITY FAIL: argmax mismatch between tp=1 and tp=2 (inter_local site missed?)"
     );
-    // The logit threshold is intentionally loose (< 10.0, not 1e-2) because the
-    // MQ3L down-residual kernel uses atomicAdd with K=inter_local (768 per rank)
-    // instead of K=inter (1536 in tp=1). Splitting K at group boundaries (256-aligned)
-    // is mathematically exact, but FP32 atomicAdd accumulation ORDER differs —
-    // tp=2 does two K=768 partial sums then adds them, while tp=1 does one K=1536
-    // accumulation. The resulting logit delta (~4-5) is a pure FP rounding artifact:
-    // argmax is exactly preserved (all 32 tokens match), confirming TP correctness.
-    // The hard correctness gate is argmax-exact above.
+    // ROOT CAUSE (KNOWN BUG — see Task-3 report): the logit delta (~4-5 at max=32)
+    // originates from the K4 main-loop optimization in
+    // `gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed`:
+    //   quads = groups_per_row >> 2
+    // With K=inter_local=768 (3 groups): quads=0 → ALL groups go through the
+    // sequential tail accumulators (acc0 only via 3 TAIL_LOAD_AND_DOT calls).
+    // With K=inter=1536   (6 groups): quads=1 → 4 groups via 4 separate K4-main-loop
+    // accumulators (acc0..acc3) + 2 via tail into acc0/acc1.
+    // Final reduction: (acc0+acc1)+(acc2+acc3) — different accumulation tree for each K.
+    // This structural difference in FP32 accumulation order produces ~4.55 max logit
+    // delta (max over 200k vocab at step 0). At --max 32, the routing margins hold and
+    // argmax is exactly preserved. At --max 128, accumulated state error causes router
+    // divergence at step ~40 (63/128 mismatches, delta grows to 42.8). This is NOT a
+    // "pure FP rounding artifact" — it is a STRUCTURAL accumulation difference that
+    // cascades to argmax divergence. The fix requires K-invariant down accumulation
+    // (e.g. remove the K4 quads optimisation and use sequential single-acc for all K,
+    // then ensure both tp=1 K=inter and tp=2 K=inter_local use the same code path by
+    // zero-padding K to inter, or switch to an output-row-parallel down projection
+    // that keeps K=inter on every rank). Both approaches require non-trivial kernel
+    // changes and are tracked as BLOCKED in the Task-3 report.
+    // HONEST THRESHOLD: at --max 32, observed delta is ~4.55; no narrower bound is
+    // achievable without fixing the accumulation bug above.
     assert!(
-        max_logit_delta < 10.0,
-        "PARITY FAIL: logit max|Δ|={max_logit_delta:.2e} >= 10.0"
+        max_logit_delta < 6.0,
+        "PARITY FAIL: logit max|Δ|={max_logit_delta:.2e} >= 6.0 (see root-cause comment above)"
     );
 
     eprintln!("\nPARITY PASS: tp=1 == tp=2 (argmax-exact, logit max|Δ|={max_logit_delta:.2e})");
