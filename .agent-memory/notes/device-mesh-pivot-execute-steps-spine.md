@@ -650,8 +650,14 @@ SuperOp stub + its `#397 Ship 6` doc header in qwen35.rs; retargeted 5 stale
 **Validation:** `cargo check --workspace --all-targets` (default incl. deltanet) 0 errors; daemon
 `--features deltanet` clean; `cargo test --lib --workspace` 966 pass/0 fail; `coherence-gate.sh` coherence
 PASS (no hard errors, qwen3.5 matrix); llama-arch `coherence_probe` OK 0/0 (covers the pure-llama
-`forward_scratch_compute` path). pflash perf-stage FAIL = known gfx1100-baseline-vs-gfx1151 artifact
-(uniform ~2× incl untouched AR baseline rows), NOT the merge.
+`forward_scratch_compute` path). **DFlash/spec-decode (the merge's dominant new surface + my capture-fn
+reconstruction):** `coherence-gate-qwen3-dspark.sh` PASS — daemon-based, drafter ENGAGED
+(`llama DSpark speculator enabled, block=7`, `dflash:true` τ=0.94–1.36), all 3 rows OK, exercises
+`dspark_body`/`dspark_core` → arch-llama `forward_scratch_compute_capture` (my reconstructed fn);
+`coherence-gate-dflash.sh` (qwen36-27b DeltaNet + ddtree) PASS — all 4 rows OK (t1/t2/t3 clean,
+unique_ratio 0.68–0.75), τ healthy (dflash-code 7.8, prose 1.0–1.6, ddtree 1.58). pflash perf-stage
+FAIL = known gfx1100-baseline-vs-gfx1151 artifact (uniform ~2× incl untouched AR baseline rows), NOT the
+merge.
 
 **Worktree gotcha:** `core.hooksPath` = `.git/hooks` (no pre-commit) → the pre-commit gate never fires
 here; run gates manually.
