@@ -169,6 +169,7 @@ fn is_dense_tp_slice(policy: &ShardPolicy) -> bool {
             | ShardPolicy::HeadSharded { .. }
             | ShardPolicy::VocabShard { .. }
     )
+    // ExpertTensorSharded has its own fulfillment path, not a dense TP slice.
 }
 
 /// Pack the bytes of a rank's *owned* experts into one compact blob. Experts are
@@ -265,6 +266,46 @@ pub fn expert_tp_row_gather(
     for row in 0..hidden {
         let base = row * row_bytes + rank * sub;
         out.extend_from_slice(&expert_blob[base..base + sub]);
+    }
+    Ok(out)
+}
+
+/// Build the per-rank TP-sliced blob for an `ExpertTensorSharded` entry.
+///
+/// Iterates over all `n_experts`, extracts each expert's blob (`expert_bytes`
+/// bytes at offset `e * expert_bytes`), and calls either
+/// [`expert_tp_column_pair`] (ColumnShard inner — gate‖up split) or
+/// [`expert_tp_row_gather`] (RowShard inner — down gather), then concatenates
+/// the per-expert rank slices. Factored out of `fulfill_into` so the blob
+/// construction (the correctness surface) is testable without a GPU.
+pub fn build_expert_tp_blob(
+    bytes: &[u8],
+    n_experts: usize,
+    expert_bytes: usize,
+    inter: usize,
+    hidden: usize,
+    block_bytes: usize,
+    rank: usize,
+    tp: usize,
+    inner: &ShardPolicy,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for e in 0..n_experts {
+        let blob = &bytes[e * expert_bytes..(e + 1) * expert_bytes];
+        let slice = match inner {
+            ShardPolicy::ColumnShard { .. } => {
+                expert_tp_column_pair(blob, inter, hidden, block_bytes, rank, tp)?
+            }
+            ShardPolicy::RowShard { .. } => {
+                expert_tp_row_gather(blob, hidden, inter, block_bytes, rank, tp)?
+            }
+            other => {
+                return Err(format!(
+                    "build_expert_tp_blob: inner must be ColumnShard or RowShard, got {other:?}"
+                ));
+            }
+        };
+        out.extend_from_slice(&slice);
     }
     Ok(out)
 }
@@ -563,6 +604,123 @@ where
             }
         }
 
+        // Expert-tensor-parallel (TP-of-experts): each rank in the Tp group holds
+        // a TP-sliced fraction of every expert. For ColumnShard inner (gate‖up),
+        // call `expert_tp_column_pair`; for RowShard inner (down), call
+        // `expert_tp_row_gather`. Blob layout: [n_experts, ...] — expert-outermost.
+        // Shape convention: [n_experts, 2*inter, hidden] for gate‖up (axis-1 = 2*inter),
+        // [n_experts, hidden, inter] for down (axis-2 = inter).
+        if let ShardPolicy::ExpertTensorSharded { n_experts, inner } = &entry.policy {
+            if devices.len() > 1 {
+                let tp = devices.len();
+                let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
+                    name: entry.name.clone(),
+                    layer: entry.layer,
+                    device: *devices.first().unwrap_or(&0),
+                    reason: format!("source read failed: {e}"),
+                })?;
+                // Derive block_bytes from dtype.
+                let block_bytes: usize = match dtype {
+                    DType::MQ2G256Lloyd => 72,
+                    DType::MQ3G256Lloyd => 112,
+                    _ => {
+                        return Err(FulfillError {
+                            name: entry.name.clone(),
+                            layer: entry.layer,
+                            device: *devices.first().unwrap_or(&0),
+                            reason: format!(
+                                "ExpertTensorSharded: unsupported dtype {dtype:?} \
+                                 (expected MQ2G256Lloyd or MQ3G256Lloyd)"
+                            ),
+                        });
+                    }
+                };
+                // Derive inter and hidden from logical_shape.
+                // Gate‖up: [n_experts, 2*inter, hidden] → inter = shape[1]/2, hidden = shape[2]
+                // Down:    [n_experts, hidden, inter]   → hidden = shape[1], inter = shape[2]
+                let (inter, hidden) = match inner.as_ref() {
+                    ShardPolicy::ColumnShard { .. } => {
+                        let two_inter = entry.logical_shape.get(1).copied().unwrap_or(0);
+                        let h = entry.logical_shape.get(2).copied().unwrap_or(0);
+                        (two_inter / 2, h)
+                    }
+                    ShardPolicy::RowShard { .. } => {
+                        let h = entry.logical_shape.get(1).copied().unwrap_or(0);
+                        let i = entry.logical_shape.get(2).copied().unwrap_or(0);
+                        (i, h)
+                    }
+                    _ => {
+                        return Err(FulfillError {
+                            name: entry.name.clone(),
+                            layer: entry.layer,
+                            device: *devices.first().unwrap_or(&0),
+                            reason: format!(
+                                "ExpertTensorSharded: inner must be ColumnShard or RowShard, \
+                                 got {inner:?}"
+                            ),
+                        });
+                    }
+                };
+                // Per-expert blob size (whole logical tensor / n_experts).
+                if *n_experts == 0 || bytes.len() % n_experts != 0 {
+                    return Err(FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: *devices.first().unwrap_or(&0),
+                        reason: format!(
+                            "ExpertTensorSharded: blob {} bytes not divisible by n_experts {}",
+                            bytes.len(),
+                            n_experts
+                        ),
+                    });
+                }
+                let expert_bytes = bytes.len() / n_experts;
+                for (rank, &dev) in devices.iter().enumerate() {
+                    // Build the per-rank blob: iterate over every expert,
+                    // slice the per-expert blob for this rank, concatenate.
+                    let per_rank_blob = build_expert_tp_blob(
+                        &bytes,
+                        *n_experts,
+                        expert_bytes,
+                        inter,
+                        hidden,
+                        block_bytes,
+                        rank,
+                        tp,
+                        inner,
+                    )
+                    .map_err(|e| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: e,
+                    })?;
+                    let gpu = gpus.devices.get(dev).ok_or_else(|| FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: dev,
+                        reason: format!("device {dev} out of range (have {})", gpus.devices.len()),
+                    })?;
+                    let mut tensor = gpu
+                        .upload_raw(&per_rank_blob, &entry.logical_shape)
+                        .map_err(|e| FulfillError {
+                            name: entry.name.clone(),
+                            layer: entry.layer,
+                            device: dev,
+                            reason: format!("upload_raw failed: {e}"),
+                        })?;
+                    tensor.dtype = dtype;
+                    store.insert(
+                        &entry.name,
+                        entry.layer,
+                        dev,
+                        WeightHandle::Resident(tensor),
+                    );
+                }
+                continue;
+            }
+        }
+
         // Remaining dense TP slices across a real (≥2) group are not implemented
         // yet (PB-1b) — refuse rather than mis-place. A size-1 group degenerates
         // to a whole-tensor upload and is fine.
@@ -724,6 +882,96 @@ mod tests {
             assert!(expert_tp_column_pair(&[0u8; 16], 300, 256, 4, 0, 7).is_err());
             assert!(expert_tp_row_gather(&[0u8; 16], 3, 300, 4, 0, 7).is_err());
         }
+    }
+
+    #[test]
+    fn expert_tensor_sharded_blob_construction() {
+        // Synthetic 1-expert gate‖up blob for Tp-2:
+        // inter=512, hidden=256, block_bytes=4 (toy).
+        // Gate‖up blob shape: [2*inter=1024 rows, hidden/256=1 block/row] = 1024 × 4B.
+        let (inter, hidden, bb) = (512usize, 256usize, 4usize);
+        let n_experts = 1usize;
+        // Build a single expert's gate‖up blob: 1024 rows × 1 block × 4B = 4096B.
+        let expert_blob: Vec<u8> = (0u32..1024).flat_map(|i| i.to_le_bytes()).collect();
+        assert_eq!(expert_blob.len(), 2 * inter * (hidden / 256) * bb);
+
+        let inner_col = ShardPolicy::ColumnShard { axis: 0 };
+        // rank 0 of tp=2 via column_pair helper directly:
+        let expected_r0 = expert_tp_column_pair(&expert_blob, inter, hidden, bb, 0, 2).unwrap();
+        let expected_r1 = expert_tp_column_pair(&expert_blob, inter, hidden, bb, 1, 2).unwrap();
+
+        // build_expert_tp_blob for a 1-expert blob should equal expert_tp_column_pair directly.
+        let got_r0 = build_expert_tp_blob(
+            &expert_blob,
+            n_experts,
+            expert_blob.len(),
+            inter,
+            hidden,
+            bb,
+            0,
+            2,
+            &inner_col,
+        )
+        .unwrap();
+        let got_r1 = build_expert_tp_blob(
+            &expert_blob,
+            n_experts,
+            expert_blob.len(),
+            inter,
+            hidden,
+            bb,
+            1,
+            2,
+            &inner_col,
+        )
+        .unwrap();
+
+        assert_eq!(got_r0.len(), expected_r0.len());
+        assert_eq!(&got_r0[..4], &expected_r0[..4]);
+        assert_eq!(got_r0, expected_r0);
+        assert_eq!(got_r1, expected_r1);
+
+        // Multi-expert (2): concatenation of per-expert slices.
+        let two_expert_blob: Vec<u8> = (0u32..2048).flat_map(|i| i.to_le_bytes()).collect();
+        let expert0 = &two_expert_blob[..expert_blob.len()];
+        let expert1 = &two_expert_blob[expert_blob.len()..];
+        let mut expected_multi = expert_tp_column_pair(expert0, inter, hidden, bb, 0, 2).unwrap();
+        expected_multi.extend(expert_tp_column_pair(expert1, inter, hidden, bb, 0, 2).unwrap());
+
+        let got_multi = build_expert_tp_blob(
+            &two_expert_blob,
+            2,
+            expert_blob.len(),
+            inter,
+            hidden,
+            bb,
+            0,
+            2,
+            &inner_col,
+        )
+        .unwrap();
+        assert_eq!(got_multi, expected_multi);
+
+        // RowShard inner (down projection): hidden=3, inter=512, tp=2.
+        let (h_down, i_down) = (3usize, 512usize);
+        let down_blob: Vec<u8> = (0u32..(h_down * (i_down / 256)) as u32)
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let inner_row = ShardPolicy::RowShard { axis: 1 };
+        let expected_down_r1 = expert_tp_row_gather(&down_blob, h_down, i_down, bb, 1, 2).unwrap();
+        let got_down_r1 = build_expert_tp_blob(
+            &down_blob,
+            1,
+            down_blob.len(),
+            i_down,
+            h_down,
+            bb,
+            1,
+            2,
+            &inner_row,
+        )
+        .unwrap();
+        assert_eq!(got_down_r1, expected_down_r1);
     }
 
     // The dense-TP refusal path is checkable without a GPU: a row-shard on a

@@ -31,6 +31,7 @@ pub fn collective_for_policy(policy: &ShardPolicy) -> Option<CollectiveHint> {
     match policy {
         ShardPolicy::RowShard { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Tp }),
         ShardPolicy::ExpertSharded { .. } => Some(CollectiveHint::AllReduce { kind: DimKind::Ep }),
+        ShardPolicy::ExpertTensorSharded { inner, .. } => collective_for_policy(inner),
         _ => None,
     }
 }
@@ -60,6 +61,8 @@ pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize
         ShardPolicy::Pin(_) | ShardPolicy::Tied { .. } => vec![mesh.device_of(&coord)],
         // Expert-sharded → the Ep group of the stage.
         ShardPolicy::ExpertSharded { .. } => mesh.group_along(DimKind::Ep, &coord),
+        // Expert-tensor-sharded → the Tp group of the stage (TP-of-experts).
+        ShardPolicy::ExpertTensorSharded { .. } => mesh.group_along(DimKind::Tp, &coord),
         // Everything else (replicate / column / row / fused-qkv / head / vocab)
         // spans the stage's Tp group (replica or per-rank shard).
         _ => mesh.group_along(DimKind::Tp, &coord),
@@ -189,6 +192,28 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                     ));
                 }
             }
+            ShardPolicy::ExpertTensorSharded { .. } => {
+                // Expert intermediate dim must be divisible by Tp and the
+                // resulting slice must be a multiple of 256 (the quant group
+                // size for MQ2G256/MQ3G256 experts).
+                // logical_shape: [n_experts, 2*inter, hidden] (gate‖up) or
+                // [n_experts, hidden, inter] (down); inter is axis 1 (for
+                // gate/up, 2*inter halved below) or axis 2 (down).
+                // We gate on axis-1 as the "inter" dim (either 2*inter for
+                // gate‖up or hidden for down — both must split cleanly, but
+                // only the inner sharding dimension matters; we conservatively
+                // check axis 1 which is always the sharded axis in MoE blobs).
+                let d = e.logical_shape.get(1).copied().unwrap_or(0);
+                if tp > 1 && !(d % tp == 0 && (d / tp) % 256 == 0) {
+                    return Err(format!(
+                        "{}: ExpertTensorSharded axis-1 dim {d} \
+                         (inter or 2·inter) not divisible by Tp={tp} \
+                         or slice {} not a multiple of 256",
+                        ctx(),
+                        d / tp
+                    ));
+                }
+            }
             // Replicate / ExpertSharded (Stride tolerates uneven) / Pin / Vocab: no divisibility gate.
             _ => {}
         }
@@ -243,6 +268,15 @@ pub enum ShardPolicy {
     Pin(PinTarget),
     /// TP logit sharding of lm_head along the vocab `axis`.
     VocabShard { axis: usize },
+    /// Tensor-parallel MoE expert sharding: each rank holds a TP-sliced
+    /// fraction of every expert's weight. `inner` = `ColumnShard` for gate‖up
+    /// projections, `RowShard` for down projections; placement spans the Tp
+    /// group (not Ep). Scaffolds manifest-transparent MoE loading where
+    /// arch-imperative loaders hold the current GPU path.
+    ExpertTensorSharded {
+        n_experts: usize,
+        inner: Box<ShardPolicy>,
+    },
 }
 
 /// The fused-QKV block order an arch packs into one tensor (so the engine knows
