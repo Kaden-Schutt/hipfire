@@ -26,6 +26,13 @@ pub enum PipelineOp {
     IndexedGateUp,
     IndexedDownExpanded,
     MoeCombine,
+    /// Bias-aware top-K routing (Step-IR [`crate::pipeline::steps::Step::MoeRoute`]).
+    /// Writes topk_indices + topk_weights. Not fusible.
+    MoeRoute,
+    /// Indexed per-expert GEMV (Step-IR [`crate::pipeline::steps::Step::IndexedMoeGemv`]).
+    /// Covers GateUp, DownExpanded, and DownResidual shapes — all three return this tag
+    /// so fusion matching treats them uniformly (none participate in any fused pattern).
+    IndexedMoeGemv,
     /// Fused rmsnorm + optional rotation (MQ-weight producer step).
     /// rotation=FwhtG256 → rmsnorm + FWHT. rotation=None → rmsnorm only.
     RmsnormAutomatic,

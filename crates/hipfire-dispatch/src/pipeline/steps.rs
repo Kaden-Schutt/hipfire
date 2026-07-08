@@ -11,6 +11,10 @@ use std::sync::OnceLock;
 use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
+use crate::families::moe::{
+    launch_indexed_down, launch_indexed_down_residual, launch_indexed_gate_up, launch_moe_combine,
+    launch_moe_route, MoeExpertRef,
+};
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
@@ -19,6 +23,30 @@ use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationV
 pub enum GemvInput<'a> {
     Raw(&'a GpuTensor),        // launch_op self-rotates via run_auto (plan-aware)
     Prerotated(&'a GpuTensor), // already FWHT-rotated; dispatched via Prerotated variant
+}
+
+/// Down-projection shape discriminant for [`Step::IndexedMoeGemv`].
+///
+/// Two kernel families underly three shapes:
+/// - **Expanded** (`GateUp` / `DownExpanded`): writes an intermediate buffer; a
+///   separate [`Step::MoeCombine`] folds the per-expert outputs with `topk_weights`
+///   into the EP partial. MQ4/HFQ4/MQ6/MQ2L support this path via
+///   [`launch_indexed_down`]. MQ3L does **not** (no `*_expanded_k4` kernel exists).
+/// - **Residual-fused** (`DownResidual`): [`launch_indexed_down_residual`] folds the
+///   weighted combine into the kernel and writes directly into the EP partial. Used
+///   by MQ2L (minimax self-combining path) and MQ3L (the only down path for MQ3L).
+///   Calling [`Step::MoeCombine`] after `DownResidual` would double-accumulate.
+pub enum MoeProj<'a> {
+    /// Gate+up projection: writes gate_batch (= step `out`) + up_batch (= `up_out`).
+    /// Requires FWHT-pre-rotated input. `topk_weights` not needed here.
+    GateUp { up_out: &'a GpuTensor },
+    /// Down expanded path (MQ4/HFQ4/MQ6/MQ2L): writes per-expert outputs to `out`
+    /// (= `down_expanded`). A separate [`Step::MoeCombine`] folds into the EP partial.
+    DownExpanded,
+    /// Down residual-fused path (MQ2L/MQ3L): folds the weighted combine into the
+    /// down kernel. The step's `out` IS the EP partial (accumulate semantics).
+    /// No [`Step::MoeCombine`] follows — that would double-accumulate.
+    DownResidual { topk_weights: &'a GpuTensor },
 }
 
 pub enum Step<'a> {
@@ -110,6 +138,59 @@ pub enum Step<'a> {
         y: &'a GpuTensor,
         dim: usize,
     },
+    /// Bias-aware top-K MoE routing (deepseek4 decode path, k=6).
+    /// Selects on `scores + gate_bias`, weights on the unbiased `scores`, normalizes,
+    /// folds in `route_scale` — all in one launch. Writes `topk_indices` and
+    /// `topk_weights`. Delegates to [`launch_moe_route`].
+    MoeRoute {
+        scores: &'a GpuTensor,
+        gate_bias: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        k: usize,
+        n_experts: usize,
+        route_scale: f32,
+    },
+    /// Indexed per-expert GEMV for the top-K selected experts (decode, B=1).
+    ///
+    /// Three shapes via `which` (see [`MoeProj`]):
+    /// - `GateUp`: gate+up → `out` = gate_batch, `which.up_out` = up_batch.
+    ///   `input` must be FWHT-pre-rotated. No `topk_weights` (combine is later).
+    /// - `DownExpanded`: down → `out` = `down_expanded` [k × expert_k].
+    ///   A separate [`Step::MoeCombine`] folds into the EP partial.
+    ///   `batch_size` is consumed; MQ3L is unsupported (use `DownResidual`).
+    /// - `DownResidual`: down + weighted-combine fused (MQ2L/MQ3L) → `out` = EP partial.
+    ///   `which.topk_weights` carries weights. No [`Step::MoeCombine`] follows.
+    ///
+    /// `tp_step_out_buf` returns `Some(&out.buf)` only for `DownResidual`
+    /// (the partial that the EP all-reduce reduces over).
+    IndexedMoeGemv {
+        experts: &'a MoeExpertRef<'a>,
+        which: MoeProj<'a>,
+        topk_indices: &'a GpuTensor,
+        /// FWHT-pre-rotated input for GateUp; SwiGLU output (rot_batch) for Down*.
+        input: GemvInput<'a>,
+        /// gate_batch for GateUp, down_expanded for DownExpanded, EP partial for DownResidual.
+        out: &'a GpuTensor,
+        k_top: usize,
+        /// Used by DownExpanded; ignored by GateUp and DownResidual.
+        batch_size: usize,
+    },
+    /// Weighted combine of per-expert expanded down outputs into the EP partial.
+    /// Delegates to [`launch_moe_combine`]. Call after [`Step::IndexedMoeGemv`] with
+    /// `which = DownExpanded` — do NOT call after `DownResidual` (double-accumulate).
+    ///
+    /// `out` is the pre-zeroed EP partial (accumulate semantics); the executor
+    /// zeroes it via `zero_before` before this step runs. `tp_step_out_buf` returns
+    /// `Some(&out.buf)` so the EP all-reduce finds the partial buffer.
+    MoeCombine {
+        down_out: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        out: &'a GpuTensor,
+        k: usize,
+        hidden: usize,
+        batch_size: usize,
+    },
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -127,6 +208,10 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::BiasAdd { .. } => PipelineOp::BiasAdd,
         Step::SiluMul { .. } => PipelineOp::SiluMul,
         Step::ResidualAdd { .. } => PipelineOp::ResidualAdd,
+        // MoE decode ops (Task 4). Not fusible — no entry in FUSED_TABLE.
+        Step::MoeRoute { .. } => PipelineOp::MoeRoute,
+        Step::IndexedMoeGemv { .. } => PipelineOp::IndexedMoeGemv,
+        Step::MoeCombine { .. } => PipelineOp::MoeCombine,
     }
 }
 
@@ -701,13 +786,29 @@ pub enum StepCollective {
     },
 }
 
-/// The `out` buffer of a step that can be row-parallel (the only kind that needs
-/// an all-reduce). `None` for step kinds that never carry a row-parallel output.
+/// The `out` buffer of a step that carries a row-parallel or EP partial output
+/// (the only kind that needs an all-reduce). `None` for steps that never carry
+/// such a buffer.
+///
+/// MoE additions (Task 4):
+/// - `MoeCombine.out` — the pre-zeroed EP partial; the executor zeros it via
+///   `zero_before` and the EP all-reduce sums it across ranks.
+/// - `IndexedMoeGemv` with `DownResidual` — the step's `out` IS the EP partial
+///   (the residual-fused kernel writes combined output directly into it).
+///   `GateUp` and `DownExpanded` do not carry a partial: their output buffers
+///   are intermediates, not reduced over the EP group.
 fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
     match step {
         Step::Gemv { out, .. } => Some(&out.buf),
         Step::GemvResidual { out, .. } => Some(&out.buf),
         Step::Gemm { y, .. } => Some(&y.buf),
+        // EP partial: combine result or residual-fused down result.
+        Step::MoeCombine { out, .. } => Some(&out.buf),
+        Step::IndexedMoeGemv {
+            which: MoeProj::DownResidual { .. },
+            out,
+            ..
+        } => Some(&out.buf),
         _ => None,
     }
 }
@@ -1197,6 +1298,66 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::ResidualAdd { x, y, dim: _ } => gpu
             .add_f32(x, y, x)
             .map_err(|e| DispatchError::Hip(e.to_string())),
+        // ── MoE decode ops (Task 4) ─────────────────────────────────────
+        Step::MoeRoute {
+            scores,
+            gate_bias,
+            topk_indices,
+            topk_weights,
+            k,
+            n_experts,
+            route_scale,
+        } => launch_moe_route(
+            gpu,
+            scores,
+            gate_bias,
+            topk_indices,
+            topk_weights,
+            *n_experts,
+            *k,
+            *route_scale,
+        ),
+        Step::IndexedMoeGemv {
+            experts,
+            which,
+            topk_indices,
+            input,
+            out,
+            k_top,
+            batch_size,
+        } => {
+            // Extract the inner tensor — the helpers take a plain &GpuTensor.
+            // Both Raw and Prerotated are accepted; callers should pass Prerotated
+            // (the activation is always FWHT-rotated before building the step).
+            let x = match input {
+                GemvInput::Raw(x) | GemvInput::Prerotated(x) => x,
+            };
+            match which {
+                MoeProj::GateUp { up_out } => {
+                    launch_indexed_gate_up(gpu, experts, topk_indices, x, out, up_out, *k_top)
+                }
+                MoeProj::DownExpanded => {
+                    launch_indexed_down(gpu, experts, topk_indices, x, out, *k_top, *batch_size)
+                }
+                MoeProj::DownResidual { topk_weights } => launch_indexed_down_residual(
+                    gpu,
+                    experts,
+                    topk_indices,
+                    topk_weights,
+                    x,
+                    out,
+                    *k_top,
+                ),
+            }
+        }
+        Step::MoeCombine {
+            down_out,
+            topk_weights,
+            out,
+            k,
+            hidden,
+            batch_size,
+        } => launch_moe_combine(gpu, down_out, topk_weights, out, *hidden, *k, *batch_size),
     }
 }
 
