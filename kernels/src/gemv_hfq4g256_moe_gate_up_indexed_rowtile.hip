@@ -3,6 +3,16 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 #include <hip/hip_runtime.h>
 
+// FALSIFIED 2026-07-08: -2.9% on gfx1201/R9700 a3b mq4r decode (130.0 -> 126.2,
+// interleaved A/B, token-id EXACT). Opt-in HIPFIRE_MOE_GATE_UP_FUSED=1, DEFAULT OFF
+// -- kept for research history, DO NOT enable. Unlike the +3.5% fused-DOWN row-tile,
+// this regresses: gate_up has NO structural win to capture (it already writes
+// y_gate/y_up directly -- no expanded buffer / combine to eliminate), and its x is
+// the shared post-rmsnorm activation, already L1-hot for every block, so the
+// row-tile's x-reuse saves nothing. Net effect is pure register cost (8 accumulators
+// vs 4) -> lower occupancy -> slower. The down win was situation-specific, not a
+// general row-tile lever. See project_zinc_decode_gap_workflow_2026_07_08.
+//
 // NUM_ROWS register row-tile of gemv_hfq4g256_moe_gate_up_k8_indexed (single-token
 // decode MoE gate_up GEMV). Each block owns NUM_ROWS output rows for ONE expert
 // rank, reusing that expert's activation x across the NUM_ROWS rows (x stays
