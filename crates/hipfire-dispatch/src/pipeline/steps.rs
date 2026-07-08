@@ -1015,6 +1015,12 @@ pub fn execute_steps_parallel(
         })
         .unwrap_or(hipfire_hardware::DimKind::Tp);
 
+    debug_assert!(
+        collectives.iter().all(|c| !matches!(c, StepCollective::AllReduce { kind: k, .. } if *k != kind)),
+        "execute_steps_parallel: mixed AllReduce kinds in one call — group resolves from the FIRST only \
+         (D2b must add per-step group resolution before composing Tp+Ep)"
+    );
+
     let group = mesh.group_along(kind, &mesh.coord_of(0));
     let group_size = group.len();
 
