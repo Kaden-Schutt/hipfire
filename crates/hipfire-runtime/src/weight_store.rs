@@ -717,8 +717,12 @@ mod tests {
         }
         #[test]
         fn rejects_unaligned() {
+            // (inter/tp) % 256 != 0 — both helpers
             assert!(expert_tp_column_pair(&[0u8; 16], 300, 256, 4, 0, 2).is_err());
-            // 300/2 not %256
+            assert!(expert_tp_row_gather(&[0u8; 16], 3, 300, 4, 0, 2).is_err());
+            // inter % tp != 0 (first guard) — both helpers
+            assert!(expert_tp_column_pair(&[0u8; 16], 300, 256, 4, 0, 7).is_err());
+            assert!(expert_tp_row_gather(&[0u8; 16], 3, 300, 4, 0, 7).is_err());
         }
     }
 
