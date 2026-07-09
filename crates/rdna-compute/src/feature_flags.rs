@@ -108,6 +108,16 @@ pub struct FeatureFlags {
     /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
     /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
     pub force_unfused: bool,
+
+    // ── Decode micro-lever: shared-expert fold ─────────────────────
+    /// Fold the always-active MoE shared-expert down projection into the
+    /// routed-expert combine (one residual RMW of the output instead of a
+    /// separate shared-expert residual GEMV + the routed combine). Env:
+    /// HIPFIRE_FOLD_SHARED_EXPERT. `None` (default) = OFF, byte-identical to
+    /// the baseline separate-shared-GEMV path. Only the MQ4 shared-down +
+    /// GPU-top-K single-GPU A3B decode path is folded; every other path
+    /// (EP, Lloyd self-combine, non-MQ4 shared-down) falls back to baseline.
+    pub fold_shared_expert: Option<bool>,
 }
 
 impl FeatureFlags {
@@ -270,6 +280,9 @@ impl FeatureFlags {
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+
+            // Decode micro-lever: shared-expert fold
+            fold_shared_expert: parse_bool("HIPFIRE_FOLD_SHARED_EXPERT"),
         }
     }
 
@@ -405,7 +418,14 @@ impl FeatureFlags {
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
             force_unfused: false,
+            fold_shared_expert: None,
         }
+    }
+
+    /// HIPFIRE_FOLD_SHARED_EXPERT resolved to a bool. Default OFF (byte-identical
+    /// to the baseline separate-shared-GEMV MoE decode path).
+    pub fn fold_shared_expert_enabled(&self) -> bool {
+        self.fold_shared_expert.unwrap_or(false)
     }
 }
 

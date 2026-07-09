@@ -1184,6 +1184,15 @@ pub const FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC: &str =
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
 
+/// WRITE (non-residual) sigmoid-scaled HFQ4-G256 GEMV: `y[row] =
+/// sigmoid(c_buf[0]) * (A[row]·x)`. Bit-for-bit copy of the accumulator body
+/// of `gemv_hfq4g256_residual_sigmoid_scaled_gpu` but assigns instead of `+=`.
+/// Feeds the `HIPFIRE_FOLD_SHARED_EXPERT` decode micro-lever: the shared-expert
+/// down output is written to a scratch buffer here and folded into the routed
+/// combine by `MOE_DOWN_COMBINE_K8_SHARED_BATCHED_SRC`.
+pub const GEMV_HFQ4G256_SIGMOID_SCALED_WRITE_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_sigmoid_scaled_write.hip");
+
 /// HFQ6/MQ6-G256 batched GEMV with fused sigmoid-scaled residual:
 ///   y_batch[bid,row] += sigmoid(c_batch[bid]) * (A[row] · x_batch[bid]).
 /// HFQ6 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched` —
@@ -1422,6 +1431,14 @@ pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 /// per-token residual row. No cross-token contention.
 pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_k8_batched.hip");
+
+/// Shared-expert-folded combine (`HIPFIRE_FOLD_SHARED_EXPERT`). Same routed
+/// K_TOP fold as `MOE_DOWN_COMBINE_K8_BATCHED_SRC` but also adds a pre-scaled
+/// shared-expert down row into the residual first, so the separate shared
+/// residual GEMV is dropped — one residual read-modify-write instead of two.
+/// Byte-identical to the baseline two-launch path.
+pub const MOE_DOWN_COMBINE_K8_SHARED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_k8_shared_batched.hip");
 
 /// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram
 /// over flattened topk_indices. Single workgroup, LDS atomics.

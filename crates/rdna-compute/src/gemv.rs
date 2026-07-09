@@ -4938,6 +4938,73 @@ impl Gpu {
         result
     }
 
+    /// WRITE (non-residual) sibling of `gemv_hfq4g256_residual_sigmoid_scaled_gpu`:
+    /// `y[row] = sigmoid(c_buf[0]) * (A[row]·x)` (assign, not `+=`). Same kernel
+    /// body / reduction, so the emitted `gate*acc` is bit-identical to the term
+    /// the residual variant would add. Feeds the `HIPFIRE_FOLD_SHARED_EXPERT`
+    /// decode micro-lever: the MoE shared-expert down output lands in a scratch
+    /// buffer here and is folded into the routed combine.
+    pub fn gemv_hfq4g256_sigmoid_scaled_write_gpu(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        c_buf: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_sigmoid_scaled_write",
+            kernels::GEMV_HFQ4G256_SIGMOID_SCALED_WRITE_SRC,
+            "gemv_hfq4g256_sigmoid_scaled_write_gpu",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let c_ptr = c_buf.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq4g256_sigmoid_scaled_write_gpu",
+            bytes,
+        );
+        // Two rows per block (row0, row0+1) — matches the residual variant.
+        let grid_x = m.div_ceil(2) as u32;
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_sigmoid_scaled_write_gpu",
+            [grid_x, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_ptr(c_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// N-batched variant of `gemv_hfq4g256_residual_sigmoid_scaled_gpu`.
     /// `x_batch` is [N × K], `y_batch` is [N × M], `c_batch` is [N]. Each
     /// (row, token) block runs the HFQ4G256 GEMV body on its token's x

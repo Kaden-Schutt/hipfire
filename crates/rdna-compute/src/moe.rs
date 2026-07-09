@@ -74,6 +74,78 @@ impl Gpu {
         result
     }
 
+    /// Shared-expert-folded combine (`HIPFIRE_FOLD_SHARED_EXPERT`). Same routed
+    /// K_TOP fold as `moe_down_combine_k8_batched`, plus it adds a pre-scaled
+    /// shared-expert down row (`shared_out`) into the residual first — dropping
+    /// the separate shared-expert residual GEMV so the residual stream is
+    /// touched with one read-modify-write instead of two. Byte-identical to the
+    /// baseline two-launch path (shared term added before the routed sum).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_k8_shared_batched(
+        &mut self,
+        expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
+        topk_weights: &GpuTensor,   // [batch_size × k_top] f32
+        shared_out: &GpuTensor,     // [batch_size × m] f32 (sigmoid-scaled shared down)
+        x_residual: &GpuTensor,     // [batch_size × m] f32 in-place +=
+        m: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_down_combine_k8_shared_batched",
+            kernels::MOE_DOWN_COMBINE_K8_SHARED_BATCHED_SRC,
+            "moe_down_combine_k8_shared_batched",
+        )?;
+        let eop = expert_outputs.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let shp = shared_out.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &shp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // BW: expert_outputs N*K_TOP*M, topk_weights N*K_TOP, shared_out N*M,
+        //     x_residual r+w 2*N*M.
+        let bytes =
+            (batch_size * k_top * m + batch_size * k_top + batch_size * m + 2 * batch_size * m) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_down_combine_k8_shared_batched",
+            bytes,
+        );
+        let block_m: u32 = 256;
+        let grid_x = (m as u32 + block_m - 1) / block_m;
+        let result = self.launch_maybe_blob(
+            "moe_down_combine_k8_shared_batched",
+            [grid_x, batch_size as u32, 1],
+            [block_m, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(eop);
+                b.push_ptr(wp);
+                b.push_ptr(shp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram.
     /// Single-CTA LDS-atomic histogram of `topk_indices[total_slots]`.
     /// Output `expert_token_counts[num_experts]` holds RAW counts; Phase 2
