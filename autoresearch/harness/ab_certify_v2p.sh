@@ -150,6 +150,18 @@ elif [ "$CLK_OK" != 1 ]; then VERDICT=VOID
 elif awk "BEGIN{exit !($F>=$WIN_F && $DELTA>$FLOOR)}"; then VERDICT=WIN
 elif awk "BEGIN{exit !($F<=$DEAD_F || ($DELTA< -$FLOOR && $F<=0.35))}"; then VERDICT=DEAD
 else VERDICT=INCONCLUSIVE; fi
+# ---- CROSS-ARCH ISOLATION GUARD (policy: a win tuned for THIS arch must NOT change ANY other fleet arch's
+#      compiled code — -any% cross-arch is unacceptable). Byte-exact preprocessor-invariance: if the edit shifts
+#      another arch's device TU, demote WIN -> CROSS_ARCH (must arch-gate the change behind #if defined(__gfxNNNN__)
+#      or move it to a .gfxNNNN file); it does NOT advance the baseline. Arch-suffixed / unpreprocessable = skip. ----
+CROSS_NOTE=""
+if [ "$VERDICT" = WIN ]; then
+  OTHER_A=""; for a in ${CROSS_ARCH_ARCHS:-gfx1100 gfx1151 gfx1030 gfx1201}; do [ "$a" = "$ARCH" ] || OTHER_A="$OTHER_A $a"; done
+  BASE_KSRC="/tmp/cai_base_$ID.hip"; git show "$BASE_SHA:$KSRC" > "$BASE_KSRC" 2>/dev/null
+  CAG=$(KSRC_DIR="$WT/kernels/src" bash "$MAIN/autoresearch/harness/cross_arch_guard.sh" "$VARIANT" "$BASE_KSRC" $OTHER_A 2>/dev/null)
+  rm -f "$BASE_KSRC"
+  case "$CAG" in CROSS_ARCH:*) VERDICT=CROSS_ARCH; CROSS_NOTE="corrupts device codegen on${CAG#CROSS_ARCH:} — arch-gate the change (#if defined(__gfx12__)) or use a .gfxNNNN variant" ;; esac
+fi
 # ---- WIN -> ADVANCE THE SHARED BASELINE so EVERY worker (this arch, all worktrees) inherits it next round.
 #      Optimistic concurrency: build the win commit on the CURRENT baseline tip and CAS the ref forward under a
 #      per-arch commit lock. A same-kernel staleness guard rejects the advance if another worker already moved
@@ -191,9 +203,9 @@ fi
 [ -f "$GPULK" ] && gpu_release >/dev/null 2>&1   # GPU phase done -> release the run-queue for the next queued certify
 rm -f /tmp/v2_base_$ID /tmp/v2_var_$ID
 mkdir -p "$(dirname "$LEDGER")"
-python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUNDS" "$F" "$DELTA" "$BM" "$VM" "$BC" "$VC" "$COMMITTED" "$LEDGER" "${BASE[*]}" "${VAR[*]}" "$BP" "$VP" <<'PY'
+python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUNDS" "$F" "$DELTA" "$BM" "$VM" "$BC" "$VC" "$COMMITTED" "$LEDGER" "${BASE[*]}" "${VAR[*]}" "$BP" "$VP" "$CROSS_NOTE" <<'PY'
 import sys,json
-(arch,kern,label,variant,verdict,rounds,f,delta,bm,vm,bc,vc,committed,ledger,bs,vs,bp,vp)=sys.argv[1:19]
+(arch,kern,label,variant,verdict,rounds,f,delta,bm,vm,bc,vc,committed,ledger,bs,vs,bp,vp,cross_note)=sys.argv[1:20]
 def prow(p):
   # match the profile row by KERNEL: the arg is the SOURCE-FILE base name, but rocprof reports the RUNTIME
   # SYMBOL name, and they can diverge after the core (gate_up file "..._indexed_batched" vs symbol
@@ -225,10 +237,12 @@ if b and v:
   if vl is not None and vl<30: fb.append(f"L2-hit {vl}% CACHE-NOT-FIXED(DRAM-thrash; SLC/stream the write-once weights, keep x/KV resident)")
   if vo is not None and vmb is not None and vo>85 and vmb>85: fb.append("SATURATED at roofline-leave it")
 feedback="; ".join(fb) if fb else ("no profile" if not v else "no clear lever signal")
+if cross_note: feedback = "CROSS_ARCH " + cross_note + ((" | " + feedback) if fb else "")
 rec={"arch":arch,"kernel":kern,"label":label,"variant":variant,"verdict":verdict,
  "WIN":verdict=="WIN","mwu_dominance":round(float(f),3),"rounds":int(rounds),
  "base_decode":round(float(bm),2),"var_decode":round(float(vm),2),"delta_pct":round(float(delta),2),
  "base_coh":bc,"var_coh":vc,"win_commit":committed or None,"roofline":roof,"profile_feedback":feedback,
+ "cross_arch":cross_note or None,
  "base_runs":[float(x) for x in bs.split()],"var_runs":[float(x) for x in vs.split()]}
 open(ledger,"a").write(json.dumps(rec)+"\n")
 out={k:rec[k] for k in ("label","verdict","mwu_dominance","delta_pct","rounds","var_coh","win_commit")}
