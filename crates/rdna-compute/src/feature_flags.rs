@@ -108,6 +108,13 @@ pub struct FeatureFlags {
     /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
     /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
     pub force_unfused: bool,
+
+    // ── Attention preamble fusion (decode micro-lever) ─────────────
+    /// Fuse the Q-head and K-head RMSNorm of the decode attention preamble
+    /// into ONE dispatch (`HIPFIRE_FUSE_ATTN_PREAMBLE`). None/false = OFF
+    /// (default): two separate `rmsnorm_batched` launches, byte-identical to
+    /// the loop/gfx1201 baseline. Value-preserving perf lever only.
+    pub fuse_attn_preamble: Option<bool>,
 }
 
 impl FeatureFlags {
@@ -270,6 +277,9 @@ impl FeatureFlags {
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+
+            // Attention preamble fusion (decode micro-lever)
+            fuse_attn_preamble: parse_bool("HIPFIRE_FUSE_ATTN_PREAMBLE"),
         }
     }
 
@@ -405,6 +415,7 @@ impl FeatureFlags {
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
             force_unfused: false,
+            fuse_attn_preamble: None,
         }
     }
 }
