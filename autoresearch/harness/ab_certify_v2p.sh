@@ -29,9 +29,42 @@ ORACLE="${ORACLE:-$MAIN/autoresearch/harness/oracle_profile.sh}"   # persistent 
 KSRC="kernels/src/${KERNEL}.hip"
 LEDGER="$MAIN/autoresearch/ledger/swarm_${ARCH}_${KERNEL}.jsonl"
 cd "$WT" || { echo "{\"label\":\"$LABEL\",\"error\":\"no worktree $WT\"}"; exit 1; }
-# reset the target kernel to the CURRENT baseline (branch may carry prior card-wins in history)
+# reset the target kernel to the CURRENT baseline (SHARED advancing frontier — every worker inherits the
+# fleet's accumulated wins here, so each variant is measured INCREMENTALLY against the current best, not a
+# frozen 2am snapshot). BASE_SHA pins the exact tip we build+measure against for the cache key + staleness guard.
 git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null || git checkout -- kernels/src/ 2>/dev/null
 git clean -fdq kernels/src/ 2>/dev/null
+BASE_SHA=$(git rev-parse "$BASELINE_REF" 2>/dev/null || git rev-parse HEAD 2>/dev/null)
+# ---- Bug-2 guard: kernels are EMBEDDED via include_str! (no runtime disk-by-name loader), and the BOD names
+#      __global__ SYMBOLS whose source often lives in a differently-named base file. A swap into a file that is
+#      NOT compiled in — or a variant byte-identical to the baseline — is a NO-OP recompile whose A/B "win" is a
+#      pure measurement phantom (the overnight 26-wins inflation). Resolve symbol->source, else reject. --------
+emit_reject(){ # $1=verdict $2=note -> minimal ledger row (counts toward exhaustion) + stdout + exit
+  mkdir -p "$(dirname "$LEDGER")"
+  python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$1" "$2" "$LEDGER" <<'PY'
+import sys,json
+arch,kern,label,variant,verdict,note,ledger=sys.argv[1:8]
+open(ledger,"a").write(json.dumps({"arch":arch,"kernel":kern,"label":label,"variant":variant,
+  "verdict":verdict,"WIN":False,"mwu_dominance":0.0,"rounds":0,"delta_pct":0.0,"note":note})+"\n")
+print(json.dumps({"label":label,"verdict":verdict,"note":note}))
+PY
+  exit 0
+}
+if ! grep -rqF "$(basename "$KSRC")" crates/*/src/ 2>/dev/null; then
+  # KERNEL is a __global__ symbol, not a compiled-in file: retarget to the UNIQUE include_str!'d .hip whose
+  # definition/launch signature is exactly `<KERNEL>(` (word-anchored, so k8 != k8_indexed). Parity gate backstops.
+  RES=""
+  for f in $(grep -rlE "__global__.*\b${KERNEL}[[:space:]]*\(" kernels/src/*.hip 2>/dev/null); do
+    grep -rqF "$(basename "$f")" crates/*/src/ 2>/dev/null && RES="$RES $(basename "$f")"
+  done
+  set -- $RES
+  if [ "$#" -eq 1 ]; then KSRC="kernels/src/$1"
+  else emit_reject DEAD_FILE "kernels/src/${KERNEL}.hip not compiled in (include_str!) and symbol->file is $#-way — un-targetable via file-swap"; fi
+fi
+# no-op EDIT guard: the variant must differ from the baseline version of the (possibly-resolved) file
+if [ -s "$VARIANT" ] && git show "$BASE_SHA:$KSRC" 2>/dev/null | cmp -s - "$VARIANT"; then
+  emit_reject NO_OP "variant byte-identical to baseline $KSRC — no real edit"
+fi
 DB=target/release/examples/daemon
 build(){ cargo build --release --example daemon --features deltanet -p hipfire-runtime 2>&1 | grep -qiE "^error|error\[" && return 1; return 0; }
 measure(){ local bin=$1 out=/tmp/v2m_${ID}.jsonl clkf=/tmp/v2m_${ID}.clk
@@ -58,14 +91,20 @@ except:c=[]
 print(f"{dec if dec is not None else 0:.2f} {'OK' if (len(t)>15 and u>0.35) else 'BAD'} {max(c) if c else 0}")
 PY
 }
-# build baseline + variant (keep both binaries). PREBUILT_BASE lets the swarm build ONE baseline daemon and
-# share it across all parallel variant-certifies (the baseline is identical per campaign) — no N× rebuild.
-if [ -n "${PREBUILT_BASE:-}" ] && [ -s "${PREBUILT_BASE}" ]; then
-  cp "$PREBUILT_BASE" /tmp/v2_base_$ID
-else
-  build || { echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"BASELINE_BUILD_FAIL\"}"; exit 0; }
-  cp "$DB" /tmp/v2_base_$ID
-fi
+# build baseline + variant (keep both binaries). The baseline daemon is cached KEYED BY THE BASELINE_REF TIP
+# SHA (not a frozen per-campaign file): all workers on one baseline generation reuse ONE build, and the cache
+# auto-invalidates the instant the shared baseline ADVANCES — so every A/B measures the variant against the
+# CURRENT best-of-fleet, never a stale snapshot (Bug 1: a frozen PREBUILT_BASE re-counted one cumulative gain
+# as a fresh win every round). A per-SHA flock collapses the N-worker rebuild on a fresh advance to one build.
+PBDIR="${PREBUILT_BASE_DIR:-/tmp}"; PBCACHE="$PBDIR/v2_pbase_${ARCH}_${BASE_SHA}"
+(
+  flock 9
+  if [ ! -s "$PBCACHE" ]; then
+    build && { cp "$DB" "$PBCACHE.$$" && mv -f "$PBCACHE.$$" "$PBCACHE"; }
+  fi
+) 9>"$PBDIR/.v2pbase_${ARCH}_${BASE_SHA}.lock"
+if [ ! -s "$PBCACHE" ]; then echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"BASELINE_BUILD_FAIL\"}"; exit 0; fi
+cp "$PBCACHE" /tmp/v2_base_$ID
 cp "$VARIANT" "$KSRC"
 if ! build; then git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null; echo "{\"arch\":\"$ARCH\",\"label\":\"$LABEL\",\"verdict\":\"VARIANT_BUILD_FAIL\"}"; exit 0; fi
 cp "$DB" /tmp/v2_var_$ID
@@ -111,13 +150,33 @@ elif [ "$CLK_OK" != 1 ]; then VERDICT=VOID
 elif awk "BEGIN{exit !($F>=$WIN_F && $DELTA>$FLOOR)}"; then VERDICT=WIN
 elif awk "BEGIN{exit !($F<=$DEAD_F || ($DELTA< -$FLOOR && $F<=0.35))}"; then VERDICT=DEAD
 else VERDICT=INCONCLUSIVE; fi
-# ---- WIN -> commit to the per-card wins-only branch ----
+# ---- WIN -> ADVANCE THE SHARED BASELINE so EVERY worker (this arch, all worktrees) inherits it next round.
+#      Optimistic concurrency: build the win commit on the CURRENT baseline tip and CAS the ref forward under a
+#      per-arch commit lock. A same-kernel staleness guard rejects the advance if another worker already moved
+#      THIS kernel since we measured (our delta would be against a now-stale version of the file) -> re-measured
+#      next round against the advanced baseline. Cross-kernel wins stack optimistically (second-order interactions
+#      are caught by the periodic coherence fold). This is what makes the fleet COMPOUND wins across worktrees
+#      instead of each worker re-counting one cumulative gain against a frozen baseline (Bug 1). ----
 COMMITTED=""
 if [ "$VERDICT" = WIN ]; then
-  git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null; git clean -fdq kernels/src/ 2>/dev/null
-  cp "$VARIANT" "$KSRC"; git add "$KSRC" 2>/dev/null
-  git -c user.email=151092359+Kaden-Schutt@users.noreply.github.com -c user.name="Kaden Schutt" \
-    commit -q -m "WIN $LABEL $KERNEL f=$F d=${DELTA}% rounds=$ROUNDS" 2>/dev/null && COMMITTED=$(git rev-parse --short HEAD)
+  BREF="refs/heads/${BASELINE_REF#refs/heads/}"
+  (
+    flock 7
+    CUR=$(git rev-parse "$BASELINE_REF" 2>/dev/null)
+    if [ -n "$CUR" ] && git diff --quiet "$BASE_SHA" "$CUR" -- "$KSRC" 2>/dev/null; then
+      BLOB=$(git hash-object -w "$VARIANT" 2>/dev/null); TIDX="/tmp/v2idx_$ID"; rm -f "$TIDX"
+      if [ -n "$BLOB" ] && GIT_INDEX_FILE="$TIDX" git read-tree "$CUR" 2>/dev/null \
+         && GIT_INDEX_FILE="$TIDX" git update-index --add --cacheinfo "100644,$BLOB,$KSRC" 2>/dev/null; then
+        TREE=$(GIT_INDEX_FILE="$TIDX" git write-tree 2>/dev/null)
+        NEW=$(git -c user.email=151092359+Kaden-Schutt@users.noreply.github.com -c user.name="Kaden Schutt" \
+              commit-tree "$TREE" -p "$CUR" -m "WIN $LABEL $KERNEL f=$F d=${DELTA}% rounds=$ROUNDS" 2>/dev/null)
+        [ -n "$NEW" ] && git update-ref "$BREF" "$NEW" "$CUR" 2>/dev/null && git rev-parse --short "$NEW" > "/tmp/v2win_$ID"
+      fi
+      rm -f "$TIDX"
+    else echo STALE_KERNEL_RACE > "/tmp/v2win_$ID"; fi
+  ) 7>"${SHARED_BASELINE_LOCK:-/tmp/.baseline_${ARCH}.lock}"
+  W=$(cat "/tmp/v2win_$ID" 2>/dev/null); rm -f "/tmp/v2win_$ID"
+  case "$W" in STALE_KERNEL_RACE) VERDICT=STALE_RACE ;; ?*) COMMITTED="$W" ;; esac
   git checkout "$BASELINE_REF" -- kernels/src/ 2>/dev/null; git clean -fdq kernels/src/ 2>/dev/null
 fi
 # ---- per-variant PROFILE on EVERY verdict (so the agent sees WHY it won/lost + what to try next,

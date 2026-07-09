@@ -21,7 +21,9 @@ for k, verds in byk.items():
     # dead. Per-round cap at +1, so K = consecutive ROUNDS, not attempts.
     if "WIN" in verds:
         exh[k] = 0
-    elif any(v in ("DEAD", "COHERENCE_FAIL", "LOSS", "NOISE") for v in verds):
+    elif any(v in ("DEAD", "COHERENCE_FAIL", "LOSS", "NOISE", "DEAD_FILE", "NO_OP") for v in verds):
+        # DEAD_FILE/NO_OP = the certify rejected a dead/no-op swap (not compiled in, or byte-identical to
+        # baseline). Count them so the loop stops re-deriving an un-targetable file instead of looping forever.
         exh[k] = exh.get(k, 0) + 1
 json.dump(exh, open(exh_path, "w"))
 if byk:
