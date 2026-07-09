@@ -19,6 +19,53 @@
 #define HD 128
 #define TILE_ROWS 4
 
+// ── Register-to-register wave32 reductions via DPP (no LDS round-trip) ──────
+//
+// The __shfl_xor / __shfl_down reductions LLVM lowers to `ds_bpermute` — an
+// LDS-routed cross-lane op gated by a serial `s_wait_dscnt`. On this recurrent
+// GDN kernel the reductions sit on the decode critical path (n_tokens==1 → the
+// per-token dependency chain), so that LDS round-trip IS the DEP_WAIT latency.
+// DPP (`v_permlanex16` + `row_xmask`) does the same permutations in the VALU
+// register file with no LDS traffic and no `s_wait_dscnt`.
+//
+// wave32 = two DPP "rows" of 16 lanes. A full 32-lane butterfly is 4 intra-16
+// steps (xor 1,2,4,8 via row_xmask, DPP ctrl 0x160|n — RDNA-native, xor stays
+// in-row) + 1 cross-16 step (xor 16 via permlanex16 half-swap). Validated
+// on-device (gfx1201): the DPP max/sum are BIT-EXACT to the __shfl_xor
+// butterfly (max is order-independent, so the requant abs-max is byte-exact
+// vs the __shfl baseline; the kv/out_v sums are a butterfly-order reduction,
+// bit-exact vs __shfl_xor but NOT vs the baseline __shfl_down shift-tree —
+// a rounding-order change far below the Q8 requant noise floor).
+#define DN_DPP_ROW_XMASK(n) (0x160 | (n))
+template <int N>
+__device__ __forceinline__ float dn_dpp_xmask(float v) {
+    int vi = __float_as_int(v);
+    int r = __builtin_amdgcn_update_dpp(vi, vi, DN_DPP_ROW_XMASK(N), 0xf, 0xf, false);
+    return __int_as_float(r);
+}
+__device__ __forceinline__ float dn_dpp_swap16(float v) {
+    // dst[i] = src[i ^ 16] — swap the two 16-lane halves (position-preserving).
+    int vi = __float_as_int(v);
+    int r = __builtin_amdgcn_permlanex16(vi, vi, 0x76543210, 0xFEDCBA98, false, false);
+    return __int_as_float(r);
+}
+__device__ __forceinline__ float dn_wave32_max_dpp(float v) {
+    v = fmaxf(v, dn_dpp_xmask<1>(v));
+    v = fmaxf(v, dn_dpp_xmask<2>(v));
+    v = fmaxf(v, dn_dpp_xmask<4>(v));
+    v = fmaxf(v, dn_dpp_xmask<8>(v));
+    v = fmaxf(v, dn_dpp_swap16(v));
+    return v; // full-wave max in every lane
+}
+__device__ __forceinline__ float dn_wave32_sum_dpp(float v) {
+    v += dn_dpp_xmask<1>(v);
+    v += dn_dpp_xmask<2>(v);
+    v += dn_dpp_xmask<4>(v);
+    v += dn_dpp_xmask<8>(v);
+    v += dn_dpp_swap16(v);
+    return v; // full-wave sum in every lane
+}
+
 extern "C" __launch_bounds__(32, 8)
 __global__ void gated_delta_net_q8_fast(
     const float* __restrict__ q,
@@ -33,7 +80,16 @@ __global__ void gated_delta_net_q8_fast(
     int n_heads,
     int head_dim,
     unsigned int frame,
-    __half* __restrict__ s_ef_residual
+    __half* __restrict__ s_ef_residual,
+    int cheap_requant,  // 0 = exact per-token abs-max reduction (default);
+                        // P>0 = CHEAP requant: carry the previous per-row scale
+                        //       (reduction-free) and only re-run the exact abs-max
+                        //       reduction every P frames (or when unseeded).
+    int dpp_reduce      // 0 = __shfl reductions (ds_bpermute, default).
+                        // 1 = DPP for the requant abs-max only (BYTE-EXACT vs
+                        //     baseline — max is order-independent).
+                        // 2 = DPP for all reductions incl. the kv/out_v sums
+                        //     (butterfly-order sums, coherence-gated not parity).
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -67,9 +123,13 @@ __global__ void gated_delta_net_q8_fast(
             float s0 = sr[tid], s1 = sr[tid+32], s2 = sr[tid+64], s3 = sr[tid+96];
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
-            for (int o = 16; o > 0; o >>= 1)
-                kv += __shfl_down(kv, o);
-            kv = __shfl(kv, 0);
+            if (dpp_reduce >= 2) {
+                kv = dn_wave32_sum_dpp(kv);   // butterfly, all lanes (no broadcast)
+            } else {
+                for (int o = 16; o > 0; o >>= 1)
+                    kv += __shfl_down(kv, o);
+                kv = __shfl(kv, 0);
+            }
 
             float delta = (v_t[row] - alpha * kv) * beta_v;
 
@@ -80,8 +140,12 @@ __global__ void gated_delta_net_q8_fast(
             sr[tid] = s0; sr[tid+32] = s1; sr[tid+64] = s2; sr[tid+96] = s3;
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
-            for (int o = 16; o > 0; o >>= 1)
-                out_v += __shfl_down(out_v, o);
+            if (dpp_reduce >= 2) {
+                out_v = dn_wave32_sum_dpp(out_v);
+            } else {
+                for (int o = 16; o > 0; o >>= 1)
+                    out_v += __shfl_down(out_v, o);
+            }
             if (tid == 0)
                 output[t * stride + h * HD + row] = out_v;
         }
@@ -103,9 +167,38 @@ __global__ void gated_delta_net_q8_fast(
             s3 += __half2float(efr[tid+96]);
         }
 
-        float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
-        for (int o = 16; o > 0; o >>= 1)
-            my_max = fmaxf(my_max, __shfl_xor(my_max, o));
+        // Per-row Q8 requant scale. The baseline computes the exact row abs-max
+        // via a serial 5-step __shfl_xor butterfly — a cross-lane reduction that
+        // sits on the recurrent decode critical path (n_tokens==1 → this tail is
+        // pure added latency, ~90% DEP_WAIT). CHEAP requant (cheap_requant>0)
+        // drops that reduction on the common path: the scale must be warp-uniform
+        // (dequant reads one scale per row), and the previous step's scale — held
+        // in s_scales, read here BEFORE we overwrite it — is uniform, so we simply
+        // carry it. Under the default EF (sigma-delta) requant the carried scale
+        // is loss-free in the running sense: any element that clips at ±127 has
+        // its clip error stored in efr and re-injected next token (error feedback
+        // absorbs a stale scale). We re-anchor with the exact reduction every P
+        // frames, and always on the first token of a sequence (prev_scale<=0).
+        float my_max;
+        bool do_reduce = true;
+        if (cheap_requant > 0) {
+            float prev_scale = s_scales[h * HD + rr];   // uniform across the warp
+            unsigned int period = (unsigned int)cheap_requant;
+            bool refresh = (prev_scale <= 0.0f) || ((frame % period) == 0u);
+            if (!refresh) {
+                my_max = prev_scale * 127.0f;           // reduction-free carry
+                do_reduce = false;
+            }
+        }
+        if (do_reduce) {
+            my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
+            if (dpp_reduce >= 1) {
+                my_max = dn_wave32_max_dpp(my_max);   // BYTE-EXACT (order-independent)
+            } else {
+                for (int o = 16; o > 0; o >>= 1)
+                    my_max = fmaxf(my_max, __shfl_xor(my_max, o));
+            }
+        }
 
         float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
 

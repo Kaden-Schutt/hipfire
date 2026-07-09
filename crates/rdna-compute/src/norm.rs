@@ -37,6 +37,65 @@ fn dn_requant_per_token() -> bool {
     })
 }
 
+/// Cheap Q8-state requant for the fast GDN kernel. DEFAULT OFF.
+///
+/// Returns the refresh period `P` passed to `gated_delta_net_q8_fast`:
+///   * `0`  → baseline: exact per-token cross-lane abs-max reduction.
+///   * `P>0` → CHEAP: carry the previous per-row scale (reduction-free) on the
+///     recurrent decode critical path, re-anchoring with the exact abs-max only
+///     every `P` frames (and on the first token of a sequence). The dropped
+///     `__shfl_xor` butterfly is the ~90% DEP_WAIT chain the ZINC dissection
+///     cited; the default EF (sigma-delta) requant makes a stale scale loss-free
+///     in the running sense (clip error is carried in the f16 residual).
+///
+/// Enable with `HIPFIRE_DN_CHEAP_REQUANT=1` (period defaults to 8); override the
+/// period with `HIPFIRE_DN_CHEAP_REQUANT_PERIOD=N`. NUMERICALLY LOSSY (the stored
+/// state changes) — gated on coherence, not byte-parity.
+fn dn_cheap_requant_period() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let on = std::env::var("HIPFIRE_DN_CHEAP_REQUANT")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false);
+        if !on {
+            return 0;
+        }
+        std::env::var("HIPFIRE_DN_CHEAP_REQUANT_PERIOD")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(8)
+            .max(1)
+    })
+}
+
+/// DPP (register-to-register) wave reductions for the fast GDN kernel, in place
+/// of the `__shfl_*` reductions that LLVM lowers to LDS-routed `ds_bpermute` +
+/// serial `s_wait_dscnt` on the recurrent decode critical path. DEFAULT OFF (0).
+///
+///   * `1` → DPP for the requant abs-max reduction only. BYTE-EXACT vs the
+///     `__shfl_xor` baseline (max is order-independent). This is the
+///     ZINC-cited kernel-exit reduction on the DEP_WAIT chain.
+///   * `2` → DPP for ALL reductions, including the kv/out_v dot-product sums.
+///     The sums become a butterfly-order reduction (bit-exact vs `__shfl_xor`
+///     but NOT vs the baseline `__shfl_down` shift-tree); the rounding-order
+///     change is far below the Q8 requant noise floor — coherence-gated.
+///
+/// Enable with `HIPFIRE_DN_DPP_REDUCE=1` (or `2`). Orthogonal to and composable
+/// with `HIPFIRE_DN_CHEAP_REQUANT`.
+fn dn_dpp_reduce() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_DN_DPP_REDUCE")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0)
+            .clamp(0, 2)
+    })
+}
+
 /// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
 /// arm instead of the sequential batch_seq. DEFAULT OFF. Correctness-first
 /// PoC: each chunk is a separate host-side launch (cross-chunk is serial).
@@ -2150,6 +2209,8 @@ impl Gpu {
         // EF residual is supported in both paths; the split is only about cadence.
         let use_fast = !dn_requant_per_token();
 
+        let crq = dn_cheap_requant_period();
+        let dpr = dn_dpp_reduce();
         let result = if use_fast {
             self.ensure_kernel(
                 "gated_delta_net_q8_fast",
@@ -2170,6 +2231,8 @@ impl Gpu {
                 &hd as *const _ as *mut c_void,
                 &fr as *const _ as *mut c_void,
                 &efp as *const _ as *mut c_void,
+                &crq as *const _ as *mut c_void,
+                &dpr as *const _ as *mut c_void,
             ];
             let timer = crate::profile::begin_timer(
                 &self.hip,
@@ -2198,6 +2261,8 @@ impl Gpu {
                     b.push_i32(hd);
                     b.push_i32(fr);
                     b.push_ptr(efp);
+                    b.push_i32(crq);
+                    b.push_i32(dpr);
                     b
                 },
             );
@@ -2342,6 +2407,8 @@ impl Gpu {
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         let mut rpt = dn_requant_per_token() as i32;
+        let mut crq = dn_cheap_requant_period();
+        let mut dpr = dn_dpp_reduce();
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -2365,6 +2432,8 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
                 &mut fr as *mut _ as *mut c_void,
                 &mut efp as *mut _ as *mut c_void,
+                &mut crq as *mut _ as *mut c_void,
+                &mut dpr as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "gated_delta_net_q8_fast",
@@ -2387,6 +2456,8 @@ impl Gpu {
                     b.push_i32(hd);
                     b.push_i32(fr);
                     b.push_ptr(efp);
+                    b.push_i32(crq);
+                    b.push_i32(dpr);
                     b
                 },
             )
