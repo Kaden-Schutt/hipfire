@@ -75,7 +75,7 @@ measure(){ local bin=$1 out=/tmp/v2m_${ID}.jsonl clkf=/tmp/v2m_${ID}.clk
 {"type":"generate","id":"w2","prompt":"Explain hash maps briefly.","temperature":0.0,"max_tokens":32}
 {"type":"generate","id":"m1","prompt":"Write a detailed paragraph about the history and future of computing.","temperature":0.0,"max_tokens":128}
 {"type":"unload"}
-' "$MODEL" | HIP_VISIBLE_DEVICES=$DEV "$bin" 2>/dev/null > "$out"
+' "$MODEL" | HIP_VISIBLE_DEVICES=$DEV "$bin" 2>"/tmp/v2e_$ID" > "$out"   # keep stderr -> daemon-reported GPU arch (rocminfo lies)
   kill "$s" 2>/dev/null; wait "$s" 2>/dev/null
   python3 - "$out" "$clkf" <<'PY'
 import json,sys
@@ -202,10 +202,15 @@ if [ "$VERDICT" != "BASELINE_BUILD_FAIL" ] && [ "$VERDICT" != "VARIANT_BUILD_FAI
 fi
 [ -f "$GPULK" ] && gpu_release >/dev/null 2>&1   # GPU phase done -> release the run-queue for the next queued certify
 rm -f /tmp/v2_base_$ID /tmp/v2_var_$ID
+# self-describing provenance: DAEMON-reported GPU arch (rocminfo lies), baseline sha, variant blob sha, prompt md5
+# -> a measurement_hash so no tok/s in the ledger is ever orphaned from the exact {arch,kernels,model,prompt} it ran on.
+GPU_ARCH=$(grep -oiE 'gfx[0-9]+' "/tmp/v2e_$ID" 2>/dev/null | head -1); rm -f "/tmp/v2e_$ID"
+PROMPT_MD5=$(printf '%s' 'Write a detailed paragraph about the history and future of computing.' | md5sum | cut -d' ' -f1)
+VAR_SHA=$(git hash-object "$VARIANT" 2>/dev/null)
 mkdir -p "$(dirname "$LEDGER")"
-python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUNDS" "$F" "$DELTA" "$BM" "$VM" "$BC" "$VC" "$COMMITTED" "$LEDGER" "${BASE[*]}" "${VAR[*]}" "$BP" "$VP" "$CROSS_NOTE" <<'PY'
-import sys,json
-(arch,kern,label,variant,verdict,rounds,f,delta,bm,vm,bc,vc,committed,ledger,bs,vs,bp,vp,cross_note)=sys.argv[1:20]
+python3 - "$ARCH" "$KERNEL" "$LABEL" "$(basename "$VARIANT")" "$VERDICT" "$ROUNDS" "$F" "$DELTA" "$BM" "$VM" "$BC" "$VC" "$COMMITTED" "$LEDGER" "${BASE[*]}" "${VAR[*]}" "$BP" "$VP" "$CROSS_NOTE" "$GPU_ARCH" "${BASE_SHA:-}" "$VAR_SHA" "$PROMPT_MD5" "$MODEL" <<'PY'
+import sys,json,hashlib
+(arch,kern,label,variant,verdict,rounds,f,delta,bm,vm,bc,vc,committed,ledger,bs,vs,bp,vp,cross_note,gpu_arch,base_sha,var_sha,prompt_md5,model)=sys.argv[1:25]
 def prow(p):
   # match the profile row by KERNEL: the arg is the SOURCE-FILE base name, but rocprof reports the RUNTIME
   # SYMBOL name, and they can diverge after the core (gate_up file "..._indexed_batched" vs symbol
@@ -213,6 +218,7 @@ def prow(p):
   # core tokens, so moe_gate_up != moe_down which split at token 4). This is the "no profile" fix.
   try: d=json.loads(p)
   except: return None
+  if not isinstance(d, dict): return None   # "null"/list/scalar profile -> no row (don't crash the ledger write)
   kt=kern.split("_"); best=None; bestn=0
   for r in d.get("rows",[]):
     rk=r.get("kernel",""); rt=rk.split("_"); n=0
@@ -238,11 +244,14 @@ if b and v:
   if vo is not None and vmb is not None and vo>85 and vmb>85: fb.append("SATURATED at roofline-leave it")
 feedback="; ".join(fb) if fb else ("no profile" if not v else "no clear lever signal")
 if cross_note: feedback = "CROSS_ARCH " + cross_note + ((" | " + feedback) if fb else "")
-rec={"arch":arch,"kernel":kern,"label":label,"variant":variant,"verdict":verdict,
+# measurement_hash pins the exact {device arch, kernel set, model, prompt, kv, maxtok} this tok/s was measured under
+# — reproducible + cross-session-comparable, so a number is never orphaned from its config (the "where is the baseline" gap).
+mhash=hashlib.sha256("|".join([gpu_arch or "?", model.rsplit("/",1)[-1], base_sha or "?", var_sha or "?", prompt_md5, "q8", "128"]).encode()).hexdigest()[:16]
+rec={"arch":arch,"gpu_arch":gpu_arch or None,"measurement_hash":mhash,"kernel":kern,"label":label,"variant":variant,"verdict":verdict,
  "WIN":verdict=="WIN","mwu_dominance":round(float(f),3),"rounds":int(rounds),
  "base_decode":round(float(bm),2),"var_decode":round(float(vm),2),"delta_pct":round(float(delta),2),
  "base_coh":bc,"var_coh":vc,"win_commit":committed or None,"roofline":roof,"profile_feedback":feedback,
- "cross_arch":cross_note or None,
+ "cross_arch":cross_note or None,"base_sha":base_sha or None,"prompt_md5":prompt_md5,
  "base_runs":[float(x) for x in bs.split()],"var_runs":[float(x) for x in vs.split()]}
 open(ledger,"a").write(json.dumps(rec)+"\n")
 out={k:rec[k] for k in ("label","verdict","mwu_dominance","delta_pct","rounds","var_coh","win_commit")}
