@@ -1249,6 +1249,16 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_rowtile.hip");
 
+/// RESEARCH ARTIFACT — CERTIFIED DEAD. S_PREFETCH_DATA variants of the indexed
+/// MoE gate_up decode GEMV (gfx12/RDNA4 only, opt-in HIPFIRE_GFX1201_MOE_PREFETCH
+/// ∈ {1,2,3,4}, default OFF). Byte-identical math; kept as a reproducible
+/// same-daemon A/B lever. ab_certify_v2p.sh vs f33ae7e9 → DEAD (+0.16%, f=0.611);
+/// the a3b decode GEMVs are TLP-latency-hidden (48–72% occ), so scalar prefetch
+/// only adds VGPR pressure and drops occupancy. See the falsification note
+/// project_sprefetch_gfx1201_decode_gemv_falsified_2026_07_09.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_PREFETCH_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_prefetch.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV. Same
 /// device-side expert-pointer table + topk_indices contract as the
 /// HFQ4G256 sibling; closes the residual hipGraph-capture gap for
