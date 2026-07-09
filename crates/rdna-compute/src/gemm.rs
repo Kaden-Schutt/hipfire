@@ -2531,6 +2531,21 @@ impl Gpu {
                     (total + 1) / 2,
                 )
             }
+        } else if self.flags.vgpr_dealloc_enabled() {
+            // Early VGPR-pool dealloc lever (HIPFIRE_VGPR_DEALLOC=1): identical
+            // arithmetic, emits s_sendmsg(MSG_DEALLOC_VGPRS) at the tail on
+            // gfx11+/gfx12 to free VGPRs early → occupancy. Distinct module +
+            // symbol name so the JIT cache does not collide with the base.
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_dealloc",
+                kernels::FUSED_QKVZA_HFQ4G256_DEALLOC_SRC,
+                "fused_qkvza_hfq4g256_dealloc",
+            )?;
+            (
+                "fused_qkvza_hfq4g256_dealloc",
+                [32u32, 1, 1],
+                (qkv_m + z_m + beta_m + alpha_m) as u32,
+            )
         } else {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256",
