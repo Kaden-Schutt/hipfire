@@ -2783,7 +2783,7 @@ pub fn ds4_prefill_moe_step_tp(
     n: usize,
     tokens: &[u32],
 ) -> Result<(), String> {
-    use hipfire_dispatch::families::moe::{launch_indexed_down_residual_i64, MoeExpertRef};
+    use hipfire_dispatch::families::moe::{launch_indexed_down_residual_i64_batched, MoeExpertRef};
     use hipfire_runtime::multi_gpu::DimKind;
 
     let num_ranks = gpus.devices.len();
@@ -2864,46 +2864,31 @@ pub fn ds4_prefill_moe_step_tp(
             .map_err(|e| format!("prefill_moe_tp zero i64 L{layer_idx} r{r}: {e:?}"))?;
     }
 
-    // Per-token i64 down: for each token b, accumulate the k_top selected experts
-    // into partials_i64[r] row b via the reproducible int64 kernel.
-    //
-    // Byte offsets (DType::F32 = 4 bytes/elem; DType::Raw = 1 byte/elem):
-    //   rot_batch row b   : sub_offset(b*k_top*inter_local, k_top*inter_local)  [F32]
-    //   topk_indices row b: sub_offset(b*k_top, k_top)                          [F32]
-    //   topk_weights row b: sub_offset(b*k_top, k_top)                          [F32]
-    //   partials_i64 row b: sub_offset(b*hidden*8, hidden*8)                    [Raw]
-    for b in 0..n {
-        let rot_off = b * k_top * inter_local;
-        let topk_off = b * k_top;
-        let i64_off = b * hidden * 8; // Raw dtype: 1 byte per "element"
-
-        for r in 0..num_ranks {
-            gpus.devices[r]
-                .bind_thread()
-                .map_err(|e| format!("prefill_moe_tp down bind {r} L{layer_idx} b{b}: {e:?}"))?;
-
-            let rot_slice = pbs_per_rank[r]
-                .moe_rot_batch
-                .sub_offset(rot_off, k_top * inter_local);
-            let idx_slice = pbs_per_rank[r]
-                .moe_topk_indices_batch
-                .sub_offset(topk_off, k_top);
-            let wt_slice = pbs_per_rank[r]
-                .moe_topk_weights_batch
-                .sub_offset(topk_off, k_top);
-            let i64_slice = partials_i64_per_rank[r].sub_offset(i64_off, hidden * 8);
-
-            launch_indexed_down_residual_i64(
-                &mut gpus.devices[r],
-                &expert_refs[r],
-                &idx_slice,
-                &wt_slice,
-                &rot_slice,
-                &i64_slice,
-                k_top,
-            )
-            .map_err(|e| format!("prefill_moe_tp down L{layer_idx} r{r} b{b}: {e:?}"))?;
-        }
+    // Batched i64 down: accumulate all n tokens' k_top selected experts into
+    // partials_i64[r] [n × hidden] in ONE launch per rank (grid z = token). The
+    // batched kernel indexes the whole per-rank buffers by token row:
+    //   rot_batch    [n × k_top × inter_local]  (stride k_top*inter_local)
+    //   topk_indices [n × k_top]                (stride k_top)
+    //   topk_weights [n × k_top]                (stride k_top)
+    //   partials_i64 [n × hidden]               (stride hidden, raw i64)
+    // Because i64 integer add is associative, this is BIT-IDENTICAL to the prior
+    // per-token loop over launch_indexed_down_residual_i64 — same partition
+    // invariance under the Tp inter-split — with n× fewer launches.
+    for r in 0..num_ranks {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("prefill_moe_tp down bind {r} L{layer_idx}: {e:?}"))?;
+        launch_indexed_down_residual_i64_batched(
+            &mut gpus.devices[r],
+            &expert_refs[r],
+            &pbs_per_rank[r].moe_topk_indices_batch,
+            &pbs_per_rank[r].moe_topk_weights_batch,
+            &pbs_per_rank[r].moe_rot_batch,
+            &partials_i64_per_rank[r],
+            k_top,
+            n,
+        )
+        .map_err(|e| format!("prefill_moe_tp down L{layer_idx} r{r}: {e:?}"))?;
     }
 
     // AllReduceI64Tp: sync streams, then peer-reduce the contiguous [n*hidden] i64

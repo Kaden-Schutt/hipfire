@@ -1142,6 +1142,47 @@ pub fn launch_indexed_down_residual_i64(
     }
 }
 
+/// Batched twin of [`launch_indexed_down_residual_i64`]: accumulates the routed
+/// down projection for `batch_size` tokens into `residual_i64` [N × M] in ONE
+/// launch (grid z = batch). Buffer layouts are the per-token layouts stacked by
+/// token: `topk_indices`/`topk_weights` are [N × k_top], `rot_batch` is
+/// [N × k_top × K], `residual_i64` is [N × M] (raw i64, S-scaled). Because i64
+/// integer add is associative, the result is BIT-IDENTICAL to calling the
+/// per-token variant in a loop — same partition invariance, fewer launches.
+/// `residual_i64` must be zeroed by the caller before the launch.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_indexed_down_residual_i64_batched(
+    gpu: &mut rdna_compute::Gpu,
+    experts: &MoeExpertRef<'_>,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    rot_batch: &GpuTensor,
+    residual_i64: &GpuTensor,
+    k_top: usize,
+    batch_size: usize,
+) -> Result<(), DispatchError> {
+    let m = experts.expert_k; // down output = hidden
+    let k = experts.expert_m; // down input  = inter (per-rank shard under TP)
+    match experts.dtype {
+        DType::MQ2G256Lloyd => gpu
+            .moe_down_mq2g256_lloyd_residual_i64_indexed_batched(
+                experts.down_ptrs,
+                topk_indices,
+                topk_weights,
+                rot_batch,
+                residual_i64,
+                m,
+                k,
+                k_top,
+                batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        other => Err(DispatchError::Hip(format!(
+            "launch_indexed_down_residual_i64_batched: only MQ2G256Lloyd supported, got {other:?}"
+        ))),
+    }
+}
+
 /// Weighted combine of per-expert expanded down outputs into `ffn_out`.
 /// Thin wrapper over `gpu.moe_down_combine_k8_batched`. Call after
 /// [`launch_indexed_down`] (the expanded path). Do NOT call after
