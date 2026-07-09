@@ -48,6 +48,7 @@ pub mod weight_store;
 pub mod paro;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod session_state;
 pub mod spec;
 pub mod spec_ngram;
 pub mod pp_serve;
