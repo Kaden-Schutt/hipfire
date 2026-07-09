@@ -4,6 +4,12 @@
 
 //! MoE scatter, permute, combine, and unscatter dispatch methods.
 
+/// Scale exponent for the reproducible MoE down fixed-point scheme.
+/// Each 256-group FP partial is multiplied by `2^E` and rounded to i64
+/// before accumulation, making cross-group / cross-rank / cross-k_top sums
+/// integer (associative → partition-invariant under TP all-reduce).
+pub const MOE_DOWN_REPRO_E: i32 = 24;
+
 use std::ffi::c_void;
 
 use crate::dispatch::{Gpu, GpuTensor};
@@ -1002,5 +1008,35 @@ impl Gpu {
             &mut params,
             blob_builder,
         )
+    }
+}
+
+#[cfg(test)]
+mod repro_scheme_tests {
+    const S: f64 = (1u64 << 24) as f64; // E=24
+    fn to_i64(x: f64) -> i64 {
+        (x * S).round() as i64
+    }
+    fn accf(groups: &[f64]) -> i64 {
+        groups.iter().map(|&g| to_i64(g)).sum()
+    } // group-wise round then int-sum
+    #[test]
+    fn split_equals_whole_bit_exact() {
+        // 6 group partials (as the kernel would produce them, bit-identical per group)
+        let g = [1.5f64, -0.25, 3.0, 7.125, -2.5, 0.0625];
+        let whole = accf(&g);
+        let half = accf(&g[0..3]) + accf(&g[3..6]); // TP-2 split + int all-reduce
+        assert_eq!(whole, half, "int64 group-sum must be partition-invariant");
+        // convert-after is identical
+        assert_eq!(whole as f64 / S, half as f64 / S);
+    }
+    #[test]
+    fn no_overflow_worst_case() {
+        // worst envelope: 1536 groups * |512| per group * S, well under i64::MAX
+        let worst = 1536i128 * (512.0 * S) as i128;
+        assert!(
+            worst < i64::MAX as i128,
+            "int64 must not overflow (got {worst})"
+        );
     }
 }
