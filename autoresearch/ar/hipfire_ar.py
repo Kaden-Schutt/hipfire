@@ -226,7 +226,8 @@ def cmd_start(a):
     else:
         pidf = f"/tmp/loop_driver_{a.arch}.pid"; out_f = f"/tmp/loop_driver_{a.arch}.out"
         env = (f"ARCH={a.arch} BASELINE_REF={baseline} CARDS={a.card} PROMPT={prompt} "
-               f"ROLLOVER={a.rollover} K={a.K}")
+               f"ROLLOVER={a.rollover} K={a.K} AGENT_HARNESS={a.harness}"
+               + (f" AGENT_MODEL={a.agent_model}" if a.agent_model else ""))
         # Pattern A: `env .. setsid nohup .. & echo $!`. setsid detaches into a new session so ssh
         # RETURNS IMMEDIATELY (a channel-hang here previously timed out the client while the driver
         # kept running => orphan runaway). setsid exec-replaces (not pgroup leader) so $! IS the real
@@ -240,7 +241,7 @@ def cmd_start(a):
             # tear down any orphan we may have spawned before failing (no silent runaway)
             if pid: _ssh(f"kill {pid} 2>/dev/null; true", host)
             print(json.dumps({"error": "launch failed / driver not LIVE", "stdout": out, "stderr": err})); return 1
-        note = f"launched driver_v3 pid={pid} on {host} (cap={a.cap}, self-terminates on exhaustion)"
+        note = f"launched driver_v3 pid={pid} on {host} (cap={a.cap}, harness={a.harness}, self-terminates on exhaustion)"
     c.execute("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
               (rid, a.arch, a.model, a.card, "running", int(time.time()), None, a.budget, 0, a.ttl, pid))
     c.commit()
@@ -255,7 +256,8 @@ def cmd_stop(a):
     killed = []
     for r in runs:
         if host and r["pid"]:
-            _ssh(f"kill {r['pid']} 2>/dev/null; pkill -f '[c]odex exec --dangerously' 2>/dev/null; true", host)
+            _ssh(f"kill {r['pid']} 2>/dev/null; pkill -f '[c]odex exec --dangerously' 2>/dev/null; "
+                 f"pkill -f '[g]rok -p' 2>/dev/null; true", host)
         killed.append({"run": r["id"], "pid": r["pid"], "after": _alive(r["pid"], host) if host and r["pid"] else "?"})
     c.execute("UPDATE runs SET status='stopped',stopped=? WHERE status='running'" + (" AND id=?" if a.run else ""),
               (int(time.time()), a.run) if a.run else (int(time.time()),)); c.commit()
@@ -289,6 +291,7 @@ def main():
     s.add_argument("--baseline", default=None); s.add_argument("--prompt", default=None)
     s.add_argument("--rollover", default="~/hipfire/autoresearch/harness/noop_rollover.sh")
     s.add_argument("--driver", default=REMOTE_DRIVER); s.add_argument("--adopt-pid", type=int, default=None, dest="adopt_pid")
+    s.add_argument("--harness", default="codex", choices=["codex", "grok"]); s.add_argument("--agent-model", default=None, dest="agent_model")
     s = sub.add_parser("stop"); s.add_argument("--run", default=None); s.add_argument("--host", default=None)
     s = sub.add_parser("purge"); s.add_argument("--run", default=None); s.add_argument("--pidless", action="store_true")
     a = p.parse_args()
