@@ -1009,6 +1009,124 @@ impl Gpu {
             blob_builder,
         )
     }
+    /// MQ3-Lloyd MoE down GEMV — reproducible int64 variant.
+    ///
+    /// Writes into `residual_i64` (raw `unsigned long long`, i.e. two's-complement
+    /// int64, S-scaled by `2^MOE_DOWN_REPRO_E = 2^24`).  The buffer must be
+    /// zero-initialised by the caller before the first expert launch.  After all
+    /// k_top expert launches, call `moe_i64_residual_to_f32` to get the f32 output.
+    ///
+    /// Partition invariant: launching with `K = K_full` gives the same `residual_i64`
+    /// as two launches with `K = K/2` slices (K must be 256-aligned per slice).
+    pub fn moe_down_mq3g256_lloyd_residual_i64_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,  // [n_exp] device pointers
+        topk_indices: &GpuTensor, // [k_top] i32
+        topk_weights: &GpuTensor, // [k_top] f32
+        rot_batch: &GpuTensor,    // [k_top × K] f32, FWHT-rotated
+        residual_i64: &GpuTensor, // [M] raw (u64/i64 reinterpret), S-scaled
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256_lloyd_moe_down_repro",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_REPRO_SRC,
+            "gemv_mq3g256_lloyd_moe_down_residual_i64_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let rip = residual_i64.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &rip as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let mq3_weight_bytes = m * (k / 256) * 112;
+        let bytes = (k_top) * (mq3_weight_bytes + k * 4 + m * 8);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "moe_down_mq3g256_lloyd_residual_i64_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_moe_down_residual_i64_k8_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(rip);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Convert an int64 S-scaled residual buffer to f32.
+    ///
+    /// `residual_i64` is raw (reinterpreted as `unsigned long long` on GPU but
+    /// semantically signed int64).  `out_f32` receives `(i64[i] as f64) / S`.
+    /// `n` = number of elements.
+    pub fn moe_i64_residual_to_f32(
+        &mut self,
+        residual_i64: &GpuTensor, // [n] raw (i64)
+        out_f32: &GpuTensor,      // [n] f32
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_i64_residual_to_f32",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_REPRO_SRC,
+            "moe_i64_residual_to_f32",
+        )?;
+        let rip = residual_i64.buf.as_ptr();
+        let op = out_f32.buf.as_ptr();
+        let n_val = n as i32;
+        let inv_s = 1.0f32 / (1u32 << (MOE_DOWN_REPRO_E as u32)) as f32;
+        let mut params: Vec<*mut c_void> = vec![
+            &rip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &inv_s as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "moe_i64_residual_to_f32",
+            [(n as u32 + 255) / 256, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(rip);
+                b.push_ptr(op);
+                b.push_i32(n_val);
+                b.push_f32(inv_s);
+                b
+            },
+        );
+        result
+    }
 }
 
 #[cfg(test)]
