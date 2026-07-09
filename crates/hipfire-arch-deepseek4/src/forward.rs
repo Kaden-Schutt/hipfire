@@ -2496,6 +2496,469 @@ fn ds4_ep_moe_step(
     Ok(())
 }
 
+// ──────────── Batched TP MoE prefill (P-D task 1) ────────────────────────────
+//
+// `ds4_prefill_moe_step_tp` is the batched analog of `ds4_ep_moe_step`:
+//   - Phase 1: per-rank replicated routing + shared-expert + gate‖up + activation
+//     (via `ffn_batched_pre_down`)
+//   - Phase 2: per-token i64 down loop → AllReduceI64Tp → ConvertI64ToF32
+//   - Phase 3: ffn_out_batch += partials (per rank)
+// Caller must run `hc_ffn_mix_batched` after this returns (not done here).
+//
+// `ffn_batched_pre_down` is DUPLICATED from the routing+gate_up+activation
+// portion of `run_moe_prefill_bias_aware` (the scalar K4 path, which is the
+// correct path for TP batched prefill). Duplication is intentional — touching
+// `ffn_batched` or `run_moe_prefill_bias_aware` to share code would risk the
+// single-GPU prefill path being non-byte-identical. The helper is private.
+
+/// Pre-down portion of the batched MoE: routing + gate‖up + activation.
+///
+/// Writes into `pbs`:
+/// - `pbs.moe_topk_indices_batch` `[n, k_top]` — selected expert indices
+/// - `pbs.moe_topk_weights_batch` `[n, k_top]` — normalised routing weights
+/// - `pbs.moe_rot_batch` `[n*k_top, inter_local]` — FWHT-rotated gate output
+///   (input to per-token i64 down). Sized for `inter_local` elements per slot;
+///   the underlying buffer holds `[n, k_top, IM]` (IM ≥ inter_local) so no OOB.
+/// - `pbs.ffn_out_batch` `[n, hidden]` — shared expert contribution (shared gate+up
+///   → activation → down), fully computed. Caller accumulates the routed
+///   partial into this after Phase 2.
+///
+/// `inter_local = moe_intermediate_size / tp`. When `tp==1` this equals the
+/// full `moe_intermediate_size` and the kernel calls are byte-identical to the
+/// single-GPU path.
+///
+/// **Does NOT** run the routed down (that is Phase 2 of the caller).
+#[allow(clippy::too_many_arguments)]
+fn ffn_batched_pre_down(
+    cfg: &DeepseekV4Config,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    hash_routing: bool,
+    n: usize,
+    tokens: &[u32],
+    inter_local: usize,
+) -> Result<bool, String> {
+    let hidden = cfg.hidden_size;
+    let im = cfg.moe_intermediate_size;
+    let k_top = cfg.num_experts_per_tok;
+
+    // ── Shared expert ─────────────────────────────────────────────────────────
+    // Mirror of ffn_batched: RMSNorm + shared gate/up + silu·clamp + [rotate] + down.
+    // All shared ops use the FULL im (not inter_local) — shared expert is
+    // replicated and unsharded on every TP rank.
+    let ffn_norm = layer.ffn_norm.as_ref().unwrap();
+    let shared_w1 = layer.shared_w1.as_ref().unwrap();
+    let shared_w2 = layer.shared_w2.as_ref().unwrap();
+    let shared_w3 = layer.shared_w3.as_ref().unwrap();
+
+    let moe_will_run = env_cache::moe_on();
+    let gate_up_need_fwht =
+        moe_will_run || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
+    let down_needs_fwht = weight_needs_fwht(shared_w2);
+
+    if gate_up_need_fwht {
+        gpu.fused_rmsnorm_rotate_mq_plain_batched(
+            &pbs.hc_x_in_batch,
+            ffn_norm,
+            &pbs.ffn_x_rot_batch,
+            &pbs.ffn_x_plain_batch,
+            hidden,
+            cfg.rms_norm_eps,
+            n,
+        )
+        .map_err(|e| format!("pre_down fused_rmsnorm l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_batched(
+            &pbs.hc_x_in_batch,
+            ffn_norm,
+            &pbs.ffn_x_plain_batch,
+            n,
+            hidden,
+            cfg.rms_norm_eps,
+        )
+        .map_err(|e| format!("pre_down rmsnorm_batched l{layer_idx}: {e:?}"))?;
+    }
+
+    gemv_auto_batched_wmma(
+        gpu,
+        shared_w1,
+        &pbs.ffn_x_rot_batch,
+        &pbs.ffn_x_plain_batch,
+        &pbs.ffn_shared_gate_batch,
+        im,
+        hidden,
+        n,
+        Some(&pbs.wmma_x_scratch_f16),
+    )?;
+    gemv_auto_batched_wmma(
+        gpu,
+        shared_w3,
+        &pbs.ffn_x_rot_batch,
+        &pbs.ffn_x_plain_batch,
+        &pbs.ffn_shared_up_batch,
+        im,
+        hidden,
+        n,
+        Some(&pbs.wmma_x_scratch_f16),
+    )?;
+    gpu.deepseek4_silu_mul_clamp_f32_batched(
+        &pbs.ffn_shared_gate_batch,
+        &pbs.ffn_shared_up_batch,
+        &pbs.ffn_shared_gate_batch,
+        im,
+        n,
+        cfg.swiglu_limit,
+    )
+    .map_err(|e| format!("pre_down silu shared l{layer_idx}: {e:?}"))?;
+    if down_needs_fwht {
+        gpu.rotate_x_mq_batched(
+            &pbs.ffn_shared_gate_batch,
+            &pbs.ffn_shared_rot_batch,
+            im,
+            n,
+        )
+        .map_err(|e| format!("pre_down rotate shared l{layer_idx}: {e:?}"))?;
+    }
+    gemv_auto_batched_wmma(
+        gpu,
+        shared_w2,
+        &pbs.ffn_shared_rot_batch,
+        &pbs.ffn_shared_gate_batch,
+        &pbs.ffn_out_batch,
+        hidden,
+        im,
+        n,
+        Some(&pbs.wmma_x_scratch_f16),
+    )?;
+
+    // ── Routed expert routing ─────────────────────────────────────────────────
+    let do_routed = std::env::var("HIPFIRE_DEEPSEEK4_MOE").ok().as_deref() != Some("0")
+        && layer.expert_gate_up_blob.is_some()
+        && layer.expert_w2_blob.is_some();
+    if !do_routed {
+        return Ok(false);
+    }
+    if hash_routing && layer.tid2eid_host.is_empty() {
+        return Ok(false);
+    }
+
+    let gate_w = layer
+        .gate_weight
+        .as_ref()
+        .ok_or_else(|| format!("pre_down l{layer_idx}: gate.weight missing"))?;
+    let n_exp = cfg.n_routed_experts;
+    let route_scale: f32 = std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.2);
+
+    // Router GEMV → moe_scores_batch [n, n_exp].
+    gemv_auto_batched_wmma(
+        gpu,
+        gate_w,
+        &pbs.ffn_x_rot_batch,
+        &pbs.ffn_x_plain_batch,
+        &pbs.moe_scores_batch,
+        n_exp,
+        hidden,
+        n,
+        Some(&pbs.wmma_x_scratch_f16),
+    )?;
+    gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
+        .map_err(|e| format!("pre_down sqrt_softplus l{layer_idx}: {e:?}"))?;
+
+    // Top-K routing → topk_indices / topk_weights.
+    if hash_routing {
+        if tokens.len() < n {
+            return Err(format!(
+                "pre_down l{layer_idx}: tokens len {} < n {n}",
+                tokens.len()
+            ));
+        }
+        let tid2eid_dev = layer.tid2eid_dev.as_ref().ok_or_else(|| {
+            format!("pre_down hash l{layer_idx}: tid2eid_dev missing")
+        })?;
+        gpu.hash_router_normalize_f32_batched(
+            tid2eid_dev,
+            &pbs.moe_scores_batch,
+            &pbs.tokens,
+            &pbs.moe_topk_indices_batch,
+            &pbs.moe_topk_weights_batch,
+            n_exp as i32,
+            k_top as i32,
+            route_scale,
+            n as i32,
+        )
+        .map_err(|e| format!("pre_down hash_router l{layer_idx}: {e:?}"))?;
+    } else {
+        let gate_bias = layer
+            .gate_bias
+            .as_ref()
+            .ok_or_else(|| format!("pre_down l{layer_idx}: gate.bias missing"))?;
+        gpu.deepseek4_moe_topk_bias_aware_batched_f32(
+            &pbs.moe_scores_batch,
+            gate_bias,
+            &pbs.moe_topk_indices_batch,
+            &pbs.moe_topk_weights_batch,
+            n_exp as i32,
+            k_top as i32,
+            route_scale,
+            n as i32,
+        )
+        .map_err(|e| format!("pre_down bias_aware_topk l{layer_idx}: {e:?}"))?;
+    }
+
+    // Gate‖up GEMV with inter_local (TP-sharded intermediate dim).
+    // Kernel writes [n*k_top, 2*inter_local] into gate_batch / up_batch.
+    let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
+    gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+        gate_up_ptrs,
+        &pbs.moe_topk_indices_batch,
+        &pbs.ffn_x_rot_batch,
+        &pbs.moe_gate_batch,
+        &pbs.moe_up_batch,
+        2 * inter_local,
+        hidden,
+        k_top,
+        n,
+    )
+    .map_err(|e| format!("pre_down gate_up l{layer_idx}: {e:?}"))?;
+
+    // SwiGLU·clamp + FWHT rotate → moe_rot_batch [n*k_top, inter_local].
+    gpu.deepseek4_silu_mul_clamp_f32_batched(
+        &pbs.moe_gate_batch,
+        &pbs.moe_up_batch,
+        &pbs.moe_gate_batch,
+        inter_local,
+        n * k_top,
+        cfg.swiglu_limit,
+    )
+    .map_err(|e| format!("pre_down silu routed l{layer_idx}: {e:?}"))?;
+    gpu.rotate_x_mq_batched(
+        &pbs.moe_gate_batch,
+        &pbs.moe_rot_batch,
+        inter_local,
+        n * k_top,
+    )
+    .map_err(|e| format!("pre_down rotate routed l{layer_idx}: {e:?}"))?;
+
+    Ok(true) // routed experts ran
+}
+
+/// Batched TP MoE step for one prefill layer — the `batch_size=n` analog of
+/// [`ds4_ep_moe_step`].
+///
+/// **Phase 1** (per rank): replicated routing + shared expert + gate‖up +
+/// activation via [`ffn_batched_pre_down`]. `inter_local = inter / tp` is
+/// the TP column-shard width; when `tp==1`, `inter_local == inter` and the
+/// result is byte-identical to a single-GPU batched run.
+///
+/// **Phase 2** (per-token i64 down + TP all-reduce):
+/// For each token `b ∈ 0..n`, per rank, calls
+/// `launch_indexed_down_residual_i64` with sliced views into the contiguous
+/// `[n*k_top, inter_local]` rot_batch and `[n, k_top]` topk_* buffers,
+/// accumulating into `partials_i64_per_rank[r]` row `b` (`[n, hidden]`
+/// i64). After all tokens, one `AllReduceI64Tp` over `n*hidden` i64
+/// elements, then `ConvertI64ToF32` per rank.
+///
+/// **Phase 3** (fold): `ffn_out_batch[r] += partials_per_rank[r]` per rank.
+/// Shared expert is already in `ffn_out_batch` from Phase 1. Caller must
+/// run `hc_ffn_mix_batched` afterwards.
+///
+/// **Constraints**:
+/// - `n ≤ pbs.max_batch` (checked implicitly: buffers are sized for max_batch).
+/// - `partials_i64_per_rank[r]` is `[n*hidden*8]` raw bytes (DType::Raw).
+/// - `partials_per_rank[r]` is `[n*hidden]` F32.
+/// - All devices must have `active_stream` set (required by `zero_before`
+///   in the AllReduceI64Tp path and by `stream_synchronize` before the reduce).
+#[allow(clippy::too_many_arguments)]
+pub fn ds4_prefill_moe_step_tp(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    pbs_per_rank: &mut [PrefillBatchScratch],
+    partials_i64_per_rank: &[GpuTensor],
+    partials_per_rank: &[GpuTensor],
+    mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
+    layer_idx: usize,
+    hash_routing: bool,
+    n: usize,
+    tokens: &[u32],
+) -> Result<(), String> {
+    use hipfire_dispatch::families::moe::{launch_indexed_down_residual_i64, MoeExpertRef};
+    use hipfire_runtime::multi_gpu::DimKind;
+
+    let num_ranks = gpus.devices.len();
+    let hidden = cfg.hidden_size;
+    let inter = cfg.moe_intermediate_size;
+    let n_exp = cfg.n_routed_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let tp = mesh.size_of(DimKind::Tp).max(1);
+    let inter_local = inter / tp;
+
+    // ── Phase 1: per-rank replicated routing + shared expert + gate‖up + activation ──
+    let mut routed = false;
+    for r in 0..num_ranks {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("prefill_moe_tp bind {r} L{layer_idx}: {e:?}"))?;
+        let layer = weights_per_rank[r].resolve_layer(layer_idx);
+        routed = ffn_batched_pre_down(
+            cfg,
+            layer,
+            &pbs_per_rank[r],
+            &mut gpus.devices[r],
+            layer_idx,
+            hash_routing,
+            n,
+            tokens,
+            inter_local,
+        )
+        .map_err(|e| format!("prefill_moe_tp pre_down L{layer_idx} r{r}: {e}"))?;
+    }
+
+    if !routed {
+        // No routed experts — partials stay zero; Phase 3 add is a no-op.
+        return Ok(());
+    }
+
+    // ── Phase 2: per-token i64 down loop + AllReduceI64Tp + ConvertI64ToF32 ──
+    //
+    // Build expert_refs once per layer (owns no data, just borrows weight ptrs).
+    // inter_local is the per-rank intermediate dim under TP; expert_k = hidden.
+    let expert_refs: Vec<MoeExpertRef> = (0..num_ranks)
+        .map(|r| {
+            let layer = weights_per_rank[r].resolve_layer(layer_idx);
+            MoeExpertRef {
+                gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
+                down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
+                dummy_gate_up: None,
+                dtype: DType::MQ2G256Lloyd,
+                n_experts: n_exp,
+                expert_m: inter_local, // per-rank shard: inter/tp
+                expert_k: hidden,
+                owned: &[],
+            }
+        })
+        .collect();
+
+    // Zero every rank's i64 partial buffer (n*hidden i64 = n*hidden*8 bytes).
+    for r in 0..num_ranks {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("prefill_moe_tp zero-i64 bind {r} L{layer_idx}: {e:?}"))?;
+        let stream = gpus.devices[r].active_stream.as_ref().ok_or_else(|| {
+            format!("prefill_moe_tp L{layer_idx} r{r}: no active_stream for i64 zero")
+        })?;
+        gpus.devices[r]
+            .hip
+            .memset_async(
+                &partials_i64_per_rank[r].buf,
+                0,
+                n * hidden * 8,
+                stream,
+            )
+            .map_err(|e| format!("prefill_moe_tp zero i64 L{layer_idx} r{r}: {e:?}"))?;
+    }
+
+    // Per-token i64 down: for each token b, accumulate the k_top selected experts
+    // into partials_i64[r] row b via the reproducible int64 kernel.
+    //
+    // Byte offsets (DType::F32 = 4 bytes/elem; DType::Raw = 1 byte/elem):
+    //   rot_batch row b   : sub_offset(b*k_top*inter_local, k_top*inter_local)  [F32]
+    //   topk_indices row b: sub_offset(b*k_top, k_top)                          [F32]
+    //   topk_weights row b: sub_offset(b*k_top, k_top)                          [F32]
+    //   partials_i64 row b: sub_offset(b*hidden*8, hidden*8)                    [Raw]
+    for b in 0..n {
+        let rot_off = b * k_top * inter_local;
+        let topk_off = b * k_top;
+        let i64_off = b * hidden * 8; // Raw dtype: 1 byte per "element"
+
+        for r in 0..num_ranks {
+            gpus.devices[r]
+                .bind_thread()
+                .map_err(|e| format!("prefill_moe_tp down bind {r} L{layer_idx} b{b}: {e:?}"))?;
+
+            let rot_slice = pbs_per_rank[r]
+                .moe_rot_batch
+                .sub_offset(rot_off, k_top * inter_local);
+            let idx_slice = pbs_per_rank[r]
+                .moe_topk_indices_batch
+                .sub_offset(topk_off, k_top);
+            let wt_slice = pbs_per_rank[r]
+                .moe_topk_weights_batch
+                .sub_offset(topk_off, k_top);
+            let i64_slice = partials_i64_per_rank[r].sub_offset(i64_off, hidden * 8);
+
+            launch_indexed_down_residual_i64(
+                &mut gpus.devices[r],
+                &expert_refs[r],
+                &idx_slice,
+                &wt_slice,
+                &rot_slice,
+                &i64_slice,
+                k_top,
+            )
+            .map_err(|e| format!("prefill_moe_tp down L{layer_idx} r{r} b{b}: {e:?}"))?;
+        }
+    }
+
+    // AllReduceI64Tp: sync streams, then peer-reduce the contiguous [n*hidden] i64
+    // partials across the Tp group. Mirrors execute_steps_parallel's AllReduceI64Tp
+    // branch (steps.rs:1200-1222) called directly to avoid per-step overhead.
+    let tp_group = mesh.group_along(DimKind::Tp, &mesh.coord_of(0));
+    for &dev in &tp_group {
+        gpus.devices[dev]
+            .bind_thread()
+            .map_err(|e| format!("prefill_moe_tp sync bind {dev} L{layer_idx}: {e:?}"))?;
+        let stream = gpus.devices[dev].active_stream.as_ref().ok_or_else(|| {
+            format!("prefill_moe_tp L{layer_idx} dev{dev}: no active_stream for i64 sync")
+        })?;
+        gpus.devices[dev]
+            .hip
+            .stream_synchronize(stream)
+            .map_err(|e| format!("prefill_moe_tp stream_sync L{layer_idx} dev{dev}: {e:?}"))?;
+    }
+    {
+        let refs: Vec<&hip_bridge::DeviceBuffer> = tp_group
+            .iter()
+            .map(|&dev| &partials_i64_per_rank[dev].buf)
+            .collect();
+        gpus.all_reduce_sum_i64_peer(&tp_group, &refs, n * hidden)
+            .map_err(|e| format!("prefill_moe_tp allreduce_i64 L{layer_idx}: {e:?}"))?;
+    }
+
+    // ConvertI64ToF32 per rank: n*hidden i64 → n*hidden f32.
+    for r in 0..num_ranks {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("prefill_moe_tp convert bind {r} L{layer_idx}: {e:?}"))?;
+        gpus.devices[r]
+            .moe_i64_residual_to_f32(
+                &partials_i64_per_rank[r],
+                &partials_per_rank[r],
+                n * hidden,
+            )
+            .map_err(|e| format!("prefill_moe_tp convert L{layer_idx} r{r}: {e:?}"))?;
+    }
+
+    // ── Phase 3: ffn_out_batch += routed partial (per rank) ──────────────────
+    // Shared expert is already in ffn_out_batch from Phase 1.
+    // add_inplace_f32 adds the whole buffer (numel = n*hidden) in one launch.
+    for r in 0..num_ranks {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("prefill_moe_tp fold bind {r} L{layer_idx}: {e:?}"))?;
+        gpus.devices[r]
+            .add_inplace_f32(&pbs_per_rank[r].ffn_out_batch, &partials_per_rank[r])
+            .map_err(|e| format!("prefill_moe_tp fold L{layer_idx} r{r}: {e:?}"))?;
+    }
+
+    Ok(())
+}
+
 // ───────────────────────── Ship 6 substrate-EP (DeepSeek-V4) ─────────────────
 //
 // Mirror of the qwen35 / MiniMax EP wiring. DeepSeek packs all routed experts
