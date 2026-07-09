@@ -48,6 +48,39 @@ use hipfire_runtime::tp_shard::TpExpertSlice;
 use rdna_compute::{DType, GpuTensor};
 use std::path::PathBuf;
 
+/// Higher-entropy default prompt for `--prefill-batch` mode. The original
+/// `"The capital of France is"` prompt is degenerate under `--prefill-len`
+/// repetition — the tail is a tight loop, so the final-position distribution is
+/// trivially peaked and check (d)'s argmax cross-check would match even under a
+/// TP bug. This varied prose paragraph keeps the local context natural at every
+/// position, so the final-position argmax is a genuine discriminator.
+const HIGH_ENTROPY_PROMPT: &str = "Marine biologists studying the deep ocean \
+have long puzzled over how bioluminescent organisms coordinate their light \
+signals across vast, lightless expanses. Recent expeditions using autonomous \
+submersibles recorded jellyfish, squid, and previously undescribed crustaceans \
+pulsing in intricate patterns that appear to encode information about depth, \
+temperature, and the presence of nearby predators. One striking observation was \
+that certain colonial siphonophores synchronise their emissions only after a \
+brief, seemingly random delay, a behaviour that mathematicians compared to the \
+firefly synchronisation models developed decades earlier. Whether these signals \
+constitute a genuine language or merely a byproduct of shared physiology remains \
+fiercely debated, but the sheer diversity of colours, rhythms, and intensities \
+suggests an evolutionary pressure toward communication in an environment where \
+sound travels poorly and chemical cues disperse too slowly to be useful.";
+
+/// Upper bound on check (d)'s tp1-batched-TP vs single-GPU-batched logit
+/// max|Δ|. The only legitimate source of this delta is the MoE-down i64-vs-f32
+/// accumulation gap: batched attention and gate‖up are the SAME helpers in both
+/// `forward_prefill_batch_tp` (i64 down) and `forward_prefill_batch_chunked`
+/// (f32 `ffn_batched` down), so they cancel. A structural TP-slicing bug instead
+/// sums wrong/extra experts → O(10-100) logit divergence, far above the gap.
+///
+/// Measured on deepseek-v4-flash.mq2lloyd (emulated Tp-2, gfx1151, 300-token
+/// high-entropy prompt): max|Δ|=2.43, top-2 margin=8.52 (so argmax is stable).
+/// Bound = 6.0 ≈ 2.5× the measured gap — headroom for prompt variance, still
+/// well below both a structural-bug delta and the argmax top-2 margin.
+const D_DELTA_BOUND: f32 = 6.0;
+
 fn fnv1a_bytes(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in data {
@@ -314,6 +347,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
+    let mut prompt_set = false;
     let mut max: usize = 32;
     let mut no_bos = false;
     let mut mtp = false;
@@ -328,6 +362,7 @@ fn main() {
             }
             "--prompt" => {
                 prompt = argv[i + 1].clone();
+                prompt_set = true;
                 i += 2;
             }
             "--max" => {
@@ -363,6 +398,15 @@ fn main() {
         }
     }
     let model = model.expect("--model required");
+
+    // In --prefill-batch mode the default France prompt is degenerate under
+    // --prefill-len repetition (see HIGH_ENTROPY_PROMPT). Swap in a higher-
+    // entropy default so check (d)'s argmax cross-check is a real discriminator,
+    // unless the caller explicitly passed --prompt.
+    if prefill_batch && !prompt_set {
+        prompt = HIGH_ENTROPY_PROMPT.to_string();
+        eprintln!("  --prefill-batch: using higher-entropy default prompt (no --prompt given)");
+    }
 
     let prompt_fnv = fnv1a_bytes(prompt.as_bytes());
     eprintln!("prompt fnv1a_bytes: 0x{prompt_fnv:016x}  max: {max}  mtp: {mtp}  prefill_batch: {prefill_batch}");
@@ -610,9 +654,53 @@ fn main() {
                  argmax_match={d_argmax_match} (tp1b={d_am_tp1b} sg={d_am_sg})"
             );
             eprintln!(
-                "  (d note: batched attention is SHARED between the two paths → excluded from \
-                 this delta; the delta isolates the MoE down i64-vs-f32; small delta + argmax \
-                 match confirms the TP batched forward is correct)"
+                "  (d note: batched attention + gate‖up are SHARED between the two paths → they \
+                 cancel; this delta isolates the MoE-down i64-vs-f32 gap (measured ~2.4 on \
+                 deepseek-v4-flash, comparable to the (c) attention delta but a distinct effect). \
+                 Argmax match against the independent single-GPU path confirms the TP batched \
+                 forward is correct)"
+            );
+
+            // Top-2 margin diagnostic: an argmax match is only meaningful if the
+            // winner is not a near-tie the tiny i64-vs-f32 down gap could flip.
+            let top2_gap = |v: &[f32]| -> f32 {
+                let mut first = f32::NEG_INFINITY;
+                let mut second = f32::NEG_INFINITY;
+                for &x in v {
+                    if x > first {
+                        second = first;
+                        first = x;
+                    } else if x > second {
+                        second = x;
+                    }
+                }
+                first - second
+            };
+            eprintln!(
+                "  (d margin: tp1b top1-top2 gap={:.3e}  sg gap={:.3e}  vs max|Δ|={d_delta:.2e})",
+                top2_gap(&tp1b_prefill_logits),
+                top2_gap(&sg_logits),
+            );
+
+            // ── (d) is now a GATE, not just a diagnostic ──────────────────────
+            // Argmax must agree with the INDEPENDENT single-GPU-batched reference:
+            // tp1-vs-tp2 parity (a)/(b) share forward_prefill_batch_tp, so a
+            // systematic batched-TP bug hides from them — (d) is the only check
+            // that catches it. The magnitude bound guards against a bug that
+            // preserves argmax but corrupts logits: the legitimate i64-vs-f32
+            // MoE-down gap measures ~2.4 here; a structural TP-slicing bug that
+            // sums wrong/extra experts is O(10-100).
+            assert!(
+                d_argmax_match,
+                "CHECK (d) FAIL: tp1-batched-TP argmax ({d_am_tp1b}) != single-GPU-batched \
+                 reference ({d_am_sg}) — the batched TP forward diverges from the independent \
+                 single-GPU path (structural TP bug the tp1-vs-tp2 checks cannot see)"
+            );
+            assert!(
+                d_delta < D_DELTA_BOUND,
+                "CHECK (d) FAIL: tp1-batched-TP vs single-GPU-batched max|Δ|={d_delta:.2e} \
+                 exceeds bound {D_DELTA_BOUND:.2e} — expected only the ~2.4 i64-vs-f32 MoE-down \
+                 gap; a larger delta indicates a structural TP bug"
             );
 
             // Free single-GPU resources.
