@@ -107,9 +107,10 @@ the i64 path for the MoE down projection:
 - `ep_minimax.rs`: `MINIMAX_EP2_FNV = 0x887c2e7717e9c3bf` — **unchanged** (live-confirmed)
 - `ep_deepseek4.rs`: `DS4_EP2_FNV = 0x6c0f2f000f1d398f` — **unchanged** (live-confirmed)
 
-FNVs held because: emulated EP-2 (`HIPFIRE_EMULATE_GPUS=2`) maps both ranks to device 0;
-the i64 path produces the same f32 output as the FP32 path on a single device (the topk_w
-fold is algebraically equivalent per group when there's no actual K-split).
+FNVs held because: the i64 per-group rounding to the 2^-24 grid produces f32 values
+that differ from the FP32 path by ~1e-7 relative error (not byte-identical); however,
+these perturbations did not flip any argmax over the tested 32-token generation on the
+test prompt. The EP-i64 path is argmax-stable on the test prompt, not byte-identical.
 
 ## Occupancy (gfx1151 — RDNA3 / Strix, wave32, 1024 VGPRs/SIMD)
 

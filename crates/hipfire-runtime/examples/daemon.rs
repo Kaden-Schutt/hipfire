@@ -1348,7 +1348,11 @@ fn main() {
                     ) {
                         Ok(bands) => bands,
                         Err(msg) => {
-                            let _ = writeln!(stdout, r#"{{"type":"error","message":"{}"}}"#, msg);
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","message":"{}"}}"#,
+                                msg
+                            );
                             let _ = stdout.flush();
                             continue;
                         }
@@ -7133,10 +7137,8 @@ fn generate(
                       // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
                       // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
                       // was hardcoded greedy-only (temp>0 → AR).
-        let spec_temp_ok = temp <= 1e-6
-            || m.speculator
-                .as_ref()
-                .map_or(false, |s| !s.requires_greedy());
+        let spec_temp_ok =
+            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
         let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(

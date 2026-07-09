@@ -1288,13 +1288,11 @@ fn minimax_ep_moe_step(
     ) = if is_lloyd_down {
         // Lloyd down (MQ2G256Lloyd / MQ3G256Lloyd): residual-fused single Step
         // writes the weighted-combine directly into the EP partial.
-        // Three sub-paths keyed on use_i64_down + tp:
-        // - TP + MQ3G256Lloyd + use_i64_down: DownResidualI64 → AllReduceI64Tp →
-        //   ConvertI64ToF32. Partition-invariant: tp=1 and tp=2 produce identical f32.
-        // - EP + MQ3G256Lloyd + use_i64_down: DownResidualI64 (local, ZeroI64Only) →
-        //   ConvertI64ToF32 → AllReduce{Ep} (FP32). EP becomes reproducible per rank.
-        // - non-MQ3L Lloyd (MQ2G256Lloyd, no i64 kernel for MQ2L on EP/TP):
-        //   DownResidual → AllReduce{Tp|Ep} (unchanged FP path).
+        // Two sub-paths keyed on use_i64_down (shared between TP and EP):
+        // - MQ3G256Lloyd + use_i64_down: DownResidualI64 → AllReduce(I64 on TP, FP32 on EP) →
+        //   ConvertI64ToF32. TP: partition-invariant (tp=1 and tp=2 produce identical f32).
+        //   EP: ZeroI64Only pre-zeros the i64 partial; AllReduce runs in FP32 post-convert.
+        // - MQ2G256Lloyd or use_i64_down=false: DownResidual → AllReduce{Tp|Ep} (FP32 path).
         let use_i64 = use_i64_down && matches!(ddt, rdna_compute::DType::MQ3G256Lloyd);
         let i64s: &[GpuTensor] = if use_i64 {
             partials_i64
@@ -1356,8 +1354,8 @@ fn minimax_ep_moe_step(
                             batch_size: 1,
                         },
                         // After AllReduceI64Tp, convert the summed int64 → f32 partial.
-                        // tp_step_out_buf returns None for ConvertI64ToF32, so no
-                        // collective is attached; the convert runs after the i64 reduce.
+                        // tp_step_out_buf returns Some(&dst.buf) for ConvertI64ToF32, so
+                        // the following AllReduce{Ep} (on EP path) can target the f32 output.
                         Step::ConvertI64ToF32 {
                             src: &i64s[r],
                             dst: &partials[r],
