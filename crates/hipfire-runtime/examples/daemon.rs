@@ -2405,90 +2405,11 @@ fn main() {
 
             "reset" => {
                 // Reset conversation state without unloading the model.
-                // Under eviction, also zero the compact_offset so absolute
-                // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
                     }
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
-                    free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
-                    free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
-                    // Free the speculator's (relocated) checkpoint ring on reset.
-                    if let Some(s) = m.speculator.as_mut() {
-                        s.reset(&mut gpu);
-                    }
-                    // Multi-GPU branch: route per-LA-layer memsets through
-                    // pp_dn_la_to_device so each buffer is zeroed on its
-                    // owning device. The single-GPU `gpu` parameter is left
-                    // alone — its scratch state isn't aliased to per-device
-                    // tensors when pp > 1. Sourced from the bundle (qwen35
-                    // dn_state moved into ModelState::Qwen35), not the
-                    // always-None m.dn_state/m.kv_cache direct fields.
-                    reset_qwen35_recurrent(m, &mut gpu);
-                    if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-                        b.kv.compact_offset = 0;
-                    }
-                    // arch_id=7: rewind the live Qwen2State position cursor so
-                    // the next prefill writes from KV[0]. Without this, a reset
-                    // between turns leaks the prior turn's KV into attention —
-                    // fluent garbage, no panic. The live state lives in the
-                    // ModelState::Qwen2 bundle (built by Qwen2Carrier); the
-                    // `qwen2_state` direct field is None for plain qwen2 and is
-                    // only populated by dots-ocr (arch_id=8). Rewind BOTH so the
-                    // reset is not a silent no-op. See `Qwen2State::reset` and
-                    // scripts/qwen2-reset-gate.sh.
-                    if let Some(ref mut s) = m.qwen2_state {
-                        s.reset();
-                    }
-                    if let Some(b) = m.qwen2_mut() {
-                        b.state.reset();
-                    }
-                    // arch_id=9: same rationale for DeepSeek V4. Prior to
-                    // 2026-05-24 the V4F state was NEVER reset, so
-                    // `state.n_tokens` accumulated across requests and
-                    // every new prefill wrote AFTER the previous turn's
-                    // KV residue — fitting symptom for the multi-turn
-                    // pi-coding-agent corruption (`CLion` for
-                    // `CLionProjects`, `/home/n/` for `/home/nick/`).
-                    // See `DeepseekV4State::reset` doc.
-                    if let Some(b) = m.deepseek4_mut() {
-                        b.state.reset();
-                        // Drop the captured V4F decode hipGraph alongside
-                        // the state. The captured kernarg blobs hold
-                        // session-1's device-buffer pointers; a fresh
-                        // capture on session-2 binds against session-2's
-                        // pointers and host scalars. Without this the
-                        // replay path crashes with "illegal memory access"
-                        // on the post-launch logits D2H — the captured
-                        // graph dispatched against a stale slot/n_valid
-                        // computation that mis-ordered against this
-                        // session's prefill state. The matching
-                        // `ar_forward_warmed_up = false` in `reset()`
-                        // ensures we retrace warmup → capture → replay
-                        // rather than jumping straight back to replay.
-                        gpu.invalidate_graph_state();
-                    }
-                    // arch_id=11: rewind the Lfm2MoeState KV + conv-state
-                    // cursors so the next prefill writes from slot 0. Same
-                    // rationale as the qwen2/deepseek4 resets above — without
-                    // it, prior-turn KV/conv residue leaks into the new turn.
-                    if let Some(b) = m.lfm2moe_mut() {
-                        let _ = b.state.reset(&mut gpu);
-                    }
-                    // arch_id=10 (MiniMax-M2): clear the KV cursor between turns.
-                    // No captured hipGraph on this path by default, so no graph
-                    // invalidation needed. reset() takes no gpu (cursor-only).
-                    if let Some(b) = m.minimax_mut() {
-                        b.state.reset();
-                    }
-                    // Restore adaptive-KV controller to start tier (q8/fwht4)
-                    // so thresholds fire correctly on the fresh conversation
-                    // instead of staying pinned at the floor tier.
-                    if let Some(ref mut ad) = m.kv_adaptive {
-                        ad.reset();
-                    }
+                    model_reset_context(m, &mut gpu);
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
