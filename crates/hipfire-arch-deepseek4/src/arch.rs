@@ -22,12 +22,12 @@ use crate::deepseek4::{
 use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
     PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
 };
-use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
 use rdna_compute::{DType, Gpu};
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
@@ -152,6 +152,22 @@ impl DeepseekV4 {
         Ok(t)
     }
 
+    /// Bytes per packed-quant block (256 elements) for a routed-expert quant
+    /// type, used for TP-of-experts column/row slicing. ds4 routed experts are
+    /// MQ2-Lloyd; MQ3-Lloyd is accepted for symmetry with the down tier. Any
+    /// other type fails fast rather than corrupting data by slicing at the wrong
+    /// granularity. (Same table as `hipfire_arch_minimax::block_bytes_for_qt`.)
+    fn block_bytes_for_qt(qt: u8) -> Result<usize, String> {
+        match qt {
+            19 => Ok(72),  // MQ2G256Lloyd
+            20 => Ok(112), // MQ3G256Lloyd
+            other => Err(format!(
+                "deepseek4 TP-expert-slice: quant_type {other} not supported for column/row \
+                 slicing (only MQ2G256Lloyd/MQ3G256Lloyd implemented)"
+            )),
+        }
+    }
+
     /// Upload routed-expert blobs for one "layer-shaped" block (a normal
     /// transformer layer or the MTP layer). Mirrors the original
     /// inline logic but is parameterized on `prefix` so the same code
@@ -168,6 +184,7 @@ impl DeepseekV4 {
     /// The non-owned w2 (down) ptr reuses the compact base — its rotate input
     /// is 0 regardless, so the down weights read don't matter. `shard = None`
     /// uploads all experts (single-GPU, byte-identical to the original).
+    #[allow(clippy::too_many_arguments)]
     fn upload_layer_routed_experts(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -176,7 +193,19 @@ impl DeepseekV4 {
         layer: &mut DeepseekV4LayerWeights,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
         keep: Option<&[u32]>,
+        // TP-of-experts: when `Some`, every expert is column/row-sliced to
+        // `inter/tp` (mutually exclusive with EP `shard`). `inter`/`hidden` are
+        // the routed-expert intermediate/model dims (`moe_intermediate_size` /
+        // `hidden_size`) needed by the slice helpers.
+        tp_slice: Option<hipfire_runtime::tp_shard::TpExpertSlice>,
+        inter: usize,
+        hidden: usize,
     ) -> Result<(), String> {
+        if tp_slice.is_some() && shard.is_some() {
+            return Err(format!(
+                "deepseek4: {prefix} TP expert slice + EP sharding are mutually exclusive"
+            ));
+        }
         // REAP keep-map: compact slot `e` loads ORIGINAL expert `src(e)`.
         // `keep = None` ⇒ identity (slot == original index), byte-identical
         // to the full load. `n_exp` is the COMPACT count (kept) when active.
@@ -222,9 +251,18 @@ impl DeepseekV4 {
                 .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
             let stride = info0.data_size;
             let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
+            // TP-of-experts: down `[hidden, inter]` → row-gather each expert to
+            // `[hidden, inter/tp]`. `packed_stride` is the per-expert byte size in
+            // the compact blob (== `stride/tp` when slicing, exact since the
+            // sliced blob is `inter/tp / inter == 1/tp` of the full row bytes).
+            let bb_dn = match tp_slice {
+                Some(_) => Self::block_bytes_for_qt(info0.quant_type)?,
+                None => 0,
+            };
             drop(_b0);
+            let packed_stride = tp_slice.map(|ts| stride / ts.tp).unwrap_or(stride);
 
-            let mut blob = Vec::with_capacity(stride * n_owned);
+            let mut blob = Vec::with_capacity(packed_stride * n_owned);
             for e in 0..n_exp {
                 // EP shard: read+pack ONLY owned experts (each rank reads just
                 // its 1/N of the file → faster load, less page-cache churn).
@@ -243,7 +281,17 @@ impl DeepseekV4 {
                         info.data_size, stride
                     ));
                 }
-                blob.extend_from_slice(&bytes);
+                if let Some(ts) = tp_slice {
+                    // Row-gather this expert's down blob to rank's inter/tp columns.
+                    let sliced = hipfire_runtime::weight_store::expert_tp_row_gather(
+                        &bytes, hidden, inter, bb_dn, ts.rank, ts.tp,
+                    )
+                    .map_err(|e2| format!("deepseek4 {prefix} E{e}: TP row gather down: {e2}"))?;
+                    debug_assert_eq!(sliced.len(), packed_stride);
+                    blob.extend_from_slice(&sliced);
+                } else {
+                    blob.extend_from_slice(&bytes);
+                }
             }
             let mut blob_shape = vec![n_owned];
             blob_shape.extend_from_slice(&shape0);
@@ -257,7 +305,7 @@ impl DeepseekV4 {
             let ptrs: Vec<u64> = (0..n_exp)
                 .map(|e| {
                     if owns(e) {
-                        base_ptr + (local_of_global[e] * stride) as u64
+                        base_ptr + (local_of_global[e] * packed_stride) as u64
                     } else {
                         base_ptr
                     }
@@ -272,7 +320,7 @@ impl DeepseekV4 {
                 .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
             layer.expert_w2_blob = Some(blob_tensor);
             layer.expert_w2_ptrs = Some(ptr_tensor);
-            layer.expert_w2_stride = stride;
+            layer.expert_w2_stride = packed_stride;
         }
         // gate_up (combined w1 ‖ w3): per-expert pread, pack ONLY owned, single
         // upload. Non-owned ptr → a shared ZEROED dummy gate_up buffer.
@@ -296,7 +344,17 @@ impl DeepseekV4 {
                 ));
             }
             let combined_stride = stride_w1 + stride_w3;
-            let mut combined = Vec::with_capacity(combined_stride * n_owned);
+            // TP-of-experts: gate‖up `[2·inter, hidden]` → column-split each
+            // expert to `[2·(inter/tp), hidden]`. `packed_combined` == the sliced
+            // per-expert byte size (`combined_stride/tp`, exact).
+            let bb_gu = match tp_slice {
+                Some(_) => Self::block_bytes_for_qt(w1_info0.quant_type)?,
+                None => 0,
+            };
+            let packed_combined = tp_slice
+                .map(|ts| combined_stride / ts.tp)
+                .unwrap_or(combined_stride);
+            let mut combined = Vec::with_capacity(packed_combined * n_owned);
             for e in 0..n_exp {
                 // EP shard: pack ONLY owned experts. Each read's `Ref` on the
                 // shared pread buffer MUST be dropped before the next pread
@@ -306,22 +364,49 @@ impl DeepseekV4 {
                     continue;
                 }
                 let w1_name = format!("{prefix}.ffn.experts.{}.w1.weight", src(e));
-                {
-                    let (_, w1_bytes) = hfq
-                        .tensor_data_pread(&w1_name)
-                        .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
-                    combined.extend_from_slice(&w1_bytes);
-                }
                 let w3_name = format!("{prefix}.ffn.experts.{}.w3.weight", src(e));
-                {
-                    let (_, w3_bytes) = hfq
-                        .tensor_data_pread(&w3_name)
-                        .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
-                    combined.extend_from_slice(&w3_bytes);
+                if let Some(ts) = tp_slice {
+                    // Column-slice needs w1‖w3 contiguous; copy each read to an
+                    // owned Vec so both preads' `Ref`s are released first (the
+                    // shared pread buffer can't be double-borrowed).
+                    let w1_owned: Vec<u8> = {
+                        let (_, b) = hfq
+                            .tensor_data_pread(&w1_name)
+                            .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
+                        b.to_vec()
+                    };
+                    let mut raw_gu = w1_owned;
+                    {
+                        let (_, b) = hfq
+                            .tensor_data_pread(&w3_name)
+                            .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
+                        raw_gu.extend_from_slice(&b);
+                    }
+                    let sliced = hipfire_runtime::weight_store::expert_tp_column_pair(
+                        &raw_gu, inter, hidden, bb_gu, ts.rank, ts.tp,
+                    )
+                    .map_err(|e2| {
+                        format!("deepseek4 {prefix} E{e}: TP column slice gate_up: {e2}")
+                    })?;
+                    debug_assert_eq!(sliced.len(), packed_combined);
+                    combined.extend_from_slice(&sliced);
+                } else {
+                    {
+                        let (_, w1_bytes) = hfq
+                            .tensor_data_pread(&w1_name)
+                            .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
+                        combined.extend_from_slice(&w1_bytes);
+                    }
+                    {
+                        let (_, w3_bytes) = hfq
+                            .tensor_data_pread(&w3_name)
+                            .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
+                        combined.extend_from_slice(&w3_bytes);
+                    }
                 }
             }
             let combined_tensor = gpu
-                .upload_raw(&combined, &[n_owned, combined_stride])
+                .upload_raw(&combined, &[n_owned, packed_combined])
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
             drop(combined);
             let base_ptr = combined_tensor.buf.as_ptr() as u64;
@@ -349,7 +434,7 @@ impl DeepseekV4 {
             let ptrs: Vec<u64> = (0..n_exp)
                 .map(|e| {
                     if owns(e) {
-                        base_ptr + (local_of_global[e] * combined_stride) as u64
+                        base_ptr + (local_of_global[e] * packed_combined) as u64
                     } else {
                         dummy_gu
                     }
@@ -364,7 +449,7 @@ impl DeepseekV4 {
                 .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
-            layer.expert_gate_up_stride = combined_stride;
+            layer.expert_gate_up_stride = packed_combined;
             // Store the owning handle (None on single-GPU / fully-owned shards).
             // Its device pointer is already baked into `ptr_tensor` above.
             layer.expert_gate_up_dummy = dummy_gate_up;
@@ -658,7 +743,7 @@ impl Architecture for DeepseekV4 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        Self::load_weights_inner(hfq, cfg, gpu, None)
+        Self::load_weights_inner(hfq, cfg, gpu, None, None)
     }
 
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
@@ -895,7 +980,23 @@ impl DeepseekV4 {
         shard: &hipfire_runtime::tp_shard::ShardConfig,
         rank: usize,
     ) -> Result<DeepseekV4Weights, String> {
-        Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)))
+        Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None)
+    }
+
+    /// TP-of-experts load entry (mirrors `MiniMaxWeights::load(.., Some(ts))`).
+    ///
+    /// Every rank owns ALL routed experts, but each expert's gate‖up is
+    /// column-split and its down is row-gathered to `inter/tp` (via
+    /// `weight_store::expert_tp_column_pair` / `_row_gather`). The shared expert,
+    /// router, attention, norms, embed/head are replicated in full per rank
+    /// (identical to `load_weights`). Mutually exclusive with EP `shard`.
+    pub fn load_weights_tp(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        tp_slice: hipfire_runtime::tp_shard::TpExpertSlice,
+    ) -> Result<DeepseekV4Weights, String> {
+        Self::load_weights_inner(hfq, cfg, gpu, None, Some(tp_slice))
     }
 
     fn load_weights_inner(
@@ -903,7 +1004,13 @@ impl DeepseekV4 {
         cfg: &DeepseekV4Config,
         gpu: &mut Gpu,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+        tp_slice: Option<hipfire_runtime::tp_shard::TpExpertSlice>,
     ) -> Result<DeepseekV4Weights, String> {
+        // EP sharding and TP-of-experts are mutually exclusive: EP sub-sets WHICH
+        // experts a rank owns; TP splits EACH expert's matrix across ranks.
+        if shard.is_some() && tp_slice.is_some() {
+            return Err("deepseek4: EP shard + TP expert slice are mutually exclusive".into());
+        }
         // Phase 1.5 host walk verifies every expected tensor is in the
         // HFQ index. We then upload all globals and per-layer
         // non-expert tensors. The 256 routed experts per layer are
@@ -1584,6 +1691,9 @@ impl DeepseekV4 {
                     layer,
                     shard,
                     keep,
+                    tp_slice,
+                    cfg.moe_intermediate_size,
+                    cfg.hidden_size,
                 )?;
             }
         }
@@ -1609,7 +1719,10 @@ impl DeepseekV4 {
                     cfg.n_routed_experts,
                     mtp,
                     shard,
-                    None, // MTP not loaded under REAP keep-map (see load_mtp guard)
+                    None,     // MTP not loaded under REAP keep-map (see load_mtp guard)
+                    tp_slice, // MTP shares ds4_ep_moe_step → slice its experts too
+                    cfg.moe_intermediate_size,
+                    cfg.hidden_size,
                 )?;
             }
         }
@@ -1839,6 +1952,9 @@ impl DeepseekV4 {
                 &mut layer,
                 None,
                 None,
+                None, // DSpark drafter stages: TP-of-experts not supported (--no-dspark path)
+                cfg.moe_intermediate_size,
+                cfg.hidden_size,
             )?;
             if s == last {
                 // Last stage carries the head-HC mix + final norm.

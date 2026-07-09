@@ -2322,6 +2322,13 @@ fn ds4_ep_moe_step(
     let inter = cfg.moe_intermediate_size;
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
+    // TP-of-experts: inter_local = inter / tp. When there is no Tp axis (EP or
+    // single-GPU), size_of returns 0, max(1) gives tp=1, inter_local == inter →
+    // byte-identical to today (the D1/D2a EP path must stay bit-exact). Under TP
+    // every rank owns ALL experts but each expert's gate‖up is column-split and
+    // its down is row-gathered to inter/tp (loaded via `load_weights_tp`).
+    let tp = mesh.size_of(hipfire_runtime::multi_gpu::DimKind::Tp).max(1);
+    let inter_local = inter / tp;
     // ── Phase 1: per-rank shared expert + routed pre-down (direct kernels) ──
     let mut routed = false;
     for r in 0..n {
@@ -2365,7 +2372,11 @@ fn ds4_ep_moe_step(
                     // ds4 routed experts are MQ2-Lloyd; DownResidualI64 supports MQ2L.
                     dtype: DType::MQ2G256Lloyd,
                     n_experts: n_exp,
-                    expert_m: inter,
+                    // inter_local: per-rank intermediate dim (inter/tp under TP,
+                    // inter otherwise). Covers both the GateUp output (2*inter_local)
+                    // and the Down contraction (inter_local); the kernel derives 2*
+                    // internally for gate‖up.
+                    expert_m: inter_local,
                     expert_k: hidden,
                     owned: &[],
                 }
@@ -2423,16 +2434,39 @@ fn ds4_ep_moe_step(
                 ]
             })
             .collect();
-        let collectives: Vec<StepCollective> = vec![
-            StepCollective::None,
-            StepCollective::None,
-            StepCollective::ZeroI64Only { dim: hidden },
-            StepCollective::AllReduce {
-                kind: hipfire_runtime::multi_gpu::DimKind::Ep,
-                dim: hidden,
-            },
-        ];
-        let zero_before: Vec<bool> = vec![false, false, true, false];
+        // Down-i64 reduction, two sub-paths keyed on the mesh axis:
+        // - TP (tp>1): AllReduceI64Tp sums the per-rank int64 accumulators BEFORE
+        //   ConvertI64ToF32. Fixed-point accumulation is partition-invariant
+        //   (sum of per-rank i64 == full-inter i64), so tp=1 and tp=2 yield
+        //   bit-identical f32 → argmax-exact AND logit max|Δ|==0. zero_before[2]
+        //   zeros each rank's i64 buffer before DownResidualI64 writes it.
+        // - EP (tp==1, current path): each rank owns a DIFFERENT expert subset,
+        //   so ZeroI64Only pre-zeros the local i64, ConvertI64ToF32 emits the f32
+        //   partial, then AllReduce{Ep} sums the distinct partials in FP32.
+        let (collectives, zero_before): (Vec<StepCollective>, Vec<bool>) = if tp > 1 {
+            (
+                vec![
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::AllReduceI64Tp { dim: hidden },
+                    StepCollective::None,
+                ],
+                vec![false, false, true, false],
+            )
+        } else {
+            (
+                vec![
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::ZeroI64Only { dim: hidden },
+                    StepCollective::AllReduce {
+                        kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                        dim: hidden,
+                    },
+                ],
+                vec![false, false, true, false],
+            )
+        };
         execute_steps_parallel(mesh, gpus, &per_rank_steps, &collectives, &zero_before)
             .map_err(|e| format!("moe-step L{l}: execute_steps_parallel: {e:?}"))?;
     }
@@ -2700,6 +2734,130 @@ pub fn forward_ep(
             "EP-DECODE-TIMING: layers(host)={layers_ms:.2} ms  final-sync(gpu)={:.2} ms",
             t_sync.elapsed().as_secs_f64() * 1000.0,
         );
+    }
+    for s in state_per_rank.iter_mut() {
+        s.n_tokens += 1;
+    }
+    Ok(())
+}
+
+/// TP-of-experts replicated N-rank decode forward for ONE token.
+///
+/// Structurally identical to [`forward_ep`] — the ONLY difference is the mesh
+/// axis: a `DimKind::Tp` mesh instead of `DimKind::Ep`. That single change makes
+/// [`ds4_ep_moe_step`] compute `inter_local = inter/tp` and emit the int64
+/// `AllReduceI64Tp` (partition-invariant) instead of `AllReduce{Ep}`.
+///
+/// Every rank holds ALL routed experts but with each expert's gate‖up
+/// column-split and its down row-gathered to `inter/tp` (loaded via
+/// [`DeepseekV4::load_weights_tp`]). The shared expert, MLA attention, router,
+/// norms, and embed/head are replicated in full per rank (bit-identical across
+/// ranks), so only the routed combine crosses the Tp group. Every device must
+/// have an `active_stream` and peer access enabled (same as `forward_ep`).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_tp(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    partials_i64: &[GpuTensor],
+    token: u32,
+    position: u32,
+) -> Result<(), String> {
+    let n = gpus.devices.len();
+    assert_eq!(
+        weights_per_rank.len(),
+        n,
+        "ds4 forward_tp: weights_per_rank len"
+    );
+    assert_eq!(
+        state_per_rank.len(),
+        n,
+        "ds4 forward_tp: state_per_rank len"
+    );
+    assert_eq!(partials.len(), n, "ds4 forward_tp: partials len");
+    assert_eq!(partials_i64.len(), n, "ds4 forward_tp: partials_i64 len");
+    let skip_ffn = env_cache::skip_ffn();
+
+    // 1. Per-rank embed + position + token-id + residual-stream init (replicated,
+    //    deterministic → bit-identical across ranks; identical to forward_ep).
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("ds4 forward_tp bind {r}: {e:?}"))?;
+        precompute_positions(cfg, &mut state_per_rank[r], &mut gpus.devices[r], position)?;
+        precompute_token_id(&mut state_per_rank[r], &mut gpus.devices[r], token)?;
+        init_residual_streams(
+            cfg,
+            &weights_per_rank[r],
+            &mut state_per_rank[r],
+            &mut gpus.devices[r],
+            token,
+        )?;
+    }
+
+    // 2. Per-layer TP program (Attend replicated; Moe all-reduce-Tp'd via the
+    //    int64 partition-invariant down path). Topological Tp mesh: a single Tp
+    //    axis of `n` ranks → `ds4_ep_moe_step` sees DimKind::Tp → tp=n,
+    //    inter_local=inter/n, AllReduceI64Tp.
+    let tp_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+        hipfire_runtime::multi_gpu::DimKind::Tp,
+        n,
+    )]);
+    for l in 0..cfg.num_hidden_layers {
+        // Attend replicated (identical to forward_ep).
+        for r in 0..n {
+            gpus.devices[r]
+                .bind_thread()
+                .map_err(|e| format!("ds4 forward_tp attn bind {r} L{l}: {e:?}"))?;
+            ds4_attn_block(
+                cfg,
+                &weights_per_rank[r],
+                &mut state_per_rank[r],
+                &mut gpus.devices[r],
+                l,
+                position,
+            )
+            .map_err(|e| format!("ds4 forward_tp attn L{l} r{r}: {e}"))?;
+        }
+        ds4_ep_moe_step(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            partials_i64,
+            &tp_mesh,
+            l,
+            token,
+            skip_ffn,
+        )
+        .map_err(|e| format!("ds4 forward_tp moe-step L{l}: {e}"))?;
+    }
+
+    // 3. Final norm + head on rank 0 → state_per_rank[0].logits.
+    {
+        gpus.devices[0]
+            .bind_thread()
+            .map_err(|e| format!("ds4 forward_tp bind0: {e:?}"))?;
+        final_norm_and_head(
+            cfg,
+            &weights_per_rank[0],
+            &mut state_per_rank[0],
+            &mut gpus.devices[0],
+        )?;
+    }
+
+    // 4. Sync every rank (host logits read races the active streams otherwise).
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("ds4 forward_tp sync bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .hip
+            .device_synchronize()
+            .map_err(|e| format!("ds4 forward_tp sync {r}: {e:?}"))?;
     }
     for s in state_per_rank.iter_mut() {
         s.n_tokens += 1;
@@ -3305,6 +3463,119 @@ pub fn mtp_forward_ep(
     gpus.devices[0]
         .download_f32(logits)
         .map_err(|e| format!("mtp_forward_ep download logits: {e:?}"))
+}
+
+/// TP-of-experts twin of [`mtp_forward_ep`]. Identical except the MTP-layer FFN
+/// runs on a `DimKind::Tp` mesh, so [`ds4_ep_moe_step`] uses `inter_local` and
+/// the partition-invariant int64 `AllReduceI64Tp` (the MTP experts are loaded
+/// column/row-sliced via [`DeepseekV4::load_weights_tp`], which slices `mtp.0`
+/// too). Used by the `tp_deepseek4 --mtp` parity harness to confirm the MTP-EP
+/// accept is unchanged under TP.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_forward_tp(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    partials_i64: &[GpuTensor],
+    h_n_per_rank: &[GpuTensor],
+    next_token: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    let n = gpus.devices.len();
+    assert_eq!(
+        weights_per_rank.len(),
+        n,
+        "mtp_forward_tp: weights_per_rank len"
+    );
+    assert_eq!(
+        state_per_rank.len(),
+        n,
+        "mtp_forward_tp: state_per_rank len"
+    );
+    assert_eq!(partials.len(), n, "mtp_forward_tp: partials len");
+    assert_eq!(partials_i64.len(), n, "mtp_forward_tp: partials_i64 len");
+    assert_eq!(h_n_per_rank.len(), n, "mtp_forward_tp: h_n_per_rank len");
+    let mtp_layer_idx = cfg.num_hidden_layers;
+
+    // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated.
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("mtp_forward_tp bind {r}: {e:?}"))?;
+        state_per_rank[r].n_tokens = position as u64;
+        mtp_pre_ffn(
+            cfg,
+            &weights_per_rank[r],
+            &mut state_per_rank[r],
+            &mut gpus.devices[r],
+            &h_n_per_rank[r],
+            next_token,
+            position,
+        )?;
+    }
+
+    // 2. MTP-layer FFN via the decomposed executor on a Tp mesh.
+    {
+        let tp_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+            hipfire_runtime::multi_gpu::DimKind::Tp,
+            n,
+        )]);
+        ds4_ep_moe_step(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            partials_i64,
+            &tp_mesh,
+            mtp_layer_idx,
+            next_token,
+            /*skip_ffn=*/ false,
+        )
+        .map_err(|e| format!("mtp_forward_tp moe-step: {e}"))?;
+    }
+
+    // 3. Per-rank capture (residual_streams → mtp_last_hidden), replicated.
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("mtp_forward_tp cap bind {r}: {e:?}"))?;
+        mtp_capture_hidden(cfg, &mut state_per_rank[r], &mut gpus.devices[r])?;
+    }
+
+    // 4. Head COMPUTE on rank 0.
+    gpus.devices[0]
+        .bind_thread()
+        .map_err(|e| format!("mtp_forward_tp head bind0: {e:?}"))?;
+    mtp_head_compute(
+        cfg,
+        &weights_per_rank[0],
+        &mut state_per_rank[0],
+        &mut gpus.devices[0],
+    )?;
+
+    // 5. Sync every rank, then download rank 0's logits.
+    for r in 0..n {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("mtp_forward_tp sync bind {r}: {e:?}"))?;
+        gpus.devices[r]
+            .hip
+            .device_synchronize()
+            .map_err(|e| format!("mtp_forward_tp sync {r}: {e:?}"))?;
+    }
+    gpus.devices[0]
+        .bind_thread()
+        .map_err(|e| format!("mtp_forward_tp dl bind0: {e:?}"))?;
+    let logits = state_per_rank[0]
+        .logits
+        .as_ref()
+        .ok_or("mtp_forward_tp: rank0 logits unset")?;
+    gpus.devices[0]
+        .download_f32(logits)
+        .map_err(|e| format!("mtp_forward_tp download logits: {e:?}"))
 }
 
 /// Batched twin of `mtp_forward` — processes `batch_size` MTP positions
