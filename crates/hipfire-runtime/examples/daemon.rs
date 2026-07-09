@@ -4231,6 +4231,46 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
 }
 
+/// Full conversation-state reset: clears CPU cursor + token history, frees GPU
+/// checkpoint rings, resets the speculator ring, zeros per-arch recurrent /
+/// KV state, and rewinds the adaptive-KV controller. This is the single
+/// canonical site for "start a fresh conversation without unloading the model"
+/// semantics — mirrors the "reset" command handler (lines ~2406-2491). All
+/// per-arch arms are no-ops when that arch is not loaded, so calling this
+/// function on any LoadedModel is always safe.
+fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    free_checkpoints(&mut m.prefill_checkpoints, gpu);
+    free_checkpoints(&mut m.dflash_checkpoints, gpu);
+    if let Some(s) = m.speculator.as_mut() {
+        s.reset(gpu);
+    }
+    reset_qwen35_recurrent(m, gpu);
+    if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+        b.kv.compact_offset = 0;
+    }
+    if let Some(ref mut s) = m.qwen2_state {
+        s.reset();
+    }
+    if let Some(b) = m.qwen2_mut() {
+        b.state.reset();
+    }
+    if let Some(b) = m.deepseek4_mut() {
+        b.state.reset();
+        gpu.invalidate_graph_state();
+    }
+    if let Some(b) = m.lfm2moe_mut() {
+        let _ = b.state.reset(gpu);
+    }
+    if let Some(b) = m.minimax_mut() {
+        b.state.reset();
+    }
+    if let Some(ref mut ad) = m.kv_adaptive {
+        ad.reset();
+    }
+}
+
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
 /// token-streaming output but replaces the AR sample loop with
 /// `spec_step_dflash` cycles — each cycle drafts B tokens via the diffusion
