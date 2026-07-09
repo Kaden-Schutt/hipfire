@@ -78,13 +78,18 @@ while [ "$round" -lt "$SAFETY_CAP" ]; do
   round=$((round+1))
   echo "===== ROUND $round START $(date -u '+%F %T') =====" >> "$LOG"
   DIGEST=$(python3 "$TRIO/gen_digest.py" "$EXH" "$BOD" "$CAND_WALL" "$K" "$FOLDED" 2>/dev/null)
-  # codex reads kernels/src from ITS OWN worktree (this worker's advancing baseline) — NOT $HOME/hipfire
+  # the agent reads kernels/src from ITS OWN worktree (this worker's advancing baseline) — NOT $HOME/hipfire
   # main, which may be an old/foreign checkout. First CARDS slot = this worker's build worktree.
   CODEX_CWD="${CODEX_CWD:-$MAIN/.aw/sw_card$(set -- $CARDS; echo "$1")}"
   [ -d "$CODEX_CWD/kernels/src" ] || CODEX_CWD="$MAIN"
-  timeout 3600 codex exec --dangerously-bypass-approvals-and-sandbox -C "$CODEX_CWD" \
-    "ROUND $round of a SELF-EXHAUSTING autoresearch loop (adaptive certify + branch wins). ${DIGEST} $(cat "$PROMPT")" \
-    >> "$LOG" 2>&1
+  # Harness-agnostic round via agent_exec.sh. Default (AGENT_HARNESS unset) is byte-identical
+  # to the prior inlined `codex exec` call; set AGENT_HARNESS=grok (+ optional AGENT_MODEL) on
+  # this driver instance to run its rounds on Grok instead — run separate instances per card
+  # group (e.g. AGENT_HARNESS=codex CARDS="0 1" ... vs AGENT_HARNESS=grok CARDS="2 3" ...) for a
+  # heterogeneous model fleet over one certify/rollover substrate.
+  ROUND_PROMPT="ROUND $round of a SELF-EXHAUSTING autoresearch loop (adaptive certify + branch wins). ${DIGEST} $(cat "$PROMPT")"
+  echo "  [driver] round $round harness=${AGENT_HARNESS:-codex} cwd=$CODEX_CWD" >> "$LOG"
+  bash "$HARN/agent_exec.sh" 3600 "$CODEX_CWD" "$ROUND_PROMPT" >> "$LOG" 2>&1
   echo "===== ROUND $round END rc=$? $(date -u '+%F %T') =====" >> "$LOG"
   # update per-kernel exhaustion counters from this round's verdicts (ARCH selects the ledger glob)
   python3 "$TRIO/update_exhaustion.py" "$EXH" "$round" "$MAIN" "$ARCH" >> "$LOG" 2>&1
