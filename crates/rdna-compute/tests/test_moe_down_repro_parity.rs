@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! GPU kernel-parity test for the MQ3-Lloyd MoE down int64 reproducible kernel.
+//! GPU kernel-parity tests for the MQ3-Lloyd and MQ2-Lloyd MoE down int64
+//! reproducible kernels.
 //!
 //! Verifies that splitting K into two halves and summing the int64 residuals
 //! produces a bit-exact result equal to a single full-K launch:
@@ -353,4 +354,307 @@ fn test_moe_down_repro_parity_k_split_bit_exact() {
         "\nPASS: full_i64[row] == half_a_i64[row] + half_b_i64[row] for all {m} rows (bit-exact)"
     );
     eprintln!("PASS: moe_i64_residual_to_f32 matches expected scaled values");
+}
+
+// ---------------------------------------------------------------------------
+// MQ2-Lloyd weight builder (72 bytes per 256-weight group)
+//
+// Layout: [8 B fp16 codebook (4 entries)] [64 B 2-bit packed indices (256 entries)]
+// ---------------------------------------------------------------------------
+
+/// Build the byte buffer for one MQ2L 256-weight group.
+/// Returns 72 bytes: 8 B fp16 codebook (4 entries) + 64 B 2-bit packed indices.
+fn build_mq2l_group_bytes(row: usize, group: usize) -> [u8; 72] {
+    let mut out = [0u8; 72];
+    // Codebook: 4 ascending centroids.
+    let base = ((row.wrapping_mul(5) + group.wrapping_mul(9)) % 13) as f32 * 0.017 - 0.1;
+    for i in 0..4usize {
+        let v = base + (i as f32 - 1.5) * 0.04;
+        let bytes = f32_to_f16_le(v);
+        out[i * 2] = bytes[0];
+        out[i * 2 + 1] = bytes[1];
+    }
+    // Pack 256 2-bit indices into 64 bytes (8 indices per byte).
+    // Thread tid (0..32) reads bytes [boff] and [boff+1] where boff = tid*2,
+    // giving 8 weights at indices tid*8 .. tid*8+7.
+    // byte[b] = q[b*8+0] | (q[b*8+1]<<2) | ... | (q[b*8+7]<<14) — but the
+    // kernel reads only 2 bytes per thread: b0 at boff, b1 at boff+1.
+    // So byte 0 → weights 0..7 packed 2-bits-each, byte 1 → weights 8..15, etc.
+    for b in 0..64usize {
+        let mut byte: u8 = 0;
+        for bit in 0..4 {
+            let wi = b * 4 + bit; // weight index (0..256)
+            let q =
+                ((row.wrapping_mul(29) ^ group.wrapping_mul(47) ^ wi.wrapping_mul(11)) & 3) as u8;
+            byte |= q << (bit * 2);
+        }
+        out[8 + b] = byte;
+    }
+    out
+}
+
+/// Build a flat MQ2L weight matrix for one expert: [M rows × groups × 72 bytes].
+fn build_mq2l_expert_weights(m: usize, groups_per_row: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(m * groups_per_row * 72);
+    for row in 0..m {
+        for g in 0..groups_per_row {
+            buf.extend_from_slice(&build_mq2l_group_bytes(row, g));
+        }
+    }
+    buf
+}
+
+/// Extract a group slice from an MQ2L expert weight matrix (72 B/group).
+fn slice_mq2l_groups(
+    full: &[u8],
+    m: usize,
+    full_groups: usize,
+    group_range: std::ops::Range<usize>,
+) -> Vec<u8> {
+    let ngroups = group_range.end - group_range.start;
+    let mut out = Vec::with_capacity(m * ngroups * 72);
+    for row in 0..m {
+        let row_start = row * full_groups * 72;
+        let slice_start = row_start + group_range.start * 72;
+        let slice_end = row_start + group_range.end * 72;
+        out.extend_from_slice(&full[slice_start..slice_end]);
+    }
+    out
+}
+
+/// Run the MQ2L int64 residual down kernel (single-token, k_top=1, weight=1.0).
+fn run_down_i64_mq2l(
+    gpu: &mut Gpu,
+    expert_data: &[u8], // [M × groups × 72 B]
+    rot_x: &[f32],      // [K]
+    m: usize,
+    k: usize,
+) -> (Vec<i64>, Vec<f32>) {
+    let expert_t = upload_u8(gpu, expert_data);
+    let ptr_val: u64 = expert_t.buf.as_ptr() as u64;
+    let expert_ptrs_t = upload_u64(gpu, &[ptr_val]);
+
+    let topk_idx_t = upload_i32(gpu, &[0i32]);
+    let topk_w_t = upload_f32(gpu, &[1.0f32]);
+    let rot_batch_t = upload_f32(gpu, rot_x);
+
+    let residual_i64_t = alloc_i64_zeros(gpu, m);
+    let out_f32_t = alloc_f32_zeros(gpu, m);
+
+    gpu.moe_down_mq2g256_lloyd_residual_i64_indexed(
+        &expert_ptrs_t,
+        &topk_idx_t,
+        &topk_w_t,
+        &rot_batch_t,
+        &residual_i64_t,
+        m,
+        k,
+        1,
+    )
+    .expect("moe_down_mq2g256_lloyd_residual_i64_indexed launch");
+
+    gpu.moe_i64_residual_to_f32(&residual_i64_t, &out_f32_t, m)
+        .expect("moe_i64_residual_to_f32 launch");
+
+    gpu.hip.device_synchronize().expect("sync");
+
+    let i64_vals = download_i64(gpu, &residual_i64_t, m);
+    let f32_vals = download_f32(gpu, &out_f32_t, m);
+    (i64_vals, f32_vals)
+}
+
+/// Run the MQ2L int64 expanded down kernel (N=1, k_top=1, no weights).
+/// Returns the single expert_outputs_i64 cell per row.
+fn run_down_i64_mq2l_expanded(
+    gpu: &mut Gpu,
+    expert_data: &[u8],
+    rot_x: &[f32],
+    m: usize,
+    k: usize,
+) -> Vec<i64> {
+    let expert_t = upload_u8(gpu, expert_data);
+    let ptr_val: u64 = expert_t.buf.as_ptr() as u64;
+    let expert_ptrs_t = upload_u64(gpu, &[ptr_val]);
+
+    let topk_idx_t = upload_i32(gpu, &[0i32]);
+    let rot_batch_t = upload_f32(gpu, rot_x);
+
+    // expert_outputs_i64: [N=1 × K_TOP=1 × M] = M elements × 8 bytes
+    let n_elems = m;
+    let byte_len = n_elems * 8;
+    let out_t = gpu
+        .alloc_tensor(&[byte_len], rdna_compute::DType::Raw)
+        .expect("alloc expanded i64");
+    gpu.hip.memset(&out_t.buf, 0, byte_len).expect("memset");
+
+    gpu.moe_down_mq2g256_lloyd_expanded_i64(
+        &expert_ptrs_t,
+        &topk_idx_t,
+        &rot_batch_t,
+        &out_t,
+        m,
+        k,
+        1, // k_top
+        1, // batch_size (N)
+    )
+    .expect("moe_down_mq2g256_lloyd_expanded_i64 launch");
+
+    gpu.hip.device_synchronize().expect("sync");
+
+    download_i64(gpu, &out_t, n_elems)
+}
+
+// ---------------------------------------------------------------------------
+// MQ2L residual parity test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_moe_down_repro_parity_mq2l_residual_k_split_bit_exact() {
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU available ({e:?})");
+            return;
+        }
+    };
+    eprintln!("GPU: {}", gpu.arch);
+
+    // M=4 rows, K=512 (2 groups of 256), split at group boundary.
+    let m = 4;
+    let k = 512;
+    let groups_per_row = k / 256;
+    let half_k = k / 2;
+    let half_groups = groups_per_row / 2;
+
+    eprintln!(
+        "MQ2L residual: M={m}, K={k} ({groups_per_row} groups), K/2={half_k} ({half_groups} group each)"
+    );
+
+    let full_weights = build_mq2l_expert_weights(m, groups_per_row);
+    let weights_a = slice_mq2l_groups(&full_weights, m, groups_per_row, 0..half_groups);
+    let weights_b = slice_mq2l_groups(
+        &full_weights,
+        m,
+        groups_per_row,
+        half_groups..groups_per_row,
+    );
+
+    let rot_x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05)
+        .collect();
+    let rot_x_a = rot_x[..half_k].to_vec();
+    let rot_x_b = rot_x[half_k..].to_vec();
+
+    let (full_i64, full_f32) = run_down_i64_mq2l(&mut gpu, &full_weights, &rot_x, m, k);
+    eprintln!("Full  i64: {:?}", full_i64);
+
+    let (half_a_i64, _) = run_down_i64_mq2l(&mut gpu, &weights_a, &rot_x_a, m, half_k);
+    eprintln!("HalfA i64: {:?}", half_a_i64);
+
+    let (half_b_i64, _) = run_down_i64_mq2l(&mut gpu, &weights_b, &rot_x_b, m, half_k);
+    eprintln!("HalfB i64: {:?}", half_b_i64);
+
+    let inv_s = 1.0f64 / (1u64 << (MOE_DOWN_REPRO_E as u64)) as f64;
+    let mut all_pass = true;
+    for row in 0..m {
+        let sum = half_a_i64[row].wrapping_add(half_b_i64[row]);
+        let fp_full = full_i64[row] as f64 * inv_s;
+        let fp_f32out = full_f32[row] as f64;
+        eprintln!(
+            "row {row}: full={full_i64_v}  a+b={sum}  match={} | fp={fp_full:.8e} f32out={fp_f32out:.8e}",
+            full_i64[row] == sum,
+            full_i64_v = full_i64[row],
+        );
+        if full_i64[row] != sum {
+            eprintln!(
+                "  FAIL row {row}: full_i64={} != half_a+half_b={}",
+                full_i64[row], sum
+            );
+            all_pass = false;
+        }
+    }
+
+    assert!(
+        all_pass,
+        "FAIL: MQ2L int64 residuals are NOT bit-exact under K-split"
+    );
+    eprintln!(
+        "\nPASS: MQ2L residual full_i64[row] == half_a + half_b for all {m} rows (bit-exact)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MQ2L expanded parity test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_moe_down_repro_parity_mq2l_expanded_k_split_bit_exact() {
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU available ({e:?})");
+            return;
+        }
+    };
+    eprintln!("GPU: {}", gpu.arch);
+
+    // M=4, K=512 (2 groups), split at group boundary.
+    let m = 4;
+    let k = 512;
+    let groups_per_row = k / 256;
+    let half_k = k / 2;
+    let half_groups = groups_per_row / 2;
+
+    eprintln!(
+        "MQ2L expanded: M={m}, K={k} ({groups_per_row} groups), K/2={half_k} ({half_groups} group each)"
+    );
+
+    let full_weights = build_mq2l_expert_weights(m, groups_per_row);
+    let weights_a = slice_mq2l_groups(&full_weights, m, groups_per_row, 0..half_groups);
+    let weights_b = slice_mq2l_groups(
+        &full_weights,
+        m,
+        groups_per_row,
+        half_groups..groups_per_row,
+    );
+
+    let rot_x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 17) as f32 - 8.0) * 0.03)
+        .collect();
+    let rot_x_a = rot_x[..half_k].to_vec();
+    let rot_x_b = rot_x[half_k..].to_vec();
+
+    let full_i64 = run_down_i64_mq2l_expanded(&mut gpu, &full_weights, &rot_x, m, k);
+    eprintln!("Full  expanded i64: {:?}", full_i64);
+
+    let half_a_i64 = run_down_i64_mq2l_expanded(&mut gpu, &weights_a, &rot_x_a, m, half_k);
+    eprintln!("HalfA expanded i64: {:?}", half_a_i64);
+
+    let half_b_i64 = run_down_i64_mq2l_expanded(&mut gpu, &weights_b, &rot_x_b, m, half_k);
+    eprintln!("HalfB expanded i64: {:?}", half_b_i64);
+
+    let mut all_pass = true;
+    for row in 0..m {
+        let sum = half_a_i64[row].wrapping_add(half_b_i64[row]);
+        eprintln!(
+            "row {row}: full={full_i64_v}  a+b={sum}  match={}",
+            full_i64[row] == sum,
+            full_i64_v = full_i64[row],
+        );
+        if full_i64[row] != sum {
+            eprintln!(
+                "  FAIL row {row}: expanded full_i64={} != half_a+half_b={}",
+                full_i64[row], sum
+            );
+            all_pass = false;
+        }
+    }
+
+    assert!(
+        all_pass,
+        "FAIL: MQ2L expanded int64 outputs are NOT bit-exact under K-split"
+    );
+    eprintln!(
+        "\nPASS: MQ2L expanded full_i64[row] == half_a + half_b for all {m} rows (bit-exact)"
+    );
 }

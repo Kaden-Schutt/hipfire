@@ -3566,6 +3566,18 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
 
+/// Same source as the MQ2L FP residual kernel — the int64 reproducible variant
+/// (`gemv_mq2g256_lloyd_moe_down_residual_i64_k8_indexed`) lives in the same
+/// .hip file. `moe_i64_residual_to_f32` is shared with MQ3L (same .hip).
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_REPRO_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
+
+/// Same source as the MQ2L batched_k4 FP kernel — the int64 reproducible
+/// batched variant (`gemv_mq2g256_lloyd_moe_down_residual_i64_k8_indexed_batched_k4`)
+/// lives in the same .hip file.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_REPRO_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k4.hip");
+
 /// MQ3-Lloyd MoE indexed family (MiniMax-M2, arch_id=10): routed-experts
 /// gate_up + down with device-side topk routing + per-expert pointer table.
 /// Mirrors the MQ2-Lloyd MoE indexed kernels (3-bit + 8-entry codebook,
@@ -4029,6 +4041,12 @@ pub const GEMM_F32_REGISTER_TILED_SRC: &str =
 /// rejection (~38% accept). Deterministic path is bit-reproducible →
 /// matches memory-cited 84% accept on K=3.
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.hip");
+
+/// Same source as the MQ2L expanded_k4 FP kernel — the int64 reproducible
+/// expanded variant (`gemv_mq2g256_lloyd_moe_down_expanded_i64_k4`) lives in
+/// the same .hip file.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_REPRO_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.hip");
 
 /// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
