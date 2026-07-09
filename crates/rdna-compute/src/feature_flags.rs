@@ -108,6 +108,13 @@ pub struct FeatureFlags {
     /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
     /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
     pub force_unfused: bool,
+
+    // ── Attention decode micro-levers ─────────────────────────────
+    /// Split-K 2-wave-concurrent flash reduce (HIPFIRE_SPLITK_2WAVE).
+    /// None = OFF (baseline single-wave [32] reduce). Some(true) selects the
+    /// value-preserving 2-wave [64] `attention_flash_q8_0_reduce_2wave` kernel
+    /// (bit-identical output; each head_dim half runs on its own wave).
+    pub splitk_2wave: Option<bool>,
 }
 
 impl FeatureFlags {
@@ -270,6 +277,9 @@ impl FeatureFlags {
             force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+
+            // Attention decode micro-levers
+            splitk_2wave: parse_bool("HIPFIRE_SPLITK_2WAVE"),
         }
     }
 
@@ -405,6 +415,7 @@ impl FeatureFlags {
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
             force_unfused: false,
+            splitk_2wave: None,
         }
     }
 }
@@ -417,5 +428,13 @@ mod tests {
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::from_env_for_test("gfx1151");
         assert!(!f.force_unfused);
+    }
+
+    #[test]
+    fn splitk_2wave_defaults_off_in_test_ctor() {
+        // Default OFF (None) → dispatch selects the single-wave baseline reduce,
+        // byte-identical to the pre-lever path.
+        let f = FeatureFlags::from_env_for_test("gfx1201");
+        assert_eq!(f.splitk_2wave, None);
     }
 }
