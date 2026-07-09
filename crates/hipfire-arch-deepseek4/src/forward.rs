@@ -9755,6 +9755,348 @@ pub fn forward_prefill_batch_chunked(
     Err("forward_prefill_batch_chunked: chunk loop completed without producing logits".to_string())
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  TP-of-experts batched prefill (Task 2)
+//  Per-rank replicated attention + shared expert; batched TP MoE down.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Single-chunk batched TP prefill forward for DeepSeek V4.
+///
+/// Mirrors `forward_prefill_batch_chunk` but drives attention and HC
+/// stages **per rank** (replicated, bit-identical), replacing the single
+/// `ffn_batched` call with `ds4_prefill_moe_step_tp` (multi-rank, called
+/// once per layer). `hc_ffn_mix_batched` is then called per rank, exactly
+/// as the single-GPU loop does after `ffn_batched`.
+///
+/// DSpark capture is SKIPPED (DSpark is off for TP prefill paths).
+///
+/// `state_per_rank` is needed for KV cache writes during the per-layer
+/// attention block — mirrors `forward_prefill_batch_chunk`'s `state` arg.
+///
+/// The caller builds the `mesh` (a pure Tp axis of `n_ranks` ranks) once
+/// before the chunk loop and passes it here.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn forward_prefill_batch_chunk_tp(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    pbs_per_rank: &mut [PrefillBatchScratch],
+    partials_per_rank: &[GpuTensor],
+    partials_i64_per_rank: &[GpuTensor],
+    mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
+    tokens: &[u32],
+    start_pos: u32,
+) -> Result<(), String> {
+    let n_ranks = gpus.devices.len();
+    let n = tokens.len();
+
+    if n == 0 {
+        return Err("forward_prefill_batch_chunk_tp: empty tokens".to_string());
+    }
+    if n > pbs_per_rank[0].max_batch {
+        return Err(format!(
+            "forward_prefill_batch_chunk_tp: chunk size {n} > max_batch {}",
+            pbs_per_rank[0].max_batch
+        ));
+    }
+
+    // ── Preamble: per-rank token/pos/n_valid uploads + embedding + HC init ──
+    //
+    // These are deterministic functions of the tokens slice → bit-identical
+    // across ranks, but each rank stages into its own pbs buffers on its
+    // own device.
+    for r in 0..n_ranks {
+        let gpu = &mut gpus.devices[r];
+        gpu.bind_thread()
+            .map_err(|e| format!("prefill_chunk_tp r{r} bind preamble: {e:?}"))?;
+
+        // Ensure an active stream so H2D uploads go async.
+        if gpu.active_stream.is_none() {
+            let s = gpu
+                .hip
+                .stream_create()
+                .map_err(|e| format!("prefill_chunk_tp r{r} stream_create: {e:?}"))?;
+            gpu.active_stream = Some(s);
+        }
+
+        let pbs = &pbs_per_rank[r];
+
+        // 1. Upload token ids.
+        let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let token_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(token_ids_host.as_ptr() as *const u8, n * 4) };
+        gpu.memcpy_htod_auto(&pbs.tokens.buf, token_bytes)
+            .map_err(|e| format!("prefill_chunk_tp r{r} htod tokens: {e:?}"))?;
+
+        // 2. Upload absolute positions.
+        let positions_host: Vec<i32> = (0..n).map(|i| (start_pos as i32) + i as i32).collect();
+        let positions_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
+        gpu.memcpy_htod_auto(&pbs.positions.buf, positions_bytes)
+            .map_err(|e| format!("prefill_chunk_tp r{r} htod positions: {e:?}"))?;
+
+        // 3. Upload n_valid_swa_arr (chunk-level; same value for all layers).
+        let win = cfg.sliding_window;
+        let n_valid_host: Vec<i32> = (0..n)
+            .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
+            .collect();
+        let n_valid_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, n * 4) };
+        gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
+            .map_err(|e| format!("prefill_chunk_tp r{r} htod n_valid_swa_arr: {e:?}"))?;
+
+        // 4. Batched embedding lookup → pbs.embed_batch [n, hidden].
+        let token_embd = weights_per_rank[r]
+            .token_embd
+            .as_ref()
+            .ok_or_else(|| format!("prefill_chunk_tp r{r}: token_embd not uploaded"))?;
+        gpu.embedding_lookup_q8_batched(
+            token_embd,
+            &pbs.embed_batch,
+            &pbs.tokens,
+            n,
+            cfg.hidden_size,
+        )
+        .map_err(|e| format!("prefill_chunk_tp r{r} embedding_lookup_q8_batched: {e:?}"))?;
+
+        // 5. Broadcast embed → HC residual streams [n, hc_mult, hidden].
+        gpu.hc_streams_init_from_embed_batched(
+            &pbs.embed_batch,
+            &pbs.streams_batch,
+            cfg.hidden_size as i32,
+            cfg.hc_mult as i32,
+            n as i32,
+        )
+        .map_err(|e| format!("prefill_chunk_tp r{r} hc_streams_init_from_embed_batched: {e:?}"))?;
+    }
+
+    // ── Per-layer loop ──────────────────────────────────────────────────────
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let hash_routing = layer_idx < cfg.num_hash_layers;
+
+        // Replicated stages per rank: attn-side HC pre → q_lora → kv_joint
+        // → tail RoPE → attention block → HC attn mix → FFN-side HC pre.
+        // Each rank binds its device before issuing kernels.
+        for r in 0..n_ranks {
+            gpus.devices[r]
+                .bind_thread()
+                .map_err(|e| format!("prefill_chunk_tp r{r} L{layer_idx} bind: {e:?}"))?;
+
+            // Attn-side HC pre, Q-LoRA, KV projection, tail RoPE.
+            {
+                let gpu = &mut gpus.devices[r];
+                let pbs = &pbs_per_rank[r];
+                let layer = weights_per_rank[r].resolve_layer(layer_idx);
+
+                mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, /*is_attn=*/ true, n)?;
+                // q_lora_batched consumes hc_x_in_batch; shallow_clone gives a
+                // borrowed view without copying device memory.
+                let hc_x_in = pbs.hc_x_in_batch.shallow_clone();
+                q_lora_batched(cfg, layer, pbs, &hc_x_in, gpu, layer_idx, n)?;
+                kv_joint_batched(cfg, layer, pbs, gpu, layer_idx, n)?;
+                apply_tail_rope_batched(cfg, layer, pbs, gpu, layer_idx, n)?;
+            }
+
+            // Attention block: pure-SWA or mixed, needs mutable state for
+            // KV cache writes (the SWA ring at `state._swa` / indexer
+            // `state._indexer` slots per layer).
+            {
+                let gpu = &mut gpus.devices[r];
+                let pbs = &pbs_per_rank[r];
+                let state = &mut state_per_rank[r];
+                let compress_ratio = weights_per_rank[r].resolve_layer(layer_idx).compress_ratio;
+                if compress_ratio == 0 {
+                    attention_block_batched_swa_only(
+                        cfg,
+                        &weights_per_rank[r],
+                        state,
+                        pbs,
+                        gpu,
+                        layer_idx,
+                        start_pos,
+                        n,
+                    )?;
+                } else {
+                    attention_block_batched_mixed(
+                        cfg,
+                        &weights_per_rank[r],
+                        state,
+                        pbs,
+                        gpu,
+                        layer_idx,
+                        start_pos,
+                        n,
+                    )?;
+                }
+            }
+
+            // HC attn mix + FFN-side HC pre.
+            {
+                let gpu = &mut gpus.devices[r];
+                let pbs = &pbs_per_rank[r];
+                let layer = weights_per_rank[r].resolve_layer(layer_idx);
+
+                hc_attn_mix_batched(cfg, pbs, gpu, n)?;
+                mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, /*is_attn=*/ false, n)?;
+            }
+        }
+
+        // TP MoE step: per-rank replicated routing + shared expert + gate‖up
+        // + activation, then batched i64 down + AllReduceI64Tp +
+        // ConvertI64ToF32 + fold routed partial into ffn_out_batch.
+        // Called ONCE across all ranks (multi-rank function).
+        ds4_prefill_moe_step_tp(
+            gpus,
+            weights_per_rank,
+            cfg,
+            pbs_per_rank,
+            partials_i64_per_rank,
+            partials_per_rank,
+            mesh,
+            layer_idx,
+            hash_routing,
+            n,
+            tokens,
+        )
+        .map_err(|e| format!("prefill_chunk_tp L{layer_idx} moe_step_tp: {e}"))?;
+
+        // hc_ffn_mix per rank (mirrors single-GPU loop after ffn_batched).
+        for r in 0..n_ranks {
+            gpus.devices[r]
+                .bind_thread()
+                .map_err(|e| format!("prefill_chunk_tp r{r} L{layer_idx} ffn_mix bind: {e:?}"))?;
+            hc_ffn_mix_batched(cfg, &pbs_per_rank[r], &mut gpus.devices[r], n)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Top-level TP batched-prefill driver for DeepSeek V4.
+///
+/// Chunks `tokens` into `min(remaining, pbs.max_batch)` slices and
+/// calls `forward_prefill_batch_chunk_tp` per chunk. After the LAST
+/// chunk, runs `final_norm_and_head_last_batched` on rank 0 and
+/// downloads rank-0 logits. Updates `state_per_rank[r].n_tokens` per
+/// rank (mirrors single-GPU KV bookkeeping).
+///
+/// The Tp mesh is built once (pure `DimKind::Tp` axis of `n_ranks`
+/// ranks) and reused across chunks.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn forward_prefill_batch_tp(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    pbs_per_rank: &mut [PrefillBatchScratch],
+    partials_per_rank: &[GpuTensor],
+    partials_i64_per_rank: &[GpuTensor],
+    tokens: &[u32],
+    start_pos: u32,
+) -> Result<Vec<f32>, String> {
+    use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind};
+
+    if tokens.is_empty() {
+        return Err("forward_prefill_batch_tp: empty tokens".to_string());
+    }
+
+    let n_ranks = gpus.devices.len();
+    assert_eq!(
+        weights_per_rank.len(),
+        n_ranks,
+        "forward_prefill_batch_tp: weights_per_rank len"
+    );
+    assert_eq!(
+        state_per_rank.len(),
+        n_ranks,
+        "forward_prefill_batch_tp: state_per_rank len"
+    );
+    assert_eq!(
+        pbs_per_rank.len(),
+        n_ranks,
+        "forward_prefill_batch_tp: pbs_per_rank len"
+    );
+    assert_eq!(
+        partials_per_rank.len(),
+        n_ranks,
+        "forward_prefill_batch_tp: partials_per_rank len"
+    );
+    assert_eq!(
+        partials_i64_per_rank.len(),
+        n_ranks,
+        "forward_prefill_batch_tp: partials_i64_per_rank len"
+    );
+
+    // Build Tp mesh once — pure Tp axis of n_ranks ranks. Reused across chunks.
+    let tp_mesh = DeviceMesh::rect(&[(DimKind::Tp, n_ranks)]);
+
+    let max_batch = pbs_per_rank[0].max_batch;
+    let mut pos_cursor = start_pos as usize;
+    let mut remaining = tokens;
+    let mut last_logits: Vec<f32> = Vec::new();
+
+    while !remaining.is_empty() {
+        let take = remaining.len().min(max_batch);
+        let chunk = &remaining[..take];
+        let is_last_chunk = take == remaining.len();
+
+        forward_prefill_batch_chunk_tp(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            pbs_per_rank,
+            partials_per_rank,
+            partials_i64_per_rank,
+            &tp_mesh,
+            chunk,
+            pos_cursor as u32,
+        )?;
+
+        // After the last chunk: run final norm + head on rank 0 and return
+        // the last-position logits (the next-token prediction).
+        if is_last_chunk {
+            gpus.devices[0]
+                .bind_thread()
+                .map_err(|e| format!("prefill_tp final_head bind r0: {e:?}"))?;
+            last_logits = final_norm_and_head_last_batched(
+                cfg,
+                &weights_per_rank[0],
+                &mut state_per_rank[0],
+                &pbs_per_rank[0],
+                &mut gpus.devices[0],
+                take,
+            )?;
+        }
+
+        pos_cursor += take;
+        remaining = &remaining[take..];
+    }
+
+    if last_logits.is_empty() {
+        return Err(
+            "forward_prefill_batch_tp: chunk loop completed without producing logits".to_string(),
+        );
+    }
+
+    // Sync every rank and update n_tokens bookkeeping (mirrors forward_ep /
+    // forward_tp decode where each rank advances its token counter).
+    let n_total = tokens.len();
+    for r in 0..n_ranks {
+        gpus.devices[r]
+            .bind_thread()
+            .map_err(|e| format!("prefill_tp sync bind r{r}: {e:?}"))?;
+        gpus.devices[r]
+            .hip
+            .device_synchronize()
+            .map_err(|e| format!("prefill_tp sync r{r}: {e:?}"))?;
+        state_per_rank[r].n_tokens += n_total as u64;
+    }
+
+    Ok(last_logits)
+}
+
 /// Manual-chunk prefill with per-position MTP fill interleaved.
 ///
 /// Mirrors the deepseek4_mtp_smoke "batched main + per-position MTP" path.
