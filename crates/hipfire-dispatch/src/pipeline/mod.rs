@@ -272,6 +272,31 @@ pub fn run_moe_decode(
     // (single-GPU, byte-identical).
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_residual);
 
+    // ── Shared-expert fold (HIPFIRE_FOLD_SHARED_EXPERT) ──────────────────────
+    // Decode micro-lever: instead of the shared-expert down running a separate
+    // sigmoid-scaled RESIDUAL GEMV into `out_target` (one RMW of the output)
+    // and the routed combine running a second RMW of the same output, write the
+    // (already sigmoid-scaled) shared-expert down into a scratch buffer and let
+    // the routed combine fold it into `out_target` — one output RMW instead of
+    // two. Byte-identical (the shared term is added into the residual before the
+    // routed sum, matching the baseline launch order).
+    //
+    // Narrowly gated to the single-GPU, MQ4 shared-down, GPU-top-K path that
+    // actually runs the shared MQ4 down + the standard combine. Every other
+    // path (EP partials, Lloyd self-combining down, non-MQ4 shared-down, CPU
+    // fallback) falls through to the untouched baseline.
+    let routed_down_self_combines_early = p.expert_dtype_tags.is_none()
+        && matches!(
+            p.dtypes.routed_down,
+            DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+        );
+    let fold_shared = ctx.flags.fold_shared_expert_enabled()
+        && res.use_gpu_topk
+        && !p.skip_shared
+        && p.routed_out.is_none()
+        && p.shared_down_w.dtype == DType::MQ4G256
+        && !routed_down_self_combines_early;
+
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
         if !res.routed_indexable_paro {
@@ -466,14 +491,30 @@ pub fn run_moe_decode(
             } else {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
-            hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-                &p.shared_down_w.buf,
-                &x_rot_alias,
-                out_target,
-                p.scalar_buf,
-                p.shared_down_w.m,
-                p.shared_down_w.k,
-            ))?;
+            if fold_shared {
+                // FOLD: write the sigmoid-scaled shared-expert down into the
+                // `ffn_out` scratch row (unused on this GPU-top-K MQ4 path) —
+                // the routed combine below folds it into `out_target`. Same
+                // reduction as the residual variant, so the emitted value is
+                // bit-identical to the term the baseline would accumulate.
+                hip!(gpu.gemv_hfq4g256_sigmoid_scaled_write_gpu(
+                    &p.shared_down_w.buf,
+                    &x_rot_alias,
+                    p.ffn_out,
+                    p.scalar_buf,
+                    p.shared_down_w.m,
+                    p.shared_down_w.k,
+                ))?;
+            } else {
+                hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
+                    &p.shared_down_w.buf,
+                    &x_rot_alias,
+                    out_target,
+                    p.scalar_buf,
+                    p.shared_down_w.m,
+                    p.shared_down_w.k,
+                ))?;
+            }
         } else {
             // Non-MQ4 shared expert down: only reached when A3B shared expert
             // uses a non-MQ4 dtype. Requires deltanet feature for sigmoid_f32.
@@ -821,14 +862,31 @@ pub fn run_moe_decode(
             DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
         );
     if !routed_down_self_combines {
-        hip!(gpu.moe_down_combine_k8_batched(
-            p.down_expanded,
-            p.topk_weights,
-            out_target,
-            down_m,
-            p.k,
-            1
-        ))?;
+        if fold_shared {
+            // FOLD: combine the routed K_TOP slots AND the sigmoid-scaled
+            // shared-expert down (`ffn_out`, written above) into `out_target`
+            // in a single residual RMW. Shared term added before the routed sum
+            // → byte-identical to the baseline (separate shared residual GEMV
+            // then routed combine).
+            hip!(gpu.moe_down_combine_k8_shared_batched(
+                p.down_expanded,
+                p.topk_weights,
+                p.ffn_out,
+                out_target,
+                down_m,
+                p.k,
+                1
+            ))?;
+        } else {
+            hip!(gpu.moe_down_combine_k8_batched(
+                p.down_expanded,
+                p.topk_weights,
+                out_target,
+                down_m,
+                p.k,
+                1
+            ))?;
+        }
     }
 
     Ok(())

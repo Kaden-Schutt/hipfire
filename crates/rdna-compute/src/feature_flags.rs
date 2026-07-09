@@ -122,6 +122,16 @@ pub struct FeatureFlags {
     /// (default): two separate `rmsnorm_batched` launches, byte-identical to
     /// the loop/gfx1201 baseline. Value-preserving perf lever only.
     pub fuse_attn_preamble: Option<bool>,
+
+    // ── Decode micro-lever: shared-expert fold ─────────────────────
+    /// Fold the always-active MoE shared-expert down projection into the
+    /// routed-expert combine (one residual RMW of the output instead of a
+    /// separate shared-expert residual GEMV + the routed combine). Env:
+    /// HIPFIRE_FOLD_SHARED_EXPERT. `None` (default) = OFF, byte-identical to
+    /// the baseline separate-shared-GEMV path. Only the MQ4 shared-down +
+    /// GPU-top-K single-GPU A3B decode path is folded; every other path
+    /// (EP, Lloyd self-combine, non-MQ4 shared-down) falls back to baseline.
+    pub fold_shared_expert: Option<bool>,
 }
 
 impl FeatureFlags {
@@ -138,6 +148,21 @@ impl FeatureFlags {
 
         let parse_usize =
             |name: &str| -> Option<usize> { std::env::var(name).ok().and_then(|s| s.parse().ok()) };
+
+        // ── Decode micro-lever master switch ───────────────────────────
+        // HIPFIRE_MICROLEVERS_ALL=1 force-enables every decode micro-lever
+        // (attn-preamble fuse, VGPR dealloc, shared-expert fold, splitk-2wave)
+        // regardless of the individual per-lever env var. Individual flags
+        // still enable their own lever when the master is unset. Each lever
+        // flag therefore resolves to `individual == true OR master == true`.
+        let microlevers_all = parse_bool("HIPFIRE_MICROLEVERS_ALL").unwrap_or(false);
+        let lever_flag = |name: &str| -> Option<bool> {
+            if microlevers_all {
+                Some(true)
+            } else {
+                parse_bool(name)
+            }
+        };
 
         let parse_mb4 = |name: &str| -> Option<Mb4Mode> {
             match std::env::var(name).ok().as_deref() {
@@ -173,7 +198,7 @@ impl FeatureFlags {
                 }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
-            vgpr_dealloc: parse_bool("HIPFIRE_VGPR_DEALLOC"),
+            vgpr_dealloc: lever_flag("HIPFIRE_VGPR_DEALLOC"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -287,7 +312,10 @@ impl FeatureFlags {
                 .unwrap_or(false),
 
             // Attention preamble fusion (decode micro-lever)
-            fuse_attn_preamble: parse_bool("HIPFIRE_FUSE_ATTN_PREAMBLE"),
+            fuse_attn_preamble: lever_flag("HIPFIRE_FUSE_ATTN_PREAMBLE"),
+
+            // Decode micro-lever: shared-expert fold
+            fold_shared_expert: lever_flag("HIPFIRE_FOLD_SHARED_EXPERT"),
         }
     }
 
@@ -430,7 +458,14 @@ impl FeatureFlags {
             hipcc_extra_flags: String::new(),
             force_unfused: false,
             fuse_attn_preamble: None,
+            fold_shared_expert: None,
         }
+    }
+
+    /// HIPFIRE_FOLD_SHARED_EXPERT resolved to a bool. Default OFF (byte-identical
+    /// to the baseline separate-shared-GEMV MoE decode path).
+    pub fn fold_shared_expert_enabled(&self) -> bool {
+        self.fold_shared_expert.unwrap_or(false)
     }
 }
 
