@@ -2748,6 +2748,14 @@ pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
 pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce.hip");
 
+/// Split-K 2-wave-concurrent variant of the flash reduce (HIPFIRE_SPLITK_2WAVE).
+/// Value-preserving: bit-identical output to ATTENTION_FLASH_Q8_0_REDUCE_SRC.
+/// Launches a 64-thread (two-WAVE32) block and maps each head_dim half to one
+/// wave (wave0→half0, wave1→half1) instead of iterating both halves serially on
+/// one wave. Selected at dispatch; default path stays on the single-wave kernel.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_2WAVE_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_2wave.hip");
+
 /// Turbo common header: shared definitions for turbo/givens kernels.
 pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common.h");
 

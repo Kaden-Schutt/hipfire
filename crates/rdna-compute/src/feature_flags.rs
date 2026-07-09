@@ -132,6 +132,13 @@ pub struct FeatureFlags {
     /// GPU-top-K single-GPU A3B decode path is folded; every other path
     /// (EP, Lloyd self-combine, non-MQ4 shared-down) falls back to baseline.
     pub fold_shared_expert: Option<bool>,
+
+    // ── Attention decode micro-levers ─────────────────────────────
+    /// Split-K 2-wave-concurrent flash reduce (HIPFIRE_SPLITK_2WAVE).
+    /// None = OFF (baseline single-wave [32] reduce). Some(true) selects the
+    /// value-preserving 2-wave [64] `attention_flash_q8_0_reduce_2wave` kernel
+    /// (bit-identical output; each head_dim half runs on its own wave).
+    pub splitk_2wave: Option<bool>,
 }
 
 impl FeatureFlags {
@@ -316,6 +323,9 @@ impl FeatureFlags {
 
             // Decode micro-lever: shared-expert fold
             fold_shared_expert: lever_flag("HIPFIRE_FOLD_SHARED_EXPERT"),
+
+            // Attention decode micro-levers
+            splitk_2wave: lever_flag("HIPFIRE_SPLITK_2WAVE"),
         }
     }
 
@@ -459,6 +469,7 @@ impl FeatureFlags {
             force_unfused: false,
             fuse_attn_preamble: None,
             fold_shared_expert: None,
+            splitk_2wave: None,
         }
     }
 
@@ -477,5 +488,13 @@ mod tests {
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::from_env_for_test("gfx1151");
         assert!(!f.force_unfused);
+    }
+
+    #[test]
+    fn splitk_2wave_defaults_off_in_test_ctor() {
+        // Default OFF (None) → dispatch selects the single-wave baseline reduce,
+        // byte-identical to the pre-lever path.
+        let f = FeatureFlags::from_env_for_test("gfx1201");
+        assert_eq!(f.splitk_2wave, None);
     }
 }

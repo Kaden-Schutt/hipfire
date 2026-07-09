@@ -33,6 +33,34 @@ fn wmma_fa_min_batch() -> usize {
 }
 
 impl Gpu {
+    /// Ensure the Q8_0 flash reduce kernel is loaded and return
+    /// `(func_name, block_dim_x)` for the launch.
+    ///
+    /// Default (HIPFIRE_SPLITK_2WAVE unset/off): the single-wave baseline
+    /// `attention_flash_q8_0_reduce` at block [32,1,1] — byte-identical to the
+    /// pre-lever dispatch. When the flag is on, selects the value-preserving
+    /// 2-wave-concurrent `attention_flash_q8_0_reduce_2wave` at block [64,1,1]
+    /// (bit-identical output; each head_dim half runs on its own wave). Both
+    /// kernels take the identical 7-argument signature and grid [n_heads,1,1],
+    /// so callers only vary the func name and block-x this returns.
+    fn ensure_q8_reduce_kernel(&mut self) -> HipResult<(&'static str, u32)> {
+        if self.flags.splitk_2wave == Some(true) {
+            self.ensure_kernel(
+                "attention_flash_q8_0_reduce_2wave",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_2WAVE_SRC,
+                "attention_flash_q8_0_reduce_2wave",
+            )?;
+            Ok(("attention_flash_q8_0_reduce_2wave", 64))
+        } else {
+            self.ensure_kernel(
+                "attention_flash_q8_0_reduce",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                "attention_flash_q8_0_reduce",
+            )?;
+            Ok(("attention_flash_q8_0_reduce", 32))
+        }
+    }
+
     /// accs_count: [n_layers * n_heads * n_bands] u64 sample counters.
     /// All accs_* buffers persist across calls; the kernel ADDS into them.
     ///
@@ -1845,11 +1873,7 @@ impl Gpu {
         }
 
         // ── Reduce kernel (reads seq_len from pos_buf, computes n_tiles) ──
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
+        let (rname, rblk) = self.ensure_q8_reduce_kernel()?;
         {
             let p_ptr = partials.buf.as_ptr();
             let o_ptr = out.buf.as_ptr();
@@ -1868,9 +1892,9 @@ impl Gpu {
                 &mt as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "attention_flash_q8_0_reduce",
+                rname,
                 [n_heads as u32, 1, 1],
-                [32, 1, 1],
+                [rblk, 1, 1],
                 0,
                 &mut params,
                 || {
@@ -3972,12 +3996,8 @@ impl Gpu {
                 )?;
             }
         } else {
-            self.ensure_kernel(
-                "attention_flash_q8_0_reduce",
-                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                "attention_flash_q8_0_reduce",
-            )?;
-            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let (rname, rblk) = self.ensure_q8_reduce_kernel()?;
+            let func = &self.functions[rname];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
             let mut nh = n_heads as i32;
@@ -3998,7 +4018,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
+                    [rblk, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -4084,13 +4104,9 @@ impl Gpu {
             }
         }
 
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
+        let (rname, rblk) = self.ensure_q8_reduce_kernel()?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let func = &self.functions[rname];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
             let mut nh = n_heads as i32;
@@ -4111,7 +4127,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
+                    [rblk, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -4315,13 +4331,9 @@ impl Gpu {
         }
 
         // Reuse Q8_0 flash reduce (output already in normal space).
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
+        let (rname, rblk) = self.ensure_q8_reduce_kernel()?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let func = &self.functions[rname];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
             let mut nh = n_heads as i32;
@@ -4342,7 +4354,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
+                    [rblk, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -4471,12 +4483,8 @@ impl Gpu {
                 )?;
             }
         } else {
-            self.ensure_kernel(
-                "attention_flash_q8_0_reduce",
-                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                "attention_flash_q8_0_reduce",
-            )?;
-            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let (rname, rblk) = self.ensure_q8_reduce_kernel()?;
+            let func = &self.functions[rname];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
             let mut nh = n_heads as i32;
@@ -4497,7 +4505,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
+                    [rblk, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -4626,12 +4634,8 @@ impl Gpu {
                 )?;
             }
         } else {
-            self.ensure_kernel(
-                "attention_flash_q8_0_reduce",
-                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                "attention_flash_q8_0_reduce",
-            )?;
-            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let (rname, rblk) = self.ensure_q8_reduce_kernel()?;
+            let func = &self.functions[rname];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
             let mut nh = n_heads as i32;
@@ -4652,7 +4656,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
+                    [rblk, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
@@ -4738,13 +4742,9 @@ impl Gpu {
             }
         }
 
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
+        let (rname, rblk) = self.ensure_q8_reduce_kernel()?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let func = &self.functions[rname];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
             let mut nh = n_heads as i32;
@@ -4765,7 +4765,7 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
+                    [rblk, 1, 1],
                     0,
                     self.stream_ref(),
                     &mut params,
