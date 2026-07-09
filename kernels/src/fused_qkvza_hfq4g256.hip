@@ -93,7 +93,11 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
         // soft-prefetch next quad weights (+272B = 2 groups) while this
         // quad's DOG runs. Hint only — identical load/FMA stream.
         if (q + 1 < quads) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+            // s_prefetch_data needs target feature gfx12-insts — arch-gate it so this SHARED
+            // kernel still compiles on gfx11/gfx10 (RDNA1-3). Hint only; skipped elsewhere.
             __builtin_amdgcn_s_prefetch_data((const void*)(gp0 + 272), 0);
+#endif
         }
 
         float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
