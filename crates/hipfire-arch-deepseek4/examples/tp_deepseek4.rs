@@ -19,12 +19,26 @@
 //! With `--mtp`, also drafts the next-next token under TP via `mtp_forward_tp`
 //! and reports the MTP-EP accept (draft vs true gen[1]) for both tp counts.
 //!
+//! With `--prefill-batch`, runs the batched TP prefill path
+//! (`forward_prefill_batch_tp`) instead of the per-token `forward_tp` prefill
+//! loop and asserts three-way bit-exact parity:
+//!   (a) tp=1-batched == tp=2-batched (argmax-exact + logit max|Δ| == 0).
+//!   (b) tp=1-batched prefill-final logits == tp=2-batched (max|Δ| == 0).
+//!   (c) tp=1 per-token prefill logits == tp=1-batched prefill logits (max|Δ| == 0).
+//!
 //! Run (emulated Tp-2 on one gfx1151, --no-dspark forced):
 //!   HIPFIRE_DETERMINISTIC=1 HIPFIRE_EMULATE_GPUS=2 HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 \
 //!   cargo run --release -p hipfire-arch-deepseek4 --example tp_deepseek4 -- \
 //!     --model ~/.hipfire/models/deepseek-v4-flash.mq2lloyd --max 32
+//!
+//! Run batched-prefill parity:
+//!   HIPFIRE_DETERMINISTIC=1 HIPFIRE_EMULATE_GPUS=2 HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 \
+//!   cargo run --release -p hipfire-arch-deepseek4 --example tp_deepseek4 -- \
+//!     --model ~/.hipfire/models/deepseek-v4-flash.mq2lloyd \
+//!     --prefill-batch --prefill-len 300 --max 16 --no-dspark
 
 use hipfire_arch_deepseek4::forward;
+use hipfire_arch_deepseek4::forward::PrefillBatchScratch;
 use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -56,10 +70,12 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 /// One end-to-end run at the given `tp`. Returns (generated tokens, per-step
-/// logits [BEFORE each token], optional MTP draft of the next-next token).
+/// logits [BEFORE each token], optional MTP draft of the next-next token,
+/// optional prefill-final logits when `prefill_batch=true`).
 /// Loads column/row-sliced experts, prefills + greedily decodes via
-/// `forward_tp`, then frees all GPU memory (so the same physical device can
-/// hold the next run under `HIPFIRE_EMULATE_GPUS`).
+/// `forward_tp` (or `forward_prefill_batch_tp` when `prefill_batch=true`),
+/// then frees all GPU memory (so the same physical device can hold the next
+/// run under `HIPFIRE_EMULATE_GPUS`).
 #[allow(clippy::too_many_arguments)]
 fn run_tp_n(
     model: &PathBuf,
@@ -69,10 +85,14 @@ fn run_tp_n(
     do_mtp: bool,
     eos_tok: u32,
     tp: usize,
-) -> (Vec<u32>, Vec<Vec<f32>>, Option<u32>) {
+    prefill_batch: bool,
+) -> (Vec<u32>, Vec<Vec<f32>>, Option<u32>, Option<Vec<f32>>) {
     let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
     let n = gpus.devices.len();
-    assert_eq!(n, tp, "init_tp gave {n} devices (check HIPFIRE_EMULATE_GPUS)");
+    assert_eq!(
+        n, tp,
+        "init_tp gave {n} devices (check HIPFIRE_EMULATE_GPUS)"
+    );
     gpus.ensure_rank_streams().expect("ensure_rank_streams");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 
@@ -110,25 +130,100 @@ fn run_tp_n(
         );
     }
 
-    // Prefill.
-    for (pos, &t) in prompt_ids.iter().enumerate() {
-        forward::forward_tp(
+    // Prefill — either batched TP path or per-token path.
+    let prefill_final_logits: Option<Vec<f32>>;
+
+    if prefill_batch {
+        // Batched TP prefill: allocate PrefillBatchScratch + per-rank partial
+        // buffers sized to max_batch, then call forward_prefill_batch_tp.
+        let max_batch = hipfire_runtime::llama::PREFILL_MAX_BATCH.min(prompt_ids.len());
+
+        let mut pbs_per_rank: Vec<PrefillBatchScratch> = Vec::with_capacity(n);
+        let mut pb_partials: Vec<GpuTensor> = Vec::with_capacity(n);
+        let mut pb_partials_i64: Vec<GpuTensor> = Vec::with_capacity(n);
+
+        for r in 0..n {
+            gpus.devices[r].bind_thread().expect("bind pbs");
+            pbs_per_rank.push(
+                PrefillBatchScratch::new(&mut gpus.devices[r], cfg, max_batch)
+                    .expect("PrefillBatchScratch::new"),
+            );
+            pb_partials.push(
+                gpus.devices[r]
+                    .zeros(&[max_batch * cfg.hidden_size], DType::F32)
+                    .expect("pb_partials"),
+            );
+            // int64 partial: max_batch * hidden * 8 bytes (DType::Raw).
+            pb_partials_i64.push(
+                gpus.devices[r]
+                    .zeros(&[max_batch * cfg.hidden_size * 8], DType::Raw)
+                    .expect("pb_partials_i64"),
+            );
+        }
+
+        let logits = forward::forward_prefill_batch_tp(
             &mut gpus,
             &weights_per_rank,
             cfg,
             &mut state_per_rank,
-            &partials,
-            &partials_i64,
-            t,
-            pos as u32,
+            &mut pbs_per_rank,
+            &pb_partials_i64,
+            &pb_partials,
+            prompt_ids,
+            0,
         )
-        .expect("forward_tp prefill");
+        .expect("forward_prefill_batch_tp");
+
+        prefill_final_logits = Some(logits);
+
+        // Free the batched-prefill scratch buffers (they are not used in decode).
+        for r in (0..n).rev() {
+            gpus.devices[r].bind_thread().expect("bind pbs free");
+            gpus.devices[r].free_tensor(pb_partials.pop().unwrap()).ok();
+            gpus.devices[r]
+                .free_tensor(pb_partials_i64.pop().unwrap())
+                .ok();
+            // PrefillBatchScratch does not expose a free method; let it drop here.
+        }
+    } else {
+        // Per-token prefill (original path).
+        for (pos, &t) in prompt_ids.iter().enumerate() {
+            forward::forward_tp(
+                &mut gpus,
+                &weights_per_rank,
+                cfg,
+                &mut state_per_rank,
+                &partials,
+                &partials_i64,
+                t,
+                pos as u32,
+            )
+            .expect("forward_tp prefill");
+        }
+        prefill_final_logits = None;
     }
+
     gpus.devices[0].bind_thread().expect("bind0");
     let mut logits = {
         let l = state_per_rank[0].logits.as_ref().expect("logits");
         gpus.devices[0].download_f32(l).expect("dl")
     };
+
+    // If batched prefill returned logits, use those (they are the same as the
+    // state logits for the last token — forward_prefill_batch_tp already ran
+    // final_norm_and_head). Cross-check: they should equal the downloaded ones.
+    if let Some(ref fl) = prefill_final_logits {
+        let max_delta: f32 = fl
+            .iter()
+            .zip(logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // These must be identical (same computation path for the last chunk).
+        assert!(
+            max_delta == 0.0,
+            "batched prefill returned logits differ from state.logits: max|Δ|={max_delta:.2e}"
+        );
+    }
 
     // MTP draft (optional): capture h_n per rank, draft next-next via mtp_forward_tp.
     let mut mtp_draft: Option<u32> = None;
@@ -212,7 +307,7 @@ fn run_tp_n(
         gpus.devices[r].drain_pool();
     }
 
-    (tokens, all_logits, mtp_draft)
+    (tokens, all_logits, mtp_draft, prefill_final_logits)
 }
 
 fn main() {
@@ -222,6 +317,8 @@ fn main() {
     let mut max: usize = 32;
     let mut no_bos = false;
     let mut mtp = false;
+    let mut prefill_batch = false;
+    let mut prefill_len: usize = 300;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -245,6 +342,14 @@ fn main() {
                 mtp = true;
                 i += 1;
             }
+            "--prefill-batch" => {
+                prefill_batch = true;
+                i += 1;
+            }
+            "--prefill-len" => {
+                prefill_len = argv[i + 1].parse().expect("--prefill-len");
+                i += 2;
+            }
             // Accepted for command-line symmetry with ep_deepseek4; DSpark is
             // ALWAYS disabled in this harness (TP-of-experts parity is AR-only,
             // and the drafter stages are not sliced).
@@ -260,7 +365,7 @@ fn main() {
     let model = model.expect("--model required");
 
     let prompt_fnv = fnv1a_bytes(prompt.as_bytes());
-    eprintln!("prompt fnv1a_bytes: 0x{prompt_fnv:016x}  max: {max}  mtp: {mtp}");
+    eprintln!("prompt fnv1a_bytes: 0x{prompt_fnv:016x}  max: {max}  mtp: {mtp}  prefill_batch: {prefill_batch}");
 
     // ── config + tokenizer ─────────────────────────────────────────────────
     let hfq0 = HfqFile::open(&model).expect("open model");
@@ -292,92 +397,242 @@ fn main() {
     let eos_tok = lookup_id("<｜end▁of▁sentence｜>").unwrap_or(tok.eos_id);
     drop(hfq0);
 
-    let mut prompt_ids: Vec<u32> = Vec::new();
+    let mut base_prompt_ids: Vec<u32> = Vec::new();
     if !no_bos {
         if let Some(b) = bos_tok {
-            prompt_ids.push(b);
+            base_prompt_ids.push(b);
         }
     }
-    prompt_ids.extend(tok.encode(&prompt));
+    base_prompt_ids.extend(tok.encode(&prompt));
+
+    // Build the prompt_ids used for all runs. In --prefill-batch mode, extend
+    // the base tokens by repeating them until we reach prefill_len, then truncate.
+    let prompt_ids: Vec<u32> = if prefill_batch && base_prompt_ids.len() < prefill_len {
+        let mut ids = base_prompt_ids.clone();
+        while ids.len() < prefill_len {
+            ids.extend_from_slice(&base_prompt_ids);
+        }
+        ids.truncate(prefill_len);
+        ids
+    } else {
+        base_prompt_ids.clone()
+    };
+
+    let prompt_token_fnv = fnv1a_bytes(
+        &prompt_ids
+            .iter()
+            .flat_map(|&t| t.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     eprintln!(
-        "prompt {:?} → {} tokens (bos-prepended={})",
+        "prompt {:?} → {} tokens (bos-prepended={})  token-ids fnv1a: 0x{prompt_token_fnv:016x}",
         prompt,
         prompt_ids.len(),
         !no_bos
     );
 
-    // ── tp=1 reference, then tp=2 ──────────────────────────────────────────
-    eprintln!("\n=== tp=1 reference run (forward_tp, i64 down) ===");
-    let (tp1_tokens, tp1_logits_all, tp1_mtp) =
-        run_tp_n(&model, &cfg, &prompt_ids, max, mtp, eos_tok, 1);
-    eprintln!("\n=== tp=2 TP-of-experts run ===");
-    let (tp2_tokens, tp2_logits_all, tp2_mtp) =
-        run_tp_n(&model, &cfg, &prompt_ids, max, mtp, eos_tok, 2);
+    if prefill_batch {
+        // ── --prefill-batch mode: three-way parity ─────────────────────────
+        //
+        // Run 1: tp=1, batched prefill.
+        // Run 2: tp=2, batched prefill.
+        // Run 3: tp=1, per-token prefill (cross-check batched vs per-token).
 
-    // ── Parity check ───────────────────────────────────────────────────────
-    eprintln!("\n=== Parity check tp1 vs tp2 ===");
-    let n_steps = tp1_tokens.len().min(tp2_tokens.len());
-    let mut argmax_ok = true;
-    let mut max_logit_delta: f32 = 0.0;
-    for step in 0..n_steps {
-        if tp1_tokens[step] != tp2_tokens[step] {
+        eprintln!("\n=== [batched] tp=1 reference run ===");
+        let (tp1b_tokens, tp1b_logits_all, tp1b_mtp, tp1b_prefill_logits) =
+            run_tp_n(&model, &cfg, &prompt_ids, max, mtp, eos_tok, 1, true);
+        let tp1b_prefill_logits = tp1b_prefill_logits.expect("tp1 batched prefill logits");
+
+        eprintln!("\n=== [batched] tp=2 TP-of-experts run ===");
+        let (tp2b_tokens, tp2b_logits_all, tp2b_mtp, tp2b_prefill_logits) =
+            run_tp_n(&model, &cfg, &prompt_ids, max, mtp, eos_tok, 2, true);
+        let tp2b_prefill_logits = tp2b_prefill_logits.expect("tp2 batched prefill logits");
+
+        eprintln!("\n=== [per-token] tp=1 cross-check run ===");
+        let (tp1pt_tokens, tp1pt_logits_all, _tp1pt_mtp, _) =
+            run_tp_n(&model, &cfg, &prompt_ids, max, mtp, eos_tok, 1, false);
+
+        // ── Parity check (a): tp=1-batched vs tp=2-batched decode stream ───
+        eprintln!("\n=== Parity check (a): tp=1-batched vs tp=2-batched decode stream ===");
+        let n_steps = tp1b_tokens.len().min(tp2b_tokens.len());
+        let mut argmax_ok = true;
+        let mut max_logit_delta: f32 = 0.0;
+        for step in 0..n_steps {
+            if tp1b_tokens[step] != tp2b_tokens[step] {
+                eprintln!(
+                    "  ARGMAX MISMATCH at step {step}: tp1b={} tp2b={}",
+                    tp1b_tokens[step], tp2b_tokens[step]
+                );
+                argmax_ok = false;
+            }
+            if step < tp1b_logits_all.len() && step < tp2b_logits_all.len() {
+                let delta = tp1b_logits_all[step]
+                    .iter()
+                    .zip(tp2b_logits_all[step].iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                max_logit_delta = max_logit_delta.max(delta);
+            }
+        }
+        if tp1b_tokens.len() != tp2b_tokens.len() {
             eprintln!(
-                "  ARGMAX MISMATCH at step {step}: tp1={} tp2={}",
-                tp1_tokens[step], tp2_tokens[step]
+                "  token count mismatch: tp1b={} tp2b={}",
+                tp1b_tokens.len(),
+                tp2b_tokens.len()
             );
             argmax_ok = false;
         }
-        if step < tp1_logits_all.len() && step < tp2_logits_all.len() {
-            let delta = tp1_logits_all[step]
-                .iter()
-                .zip(tp2_logits_all[step].iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            max_logit_delta = max_logit_delta.max(delta);
+        eprintln!("  argmax-exact: {argmax_ok}");
+        eprintln!("  decode logit max|Δ|: {max_logit_delta:.2e}");
+
+        // ── Parity check (b): prefill-final logits tp=1-batched vs tp=2-batched
+        eprintln!("\n=== Parity check (b): prefill-final logits tp=1-batched vs tp=2-batched ===");
+        let prefill_b12_delta: f32 = tp1b_prefill_logits
+            .iter()
+            .zip(tp2b_prefill_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("  prefill logit max|Δ| (tp1b vs tp2b): {prefill_b12_delta:.2e}");
+
+        // ── Parity check (c): tp=1 per-token prefill vs tp=1 batched prefill ──
+        // The first entry of tp1pt_logits_all is the per-token prefill-final logit
+        // (computed after the last prompt token). Cross-check with batched.
+        eprintln!("\n=== Parity check (c): tp=1 per-token prefill-final vs tp=1 batched prefill-final ===");
+        let pt_prefill_logits = tp1pt_logits_all.first().expect("tp1pt_logits_all is empty");
+        let prefill_c_delta: f32 = tp1b_prefill_logits
+            .iter()
+            .zip(pt_prefill_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("  prefill logit max|Δ| (tp1b-batched vs tp1-per-token): {prefill_c_delta:.2e}");
+
+        eprintln!("\n  tp=1-batched generation:\n{}", tok.decode(&tp1b_tokens));
+        eprintln!("  tp=2-batched generation:\n{}", tok.decode(&tp2b_tokens));
+        eprintln!(
+            "  tp=1-per-token generation:\n{}",
+            tok.decode(&tp1pt_tokens)
+        );
+
+        if mtp {
+            let acc = |tokens: &[u32], draft: Option<u32>| -> String {
+                match (draft, tokens.get(1).copied()) {
+                    (Some(d), Some(t)) if d == t => format!("ACCEPT ✓ (draft={d})"),
+                    (Some(d), t) => format!("reject (draft={d} vs gen[1]={t:?})"),
+                    (None, _) => "no draft".to_string(),
+                }
+            };
+            eprintln!("  MTP tp=1b accept: {}", acc(&tp1b_tokens, tp1b_mtp));
+            eprintln!("  MTP tp=2b accept: {}", acc(&tp2b_tokens, tp2b_mtp));
+            assert_eq!(
+                tp1b_mtp, tp2b_mtp,
+                "MTP draft diverged between tp=1-batched and tp=2-batched"
+            );
         }
-    }
-    if tp1_tokens.len() != tp2_tokens.len() {
-        eprintln!(
-            "  token count mismatch: tp1={} tp2={}",
-            tp1_tokens.len(),
-            tp2_tokens.len()
-        );
-        argmax_ok = false;
-    }
-    eprintln!("  argmax-exact: {argmax_ok}");
-    eprintln!("  logit max|Δ|: {max_logit_delta:.2e}");
-    eprintln!("  tp=1 generation:\n{}", tok.decode(&tp1_tokens));
-    eprintln!("  tp=2 generation:\n{}", tok.decode(&tp2_tokens));
 
-    if mtp {
-        // MTP-EP accept: draft predicted the token AFTER t0 → true gen[1].
-        let acc = |tokens: &[u32], draft: Option<u32>| -> String {
-            match (draft, tokens.get(1).copied()) {
-                (Some(d), Some(t)) if d == t => format!("ACCEPT ✓ (draft={d})"),
-                (Some(d), t) => format!("reject (draft={d} vs gen[1]={t:?})"),
-                (None, _) => "no draft".to_string(),
+        assert!(
+            argmax_ok,
+            "PARITY FAIL (a): argmax mismatch tp=1-batched vs tp=2-batched"
+        );
+        assert!(
+            max_logit_delta == 0.0,
+            "PARITY FAIL (a): decode logit max|Δ|={max_logit_delta:.2e} != 0.0"
+        );
+        assert!(
+            prefill_b12_delta == 0.0,
+            "PARITY FAIL (b): prefill-final logit max|Δ|={prefill_b12_delta:.2e} != 0.0 (tp1b vs tp2b)"
+        );
+        assert!(
+            prefill_c_delta == 0.0,
+            "PARITY FAIL (c): prefill-final logit max|Δ|={prefill_c_delta:.2e} != 0.0 (batched vs per-token)"
+        );
+
+        eprintln!("\nPARITY PASS (--prefill-batch):");
+        eprintln!("  (a) decode argmax-exact + logit max|Δ|={max_logit_delta:.2e} (tp1b vs tp2b)");
+        eprintln!("  (b) prefill-final logit max|Δ|={prefill_b12_delta:.2e} (tp1b vs tp2b)");
+        eprintln!(
+            "  (c) prefill-final logit max|Δ|={prefill_c_delta:.2e} (batched vs per-token tp1)"
+        );
+    } else {
+        // ── Original mode: tp=1 vs tp=2 per-token parity ──────────────────
+        eprintln!(
+            "prompt {:?} → {} tokens (bos-prepended={})",
+            prompt,
+            prompt_ids.len(),
+            !no_bos
+        );
+
+        eprintln!("\n=== tp=1 reference run (forward_tp, i64 down) ===");
+        let (tp1_tokens, tp1_logits_all, tp1_mtp, _) =
+            run_tp_n(&model, &cfg, &prompt_ids, max, mtp, eos_tok, 1, false);
+        eprintln!("\n=== tp=2 TP-of-experts run ===");
+        let (tp2_tokens, tp2_logits_all, tp2_mtp, _) =
+            run_tp_n(&model, &cfg, &prompt_ids, max, mtp, eos_tok, 2, false);
+
+        // ── Parity check ───────────────────────────────────────────────────
+        eprintln!("\n=== Parity check tp1 vs tp2 ===");
+        let n_steps = tp1_tokens.len().min(tp2_tokens.len());
+        let mut argmax_ok = true;
+        let mut max_logit_delta: f32 = 0.0;
+        for step in 0..n_steps {
+            if tp1_tokens[step] != tp2_tokens[step] {
+                eprintln!(
+                    "  ARGMAX MISMATCH at step {step}: tp1={} tp2={}",
+                    tp1_tokens[step], tp2_tokens[step]
+                );
+                argmax_ok = false;
             }
-        };
-        eprintln!("  MTP tp=1 accept: {}", acc(&tp1_tokens, tp1_mtp));
-        eprintln!("  MTP tp=2 accept: {}", acc(&tp2_tokens, tp2_mtp));
-        eprintln!(
-            "  MTP draft parity tp1==tp2: {} (tp1={:?} tp2={:?})",
-            tp1_mtp == tp2_mtp,
-            tp1_mtp,
-            tp2_mtp
-        );
-        assert_eq!(tp1_mtp, tp2_mtp, "MTP draft diverged between tp=1 and tp=2");
-    }
+            if step < tp1_logits_all.len() && step < tp2_logits_all.len() {
+                let delta = tp1_logits_all[step]
+                    .iter()
+                    .zip(tp2_logits_all[step].iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                max_logit_delta = max_logit_delta.max(delta);
+            }
+        }
+        if tp1_tokens.len() != tp2_tokens.len() {
+            eprintln!(
+                "  token count mismatch: tp1={} tp2={}",
+                tp1_tokens.len(),
+                tp2_tokens.len()
+            );
+            argmax_ok = false;
+        }
+        eprintln!("  argmax-exact: {argmax_ok}");
+        eprintln!("  logit max|Δ|: {max_logit_delta:.2e}");
+        eprintln!("  tp=1 generation:\n{}", tok.decode(&tp1_tokens));
+        eprintln!("  tp=2 generation:\n{}", tok.decode(&tp2_tokens));
 
-    assert!(
-        argmax_ok,
-        "PARITY FAIL: argmax mismatch between tp=1 and tp=2 (an inter_local site was missed?)"
-    );
-    // The int64 down path is partition-invariant: sum of per-rank i64 == full i64,
-    // so tp=1 and tp=2 produce bit-identical f32 logits.
-    assert!(
-        max_logit_delta == 0.0,
-        "PARITY FAIL: logit max|Δ|={max_logit_delta:.2e} != 0.0 (FP leak in int64 TP path)"
-    );
-    eprintln!("\nPARITY PASS: tp=1 == tp=2 (argmax-exact, logit max|Δ|={max_logit_delta:.2e})");
+        if mtp {
+            // MTP-EP accept: draft predicted the token AFTER t0 → true gen[1].
+            let acc = |tokens: &[u32], draft: Option<u32>| -> String {
+                match (draft, tokens.get(1).copied()) {
+                    (Some(d), Some(t)) if d == t => format!("ACCEPT ✓ (draft={d})"),
+                    (Some(d), t) => format!("reject (draft={d} vs gen[1]={t:?})"),
+                    (None, _) => "no draft".to_string(),
+                }
+            };
+            eprintln!("  MTP tp=1 accept: {}", acc(&tp1_tokens, tp1_mtp));
+            eprintln!("  MTP tp=2 accept: {}", acc(&tp2_tokens, tp2_mtp));
+            eprintln!(
+                "  MTP draft parity tp1==tp2: {} (tp1={:?} tp2={:?})",
+                tp1_mtp == tp2_mtp,
+                tp1_mtp,
+                tp2_mtp
+            );
+            assert_eq!(tp1_mtp, tp2_mtp, "MTP draft diverged between tp=1 and tp=2");
+        }
+
+        assert!(
+            argmax_ok,
+            "PARITY FAIL: argmax mismatch between tp=1 and tp=2 (an inter_local site was missed?)"
+        );
+        // The int64 down path is partition-invariant: sum of per-rank i64 == full i64,
+        // so tp=1 and tp=2 produce bit-identical f32 logits.
+        assert!(
+            max_logit_delta == 0.0,
+            "PARITY FAIL: logit max|Δ|={max_logit_delta:.2e} != 0.0 (FP leak in int64 TP path)"
+        );
+        eprintln!("\nPARITY PASS: tp=1 == tp=2 (argmax-exact, logit max|Δ|={max_logit_delta:.2e})");
+    }
 }

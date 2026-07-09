@@ -9775,15 +9775,15 @@ pub fn forward_prefill_batch_chunked(
 ///
 /// The caller builds the `mesh` (a pure Tp axis of `n_ranks` ranks) once
 /// before the chunk loop and passes it here.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn forward_prefill_batch_chunk_tp(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
     pbs_per_rank: &mut [PrefillBatchScratch],
-    partials_per_rank: &[GpuTensor],
     partials_i64_per_rank: &[GpuTensor],
+    partials_per_rank: &[GpuTensor],
     mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
     tokens: &[u32],
     start_pos: u32,
@@ -9983,15 +9983,15 @@ fn forward_prefill_batch_chunk_tp(
 ///
 /// The Tp mesh is built once (pure `DimKind::Tp` axis of `n_ranks`
 /// ranks) and reused across chunks.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch_tp(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
     pbs_per_rank: &mut [PrefillBatchScratch],
-    partials_per_rank: &[GpuTensor],
     partials_i64_per_rank: &[GpuTensor],
+    partials_per_rank: &[GpuTensor],
     tokens: &[u32],
     start_pos: u32,
 ) -> Result<Vec<f32>, String> {
@@ -10047,8 +10047,8 @@ pub fn forward_prefill_batch_tp(
             cfg,
             state_per_rank,
             pbs_per_rank,
-            partials_per_rank,
             partials_i64_per_rank,
+            partials_per_rank,
             &tp_mesh,
             chunk,
             pos_cursor as u32,
