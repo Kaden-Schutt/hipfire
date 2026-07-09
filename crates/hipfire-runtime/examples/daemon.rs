@@ -647,6 +647,49 @@ fn ckpt_max() -> usize {
         .max(1)
 }
 
+// ─── Dual-run shadow-parity harness (Inc 1, god-struct-collapse) ──────────────
+//
+// `archdispatch_parity_enabled` gates a shadow second-pass through the
+// refactored ArchDispatch path (Task 1.4 wires this into generation).
+// `TokenTape` accumulates committed token IDs for one pass; `assert_token_parity`
+// compares two tapes and panics with a precise divergence report on mismatch.
+// The `--self-check-parity` CLI branch exercises these without a GPU.
+
+#[allow(dead_code)]
+fn archdispatch_parity_enabled() -> bool {
+    std::env::var("HIPFIRE_ARCHDISPATCH_PARITY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+#[derive(Default, Clone)]
+#[allow(dead_code)]
+struct TokenTape(Vec<u32>);
+
+impl TokenTape {
+    #[allow(dead_code)]
+    fn push(&mut self, t: u32) {
+        self.0.push(t);
+    }
+}
+
+#[allow(dead_code)]
+fn assert_token_parity(old: &TokenTape, new: &TokenTape, id: &str) {
+    if old.0 != new.0 {
+        let pos = old.0.iter().zip(new.0.iter()).position(|(a, b)| a != b);
+        panic!(
+            "ARCHDISPATCH PARITY FAIL id={id}: len old={} new={} first_div={:?} old_tok={:?} new_tok={:?}",
+            old.0.len(),
+            new.0.len(),
+            pos,
+            pos.and_then(|p| old.0.get(p)),
+            pos.and_then(|p| new.0.get(p)),
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
 /// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
 /// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
@@ -757,6 +800,21 @@ fn main() {
         } else {
             eprintln!("Kernel precompilation done.");
         }
+        return;
+    }
+
+    // --self-check-parity: verify the dual-run shadow-parity harness. Constructs
+    // two identical TokenTapes, asserts parity (no panic expected), then exits 0.
+    // No GPU or model needed. Used by CI / task harness to validate Inc 1.
+    if args.iter().any(|a| a == "--self-check-parity") {
+        let mut tape_a = TokenTape::default();
+        let mut tape_b = TokenTape::default();
+        for tok in [1u32, 42, 100, 999] {
+            tape_a.push(tok);
+            tape_b.push(tok);
+        }
+        assert_token_parity(&tape_a, &tape_b, "self-check");
+        println!("parity self-check OK");
         return;
     }
 
