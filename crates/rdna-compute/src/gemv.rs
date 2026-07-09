@@ -5824,6 +5824,14 @@ impl Gpu {
             static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
             let fused = *GATE_UP_FUSED
                 .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
+            // Opt-in high-occupancy experiment (HIPFIRE_MOE_GATE_UP_HIOCC=1):
+            // same grid/block/output contract as the base, VGPR-reduced. MEASURED
+            // NULL on gfx1201 (base already at the 16-wave/SIMD VGPR-occupancy
+            // ceiling) — kept as a falsified-in-place record. Coherence-equivalent
+            // (accumulator reassociation), not byte-exact.
+            static GATE_UP_HIOCC: OnceLock<bool> = OnceLock::new();
+            let hiocc = *GATE_UP_HIOCC
+                .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_HIOCC").as_deref() == Ok("1"));
             if fused {
                 self.ensure_kernel(
                     "gemv_hfq4g256_moe_gate_up_indexed_rowtile",
@@ -5834,6 +5842,17 @@ impl Gpu {
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
                     [32u32, 1, 1],
                     ((m as u32) + 1) / 2,
+                )
+            } else if hiocc {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_hiocc",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_HIOCC_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_hiocc",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_hiocc",
+                    [32u32, 1, 1],
+                    m as u32,
                 )
             } else {
                 self.ensure_kernel(

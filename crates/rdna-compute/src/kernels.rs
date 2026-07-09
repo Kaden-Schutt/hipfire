@@ -1249,6 +1249,16 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_rowtile.hip");
 
+/// High-occupancy experiment variant of the indexed MoE gate_up GEMV (opt-in,
+/// HIPFIRE_MOE_GATE_UP_HIOCC=1, default OFF). Same grid/block/output contract as
+/// the base; reduces VGPR (2-way accumulator tree + wave-uniform scale/zp forced
+/// to SGPR) to try to raise occupancy. MEASURED NULL on gfx1201: the base is
+/// already at 96 VGPR = 16 waves/SIMD (RDNA4 max VGPR-occupancy), so VGPR
+/// reduction lands at 95 with no occupancy change — kept as a falsified-in-place
+/// record. Coherence-equivalent (NOT byte-exact): accumulator reassociation.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_HIOCC_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_hiocc.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV. Same
 /// device-side expert-pointer table + topk_indices contract as the
 /// HFQ4G256 sibling; closes the residual hipGraph-capture gap for
