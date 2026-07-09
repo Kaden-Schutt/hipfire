@@ -676,7 +676,18 @@ impl TokenTape {
 #[allow(dead_code)]
 fn assert_token_parity(old: &TokenTape, new: &TokenTape, id: &str) {
     if old.0 != new.0 {
-        let pos = old.0.iter().zip(new.0.iter()).position(|(a, b)| a != b);
+        // First divergent position. If the tapes agree on every zipped pair but
+        // differ in length (one is a strict prefix of the other), point at the
+        // boundary of the shorter tape rather than reporting `None` — otherwise
+        // a length-mismatch panic reads `first_div=None`, which looks like "no
+        // divergence found" and hides a real different-token-count mismatch
+        // (e.g. EOS committed at a different position).
+        let pos = old
+            .0
+            .iter()
+            .zip(new.0.iter())
+            .position(|(a, b)| a != b)
+            .or_else(|| (old.0.len() != new.0.len()).then(|| old.0.len().min(new.0.len())));
         panic!(
             "ARCHDISPATCH PARITY FAIL id={id}: len old={} new={} first_div={:?} old_tok={:?} new_tok={:?}",
             old.0.len(),
