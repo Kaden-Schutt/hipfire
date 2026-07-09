@@ -550,25 +550,29 @@ fn main() {
              [EXPECTED non-zero: batched flash-attn ≠ per-token scalar attn]"
         );
 
-        // ── Check (d): tp=1 batched-TP vs single-GPU per-token reference ─────────
-        // Loads the model WHOLE (no tp-slicing, via Architecture::load_weights),
-        // runs the repo's single-GPU forward_prefill_batch on the same prompt_ids,
-        // and compares final-position logits to tp1b_prefill_logits.
+        // ── Check (d): tp=1 batched-TP vs single-GPU BATCHED reference ───────────
+        // Loads the model WHOLE (no tp-slicing, via Architecture::load_weights) and
+        // runs the repo's single-GPU BATCHED prefill `forward_prefill_batch_chunked`
+        // on the same prompt_ids, comparing final-position logits to tp1b_prefill_logits.
         //
-        // Why forward_prefill_batch (not forward_prefill_batch_chunked):
-        // forward_prefill_batch_chunked routes through forward_prefill_batch_chunk,
-        // which is a WIP that errors at the first unimplemented stage. The working
-        // single-GPU reference is forward_prefill_batch — a per-token decode_step loop
-        // that is definitely correct and is what the repo uses in non-TP serving.
+        // Reference = forward_prefill_batch_chunked (NOT the per-token
+        // forward_prefill_batch fallback). forward_prefill_batch_chunk carries a
+        // STALE "work in progress / errors out" doc comment (dated 2026-05-18), but
+        // its body is fully wired (attention_block_batched_swa_only/mixed + ffn_batched)
+        // and forward_prefill_batch_chunk_tp mirrors it verbatim — both ran on GPU.
+        // forward_prefill_batch_chunked is the "strict batched-only" driver returning
+        // last-position logits.
         //
-        // What (d) isolates: attention is per-token scalar in both the tp=1-batched
-        // TP path (forward_prefill_batch_tp calls forward_prefill_batch_chunk_tp
-        // which does per-token scalar attn like the single-GPU path) and here,
-        // so the only numerical difference comes from the MoE down path:
-        // tp=1-batched-TP uses per-token i64 accumulation;
-        // single-GPU uses per-token f32 scalar.
-        // A small delta + argmax match confirms the TP batched forward is correct.
-        eprintln!("\n=== Check (d): tp=1-batched-TP vs single-GPU per-token reference ===");
+        // What (d) isolates: my forward_prefill_batch_tp (tp=1) and
+        // forward_prefill_batch_chunked share the IDENTICAL batched attention +
+        // gate‖up (same helpers), so the batched-attn reduction order is the same in
+        // both — it does NOT enter this delta (unlike check (c) vs per-token). The
+        // ONLY difference is the routed MoE DOWN: tp=1-batched-TP uses per-token int64
+        // accumulation; single-GPU-batched uses ffn_batched's f32 grouped/scalar down.
+        // So a small delta + argmax match here positively confirms the TP batched
+        // forward is correct (no TP-path bug) — the down i64-vs-f32 gap is the only
+        // expected source. This is the rigorous cross-check (c) could not be.
+        eprintln!("\n=== Check (d): tp=1-batched-TP vs single-GPU-BATCHED reference ===");
         {
             let mut gpus_sg = Gpus::init_tp(1, cfg.num_hidden_layers).expect("init_tp sg");
             gpus_sg.devices[0].bind_thread().expect("bind sg");
@@ -578,20 +582,20 @@ fn main() {
                 .expect("load_weights sg");
 
             let max_batch_sg = hipfire_runtime::llama::PREFILL_MAX_BATCH.min(prompt_ids.len());
-            let mut pbs_sg = PrefillBatchScratch::new(&mut gpus_sg.devices[0], &cfg, max_batch_sg)
+            let pbs_sg = PrefillBatchScratch::new(&mut gpus_sg.devices[0], &cfg, max_batch_sg)
                 .expect("PrefillBatchScratch sg");
             let mut state_sg = DeepseekV4State::new(&cfg).expect("state sg");
 
-            let sg_logits = forward::forward_prefill_batch(
+            let sg_logits = forward::forward_prefill_batch_chunked(
                 &cfg,
                 &w_sg,
                 &mut state_sg,
                 &mut gpus_sg.devices[0],
                 &prompt_ids,
                 0,
-                &mut pbs_sg,
+                &pbs_sg,
             )
-            .expect("forward_prefill_batch sg");
+            .expect("forward_prefill_batch_chunked sg");
 
             let d_delta: f32 = tp1b_prefill_logits
                 .iter()
@@ -602,12 +606,13 @@ fn main() {
             let d_am_sg = argmax(&sg_logits);
             let d_argmax_match = d_am_tp1b == d_am_sg;
             eprintln!(
-                "  check (d): tp1-batched-TP vs single-GPU-per-token  max|Δ|={d_delta:.2e}  \
+                "  check (d): tp1-batched-TP vs single-GPU-batched  max|Δ|={d_delta:.2e}  \
                  argmax_match={d_argmax_match} (tp1b={d_am_tp1b} sg={d_am_sg})"
             );
             eprintln!(
-                "  (d note: both paths use per-token scalar attn; delta isolates i64 MoE down \
-                 vs f32 scalar; small delta + argmax match confirms TP batched forward correct)"
+                "  (d note: batched attention is SHARED between the two paths → excluded from \
+                 this delta; the delta isolates the MoE down i64-vs-f32; small delta + argmax \
+                 match confirms the TP batched forward is correct)"
             );
 
             // Free single-GPU resources.
