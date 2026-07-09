@@ -30,6 +30,13 @@ pub struct FeatureFlags {
     pub gemv_rows_default: u32,
     pub gemv_dp4a: Option<bool>,
 
+    /// Early VGPR-pool deallocation lever (HIPFIRE_VGPR_DEALLOC). When true,
+    /// VGPR-heavy decode kernels dispatch a `_dealloc` variant that emits
+    /// `s_sendmsg(MSG_DEALLOC_VGPRS)` at the tail (gfx11+/gfx12) to free the
+    /// VGPR pool early → next wave launches sooner (occupancy). Value-preserving:
+    /// identical decode output. `None` = OFF (default; byte-identical baseline).
+    pub vgpr_dealloc: Option<bool>,
+
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
     pub hfq3_mmq: Option<bool>,
@@ -166,6 +173,7 @@ impl FeatureFlags {
                 }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
+            vgpr_dealloc: parse_bool("HIPFIRE_VGPR_DEALLOC"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -289,6 +297,11 @@ impl FeatureFlags {
         self.gemv_dp4a.unwrap_or(self.gemv_dp4a_default_on)
     }
 
+    /// Early VGPR-pool deallocation lever. Default OFF (byte-identical baseline).
+    pub fn vgpr_dealloc_enabled(&self) -> bool {
+        self.vgpr_dealloc.unwrap_or(false)
+    }
+
     pub fn gemv_prefetch_enabled(&self) -> bool {
         self.gemv_prefetch.unwrap_or(self.gemv_prefetch_default_on)
     }
@@ -356,6 +369,7 @@ impl FeatureFlags {
             gemv_rows: None,
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
+            vgpr_dealloc: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

@@ -5815,6 +5815,22 @@ impl Gpu {
                 [64u32, 1, 1],
                 ((m as u32) + 1) / 2,
             )
+        } else if self.flags.vgpr_dealloc_enabled() {
+            // Early VGPR-pool dealloc lever (HIPFIRE_VGPR_DEALLOC=1): identical
+            // arithmetic, emits s_sendmsg(MSG_DEALLOC_VGPRS) at the tail on
+            // gfx11+/gfx12 to free VGPRs early → occupancy on this VGPR-heavy
+            // MoE gate_up decode kernel. Distinct module + symbol name so the
+            // JIT cache does not collide with the base.
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed_dealloc",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DEALLOC_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_dealloc",
+            )?;
+            (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_dealloc",
+                [32u32, 1, 1],
+                m as u32,
+            )
         } else {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed",

@@ -1243,6 +1243,13 @@ pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip");
 
+/// VGPR-dealloc variant of `gemv_hfq4g256_moe_gate_up_k8_indexed` (opt-in via
+/// HIPFIRE_VGPR_DEALLOC=1). Byte-identical arithmetic; emits
+/// `s_sendmsg(MSG_DEALLOC_VGPRS)` at the tail (gfx11+/gfx12 only) to free the
+/// VGPR pool early for occupancy. Value-preserving perf lever; default OFF.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_DEALLOC_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_dealloc.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV. Same
 /// device-side expert-pointer table + topk_indices contract as the
 /// HFQ4G256 sibling; closes the residual hipGraph-capture gap for
@@ -2268,6 +2275,13 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str =
 // row counts. Works on every RDNA generation — see the kernel header.
 pub const FUSED_QKVZA_HFQ4G256_SRC: &str =
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip");
+
+// VGPR-dealloc variant of fused_qkvza_hfq4g256 (opt-in via HIPFIRE_VGPR_DEALLOC=1).
+// Byte-identical arithmetic; emits s_sendmsg(MSG_DEALLOC_VGPRS) at the tail
+// (gfx11+/gfx12 only) to free the VGPR pool early for occupancy. Value-preserving
+// perf lever; default OFF.
+pub const FUSED_QKVZA_HFQ4G256_DEALLOC_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_dealloc.hip");
 
 // CDNA3 (MI300X / gfx94x) wave64-native counterpart: block=[64,1,1] with
 // two fused-qkvza rows per block (one per warp). Grid halves from total_m
