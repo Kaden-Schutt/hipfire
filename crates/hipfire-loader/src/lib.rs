@@ -533,12 +533,18 @@ pub enum EpArch {
         weights: Vec<hipfire_arch_deepseek4::DeepseekV4Weights>,
         state: Vec<hipfire_arch_deepseek4::DeepseekV4State>,
         partials: Vec<rdna_compute::GpuTensor>,
+        /// Per-rank int64 scratch for the reproducible EP i64 down path.
+        /// Each buffer holds `hidden_size * 8` raw bytes; pre-zeroed per step.
+        partials_i64: Vec<rdna_compute::GpuTensor>,
     },
     Minimax {
         config: minimax::MiniMaxConfig,
         weights: Vec<minimax::MiniMaxWeights>,
         state: Vec<minimax::MiniMaxState>,
         partials: Vec<rdna_compute::GpuTensor>,
+        /// Per-rank int64 scratch for the reproducible EP i64 down path.
+        /// Each buffer holds `hidden_size * 8` raw bytes; pre-zeroed per step.
+        partials_i64: Vec<rdna_compute::GpuTensor>,
     },
 }
 
@@ -1234,6 +1240,7 @@ struct Ds4EpStaging {
     weights: Vec<deepseek4::DeepseekV4Weights>,
     state: Vec<deepseek4::DeepseekV4State>,
     partials: Vec<rdna_compute::GpuTensor>,
+    partials_i64: Vec<rdna_compute::GpuTensor>,
 }
 
 impl Ds4EpStaging {
@@ -1243,6 +1250,7 @@ impl Ds4EpStaging {
             weights: Vec::new(),
             state: Vec::new(),
             partials: Vec::new(),
+            partials_i64: Vec::new(),
         }
     }
     fn gpus_mut(&mut self) -> &mut Gpus {
@@ -1256,12 +1264,14 @@ impl Ds4EpStaging {
         Vec<deepseek4::DeepseekV4Weights>,
         Vec<deepseek4::DeepseekV4State>,
         Vec<rdna_compute::GpuTensor>,
+        Vec<rdna_compute::GpuTensor>,
     ) {
         let gpus = self.gpus.take().expect("into_parts called twice");
         let weights = std::mem::take(&mut self.weights);
         let state = std::mem::take(&mut self.state);
         let partials = std::mem::take(&mut self.partials);
-        (gpus, weights, state, partials)
+        let partials_i64 = std::mem::take(&mut self.partials_i64);
+        (gpus, weights, state, partials, partials_i64)
     }
 }
 
@@ -1292,6 +1302,12 @@ impl Drop for Ds4EpStaging {
                 let _ = dev.free_tensor(p);
             }
         }
+        for (r, p) in self.partials_i64.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
         for dev in gpus.devices.iter_mut() {
             let _ = dev.bind_thread();
             dev.invalidate_weight_caches();
@@ -1308,6 +1324,7 @@ struct MinimaxEpStaging {
     weights: Vec<minimax::MiniMaxWeights>,
     state: Vec<minimax::MiniMaxState>,
     partials: Vec<rdna_compute::GpuTensor>,
+    partials_i64: Vec<rdna_compute::GpuTensor>,
 }
 
 impl MinimaxEpStaging {
@@ -1317,6 +1334,7 @@ impl MinimaxEpStaging {
             weights: Vec::new(),
             state: Vec::new(),
             partials: Vec::new(),
+            partials_i64: Vec::new(),
         }
     }
     fn gpus_mut(&mut self) -> &mut Gpus {
@@ -1330,12 +1348,14 @@ impl MinimaxEpStaging {
         Vec<minimax::MiniMaxWeights>,
         Vec<minimax::MiniMaxState>,
         Vec<rdna_compute::GpuTensor>,
+        Vec<rdna_compute::GpuTensor>,
     ) {
         let gpus = self.gpus.take().expect("into_parts called twice");
         let weights = std::mem::take(&mut self.weights);
         let state = std::mem::take(&mut self.state);
         let partials = std::mem::take(&mut self.partials);
-        (gpus, weights, state, partials)
+        let partials_i64 = std::mem::take(&mut self.partials_i64);
+        (gpus, weights, state, partials, partials_i64)
     }
 }
 
@@ -1361,6 +1381,12 @@ impl Drop for MinimaxEpStaging {
             }
         }
         for (r, p) in self.partials.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                let _ = dev.free_tensor(p);
+            }
+        }
+        for (r, p) in self.partials_i64.drain(..).enumerate() {
             if let Some(dev) = gpus.devices.get_mut(r) {
                 let _ = dev.bind_thread();
                 let _ = dev.free_tensor(p);
@@ -1551,6 +1577,10 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
             .zeros(&[config.hidden_size], rdna_compute::DType::F32)
             .map_err(|e| format!("partial {r}: {e:?}"))?;
         staging.partials.push(p);
+        let pi = staging.gpus_mut().devices[r]
+            .zeros(&[config.hidden_size * 8], rdna_compute::DType::Raw)
+            .map_err(|e| format!("partial_i64 {r}: {e:?}"))?;
+        staging.partials_i64.push(pi);
     }
     let peer = staging
         .gpus_mut()
@@ -1561,7 +1591,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
         .ensure_rank_streams()
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
-    let (gpus, weights, state, partials) = staging.into_parts();
+    let (gpus, weights, state, partials, partials_i64) = staging.into_parts();
 
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
@@ -1580,6 +1610,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, mesh: &DeviceMesh) -> Result<Lo
                 weights,
                 state,
                 partials,
+                partials_i64,
             },
         }),
         deepseek4_eos_tok: eos_tok,
@@ -1673,6 +1704,10 @@ fn load_model_ep_minimax(
             .zeros(&[config.hidden_size], rdna_compute::DType::F32)
             .map_err(|e| format!("partial {r}: {e:?}"))?;
         staging.partials.push(p);
+        let pi = staging.gpus_mut().devices[r]
+            .zeros(&[config.hidden_size * 8], rdna_compute::DType::Raw)
+            .map_err(|e| format!("partial_i64 {r}: {e:?}"))?;
+        staging.partials_i64.push(pi);
     }
     let peer = staging
         .gpus_mut()
@@ -1683,7 +1718,7 @@ fn load_model_ep_minimax(
         .ensure_rank_streams()
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
-    let (gpus, weights, state, partials) = staging.into_parts();
+    let (gpus, weights, state, partials, partials_i64) = staging.into_parts();
 
     let eos_tok: u32 = {
         let try_one = |s: &str| -> Option<u32> {
@@ -1709,6 +1744,7 @@ fn load_model_ep_minimax(
                 weights,
                 state,
                 partials,
+                partials_i64,
             },
         }),
         minimax_eos_tok: eos_tok,

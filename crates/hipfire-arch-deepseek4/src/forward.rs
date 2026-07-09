@@ -2307,6 +2307,7 @@ fn ds4_ep_moe_step(
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
     partials: &[GpuTensor],
+    partials_i64: &[GpuTensor],
     mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
     l: usize,
     token: u32,
@@ -2321,7 +2322,6 @@ fn ds4_ep_moe_step(
     let inter = cfg.moe_intermediate_size;
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
-    let is_hash = l < cfg.num_hash_layers;
     // ── Phase 1: per-rank shared expert + routed pre-down (direct kernels) ──
     let mut routed = false;
     for r in 0..n {
@@ -2342,10 +2342,15 @@ fn ds4_ep_moe_step(
         .map_err(|e| format!("moe-step pre-down L{l} r{r}: {e}"))?;
     }
 
-    // ── Phase 2: routed down + EP all-reduce via execute_steps_parallel ──
+    // ── Phase 2: routed down (int64) + EP all-reduce (FP32) ─────────────────
     // When the layer is shared-only (no routed experts), the primitive would
     // all-reduce a zeroed partial and add zero — a no-op — so we skip the
     // executor entirely and go straight to the tail (byte-identical: x+0==x).
+    //
+    // Unified int64 path (both hash and non-hash): DownResidualI64 accumulates
+    // the weighted-combine into per-rank i64 scratch (ZeroI64Only pre-zeros it),
+    // ConvertI64ToF32 converts to the f32 partial, AllReduce{Ep} sums across ranks.
+    // ds4 routed experts are MQ2-Lloyd → `launch_indexed_down_residual_i64` covers both.
     if routed {
         // ds4 routed experts use MQ2-Lloyd for both gate_up and down; the same
         // MoeExpertRef covers the GateUp prefix Steps and the Down Step.
@@ -2357,8 +2362,7 @@ fn ds4_ep_moe_step(
                     gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
                     down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
                     dummy_gate_up: None,
-                    // ds4 routed experts are MQ2-Lloyd (the primitive hardcodes
-                    // this down kernel); byte-identity requires the same dtype.
+                    // ds4 routed experts are MQ2-Lloyd; DownResidualI64 supports MQ2L.
                     dtype: DType::MQ2G256Lloyd,
                     n_experts: n_exp,
                     expert_m: inter,
@@ -2367,128 +2371,68 @@ fn ds4_ep_moe_step(
                 }
             })
             .collect();
-        let (per_rank_steps, collectives, zero_before): (
-            Vec<Vec<Step>>,
-            Vec<StepCollective>,
-            Vec<bool>,
-        ) = if is_hash {
-            // Hash layers: residual-fused down (down + weighted-combine) writes
-            // the EP partial directly — mirrors ffn_hash_routed's down kernel.
-            let steps = (0..n)
-                .map(|r| {
-                    let s = &state_per_rank[r];
-                    let mut rank_steps: Vec<Step> = vec![
-                        Step::IndexedMoeGemv {
-                            experts: &expert_refs[r],
-                            which: MoeProj::GateUp {
-                                up_out: s.moe_up_batch.as_ref().unwrap(),
-                            },
-                            topk_indices: s.moe_topk_indices.as_ref().unwrap(),
-                            input: GemvInput::Prerotated(s.ffn_x_rot.as_ref().unwrap()),
-                            out: s.moe_gate_batch.as_ref().unwrap(),
-                            k_top,
-                            batch_size: 1,
-                        },
-                        Step::MoeActivation {
-                            variant: MoeActivationVariant::Ds4ClampRotate {
-                                swiglu_limit: cfg.swiglu_limit,
-                            },
-                            gate: s.moe_gate_batch.as_ref().unwrap(),
-                            up: s.moe_up_batch.as_ref().unwrap(),
-                            rot_out: s.moe_rot_batch.as_ref().unwrap(),
-                            inter,
-                            k_top,
-                        },
-                    ];
-                    rank_steps.push(Step::IndexedMoeGemv {
+        // Unified int64 path for both hash and non-hash layers:
+        // [GateUp, MoeActivation, DownResidualI64, ConvertI64ToF32]
+        // Collectives: [None, None, ZeroI64Only{hidden}, AllReduce{Ep,hidden}]
+        // zero_before: [false, false, true, false]
+        let per_rank_steps: Vec<Vec<Step>> = (0..n)
+            .map(|r| {
+                let s = &state_per_rank[r];
+                vec![
+                    Step::IndexedMoeGemv {
                         experts: &expert_refs[r],
-                        which: MoeProj::DownResidual {
+                        which: MoeProj::GateUp {
+                            up_out: s.moe_up_batch.as_ref().unwrap(),
+                        },
+                        topk_indices: s.moe_topk_indices.as_ref().unwrap(),
+                        input: GemvInput::Prerotated(s.ffn_x_rot.as_ref().unwrap()),
+                        out: s.moe_gate_batch.as_ref().unwrap(),
+                        k_top,
+                        batch_size: 1,
+                    },
+                    Step::MoeActivation {
+                        variant: MoeActivationVariant::Ds4ClampRotate {
+                            swiglu_limit: cfg.swiglu_limit,
+                        },
+                        gate: s.moe_gate_batch.as_ref().unwrap(),
+                        up: s.moe_up_batch.as_ref().unwrap(),
+                        rot_out: s.moe_rot_batch.as_ref().unwrap(),
+                        inter,
+                        k_top,
+                    },
+                    // DownResidualI64: accumulates S-scaled int64 into partials_i64[r].
+                    // ZeroI64Only pre-zeros the i64 buffer (8 bytes/elem) before launch.
+                    Step::IndexedMoeGemv {
+                        experts: &expert_refs[r],
+                        which: MoeProj::DownResidualI64 {
                             topk_weights: s.moe_topk_weights.as_ref().unwrap(),
                         },
                         topk_indices: s.moe_topk_indices.as_ref().unwrap(),
                         input: GemvInput::Prerotated(s.moe_rot_batch.as_ref().unwrap()),
-                        out: &partials[r],
+                        out: &partials_i64[r],
                         k_top,
                         batch_size: 1,
-                    });
-                    rank_steps
-                })
-                .collect();
-            let colls: Vec<StepCollective> = vec![
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::AllReduce {
-                    kind: hipfire_runtime::multi_gpu::DimKind::Ep,
-                    dim: hidden,
-                },
-            ];
-            let zbefore: Vec<bool> = vec![false, false, true];
-            (steps, colls, zbefore)
-        } else {
-            // Non-hash layers: EXPANDED down (per-expert outputs) + a separate
-            // weighted MoeCombine into the pre-zeroed EP partial — mirrors the
-            // deterministic run_moe_decode_bias_aware down+combine.
-            let steps = (0..n)
-                .map(|r| {
-                    let s = &state_per_rank[r];
-                    let mut rank_steps: Vec<Step> = vec![
-                        Step::IndexedMoeGemv {
-                            experts: &expert_refs[r],
-                            which: MoeProj::GateUp {
-                                up_out: s.moe_up_batch.as_ref().unwrap(),
-                            },
-                            topk_indices: s.moe_topk_indices.as_ref().unwrap(),
-                            input: GemvInput::Prerotated(s.ffn_x_rot.as_ref().unwrap()),
-                            out: s.moe_gate_batch.as_ref().unwrap(),
-                            k_top,
-                            batch_size: 1,
-                        },
-                        Step::MoeActivation {
-                            variant: MoeActivationVariant::Ds4ClampRotate {
-                                swiglu_limit: cfg.swiglu_limit,
-                            },
-                            gate: s.moe_gate_batch.as_ref().unwrap(),
-                            up: s.moe_up_batch.as_ref().unwrap(),
-                            rot_out: s.moe_rot_batch.as_ref().unwrap(),
-                            inter,
-                            k_top,
-                        },
-                    ];
-                    rank_steps.extend([
-                        Step::IndexedMoeGemv {
-                            experts: &expert_refs[r],
-                            which: MoeProj::DownExpanded,
-                            topk_indices: s.moe_topk_indices.as_ref().unwrap(),
-                            input: GemvInput::Prerotated(s.moe_rot_batch.as_ref().unwrap()),
-                            out: s.moe_down_expert_outputs.as_ref().unwrap(),
-                            k_top,
-                            batch_size: 1,
-                        },
-                        Step::MoeCombine {
-                            down_out: s.moe_down_expert_outputs.as_ref().unwrap(),
-                            topk_weights: s.moe_topk_weights.as_ref().unwrap(),
-                            out: &partials[r],
-                            k: k_top,
-                            hidden,
-                            batch_size: 1,
-                            inverse_perm: None,
-                        },
-                    ]);
-                    rank_steps
-                })
-                .collect();
-            let colls: Vec<StepCollective> = vec![
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::None,
-                StepCollective::AllReduce {
-                    kind: hipfire_runtime::multi_gpu::DimKind::Ep,
-                    dim: hidden,
-                },
-            ];
-            let zbefore: Vec<bool> = vec![false, false, false, true];
-            (steps, colls, zbefore)
-        };
+                    },
+                    // ConvertI64ToF32: converts the local i64 accumulator to the f32 partial.
+                    // AllReduce{Ep} on ConvertI64ToF32's dst (partials[r]) sums across ranks.
+                    Step::ConvertI64ToF32 {
+                        src: &partials_i64[r],
+                        dst: &partials[r],
+                        n: hidden,
+                    },
+                ]
+            })
+            .collect();
+        let collectives: Vec<StepCollective> = vec![
+            StepCollective::None,
+            StepCollective::None,
+            StepCollective::ZeroI64Only { dim: hidden },
+            StepCollective::AllReduce {
+                kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                dim: hidden,
+            },
+        ];
+        let zero_before: Vec<bool> = vec![false, false, true, false];
         execute_steps_parallel(mesh, gpus, &per_rank_steps, &collectives, &zero_before)
             .map_err(|e| format!("moe-step L{l}: execute_steps_parallel: {e:?}"))?;
     }
@@ -2550,6 +2494,7 @@ pub fn forward_ep(
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
     partials: &[GpuTensor],
+    partials_i64: &[GpuTensor],
     token: u32,
     position: u32,
 ) -> Result<(), String> {
@@ -2565,6 +2510,7 @@ pub fn forward_ep(
         "ds4 forward_ep: state_per_rank len"
     );
     assert_eq!(partials.len(), n, "ds4 forward_ep: partials len");
+    assert_eq!(partials_i64.len(), n, "ds4 forward_ep: partials_i64 len");
     let hidden = cfg.hidden_size;
     let skip_ffn = env_cache::skip_ffn();
 
@@ -2634,6 +2580,7 @@ pub fn forward_ep(
             cfg,
             state_per_rank,
             partials,
+            partials_i64,
             &ep_mesh,
             l,
             token,
@@ -3255,6 +3202,7 @@ pub fn mtp_forward_ep(
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
     partials: &[GpuTensor],
+    partials_i64: &[GpuTensor],
     h_n_per_rank: &[GpuTensor],
     next_token: u32,
     position: u32,
@@ -3271,6 +3219,7 @@ pub fn mtp_forward_ep(
         "mtp_forward_ep: state_per_rank len"
     );
     assert_eq!(partials.len(), n, "mtp_forward_ep: partials len");
+    assert_eq!(partials_i64.len(), n, "mtp_forward_ep: partials_i64 len");
     assert_eq!(h_n_per_rank.len(), n, "mtp_forward_ep: h_n_per_rank len");
     let hidden = cfg.hidden_size;
     let mtp_layer_idx = cfg.num_hidden_layers;
@@ -3308,6 +3257,7 @@ pub fn mtp_forward_ep(
             cfg,
             state_per_rank,
             partials,
+            partials_i64,
             &ep_mesh,
             mtp_layer_idx,
             next_token,

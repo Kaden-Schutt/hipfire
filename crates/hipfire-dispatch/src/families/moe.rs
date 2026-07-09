@@ -1095,11 +1095,11 @@ pub fn launch_indexed_down_residual(
     }
 }
 
-/// Reproducible int64 down path (MQ3G256Lloyd only): calls
-/// `moe_down_mq3g256_lloyd_residual_i64_indexed` which atomically accumulates
+/// Reproducible int64 down path (MQ2G256Lloyd + MQ3G256Lloyd): accumulates
 /// S-scaled int64 values into `residual_i64` (pre-zeroed by the caller).
-/// After all expert launches and the cross-rank i64 all-reduce,
-/// `moe_i64_residual_to_f32` converts the summed i64 to f32.
+/// After conversion via `moe_i64_residual_to_f32`, the result is FP32.
+/// Used on both the TP path (AllReduceI64Tp then convert) and the EP i64 path
+/// (convert per rank then AllReduce{Ep} in FP32).
 pub fn launch_indexed_down_residual_i64(
     gpu: &mut rdna_compute::Gpu,
     experts: &MoeExpertRef<'_>,
@@ -1112,6 +1112,18 @@ pub fn launch_indexed_down_residual_i64(
     let m = experts.expert_k; // down output = hidden
     let k = experts.expert_m; // down input  = inter
     match experts.dtype {
+        DType::MQ2G256Lloyd => gpu
+            .moe_down_mq2g256_lloyd_residual_i64_indexed(
+                experts.down_ptrs,
+                topk_indices,
+                topk_weights,
+                rot_batch,
+                residual_i64,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
         DType::MQ3G256Lloyd => gpu
             .moe_down_mq3g256_lloyd_residual_i64_indexed(
                 experts.down_ptrs,
@@ -1125,7 +1137,7 @@ pub fn launch_indexed_down_residual_i64(
             )
             .map_err(|e| DispatchError::Hip(e.to_string())),
         other => Err(DispatchError::Hip(format!(
-            "launch_indexed_down_residual_i64: only MQ3G256Lloyd supported, got {other:?}"
+            "launch_indexed_down_residual_i64: only MQ2G256Lloyd/MQ3G256Lloyd supported, got {other:?}"
         ))),
     }
 }

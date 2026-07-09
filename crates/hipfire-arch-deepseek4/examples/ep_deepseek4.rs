@@ -172,6 +172,9 @@ fn main() {
 
     let mut state_per_rank: Vec<DeepseekV4State> = Vec::with_capacity(n);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(n);
+    // int64 scratch: hidden * 8 bytes per element (raw bytes, DType::Raw).
+    // Used by DownResidualI64 on the EP i64 path; pre-zeroed per step by the executor.
+    let mut partials_i64: Vec<GpuTensor> = Vec::with_capacity(n);
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind");
         state_per_rank.push(DeepseekV4State::new(&cfg).expect("state"));
@@ -179,6 +182,11 @@ fn main() {
             gpus.devices[r]
                 .zeros(&[cfg.hidden_size], DType::F32)
                 .expect("partial"),
+        );
+        partials_i64.push(
+            gpus.devices[r]
+                .zeros(&[cfg.hidden_size * 8], DType::Raw)
+                .expect("partial_i64"),
         );
     }
     let peer = gpus.enable_peer_all().expect("enable_peer_all");
@@ -234,6 +242,7 @@ fn main() {
             &cfg,
             &mut state_per_rank,
             &partials,
+            &partials_i64,
             t,
             pos as u32,
         )
@@ -285,6 +294,7 @@ fn main() {
             &cfg,
             &mut state_per_rank,
             &partials,
+            &partials_i64,
             &h_n_per_rank,
             t0,
             prompt_ids.len() as u32,
@@ -320,6 +330,7 @@ fn main() {
             &cfg,
             &mut state_per_rank,
             &partials,
+            &partials_i64,
             next,
             pos as u32,
         )

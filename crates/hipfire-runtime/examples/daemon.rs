@@ -1348,11 +1348,7 @@ fn main() {
                     ) {
                         Ok(bands) => bands,
                         Err(msg) => {
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"error","message":"{}"}}"#,
-                                msg
-                            );
+                            let _ = writeln!(stdout, r#"{{"type":"error","message":"{}"}}"#, msg);
                             let _ = stdout.flush();
                             continue;
                         }
@@ -3351,6 +3347,7 @@ fn ep_serve_ds4(
             weights,
             state,
             partials,
+            partials_i64,
         } = inner
         else {
             let _ = writeln!(
@@ -3379,7 +3376,14 @@ fn ep_serve_ds4(
                 break;
             }
             if let Err(e) = deepseek4::forward::forward_ep(
-                gpus, weights, config, state, partials, t, pos as u32,
+                gpus,
+                weights,
+                config,
+                state,
+                partials,
+                partials_i64,
+                t,
+                pos as u32,
             ) {
                 let _ = writeln!(
                     stdout,
@@ -3503,13 +3507,21 @@ fn ep_serve_ds4(
             weights,
             state,
             partials,
+            partials_i64,
         } = inner
         else {
             break;
         };
-        if let Err(e) =
-            deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
-        {
+        if let Err(e) = deepseek4::forward::forward_ep(
+            gpus,
+            weights,
+            config,
+            state,
+            partials,
+            partials_i64,
+            next,
+            pos as u32,
+        ) {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#,
@@ -3699,6 +3711,7 @@ fn ep_serve_minimax(
             weights,
             state,
             partials,
+            partials_i64,
         } = inner
         else {
             let _ = writeln!(
@@ -3721,9 +3734,16 @@ fn ep_serve_minimax(
                 break;
             }
             let pos = (prefill_from + i) as u32;
-            if let Err(e) =
-                minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos)
-            {
+            if let Err(e) = minimax::forward::forward_ep(
+                gpus,
+                weights,
+                config,
+                state,
+                partials,
+                partials_i64,
+                t,
+                pos,
+            ) {
                 let _ = writeln!(
                     stdout,
                     r#"{{"type":"error","id":"{}","message":"forward_ep prefill: {}"}}"#,
@@ -3822,13 +3842,21 @@ fn ep_serve_minimax(
             weights,
             state,
             partials,
+            partials_i64,
         } = inner
         else {
             break;
         };
-        if let Err(e) =
-            minimax::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
-        {
+        if let Err(e) = minimax::forward::forward_ep(
+            gpus,
+            weights,
+            config,
+            state,
+            partials,
+            partials_i64,
+            next,
+            pos as u32,
+        ) {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"forward_ep decode: {}"}}"#,
@@ -7105,8 +7133,10 @@ fn generate(
                       // flags) — same predicate the arch_id=7 path uses above. The τ-adaptive
                       // block controller makes temp>0 DSpark beat AR + CACTUS adds more; this
                       // was hardcoded greedy-only (temp>0 → AR).
-        let spec_temp_ok =
-            temp <= 1e-6 || m.speculator.as_ref().map_or(false, |s| !s.requires_greedy());
+        let spec_temp_ok = temp <= 1e-6
+            || m.speculator
+                .as_ref()
+                .map_or(false, |s| !s.requires_greedy());
         let spec_mode = deepseek4_spec_requested(m) && spec_temp_ok;
         if spec_mode && m.speculator.is_some() {
             generate_deepseek4_spec(

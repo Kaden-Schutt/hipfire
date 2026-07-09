@@ -924,6 +924,11 @@ pub enum StepCollective {
     /// `dim` is the element count in int64 (= hidden). Uses `all_reduce_sum_i64_peer`.
     /// The `zero_before` flag for this step must use `dim * 8` bytes (not `dim * 4`).
     AllReduceI64Tp { dim: usize },
+    /// Zero-only: zeroes the step's output buffer (8 bytes/elem = i64) but runs no
+    /// cross-rank collective. Used before `DownResidualI64` on the EP i64 path,
+    /// where the cross-rank reduce is FP32 (attached to the subsequent
+    /// `ConvertI64ToF32` step via `AllReduce{Ep}`).
+    ZeroI64Only { dim: usize },
 }
 
 /// The `out` buffer of a step that carries a row-parallel or EP partial output
@@ -961,8 +966,9 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         Step::ScoreActivation { .. } => None,
         // MoeActivation is an intermediate (not an EP partial).
         Step::MoeActivation { .. } => None,
-        // ConvertI64ToF32 is a post-reduce step; dst is the f32 partial, not a collective partial.
-        Step::ConvertI64ToF32 { .. } => None,
+        // ConvertI64ToF32: on the EP i64 path (ZeroI64Only→DownResidualI64→ConvertI64ToF32→AllReduce{Ep}),
+        // the f32 `dst` IS the EP partial that the AllReduce{Ep} collective must target.
+        Step::ConvertI64ToF32 { dst, .. } => Some(&dst.buf),
         _ => None,
     }
 }
@@ -1068,6 +1074,7 @@ pub fn execute_steps_parallel(
                 let (dim, elem_bytes) = match &collectives[i] {
                     StepCollective::AllReduce { dim, .. } => (*dim, 4usize),
                     StepCollective::AllReduceI64Tp { dim } => (*dim, 8usize),
+                    StepCollective::ZeroI64Only { dim } => (*dim, 8usize),
                     StepCollective::None => {
                         return Err(DispatchError::Hip(format!(
                             "execute_steps_parallel: zero_before[{i}] is true but collective is None (no dim)"
@@ -1093,7 +1100,7 @@ pub fn execute_steps_parallel(
             gpus.devices[dev].bind_thread().map_err(hip_err)?;
             let ctx = DispatchCtx::new(&gpus.devices[dev]);
             launch_op(&mut gpus.devices[dev], &ctx, &per_rank_steps[0][i])?;
-            // All-reduce is identity for g==1; skip.
+            // All-reduce is identity for g==1; skip (including ZeroI64Only).
         }
         return Ok(());
     }
@@ -1114,6 +1121,7 @@ pub fn execute_steps_parallel(
             let (dim, elem_bytes) = match &collectives[i] {
                 StepCollective::AllReduce { dim, .. } => (*dim, 4usize),
                 StepCollective::AllReduceI64Tp { dim } => (*dim, 8usize),
+                StepCollective::ZeroI64Only { dim } => (*dim, 8usize),
                 StepCollective::None => {
                     return Err(DispatchError::Hip(format!(
                         "execute_steps_parallel: zero_before[{i}] is true but collective is None (no dim)"
@@ -1212,6 +1220,11 @@ pub fn execute_steps_parallel(
                 }
                 gpus.all_reduce_sum_i64_peer(&group, &refs, *dim)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            StepCollective::ZeroI64Only { .. } => {
+                // Zero-only: buffer was already zeroed in the zero_before block above.
+                // No cross-rank reduce — the EP i64 path reduces in FP32 (attached
+                // to the ConvertI64ToF32 step's AllReduce{Ep} collective).
             }
             StepCollective::None => {}
         }

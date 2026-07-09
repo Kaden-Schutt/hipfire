@@ -1288,11 +1288,13 @@ fn minimax_ep_moe_step(
     ) = if is_lloyd_down {
         // Lloyd down (MQ2G256Lloyd / MQ3G256Lloyd): residual-fused single Step
         // writes the weighted-combine directly into the EP partial.
-        // Two sub-paths:
+        // Three sub-paths keyed on use_i64_down + tp:
         // - TP + MQ3G256Lloyd + use_i64_down: DownResidualI64 → AllReduceI64Tp →
-        //   ConvertI64ToF32. Partition-invariant: split=2 produces the same f32 as
-        //   split=1 (i64 exact integer sum, then single convert).
-        // - EP (or non-MQ3L Lloyd): DownResidual → AllReduce{Ep} (unchanged, byte-exact).
+        //   ConvertI64ToF32. Partition-invariant: tp=1 and tp=2 produce identical f32.
+        // - EP + MQ3G256Lloyd + use_i64_down: DownResidualI64 (local, ZeroI64Only) →
+        //   ConvertI64ToF32 → AllReduce{Ep} (FP32). EP becomes reproducible per rank.
+        // - non-MQ3L Lloyd (MQ2G256Lloyd, no i64 kernel for MQ2L on EP/TP):
+        //   DownResidual → AllReduce{Tp|Ep} (unchanged FP path).
         let use_i64 = use_i64_down && matches!(ddt, rdna_compute::DType::MQ3G256Lloyd);
         let i64s: &[GpuTensor] = if use_i64 {
             partials_i64
@@ -1424,20 +1426,39 @@ fn minimax_ep_moe_step(
         // Collectives: i64 path has 6 steps (4 pre-down + DownI64 + Convert);
         // f32 path has 5 steps (4 pre-down + DownResidual).
         let (colls, zbefore) = if use_i64 {
-            // AllReduce kind: Tp (always, since use_i64 implies TP path).
-            // zero_before=true on the DownResidualI64 step (index 4) zeroes the i64 partial.
-            // The ConvertI64ToF32 step (index 5) has no collective and no pre-zero.
-            (
-                vec![
-                    StepCollective::None,
-                    StepCollective::None,
-                    StepCollective::None,
-                    StepCollective::None,
-                    StepCollective::AllReduceI64Tp { dim: hidden },
-                    StepCollective::None,
-                ],
-                vec![false, false, false, false, true, false],
-            )
+            // Two sub-paths keyed on tp:
+            // - TP (tp>1): DownResidualI64 → AllReduceI64Tp → ConvertI64ToF32 (no collective).
+            //   The i64 all-reduce is partition-invariant: tp=1 and tp=2 produce identical f32.
+            // - EP (tp==1): DownResidualI64 (local only, ZeroI64Only for pre-zero) →
+            //   ConvertI64ToF32 → AllReduce{Ep} (FP32). Cross-rank reduce in FP32.
+            if tp > 1 {
+                (
+                    vec![
+                        StepCollective::None,
+                        StepCollective::None,
+                        StepCollective::None,
+                        StepCollective::None,
+                        StepCollective::AllReduceI64Tp { dim: hidden },
+                        StepCollective::None,
+                    ],
+                    vec![false, false, false, false, true, false],
+                )
+            } else {
+                (
+                    vec![
+                        StepCollective::None,
+                        StepCollective::None,
+                        StepCollective::None,
+                        StepCollective::None,
+                        StepCollective::ZeroI64Only { dim: hidden },
+                        StepCollective::AllReduce {
+                            kind: hipfire_runtime::multi_gpu::DimKind::Ep,
+                            dim: hidden,
+                        },
+                    ],
+                    vec![false, false, false, false, true, false],
+                )
+            }
         } else {
             // AllReduce kind: Tp when there is a Tp axis (TP-of-experts), Ep otherwise.
             let ar_kind = if tp > 1 {
@@ -1577,6 +1598,7 @@ pub fn forward_ep(
     cfg: &MiniMaxConfig,
     state_per_rank: &mut [MiniMaxState],
     partials: &[GpuTensor],
+    partials_i64: &[GpuTensor],
     token: u32,
     position: u32,
 ) -> Result<(), String> {
@@ -1588,6 +1610,7 @@ pub fn forward_ep(
     );
     assert_eq!(state_per_rank.len(), n, "forward_ep: state_per_rank len");
     assert_eq!(partials.len(), n, "forward_ep: partials len");
+    assert_eq!(partials_i64.len(), n, "forward_ep: partials_i64 len");
     let hidden = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
 
@@ -1651,8 +1674,8 @@ pub fn forward_ep(
             cfg,
             state_per_rank,
             partials,
-            None,  // EP path: no i64 partials (f32 DownResidual stays unchanged)
-            false, // use_i64_down: false for EP
+            Some(partials_i64), // EP i64: DownResidualI64 → ConvertI64ToF32 → AllReduce{Ep}
+            true,               // use_i64_down: true → reproducible int64 down per rank
             &ep_mesh,
             l,
         )
