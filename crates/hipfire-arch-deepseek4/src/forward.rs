@@ -2613,13 +2613,8 @@ fn ffn_batched_pre_down(
     )
     .map_err(|e| format!("pre_down silu shared l{layer_idx}: {e:?}"))?;
     if down_needs_fwht {
-        gpu.rotate_x_mq_batched(
-            &pbs.ffn_shared_gate_batch,
-            &pbs.ffn_shared_rot_batch,
-            im,
-            n,
-        )
-        .map_err(|e| format!("pre_down rotate shared l{layer_idx}: {e:?}"))?;
+        gpu.rotate_x_mq_batched(&pbs.ffn_shared_gate_batch, &pbs.ffn_shared_rot_batch, im, n)
+            .map_err(|e| format!("pre_down rotate shared l{layer_idx}: {e:?}"))?;
     }
     gemv_auto_batched_wmma(
         gpu,
@@ -2677,9 +2672,10 @@ fn ffn_batched_pre_down(
                 tokens.len()
             ));
         }
-        let tid2eid_dev = layer.tid2eid_dev.as_ref().ok_or_else(|| {
-            format!("pre_down hash l{layer_idx}: tid2eid_dev missing")
-        })?;
+        let tid2eid_dev = layer
+            .tid2eid_dev
+            .as_ref()
+            .ok_or_else(|| format!("pre_down hash l{layer_idx}: tid2eid_dev missing"))?;
         gpu.hash_router_normalize_f32_batched(
             tid2eid_dev,
             &pbs.moe_scores_batch,
@@ -2798,6 +2794,16 @@ pub fn ds4_prefill_moe_step_tp(
     let tp = mesh.size_of(DimKind::Tp).max(1);
     let inter_local = inter / tp;
 
+    let tp_group = mesh.group_along(DimKind::Tp, &mesh.coord_of(0));
+    // This step assumes a pure-Tp mesh: every device is a Tp-axis peer, so
+    // num_ranks == the Tp group size. A multi-axis mesh (e.g. PP×TP) would make
+    // the per-rank 0..num_ranks loops and the Tp-group all-reduce diverge.
+    debug_assert_eq!(
+        num_ranks,
+        tp_group.len(),
+        "ds4_prefill_moe_step_tp: pure-Tp mesh required (num_ranks must equal the Tp-axis group size)"
+    );
+
     // ── Phase 1: per-rank replicated routing + shared expert + gate‖up + activation ──
     let mut routed = false;
     for r in 0..num_ranks {
@@ -2820,7 +2826,7 @@ pub fn ds4_prefill_moe_step_tp(
     }
 
     if !routed {
-        // No routed experts — partials stay zero; Phase 3 add is a no-op.
+        // Shared-only layer: partials_i64_per_rank / partials_per_rank are left untouched — their contents are only valid after a routed==true exit (Phase 2/3 skipped).
         return Ok(());
     }
 
@@ -2854,12 +2860,7 @@ pub fn ds4_prefill_moe_step_tp(
         })?;
         gpus.devices[r]
             .hip
-            .memset_async(
-                &partials_i64_per_rank[r].buf,
-                0,
-                n * hidden * 8,
-                stream,
-            )
+            .memset_async(&partials_i64_per_rank[r].buf, 0, n * hidden * 8, stream)
             .map_err(|e| format!("prefill_moe_tp zero i64 L{layer_idx} r{r}: {e:?}"))?;
     }
 
@@ -2908,7 +2909,6 @@ pub fn ds4_prefill_moe_step_tp(
     // AllReduceI64Tp: sync streams, then peer-reduce the contiguous [n*hidden] i64
     // partials across the Tp group. Mirrors execute_steps_parallel's AllReduceI64Tp
     // branch (steps.rs:1200-1222) called directly to avoid per-step overhead.
-    let tp_group = mesh.group_along(DimKind::Tp, &mesh.coord_of(0));
     for &dev in &tp_group {
         gpus.devices[dev]
             .bind_thread()
@@ -2936,11 +2936,7 @@ pub fn ds4_prefill_moe_step_tp(
             .bind_thread()
             .map_err(|e| format!("prefill_moe_tp convert bind {r} L{layer_idx}: {e:?}"))?;
         gpus.devices[r]
-            .moe_i64_residual_to_f32(
-                &partials_i64_per_rank[r],
-                &partials_per_rank[r],
-                n * hidden,
-            )
+            .moe_i64_residual_to_f32(&partials_i64_per_rank[r], &partials_per_rank[r], n * hidden)
             .map_err(|e| format!("prefill_moe_tp convert L{layer_idx} r{r}: {e:?}"))?;
     }
 
