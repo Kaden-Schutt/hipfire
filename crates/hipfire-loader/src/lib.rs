@@ -10,6 +10,7 @@ pub use carriers::*;
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
 /// both `LoadedModel`/`ModelState` and the arch crates are in scope.
+pub mod model_parallel;
 pub mod session_state;
 pub mod spec_build;
 
