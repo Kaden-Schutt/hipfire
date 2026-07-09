@@ -53,12 +53,12 @@ impl SessionState {
     /// Mirrors `free_checkpoints` in daemon.rs — routes every drop through
     /// `DeltaNetSnapshot::free_gpu` so bare `Vec::clear()` cannot orphan
     /// HIP allocations (no `Drop` on `DeltaNetSnapshot`).
-    pub fn clear(&mut self, _gpu: &mut rdna_compute::Gpu) {
+    pub fn clear(&mut self, gpu: &mut rdna_compute::Gpu) {
         for (_, snap) in self.prefill_checkpoints.drain(..) {
-            snap.free_gpu(_gpu);
+            snap.free_gpu(gpu);
         }
         for (_, snap) in self.dflash_checkpoints.drain(..) {
-            snap.free_gpu(_gpu);
+            snap.free_gpu(gpu);
         }
         self.seq_pos = 0;
         self.conversation_tokens.clear();
