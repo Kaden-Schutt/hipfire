@@ -699,6 +699,94 @@ fn assert_token_parity(old: &TokenTape, new: &TokenTape, id: &str) {
     }
 }
 
+// ─── ArchDispatch impls (Inc 1, god-struct-collapse) ─────────────────────────
+//
+// One `impl ArchDispatch` per arch family; wired into `ar_generate` in Task 1.4.
+// Until then, the structs are unused scaffolding: `#[allow(dead_code)]` silences
+// the compiler while the trait contract is being built arch by arch.
+
+/// Extract the qwen35 EOS token from the loaded model state.
+/// Mirrors the `config.eos_token` reads at daemon.rs:9210 and :5455
+/// (`target.config.eos_token` in `generate_dflash`, `b.config.eos_token` in the
+/// AR decode loop) — both read the same field on `Qwen35Config`.
+#[allow(dead_code)]
+fn qwen35_eos(m: &LoadedModel) -> u32 {
+    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+        b.config.eos_token
+    } else {
+        // Unreachable in production: Qwen35Dispatch is only constructed
+        // when the model is a qwen35 arch (5/6) and the bundle is present.
+        0
+    }
+}
+
+/// Wraps `&mut LoadedModel` to implement `ArchDispatch` for the qwen35 family
+/// (arch_id 5 = dense, 6 = MoE-A3B). Unused until Task 1.4 wires it into
+/// `ar_generate`; all methods delegate verbatim to existing daemon helpers.
+#[allow(dead_code)]
+struct Qwen35Dispatch<'m> {
+    m: &'m mut LoadedModel,
+}
+
+#[allow(dead_code)]
+impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
+    fn arch_id(&self) -> u32 {
+        // Direct field read — mirrors every `m.arch_id` branch in the daemon.
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        // Delegates to qwen35_eos: mirrors `b.config.eos_token` (AR loop,
+        // daemon.rs:9210) and `target.config.eos_token` (DFlash, daemon.rs:5455).
+        qwen35_eos(self.m)
+    }
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        // Last-resort arch ladder for arch_id 5/6: the `else` branch at
+        // daemon.rs:1906 (`(0.3_f64, 0.8_f64)`) plus the hardcoded
+        // `default_repeat_penalty = 1.0` (daemon.rs:1954, arch_id != 11).
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 0.3,
+            top_p: 0.8,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        // qwen35 AR: think-mode (primed_think/think_pair), user stop-seqs
+        // (stop_seqs Vec<String>), grammar-guided tool calls (Matcher). No vision
+        // in the AR path (VL is a separate forward through generate_qwen35_vl).
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: true,
+            supports_stop_seq: true,
+            supports_grammar: true,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        // Exact existing helper (daemon.rs:4105): handles both the pp>1
+        // multi-GPU DeltaNet memset path and the single-GPU path; also
+        // resets kv_cache.compact_offset. No logic duplicated here.
+        reset_qwen35_recurrent(self.m, gpu);
+    }
+
+    fn as_spec_target(&mut self) -> Option<&mut dyn hipfire_runtime::spec::SpecTarget> {
+        // TODO(Task 1.4): wire qwen35 SpecTarget when ar_generate needs it.
+        //
+        // The qwen35 carrier's `spec_target_guard` (carriers.rs:298) moves the
+        // bundle out of `m.state` into a `Qwen35SlotGuard` that reopens the
+        // HfqFile and restores the bundle on Drop — it returns a
+        // `Box<dyn SpecTargetGuard>`, not a bare `&mut dyn SpecTarget`. There is
+        // no existing getter that yields a `&mut dyn SpecTarget` from a live
+        // `&mut LoadedModel` without the guard machinery. Returning None here
+        // is safe: `as_spec_target` is the default no-op path; the spec loop
+        // continues to go through `carrier.spec_target_guard` directly until
+        // Task 1.4 introduces the abstracted generate path.
+        None
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
