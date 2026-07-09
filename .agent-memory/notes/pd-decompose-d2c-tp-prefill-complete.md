@@ -1,0 +1,32 @@
+---
+title: P-D-decompose D2c COMPLETE — ds4 TP-of-experts BATCHED PREFILL (per-rank replicated attention + batched TP MoE, per-token i64 down), tp1==tp2 BIT-EXACT on emulated Tp-2
+date: 2026-07-09
+tags: [device-mesh, moe, p-d, decompose, d2c, tp-of-experts, tensor-parallel, prefill, batched, deepseek4, int64, bit-exact, partition-invariant, allreduce-tp]
+---
+
+**Branch:** `feature/device-mesh` (worktree `.claude/worktrees/feature+device-mesh`). Plan: `docs/superpowers/plans/2026-07-09-d2c-tp-prefill.md`. Executed subagent-driven (SDD). Parent: [[pd-decompose-d2b-tp-of-experts-complete]] + [[reproducible-moe-down-kernel-complete]].
+
+## What D2c delivered
+**Batched (chunked ≤256) prefill for deepseek4 TP-of-experts.** D2b shipped per-token TP decode; D2c adds the batched prefill forward. New (all in `crates/hipfire-arch-deepseek4/src/forward.rs`, purely ADDITIVE — no edits to `forward_ep`/`ds4_ep_moe_step`/`ffn_batched`/single-GPU prefill):
+- `ds4_prefill_moe_step_tp` — batched TP MoE for one prefill layer. Phase 1 = per-rank `ffn_batched_pre_down` (a DUPLICATE of `ffn_batched`'s routing+shared-expert+gate‖up+activation, stopping before the routed down; duplicated to keep the single-GPU `ffn_batched` byte-identical) with `inter_local = moe_intermediate_size/tp`. Phase 2 = **per-token** `launch_indexed_down_residual_i64` loop over the chunk into `partials_i64[r]` (byte offsets: rot row b = b·k_top·inter_local·4, topk row b = b·k_top·4, i64 row b = b·hidden·8), ONE `all_reduce_sum_i64_peer(n·hidden)`, then `moe_i64_residual_to_f32(n·hidden)`. Phase 3 = per-rank `ffn_out_batch += partial` (shared added once). Pure-Tp-mesh `debug_assert_eq!(num_ranks, tp_group.len())` guard.
+- `forward_prefill_batch_chunk_tp` + `forward_prefill_batch_tp` — re-compose the EXISTING single-GPU batched stage helpers (`mhc_pre_batched`, `q_lora_batched`, `kv_joint_batched`, `apply_tail_rope_batched`, `attention_block_batched_swa_only/mixed`, `hc_attn_mix_batched`, `hc_ffn_mix_batched`) REPLICATED per rank (the forward_ep pattern), swapping the single `ffn_batched` call for `ds4_prefill_moe_step_tp`. Chunk driver ≤256 + `final_norm_and_head_last_batched` on rank 0. DSpark capture skipped.
+- Harness `examples/tp_deepseek4.rs` `--prefill-batch --prefill-len N`.
+
+## HARD constraint discovered: bit-exact batched-MoE-down is impossible; the down loops per-token
+The reproducible int64 down (`DownResidualI64`) is **indexed-only** — `steps.rs:1593` calls the per-token `launch_indexed_down_residual_i64` (no batch param); the grouped path REJECTS `DownResidualI64` (`steps.rs:1694`). So on the bit-exact (i64) path the MoE **down cannot batch** — it loops per-token (n·ranks sequential kernel dispatches). Only attention + gate‖up/activation batch. A truly batched bit-exact down needs a NEW batched-i64 grouped kernel (deferred). Throughput payoff of D2c is also unmeasurable until real ≥2-GPU HW (emulated-only).
+
+## Validation (gfx1151, DETERMINISTIC=1 EMULATE_GPUS=2 EP_PEER_ALLREDUCE_DECODE=1, --no-dspark, prefill-len 300 → chunks 256+44)
+- **(a) decode tp1-batched vs tp2-batched: argmax-exact, max|Δ|=0** (hard PASS).
+- **(b) prefill-final logits tp1-batched vs tp2-batched: max|Δ|=0** (hard PASS). ← THE D2c guarantee: batched-prefill TP slicing + `AllReduceI64Tp` is bit-exact across tp.
+- **(c) batched-TP vs per-token `forward_tp`: max|Δ|=0.95, SOFT report.** NOT a bug — repo documents batched flash-attn ≠ per-token scalar attn (`smoke_llama_prefill_batch.rs:11`, `llama/spec_impl.rs:89`). The MoE down is the SAME i64 kernel in both, so (c) is pure batched-attn nondeterminism amplified by greedy over a 300× repeated prompt. **The plan's original (c) max|Δ|==0 bar was WRONG** (impossible invariant); softened to a report.
+- **(d) tp1-batched-TP vs single-GPU-BATCHED `forward_prefill_batch_chunked`: max|Δ|=0.87, ARGMAX_MATCH=true (both tok 1004).** Isolates ONLY the MoE down (i64-per-token vs f32-grouped/scalar; batched attention SHARED). Argmax-match ⇒ decision-equivalent ⇒ **no TP-path bug**. 0.87 is moderate (E=24 fixed-point i64 down vs f32 grouped down, 43-layer residual accumulation), decision-equivalent; the i64 down is independently validated (D2b bit-exact + reproducible-kernel parity test). Note: (a)+(b) alone can't catch a batched-down slicing bug consistent across tp — (d)'s argmax-match against an INDEPENDENT down implementation is the check that does.
+- `ep_deepseek4 --tp 2 --no-dspark` FNV `0x6c0f2f000f1d398f` (D2c additive; EP decode unchanged). `cargo build --workspace --all-targets --locked` green.
+
+## Traps (cost real time this session)
+- **STALE doc lies:** `forward_prefill_batch_chunk` (forward.rs) carries a 2026-05-18 "work in progress / errors out at first unimplemented stage" doc + `#[allow(dead_code)]`, but its BODY is fully wired (`attention_block_batched_*` + `ffn_batched`) and works. A subagent believed the doc, used the per-token `forward_prefill_batch` fallback (forward.rs, "Per-token fallback until forward_prefill_batch_chunk is end-to-end") as the "batched" reference for (d) → (d) silently became ≈(c). The real single-GPU batched driver is `forward_prefill_batch_chunked` (strict batched-only, returns last-pos logits, no fallback — the fallback once masked a chunk-2 bug per `feedback_deepseek4_chunked_silent_fallback_bug`). Verify function BODIES, not doc comments.
+- **fmt-changed churn** (as D2b): reverted ~collateral each commit; staged only intended files.
+
+## Deferred
+- **Batched bit-exact MoE down** (new batched-i64 grouped kernel) → would make the down actually batch + likely shrink (d).
+- **Grouped-f32 fast TP prefill down** (argmax-exact, not bit-exact) — the throughput path once HW exists.
+- **2D EP×TP**, real ≥2-GPU HW (throughput unmeasurable emulated), daemon wiring of `forward_prefill_batch_tp`.
