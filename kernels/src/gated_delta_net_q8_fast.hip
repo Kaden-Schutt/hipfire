@@ -6,12 +6,16 @@
 // Supports EF residual (sigma-delta) but always does single-end requant
 // OUTSIDE the per-token loop. No per-token requant mode.
 //
-// Why: the full kernel moved the requant inside the loop to support
-// per-token requant (PARO path). This increased register pressure because
-// the compiler must carry the requant live-set (q0..q3, scale, rng, EF
-// temporaries) across the entire loop body. On gfx906 wave64 (256 VGPRs/file)
-// this causes spill-to-scratch: 108→172 bytes per workitem (+60%), costing
-// +38% per dispatch. This variant avoids that by keeping the loop lean.
+// VARIANT R14c1 gdn_lds_float4_pack:
+// BOD: mem-active(mixed) occ~17% mem_busy~33% L2~86% vgpr=64 LDS=2048.
+// Baseline stores each lane's 4 HD-slices (tid, tid+32, tid+64, tid+96)
+// as four scalar LDS floats → 4 loads + 4 stores per row per token.
+// Pack as float4 S_f4[row*32 + tid] (same 2048 B footprint): one b128-class
+// LDS transaction per row touch. Math identical (same 4-way partials, same
+// shfl_down reduce tree, same update/requant). Hypothesis: LDS scalar
+// multi-issue is on the critical path of the per-row state machine under
+// low-occ decode (n_tokens=1); packing raises effective LDS bandwidth
+// without raising VGPR (still 4 live floats, just as a vector).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -42,17 +46,19 @@ __global__ void gated_delta_net_q8_fast(
     const int stride = n_heads * HD;
     const int row_start = tile * TILE_ROWS;
 
-    __shared__ float S_tile[TILE_ROWS * HD];  // 4 KiB
+    // Packed layout: S_f4[r * 32 + tid] = {S[r][tid], S[r][tid+32],
+    // S[r][tid+64], S[r][tid+96]} — same 4*128 floats as the scalar tile.
+    __shared__ float4 S_f4[TILE_ROWS * 32];  // 4 KiB
 
     signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
     for (int r = 0; r < TILE_ROWS; r++) {
         const float scale = s_scales[h * HD + row_start + r];
         const signed char* src = sq_base + r * HD;
-        float* dst = S_tile + r * HD;
-        dst[tid]      = scale * (float)src[tid];
-        dst[tid + 32] = scale * (float)src[tid + 32];
-        dst[tid + 64] = scale * (float)src[tid + 64];
-        dst[tid + 96] = scale * (float)src[tid + 96];
+        S_f4[r * 32 + tid] = make_float4(
+            scale * (float)src[tid],
+            scale * (float)src[tid + 32],
+            scale * (float)src[tid + 64],
+            scale * (float)src[tid + 96]);
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -69,8 +75,8 @@ __global__ void gated_delta_net_q8_fast(
         float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
         for (int r = 0; r < TILE_ROWS; r++) {
             int row = row_start + r;
-            float* sr = S_tile + r * HD;
-            float s0 = sr[tid], s1 = sr[tid+32], s2 = sr[tid+64], s3 = sr[tid+96];
+            float4 s = S_f4[r * 32 + tid];
+            float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
             for (int o = 16; o > 0; o >>= 1)
@@ -87,7 +93,7 @@ __global__ void gated_delta_net_q8_fast(
             s1 = alpha * s1 + k1 * delta;
             s2 = alpha * s2 + k2 * delta;
             s3 = alpha * s3 + k3 * delta;
-            sr[tid] = s0; sr[tid+32] = s1; sr[tid+64] = s2; sr[tid+96] = s3;
+            S_f4[r * 32 + tid] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
             for (int o = 16; o > 0; o >>= 1)
@@ -110,8 +116,8 @@ __global__ void gated_delta_net_q8_fast(
     const bool use_ef = (s_ef_residual != nullptr);
     for (int r = 0; r < TILE_ROWS; r++) {
         int rr = row_start + r;
-        float* sr = S_tile + r * HD;
-        float s0 = sr[tid], s1 = sr[tid+32], s2 = sr[tid+64], s3 = sr[tid+96];
+        float4 s = S_f4[r * 32 + tid];
+        float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
         __half* efr = use_ef ? (s_ef_residual + h * HD * HD + rr * HD) : nullptr;
         if (use_ef) {
