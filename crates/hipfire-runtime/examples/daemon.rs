@@ -785,6 +785,91 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         // Task 1.4 introduces the abstracted generate path.
         None
     }
+
+    fn prefill_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ModelState::Qwen35(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
+            return Err("prefill_forward: not a qwen35 bundle".into());
+        };
+        qwen35::forward_prefill_batch(
+            gpu,
+            &b.weights,
+            &b.config,
+            chunk,
+            seq_pos,
+            &mut b.kv_cache,
+            &mut b.dn_state,
+            &b.scratch,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| format!("forward_prefill_batch: {:?}", e))
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ModelState::Qwen35(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
+            return Err("decode_step_forward: not a qwen35 bundle".into());
+        };
+        qwen35::forward_scratch(
+            gpu,
+            &b.weights,
+            &b.config,
+            token,
+            seq_pos,
+            &mut b.kv_cache,
+            &mut b.dn_state,
+            &b.scratch,
+        )
+        .map_err(|e| format!("forward_scratch: {:?}", e))
+    }
+
+    fn init_grammar(
+        &self,
+        tool_schemas: &[(String, Vec<String>)],
+    ) -> Option<Box<dyn hipfire_runtime::arch_dispatch::GrammarMatcher>> {
+        let schemas: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = tool_schemas
+            .iter()
+            .map(|(name, required)| hipfire_arch_qwen35::grammar::ToolSchema {
+                name: name.clone(),
+                required: required.clone(),
+            })
+            .collect();
+        Some(Box::new(Qwen35GrammarMatcher(
+            hipfire_arch_qwen35::grammar::Matcher::new(schemas),
+        )))
+    }
+}
+
+/// Newtype wrapper so daemon.rs (which owns this type) can implement
+/// `GrammarMatcher` for the qwen35 `Matcher` without violating the orphan rule
+/// (neither `GrammarMatcher` nor `Matcher` is defined here without the newtype).
+#[allow(dead_code)]
+struct Qwen35GrammarMatcher(hipfire_arch_qwen35::grammar::Matcher);
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::GrammarMatcher for Qwen35GrammarMatcher {
+    fn token_mask(&self, vocab: &[String], out: &mut [bool]) {
+        self.0.token_mask(vocab, out);
+    }
+
+    fn advance(&mut self, text: &str) {
+        self.0.advance(text);
+    }
+
+    fn is_free(&self) -> bool {
+        self.0.is_free()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
