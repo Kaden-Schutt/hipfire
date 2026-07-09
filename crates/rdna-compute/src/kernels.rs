@@ -2508,6 +2508,13 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
+/// Fused Q-head + K-head RMSNorm for the decode attention preamble
+/// (`HIPFIRE_FUSE_ATTN_PREAMBLE`). Byte-identical per-head math vs the two
+/// split `rmsnorm_f32` launches — merges them into one dispatch via a
+/// workgroup-id Q/K branch. See kernels/src/rmsnorm_qk_fused.hip.
+pub const RMSNORM_QK_FUSED_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_qk_fused.hip");
+
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
 pub const TRIATTN_ACCUMULATE_SRC: &str =

@@ -11574,19 +11574,14 @@ fn run_fa_layer_body(
         config.n_heads,
         config.head_dim,
     )?;
-    gpu.rmsnorm_batched(
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    qk_rmsnorm_preamble(
+        gpu,
         &s.fa_q,
         &layer.q_norm,
-        &s.fa_q,
-        config.n_heads,
-        config.head_dim,
-        config.norm_eps,
-    )?;
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    gpu.rmsnorm_batched(
         &s.fa_k,
         &layer.k_norm,
-        &s.fa_k,
+        config.n_heads,
         config.n_kv_heads,
         config.head_dim,
         config.norm_eps,
@@ -12167,18 +12162,13 @@ fn forward_scratch_layers(
                     config.n_heads,
                     config.head_dim,
                 )?;
-                gpu.rmsnorm_batched(
+                qk_rmsnorm_preamble(
+                    gpu,
                     &s.fa_q,
                     &layer.q_norm,
-                    &s.fa_q,
-                    config.n_heads,
-                    config.head_dim,
-                    config.norm_eps,
-                )?;
-                gpu.rmsnorm_batched(
                     &s.fa_k,
                     &layer.k_norm,
-                    &s.fa_k,
+                    config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,
                     config.norm_eps,
@@ -12456,18 +12446,13 @@ fn forward_scratch_layers(
                     config.n_heads,
                     config.head_dim,
                 )?;
-                gpu.rmsnorm_batched(
+                qk_rmsnorm_preamble(
+                    gpu,
                     &s.fa_q,
                     &layer.q_norm,
-                    &s.fa_q,
-                    config.n_heads,
-                    config.head_dim,
-                    config.norm_eps,
-                )?;
-                gpu.rmsnorm_batched(
                     &s.fa_k,
                     &layer.k_norm,
-                    &s.fa_k,
+                    config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,
                     config.norm_eps,
@@ -13228,6 +13213,39 @@ fn triattn_tap(
     Ok(())
 }
 
+/// Q/K per-head RMSNorm for the decode attention preamble.
+///
+/// Default (`HIPFIRE_FUSE_ATTN_PREAMBLE` unset/off): two back-to-back
+/// `rmsnorm_batched` launches — Q then K — byte-identical to the
+/// loop/gfx1201 baseline. When the flag is set, the Q-head and K-head norms
+/// are merged into ONE dispatch (`rmsnorm_qk_fused`, a workgroup-id Q/K
+/// branch) to shave a per-token kernel launch. The fused kernel's per-head
+/// math and reduction order are identical to the split path, so decode output
+/// is value-preserving either way. Both norms share `head_dim` as the feature
+/// length, which the Qwen3.5-family attention preamble always satisfies.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn qk_rmsnorm_preamble(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    q_norm: &GpuTensor,
+    k: &GpuTensor,
+    k_norm: &GpuTensor,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> HipResult<()> {
+    if gpu.flags.fuse_attn_preamble.unwrap_or(false) {
+        gpu.rmsnorm_qk_fused(
+            q, q_norm, q, k, k_norm, k, n_q_heads, n_kv_heads, head_dim, eps,
+        )
+    } else {
+        gpu.rmsnorm_batched(q, q_norm, q, n_q_heads, head_dim, eps)?;
+        gpu.rmsnorm_batched(k, k_norm, k, n_kv_heads, head_dim, eps)
+    }
+}
+
 /// KV cache write + attention dispatch. Inline from original.
 fn kv_cache_attention_dispatch(
     ctx: &DispatchCtx,
@@ -13632,18 +13650,13 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     config.n_heads,
                     config.head_dim,
                 )?;
-                gpu.rmsnorm_batched(
+                qk_rmsnorm_preamble(
+                    gpu,
                     &s.fa_q,
                     q_norm,
-                    &s.fa_q,
-                    config.n_heads,
-                    config.head_dim,
-                    config.norm_eps,
-                )?;
-                gpu.rmsnorm_batched(
                     &s.fa_k,
                     k_norm,
-                    &s.fa_k,
+                    config.n_heads,
                     config.n_kv_heads,
                     config.head_dim,
                     config.norm_eps,
@@ -14715,19 +14728,14 @@ fn forward_scratch_layers_multi(
                         config.n_heads,
                         config.head_dim,
                     )?;
-                    gpu.rmsnorm_batched(
+                    let kv_dim = config.n_kv_heads * config.head_dim;
+                    qk_rmsnorm_preamble(
+                        gpu,
                         &s.fa_q,
                         &layer.q_norm,
-                        &s.fa_q,
-                        config.n_heads,
-                        config.head_dim,
-                        config.norm_eps,
-                    )?;
-                    let kv_dim = config.n_kv_heads * config.head_dim;
-                    gpu.rmsnorm_batched(
                         &s.fa_k,
                         &layer.k_norm,
-                        &s.fa_k,
+                        config.n_heads,
                         config.n_kv_heads,
                         config.head_dim,
                         config.norm_eps,
@@ -15339,19 +15347,14 @@ fn forward_scratch_layers_multi(
                         config.n_heads,
                         config.head_dim,
                     )?;
-                    gpu.rmsnorm_batched(
+                    let kv_dim = config.n_kv_heads * config.head_dim;
+                    qk_rmsnorm_preamble(
+                        gpu,
                         &s.fa_q,
                         &layer.q_norm,
-                        &s.fa_q,
-                        config.n_heads,
-                        config.head_dim,
-                        config.norm_eps,
-                    )?;
-                    let kv_dim = config.n_kv_heads * config.head_dim;
-                    gpu.rmsnorm_batched(
                         &s.fa_k,
                         &layer.k_norm,
-                        &s.fa_k,
+                        config.n_heads,
                         config.n_kv_heads,
                         config.head_dim,
                         config.norm_eps,

@@ -177,6 +177,89 @@ impl Gpu {
         result
     }
 
+    /// Fused Q-head + K-head RMSNorm (decode attention-preamble micro-lever,
+    /// `HIPFIRE_FUSE_ATTN_PREAMBLE`). Replaces the two back-to-back
+    /// `rmsnorm_batched` launches (Q then K) with a single dispatch over
+    /// `n_q_heads + n_kv_heads` blocks; a workgroup-id branch in the kernel
+    /// selects the Q or K side. VALUE-PRESERVING: per-head math, reduction
+    /// order, and launch geometry are byte-identical to the split path. Both
+    /// sides must share the same feature length `n` (= head_dim), which the
+    /// Qwen3.5-family attention preamble always satisfies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_qk_fused(
+        &mut self,
+        xq: &GpuTensor,
+        wq: &GpuTensor,
+        outq: &GpuTensor,
+        xk: &GpuTensor,
+        wk: &GpuTensor,
+        outk: &GpuTensor,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        n: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_qk_fused",
+            kernels::RMSNORM_QK_FUSED_SRC,
+            "rmsnorm_qk_fused",
+        )?;
+
+        let mut xq_ptr = xq.buf.as_ptr();
+        let mut wq_ptr = wq.buf.as_ptr();
+        let mut outq_ptr = outq.buf.as_ptr();
+        let mut xk_ptr = xk.buf.as_ptr();
+        let mut wk_ptr = wk.buf.as_ptr();
+        let mut outk_ptr = outk.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut n_q_val = n_q_heads as i32;
+        let mut eps_val = eps;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut wq_ptr as *mut _ as *mut c_void,
+            &mut outq_ptr as *mut _ as *mut c_void,
+            &mut xk_ptr as *mut _ as *mut c_void,
+            &mut wk_ptr as *mut _ as *mut c_void,
+            &mut outk_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut n_q_val as *mut _ as *mut c_void,
+            &mut eps_val as *mut _ as *mut c_void,
+        ];
+
+        let grid = (n_q_heads + n_kv_heads) as u32;
+        let block_size = 256u32.min(n as u32);
+        let shared_mem = block_size * 4;
+        let bytes = crate::profile::rmsnorm_bytes((n_q_heads + n_kv_heads) * n);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_qk_fused", bytes);
+        let result = self.launch_maybe_blob(
+            "rmsnorm_qk_fused",
+            [grid, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xq_ptr);
+                b.push_ptr(wq_ptr);
+                b.push_ptr(outq_ptr);
+                b.push_ptr(xk_ptr);
+                b.push_ptr(wk_ptr);
+                b.push_ptr(outk_ptr);
+                b.push_i32(n_val);
+                b.push_i32(n_q_val);
+                b.push_f32(eps_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// c = a + b (element-wise)
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
