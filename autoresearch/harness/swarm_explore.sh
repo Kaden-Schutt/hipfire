@@ -36,6 +36,8 @@ for spec in $WORKERS; do
       LOOP_PROGRESS="$STATE/loop_progress_${ARCH}_w${i}.log" PROMPT="$P" \
       HIPFIRE_GPU_LOCKFILE="/tmp/hipfire-gpu-${ARCH}-dev${dev}.lock" \
       LOG="$STATE/loop_driver_${ARCH}_w${i}.log" ROLLOVER="$HARN/noop_rollover.sh" \
+      AGENT_HARNESS="${AGENT_HARNESS:-codex}" AGENT_MODEL="${AGENT_MODEL:-}" AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-100}" \
+      GROK_BIN="${GROK_BIN:-$HOME/.local/bin/grok}" \
       PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$PATH" \
       setsid nohup bash "$HARN/v2/driver_v3.sh" "$CAP" >/dev/null 2>&1 </dev/null &
   echo "w$i: slot=$s dev=$dev drm=card$drm branch=$BR pid=$! lock=dev${dev}"

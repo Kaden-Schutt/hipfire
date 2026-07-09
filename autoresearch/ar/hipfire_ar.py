@@ -219,6 +219,37 @@ def cmd_start(a):
     c = db(); rid = f"{a.arch}-c{a.card}-{int(time.time())}"
     baseline = a.baseline or f"loop_baseline_{a.arch}"
     prompt = a.prompt or f"~/hipfire/autoresearch/harness/loop_round_prompt_{a.arch}.txt"
+    # SWARM: launch N parallel per-card workers via swarm_explore.sh (each an independent driver_v3
+    # over agent_exec.sh -> the chosen harness). swarm_explore setsid-detaches every worker and echoes
+    # its pid, then exits — so this ssh returns after launch. Each worker is recorded as a bounded run.
+    if getattr(a, "swarm", False):
+        cards = (a.cards or "0 1 2 3").split()
+        workers = a.workers or " ".join(f"{x}:{x}:{x}" for x in cards)  # slot:dev:drmcard
+        tip = a.baseline or f"loop/{a.arch}"
+        sw = f"{REMOTE_REPO}/autoresearch/harness/swarm_explore.sh"
+        out_f = f"/tmp/swarm_{a.arch}.out"
+        env = (f"ARCH={a.arch} MODEL={a.model} K={a.K} CAP={a.cap} BASE_TIP={tip} "
+               f"WORKERS='{workers}' AGENT_HARNESS={a.harness}"
+               + (f" AGENT_MODEL={a.agent_model}" if a.agent_model else ""))
+        launch = (f"env {env} bash {sw} > {out_f} 2>&1; "
+                  f"grep -oE 'pid=[0-9]+' {out_f} | grep -oE '[0-9]+' | tr '\\n' ' '")
+        rc, out, err = _ssh(launch, host)
+        pids = [int(p) for p in out.strip().split() if p.strip().isdigit()]
+        if not pids:
+            _, dump, _ = _ssh(f"tail -25 {out_f} 2>/dev/null", host)
+            print(json.dumps({"error": "swarm launch produced no worker pids", "swarm_out": dump[-1000:]})); return 1
+        runs = []
+        for idx, p in enumerate(pids):
+            wid = f"{a.arch}-swarm-w{idx}-{int(time.time())}"
+            c.execute("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      (wid, a.arch, a.model, idx, "running", int(time.time()), None, a.budget, 0, a.ttl, p))
+            runs.append({"run": wid, "worker": idx, "pid": p, "live": _alive(p, host)})
+        c.commit()
+        nlive = sum(1 for r in runs if r["live"] == "LIVE")
+        print(json.dumps({"swarm": a.arch, "workers": len(pids), "live": nlive, "tip": tip,
+                          "harness": a.harness, "K": a.K, "cap": a.cap, "ttl": a.ttl, "runs": runs,
+                          "note": f"swarm launched on {host}: {nlive}/{len(pids)} workers LIVE"}))
+        return 0 if nlive else 1
     if a.adopt_pid:
         if _alive(a.adopt_pid, host) != "LIVE":
             print(json.dumps({"error": f"adopt pid {a.adopt_pid} not LIVE on {host}"})); return 1
@@ -256,8 +287,13 @@ def cmd_stop(a):
     killed = []
     for r in runs:
         if host and r["pid"]:
-            _ssh(f"kill {r['pid']} 2>/dev/null; pkill -f '[c]odex exec --dangerously' 2>/dev/null; "
-                 f"pkill -f '[g]rok -p' 2>/dev/null; true", host)
+            # kill the recorded driver pid, then reap the whole loop tree: agent round (codex/grok),
+            # the driver, and any live daemon so the GPU is freed. Broad by design for a clean `ar stop`.
+            _ssh(f"kill {r['pid']} 2>/dev/null; "
+                 f"pkill -9 -f '[c]odex exec --dangerously' 2>/dev/null; "
+                 f"pkill -9 -f '[g]rok -p' 2>/dev/null; "
+                 f"pkill -9 -f '[d]river_v3.sh' 2>/dev/null; "
+                 f"pkill -9 -f '[a]gent_exec.sh' 2>/dev/null; true", host)
         killed.append({"run": r["id"], "pid": r["pid"], "after": _alive(r["pid"], host) if host and r["pid"] else "?"})
     c.execute("UPDATE runs SET status='stopped',stopped=? WHERE status='running'" + (" AND id=?" if a.run else ""),
               (int(time.time()), a.run) if a.run else (int(time.time()),)); c.commit()
@@ -292,6 +328,7 @@ def main():
     s.add_argument("--rollover", default="~/hipfire/autoresearch/harness/noop_rollover.sh")
     s.add_argument("--driver", default=REMOTE_DRIVER); s.add_argument("--adopt-pid", type=int, default=None, dest="adopt_pid")
     s.add_argument("--harness", default="codex", choices=["codex", "grok"]); s.add_argument("--agent-model", default=None, dest="agent_model")
+    s.add_argument("--swarm", action="store_true"); s.add_argument("--cards", default=None); s.add_argument("--workers", default=None)
     s = sub.add_parser("stop"); s.add_argument("--run", default=None); s.add_argument("--host", default=None)
     s = sub.add_parser("purge"); s.add_argument("--run", default=None); s.add_argument("--pidless", action="store_true")
     a = p.parse_args()
