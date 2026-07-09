@@ -287,6 +287,43 @@ impl Gpu {
         result
     }
 
+    /// `a[i] += b[i]` (element-wise, int64) for `count` elements.
+    /// Used by `all_reduce_sum_i64_peer` for the reproducible MoE down collective.
+    pub fn add_inplace_i64(
+        &mut self,
+        a: *mut std::ffi::c_void,
+        b: *mut std::ffi::c_void,
+        count: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_i64")?;
+
+        let n = count as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a as *const _ as *mut c_void,
+            &b as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let result = self.launch_maybe_blob(
+            "add_inplace_i64",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a);
+                bb.push_ptr(b);
+                bb.push_i32(n);
+                bb
+            },
+        );
+        result
+    }
+
     /// c = a * b (element-wise)
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;

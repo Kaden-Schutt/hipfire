@@ -13,9 +13,9 @@ use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::moe::{
     launch_grouped_down, launch_grouped_gate_up, launch_indexed_down, launch_indexed_down_residual,
-    launch_indexed_gate_up, launch_moe_activation, launch_moe_combine, launch_moe_combine_grouped,
-    launch_moe_route, launch_moe_scatter, launch_moe_unscatter, launch_score_activation,
-    MoeExpertRef,
+    launch_indexed_down_residual_i64, launch_indexed_gate_up, launch_moe_activation,
+    launch_moe_combine, launch_moe_combine_grouped, launch_moe_route, launch_moe_scatter,
+    launch_moe_unscatter, launch_score_activation, MoeExpertRef,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -69,6 +69,12 @@ pub enum MoeProj<'a> {
     /// down kernel. The step's `out` IS the EP partial (accumulate semantics).
     /// No [`Step::MoeCombine`] follows — that would double-accumulate.
     DownResidual { topk_weights: &'a GpuTensor },
+    /// Reproducible int64 down path (MQ3L TP): writes an S-scaled int64 accumulator
+    /// into `out` (which must be an i64 buffer of `hidden` elements, pre-zeroed).
+    /// After an [`StepCollective::AllReduceI64Tp`] all-reduce, a
+    /// [`Step::ConvertI64ToF32`] converts the summed int64 into the FP partial.
+    /// EP path stays on `DownResidual` (FP). Only used when `tp > 1`.
+    DownResidualI64 { topk_weights: &'a GpuTensor },
 }
 
 pub enum Step<'a> {
@@ -292,6 +298,16 @@ pub enum Step<'a> {
         inter: usize,
         k_top: usize,
     },
+    /// Convert an int64 S-scaled residual buffer to f32. Used after
+    /// [`StepCollective::AllReduceI64Tp`] in the reproducible MoE down TP path.
+    /// `src` is the i64 partial (hidden elements, S-scaled); `dst` is the f32
+    /// partial that the Phase-3 residual add consumes. `n` = hidden.
+    /// `tp_step_out_buf` returns `None` — this is a post-reduce convert, not a partial.
+    ConvertI64ToF32 {
+        src: &'a GpuTensor,
+        dst: &'a GpuTensor,
+        n: usize,
+    },
     // ── Note (Task 6): ds4 `hc_ffn_mix` is intentionally NOT a Step variant ──
     // The ds4 MoE tail mixes the EP all-reduced `ffn_out` partial into
     // `residual_streams` via `hc_mix_4stream` + `memcpy_dtod_auto`. Its two view
@@ -330,6 +346,8 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::ScoreActivation { .. } => PipelineOp::RmsnormAutomatic,
         // SwiGLU + FWHT rotate intermediate; not fusible.
         Step::MoeActivation { .. } => PipelineOp::RmsnormAutomatic,
+        // Post-reduce int64→f32 convert; not fusible.
+        Step::ConvertI64ToF32 { .. } => PipelineOp::RmsnormAutomatic,
     }
 }
 
@@ -902,6 +920,10 @@ pub enum StepCollective {
         kind: hipfire_hardware::DimKind,
         dim: usize,
     },
+    /// Int64 all-reduce over the Tp group (reproducible MoE down TP path).
+    /// `dim` is the element count in int64 (= hidden). Uses `all_reduce_sum_i64_peer`.
+    /// The `zero_before` flag for this step must use `dim * 8` bytes (not `dim * 4`).
+    AllReduceI64Tp { dim: usize },
 }
 
 /// The `out` buffer of a step that carries a row-parallel or EP partial output
@@ -927,12 +949,20 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
             out,
             ..
         } => Some(&out.buf),
+        // Reproducible int64 TP down: out is the i64 partial buffer.
+        Step::IndexedMoeGemv {
+            which: MoeProj::DownResidualI64 { .. },
+            out,
+            ..
+        } => Some(&out.buf),
         // Prefill grouped ops: intermediates, never EP partials.
         Step::MoeScatter { .. } | Step::GroupedMoeGemm { .. } | Step::MoeUnscatter { .. } => None,
         // Score activation is a pre-routing elementwise op; no EP partial.
         Step::ScoreActivation { .. } => None,
         // MoeActivation is an intermediate (not an EP partial).
         Step::MoeActivation { .. } => None,
+        // ConvertI64ToF32 is a post-reduce step; dst is the f32 partial, not a collective partial.
+        Step::ConvertI64ToF32 { .. } => None,
         _ => None,
     }
 }
@@ -1025,9 +1055,52 @@ pub fn execute_steps_parallel(
     let group = mesh.group_along(kind, &mesh.coord_of(0));
     let group_size = group.len();
 
-    if group_size <= 1 {
+    // Single-rank fast-path (tp==1 running through forward_tp): run all steps
+    // sequentially on rank 0; all-reduces are identity (g==1) so skip them.
+    // `zero_before` still applies (the i64 partial must be zeroed before the
+    // i64 kernel even when there is no reduce).
+    if group_size == 1 {
+        let n_steps = validate_parallel_args(group_size, per_rank_steps, collectives, zero_before)?;
+        let dev = group[0];
+        let hip_err = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+        for i in 0..n_steps {
+            if zero_before[i] {
+                let (dim, elem_bytes) = match &collectives[i] {
+                    StepCollective::AllReduce { dim, .. } => (*dim, 4usize),
+                    StepCollective::AllReduceI64Tp { dim } => (*dim, 8usize),
+                    StepCollective::None => {
+                        return Err(DispatchError::Hip(format!(
+                            "execute_steps_parallel: zero_before[{i}] is true but collective is None (no dim)"
+                        )));
+                    }
+                };
+                gpus.devices[dev].bind_thread().map_err(hip_err)?;
+                let stream = gpus.devices[dev].active_stream.as_ref().ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_parallel: device {dev} has no active_stream for zero_before (g==1)"
+                    ))
+                })?;
+                let buf = tp_step_out_buf(&per_rank_steps[0][i]).ok_or_else(|| {
+                    DispatchError::Hip(format!(
+                        "execute_steps_parallel: step {i} zero_before=true but has no out buffer (g==1)"
+                    ))
+                })?;
+                gpus.devices[dev]
+                    .hip
+                    .memset_async(buf, 0, dim * elem_bytes, stream)
+                    .map_err(hip_err)?;
+            }
+            gpus.devices[dev].bind_thread().map_err(hip_err)?;
+            let ctx = DispatchCtx::new(&gpus.devices[dev]);
+            launch_op(&mut gpus.devices[dev], &ctx, &per_rank_steps[0][i])?;
+            // All-reduce is identity for g==1; skip.
+        }
+        return Ok(());
+    }
+
+    if group_size < 1 {
         return Err(DispatchError::Hip(format!(
-            "execute_steps_parallel: {kind:?} group size {group_size} — needs >1 ranks"
+            "execute_steps_parallel: {kind:?} group size {group_size} — needs ≥1 rank"
         )));
     }
     let n_steps = validate_parallel_args(group_size, per_rank_steps, collectives, zero_before)?;
@@ -1036,10 +1109,11 @@ pub fn execute_steps_parallel(
 
     for i in 0..n_steps {
         // Optional pre-zero of each rank's output buffer (EP accumulation pattern):
-        // memset_async, dim*4 bytes, on the rank's active_stream.
+        // f32 partial: memset_async dim*4 bytes; i64 partial: memset_async dim*8 bytes.
         if zero_before[i] {
-            let dim = match &collectives[i] {
-                StepCollective::AllReduce { dim, .. } => *dim,
+            let (dim, elem_bytes) = match &collectives[i] {
+                StepCollective::AllReduce { dim, .. } => (*dim, 4usize),
+                StepCollective::AllReduceI64Tp { dim } => (*dim, 8usize),
                 StepCollective::None => {
                     return Err(DispatchError::Hip(format!(
                         "execute_steps_parallel: zero_before[{i}] is true but collective is None (no dim)"
@@ -1060,7 +1134,7 @@ pub fn execute_steps_parallel(
                 })?;
                 gpus.devices[dev]
                     .hip
-                    .memset_async(buf, 0, dim * 4, stream)
+                    .memset_async(buf, 0, dim * elem_bytes, stream)
                     .map_err(hip_err)?;
             }
         }
@@ -1073,47 +1147,73 @@ pub fn execute_steps_parallel(
         }
 
         // Collective: all-reduce the partial outputs over the axis group.
-        if let StepCollective::AllReduce {
-            kind: coll_kind,
-            dim,
-        } = &collectives[i]
-        {
-            for &dev in &group {
-                let g = &gpus.devices[dev];
-                g.bind_thread().map_err(hip_err)?;
-                let stream = g.active_stream.as_ref().ok_or_else(|| {
-                    DispatchError::Hip(format!(
-                        "execute_steps_parallel: device {dev} has no active_stream"
-                    ))
-                })?;
-                g.hip.stream_synchronize(stream).map_err(hip_err)?;
-            }
-            let mut refs: Vec<&hip_bridge::DeviceBuffer> = Vec::with_capacity(group_size);
-            for (r, _) in group.iter().enumerate() {
-                let buf = tp_step_out_buf(&per_rank_steps[r][i]).ok_or_else(|| {
-                    DispatchError::Hip(format!(
-                        "execute_steps_parallel: step {i} marked AllReduce but has no out buffer"
-                    ))
-                })?;
-                refs.push(buf);
-            }
-            // Peer/RCCL choice: Tp always uses peer (RCCL not installed on Tp path);
-            // Ep branches on HIPFIRE_EP_PEER_ALLREDUCE_DECODE. Mirrors lib.rs:823-826.
-            match coll_kind {
-                hipfire_hardware::DimKind::Tp => {
-                    gpus.all_reduce_sum_f32_peer(&group, &refs, *dim)
-                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        match &collectives[i] {
+            StepCollective::AllReduce {
+                kind: coll_kind,
+                dim,
+            } => {
+                for &dev in &group {
+                    let g = &gpus.devices[dev];
+                    g.bind_thread().map_err(hip_err)?;
+                    let stream = g.active_stream.as_ref().ok_or_else(|| {
+                        DispatchError::Hip(format!(
+                            "execute_steps_parallel: device {dev} has no active_stream"
+                        ))
+                    })?;
+                    g.hip.stream_synchronize(stream).map_err(hip_err)?;
                 }
-                _ => {
-                    if hipfire_hardware::ep_peer_allreduce_decode() {
+                let mut refs: Vec<&hip_bridge::DeviceBuffer> = Vec::with_capacity(group_size);
+                for (r, _) in group.iter().enumerate() {
+                    let buf = tp_step_out_buf(&per_rank_steps[r][i]).ok_or_else(|| {
+                        DispatchError::Hip(format!(
+                            "execute_steps_parallel: step {i} marked AllReduce but has no out buffer"
+                        ))
+                    })?;
+                    refs.push(buf);
+                }
+                // Peer/RCCL choice: Tp always uses peer (RCCL not installed on Tp path);
+                // Ep branches on HIPFIRE_EP_PEER_ALLREDUCE_DECODE. Mirrors lib.rs:823-826.
+                match coll_kind {
+                    hipfire_hardware::DimKind::Tp => {
                         gpus.all_reduce_sum_f32_peer(&group, &refs, *dim)
                             .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                    } else {
-                        gpus.all_reduce_sum_f32(&group, &refs, *dim)
-                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    }
+                    _ => {
+                        if hipfire_hardware::ep_peer_allreduce_decode() {
+                            gpus.all_reduce_sum_f32_peer(&group, &refs, *dim)
+                                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                        } else {
+                            gpus.all_reduce_sum_f32(&group, &refs, *dim)
+                                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                        }
                     }
                 }
             }
+            StepCollective::AllReduceI64Tp { dim } => {
+                // Reproducible int64 TP down: sync streams, peer-reduce int64 partials.
+                for &dev in &group {
+                    let g = &gpus.devices[dev];
+                    g.bind_thread().map_err(hip_err)?;
+                    let stream = g.active_stream.as_ref().ok_or_else(|| {
+                        DispatchError::Hip(format!(
+                            "execute_steps_parallel: device {dev} has no active_stream (i64 reduce)"
+                        ))
+                    })?;
+                    g.hip.stream_synchronize(stream).map_err(hip_err)?;
+                }
+                let mut refs: Vec<&hip_bridge::DeviceBuffer> = Vec::with_capacity(group_size);
+                for (r, _) in group.iter().enumerate() {
+                    let buf = tp_step_out_buf(&per_rank_steps[r][i]).ok_or_else(|| {
+                        DispatchError::Hip(format!(
+                            "execute_steps_parallel: step {i} marked AllReduceI64Tp but has no out buffer"
+                        ))
+                    })?;
+                    refs.push(buf);
+                }
+                gpus.all_reduce_sum_i64_peer(&group, &refs, *dim)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            }
+            StepCollective::None => {}
         }
     }
     Ok(())
@@ -1477,8 +1577,20 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     out,
                     *k_top,
                 ),
+                MoeProj::DownResidualI64 { topk_weights } => launch_indexed_down_residual_i64(
+                    gpu,
+                    experts,
+                    topk_indices,
+                    topk_weights,
+                    x,
+                    out,
+                    *k_top,
+                ),
             }
         }
+        Step::ConvertI64ToF32 { src, dst, n } => gpu
+            .moe_i64_residual_to_f32(src, dst, *n)
+            .map_err(|e| DispatchError::Hip(e.to_string())),
         Step::MoeCombine {
             down_out,
             topk_weights,
@@ -1564,11 +1676,13 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 *k_top,
                 *batch_size,
             ),
-            MoeProj::DownResidual { .. } => Err(DispatchError::Hip(
-                "GroupedMoeGemm: DownResidual is not a valid grouped projection; \
-                 use DownExpanded + MoeCombine(inverse_perm=Some) for grouped down"
-                    .to_string(),
-            )),
+            MoeProj::DownResidual { .. } | MoeProj::DownResidualI64 { .. } => {
+                Err(DispatchError::Hip(
+                    "GroupedMoeGemm: DownResidual/DownResidualI64 is not a valid grouped \
+                     projection; use DownExpanded + MoeCombine(inverse_perm=Some) for grouped down"
+                        .to_string(),
+                ))
+            }
         },
         Step::MoeUnscatter {
             y_grouped,

@@ -113,30 +113,58 @@ fn main() {
     let max_seq = prompt_ids.len() + max + 16;
     eprintln!("prompt {:?} → {} tokens", prompt, prompt_ids.len());
 
-    // ── tp=1 run (whole experts, single-GPU decode_step) ─────────────────────
-    // Uses single-GPU `decode_step` which doesn't require a multi-rank Gpus setup.
-    eprintln!("\n=== tp=1 reference run ===");
+    // ── tp=1 reference run — forward_tp with n_ranks=1 and the int64 down path ──
+    // Uses forward_tp (not decode_step) so both tp=1 and tp=2 share the same
+    // int64 kernel path. The i64 kernel is partition-invariant, so tp=1 (K=inter)
+    // and tp=2 (K=inter/2 each, i64 all-reduce) produce BIT-IDENTICAL f32 logits.
+    eprintln!("\n=== tp=1 reference run (forward_tp, i64 down) ===");
     let tp1_tokens;
     let tp1_logits_all;
     {
-        let mut gpus1 = Gpus::init_tp(1, cfg.num_hidden_layers).expect("init_tp(1)");
+        let tp1 = 1usize;
+        let mut gpus1 = Gpus::init_tp(tp1, cfg.num_hidden_layers).expect("init_tp(1)");
+        gpus1.ensure_rank_streams().expect("rank_streams tp1");
+        let _ = gpus1.enable_peer_all().expect("peer_all tp1");
 
         let t_load = std::time::Instant::now();
         let mut hfq = HfqFile::open(&model).expect("open model tp1");
-        let w = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpus1.devices[0], None, None)
+        let ts = TpExpertSlice { tp: tp1, rank: 0 };
+        let w = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpus1.devices[0], None, Some(ts))
             .expect("load tp1");
         eprintln!("  tp=1 loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 
-        let mut state = MiniMaxState::new_with_max_seq(&mut gpus1.devices[0], &cfg, max_seq)
-            .expect("state tp1");
+        let mut state_per_rank: Vec<MiniMaxState> =
+            vec![
+                MiniMaxState::new_with_max_seq(&mut gpus1.devices[0], &cfg, max_seq)
+                    .expect("state tp1"),
+            ];
+        let mut partials: Vec<GpuTensor> = vec![gpus1.devices[0]
+            .zeros(&[cfg.hidden_size], DType::F32)
+            .expect("partial tp1")];
+        // int64 scratch: hidden * 8 bytes per element (raw bytes, no DType::I64).
+        let mut partials_i64: Vec<GpuTensor> = vec![gpus1.devices[0]
+            .zeros(&[cfg.hidden_size * 8], DType::Raw)
+            .expect("partial_i64 tp1")];
+        let weights_per_rank: Vec<MiniMaxWeights> = vec![w];
 
-        // Prefill via single-GPU decode_step.
-        let mut logits = Vec::new();
+        // Prefill via forward_tp (i64 down path).
         for (pos, &t) in prompt_ids.iter().enumerate() {
-            logits =
-                forward::decode_step(&cfg, &w, &mut state, &mut gpus1.devices[0], t, pos as u32)
-                    .expect("decode_step prefill tp1");
+            forward::forward_tp(
+                &mut gpus1,
+                &weights_per_rank,
+                &cfg,
+                &mut state_per_rank,
+                &partials,
+                &partials_i64,
+                t,
+                pos as u32,
+            )
+            .expect("forward_tp prefill tp1");
         }
+        gpus1.devices[0].bind_thread().expect("bind0 tp1");
+        let mut logits = gpus1.devices[0]
+            .download_f32(&state_per_rank[0].logits)
+            .expect("dl tp1");
 
         let mut tokens = Vec::new();
         let mut all_logits: Vec<Vec<f32>> = Vec::new();
@@ -148,15 +176,21 @@ fn main() {
             if matches!(next, 200020 | 151643 | 151645 | 2) {
                 break;
             }
-            logits = forward::decode_step(
+            forward::forward_tp(
+                &mut gpus1,
+                &weights_per_rank,
                 &cfg,
-                &w,
-                &mut state,
-                &mut gpus1.devices[0],
+                &mut state_per_rank,
+                &partials,
+                &partials_i64,
                 next,
                 pos as u32,
             )
-            .expect("decode_step tp1");
+            .expect("forward_tp tp1");
+            gpus1.devices[0].bind_thread().expect("bind0 tp1");
+            logits = gpus1.devices[0]
+                .download_f32(&state_per_rank[0].logits)
+                .expect("dl tp1");
             all_logits.push(logits.clone());
             pos += 1;
         }
@@ -164,24 +198,30 @@ fn main() {
         tp1_tokens = tokens;
         tp1_logits_all = all_logits;
 
-        // ── THROWAWAY: selfcheck-tp1 — run tp=1 a SECOND time with fresh state,
-        // same weights, to measure the atomic-add nondeterminism floor.
-        // Reports tp1-vs-tp1 max|Δ| and top-5 logit magnitudes, then exits.
         if selfcheck_tp1 {
             eprintln!("\n=== selfcheck-tp1: second tp=1 pass (nondeterminism floor) ===");
-            let mut state2 = MiniMaxState::new_with_max_seq(&mut gpus1.devices[0], &cfg, max_seq)
-                .expect("state tp1 second pass");
+            let mut state2 =
+                vec![
+                    MiniMaxState::new_with_max_seq(&mut gpus1.devices[0], &cfg, max_seq)
+                        .expect("state tp1 second pass"),
+                ];
             let mut logits2 = Vec::new();
             for (pos, &t) in prompt_ids.iter().enumerate() {
-                logits2 = forward::decode_step(
+                forward::forward_tp(
+                    &mut gpus1,
+                    &weights_per_rank,
                     &cfg,
-                    &w,
                     &mut state2,
-                    &mut gpus1.devices[0],
+                    &partials,
+                    &partials_i64,
                     t,
                     pos as u32,
                 )
-                .expect("decode_step prefill tp1 second pass");
+                .expect("forward_tp prefill tp1 second pass");
+                gpus1.devices[0].bind_thread().expect("bind0");
+                logits2 = gpus1.devices[0]
+                    .download_f32(&state2[0].logits)
+                    .expect("dl tp1 second pass");
             }
             let mut tokens2 = Vec::new();
             let mut all_logits2: Vec<Vec<f32>> = Vec::new();
@@ -193,21 +233,26 @@ fn main() {
                 if matches!(next2, 200020 | 151643 | 151645 | 2) {
                     break;
                 }
-                logits2 = forward::decode_step(
+                forward::forward_tp(
+                    &mut gpus1,
+                    &weights_per_rank,
                     &cfg,
-                    &w,
                     &mut state2,
-                    &mut gpus1.devices[0],
+                    &partials,
+                    &partials_i64,
                     next2,
                     pos2 as u32,
                 )
-                .expect("decode_step tp1 second pass");
+                .expect("forward_tp tp1 second pass");
+                gpus1.devices[0].bind_thread().expect("bind0");
+                logits2 = gpus1.devices[0]
+                    .download_f32(&state2[0].logits)
+                    .expect("dl tp1 second pass");
                 all_logits2.push(logits2.clone());
                 pos2 += 1;
             }
             eprintln!("  tp1-pass2 generated {} tokens", tokens2.len());
 
-            // Compare pass1 vs pass2.
             let n_steps2 = tp1_tokens.len().min(tokens2.len());
             let mut argmax_ok2 = true;
             let mut max_logit_delta_tp1: f32 = 0.0;
@@ -232,7 +277,6 @@ fn main() {
                     }
                 }
             }
-            // Report top-5 logit magnitudes at step 0 for scale context.
             if let Some(l0) = tp1_logits_all.first() {
                 let mut top5: Vec<f32> = l0.iter().map(|x| x.abs()).collect();
                 top5.sort_by(|a, b| b.partial_cmp(a).unwrap());
@@ -243,16 +287,22 @@ fn main() {
             }
             eprintln!("  tp1-vs-tp1 argmax-exact: {argmax_ok2}");
             eprintln!("  tp1-vs-tp1 logit max|Δ|: {max_logit_delta_tp1:.4e}");
-            eprintln!("\nSELFCHECK-TP1 DONE — compare to tp1-vs-tp2 max|Δ| to classify nondeterminism source");
+            eprintln!("\nSELFCHECK-TP1 DONE");
             return;
         }
 
-        // Explicitly free GPU memory before tp=2 load. free_gpu returns memory to the
-        // per-Gpu pool but does NOT call hipFree — drain_pool does the actual hipFree
-        // so the HIP allocator can reclaim the memory for the tp=2 run on the same device.
-        state.free_gpu(&mut gpus1.devices[0]);
-        w.free_gpu(&mut gpus1.devices[0]);
-        gpus1.devices[0].drain_pool();
+        // Free GPU memory before tp=2 load (so the same physical device can
+        // hold the tp=2 weights under HIPFIRE_EMULATE_GPUS=2).
+        let mut gpu0 = &mut gpus1.devices[0];
+        for s in state_per_rank {
+            s.free_gpu(gpu0);
+        }
+        for w in weights_per_rank {
+            w.free_gpu(gpu0);
+        }
+        // partials and partials_i64 are plain GpuTensors; return them to the pool.
+        gpu0.bind_thread().expect("bind0 tp1 free");
+        gpu0.drain_pool();
     }
 
     // ── tp=2 run (TP-of-experts: every rank owns all experts, inter/2 each) ───
@@ -280,6 +330,7 @@ fn main() {
 
         let mut state_per_rank: Vec<MiniMaxState> = Vec::with_capacity(tp);
         let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
+        let mut partials_i64: Vec<GpuTensor> = Vec::with_capacity(tp);
         for r in 0..tp {
             gpus2.devices[r].bind_thread().expect("bind");
             state_per_rank.push(
@@ -291,6 +342,12 @@ fn main() {
                     .zeros(&[cfg.hidden_size], DType::F32)
                     .expect("partial tp2"),
             );
+            // int64 scratch: hidden * 8 bytes (DType::Raw, element = 1 byte).
+            partials_i64.push(
+                gpus2.devices[r]
+                    .zeros(&[cfg.hidden_size * 8], DType::Raw)
+                    .expect("partial_i64 tp2"),
+            );
         }
 
         // Prefill.
@@ -301,6 +358,7 @@ fn main() {
                 &cfg,
                 &mut state_per_rank,
                 &partials,
+                &partials_i64,
                 t,
                 pos as u32,
             )
@@ -328,6 +386,7 @@ fn main() {
                 &cfg,
                 &mut state_per_rank,
                 &partials,
+                &partials_i64,
                 next,
                 pos as u32,
             )
@@ -398,33 +457,15 @@ fn main() {
 
     assert!(
         argmax_ok,
-        "PARITY FAIL: argmax mismatch between tp=1 and tp=2 (inter_local site missed?)"
+        "PARITY FAIL: argmax mismatch between tp=1 and tp=2 (int64 path has a leak?)"
     );
-    // ROOT CAUSE (KNOWN BUG — see Task-3 report): the logit delta (~4-5 at max=32)
-    // originates from the K4 main-loop optimization in
-    // `gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed`:
-    //   quads = groups_per_row >> 2
-    // With K=inter_local=768 (3 groups): quads=0 → ALL groups go through the
-    // sequential tail accumulators (acc0 only via 3 TAIL_LOAD_AND_DOT calls).
-    // With K=inter=1536   (6 groups): quads=1 → 4 groups via 4 separate K4-main-loop
-    // accumulators (acc0..acc3) + 2 via tail into acc0/acc1.
-    // Final reduction: (acc0+acc1)+(acc2+acc3) — different accumulation tree for each K.
-    // This structural difference in FP32 accumulation order produces ~4.55 max logit
-    // delta (max over 200k vocab at step 0). At --max 32, the routing margins hold and
-    // argmax is exactly preserved. At --max 128, accumulated state error causes router
-    // divergence at step ~40 (63/128 mismatches, delta grows to 42.8). This is NOT a
-    // "pure FP rounding artifact" — it is a STRUCTURAL accumulation difference that
-    // cascades to argmax divergence. The fix requires K-invariant down accumulation
-    // (e.g. remove the K4 quads optimisation and use sequential single-acc for all K,
-    // then ensure both tp=1 K=inter and tp=2 K=inter_local use the same code path by
-    // zero-padding K to inter, or switch to an output-row-parallel down projection
-    // that keeps K=inter on every rank). Both approaches require non-trivial kernel
-    // changes and are tracked as BLOCKED in the Task-3 report.
-    // HONEST THRESHOLD: at --max 32, observed delta is ~4.55; no narrower bound is
-    // achievable without fixing the accumulation bug above.
+    // Both tp=1 and tp=2 use forward_tp with the int64 down path
+    // (DownResidualI64 → AllReduceI64Tp → ConvertI64ToF32). The i64 kernel is
+    // partition-invariant: sum(i64_rank0 + i64_rank1) == i64_full, so tp=1 and tp=2
+    // produce bit-identical int64 accumulators → identical f32 after convert.
     assert!(
-        max_logit_delta < 6.0,
-        "PARITY FAIL: logit max|Δ|={max_logit_delta:.2e} >= 6.0 (see root-cause comment above)"
+        max_logit_delta == 0.0,
+        "PARITY FAIL: logit max|Δ|={max_logit_delta:.2e} != 0.0 (FP leak in int64 TP path)"
     );
 
     eprintln!("\nPARITY PASS: tp=1 == tp=2 (argmax-exact, logit max|Δ|={max_logit_delta:.2e})");

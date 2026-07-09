@@ -1180,12 +1180,27 @@ pub fn forward_batch(
 /// peer access enabled. `mesh` must carry an `Ep` axis whose
 /// `group_along(Ep)` equals the EP device group.
 #[allow(clippy::too_many_arguments)]
+/// `minimax_ep_moe_step` inner.
+///
+/// `partials_i64`: per-rank int64 scratch buffers (each `[hidden]` elements, raw i64).
+/// Must be `Some` when `use_i64_down = true`. Ignored on the EP path and for
+/// non-Lloyd-down dtypes (the i64 kernel only supports MQ3G256Lloyd).
+///
+/// `use_i64_down`: when true, the Lloyd-down step uses
+/// `DownResidualI64 → AllReduceI64Tp → ConvertI64ToF32` instead of the f32
+/// `DownResidual → AllReduce{Tp}` path. Callers use `true` for TP (`forward_tp`)
+/// and `false` for EP (`forward_ep`). This makes the TP path reproducible across
+/// splits: the i64 partial is partition-invariant, so tp=1 and tp=2 produce
+/// bit-identical f32 outputs after the convert.
+#[allow(clippy::too_many_arguments)]
 fn minimax_ep_moe_step(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
     weights_per_rank: &[MiniMaxWeights],
     cfg: &MiniMaxConfig,
     state_per_rank: &[MiniMaxState],
     partials: &[GpuTensor],
+    partials_i64: Option<&[GpuTensor]>,
+    use_i64_down: bool,
     mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
     l: usize,
 ) -> Result<(), String> {
@@ -1273,78 +1288,177 @@ fn minimax_ep_moe_step(
     ) = if is_lloyd_down {
         // Lloyd down (MQ2G256Lloyd / MQ3G256Lloyd): residual-fused single Step
         // writes the weighted-combine directly into the EP partial.
-        // This is the SHIPPED path (M2.7.mq2 down=MQ3L) — must stay byte-identical.
-        let steps = (0..n)
-            .map(|r| {
-                let s = &state_per_rank[r];
-                let layer = &weights_per_rank[r].layers[l];
-                let mut rank_steps: Vec<Step> = vec![
-                    Step::ScoreActivation {
-                        scores: &s.router_logits,
-                        kind: ScoreActKind::Sigmoid,
-                    },
-                    Step::MoeRoute {
-                        scores: &s.router_logits,
-                        gate_bias: &layer.routing_bias,
-                        topk_indices: &s.topk_indices,
-                        topk_weights: &s.topk_weights,
-                        k: k_top,
-                        n_experts: n_exp,
-                        route_scale: 1.0,
-                    },
-                    Step::IndexedMoeGemv {
-                        experts: &gu_refs[r],
-                        which: MoeProj::GateUp {
-                            up_out: &s.up_batch,
+        // Two sub-paths:
+        // - TP + MQ3G256Lloyd + use_i64_down: DownResidualI64 → AllReduceI64Tp →
+        //   ConvertI64ToF32. Partition-invariant: split=2 produces the same f32 as
+        //   split=1 (i64 exact integer sum, then single convert).
+        // - EP (or non-MQ3L Lloyd): DownResidual → AllReduce{Ep} (unchanged, byte-exact).
+        let use_i64 = use_i64_down && matches!(ddt, rdna_compute::DType::MQ3G256Lloyd);
+        let i64s: &[GpuTensor] = if use_i64 {
+            partials_i64
+                .expect("partials_i64 required when use_i64_down=true and down dtype=MQ3G256Lloyd")
+        } else {
+            &[]
+        };
+        let steps = if use_i64 {
+            (0..n)
+                .map(|r| {
+                    let s = &state_per_rank[r];
+                    let layer = &weights_per_rank[r].layers[l];
+                    let mut rank_steps: Vec<Step> = vec![
+                        Step::ScoreActivation {
+                            scores: &s.router_logits,
+                            kind: ScoreActKind::Sigmoid,
+                        },
+                        Step::MoeRoute {
+                            scores: &s.router_logits,
+                            gate_bias: &layer.routing_bias,
+                            topk_indices: &s.topk_indices,
+                            topk_weights: &s.topk_weights,
+                            k: k_top,
+                            n_experts: n_exp,
+                            route_scale: 1.0,
+                        },
+                        Step::IndexedMoeGemv {
+                            experts: &gu_refs[r],
+                            which: MoeProj::GateUp {
+                                up_out: &s.up_batch,
+                            },
+                            topk_indices: &s.topk_indices,
+                            input: GemvInput::Prerotated(&s.ffn_x_rot),
+                            out: &s.gate_batch,
+                            k_top,
+                            batch_size: 1,
+                        },
+                        Step::MoeActivation {
+                            variant: MoeActivationVariant::MinimaxFused {
+                                awq_scale: layer.experts[0].down.awq_scale.as_ref(),
+                            },
+                            gate: &s.gate_batch,
+                            up: &s.up_batch,
+                            rot_out: &s.rot_batch,
+                            inter: inter_local,
+                            k_top,
+                        },
+                        // DownResidualI64: writes S-scaled int64 into partials_i64[r].
+                        // zero_before=true zeroes the i64 buffer (8 bytes/elem) before launch.
+                        Step::IndexedMoeGemv {
+                            experts: &expert_refs[r],
+                            which: MoeProj::DownResidualI64 {
+                                topk_weights: &s.topk_weights,
+                            },
+                            topk_indices: &s.topk_indices,
+                            input: GemvInput::Prerotated(&s.rot_batch),
+                            out: &i64s[r],
+                            k_top,
+                            batch_size: 1,
+                        },
+                        // After AllReduceI64Tp, convert the summed int64 → f32 partial.
+                        // tp_step_out_buf returns None for ConvertI64ToF32, so no
+                        // collective is attached; the convert runs after the i64 reduce.
+                        Step::ConvertI64ToF32 {
+                            src: &i64s[r],
+                            dst: &partials[r],
+                            n: hidden,
+                        },
+                    ];
+                    rank_steps
+                })
+                .collect()
+        } else {
+            (0..n)
+                .map(|r| {
+                    let s = &state_per_rank[r];
+                    let layer = &weights_per_rank[r].layers[l];
+                    let mut rank_steps: Vec<Step> = vec![
+                        Step::ScoreActivation {
+                            scores: &s.router_logits,
+                            kind: ScoreActKind::Sigmoid,
+                        },
+                        Step::MoeRoute {
+                            scores: &s.router_logits,
+                            gate_bias: &layer.routing_bias,
+                            topk_indices: &s.topk_indices,
+                            topk_weights: &s.topk_weights,
+                            k: k_top,
+                            n_experts: n_exp,
+                            route_scale: 1.0,
+                        },
+                        Step::IndexedMoeGemv {
+                            experts: &gu_refs[r],
+                            which: MoeProj::GateUp {
+                                up_out: &s.up_batch,
+                            },
+                            topk_indices: &s.topk_indices,
+                            input: GemvInput::Prerotated(&s.ffn_x_rot),
+                            out: &s.gate_batch,
+                            k_top,
+                            batch_size: 1,
+                        },
+                        Step::MoeActivation {
+                            variant: MoeActivationVariant::MinimaxFused {
+                                awq_scale: layer.experts[0].down.awq_scale.as_ref(),
+                            },
+                            gate: &s.gate_batch,
+                            up: &s.up_batch,
+                            rot_out: &s.rot_batch,
+                            inter: inter_local,
+                            k_top,
+                        },
+                    ];
+                    rank_steps.push(Step::IndexedMoeGemv {
+                        experts: &expert_refs[r],
+                        which: MoeProj::DownResidual {
+                            topk_weights: &s.topk_weights,
                         },
                         topk_indices: &s.topk_indices,
-                        input: GemvInput::Prerotated(&s.ffn_x_rot),
-                        out: &s.gate_batch,
+                        input: GemvInput::Prerotated(&s.rot_batch),
+                        out: &partials[r],
                         k_top,
                         batch_size: 1,
-                    },
-                    Step::MoeActivation {
-                        variant: MoeActivationVariant::MinimaxFused {
-                            awq_scale: layer.experts[0].down.awq_scale.as_ref(),
-                        },
-                        gate: &s.gate_batch,
-                        up: &s.up_batch,
-                        rot_out: &s.rot_batch,
-                        inter: inter_local,
-                        k_top,
-                    },
-                ];
-                rank_steps.push(Step::IndexedMoeGemv {
-                    experts: &expert_refs[r],
-                    which: MoeProj::DownResidual {
-                        topk_weights: &s.topk_weights,
-                    },
-                    topk_indices: &s.topk_indices,
-                    input: GemvInput::Prerotated(&s.rot_batch),
-                    out: &partials[r],
-                    k_top,
-                    batch_size: 1,
-                });
-                rank_steps
-            })
-            .collect();
-        // AllReduce kind: Tp when there is a Tp axis (TP-of-experts), Ep otherwise.
-        let ar_kind = if tp > 1 {
-            hipfire_runtime::multi_gpu::DimKind::Tp
-        } else {
-            hipfire_runtime::multi_gpu::DimKind::Ep
+                    });
+                    rank_steps
+                })
+                .collect()
         };
-        let colls: Vec<StepCollective> = vec![
-            StepCollective::None,
-            StepCollective::None,
-            StepCollective::None,
-            StepCollective::None,
-            StepCollective::AllReduce {
-                kind: ar_kind,
-                dim: hidden,
-            },
-        ];
-        let zbefore: Vec<bool> = vec![false, false, false, false, true];
+        // Collectives: i64 path has 6 steps (4 pre-down + DownI64 + Convert);
+        // f32 path has 5 steps (4 pre-down + DownResidual).
+        let (colls, zbefore) = if use_i64 {
+            // AllReduce kind: Tp (always, since use_i64 implies TP path).
+            // zero_before=true on the DownResidualI64 step (index 4) zeroes the i64 partial.
+            // The ConvertI64ToF32 step (index 5) has no collective and no pre-zero.
+            (
+                vec![
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::AllReduceI64Tp { dim: hidden },
+                    StepCollective::None,
+                ],
+                vec![false, false, false, false, true, false],
+            )
+        } else {
+            // AllReduce kind: Tp when there is a Tp axis (TP-of-experts), Ep otherwise.
+            let ar_kind = if tp > 1 {
+                hipfire_runtime::multi_gpu::DimKind::Tp
+            } else {
+                hipfire_runtime::multi_gpu::DimKind::Ep
+            };
+            (
+                vec![
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::None,
+                    StepCollective::AllReduce {
+                        kind: ar_kind,
+                        dim: hidden,
+                    },
+                ],
+                vec![false, false, false, false, true],
+            )
+        };
         (steps, colls, zbefore)
     } else {
         // Non-Lloyd down (MQ4G256/HFQ4G256/MQ6G256/HFQ6G256): expanded path
@@ -1537,6 +1651,8 @@ pub fn forward_ep(
             cfg,
             state_per_rank,
             partials,
+            None,  // EP path: no i64 partials (f32 DownResidual stays unchanged)
+            false, // use_i64_down: false for EP
             &ep_mesh,
             l,
         )
@@ -1602,6 +1718,7 @@ pub fn forward_tp(
     cfg: &MiniMaxConfig,
     state_per_rank: &mut [MiniMaxState],
     partials: &[GpuTensor],
+    partials_i64: &[GpuTensor],
     token: u32,
     position: u32,
 ) -> Result<(), String> {
@@ -1613,6 +1730,7 @@ pub fn forward_tp(
     );
     assert_eq!(state_per_rank.len(), n, "forward_tp: state_per_rank len");
     assert_eq!(partials.len(), n, "forward_tp: partials len");
+    assert_eq!(partials_i64.len(), n, "forward_tp: partials_i64 len");
     let hidden = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
 
@@ -1663,13 +1781,16 @@ pub fn forward_tp(
             .map_err(|e| format!("forward_tp attn L{l} r{r}: {e}"))?;
         }
         // MoE all-reduce Tp: each rank holds all experts with sliced inter/tp weights.
-        // minimax_ep_moe_step dispatches AllReduce{Tp} because mesh has DimKind::Tp.
+        // int64 down path: DownResidualI64 → AllReduceI64Tp → ConvertI64ToF32.
+        // Partition-invariant: tp=1 and tp=2 produce bit-identical f32 outputs.
         minimax_ep_moe_step(
             gpus,
             weights_per_rank,
             cfg,
             state_per_rank,
             partials,
+            Some(partials_i64), // i64 scratch buffers for reproducible TP down
+            true,               // use_i64_down: always true on the TP path
             &tp_mesh,
             l,
         )

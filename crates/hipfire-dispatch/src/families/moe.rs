@@ -1095,6 +1095,41 @@ pub fn launch_indexed_down_residual(
     }
 }
 
+/// Reproducible int64 down path (MQ3G256Lloyd only): calls
+/// `moe_down_mq3g256_lloyd_residual_i64_indexed` which atomically accumulates
+/// S-scaled int64 values into `residual_i64` (pre-zeroed by the caller).
+/// After all expert launches and the cross-rank i64 all-reduce,
+/// `moe_i64_residual_to_f32` converts the summed i64 to f32.
+pub fn launch_indexed_down_residual_i64(
+    gpu: &mut rdna_compute::Gpu,
+    experts: &MoeExpertRef<'_>,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    rot_batch: &GpuTensor,
+    residual_i64: &GpuTensor,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    let m = experts.expert_k; // down output = hidden
+    let k = experts.expert_m; // down input  = inter
+    match experts.dtype {
+        DType::MQ3G256Lloyd => gpu
+            .moe_down_mq3g256_lloyd_residual_i64_indexed(
+                experts.down_ptrs,
+                topk_indices,
+                topk_weights,
+                rot_batch,
+                residual_i64,
+                m,
+                k,
+                k_top,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string())),
+        other => Err(DispatchError::Hip(format!(
+            "launch_indexed_down_residual_i64: only MQ3G256Lloyd supported, got {other:?}"
+        ))),
+    }
+}
+
 /// Weighted combine of per-expert expanded down outputs into `ffn_out`.
 /// Thin wrapper over `gpu.moe_down_combine_k8_batched`. Call after
 /// [`launch_indexed_down`] (the expanded path). Do NOT call after

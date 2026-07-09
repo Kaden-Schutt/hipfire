@@ -145,7 +145,7 @@ fn pack_3bit_group(qs: &[u8; 256]) -> [u8; 96] {
             let q = qs[tid * 8 + i] as u32 & 7;
             pk |= q << (3 * i);
         }
-        out[tid * 3]     = (pk & 0xff) as u8;
+        out[tid * 3] = (pk & 0xff) as u8;
         out[tid * 3 + 1] = ((pk >> 8) & 0xff) as u8;
         out[tid * 3 + 2] = ((pk >> 16) & 0xff) as u8;
     }
@@ -161,7 +161,7 @@ fn build_group_bytes(row: usize, group: usize) -> [u8; 112] {
     for i in 0..8usize {
         let v = base + (i as f32 - 3.5) * 0.025;
         let bytes = f32_to_f16_le(v);
-        out[i * 2]     = bytes[0];
+        out[i * 2] = bytes[0];
         out[i * 2 + 1] = bytes[1];
     }
     // Indices: pseudo-random in [0, 8).
@@ -187,13 +187,18 @@ fn build_expert_weights(m: usize, groups_per_row: usize) -> Vec<u8> {
 
 /// Extract rows of only specific groups from a full expert weight matrix.
 /// `group_range` is the range of group indices to extract.
-fn slice_groups(full: &[u8], m: usize, full_groups: usize, group_range: std::ops::Range<usize>) -> Vec<u8> {
+fn slice_groups(
+    full: &[u8],
+    m: usize,
+    full_groups: usize,
+    group_range: std::ops::Range<usize>,
+) -> Vec<u8> {
     let ngroups = group_range.end - group_range.start;
     let mut out = Vec::with_capacity(m * ngroups * 112);
     for row in 0..m {
         let row_start = row * full_groups * 112;
         let slice_start = row_start + group_range.start * 112;
-        let slice_end   = row_start + group_range.end   * 112;
+        let slice_end = row_start + group_range.end * 112;
         out.extend_from_slice(&full[slice_start..slice_end]);
     }
     out
@@ -207,8 +212,8 @@ fn slice_groups(full: &[u8], m: usize, full_groups: usize, group_range: std::ops
 /// return the i64 residual and the f32 convert output.
 fn run_down_i64(
     gpu: &mut Gpu,
-    expert_data: &[u8],    // [M × groups × 112 B]
-    rot_x: &[f32],         // [K] (K = groups * 256)
+    expert_data: &[u8], // [M × groups × 112 B]
+    rot_x: &[f32],      // [K] (K = groups * 256)
     m: usize,
     k: usize,
 ) -> (Vec<i64>, Vec<f32>) {
@@ -219,7 +224,7 @@ fn run_down_i64(
 
     // topk_indices = [0] (select expert 0), topk_weights = [1.0].
     let topk_idx_t = upload_i32(gpu, &[0i32]);
-    let topk_w_t   = upload_f32(gpu, &[1.0f32]);
+    let topk_w_t = upload_f32(gpu, &[1.0f32]);
 
     // rot_batch = [1 × K] (k_top=1).
     let rot_batch_t = upload_f32(gpu, rot_x);
@@ -245,7 +250,9 @@ fn run_down_i64(
     gpu.moe_i64_residual_to_f32(&residual_i64_t, &out_f32_t, m)
         .expect("moe_i64_residual_to_f32 launch");
 
-    gpu.hip.device_synchronize().expect("sync after down kernels");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after down kernels");
 
     let i64_vals = download_i64(gpu, &residual_i64_t, m);
     let f32_vals = download_f32(gpu, &out_f32_t, m);
@@ -261,7 +268,7 @@ fn run_down_i64(
 fn test_moe_down_repro_parity_k_split_bit_exact() {
     // Skip if no GPU.
     let mut gpu = match Gpu::init() {
-        Ok(g)  => g,
+        Ok(g) => g,
         Err(e) => {
             eprintln!("SKIP: no GPU available ({e:?})");
             return;
@@ -271,20 +278,27 @@ fn test_moe_down_repro_parity_k_split_bit_exact() {
 
     // Small shape: M=4 output rows, K=512 (2 groups of 256).
     // K must be even and both halves divisible by 256.
-    let m              = 4;
-    let k              = 512; // 2 groups
+    let m = 4;
+    let k = 512; // 2 groups
     let groups_per_row = k / 256;
-    let half_k         = k / 2;
-    let half_groups    = groups_per_row / 2; // = 1
+    let half_k = k / 2;
+    let half_groups = groups_per_row / 2; // = 1
 
-    eprintln!("Shape: M={m}, K={k} ({groups_per_row} groups), K/2={half_k} ({half_groups} group each)");
+    eprintln!(
+        "Shape: M={m}, K={k} ({groups_per_row} groups), K/2={half_k} ({half_groups} group each)"
+    );
 
     // Build the full expert weight matrix.
     let full_weights = build_expert_weights(m, groups_per_row);
 
     // Split into two halves (groups 0..1 and 1..2).
     let weights_a = slice_groups(&full_weights, m, groups_per_row, 0..half_groups);
-    let weights_b = slice_groups(&full_weights, m, groups_per_row, half_groups..groups_per_row);
+    let weights_b = slice_groups(
+        &full_weights,
+        m,
+        groups_per_row,
+        half_groups..groups_per_row,
+    );
 
     // Activation vector x[K]: deterministic values in [-0.3, 0.3).
     let rot_x: Vec<f32> = (0..k)
@@ -310,7 +324,7 @@ fn test_moe_down_repro_parity_k_split_bit_exact() {
     let mut all_pass = true;
     for row in 0..m {
         let sum = half_a_i64[row].wrapping_add(half_b_i64[row]);
-        let fp_full   = full_i64[row] as f64 * inv_s;
+        let fp_full = full_i64[row] as f64 * inv_s;
         let fp_f32out = full_f32[row] as f64;
         eprintln!(
             "row {row}: full={full_i64_v}  a+b={sum}  match={} | fp={fp_full:.8e} f32out={fp_f32out:.8e}",
@@ -318,7 +332,10 @@ fn test_moe_down_repro_parity_k_split_bit_exact() {
             full_i64_v = full_i64[row],
         );
         if full_i64[row] != sum {
-            eprintln!("  FAIL row {row}: full_i64={} != half_a+half_b={}", full_i64[row], sum);
+            eprintln!(
+                "  FAIL row {row}: full_i64={} != half_a+half_b={}",
+                full_i64[row], sum
+            );
             all_pass = false;
         }
         // FP convert should match to within 1 ULP (the i64 values are bit-identical).
@@ -328,7 +345,12 @@ fn test_moe_down_repro_parity_k_split_bit_exact() {
         }
     }
 
-    assert!(all_pass, "FAIL: int64 residuals are NOT bit-exact under K-split (partition non-invariant)");
-    eprintln!("\nPASS: full_i64[row] == half_a_i64[row] + half_b_i64[row] for all {m} rows (bit-exact)");
+    assert!(
+        all_pass,
+        "FAIL: int64 residuals are NOT bit-exact under K-split (partition non-invariant)"
+    );
+    eprintln!(
+        "\nPASS: full_i64[row] == half_a_i64[row] + half_b_i64[row] for all {m} rows (bit-exact)"
+    );
     eprintln!("PASS: moe_i64_residual_to_f32 matches expected scaled values");
 }

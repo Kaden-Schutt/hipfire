@@ -766,6 +766,76 @@ impl Gpus {
         Ok(())
     }
 
+    /// Int64 peer-direct all-reduce: sums `count` int64 elements in-place across
+    /// `group`. Mirrors [`Self::all_reduce_sum_f32_peer`] exactly — same peer-copy
+    /// structure, same scratch management — but operates on 8-byte int64 elements
+    /// using `add_inplace_i64` for the local accumulation step.
+    ///
+    /// Used by the TP down collective in the reproducible MoE down scheme: each
+    /// rank writes a S-scaled int64 partial, the partials are summed here (exact,
+    /// no FP rounding), then `moe_i64_residual_to_f32` converts after.
+    pub fn all_reduce_sum_i64_peer(
+        &mut self,
+        group: &[usize],
+        buffers: &[&hip_bridge::DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let g = group.len();
+        if buffers.len() != g {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "all_reduce_sum_i64_peer: buffers.len()={} != group.len()={g}",
+                    buffers.len()
+                ),
+            ));
+        }
+        if g <= 1 {
+            return Ok(());
+        }
+        let bytes = count * 8; // 8 bytes per i64
+        self.ensure_peer_ar_tmp(bytes)?;
+
+        // Phase 1: copy every peer's ORIGINAL buffer into a local temp slot.
+        let mut evts = Vec::with_capacity(g * (g - 1));
+        for k in 0..g {
+            let dev_k = group[k];
+            let mut slot = 0usize;
+            for m in 0..g {
+                if m == k {
+                    continue;
+                }
+                let dev_m = group[m];
+                let evt = self.boundary_copy(
+                    dev_m,
+                    dev_k,
+                    buffers[m],
+                    &self.peer_ar_tmp[dev_k][slot],
+                    bytes,
+                )?;
+                evts.push(evt);
+                slot += 1;
+            }
+        }
+        for evt in evts {
+            self.wait_boundary(evt)?;
+        }
+
+        // Phase 2: add the peer temps into each rank's buffer (int64, exact).
+        for k in 0..g {
+            let dev_k = group[k];
+            let dst_ptr = buffers[k].as_ptr();
+            let src_ptrs: Vec<*mut std::ffi::c_void> = (0..g - 1)
+                .map(|slot| self.peer_ar_tmp[dev_k][slot].as_ptr())
+                .collect();
+            self.devices[dev_k].bind_thread()?;
+            for &src_ptr in &src_ptrs {
+                self.devices[dev_k].add_inplace_i64(dst_ptr, src_ptr, count)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Ensure every device has an `active_stream` — the FIFO stream the EP
     /// collective enqueues its per-rank work on. Idempotent (no-op if already
     /// set). The EP forward requires this; call it once after the ranks are

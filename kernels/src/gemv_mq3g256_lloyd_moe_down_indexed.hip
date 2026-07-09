@@ -139,14 +139,21 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexe
 //
 // Same codebook decode as above, but each 256-group's FP warp-reduced partial
 // is converted to i64 (S=2^24 fixed-point) before cross-group accumulation.
-// The topk_w fold and residual write use integer atomicAdd on a separate
-// `residual_i64` buffer (int64, S-scaled).  This makes the result partition-
-// invariant under any K-split:
+// The topk_w is folded at GROUP level (not expert level) for partition
+// invariance: `round(topk_w * partial_g * S)` is accumulated per group, then
+// written via integer atomicAdd.  This makes the result partition-invariant
+// under any K-split where groups are 256-aligned:
 //   full_i64[row] == half_a_i64[row] + half_b_i64[row]   (bit-exact)
 // because (a) each group is wholly on one rank (K 256-aligned), (b) the
 // within-group warp reduce is FP (same as before, independent per group),
-// (c) cross-group accumulation is i64 (exact, no rounding tree), and
+// (c) topk_w is folded per group (so each group contributes exactly the same
+//     bits regardless of which rank holds it), and
 // (d) atomicAdd on unsigned long long is integer (order-independent).
+//
+// NOTE: folding topk_w AFTER summing all groups (i.e. round(topk_w * acc_i64))
+// is NOT partition-invariant because round(w*(a+b)) != round(w*a)+round(w*b).
+// The per-group fold avoids this: each rank accumulates only its own groups and
+// the integer sum across ranks equals the single-rank result.
 //
 // Call `moe_i64_residual_to_f32` after all expert launches to convert back.
 //
@@ -181,8 +188,9 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_i64_k8_indexed(
 
     long long acc_i64 = 0LL;
 
-    // Scale: S = 2^24.  Declared as float for per-group conversion.
+    // Scale: S = 2^24.  topk_w read once per thread block (same for all groups).
     const float S = (float)(1 << 24);
+    const float topk_w = topk_weights[krank];
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_ptr + g * 112;
@@ -212,19 +220,20 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_i64_k8_indexed(
         for (int offset = 16; offset > 0; offset >>= 1)
             partial += __shfl_down(partial, offset);
 
-        // Lane 0 accumulates in int64 (exact, no FP cross-group rounding)
+        // Lane 0: fold topk_w at GROUP level and accumulate in int64.
+        // round(topk_w * partial * S) per group — partition-invariant because
+        // each group is wholly on one TP rank; no cross-rank rounding error.
         if (tid == 0) {
-            acc_i64 += (long long)llroundf(partial * S);
+            acc_i64 += (long long)llroundf(topk_w * partial * S);
         }
         __syncthreads(); // guard LDS reload for next iteration
     }
 
-    // Fold topk_w and write to the int64 residual buffer via integer atomicAdd.
-    // unsigned long long atomicAdd is reinterpret-cast from signed i64 (two's
-    // complement arithmetic is identical for both types).
+    // Write accumulated i64 (topk_w already folded per group) via atomicAdd.
+    // unsigned long long atomicAdd reinterprets signed i64 bits (two's-complement
+    // addition is identical for both types).
     if (tid == 0) {
-        const long long contrib = llround((double)topk_weights[krank] * (double)acc_i64);
-        atomicAdd(&residual_i64[row], (unsigned long long)contrib);
+        atomicAdd(&residual_i64[row], (unsigned long long)acc_i64);
     }
 }
 
