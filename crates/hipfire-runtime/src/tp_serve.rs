@@ -865,6 +865,13 @@ impl TpModel {
             dev.invalidate_weight_caches();
             dev.invalidate_graph_state();
             dev.drain_pool();
+            // Destroy the per-device stream `load` created (active_stream = Some).
+            // Nothing else tears it down, so skipping it leaks a HIP stream (and
+            // its driver-side command buffer) every load/unload cycle — the TP
+            // residual PP (active_stream = None) never had.
+            if let Some(s) = dev.active_stream.take() {
+                let _ = dev.hip.stream_destroy(s);
+            }
         }
         // `self.gpus` drops here → tears down device contexts.
     }
