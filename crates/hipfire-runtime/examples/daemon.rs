@@ -1996,6 +1996,15 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
 #[allow(dead_code)]
 struct Deepseek4EpDispatch<'m> {
     m: &'m mut LoadedModel,
+    /// Raw request tools (OpenAI schema). Held so `init_grammar` can rebuild the
+    /// FULL ds4 `ToolSchema` (name + params-from-`properties` + required) — the
+    /// trait's `(name, required)` tuple drops `params`, which the ds4 grammar
+    /// needs (the allowed param-name set per invoke). Mirrors Cohere2MoeDispatch
+    /// holding `tools` for its stream parser.
+    tools: Option<Vec<serde_json::Value>>,
+    /// Assistant-prefix think mode → picks the dsml parser's `new_in_think`
+    /// (prompt ended inside `<think>`) vs `new` start state in `stream_parser`.
+    think_mode: ThinkMode,
 }
 
 #[allow(dead_code)]
@@ -2211,6 +2220,180 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
                 ..
             }) => config.vocab_size,
             _ => 0,
+        }
+    }
+
+    fn init_grammar(
+        &self,
+        _tool_schemas: &[(String, Vec<String>)],
+    ) -> Option<Box<dyn hipfire_runtime::arch_dispatch::GrammarMatcher>> {
+        // ds4's grammar needs the FULL ToolSchema (name + params + required); the
+        // trait's `(name, required)` tuple lacks `params`, so we rebuild it from
+        // the held raw `tools` — verbatim ep_serve_ds4:4541-4575 (params = the
+        // `properties` keys; required = the `required` array).
+        let schemas: Vec<deepseek4::grammar::ToolSchema> = self
+            .tools
+            .as_deref()
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let parameters = func.get("parameters");
+                        let params: Vec<String> = parameters
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let required: Vec<String> = parameters
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema {
+                            name,
+                            params,
+                            required,
+                        }
+                    })
+                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if schemas.is_empty() {
+            return None;
+        }
+        Some(Box::new(Deepseek4GrammarMatcher(
+            deepseek4::grammar::Matcher::new(schemas),
+        )))
+    }
+
+    fn stream_parser(
+        &self,
+        _cfg: hipfire_runtime::stream_parser::DefaultStreamParserConfig,
+    ) -> Box<dyn hipfire_runtime::stream_parser::StreamParser> {
+        // ds4 output is the DSML state machine, not the EosFilter/think-cap default —
+        // ignore `cfg`. Start state depends on whether the assistant prefix opened
+        // inside `<think>` (ep_serve_ds4:4537).
+        Box::new(Deepseek4StreamParser::new(self.think_mode))
+    }
+}
+
+/// Newtype so daemon.rs (owner) can implement the runtime `GrammarMatcher` for the
+/// ds4 `Matcher` without the orphan rule. 1:1 with the concrete matcher; the ds4
+/// `Matcher` tracks no attractor, so `attractor_detected` keeps the trait default.
+#[allow(dead_code)]
+struct Deepseek4GrammarMatcher(deepseek4::grammar::Matcher);
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::GrammarMatcher for Deepseek4GrammarMatcher {
+    fn token_mask(&self, vocab: &[String], out: &mut [bool]) {
+        self.0.token_mask(vocab, out);
+    }
+
+    fn advance(&mut self, text: &str) {
+        self.0.advance(text);
+    }
+
+    fn is_free(&self) -> bool {
+        self.0.is_free()
+    }
+}
+
+/// Wraps `deepseek4::dsml::StreamParser` for the generic `ar_generate` output
+/// layer. The dsml parser consumes decoded TEXT (`feed(&str)`) and its `finish`
+/// CONSUMES self, so we hold it behind an `Option` and `take()` on `finish`. Each
+/// committed token's running-vector byte delta (utf8-lossy) is fed as text; the
+/// dsml `StreamEvent`s map to `StreamAction`s (Token→visible Emit, Reasoning→
+/// reasoning Emit, ToolCalls→the `{name,arguments}` array — same shape as
+/// `emit_stream_event`, daemon.rs:445).
+#[allow(dead_code)]
+struct Deepseek4StreamParser {
+    inner: Option<deepseek4::dsml::StreamParser>,
+}
+
+impl Deepseek4StreamParser {
+    fn new(think_mode: ThinkMode) -> Self {
+        let inner = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
+        Self { inner: Some(inner) }
+    }
+
+    /// Translate dsml `StreamEvent`s into driver `StreamAction`s. Static so it can
+    /// be unit-tested without a live dsml parse (inc 3's mapping test).
+    fn map_events(
+        evs: Vec<deepseek4::dsml::StreamEvent>,
+    ) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
+        use deepseek4::dsml::StreamEvent;
+        use hipfire_runtime::stream_parser::StreamAction;
+        let mut acts = Vec::new();
+        for ev in evs {
+            match ev {
+                StreamEvent::Token(text) => acts.push(StreamAction::Emit {
+                    text,
+                    reasoning: false,
+                }),
+                StreamEvent::Reasoning(text) => acts.push(StreamAction::Emit {
+                    text,
+                    reasoning: true,
+                }),
+                StreamEvent::ToolCalls(calls) => {
+                    // Same shape emit_stream_event uses: a `calls` array of
+                    // {name, arguments}. The driver wraps it as
+                    // {"type":"tool_calls","id":..,"calls":<array>} (daemon.rs:8718).
+                    let arr: Vec<serde_json::Value> = calls
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({ "name": c.name, "arguments": c.arguments })
+                        })
+                        .collect();
+                    acts.push(StreamAction::ToolCalls(serde_json::Value::Array(arr)));
+                }
+            }
+        }
+        acts
+    }
+}
+
+impl hipfire_runtime::stream_parser::StreamParser for Deepseek4StreamParser {
+    fn feed(
+        &mut self,
+        tok: u32,
+        bytes: &[u8],
+    ) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
+        // dsml works on decoded text, not token ids — the token id is inert; the
+        // running-vector byte delta IS this token's decoded text.
+        let _ = tok;
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        let piece = String::from_utf8_lossy(bytes);
+        Self::map_events(inner.feed(&piece))
+    }
+
+    fn on_eos(&mut self) -> hipfire_runtime::stream_parser::EosDecision {
+        // ep_serve_ds4 breaks on the sampled eos WITHOUT forwarding/emitting/feeding
+        // it (daemon.rs:4751): the eos never enters KV, the tape, or the parser.
+        // `Stop` reproduces that exactly (CommitAndStop would forward + emit_only the
+        // eos → an extra forward pass + a spurious emit, diverging from the reference).
+        hipfire_runtime::stream_parser::EosDecision::Stop
+    }
+
+    fn finish(&mut self) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
+        // dsml `finish` CONSUMES self → take the inner parser out and flush.
+        match self.inner.take() {
+            Some(inner) => Self::map_events(inner.finish()),
+            None => Vec::new(),
         }
     }
 }
@@ -14827,5 +15010,66 @@ mod c2m_stream_parser_tests {
         p.emitted_visible = false;
         p.eos_suppressions = Cohere2MoeStreamParser::MAX_EOS_SUPPRESS;
         assert_eq!(p.on_eos(), EosDecision::Stop);
+    }
+}
+
+#[cfg(test)]
+mod ds4_stream_parser_tests {
+    use super::Deepseek4StreamParser;
+    use hipfire_arch_deepseek4::dsml::{StreamEvent, ToolCall};
+    use hipfire_runtime::stream_parser::{EosDecision, StreamAction, StreamParser};
+
+    #[test]
+    fn maps_token_and_reasoning_to_emit_channels() {
+        let acts = Deepseek4StreamParser::map_events(vec![
+            StreamEvent::Token("hi".into()),
+            StreamEvent::Reasoning("because".into()),
+        ]);
+        assert_eq!(
+            acts,
+            vec![
+                StreamAction::Emit {
+                    text: "hi".into(),
+                    reasoning: false
+                },
+                StreamAction::Emit {
+                    text: "because".into(),
+                    reasoning: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_tool_calls_to_name_arguments_array() {
+        let acts = Deepseek4StreamParser::map_events(vec![StreamEvent::ToolCalls(vec![ToolCall {
+            name: "get_weather".into(),
+            arguments: serde_json::json!({ "city": "Tokyo" }),
+        }])]);
+        assert_eq!(acts.len(), 1);
+        match &acts[0] {
+            StreamAction::ToolCalls(v) => {
+                // Same shape emit_stream_event emits: [{"name":..,"arguments":..}].
+                assert_eq!(
+                    *v,
+                    serde_json::json!([{ "name": "get_weather", "arguments": { "city": "Tokyo" } }])
+                );
+            }
+            other => panic!("expected ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_eos_is_stop_not_commit() {
+        // ep_serve_ds4 breaks on the sampled eos without forwarding/emitting it.
+        let mut p = Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink);
+        assert_eq!(p.on_eos(), EosDecision::Stop);
+    }
+
+    #[test]
+    fn finish_consumes_inner_and_is_idempotent() {
+        let mut p = Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink);
+        let _ = p.finish(); // takes the inner dsml parser
+        assert_eq!(p.finish(), Vec::new()); // second finish: inner is None → empty
     }
 }
