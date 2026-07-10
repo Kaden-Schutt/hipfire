@@ -648,20 +648,13 @@ fn ckpt_max() -> usize {
         .max(1)
 }
 
-// ─── Dual-run shadow-parity harness (Inc 1, god-struct-collapse) ──────────────
+// ─── Token-parity harness (dual-run scaffolding, now retained for self-check) ──
 //
-// `archdispatch_parity_enabled` gates a shadow second-pass through the
-// refactored ArchDispatch path (Task 1.4 wires this into generation).
 // `TokenTape` accumulates committed token IDs for one pass; `assert_token_parity`
-// compares two tapes and panics with a precise divergence report on mismatch.
-// The `--self-check-parity` CLI branch exercises these without a GPU.
-
-#[allow(dead_code)]
-fn archdispatch_parity_enabled() -> bool {
-    std::env::var("HIPFIRE_ARCHDISPATCH_PARITY")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
+// compares two tapes and panics with a precise divergence report on mismatch. The
+// per-arch dual-runs that used the `HIPFIRE_ARCHDISPATCH_PARITY` gate were deleted
+// at each fold's flip; these two are retained for the `--self-check-parity` CLI
+// branch (exercises them without a GPU).
 
 #[derive(Default, Clone)]
 #[allow(dead_code)]
@@ -4872,8 +4865,9 @@ struct EpSampling {
     min_p: Option<f32>,
 }
 
-/// A dense llama-family model served by the shared [`generate_dense`] loop: a
-/// per-token forward + logits over its own multi-GPU state. Implemented by both
+/// A dense llama-family model served over the unified `ar_generate` driver (via
+/// `DenseDispatch` + `dense_serve_via_ar_generate`): a per-token forward + logits
+/// over its own multi-GPU state. Implemented by both
 /// `TpModel` (Tp axis, PB-TP5) and `PpModel` (Pp axis, P-C) so the daemon's decode
 /// loop is agnostic to which parallelism axis the model is served on. (Inherent
 /// methods are called via the fully-qualified path so the trait forwarders don't
@@ -4960,6 +4954,22 @@ fn dense_serve_via_ar_generate(
     };
     let new_tokens = plan.new_tokens;
     let start_pos = plan.start_pos;
+    // Capacity guard (review I-1): generate_dense caught TpModel/PpModel::prefill's
+    // overflow Err and emitted a clean {"type":"error"}; ar_generate `.unwrap()`s the
+    // forward hooks, so without this an oversized prompt PANICS the serve thread. The
+    // absolute KV span is rendered.len() (== start_pos + the prefilled suffix) +
+    // max_tokens decode tokens. Return BEFORE mutating state. Mirrors the ds4/minimax
+    // EP via-helpers.
+    let rendered_n = start_pos.saturating_add(new_tokens.len());
+    if rendered_n.saturating_add(max_tokens) > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, rendered_n, max_tokens, m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
     if start_pos == 0 {
         m.conversation_tokens.clear();
     } else {
@@ -9243,9 +9253,10 @@ fn generate(
     // request and does not carry RNG state across requests. Matches the u32 the
     // GPU sample path uses (0x13579BDF).
     hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
-    // Dense multi-GPU serve (PB-TP5 Tp / P-C Pp): route to the shared generate_dense
-    // BEFORE any arch short-circuit / EP. The model lives in `m.tp` (TpModel) or
-    // `m.pp_dense` (PpModel) over its own Gpus; the single-GPU arch fields are None.
+    // Dense multi-GPU serve (PB-TP5 Tp / P-C Pp): route through the unified
+    // ar_generate driver (dense_serve_via_ar_generate) BEFORE any arch short-circuit
+    // / EP. The model lives in `m.tp` (TpModel) or `m.pp_dense` (PpModel) over its own
+    // Gpus; the single-GPU arch fields are None.
     // Disjoint field borrows: `m.tokenizer` (read) + the model field (mut).
     if m.tp.is_some() {
         // Dense TP AR decode on the unified ar_generate driver (folds generate_dense).
