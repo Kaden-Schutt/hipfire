@@ -50,6 +50,22 @@ pub trait GrammarMatcher {
     }
 }
 
+/// Device context threaded through the AR-phase forward hooks so ONE driver
+/// (`ar_generate`) serves both single-GPU and multi-GPU (deepseek4 EP) arches.
+///
+/// `Single` carries the daemon-owned bare `Gpu` that the single-GPU arches run
+/// on. `Mesh` is a UNIT marker — it carries no device: an EP model's `Gpus`
+/// lives INSIDE `LoadedModel` (`m.ep.gpus`), i.e. inside the same `&mut m` the
+/// dispatch borrows as `&mut self`, so a `Mesh(&mut Gpus)` variant would alias
+/// that borrow (two overlapping `&mut m`). The mesh dispatch therefore reaches
+/// its `Gpus` through `&mut self` and treats `Mesh` purely as "I am the mesh
+/// arm". Single-GPU dispatches match `Single(gpu)` and run byte-unchanged.
+/// See docs/superpowers/specs/2026-07-10-axis-b-modelparallel-collapse-design.md.
+pub enum ForwardCtx<'a> {
+    Single(&'a mut rdna_compute::Gpu),
+    Mesh,
+}
+
 /// One trait object per loaded model. Owns arch-specific decode behavior so the
 /// daemon's dispatch stops branching on `arch_id`.
 pub trait ArchDispatch {
@@ -83,11 +99,11 @@ pub trait ArchDispatch {
     #[allow(dead_code)]
     fn prefill_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         chunk: &[u32],
         seq_pos: usize,
     ) -> Result<(), String> {
-        let _ = (gpu, chunk, seq_pos);
+        let _ = (ctx, chunk, seq_pos);
         Err("prefill_forward not implemented for this arch".into())
     }
 
@@ -97,11 +113,11 @@ pub trait ArchDispatch {
     #[allow(dead_code)]
     fn decode_step_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         token: u32,
         seq_pos: usize,
     ) -> Result<(), String> {
-        let _ = (gpu, token, seq_pos);
+        let _ = (ctx, token, seq_pos);
         Err("decode_step_forward not implemented for this arch".into())
     }
 
@@ -138,10 +154,10 @@ pub trait ArchDispatch {
     #[allow(dead_code)]
     fn maybe_evict(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         seq_pos: usize,
     ) -> Result<Option<usize>, String> {
-        let _ = (gpu, seq_pos);
+        let _ = (ctx, seq_pos);
         Ok(None)
     }
 
@@ -150,8 +166,8 @@ pub trait ArchDispatch {
     /// returns nothing. Mirrors `m.kv_adaptive.maybe_downshift(gpu, kv,
     /// seq_pos)`. Default: no adaptive-KV.
     #[allow(dead_code)]
-    fn maybe_adaptive_downshift(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
-        let _ = (gpu, seq_pos);
+    fn maybe_adaptive_downshift(&mut self, ctx: ForwardCtx<'_>, seq_pos: usize) {
+        let _ = (ctx, seq_pos);
     }
 
     /// Snapshot the recurrent state at `seq_pos` for later checkpoint-resume.
@@ -159,8 +175,8 @@ pub trait ArchDispatch {
     /// Mirrors `speculative::take_dn_checkpoint(&mut m.prefill_checkpoints, dn,
     /// gpu, seq_pos, ckpt_interval(), ckpt_max())`. Default: no-op.
     #[allow(dead_code)]
-    fn take_prefill_checkpoint(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
-        let _ = (gpu, seq_pos);
+    fn take_prefill_checkpoint(&mut self, ctx: ForwardCtx<'_>, seq_pos: usize) {
+        let _ = (ctx, seq_pos);
     }
 
     /// Zero the arch's recurrent decode state on abort (DeltaNet s/conv
@@ -170,8 +186,8 @@ pub trait ArchDispatch {
     /// emit, early return). Mirrors the two abort blocks (daemon.rs:8921,
     /// 9233). Default: no recurrent state to zero.
     #[allow(dead_code)]
-    fn abort_zero_recurrent(&mut self, gpu: &mut rdna_compute::Gpu) {
-        let _ = gpu;
+    fn abort_zero_recurrent(&mut self, ctx: ForwardCtx<'_>) {
+        let _ = ctx;
     }
 
     /// Sample one token from the arch's `scratch.logits`. When `grammar_mask`
@@ -181,18 +197,23 @@ pub trait ArchDispatch {
     /// the arch bundle's `scratch` never crosses the trait boundary. Mirrors
     /// the three sample sites (daemon.rs:9119, 9581, 9729). Default fails
     /// loudly — a real arch must sample.
+    ///
+    /// Receiver is `&mut self` (not `&self`): the mesh (EP) impl reaches its
+    /// `Gpus` through `&mut self` (the `Mesh` ctx carries no device). The
+    /// single-GPU impls don't mutate self, so this is a behavior-preserving
+    /// widening for them.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn sample(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
+        &mut self,
+        ctx: ForwardCtx<'_>,
         cfg: &crate::sampler::SamplerConfig,
         vocab_size: usize,
         ngram_scope: &[u32],
         grammar_mask: Option<&[bool]>,
         rng_state: &mut u32,
     ) -> Result<u32, String> {
-        let _ = (gpu, cfg, vocab_size, ngram_scope, grammar_mask, rng_state);
+        let _ = (ctx, cfg, vocab_size, ngram_scope, grammar_mask, rng_state);
         Err("sample not implemented for this arch".into())
     }
 

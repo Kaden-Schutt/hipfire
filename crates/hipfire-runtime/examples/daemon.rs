@@ -35,6 +35,7 @@ use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_runtime::arch_dispatch::ForwardCtx;
 use hipfire_runtime::emit_text::{currently_in_think, extract_tool_calls_from_text};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
@@ -795,10 +796,13 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
 
     fn prefill_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         chunk: &[u32],
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let ModelState::Qwen35(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
             return Err("prefill_forward: not a qwen35 bundle".into());
         };
@@ -821,10 +825,13 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
 
     fn decode_step_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         token: u32,
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let ModelState::Qwen35(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
             return Err("decode_step_forward: not a qwen35 bundle".into());
         };
@@ -859,9 +866,12 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
 
     fn maybe_evict(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         seq_pos: usize,
     ) -> Result<Option<usize>, String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let m = &mut *self.m;
         // Mirror the arm's field-split: borrow m.state (kv, mut) then m.eviction
         // (shared) — disjoint fields of *m, so NLL permits both live.
@@ -882,7 +892,10 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         }
     }
 
-    fn maybe_adaptive_downshift(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
+    fn maybe_adaptive_downshift(&mut self, ctx: ForwardCtx<'_>, seq_pos: usize) {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let m = &mut *self.m;
         let Some(ModelState::Qwen35(b)) = m.state.as_mut() else {
             return;
@@ -911,7 +924,10 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         }
     }
 
-    fn take_prefill_checkpoint(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
+    fn take_prefill_checkpoint(&mut self, ctx: ForwardCtx<'_>, seq_pos: usize) {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let m = &mut *self.m;
         let Some(ModelState::Qwen35(b)) = m.state.as_mut() else {
             return;
@@ -926,7 +942,10 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         );
     }
 
-    fn abort_zero_recurrent(&mut self, gpu: &mut rdna_compute::Gpu) {
+    fn abort_zero_recurrent(&mut self, ctx: ForwardCtx<'_>) {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let m = &mut *self.m;
         if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
             for s in &b.dn_state.s_matrices {
@@ -947,14 +966,17 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
     }
 
     fn sample(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
+        &mut self,
+        ctx: ForwardCtx<'_>,
         cfg: &hipfire_runtime::sampler::SamplerConfig,
         vocab_size: usize,
         ngram_scope: &[u32],
         grammar_mask: Option<&[bool]>,
         rng_state: &mut u32,
     ) -> Result<u32, String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let m = &*self.m;
         let ModelState::Qwen35(b) = m.state.as_ref().ok_or("no state")? else {
             return Err("sample: not a qwen35 bundle".into());
@@ -1147,10 +1169,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
 
     fn prefill_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         chunk: &[u32],
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         // Per-token forward_step (matches generate_qwen2's per-token prefill).
         // state.next_pos is the internal cursor → the driver's seq_pos is advisory.
         let _ = seq_pos;
@@ -1166,10 +1191,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
 
     fn decode_step_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         token: u32,
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let _ = seq_pos;
         let ModelState::Qwen2(b) = self.m.state.as_mut().ok_or("no state")? else {
             return Err("decode_step_forward: not a qwen2 bundle".into());
@@ -1179,14 +1207,17 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
     }
 
     fn sample(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
+        &mut self,
+        ctx: ForwardCtx<'_>,
         cfg: &hipfire_runtime::sampler::SamplerConfig,
         vocab_size: usize,
         ngram_scope: &[u32],
         grammar_mask: Option<&[bool]>,
         rng_state: &mut u32,
     ) -> Result<u32, String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         // Greedy argmax over state.logits — byte-identical to forward_step_greedy's
         // internal `gpu.argmax_f32(state.logits, cfg.vocab_size)`. All sampling
         // controls are inert for qwen2.
@@ -1298,10 +1329,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
 
     fn prefill_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         chunk: &[u32],
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let ModelState::Llama(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
             return Err("prefill_forward: not a llama bundle".into());
         };
@@ -1313,10 +1347,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
 
     fn decode_step_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         token: u32,
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let ModelState::Llama(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
             return Err("decode_step_forward: not a llama bundle".into());
         };
@@ -1329,14 +1366,17 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
     }
 
     fn sample(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
+        &mut self,
+        ctx: ForwardCtx<'_>,
         cfg: &hipfire_runtime::sampler::SamplerConfig,
         vocab_size: usize,
         ngram_scope: &[u32],
         _grammar_mask: Option<&[bool]>,
         rng_state: &mut u32,
     ) -> Result<u32, String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         // llama has no grammar → mask is always None; GPU fast path only.
         let m = &*self.m;
         let ModelState::Llama(b) = m.state.as_ref().ok_or("no state")? else {
@@ -1486,10 +1526,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
 
     fn prefill_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         chunk: &[u32],
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let b = self.m.minimax_mut().ok_or("prefill_forward: no minimax bundle")?;
         let batched = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL").map_or(true, |v| v != "0")
             && minimax::forward::forward_batch_supported(&b.weights);
@@ -1512,10 +1555,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
 
     fn decode_step_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         token: u32,
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let b = self.m.minimax_mut().ok_or("decode_step_forward: no minimax bundle")?;
         minimax::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
             .map(|_| ())
@@ -1523,14 +1569,17 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
     }
 
     fn sample(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
+        &mut self,
+        ctx: ForwardCtx<'_>,
         cfg: &hipfire_runtime::sampler::SamplerConfig,
         vocab_size: usize,
         ngram_scope: &[u32],
         grammar_mask: Option<&[bool]>,
         rng_state: &mut u32,
     ) -> Result<u32, String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         // Host-side sample from state.logits (GPU). Generic sampler (uplift):
         // temp0 == argmax (parity vs legacy sample_token); temp>0 differs by design.
         let _ = (vocab_size, grammar_mask, rng_state);
@@ -1641,10 +1690,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
 
     fn prefill_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         chunk: &[u32],
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let b = self
             .m
             .cohere2moe_mut()
@@ -1680,10 +1732,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
 
     fn decode_step_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         token: u32,
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let b = self
             .m
             .cohere2moe_mut()
@@ -1694,14 +1749,17 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
     }
 
     fn sample(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
+        &mut self,
+        ctx: ForwardCtx<'_>,
         cfg: &hipfire_runtime::sampler::SamplerConfig,
         vocab_size: usize,
         ngram_scope: &[u32],
         grammar_mask: Option<&[bool]>,
         rng_state: &mut u32,
     ) -> Result<u32, String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let _ = (vocab_size, grammar_mask, rng_state);
         let b = self.m.cohere2moe().ok_or("sample: no cohere2moe bundle")?;
         let mut logits = gpu
@@ -1819,10 +1877,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
 
     fn prefill_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         chunk: &[u32],
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         // Per-token decode_step (no batched prefill kernel for lfm2moe).
         let b = self.m.lfm2moe_mut().ok_or("prefill_forward: no lfm2moe bundle")?;
         let mut pos = seq_pos as u32;
@@ -1836,10 +1897,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
 
     fn decode_step_forward(
         &mut self,
-        gpu: &mut rdna_compute::Gpu,
+        ctx: ForwardCtx<'_>,
         token: u32,
         seq_pos: usize,
     ) -> Result<(), String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         let b = self.m.lfm2moe_mut().ok_or("decode_step_forward: no lfm2moe bundle")?;
         lfm2moe::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
             .map(|_| ())
@@ -1847,14 +1911,17 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
     }
 
     fn sample(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
+        &mut self,
+        ctx: ForwardCtx<'_>,
         cfg: &hipfire_runtime::sampler::SamplerConfig,
         vocab_size: usize,
         ngram_scope: &[u32],
         grammar_mask: Option<&[bool]>,
         rng_state: &mut u32,
     ) -> Result<u32, String> {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         // Host-side sample from state.logits (GPU-resident; decode_step writes+downloads
         // it). Generic sampler (uplift): temp0 == argmax (parity vs legacy sample_token).
         let _ = (vocab_size, grammar_mask, rng_state);
@@ -8192,9 +8259,9 @@ fn ar_generate(
             let space = window.saturating_sub(seq_pos).max(1);
             let chunk_len = remaining.len().min(space);
             let (chunk, rest) = remaining.split_at(chunk_len);
-            dispatch.prefill_forward(gpu, chunk, seq_pos).unwrap();
+            dispatch.prefill_forward(ForwardCtx::Single(&mut *gpu), chunk, seq_pos).unwrap();
             seq_pos += chunk_len;
-            if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+            if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
                 seq_pos = new_phys;
             }
             remaining = rest;
@@ -8211,17 +8278,17 @@ fn ar_generate(
             }
             let end = (start + chunk_max).min(new_tokens.len());
             let chunk = &new_tokens[start..end];
-            dispatch.prefill_forward(gpu, chunk, seq_pos).unwrap();
+            dispatch.prefill_forward(ForwardCtx::Single(&mut *gpu), chunk, seq_pos).unwrap();
             seq_pos += chunk.len();
-            dispatch.maybe_adaptive_downshift(gpu, seq_pos);
+            dispatch.maybe_adaptive_downshift(ForwardCtx::Single(&mut *gpu), seq_pos);
             if ckpt_resume_enabled() {
-                dispatch.take_prefill_checkpoint(gpu, seq_pos);
+                dispatch.take_prefill_checkpoint(ForwardCtx::Single(&mut *gpu), seq_pos);
             }
             start = end;
         }
     }
     if prefill_aborted {
-        dispatch.abort_zero_recurrent(gpu);
+        dispatch.abort_zero_recurrent(ForwardCtx::Single(&mut *gpu));
         seq_pos = 0;
         dispatch.set_seq_pos(0);
         dispatch.conversation_tokens_mut().clear();
@@ -8240,7 +8307,7 @@ fn ar_generate(
         return;
     }
     // Post-prefill adaptive-KV downshift.
-    dispatch.maybe_adaptive_downshift(gpu, seq_pos);
+    dispatch.maybe_adaptive_downshift(ForwardCtx::Single(&mut *gpu), seq_pos);
     dispatch.conversation_tokens_mut().extend_from_slice(&new_tokens);
 
     // Boundary marker for the prompt-cache / asst_turn_cache slice: the model's
@@ -8333,7 +8400,7 @@ fn ar_generate(
             None
         };
         dispatch
-            .sample(gpu, &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state)
+            .sample(ForwardCtx::Single(&mut *gpu), &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state)
             .unwrap()
     };
     if grammar_active {
@@ -8433,7 +8500,7 @@ fn ar_generate(
             dispatch.set_seq_pos(0);
             dispatch.conversation_tokens_mut().clear();
             dispatch.free_prefill_checkpoints(gpu);
-            dispatch.abort_zero_recurrent(gpu);
+            dispatch.abort_zero_recurrent(ForwardCtx::Single(&mut *gpu));
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -8499,16 +8566,16 @@ fn ar_generate(
         };
 
         dispatch
-            .decode_step_forward(gpu, next_token, seq_pos)
+            .decode_step_forward(ForwardCtx::Single(&mut *gpu), next_token, seq_pos)
             .unwrap();
         seq_pos += 1;
         if ckpt_resume_enabled() {
-            dispatch.take_prefill_checkpoint(gpu, seq_pos);
+            dispatch.take_prefill_checkpoint(ForwardCtx::Single(&mut *gpu), seq_pos);
         }
-        if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+        if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
             seq_pos = new_phys;
         }
-        dispatch.maybe_adaptive_downshift(gpu, seq_pos);
+        dispatch.maybe_adaptive_downshift(ForwardCtx::Single(&mut *gpu), seq_pos);
 
         // ── Terminal eos (CommitAndStop, decided pre-commit above) ───────────
         // The eos token has now been committed + forwarded; emit it through the filter
@@ -8599,7 +8666,7 @@ fn ar_generate(
                             None
                         };
                     dispatch
-                        .sample(gpu, &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
+                        .sample(ForwardCtx::Single(&mut *gpu), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
                         .unwrap()
                 };
                 if grammar_active {
@@ -8645,9 +8712,9 @@ fn ar_generate(
                     for act in parser.emit_only(tok, &new_bytes2) {
                         exec_stream_action!(act);
                     }
-                    dispatch.decode_step_forward(gpu, tok, seq_pos).unwrap();
+                    dispatch.decode_step_forward(ForwardCtx::Single(&mut *gpu), tok, seq_pos).unwrap();
                     seq_pos += 1;
-                    if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+                    if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
                         seq_pos = new_phys;
                     }
                     generated += 1;
@@ -8723,7 +8790,7 @@ fn ar_generate(
                 None
             };
             dispatch
-                .sample(gpu, &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
+                .sample(ForwardCtx::Single(&mut *gpu), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
                 .unwrap()
         };
         if grammar_active {
@@ -8755,9 +8822,9 @@ fn ar_generate(
         .unwrap_or(0);
     if im_end_token == Some(last_conv) && !nl.is_empty() {
         for &t in nl {
-            dispatch.decode_step_forward(gpu, t, seq_pos).unwrap();
+            dispatch.decode_step_forward(ForwardCtx::Single(&mut *gpu), t, seq_pos).unwrap();
             seq_pos += 1;
-            if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+            if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
                 seq_pos = new_phys;
             }
             dispatch.conversation_tokens_mut().push(t);
