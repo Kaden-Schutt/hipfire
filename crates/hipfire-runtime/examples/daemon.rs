@@ -2668,6 +2668,160 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
     }
 }
 
+/// Dense multi-GPU (TP / dense-PP) AR dispatch — the THIRD mesh dispatch. Wraps a
+/// `DenseServed` model (TpModel when `!is_pp`, PpModel when `is_pp`) whose `Gpus`
+/// lives inside `m.tp` / `m.pp_dense`, so `ForwardCtx::Mesh` reaches it through
+/// `&mut self`. Folds `generate_dense`: per-token `forward_token` (batched `prefill`
+/// at pos 0, per-token suffix on an LCP hit), host `sample_cpu` over `logits()`,
+/// `is_eos = eos || is_terminator`. Lean — no think / grammar / eviction /
+/// checkpoints. Dense models track no cursor, so the gate preamble seeds `m.seq_pos`
+/// from the LCP start_pos and ar_generate advances it.
+#[allow(dead_code)]
+struct DenseDispatch<'m> {
+    m: &'m mut LoadedModel,
+    /// false = TP (m.tp), true = dense-PP (m.pp_dense).
+    is_pp: bool,
+}
+
+impl DenseDispatch<'_> {
+    fn dense_model(&mut self) -> &mut dyn DenseServed {
+        if self.is_pp {
+            self.m.pp_dense.as_mut().expect("DenseDispatch: no pp_dense") as &mut dyn DenseServed
+        } else {
+            self.m.tp.as_mut().expect("DenseDispatch: no tp") as &mut dyn DenseServed
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::ArchDispatch for DenseDispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        if self.is_pp {
+            self.m.pp_dense.as_ref().map(|p| p.eos_token()).unwrap_or(0)
+        } else {
+            self.m.tp.as_ref().map(|t| t.eos_token()).unwrap_or(0)
+        }
+    }
+
+    fn is_eos(&self, tok: u32) -> bool {
+        // generate_dense breaks on `next == eos || tokenizer.is_terminator(next)`.
+        tok == self.eos_token() || self.tokenizer().is_terminator(tok)
+    }
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 0.7,
+            top_p: 0.9,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        // Lean dense serve (generate_dense's contract): user stop-seqs only.
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: false,
+            supports_stop_seq: true,
+            supports_grammar: false,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
+        // Dense is stateless per request (KV overwritten by re-prefill each turn) —
+        // a fresh context just rewinds the driver cursor + token history.
+        self.m.seq_pos = 0;
+        self.m.conversation_tokens.clear();
+    }
+
+    fn prefill_forward(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("dense dispatch received Single ctx")
+        };
+        // start_pos==0 (cache miss): the model's BATCHED prefill (positions 0..len,
+        // internally chunked ≤256). start_pos>0 (LCP hit): per-token forward over the
+        // cached prefix. Mirrors generate_dense. prefill_max_batch=MAX → ar_generate
+        // hands one chunk, so seq_pos is the LCP start and the model batches itself.
+        let model = self.dense_model();
+        if seq_pos == 0 {
+            model.prefill(chunk)
+        } else {
+            for (i, &t) in chunk.iter().enumerate() {
+                model.forward_token(t, seq_pos + i)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("dense dispatch received Single ctx")
+        };
+        self.dense_model().forward_token(token, seq_pos)
+    }
+
+    fn sample(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("dense dispatch received Single ctx")
+        };
+        // Host sampler over the downloaded logits (generate_dense uses sample_cpu).
+        // No grammar for dense; rng_state (GPU xorshift) inert — sample_cpu uses the
+        // cpu-sampler RNG seeded per request.
+        let _ = (vocab_size, grammar_mask, rng_state);
+        let mut logits = self.dense_model().logits()?;
+        Ok(sampler::sample_cpu(&mut logits, ngram_scope, cfg))
+    }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        self.m.seq_pos
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        self.m.seq_pos = seq_pos;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        // Inert for dense: sample_cpu sizes off logits.len() and there is no grammar
+        // mask; the driver's GPU-sampler / grammar paths that read this are unused.
+        0
+    }
+
+    fn prefill_max_batch(&self) -> usize {
+        // One chunk: DenseServed::prefill batches internally (≤256) at pos 0, so the
+        // whole suffix goes in a single prefill_forward call (seq_pos = LCP start).
+        usize::MAX
+    }
+}
+
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
 /// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
 /// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
