@@ -4788,19 +4788,145 @@ fn generate_ep(
             primed_think,
             sampling,
         ),
-        _ => ep_serve_ds4(
-            m,
-            stdout,
-            id,
-            &prompt_ids,
-            eos_tok,
-            max_tokens,
-            think_mode,
-            tools,
-            stop,
-            sampling,
-        ),
+        _ => {
+            if archdispatch_parity_enabled() {
+                // Axis B inc 4b dual-run: legacy ep_serve_ds4 (captures old_tape) vs
+                // the unified ar_generate+Mesh path (new_tape), asserting an identical
+                // committed-token stream. Reset EP state + re-seed the cpu sampler
+                // between arms so the ar_generate arm starts from ep_serve_ds4's
+                // start-of-turn condition. Flag off = legacy path only (this increment
+                // does NOT flip prod; inc 5 validates on GPU then flips).
+                let mut old_tape = TokenTape::default();
+                ep_serve_ds4(
+                    m,
+                    stdout,
+                    id,
+                    &prompt_ids,
+                    eos_tok,
+                    max_tokens,
+                    think_mode,
+                    tools,
+                    stop,
+                    sampling,
+                    Some(&mut old_tape),
+                );
+                ep_reset_ds4_state(m);
+                hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+                let mut new_tape = TokenTape::default();
+                ep_serve_ds4_via_ar_generate(
+                    m,
+                    stdout,
+                    id,
+                    &prompt_ids,
+                    max_tokens,
+                    think_mode,
+                    tools,
+                    stop,
+                    sampling,
+                    Some(&mut new_tape),
+                );
+                assert_token_parity(&old_tape, &new_tape, id);
+            } else {
+                ep_serve_ds4(
+                    m,
+                    stdout,
+                    id,
+                    &prompt_ids,
+                    eos_tok,
+                    max_tokens,
+                    think_mode,
+                    tools,
+                    stop,
+                    sampling,
+                    None,
+                );
+            }
+        }
     }
+}
+
+/// Per-rank ds4 EP cross-conversation reset — `bind_thread → reset →
+/// zero_decode_caches → invalidate_graph_state` on each rank's own device, then
+/// the generic `seq_pos=0 / conversation_tokens.clear()`. Mirrors ep_serve_ds4's
+/// start-of-turn reset (which it does internally). No single-GPU `gpu` needed: EP
+/// reaches its devices via `m.ep.gpus`. Used between the inc-4 dual-run arms; the
+/// inc-5 flip calls it per turn before `ep_serve_ds4_via_ar_generate` (EP has no
+/// LCP → every turn re-prefills the full prompt from a clean state).
+fn ep_reset_ds4_state(m: &mut LoadedModel) {
+    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+        if let EpArch::Ds4 { state, .. } = inner {
+            for (rank, s) in state.iter_mut().enumerate() {
+                let g = &mut gpus.devices[rank];
+                let _ = g.bind_thread();
+                s.reset();
+                s.zero_decode_caches(g);
+                g.invalidate_graph_state();
+            }
+        }
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+}
+
+/// Drive ds4 EP AR decode through the unified `ar_generate` driver (Axis B): build
+/// a `Deepseek4EpDispatch` + `ForwardCtx::Mesh`, cold-prefill the full DSML prompt
+/// (EP has no LCP), and let `ar_generate`'s generic loop drive forward / sample /
+/// output. The EP-specific parts (multi-rank `forward_ep`, rank-0 host
+/// `sample_full_dist`, DSML output) live in the dispatch + `Deepseek4StreamParser`.
+/// The caller must reset EP state first (this does no internal reset). Used by the
+/// inc-4 dual-run; becomes the prod path at the inc-5 flip.
+#[allow(clippy::too_many_arguments)]
+fn ep_serve_ds4_via_ar_generate(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    stop: &[String],
+    sampling: EpSampling,
+    tape: Option<&mut TokenTape>,
+) {
+    let mut disp = Deepseek4EpDispatch {
+        m,
+        tools: tools.map(|t| t.to_vec()),
+        think_mode,
+    };
+    ar_generate(
+        &mut disp,
+        ForwardCtx::Mesh,
+        stdout,
+        id,
+        sampling.temp,
+        sampling.top_p,
+        sampling.top_k,
+        sampling.min_p,
+        max_tokens,
+        1.0, // repeat_penalty — EP uses sample_full_dist (no penalties)
+        0,   // repeat_window
+        0.0, // presence_penalty
+        0.0, // frequency_penalty
+        0,   // budget_alert_at_tok
+        "",  // budget_alert_text
+        0,   // max_think_tokens — ds4 think handled by the dsml StreamParser
+        hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        stop,
+        tools,               // activates grammar; ds4 init_grammar rebuilds from disp.tools
+        prompt_ids.to_vec(), // new_tokens: full DSML prompt (cold prefill, no LCP)
+        &[],                 // im_end — ds4 stops via is_eos, not im_end
+        &[],                 // nl
+        None,                // im_end_token
+        None,                // tool_call_pair — dsml StreamParser owns tool-call events
+        None,                // think_pair — dsml StreamParser owns think routing
+        prompt_ids.len(),    // prefill_tokens (full cold prefill)
+        0,                   // cached_tokens_count (no LCP for EP)
+        None,                // pflash_summary
+        None,                // pflash_bypass_reason
+        None,                // pflash_alpha
+        std::time::Instant::now(),
+        tape,
+    );
 }
 
 /// Stream a token JSON event; returns true if a stop sequence is now satisfied.
@@ -4908,6 +5034,9 @@ fn ep_serve_ds4(
     tools: Option<&[serde_json::Value]>,
     stop: &[String],
     sampling: EpSampling,
+    // Axis B inc 4b: when Some, record every committed token id (for the dual-run
+    // token-parity check against the ar_generate arm). None on the prod path.
+    mut tape: Option<&mut TokenTape>,
 ) {
     use hipfire_arch_deepseek4::dsml::StreamEvent;
     use std::time::Instant;
@@ -5188,6 +5317,9 @@ fn ep_serve_ds4(
             generated,
             t_decode.elapsed().as_millis() as u64,
         );
+        if let Some(t) = tape.as_deref_mut() {
+            t.push(next);
+        }
         let _ = stdout.flush();
         if grammar_active {
             matcher.advance(&piece);
