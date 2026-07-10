@@ -725,6 +725,39 @@ impl LlamaWeights {
             let _ = gpu.free_tensor(l.w_down.buf);
         }
     }
+
+    /// Distributed free: return each buffer to the pool of the device it was
+    /// loaded onto (embed→device 0, output_norm/output→`output_device`, layer
+    /// i→`device_for_layer(i)`). The distributed analog of [`free_gpu`], used by
+    /// `PpModel::free` once weights are loaded per stage. `free_tensor` binds the
+    /// owning device itself; the caller drains each pool afterward.
+    pub fn free_gpu_multi(self, gpus: &mut crate::multi_gpu::Gpus) {
+        let out_dev = gpus.output_device;
+        let _ = gpus.devices[0].free_tensor(self.token_embd);
+        let _ = gpus.devices[out_dev].free_tensor(self.output_norm);
+        if !self.lm_head_aliases_embd {
+            let _ = gpus.devices[out_dev].free_tensor(self.output.buf);
+        }
+        for (i, l) in self.layers.into_iter().enumerate() {
+            let d = gpus.device_for_layer(i);
+            let g = &mut gpus.devices[d];
+            let _ = g.free_tensor(l.attn_norm);
+            let _ = g.free_tensor(l.wq.buf);
+            let _ = g.free_tensor(l.wk.buf);
+            let _ = g.free_tensor(l.wv.buf);
+            let _ = g.free_tensor(l.wo.buf);
+            if let Some(t) = l.q_norm {
+                let _ = g.free_tensor(t);
+            }
+            if let Some(t) = l.k_norm {
+                let _ = g.free_tensor(t);
+            }
+            let _ = g.free_tensor(l.ffn_norm);
+            let _ = g.free_tensor(l.w_gate.buf);
+            let _ = g.free_tensor(l.w_up.buf);
+            let _ = g.free_tensor(l.w_down.buf);
+        }
+    }
 }
 
 /// Dispatch GEMV for a weight tensor (quantized or F32).
@@ -5296,7 +5329,6 @@ pub fn forward_scratch_compute_capture(
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     Ok(())
 }
-
 
 /// Final RMSNorm + lm_head projection → `scratch.logits`. Under PP the last
 /// stage runs this after its band. Split out of the old `forward_scratch_compute`
