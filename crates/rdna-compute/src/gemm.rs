@@ -3673,8 +3673,6 @@ impl Gpu {
                     // are tiny LA tails that waste most of a 128-row MMQ tile.
                     // Keep this off by default and do not widen it to gfx12 or
                     // gfx10; their MMQ/dot2 tradeoffs and source families differ.
-                    // The env override is resolved once through FeatureFlags at
-                    // Gpu initialization, not from this dispatch hot path.
                     if self.flags.qkvza_split_tail
                         && self.arch_caps.is_rdna3_dgpu()
                         && qkv_m % 128 == 0
