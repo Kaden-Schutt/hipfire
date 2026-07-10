@@ -8516,6 +8516,34 @@ fn ar_generate(
     // model and written back at finalize / on abort.
     let mut seq_pos = dispatch.seq_pos();
 
+    // On any GPU forward / hook error mid-generation, emit a clean {"type":"error"}
+    // and reset the arch to a clean state (mirrors the abort cleanup) so a partial
+    // state can't bleed into the next request, then return — instead of a `.unwrap()`
+    // panic that kills the serve thread. Shared by all arches on this driver (the
+    // deleted generate_dense had an equivalent `fail!`; the EP/dense folds inherit
+    // this). Used as an expression (yields the Ok value) or a statement.
+    macro_rules! hook_or_fail {
+        ($call:expr, $what:expr) => {
+            match $call {
+                Ok(v) => v,
+                Err(e) => {
+                    dispatch.abort_zero_recurrent(ctx.reborrow());
+                    dispatch.set_seq_pos(0);
+                    dispatch.conversation_tokens_mut().clear();
+                    dispatch.free_prefill_checkpoints(ctx.reborrow());
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","id":"{}","message":{}}}"#,
+                        id,
+                        serde_json::to_string(&format!("{}: {}", $what, e)).unwrap_or_default()
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        };
+    }
+
     // ── Prefill (abort-aware) ────────────────────────────────────────────
     let mut prefill_aborted = false;
     if let Some(window) = dispatch.eviction_window() {
@@ -8529,9 +8557,9 @@ fn ar_generate(
             let space = window.saturating_sub(seq_pos).max(1);
             let chunk_len = remaining.len().min(space);
             let (chunk, rest) = remaining.split_at(chunk_len);
-            dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos).unwrap();
+            hook_or_fail!(dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos), "prefill forward");
             seq_pos += chunk_len;
-            if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
+            if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
                 seq_pos = new_phys;
             }
             remaining = rest;
@@ -8548,7 +8576,7 @@ fn ar_generate(
             }
             let end = (start + chunk_max).min(new_tokens.len());
             let chunk = &new_tokens[start..end];
-            dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos).unwrap();
+            hook_or_fail!(dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos), "prefill forward");
             seq_pos += chunk.len();
             dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
             if ckpt_resume_enabled() {
@@ -8669,9 +8697,10 @@ fn ar_generate(
         } else {
             None
         };
-        dispatch
-            .sample(ctx.reborrow(), &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state)
-            .unwrap()
+        hook_or_fail!(
+            dispatch.sample(ctx.reborrow(), &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state),
+            "sample"
+        )
     };
     if grammar_active {
         let text = dispatch.tokenizer().decode(&[tok0]);
@@ -8866,7 +8895,7 @@ fn ar_generate(
         if ckpt_resume_enabled() {
             dispatch.take_prefill_checkpoint(ctx.reborrow(), seq_pos);
         }
-        if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
+        if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
             seq_pos = new_phys;
         }
         dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
@@ -8959,9 +8988,10 @@ fn ar_generate(
                         } else {
                             None
                         };
-                    dispatch
-                        .sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
-                        .unwrap()
+                    hook_or_fail!(
+                        dispatch.sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state),
+                        "sample"
+                    )
                 };
                 if grammar_active {
                     let text = dispatch.tokenizer().decode(&[next_token]);
@@ -9006,9 +9036,9 @@ fn ar_generate(
                     for act in parser.emit_only(tok, &new_bytes2) {
                         exec_stream_action!(act);
                     }
-                    dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos).unwrap();
+                    hook_or_fail!(dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos), "decode forward");
                     seq_pos += 1;
-                    if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
+                    if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
                         seq_pos = new_phys;
                     }
                     generated += 1;
@@ -9083,9 +9113,10 @@ fn ar_generate(
             } else {
                 None
             };
-            dispatch
-                .sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
-                .unwrap()
+            hook_or_fail!(
+                dispatch.sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state),
+                "sample"
+            )
         };
         if grammar_active {
             let text = dispatch.tokenizer().decode(&[next_token]);
@@ -9116,9 +9147,9 @@ fn ar_generate(
         .unwrap_or(0);
     if im_end_token == Some(last_conv) && !nl.is_empty() {
         for &t in nl {
-            dispatch.decode_step_forward(ctx.reborrow(), t, seq_pos).unwrap();
+            hook_or_fail!(dispatch.decode_step_forward(ctx.reborrow(), t, seq_pos), "decode forward");
             seq_pos += 1;
-            if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
+            if let Some(new_phys) = hook_or_fail!(dispatch.maybe_evict(ctx.reborrow(), seq_pos), "kv eviction") {
                 seq_pos = new_phys;
             }
             dispatch.conversation_tokens_mut().push(t);
