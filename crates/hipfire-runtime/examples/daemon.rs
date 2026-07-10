@@ -1587,6 +1587,172 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Cohere2-MoE / North-Mini-Code (arch 12) AR dispatch. Forward mirrors
+/// MinimaxDispatch (batched/per-token `decode_step`, host-side `sample_cpu`), but the
+/// OUTPUT is the agentic-marker state machine: `stream_parser()` returns a
+/// `Cohere2MoeStreamParser` (section routing / forced-token queue / empty-turn on_eos
+/// `Inject` / `tool_calls`). The eos `<|END_OF_TURN_TOKEN|>` is consumed by the parser
+/// (`on_eos`), never emitted — so no `eos_filter_config` is needed. `tools` is held so
+/// `stream_parser()` can build the parser's `known_tools`/`tool_params`.
+struct Cohere2MoeDispatch<'m> {
+    m: &'m mut LoadedModel,
+    tools: Option<Vec<serde_json::Value>>,
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        self.m.cohere2moe().map(|b| b.eos_tok).unwrap_or(0)
+    }
+
+    fn is_eos(&self, tok: u32) -> bool {
+        self.m.cohere2moe().map(|b| tok == b.eos_tok).unwrap_or(false)
+    }
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        // North HF regime (temp≈1.0); mirrors generate_cohere2moe.
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 1.0,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: true,
+            supports_stop_seq: true,
+            supports_grammar: false,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        if let Some(b) = self.m.cohere2moe_mut() {
+            let _ = b.state.reset(gpu);
+        }
+        self.m.seq_pos = 0;
+        self.m.conversation_tokens.clear();
+    }
+
+    fn prefill_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let b = self
+            .m
+            .cohere2moe_mut()
+            .ok_or("prefill_forward: no cohere2moe bundle")?;
+        let batched = cohere2moe::forward::forward_batch_supported(&b.weights);
+        let mut pos = seq_pos;
+        if batched {
+            for sub in chunk.chunks(64) {
+                cohere2moe::forward::forward_batch(&b.config, &b.weights, &mut b.state, gpu, sub, pos)
+                    .map_err(|e| format!("cohere2moe forward_batch (prefill): {e}"))?;
+                pos += sub.len();
+            }
+        } else {
+            for &tok in chunk {
+                cohere2moe::forward::decode_step(
+                    &b.config,
+                    &b.weights,
+                    &mut b.state,
+                    gpu,
+                    tok,
+                    pos as u32,
+                )
+                .map_err(|e| format!("cohere2moe decode_step (prefill): {e}"))?;
+                pos += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let b = self
+            .m
+            .cohere2moe_mut()
+            .ok_or("decode_step_forward: no cohere2moe bundle")?;
+        cohere2moe::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
+            .map(|_| ())
+            .map_err(|e| format!("cohere2moe decode_step (decode): {e}"))
+    }
+
+    fn sample(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        let _ = (vocab_size, grammar_mask, rng_state);
+        let b = self.m.cohere2moe().ok_or("sample: no cohere2moe bundle")?;
+        let mut logits = gpu
+            .download_f32(&b.state.logits)
+            .map_err(|e| format!("cohere2moe download logits: {e:?}"))?;
+        Ok(sampler::sample_cpu(&mut logits, ngram_scope, cfg))
+    }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        self.m
+            .cohere2moe()
+            .map(|b| b.state.n_tokens)
+            .unwrap_or(self.m.seq_pos)
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        let _ = seq_pos;
+        let np = self
+            .m
+            .cohere2moe()
+            .map(|b| b.state.n_tokens)
+            .unwrap_or(self.m.seq_pos);
+        self.m.seq_pos = np;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.m.cohere2moe().map(|b| b.config.vocab_size).unwrap_or(0)
+    }
+
+    fn stream_parser(
+        &self,
+        cfg: hipfire_runtime::stream_parser::DefaultStreamParserConfig,
+    ) -> Box<dyn hipfire_runtime::stream_parser::StreamParser> {
+        // cohere2moe ignores the default (EosFilter/think-cap) config — its output is the
+        // agentic-marker state machine. Reuse cfg's max_tokens/max_think_tokens (the
+        // request values the driver threaded) for the parser's think-budget clamp.
+        Box::new(Cohere2MoeStreamParser::new(
+            self.tokenizer(),
+            self.tools.as_deref(),
+            cfg.max_tokens,
+            cfg.max_think_tokens,
+        ))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 /// LFM2.5 (arch 11) AR dispatch. Plain per-token loop (no batched prefill, no
 /// LCP — the legacy path cold-resets state every turn since the hybrid conv+GQA
 /// state can't be rewound to an arbitrary prefix), so the recurrent/checkpoint/
@@ -8268,6 +8434,35 @@ fn ar_generate(
             let _ = stdout.flush();
             return;
         }
+        // ── eos / im_end pre-decision (BEFORE commit) ────────────────────────
+        // A sampled eos consults the parser's discipline. `CommitAndStop` (the
+        // simple-arch default) falls through to commit+forward+emit the eos then
+        // break — byte-identical to the legacy inline eos break. `Inject` (cohere2moe
+        // empty-turn guard) enqueues continuation markers and continues WITHOUT
+        // committing the eos (the markers surface via next_forced next iter). `Stop`
+        // breaks without committing. Forced tokens are never eos.
+        let mut eos_commit_and_stop = false;
+        if !was_forced && (dispatch.is_eos(next_token) || im_end_token == Some(next_token)) {
+            match parser.on_eos() {
+                hipfire_runtime::stream_parser::EosDecision::Stop => break,
+                hipfire_runtime::stream_parser::EosDecision::Inject(v) => {
+                    for t in v {
+                        parser.enqueue(t);
+                    }
+                    match parser.next_forced() {
+                        Some(f) => {
+                            next_token = f;
+                            was_forced = true;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                hipfire_runtime::stream_parser::EosDecision::CommitAndStop => {
+                    eos_commit_and_stop = true;
+                }
+            }
+        }
         generated += 1;
         dispatch.conversation_tokens_mut().push(next_token);
         streamed_tokens.push(next_token);
@@ -8302,25 +8497,14 @@ fn ar_generate(
         }
         dispatch.maybe_adaptive_downshift(gpu, seq_pos);
 
-        // ── eos / im_end terminal token (CommitAndStop) ──────────────────────
-        // The legacy loop emitted+forwarded the eos token then broke BEFORE the guard
-        // block; `emit_only` reproduces that (filter emit, no think/n-gram/stop guards).
-        if dispatch.is_eos(next_token) || im_end_token == Some(next_token) {
-            match parser.on_eos() {
-                hipfire_runtime::stream_parser::EosDecision::Stop => break,
-                hipfire_runtime::stream_parser::EosDecision::CommitAndStop => {
-                    for act in parser.emit_only(next_token, &new_bytes) {
-                        exec_stream_action!(act);
-                    }
-                    break;
-                }
-                hipfire_runtime::stream_parser::EosDecision::Inject(_toks) => {
-                    // DefaultStreamParser returns only CommitAndStop; Inject is
-                    // cohere2moe's empty-turn guard (Task 7), which needs the eos checked
-                    // BEFORE commit — a structural loop change deferred to that task.
-                    break;
-                }
+        // ── Terminal eos (CommitAndStop, decided pre-commit above) ───────────
+        // The eos token has now been committed + forwarded; emit it through the filter
+        // (display-suppressed) then break — byte-identical to the legacy inline eos break.
+        if eos_commit_and_stop {
+            for act in parser.emit_only(next_token, &new_bytes) {
+                exec_stream_action!(act);
             }
+            break;
         }
 
         // ── Output shaping + guards ──────────────────────────────────────────
@@ -12917,6 +13101,15 @@ fn generate_cohere2moe(
     let mut tool_calls_emitted = false;
     let mut vis_buf = String::new();
 
+    // Dual-run shadow parity (Task 7, cohere2moe). Under HIPFIRE_ARCHDISPATCH_PARITY=1 the
+    // legacy loop captures every committed token (markers + forced/injected + text) into
+    // __old_tape; after it completes we model_reset_context + re-run ar_generate via
+    // Cohere2MoeDispatch into __new_tape + assert_token_parity. Flag off = legacy only.
+    // NOTE (adversarial review): temp0 token-parity is a FLOOR — BLIND to tool_calls
+    // events; T8 does event-equivalence via coherence-gate-cohere2moe.sh + guard fixtures.
+    let __parity = std::env::var("HIPFIRE_ARCHDISPATCH_PARITY").ok().as_deref() == Some("1");
+    let mut __old_tape = TokenTape::default();
+
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
@@ -13002,6 +13195,9 @@ fn generate_cohere2moe(
             generated_count,
             decode_t0.elapsed().as_millis() as u64,
         );
+        if __parity {
+            __old_tape.push(next_tok);
+        }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -13137,6 +13333,53 @@ fn generate_cohere2moe(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
+
+    // ── Dual-run shadow-parity re-run (Task 7). Reset the (legacy-mutated) context and
+    // re-drive the request through ar_generate/Cohere2MoeDispatch into __new_tape, then
+    // assert token-identity. FLOOR only — blind to tool_calls events (T8 checks those).
+    if __parity {
+        model_reset_context(m, gpu);
+        let mut __new_tape = TokenTape::default();
+        let mut __disp = Cohere2MoeDispatch {
+            m: &mut *m,
+            tools: tools.map(|t| t.to_vec()),
+        };
+        ar_generate(
+            &mut __disp,
+            gpu,
+            stdout,
+            id,
+            temp,
+            top_p,
+            None, // top_k
+            None, // min_p
+            max_tokens,
+            1.0, // repeat_penalty
+            0,   // repeat_window
+            0.0, // presence_penalty
+            0.0, // frequency_penalty
+            0,   // budget_alert_at_tok
+            "",  // budget_alert_text
+            max_think_tokens,
+            hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            &[],                // stop
+            None,               // tools (grammar off; Cohere2MoeStreamParser owns tools)
+            prompt_ids.clone(), // new_tokens: full render (context reset)
+            &[],                // im_end
+            &[],                // nl
+            None,               // im_end_token
+            None,               // tool_call_pair
+            None,               // think_pair
+            prompt_ids.len(),   // prefill_tokens
+            0,                  // cached_tokens_count
+            None,               // pflash_summary
+            None,               // pflash_bypass_reason
+            None,               // pflash_alpha
+            t0,
+            Some(&mut __new_tape),
+        );
+        assert_token_parity(&__old_tape, &__new_tape, id);
+    }
 }
 
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
