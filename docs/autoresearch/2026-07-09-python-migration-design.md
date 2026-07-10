@@ -163,7 +163,7 @@ Python drives git via `subprocess` (not GitPython/pygit2) — we still shell out
 
 Order **parity → perf → coherence** (cheapest-first), reusing the built arms:
 - **PARITY**: raw-daemon short greedy, token-id-exact value preservation (the one sanctioned voodoo path). A value change ⇒ `PARITY_FAIL`.
-- **PERF**: measured through **`serve_harness`** (the real CLI spawn — no raw-daemon voodoo). Statistical primary = rocprof pinned-clock kernel-**duration** (`profile_standard`) → Mann-Whitney U (duration is noise-robust; the raw HTTP tok/s proxy showed a +3% thermal artifact). `kernel_decode_tok_s` is captured on the same run and written to the ledger as the human-facing tok/s number. No gain ⇒ `DEAD`.
+- **PERF**: measured through **`serve_harness`** (the real CLI spawn — no raw-daemon voodoo). **Two statistics, BOTH gating (conjunctive): a WIN requires `kernel_decode_tok_s` UP *and* rocprof pinned-clock kernel-`duration` DOWN** (`profile_standard`), each by an independent Mann-Whitney U. A gain in one but not the other ⇒ `DEAD`. Requiring both closes the failure mode where a thermal artifact inflates tok/s while duration is flat (or a duration win hides a tok/s regression). **Both statistics are written to every ledger row**; tok/s is also the human-facing number.
 - **COHERENCE**: the real `hipfire serve` path (thinking on, sampled), paired seed-set → McNemar, with the token-id attractor detector + semantic validators.
 - **Guards**: `resolve.py` (symbol→file, DEAD_FILE/NO_OP) and `cross_arch.py` (preprocessor-invariance: a gfx1201 edit must not change any other arch's device TU) run before/around the arms.
 
@@ -213,6 +213,7 @@ The migration is built by a **Workflow**: per phase, parallel Claude agents buil
 
 - **Source of truth:** `loop/gfx1201 @ fd6deaa9` ("loop/gfx1200" was a typo). gfx1201 naming throughout.
 - **Sequencing:** migrate first; the Sol/Terra/Luna eval is Phase 5's acceptance test, run on **mq4r** (the loop tunes the shared MoE-GEMV kernels; mq4r is the primary speed SKU at 160 tok/s vs ZINC 166). mq4p's Q8-linear-attention gap (108 tok/s) is a separate later effort.
+- **Perf gate:** conjunctive — a WIN needs tok/s UP *and* duration DOWN (both recorded on every ledger row); either alone ⇒ DEAD.
 - **Watcher authority:** auto-enforce fold/rollover, guardrailed (dry-run + reversible + leashes); master-push/default-flip stay human gates.
 - **Workflow:** the migration is executed by a multi-agent workflow; the loop runtime stays the `ar/` package.
 - **Language:** Python (tooling, not hot path). Not TS (that owns the user CLI). Git piloted via `subprocess` to keep flock-on-death semantics.
