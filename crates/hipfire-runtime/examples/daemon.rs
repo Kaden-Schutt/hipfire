@@ -1233,6 +1233,198 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
     }
 }
 
+/// Wraps `&mut LoadedModel` to implement `ArchDispatch` for llama (arch_id 0/1).
+/// SPLIT via `llama::forward_prefill_batch` (writes scratch.logits, no sampling)
+/// for BOTH prefill and single-token decode, then the generic sampler — llama
+/// joins the qwen35/qwen2 split model.
+///
+/// NOTE (path decision, Inc 3): the legacy llama arm used the FUSED
+/// `llama::forward_scratch` (optimized decode kernel + temp/top_p + window-based
+/// repeat penalty baked in). Routing through ar_generate instead adopts the
+/// standard batched forward + the full generic sampler (top_k/min_p/penalties),
+/// per bjoern's uplift decision. So llama output is NOT byte-identical to the
+/// legacy arm — validate via COHERENCE, not strict parity. Perf follow-up: add a
+/// fused `decode_step_sample` hook (forward_scratch) to recover the B=1 decode
+/// kernel; correctness-first here.
+#[allow(dead_code)]
+struct LlamaDispatch<'m> {
+    m: &'m mut LoadedModel,
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        if let Some(ModelState::Llama(b)) = self.m.state.as_ref() {
+            b.config.eos_token
+        } else {
+            0
+        }
+    }
+
+    fn is_eos(&self, tok: u32) -> bool {
+        // Legacy llama arm stop: config.eos_token OR any tokenizer terminator.
+        tok == self.eos_token() || self.tokenizer().is_terminator(tok)
+    }
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 0.7,
+            top_p: 0.9,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: false,
+            supports_stop_seq: true,
+            supports_grammar: false,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
+        // Llama has no DeltaNet recurrent state; a fresh context resets the KV
+        // compaction offset (seq_pos/conversation are cleared by the caller via
+        // model_reset_context; KV contents are overwritten by re-prefill).
+        if let Some(ModelState::Llama(b)) = self.m.state.as_mut() {
+            b.kv.compact_offset = 0;
+        }
+    }
+
+    fn prefill_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ModelState::Llama(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
+            return Err("prefill_forward: not a llama bundle".into());
+        };
+        llama::forward_prefill_batch(
+            gpu, &b.weights, &b.config, chunk, seq_pos, &mut b.kv, &b.scratch, None,
+        )
+        .map_err(|e| format!("llama forward_prefill_batch: {:?}", e))
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ModelState::Llama(ref mut b) = *self.m.state.as_mut().ok_or("no state")? else {
+            return Err("decode_step_forward: not a llama bundle".into());
+        };
+        // Single-token decode via the batched-prefill path (writes scratch.logits
+        // without sampling). Perf follow-up: forward_scratch decode kernel.
+        llama::forward_prefill_batch(
+            gpu, &b.weights, &b.config, &[token], seq_pos, &mut b.kv, &b.scratch, None,
+        )
+        .map_err(|e| format!("llama decode forward_prefill_batch: {:?}", e))
+    }
+
+    fn sample(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        _grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        // llama has no grammar → mask is always None; GPU fast path only.
+        let m = &*self.m;
+        let ModelState::Llama(b) = m.state.as_ref().ok_or("no state")? else {
+            return Err("sample: not a llama bundle".into());
+        };
+        let scratch = &b.scratch;
+        let tok = sampler::sample(
+            gpu,
+            &scratch.logits,
+            &scratch.sample_buf,
+            &scratch.repeat_buf,
+            vocab_size,
+            ngram_scope,
+            cfg,
+            rng_state,
+        );
+        Ok(tok)
+    }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        self.m.seq_pos
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        self.m.seq_pos = seq_pos;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        if let Some(ModelState::Llama(b)) = self.m.state.as_ref() {
+            b.config.vocab_size
+        } else {
+            0
+        }
+    }
+
+    fn repeat_buf_cap_bytes(&self) -> usize {
+        if let Some(ModelState::Llama(b)) = self.m.state.as_ref() {
+            b.scratch.repeat_buf.buf.size()
+        } else {
+            0
+        }
+    }
+
+    fn prefill_max_batch(&self) -> usize {
+        llama::PREFILL_MAX_BATCH
+    }
+
+    fn free_prefill_checkpoints(&mut self, gpu: &mut rdna_compute::Gpu) {
+        free_checkpoints(&mut self.m.prefill_checkpoints, gpu);
+    }
+
+    fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
+        if self.m.decoded_vocab.is_none() {
+            let v: Vec<String> = {
+                let tok = self.m.tokenizer.as_ref().unwrap();
+                let n = tok.vocab_size();
+                (0..n).map(|id| tok.decode(&[id as u32])).collect()
+            };
+            self.m.decoded_vocab = Some(std::sync::Arc::new(v));
+        }
+        self.m.decoded_vocab.clone().unwrap()
+    }
+
+    fn has_eviction(&self) -> bool {
+        self.m.eviction.is_some()
+    }
+
+    fn physical_cap(&self) -> usize {
+        self.m.physical_cap
+    }
+
+    fn eviction_window(&self) -> Option<usize> {
+        self.m.eviction.as_ref().map(|ev| ev.budget() + ev.beta())
+    }
+
+    fn insert_asst_turn(&mut self, fp: u64, seq: Vec<u32>) {
+        self.m.asst_turn_cache.insert(fp, seq);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
