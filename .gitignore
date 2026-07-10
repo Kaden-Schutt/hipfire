@@ -138,6 +138,7 @@ docs/investigations/*/sources/
 *.rocpd
 *.pftrace
 autoresearch/state/ar.db
+autoresearch/db/ar.db
 # runtime-derived, arch-scoped loop state (reconstructible from the committed ledger via `ar ingest`);
 # the durable record is autoresearch/ledger/*.jsonl + the tracked bod_*/queues census snapshots.
 autoresearch/state/loop_progress_*.log
