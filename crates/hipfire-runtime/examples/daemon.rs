@@ -10147,169 +10147,46 @@ fn generate(
             None,
         );
     } else {
-        // LLaMA path -- multi-turn aware
-        let ModelState::Llama(b) = m.state.as_mut().unwrap() else {
-            unreachable!()
-        };
-        let config = &b.config;
-        let weights = &b.weights;
-        let scratch = &b.scratch;
-        let kv = &mut b.kv;
-
-        let mut rng_state = 42u32;
-        for (i, &tok) in new_tokens.iter().enumerate() {
-            let pos = m.seq_pos + i;
-            let (_, rng) = llama::forward_scratch(
-                gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
-            )
-            .unwrap();
-            rng_state = rng;
-        }
-        let this_turn_prompt_len_llama = new_tokens.len();
-        m.seq_pos += new_tokens.len();
-        m.conversation_tokens.extend_from_slice(&new_tokens);
-        let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
-
-        let mut out_bytes = [0u8; 8];
-        gpu.hip
-            .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
-            .unwrap();
-        let mut next_token =
-            u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
-        rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
-        // Prefill ends here: prompt is processed AND first token is ready (D2H
-        // sync is the user-observable "time to first token" boundary). Decode
-        // below measures the pure forward+sample steady-state.
-        let t_prefill = Instant::now();
-
-        let mut generated = 0;
-        let mut streamed_tokens: Vec<u32> = Vec::new();
-        // `bytes_fed_to_filter` is the index into the freshly-decoded
-        // byte stream past which we have not yet handed bytes to the
-        // filter. The filter owns UTF-8 boundary buffering and any
-        // future arch quirks (Gemma 4 marker holdback, strip-think,
-        // byte-level stop_at); see crates/engine/src/eos_filter.rs.
-        let mut bytes_fed_to_filter = 0usize;
-        let mut filter = EosFilter::new(EosFilterConfig::default());
-
-        for _ in 0..max_tokens {
-            generated += 1;
-            m.conversation_tokens.push(next_token);
-            streamed_tokens.push(next_token);
-            emit_committed_event(
-                stdout,
-                id,
-                next_token,
-                streamed_tokens.len() - 1,
-                t0.elapsed().as_millis() as u64,
-            );
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default()
-                );
-                let _ = stdout.flush();
-            }
-
-            // Scope repeat_buf to this turn's prompt + generated tokens
-            // (same logic as the Qwen3.5 path: prompt anchor + current turn).
-            let rw = repeat_window.min(64);
-            let scope_start =
-                ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
-            let hist_slice = &m.conversation_tokens[scope_start..];
-            let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            gpu.hip
-                .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
-                .unwrap();
-
-            // Write K/V for this token FIRST so the next turn's context is
-            // always fully populated. The sampled next_token from this call
-            // is discarded when we break on im_end/eos — wasteful by one
-            // launch but avoids a KV cache gap at the terminator.
-            let pos = m.seq_pos + generated - 1;
-            let (tok, rng) = llama::forward_scratch(
-                gpu,
-                weights,
-                config,
-                next_token,
-                pos,
-                kv,
-                scratch,
-                temp,
-                top_p,
-                rng_state,
-                hist_slice.len(),
-                repeat_penalty,
-            )
-            .unwrap();
-
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
-                break;
-            }
-
-            next_token = tok;
-            rng_state = rng;
-        }
-        m.seq_pos += generated;
-
-        // ChatML \n boundary — run through forward to keep KV cache in sync
-        if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
-            for &t in &nl {
-                let (_, rng2) = llama::forward_scratch(
-                    gpu, weights, config, t, m.seq_pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
-                )
-                .unwrap();
-                rng_state = rng2;
-                m.seq_pos += 1;
-                m.conversation_tokens.push(t);
-            }
-        }
-
-        let t_end = Instant::now();
-        let total_s = t_end.duration_since(t0).as_secs_f64();
-        let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-        let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-        let tok_s = if total_s > 0.0 {
-            generated as f64 / total_s
-        } else {
-            0.0
-        };
-        let prefill_tok_s = if prefill_s > 0.0 {
-            prefill_tokens as f64 / prefill_s
-        } else {
-            0.0
-        };
-        let decode_tok_s = if decode_s > 0.0 {
-            generated as f64 / decode_s
-        } else {
-            0.0
-        };
-        let _ = writeln!(
+        // LLaMA (arch 0/1) AR decode via the generic ArchDispatch driver
+        // (Inc 3, path-a uplift): batched forward + generic sampler via
+        // LlamaDispatch. Gains loop guard / think-cap / stop-seqs / richer
+        // sampling. NOT byte-identical to the legacy fused forward_scratch arm
+        // (coherence + perf validated, not strict parity). pflash is qwen35-only.
+        let mut __disp = LlamaDispatch { m: &mut *m };
+        ar_generate(
+            &mut __disp,
+            gpu,
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
             id,
-            generated,
-            tok_s,
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
+            assistant_prefix,
+            stop,
+            tools,
+            new_tokens,
+            &im_end,
+            &nl,
+            im_end_token,
+            tool_call_pair,
+            think_pair,
             prefill_tokens,
-            prefill_s * 1000.0,
-            prefill_tok_s,
-            decode_tok_s,
-            prefill_s * 1000.0,
-            pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
+            cached_tokens_count,
+            None,
+            None,
+            None,
+            t0,
+            None,
         );
-        let _ = stdout.flush();
     }
 }
 
