@@ -18,10 +18,30 @@ namespace cg = cooperative_groups;
 // SAME global scratch buffers the separate kernels use, so they survive the
 // barrier untouched.
 //
-// WHY: a3b batch-1 decode is ~87% GPU-idle — ~122 kernel dispatches/token, each
-// paying a ~45us GPU-side inter-kernel gap. Fusing 3 dispatches/layer into 1
-// (x40 layers) removes ~80 of those gaps. Spike-validated 3.6-4.9x on the pure
-// dispatch-overhead micro on gfx1100/gfx1201.
+// WHY (hypothesis): a3b batch-1 decode looked ~87% GPU-idle — ~122 kernel
+// dispatches/token, each seemingly paying a ~45us GPU-side inter-kernel gap.
+// Fusing 3 dispatches/layer into 1 (x40 layers) should remove ~80 of those gaps.
+// Spike-validated 3.6-4.9x on the pure dispatch-overhead micro on gfx1100/gfx1201.
+//
+// MEASURED RESULT — FALSIFIED for decode (2026-07-10, gfx1201 R9700, a3b mq4r,
+// warm, registry sampling, q8 KV, max256; serve_harness A/B, all turns stable):
+//   A baseline graph-ON  = 153.1 tok/s   (target to beat)
+//   C baseline graph-OFF = 143.0 tok/s
+//   B THIS megakernel    = 132.4 tok/s   -> -7.4% vs C, -13.5% vs A
+// Output is BYTE-EXACT to the split path (parity PASS), but perf REGRESSES. Two
+// independent causes, both structural to the cooperative approach:
+//   1. The fusion itself loses -7.4% (B vs C, both graph-off): grid.sync barriers
+//      (2/layer x 40) + the co-residency cap (all blocks must fit at once, so each
+//      phase runs on FEWER blocks than the split kernels' full grids and grid-
+//      strides serially) cost MORE than the dispatch gap they remove. The rocprof
+//      "idle" is intra-kernel memory-latency stall (batch-1 under-saturates BW),
+//      NOT a recoverable inter-kernel gap.
+//   2. Cooperative launch cannot be hipGraph-captured, forfeiting the +7.1% graph
+//      gain (A vs C) — unrecoverable.
+// => Dispatch fusion is a DEAD END for latency-bound batch-1 decode; the lever is
+//    batch-K (MTP/spec-decode). Kept opt-in (default OFF, byte-exact) as a
+//    documented negative result + reusable cooperative-launch reference. DO NOT
+//    enable HIPFIRE_MOE_MEGAKERNEL for decode perf.
 //
 // BIT-EXACTNESS: each phase's per-output-element math is copied VERBATIM from
 // its standalone kernel (same accumulation order, same 4-acc pairwise +

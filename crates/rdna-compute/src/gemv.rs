@@ -6570,17 +6570,22 @@ impl Gpu {
                     .module_occupancy_max_active_blocks_per_multiprocessor(func, 32, 0)?
             }
         };
-        let cu = self
+        // `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` returns blocks per the
+        // SAME "multiprocessor" unit that `hipDeviceAttributeMultiprocessorCount`
+        // reports (WGP on RDNA wave32), so multiply by the RAW attribute value.
+        // Do NOT apply `hip_mp_count_to_cu_count` (×2 WGP→CU) here — that doubles the
+        // grid past the co-resident limit and cooperative launch rejects it
+        // (hipError 720 "too many blocks").
+        let n_mp = self
             .hip
             .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, 0)
             .ok()
             .filter(|&v| v > 0)
-            .map(|v| crate::profiler::hip_mp_count_to_cu_count(&self.arch, v as u32))
-            .filter(|&v| (4..=256).contains(&v))
+            .map(|v| v as usize)
             .unwrap_or(16);
         const NR: usize = 2; // must match MOE_MEGA_NUM_ROWS in the kernel
         let logical_max = (f * k_top).max((d + NR - 1) / NR).max((f / 256) * k_top);
-        let grid_blocks = ((occ.max(1) as usize) * (cu as usize)).min(logical_max).max(1) as u32;
+        let mut grid_blocks = ((occ.max(1) as usize) * n_mp).min(logical_max).max(1) as u32;
 
         let gup = expert_ptrs_gu.buf.as_ptr();
         let dnp = expert_ptrs_dn.buf.as_ptr();
@@ -6613,15 +6618,29 @@ impl Gpu {
             &kt_val as *const _ as *mut c_void,
         ];
         let func = self.functions.get("moe_megakernel_mq4_hfq4g256").unwrap();
-        unsafe {
-            self.hip.launch_cooperative_kernel(
-                func,
-                [grid_blocks, 1, 1],
-                [32, 1, 1],
-                0,
-                self.active_stream.as_ref(),
-                &mut params,
-            )
+        // Launch the cooperative grid. `occ × n_mp` is the documented co-resident
+        // capacity, but a driver may reserve a block or two at the exact limit, so
+        // halve-and-retry on "too many blocks" rather than propagate a panic. The
+        // grid-stride loops make any grid size correct — a smaller grid only does
+        // more stride iterations. Fewer blocks is always safe; bail on any other error.
+        loop {
+            let res = unsafe {
+                self.hip.launch_cooperative_kernel(
+                    func,
+                    [grid_blocks, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.active_stream.as_ref(),
+                    &mut params,
+                )
+            };
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) if grid_blocks > 1 && e.message.contains("too many blocks") => {
+                    grid_blocks = (grid_blocks / 2).max(1);
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
