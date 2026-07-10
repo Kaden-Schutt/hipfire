@@ -2229,6 +2229,24 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
         }
     }
 
+    fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
+        // The grammar path (tool calls) needs the decoded-vocab table for token
+        // masks; ep_serve_ds4 builds it inline (daemon.rs ~4578). Lazy-cache on
+        // m.decoded_vocab, identical to Qwen35Dispatch. Without this override the
+        // trait default unimplemented!() panics the moment grammar activates — a
+        // gap invisible to the non-grammar dual-run rows (caught by the tool-call
+        // parity run, Axis B inc 5).
+        if self.m.decoded_vocab.is_none() {
+            let v: Vec<String> = {
+                let tok = self.m.tokenizer.as_ref().unwrap();
+                let n = tok.vocab_size();
+                (0..n).map(|id| tok.decode(&[id as u32])).collect()
+            };
+            self.m.decoded_vocab = Some(std::sync::Arc::new(v));
+        }
+        self.m.decoded_vocab.clone().unwrap()
+    }
+
     fn init_grammar(
         &self,
         _tool_schemas: &[(String, Vec<String>)],
