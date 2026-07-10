@@ -1652,7 +1652,11 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Cohere2MoeDispatch<'_> {
         let batched = cohere2moe::forward::forward_batch_supported(&b.weights);
         let mut pos = seq_pos;
         if batched {
-            for sub in chunk.chunks(64) {
+            // Chunk at 256 to match the legacy generate_cohere2moe prefill (`i+256`);
+            // forward_batch is NOT numerically batch-size-invariant (WMMA/grouped-MoE
+            // reduction order), so a different chunk size shifts the logits and flips
+            // an argmax a few tokens into decode → dual-run temp0 parity fails.
+            for sub in chunk.chunks(256) {
                 cohere2moe::forward::forward_batch(&b.config, &b.weights, &mut b.state, gpu, sub, pos)
                     .map_err(|e| format!("cohere2moe forward_batch (prefill): {e}"))?;
                 pos += sub.len();
@@ -5305,6 +5309,15 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if let Some(b) = m.minimax_mut() {
         b.state.reset();
+    }
+    // Cohere2-MoE (arch 12): reset n_tokens + clear the KV. Was MISSING — every
+    // other dual-run/reset arch is handled above, so the ArchDispatch dual-run's
+    // ar_generate arm (which relies on model_reset_context to restore the clean
+    // pre-legacy-arm state) started on stale cohere2moe KV/n_tokens → drifted
+    // logits → a temp0 argmax flip a few tokens into decode. Also closes a latent
+    // #462-class multi-turn bleed on the `reset` command for cohere2moe.
+    if let Some(b) = m.cohere2moe_mut() {
+        let _ = b.state.reset(gpu);
     }
     if let Some(ref mut ad) = m.kv_adaptive {
         ad.reset();
