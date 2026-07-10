@@ -126,6 +126,13 @@ def _run_worker_detached(cfg: LoopConfig, worker: WorkerCfg, plan: dict, safety_
     """
     os.environ["HIP_VISIBLE_DEVICES"] = str(worker.dev)
     os.environ["HIPFIRE_GPU_LOCKFILE"] = plan["lockfile"]
+    # The agent harness (codex/grok) + cargo + rocprof live in per-user bin dirs
+    # that a NON-login spawn context lacks (swarm_explore.sh set this via PATH=…).
+    # Without it run_round's subprocess.run(["codex",…]) FileNotFound-crashes.
+    _home = os.path.expanduser("~")
+    _bins = [os.path.join(_home, ".local/bin"), os.path.join(_home, ".cargo/bin"),
+             os.path.join(_home, ".bun/bin"), "/opt/rocm/bin"]
+    os.environ["PATH"] = os.pathsep.join(_bins + [os.environ.get("PATH", "")])
     try:
         os.chdir(repo)
     except OSError:
@@ -137,7 +144,16 @@ def _run_worker_detached(cfg: LoopConfig, worker: WorkerCfg, plan: dict, safety_
         pass
     wname = plan["anchor"].rsplit("/", 1)[-1]  # loop/gfx1201_w0 -> gfx1201_w0
     _redirect_stdio(os.path.join(log_dir, f"loop_driver_{wname}.log"))
-    driver.run_loop(cfg, worker, safety_cap)
+    # Log the traceback to the (redirected) stderr BEFORE the caller's os._exit(0)
+    # swallows it — otherwise a crashed worker leaves only a 0-byte log.
+    try:
+        driver.run_loop(cfg, worker, safety_cap)
+    except BaseException:
+        import sys
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
 
 
 def _default_spawn(cfg: LoopConfig, worker: WorkerCfg, plan: dict, safety_cap: int, repo: str) -> int:
