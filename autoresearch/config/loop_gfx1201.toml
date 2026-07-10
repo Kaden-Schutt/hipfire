@@ -11,23 +11,12 @@ cand_wall     = 3.0                     # min BOD wall% to be a candidate
 k_exhaust     = 5                       # 5 tests/kernel: consecutive DEAD/INCONCLUSIVE ⇒ EXHAUSTED (a WIN resets)
 agent_harness = "codex"
 
-# Per-worker heterogeneity — the sed-munge replacement. Luna@max card1,
-# Terra@xhigh card2, Sol@medium card3 (Sol/Terra/Luna unbiased lever-finders).
+# Roofline-MLP campaign (2026-07-10): single Sol@medium worker, seeded with the
+# roofline map in prompt_gfx1201.md (headroom targets: gate_up VGPR, sigmoid_scaled
+# occ, down/residual pipelining). Sol = unbiased lever-finder.
 [[workers]]
-card   = 1
-dev    = 1
-model  = "gpt-5.6-luna"
-effort = "max"
-
-[[workers]]
-card   = 2
-dev    = 2
-model  = "gpt-5.6-terra"
-effort = "xhigh"
-
-[[workers]]
-card   = 3
-dev    = 3
+card   = 0
+dev    = 0
 model  = "gpt-5.6-sol"
 effort = "medium"
 
