@@ -9753,6 +9753,17 @@ fn generate(
     let t0 = Instant::now();
 
     if m.arch_id == 5 || m.arch_id == 6 {
+        // Dual-run shadow parity (Inc 1 Task 1.4c). When HIPFIRE_ARCHDISPATCH_PARITY=1,
+        // the legacy arm below captures its committed tokens into `__old_tape`; after it
+        // completes we reset the context and re-run the generic `ar_generate` into
+        // `__new_tape`, then `assert_token_parity`. Default (flag off): legacy arm only,
+        // zero behavior change. The legacy arm's abort paths `return` early → they skip
+        // the parity re-run (aborts are not the parity target). The re-run resets to a
+        // fresh single-turn context, so the gate MUST use prompts short enough that
+        // adaptive-KV / eviction never fire (they carry controller state model_reset_
+        // context does not rewind) — the coherence/serve-multiturn prompts qualify.
+        let __parity = archdispatch_parity_enabled();
+        let mut __old_tape = TokenTape::default();
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
         let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
@@ -10226,6 +10237,9 @@ fn generate(
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            if __parity {
+                __old_tape.push(next_token);
+            }
             emit_committed_event(
                 stdout,
                 id,
@@ -10438,6 +10452,9 @@ fn generate(
                             grammar_matcher.advance(&tokenizer.decode(&[t]));
                         }
                         streamed_tokens.push(t);
+                        if __parity {
+                            __old_tape.push(t);
+                        }
                         emit_committed_event(
                             stdout,
                             id,
@@ -10592,6 +10609,9 @@ fn generate(
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
+                        if __parity {
+                            __old_tape.push(tok);
+                        }
                         emit_committed_event(
                             stdout,
                             id,
@@ -10897,6 +10917,54 @@ fn generate(
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
+
+        // Dual-run parity re-run (Inc 1 Task 1.4c) — see setup at the top of this arm.
+        // Legacy arm is done; reset to a fresh single-turn context and re-run the
+        // generic `ar_generate` capturing into `__new_tape`, then assert byte-parity.
+        // In parity mode BOTH passes write to stdout (double output) — this is a
+        // diagnostic flag, not a serving path.
+        if __parity {
+            model_reset_context(m, gpu);
+            let mut __new_tape = TokenTape::default();
+            {
+                let mut __disp = Qwen35Dispatch { m: &mut *m };
+                ar_generate(
+                    &mut __disp,
+                    gpu,
+                    stdout,
+                    id,
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    max_tokens,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    budget_alert_at_tok,
+                    budget_alert_text,
+                    max_think_tokens,
+                    assistant_prefix,
+                    stop,
+                    tools,
+                    new_tokens,
+                    &im_end,
+                    &nl,
+                    im_end_token,
+                    tool_call_pair,
+                    think_pair,
+                    prefill_tokens,
+                    cached_tokens_count,
+                    pflash_summary,
+                    pflash_bypass_reason,
+                    pflash_alpha,
+                    t0,
+                    Some(&mut __new_tape),
+                );
+            }
+            assert_token_parity(&__old_tape, &__new_tape, id);
+        }
     } else {
         // LLaMA path -- multi-turn aware
         let ModelState::Llama(b) = m.state.as_mut().unwrap() else {
