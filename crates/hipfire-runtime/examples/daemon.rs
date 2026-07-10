@@ -741,6 +741,13 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         qwen35_eos(self.m)
     }
 
+    fn is_eos(&self, tok: u32) -> bool {
+        // Preserves the legacy qwen35 arm's stop: primary eos OR any tokenizer
+        // terminator (eos_id / eot_id). Byte-identical to the pre-hook ar_generate
+        // stop expression → qwen35 parity unchanged.
+        tok == self.eos_token() || self.tokenizer().is_terminator(tok)
+    }
+
     fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
         // Last-resort arch ladder for arch_id 5/6: the `else` branch at
         // daemon.rs:1906 (`(0.3_f64, 0.8_f64)`) plus the hardcoded
@@ -1093,6 +1100,17 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
             b.config.eos_token_id
         } else {
             0
+        }
+    }
+
+    fn is_eos(&self, tok: u32) -> bool {
+        // Matches generate_qwen2's stop: membership in the full eos_token_ids SET
+        // (NOT the tokenizer's terminator set — qwen2's legacy loop ignored eot_id).
+        // Faithful port; broadening to include eot is a separate deliberate change.
+        if let Some(ModelState::Qwen2(b)) = self.m.state.as_ref() {
+            b.config.eos_token_ids.contains(&tok)
+        } else {
+            false
         }
     }
 
@@ -7722,13 +7740,12 @@ fn ar_generate(
         }
         dispatch.maybe_adaptive_downshift(gpu, seq_pos);
 
-        if next_token == dispatch.eos_token() {
+        // Arch-specific eos/terminator set (qwen35 = eos||terminator; qwen2 =
+        // eos_token_ids set). im_end + stop-seqs stay driver-generic below.
+        if dispatch.is_eos(next_token) {
             break;
         }
         if im_end_token == Some(next_token) {
-            break;
-        }
-        if dispatch.tokenizer().is_terminator(next_token) {
             break;
         }
 

@@ -55,6 +55,15 @@ pub trait GrammarMatcher {
 pub trait ArchDispatch {
     fn arch_id(&self) -> u32;
     fn eos_token(&self) -> u32;
+    /// True when `tok` should terminate AR generation for this arch. The stop set
+    /// is arch-specific: qwen35 = primary eos OR the tokenizer's terminator set;
+    /// qwen2 = the full `eos_token_ids` config set. Default = primary eos only.
+    /// `ar_generate` consults this plus the driver-generic im_end / stop-seq checks
+    /// — so the per-arch eos/terminator convention lives here, not hardcoded in the
+    /// generic driver.
+    fn is_eos(&self, tok: u32) -> bool {
+        tok == self.eos_token()
+    }
     fn sampling_defaults(&self) -> SamplingDefaults;
     fn features(&self) -> ArchFeatures;
     /// TOTAL recurrent/KV reset for a fresh context. The #462 lever: a new arch
