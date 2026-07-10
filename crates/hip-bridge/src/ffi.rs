@@ -193,6 +193,22 @@ pub struct HipRuntime {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> u32,
+    // Optional: cooperative launch (all blocks co-resident -> grid.sync()). None if the
+    // HIP runtime lacks the symbol, so init never fails on its account.
+    fn_module_launch_cooperative_kernel: Option<
+        unsafe extern "C" fn(
+            HipFunction,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            c_uint,
+            HipStream,
+            *mut *mut c_void,
+        ) -> u32,
+    >,
 
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
@@ -429,6 +445,21 @@ impl HipRuntime {
                         *mut *mut c_void,
                     ) -> u32
                 ),
+                fn_module_launch_cooperative_kernel: lib
+                    .get::<unsafe extern "C" fn(
+                        HipFunction,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        HipStream,
+                        *mut *mut c_void,
+                    ) -> u32>(b"hipModuleLaunchCooperativeKernel")
+                    .map(|s| *s.into_raw())
+                    .ok(),
                 fn_event_create: load_fn!(
                     lib,
                     "hipEventCreate",
@@ -1026,6 +1057,45 @@ impl HipRuntime {
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipModuleLaunchKernel")
+    }
+
+    /// Launch a COOPERATIVE kernel: all blocks are co-resident, enabling grid-wide
+    /// `grid.sync()`. Used by the fused MoE megakernel to run multiple dependent phases
+    /// (gate_up -> silu -> down+combine) in one dispatch, collapsing the per-kernel
+    /// launch gap. Errors if the runtime lacks `hipModuleLaunchCooperativeKernel` so the
+    /// caller can fall back to the separate-kernel path.
+    ///
+    /// # Safety
+    /// `params` must contain valid pointers matching the kernel signature; `grid` must fit
+    /// the co-resident limit (query via `hipOccupancyMaxActiveBlocksPerMultiprocessor`).
+    pub unsafe fn launch_cooperative_kernel(
+        &self,
+        func: &Function,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: Option<&Stream>,
+        params: &mut [*mut c_void],
+    ) -> HipResult<()> {
+        let f = self.fn_module_launch_cooperative_kernel.ok_or_else(|| {
+            HipError::new(0, "hipModuleLaunchCooperativeKernel unavailable in this HIP runtime")
+        })?;
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
+        let code = f(
+            func.0,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+            shared_mem,
+            stream_raw,
+            params.as_mut_ptr(),
+        );
+        crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        self.check(code, "hipModuleLaunchCooperativeKernel")
     }
 
     /// Launch a kernel using the `extra` path, passing a contiguous kernarg
