@@ -849,6 +849,132 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
             hipfire_arch_qwen35::grammar::Matcher::new(schemas),
         )))
     }
+
+    fn maybe_evict(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        seq_pos: usize,
+    ) -> Result<Option<usize>, String> {
+        let m = &mut *self.m;
+        // Mirror the arm's field-split: borrow m.state (kv, mut) then m.eviction
+        // (shared) — disjoint fields of *m, so NLL permits both live.
+        let ModelState::Qwen35(b) = m.state.as_mut().ok_or("no state")? else {
+            return Err("maybe_evict: not a qwen35 bundle".into());
+        };
+        let kv = &mut b.kv_cache;
+        let Some(ev) = m.eviction.as_ref() else {
+            return Ok(None);
+        };
+        match ev.maybe_evict(gpu, kv, seq_pos) {
+            Ok(Some(hipfire_runtime::triattn::EvictionResult {
+                new_physical: new_phys,
+                ..
+            })) => Ok(Some(new_phys)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("maybe_evict: {:?}", e)),
+        }
+    }
+
+    fn maybe_adaptive_downshift(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
+        let m = &mut *self.m;
+        let Some(ModelState::Qwen35(b)) = m.state.as_mut() else {
+            return;
+        };
+        let kv = &mut b.kv_cache;
+        // Stderr phase-label is unified here (the arm distinguishes prefill /
+        // post-prefill / decode); logging is diagnostic and NOT part of token
+        // parity (assert_token_parity compares committed token IDs only).
+        if let Some(ad) = m.kv_adaptive.as_mut() {
+            match ad.maybe_downshift(gpu, kv, seq_pos) {
+                Ok(applied) => {
+                    for step in &applied {
+                        eprintln!(
+                            "[adaptive-kv] downshift @ pos {}: {:?} (K={:?} V={:?})",
+                            seq_pos, step, ad.cur_k, ad.cur_v
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[adaptive-kv] maybe_downshift error @ pos {}: {:?} — skipping",
+                        seq_pos, e
+                    );
+                }
+            }
+        }
+    }
+
+    fn take_prefill_checkpoint(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
+        let m = &mut *self.m;
+        let Some(ModelState::Qwen35(b)) = m.state.as_mut() else {
+            return;
+        };
+        speculative::take_dn_checkpoint(
+            &mut m.prefill_checkpoints,
+            &mut b.dn_state,
+            gpu,
+            seq_pos,
+            ckpt_interval(),
+            ckpt_max(),
+        );
+    }
+
+    fn abort_zero_recurrent(&mut self, gpu: &mut rdna_compute::Gpu) {
+        let m = &mut *self.m;
+        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            for s in &b.dn_state.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &b.dn_state.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &b.dn_state.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            b.kv_cache.compact_offset = 0;
+        }
+        // Co-resident Llama KV reset (arm does the same defensive no-op).
+        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+            b.kv.compact_offset = 0;
+        }
+    }
+
+    fn sample(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        let m = &*self.m;
+        let ModelState::Qwen35(b) = m.state.as_ref().ok_or("no state")? else {
+            return Err("sample: not a qwen35 bundle".into());
+        };
+        let scratch = &b.scratch;
+        // Grammar-constraining → CPU path (download, apply the driver-computed
+        // mask, sample_cpu); free → GPU fast path. Mirrors daemon.rs:9119.
+        let tok = if let Some(mask) = grammar_mask {
+            let mut logits = gpu
+                .download_f32(&scratch.logits)
+                .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
+            hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(mask, &mut logits);
+            sampler::sample_cpu(&mut logits, ngram_scope, cfg)
+        } else {
+            sampler::sample(
+                gpu,
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                vocab_size,
+                ngram_scope,
+                cfg,
+                rng_state,
+            )
+        };
+        Ok(tok)
+    }
 }
 
 /// Newtype wrapper so daemon.rs (which owns this type) can implement
@@ -869,6 +995,10 @@ impl hipfire_runtime::arch_dispatch::GrammarMatcher for Qwen35GrammarMatcher {
 
     fn is_free(&self) -> bool {
         self.0.is_free()
+    }
+
+    fn attractor_detected(&self) -> bool {
+        self.0.attractor_detected()
     }
 }
 

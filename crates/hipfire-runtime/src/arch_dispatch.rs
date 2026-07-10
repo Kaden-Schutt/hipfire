@@ -181,7 +181,7 @@ pub trait ArchDispatch {
         vocab_size: usize,
         ngram_scope: &[u32],
         grammar_mask: Option<&[bool]>,
-        rng_state: &mut u64,
+        rng_state: &mut u32,
     ) -> Result<u32, String> {
         let _ = (gpu, cfg, vocab_size, ngram_scope, grammar_mask, rng_state);
         Err("sample not implemented for this arch".into())
