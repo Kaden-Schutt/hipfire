@@ -61,6 +61,7 @@ pub mod weight_pager;
 
 pub mod emit_text;
 pub mod eos_filter;
+pub mod stream_parser;
 pub mod prompt_frame;
 pub mod tokenizer;
 pub mod tool_call;
