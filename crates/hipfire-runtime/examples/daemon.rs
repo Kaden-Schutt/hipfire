@@ -1425,6 +1425,154 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
     }
 }
 
+/// Wraps `&mut LoadedModel` to implement `ArchDispatch` for MiniMax-M2 (arch 10).
+/// SPLIT: minimax forward writes `state.logits` (GPU-resident) and also downloads
+/// a host `Vec<f32>` (ignored here — the `sample` hook re-downloads `state.logits`;
+/// the double D2H is free on UMA). Prefill uses batched `forward_batch` (sub-chunked
+/// to 64) when supported, else per-token `decode_step`. UPLIFT (bjoern): minimax
+/// adopts the generic sampler (was `deepseek4::sampling::sample_token` temp/top_p +
+/// Xorshift) → byte-parity holds only at temp0 (argmax); temp>0 output changes by
+/// design. No eviction / recurrent / checkpoints / grammar (MoE attention). The
+/// `primed_think` re-emit + Jinja/LCP-partial preamble stay in `generate_minimax`.
+/// NOTE (Inc 4): dead-code groundwork — NOT wired/flipped; controller wires the
+/// dual-run in generate_minimax then GPU-validates temp0 parity + coherence.
+#[allow(dead_code)]
+struct MinimaxDispatch<'m> {
+    m: &'m mut LoadedModel,
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        self.m.minimax().map(|b| b.eos_tok).unwrap_or(0)
+    }
+
+    fn is_eos(&self, tok: u32) -> bool {
+        // Matches generate_minimax's stop (`next_tok == eos_tok`).
+        self.m.minimax().map(|b| tok == b.eos_tok).unwrap_or(false)
+    }
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 1.0,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        // Interleaved-thinking (primed_think); user stop-seqs (uplift); no grammar,
+        // no vision.
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: true,
+            supports_stop_seq: true,
+            supports_grammar: false,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        let _ = gpu;
+        if let Some(b) = self.m.minimax_mut() {
+            b.state.reset();
+        }
+        self.m.seq_pos = 0;
+        self.m.conversation_tokens.clear();
+    }
+
+    fn prefill_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let b = self.m.minimax_mut().ok_or("prefill_forward: no minimax bundle")?;
+        let batched = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL").map_or(true, |v| v != "0")
+            && minimax::forward::forward_batch_supported(&b.weights);
+        let mut pos = seq_pos;
+        if batched {
+            for sub in chunk.chunks(64) {
+                minimax::forward::forward_batch(&b.config, &b.weights, &mut b.state, gpu, sub, pos)
+                    .map_err(|e| format!("minimax forward_batch (prefill): {e}"))?;
+                pos += sub.len();
+            }
+        } else {
+            for &tok in chunk {
+                minimax::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, tok, pos as u32)
+                    .map_err(|e| format!("minimax decode_step (prefill): {e}"))?;
+                pos += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let b = self.m.minimax_mut().ok_or("decode_step_forward: no minimax bundle")?;
+        minimax::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
+            .map(|_| ())
+            .map_err(|e| format!("minimax decode_step (decode): {e}"))
+    }
+
+    fn sample(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        // Host-side sample from state.logits (GPU). Generic sampler (uplift):
+        // temp0 == argmax (parity vs legacy sample_token); temp>0 differs by design.
+        let _ = (vocab_size, grammar_mask, rng_state);
+        let b = self.m.minimax().ok_or("sample: no minimax bundle")?;
+        let mut logits = gpu
+            .download_f32(&b.state.logits)
+            .map_err(|e| format!("minimax download logits: {e:?}"))?;
+        Ok(sampler::sample_cpu(&mut logits, ngram_scope, cfg))
+    }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        // The minimax KV cursor is state.n_tokens (advanced internally by
+        // forward_batch/decode_step); seed the driver's local from it.
+        self.m
+            .minimax()
+            .map(|b| b.state.n_tokens)
+            .unwrap_or(self.m.seq_pos)
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        let _ = seq_pos;
+        let np = self
+            .m
+            .minimax()
+            .map(|b| b.state.n_tokens)
+            .unwrap_or(self.m.seq_pos);
+        self.m.seq_pos = np;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.m.minimax().map(|b| b.config.vocab_size).unwrap_or(0)
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
