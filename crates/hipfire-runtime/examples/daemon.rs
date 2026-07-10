@@ -12841,7 +12841,6 @@ fn generate_cohere2moe(
         return;
     }
 
-    let eos_tok = m.cohere2moe().unwrap().eos_tok;
 
     // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
     // FULL rendered conversation + generation would overflow. `prompt_ids` is
@@ -12925,474 +12924,52 @@ fn generate_cohere2moe(
 
     let t0 = Instant::now();
 
-    // ── Prefill: BATCHED `forward_batch` (~9× the per-token path) when the
-    // expert tier supports the indexed-MoE GEMV (MQ4/MQ6), chunked at 256 (the
-    // WMMA Q8-projection + grouped-MoE sweet spot). `forward_batch` writes KV at
-    // [start_pos..start_pos+b] and its attention covers the cached prefix
-    // [0..start_pos], so it composes with the prompt cache (start_pos = lcp).
-    // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
-    // The LAST forward's logits predict the first generated token. ──
-    let mut last_logits: Vec<f32> = Vec::new();
-    {
-        let b = m.cohere2moe_mut().unwrap();
-        let cfg = &b.config;
-        let weights = &b.weights;
-        let state = &mut b.state;
-        if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
-            let mut i = 0;
-            while i < prefill_ids.len() {
-                let end = (i + 256).min(prefill_ids.len());
-                let start_pos = state.n_tokens;
-                match cohere2moe::forward::forward_batch(
-                    cfg,
-                    weights,
-                    state,
-                    gpu,
-                    &prefill_ids[i..end],
-                    start_pos,
-                ) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("cohere2moe batched prefill failed: {e:?}"),
-                        );
-                        return;
-                    }
-                }
-                i = end;
-            }
-        } else {
-            let mut position = state.n_tokens as u32;
-            for &tok in &prefill_ids {
-                match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
-                        return;
-                    }
-                }
-                position += 1;
-            }
-        }
-    }
-    for &tok in &prefill_ids {
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // Re-emit a leading `<think>\n` opener into the token stream (display-only,
-    // not pushed to state) when the rendered prompt primed the assistant turn
-    // inside a reasoning block, so downstream `<think>` consumers see a
-    // well-formed block. No-op for templates that don't prime think.
-    if primed_think {
-        let _ = writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"type": "token", "id": id, "text": "<think>\n"}),
-        );
-        let _ = stdout.flush();
-    }
-
-    // ── Decode loop. Sample host-side from the running logits vector.
-    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    // Cohere agentic markers are SPECIAL TOKENS. Resolve their ids once (scoped
-    // borrow so the loop can still mutate `m`). This model emits <|START_TEXT|>
-    // for its response (NOT the template's <|START_RESPONSE|>, which isn't a
-    // real special token here — verified empirically).
-    let (mk_think0, mk_think1, mk_text0, mk_text1, mk_act0, mk_act1) = {
-        let tk = m.tokenizer.as_ref().unwrap();
-        // `encode` SPLITS these added tokens (they round-trip on DECODE only),
-        // so resolve content→id via special_token_id, with North-Mini-Code's
-        // fixed marker ids as the fallback.
-        let mark = |s: &str, fb: u32| -> u32 { tk.special_token_id(s).unwrap_or(fb) };
-        (
-            mark("<|START_THINKING|>", 255010),
-            mark("<|END_THINKING|>", 255011),
-            mark("<|START_TEXT|>", 255012),
-            mark("<|END_TEXT|>", 255013),
-            mark("<|START_ACTION|>", 255014),
-            mark("<|END_ACTION|>", 255015),
-        )
+    // ── Decode via the generic ar_generate/Cohere2MoeDispatch driver (Task 9 flip).
+    // Cohere2MoeStreamParser (via the stream_parser() override) owns the agentic-marker
+    // state machine + tool_calls + empty-turn / think-budget / repeat guards. `prefill_ids`
+    // is the LCP suffix (the preamble rewound state.n_tokens=lcp); ar_generate prefills it
+    // from seq_pos = Cohere2MoeDispatch.seq_pos() = state.n_tokens, preserving multi-turn
+    // prefix reuse. Proven token-parity-equivalent to the deleted legacy loop on North.
+    let cached_tokens_count = prompt_ids.len().saturating_sub(prefill_ids.len());
+    let prefill_len = prefill_ids.len();
+    let mut __disp = Cohere2MoeDispatch {
+        m: &mut *m,
+        tools: tools.map(|t| t.to_vec()),
     };
-    #[derive(PartialEq, Clone, Copy)]
-    enum Sec {
-        Pre,
-        Think,
-        Text,
-        Action,
-    }
-    let mut sec = Sec::Pre;
-    let mut action_buf = String::new();
-
-    // Degenerate-output guards. The long-context forward can collapse into a
-    // single-token attractor — observed in a Pi session where a ~30K-token
-    // prompt drove the model to emit `<PAD>` until the client aborted ~9.5 min
-    // later. These stop the decode promptly instead of hanging. They do NOT mask
-    // the underlying forward bug: a fired guard MEANS the forward produced
-    // garbage (long-context attention/KV) and is logged loudly so it's caught.
-    let pad_tok = m.tokenizer.as_ref().unwrap().special_token_id("<PAD>");
-    let mut last_tok: u32 = u32::MAX;
-    let mut repeat_run: usize = 0;
-    const REPEAT_GUARD: usize = 24; // consecutive-identical-token attractor
-
-    // Empty-turn guard: North sometimes emits <|END_THINKING|> then
-    // <|END_OF_TURN_TOKEN|> with no response or action, surfacing as a turn with
-    // reasoning only and empty visible content (the model ends after <think>
-    // without returning a result). Track whether anything visible (a text token
-    // or a tool_call) was produced; if EOS arrives before that, mask it and
-    // re-sample so the model is forced into <|START_TEXT|>/<|START_ACTION|> and
-    // actually returns content. Opt out with HIPFIRE_C2M_EMPTY_TURN_GUARD=0.
-    let empty_turn_guard = std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
-        .ok()
-        .as_deref()
-        != Some("0");
-    let mut emitted_visible = false;
-    let mut eos_suppressions = 0usize;
-    const MAX_EOS_SUPPRESS: usize = 3;
-
-    // Think-budget force-close (mechanism #2): a heavy reasoner can out-think its
-    // token budget and return reasoning only (it hits max_tokens still inside
-    // <think>). Reserve room for an answer; honor an explicit max_think_tokens
-    // when the client sets one. When thinking reaches the budget with nothing
-    // visible yet, inject <|END_THINKING|> + <|START_TEXT|> so the model closes
-    // thinking and answers within the reserve instead of hitting the cap empty.
-    let think_reserve = (max_tokens / 4).clamp(64, 512).min(max_tokens / 2);
-    let think_budget = if max_think_tokens > 1 {
-        max_think_tokens.min(max_tokens.saturating_sub(think_reserve))
-    } else {
-        max_tokens.saturating_sub(think_reserve)
-    };
-    let mut think_count = 0usize;
-    let mut think_force_closed = false;
-    let mut forced_toks: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-
-    // Tool-calling robustness against non-Cohere harnesses: known tool names (to
-    // snap a verbose/hallucinated name back to the real tool) and a buffer of the
-    // visible output (to recover a tool call the model wrote as TEXT instead of
-    // via <|START_ACTION|>). Handles both {function:{name}} (OpenAI) and {name}.
-    let known_tools: Vec<String> = tools
-        .map(|ts| {
-            ts.iter()
-                .filter_map(|t| {
-                    t.get("function")
-                        .and_then(|f| f.get("name"))
-                        .or_else(|| t.get("name"))
-                        .and_then(|n| n.as_str())
-                        .map(String::from)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // name -> [parameter names], for snapping glitched argument keys.
-    let tool_params: Vec<(String, Vec<String>)> = tools
-        .map(|ts| {
-            ts.iter()
-                .filter_map(|t| {
-                    let f = t.get("function").unwrap_or(t);
-                    let name = f.get("name").and_then(|n| n.as_str())?.to_string();
-                    let params = f
-                        .get("parameters")
-                        .and_then(|p| p.get("properties"))
-                        .and_then(|p| p.as_object())
-                        .map(|o| o.keys().cloned().collect())
-                        .unwrap_or_default();
-                    Some((name, params))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut tool_calls_emitted = false;
-    let mut vis_buf = String::new();
-
-    // Dual-run shadow parity (Task 7, cohere2moe). Under HIPFIRE_ARCHDISPATCH_PARITY=1 the
-    // legacy loop captures every committed token (markers + forced/injected + text) into
-    // __old_tape; after it completes we model_reset_context + re-run ar_generate via
-    // Cohere2MoeDispatch into __new_tape + assert_token_parity. Flag off = legacy only.
-    // NOTE (adversarial review): temp0 token-parity is a FLOOR — BLIND to tool_calls
-    // events; T8 does event-equivalence via coherence-gate-cohere2moe.sh + guard fixtures.
-    let __parity = std::env::var("HIPFIRE_ARCHDISPATCH_PARITY").ok().as_deref() == Some("1");
-    let mut __old_tape = TokenTape::default();
-
-    let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        if empty_turn_guard
-            && forced_toks.is_empty()
-            && !think_force_closed
-            && !emitted_visible
-            && sec == Sec::Think
-            && think_count >= think_budget
-        {
-            eprintln!(
-                "[cohere2moe] think-budget guard: force-closing thinking at {think_count} think-tok \
-                 (budget {think_budget}, max_tokens {max_tokens}) — forcing an answer"
-            );
-            forced_toks.push_back(mk_think1);
-            forced_toks.push_back(mk_text0);
-            think_force_closed = true;
-        }
-        let mut next_tok = match forced_toks.pop_front() {
-            Some(t) => t,
-            None => deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng),
-        };
-        if next_tok == eos_tok {
-            if empty_turn_guard && !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
-                // Reasoning-only turn in progress — the model is ending after
-                // <think> with nothing visible. FORCE a <|START_TEXT|> continuation
-                // rather than re-sampling the EOS-masked distribution: re-sampling
-                // drew from the low-probability tail (where garbage / other-language
-                // tokens live), emitting a garbage first token that then derailed the
-                // turn (the "veen hier" / "ماعopilot" glitches). Injecting the marker
-                // puts the model in the response section so its NEXT token is sampled
-                // normally (same as the think-budget force-close, which is coherent).
-                // Close thinking first if we somehow took EOS while still inside it.
-                eos_suppressions += 1;
-                eprintln!(
-                    "[cohere2moe] empty-turn guard: forcing START_TEXT (EOS after thinking, no \
-                     visible output, #{eos_suppressions}/{MAX_EOS_SUPPRESS}) at gen {generated_count}"
-                );
-                if sec == Sec::Think {
-                    forced_toks.push_back(mk_think1);
-                }
-                forced_toks.push_back(mk_text0);
-                next_tok = forced_toks.pop_front().unwrap();
-            } else {
-                break;
-            }
-        }
-        // Degenerate-output guards (see above). `<PAD>` is never a valid
-        // generation token, and any token repeating REPEAT_GUARD× in a row is an
-        // attractor. Either means the forward collapsed — stop before emitting
-        // or decoding further, and log so the real bug isn't silently swallowed.
-        if Some(next_tok) == pad_tok {
-            eprintln!(
-                "[cohere2moe] DEGENERATE OUTPUT: <PAD> (id {next_tok}) emitted at gen {generated_count}, \
-                 ctx={} — forward collapse (long-context attention/KV bug); stopping",
-                m.cohere2moe().map(|b| b.state.n_tokens).unwrap_or(0)
-            );
-            break;
-        }
-        if next_tok == last_tok {
-            repeat_run += 1;
-            if repeat_run >= REPEAT_GUARD {
-                eprintln!(
-                    "[cohere2moe] DEGENERATE OUTPUT: token {next_tok} repeated {repeat_run}× at gen {generated_count} \
-                     (attractor) — forward collapse; stopping"
-                );
-                break;
-            }
-        } else {
-            last_tok = next_tok;
-            repeat_run = 1;
-        }
-        // Probe-mode token-id stream (HIPFIRE_EMIT_TOKEN_IDS=1). Was wired into
-        // the qwen35/deepseek4 generate loops but NOT here, so coherence_probe
-        // and token-id detectors silently saw nothing for north-mini-code.
-        emit_committed_event(
-            stdout,
-            id,
-            next_tok,
-            generated_count,
-            decode_t0.elapsed().as_millis() as u64,
-        );
-        if __parity {
-            __old_tape.push(next_tok);
-        }
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // Agentic-marker state machine — markers themselves are never emitted.
-        if next_tok == mk_think0 {
-            sec = Sec::Think;
-        } else if next_tok == mk_text0 {
-            sec = Sec::Text;
-        } else if next_tok == mk_act0 {
-            sec = Sec::Action;
-            action_buf.clear();
-        } else if next_tok == mk_think1 || next_tok == mk_text1 {
-            sec = Sec::Pre;
-        } else if next_tok == mk_act1 {
-            // End of an action block → parse the JSON array into tool_calls,
-            // snapping any verbose/hallucinated tool name to a real tool.
-            let mut calls = cohere2moe::spec_emit::parse_cohere_action(&action_buf);
-            cohere2moe::spec_emit::snap_call_names(&mut calls, &known_tools, &tool_params);
-            if !calls.is_empty() {
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::json!({"type": "tool_calls", "id": id, "calls": calls}),
-                );
-                let _ = stdout.flush();
-                emitted_visible = true;
-                tool_calls_emitted = true;
-            }
-            sec = Sec::Pre;
-        } else {
-            // Build the fragment through serde_json so arbitrary UTF-8 can't
-            // corrupt the JSONL line.
-            let frag = {
-                let tokenizer = m.tokenizer.as_ref().unwrap();
-                tokenizer.decode(&[next_tok])
-            };
-            // Defense-in-depth: never emit a Cohere structural marker into
-            // visible output / the action buffer. The ID state machine above
-            // handles the 6 THINKING/TEXT/ACTION markers; this catches any OTHER
-            // special token the model might emit (START_OF_TURN_TOKEN,
-            // CHATBOT_TOKEN, START_TOOL_RESULT, …) — each decodes to a full
-            // `<|MARKER|>`. The token is still fed to decode_step below; only its
-            // emit is dropped, so a state-machine miss can never leak a marker.
-            let is_marker = frag.len() > 4
-                && frag.starts_with("<|")
-                && frag.ends_with("|>")
-                && frag[2..frag.len() - 2]
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '_');
-            if is_marker {
-                // suppressed
-            } else {
-                match sec {
-                    Sec::Action => action_buf.push_str(&frag),
-                    Sec::Think => {
-                        // Reasoning channel: tagged so clients can fold it; the CLI
-                        // (ignoring unknown fields) shows it inline.
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true}),
-                        );
-                        let _ = stdout.flush();
-                        think_count += 1;
-                    }
-                    Sec::Text | Sec::Pre => {
-                        vis_buf.push_str(&frag);
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag}),
-                        );
-                        let _ = stdout.flush();
-                        emitted_visible = true;
-                    }
-                }
-            }
-        }
-
-        // Advance one step on the freshly sampled token (plain eager decode —
-        // no hipGraph variant on this arch yet).
-        let step = {
-            let b = m.cohere2moe_mut().unwrap();
-            let cfg = &b.config;
-            let weights = &b.weights;
-            let state = &mut b.state;
-            let position = state.n_tokens as u32;
-            cohere2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
-        };
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
-                return;
-            }
-        }
-    }
-
-    m.seq_pos = m.cohere2moe().unwrap().state.n_tokens;
-
-    // Tool-call-as-text recovery: if the model never emitted a <|START_ACTION|>
-    // block but wrote a tool-call JSON array (`[{tool_name, parameters}]`) as
-    // visible text — which happens when a non-Cohere harness primes it with a
-    // generic tool-call format — parse it out and emit it as a real tool_calls
-    // event so the harness can actually execute it.
-    if !tool_calls_emitted {
-        let mut recovered = cohere2moe::spec_emit::parse_cohere_action(&vis_buf);
-        if !recovered.is_empty() {
-            cohere2moe::spec_emit::snap_call_names(&mut recovered, &known_tools, &tool_params);
-            eprintln!(
-                "[cohere2moe] recovered {} tool_call(s) written as text (model skipped <|START_ACTION|>)",
-                recovered.len()
-            );
-            let _ = writeln!(
-                stdout,
-                "{}",
-                serde_json::json!({"type": "tool_calls", "id": id, "calls": recovered}),
-            );
-            let _ = stdout.flush();
-        }
-    }
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let _ = writeln!(
+    ar_generate(
+        &mut __disp,
+        gpu,
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        id,
+        temp,
+        top_p,
+        None, // top_k
+        None, // min_p
+        max_tokens,
+        1.0, // repeat_penalty
+        0,   // repeat_window
+        0.0, // presence_penalty
+        0.0, // frequency_penalty
+        0,   // budget_alert_at_tok
+        "",  // budget_alert_text
+        max_think_tokens,
+        hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        &[],         // stop
+        None,        // tools (grammar off; Cohere2MoeStreamParser owns tools)
+        prefill_ids, // new_tokens: the LCP suffix (prod: no reset)
+        &[],         // im_end
+        &[],         // nl
+        None,        // im_end_token
+        None,        // tool_call_pair
+        None,        // think_pair
+        prefill_len, // prefill_tokens
+        cached_tokens_count,
+        None, // pflash_summary
+        None, // pflash_bypass_reason
+        None, // pflash_alpha
+        t0,
+        None, // tape (prod: no dual-run)
     );
-    let _ = stdout.flush();
-
-    // ── Dual-run shadow-parity re-run (Task 7). Reset the (legacy-mutated) context and
-    // re-drive the request through ar_generate/Cohere2MoeDispatch into __new_tape, then
-    // assert token-identity. FLOOR only — blind to tool_calls events (T8 checks those).
-    if __parity {
-        model_reset_context(m, gpu);
-        let mut __new_tape = TokenTape::default();
-        let mut __disp = Cohere2MoeDispatch {
-            m: &mut *m,
-            tools: tools.map(|t| t.to_vec()),
-        };
-        ar_generate(
-            &mut __disp,
-            gpu,
-            stdout,
-            id,
-            temp,
-            top_p,
-            None, // top_k
-            None, // min_p
-            max_tokens,
-            1.0, // repeat_penalty
-            0,   // repeat_window
-            0.0, // presence_penalty
-            0.0, // frequency_penalty
-            0,   // budget_alert_at_tok
-            "",  // budget_alert_text
-            max_think_tokens,
-            hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-            &[],                // stop
-            None,               // tools (grammar off; Cohere2MoeStreamParser owns tools)
-            prompt_ids.clone(), // new_tokens: full render (context reset)
-            &[],                // im_end
-            &[],                // nl
-            None,               // im_end_token
-            None,               // tool_call_pair
-            None,               // think_pair
-            prompt_ids.len(),   // prefill_tokens
-            0,                  // cached_tokens_count
-            None,               // pflash_summary
-            None,               // pflash_bypass_reason
-            None,               // pflash_alpha
-            t0,
-            Some(&mut __new_tape),
-        );
-        assert_token_parity(&__old_tape, &__new_tape, id);
-    }
 }
 
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
