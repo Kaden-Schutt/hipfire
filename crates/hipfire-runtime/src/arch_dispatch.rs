@@ -66,6 +66,18 @@ pub enum ForwardCtx<'a> {
     Mesh,
 }
 
+impl ForwardCtx<'_> {
+    /// Re-borrow the context for a single hook call. `ar_generate` holds one
+    /// `ForwardCtx` for the whole decode and hands each forward hook a fresh
+    /// short-lived reborrow (the `Single` device can't be moved out per call).
+    pub fn reborrow(&mut self) -> ForwardCtx<'_> {
+        match self {
+            ForwardCtx::Single(g) => ForwardCtx::Single(&mut **g),
+            ForwardCtx::Mesh => ForwardCtx::Mesh,
+        }
+    }
+}
+
 /// One trait object per loaded model. Owns arch-specific decode behavior so the
 /// daemon's dispatch stops branching on `arch_id`.
 pub trait ArchDispatch {
@@ -300,8 +312,8 @@ pub trait ArchDispatch {
 
     /// Drain + free the prefill checkpoint ring (abort path).
     #[allow(dead_code)]
-    fn free_prefill_checkpoints(&mut self, gpu: &mut rdna_compute::Gpu) {
-        let _ = gpu;
+    fn free_prefill_checkpoints(&mut self, ctx: ForwardCtx<'_>) {
+        let _ = ctx;
     }
 
     /// Build (once, cached) + return the decoded-vocab table used for grammar

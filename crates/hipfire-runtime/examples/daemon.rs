@@ -1041,7 +1041,10 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         qwen35::PREFILL_MAX_BATCH
     }
 
-    fn free_prefill_checkpoints(&mut self, gpu: &mut rdna_compute::Gpu) {
+    fn free_prefill_checkpoints(&mut self, ctx: ForwardCtx<'_>) {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         free_checkpoints(&mut self.m.prefill_checkpoints, gpu);
     }
 
@@ -1432,7 +1435,10 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
         llama::PREFILL_MAX_BATCH
     }
 
-    fn free_prefill_checkpoints(&mut self, gpu: &mut rdna_compute::Gpu) {
+    fn free_prefill_checkpoints(&mut self, ctx: ForwardCtx<'_>) {
+        let ForwardCtx::Single(gpu) = ctx else {
+            unreachable!("single-GPU dispatch received Mesh ctx")
+        };
         free_checkpoints(&mut self.m.prefill_checkpoints, gpu);
     }
 
@@ -8601,7 +8607,7 @@ fn generate_multi(
 #[allow(clippy::too_many_arguments)]
 fn ar_generate(
     dispatch: &mut dyn hipfire_runtime::arch_dispatch::ArchDispatch,
-    gpu: &mut rdna_compute::Gpu,
+    mut ctx: ForwardCtx<'_>,
     stdout: &mut std::io::Stdout,
     id: &str,
     temp: f32,
@@ -8678,9 +8684,9 @@ fn ar_generate(
             let space = window.saturating_sub(seq_pos).max(1);
             let chunk_len = remaining.len().min(space);
             let (chunk, rest) = remaining.split_at(chunk_len);
-            dispatch.prefill_forward(ForwardCtx::Single(&mut *gpu), chunk, seq_pos).unwrap();
+            dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos).unwrap();
             seq_pos += chunk_len;
-            if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
+            if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
                 seq_pos = new_phys;
             }
             remaining = rest;
@@ -8697,21 +8703,21 @@ fn ar_generate(
             }
             let end = (start + chunk_max).min(new_tokens.len());
             let chunk = &new_tokens[start..end];
-            dispatch.prefill_forward(ForwardCtx::Single(&mut *gpu), chunk, seq_pos).unwrap();
+            dispatch.prefill_forward(ctx.reborrow(), chunk, seq_pos).unwrap();
             seq_pos += chunk.len();
-            dispatch.maybe_adaptive_downshift(ForwardCtx::Single(&mut *gpu), seq_pos);
+            dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
             if ckpt_resume_enabled() {
-                dispatch.take_prefill_checkpoint(ForwardCtx::Single(&mut *gpu), seq_pos);
+                dispatch.take_prefill_checkpoint(ctx.reborrow(), seq_pos);
             }
             start = end;
         }
     }
     if prefill_aborted {
-        dispatch.abort_zero_recurrent(ForwardCtx::Single(&mut *gpu));
+        dispatch.abort_zero_recurrent(ctx.reborrow());
         seq_pos = 0;
         dispatch.set_seq_pos(0);
         dispatch.conversation_tokens_mut().clear();
-        dispatch.free_prefill_checkpoints(gpu);
+        dispatch.free_prefill_checkpoints(ctx.reborrow());
         let _ = writeln!(
             stdout,
             r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -8726,7 +8732,7 @@ fn ar_generate(
         return;
     }
     // Post-prefill adaptive-KV downshift.
-    dispatch.maybe_adaptive_downshift(ForwardCtx::Single(&mut *gpu), seq_pos);
+    dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
     dispatch.conversation_tokens_mut().extend_from_slice(&new_tokens);
 
     // Boundary marker for the prompt-cache / asst_turn_cache slice: the model's
@@ -8819,7 +8825,7 @@ fn ar_generate(
             None
         };
         dispatch
-            .sample(ForwardCtx::Single(&mut *gpu), &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state)
+            .sample(ctx.reborrow(), &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state)
             .unwrap()
     };
     if grammar_active {
@@ -8918,8 +8924,8 @@ fn ar_generate(
             seq_pos = 0;
             dispatch.set_seq_pos(0);
             dispatch.conversation_tokens_mut().clear();
-            dispatch.free_prefill_checkpoints(gpu);
-            dispatch.abort_zero_recurrent(ForwardCtx::Single(&mut *gpu));
+            dispatch.free_prefill_checkpoints(ctx.reborrow());
+            dispatch.abort_zero_recurrent(ctx.reborrow());
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -8985,16 +8991,16 @@ fn ar_generate(
         };
 
         dispatch
-            .decode_step_forward(ForwardCtx::Single(&mut *gpu), next_token, seq_pos)
+            .decode_step_forward(ctx.reborrow(), next_token, seq_pos)
             .unwrap();
         seq_pos += 1;
         if ckpt_resume_enabled() {
-            dispatch.take_prefill_checkpoint(ForwardCtx::Single(&mut *gpu), seq_pos);
+            dispatch.take_prefill_checkpoint(ctx.reborrow(), seq_pos);
         }
-        if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
+        if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
             seq_pos = new_phys;
         }
-        dispatch.maybe_adaptive_downshift(ForwardCtx::Single(&mut *gpu), seq_pos);
+        dispatch.maybe_adaptive_downshift(ctx.reborrow(), seq_pos);
 
         // ── Terminal eos (CommitAndStop, decided pre-commit above) ───────────
         // The eos token has now been committed + forwarded; emit it through the filter
@@ -9085,7 +9091,7 @@ fn ar_generate(
                             None
                         };
                     dispatch
-                        .sample(ForwardCtx::Single(&mut *gpu), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
+                        .sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
                         .unwrap()
                 };
                 if grammar_active {
@@ -9131,9 +9137,9 @@ fn ar_generate(
                     for act in parser.emit_only(tok, &new_bytes2) {
                         exec_stream_action!(act);
                     }
-                    dispatch.decode_step_forward(ForwardCtx::Single(&mut *gpu), tok, seq_pos).unwrap();
+                    dispatch.decode_step_forward(ctx.reborrow(), tok, seq_pos).unwrap();
                     seq_pos += 1;
-                    if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
+                    if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
                         seq_pos = new_phys;
                     }
                     generated += 1;
@@ -9209,7 +9215,7 @@ fn ar_generate(
                 None
             };
             dispatch
-                .sample(ForwardCtx::Single(&mut *gpu), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
+                .sample(ctx.reborrow(), &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
                 .unwrap()
         };
         if grammar_active {
@@ -9241,9 +9247,9 @@ fn ar_generate(
         .unwrap_or(0);
     if im_end_token == Some(last_conv) && !nl.is_empty() {
         for &t in nl {
-            dispatch.decode_step_forward(ForwardCtx::Single(&mut *gpu), t, seq_pos).unwrap();
+            dispatch.decode_step_forward(ctx.reborrow(), t, seq_pos).unwrap();
             seq_pos += 1;
-            if let Some(new_phys) = dispatch.maybe_evict(ForwardCtx::Single(&mut *gpu), seq_pos).unwrap() {
+            if let Some(new_phys) = dispatch.maybe_evict(ctx.reborrow(), seq_pos).unwrap() {
                 seq_pos = new_phys;
             }
             dispatch.conversation_tokens_mut().push(t);
@@ -11101,7 +11107,7 @@ fn generate(
         let mut __disp = Qwen35Dispatch { m: &mut *m };
         ar_generate(
             &mut __disp,
-            gpu,
+            ForwardCtx::Single(gpu),
             stdout,
             id,
             temp,
@@ -11142,7 +11148,7 @@ fn generate(
         let mut __disp = LlamaDispatch { m: &mut *m };
         ar_generate(
             &mut __disp,
-            gpu,
+            ForwardCtx::Single(gpu),
             stdout,
             id,
             temp,
@@ -12566,7 +12572,7 @@ fn generate_lfm2moe(
     let mut __disp = Lfm2MoeDispatch { m: &mut *m, stop_ids };
     ar_generate(
         &mut __disp,
-        gpu,
+        ForwardCtx::Single(gpu),
         stdout,
         id,
         temp,
@@ -12881,7 +12887,7 @@ fn generate_minimax(
     let mut __disp = MinimaxDispatch { m: &mut *m };
     ar_generate(
         &mut __disp,
-        gpu,
+        ForwardCtx::Single(gpu),
         stdout,
         id,
         temp,
@@ -13432,7 +13438,7 @@ fn generate_cohere2moe(
     };
     ar_generate(
         &mut __disp,
-        gpu,
+        ForwardCtx::Single(gpu),
         stdout,
         id,
         temp,
@@ -13585,7 +13591,7 @@ fn generate_qwen2(
     let mut __disp = Qwen2Dispatch { m: &mut *m };
     ar_generate(
         &mut __disp,
-        gpu,
+        ForwardCtx::Single(gpu),
         stdout,
         id,
         0.0,
