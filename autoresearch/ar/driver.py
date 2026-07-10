@@ -56,6 +56,21 @@ def _load_prompt(repo: str, arch: str) -> str:
     return ""
 
 
+def _retarget(prompt: str, repo: str, worker: WorkerCfg) -> str:
+    """Fill the per-worker placeholders ``swarm_explore.sh``'s ``sed`` used to inject.
+
+    ``{{repo}}`` → the host checkout, ``{{card}}`` / ``{{dev}}`` → this worker's
+    DRM card / HIP device. Without this, every worker's prompt would target
+    ``card0`` / ``dev 0`` and clobber the same ``/tmp/exp_…c0.hip`` (the migration
+    dropped the sed-munge; the driver injects the targeting instead).
+    """
+    return (
+        prompt.replace("{{repo}}", repo)
+        .replace("{{card}}", str(worker.card))
+        .replace("{{dev}}", str(worker.dev))
+    )
+
+
 def _default_hooks(cfg: LoopConfig, worker: WorkerCfg, repo: str) -> dict:
     """Real seams bound to the state store, agent harness, and git CAS.
 
@@ -146,7 +161,7 @@ def run_loop(cfg: LoopConfig, worker: WorkerCfg, safety_cap: int, *, hooks: dict
         h.update(hooks)
 
     cwd = _worker_cwd(repo, worker)
-    base_prompt = _load_prompt(repo, cfg.arch)
+    base_prompt = _retarget(_load_prompt(repo, cfg.arch), repo, worker)
 
     rounds = 0
     while rounds < safety_cap and not h["is_exhausted"]():
