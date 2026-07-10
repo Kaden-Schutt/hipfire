@@ -1979,6 +1979,242 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Deepseek4 (arch 9) EXPERT-PARALLEL (multi-GPU) AR dispatch — the FIRST mesh
+/// `ArchDispatch`. Unlike the six single-GPU impls, its device (`Gpus`) lives
+/// INSIDE `m.ep` (`EpState.gpus`), i.e. inside the same `&mut m` this dispatch
+/// borrows — so every forward hook matches `ForwardCtx::Mesh` and reaches the
+/// mesh through `&mut self`; `Single` is `unreachable!()`. Mirrors `ep_serve_ds4`
+/// (daemon.rs): per-token `forward_ep` for both prefill and decode, rank-0 logits
+/// download, and the HOST full-distribution sampler `llama::sample_full_dist`
+/// (NOT the GPU sampler / `sample_cpu`). EP AR is MTP-free (spec-decode is the
+/// separate `generate_deepseek4_spec`). No eviction / adaptive-KV / prefill
+/// checkpoints → the tangle hooks keep their trait-default no-ops.
+///
+/// NOTE (Axis B inc 2): build-only groundwork — NOT wired/flipped. Inc 3 adds the
+/// DSML grammar/stream-parser output; inc 4 routes the `m.ep.is_some()` gate
+/// through `ar_generate`; inc 5 validates the FNV anchor + dual-run parity.
+#[allow(dead_code)]
+struct Deepseek4EpDispatch<'m> {
+    m: &'m mut LoadedModel,
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        // ds4 EP eos: the loader-resolved carrier `m.deepseek4_eos_tok`
+        // (ep_serve_ds4 takes `eos_tok = m.deepseek4_eos_tok`, daemon.rs:4246).
+        self.m.deepseek4_eos_tok
+    }
+
+    // is_eos = trait default (tok == eos_token): ep_serve_ds4 breaks on
+    // `next == eos_tok`, so the primary-eos-only stop is byte-faithful.
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        // deepseek4 HF regime; mirrors the generic arch ladder default.
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 0.3,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        // ds4 DSML: think blocks + tool-call grammar; user stop-seqs; no vision.
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: true,
+            supports_stop_seq: true,
+            supports_grammar: true,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
+        // EP reaches its own devices via `m.ep.gpus`, NOT the single-GPU param
+        // (which is inert here). Mirror ep_serve_ds4's per-rank cross-conversation
+        // reset (daemon.rs:4522): `reset()` rewinds n_tokens; `zero_decode_caches`
+        // clears the position-indexed SWA-ring / compressed+full KV / indexer
+        // scratch; `invalidate_graph_state` drops the captured HIP graph. Zeroing
+        // the decode caches is load-bearing — `reset()` alone bleeds the prior
+        // turn's residue into the next conversation.
+        if let Some(EpState { gpus, inner }) = self.m.ep.as_mut() {
+            if let EpArch::Ds4 { state, .. } = inner {
+                for (rank, s) in state.iter_mut().enumerate() {
+                    let g = &mut gpus.devices[rank];
+                    let _ = g.bind_thread();
+                    s.reset();
+                    s.zero_decode_caches(g);
+                    g.invalidate_graph_state();
+                }
+            }
+        }
+        self.m.seq_pos = 0;
+        self.m.conversation_tokens.clear();
+    }
+
+    fn prefill_forward(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("deepseek4-EP dispatch received Single ctx")
+        };
+        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("prefill_forward: no ep state")?;
+        let EpArch::Ds4 {
+            config,
+            weights,
+            state,
+            partials,
+            partials_i64,
+        } = inner
+        else {
+            return Err("prefill_forward: EP arch mismatch (expected ds4)".into());
+        };
+        // `forward_ep` is single-token; ep_serve_ds4 prefills the prompt one
+        // token at a time (daemon.rs:4633). Replay the chunk at absolute
+        // positions `seq_pos + i`.
+        for (i, &t) in chunk.iter().enumerate() {
+            deepseek4::forward::forward_ep(
+                gpus,
+                weights,
+                config,
+                state,
+                partials,
+                partials_i64,
+                t,
+                (seq_pos + i) as u32,
+            )
+            .map_err(|e| format!("forward_ep prefill: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("deepseek4-EP dispatch received Single ctx")
+        };
+        let EpState { gpus, inner } = self
+            .m
+            .ep
+            .as_mut()
+            .ok_or("decode_step_forward: no ep state")?;
+        let EpArch::Ds4 {
+            config,
+            weights,
+            state,
+            partials,
+            partials_i64,
+        } = inner
+        else {
+            return Err("decode_step_forward: EP arch mismatch (expected ds4)".into());
+        };
+        deepseek4::forward::forward_ep(
+            gpus,
+            weights,
+            config,
+            state,
+            partials,
+            partials_i64,
+            token,
+            seq_pos as u32,
+        )
+        .map_err(|e| format!("forward_ep decode: {e}"))
+    }
+
+    fn sample(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("deepseek4-EP dispatch received Single ctx")
+        };
+        // EP samples HOST-side over rank-0's downloaded logits via the full-dist
+        // sampler (ep_serve_ds4:4744) — NOT the GPU sampler. So `ngram_scope` and
+        // `rng_state` (the GPU xorshift seed) are inert; the cpu-sampler RNG is
+        // seeded once per request in the preamble (`reset_cpu_sampler_rng`, wired
+        // by inc 4). The grammar mask (built by the driver's Deepseek4GrammarMatcher,
+        // inc 3) is applied to the downloaded logits HERE before the draw
+        // (`apply_mask_to_logits` stays internal to EP, per the design).
+        let _ = (vocab_size, ngram_scope, rng_state);
+        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("sample: no ep state")?;
+        let EpArch::Ds4 { state, .. } = inner else {
+            return Err("sample: EP arch mismatch (expected ds4)".into());
+        };
+        let _ = gpus.devices[0].bind_thread();
+        let logits_gt = state[0].logits.as_ref().ok_or("sample: EP logits unset")?;
+        let mut logits = gpus.devices[0]
+            .download_f32(logits_gt)
+            .map_err(|e| format!("EP logits download: {e:?}"))?;
+        if let Some(mask) = grammar_mask {
+            deepseek4::grammar::Matcher::apply_mask_to_logits(mask, &mut logits);
+        }
+        Ok(hipfire_runtime::llama::sample_full_dist(
+            &logits,
+            cfg.temperature,
+            cfg.top_p,
+            cfg.top_k,
+            cfg.min_p,
+        ))
+    }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        // The EP KV cursor is rank-0's `state.n_tokens` (advanced internally by
+        // forward_ep); seed the driver's local from it.
+        match self.m.ep.as_ref() {
+            Some(EpState {
+                inner: EpArch::Ds4 { state, .. },
+                ..
+            }) => state[0].n_tokens as usize,
+            _ => self.m.seq_pos,
+        }
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        let _ = seq_pos;
+        let np = match self.m.ep.as_ref() {
+            Some(EpState {
+                inner: EpArch::Ds4 { state, .. },
+                ..
+            }) => state[0].n_tokens as usize,
+            _ => self.m.seq_pos,
+        };
+        self.m.seq_pos = np;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self.m.ep.as_ref() {
+            Some(EpState {
+                inner: EpArch::Ds4 { config, .. },
+                ..
+            }) => config.vocab_size,
+            _ => 0,
+        }
+    }
+}
+
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
 /// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
 /// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
