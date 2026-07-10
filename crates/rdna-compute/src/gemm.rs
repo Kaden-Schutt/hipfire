@@ -3673,11 +3673,9 @@ impl Gpu {
                     // are tiny LA tails that waste most of a 128-row MMQ tile.
                     // Keep this off by default and do not widen it to gfx12 or
                     // gfx10; their MMQ/dot2 tradeoffs and source families differ.
-                    static QKVZA_SPLIT_TAIL: OnceLock<bool> = OnceLock::new();
-                    let split_tail = *QKVZA_SPLIT_TAIL.get_or_init(|| {
-                        std::env::var("HIPFIRE_QKVZA_SPLIT_TAIL").ok().as_deref() == Some("1")
-                    });
-                    if split_tail
+                    // The env override is resolved once through FeatureFlags at
+                    // Gpu initialization, not from this dispatch hot path.
+                    if self.flags.qkvza_split_tail
                         && self.arch_caps.is_rdna3_dgpu()
                         && qkv_m % 128 == 0
                         && z_m % 128 == 0
