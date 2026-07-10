@@ -1070,6 +1070,151 @@ impl hipfire_runtime::arch_dispatch::GrammarMatcher for Qwen35GrammarMatcher {
     }
 }
 
+/// Wraps `&mut LoadedModel` to implement `ArchDispatch` for qwen2 (arch_id 7).
+/// Greedy-only, SPLIT forward/sample: `qwen2::forward_step` writes state.logits,
+/// the driver samples via `gpu.argmax_f32` — byte-identical to the arch's fused
+/// `forward_step_greedy` (= forward_step + argmax_f32). No grammar / recurrent /
+/// eviction / adaptive-KV / checkpoints / pflash / asst-turn cache, so the tangle
+/// hooks + those accessors keep their no-op/safe trait defaults. Unused until
+/// Inc 2 routes `generate_qwen2` through `ar_generate`.
+#[allow(dead_code)]
+struct Qwen2Dispatch<'m> {
+    m: &'m mut LoadedModel,
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::ArchDispatch for Qwen2Dispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        if let Some(ModelState::Qwen2(b)) = self.m.state.as_ref() {
+            b.config.eos_token_id
+        } else {
+            0
+        }
+    }
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        // qwen2 AR is greedy-only; inert (the daemon drives it greedy).
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 0.0,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        // Legacy qwen2 loop: no think, no user stop-seq, no grammar, no vision
+        // (VL is a separate generate_vl path).
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: false,
+            supports_stop_seq: false,
+            supports_grammar: false,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        // Mirrors generate_qwen2's overflow-reset: Qwen2State cursor + daemon
+        // bookkeeping. No GPU buffers to free (KV is overwritten on re-prefill).
+        let _ = gpu;
+        if let Some(ModelState::Qwen2(b)) = self.m.state.as_mut() {
+            b.state.reset();
+        }
+        self.m.seq_pos = 0;
+        self.m.conversation_tokens.clear();
+    }
+
+    fn prefill_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        // Per-token forward_step (matches generate_qwen2's per-token prefill).
+        // state.next_pos is the internal cursor → the driver's seq_pos is advisory.
+        let _ = seq_pos;
+        let ModelState::Qwen2(b) = self.m.state.as_mut().ok_or("no state")? else {
+            return Err("prefill_forward: not a qwen2 bundle".into());
+        };
+        for &tok in chunk {
+            qwen2::forward_step(gpu, &b.weights, &b.config, &mut b.state, tok)
+                .map_err(|e| format!("qwen2 forward_step (prefill): {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let _ = seq_pos;
+        let ModelState::Qwen2(b) = self.m.state.as_mut().ok_or("no state")? else {
+            return Err("decode_step_forward: not a qwen2 bundle".into());
+        };
+        qwen2::forward_step(gpu, &b.weights, &b.config, &mut b.state, token)
+            .map_err(|e| format!("qwen2 forward_step (decode): {e:?}"))
+    }
+
+    fn sample(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        // Greedy argmax over state.logits — byte-identical to forward_step_greedy's
+        // internal `gpu.argmax_f32(state.logits, cfg.vocab_size)`. All sampling
+        // controls are inert for qwen2.
+        let _ = (cfg, vocab_size, ngram_scope, grammar_mask, rng_state);
+        let ModelState::Qwen2(b) = self.m.state.as_ref().ok_or("no state")? else {
+            return Err("sample: not a qwen2 bundle".into());
+        };
+        gpu.argmax_f32(&b.state.logits, b.config.vocab_size)
+            .map_err(|e| format!("qwen2 argmax: {e:?}"))
+    }
+
+    // ── accessors ar_generate needs (rest use trait defaults, correct for qwen2) ──
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        self.m.seq_pos
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        // Adopt the arch cursor as authority (== generate_qwen2's finalize
+        // `m.seq_pos = state.next_pos`; equal to the driver's local for a
+        // single-turn run, but exact for multi-turn).
+        let _ = seq_pos;
+        let np = if let Some(ModelState::Qwen2(b)) = self.m.state.as_ref() {
+            b.state.next_pos
+        } else {
+            return;
+        };
+        self.m.seq_pos = np;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        if let Some(ModelState::Qwen2(b)) = self.m.state.as_ref() {
+            b.config.vocab_size
+        } else {
+            0
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
@@ -12515,6 +12660,16 @@ fn generate_qwen2(
     _repeat_penalty: f32,
     _repeat_window: usize,
 ) {
+    // Dual-run shadow parity (Inc 2). When HIPFIRE_ARCHDISPATCH_PARITY=1, the
+    // legacy greedy loop below captures its committed tokens into __old_tape;
+    // after it finishes we reset + re-run the generic `ar_generate` (via
+    // Qwen2Dispatch) into __new_tape and assert_token_parity. Flag off = legacy
+    // loop only, zero behavior change. qwen2 is greedy so temp0 argmax parity is
+    // deterministic. WATCH: legacy stops on cfg.eos_token_ids (a SET); ar_generate
+    // stops on eos_token()==eos_token_ids[0] + tokenizer.is_terminator (eos_id +
+    // eot_id) — the GPU parity gate confirms the sets coincide for real output.
+    let __parity = archdispatch_parity_enabled();
+    let mut __old_tape = TokenTape::default();
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
         None => {
@@ -12645,6 +12800,9 @@ fn generate_qwen2(
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);
+        if __parity {
+            __old_tape.push(next_tok);
+        }
         generated_count += 1;
 
         match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
@@ -12673,6 +12831,59 @@ fn generate_qwen2(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
+
+    // Dual-run parity re-run (Inc 2) — see setup at the top of this fn. Reset the
+    // qwen2 context to fresh single-turn (Qwen2Dispatch::reset == generate_qwen2's
+    // overflow-reset) and re-run the generic ar_generate with greedy/no-frame
+    // params that reproduce this loop, then assert byte-parity on committed tokens.
+    if __parity {
+        let __prefill_tokens = prompt_ids.len();
+        // Reset to fresh single-turn (== generate_qwen2's overflow-reset).
+        if let Some(ModelState::Qwen2(b)) = m.state.as_mut() {
+            b.state.reset();
+        }
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        let mut __new_tape = TokenTape::default();
+        {
+            let mut __disp = Qwen2Dispatch { m: &mut *m };
+            ar_generate(
+                &mut __disp,
+                gpu,
+                stdout,
+                id,
+                0.0,          // temp — greedy
+                1.0,          // top_p
+                None,         // top_k
+                None,         // min_p
+                max_tokens,
+                1.0,          // repeat_penalty (inert; qwen2 sample is pure argmax)
+                0,            // repeat_window
+                0.0,          // presence_penalty
+                0.0,          // frequency_penalty
+                0,            // budget_alert_at_tok = 0 → budget path disabled
+                "",           // budget_alert_text
+                0,            // max_think_tokens = 0 → think-cap disabled
+                hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                &[],          // stop
+                None,         // tools → grammar None
+                prompt_ids,   // new_tokens (raw prompt, no framing — matches legacy)
+                &[],          // im_end
+                &[],          // nl
+                None,         // im_end_token = None → no ChatML trailer
+                None,         // tool_call_pair
+                None,         // think_pair
+                __prefill_tokens,
+                0,            // cached_tokens_count
+                None,         // pflash_summary
+                None,         // pflash_bypass_reason
+                None,         // pflash_alpha
+                t0,
+                Some(&mut __new_tape),
+            );
+        }
+        assert_token_parity(&__old_tape, &__new_tape, id);
+    }
 }
 
 fn generate_vl(
