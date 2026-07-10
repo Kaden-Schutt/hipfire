@@ -5,29 +5,35 @@
 #include <hip/hip_runtime.h>
 
 // HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
-// Default (arch-agnostic) kernel. See gemv_hfq4g256.hip for the full
-// writeup on why this had to be re-ported from the gfx1100 variant to
-// produce byte-exact output against the MQ4 quality-gate baselines.
-// TL;DR: single-accumulator sequential summation drifts from the
-// 4-accumulator pairwise-combine ordering used to generate the
-// baselines on gfx1100, breaking cross-arch exactness.
 //
-// Identical math to gemv_hfq4g256 except the final write accumulates
-// into y instead of overwriting. Used for wo and w_down projections
-// in the Qwen3.5 forward path to eliminate one add_inplace_f32 launch
-// per residual (~10 µs per call).
+// VARIANT R36c1 res_w_preload:
+// BOD residual mixed (occ~23%, mem_busy~45%, L2~78%, vgpr=72): post
+// R15 hoist_x32, free micro-schedule (DOG order / LDS-x) is exhausted —
+// TLP already hides latency. Gate_up R35c2 won by fully separating the
+// weight MEMORY phase from the DOG VALU phase after x-hoist: sequential
+// sc/zp/pk streams for the whole group-quad, then a pure FMA burst.
+//
+// Hypothesis: same separation helps residual's dual-row weight stream
+// (2 rows × 4 groups = 8 headers). Baseline interleaves load+FMA per
+// DOG; here load all 8 sc/zp/pk first (row0 g0..g3 then row1 g0..g3 —
+// sequential along each row_ptr), then 8 DOG FMAs with identical math
+// and acc slots. Value-preserving. Expect VGPR up modestly (hold 8
+// headers); if DROPPED-WAVES dominates, this path is closed for residual.
 
+#if defined(__gfx1200__) || defined(__gfx1201__)
+// RDNA4-only occupancy probe: force the compiler to target 32 resident
+// one-wave blocks (64 VGPR/thread budget) on this low-occupancy kernel.
+// The non-gfx12 device code remains byte-identical to the baseline.
+__launch_bounds__(32, 32)
+#else
 __launch_bounds__(32, 16)
+#endif
 extern "C" __global__ void gemv_hfq4g256_residual(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
     int M, int K
 ) {
-    // R18c1_res_r2_xf4_vrw: keep the confirmed two-row residual reuse and
-    // paired read-modify-write, but load each x slice as two float4 vectors.
-    // Prior x-load vectorization was neutral on MoE gate/down; this checks the
-    // plain residual stream separately.
     const int row0 = blockIdx.x << 1;
     if (row0 >= M) return;
     const int row1 = row0 + 1;
@@ -45,81 +51,116 @@ extern "C" __global__ void gemv_hfq4g256_residual(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
-    #define LOAD_X8(b) \
-        const float4 xv0 = *reinterpret_cast<const float4*>(x + (b)); \
-        const float4 xv1 = *reinterpret_cast<const float4*>(x + (b) + 4); \
-        const float x0 = xv0.x; \
-        const float x1 = xv0.y; \
-        const float x2 = xv0.z; \
-        const float x3 = xv0.w; \
-        const float x4 = xv1.x; \
-        const float x5 = xv1.y; \
-        const float x6 = xv1.z; \
-        const float x7 = xv1.w
+    #define DOG_X8(sc, zp, pk, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
+        (a) += ((sc) * (float)((pk) & 0xFu)         + (zp)) * (x0) \
+             + ((sc) * (float)(((pk) >> 4) & 0xFu)  + (zp)) * (x1) \
+             + ((sc) * (float)(((pk) >> 8) & 0xFu)  + (zp)) * (x2) \
+             + ((sc) * (float)(((pk) >> 12) & 0xFu) + (zp)) * (x3) \
+             + ((sc) * (float)(((pk) >> 16) & 0xFu) + (zp)) * (x4) \
+             + ((sc) * (float)(((pk) >> 20) & 0xFu) + (zp)) * (x5) \
+             + ((sc) * (float)(((pk) >> 24) & 0xFu) + (zp)) * (x6) \
+             + ((sc) * (float)(((pk) >> 28) & 0xFu) + (zp)) * (x7); \
+    } while (0)
 
-    #define DOG_X8(gp, a) do { \
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
-        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
-             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
-             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
+    #define LOAD_W(gp, sc, zp, pk) do { \
+        (sc) = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
+        (zp) = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
+        (pk) = *(const unsigned int*)((gp) + 8 + boff); \
     } while (0)
 
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
 
-        {
-            LOAD_X8(base0);
-            DOG_X8(row_ptr0 + g * 136, acc0);
-            if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc0);
-        }
-        {
-            LOAD_X8(base0 + 256);
-            DOG_X8(row_ptr0 + (g + 1) * 136, acc1);
-            if (have_row1) DOG_X8(row_ptr1 + (g + 1) * 136, bcc1);
-        }
-        {
-            LOAD_X8(base0 + 512);
-            DOG_X8(row_ptr0 + (g + 2) * 136, acc2);
-            if (have_row1) DOG_X8(row_ptr1 + (g + 2) * 136, bcc2);
-        }
-        {
-            LOAD_X8(base0 + 768);
-            DOG_X8(row_ptr0 + (g + 3) * 136, acc3);
-            if (have_row1) DOG_X8(row_ptr1 + (g + 3) * 136, bcc3);
-        }
+        // Hoist full 32-wide x for this quad (4 groups × 8) via float4 pairs.
+        const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
+        const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
+        const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
+        const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
+        const float4 xv2a = *reinterpret_cast<const float4*>(x + base0 + 512);
+        const float4 xv2b = *reinterpret_cast<const float4*>(x + base0 + 516);
+        const float4 xv3a = *reinterpret_cast<const float4*>(x + base0 + 768);
+        const float4 xv3b = *reinterpret_cast<const float4*>(x + base0 + 772);
+
+        // Weight MEMORY phase: sequential along row0 then row1 (8 headers).
+        float sc0a, zp0a, sc1a, zp1a, sc2a, zp2a, sc3a, zp3a;
+        float sc0b, zp0b, sc1b, zp1b, sc2b, zp2b, sc3b, zp3b;
+        unsigned int pk0a, pk1a, pk2a, pk3a, pk0b, pk1b, pk2b, pk3b;
+        LOAD_W(row_ptr0 + g * 136, sc0a, zp0a, pk0a);
+        LOAD_W(row_ptr0 + (g + 1) * 136, sc1a, zp1a, pk1a);
+        LOAD_W(row_ptr0 + (g + 2) * 136, sc2a, zp2a, pk2a);
+        LOAD_W(row_ptr0 + (g + 3) * 136, sc3a, zp3a, pk3a);
+        LOAD_W(row_ptr1 + g * 136, sc0b, zp0b, pk0b);
+        LOAD_W(row_ptr1 + (g + 1) * 136, sc1b, zp1b, pk1b);
+        LOAD_W(row_ptr1 + (g + 2) * 136, sc2b, zp2b, pk2b);
+        LOAD_W(row_ptr1 + (g + 3) * 136, sc3b, zp3b, pk3b);
+
+        // Pure FMA phase: same dual-row DOG order and acc slots as baseline.
+        DOG_X8(sc0a, zp0a, pk0a, acc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(sc0b, zp0b, pk0b, bcc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+
+        DOG_X8(sc1a, zp1a, pk1a, acc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(sc1b, zp1b, pk1b, bcc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+
+        DOG_X8(sc2a, zp2a, pk2a, acc2,
+               xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
+        DOG_X8(sc2b, zp2b, pk2b, bcc2,
+               xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
+
+        DOG_X8(sc3a, zp3a, pk3a, acc3,
+               xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
+        DOG_X8(sc3b, zp3b, pk3b, bcc3,
+               xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
     }
 
     if (tail >= 1) {
         const int g = quads << 2;
-        int base = g * 256 + tid * 8;
-        LOAD_X8(base);
-        DOG_X8(row_ptr0 + g * 136, acc0);
-        if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc0);
+        const int base = g * 256 + tid * 8;
+        const float4 xa = *reinterpret_cast<const float4*>(x + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+        float sc0, zp0, sc1, zp1;
+        unsigned int pk0, pk1;
+        LOAD_W(row_ptr0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, sc1, zp1, pk1);
+        DOG_X8(sc0, zp0, pk0, acc0,
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
+        DOG_X8(sc1, zp1, pk1, bcc0,
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
-        int base = g * 256 + tid * 8;
-        LOAD_X8(base);
-        DOG_X8(row_ptr0 + g * 136, acc1);
-        if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc1);
+        const int base = g * 256 + tid * 8;
+        const float4 xa = *reinterpret_cast<const float4*>(x + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+        float sc0, zp0, sc1, zp1;
+        unsigned int pk0, pk1;
+        LOAD_W(row_ptr0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, sc1, zp1, pk1);
+        DOG_X8(sc0, zp0, pk0, acc1,
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
+        DOG_X8(sc1, zp1, pk1, bcc1,
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
-        int base = g * 256 + tid * 8;
-        LOAD_X8(base);
-        DOG_X8(row_ptr0 + g * 136, acc2);
-        if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc2);
+        const int base = g * 256 + tid * 8;
+        const float4 xa = *reinterpret_cast<const float4*>(x + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
+        float sc0, zp0, sc1, zp1;
+        unsigned int pk0, pk1;
+        LOAD_W(row_ptr0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, sc1, zp1, pk1);
+        DOG_X8(sc0, zp0, pk0, acc2,
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
+        DOG_X8(sc1, zp1, pk1, bcc2,
+               xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
+    #undef LOAD_W
     #undef DOG_X8
-    #undef LOAD_X8
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     float bcc = (bcc0 + bcc1) + (bcc2 + bcc3);
