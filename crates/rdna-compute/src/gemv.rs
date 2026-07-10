@@ -6511,6 +6511,120 @@ impl Gpu {
         result
     }
 
+    /// Fused MoE routed-core MEGAKERNEL (mq4 / uniform HFQ4-G256): runs
+    /// gate_up → grid.sync → SwiGLU+FWHT → grid.sync → down+combine+residual in
+    /// ONE cooperative-launch dispatch, collapsing the three routed-core decode
+    /// dispatches (and their ~45 µs/kernel GPU-side inter-launch gaps) into one.
+    /// Token-id bit-identical to the `HIPFIRE_MOE_DOWN_FUSED=1` split path — each
+    /// phase's arithmetic is verbatim; only the block→work mapping changes.
+    ///
+    /// Cooperative launch requires all blocks co-resident, so the grid is sized
+    /// to `occupancy/CU × CU count` (capped at the largest phase's logical work)
+    /// and the kernel CANNOT be captured into a hipGraph — callers must route
+    /// here only with graph capture OFF. Returns an error (letting the dispatch
+    /// layer fall back to the split path) if the HIP runtime lacks
+    /// `hipModuleLaunchCooperativeKernel` or the occupancy query.
+    ///
+    /// Shapes (decode, N=1): `x` [d] gate_up input (post norm+rotate);
+    /// `y_gate`/`y_up`/`rot_batch` [k_top × f] scratch; `x_residual` [d]
+    /// accumulated in place (`+=`). `d` = model dim (gate_up input / down
+    /// output), `f` = ffn intermediate per expert. The 2×256 FWHT sign tables
+    /// are fetched internally from `self.scratch.mq_signs1/2` (via
+    /// `ensure_mq_signs`), matching `fused_silu_mul_rotate_mq_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_megakernel_mq4_hfq4g256(
+        &mut self,
+        expert_ptrs_gu: &GpuTensor,
+        expert_ptrs_dn: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        d: usize,
+        f: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "moe_megakernel_mq4_hfq4g256",
+            kernels::MOE_MEGAKERNEL_MQ4_SRC,
+            "moe_megakernel_mq4_hfq4g256",
+        )?;
+
+        // Size the cooperative grid: largest co-resident block count the
+        // hardware allows (occupancy/CU × CU count), capped at the largest
+        // phase's logical work (gate_up = f·k_top dominates; extra blocks would
+        // just no-op through every grid-stride loop and inflate the grid.sync
+        // cost). `?` on the occupancy query propagates the "unavailable" error
+        // so the dispatch layer falls back to the split path.
+        let occ = {
+            let func = self.functions.get("moe_megakernel_mq4_hfq4g256").ok_or_else(|| {
+                hip_bridge::HipError::new(0, "moe_megakernel_mq4_hfq4g256: function not loaded")
+            })?;
+            unsafe {
+                self.hip
+                    .module_occupancy_max_active_blocks_per_multiprocessor(func, 32, 0)?
+            }
+        };
+        let cu = self
+            .hip
+            .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, 0)
+            .ok()
+            .filter(|&v| v > 0)
+            .map(|v| crate::profiler::hip_mp_count_to_cu_count(&self.arch, v as u32))
+            .filter(|&v| (4..=256).contains(&v))
+            .unwrap_or(16);
+        const NR: usize = 2; // must match MOE_MEGA_NUM_ROWS in the kernel
+        let logical_max = (f * k_top).max((d + NR - 1) / NR).max((f / 256) * k_top);
+        let grid_blocks = ((occ.max(1) as usize) * (cu as usize)).min(logical_max).max(1) as u32;
+
+        let gup = expert_ptrs_gu.buf.as_ptr();
+        let dnp = expert_ptrs_dn.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let d_val = d as i32;
+        let f_val = f as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gup as *const _ as *mut c_void,
+            &dnp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &d_val as *const _ as *mut c_void,
+            &f_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let func = self.functions.get("moe_megakernel_mq4_hfq4g256").unwrap();
+        unsafe {
+            self.hip.launch_cooperative_kernel(
+                func,
+                [grid_blocks, 1, 1],
+                [32, 1, 1],
+                0,
+                self.active_stream.as_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed
     /// MoE down. Same expanded-output contract as the HFQ4G256 sibling;
     /// caller must follow with `moe_down_combine_k8_batched` to fold the

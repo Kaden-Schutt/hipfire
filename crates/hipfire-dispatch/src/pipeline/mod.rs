@@ -44,6 +44,18 @@ fn moe_down_fused_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("HIPFIRE_MOE_DOWN_FUSED").as_deref() == Ok("1"))
 }
 
+/// Opt-in fused MoE routed-core MEGAKERNEL: collapse the three decode routed-core
+/// dispatches (gate_up → silu+FWHT → down+combine+residual) into ONE
+/// cooperative-launch kernel, removing ~2 of the ~45 µs/kernel GPU-side
+/// inter-launch gaps per layer. Token-id bit-identical to the split path. Only
+/// the uniform HFQ4G256 (mq4) wave32 decode path is eligible, and only with
+/// graph capture OFF (cooperative launch cannot be hipGraph-captured). Default
+/// OFF ⇒ dispatch is byte-for-byte unchanged. Cached once per process.
+fn moe_megakernel_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("HIPFIRE_MOE_MEGAKERNEL").as_deref() == Ok("1"))
+}
+
 pub struct LinearParams<'a> {
     pub x: &'a GpuTensor,
     pub y: &'a GpuTensor,
@@ -528,6 +540,19 @@ pub fn run_moe_decode(
     // byte-identical two-kernel path.
     let mut mq4_down_fused = false;
 
+    // Fused routed-core megakernel eligibility: opt-in, uniform HFQ4G256 (mq4)
+    // routed gate_up+down, wave32 (RDNA — the reduction uses `__shfl_down` 16→1),
+    // no per-expert dtype tags / paro sidecar, and NOT under hipGraph capture
+    // (cooperative launch cannot be captured). When true, ONE cooperative launch
+    // replaces the gate_up, silu+rotate, and down+combine dispatches below.
+    let use_megakernel = moe_megakernel_enabled()
+        && !res.routed_indexable_paro
+        && p.expert_dtype_tags.is_none()
+        && p.dtypes.routed_gate_up == DType::MQ4G256
+        && p.dtypes.routed_down == DType::MQ4G256
+        && ctx.arch.is_wave32()
+        && gpu.graphs.replay.capturing.is_none();
+
     {
         // ── Routed-expert dispatch via device-indexed merged kernels ──────────
         //
@@ -547,7 +572,28 @@ pub fn run_moe_decode(
         // routed_indexable_mqN flag — so the mixed "mq6-down" file (gate_up MQ4,
         // down MQ6) dispatches the MQ4 gate_up GEMV and the MQ6 down GEMV. The
         // all-MQ4 and all-MQ6 files select the same kernels as before (byte-identical).
-        if res.routed_indexable_paro {
+        if use_megakernel {
+            // ONE cooperative launch runs the entire routed core: gate_up →
+            // grid.sync → silu+FWHT → grid.sync → down + K_TOP weighted-combine +
+            // residual add. Token-id identical to the split gate_up/silu/down
+            // path below; `mq4_down_fused` skips the trailing combine. `d` = hidden
+            // (= down_m = gate_up_k), `f` = mi (per-expert FFN width = down_k).
+            hip!(gpu.moe_megakernel_mq4_hfq4g256(
+                p.expert_gate_up_ptrs,
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                p.rot_batch,
+                out_target,
+                down_m,
+                p.mi,
+                p.k,
+            ))?;
+            mq4_down_fused = true;
+        } else if res.routed_indexable_paro {
             hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
@@ -666,7 +712,9 @@ pub fn run_moe_decode(
         }
 
         // Gate→down: fused silu+mul+rotate
-        if res.routed_indexable_paro {
+        if use_megakernel {
+            // silu+FWHT already run inside the megakernel above.
+        } else if res.routed_indexable_paro {
             let paro_down = p
                 .routed_down_paro
                 .as_ref()
@@ -709,7 +757,10 @@ pub fn run_moe_decode(
 
         // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
         // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-        if let Some(tags) = p.expert_dtype_tags {
+        if use_megakernel {
+            // down + K_TOP weighted-combine + residual already run inside the
+            // megakernel above (mq4_down_fused set → trailing combine skipped).
+        } else if let Some(tags) = p.expert_dtype_tags {
             // Per-expert mixed down (graded MQ6 hot / MQ2-Lloyd cold). One
             // merged kernel; block-per-(row,krank,token) reads tags[expert_id]
             // (block-uniform → no warp divergence) and branches the dequant.

@@ -1332,6 +1332,22 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip");
 
+/// Fused MoE routed-core MEGAKERNEL (mq4 / uniform HFQ4-G256). One
+/// cooperative-launch dispatch runs all three decode routed-core stages —
+/// gate_up GEMV → grid.sync → SwiGLU+FWHT rotate → grid.sync →
+/// down GEMV + K_TOP weighted-accumulate + residual add — collapsing the
+/// three separate dispatches (and their ~45 µs/kernel GPU-side inter-launch
+/// gaps) into one. Each stage's arithmetic is copied VERBATIM from its
+/// standalone kernel (`gemv_hfq4g256_moe_gate_up_k8_indexed`,
+/// `fused_silu_mul_mq_rotate`, `gemv_hfq4g256_moe_down_k8_indexed_fused_acc`);
+/// only the block→work mapping changes (grid-stride onto the fixed co-resident
+/// grid), so output is token-id identical to the `HIPFIRE_MOE_DOWN_FUSED=1`
+/// split path. Wave32-only (RDNA); requires cooperative launch (all blocks
+/// co-resident) so it cannot be hipGraph-captured — opt-in via
+/// `HIPFIRE_MOE_MEGAKERNEL=1` at the dispatch layer, graph-capture OFF.
+pub const MOE_MEGAKERNEL_MQ4_SRC: &str =
+    include_str!("../../../kernels/src/moe_megakernel_mq4.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
 /// with `MOE_DOWN_COMBINE_K8_BATCHED_SRC` for the K_TOP fold. Closes the
