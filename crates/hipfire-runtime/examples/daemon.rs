@@ -2492,8 +2492,12 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
 
     fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
         // Fresh-context reset: per-rank state.reset() (mirrors single-GPU
-        // MinimaxDispatch::reset, looped over ranks). The per-TURN LCP prefix rewind
-        // is the arm's preamble, not this hook (ar_generate doesn't call reset).
+        // MinimaxDispatch::reset, looped over ranks). Unlike Deepseek4EpDispatch::reset
+        // this needs NO zero_decode_caches / invalidate_graph_state — MiniMax uses
+        // standard attention (KV overwritten by re-prefill) with no position-indexed
+        // decode caches (matches the deleted ep_serve_minimax's reset). The per-TURN
+        // LCP prefix rewind is the arm's preamble, not this hook (ar_generate doesn't
+        // call reset).
         if let Some(EpState { inner, .. }) = self.m.ep.as_mut() {
             if let EpArch::Minimax { state, .. } = inner {
                 for s in state.iter_mut() {
@@ -5168,7 +5172,6 @@ fn generate_ep(
                 primed_think,
                 stop,
                 sampling,
-                None,
             );
         }
         _ => {
@@ -5189,7 +5192,6 @@ fn generate_ep(
                 tools,
                 stop,
                 sampling,
-                None,
             );
         }
     }
@@ -5236,7 +5238,6 @@ fn ep_serve_ds4_via_ar_generate(
     tools: Option<&[serde_json::Value]>,
     stop: &[String],
     sampling: EpSampling,
-    tape: Option<&mut TokenTape>,
 ) {
     // Capacity guard (was ep_serve_ds4's O2b-2 guard, lost in the flip): EP
     // cold-prefills the FULL prompt every turn (no LCP), so the absolute KV span is
@@ -5293,7 +5294,7 @@ fn ep_serve_ds4_via_ar_generate(
         None,                // pflash_bypass_reason
         None,                // pflash_alpha
         std::time::Instant::now(),
-        tape,
+        None, // tape (dual-run scaffolding removed at the flip)
     );
 }
 
@@ -5314,7 +5315,6 @@ fn ep_serve_minimax_via_ar_generate(
     primed_think: bool,
     stop: &[String],
     sampling: EpSampling,
-    tape: Option<&mut TokenTape>,
 ) {
     let prompt_n = prompt_ids.len();
     // Capacity guard (mirror ep_serve_minimax): absolute KV span is prompt_n +
@@ -5401,7 +5401,7 @@ fn ep_serve_minimax_via_ar_generate(
         None, // pflash_bypass_reason
         None, // pflash_alpha
         std::time::Instant::now(),
-        tape,
+        None, // tape (dual-run scaffolding removed at the flip)
     );
 }
 
@@ -5628,6 +5628,37 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(ref mut ad) = m.kv_adaptive {
         ad.reset();
     }
+    // Mesh (multi-GPU) state. The flipped EP/dense serve paths already reset per
+    // turn (generate_ep's ep_reset_ds4_state / minimax's LCP rewind / dense's cold
+    // re-prefill from pos 0), so this is belt-and-suspenders — but it makes the
+    // `reset` command EXPLICITLY correct instead of relying on the per-turn-reset
+    // invariant (the eos-checklist lesson: "confirm model_reset_context resets the
+    // arch"). Uses `m.ep.gpus`, NOT the passed single-GPU `gpu` (distinct handles).
+    if let Some(EpState { gpus, inner }) = m.ep.as_mut() {
+        match inner {
+            EpArch::Ds4 { state, .. } => {
+                for (rank, s) in state.iter_mut().enumerate() {
+                    let g = &mut gpus.devices[rank];
+                    let _ = g.bind_thread();
+                    s.reset();
+                    s.zero_decode_caches(g);
+                    g.invalidate_graph_state();
+                }
+            }
+            EpArch::Minimax { state, .. } => {
+                // MiniMax uses standard attention (KV overwritten by re-prefill) with
+                // no position-indexed decode caches, so a per-rank `state.reset()` is
+                // sufficient — the extra ds4 zero_decode_caches/invalidate_graph_state
+                // steps aren't needed (matches the deleted ep_serve_minimax's reset).
+                for s in state.iter_mut() {
+                    s.reset();
+                }
+            }
+        }
+    }
+    // Dense TP/PP (m.tp / m.pp_dense) are stateless per request — KV is overwritten
+    // by the next turn's re-prefill from pos 0, so clearing seq_pos/conversation_tokens
+    // above is sufficient; the models expose no reset and need none.
 }
 
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
