@@ -1571,6 +1571,18 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
     fn vocab_size(&self) -> usize {
         self.m.minimax().map(|b| b.config.vocab_size).unwrap_or(0)
     }
+
+    fn eos_filter_config(&self) -> hipfire_runtime::eos_filter::EosFilterConfig {
+        // MiniMax's eos token IS the `[e~[` turn-end marker (loader eos candidate,
+        // carriers.rs). It decodes to that literal (not empty like ChatML `<|im_end|>`),
+        // so ar_generate — which commits+emits the eos token before its is_eos break —
+        // would leak it into the visible stream. Strip it here. The legacy loop broke
+        // pre-emit; this restores that suppression on eos-terminated turns.
+        hipfire_runtime::eos_filter::EosFilterConfig {
+            stop_at: vec![b"[e~[".to_vec()],
+            ..Default::default()
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -8000,7 +8012,9 @@ fn ar_generate(
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
+    // Per-arch output filter (default empty pass-through; minimax strips its `[e~[`
+    // eos marker, which ar_generate commits+emits before the is_eos break).
+    let mut filter = EosFilter::new(dispatch.eos_filter_config());
     let mut alert_fired = false;
     let mut think_count: usize = 0;
     let mut prev_in_think: bool = false;

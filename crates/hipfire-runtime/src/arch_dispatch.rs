@@ -246,6 +246,20 @@ pub trait ArchDispatch {
         0
     }
 
+    /// Output-stream filter config for this arch's decode loop. Default = the
+    /// empty pass-through (`EosFilterConfig::default()`), correct for arches
+    /// whose eos / special tokens decode to EMPTY text (e.g. ChatML `<|im_end|>`,
+    /// which never reaches the visible stream). Arches whose structural eos
+    /// marker decodes to a LITERAL that would otherwise leak into visible output
+    /// override this to strip it — `ar_generate` commits then emits the eos token
+    /// before the `is_eos` break, so the marker must be filtered here (e.g.
+    /// MiniMax `[e~[`). Off-arch behavior is unchanged (default is byte-identical
+    /// to the prior `EosFilterConfig::default()`).
+    #[allow(dead_code)]
+    fn eos_filter_config(&self) -> crate::eos_filter::EosFilterConfig {
+        crate::eos_filter::EosFilterConfig::default()
+    }
+
     /// The arch's batched-prefill chunk boundary (qwen35 `PREFILL_MAX_BATCH`).
     #[allow(dead_code)]
     fn prefill_max_batch(&self) -> usize {
