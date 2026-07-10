@@ -8167,27 +8167,85 @@ fn ar_generate(
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
-    // Per-arch output filter (default empty pass-through; minimax strips its `[e~[`
-    // eos marker, which ar_generate commits+emits before the is_eos break).
-    let mut filter = EosFilter::new(dispatch.eos_filter_config());
     let mut alert_fired = false;
-    let mut think_count: usize = 0;
-    let mut prev_in_think: bool = false;
-    let mut force_answer_latched = false;
     let think_open_tok = dispatch.tokenizer().special_token_id("<think>");
     let max_total_think: usize = std::env::var("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let mut total_think_tokens: usize = 0;
     let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(768);
-    let mut latch_gen_mark: Option<usize> = None;
 
-    let loop_guard =
-        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+    // Output parser (Inc Axis-A). `DefaultStreamParser` reproduces the inline emit /
+    // stop-seq / think-cap (force-close surfaced via next_forced) / n-gram behavior.
+    // Budget-alert stays DRIVER-side (cfg `budget_alert_at_tok=0`); its nudge tokens
+    // emit through `parser.emit_only`. The parser owns the EosFilter; the driver owns
+    // `streamed_tokens` + `bytes_fed_to_filter` and hands the running-vector byte delta.
+    let mut parser = dispatch.stream_parser(
+        hipfire_runtime::stream_parser::DefaultStreamParserConfig {
+            eos_filter: dispatch.eos_filter_config(),
+            stop_seqs: stop.to_vec(),
+            max_tokens,
+            max_think_tokens,
+            think_continuation_ids: dispatch.tokenizer().encode(&think_continuation()),
+            max_total_think,
+            post_latch_answer_budget,
+            budget_alert_at_tok: 0,
+            budget_alert_ids: Vec::new(),
+            started_in_think: matches!(
+                assistant_prefix,
+                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+            ),
+        },
+    );
+
+    // Execute a StreamAction the parser returned (token/reasoning/info/tool_calls);
+    // `Stop` is handled by the caller. Mirrors the legacy inline writes byte-for-byte.
+    macro_rules! exec_stream_action {
+        ($act:expr) => {{
+            match $act {
+                hipfire_runtime::stream_parser::StreamAction::Emit { text, reasoning } => {
+                    if reasoning {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"token","id":"{}","text":{},"reasoning":true}}"#,
+                            id,
+                            serde_json::to_string(&text).unwrap_or_default()
+                        );
+                    } else {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"token","id":"{}","text":{}}}"#,
+                            id,
+                            serde_json::to_string(&text).unwrap_or_default()
+                        );
+                    }
+                    let _ = stdout.flush();
+                }
+                hipfire_runtime::stream_parser::StreamAction::Info(msg) => {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","id":"{}","message":{}}}"#,
+                        id,
+                        serde_json::to_string(&msg).unwrap_or_default()
+                    );
+                    let _ = stdout.flush();
+                }
+                hipfire_runtime::stream_parser::StreamAction::ToolCalls(v) => {
+                    let _ = writeln!(stdout, r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#, id, v);
+                    let _ = stdout.flush();
+                }
+                hipfire_runtime::stream_parser::StreamAction::Stop => {}
+            }
+        }};
+    }
+
+    // Whether `next_token` came from the parser's forced queue (think-cap splice).
+    // Forced tokens are emit-only (bypass the guards, matching the legacy inline
+    // splice); sampled tokens go through `feed`. tok0 is sampled → false.
+    let mut was_forced = false;
 
     while generated < max_tokens {
         if check_abort(id) {
@@ -8223,19 +8281,14 @@ fn ar_generate(
             streamed_tokens.len() - 1,
             t0.elapsed().as_millis() as u64,
         );
-        let all_bytes = dispatch.tokenizer().decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-        bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            let text = std::str::from_utf8(&text_bytes).unwrap();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"token","id":"{}","text":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default()
-            );
-            let _ = stdout.flush();
-        }
+        // Running-vector byte delta (BPE detok is non-local → whole-vector diff, the
+        // exact stream the legacy filter consumed). The parser owns its EosFilter.
+        let new_bytes: Vec<u8> = {
+            let all_bytes = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+            let nb = all_bytes[bytes_fed_to_filter..].to_vec();
+            bytes_fed_to_filter = all_bytes.len();
+            nb
+        };
 
         dispatch
             .decode_step_forward(gpu, next_token, seq_pos)
@@ -8249,136 +8302,49 @@ fn ar_generate(
         }
         dispatch.maybe_adaptive_downshift(gpu, seq_pos);
 
-        // Arch-specific eos/terminator set (qwen35 = eos||terminator; qwen2 =
-        // eos_token_ids set). im_end + stop-seqs stay driver-generic below.
-        if dispatch.is_eos(next_token) {
-            break;
-        }
-        if im_end_token == Some(next_token) {
-            break;
-        }
-
-        if !stop.is_empty() {
-            let decoded_suffix = dispatch.tokenizer().decode(&streamed_tokens);
-            if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                break;
-            }
-        }
-
-        // max_think_tokens / total-think / force-answer enforcement.
-        let force_answer_now = check_force_answer(id);
-        if force_answer_now {
-            force_answer_latched = true;
-        }
-        if max_think_tokens > 0 || force_answer_now || force_answer_latched || max_total_think > 0 {
-            let raw_so_far = dispatch.tokenizer().decode_bytes(&streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(
-                raw_str,
-                matches!(
-                    assistant_prefix,
-                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                ),
-            );
-            if in_think {
-                total_think_tokens += 1;
-            }
-            if max_total_think > 0 && total_think_tokens >= max_total_think {
-                force_answer_latched = true;
-            }
-            if force_answer_latched && latch_gen_mark.is_none() {
-                latch_gen_mark = Some(generated);
-            }
-            if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
-                eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
-                break;
-            }
-            if let Some(mark) = latch_gen_mark {
-                if generated.saturating_sub(mark) >= post_latch_answer_budget {
-                    eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
+        // ── eos / im_end terminal token (CommitAndStop) ──────────────────────
+        // The legacy loop emitted+forwarded the eos token then broke BEFORE the guard
+        // block; `emit_only` reproduces that (filter emit, no think/n-gram/stop guards).
+        if dispatch.is_eos(next_token) || im_end_token == Some(next_token) {
+            match parser.on_eos() {
+                hipfire_runtime::stream_parser::EosDecision::Stop => break,
+                hipfire_runtime::stream_parser::EosDecision::CommitAndStop => {
+                    for act in parser.emit_only(next_token, &new_bytes) {
+                        exec_stream_action!(act);
+                    }
+                    break;
+                }
+                hipfire_runtime::stream_parser::EosDecision::Inject(_toks) => {
+                    // DefaultStreamParser returns only CommitAndStop; Inject is
+                    // cohere2moe's empty-turn guard (Task 7), which needs the eos checked
+                    // BEFORE commit — a structural loop change deferred to that task.
                     break;
                 }
             }
-            if max_think_tokens > 0 {
-                if in_think {
-                    if !prev_in_think {
-                        think_count = 1;
-                    } else {
-                        think_count += 1;
-                    }
+        }
+
+        // ── Output shaping + guards ──────────────────────────────────────────
+        // Forced tokens (think-cap continuation splice) bypass the guards via
+        // `emit_only` (the legacy inline splice forwarded them without re-running the
+        // guards). Sampled tokens go through `feed` (emit + stop-seq + think-cap enqueue
+        // + n-gram); a `Stop` action breaks the loop.
+        if was_forced {
+            for act in parser.emit_only(next_token, &new_bytes) {
+                exec_stream_action!(act);
+            }
+        } else {
+            parser.note_force_answer(check_force_answer(id));
+            let mut feed_stop = false;
+            for act in parser.feed(next_token, &new_bytes) {
+                if matches!(act, hipfire_runtime::stream_parser::StreamAction::Stop) {
+                    feed_stop = true;
                 } else {
-                    think_count = 0;
-                }
-                prev_in_think = in_think;
-            }
-            let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
-
-            if in_think && (budget_hit || force_answer_now || force_answer_latched) {
-                if force_answer_now {
-                    eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
-                } else if force_answer_latched {
-                    eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
-                }
-                let close_tokens = dispatch.tokenizer().encode(&think_continuation());
-                let budget_left = max_tokens.saturating_sub(generated);
-                let take = close_tokens.len().min(budget_left);
-                for &t in &close_tokens[..take] {
-                    dispatch.decode_step_forward(gpu, t, seq_pos).unwrap();
-                    seq_pos += 1;
-                    if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
-                        seq_pos = new_phys;
-                    }
-                    dispatch.conversation_tokens_mut().push(t);
-                    if grammar_active {
-                        let text = dispatch.tokenizer().decode(&[t]);
-                        matcher.as_mut().unwrap().advance(&text);
-                    }
-                    streamed_tokens.push(t);
-                    if let Some(tp) = tape.as_deref_mut() {
-                        tp.push(t);
-                    }
-                    emit_committed_event(
-                        stdout,
-                        id,
-                        t,
-                        streamed_tokens.len() - 1,
-                        t0.elapsed().as_millis() as u64,
-                    );
-                    let all_bytes = dispatch.tokenizer().decode_bytes(&streamed_tokens);
-                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                        let text = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{}}}"#,
-                            id,
-                            serde_json::to_string(&text).unwrap_or_default()
-                        );
-                        let _ = stdout.flush();
-                    }
-                    generated += 1;
-                }
-                think_count = 0;
-                prev_in_think = false;
-                if generated >= max_tokens {
-                    break;
+                    exec_stream_action!(act);
                 }
             }
-        }
-
-        // N-gram loop detector.
-        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-            loop_guard.check(&streamed_tokens)
-        {
-            let window_len = loop_guard.window_len(streamed_tokens.len());
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                id, count, window_len
-            );
-            let _ = stdout.flush();
-            break;
+            if feed_stop {
+                break;
+            }
         }
 
         // Budget-alert injection.
@@ -8443,6 +8409,7 @@ fn ar_generate(
                     let text = dispatch.tokenizer().decode(&[next_token]);
                     matcher.as_mut().unwrap().advance(&text);
                 }
+                was_forced = false;
                 continue;
             }
             let nudge_tokens = dispatch.tokenizer().encode(budget_alert_text);
@@ -8470,18 +8437,16 @@ fn ar_generate(
                         streamed_tokens.len() - 1,
                         t0.elapsed().as_millis() as u64,
                     );
-                    let all_bytes2 = dispatch.tokenizer().decode_bytes(&streamed_tokens);
-                    let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes2.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes2) {
-                        let t = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{}}}"#,
-                            id,
-                            serde_json::to_string(&t).unwrap_or_default()
-                        );
-                        let _ = stdout.flush();
+                    let new_bytes2: Vec<u8> = {
+                        let all_bytes2 = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+                        let nb = all_bytes2[bytes_fed_to_filter..].to_vec();
+                        bytes_fed_to_filter = all_bytes2.len();
+                        nb
+                    };
+                    // Nudge tokens bypass the guards (like the think-cap splice) — emit
+                    // through the parser's filter, no feed().
+                    for act in parser.emit_only(tok, &new_bytes2) {
+                        exec_stream_action!(act);
                     }
                     dispatch.decode_step_forward(gpu, tok, seq_pos).unwrap();
                     seq_pos += 1;
@@ -8510,6 +8475,20 @@ fn ar_generate(
             }
         }
 
+        // Next token: forced (think-cap continuation splice, drained one at a time) or
+        // the steady-state sample. Forced tokens are emit-only at the top of the next
+        // iteration (was_forced), matching the legacy inline splice.
+        if let Some(f) = parser.next_forced() {
+            next_token = f;
+            was_forced = true;
+            if grammar_active {
+                let text = dispatch.tokenizer().decode(&[f]);
+                matcher.as_mut().unwrap().advance(&text);
+            }
+            continue;
+        }
+        was_forced = false;
+
         // Steady-state sample.
         let ngram_scope: &[u32] = &streamed_tokens;
         let mut blocked: Vec<u32> = Vec::new();
@@ -8520,7 +8499,7 @@ fn ar_generate(
             2,
             &mut blocked,
         );
-        if force_answer_latched {
+        if parser.force_answer_latched() {
             if let Some(t) = think_open_tok {
                 blocked.push(t);
             }

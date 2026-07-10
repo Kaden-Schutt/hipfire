@@ -45,6 +45,36 @@ pub trait StreamParser {
     /// Consume a committed token: its id + the running-vector byte delta.
     fn feed(&mut self, tok: u32, bytes: &[u8]) -> Vec<StreamAction>;
 
+    /// The driver calls this each iteration with the external force-answer signal
+    /// (`check_force_answer(id)`) before the forced/sample decision; default no-op.
+    fn note_force_answer(&mut self, now: bool) {
+        let _ = now;
+    }
+
+    /// Whether the force-answer latch is set — the driver's steady-state sampler blocks
+    /// the `<think>` re-open token when latched (ar_generate 8523). Default false.
+    fn force_answer_latched(&self) -> bool {
+        false
+    }
+
+    /// Emit a token's bytes through the output filter WITHOUT running the guards
+    /// (think-cap / n-gram / stop-seq / budget). Used for the terminal eos token on
+    /// `EosDecision::CommitAndStop`: the legacy loop emits+forwards the eos token then
+    /// breaks BEFORE the guard block, so running feed's guards on it would diverge
+    /// (spurious Info / think-enqueue). Default treats the bytes as a plain visible
+    /// emit; `DefaultStreamParser` overrides to route them through its EosFilter (so a
+    /// marker-eos is stripped, matching the legacy filter behavior).
+    fn emit_only(&mut self, tok: u32, bytes: &[u8]) -> Vec<StreamAction> {
+        let _ = tok;
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        vec![StreamAction::Emit {
+            text: String::from_utf8_lossy(bytes).into_owned(),
+            reasoning: false,
+        }]
+    }
+
     /// End of generation. Flush pending bytes / recover tool-calls-from-text.
     fn finish(&mut self) -> Vec<StreamAction> {
         Vec::new()
@@ -161,15 +191,6 @@ impl DefaultStreamParser {
         }
     }
 
-    /// The driver calls this each iteration with `check_force_answer(id)` (the external
-    /// per-request signal). Latches like ar_generate 8269–8272.
-    pub fn note_force_answer(&mut self, now: bool) {
-        self.force_answer_now = now;
-        if now {
-            self.force_answer_latched = true;
-        }
-    }
-
     fn in_think(&self) -> bool {
         let raw = std::str::from_utf8(&self.decoded).unwrap_or("");
         crate::emit_text::currently_in_think(raw, self.cfg.started_in_think)
@@ -180,6 +201,18 @@ impl StreamParser for DefaultStreamParser {
     fn next_forced(&mut self) -> Option<u32> {
         // Think-cap / budget-alert enqueue happens in feed(); next_forced drains it.
         self.forced.pop_front()
+    }
+
+    fn note_force_answer(&mut self, now: bool) {
+        // Latches like ar_generate 8269–8272.
+        self.force_answer_now = now;
+        if now {
+            self.force_answer_latched = true;
+        }
+    }
+
+    fn force_answer_latched(&self) -> bool {
+        self.force_answer_latched
     }
 
     fn feed(&mut self, tok: u32, bytes: &[u8]) -> Vec<StreamAction> {
@@ -300,6 +333,24 @@ impl StreamParser for DefaultStreamParser {
             }
         }
 
+        acts
+    }
+
+    fn emit_only(&mut self, tok: u32, bytes: &[u8]) -> Vec<StreamAction> {
+        // Terminal eos: emit through the filter (a marker-eos is stripped), update the
+        // accumulators for consistency, but run NO guards (the legacy loop breaks before
+        // the guard block on eos). No `generated`/think-counter mutation.
+        self.streamed.push(tok);
+        self.decoded.extend_from_slice(bytes);
+        let mut acts = Vec::new();
+        if let FilterAction::Emit(text_bytes) = self.filter.observe(bytes) {
+            if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                acts.push(StreamAction::Emit {
+                    text: text.to_string(),
+                    reasoning: false,
+                });
+            }
+        }
         acts
     }
 

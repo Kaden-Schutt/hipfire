@@ -260,6 +260,17 @@ pub trait ArchDispatch {
         crate::eos_filter::EosFilterConfig::default()
     }
 
+    /// The per-request output parser. Default builds a `DefaultStreamParser` from the
+    /// driver-supplied config (reproduces the inline emit / stop-seq / think-cap /
+    /// n-gram path). Arches with structured output (cohere2moe markers) override.
+    #[allow(dead_code)]
+    fn stream_parser(
+        &self,
+        cfg: crate::stream_parser::DefaultStreamParserConfig,
+    ) -> Box<dyn crate::stream_parser::StreamParser> {
+        Box::new(crate::stream_parser::DefaultStreamParser::new(cfg))
+    }
+
     /// The arch's batched-prefill chunk boundary (qwen35 `PREFILL_MAX_BATCH`).
     #[allow(dead_code)]
     fn prefill_max_batch(&self) -> usize {
