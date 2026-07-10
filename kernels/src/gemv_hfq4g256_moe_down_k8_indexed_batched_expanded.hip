@@ -71,6 +71,16 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     const char* row_ptr3 = A + (long long)(have_row3 ? row3 : row0) * row_stride;
     const int boff = tid * 4;
 
+    // gfx12: initiate the four first-demand group-0 cacheline fetches while
+    // the existing x float4 hoist provides independent VMEM work.  Group 1
+    // is adjacent and already covered by the group-0 compute window.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr0, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr1, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr2, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr3, 0);
+#endif
+
     // 2 live pairwise slots/row (acc2/acc3 would stay 0 on groups==2).
     float acc0 = 0.0f, acc1 = 0.0f;
     float bcc0 = 0.0f, bcc1 = 0.0f;
@@ -144,3 +154,4 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         if (have_row3) expert_outputs[out_base + row3] = dcc;
     }
 }
+
