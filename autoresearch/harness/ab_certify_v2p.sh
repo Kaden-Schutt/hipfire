@@ -14,6 +14,7 @@ ARCH=$1 DEV=$2 CARD=$3 MODEL=$4 KERNEL=$5 LABEL=$6 VARIANT=$7
 MAIN="${AR_MAIN:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/../.." && pwd)}"   # derive repo root from THIS script's location (was ~/hipfire); AR_MAIN overrides. Makes deps/ledger/worktree resolve against whichever checkout invoked the grader.
 WT="${WT_OVERRIDE:-$MAIN/.aw/sw_card${CARD}}"   # WT_OVERRIDE = per-worker worktree for the swarm (parallel builds must not share kernels/src+target)
 export PATH=$HOME/.bun/bin:$PATH
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"; export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"   # pin the Rust toolchain BEFORE the HOME override (else rustup can't find its default toolchain in the isolated .swhome)
 export HOME="$WT/.swhome"; mkdir -p "$HOME/.hipfire"
 export HIPFIRE_DAEMON_ID="sw_card${CARD}"; ID="$HIPFIRE_DAEMON_ID"
 export CARGO_TARGET_DIR="$WT/target"
