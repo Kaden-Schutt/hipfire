@@ -8739,6 +8739,14 @@ fn ar_generate(
         }
     }
 
+    // End-of-generation flush. DefaultStreamParser returns nothing here (byte-identical
+    // for the 5 simple arches); Cohere2MoeStreamParser runs its tool-call-as-text recovery
+    // (re-parses vis_buf for a Cohere action written as visible text — Guard 4), emitting a
+    // `tool_calls` event the driver's ChatML `extract_tool_calls_from_text` below cannot.
+    for act in parser.finish() {
+        exec_stream_action!(act);
+    }
+
     // ChatML \n trailer after <|im_end|>.
     let last_conv = dispatch
         .conversation_tokens_mut()
