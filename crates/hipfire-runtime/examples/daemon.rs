@@ -12233,6 +12233,265 @@ fn generate_minimax(
 /// per-token `decode_step` (no hipGraph variant yet). Out of scope (NOT wired):
 /// spec-decode, MTP, grammar-constrained decoding, tool EXECUTION, repeat
 /// penalty, multi-GPU.
+/// StreamParser for cohere2moe / North-Mini-Code (arch 12) — a verbatim port of the
+/// agentic-marker state machine in `generate_cohere2moe`'s decode loop (daemon.rs
+/// ~12660–12866). Sampling stays in the driver; this owns output routing + stop /
+/// forced-injection. Built-only until Task 7 wires `generate_cohere2moe` onto
+/// `ar_generate`. Faithful (NOT byte-identical) — validated by event equivalence +
+/// `coherence-gate-cohere2moe.sh`, since token-parity is blind to the tool_calls /
+/// reasoning EVENTS that are this arch's whole point.
+#[allow(dead_code)]
+struct Cohere2MoeStreamParser {
+    sec: C2mSec,
+    action_buf: String,
+    vis_buf: String,
+    forced: std::collections::VecDeque<u32>,
+    think_count: usize,
+    think_budget: usize,
+    think_force_closed: bool,
+    empty_turn_guard: bool,
+    emitted_visible: bool,
+    eos_suppressions: usize,
+    tool_calls_emitted: bool,
+    last_tok: u32,
+    repeat_run: usize,
+    mk_think0: u32,
+    mk_think1: u32,
+    mk_text0: u32,
+    mk_text1: u32,
+    mk_act0: u32,
+    mk_act1: u32,
+    pad_tok: Option<u32>,
+    known_tools: Vec<String>,
+    tool_params: Vec<(String, Vec<String>)>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+#[allow(dead_code)]
+enum C2mSec {
+    Pre,
+    Think,
+    Text,
+    Action,
+}
+
+#[allow(dead_code)]
+impl Cohere2MoeStreamParser {
+    const REPEAT_GUARD: usize = 24;
+    const MAX_EOS_SUPPRESS: usize = 3;
+
+    /// Mirrors the setup block at generate_cohere2moe ~12560–12659: resolve the 6
+    /// marker ids + `<PAD>`, build `known_tools`/`tool_params` from the schemas, and
+    /// compute `think_budget` (the `think_reserve` clamp).
+    fn new(
+        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        tools: Option<&[serde_json::Value]>,
+        max_tokens: usize,
+        max_think_tokens: usize,
+    ) -> Self {
+        let mark = |s: &str, fb: u32| -> u32 { tokenizer.special_token_id(s).unwrap_or(fb) };
+        let known_tools: Vec<String> = tools
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| {
+                        t.get("function")
+                            .and_then(|f| f.get("name"))
+                            .or_else(|| t.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tool_params: Vec<(String, Vec<String>)> = tools
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| {
+                        let f = t.get("function").unwrap_or(t);
+                        let name = f.get("name").and_then(|n| n.as_str())?.to_string();
+                        let params = f
+                            .get("parameters")
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|o| o.keys().cloned().collect())
+                            .unwrap_or_default();
+                        Some((name, params))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let think_reserve = (max_tokens / 4).clamp(64, 512).min(max_tokens / 2);
+        let think_budget = if max_think_tokens > 1 {
+            max_think_tokens.min(max_tokens.saturating_sub(think_reserve))
+        } else {
+            max_tokens.saturating_sub(think_reserve)
+        };
+        Self {
+            sec: C2mSec::Pre,
+            action_buf: String::new(),
+            vis_buf: String::new(),
+            forced: std::collections::VecDeque::new(),
+            think_count: 0,
+            think_budget,
+            think_force_closed: false,
+            empty_turn_guard: std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD").ok().as_deref()
+                != Some("0"),
+            emitted_visible: false,
+            eos_suppressions: 0,
+            tool_calls_emitted: false,
+            last_tok: u32::MAX,
+            repeat_run: 0,
+            mk_think0: mark("<|START_THINKING|>", 255010),
+            mk_think1: mark("<|END_THINKING|>", 255011),
+            mk_text0: mark("<|START_TEXT|>", 255012),
+            mk_text1: mark("<|END_TEXT|>", 255013),
+            mk_act0: mark("<|START_ACTION|>", 255014),
+            mk_act1: mark("<|END_ACTION|>", 255015),
+            pad_tok: tokenizer.special_token_id("<PAD>"),
+            known_tools,
+            tool_params,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::stream_parser::StreamParser for Cohere2MoeStreamParser {
+    fn next_forced(&mut self) -> Option<u32> {
+        // Pre-sample think-budget force-close (12667–12681): only when the queue is
+        // empty and we're still reasoning past budget with nothing visible.
+        if self.empty_turn_guard
+            && self.forced.is_empty()
+            && !self.think_force_closed
+            && !self.emitted_visible
+            && self.sec == C2mSec::Think
+            && self.think_count >= self.think_budget
+        {
+            self.forced.push_back(self.mk_think1);
+            self.forced.push_back(self.mk_text0);
+            self.think_force_closed = true;
+        }
+        self.forced.pop_front()
+    }
+
+    fn on_eos(&mut self) -> hipfire_runtime::stream_parser::EosDecision {
+        use hipfire_runtime::stream_parser::EosDecision;
+        // Empty-turn guard (12687–12709): a reasoning-only turn ending with no visible
+        // output — inject START_TEXT (closing THINK first if still inside) instead of
+        // committing the eos. Bounded to MAX_EOS_SUPPRESS.
+        if self.empty_turn_guard
+            && !self.emitted_visible
+            && self.eos_suppressions < Self::MAX_EOS_SUPPRESS
+        {
+            self.eos_suppressions += 1;
+            let mut v = Vec::new();
+            if self.sec == C2mSec::Think {
+                v.push(self.mk_think1);
+            }
+            v.push(self.mk_text0);
+            EosDecision::Inject(v)
+        } else {
+            // cohere2moe does NOT commit the eos (legacy breaks pre-commit at 12708).
+            EosDecision::Stop
+        }
+    }
+
+    fn enqueue(&mut self, tok: u32) {
+        self.forced.push_back(tok);
+    }
+
+    fn feed(&mut self, tok: u32, bytes: &[u8]) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
+        use hipfire_runtime::stream_parser::StreamAction;
+        let mut acts = Vec::new();
+
+        // Degenerate-output guards (12715–12735). NB: in the StreamParser model the
+        // driver has already committed `tok`; a degenerate stop that commits one extra
+        // <PAD>/attractor token before aborting is immaterial (the turn is garbage).
+        if Some(tok) == self.pad_tok {
+            acts.push(StreamAction::Stop);
+            return acts;
+        }
+        if tok == self.last_tok {
+            self.repeat_run += 1;
+            if self.repeat_run >= Self::REPEAT_GUARD {
+                acts.push(StreamAction::Stop);
+                return acts;
+            }
+        } else {
+            self.last_tok = tok;
+            self.repeat_run = 1;
+        }
+
+        // Agentic-marker state machine (12750–12822) — markers themselves never emit.
+        if tok == self.mk_think0 {
+            self.sec = C2mSec::Think;
+        } else if tok == self.mk_text0 {
+            self.sec = C2mSec::Text;
+        } else if tok == self.mk_act0 {
+            self.sec = C2mSec::Action;
+            self.action_buf.clear();
+        } else if tok == self.mk_think1 || tok == self.mk_text1 {
+            self.sec = C2mSec::Pre;
+        } else if tok == self.mk_act1 {
+            let mut calls = cohere2moe::spec_emit::parse_cohere_action(&self.action_buf);
+            cohere2moe::spec_emit::snap_call_names(&mut calls, &self.known_tools, &self.tool_params);
+            if !calls.is_empty() {
+                acts.push(StreamAction::ToolCalls(serde_json::json!(calls)));
+                self.emitted_visible = true;
+                self.tool_calls_emitted = true;
+            }
+            self.sec = C2mSec::Pre;
+        } else {
+            let frag = String::from_utf8_lossy(bytes);
+            // Defense-in-depth marker suppression (12789–12796): any OTHER special
+            // token decoding to `<|UPPER_SNAKE|>` is dropped from output.
+            let is_marker = frag.len() > 4
+                && frag.starts_with("<|")
+                && frag.ends_with("|>")
+                && frag[2..frag.len() - 2]
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_');
+            if !is_marker {
+                match self.sec {
+                    C2mSec::Action => self.action_buf.push_str(&frag),
+                    C2mSec::Think => {
+                        acts.push(StreamAction::Emit {
+                            text: frag.into_owned(),
+                            reasoning: true,
+                        });
+                        self.think_count += 1;
+                    }
+                    C2mSec::Text | C2mSec::Pre => {
+                        self.vis_buf.push_str(&frag);
+                        acts.push(StreamAction::Emit {
+                            text: frag.into_owned(),
+                            reasoning: false,
+                        });
+                        self.emitted_visible = true;
+                    }
+                }
+            }
+        }
+        acts
+    }
+
+    fn finish(&mut self) -> Vec<hipfire_runtime::stream_parser::StreamAction> {
+        use hipfire_runtime::stream_parser::StreamAction;
+        // Tool-call-as-text recovery (12851–12866).
+        if !self.tool_calls_emitted {
+            let mut recovered = cohere2moe::spec_emit::parse_cohere_action(&self.vis_buf);
+            if !recovered.is_empty() {
+                cohere2moe::spec_emit::snap_call_names(
+                    &mut recovered,
+                    &self.known_tools,
+                    &self.tool_params,
+                );
+                return vec![StreamAction::ToolCalls(serde_json::json!(recovered))];
+            }
+        }
+        Vec::new()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_cohere2moe(
     m: &mut LoadedModel,
@@ -14357,5 +14616,72 @@ mod tool_call_parser_tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+}
+
+#[cfg(test)]
+mod c2m_stream_parser_tests {
+    use super::{C2mSec, Cohere2MoeStreamParser};
+    use hipfire_runtime::stream_parser::{StreamAction, StreamParser};
+
+    // Build a parser with explicit test marker ids (bypasses tokenizer/new()).
+    fn mk() -> Cohere2MoeStreamParser {
+        Cohere2MoeStreamParser {
+            sec: C2mSec::Pre,
+            action_buf: String::new(),
+            vis_buf: String::new(),
+            forced: std::collections::VecDeque::new(),
+            think_count: 0,
+            think_budget: usize::MAX,
+            think_force_closed: false,
+            empty_turn_guard: true,
+            emitted_visible: false,
+            eos_suppressions: 0,
+            tool_calls_emitted: false,
+            last_tok: u32::MAX,
+            repeat_run: 0,
+            mk_think0: 10,
+            mk_think1: 11,
+            mk_text0: 12,
+            mk_text1: 13,
+            mk_act0: 14,
+            mk_act1: 15,
+            pad_tok: None,
+            known_tools: Vec::new(),
+            tool_params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn section_machine_routes_and_suppresses_markers() {
+        let mut p = mk();
+        // [START_THINKING, "hi", END_THINKING, START_TEXT, "yo"]
+        assert_eq!(p.feed(10, b""), Vec::new()); // START_THINKING → Think, suppressed
+        assert_eq!(
+            p.feed(99, b"hi"),
+            vec![StreamAction::Emit { text: "hi".into(), reasoning: true }]
+        );
+        assert_eq!(p.feed(11, b""), Vec::new()); // END_THINKING → Pre, suppressed
+        assert_eq!(p.feed(12, b""), Vec::new()); // START_TEXT → Text, suppressed
+        assert_eq!(
+            p.feed(98, b"yo"),
+            vec![StreamAction::Emit { text: "yo".into(), reasoning: false }]
+        );
+    }
+
+    #[test]
+    fn empty_turn_guard_injects_start_text_then_stops() {
+        use hipfire_runtime::stream_parser::EosDecision;
+        let mut p = mk();
+        // Inside Think, nothing visible → on_eos injects [END_THINKING, START_TEXT].
+        let _ = p.feed(10, b""); // enter Think
+        match p.on_eos() {
+            EosDecision::Inject(v) => assert_eq!(v, vec![11, 12]),
+            other => panic!("expected Inject, got {other:?}"),
+        }
+        // After MAX_EOS_SUPPRESS, falls through to Stop.
+        p.emitted_visible = false;
+        p.eos_suppressions = Cohere2MoeStreamParser::MAX_EOS_SUPPRESS;
+        assert_eq!(p.on_eos(), EosDecision::Stop);
     }
 }

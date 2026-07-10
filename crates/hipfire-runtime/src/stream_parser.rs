@@ -75,6 +75,14 @@ pub trait StreamParser {
         }]
     }
 
+    /// Push a token onto the parser's forced-injection queue. The driver calls this
+    /// for each token an `on_eos()` -> `Inject(..)` returned (cohere2moe's empty-turn
+    /// guard) so the tokens surface via `next_forced()` on the next iteration. Default
+    /// no-op (DefaultStreamParser never returns `Inject`).
+    fn enqueue(&mut self, tok: u32) {
+        let _ = tok;
+    }
+
     /// End of generation. Flush pending bytes / recover tool-calls-from-text.
     fn finish(&mut self) -> Vec<StreamAction> {
         Vec::new()
