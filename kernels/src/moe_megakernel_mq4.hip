@@ -23,6 +23,24 @@ namespace cg = cooperative_groups;
 // (grid.sync + co-residency) remains, vs 4 graph nodes (3 inter-node replay
 // gaps) for the split path.
 //
+// MEASURED RESULT — DEAD FOR DECODE (2026-07-10, gfx1201 R9700, a3b mq4r, warm,
+// q8/max256). PARITY bit-exact (correct), but perf loses in EVERY config:
+//   baseline (winning) graph-ON = 157.4 tok/s
+//   this megakernel  graph-OFF  = 125.5  (-20%)
+//   this megakernel  graph-ON   =  69.5  (-56%)
+// THE finding: hipGraph makes a COOPERATIVE kernel ~2x SLOWER (125->69.5), not
+// faster. Normal kernels gain +7% from the graph; a cooperative node loses -45%.
+// Cooperative launch needs EXCLUSIVE full-device co-residency, so the runtime
+// drains the whole GPU before each of the 40 per-layer megakernel launches. Eager
+// mode hides those drains behind CPU dispatch gaps; graph replay (which exists to
+// remove CPU gaps) EXPOSES them. Cooperative launch and hipGraph are fundamentally
+// at odds — the "coop+capture works on gfx1201" fact is a PERFORMANCE TRAP.
+// Since grid.sync REQUIRES co-residency, the megakernel can never keep the +7%
+// graph the baseline relies on, and no reshape (occupancy/blocks/phases) touches
+// the per-launch drain. Dispatch-gap thesis falsified for latency-bound batch-1
+// decode. Kept opt-in default-OFF as a documented dead-end + coop/occupancy FFI
+// reference. DO NOT enable HIPFIRE_MOE_MEGAKERNEL for decode perf.
+//
 // BIT-EXACT: each phase's arithmetic + scheduling is copied VERBATIM from its
 // WINNING standalone kernel (hoist_x32 + weight-preload + notail for gate_up;
 // NR=4 + s_prefetch + x-hoist for down-expanded; unchanged silu; unchanged
