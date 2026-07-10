@@ -87,10 +87,6 @@ impl PpModel {
         // `init_uniform` bands layers across stages (layer_to_device via
         // uniform_split_counts — the same split `mesh.stage_for_layer` uses).
         let mut gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
-        // Peer access for the cross-stage boundary copy. NB: NO ensure_rank_streams
-        // / active_stream — stages stay on the sync memset + sync boundary path.
-        gpus.enable_peer_all()
-            .map_err(|e| format!("enable_peer_all: {e:?}"))?;
 
         // Layer bands from the device mapping (stage s = contiguous run of layers).
         let out_dev = gpus.output_device;
@@ -139,6 +135,16 @@ impl PpModel {
                     .map_err(|e| format!("kv{s}: {e:?}"))?,
             );
         }
+
+        // Peer access for the cross-stage boundary copy — enabled AFTER every
+        // stage's weights + scratch + KV are live. `enable_peer_all` does not
+        // retroactively map allocations made after the enable call (its
+        // documented contract), so calling it earlier would let post-alloc peer
+        // copies silently write nothing on real multi-GPU HW. NB: NO
+        // ensure_rank_streams / active_stream — stages stay on the sync memset +
+        // sync boundary path.
+        gpus.enable_peer_all()
+            .map_err(|e| format!("enable_peer_all: {e:?}"))?;
 
         Ok(PpModel {
             gpus,
@@ -381,6 +387,37 @@ impl PpModel {
         llama::forward_scratch_head(g, &self.weights, &self.config, &self.scratch[last])
             .map_err(herr)?;
         g.download_f32(&self.scratch[last].logits).map_err(herr)
+    }
+
+    /// Free every GPU allocation this PP model owns (whole weights on the output
+    /// stage + per-stage scratch + KV), then drain each device pool. Same
+    /// rationale as [`crate::tp_serve::TpModel::free`]: a bare `drop(PpModel)`
+    /// reclaimed nothing (no freeing `Drop` on `GpuTensor` / `DeviceBuffer` /
+    /// `GpuPool`, and `Gpu::drop` only re-binds), so a load/unload cycle leaked
+    /// the model.
+    pub fn free(mut self) {
+        // Whole weights live on the output stage device.
+        let out = self.gpus.output_device;
+        {
+            let g = &mut self.gpus.devices[out];
+            let _ = g.bind_thread();
+            self.weights.free_gpu(g);
+        }
+        // Per-stage scratch + KV (stage s was allocated on device s).
+        for (s, (sc, kv)) in self.scratch.into_iter().zip(self.kv).enumerate() {
+            let g = &mut self.gpus.devices[s];
+            let _ = g.bind_thread();
+            sc.free_gpu(g);
+            kv.free_gpu(g);
+        }
+        // Actually release the freed buffers back to the system, per device.
+        for dev in self.gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+        // `self.gpus` drops here → tears down stage device contexts.
     }
 }
 

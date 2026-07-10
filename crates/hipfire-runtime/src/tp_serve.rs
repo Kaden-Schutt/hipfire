@@ -144,8 +144,6 @@ impl TpModel {
         }
 
         let mut gpus = Gpus::from_mesh(mesh, n_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
-        gpus.enable_peer_all()
-            .map_err(|e| format!("enable_peer_all: {e:?}"))?;
         for dev in gpus.devices.iter_mut() {
             dev.bind_thread().map_err(|e| format!("bind: {e:?}"))?;
             let s = dev
@@ -225,6 +223,15 @@ impl TpModel {
                 norms,
             });
         }
+
+        // Peer access for the cross-rank all-reduce peer copies — enabled AFTER
+        // all weights (rank-0 full + sharded store) + KV + per-rank scratch are
+        // live. `enable_peer_all` does not retroactively map allocations made
+        // after the enable call (its documented contract), so calling it earlier
+        // would let the all-reduce peer copies silently write nothing on real
+        // multi-GPU HW.
+        gpus.enable_peer_all()
+            .map_err(|e| format!("enable_peer_all: {e:?}"))?;
 
         let mut collectives: Vec<TpCollective> = (0..16).map(|_| TpCollective::None).collect();
         collectives[8] = TpCollective::AllReduceOut { dim: d };
@@ -813,6 +820,53 @@ impl TpModel {
         let _ = g.free_tensor(tmp);
         let _ = g.free_tensor(logits);
         Ok(out)
+    }
+
+    /// Free every GPU allocation this TP model owns (per-rank buffers + KV +
+    /// replicated norms + `pos_buf`, the sharded quant store, and rank-0's full
+    /// weights), then drain each device pool so the VRAM returns to the system.
+    ///
+    /// `unload_model`'s prior bare `drop(TpModel)` reclaimed *nothing*: none of
+    /// `GpuTensor` / `hip_bridge::DeviceBuffer` / `GpuPool` has a freeing `Drop`,
+    /// and `Gpu::drop` only re-binds the device — so every load/unload cycle
+    /// leaked the whole model. This mirrors the EP unload path in the loader:
+    /// typed frees → `drain_pool` → drop `Gpus`.
+    pub fn free(mut self) {
+        // Per-rank buffers + norms + pos_buf + KV, each on its own rank device.
+        for (r, rank) in self.ranks.into_iter().enumerate() {
+            let g = &mut self.gpus.devices[self.group[r]];
+            let _ = g.bind_thread();
+            for t in [
+                rank.x, rank.tmp, rank.x_rot, rank.q, rank.k, rank.v, rank.attn,
+                rank.o, rank.gate, rank.up, rank.hidden, rank.fo, rank.partials,
+            ] {
+                let _ = g.free_tensor(t);
+            }
+            for (a, f, q, k) in rank.norms {
+                let _ = g.free_tensor(a);
+                let _ = g.free_tensor(f);
+                let _ = g.free_tensor(q);
+                let _ = g.free_tensor(k);
+            }
+            let _ = g.hip.free(rank.pos_buf);
+            rank.kv.free_gpu(g);
+        }
+        // Sharded quant weights (spans every device).
+        self.store.free_all(&self.gpus);
+        // Rank-0 full weights (embed / lm_head / final-norm + F32 norm source).
+        {
+            let g = &mut self.gpus.devices[self.group[0]];
+            let _ = g.bind_thread();
+            self.weights.free_gpu(g);
+        }
+        // Actually release the freed buffers back to the system, per device.
+        for dev in self.gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+        // `self.gpus` drops here → tears down device contexts.
     }
 }
 

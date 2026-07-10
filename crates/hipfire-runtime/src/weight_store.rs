@@ -118,8 +118,9 @@ impl WeightStore {
 
     /// Free every resident buffer (best-effort, on the device it was uploaded
     /// to) and consume the store — the transactional rollback for
-    /// [`fulfill_manifest`]. `Alias` handles own no buffer, so they are skipped.
-    fn free_all(self, gpus: &crate::multi_gpu::Gpus) {
+    /// [`fulfill_manifest`], also the sharded-weight arm of `TpModel::free`.
+    /// `Alias` handles own no buffer, so they are skipped.
+    pub(crate) fn free_all(self, gpus: &crate::multi_gpu::Gpus) {
         for ((_, _, dev), handle) in self.placements {
             if let WeightHandle::Resident(t) = handle {
                 if let Some(g) = gpus.devices.get(dev) {

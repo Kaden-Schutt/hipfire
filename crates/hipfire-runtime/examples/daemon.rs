@@ -648,13 +648,18 @@ fn ckpt_max() -> usize {
         .max(1)
 }
 
-// ─── Token-parity harness (dual-run scaffolding, now retained for self-check) ──
+// ─── Token-parity harness (per-flip dual-run comparator; dormant in prod) ──────
 //
 // `TokenTape` accumulates committed token IDs for one pass; `assert_token_parity`
-// compares two tapes and panics with a precise divergence report on mismatch. The
-// per-arch dual-runs that used the `HIPFIRE_ARCHDISPATCH_PARITY` gate were deleted
-// at each fold's flip; these two are retained for the `--self-check-parity` CLI
-// branch (exercises them without a GPU).
+// compares two tapes and panics with a precise divergence report on mismatch.
+// This is the shadow-assert each arch flip runs LIVE (old path + new
+// `ar_generate` path on the same request, asserting token-identical) and then
+// deletes once the old path is removed — so in production it compares nothing:
+// every `ar_generate` call site passes `tape: None`. The `tape` param stays
+// threaded through `ar_generate` so the next arch flip can re-enable a dual-run
+// without re-plumbing. `--self-check-parity` exercises the comparator (both
+// directions) without a GPU — it does NOT prove old-vs-new decode parity, which
+// only the live per-flip dual-run can.
 
 #[derive(Default, Clone)]
 #[allow(dead_code)]
@@ -2932,9 +2937,12 @@ fn main() {
         return;
     }
 
-    // --self-check-parity: verify the dual-run shadow-parity harness. Constructs
-    // two identical TokenTapes, asserts parity (no panic expected), then exits 0.
-    // No GPU or model needed. Used by CI / task harness to validate Inc 1.
+    // --self-check-parity: smoke-test the dual-run COMPARATOR (no GPU, no model).
+    // This does NOT prove old-vs-new decode parity — that is the live per-flip
+    // dual-run threaded through ar_generate. It only guards that
+    // `assert_token_parity` still works in BOTH directions: accepts identical
+    // tapes AND panics on a divergence. (The prior version asserted only the
+    // first, so it proved nothing beyond "equality holds".)
     if args.iter().any(|a| a == "--self-check-parity") {
         let mut tape_a = TokenTape::default();
         let mut tape_b = TokenTape::default();
@@ -2942,8 +2950,24 @@ fn main() {
             tape_a.push(tok);
             tape_b.push(tok);
         }
-        assert_token_parity(&tape_a, &tape_b, "self-check");
-        println!("parity self-check OK");
+        // Positive: identical tapes must NOT panic.
+        assert_token_parity(&tape_a, &tape_b, "self-check-equal");
+        // Negative: a divergent tape MUST panic — else the comparator is blind
+        // and a real flip regression would slip through unnoticed.
+        let mut tape_c = tape_b.clone();
+        tape_c.push(1234);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let detected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_token_parity(&tape_a, &tape_c, "self-check-diverge")
+        }))
+        .is_err();
+        std::panic::set_hook(prev_hook);
+        assert!(
+            detected,
+            "parity comparator failed to detect a divergent tape"
+        );
+        println!("parity self-check OK (comparator accepts equal, rejects divergent)");
         return;
     }
 

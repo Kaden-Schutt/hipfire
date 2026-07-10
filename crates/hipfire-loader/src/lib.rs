@@ -1768,16 +1768,20 @@ fn load_model_ep_minimax(
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Dense-TP unload (PB-TP5): the `TpModel` owns its own `Gpus` + `WeightStore`
-    // + per-rank buffers; dropping it tears down the device contexts (reclaiming
-    // all rank VRAM), like the EP path's final `drop(gpus)`. The daemon's single
-    // `gpu` is untouched (unused for tp>1).
+    // + per-rank buffers. `TpModel::free` frees every owned tensor and drains
+    // each device pool, THEN drops the `Gpus`. A bare `drop(tp)` reclaimed
+    // nothing — none of `GpuTensor` / `DeviceBuffer` / `GpuPool` has a freeing
+    // `Drop`, so it leaked the whole model per load/unload cycle (mirrors the EP
+    // arm below, which frees explicitly for the same reason). The daemon's
+    // single `gpu` is untouched (unused for tp>1).
     if let Some(tp) = m.tp.take() {
-        drop(tp);
+        tp.free();
     }
-    // Dense-PP unload (P-C): PpModel owns its own Gpus + per-stage scratch/KV;
-    // dropping it tears down the stage device contexts. Daemon `gpu` untouched.
+    // Dense-PP unload (P-C): PpModel owns its own Gpus + per-stage scratch/KV.
+    // `PpModel::free` frees them + drains each stage pool before dropping the
+    // `Gpus` (same no-freeing-`Drop` leak as the TP arm). Daemon `gpu` untouched.
     if let Some(pp) = m.pp_dense.take() {
-        drop(pp);
+        pp.free();
         // Return here (like the EP arm below): a dense-PP model owns its entire
         // mesh (Gpus + per-stage scratch/KV) inside the PpModel, so dropping it
         // is the whole teardown. Without this return a dense-PP unload falls
