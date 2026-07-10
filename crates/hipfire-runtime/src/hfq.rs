@@ -1252,28 +1252,10 @@ fn load_embedding_llama(
     load_embedding(gpu, info.quant_type, data, config.vocab_size, config.dim)
 }
 
-/// Load LLaMA weights from an HFQ file onto GPU.
-pub fn load_weights_hfq(
-    hfq: &HfqFile,
-    config: &LlamaConfig,
-    gpu: &mut Gpu,
-) -> HipResult<LlamaWeights> {
-    // R2 guard: the LLaMA-family loader does NOT read Q/K/V proj bias —
-    // `LayerWeights` has no `wq_bias` / `wk_bias` / `wv_bias` fields and
-    // the per-layer load below only names `*.q_proj.weight`. Qwen2
-    // requires those biases (`attention_bias=true` is the modeling
-    // default). The quantiser used to auto-tag every Qwen2 model as
-    // `arch_id=1`, which the daemon dispatches to this loader; the
-    // result was silently-wrong outputs with no warning. As of the
-    // `--arch-id` flag (see `hipfire-quantize`), Qwen2 models should be
-    // tagged `arch_id=7` and dispatched to `hipfire-arch-qwen2`.
-    //
-    // If we see `q_proj.bias` while loading as the LLaMA family, the
-    // input is a mis-tagged Qwen2 HFQ. Refuse hard with a pointer at
-    // the correct path. (Detection by manifest is robust to either the
-    // model_type tag or the model family — both LLaMA and Qwen3 lack
-    // these bias tensors, so any HFQ with `model.layers.0.self_attn.q_proj.bias`
-    // is by definition a Qwen2-family input.)
+/// The LLaMA-family loader drops Q/K/V proj bias; a Qwen2 HFQ (which needs them)
+/// must not be loaded here. Refuse hard if `q_proj.bias` is present. Shared by
+/// the single-device and distributed entry points.
+fn reject_qwen2_hfq(hfq: &HfqFile) -> HipResult<()> {
     if hfq
         .find_tensor_info("model.layers.0.self_attn.q_proj.bias")
         .is_some()
@@ -1285,21 +1267,28 @@ pub fn load_weights_hfq(
                  tensor `model.layers.0.self_attn.q_proj.bias` is present, \
                  which means this is a Qwen2 (attention_bias=true) model. \
                  The LLaMA loader drops Q/K/V proj bias and would produce \
-                 wrong outputs. \
-                 Current HFQ arch_id = {}. Re-quantise with \
-                 `hipfire-quantize --arch-id 7 ...` so the daemon \
-                 dispatches arch_id=7 to hipfire-arch-qwen2 (once that \
-                 crate is wired in), or — for inspection only — load \
-                 directly via `cargo run --example inspect_hfq -p \
-                 hipfire-arch-qwen2 -- <path>`. \
-                 See docs/plans/dots-ocr-devlog.md §7.",
+                 wrong outputs. Current HFQ arch_id = {}. Re-quantise with \
+                 `hipfire-quantize --arch-id 7 ...`.",
                 hfq.arch_id
             ),
         ));
     }
+    Ok(())
+}
 
+/// Load a dense llama-family HFQ distributed across a device slice per `layout`:
+/// embed on device 0, final-norm + output on `layout.output_device()`, each
+/// layer on `layout.device_for_layer(i)`. The single-device `load_weights_hfq`
+/// is the `Layout::single` special case. The returned `LlamaWeights.layers` Vec
+/// is full-length; each tensor resides on its layer's device.
+pub fn load_weights_hfq_distributed(
+    hfq: &HfqFile,
+    config: &LlamaConfig,
+    devices: &mut [Gpu],
+    layout: &crate::model_load::Layout,
+) -> HipResult<LlamaWeights> {
+    reject_qwen2_hfq(hfq)?;
     let mut source = LlamaHfqSource { hfq, cfg: config };
-    let layout = crate::model_load::Layout::single(config.n_layers);
     let LoadedWeights {
         token_embd,
         embd_format,
@@ -1307,7 +1296,7 @@ pub fn load_weights_hfq(
         output,
         layers,
         lm_head_aliases_embd,
-    } = rt_load_weights(&mut source, std::slice::from_mut(gpu), &layout)?;
+    } = rt_load_weights(&mut source, devices, layout)?;
     Ok(LlamaWeights {
         token_embd,
         embd_format,
@@ -1316,6 +1305,16 @@ pub fn load_weights_hfq(
         layers,
         lm_head_aliases_embd,
     })
+}
+
+/// Load LLaMA weights from an HFQ file onto GPU.
+pub fn load_weights_hfq(
+    hfq: &HfqFile,
+    config: &LlamaConfig,
+    gpu: &mut Gpu,
+) -> HipResult<LlamaWeights> {
+    let layout = crate::model_load::Layout::single(config.n_layers);
+    load_weights_hfq_distributed(hfq, config, std::slice::from_mut(gpu), &layout)
 }
 
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
