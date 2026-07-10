@@ -20,7 +20,14 @@
 // and acc slots. Value-preserving. Expect VGPR up modestly (hold 8
 // headers); if DROPPED-WAVES dominates, this path is closed for residual.
 
+#if defined(__gfx1200__) || defined(__gfx1201__)
+// RDNA4-only occupancy probe: force the compiler to target 32 resident
+// one-wave blocks (64 VGPR/thread budget) on this low-occupancy kernel.
+// The non-gfx12 device code remains byte-identical to the baseline.
+__launch_bounds__(32, 32)
+#else
 __launch_bounds__(32, 16)
+#endif
 extern "C" __global__ void gemv_hfq4g256_residual(
     const char* __restrict__ A,
     const float* __restrict__ x,
