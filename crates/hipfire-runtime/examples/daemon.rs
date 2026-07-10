@@ -2450,6 +2450,224 @@ impl hipfire_runtime::stream_parser::StreamParser for Deepseek4StreamParser {
     }
 }
 
+/// MiniMax-M2 (arch 10) EXPERT-PARALLEL (multi-GPU) AR dispatch — the second mesh
+/// dispatch (after Deepseek4EpDispatch). Same shape: `ForwardCtx::Mesh` reaches
+/// `m.ep.gpus` through `&mut self`; per-token `forward_ep` prefill(loop)/decode;
+/// rank-0 `download_f32` + HOST `sample_full_dist`. OUTPUT is plain text (NOT DSML) —
+/// so it reuses MinimaxDispatch's hooks: the `[e~[` eos filter + the DEFAULT
+/// StreamParser (no grammar, no tool-call channel). The LCP prefix-cache rewind +
+/// the display-only `<think>` primer live in the arch-10 arm's preamble (mirroring
+/// ep_serve_minimax), NOT here.
+///
+/// NOTE: build-only groundwork — the arch-10 arm wires + validates + flips it.
+#[allow(dead_code)]
+struct MinimaxEpDispatch<'m> {
+    m: &'m mut LoadedModel,
+}
+
+#[allow(dead_code)]
+impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        // EP eos: minimax EP state lives in m.ep (minimax() is None), so the eos is
+        // carried on LoadedModel (ep_serve_minimax reads m.minimax_eos_tok).
+        self.m.minimax_eos_tok
+    }
+
+    // is_eos = trait default (tok == eos): ep_serve_minimax breaks on `next==eos_tok`.
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 1.0,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        // Interleaved-thinking + user stop-seqs; no grammar (no EP tool calls), no vision.
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: true,
+            supports_stop_seq: true,
+            supports_grammar: false,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, _gpu: &mut rdna_compute::Gpu) {
+        // Fresh-context reset: per-rank state.reset() (mirrors single-GPU
+        // MinimaxDispatch::reset, looped over ranks). The per-TURN LCP prefix rewind
+        // is the arm's preamble, not this hook (ar_generate doesn't call reset).
+        if let Some(EpState { inner, .. }) = self.m.ep.as_mut() {
+            if let EpArch::Minimax { state, .. } = inner {
+                for s in state.iter_mut() {
+                    s.reset();
+                }
+            }
+        }
+        self.m.seq_pos = 0;
+        self.m.conversation_tokens.clear();
+    }
+
+    fn prefill_forward(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("minimax-EP dispatch received Single ctx")
+        };
+        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("prefill_forward: no ep state")?;
+        let EpArch::Minimax {
+            config,
+            weights,
+            state,
+            partials,
+            partials_i64,
+        } = inner
+        else {
+            return Err("prefill_forward: EP arch mismatch (expected minimax)".into());
+        };
+        for (i, &t) in chunk.iter().enumerate() {
+            minimax::forward::forward_ep(
+                gpus,
+                weights,
+                config,
+                state,
+                partials,
+                partials_i64,
+                t,
+                (seq_pos + i) as u32,
+            )
+            .map_err(|e| format!("minimax forward_ep prefill: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("minimax-EP dispatch received Single ctx")
+        };
+        let EpState { gpus, inner } = self
+            .m
+            .ep
+            .as_mut()
+            .ok_or("decode_step_forward: no ep state")?;
+        let EpArch::Minimax {
+            config,
+            weights,
+            state,
+            partials,
+            partials_i64,
+        } = inner
+        else {
+            return Err("decode_step_forward: EP arch mismatch (expected minimax)".into());
+        };
+        minimax::forward::forward_ep(
+            gpus,
+            weights,
+            config,
+            state,
+            partials,
+            partials_i64,
+            token,
+            seq_pos as u32,
+        )
+        .map_err(|e| format!("minimax forward_ep decode: {e}"))
+    }
+
+    fn sample(
+        &mut self,
+        ctx: ForwardCtx<'_>,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        let ForwardCtx::Mesh = ctx else {
+            unreachable!("minimax-EP dispatch received Single ctx")
+        };
+        // EP host full-dist sampler over rank-0 logits (ep_serve_minimax). No grammar
+        // for minimax EP, so grammar_mask is always None; ngram_scope/rng_state inert.
+        let _ = (vocab_size, ngram_scope, grammar_mask, rng_state);
+        let EpState { gpus, inner } = self.m.ep.as_mut().ok_or("sample: no ep state")?;
+        let EpArch::Minimax { state, .. } = inner else {
+            return Err("sample: EP arch mismatch (expected minimax)".into());
+        };
+        let _ = gpus.devices[0].bind_thread();
+        let logits = gpus.devices[0]
+            .download_f32(&state[0].logits)
+            .map_err(|e| format!("minimax EP logits download: {e:?}"))?;
+        Ok(hipfire_runtime::llama::sample_full_dist(
+            &logits,
+            cfg.temperature,
+            cfg.top_p,
+            cfg.top_k,
+            cfg.min_p,
+        ))
+    }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        match self.m.ep.as_ref() {
+            Some(EpState {
+                inner: EpArch::Minimax { state, .. },
+                ..
+            }) => state[0].n_tokens,
+            _ => self.m.seq_pos,
+        }
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        let _ = seq_pos;
+        let np = match self.m.ep.as_ref() {
+            Some(EpState {
+                inner: EpArch::Minimax { state, .. },
+                ..
+            }) => state[0].n_tokens,
+            _ => self.m.seq_pos,
+        };
+        self.m.seq_pos = np;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self.m.ep.as_ref() {
+            Some(EpState {
+                inner: EpArch::Minimax { config, .. },
+                ..
+            }) => config.vocab_size,
+            _ => 0,
+        }
+    }
+
+    fn eos_filter_config(&self) -> hipfire_runtime::eos_filter::EosFilterConfig {
+        // Reuse MinimaxDispatch's suppression: minimax's eos IS the `[e~[` turn-end
+        // marker (decodes to that literal, not empty), so ar_generate — which
+        // commits+emits the eos before its is_eos break — would leak it. Strip here.
+        hipfire_runtime::eos_filter::EosFilterConfig {
+            stop_at: vec![b"[e~[".to_vec()],
+            ..Default::default()
+        }
+    }
+}
+
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
 /// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
 /// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
