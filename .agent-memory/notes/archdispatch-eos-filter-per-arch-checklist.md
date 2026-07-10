@@ -47,3 +47,15 @@ latent #462 reset-command multi-turn bleed. The dual-run parity CAUGHT it (fix c
 `forward_batch` is NOT numerically batch-size-invariant — a `Dispatch.prefill_forward`
 chunk size that differs from the legacy prefill's chunk size shifts logits and fails temp0
 parity (match the legacy chunk size, e.g. cohere2moe 256).
+
+**THIRD lesson (Axis B, deepseek4-EP): `on_eos()` discipline + a grammar gotcha.**
+(1) An arch whose legacy loop BREAKS on the sampled eos *before* feeding/forwarding it
+(ep_serve_ds4: `if next==eos_tok { break }`) needs `on_eos() = EosDecision::Stop`, NOT
+`CommitAndStop` — the eos must never enter KV/tape/parser. CommitAndStop would forward +
+emit_only the eos (extra forward pass + spurious emit) → parity divergence. (2) A
+grammar-capable dispatch MUST override `ensure_decoded_vocab` — the driver calls it the
+moment tools activate; the trait default `unimplemented!()` panics. This is INVISIBLE to
+every non-grammar dual-run row (they never call it) — only a tool-call prompt exposes it.
+Always include a tool-call row in the arch's dual-run. (3) `model_reset_context` still
+didn't reset `m.ep` after this fold — BENIGN only because generate_ep resets EP per-turn
+(EP has no LCP); a non-generate EP path would bleed. See [[daemon-god-struct-archdispatch-design]].
