@@ -186,6 +186,101 @@ pub trait ArchDispatch {
         let _ = (gpu, cfg, vocab_size, ngram_scope, grammar_mask, rng_state);
         Err("sample not implemented for this arch".into())
     }
+
+    // ── AR-phase driver accessors (Inc 1, Task 1.4b-iii) ──────────────────
+    // The generic ar_generate driver keeps loop state (seq_pos, streamed
+    // tokens, counters) as locals but still needs a handful of the model's
+    // driver-generic fields, which live on `LoadedModel` (a hipfire-loader
+    // type the runtime lib cannot name). These accessors expose them via
+    // runtime-nameable types so the driver stays arch-blind.
+
+    /// The model's tokenizer. Re-fetched per use in the driver (short shared
+    /// borrow) so it never aliases a `&mut self` hook call.
+    #[allow(dead_code)]
+    fn tokenizer(&self) -> &crate::tokenizer::Tokenizer {
+        unimplemented!("tokenizer accessor not implemented for this arch")
+    }
+
+    /// The model's cumulative sequence position (physical KV write slot). The
+    /// driver seeds its `seq_pos` local from this and writes the final value
+    /// back via `set_seq_pos`.
+    #[allow(dead_code)]
+    fn seq_pos(&self) -> usize {
+        0
+    }
+
+    /// Write the driver's final `seq_pos` back to the model (the old arm
+    /// mutated `m.seq_pos` directly; the driver mirrors it here at finalize /
+    /// on abort).
+    #[allow(dead_code)]
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        let _ = seq_pos;
+    }
+
+    /// The running cross-turn conversation-token buffer (pushed per committed
+    /// token, extended after prefill, cleared on abort).
+    #[allow(dead_code)]
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        unimplemented!("conversation_tokens_mut not implemented for this arch")
+    }
+
+    /// Vocab size (from the arch config).
+    #[allow(dead_code)]
+    fn vocab_size(&self) -> usize {
+        0
+    }
+
+    /// Byte size of the GPU repeat-penalty scratch buffer (used to bound the
+    /// effective repeat window). Mirrors `scratch.repeat_buf.buf.size()`.
+    #[allow(dead_code)]
+    fn repeat_buf_cap_bytes(&self) -> usize {
+        0
+    }
+
+    /// The arch's batched-prefill chunk boundary (qwen35 `PREFILL_MAX_BATCH`).
+    #[allow(dead_code)]
+    fn prefill_max_batch(&self) -> usize {
+        256
+    }
+
+    /// Drain + free the prefill checkpoint ring (abort path).
+    #[allow(dead_code)]
+    fn free_prefill_checkpoints(&mut self, gpu: &mut rdna_compute::Gpu) {
+        let _ = gpu;
+    }
+
+    /// Build (once, cached) + return the decoded-vocab table used for grammar
+    /// token masks. Mirrors the `m.decoded_vocab` lazy cache.
+    #[allow(dead_code)]
+    fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
+        unimplemented!("ensure_decoded_vocab not implemented for this arch")
+    }
+
+    /// True when KV eviction is configured.
+    #[allow(dead_code)]
+    fn has_eviction(&self) -> bool {
+        false
+    }
+
+    /// Physical KV capacity (upper bound for the budget-alert headroom check).
+    #[allow(dead_code)]
+    fn physical_cap(&self) -> usize {
+        usize::MAX
+    }
+
+    /// The eviction prefill-chunk window (`budget + beta`) when eviction is
+    /// configured; `None` selects the plain `prefill_max_batch` chunk path.
+    #[allow(dead_code)]
+    fn eviction_window(&self) -> Option<usize> {
+        None
+    }
+
+    /// Store the model's verbatim emitted token sequence under its turn
+    /// fingerprint (the asst-turn prompt cache).
+    #[allow(dead_code)]
+    fn insert_asst_turn(&mut self, fp: u64, seq: Vec<u32>) {
+        let _ = (fp, seq);
+    }
 }
 
 #[cfg(test)]

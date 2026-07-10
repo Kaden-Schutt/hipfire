@@ -975,6 +975,74 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         };
         Ok(tok)
     }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        self.m.seq_pos
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        self.m.seq_pos = seq_pos;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        if let Some(ModelState::Qwen35(b)) = self.m.state.as_ref() {
+            b.config.vocab_size
+        } else {
+            0
+        }
+    }
+
+    fn repeat_buf_cap_bytes(&self) -> usize {
+        if let Some(ModelState::Qwen35(b)) = self.m.state.as_ref() {
+            b.scratch.repeat_buf.buf.size()
+        } else {
+            0
+        }
+    }
+
+    fn prefill_max_batch(&self) -> usize {
+        qwen35::PREFILL_MAX_BATCH
+    }
+
+    fn free_prefill_checkpoints(&mut self, gpu: &mut rdna_compute::Gpu) {
+        free_checkpoints(&mut self.m.prefill_checkpoints, gpu);
+    }
+
+    fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
+        if self.m.decoded_vocab.is_none() {
+            let v: Vec<String> = {
+                let tok = self.m.tokenizer.as_ref().unwrap();
+                let n = tok.vocab_size();
+                (0..n).map(|id| tok.decode(&[id as u32])).collect()
+            };
+            self.m.decoded_vocab = Some(std::sync::Arc::new(v));
+        }
+        self.m.decoded_vocab.clone().unwrap()
+    }
+
+    fn has_eviction(&self) -> bool {
+        self.m.eviction.is_some()
+    }
+
+    fn physical_cap(&self) -> usize {
+        self.m.physical_cap
+    }
+
+    fn eviction_window(&self) -> Option<usize> {
+        self.m.eviction.as_ref().map(|ev| ev.budget() + ev.beta())
+    }
+
+    fn insert_asst_turn(&mut self, fp: u64, seq: Vec<u32>) {
+        self.m.asst_turn_cache.insert(fp, seq);
+    }
 }
 
 /// Newtype wrapper so daemon.rs (which owns this type) can implement
@@ -7181,6 +7249,772 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Generic auto-regressive decode driver (Inc 1, Task 1.4b-iii). Extracted
+/// verbatim-in-behavior from the qwen35 AR arm of `generate` (arch 5/6), but
+/// every arch-coupled op routes through `ArchDispatch` hooks and all loop state
+/// (seq_pos, streamed tokens, think/budget counters, rng) is local. DEAD CODE
+/// this stage: NOT routed at the `if m.arch_id==5||6` dispatch point. The 1.4c
+/// dual-run parity harness validates token-identity vs the old arm on GPU.
+///
+/// Faithfulness note (for the 1.4c reviewer): `ngram_scope` uses the local
+/// `streamed_tokens` in place of `m.conversation_tokens[ngram_scope_start..]`
+/// (proven identical push-order at every sample site); the asst-turn cached_seq
+/// still reads the real conversation buffer (it includes the post-loop ChatML
+/// trailer that `streamed_tokens` does not). Adaptive-KV stderr phase labels are
+/// unified in the hook (diagnostic only, not token-affecting).
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn ar_generate(
+    dispatch: &mut dyn hipfire_runtime::arch_dispatch::ArchDispatch,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    stop: &[String],
+    tools: Option<&[serde_json::Value]>,
+    new_tokens: Vec<u32>,
+    #[allow(unused_variables)] im_end: &[u32],
+    nl: &[u32],
+    im_end_token: Option<u32>,
+    tool_call_pair: Option<(u32, u32)>,
+    think_pair: Option<(u32, u32)>,
+    prefill_tokens: usize,
+    cached_tokens_count: usize,
+    pflash_summary: Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+    pflash_bypass_reason: Option<String>,
+    pflash_alpha: Option<f32>,
+    t0: std::time::Instant,
+    mut tape: Option<&mut TokenTape>,
+) {
+    // Local copy of the `generate`-nested pflash `done`-event fragment builder
+    // (pure over its args; duplicated here so ar_generate stays self-contained).
+    fn pflash_done_fragment(
+        s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+        bypass_reason: &Option<String>,
+        alpha: Option<f32>,
+    ) -> String {
+        match (s, bypass_reason) {
+            (Some(cp), _) => format!(
+                r#","pflash":{{"source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"alpha":{:.6},"score_ms":{},"total_ms":{},"source_md5":"{}","compressed_md5":"{}"}}"#,
+                cp.source_tokens,
+                cp.kept_tokens,
+                cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+                alpha.unwrap_or(0.0),
+                cp.timings.score_ms,
+                cp.timings.total_ms,
+                cp.source_md5,
+                cp.compressed_md5,
+            ),
+            (None, Some(reason)) => format!(
+                r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
+                reason.replace('"', "'"),
+                alpha.unwrap_or(0.0),
+            ),
+            (None, None) => String::new(),
+        }
+    }
+
+    // seq_pos is a driver local (cumulative physical KV slot); seeded from the
+    // model and written back at finalize / on abort.
+    let mut seq_pos = dispatch.seq_pos();
+
+    // ── Prefill (abort-aware) ────────────────────────────────────────────
+    let mut prefill_aborted = false;
+    if let Some(window) = dispatch.eviction_window() {
+        // Eviction path: chunk to the (budget+beta) window, evict between chunks.
+        let mut remaining: &[u32] = &new_tokens;
+        while !remaining.is_empty() {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
+            let space = window.saturating_sub(seq_pos).max(1);
+            let chunk_len = remaining.len().min(space);
+            let (chunk, rest) = remaining.split_at(chunk_len);
+            dispatch.prefill_forward(gpu, chunk, seq_pos).unwrap();
+            seq_pos += chunk_len;
+            if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+                seq_pos = new_phys;
+            }
+            remaining = rest;
+        }
+    } else {
+        // No-eviction: chunk at prefill_max_batch so abort fires between batches;
+        // adaptive-KV downshift + checkpoint between chunks.
+        let chunk_max = dispatch.prefill_max_batch();
+        let mut start = 0usize;
+        while start < new_tokens.len() {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
+            let end = (start + chunk_max).min(new_tokens.len());
+            let chunk = &new_tokens[start..end];
+            dispatch.prefill_forward(gpu, chunk, seq_pos).unwrap();
+            seq_pos += chunk.len();
+            dispatch.maybe_adaptive_downshift(gpu, seq_pos);
+            if ckpt_resume_enabled() {
+                dispatch.take_prefill_checkpoint(gpu, seq_pos);
+            }
+            start = end;
+        }
+    }
+    if prefill_aborted {
+        dispatch.abort_zero_recurrent(gpu);
+        seq_pos = 0;
+        dispatch.set_seq_pos(0);
+        dispatch.conversation_tokens_mut().clear();
+        dispatch.free_prefill_checkpoints(gpu);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+            id
+        );
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    // Post-prefill adaptive-KV downshift.
+    dispatch.maybe_adaptive_downshift(gpu, seq_pos);
+    dispatch.conversation_tokens_mut().extend_from_slice(&new_tokens);
+
+    // Boundary marker for the prompt-cache / asst_turn_cache slice: the model's
+    // verbatim emitted tokens start here in the conversation buffer.
+    let decode_start_tokens_idx = dispatch.conversation_tokens_mut().len();
+
+    let vocab_size = dispatch.vocab_size();
+    let mut rng_state: u32 = 0x13579BDFu32;
+    let repeat_buf_cap = (dispatch.repeat_buf_cap_bytes() / 4).min(repeat_window.max(1));
+
+    let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
+        .into_iter()
+        .chain(think_pair.into_iter())
+        .collect();
+
+    // ── Grammar-guided decoding setup ────────────────────────────────────
+    let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
+    let tool_pairs: Vec<(String, Vec<String>)> = if grammar_enabled {
+        tools
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())?
+                            .to_string();
+                        let required: Vec<String> = func
+                            .get("parameters")
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some((name, required))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let grammar_active = !tool_pairs.is_empty();
+    let mut matcher: Option<Box<dyn hipfire_runtime::arch_dispatch::GrammarMatcher>> =
+        if grammar_active {
+            dispatch.init_grammar(&tool_pairs)
+        } else {
+            None
+        };
+    let grammar_vocab_arc = if grammar_active {
+        Some(dispatch.ensure_decoded_vocab())
+    } else {
+        None
+    };
+    let empty_vocab: Vec<String> = Vec::new();
+    let grammar_vocab: &[String] = grammar_vocab_arc
+        .as_deref()
+        .map(|v| v.as_slice())
+        .unwrap_or(&empty_vocab);
+    let mut grammar_mask: Vec<bool> = vec![true; grammar_vocab.len()];
+
+    // ── First sample (tok0) ──────────────────────────────────────────────
+    // ngram_scope is empty at tok0 (no generated tokens yet).
+    let ngram_scope0: &[u32] = &[];
+    let mut blocked0: Vec<u32> = Vec::new();
+    sampler::collect_unclosed_attractor_blocks(ngram_scope0, &attractor_pairs, 20, 2, &mut blocked0);
+    let cfg0 = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window: repeat_buf_cap,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: blocked0,
+        top_k,
+        min_p,
+    };
+    let tok0 = {
+        let mask: Option<&[bool]> = if grammar_active && !matcher.as_ref().unwrap().is_free() {
+            matcher
+                .as_ref()
+                .unwrap()
+                .token_mask(grammar_vocab, &mut grammar_mask);
+            Some(&grammar_mask)
+        } else {
+            None
+        };
+        dispatch
+            .sample(gpu, &cfg0, vocab_size, ngram_scope0, mask, &mut rng_state)
+            .unwrap()
+    };
+    if grammar_active {
+        let text = dispatch.tokenizer().decode(&[tok0]);
+        matcher.as_mut().unwrap().advance(&text);
+    }
+    let t_prefill = Instant::now();
+    let mut next_token = tok0;
+
+    let mut generated = 0;
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = EosFilter::new(EosFilterConfig::default());
+    let mut alert_fired = false;
+    let mut think_count: usize = 0;
+    let mut prev_in_think: bool = false;
+    let mut force_answer_latched = false;
+    let think_open_tok = dispatch.tokenizer().special_token_id("<think>");
+    let max_total_think: usize = std::env::var("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut total_think_tokens: usize = 0;
+    let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(768);
+    let mut latch_gen_mark: Option<usize> = None;
+
+    let loop_guard =
+        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+
+    while generated < max_tokens {
+        if check_abort(id) {
+            // Client cancelled mid-decode — full cold reset (mirrors DFlash abort).
+            seq_pos = 0;
+            dispatch.set_seq_pos(0);
+            dispatch.conversation_tokens_mut().clear();
+            dispatch.free_prefill_checkpoints(gpu);
+            dispatch.abort_zero_recurrent(gpu);
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
+                id
+            );
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#,
+                id, generated
+            );
+            let _ = stdout.flush();
+            return;
+        }
+        generated += 1;
+        dispatch.conversation_tokens_mut().push(next_token);
+        streamed_tokens.push(next_token);
+        if let Some(t) = tape.as_deref_mut() {
+            t.push(next_token);
+        }
+        emit_committed_event(
+            stdout,
+            id,
+            next_token,
+            streamed_tokens.len() - 1,
+            t0.elapsed().as_millis() as u64,
+        );
+        let all_bytes = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[bytes_fed_to_filter..];
+        bytes_fed_to_filter = all_bytes.len();
+        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            let text = std::str::from_utf8(&text_bytes).unwrap();
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                id,
+                serde_json::to_string(&text).unwrap_or_default()
+            );
+            let _ = stdout.flush();
+        }
+
+        dispatch
+            .decode_step_forward(gpu, next_token, seq_pos)
+            .unwrap();
+        seq_pos += 1;
+        if ckpt_resume_enabled() {
+            dispatch.take_prefill_checkpoint(gpu, seq_pos);
+        }
+        if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+            seq_pos = new_phys;
+        }
+        dispatch.maybe_adaptive_downshift(gpu, seq_pos);
+
+        if next_token == dispatch.eos_token() {
+            break;
+        }
+        if im_end_token == Some(next_token) {
+            break;
+        }
+        if dispatch.tokenizer().is_terminator(next_token) {
+            break;
+        }
+
+        if !stop.is_empty() {
+            let decoded_suffix = dispatch.tokenizer().decode(&streamed_tokens);
+            if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+                break;
+            }
+        }
+
+        // max_think_tokens / total-think / force-answer enforcement.
+        let force_answer_now = check_force_answer(id);
+        if force_answer_now {
+            force_answer_latched = true;
+        }
+        if max_think_tokens > 0 || force_answer_now || force_answer_latched || max_total_think > 0 {
+            let raw_so_far = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let in_think = currently_in_think(
+                raw_str,
+                matches!(
+                    assistant_prefix,
+                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                ),
+            );
+            if in_think {
+                total_think_tokens += 1;
+            }
+            if max_total_think > 0 && total_think_tokens >= max_total_think {
+                force_answer_latched = true;
+            }
+            if force_answer_latched && latch_gen_mark.is_none() {
+                latch_gen_mark = Some(generated);
+            }
+            if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
+                eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
+                break;
+            }
+            if let Some(mark) = latch_gen_mark {
+                if generated.saturating_sub(mark) >= post_latch_answer_budget {
+                    eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
+                    break;
+                }
+            }
+            if max_think_tokens > 0 {
+                if in_think {
+                    if !prev_in_think {
+                        think_count = 1;
+                    } else {
+                        think_count += 1;
+                    }
+                } else {
+                    think_count = 0;
+                }
+                prev_in_think = in_think;
+            }
+            let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
+
+            if in_think && (budget_hit || force_answer_now || force_answer_latched) {
+                if force_answer_now {
+                    eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
+                } else if force_answer_latched {
+                    eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
+                }
+                let close_tokens = dispatch.tokenizer().encode(&think_continuation());
+                let budget_left = max_tokens.saturating_sub(generated);
+                let take = close_tokens.len().min(budget_left);
+                for &t in &close_tokens[..take] {
+                    dispatch.decode_step_forward(gpu, t, seq_pos).unwrap();
+                    seq_pos += 1;
+                    if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+                        seq_pos = new_phys;
+                    }
+                    dispatch.conversation_tokens_mut().push(t);
+                    if grammar_active {
+                        let text = dispatch.tokenizer().decode(&[t]);
+                        matcher.as_mut().unwrap().advance(&text);
+                    }
+                    streamed_tokens.push(t);
+                    if let Some(tp) = tape.as_deref_mut() {
+                        tp.push(t);
+                    }
+                    emit_committed_event(
+                        stdout,
+                        id,
+                        t,
+                        streamed_tokens.len() - 1,
+                        t0.elapsed().as_millis() as u64,
+                    );
+                    let all_bytes = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
+                    bytes_fed_to_filter = all_bytes.len();
+                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                        let text = std::str::from_utf8(&text_bytes).unwrap();
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"token","id":"{}","text":{}}}"#,
+                            id,
+                            serde_json::to_string(&text).unwrap_or_default()
+                        );
+                        let _ = stdout.flush();
+                    }
+                    generated += 1;
+                }
+                think_count = 0;
+                prev_in_think = false;
+                if generated >= max_tokens {
+                    break;
+                }
+            }
+        }
+
+        // N-gram loop detector.
+        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
+            loop_guard.check(&streamed_tokens)
+        {
+            let window_len = loop_guard.window_len(streamed_tokens.len());
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
+                id, count, window_len
+            );
+            let _ = stdout.flush();
+            break;
+        }
+
+        // Budget-alert injection.
+        if !alert_fired
+            && budget_alert_at_tok > 0
+            && generated >= budget_alert_at_tok
+            && !budget_alert_text.is_empty()
+        {
+            alert_fired = true;
+            let raw_so_far = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let in_think = currently_in_think(
+                raw_str,
+                matches!(
+                    assistant_prefix,
+                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                ),
+            );
+            if !in_think {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#,
+                    id
+                );
+                let _ = stdout.flush();
+                let ngram_scope: &[u32] = &streamed_tokens;
+                let mut blocked: Vec<u32> = Vec::new();
+                sampler::collect_unclosed_attractor_blocks(
+                    ngram_scope,
+                    &attractor_pairs,
+                    20,
+                    2,
+                    &mut blocked,
+                );
+                let cfg = SamplerConfig {
+                    temperature: temp,
+                    top_p,
+                    repeat_penalty,
+                    repeat_window: repeat_buf_cap,
+                    presence_penalty,
+                    frequency_penalty,
+                    blocked_tokens: blocked,
+                    top_k,
+                    min_p,
+                };
+                next_token = {
+                    let mask: Option<&[bool]> =
+                        if grammar_active && !matcher.as_ref().unwrap().is_free() {
+                            matcher
+                                .as_ref()
+                                .unwrap()
+                                .token_mask(grammar_vocab, &mut grammar_mask);
+                            Some(&grammar_mask)
+                        } else {
+                            None
+                        };
+                    dispatch
+                        .sample(gpu, &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
+                        .unwrap()
+                };
+                if grammar_active {
+                    let text = dispatch.tokenizer().decode(&[next_token]);
+                    matcher.as_mut().unwrap().advance(&text);
+                }
+                continue;
+            }
+            let nudge_tokens = dispatch.tokenizer().encode(budget_alert_text);
+            let budget_left = max_tokens.saturating_sub(generated);
+            let nudge_len = nudge_tokens.len().min(budget_left);
+            let need_kv = seq_pos
+                .saturating_add(nudge_len)
+                .saturating_add(
+                    max_tokens
+                        .saturating_sub(generated)
+                        .saturating_sub(nudge_len),
+                )
+                .saturating_add(nl.len());
+            if nudge_len > 0 && (dispatch.has_eviction() || need_kv <= dispatch.physical_cap()) {
+                for &tok in &nudge_tokens[..nudge_len] {
+                    dispatch.conversation_tokens_mut().push(tok);
+                    streamed_tokens.push(tok);
+                    if let Some(tp) = tape.as_deref_mut() {
+                        tp.push(tok);
+                    }
+                    emit_committed_event(
+                        stdout,
+                        id,
+                        tok,
+                        streamed_tokens.len() - 1,
+                        t0.elapsed().as_millis() as u64,
+                    );
+                    let all_bytes2 = dispatch.tokenizer().decode_bytes(&streamed_tokens);
+                    let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
+                    bytes_fed_to_filter = all_bytes2.len();
+                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes2) {
+                        let t = std::str::from_utf8(&text_bytes).unwrap();
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"token","id":"{}","text":{}}}"#,
+                            id,
+                            serde_json::to_string(&t).unwrap_or_default()
+                        );
+                        let _ = stdout.flush();
+                    }
+                    dispatch.decode_step_forward(gpu, tok, seq_pos).unwrap();
+                    seq_pos += 1;
+                    if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+                        seq_pos = new_phys;
+                    }
+                    generated += 1;
+                }
+            } else if nudge_len < nudge_tokens.len() {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#,
+                    id, nudge_len, budget_left
+                );
+                let _ = stdout.flush();
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#,
+                    id
+                );
+                let _ = stdout.flush();
+            }
+            if generated >= max_tokens {
+                break;
+            }
+        }
+
+        // Steady-state sample.
+        let ngram_scope: &[u32] = &streamed_tokens;
+        let mut blocked: Vec<u32> = Vec::new();
+        sampler::collect_unclosed_attractor_blocks(
+            ngram_scope,
+            &attractor_pairs,
+            20,
+            2,
+            &mut blocked,
+        );
+        if force_answer_latched {
+            if let Some(t) = think_open_tok {
+                blocked.push(t);
+            }
+        }
+        let cfg = SamplerConfig {
+            temperature: temp,
+            top_p,
+            repeat_penalty,
+            repeat_window: repeat_buf_cap,
+            presence_penalty,
+            frequency_penalty,
+            blocked_tokens: blocked,
+            top_k,
+            min_p,
+        };
+        next_token = {
+            let mask: Option<&[bool]> = if grammar_active && !matcher.as_ref().unwrap().is_free() {
+                matcher
+                    .as_ref()
+                    .unwrap()
+                    .token_mask(grammar_vocab, &mut grammar_mask);
+                Some(&grammar_mask)
+            } else {
+                None
+            };
+            dispatch
+                .sample(gpu, &cfg, vocab_size, ngram_scope, mask, &mut rng_state)
+                .unwrap()
+        };
+        if grammar_active {
+            let text = dispatch.tokenizer().decode(&[next_token]);
+            let was_detected = matcher.as_ref().unwrap().attractor_detected();
+            matcher.as_mut().unwrap().advance(&text);
+            if !was_detected && matcher.as_ref().unwrap().attractor_detected() {
+                eprintln!(
+                    "[grammar-ngram] attractor detected in tool_call args at gen={} — forcing close",
+                    generated,
+                );
+            }
+        }
+    }
+
+    // ChatML \n trailer after <|im_end|>.
+    let last_conv = dispatch
+        .conversation_tokens_mut()
+        .last()
+        .copied()
+        .unwrap_or(0);
+    if im_end_token == Some(last_conv) && !nl.is_empty() {
+        for &t in nl {
+            dispatch.decode_step_forward(gpu, t, seq_pos).unwrap();
+            seq_pos += 1;
+            if let Some(new_phys) = dispatch.maybe_evict(gpu, seq_pos).unwrap() {
+                seq_pos = new_phys;
+            }
+            dispatch.conversation_tokens_mut().push(t);
+        }
+    }
+
+    // Write the final physical slot back to the model (old arm mutated
+    // m.seq_pos directly per token).
+    dispatch.set_seq_pos(seq_pos);
+
+    // ── parse tool_calls + content once ──────────────────────────────────
+    let decoded_full = dispatch.tokenizer().decode(&streamed_tokens);
+    let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+
+    if !emit_tool_calls.is_empty() {
+        let calls_json: Vec<serde_json::Value> = emit_tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })
+            })
+            .collect();
+        let calls_str = serde_json::to_string(&calls_json).unwrap_or_else(|_| "[]".to_string());
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
+            id, calls_str,
+        );
+    }
+
+    // ── asst_turn_cache write ────────────────────────────────────────────
+    {
+        let mut cached_seq: Vec<u32> =
+            dispatch.conversation_tokens_mut()[decode_start_tokens_idx..].to_vec();
+        while let Some(&last) = cached_seq.last() {
+            if nl.contains(&last) {
+                cached_seq.pop();
+            } else {
+                break;
+            }
+        }
+        if let Some(&last) = cached_seq.last() {
+            if im_end_token == Some(last) {
+                cached_seq.pop();
+            }
+        }
+        if !cached_seq.is_empty() {
+            let stripped = strip_think_for_fingerprint(&decoded_full);
+            let emit_text =
+                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+            let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "[qwen-cache store] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+                    fp,
+                    cached_seq.len(),
+                    emit_text.len(),
+                    emit_tool_calls.len(),
+                    emit_text.chars().take(60).collect::<String>(),
+                );
+            }
+            dispatch.insert_asst_turn(fp, cached_seq);
+        }
+    }
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 {
+        generated as f64 / total_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        prefill_tokens as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    let hit_length_cap = generated >= max_tokens;
+    let finish_reason = if hit_length_cap {
+        "length"
+    } else if !emit_tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+        id,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0,
+        cached_tokens_count,
+        finish_reason,
+        pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
+    );
+    let _ = stdout.flush();
+}
+
 fn generate(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
