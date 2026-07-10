@@ -12142,6 +12142,20 @@ fn generate_minimax(
         .unwrap_or(0x9E3779B97F4A7C15);
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
+    // Dual-run shadow parity (Inc 4 Task, minimax). When HIPFIRE_ARCHDISPATCH_PARITY=1
+    // the legacy loop below captures every SAMPLED token (including the terminal eos
+    // that breaks the loop) into `__old_tape`; after the legacy run completes we
+    // model_reset_context and re-run the generic `ar_generate` (via MinimaxDispatch)
+    // into `__new_tape`, then assert_token_parity. Flag off = legacy loop only, zero
+    // behavior change. Parity is greedy-only (temp=0): the legacy sampler
+    // (deepseek4::sampling::sample_token) and ar_generate's uplift sampler
+    // (sampler::sample_cpu) both reduce to argmax at temp0; at temp>0 they diverge by
+    // design. The terminal-eos capture matches ar_generate's tape (it pushes the eos
+    // before its post-decode eos break, whereas the legacy loop breaks pre-commit).
+    let __parity =
+        std::env::var("HIPFIRE_ARCHDISPATCH_PARITY").ok().as_deref() == Some("1");
+    let mut __old_tape = TokenTape::default();
+
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
@@ -12150,6 +12164,9 @@ fn generate_minimax(
         }
         // Sample next token from the most recent logits.
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if __parity {
+            __old_tape.push(next_tok);
+        }
         if next_tok == eos_tok {
             break;
         }
@@ -12206,6 +12223,55 @@ fn generate_minimax(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
+
+    // ── Dual-run shadow-parity re-run (Inc 4). Reset the context (which the legacy
+    // run above mutated) and re-drive the SAME request through the generic
+    // ar_generate/MinimaxDispatch path, capturing its committed tokens into
+    // `__new_tape`. Because the reset zeroes MiniMaxState (n_tokens=0) and clears the
+    // conversation, the re-run prefills the FULL rendered prompt (`prompt_ids`), not
+    // the LCP suffix — so it is self-contained regardless of the original cache reuse.
+    // A greedy (temp0) request MUST produce a byte-identical token stream; any
+    // divergence panics with the first differing position. Off in prod (flag gated).
+    if __parity {
+        model_reset_context(m, gpu);
+        let mut __new_tape = TokenTape::default();
+        let mut __disp = MinimaxDispatch { m: &mut *m };
+        ar_generate(
+            &mut __disp,
+            gpu,
+            stdout,
+            id,
+            temp,
+            top_p,
+            None,               // top_k (legacy passes 0 == disabled)
+            None,               // min_p
+            max_tokens,
+            1.0,                // repeat_penalty (legacy: none)
+            0,                  // repeat_window
+            0.0,                // presence_penalty
+            0.0,                // frequency_penalty
+            0,                  // budget_alert_at_tok
+            "",                 // budget_alert_text
+            0,                  // max_think_tokens (minimax has no force-close think)
+            hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            &[],                // stop
+            None,               // tools (grammar off)
+            prompt_ids.clone(), // new_tokens: full render (context was reset)
+            &[],                // im_end
+            &[],                // nl
+            None,               // im_end_token
+            None,               // tool_call_pair
+            None,               // think_pair
+            prompt_ids.len(),   // prefill_tokens
+            0,                  // cached_tokens_count (fresh after reset)
+            None,               // pflash_summary
+            None,               // pflash_bypass_reason
+            None,               // pflash_alpha
+            t0,
+            Some(&mut __new_tape),
+        );
+        assert_token_parity(&__old_tape, &__new_tape, id);
+    }
 }
 
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
