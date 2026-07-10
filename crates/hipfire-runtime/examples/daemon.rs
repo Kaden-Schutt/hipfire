@@ -11958,8 +11958,6 @@ fn generate_minimax(
         return;
     }
 
-    let eos_tok = m.minimax().unwrap().eos_tok;
-
     // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when the
     // FULL rendered conversation + generation would overflow. `prompt_ids` is
     // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
@@ -12056,73 +12054,21 @@ fn generate_minimax(
             }
         };
 
+    // Reused-prefix count for the done event: `prompt_ids` is the full render,
+    // `prefill_ids` the post-LCP suffix ar_generate will prefill.
+    let cached_tokens_count = prompt_ids.len().saturating_sub(prefill_ids.len());
+    let prefill_len = prefill_ids.len();
     let t0 = Instant::now();
 
-    // ── Prefill: decode_step per prompt token, or chunked batched prefill.
-    // Disjoint field borrows of `m` (config / weights / state) let us also
-    // push to `m.conversation_tokens` in the same scope. The LAST forward's
-    // logits are the predictions for the first generated token. ──
-    let mut last_logits: Vec<f32> = Vec::new();
-    {
-        let b = m.minimax_mut().unwrap();
-        let cfg = &b.config;
-        let weights = &b.weights;
-        let state = &mut b.state;
-        // Batched prefill: process the prompt in chunks of <=64 tokens through
-        // the batched verify forward (one weight read per chunk vs one
-        // decode_step per token) → much lower TTFT. Validated byte-identical to
-        // the sequential path (cosine 1.0). DEFAULT ON when every layer's expert
-        // dtypes have batched kernels; the pre-check routes unsupported tiers
-        // (MQ3-Lloyd etc.) to the sequential path to avoid a mid-pass error.
-        // Force off with HIPFIRE_MINIMAX_BATCH_PREFILL=0.
-        let batch_prefill = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL")
-            .map_or(true, |v| v != "0")
-            && minimax::forward::forward_batch_supported(weights);
-        if batch_prefill && !prefill_ids.is_empty() {
-            let mut pos = state.n_tokens;
-            for chunk in prefill_ids.chunks(64) {
-                match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("minimax batch prefill failed: {e:?}"),
-                        );
-                        return;
-                    }
-                }
-                pos += chunk.len();
-            }
-        } else {
-            let mut position = state.n_tokens as u32;
-            for &tok in &prefill_ids {
-                match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
-                        return;
-                    }
-                }
-                position += 1;
-            }
-        }
-    }
-    for &tok in &prefill_ids {
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // MiniMax-M2's chat template unconditionally primes the assistant turn
-    // with `<think>\n` (chat_template.jinja generation-prompt block), so the
-    // model's GENERATED tokens begin *inside* the reasoning block and it only
-    // ever emits the closing `</think>`. Every downstream `<think>` consumer —
-    // the serve reasoning_content/content split, the run/chat-path stripper,
-    // and the history `stripThinkingInline` — keys on a LEADING `<think>` and
-    // so never engages, leaking the chain-of-thought into `message.content`.
-    // The primer is already in the KV from prefill; re-emit it into the token
-    // stream (display-only, not pushed to state) so the assistant message is a
-    // well-formed `<think>...</think>...` block for every consumer.
+    // MiniMax-M2's chat template unconditionally primes the assistant turn with
+    // `<think>\n` (chat_template.jinja generation-prompt block), so generated tokens
+    // begin *inside* the reasoning block and the model only ever emits the closing
+    // `</think>`. Every downstream `<think>` consumer — the serve reasoning/content
+    // split, the run/chat-path stripper, the history `stripThinkingInline` — keys on
+    // a LEADING `<think>`, so re-emit the primer into the DISPLAY stream here, before
+    // ar_generate (which now owns prefill+decode), making the assistant message a
+    // well-formed `<think>...</think>...` block. Display-only: the primer is already
+    // in the KV from the render and is never committed to state.
     if primed_think {
         let _ = writeln!(
             stdout,
@@ -12132,146 +12078,49 @@ fn generate_minimax(
         let _ = stdout.flush();
     }
 
-    // ── Decode loop. Sample host-side from the running logits vector.
-    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    // Dual-run shadow parity (Inc 4 Task, minimax). When HIPFIRE_ARCHDISPATCH_PARITY=1
-    // the legacy loop below captures every SAMPLED token (including the terminal eos
-    // that breaks the loop) into `__old_tape`; after the legacy run completes we
-    // model_reset_context and re-run the generic `ar_generate` (via MinimaxDispatch)
-    // into `__new_tape`, then assert_token_parity. Flag off = legacy loop only, zero
-    // behavior change. Parity is greedy-only (temp=0): the legacy sampler
-    // (deepseek4::sampling::sample_token) and ar_generate's uplift sampler
-    // (sampler::sample_cpu) both reduce to argmax at temp0; at temp>0 they diverge by
-    // design. The terminal-eos capture matches ar_generate's tape (it pushes the eos
-    // before its post-decode eos break, whereas the legacy loop breaks pre-commit).
-    let __parity =
-        std::env::var("HIPFIRE_ARCHDISPATCH_PARITY").ok().as_deref() == Some("1");
-    let mut __old_tape = TokenTape::default();
-
-    let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        // Sample next token from the most recent logits.
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        if __parity {
-            __old_tape.push(next_tok);
-        }
-        if next_tok == eos_tok {
-            break;
-        }
-
-        // Emit the text fragment. Build through serde_json so a user-supplied
-        // `id` or arbitrary-UTF-8 fragment can't corrupt the JSONL line.
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // Advance one step on the freshly sampled token.
-        let step = {
-            let b = m.minimax_mut().unwrap();
-            let cfg = &b.config;
-            let weights = &b.weights;
-            let state = &mut b.state;
-            let position = state.n_tokens as u32;
-            // hipGraph decode (opt-in via HIPFIRE_MINIMAX_GRAPH=1, default eager
-            // — measured only +1.0% on gfx1151). First call warms up eager, then
-            // captures + replays.
-            minimax::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, position)
-        };
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
-                return;
-            }
-        }
-    }
-
-    m.seq_pos = m.minimax().unwrap().state.n_tokens;
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let _ = writeln!(
+    // ── Decode via the generic ar_generate/MinimaxDispatch driver (Inc 4 flip).
+    // ar_generate prefills `new_tokens` starting at seq_pos = MiniMaxState.n_tokens
+    // (set by the LCP rewind above), then runs the AR loop. Proven token-identical to
+    // the legacy loop at temp0 on MiniMax-M2.7.mq2 via the dual-run shadow parity that
+    // this replaces. UPLIFT over the legacy loop: the n-gram loop guard + the generic
+    // sampler (sampler::sample_cpu — temp0 == the legacy argmax; temp>0 nucleus by
+    // design). No think-cap (minimax primes its own `<think>` and emits its own
+    // `</think>`), no grammar, no stop-seqs plumbed.
+    let mut __disp = MinimaxDispatch { m: &mut *m };
+    ar_generate(
+        &mut __disp,
+        gpu,
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        id,
+        temp,
+        top_p,
+        None, // top_k
+        None, // min_p
+        max_tokens,
+        1.0, // repeat_penalty (legacy: none)
+        0,   // repeat_window
+        0.0, // presence_penalty
+        0.0, // frequency_penalty
+        0,   // budget_alert_at_tok
+        "",  // budget_alert_text
+        0,   // max_think_tokens (no force-close think on minimax)
+        hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        &[],         // stop
+        None,        // tools (grammar off)
+        prefill_ids, // new_tokens: the post-LCP suffix to prefill
+        &[],         // im_end
+        &[],         // nl
+        None,        // im_end_token
+        None,        // tool_call_pair
+        None,        // think_pair
+        prefill_len,
+        cached_tokens_count,
+        None, // pflash_summary
+        None, // pflash_bypass_reason
+        None, // pflash_alpha
+        t0,
+        None, // tape (prod: no dual-run)
     );
-    let _ = stdout.flush();
-
-    // ── Dual-run shadow-parity re-run (Inc 4). Reset the context (which the legacy
-    // run above mutated) and re-drive the SAME request through the generic
-    // ar_generate/MinimaxDispatch path, capturing its committed tokens into
-    // `__new_tape`. Because the reset zeroes MiniMaxState (n_tokens=0) and clears the
-    // conversation, the re-run prefills the FULL rendered prompt (`prompt_ids`), not
-    // the LCP suffix — so it is self-contained regardless of the original cache reuse.
-    // A greedy (temp0) request MUST produce a byte-identical token stream; any
-    // divergence panics with the first differing position. Off in prod (flag gated).
-    if __parity {
-        model_reset_context(m, gpu);
-        let mut __new_tape = TokenTape::default();
-        let mut __disp = MinimaxDispatch { m: &mut *m };
-        ar_generate(
-            &mut __disp,
-            gpu,
-            stdout,
-            id,
-            temp,
-            top_p,
-            None,               // top_k (legacy passes 0 == disabled)
-            None,               // min_p
-            max_tokens,
-            1.0,                // repeat_penalty (legacy: none)
-            0,                  // repeat_window
-            0.0,                // presence_penalty
-            0.0,                // frequency_penalty
-            0,                  // budget_alert_at_tok
-            "",                 // budget_alert_text
-            0,                  // max_think_tokens (minimax has no force-close think)
-            hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-            &[],                // stop
-            None,               // tools (grammar off)
-            prompt_ids.clone(), // new_tokens: full render (context was reset)
-            &[],                // im_end
-            &[],                // nl
-            None,               // im_end_token
-            None,               // tool_call_pair
-            None,               // think_pair
-            prompt_ids.len(),   // prefill_tokens
-            0,                  // cached_tokens_count (fresh after reset)
-            None,               // pflash_summary
-            None,               // pflash_bypass_reason
-            None,               // pflash_alpha
-            t0,
-            Some(&mut __new_tape),
-        );
-        assert_token_parity(&__old_tape, &__new_tape, id);
-    }
 }
 
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
