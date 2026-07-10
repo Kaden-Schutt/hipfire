@@ -110,6 +110,10 @@ pub struct FeatureFlags {
     pub hfq4_mmq_gfx906_y64: bool,
     pub gate_up_variant: Option<String>,
     pub gate_up_nosync: bool,
+    /// RDNA3 QKVZA prefill route that keeps the large QKV/Z projections on
+    /// MMQ while sending the narrow beta/alpha tails through dot2.
+    /// Opt in with HIPFIRE_QKVZA_SPLIT_TAIL=1.
+    pub qkvza_split_tail: bool,
     pub gfx942_gemv_v2: Option<bool>,
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
@@ -408,6 +412,7 @@ impl FeatureFlags {
                 .map_or(false, |v| v == "1"),
             gate_up_variant: std::env::var("HIPFIRE_GATE_UP_VARIANT").ok(),
             gate_up_nosync: std::env::var("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
+            qkvza_split_tail: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL").unwrap_or(false),
             gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
             gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
@@ -639,6 +644,7 @@ impl FeatureFlags {
             hfq4_mmq_gfx906_y64: false,
             gate_up_variant: None,
             gate_up_nosync: false,
+            qkvza_split_tail: false,
             gfx942_gemv_v2: None,
             gfx942_gemv_v3: false,
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),
@@ -690,10 +696,44 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    const QKVZA_SPLIT_TAIL_ENV: &str = "HIPFIRE_QKVZA_SPLIT_TAIL";
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore(Option<OsString>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(QKVZA_SPLIT_TAIL_ENV, value),
+                None => std::env::remove_var(QKVZA_SPLIT_TAIL_ENV),
+            }
+        }
+    }
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::from_env_for_test("gfx1151");
         assert!(!f.force_unfused);
+    }
+
+    #[test]
+    fn qkvza_split_tail_defaults_false_in_test_ctor() {
+        let f = FeatureFlags::from_env_for_test("gfx1100");
+        assert!(!f.qkvza_split_tail);
+    }
+
+    #[test]
+    fn qkvza_split_tail_is_resolved_from_env() {
+        let _lock = ENV_LOCK.lock().expect("feature flag env lock poisoned");
+        let _restore = EnvRestore(std::env::var_os(QKVZA_SPLIT_TAIL_ENV));
+
+        std::env::remove_var(QKVZA_SPLIT_TAIL_ENV);
+        assert!(!FeatureFlags::from_env("gfx1100").qkvza_split_tail);
+
+        std::env::set_var(QKVZA_SPLIT_TAIL_ENV, "1");
+        assert!(FeatureFlags::from_env("gfx1100").qkvza_split_tail);
     }
 }
