@@ -112,10 +112,15 @@ def run_round(
 ) -> int:
     """Run one autonomous round; return the agent process's exit code.
 
-    The ``prompt`` string is piped to the child on **stdin** (the argv carries
-    the ``-`` sentinel, never the prompt text), so a large or
-    whitespace-sensitive round prompt is delivered byte-exact.
+    Codex reads the prompt from **stdin** (the argv carries the ``-`` sentinel).
+    Grok's ``-p/--single`` takes the prompt as an ARG *value* (it does NOT read
+    stdin), so for grok the prompt is embedded in the argv and nothing is piped.
     """
-    argv = build_argv(harness, model, effort, STDIN, cwd, max_turns)
-    proc = subprocess.run(argv, input=prompt, text=True)
+    h = (harness or "codex").lower()
+    if h == "grok":
+        argv = build_argv(harness, model, effort, prompt, cwd, max_turns)
+        proc = subprocess.run(argv, text=True)
+    else:
+        argv = build_argv(harness, model, effort, STDIN, cwd, max_turns)
+        proc = subprocess.run(argv, input=prompt, text=True)
     return proc.returncode
