@@ -40,6 +40,14 @@ pub trait GrammarMatcher {
     fn token_mask(&self, vocab: &[String], out: &mut [bool]);
     fn advance(&mut self, text: &str);
     fn is_free(&self) -> bool;
+    /// True once the matcher has observed a structural attractor (a decode
+    /// loop the grammar state machine can detect). Mirrors the concrete
+    /// `Matcher::attractor_detected`. Default `false` for arches whose matcher
+    /// doesn't track attractors — the driver's warn at the main-loop advance
+    /// site (daemon.rs:9751) then never fires, which is a benign no-op.
+    fn attractor_detected(&self) -> bool {
+        false
+    }
 }
 
 /// One trait object per loaded model. Owns arch-specific decode behavior so the
@@ -103,6 +111,80 @@ pub trait ArchDispatch {
     ) -> Option<Box<dyn GrammarMatcher>> {
         let _ = tool_schemas;
         None
+    }
+
+    // ── AR-phase tangle hooks (Inc 1, Task 1.4b) ──────────────────────────
+    // The "arch-neutral tangle" (eviction / adaptive-KV / checkpoint / abort)
+    // is neutral in LOGIC but operates on the arch bundle's `kv_cache` /
+    // `dn_state`, which a generic driver cannot name (they live behind
+    // `ModelState::<Arch>`). So each is a hook: the impl field-splits `m`
+    // internally (`m.eviction`/`m.kv_adaptive`/`m.prefill_checkpoints` are
+    // disjoint from `m.state`), keeping the generic driver arch-blind.
+
+    /// Apply KV eviction after a forward advanced `seq_pos`. Returns
+    /// `Ok(Some(new_physical))` when an eviction compacted the cache (the
+    /// driver then adopts it as the new physical write slot), `Ok(None)` when
+    /// no eviction is configured or none fired. Mirrors the arm's
+    /// `m.eviction.maybe_evict(gpu, kv, seq_pos)` sites. Default: no eviction.
+    #[allow(dead_code)]
+    fn maybe_evict(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        seq_pos: usize,
+    ) -> Result<Option<usize>, String> {
+        let _ = (gpu, seq_pos);
+        Ok(None)
+    }
+
+    /// Downshift adaptive-KV precision if `seq_pos` crossed a capacity
+    /// threshold. Logs applied steps to stderr internally (matching the arm),
+    /// returns nothing. Mirrors `m.kv_adaptive.maybe_downshift(gpu, kv,
+    /// seq_pos)`. Default: no adaptive-KV.
+    #[allow(dead_code)]
+    fn maybe_adaptive_downshift(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
+        let _ = (gpu, seq_pos);
+    }
+
+    /// Snapshot the recurrent state at `seq_pos` for later checkpoint-resume.
+    /// The driver gates this on its own `ckpt_resume_enabled()` before calling.
+    /// Mirrors `speculative::take_dn_checkpoint(&mut m.prefill_checkpoints, dn,
+    /// gpu, seq_pos, ckpt_interval(), ckpt_max())`. Default: no-op.
+    #[allow(dead_code)]
+    fn take_prefill_checkpoint(&mut self, gpu: &mut rdna_compute::Gpu, seq_pos: usize) {
+        let _ = (gpu, seq_pos);
+    }
+
+    /// Zero the arch's recurrent decode state on abort (DeltaNet s/conv
+    /// buffers + KV `compact_offset`, plus a co-resident Llama KV's
+    /// `compact_offset`). The driver still owns the generic parts of abort
+    /// (`seq_pos=0`, `conversation_tokens.clear()`, `free_checkpoints`, event
+    /// emit, early return). Mirrors the two abort blocks (daemon.rs:8921,
+    /// 9233). Default: no recurrent state to zero.
+    #[allow(dead_code)]
+    fn abort_zero_recurrent(&mut self, gpu: &mut rdna_compute::Gpu) {
+        let _ = gpu;
+    }
+
+    /// Sample one token from the arch's `scratch.logits`. When `grammar_mask`
+    /// is `Some`, take the CPU path (download logits, apply the mask, then
+    /// `sample_cpu`); otherwise the GPU fast path (`sampler::sample`). The
+    /// driver builds the mask via the `GrammarMatcher` and passes it here so
+    /// the arch bundle's `scratch` never crosses the trait boundary. Mirrors
+    /// the three sample sites (daemon.rs:9119, 9581, 9729). Default fails
+    /// loudly — a real arch must sample.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn sample(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        cfg: &crate::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u64,
+    ) -> Result<u32, String> {
+        let _ = (gpu, cfg, vocab_size, ngram_scope, grammar_mask, rng_state);
+        Err("sample not implemented for this arch".into())
     }
 }
 
