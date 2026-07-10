@@ -5041,17 +5041,56 @@ fn generate_ep(
         m.deepseek4_eos_tok
     };
     match m.arch_id {
-        10 => ep_serve_minimax(
-            m,
-            stdout,
-            id,
-            &prompt_ids,
-            eos_tok,
-            max_tokens,
-            stop,
-            primed_think,
-            sampling,
-        ),
+        10 => {
+            if archdispatch_parity_enabled() {
+                // minimax-EP dual-run (inc M2): legacy ep_serve_minimax (old_tape) vs
+                // ar_generate+Mesh (new_tape), asserting an identical committed-token
+                // stream. No explicit reset between arms — minimax uses LCP, and the
+                // ar_generate arm's own LCP preamble self-heals (a full-prompt prior
+                // tape → cache miss → cold prefill, matching the first arm). Re-seed
+                // the cpu sampler between arms. Flag off = legacy only (inc M3 flips).
+                let mut old_tape = TokenTape::default();
+                ep_serve_minimax(
+                    m,
+                    stdout,
+                    id,
+                    &prompt_ids,
+                    eos_tok,
+                    max_tokens,
+                    stop,
+                    primed_think,
+                    sampling,
+                    Some(&mut old_tape),
+                );
+                hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+                let mut new_tape = TokenTape::default();
+                ep_serve_minimax_via_ar_generate(
+                    m,
+                    stdout,
+                    id,
+                    &prompt_ids,
+                    max_tokens,
+                    primed_think,
+                    stop,
+                    sampling,
+                    Some(&mut new_tape),
+                );
+                assert_token_parity(&old_tape, &new_tape, id);
+            } else {
+                ep_serve_minimax(
+                    m,
+                    stdout,
+                    id,
+                    &prompt_ids,
+                    eos_tok,
+                    max_tokens,
+                    stop,
+                    primed_think,
+                    sampling,
+                    None,
+                );
+            }
+        }
         _ => {
             // Axis B FLIP: ds4 EP AR decode runs on the unified `ar_generate` driver
             // (deepseek4-EP no longer has a bespoke serve loop). EP has no LCP → reset
@@ -5178,6 +5217,114 @@ fn ep_serve_ds4_via_ar_generate(
     );
 }
 
+/// Drive minimax-EP AR decode through the unified `ar_generate` driver. Mirrors the
+/// single-GPU `generate_minimax` flip (LCP partial-reuse preamble + display-only
+/// `<think>` primer → ar_generate) but with the EP forward/sample (MinimaxEpDispatch
+/// + ForwardCtx::Mesh) and a PER-RANK `n_tokens` rewind. Unlike ds4 (no LCP, cold
+/// reset every turn), minimax rewinds each rank's KV cursor to the common prefix and
+/// prefills only the divergent suffix. Used by the inc-M2 dual-run; becomes prod at
+/// the inc-M3 flip.
+#[allow(clippy::too_many_arguments)]
+fn ep_serve_minimax_via_ar_generate(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    primed_think: bool,
+    stop: &[String],
+    sampling: EpSampling,
+    tape: Option<&mut TokenTape>,
+) {
+    let prompt_n = prompt_ids.len();
+    // Capacity guard (mirror ep_serve_minimax): absolute KV span is prompt_n +
+    // max_tokens; overrunning drives forward_ep past the per-rank KV buffer.
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_n, max_tokens, m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    // LCP partial reuse (mirror generate_minimax + ep_serve_minimax's per-rank rewind):
+    // rewind every rank's KV cursor to the common prefix, prefill only the suffix.
+    let prefill_ids: Vec<u32> = {
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_n);
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
+        let cache_hit = lcp > 0 && lcp < prompt_n;
+        let prefill_from = if cache_hit {
+            m.conversation_tokens.truncate(lcp);
+            lcp
+        } else {
+            m.conversation_tokens.clear();
+            0
+        };
+        if let Some(EpState {
+            inner: EpArch::Minimax { state, .. },
+            ..
+        }) = m.ep.as_mut()
+        {
+            for s in state.iter_mut() {
+                s.n_tokens = prefill_from;
+            }
+        }
+        m.seq_pos = prefill_from;
+        prompt_ids[prefill_from..].to_vec()
+    };
+    let cached_tokens_count = prompt_n.saturating_sub(prefill_ids.len());
+    let prefill_len = prefill_ids.len();
+    // Display-only `<think>` primer re-emit (mirror ep_serve_minimax) — NOT in the tape.
+    if primed_think {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type":"token","id":id,"text":"<think>\n"})
+        );
+        let _ = stdout.flush();
+    }
+    let mut disp = MinimaxEpDispatch { m: &mut *m };
+    ar_generate(
+        &mut disp,
+        ForwardCtx::Mesh,
+        stdout,
+        id,
+        sampling.temp,
+        sampling.top_p,
+        sampling.top_k,
+        sampling.min_p,
+        max_tokens,
+        1.0, // repeat_penalty — EP uses sample_full_dist (no penalties)
+        0,   // repeat_window
+        0.0, // presence_penalty
+        0.0, // frequency_penalty
+        0,   // budget_alert_at_tok
+        "",  // budget_alert_text
+        0,   // max_think_tokens (no force-close think on minimax)
+        hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        stop, // user stop sequences (DefaultStreamParser honors them)
+        None, // tools (minimax EP has no grammar)
+        prefill_ids, // new_tokens: the post-LCP suffix
+        &[],  // im_end (minimax stops via is_eos / [e~[ filter)
+        &[],  // nl
+        None, // im_end_token
+        None, // tool_call_pair
+        None, // think_pair (primer emitted display-only above)
+        prefill_len,
+        cached_tokens_count,
+        None, // pflash_summary
+        None, // pflash_bypass_reason
+        None, // pflash_alpha
+        std::time::Instant::now(),
+        tape,
+    );
+}
+
 /// Stream a token JSON event; returns true if a stop sequence is now satisfied.
 fn ep_emit_token(
     stdout: &mut std::io::Stdout,
@@ -5288,6 +5435,9 @@ fn ep_serve_minimax(
     stop: &[String],
     primed_think: bool,
     sampling: EpSampling,
+    // minimax-EP fold (inc M2): capture committed tokens for the dual-run parity
+    // check against the ar_generate arm. None on the prod path.
+    mut tape: Option<&mut TokenTape>,
 ) {
     use std::time::Instant;
     let prompt_n = prompt_ids.len();
@@ -5490,6 +5640,9 @@ fn ep_serve_minimax(
         let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
         generated += 1;
         m.conversation_tokens.push(next);
+        if let Some(t) = tape.as_deref_mut() {
+            t.push(next);
+        }
         if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) {
             break;
         }
