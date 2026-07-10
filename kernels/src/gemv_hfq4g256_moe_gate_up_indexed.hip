@@ -75,30 +75,6 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
              + ((sc) * (float)(((pk) >> 28) & 0xFu) + (zp)) * (x7); \
     } while (0)
 
-    #define LOAD_X8(b) \
-        const float x0 = x[(b) + 0]; \
-        const float x1 = x[(b) + 1]; \
-        const float x2 = x[(b) + 2]; \
-        const float x3 = x[(b) + 3]; \
-        const float x4 = x[(b) + 4]; \
-        const float x5 = x[(b) + 5]; \
-        const float x6 = x[(b) + 6]; \
-        const float x7 = x[(b) + 7]
-
-    #define DOG_X8(gp, a) do { \
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
-        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
-             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
-             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
-    } while (0)
-
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
