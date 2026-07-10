@@ -1587,6 +1587,161 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxDispatch<'_> {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// LFM2.5 (arch 11) AR dispatch. Plain per-token loop (no batched prefill, no
+/// LCP — the legacy path cold-resets state every turn since the hybrid conv+GQA
+/// state can't be rewound to an arbitrary prefix), so the recurrent/checkpoint/
+/// eviction hooks stay trait-default no-ops: any partial conv-state after an abort
+/// is recovered by the next turn's cold `state.reset`. Two arch specifics vs the
+/// minimax dispatch: (1) a STOP-ID SET — LFM2 ends a turn with `<|im_end|>` (=eos_tok)
+/// but ALSO emits `<|endoftext|>` / `</s>`, whose literal strings decode verbatim;
+/// (2) an `eos_filter_config` stripping all three (ar_generate commits+emits the
+/// stop token before its is_eos break, so the literal would otherwise leak — the
+/// legacy loop's id + string-frag guards both broke pre-emit).
+struct Lfm2MoeDispatch<'m> {
+    m: &'m mut LoadedModel,
+    /// eos_tok (`<|im_end|>`) + the `<|endoftext|>` / `</s>` special-token ids,
+    /// resolved via `special_token_id` (which looks up the added-token table —
+    /// `encode` of these strings does NOT round-trip to their single id). Computed
+    /// once in the preamble; `is_eos` tests membership.
+    stop_ids: Vec<u32>,
+}
+
+impl hipfire_runtime::arch_dispatch::ArchDispatch for Lfm2MoeDispatch<'_> {
+    fn arch_id(&self) -> u32 {
+        self.m.arch_id
+    }
+
+    fn eos_token(&self) -> u32 {
+        self.m.lfm2moe().map(|b| b.eos_tok).unwrap_or(0)
+    }
+
+    fn is_eos(&self, tok: u32) -> bool {
+        // Matches generate_lfm2moe's `stop_toks.contains(&next_tok)` + the string-frag
+        // guard, unified as an id set (special_token_id resolves the non-round-tripping
+        // `<|endoftext|>` / `</s>`).
+        self.stop_ids.contains(&tok)
+    }
+
+    fn sampling_defaults(&self) -> hipfire_runtime::arch_dispatch::SamplingDefaults {
+        hipfire_runtime::arch_dispatch::SamplingDefaults {
+            temp: 0.3,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    fn features(&self) -> hipfire_runtime::arch_dispatch::ArchFeatures {
+        hipfire_runtime::arch_dispatch::ArchFeatures {
+            supports_think: true,
+            supports_stop_seq: true,
+            supports_grammar: false,
+            supports_vision: false,
+        }
+    }
+
+    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        if let Some(b) = self.m.lfm2moe_mut() {
+            let _ = b.state.reset(gpu);
+        }
+        self.m.seq_pos = 0;
+        self.m.conversation_tokens.clear();
+    }
+
+    fn prefill_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        chunk: &[u32],
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        // Per-token decode_step (no batched prefill kernel for lfm2moe).
+        let b = self.m.lfm2moe_mut().ok_or("prefill_forward: no lfm2moe bundle")?;
+        let mut pos = seq_pos as u32;
+        for &tok in chunk {
+            lfm2moe::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, tok, pos)
+                .map_err(|e| format!("lfm2moe decode_step (prefill): {e}"))?;
+            pos += 1;
+        }
+        Ok(())
+    }
+
+    fn decode_step_forward(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        token: u32,
+        seq_pos: usize,
+    ) -> Result<(), String> {
+        let b = self.m.lfm2moe_mut().ok_or("decode_step_forward: no lfm2moe bundle")?;
+        lfm2moe::forward::decode_step(&b.config, &b.weights, &mut b.state, gpu, token, seq_pos as u32)
+            .map(|_| ())
+            .map_err(|e| format!("lfm2moe decode_step (decode): {e}"))
+    }
+
+    fn sample(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        cfg: &hipfire_runtime::sampler::SamplerConfig,
+        vocab_size: usize,
+        ngram_scope: &[u32],
+        grammar_mask: Option<&[bool]>,
+        rng_state: &mut u32,
+    ) -> Result<u32, String> {
+        // Host-side sample from state.logits (GPU-resident; decode_step writes+downloads
+        // it). Generic sampler (uplift): temp0 == argmax (parity vs legacy sample_token).
+        let _ = (vocab_size, grammar_mask, rng_state);
+        let b = self.m.lfm2moe().ok_or("sample: no lfm2moe bundle")?;
+        let mut logits = gpu
+            .download_f32(&b.state.logits)
+            .map_err(|e| format!("lfm2moe download logits: {e:?}"))?;
+        Ok(sampler::sample_cpu(&mut logits, ngram_scope, cfg))
+    }
+
+    fn tokenizer(&self) -> &hipfire_runtime::tokenizer::Tokenizer {
+        self.m.tokenizer.as_ref().unwrap()
+    }
+
+    fn seq_pos(&self) -> usize {
+        self.m
+            .lfm2moe()
+            .map(|b| b.state.n_tokens)
+            .unwrap_or(self.m.seq_pos)
+    }
+
+    fn set_seq_pos(&mut self, seq_pos: usize) {
+        let _ = seq_pos;
+        let np = self
+            .m
+            .lfm2moe()
+            .map(|b| b.state.n_tokens)
+            .unwrap_or(self.m.seq_pos);
+        self.m.seq_pos = np;
+    }
+
+    fn conversation_tokens_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.m.conversation_tokens
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.m.lfm2moe().map(|b| b.config.vocab_size).unwrap_or(0)
+    }
+
+    fn eos_filter_config(&self) -> hipfire_runtime::eos_filter::EosFilterConfig {
+        // LFM2 stop-class tokens decode to their LITERAL strings (unlike ChatML
+        // `<|im_end|>` on qwen, which decodes to empty). ar_generate commits+emits the
+        // stop token before its is_eos break, so strip all three here — the legacy loop
+        // broke on both the id set and a decoded-frag string guard, pre-emit.
+        hipfire_runtime::eos_filter::EosFilterConfig {
+            stop_at: vec![
+                b"<|im_end|>".to_vec(),
+                b"<|endoftext|>".to_vec(),
+                b"</s>".to_vec(),
+            ],
+            ..Default::default()
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
 /// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
 /// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
@@ -11683,6 +11838,25 @@ fn generate_lfm2moe(
         v
     };
 
+    // Stop-id set for Lfm2MoeDispatch::is_eos. Unlike `stop_toks` (which uses `encode`
+    // and so only catches the round-tripping `<|im_end|>`=eos_tok), this resolves the
+    // ACTUAL special-token ids via `special_token_id` — so ar_generate's single is_eos
+    // check catches `<|endoftext|>` / `</s>` too (the legacy loop needed a separate
+    // decoded-frag string guard for those). Paired with the dispatch's eos_filter_config
+    // (strips their literals from display).
+    let stop_ids: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut v = vec![eos_tok];
+        for s in ["<|im_end|>", "<|endoftext|>", "</s>"] {
+            if let Some(id) = tk.special_token_id(s) {
+                if !v.contains(&id) {
+                    v.push(id);
+                }
+            }
+        }
+        v
+    };
+
     // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
     // prior design only reset on capacity overflow, so every request APPENDED to
     // the KV at the growing `n_tokens` and the model attended to all prior
@@ -11754,6 +11928,15 @@ fn generate_lfm2moe(
         .unwrap_or(0x9E3779B97F4A7C15);
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
+    // Dual-run shadow parity (Inc 5, lfm2moe). Same shape as the minimax wiring:
+    // HIPFIRE_ARCHDISPATCH_PARITY=1 captures every sampled token (incl. the terminal
+    // stop token both break paths reach pre-emit) into __old_tape, then after the
+    // legacy run we model_reset_context + re-run ar_generate via Lfm2MoeDispatch into
+    // __new_tape + assert_token_parity. Flag off = legacy loop only. Greedy-only (temp0).
+    let __parity =
+        std::env::var("HIPFIRE_ARCHDISPATCH_PARITY").ok().as_deref() == Some("1");
+    let mut __old_tape = TokenTape::default();
+
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
@@ -11761,6 +11944,9 @@ fn generate_lfm2moe(
             break;
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if __parity {
+            __old_tape.push(next_tok);
+        }
         if stop_toks.contains(&next_tok) {
             break;
         }
@@ -11820,6 +12006,54 @@ fn generate_lfm2moe(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
+
+    // ── Dual-run shadow-parity re-run (Inc 5). Reset the (legacy-mutated) context and
+    // re-drive the request through ar_generate/Lfm2MoeDispatch into __new_tape, then
+    // assert token-identity. lfm2moe cold-resets every turn so there is no cache to
+    // reconstruct — the re-run just prefills the full prompt_ids from n_tokens=0.
+    if __parity {
+        model_reset_context(m, gpu);
+        let mut __new_tape = TokenTape::default();
+        let mut __disp = Lfm2MoeDispatch {
+            m: &mut *m,
+            stop_ids: stop_ids.clone(),
+        };
+        ar_generate(
+            &mut __disp,
+            gpu,
+            stdout,
+            id,
+            temp,
+            top_p,
+            None, // top_k
+            None, // min_p
+            max_tokens,
+            1.0, // repeat_penalty (legacy: none)
+            0,   // repeat_window
+            0.0, // presence_penalty
+            0.0, // frequency_penalty
+            0,   // budget_alert_at_tok
+            "",  // budget_alert_text
+            0,   // max_think_tokens
+            hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            &[],                // stop
+            None,               // tools (grammar off)
+            prompt_ids.clone(), // new_tokens: full render (context was reset)
+            &[],                // im_end
+            &[],                // nl
+            None,               // im_end_token
+            None,               // tool_call_pair
+            None,               // think_pair
+            prompt_ids.len(),   // prefill_tokens
+            0,                  // cached_tokens_count
+            None,               // pflash_summary
+            None,               // pflash_bypass_reason
+            None,               // pflash_alpha
+            t0,
+            Some(&mut __new_tape),
+        );
+        assert_token_parity(&__old_tape, &__new_tape, id);
+    }
 }
 
 /// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
