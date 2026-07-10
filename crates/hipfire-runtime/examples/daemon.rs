@@ -2302,12 +2302,13 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
 
     fn stream_parser(
         &self,
-        _cfg: hipfire_runtime::stream_parser::DefaultStreamParserConfig,
+        cfg: hipfire_runtime::stream_parser::DefaultStreamParserConfig,
     ) -> Box<dyn hipfire_runtime::stream_parser::StreamParser> {
-        // ds4 output is the DSML state machine, not the EosFilter/think-cap default —
-        // ignore `cfg`. Start state depends on whether the assistant prefix opened
-        // inside `<think>` (ep_serve_ds4:4537).
-        Box::new(Deepseek4StreamParser::new(self.think_mode))
+        // ds4 output is the DSML state machine, not the EosFilter/think-cap default,
+        // so most of `cfg` is inert — but honor `cfg.stop_seqs` (user stop sequences;
+        // ep_serve_ds4 checked them per token). Start state depends on whether the
+        // assistant prefix opened inside `<think>` (ep_serve_ds4:4537).
+        Box::new(Deepseek4StreamParser::new(self.think_mode, cfg.stop_seqs))
     }
 }
 
@@ -2342,15 +2343,27 @@ impl hipfire_runtime::arch_dispatch::GrammarMatcher for Deepseek4GrammarMatcher 
 #[allow(dead_code)]
 struct Deepseek4StreamParser {
     inner: Option<deepseek4::dsml::StreamParser>,
+    /// User stop sequences (request `stop`). ep_serve_ds4 broke per token on
+    /// `text_acc.ends_with(s)`; the dsml parser doesn't know about them, so honor
+    /// them here — without this, `stop` is silently a no-op for ds4-EP while
+    /// `features().supports_stop_seq` advertises support (review I1).
+    stop_seqs: Vec<String>,
+    /// Accumulated decoded text (all pieces), for the stop-seq suffix check —
+    /// mirrors ep_serve_ds4's `text_acc`.
+    text_acc: String,
 }
 
 impl Deepseek4StreamParser {
-    fn new(think_mode: ThinkMode) -> Self {
+    fn new(think_mode: ThinkMode, stop_seqs: Vec<String>) -> Self {
         let inner = match think_mode {
             ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
             ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
         };
-        Self { inner: Some(inner) }
+        Self {
+            inner: Some(inner),
+            stop_seqs,
+            text_acc: String::new(),
+        }
     }
 
     /// Translate dsml `StreamEvent`s into driver `StreamAction`s. Static so it can
@@ -2398,11 +2411,26 @@ impl hipfire_runtime::stream_parser::StreamParser for Deepseek4StreamParser {
         // dsml works on decoded text, not token ids — the token id is inert; the
         // running-vector byte delta IS this token's decoded text.
         let _ = tok;
-        let Some(inner) = self.inner.as_mut() else {
-            return Vec::new();
-        };
         let piece = String::from_utf8_lossy(bytes);
-        Self::map_events(inner.feed(&piece))
+        let mut acts = {
+            let Some(inner) = self.inner.as_mut() else {
+                return Vec::new();
+            };
+            Self::map_events(inner.feed(&piece))
+        };
+        // Honor user stop sequences after the token's emit actions (mirrors
+        // ep_serve_ds4's per-token `text_acc.ends_with(s)` break, review I1).
+        if !self.stop_seqs.is_empty() {
+            self.text_acc.push_str(&piece);
+            if self
+                .stop_seqs
+                .iter()
+                .any(|s| !s.is_empty() && self.text_acc.ends_with(s.as_str()))
+            {
+                acts.push(hipfire_runtime::stream_parser::StreamAction::Stop);
+            }
+        }
+        acts
     }
 
     fn on_eos(&mut self) -> hipfire_runtime::stream_parser::EosDecision {
@@ -4873,6 +4901,24 @@ fn ep_serve_ds4_via_ar_generate(
     sampling: EpSampling,
     tape: Option<&mut TokenTape>,
 ) {
+    // Capacity guard (was ep_serve_ds4's O2b-2 guard, lost in the flip): EP
+    // cold-prefills the FULL prompt every turn (no LCP), so the absolute KV span is
+    // prompt_n + max_tokens. ar_generate has NO pre-prefill physical_cap check on the
+    // EP path (its cap check lives in the budget-alert branch, off for EP:
+    // budget_alert_at_tok=0), so an oversized prompt would drive forward_ep past the
+    // per-rank KV buffer → corruption/serve-wide crash. Emit a clean error and return
+    // BEFORE prefill, exactly as ep_serve_ds4 did. saturating_add so an adversarial
+    // max_tokens can't wrap usize and slip under the cap.
+    let prompt_n = prompt_ids.len();
+    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            id, prompt_n, max_tokens, m.physical_cap
+        );
+        let _ = stdout.flush();
+        return;
+    }
     let mut disp = Deepseek4EpDispatch {
         m,
         tools: tools.map(|t| t.to_vec()),
@@ -8568,6 +8614,14 @@ fn ar_generate(
         },
     );
 
+    // Tool calls emitted BY THE PARSER (ds4 DSML / cohere2moe markers) — captured
+    // in the ToolCalls arm below so finish_reason + the asst-cache fingerprint can
+    // reflect them. The driver's ChatML `extract_tool_calls_from_text` (used at
+    // end-of-turn) only matches `<tool_call>` text (qwen), so without this a custom
+    // parser's tool call would leave finish_reason=stop/length + a []-fingerprint
+    // (cache miss on echo-back) even though the wire event fired (review I2).
+    let mut parser_tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+
     // Execute a StreamAction the parser returned (token/reasoning/info/tool_calls);
     // `Stop` is handled by the caller. Mirrors the legacy inline writes byte-for-byte.
     macro_rules! exec_stream_action {
@@ -8603,6 +8657,22 @@ fn ar_generate(
                 hipfire_runtime::stream_parser::StreamAction::ToolCalls(v) => {
                     let _ = writeln!(stdout, r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#, id, v);
                     let _ = stdout.flush();
+                    // Capture for finish_reason + fingerprint (review I2). The wire
+                    // event already went out above — this only feeds the metadata,
+                    // so no double-emit. `v` is a `{name,arguments}` array.
+                    if let serde_json::Value::Array(arr) = &v {
+                        for c in arr {
+                            if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
+                                parser_tool_calls.push(hipfire_runtime::prompt_frame::ToolCall {
+                                    name: name.to_string(),
+                                    arguments: c
+                                        .get("arguments")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null),
+                                });
+                            }
+                        }
+                    }
                 }
                 hipfire_runtime::stream_parser::StreamAction::Stop => {}
             }
@@ -8958,10 +9028,15 @@ fn ar_generate(
 
     // ── parse tool_calls + content once ──────────────────────────────────
     let decoded_full = dispatch.tokenizer().decode(&streamed_tokens);
-    let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+    // ChatML text-recovered tool calls (qwen: written as `<tool_call>` text). Custom
+    // parsers (ds4 DSML / cohere2moe markers) emit their calls via the ToolCalls
+    // StreamAction instead — captured in `parser_tool_calls` above.
+    let text_tool_calls = extract_tool_calls_from_text(&decoded_full);
 
-    if !emit_tool_calls.is_empty() {
-        let calls_json: Vec<serde_json::Value> = emit_tool_calls
+    // Wire re-emit is ONLY for text-recovered calls — parser-emitted calls already
+    // went out via the StreamAction arm, so re-emitting here would double them (I2).
+    if !text_tool_calls.is_empty() {
+        let calls_json: Vec<serde_json::Value> = text_tool_calls
             .iter()
             .map(|tc| {
                 serde_json::json!({
@@ -8977,6 +9052,14 @@ fn ar_generate(
             id, calls_str,
         );
     }
+
+    // finish_reason + asst-cache fingerprint reflect tool calls from EITHER source
+    // (text extraction for qwen; parser StreamAction for ds4/cohere2moe) — review I2.
+    let emit_tool_calls = if text_tool_calls.is_empty() {
+        parser_tool_calls
+    } else {
+        text_tool_calls
+    };
 
     // ── asst_turn_cache write ────────────────────────────────────────────
     {
@@ -14764,14 +14847,33 @@ mod ds4_stream_parser_tests {
     #[test]
     fn on_eos_is_stop_not_commit() {
         // ep_serve_ds4 breaks on the sampled eos without forwarding/emitting it.
-        let mut p = Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink);
+        let mut p =
+            Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink, Vec::new());
         assert_eq!(p.on_eos(), EosDecision::Stop);
     }
 
     #[test]
     fn finish_consumes_inner_and_is_idempotent() {
-        let mut p = Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink);
+        let mut p =
+            Deepseek4StreamParser::new(hipfire_runtime::prompt_frame::ThinkMode::NonThink, Vec::new());
         let _ = p.finish(); // takes the inner dsml parser
         assert_eq!(p.finish(), Vec::new()); // second finish: inner is None → empty
+    }
+
+    #[test]
+    fn honors_user_stop_sequences() {
+        // review I1: `stop` must not be a no-op for ds4-EP. The stop check runs on
+        // the accumulated raw pieces (independent of dsml buffering).
+        let mut p = Deepseek4StreamParser::new(
+            hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            vec!["END".to_string()],
+        );
+        let a1 = p.feed(1, b"hello ");
+        assert!(!a1.iter().any(|x| matches!(x, StreamAction::Stop)));
+        let a2 = p.feed(2, b"END");
+        assert!(
+            a2.iter().any(|x| matches!(x, StreamAction::Stop)),
+            "stop sequence at the decoded suffix must append a Stop action"
+        );
     }
 }
