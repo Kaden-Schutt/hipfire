@@ -1,64 +1,42 @@
-# Task 7 Report — D2a Toggle Deletion & Single-Path Flip
+# Task 7 Report — Cohere2MoeDispatch + Inject arm + cohere2moe dual-run
 
-## Toggle Sites Removed
+**Status:** DONE (build-only). **Commit:** (see git head). daemon builds clean; lib 342 passed.
 
-### minimax (`crates/hipfire-arch-minimax/src/forward.rs`)
-- Removed `moe_step_predown_enabled` from imports
-- Removed `let predown = moe_step_predown_enabled();`
-- Removed the entire `if !predown { ... }` direct-dispatch block in Phase 1 (sigmoid, topk, gate_up, silu_mul_rotate)
-- Both Lloyd and non-Lloyd Phase 2 step builders: replaced `if predown { vec![...] } else { vec![] }` with unconditional 4-step prefix
-- Both Lloyd and non-Lloyd collectives/zbefore: replaced conditional `if predown { colls.extend(...) }` with unconditional flat vecs
+## (A) Cohere2MoeDispatch (daemon.rs, after MinimaxDispatch)
+Full ArchDispatch modeled on MinimaxDispatch. Confirmed: `m.cohere2moe()`/`cohere2moe_mut()`
+accessors; `Cohere2MoeBundle.eos_tok` = END_OF_TURN; `state.n_tokens`/`state.logits` (GPU-
+resident, decode_step downloads+returns it — same as minimax); `state.reset(gpu)->Result`;
+`config.vocab_size`; `forward::{decode_step, forward_batch, forward_batch_supported}`.
+- forward hooks: batched forward_batch (chunks-of-64) when forward_batch_supported else
+  per-token decode_step; sample = download state.logits + sample_cpu.
+- Struct holds `tools: Option<Vec<Value>>` (constructed per-request) so `stream_parser()` can
+  build the parser's known_tools/tool_params.
+- `stream_parser(cfg)` OVERRIDE → `Cohere2MoeStreamParser::new(tokenizer, tools, cfg.max_tokens,
+  cfg.max_think_tokens)`. No eos_filter_config (eos consumed by on_eos, never emitted).
 
-### ds4 (`crates/hipfire-arch-deepseek4/src/forward.rs`)
-- Removed `moe_step_predown_enabled` from imports
-- Removed `let predown = moe_step_predown_enabled();`
-- **Double-run avoidance:** removed `ds4_moe_gate_up_silu_rotate(cfg, layer, state, gpu, layer_idx)?;` from both `ds4_bias_pre_down` and `ds4_hash_pre_down` — these were the direct calls that would have double-run gate_up once the ep step unconditionally prepends the GateUp Step
-- **Deleted `ds4_moe_gate_up_silu_rotate`** entirely (no callers remain)
-- Both hash and non-hash arms of `ds4_ep_moe_step`: replaced `if predown { vec![...] } else { vec![] }` with unconditional 2-step prefix (GateUp + MoeActivation{Ds4ClampRotate})
-- Both arms: replaced conditional `if predown { colls.extend; zbefore.extend }` with flat unconditional vecs
+## (B) Driver on_eos→Inject fix (ar_generate)
+Moved the eos decision to PRE-COMMIT (loop top, after abort). `eos_commit_and_stop` flag falls
+through to commit+forward+emit_only+break (byte-identical to the prior post-forward
+CommitAndStop). `Inject(v)` → `for t in v { parser.enqueue(t) }` + `next_token = next_forced();
+was_forced=true; continue` — eos NOT committed. `Stop` → break (no commit). Removed the old
+post-forward eos block. DefaultStreamParser (always CommitAndStop) path verified unchanged.
 
-## Toggle Scaffolding Deleted
-- `crates/hipfire-dispatch/src/pipeline/moe_step_toggle.rs` — deleted
-- `mod moe_step_toggle; pub use moe_step_toggle::...` removed from `pipeline/mod.rs`
+## (C) Dual-run in generate_cohere2moe
+`__parity`/`__old_tape` before the loop; `__old_tape.push(next_tok)` at the single commit site
+(13182-13190, every marker/forced/text token); parity re-run after the done event
+(model_reset_context + Cohere2MoeDispatch{m, tools} + ar_generate(prompt_ids full render,
+tape=Some) + assert_token_parity). Legacy loop intact (T9 deletes).
 
-## Doc Fix
-- `crates/hipfire-dispatch/src/pipeline/steps.rs` `MoeActivationVariant::MinimaxFused` doc: replaced false claim "no per-weight AWQ" with accurate dispatch description (`Some` → AWQ-scaled kernel / `None` → plain kernel; shipped M2.7.mq2 carries AWQ and passes `Some`)
-
-## Examples → Single-Run Assert
-- `ep_minimax.rs`: removed `set_moe_step_predown_override` import+calls, removed second ON-pass run, kept single generate loop, added `assert_eq!(fnv, 0x887c2e7717e9c3bf)`
-- `ep_deepseek4.rs`: same — removed `set_moe_step_predown_override` import+calls, removed second ON-pass run, added `assert_eq!(fnv, 0x6c0f2f000f1d398f)`
-
-## git status --short Before Commit
-```
- M crates/hipfire-arch-deepseek4/examples/ep_deepseek4.rs
- M crates/hipfire-arch-deepseek4/src/forward.rs
- M crates/hipfire-arch-minimax/examples/ep_minimax.rs
- M crates/hipfire-arch-minimax/src/forward.rs
- M crates/hipfire-dispatch/src/pipeline/mod.rs
- D crates/hipfire-dispatch/src/pipeline/moe_step_toggle.rs
- M crates/hipfire-dispatch/src/pipeline/steps.rs
-```
-Exactly 7 files (6 modified + 1 deleted). No unrelated files.
-
-## Validation Results
-
-### Workspace Build
-`cargo build --release --workspace --all-targets --locked` — PASS (0 errors)
-
-### ep_minimax (HIPFIRE_EMULATE_GPUS=2, HIPFIRE_DETERMINISTIC=1, tp=2, max=32)
-```
-gen FNV: 0x887c2e7717e9c3bf
-assert_eq!(fnv, 0x887c2e7717e9c3bf) — PASS
-```
-
-### ep_deepseek4 (HIPFIRE_EMULATE_GPUS=2, HIPFIRE_DETERMINISTIC=1, tp=2, max=32, --no-dspark)
-```
-gen FNV: 0x6c0f2f000f1d398f
-assert_eq!(fnv, 0x6c0f2f000f1d398f) — PASS
-```
-
-### ds4 Recall Gate
-`./scripts/coherence-gate-deepseek4-recall.sh` — HARD-FAIL at depth=1500 (recall mangled).
-Pre-existing known gfx1151 long-context recall degradation, NOT caused by our changes.
-The gate exercises the single-GPU `decode_step_body` path; the modified code is
-`ds4_ep_moe_step` (EP-only, never invoked by the single-GPU path). Per brief: noted, not blocking.
+## What T8 MUST validate (GPU, north-mini-code.mq4.hfq)
+1. Token-parity FLOOR: HIPFIRE_ARCHDISPATCH_PARITY=1 temp0 — no PARITY FAIL (but it is BLIND to
+   tool_calls/reasoning events; do NOT accept green parity as sufficient).
+2. EVENT-EQUIVALENCE (the real bar): `scripts/coherence-gate-cohere2moe.sh` (hard-fails on
+   `<|MARKER|>` leak + error event) + the 4 guard fixtures from Task 6, live-tuned:
+   - empty_turn → on_eos Inject fires (may need subtler prompt / verify it reason-only-stops)
+   - think_budget → SET max_think_tokens (~100) so the force-close trips
+   - toolcall / toolcall_as_text → SUPPLY a tool schema at run time (else North can't call)
+   Diff the prod-path (flag off) event stream vs a legacy-path capture of the same inputs.
+3. Concern: the empty-turn on_eos Inject re-entry (pre-commit) is a structural change to the
+   shared driver — confirm DefaultStreamParser arches (qwen35/minimax/lfm2moe) still byte-
+   identical (re-run a quick T4-style check if paranoid; the CommitAndStop path is unchanged
+   by construction but the eos check moved location).
