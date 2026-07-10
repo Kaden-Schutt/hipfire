@@ -1314,6 +1314,18 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Fused MoE routed-core MEGAKERNEL v2 (mq4 / uniform HFQ4-G256), based on the
+/// loop/gfx1201 WINNING kernels. One cooperative-launch dispatch runs all four
+/// decode routed-core stages — gate_up (hoist/preload/notail) → grid.sync →
+/// SwiGLU+FWHT → grid.sync → down-expanded (NR=4 + s_prefetch) → grid.sync →
+/// K_TOP weighted combine + residual add — collapsing four graph nodes (three
+/// inter-node replay gaps) into one. Each stage copies its WINNING standalone
+/// kernel's math+scheduling verbatim, so output is token-id identical to the
+/// split path. Runs UNDER hipGraph capture on gfx1201 (cooperative+capture
+/// verified value-copy-safe). Wave32-only; opt-in `HIPFIRE_MOE_MEGAKERNEL=1`.
+pub const MOE_MEGAKERNEL_MQ4_SRC: &str =
+    include_str!("../../../kernels/src/moe_megakernel_mq4.hip");
+
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
 /// with `MOE_DOWN_COMBINE_K8_BATCHED_SRC` for the K_TOP fold. Closes the

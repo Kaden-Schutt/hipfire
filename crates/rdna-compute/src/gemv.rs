@@ -5781,6 +5781,118 @@ impl Gpu {
 
     /// Index-aware MoE gate_up GEMV. Reads expert_ids from a device-side
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
+    /// Fused MoE routed-core MEGAKERNEL v2 (mq4 / uniform HFQ4-G256): runs
+    /// gate_up → silu+FWHT → down-expanded → combine+residual in ONE
+    /// cooperative-launch dispatch, based on the loop/gfx1201 WINNING kernels.
+    /// Token-id identical to the split path. Capture-safe on gfx1201 (cooperative
+    /// kernargs are value-copied at capture — verified), so it runs UNDER the AR
+    /// decode graph. Signs are fetched from scratch (`ensure_mq_signs`). `d` =
+    /// model hidden (gate_up in / down out); `f` = mi (ffn width per expert).
+    /// `expert_outputs` is the `[K_TOP × d]` expanded scratch (phase-3 out).
+    /// Errors (dispatch falls back to the split path) if the runtime lacks the
+    /// cooperative-launch / occupancy symbols.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_megakernel_mq4_hfq4g256(
+        &mut self,
+        expert_ptrs_gu: &GpuTensor,
+        expert_ptrs_dn: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        x_residual: &GpuTensor,
+        d: usize,
+        f: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "moe_megakernel_mq4",
+            kernels::MOE_MEGAKERNEL_MQ4_SRC,
+            "moe_megakernel_mq4_hfq4g256",
+        )?;
+        // Cooperative grid = occupancy/WGP × RAW MultiprocessorCount (NOT the ×2
+        // physical-CU conversion — that overshoots the co-resident limit → hipError
+        // 720), capped at the largest phase's logical block count.
+        let occ = {
+            let func = self.functions.get("moe_megakernel_mq4_hfq4g256").ok_or_else(|| {
+                hip_bridge::HipError::new(0, "moe_megakernel_mq4_hfq4g256: function not loaded")
+            })?;
+            unsafe {
+                self.hip
+                    .module_occupancy_max_active_blocks_per_multiprocessor(func, 32, 0)?
+            }
+        };
+        let n_mp = self
+            .hip
+            .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, 0)
+            .ok()
+            .filter(|&v| v > 0)
+            .map(|v| v as usize)
+            .unwrap_or(16);
+        let logical_max = (f * k_top).max(((d + 3) / 4) * k_top).max((d + 31) / 32);
+        let mut grid_blocks = ((occ.max(1) as usize) * n_mp).min(logical_max).max(1) as u32;
+
+        let gup = expert_ptrs_gu.buf.as_ptr();
+        let dnp = expert_ptrs_dn.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let d_val = d as i32;
+        let f_val = f as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gup as *const _ as *mut c_void,
+            &dnp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &d_val as *const _ as *mut c_void,
+            &f_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let func = self.functions.get("moe_megakernel_mq4_hfq4g256").unwrap();
+        // occ×n_mp is the co-resident capacity; halve-and-retry if a driver reserve
+        // rejects the exact limit (grid-stride makes any grid size correct).
+        loop {
+            let res = unsafe {
+                self.hip.launch_cooperative_kernel(
+                    func,
+                    [grid_blocks, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.active_stream.as_ref(),
+                    &mut params,
+                )
+            };
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) if grid_blocks > 1 && e.message.contains("too many blocks") => {
+                    grid_blocks = (grid_blocks / 2).max(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.
     #[allow(clippy::too_many_arguments)]
     /// `n_ranks` is the number of top-k ranks (grid.y workgroups) this launch
