@@ -39,7 +39,7 @@
 
 use crate::tp_shard::ShardConfig;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry};
-use hipfire_hardware::DeviceMesh;
+use hipfire_hardware::{DeviceMesh, DimKind};
 use rdna_compute::{DType, GpuTensor};
 use std::collections::HashMap;
 
@@ -370,8 +370,14 @@ fn fulfill_into<F>(
 where
     F: Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
 {
+    debug_assert!(
+        mesh.axes().iter().filter(|a| a.kind != DimKind::Pp).count() <= 1,
+        "fulfill_manifest: single non-Pp axis only; composed Tp×Ep slicing is Phase 5b",
+    );
     for entry in weights {
         let devices = placement_devices(entry, mesh, n_layers);
+        let tp_axis = mesh.size_of(DimKind::Tp);
+        let ep_axis = mesh.size_of(DimKind::Ep);
 
         // Tied: no upload — record an alias to the source entry on its device.
         if let ShardPolicy::Tied { source: src } = &entry.policy {
@@ -390,7 +396,7 @@ where
         // contiguous, no arch-specific quant handling. (Size-1 group falls
         // through to whole-tensor: all experts on the one device.)
         if let ShardPolicy::ExpertSharded { n_experts, assign } = &entry.policy {
-            if devices.len() > 1 {
+            if ep_axis > 1 {
                 let tp_size = devices.len();
                 let shard = ShardConfig::new(tp_size, false, *n_experts, *assign).map_err(|e| {
                     FulfillError {
@@ -454,7 +460,7 @@ where
         // (Row/FusedQkv/Head/Vocab, and non-axis-0 Column, still refuse below —
         // those need strided / head-aware / group-aligned gathers, PB-1b/1c.)
         if let ShardPolicy::ColumnShard { axis: 0 } = &entry.policy {
-            if devices.len() > 1 {
+            if tp_axis > 1 {
                 let tp = devices.len();
                 let rows = *entry.logical_shape.first().unwrap_or(&0);
                 if rows == 0 || rows % tp != 0 {
@@ -527,7 +533,7 @@ where
         // group-alignment guarantee is the manifest's. The gathered per-rank blob
         // is a valid row-major [m, k/tp] quant tensor the GEMV kernel consumes as-is.
         if let ShardPolicy::RowShard { .. } = &entry.policy {
-            if devices.len() > 1 {
+            if tp_axis > 1 {
                 let tp = devices.len();
                 let rows = *entry.logical_shape.first().unwrap_or(&0);
                 let inner: usize = entry.logical_shape.iter().skip(1).product();
@@ -612,7 +618,7 @@ where
         // Shape convention: [n_experts, 2*inter, hidden] for gate‖up (axis-1 = 2*inter),
         // [n_experts, hidden, inter] for down (axis-2 = inter).
         if let ShardPolicy::ExpertTensorSharded { n_experts, inner } = &entry.policy {
-            if devices.len() > 1 {
+            if tp_axis > 1 {
                 let tp = devices.len();
                 let (bytes, dtype) = source(entry).map_err(|e| FulfillError {
                     name: entry.name.clone(),
@@ -725,7 +731,7 @@ where
         // Remaining dense TP slices across a real (≥2) group are not implemented
         // yet (PB-1b) — refuse rather than mis-place. A size-1 group degenerates
         // to a whole-tensor upload and is fine.
-        if is_dense_tp_slice(&entry.policy) && devices.len() > 1 {
+        if is_dense_tp_slice(&entry.policy) && tp_axis > 1 {
             return Err(FulfillError {
                 name: entry.name.clone(),
                 layer: entry.layer,
@@ -981,16 +987,22 @@ mod tests {
     // (the same predicates fulfill_manifest branches on).
     #[test]
     fn dense_tp_slice_would_refuse_on_multi_device() {
-        // RowShard maps to the Tp group, so a Tp-2 mesh gives a 2-device split
-        // → refusal. (On an Ep-only mesh it degenerates to a Tp singleton.)
+        // RowShard on a Tp-2 mesh: 2-device split → refusal decision. The refuse
+        // predicate keys off the Tp axis size (not the device count).
         let tp2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
         let e = wl("wo", 0, ShardPolicy::RowShard { axis: 1 });
         let devs = placement_devices(&e, &tp2, 4);
         assert_eq!(devs.len(), 2);
-        assert!(is_dense_tp_slice(&e.policy) && devs.len() > 1);
-        // ExpertSharded on a 2-device Ep mesh is NOT refused — it has its own
-        // path — but it does place across the whole Ep group.
+        assert!(is_dense_tp_slice(&e.policy) && tp2.size_of(DimKind::Tp) > 1);
+        // RowShard on an Ep-only mesh: placed across the whole EP group, but the
+        // Tp axis is size 1 → NOT sliced/refused; it replicates (whole tensor per
+        // rank) via the fall-through path. This is the EP-only fix.
         let ep2 = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        let redevs = placement_devices(&e, &ep2, 4);
+        assert_eq!(redevs, vec![0, 1]);
+        assert!(!(is_dense_tp_slice(&e.policy) && ep2.size_of(DimKind::Tp) > 1));
+        // ExpertSharded on a 2-device Ep mesh places across the whole Ep group
+        // and is sliced by expert (Ep axis > 1), never refused.
         let exp = wl(
             "experts",
             0,
@@ -1001,11 +1013,11 @@ mod tests {
         );
         let edevs = placement_devices(&exp, &ep2, 4);
         assert_eq!(edevs.len(), 2);
-        assert!(!is_dense_tp_slice(&exp.policy));
-        // Same dense entry on a single mesh degenerates to whole-tensor (no refusal).
+        assert!(!is_dense_tp_slice(&exp.policy) && ep2.size_of(DimKind::Ep) > 1);
+        // Same dense entry on a single mesh degenerates to whole-tensor.
         let single = DeviceMesh::single();
         let devs1 = placement_devices(&e, &single, 4);
         assert_eq!(devs1, vec![0]);
-        assert!(!(is_dense_tp_slice(&e.policy) && devs1.len() > 1));
+        assert!(!(is_dense_tp_slice(&e.policy) && single.size_of(DimKind::Tp) > 1));
     }
 }
