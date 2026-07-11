@@ -28,21 +28,36 @@ def trial_merge(base_ref: str, head_ref: str, repo: str, run_git=None) -> dict:
     merged_tree = lines[0].strip() if lines else None
     if rc == 0:
         return {"clean": True, "merged_tree": merged_tree, "conflicts": []}
-    # rc != 0: conflicts. Format is <tree>\n\n<conflicted path>*  — take the
-    # non-empty lines after the first blank separator.
+    # rc != 0: conflicts. Real `git merge-tree --write-tree --name-only` layout is
+    #   <tree OID>\n<conflicted path>*\n\n<freeform informational messages>
+    # i.e. the conflicted paths are the lines AFTER the OID and BEFORE the first
+    # blank separator; everything after the blank ("Auto-merging …", "CONFLICT …")
+    # is non-machine-parseable prose and must NOT be treated as a path.
     conflicts: list[str] = []
-    seen_blank = False
     for ln in lines[1:]:
         if not ln.strip():
-            seen_blank = True
-            continue
-        if seen_blank:
-            conflicts.append(ln.strip())
+            break                       # blank line ends the conflicted-path section
+        conflicts.append(ln.strip())
     return {"clean": False, "merged_tree": merged_tree, "conflicts": conflicts}
 
 
-def assemble_bod(*, conflicts=None, perf_regressions=None, coherence_fails=None) -> dict:
-    """Assemble the Bill of Debt — the itemized blockers a PR must clear (spec §10)."""
+# run_gate REJECT reasons (autoresearch/ar/gate/engine.py) -> BOD blocker kinds.
+# A reason with no explicit mapping is itemized under its own name (never dropped).
+_REASON_KIND = {
+    "perf_regression": "perf_regression",
+    "coherence": "coherence",
+    "parity": "parity",
+    "cross_arch": "cross_arch",
+}
+
+
+def assemble_bod(*, conflicts=None, perf_regressions=None, coherence_fails=None,
+                 reasons=None) -> dict:
+    """Assemble the Bill of Debt — the itemized blockers a PR must clear (spec §10).
+
+    ``reasons`` itemizes raw run_gate REJECT reasons generically (parity /
+    cross_arch / perf_regression / coherence / …), so no real blocker is ever
+    silently dropped."""
     blockers: list[dict] = []
     for c in conflicts or []:
         blockers.append({"kind": "merge_conflict", "detail": c})
@@ -50,6 +65,8 @@ def assemble_bod(*, conflicts=None, perf_regressions=None, coherence_fails=None)
         blockers.append({"kind": "perf_regression", "detail": r})
     for c in coherence_fails or []:
         blockers.append({"kind": "coherence", "detail": c})
+    for r in reasons or []:
+        blockers.append({"kind": _REASON_KIND.get(r, r), "detail": r})
     summary = f"{len(blockers)} blocker(s)" if blockers else "no blockers"
     return {"blockers": blockers, "summary": summary}
 
@@ -84,9 +101,8 @@ def gate4(*, base_ref, head_ref, staging_ref, repo, run_merged_gate,
         if g["verdict"] == "PASS":
             return {"verdict": "PASS", "bod": None, "merged": tm, "gate": g}
 
-    reasons = g.get("reasons", [])
-    bod = assemble_bod(
-        perf_regressions=[r for r in reasons if "perf" in r],
-        coherence_fails=[r for r in reasons if "coher" in r],
-    )
+    # Itemize EVERY REJECT reason (parity / cross_arch / perf_regression /
+    # coherence) so a parity- or cross-arch-only clobber still yields a populated,
+    # non-self-contradictory BOD.
+    bod = assemble_bod(reasons=g.get("reasons", []))
     return {"verdict": "BOD", "bod": bod, "merged": tm, "gate": g}

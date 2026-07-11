@@ -8,8 +8,12 @@ def _git_clean(repo, *args):
 
 
 def _git_conflict(repo, *args):
-    # rc 1, tree OID line, blank line, then conflicted paths (--name-only)
-    return (1, "deadbeef\n\ncrates/hipfire-runtime/examples/daemon.rs\n")
+    # REAL `git merge-tree --write-tree --name-only` conflict layout (verified
+    # against live git): <OID>\n<conflicted path>*\n\n<freeform informational prose>.
+    # The conflicted paths come BEFORE the blank; Auto-merging/CONFLICT lines after.
+    return (1, "deadbeef\ncrates/hipfire-runtime/examples/daemon.rs\n\n"
+               "Auto-merging crates/hipfire-runtime/examples/daemon.rs\n"
+               "CONFLICT (content): Merge conflict in crates/hipfire-runtime/examples/daemon.rs\n")
 
 
 def test_clean_merge():
@@ -23,6 +27,17 @@ def test_conflicted_merge_lists_paths():
     r = trial_merge("staging", "pr", "/repo", run_git=_git_conflict)
     assert r["clean"] is False
     assert r["conflicts"] == ["crates/hipfire-runtime/examples/daemon.rs"]
+
+
+def test_conflict_excludes_informational_prose_and_handles_multiple():
+    # Two conflicted paths before the blank; Auto-merging/CONFLICT prose after it
+    # must NOT be captured as paths (the defect the shared-assumption mock hid).
+    def two(repo, *args):
+        return (1, "oid\ncrates/a.rs\ncrates/b.rs\n\n"
+                   "Auto-merging crates/a.rs\nCONFLICT (content): Merge conflict in crates/a.rs\n")
+
+    r = trial_merge("staging", "pr", "/repo", run_git=two)
+    assert r["conflicts"] == ["crates/a.rs", "crates/b.rs"]
 
 
 def test_passes_refs_to_git():
@@ -114,3 +129,21 @@ def test_post_merge_clobber_fixed_then_passes():
               run_merged_gate=lambda: gates.pop(0),
               merge_fix=lambda kind, detail: {"fixed": True}, trial_merge_fn=_clean_tm)
     assert r["verdict"] == "PASS"
+
+
+def test_post_merge_clobber_parity_is_itemized_not_empty():
+    # A parity-only clobber must produce a POPULATED BOD (the defect: parity/
+    # cross_arch reasons were dropped, yielding verdict=BOD + "no blockers").
+    r = gate4(base_ref="m", head_ref="pr", staging_ref="staging", repo="/repo",
+              run_merged_gate=_gate("REJECT", ["parity"]),
+              merge_fix=None, trial_merge_fn=_clean_tm)
+    assert r["verdict"] == "BOD"
+    assert r["bod"]["blockers"] == [{"kind": "parity", "detail": "parity"}]
+    assert r["bod"]["summary"] != "no blockers"
+
+
+def test_post_merge_clobber_cross_arch_is_itemized():
+    r = gate4(base_ref="m", head_ref="pr", staging_ref="staging", repo="/repo",
+              run_merged_gate=_gate("REJECT", ["cross_arch"]),
+              merge_fix=None, trial_merge_fn=_clean_tm)
+    assert [b["kind"] for b in r["bod"]["blockers"]] == ["cross_arch"]
