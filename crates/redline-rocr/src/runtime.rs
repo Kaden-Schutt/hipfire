@@ -1453,10 +1453,7 @@ impl KernargPool {
     /// Allocate CPU-writable, GPU-accessible command memory. The executable
     /// flag is required for MEC indirect-buffer fetches even though the PM4
     /// words are data rather than shader ISA.
-    pub fn allocate_executable_bytes(
-        &self,
-        length: usize,
-    ) -> Result<KernargBuffer, RuntimeError> {
+    pub fn allocate_executable_bytes(&self, length: usize) -> Result<KernargBuffer, RuntimeError> {
         self.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG)
     }
 
@@ -1790,10 +1787,16 @@ impl Executable {
             abi::EXECUTABLE_SYMBOL_INFO_KERNEL_DYNAMIC_CALLSTACK,
             (&mut metadata.dynamic_callstack as *mut bool).cast(),
         )?;
+        let pm4 = parse_kernel_pm4_metadata(
+            &self.inner._code_object,
+            symbol_name,
+            metadata.kernel_object,
+        );
         Ok(Kernel {
             executable: self.inner.clone(),
             name: symbol_name.to_owned(),
             metadata,
+            pm4,
         })
     }
 }
@@ -1819,20 +1822,27 @@ fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeErro
             .map_err(|_| RuntimeError::InvalidOffloadBundle("entry ID length overflows usize"))?;
         let id_end = cursor
             .checked_add(id_len)
-            .ok_or(RuntimeError::InvalidOffloadBundle("entry ID range overflows"))?;
+            .ok_or(RuntimeError::InvalidOffloadBundle(
+                "entry ID range overflows",
+            ))?;
         let id = code
             .get(cursor..id_end)
             .ok_or(RuntimeError::InvalidOffloadBundle("truncated entry ID"))?;
         cursor = id_end;
         let end = offset
             .checked_add(size)
-            .ok_or(RuntimeError::InvalidOffloadBundle("entry payload range overflows"))?;
+            .ok_or(RuntimeError::InvalidOffloadBundle(
+                "entry payload range overflows",
+            ))?;
         if end > code.len() {
             return Err(RuntimeError::InvalidOffloadBundle(
                 "entry payload exceeds bundle",
             ));
         }
-        if id.windows(b"amdgcn-amd-amdhsa".len()).any(|window| window == b"amdgcn-amd-amdhsa") {
+        if id
+            .windows(b"amdgcn-amd-amdhsa".len())
+            .any(|window| window == b"amdgcn-amd-amdhsa")
+        {
             if amdgpu.replace((offset, end)).is_some() {
                 return Err(RuntimeError::InvalidOffloadBundle(
                     "multiple AMDGPU code objects require an explicit target",
@@ -1849,10 +1859,14 @@ fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeErro
 fn read_bundle_u64(code: &[u8], cursor: &mut usize) -> Result<u64, RuntimeError> {
     let end = cursor
         .checked_add(8)
-        .ok_or(RuntimeError::InvalidOffloadBundle("bundle header overflows"))?;
+        .ok_or(RuntimeError::InvalidOffloadBundle(
+            "bundle header overflows",
+        ))?;
     let bytes: [u8; 8] = code
         .get(*cursor..end)
-        .ok_or(RuntimeError::InvalidOffloadBundle("truncated bundle header"))?
+        .ok_or(RuntimeError::InvalidOffloadBundle(
+            "truncated bundle header",
+        ))?
         .try_into()
         .expect("slice length checked");
     *cursor = end;
@@ -1887,6 +1901,16 @@ pub struct Kernel {
     executable: Arc<ExecutableInner>,
     name: String,
     metadata: KernelMetadata,
+    pm4: Option<KernelPm4Metadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelPm4Metadata {
+    pub code_entry: u64,
+    pub compute_pgm_rsrc1: u32,
+    pub compute_pgm_rsrc2: u32,
+    pub compute_pgm_rsrc3: u32,
+    pub kernel_code_properties: u16,
 }
 
 impl fmt::Debug for Kernel {
@@ -1907,9 +1931,117 @@ impl Kernel {
         self.metadata
     }
 
+    pub fn pm4_metadata(&self) -> Option<KernelPm4Metadata> {
+        self.pm4
+    }
+
     pub fn agent(&self) -> abi::Agent {
         self.executable.agent
     }
+}
+
+fn parse_kernel_pm4_metadata(
+    elf: &[u8],
+    symbol_name: &str,
+    loaded_descriptor: u64,
+) -> Option<KernelPm4Metadata> {
+    const ELF64_HEADER_BYTES: usize = 64;
+    const ELF64_SYMBOL_BYTES: usize = 24;
+    const PT_LOAD: u32 = 1;
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_DYNSYM: u32 = 11;
+    if elf.len() < ELF64_HEADER_BYTES || elf.get(0..4)? != b"\x7fELF" {
+        return None;
+    }
+    let phoff = read_elf_u64(elf, 32)? as usize;
+    let shoff = read_elf_u64(elf, 40)? as usize;
+    let phentsize = read_elf_u16(elf, 54)? as usize;
+    let phnum = read_elf_u16(elf, 56)? as usize;
+    let shentsize = read_elf_u16(elf, 58)? as usize;
+    let shnum = read_elf_u16(elf, 60)? as usize;
+    if phentsize < 56 || shentsize < 64 {
+        return None;
+    }
+    let va_to_offset = |va: u64| -> Option<usize> {
+        for index in 0..phnum {
+            let base = phoff.checked_add(index.checked_mul(phentsize)?)?;
+            if read_elf_u32(elf, base)? != PT_LOAD {
+                continue;
+            }
+            let offset = read_elf_u64(elf, base + 8)?;
+            let vaddr = read_elf_u64(elf, base + 16)?;
+            let filesz = read_elf_u64(elf, base + 32)?;
+            if va >= vaddr && va < vaddr.checked_add(filesz)? {
+                return usize::try_from(offset.checked_add(va - vaddr)?).ok();
+            }
+        }
+        None
+    };
+    let mut descriptor_va = None;
+    for section in 0..shnum {
+        let base = shoff.checked_add(section.checked_mul(shentsize)?)?;
+        let section_type = read_elf_u32(elf, base + 4)?;
+        if section_type != SHT_SYMTAB && section_type != SHT_DYNSYM {
+            continue;
+        }
+        let symbols_offset = read_elf_u64(elf, base + 24)? as usize;
+        let symbols_size = read_elf_u64(elf, base + 32)? as usize;
+        let string_section = read_elf_u32(elf, base + 40)? as usize;
+        let entry_size = read_elf_u64(elf, base + 56)? as usize;
+        if entry_size < ELF64_SYMBOL_BYTES || string_section >= shnum {
+            continue;
+        }
+        let string_base = shoff.checked_add(string_section.checked_mul(shentsize)?)?;
+        let strings_offset = read_elf_u64(elf, string_base + 24)? as usize;
+        let strings_size = read_elf_u64(elf, string_base + 32)? as usize;
+        let strings = elf.get(strings_offset..strings_offset.checked_add(strings_size)?)?;
+        for index in 0..(symbols_size / entry_size) {
+            let symbol = symbols_offset.checked_add(index.checked_mul(entry_size)?)?;
+            let name_offset = read_elf_u32(elf, symbol)? as usize;
+            let name_tail = strings.get(name_offset..)?;
+            let name_end = name_tail.iter().position(|byte| *byte == 0)?;
+            if name_tail.get(..name_end)? == symbol_name.as_bytes() {
+                descriptor_va = Some(read_elf_u64(elf, symbol + 8)?);
+                break;
+            }
+        }
+        if descriptor_va.is_some() {
+            break;
+        }
+    }
+    let descriptor_offset = va_to_offset(descriptor_va?)?;
+    let descriptor = elf.get(descriptor_offset..descriptor_offset.checked_add(64)?)?;
+    let entry_offset = i64::from_le_bytes(descriptor.get(16..24)?.try_into().ok()?);
+    let code_entry = if entry_offset >= 0 {
+        loaded_descriptor.checked_add(entry_offset as u64)?
+    } else {
+        loaded_descriptor.checked_sub(entry_offset.unsigned_abs())?
+    };
+    Some(KernelPm4Metadata {
+        code_entry,
+        compute_pgm_rsrc3: read_elf_u32(descriptor, 44)?,
+        compute_pgm_rsrc1: read_elf_u32(descriptor, 48)?,
+        compute_pgm_rsrc2: read_elf_u32(descriptor, 52)?,
+        kernel_code_properties: read_elf_u16(descriptor, 56)?,
+    })
+}
+
+fn read_elf_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_elf_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_elf_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 fn check_status(
@@ -2148,6 +2280,65 @@ mod tests {
         let state = QueueFaultState::default();
         state.record(abi::STATUS_SUCCESS);
         assert_eq!(state.status(), Some(abi::STATUS_SUCCESS));
+    }
+
+    #[test]
+    fn parses_pm4_resources_and_rebases_descriptor_entry() {
+        const PHOFF: usize = 64;
+        const SHOFF: usize = 120;
+        const SYMTAB: usize = 312;
+        const STRTAB: usize = 336;
+        const DESCRIPTOR: usize = 384;
+        let mut elf = vec![0_u8; 512];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // little endian
+        elf[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes());
+        elf[40..48].copy_from_slice(&(SHOFF as u64).to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        elf[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&3_u16.to_le_bytes());
+
+        // One PT_LOAD maps ELF virtual addresses directly to file offsets.
+        elf[PHOFF..PHOFF + 4].copy_from_slice(&1_u32.to_le_bytes());
+        let elf_len = elf.len() as u64;
+        elf[PHOFF + 32..PHOFF + 40].copy_from_slice(&elf_len.to_le_bytes());
+
+        // Section 1: one ELF64 symbol; section 2: its string table.
+        let sym_section = SHOFF + 64;
+        elf[sym_section + 4..sym_section + 8].copy_from_slice(&2_u32.to_le_bytes());
+        elf[sym_section + 24..sym_section + 32].copy_from_slice(&(SYMTAB as u64).to_le_bytes());
+        elf[sym_section + 32..sym_section + 40].copy_from_slice(&24_u64.to_le_bytes());
+        elf[sym_section + 40..sym_section + 44].copy_from_slice(&2_u32.to_le_bytes());
+        elf[sym_section + 56..sym_section + 64].copy_from_slice(&24_u64.to_le_bytes());
+        let str_section = SHOFF + 128;
+        elf[str_section + 4..str_section + 8].copy_from_slice(&3_u32.to_le_bytes());
+        elf[str_section + 24..str_section + 32].copy_from_slice(&(STRTAB as u64).to_le_bytes());
+        let symbol_name = b"\0kernel.kd\0";
+        elf[str_section + 32..str_section + 40]
+            .copy_from_slice(&(symbol_name.len() as u64).to_le_bytes());
+        elf[STRTAB..STRTAB + symbol_name.len()].copy_from_slice(symbol_name);
+        elf[SYMTAB..SYMTAB + 4].copy_from_slice(&1_u32.to_le_bytes());
+        elf[SYMTAB + 8..SYMTAB + 16].copy_from_slice(&(DESCRIPTOR as u64).to_le_bytes());
+
+        elf[DESCRIPTOR + 16..DESCRIPTOR + 24].copy_from_slice(&0x120_i64.to_le_bytes());
+        elf[DESCRIPTOR + 44..DESCRIPTOR + 48].copy_from_slice(&0x150_u32.to_le_bytes());
+        elf[DESCRIPTOR + 48..DESCRIPTOR + 52].copy_from_slice(&0xe00f_0004_u32.to_le_bytes());
+        elf[DESCRIPTOR + 52..DESCRIPTOR + 56].copy_from_slice(&0x84_u32.to_le_bytes());
+        elf[DESCRIPTOR + 56..DESCRIPTOR + 58].copy_from_slice(&0x408_u16.to_le_bytes());
+
+        let parsed = parse_kernel_pm4_metadata(&elf, "kernel.kd", 0x7f00_0000).unwrap();
+        assert_eq!(
+            parsed,
+            KernelPm4Metadata {
+                code_entry: 0x7f00_0120,
+                compute_pgm_rsrc1: 0xe00f_0004,
+                compute_pgm_rsrc2: 0x84,
+                compute_pgm_rsrc3: 0x150,
+                kernel_code_properties: 0x408,
+            }
+        );
     }
 
     fn queue_depth_sample(queue_id: u64, read_index: u64, write_index: u64) -> QueueDepthSample {

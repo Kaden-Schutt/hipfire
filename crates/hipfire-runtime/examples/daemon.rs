@@ -282,7 +282,10 @@ fn redline_qwen_debug_hashes(
         hashes.insert((*name).to_owned(), format!("{:016x}", redline_hash(&bytes)));
     }
     let state = redline_qwen_snapshot(gpu, bundle)?;
-    hashes.insert("all_kv".to_owned(), format!("{:016x}", redline_hash(&state.kv)));
+    hashes.insert(
+        "all_kv".to_owned(),
+        format!("{:016x}", redline_hash(&state.kv)),
+    );
     hashes.insert(
         "all_recurrent".to_owned(),
         format!("{:016x}", redline_hash(&state.recurrent)),
@@ -367,7 +370,9 @@ fn redline_reset_qwen(
             .memset(buffer, 0, buffer.size())
             .map_err(|error| error.to_string())?;
     }
-    gpu.hip.device_synchronize().map_err(|error| error.to_string())
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
 }
 
 fn redline_prime_qwen(
@@ -391,7 +396,9 @@ fn redline_prime_qwen(
         None,
     )
     .map_err(|error| error.to_string())?;
-    gpu.hip.device_synchronize().map_err(|error| error.to_string())
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
 }
 
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
@@ -3138,7 +3145,9 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "redline_shadow_aql" => {
+            "redline_shadow_aql" | "redline_shadow_pm4" => {
+                let pm4 =
+                    msg.get("type").and_then(|value| value.as_str()) == Some("redline_shadow_pm4");
                 let context = msg
                     .get("context_tokens")
                     .and_then(|value| value.as_u64())
@@ -3164,7 +3173,16 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
-                let prepared = match gpu.replay.prepare_linear_aql(gpu.device_id as usize) {
+                let prepared = match if pm4 {
+                    let launch_count = gpu.replay.recorded_launches().len();
+                    gpu.replay
+                        .prepare_pm4_prefix(gpu.device_id as usize, launch_count)
+                        .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+                } else {
+                    gpu.replay
+                        .prepare_linear_aql(gpu.device_id as usize)
+                        .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+                } {
                     Ok(summary) => summary,
                     Err(reason) => {
                         let _ = writeln!(
@@ -3200,10 +3218,16 @@ fn main() {
                             &bundle.scratch,
                         )
                         .map_err(|error| error.to_string())?;
-                        let timing = unsafe { gpu.replay.replay_linear_aql() }?;
-                        gpu_us += timing.span_microseconds();
+                        if pm4 {
+                            unsafe { gpu.replay.replay_pm4() }?;
+                        } else {
+                            let timing = unsafe { gpu.replay.replay_linear_aql() }?;
+                            gpu_us += timing.span_microseconds();
+                        }
                     }
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
                     let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
                     let snapshot = redline_qwen_snapshot(&gpu, bundle)?;
                     Ok((snapshot, host_us, gpu_us))
@@ -3244,7 +3268,9 @@ fn main() {
                         gpu.replay_recorded_hip_prefix(prepared.0)
                             .map_err(|error| error.to_string())?;
                     }
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
                     redline_qwen_snapshot(&gpu, bundle)
                 })();
                 let blob_snapshot = match blob_result {
@@ -3271,7 +3297,9 @@ fn main() {
                     };
                     redline_reset_qwen(&mut gpu, bundle)?;
                     redline_prime_qwen(&mut gpu, bundle, context)?;
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
                     let started = Instant::now();
                     for i in 0..iterations {
                         qwen35::forward_scratch(
@@ -3286,7 +3314,9 @@ fn main() {
                         )
                         .map_err(|error| error.to_string())?;
                     }
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
                     let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
                     let snapshot = redline_qwen_snapshot(&gpu, bundle)?;
                     Ok((snapshot, host_us))
@@ -3318,11 +3348,13 @@ fn main() {
                     "{}",
                     serde_json::json!({
                         "type": "redline_shadow_result",
+                        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
                         "context_tokens": context,
                         "iterations": iterations,
                         "dispatches": prepared.0,
                         "packets": prepared.1,
                         "queue_id": prepared.2,
+                        "command_dwords": prepared.3,
                         "bit_exact": bit_exact,
                         "blob_bit_exact": blob_bit_exact,
                         "logits_equal": logits_equal,
@@ -3348,6 +3380,10 @@ fn main() {
                     .get("prefix")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(2) as usize;
+                let pm4 = msg
+                    .get("pm4")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
@@ -3365,10 +3401,15 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
-                let prepared = match gpu
-                    .replay
-                    .prepare_linear_aql_prefix(gpu.device_id as usize, prefix)
-                {
+                let prepared = match if pm4 {
+                    gpu.replay
+                        .prepare_pm4_prefix(gpu.device_id as usize, prefix)
+                        .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+                } else {
+                    gpu.replay
+                        .prepare_linear_aql_prefix(gpu.device_id as usize, prefix)
+                        .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+                } {
                     Ok(summary) => summary,
                     Err(reason) => {
                         let _ = writeln!(
@@ -3396,16 +3437,26 @@ fn main() {
                         &bundle.scratch,
                     )
                     .map_err(|error| error.to_string())?;
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
                     let initial = redline_qwen_debug_hashes(&gpu, bundle)?;
-                    unsafe { gpu.replay.replay_linear_aql() }?;
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    let replay_started = Instant::now();
+                    if pm4 {
+                        unsafe { gpu.replay.replay_pm4() }?;
+                    } else {
+                        unsafe { gpu.replay.replay_linear_aql() }?;
+                    }
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let replay_host_us = replay_started.elapsed().as_secs_f64() * 1e6;
                     let hashes = redline_qwen_debug_hashes(&gpu, bundle)?;
                     let mut dn_k = Vec::new();
                     redline_append_buffer(&gpu, &mut dn_k, &bundle.scratch.dn_k.buf)?;
-                    Ok((initial, hashes, dn_k))
+                    Ok((initial, hashes, dn_k, replay_host_us))
                 })();
-                let (aql_initial, aql_hashes, aql_dn_k) = match aql_hashes {
+                let (aql_initial, aql_hashes, aql_dn_k, direct_host_us) = match aql_hashes {
                     Ok(result) => result,
                     Err(reason) => {
                         let _ = writeln!(
@@ -3433,17 +3484,23 @@ fn main() {
                         &bundle.scratch,
                     )
                     .map_err(|error| error.to_string())?;
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
                     let initial = redline_qwen_debug_hashes(&gpu, bundle)?;
+                    let replay_started = Instant::now();
                     gpu.replay_recorded_hip_prefix(prefix)
                         .map_err(|error| error.to_string())?;
-                    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let replay_host_us = replay_started.elapsed().as_secs_f64() * 1e6;
                     let hashes = redline_qwen_debug_hashes(&gpu, bundle)?;
                     let mut dn_k = Vec::new();
                     redline_append_buffer(&gpu, &mut dn_k, &bundle.scratch.dn_k.buf)?;
-                    Ok((initial, hashes, dn_k))
+                    Ok((initial, hashes, dn_k, replay_host_us))
                 })();
-                let (hip_initial, hip_hashes, hip_dn_k) = match hip_hashes {
+                let (hip_initial, hip_hashes, hip_dn_k, hip_host_us) = match hip_hashes {
                     Ok(result) => result,
                     Err(reason) => {
                         let _ = writeln!(
@@ -3512,7 +3569,14 @@ fn main() {
                     serde_json::json!({
                         "type": "redline_prefix_result",
                         "prefix": prefix,
+                        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
                         "dispatches": prepared.0,
+                        "packets": prepared.1,
+                        "queue_id": prepared.2,
+                        "command_dwords": prepared.3,
+                        "direct_host_us": direct_host_us,
+                        "hip_host_us": hip_host_us,
+                        "speedup_over_hip": hip_host_us / direct_host_us,
                         "equal": differing.is_empty(),
                         "differing": differing,
                         "initial_equal": aql_initial == hip_initial,

@@ -123,6 +123,11 @@ def main():
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--prefix", type=int, help="compare only the first N captured launches")
+    parser.add_argument(
+        "--pm4",
+        action="store_true",
+        help="lower --prefix to one retained PM4 indirect buffer",
+    )
     args = parser.parse_args()
 
     model = Path(args.model).expanduser().resolve()
@@ -241,14 +246,15 @@ def main():
         if args.prefix is None:
             report["aql_shadow"] = daemon.request(
                 {
-                    "type": "redline_shadow_aql",
+                    "type": "redline_shadow_pm4" if args.pm4 else "redline_shadow_aql",
                     "context_tokens": args.decode_context,
                     "iterations": args.shadow_iterations,
                 }
             )
             shadow_pass = report["aql_shadow"]["bit_exact"]
             print(
-                f"aql-shadow: exact={shadow_pass} "
+                f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
+                f"exact={shadow_pass} "
                 f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
                 f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
                 flush=True,
@@ -259,11 +265,13 @@ def main():
                     "type": "redline_prefix_shadow",
                     "context_tokens": args.decode_context,
                     "prefix": args.prefix,
+                    "pm4": args.pm4,
                 }
             )
             shadow_pass = report["prefix_shadow"]["equal"]
             print(
-                f"prefix-shadow: prefix={args.prefix} exact={shadow_pass} "
+                f"prefix-shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
+                f"prefix={args.prefix} exact={shadow_pass} "
                 f"differing={report['prefix_shadow']['differing']}",
                 flush=True,
             )

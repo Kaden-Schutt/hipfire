@@ -5106,6 +5106,9 @@ pub fn forward_scratch(
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
     gpu.replay.set_forward_eligible(graph_eligible);
+    gpu.replay
+        .begin_auto_capture_if_armed()
+        .map_err(|reason| HipError::new(0, reason))?;
     if ar_graph_test && !graph_eligible {
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;
@@ -5144,7 +5147,21 @@ pub fn forward_scratch(
         return match replay {
             Ok(_) => Ok(()),
             Err(reason) => {
-                gpu.replay.poison(format!("prepared AQL replay failed: {reason}"));
+                gpu.replay
+                    .poison(format!("prepared AQL replay failed: {reason}"));
+                Err(HipError::new(0, &reason))
+            }
+        };
+    }
+    if gpu.replay.should_route_pm4() {
+        gpu.hip
+            .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        let replay = unsafe { gpu.replay.replay_pm4() };
+        return match replay {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                gpu.replay
+                    .poison(format!("prepared PM4 replay failed: {reason}"));
                 Err(HipError::new(0, &reason))
             }
         };
@@ -5210,9 +5227,19 @@ pub fn forward_scratch(
         gpu.replay
             .finish_capture()
             .map_err(|reason| HipError::new(0, reason))?;
-        if let Err(reason) = gpu.replay.prepare_linear_aql(gpu.device_id as usize) {
+        let prepare = if gpu.replay.uses_pm4_transport() {
+            let launches = gpu.replay.recorded_launches().len();
             gpu.replay
-                .poison(format!("AQL prepare after warmup failed: {reason}"));
+                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                .map(|_| ())
+        } else {
+            gpu.replay
+                .prepare_linear_aql(gpu.device_id as usize)
+                .map(|_| ())
+        };
+        if let Err(reason) = prepare {
+            gpu.replay
+                .poison(format!("Redline prepare after warmup failed: {reason}"));
             eprintln!("[redline] falling back to HIP: {reason}");
         }
     }

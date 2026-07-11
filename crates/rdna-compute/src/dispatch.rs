@@ -1189,6 +1189,9 @@ impl Gpu {
                     .get(func_name)
                     .or_else(|| match func_name {
                         "mq_rotate_x" => self.compiler.compiled_kernels().get("gemv_mq4g256"),
+                        "deinterleave_f32_batched" => {
+                            self.compiler.compiled_kernels().get("deinterleave_batched")
+                        }
                         name if name.starts_with("gemv_hfq4g256_multirow_r") => self
                             .compiler
                             .compiled_kernels()

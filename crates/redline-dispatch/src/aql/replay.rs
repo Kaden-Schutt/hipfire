@@ -10,8 +10,8 @@ use redline_rocr::packet::{
     PacketError, PacketImage,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, GpuDevice, HeaderPolicy, KernargBuffer, Kernel,
-    QueueDepthReport, QueueSet, RuntimeError,
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy,
+    KernargBuffer, KernargPool, Kernel, QueueDepthReport, QueueSet, RuntimeError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +39,109 @@ fn apply_quiescence_transition(
             // in-flight state so graph Drop retries queue inactivation.
             *in_flight = true;
             *usable = false;
+        }
+    }
+}
+
+/// One retained GFX12 PM4 indirect buffer submitted through AMD's
+/// vendor-specific AQL packet. One queue publication replaces every dispatch
+/// packet in the command stream while preserving public ROCr ownership and
+/// completion handling.
+pub struct SingleQueuePm4Ib {
+    queues: QueueSet,
+    completion: CompletionSignal,
+    indirect: KernargBuffer,
+    batch: Vec<PacketImage>,
+    usable: bool,
+}
+
+impl SingleQueuePm4Ib {
+    pub fn create(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        commands: &Gfx12Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        if commands.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let bytes = commands.as_bytes();
+        let mut indirect = pool.allocate_executable_bytes(bytes.len())?;
+        indirect.write_exact(&bytes)?;
+        let completion = CompletionSignal::new(device)?;
+        let packet = PacketImage::pm4_indirect_buffer(
+            indirect.address(),
+            commands.len_dwords(),
+            completion.raw(),
+        )?;
+        let queue_size = *device.queue_size_range().start();
+        let queues = QueueSet::create(device, 1, queue_size)?;
+        Ok(Self {
+            queues,
+            completion,
+            indirect,
+            batch: vec![packet],
+            usable: true,
+        })
+    }
+
+    pub fn queue_id(&self) -> u64 {
+        self.queues
+            .queue_ids()
+            .next()
+            .expect("single-queue PM4 replay owns one queue")
+    }
+
+    pub fn indirect_address(&self) -> usize {
+        self.indirect.address() as usize
+    }
+
+    /// Submit and synchronously prove completion with a finite timeout.
+    ///
+    /// # Safety
+    ///
+    /// All code, kernarg, and pointee addresses encoded in the retained IB
+    /// must remain live and GPU-accessible until this returns `Ok`. After an
+    /// error they must remain live through this object's destruction.
+    pub unsafe fn replay_and_wait(&mut self) -> Result<(), ReplayError> {
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        self.completion.reset();
+        if let Err(error) = self
+            .queues
+            .prepare_batches(std::slice::from_ref(&self.batch))
+        {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = self.queues.ring_prepared() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        match self
+            .queues
+            .wait_signal(&self.completion, DEFAULT_WAIT_TIMEOUT)
+        {
+            Ok(()) => Ok(()),
+            Err(operation) => {
+                self.usable = false;
+                match self.queues.inactivate_all() {
+                    Ok(()) => Err(operation.into()),
+                    Err(teardown) => Err(RuntimeError::OperationAndTeardown {
+                        operation: Box::new(operation),
+                        teardown: Box::new(teardown),
+                    }
+                    .into()),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SingleQueuePm4Ib {
+    fn drop(&mut self) {
+        if !self.usable {
+            let _ = self.queues.inactivate_all();
         }
     }
 }
@@ -685,15 +788,15 @@ impl SingleQueueBatchGraph {
         if self.in_flight {
             return Err(ReplayError::KernargPatchWhileInFlight);
         }
-        let recorded = self
-            .dispatches
-            .get_mut(dispatch)
-            .ok_or(ReplayError::KernargPatchOutOfBounds {
-                dispatch,
-                offset,
-                bytes: 4,
-                kernarg_bytes: 0,
-            })?;
+        let recorded =
+            self.dispatches
+                .get_mut(dispatch)
+                .ok_or(ReplayError::KernargPatchOutOfBounds {
+                    dispatch,
+                    offset,
+                    bytes: 4,
+                    kernarg_bytes: 0,
+                })?;
         let kernarg_bytes = recorded.kernarg.len();
         let end = offset
             .checked_add(4)
@@ -703,16 +806,14 @@ impl SingleQueueBatchGraph {
                 bytes: 4,
                 kernarg_bytes,
             })?;
-        let destination = recorded
-            .kernarg
-            .as_mut_bytes()
-            .get_mut(offset..end)
-            .ok_or(ReplayError::KernargPatchOutOfBounds {
+        let destination = recorded.kernarg.as_mut_bytes().get_mut(offset..end).ok_or(
+            ReplayError::KernargPatchOutOfBounds {
                 dispatch,
                 offset,
                 bytes: 4,
                 kernarg_bytes,
-            })?;
+            },
+        )?;
         destination.copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
