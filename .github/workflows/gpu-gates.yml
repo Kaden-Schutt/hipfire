@@ -344,6 +344,9 @@ jobs:
           BOX: ${{ matrix.box }}
         run: |
           set -eu
+          # The runner service is non-login and does not inherit ~/.local/bin,
+          # while both boxes install their authenticated codex binary there.
+          export PATH="$HOME/.local/bin:$PATH"
           source scripts/gpu-lock.sh
           gpu_acquire "gpu-gate-behavior-${BOX}"
           trap gpu_release EXIT
