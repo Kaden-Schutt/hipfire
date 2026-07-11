@@ -114,3 +114,46 @@ def test_stack_train_folds_clean_and_collects_debt():
 def test_stack_train_empty_is_master():
     out = stack_train(approved_prs=[], master_ref="M", repo="/r", fold_fn=lambda p, s: None)
     assert out["train"] == [] and out["staging_ref"] == "M" and out["debt"] == []
+
+
+from autoresearch.ar.gate.staging import land_train
+
+
+def _git_ok(repo, *args):
+    if args[:1] == ("merge",):
+        return (0, "")
+    if args[:2] == ("rev-parse", "HEAD"):
+        return (0, "landedsha\n")
+    return (0, "")
+
+
+def _repro_ok(stg, master, repo):
+    return {"reproduced": True, "failures": []}
+
+
+def test_land_flushes_train_and_closes_behind():
+    out = land_train(train=["pr1", "pr3"], staging_ref="stg", master_ref="M", repo="/r",
+                     git=_git_ok, land_reproduce_fn=_repro_ok)
+    assert out["landed"] is True and out["closed"] == ["pr1", "pr3"]
+    assert out["master_sha"] == "landedsha"
+
+
+def test_land_empty_train_is_noop():
+    out = land_train(train=[], staging_ref="stg", master_ref="M", repo="/r",
+                     git=_git_ok, land_reproduce_fn=_repro_ok)
+    assert out["landed"] is False and out["reason"] == "empty-train"
+
+
+def test_land_reclobber_blocks_landing():
+    bad = lambda stg, master, repo: {"reproduced": False, "failures": ["behavior:x"]}
+    out = land_train(train=["pr1"], staging_ref="stg", master_ref="M", repo="/r",
+                     git=_git_ok, land_reproduce_fn=bad)
+    assert out["landed"] is False and out["reason"] == "landing-clobber" and out["closed"] == []
+
+
+def test_land_merge_failure_does_not_close():
+    def git_fail(repo, *args):
+        return (1, "conflict") if args[:1] == ("merge",) else (0, "")
+    out = land_train(train=["pr1"], staging_ref="stg", master_ref="M", repo="/r",
+                     git=git_fail, land_reproduce_fn=_repro_ok)
+    assert out["landed"] is False and out["reason"] == "merge-failed" and out["closed"] == []

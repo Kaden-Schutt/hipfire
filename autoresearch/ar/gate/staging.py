@@ -79,3 +79,22 @@ def stack_train(*, approved_prs, master_ref, repo, fold_fn) -> dict:
         else:
             debt.append({"pr": pr, "reason": res["reason"], "detail": res.get("detail", "")})
     return {"train": train, "debt": debt, "staging_ref": staging_ref}
+
+
+def land_train(*, train, staging_ref, master_ref, repo, git, land_reproduce_fn) -> dict:
+    """Flush the whole approved train to master in one non-clobber merge (spec §11).
+    Re-validates the LANDED result (recall-reproduce the stack's behaviors) BEFORE
+    finalizing, then merges non-squash so folded commits become master ancestors; the
+    folded PRs are returned in ``closed`` for close-behind bookkeeping."""
+    if not train:
+        return {"landed": False, "master_sha": None, "closed": [], "reason": "empty-train"}
+
+    rr = land_reproduce_fn(staging_ref, master_ref, repo)
+    if not rr.get("reproduced"):
+        return {"landed": False, "master_sha": None, "closed": [], "reason": "landing-clobber"}
+
+    rc, _ = git(repo, "merge", "--no-ff", staging_ref)
+    if rc != 0:
+        return {"landed": False, "master_sha": None, "closed": [], "reason": "merge-failed"}
+    _, head = git(repo, "rev-parse", "HEAD")
+    return {"landed": True, "master_sha": head.strip(), "closed": list(train), "reason": "landed"}
