@@ -34,31 +34,36 @@ def recall_reproduce(pr_ref, merged_ref, recorded, repo, *, reproduce_fn) -> dic
 
 def fold_pr(*, pr_ref, staging_ref, master_ref, repo, recorded,
             trial_merge_fn, merge_fix_fn=None, reproduce_fn) -> dict:
-    """Fold one PR onto staging: trial-merge -> (resolve) -> recall-reproduce -> FOLDED/BOD."""
-    def _validate(stg):
+    """Fold one PR onto staging: trial-merge -> (merge-fix resolve) -> recall-reproduce
+    -> FOLDED/BOD. Per spec §10 BOTH a textual conflict AND a semantic clobber (clean
+    merge but a recorded behavior fails to reproduce) get a merge-fix attempt before a
+    BOD — the fixer is never skipped for a clobber."""
+    def _try(stg):
+        # -> ("FOLDED", merged_tree) | ("clobber", detail) | ("conflict", None)
         tm = trial_merge_fn(stg, pr_ref, repo)
         if not tm["clean"]:
-            return None
+            return ("conflict", None)
         rr = recall_reproduce(pr_ref, tm["merged_tree"], recorded, repo, reproduce_fn=reproduce_fn)
         if not rr["reproduced"]:
-            return {"pr": pr_ref, "verdict": "BOD", "staging_ref": stg,
-                    "reason": "clobber", "detail": ", ".join(rr["failures"])}
-        return {"pr": pr_ref, "verdict": "FOLDED", "staging_ref": tm["merged_tree"],
-                "reason": "folded", "detail": ""}
+            return ("clobber", ", ".join(rr["failures"]))
+        return ("FOLDED", tm["merged_tree"])
 
-    res = _validate(staging_ref)
-    if res is not None:
-        return res
+    outcome, data = _try(staging_ref)
+    if outcome == "FOLDED":
+        return {"pr": pr_ref, "verdict": "FOLDED", "staging_ref": data, "reason": "folded", "detail": ""}
 
-    # trial conflicted: try the codex merge-fix (resolve on staging), then re-validate.
+    # Conflict OR clobber -> dispatch the codex merge-fix (resolve on staging), re-validate.
     if merge_fix_fn is not None:
         fix = merge_fix_fn(pr_ref, staging_ref, repo)
         if fix.get("resolved"):
-            res = _validate(fix["staging_ref"])
-            if res is not None:
-                return res
+            o2, d2 = _try(fix["staging_ref"])
+            if o2 == "FOLDED":
+                return {"pr": pr_ref, "verdict": "FOLDED", "staging_ref": d2, "reason": "folded", "detail": ""}
 
-    # unresolved -> BOD, split reason for an actionable message.
+    # Unresolved -> BOD with an actionable reason.
+    if outcome == "clobber":
+        return {"pr": pr_ref, "verdict": "BOD", "staging_ref": staging_ref,
+                "reason": "clobber", "detail": data}
     reason = classify_conflict(pr_ref, master_ref, repo, trial_merge_fn=trial_merge_fn)
     return {"pr": pr_ref, "verdict": "BOD", "staging_ref": staging_ref,
             "reason": reason, "detail": "rebase on master" if reason == "stale"

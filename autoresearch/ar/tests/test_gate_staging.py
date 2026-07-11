@@ -93,6 +93,32 @@ def test_conflict_fixed_then_reproduces_is_folded():
     assert r["verdict"] == "FOLDED" and r["staging_ref"] == "merged"
 
 
+def test_semantic_clobber_gets_a_merge_fix_attempt():
+    # Clean textual merge but behavior does NOT reproduce (semantic clobber, spec §10):
+    # must ATTEMPT merge_fix, not BOD immediately. Broken on the original tip, fine after
+    # the fix moves the tip to 'fixed'.
+    def tm(base, head, repo):
+        return {"clean": True, "merged_tree": "merged-" + base, "conflicts": []}
+
+    def repro(pr, merged, rec, repo):
+        ok = merged == "merged-fixed"
+        return {"reproduced": ok, "failures": [] if ok else ["behavior:x"]}
+
+    fix = lambda pr, stg, repo: {"resolved": True, "staging_ref": "fixed"}
+    r = fold_pr(pr_ref="pr1", staging_ref="stg", **_K,
+                trial_merge_fn=tm, merge_fix_fn=fix, reproduce_fn=repro)
+    assert r["verdict"] == "FOLDED" and r["staging_ref"] == "merged-fixed"
+
+
+def test_semantic_clobber_fixer_fails_is_bod_clobber():
+    tm = lambda base, head, repo: {"clean": True, "merged_tree": "merged", "conflicts": []}
+    repro = lambda pr, merged, rec, repo: {"reproduced": False, "failures": ["behavior:x"]}
+    fix = lambda pr, stg, repo: {"resolved": False, "staging_ref": stg}
+    r = fold_pr(pr_ref="pr1", staging_ref="stg", **_K,
+                trial_merge_fn=tm, merge_fix_fn=fix, reproduce_fn=repro)
+    assert r["verdict"] == "BOD" and r["reason"] == "clobber"
+
+
 from autoresearch.ar.gate.staging import stack_train
 
 
