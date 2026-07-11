@@ -37,3 +37,24 @@ def test_passes_refs_to_git():
     assert seen["repo"] == "/repo"
     assert "merge-tree" in seen["args"]
     assert seen["args"][-2:] == ("staging", "pr")
+
+
+from autoresearch.ar.gate.merge import assemble_bod
+
+
+def test_bod_collects_all_kinds():
+    bod = assemble_bod(
+        conflicts=["daemon.rs"],
+        perf_regressions=["perf_regression"],
+        coherence_fails=["coherence"],
+    )
+    kinds = [b["kind"] for b in bod["blockers"]]
+    assert kinds == ["merge_conflict", "perf_regression", "coherence"]
+    assert bod["blockers"][0]["detail"] == "daemon.rs"
+    assert "3" in bod["summary"]
+
+
+def test_bod_empty_is_clean():
+    bod = assemble_bod()
+    assert bod["blockers"] == []
+    assert bod["summary"] == "no blockers"

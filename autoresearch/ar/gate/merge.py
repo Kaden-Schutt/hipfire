@@ -39,3 +39,16 @@ def trial_merge(base_ref: str, head_ref: str, repo: str, run_git=None) -> dict:
         if seen_blank:
             conflicts.append(ln.strip())
     return {"clean": False, "merged_tree": merged_tree, "conflicts": conflicts}
+
+
+def assemble_bod(*, conflicts=None, perf_regressions=None, coherence_fails=None) -> dict:
+    """Assemble the Bill of Debt — the itemized blockers a PR must clear (spec §10)."""
+    blockers: list[dict] = []
+    for c in conflicts or []:
+        blockers.append({"kind": "merge_conflict", "detail": c})
+    for r in perf_regressions or []:
+        blockers.append({"kind": "perf_regression", "detail": r})
+    for c in coherence_fails or []:
+        blockers.append({"kind": "coherence", "detail": c})
+    summary = f"{len(blockers)} blocker(s)" if blockers else "no blockers"
+    return {"blockers": blockers, "summary": summary}
