@@ -4756,12 +4756,11 @@ struct PromptCachePlan {
 /// `build_cached_history` call sites (LCP planning in `plan_prompt_cache`
 /// and the actual prompt render) read this so their token streams stay
 /// byte-consistent — a mismatch would break the LCP forward-extension.
-fn qwen_history_tool_render() -> hipfire_runtime::prompt_frame::ToolCallRender {
-    if std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() == Some("0") {
-        hipfire_runtime::prompt_frame::ToolCallRender::QwenXml
-    } else {
-        hipfire_runtime::prompt_frame::ToolCallRender::HermesJson
-    }
+fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_frame::ToolCallRender {
+    hipfire_runtime::prompt_frame::qwen35_history_render(
+        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        model_path,
+    )
 }
 
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
@@ -4785,6 +4784,7 @@ fn plan_prompt_cache(
     system_prompt: Option<&str>,
     prompt: &str,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tool_render: hipfire_runtime::prompt_frame::ToolCallRender,
     messages_history: &[hipfire_runtime::prompt_frame::Message],
     cache_disabled: bool,
     // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`) and
@@ -4800,7 +4800,7 @@ fn plan_prompt_cache(
         messages_history,
         &q_tokens,
         assistant_prefix,
-        qwen_history_tool_render(),
+        tool_render,
         |msg| {
             let stripped = strip_think_for_fingerprint(&msg.content);
             let normalized =
@@ -5202,6 +5202,7 @@ fn generate_dflash(
                 system_prompt,
                 prompt,
                 assistant_prefix,
+                qwen_history_tool_render(&m.model_path),
                 hist,
                 cache_disabled,
                 &dflash_ckpt_positions,
@@ -5241,7 +5242,10 @@ fn generate_dflash(
     // list from the raw tool JSON inside `make_spec_emitter`. This wrapper only
     // honors the `HIPFIRE_QWEN35_GRAMMAR=0` kill-switch by withholding `tools`
     // (⇒ empty schema ⇒ grammar inactive).
-    let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
+    let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
+        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        &m.model_path,
+    );
     let emit_tools: Option<Vec<serde_json::Value>> = if grammar_enabled {
         tools.map(|t| t.to_vec())
     } else {
@@ -7086,7 +7090,10 @@ fn generate_multi(
     // vocab is built into a request-local Vec rather than cached on `m`
     // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
     // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
-    let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
+    let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
+        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        &m.model_path,
+    );
     let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
         tools
             .map(|arr| {
@@ -8958,7 +8965,7 @@ fn generate(
                 history,
                 &q_tokens,
                 assistant_prefix,
-                qwen_history_tool_render(),
+                qwen_history_tool_render(&m.model_path),
                 |msg| {
                     // Match the store side's stripping. The store applies
                     // `strip_think_for_fingerprint` then `maybe_normalize_prompt`
@@ -9616,7 +9623,10 @@ fn generate(
         // structurally-similar DSML grammar.
         //
         // Disable with `HIPFIRE_QWEN35_GRAMMAR=0` for A/B comparison.
-        let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
+        let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
+            std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+            &m.model_path,
+        );
         let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
             tools
                 .map(|arr| {
