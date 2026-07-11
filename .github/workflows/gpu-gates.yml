@@ -98,10 +98,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: |
-            --max-turns 15
+            --max-turns 40
             --disallowedTools WebSearch,WebFetch,Agent
           prompt: |
             You are the Tier-3 gate ORCHESTRATOR for hipfire PR #${{ needs.decide.outputs.pr }}.
+            Budget your turns: read the diff, understand it, write codex_gate_prompt.txt, and STOP —
+            if you approach the turn limit, write the file with what you have rather than exploring more.
             Read the diff SEMANTICALLY (`git diff ${{ needs.decide.outputs.base }}
             ${{ needs.decide.outputs.head }}`) + the PR description and UNDERSTAND what this PR does.
             Then WRITE, to `codex_gate_prompt.txt` in the workspace root, a complete self-contained
@@ -135,7 +137,10 @@ jobs:
   gate:
     name: gpu-gate / ${{ matrix.box }}
     needs: [decide, dispatch]
-    if: ${{ needs.decide.outputs.run == 'true' }}
+    # always() so a FAILED dispatch (e.g. Claude hit max-turns authoring the prompt) does not
+    # SKIP the gate — it falls back to the generic codex prompt. Authorization is still gated
+    # on decide.run; if decide itself failed, run is empty => false => skip.
+    if: ${{ always() && needs.decide.outputs.run == 'true' }}
     strategy:
       fail-fast: false
       matrix:
