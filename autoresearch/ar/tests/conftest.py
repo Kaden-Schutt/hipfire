@@ -56,3 +56,10 @@ def loop_toml():
     """Absolute path to the stable 3-worker loop-config fixture. Decouples
     loader/config-verb tests from the campaign-mutable loop_gfx1201.toml."""
     return os.path.join(_FIXTURES, "loop_test.toml")
+
+
+@pytest.fixture
+def pr_gate_toml():
+    """Absolute path to the stable Tier-3 gate-config fixture. Decouples the gate
+    CLI --plan tests from the shipped pr_gate.toml (whose canonical SKUs change)."""
+    return os.path.join(_FIXTURES, "pr_gate_test.toml")

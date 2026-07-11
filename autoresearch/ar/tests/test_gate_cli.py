@@ -13,8 +13,8 @@ def _run(argv):
     return rc, buf.getvalue()
 
 
-def test_gate_plan_lists_fitting_models_and_other_archs():
-    rc, out = _run(["gate", "--arch", "gfx1201", "--plan"])
+def test_gate_plan_lists_fitting_models_and_other_archs(pr_gate_toml):
+    rc, out = _run(["gate", "--arch", "gfx1201", "--plan", "--gate-config", pr_gate_toml])
     assert rc == 0
     d = json.loads(out)
     assert d["arch"] == "gfx1201"
@@ -23,10 +23,12 @@ def test_gate_plan_lists_fitting_models_and_other_archs():
     assert d["floor"] == 0.15 and d["alpha"] == 0.05
 
 
-def test_gate_plan_extra_model_included_only_where_it_fits():
-    rc, out = _run(["gate", "--arch", "gfx1151", "--plan", "--models", "deepseek4"])
+def test_gate_plan_extra_model_included_only_where_it_fits(pr_gate_toml):
+    rc, out = _run(["gate", "--arch", "gfx1151", "--plan", "--models", "deepseek4",
+                    "--gate-config", pr_gate_toml])
     assert json.loads(out)["models"] == ["qwen3.6-27b", "qwen3.6-a3b", "deepseek4"]
-    rc, out = _run(["gate", "--arch", "gfx1100", "--plan", "--models", "deepseek4"])
+    rc, out = _run(["gate", "--arch", "gfx1100", "--plan", "--models", "deepseek4",
+                    "--gate-config", pr_gate_toml])
     assert json.loads(out)["models"] == ["qwen3.6-27b", "qwen3.6-a3b"]
 
 
