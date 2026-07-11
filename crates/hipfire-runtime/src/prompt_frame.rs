@@ -360,6 +360,47 @@ impl<'a> ChatScaffold<'a> {
     }
 }
 
+/// How a historical assistant turn's `tool_calls` are re-rendered on a
+/// cache MISS in [`build_cached_history`] — the hand-rolled ChatScaffold
+/// path used only when `HIPFIRE_JINJA_CHAT=0`. (The default jinja path
+/// renders history through the model's trained chat_template instead, via
+/// `build_cached_history_jinja`, and is unaffected by this enum.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolCallRender {
+    /// Legacy Hermes JSON: `\n<tool_call>\n{"name":..,"arguments":..}\n</tool_call>`.
+    /// Correct for Hermes-native models (carnice) and grammar-forced JSON.
+    HermesJson,
+    /// Qwen native XML: `\n<tool_call>\n<function=NAME>\n<parameter=ARG>\nVALUE\n</parameter>\n…\n</function>\n</tool_call>`.
+    /// Matches what grammar-off Qwen3.5/3.6 actually emit (and their
+    /// upstream chat_template), so a cache-miss history replay shows the
+    /// model its own format instead of fighting it with JSON.
+    QwenXml,
+}
+
+/// Render one tool call in Qwen3.5/3.6 native XML, matching the shape the
+/// model emits and its upstream chat_template produces. A string argument
+/// is emitted verbatim; any other JSON value is compact-serialized
+/// (mirrors the template's `value | string if string else value | tojson`).
+fn render_tool_call_qwen_xml(tc: &ToolCall) -> String {
+    let mut s = String::from("\n<tool_call>\n<function=");
+    s.push_str(&tc.name);
+    s.push_str(">\n");
+    if let Some(obj) = tc.arguments.as_object() {
+        for (k, v) in obj {
+            s.push_str("<parameter=");
+            s.push_str(k);
+            s.push_str(">\n");
+            match v {
+                serde_json::Value::String(sv) => s.push_str(sv),
+                other => s.push_str(&serde_json::to_string(other).unwrap_or_default()),
+            }
+            s.push_str("\n</parameter>\n");
+        }
+    }
+    s.push_str("</function>\n</tool_call>");
+    s
+}
+
 /// Build a multi-turn token stream from structured history, splicing
 /// cached verbatim token sequences for any historical assistant turn
 /// that `cache_lookup` returns `Some` for. Used by the daemon's Qwen
@@ -387,6 +428,7 @@ pub fn build_cached_history(
     history: &[Message],
     live_user_tokens: &[u32],
     assistant_prefix: AssistantPrefix,
+    tool_render: ToolCallRender,
     mut cache_lookup: impl FnMut(&Message) -> Option<Vec<u32>>,
 ) -> Vec<u32> {
     let scaffold = ChatScaffold::for_tokenizer(tokenizer);
@@ -444,14 +486,19 @@ pub fn build_cached_history(
                         out.extend(tokenizer.encode(&msg.content));
                     }
                     for tc in &msg.tool_calls {
-                        let payload = serde_json::json!({
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                        });
-                        let rendered = format!(
-                            "\n<tool_call>\n{}\n</tool_call>",
-                            serde_json::to_string(&payload).unwrap_or_default(),
-                        );
+                        let rendered = match tool_render {
+                            ToolCallRender::HermesJson => {
+                                let payload = serde_json::json!({
+                                    "name": tc.name,
+                                    "arguments": tc.arguments,
+                                });
+                                format!(
+                                    "\n<tool_call>\n{}\n</tool_call>",
+                                    serde_json::to_string(&payload).unwrap_or_default(),
+                                )
+                            }
+                            ToolCallRender::QwenXml => render_tool_call_qwen_xml(tc),
+                        };
                         out.extend(tokenizer.encode(&rendered));
                     }
                 }
@@ -1647,6 +1694,94 @@ mod tests {
         assert!(
             out.contains("tool:72F[id=call_1];"),
             "tool response w/ tool_call_id rendered: {out:?}",
+        );
+    }
+
+    #[test]
+    fn cache_miss_history_tool_call_renders_native_xml_for_qwen() {
+        // Non-jinja ChatScaffold replay: on a cache MISS the historical
+        // assistant tool_call must re-render in the model's OWN format.
+        // For grammar-off Qwen3.5/3.6 that is native XML
+        // (`<function=NAME><parameter=ARG>`), NOT Hermes JSON — otherwise a
+        // post-eviction replay shows the model JSON and nudges it off its
+        // trained tool-call distribution.
+        let t = make_tokenizer();
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: "weather?".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "SF"}),
+                }],
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+        // cache_lookup returns None => MISS => the miss-branch render runs.
+        let toks = build_cached_history(
+            &t,
+            None,
+            &history,
+            &[],
+            AssistantPrefix::Plain,
+            ToolCallRender::QwenXml,
+            |_| None,
+        );
+        let text = t.decode(&toks);
+        assert!(
+            text.contains("<function=get_weather>"),
+            "expected native XML function tag, got: {text:?}"
+        );
+        assert!(
+            text.contains("<parameter=city>"),
+            "expected native XML parameter tag, got: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"name\""),
+            "must NOT emit Hermes JSON payload, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn cache_miss_history_tool_call_renders_hermes_json_when_selected() {
+        // Hermes-native models (carnice / grammar-forced JSON) must keep
+        // the legacy `{"name":..,"arguments":..}` payload on replay.
+        let t = make_tokenizer();
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"city": "SF"}),
+            }],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let toks = build_cached_history(
+            &t,
+            None,
+            &history,
+            &[],
+            AssistantPrefix::Plain,
+            ToolCallRender::HermesJson,
+            |_| None,
+        );
+        let text = t.decode(&toks);
+        assert!(
+            text.contains("{\"name\":\"get_weather\""),
+            "expected Hermes JSON payload, got: {text:?}"
+        );
+        assert!(
+            !text.contains("<function="),
+            "must NOT emit XML function tag, got: {text:?}"
         );
     }
 

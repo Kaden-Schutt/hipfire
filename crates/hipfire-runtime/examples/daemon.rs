@@ -4748,6 +4748,22 @@ struct PromptCachePlan {
     resume_from: Option<usize>,
 }
 
+/// Format for re-rendering a historical assistant `tool_call` on a cache
+/// MISS in the non-jinja ChatScaffold path (`HIPFIRE_JINJA_CHAT=0`).
+/// Mirrors the CLI's per-model grammar gating: grammar OFF (the default
+/// for native-XML Qwen3.5/3.6) => native XML; grammar ON (Hermes-format
+/// models like carnice, or a user override) => Hermes JSON. Both
+/// `build_cached_history` call sites (LCP planning in `plan_prompt_cache`
+/// and the actual prompt render) read this so their token streams stay
+/// byte-consistent — a mismatch would break the LCP forward-extension.
+fn qwen_history_tool_render() -> hipfire_runtime::prompt_frame::ToolCallRender {
+    if std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() == Some("0") {
+        hipfire_runtime::prompt_frame::ToolCallRender::QwenXml
+    } else {
+        hipfire_runtime::prompt_frame::ToolCallRender::HermesJson
+    }
+}
+
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
 /// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
 /// so the DFlash path can use it too. Renders the canonical conversation via
@@ -4784,6 +4800,7 @@ fn plan_prompt_cache(
         messages_history,
         &q_tokens,
         assistant_prefix,
+        qwen_history_tool_render(),
         |msg| {
             let stripped = strip_think_for_fingerprint(&msg.content);
             let normalized =
@@ -8941,6 +8958,7 @@ fn generate(
                 history,
                 &q_tokens,
                 assistant_prefix,
+                qwen_history_tool_render(),
                 |msg| {
                     // Match the store side's stripping. The store applies
                     // `strip_think_for_fingerprint` then `maybe_normalize_prompt`
