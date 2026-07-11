@@ -5816,16 +5816,37 @@ impl Gpu {
                 ((m as u32) + 1) / 2,
             )
         } else {
-            self.ensure_kernel(
-                "gemv_hfq4g256_moe_gate_up_indexed",
-                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
-                "gemv_hfq4g256_moe_gate_up_k8_indexed",
-            )?;
-            (
-                "gemv_hfq4g256_moe_gate_up_k8_indexed",
-                [32u32, 1, 1],
-                m as u32,
-            )
+            // Opt-in NUM_ROWS=2 register row-tile (HIPFIRE_MOE_GATE_UP_FUSED=1):
+            // ceil(M/2) blocks, each owning 2 output rows sharing this expert's x.
+            // Token-id exact vs base (per-row math unchanged). Grid divisor here
+            // MUST match the kernel's MOE_GATE_UP_NUM_ROWS.
+            use std::sync::OnceLock;
+            static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
+            let fused = *GATE_UP_FUSED
+                .get_or_init(|| std::env::var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
+            if fused {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed_rowtile",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
+                    [32u32, 1, 1],
+                    ((m as u32) + 1) / 2,
+                )
+            } else {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_indexed",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed",
+                    [32u32, 1, 1],
+                    m as u32,
+                )
+            }
         };
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
@@ -6405,6 +6426,91 @@ impl Gpu {
         }
         result
     }
+
+    /// Fused atomic-free MoE down: GEMV + K_TOP weighted-accumulate +
+    /// residual add in ONE launch. Drop-in replacement for the two-kernel
+    /// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` (writes
+    /// `[N × K_TOP × M]`) FOLLOWED BY `moe_down_combine_k8_batched`
+    /// (weighted-sums into `x_residual`). Each block owns one (token, row),
+    /// loops all K_TOP experts internally, and does a single race-free
+    /// `x_residual[token][row] += Σ_k weight[k]·down_k(row)` — no expanded
+    /// intermediate, no atomicAdd. `x_residual` is accumulated in place
+    /// (same `+=` contract as the combine it replaces). Wave32-only (RDNA);
+    /// gated behind `HIPFIRE_MOE_DOWN_FUSED=1` at the dispatch layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_down_k8_indexed_fused_acc(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor, // [batch_size × m] f32, accumulated in place
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_down_k8_indexed_fused_acc",
+            kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC,
+            "gemv_hfq4g256_moe_down_k8_indexed_fused_acc",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // Fused path skips the expanded [N×K_TOP×M] write + re-read; traffic
+        // is the routed-expert weight reads plus the per-token residual write.
+        let bytes = batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_hfq4g256_moe_down_k8_indexed_fused_acc",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_down_k8_indexed_fused_acc",
+            // NUM_ROWS=2 register row-tiling: each block owns 2 output rows (reuses the
+            // per-expert X across them) -> ceil(M/2) blocks in x. Must match the kernel's
+            // MOE_DOWN_FUSED_NUM_ROWS (2 — swept optimum for wave32 gfx1201, +3.5%).
+            [((m + 1) / 2) as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed
     /// MoE down. Same expanded-output contract as the HFQ4G256 sibling;
