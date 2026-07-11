@@ -63,3 +63,19 @@ def fold_pr(*, pr_ref, staging_ref, master_ref, repo, recorded,
     return {"pr": pr_ref, "verdict": "BOD", "staging_ref": staging_ref,
             "reason": reason, "detail": "rebase on master" if reason == "stale"
             else "conflicts with an already-approved PR on the stack"}
+
+
+def stack_train(*, approved_prs, master_ref, repo, fold_fn) -> dict:
+    """Greedily stack the approved PRs onto a derived staging (starting at master).
+    fold_fn(pr, staging_ref) -> a fold_pr-style result. FOLDED advances the tip and
+    joins the train; BOD is collected as debt (tip unchanged) and stacking continues."""
+    staging_ref = master_ref
+    train, debt = [], []
+    for pr in approved_prs:
+        res = fold_fn(pr, staging_ref)
+        if res["verdict"] == "FOLDED":
+            staging_ref = res["staging_ref"]
+            train.append(pr)
+        else:
+            debt.append({"pr": pr, "reason": res["reason"], "detail": res.get("detail", "")})
+    return {"train": train, "debt": debt, "staging_ref": staging_ref}

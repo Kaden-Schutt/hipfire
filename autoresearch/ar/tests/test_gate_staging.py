@@ -91,3 +91,26 @@ def test_conflict_fixed_then_reproduces_is_folded():
     r = fold_pr(pr_ref="pr1", staging_ref="stg", **_K,
                 trial_merge_fn=tm, merge_fix_fn=fix, reproduce_fn=_repro(True))
     assert r["verdict"] == "FOLDED" and r["staging_ref"] == "merged"
+
+
+from autoresearch.ar.gate.staging import stack_train
+
+
+def test_stack_train_folds_clean_and_collects_debt():
+    # fold_fn: pr2 BODs (stale); others FOLD, advancing the tip.
+    def fold_fn(pr, staging_ref):
+        if pr == "pr2":
+            return {"pr": pr, "verdict": "BOD", "staging_ref": staging_ref,
+                    "reason": "stale", "detail": "rebase on master"}
+        return {"pr": pr, "verdict": "FOLDED", "staging_ref": staging_ref + "+" + pr,
+                "reason": "folded", "detail": ""}
+
+    out = stack_train(approved_prs=["pr1", "pr2", "pr3"], master_ref="M", repo="/r", fold_fn=fold_fn)
+    assert out["train"] == ["pr1", "pr3"]
+    assert [d["pr"] for d in out["debt"]] == ["pr2"] and out["debt"][0]["reason"] == "stale"
+    assert out["staging_ref"] == "M+pr1+pr3"     # tip advanced only by folded PRs
+
+
+def test_stack_train_empty_is_master():
+    out = stack_train(approved_prs=[], master_ref="M", repo="/r", fold_fn=lambda p, s: None)
+    assert out["train"] == [] and out["staging_ref"] == "M" and out["debt"] == []
