@@ -290,6 +290,29 @@ commits become master ancestors; each folded PR is closed with a
 `landed via staging stack → <master-sha>` comment + link. Where GitHub detects
 the ancestry it shows "merged"; otherwise "closed (landed via stack)".
 
+### 11.1 Backlog sweep
+
+`ar gate --sweep` (and a scheduled job) drains the open-PR backlog in one pass onto
+a **collection branch** — `feat/rdna-kernel-oracle` for the current batch — then lands
+the whole non-clobbering stack on master together. For each open eligible PR:
+
+- **Gate it. A REJECT is *punted, not resolved*.** In particular a **perf regression
+  is skipped and the sweep moves to the next PR** — perf is never auto-fixed. Only
+  *merge conflicts* get the Gate-4 codex merge-fix during the fold; a functional gate
+  failure (perf regression / parity / coherence) punts with a BOD.
+- **Fold the approved onto the collection branch** — Gate-4 resolve-not-punt for
+  conflicts, §10 recall-reproduce for post-merge validation.
+- **Perf-supersede.** If a fold LOSES a perf gain another PR won ("perf superseded,
+  but lost in merge"), the **perf-preserving branch wins** and supersedes the loser:
+  gracefully (the merge-fix keeps both) if possible, else the **higher perf-delta**
+  branch stays on the train and the loser is dropped (`superseded`).
+
+The sweep returns `{train, punted, superseded}`. The train lands on master via §11's
+`land_train` once the collection branch is **proven non-clobbering** (§10 recall-reproduce
+on the landed result). A superseded loser is **deferred, not lost** — it can re-enter a
+later sweep once rebased. (Core: `gate/sweep.py`, unit-tested; the GPU/git/codex bindings
+are prod wiring.)
+
 ## 12. Authority & triggers
 
 | Author | Gate acts? | On green pass |
