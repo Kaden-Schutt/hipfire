@@ -382,6 +382,18 @@ pub enum ToolCallRender {
 /// is emitted verbatim; any other JSON value is compact-serialized
 /// (mirrors the template's `value | string if string else value | tojson`).
 fn render_tool_call_qwen_xml(tc: &ToolCall) -> String {
+    // Invariant: tool-call arguments are a JSON object (per the tool schema).
+    // A non-object degrades to an empty `<function=…></function>` below; assert
+    // in debug so a violation surfaces in tests, degrade gracefully in release.
+    // NOTE: parameter values are NOT XML-escaped — a value literally containing
+    // `</parameter>`/`</function>` would desync the replayed token stream, but
+    // that only turns a cache-hit into a cache-miss (LCP divergence forces a
+    // re-prefill), and mirrors the model's own upstream chat_template.
+    debug_assert!(
+        tc.arguments.is_object(),
+        "tool-call arguments should be a JSON object, got {:?}",
+        tc.arguments
+    );
     let mut s = String::from("\n<tool_call>\n<function=");
     s.push_str(&tc.name);
     s.push_str(">\n");
@@ -399,6 +411,36 @@ fn render_tool_call_qwen_xml(tc: &ToolCall) -> String {
     }
     s.push_str("</function>\n</tool_call>");
     s
+}
+
+/// Whether the Hermes-JSON tool-call grammar (and history render) should be ON
+/// for a Qwen3.5/3.6-family model, given the `HIPFIRE_QWEN35_GRAMMAR` env value
+/// (`None` if unset) and the loaded model path. Lives in the lib — not only in
+/// the CLI's `resolveToolGrammar` — so the DAEMON defaults correctly when
+/// launched DIRECTLY: the GPU behavior gate and `coherence-gate.sh` /
+/// `agentic-gate.sh` spawn `examples/daemon` without the CLI's `applyConfigEnv`,
+/// so without this they fall back to Hermes and never exercise the native-XML
+/// path. Precedence: explicit env wins (`"0"` = off kill-switch, any other set
+/// value = on); otherwise carnice (Hermes-native) => ON, plain Qwen3.5/3.6
+/// (XML-native) => OFF. Keyed on `carnice` in the model file name (all carnice
+/// cards ship as `carnice-*.mq{4,6}`), the only Hermes family in this arch.
+pub fn qwen35_grammar_on(env: Option<&str>, model_path: &str) -> bool {
+    match env {
+        Some("0") => false,
+        Some(_) => true,
+        None => model_path.to_ascii_lowercase().contains("carnice"),
+    }
+}
+
+/// Cache-miss history re-render format (non-jinja `HIPFIRE_JINJA_CHAT=0` path)
+/// for the same inputs as [`qwen35_grammar_on`]: grammar ON => Hermes JSON,
+/// grammar OFF => Qwen native XML.
+pub fn qwen35_history_render(env: Option<&str>, model_path: &str) -> ToolCallRender {
+    if qwen35_grammar_on(env, model_path) {
+        ToolCallRender::HermesJson
+    } else {
+        ToolCallRender::QwenXml
+    }
 }
 
 /// Build a multi-turn token stream from structured history, splicing
@@ -1782,6 +1824,55 @@ mod tests {
         assert!(
             !text.contains("<function="),
             "must NOT emit XML function tag, got: {text:?}"
+        );
+    }
+
+    // ── Model-aware tool-call format default ────────────────────────────
+    // The DAEMON (not just the CLI) must default the tool-call format by
+    // model, so a daemon-direct launch (GPU behavior gate, coherence-gate.sh,
+    // agentic-gate.sh) gets native XML for plain Qwen3.5/3.6 — not Hermes.
+
+    #[test]
+    fn grammar_default_off_for_plain_qwen() {
+        // No env => plain (non-carnice) Qwen3.5/3.6 defaults grammar OFF (XML).
+        assert!(!qwen35_grammar_on(None, "/models/qwen3.6-27b.mq4"));
+        assert!(!qwen35_grammar_on(None, "/models/qwen3.5-4b.mq4"));
+    }
+
+    #[test]
+    fn grammar_default_on_for_carnice() {
+        // No env => carnice (Hermes-native) defaults grammar ON (JSON).
+        assert!(qwen35_grammar_on(None, "/models/carnice-27b.mq4"));
+        assert!(qwen35_grammar_on(None, "/MODELS/Carnice-9b.mq6")); // case-insensitive
+    }
+
+    #[test]
+    fn grammar_env_zero_is_killswitch_even_for_carnice() {
+        assert!(!qwen35_grammar_on(Some("0"), "/models/carnice-27b.mq4"));
+    }
+
+    #[test]
+    fn grammar_env_set_forces_on_even_for_plain_qwen() {
+        assert!(qwen35_grammar_on(Some("1"), "/models/qwen3.6-27b.mq4"));
+    }
+
+    #[test]
+    fn history_render_follows_model_default_and_env() {
+        assert_eq!(
+            qwen35_history_render(None, "/m/qwen3.6-27b.mq4"),
+            ToolCallRender::QwenXml
+        );
+        assert_eq!(
+            qwen35_history_render(None, "/m/carnice-27b.mq4"),
+            ToolCallRender::HermesJson
+        );
+        assert_eq!(
+            qwen35_history_render(Some("1"), "/m/qwen3.6-27b.mq4"),
+            ToolCallRender::HermesJson
+        );
+        assert_eq!(
+            qwen35_history_render(Some("0"), "/m/carnice-27b.mq4"),
+            ToolCallRender::QwenXml
         );
     }
 
