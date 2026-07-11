@@ -36,3 +36,32 @@ def test_gate_is_operator_only():
     rc, out = _run(["--role", "agent", "gate", "--arch", "gfx1201", "--plan"])
     assert rc == 3
     assert json.loads(out)["reason"] == "ROLE_FORBIDDEN"
+
+
+def test_gate_validate_plan_emits_empty_matrix_for_trivial_skip(tmp_path, pr_gate_toml):
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({
+        "schema": 1,
+        "decision": "skip",
+        "risk": "trivial",
+        "reason": "no runtime change",
+        "boxes": {
+            "hipx": {"run": False, "archs": [], "models": [], "behavior_tests": []},
+            "hiptrx": {"run": False, "archs": [], "models": [], "behavior_tests": []},
+        },
+    }))
+    rc, out = _run(["gate", "--validate-plan", str(plan), "--base", "HEAD", "--head", "HEAD",
+                    "--gate-config", pr_gate_toml])
+    assert rc == 0
+    parsed = json.loads(out)
+    assert parsed["valid"] is True and parsed["matrix"] == {"include": []}
+
+
+def test_gate_validate_action_refuses_green_for_bod(tmp_path):
+    interp = tmp_path / "interp.json"
+    action = tmp_path / "action.json"
+    interp.write_text(json.dumps({"outcome": {"status": "failure", "action": "bod"}}))
+    action.write_text(json.dumps({"action": "auto_merge", "comment_markdown": "green"}))
+    rc, out = _run(["gate", "--validate-action", str(action), "--interp-json", str(interp)])
+    assert rc == 2
+    assert json.loads(out)["valid"] is False

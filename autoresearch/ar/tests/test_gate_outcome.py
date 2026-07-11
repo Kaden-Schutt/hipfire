@@ -66,6 +66,18 @@ def test_any_arch_reject_is_bod_failure():
     assert any(b["detail"] == "perf_regression" for b in o["bod"]["blockers"])
 
 
+def test_empty_or_unknown_evidence_is_failure_not_green():
+    empty = decide_pr(arch_results=[], author="Kaden-Schutt", is_draft=False,
+                      helpful=True, cfg=_cfg())
+    assert empty["action"] == "bod" and empty["status"] == "failure"
+    unknown = decide_pr(
+        arch_results=[{"arch": "gfx1201", "verdict": "MAYBE", "reasons": []}],
+        author="Kaden-Schutt", is_draft=False, helpful=True, cfg=_cfg(),
+    )
+    assert unknown["action"] == "bod" and unknown["status"] == "failure"
+    assert unknown["bod"]["blockers"][0]["kind"] == "invalid_verdict"
+
+
 def test_arch_bod_blockers_are_aggregated():
     b = {"blockers": [{"kind": "merge_conflict", "detail": "daemon.rs"}], "summary": "1 blocker(s)"}
     mixed = _PASS + [{"arch": "gfx1201", "verdict": "BOD", "reasons": [], "bod": b}]

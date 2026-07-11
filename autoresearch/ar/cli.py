@@ -343,6 +343,66 @@ def cmd_gate(a) -> int:
     cfg = load_gate_config(path)
     repo = _repo()
 
+    if getattr(a, "validate_plan", None):
+        # Fail-closed release gate for the self-hosted matrix. Claude writes the
+        # plan; deterministic path/arch/model floors decide whether any runner
+        # may start and emit the exact dynamic matrix when valid.
+        from .gate import dispatch
+        from .gate.run import changed_files, diff_lines
+
+        try:
+            with open(a.validate_plan) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            print(json.dumps({"valid": False, "errors": [f"plan unreadable: {e}"],
+                              "matrix": {"include": []}}, indent=2))
+            return 2
+        out = dispatch.validate_dispatch_plan(
+            raw, changed_files(a.base, a.head, repo), cfg,
+            lines_changed=diff_lines(a.base, a.head, repo),
+        )
+        print(json.dumps(out, indent=2))
+        return 0 if out["valid"] else 2
+
+    if getattr(a, "validate_action", None):
+        # Claude interprets the deterministic result into a proposed action; this
+        # check prevents a failed gate from being narrated into a green action.
+        from .gate import dispatch
+
+        if not a.interp_json:
+            print(json.dumps({"valid": False, "errors": ["--interp-json is required"]},
+                             indent=2))
+            return 2
+        try:
+            with open(a.interp_json) as fh:
+                interp = json.load(fh)
+            with open(a.validate_action) as fh:
+                action = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            print(json.dumps({"valid": False, "errors": [f"action input unreadable: {e}"]},
+                             indent=2))
+            return 2
+        out = dispatch.validate_interpret_action(interp, action)
+        print(json.dumps(out, indent=2))
+        return 0 if out["valid"] else 2
+
+    if getattr(a, "verify_evidence", None):
+        from .gate import dispatch
+
+        try:
+            with open(a.verify_evidence) as fh:
+                plan = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            print(json.dumps({"valid": False, "errors": [f"dispatch unreadable: {e}"],
+                              "behavior_results": []}, indent=2))
+            return 2
+        out = dispatch.verify_evidence(
+            plan, results_dir=a.results, behavior_dir=a.behavior_dir,
+            pr=a.pr, base_sha=a.base, head_sha=a.head,
+        )
+        print(json.dumps(out, indent=2))
+        return 0 if out["valid"] else 2
+
     if getattr(a, "sweep", False):
         # Backlog sweep (spec §11.1): gate all open eligible PRs, punt regressions,
         # stack the approved onto the collection branch. LIVE (GPU / codex / git).
@@ -390,9 +450,11 @@ def cmd_gate(a) -> int:
             author=(a.author or ""), is_draft=a.draft, helpful=(not a.not_helpful), cfg=cfg,
             behavior_results=beh,
         )
-        print(json.dumps({"pr": a.pr, "pr_class": res["pr_class"], "executor": res["route"],
-                          "outcome": res["outcome"]}, indent=2))
-        print("\n--- PR comment ---\n" + res["comment"])
+        payload = {"pr": a.pr, "pr_class": res["pr_class"], "executor": res["route"],
+                   "outcome": res["outcome"], "comment": res["comment"]}
+        print(json.dumps(payload, indent=2))
+        if not a.json:
+            print("\n--- PR comment ---\n" + res["comment"])
         return 1 if res["outcome"]["status"] == "failure" else 0
 
     if getattr(a, "collect", False):
@@ -621,6 +683,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Claude plan.json — run its bespoke codex behavior tests (spec §8)")
     s.add_argument("--behavior-results", dest="behavior_results", default=None,
                    help="behavior_results JSON to fold into --interpret")
+    s.add_argument("--validate-plan", dest="validate_plan", default=None,
+                   help="validate Claude dispatch JSON and emit the dynamic runner matrix")
+    s.add_argument("--validate-action", dest="validate_action", default=None,
+                   help="validate Claude action JSON against --interp-json")
+    s.add_argument("--interp-json", dest="interp_json", default=None,
+                   help="pure deterministic interpretation JSON for --validate-action")
+    s.add_argument("--verify-evidence", dest="verify_evidence", default=None,
+                   help="verify every selected runner/behavior artifact in a validated dispatch")
+    s.add_argument("--behavior-dir", dest="behavior_dir", default=None,
+                   help="downloaded behavior artifact directory for --verify-evidence")
     s.add_argument("--verdict-dir", dest="verdict_dir", default=None,
                    help="dir for codex behavior-test verdict files (--behavior-tests)")
     s.add_argument("--sweep", action="store_true",
