@@ -401,7 +401,10 @@ def cmd_gate(a) -> int:
         from .gate.run import changed_files, collect_cell_data
 
         files = changed_files(a.base, a.head, repo)
-        print(json.dumps(collect_cell_data(a.arch, files, a.base, a.head, repo, cfg, dev=a.dev), indent=2))
+        # --models = Claude's SKU selection for this change (codex passes it); None => canonical.
+        models = [m for m in (a.models.split(",") if a.models else []) if m] or None
+        print(json.dumps(collect_cell_data(a.arch, files, a.base, a.head, repo, cfg,
+                                            dev=a.dev, models=models), indent=2))
         return 0
 
     if getattr(a, "grade", None):

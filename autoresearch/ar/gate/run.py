@@ -161,13 +161,19 @@ def affected_archs(files, cfg) -> list:
     return [a for a in cfg.archs if a in got]
 
 
-def collect_cell_data(arch, files, base, head, repo, cfg, *, dev=None) -> dict:
+def collect_cell_data(arch, files, base, head, repo, cfg, *, dev=None, models=None) -> dict:
     """MECHANICAL eval (a TOOL the codex agent drives) — build base+head daemons and run
-    ``serve_harness.py`` base-vs-head per fitting model. Returns RAW rows + any errors AS
-    DATA (never crashes on empty/build-fail), so the AGENT can judge and ADAPT (re-run an
+    ``serve_harness.py`` base-vs-head per model. Returns RAW rows + any errors AS DATA
+    (never crashes on empty/build-fail), so the AGENT can judge and ADAPT (re-run an
     empty cell, diagnose a build error) rather than a program hard-failing. Deferral
     short-circuits with no build (§4.1). Cross-arch leak (deferred archs only) is a
-    file-based flag carried alongside, not a hard reject here — the agent weighs it."""
+    file-based flag carried alongside, not a hard reject here — the agent weighs it.
+
+    ``models`` = the SKUs to serve_harness — **Claude selects these from the diff** (a
+    dense-only change → the 27B; an MoE/router change → a3b; a shared change → all) and
+    codex passes them in; they are NOT hardcoded. Any SKU that doesn't fit ``arch`` is
+    dropped. When ``models`` is None (e.g. Claude's dispatch was skipped on a workflow-
+    touching PR), fall back to the canonical set for the arch (``cfg.models_for``)."""
     from .build import build_daemon
     from .device import resolve_device
     from . import serve_probe
@@ -194,8 +200,11 @@ def collect_cell_data(arch, files, base, head, repo, cfg, *, dev=None) -> dict:
         out["cells"] = []
         return out
 
+    # Claude-selected models (filtered to those that fit the arch); canonical fallback.
+    sel = [m for m in (models or []) if cfg.fits(m, arch)] or cfg.models_for(arch)
+    out["models"] = sel
     cells, base_port = [], 11540 + dev * 40
-    for i, m in enumerate(cfg.models_for(arch)):
+    for i, m in enumerate(sel):
         mp = os.path.join(models_dir, m)
         cell = {"model": m}
         for role, daemon, port in (("base_rows", out["base_bin"], base_port + i * 2),

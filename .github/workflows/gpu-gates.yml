@@ -108,6 +108,10 @@ jobs:
             workspace root, exactly this shape:
               {
                 "risk": "trivial|low|moderate|high-risk",
+                "models": ["<SKUs the serve_harness A/B should cover for THIS change — SELECT them,
+                   do not default: a dense-only change -> qwen3.6-27b.mq4; an MoE/router/expert
+                   change -> qwen3.6-35b-a3b.mq4r + qwen3.6-35b-a3b.mq4p; a shared change -> all
+                   fitting SKUs. Use [] to mean 'the canonical set for the arch'.>"],
                 "serve_floor": { "perf_ab": true|false },
                 "behavior_tests": [
                   { "what": "<short>",
@@ -180,8 +184,13 @@ jobs:
               codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$PWD" - <<PROMPT
           You are the hipfire Tier-3 GPU-gate executor for PR #${{ needs.decide.outputs.pr }} on $arch.
           Drive the eval and ADAPT — do not give up after one command, and do NOT fabricate a PASS.
-          1. COLLECT (build base+head daemons + serve_harness base-vs-head per model):
-             python3 -m autoresearch.ar gate --collect --arch $arch --base $BASE --head $HEAD > /tmp/collect_$arch.json
+          0. MODELS: if plan.json exists and its "models" is a non-empty list, those are the SKUs to
+             test (Claude selected them for this change) — pass them as --models <comma,list>. If
+             plan.json is absent (Claude's dispatch was skipped, e.g. a workflow-touching PR) or
+             "models" is [], omit --models so the canonical set for the arch is used. You MAY also
+             adjust the selection if the diff clearly implicates a specific SKU serve_harness must cover.
+          1. COLLECT (build base+head daemons + serve_harness base-vs-head per selected model):
+             python3 -m autoresearch.ar gate --collect --arch $arch --base $BASE --head $HEAD [--models <sel>] > /tmp/collect_$arch.json
              If the JSON has "build_error", the PR does not compile -> the arch verdict is REJECT (build_fail); write that to results/$arch.json and stop.
           2. GRADE (deterministic parity/coherence/perf per model):
              python3 -m autoresearch.ar gate --grade /tmp/collect_$arch.json > results/$arch.json
