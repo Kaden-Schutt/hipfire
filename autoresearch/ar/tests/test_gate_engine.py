@@ -72,3 +72,78 @@ def test_improvement_passes():
                dur={"base": [10.0] * 8, "var": [9.2] * 8})
     row = gate_cell(r, base_daemon="base", var_daemon="var", **_CELL)
     assert row["gate_verdict"] == "PASS" and row["reason"] == "improvement"
+
+
+from autoresearch.ar.gate.config import GateConfig
+from autoresearch.ar.gate.engine import run_gate
+
+_CFG = GateConfig(
+    archs=["gfx1100", "gfx1151", "gfx1201"],
+    canonical_models=["qwen3.6-27b", "qwen3.6-a3b"],
+    fit={"qwen3.6-27b": ["gfx1100", "gfx1151", "gfx1201"],
+         "qwen3.6-a3b": ["gfx1100", "gfx1151", "gfx1201"],
+         "deepseek4": ["gfx1151"]},
+    maintainers=["Kaden-Schutt"],
+)
+
+
+def _no_leak(*a, **k):
+    return []
+
+
+def _factory(**per_model):
+    """runner_factory returning a fresh Runner per model (per_model overrides)."""
+    def make(model):
+        return per_model.get(model, Runner())
+    return make
+
+
+def test_run_gate_all_neutral_passes():
+    res = run_gate(arch="gfx1201", changed_kernel_files=[],
+                   models=["qwen3.6-27b", "qwen3.6-a3b"], base_ref="master",
+                   head_ref="pr", repo="/repo", cfg=_CFG,
+                   runner_factory=_factory(), cross_arch_fn=_no_leak)
+    assert res["verdict"] == "PASS"
+    assert len(res["cells"]) == 2
+
+
+def test_run_gate_cross_arch_leak_rejects():
+    def leak(kernel_file, arch, other_archs, repo, base_sha=None, preprocess=None):
+        return ["gfx1100"]                       # this file perturbs gfx1100 codegen
+    res = run_gate(arch="gfx1201", changed_kernel_files=["kernels/src/x.hip"],
+                   models=["qwen3.6-a3b"], base_ref="master", head_ref="pr",
+                   repo="/repo", cfg=_CFG, runner_factory=_factory(), cross_arch_fn=leak)
+    assert res["verdict"] == "REJECT"
+    assert res["cross_arch_leaks"] == [{"file": "kernels/src/x.hip", "leaks": ["gfx1100"]}]
+
+
+def test_run_gate_no_fitting_model_is_pass_na():
+    res = run_gate(arch="gfx1100", changed_kernel_files=[], models=[],
+                   base_ref="master", head_ref="pr", repo="/repo", cfg=_CFG,
+                   runner_factory=_factory(), cross_arch_fn=_no_leak)
+    assert res["verdict"] == "PASS" and "no-fitting-model" in res["reasons"]
+
+
+def test_run_gate_confirm_rerun_flips_noise_to_pass():
+    # first runner regresses, the rerun (fresh from factory) is neutral -> PASS
+    calls = {"n": 0}
+    regress = Runner(tok={"base": [150] * 8, "var": [140] * 8},
+                     dur={"base": [10.0] * 8, "var": [10.8] * 8})
+
+    def make(model):
+        calls["n"] += 1
+        return regress if calls["n"] == 1 else Runner()   # 2nd call = neutral
+    res = run_gate(arch="gfx1201", changed_kernel_files=[], models=["qwen3.6-a3b"],
+                   base_ref="master", head_ref="pr", repo="/repo", cfg=_CFG,
+                   runner_factory=make, cross_arch_fn=_no_leak)
+    assert res["verdict"] == "PASS" and calls["n"] == 2      # reran once
+
+
+def test_run_gate_replicated_regression_rejects():
+    def make(model):
+        return Runner(tok={"base": [150] * 8, "var": [140] * 8},
+                      dur={"base": [10.0] * 8, "var": [10.8] * 8})
+    res = run_gate(arch="gfx1201", changed_kernel_files=[], models=["qwen3.6-a3b"],
+                   base_ref="master", head_ref="pr", repo="/repo", cfg=_CFG,
+                   runner_factory=make, cross_arch_fn=_no_leak)
+    assert res["verdict"] == "REJECT" and "perf_regression" in res["reasons"]

@@ -9,12 +9,13 @@ gate.perf_policy.classify_perf.
 """
 from __future__ import annotations
 
+from ..certify import cross_arch
 from ..certify import perf
 from ..certify import verdict as V
 from ..certify.orchestrator import DEFAULT_SEEDS, ServeRunner, measurement_hash
 from .perf_policy import _delta_pct, classify_perf
 
-__all__ = ["gate_cell", "ServeRunner"]
+__all__ = ["gate_cell", "run_gate", "ServeRunner"]
 
 
 def _row(*, gate_verdict, reason, perf_class, arch, model, base_daemon, var_daemon,
@@ -58,3 +59,48 @@ def gate_cell(runner, *, base_daemon, var_daemon, arch, model, base_ref, kv, max
     if pclass == "REGRESSION":
         return _row(gate_verdict="REJECT", reason="perf_regression", **common)
     return _row(gate_verdict="PASS", reason=pclass.lower(), **common)
+
+
+def run_gate(*, arch, changed_kernel_files, models, base_ref, head_ref, repo, cfg,
+             runner_factory, cross_arch_fn=None, kv="q8", maxtok=128, prompt_md5="",
+             rerun_on_regression=True) -> dict:
+    """Certify a PR on one arch: cross-arch isolation + every fitting (model,arch)
+    cell. REJECT on any cross-arch leak, parity/coherence fail, or replicated perf
+    regression; PASS otherwise (empty models => N/A PASS)."""
+    cross = cross_arch_fn or cross_arch.check_cross_arch
+    reasons: list[str] = []
+    leaks: list[dict] = []
+
+    # Cross-arch isolation (cheapest; independent of GPU cells).
+    for f in changed_kernel_files:
+        got = cross(f, arch, cfg.other_archs(arch), repo, base_sha=base_ref)
+        if got:
+            leaks.append({"file": f, "leaks": list(got)})
+    if leaks:
+        reasons.append("cross_arch")
+
+    cells: list[dict] = []
+    if not models:
+        reasons.append("no-fitting-model")
+
+    for model in models:
+        cell = gate_cell(runner_factory(model), base_daemon="base", var_daemon="var",
+                         arch=arch, model=model, base_ref=base_ref, kv=kv, maxtok=maxtok,
+                         prompt_md5=prompt_md5)
+        # NOTE: base_daemon/var_daemon are the opaque daemon identities the runner
+        # maps to base_ref vs head_ref builds; the factory-built runner resolves
+        # these handles. Real (Phase-3) LiveServeRunner is constructed by the
+        # factory bound to (base_ref, head_ref).
+        if cell["gate_verdict"] == "REJECT" and cell["reason"] == "perf_regression" and rerun_on_regression:
+            confirm = gate_cell(runner_factory(model), base_daemon="base", var_daemon="var",
+                                arch=arch, model=model, base_ref=base_ref, kv=kv, maxtok=maxtok,
+                                prompt_md5=prompt_md5)
+            if not (confirm["gate_verdict"] == "REJECT" and confirm["reason"] == "perf_regression"):
+                cell = confirm            # first was noise; keep the (passing) rerun
+        cells.append(cell)
+        if cell["gate_verdict"] == "REJECT":
+            reasons.append(cell["reason"])
+
+    verdict = "REJECT" if (leaks or any(c["gate_verdict"] == "REJECT" for c in cells)) else "PASS"
+    return {"arch": arch, "verdict": verdict, "cells": cells,
+            "cross_arch_leaks": leaks, "reasons": reasons}

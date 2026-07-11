@@ -7,5 +7,6 @@ loop's WIN gate), but PASS perf-neutral and improvement PRs — and run coherenc
 even on a neutral PR (unlike the loop's certify, which short-circuits).
 """
 from .config import GateConfig, load_gate_config
+from .engine import gate_cell, run_gate
 
-__all__ = ["GateConfig", "load_gate_config"]
+__all__ = ["GateConfig", "load_gate_config", "gate_cell", "run_gate"]
