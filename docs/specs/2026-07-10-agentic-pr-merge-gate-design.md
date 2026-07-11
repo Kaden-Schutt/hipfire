@@ -273,8 +273,11 @@ fallback if self-hosted runners ever prove painful.
   check-run `gpu-gate / <arch>`.
 - **Concurrency:** GH group per PR (`cancel-in-progress`) **+ on-box
   `gpu-lock.sh`** so gate jobs serialize with the autoresearch loop and with each
-  other (hipx runs both gfx1100 and gfx1151 → they queue on hipx's lock). The
-  gate is a lock *citizen*, never `rm`s the lockfile.
+  other (hipx runs both gfx1100 and gfx1151 → they queue on hipx's per-box lock,
+  keeping co-resident perf measurements from perturbing each other). The gate is
+  a lock *citizen* (never `rm`s the lockfile) but a **priority** one — it can
+  preempt the background loop (§17) so a human waiting on a PR is never starved
+  behind a 12h loop run.
 - **Aggregator / interpret job** (`workflow_run: completed`): re-invokes Claude
   (Tier 2) to read the per-arch rows + drift state, post one PR comment (verdict
   table + ledger rows), set the aggregate status, and take the merge/tag/BOD
@@ -311,8 +314,26 @@ codex/grok auth on-box.
 
 - **GPU noise / clock skew** → `INCONCLUSIVE`/`VOID` → **neutral** status + one
   auto-retry, then human — never a hard fail on noise.
-- **Runner offline / lock held by loop** → job queues; timeout → neutral, not
-  fail (surface "runner busy").
+- **GPU lock contention (the whole resolution).** The gate never hangs, never
+  false-fails, and never starves:
+  - *Holder crashed / killed / OOM'd* → `flock(1)` on an open fd means the kernel
+    **auto-releases** the lock on holder death — no stale lock is possible — so
+    the gate acquires on its next 5s poll. Nothing to do (never `rm` the
+    lockfile).
+  - *Holder is a peer gate job on the same box* (hipx: gfx1100 + gfx1151) → they
+    serialize on the per-box lock **by design**, so neither perturbs the other's
+    perf measurement; the reentrancy guard (`HIPFIRE_GPU_LOCK_OWNER`) keeps a
+    gate's own nested sub-measurements from self-deadlocking.
+  - *Holder is the healthy long-running autoresearch loop* → the gate drops a
+    **`gate-priority` marker** before waiting; the loop honors it **between
+    rounds** and pauses re-acquiring until the gate clears it, so the gate is
+    served within one loop-round instead of after the loop's 12h TTL. This
+    priority hook is a **Phase-0 change to the loop** (`driver.py`/`watcher.py`
+    check the marker at each round boundary).
+  - *Backstop* → the gate's `GPU_LOCK_TIMEOUT` is set well under the GH job
+    timeout; on timeout the check is **neutral (retry-later)** with a "GPU busy —
+    will re-run" note and the aggregator re-fires it. A busy GPU can never red a
+    PR, and no job hangs to the GH ceiling.
 - **Build fail at base or head** on an arch → `BUILD_FAIL` (real fail — the PR
   broke that arch's daemon build; Tier 1 only covers the generic workspace).
 - **Agent round failure** (dispatch/interpret/merge-fix) → fall back to the
@@ -338,7 +359,9 @@ codex/grok auth on-box.
 
 ## 19. Rollout
 
-1. **Phase 0** — runners on hipx/hiptrx (§16).
+1. **Phase 0** — runners on hipx/hiptrx (§16) + the loop `gate-priority` hook
+   (`driver.py`/`watcher.py` honor the marker between rounds, §17) so the gate can
+   preempt a running loop.
 2. **Phase 1** — `ar gate` engine (gates 0–3b) + no-GPU unit tests.
 3. **Phase 2** — Gate 4 non-clobber + codex merge-fix + BOD.
 4. **Phase 3** — `gpu-gates.yml` + re-enable/elevate `claude-review.yml`
