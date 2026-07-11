@@ -40,9 +40,19 @@ pub struct Qwen35Emit<'a> {
     open_think_prefix: bool,
     think_count: usize,
     prev_in_think: bool,
+    /// Think-budget force-close continuation drained by `take_forced` so the
+    /// target advances over `</think>` and continues into visible output.
+    forced: Vec<u32>,
+    /// Prevent an endlessly re-opened reasoning span from being force-closed
+    /// repeatedly. A second cap hit hard-stops through `ThinkCap`.
+    think_force_closed: bool,
     /// `generated` counter at the point of the most recent `observe` — only used
     /// for the attractor-detect log message (byte-for-byte stderr parity).
     generated_hint: usize,
+}
+
+fn think_continuation_text() -> String {
+    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
 }
 
 impl<'a> Qwen35Emit<'a> {
@@ -97,6 +107,8 @@ impl<'a> Qwen35Emit<'a> {
             open_think_prefix: matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink),
             think_count: 0,
             prev_in_think: false,
+            forced: Vec::new(),
+            think_force_closed: false,
             generated_hint: 0,
         })
     }
@@ -216,9 +228,12 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             self.prev_in_think = in_think;
 
             if in_think && self.think_count >= self.max_think_tokens {
-                // Force-close: stream `</think>\n` and stop. The inline path
-                // wrote this literal token frame directly (not through the
-                // filter, not into streamed_tokens) — preserve that exactly.
+                if !self.think_force_closed {
+                    self.forced = self.tokenizer.encode(&think_continuation_text());
+                    self.think_force_closed = true;
+                    return EmitOutcome { events, stop: None };
+                }
+                // A pathological re-open after the injected close hard-stops.
                 events.push(ClientEvent::Token("</think>\n".to_string()));
                 return EmitOutcome {
                     events,
@@ -270,5 +285,9 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     /// attractor-detect log message reports the same number it did inline.
     fn set_generated_hint(&mut self, generated: usize) {
         self.generated_hint = generated;
+    }
+
+    fn take_forced(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.forced)
     }
 }

@@ -655,6 +655,22 @@ function savePerModelConfigs(all: PerModelConfigs) {
 // possibly-undefined check.
 type ResolvedConfig = HipfireConfig & { max_think_tokens: number; max_think_explicit: boolean };
 
+// Pure serve-layer cap resolution, exported so the default-medium behavior is
+// regression-tested without starting a daemon. `undefined` means uncapped.
+export function resolveServeThinkCap(
+  thinking: HipfireConfig["thinking"],
+  maxThinkTokens: number,
+  enableThinking: boolean | undefined,
+  reasoningEffort: number | null,
+): number | undefined {
+  let cap = thinking === "off"
+    ? 1
+    : (maxThinkTokens > 0 ? maxThinkTokens : undefined);
+  if (enableThinking === false) cap = 1;
+  if (reasoningEffort !== null) cap = reasoningEffort === 0 ? undefined : reasoningEffort;
+  return cap;
+}
+
 function resolveModelConfig(tag: string | null | undefined): ResolvedConfig {
   const base = loadConfig();
   if (!tag) { resolveThinkingBudget(base); return base as ResolvedConfig; }
@@ -3669,37 +3685,19 @@ async function serve(port: number, host: string) {
           if (typeof sendView.min_p === "number") genParams.min_p = sendView.min_p;
         }
         void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
-        // Serve API is UNCAPPED by default (OpenAI/o1 convention — the client
-        // bounds length via max_tokens). The CLI-chat think-budget preset is a
-        // chat convenience, NOT an API default: forwarding the bare "med" preset
-        // here made the daemon route EVERY thinking request to AR (its
-        // `budgeted_thinking_needs_ar` gate), which DISABLED DFlash/MTP through
-        // the serve — they can't continue past a *forced* </think> so a budget
-        // sends them to AR. So forward a budget only when the operator set one
-        // EXPLICITLY (raw max_think_tokens or a non-default thinking_budget);
-        // `reasoning_effort` still caps per-request below and thinking=off
-        // hard-suppresses. (#74 trade-off accepted per design: an uncapped
-        // thinking model on a SMALL max_tokens can return empty content, so
-        // clients should size max_tokens for the reasoning they ask for, or pass
-        // reasoning_effort. The `hipfire run`/chat paths keep the preset budget.)
-        if (effective.thinking === "off") {
-          genParams.max_think_tokens = 1;
-        } else if (effective.max_think_tokens > 0 && effective.max_think_explicit) {
-          genParams.max_think_tokens = effective.max_think_tokens;
-        }
-        // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
-        // token (model emits <think> then is forced to close). Overrides
-        // per-model max_think_tokens because the request semantics are more
-        // specific than the static config.
-        if (enableThinking === false) genParams.max_think_tokens = 1;
-        // reasoning.effort wins over both per-model and enable_thinking
-        // when present (it's the most explicit per-request signal). xhigh
-        // (0 = uncapped) only applies when set; we don't unconditionally
-        // clobber a per-model max_think_tokens with 0.
-        if (reasoningEffort !== null) {
-          if (reasoningEffort === 0) delete genParams.max_think_tokens;
-          else genParams.max_think_tokens = reasoningEffort;
-        }
+        // Forward the resolved think budget by default ("med" = 2048). Sampled
+        // thinking models can otherwise reason to the max_tokens wall without
+        // closing </think>, yielding no visible answer. The daemon's AR and
+        // spec-decode paths force-close at the cap and continue into the answer.
+        // reasoning_effort remains the per-request override; xhigh removes the
+        // cap, and thinking=off still hard-suppresses reasoning.
+        const serveThinkCap = resolveServeThinkCap(
+          effective.thinking,
+          effective.max_think_tokens,
+          enableThinking,
+          reasoningEffort,
+        );
+        if (serveThinkCap !== undefined) genParams.max_think_tokens = serveThinkCap;
         // Wire thinking control for both legacy assistant_prefix
         // (ChatFrame::ClosedThink) and the new Jinja template path.
         // The Jinja path uses max_think_tokens==1 as the signal for
