@@ -382,8 +382,6 @@ pub struct LoadedModel {
     pub session: SessionState,
     pub persist: PersistState,
     pub conversation_tokens: Vec<u32>,
-    pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
-    pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     pub model_path: String,
@@ -449,15 +447,10 @@ impl LoadedModel {
             max_seq,
             physical_cap,
             eviction: None,
-            session: SessionState {
-                kv_adaptive: None,
-                ..Default::default()
-            },
+            session: SessionState::default(),
             persist: PersistState::default(),
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
-            prefill_checkpoints: Vec::new(),
-            dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path,
             speculator: None,
@@ -1959,7 +1952,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(spec) = m.speculator {
         // Frees the drafter's GPU buffers (draft weights + scratch) AND its
         // checkpoint ring — a drafter that forgets is a compile error, not a
-        // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
+        // silent VRAM leak. The vestigial `m.session.dflash_checkpoints` (now always
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
     }
@@ -1975,10 +1968,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(dn) = m.dn_state {
         dn.free_gpu(gpu);
     }
-    for (_, snap) in m.prefill_checkpoints {
+    for (_, snap) in m.session.prefill_checkpoints {
         snap.free_gpu(gpu);
     }
-    for (_, snap) in m.dflash_checkpoints {
+    for (_, snap) in m.session.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
     // Free arch-specific GPU state from the carrier bundle

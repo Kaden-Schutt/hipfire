@@ -931,7 +931,7 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
             return;
         };
         speculative::take_dn_checkpoint(
-            &mut m.prefill_checkpoints,
+            &mut m.session.prefill_checkpoints,
             &mut b.dn_state,
             gpu,
             seq_pos,
@@ -1043,7 +1043,7 @@ impl<'m> hipfire_runtime::arch_dispatch::ArchDispatch for Qwen35Dispatch<'m> {
         let ForwardCtx::Single(gpu) = ctx else {
             unreachable!("single-GPU dispatch received Mesh ctx")
         };
-        free_checkpoints(&mut self.m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut self.m.session.prefill_checkpoints, gpu);
     }
 
     fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
@@ -1437,7 +1437,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for LlamaDispatch<'_> {
         let ForwardCtx::Single(gpu) = ctx else {
             unreachable!("single-GPU dispatch received Mesh ctx")
         };
-        free_checkpoints(&mut self.m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut self.m.session.prefill_checkpoints, gpu);
     }
 
     fn ensure_decoded_vocab(&mut self) -> std::sync::Arc<Vec<String>> {
@@ -4243,10 +4243,10 @@ fn main() {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
                         m.conversation_tokens.clear();
-                        free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
-                        free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                        free_checkpoints(&mut m.session.prefill_checkpoints, &mut gpu);
+                        free_checkpoints(&mut m.session.dflash_checkpoints, &mut gpu);
                         // The DFlash checkpoint ring now lives inside the
-                        // speculator (m.dflash_checkpoints is vestigial/empty),
+                        // speculator (m.session.dflash_checkpoints is vestigial/empty),
                         // so free THAT ring on conversation reset too — else its
                         // GPU snapshots persist until the next prefill-miss.
                         if let Some(s) = m.speculator.as_mut() {
@@ -5477,7 +5477,7 @@ fn plan_prompt_cache(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     messages_history: &[hipfire_runtime::prompt_frame::Message],
     cache_disabled: bool,
-    // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`) and
+    // Ascending DeltaNet checkpoint positions (from `m.session.dflash_checkpoints`) and
     // whether resume-from-checkpoint is enabled. On a divergence the plan picks
     // the latest checkpoint `<= lcp && < rendered.len()` to resume from.
     dflash_ckpt_positions: &[usize],
@@ -5615,8 +5615,8 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     m.seq_pos = 0;
     m.conversation_tokens.clear();
-    free_checkpoints(&mut m.prefill_checkpoints, gpu);
-    free_checkpoints(&mut m.dflash_checkpoints, gpu);
+    free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
+    free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
     if let Some(s) = m.speculator.as_mut() {
         s.reset(gpu);
     }
@@ -7421,8 +7421,8 @@ fn generate_multi(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
         // because a `&tokenizer` borrow of `m` is live here; covers both the
@@ -7655,8 +7655,8 @@ fn generate_multi(
     if try_jinja && m.seq_pos > 0 {
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
         if m.pp > 1 {
@@ -7761,8 +7761,8 @@ fn generate_multi(
         () => {{
             m.seq_pos = 0;
             m.conversation_tokens.clear();
-            free_checkpoints(&mut m.prefill_checkpoints, gpu);
-            free_checkpoints(&mut m.dflash_checkpoints, gpu);
+            free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
+            free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
             for (i, s) in dn.s_matrices.iter().enumerate() {
                 let g = &mut gpus.devices[dn_la_to_device[i] as usize];
                 let _ = g.bind_thread();
@@ -10073,8 +10073,8 @@ fn generate(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset — this AR
         // path is reachable by a DFlash-capable model (temp>0 / budgeted-think /
         // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
@@ -10741,19 +10741,19 @@ fn generate(
                 && evict_safe
                 && matches!(m.state.as_ref(), Some(ModelState::Qwen35(_)))
             {
-                m.prefill_checkpoints
+                m.session.prefill_checkpoints
                     .iter()
                     .rposition(|(p, _)| *p <= lcp && *p < rendered.len())
             } else {
                 None
             };
             let resumed = if let Some(idx) = resume_idx {
-                let rpos = m.prefill_checkpoints[idx].0;
+                let rpos = m.session.prefill_checkpoints[idx].0;
                 // RESTORE only (do NOT zero): roll the bundle's DeltaNet state
                 // back to the checkpoint. Disjoint split: m.state and
-                // m.prefill_checkpoints are different fields of `m`.
+                // m.session.prefill_checkpoints are different fields of `m`.
                 let ok = if let (Some(ModelState::Qwen35(b)), Some(ck)) =
-                    (m.state.as_mut(), m.prefill_checkpoints.get(idx))
+                    (m.state.as_mut(), m.session.prefill_checkpoints.get(idx))
                 {
                     ck.1.restore_to(&mut b.dn_state, gpu).is_ok()
                 } else {
@@ -10765,7 +10765,7 @@ fn generate(
                     // seq_pos already points the KV write head at rpos — nothing
                     // to restore (checkpoints are only captured with offset 0).
                     m.conversation_tokens.truncate(rpos);
-                    truncate_checkpoints(&mut m.prefill_checkpoints, idx + 1, gpu);
+                    truncate_checkpoints(&mut m.session.prefill_checkpoints, idx + 1, gpu);
                     cached_tokens_count = rpos;
                     eprintln!(
                         "[qwen-cache resume] rewound to checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
@@ -10789,7 +10789,7 @@ fn generate(
                     // m.dn_state/m.kv_cache.
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
-                    free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                    free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
                     if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
                         let dn = &b.dn_state;
                         for s in &dn.s_matrices {
@@ -10841,8 +10841,8 @@ fn generate(
     if jinja_active && !cache_eligible && m.seq_pos > 0 {
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset — this AR
         // path is reachable by a DFlash-capable model.
         if let Some(s) = m.speculator.as_mut() {
@@ -13625,8 +13625,8 @@ fn generate_vl(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset.
         if let Some(s) = m.speculator.as_mut() {
             s.reset(gpu);
