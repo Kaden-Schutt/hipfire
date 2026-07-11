@@ -1,0 +1,368 @@
+# Agentic PR Merge-Gate — Design Spec
+
+> Status: **DRAFT / approved-in-brainstorm** · Date: 2026-07-10 · Branch: `feat/rdna-kernel-oracle`
+> Author: Kaden Schutt
+>
+> An agent-orchestrated, GPU-backed PR pipeline that reads a PR, tests the
+> behaviors it touches on the RDNA fleet (gfx1100 / gfx1151 / gfx1201) via
+> `serve_harness`, renders a deterministic parity/perf/coherence verdict, and —
+> when clean, non-clobbering, and meaningfully helpful — lands it (auto for
+> Kaden's PRs; agent-executed on a maintainer's `@claude /merge`), stacking
+> approved PRs on a `staging` merge-train so PR debt never accumulates.
+
+## 1. Goal
+
+Replace "Kaden manually approves every merge" with an agent that certifies each
+PR on real hardware and either lands it or returns an actionable **Bill of Debt
+(BOD)**. First real use: certify the `feat/rdna-kernel-oracle → master` merge
+across all three archs before it lands.
+
+## 2. Non-goals
+
+- **No new perf-search.** This gate *certifies* PRs; it does not hunt kernels
+  (that is the autoresearch loop). It reuses the loop's `certify/` engine.
+- **No maintainer permission change.** The **agent** (Claude App, write scope)
+  performs every merge; maintainer GitHub permissions stay exactly as they are.
+- **No Vulkan / no spec-decode targeting** — inherits the repo's standing rules;
+  the gate is arch/behavior-agnostic and does not privilege any lever.
+- **No running untrusted fork code with secrets** — the trust boundary from
+  `claude-review.yml` is preserved (fork PRs never auto-run on GPU hardware).
+
+## 3. Where it sits (tier architecture)
+
+Completes the pipeline `ci.yml` and `claude-review.yml` already reference:
+
+| Tier | Workflow | Runner | Role | Status |
+|---|---|---|---|---|
+| 1 | `ci.yml` | ubuntu | build + `test --lib` | exists, required |
+| 2 | `claude-review.yml` | ubuntu | **dispatcher + interpreter** (GPU-free): read diff → select tests → trigger Tier 3 → interpret results → verdict/merge/BOD | exists (re-enable + elevate) |
+| **3** | **`gpu-gates.yml`** | **self-hosted matrix** | **deterministic `ar gate`**: fit → cross-arch → parity → perf → coherence → non-clobber merge | **new** |
+
+**Division of labor:** Claude (Tier 2) is the *brain* — it decides what to test,
+triggers Tier 3, and interprets the machine verdict into a human/contributor
+recommendation and a merge action. Tier 3 is the *instrument* — a deterministic
+`ar gate` per arch that renders parity/perf/coherence verdicts. codex/grok stay
+on-box as the executors that run `ar gate` and perform agentic sub-tasks
+(behavior tests, merge-fix, offender bisect). **Claude orchestrates; the engine
+decides the raw verdict.**
+
+## 4. The gate pipeline (per eligible arch, cheapest-first, short-circuiting)
+
+| Gate | What it does | Reuses | Fail → |
+|---|---|---|---|
+| **0 · fit/smoke** | target model loads + runs one generation on that arch's GPU | `LiveServeRunner` spawn | **N/A skip** (not a failure) — unless the change *requires* that arch, then hard-fail |
+| **1 · cross-arch** | each changed `kernels/src/*.hip` does not alter another arch's device codegen (byte-exact preprocessor invariance) | `cross_arch.check_cross_arch` | reject — "arch-bleed; `#if`-gate the gfxNNNN path" |
+| **2 · parity** | token-exact greedy vs base (FP32 + deterministic) | `verdict.parity_result` | reject |
+| **3 · perf** | no significant, replicated regression (see §6) | `verdict.perf_result` + `perf.mwu` | reject + offender recommendation |
+| **3b · coherence** | attractor / validator / McNemar vs base | `verdict.coherence_result` | reject |
+| **4 · non-clobber merge** | merge PR into the **staging tip**, re-run 3 + 3b on the merged tree | §10 | codex merge-fix → re-fire; still fail → **BOD** |
+
+Gate 0 is per `(model, arch)` cell; a cell that does not fit is skipped as N/A,
+never a failure. "If any *eligible* arch regresses → reject."
+
+## 5. Model × arch fit map (config-driven)
+
+`autoresearch/config/pr_gate.toml` declares, per SKU, which archs it fits. The
+gate runs only fitting cells.
+
+| SKU | gfx1100 (24 GB) | gfx1151 (96 GB) | gfx1201 (32 GB) | Notes |
+|---|---|---|---|---|
+| `qwen3.6-27b` (dense) | ✅ | ✅ | ✅ | canonical |
+| `qwen3.6-a3b` (MoE) | ✅ | ✅ | ✅ | canonical |
+| `deepseek4` (EP) | ✗ | ✅ | (EP-4 multi) | example: DS4 change → gfx1151 only |
+
+The **canonical battery** (`qwen3.6-27b` + `qwen3.6-a3b`) always runs on every
+arch it fits; a change that touches a specific model/arch **adds** that cell
+(Claude selects it — §8). Auto-merge requires clean + non-clobber on the
+canonical battery **and** on whatever the change touches.
+
+## 6. Perf governance (two mechanisms, two reference frames)
+
+**Baseline B — per-arch × SKU high-water master perf** (3-run-avg decode tok/s).
+Stored in `autoresearch/state/pr_gate_baselines.json` (tracked). Moves **up only**
+on a confirmed improvement that also passes parity + coherence; **never down**.
+It is the restoration target for the drift guard.
+
+### 6.1 Per-PR perf gate — reject any significant, replicated regression
+
+The mirror of the loop's WIN gate. Uses `verdict.perf_result` (conjunctive
+Mann-Whitney): the loop declares WIN iff tok/s↑ AND duration↓ both significant;
+the gate declares **REGRESSION** iff **tok/s↓ AND duration↑ both mwu-significant
+(α=0.05)**, beyond the existing `perf.FLOOR = 0.15%`, measured **head-vs-base
+interleaved in the same run** (base = the staging tip, §11), **adaptive-sampled**
+(min ~3 up to `perf.CAP = 16`) so significance requires a real effect at a
+practical sample budget. (The stored baseline B and the drift-guard master
+measurement, §6.2, use a fixed **3-run average** — the stable "last measured
+master" number; the per-PR *significance* test is the adaptive interleaved A/B.)
+
+- **Not significant** (within the ±1–3% noise band) → **PASS** (no magnitude
+  threshold; significance is the discriminator, so noise passes automatically).
+- **Significant regression on the first pass** → **confirmation rerun** (fresh,
+  warmed). If the rerun is not significant → noise → **PASS**. If it replicates →
+  **REJECT** + offender recommendation (§9).
+- **Improvement** (mwu WIN) + parity + coherence → **PASS**; on landing this
+  raises B (§6.2).
+- The `0.15%` floor is belt-and-suspenders against large-N nitpicking; the
+  `CAP=16` sample budget already means only effects big enough to be significant
+  at n≤16 (realistically ≳0.5%) ever flag.
+
+### 6.2 Longitudinal drift guard — −3% cumulative vs high-water B
+
+Every *significant* single-PR regression is already rejected, so the only thing
+that can erode master is the slow bleed of *individually-insignificant*
+regressions. On every landing (§11), the merged master tip is re-measured per
+arch:
+
+- If a new high → **B resets up** (drift budget resets).
+- If the tip has drifted **≤ −3% below B** → **auto-open an investigation**:
+  identify the PRs merged since the last B-reset that each passed at
+  sub-significance (the accumulators), and post a recommendation to **restore to
+  B** (named bisect/revert candidates). Runs as an `ar`-driven job; output is a
+  tracking issue + a BOD-style report, not an automatic revert.
+
+## 7. Parity + coherence = the ar loop (unchanged)
+
+Parity is token-exact greedy (FP32 + `HIPFIRE_DETERMINISTIC=1`). Coherence is
+`detect_attractor` (tiered DFlash thresholds) + `run_validators` (genre-specific)
++ `mcnemar_worse` (paired base-vs-PR failure test). A perf improvement is
+accepted **only if** parity + coherence also pass — the loop's exact contract.
+
+## 8. Behavior test — Claude's dispatch intelligence
+
+Claude reads the diff **and the contributor's PR description** and produces a
+schema-validated test plan for Tier 3:
+
+```
+{ genres:[…], batteries:[…], long_context:bool, session_files:[…],
+  models:[…], archs:[…], extra_prompts:[{genre,prompt,expects}],
+  perf_ab: bool, reason:"…" }
+```
+
+- **Hot-path / behavioral change** (e.g. MTP, sampler, dispatch predicate) →
+  `perf_ab:true` + the touched behavior A/B'd vs master ("is this helpful?").
+- **Pure scaffolding off the hot path** → `perf_ab:false` (run gates 0–2, 4;
+  skip the perf A/B — nothing to regress).
+- Claude either sets the matrix inputs, **or** fires a scaffolded
+  `codex exec "<test the behavior the contributor described>"` on-box for a
+  behavior the fixed battery does not cover.
+- **Guardrail:** the **canonical regression battery always runs** regardless of
+  Claude's plan — Claude may *add* coverage, never remove the floor. An
+  agent-selection error therefore cannot manufacture a false PASS. If the agent
+  round errors/times out, Tier 3 falls back to the canonical battery and flags
+  degraded coverage — never blocks, never false-passes.
+
+## 9. Offender location → contributor recommendation
+
+`certify` runs per kernel, so a regression is attributed to the specific kernel
+whose perf arm went negative. Claude interprets that attribution and writes,
+e.g.:
+
+> ❌ **gpu-gate / gfx1201 — perf regression −3.2%** (confirmed, 2 runs).
+> Offending change: `kernels/src/gemv_hfq4g256_moe_down…hip`. Parity ✅
+> coherence ✅ — this is perf-only. Please adjust it to be perf-neutral to
+> gfx1201 (arch-gate the gfx1201 path, or restore the prior schedule).
+
+When the diff touches several kernels, codex/grok on-box bisects by re-running
+`ar gate` over kernel subsets to isolate the offender before Claude writes the
+recommendation.
+
+## 10. Gate 4 — non-clobber merge, codex merge-fix, BOD
+
+Isolation-clean ≠ merge-clean. Gate 4 performs the actual merge into the
+**staging tip** (§11) locally and re-runs gates 3 + 3b on the *result*.
+
+- **Clobber (post-merge regression/incoherence)** → Claude dispatches a
+  **targeted codex merge-fix** (in-repo branches only — cannot push to a fork) →
+  re-fires the perf gate.
+- **Fix succeeds** → PR proceeds (folds onto staging).
+- **Fix fails** (or fork branch) → the PR receives a **Bill of Debt (BOD)**: the
+  itemized blockers (the conflicting hunks, the regressing kernel, the failed
+  coherence row) the contributor must clear before it can land.
+- **Documented-clobber exception:** when stacking surfaces a behavioral
+  interaction that is *resolved by a new command/feature* one PR introduces (not
+  a true regression), the gate flags it for **documentation** rather than
+  rejection; Claude records it in the landing ledger and requests a doc line.
+
+## 11. Staging merge-train (debt prevention)
+
+`origin/staging` = `master` + {all currently-approved-but-unlanded PRs}, a
+**derived** branch, deterministically rebuilt from `master + the approved set`
+(so a stale/dropped approval self-heals).
+
+1. A PR that passes gates 0–3b is **folded onto staging**; Gate 4 verifies
+   non-clobber against the **staging tip** (= master + prior approved stack), so
+   each PR stacks coherently on the others, not just on master.
+2. Approved PRs **accumulate** on staging (they stay "open" on GitHub; content
+   rides staging).
+3. **Any landing event flushes the whole train:** Kaden's auto-merge **or** a
+   maintainer `@claude /merge` lands the **entire staging stack** on master in
+   one non-clobber merge — merging one PR carries **all** currently-approved PRs
+   with it. Folded PRs then **close behind it**.
+4. staging **re-syncs to master** after every landing (§13) → never stale.
+
+**Only debt = a denied PR the contributor has not re-attempted.** Approved PRs
+are never debt — they are always on the train. The perf baseline for an
+individual PR is the staging tip, so the *stack as a whole* cannot regress; on
+landing the master tip is re-measured for the drift guard (§6.2).
+
+**GitHub close semantics:** landing is a real (non-squash) merge so folded
+commits become master ancestors; each folded PR is closed with a
+`landed via staging stack → <master-sha>` comment + link. Where GitHub detects
+the ancestry it shows "merged"; otherwise "closed (landed via stack)".
+
+## 12. Authority & triggers
+
+| Author | Auto-run? | On pass |
+|---|---|---|
+| **Kaden-Schutt** | yes (open, non-draft) | agent **auto-merges** (flushes the train) — the agentic review *is* the approval that now gates the others |
+| **fivetide / unverbraucht / nwoolmer** | yes (open, non-draft) | agent **tags the author**: "✅ passed — comment `@claude /merge` to land it (+N stacked)." Author `/merge`s → **agent merges on their behalf** |
+| **non-maintainer** | no | a maintainer runs `/gate`; on pass the maintainer `@claude /merge`s to land safely |
+| **Draft (any author)** | no | on invocation → **verdict + BOD only**, never merges |
+
+Maintainer list lives in `pr_gate.toml` (not hardcoded in YAML). Fork PRs never
+auto-run (secrets withheld — the `claude-review` trust boundary); a maintainer
+`/gate` after vetting brings them in.
+
+**"Meaningfully helpful" (the auto-merge judgment).** After all deterministic
+gates pass, Claude gates auto-merge on a helpfulness check to keep no-op churn
+off master. A PR is helpful iff it passes all gates **and** it is one of: a
+measured perf/behavior improvement; a bug/correctness fix; a feature or
+capability the contributor's description states; or scaffolding whose stated
+purpose (enabling later work) is served and which is provably off the hot path
+(no perf A/B needed per §8). It is **not** helpful if it is a pure no-op, a
+revert-churn, or a change whose only effect is a (permitted, sub-significance)
+regression. Helpfulness is a *merge* gate, not a *pass* gate — an unhelpful PR
+still gets a green verdict + a "no-op: clarify intent" note rather than a BOD.
+
+**Permissions:** the agent (Claude App) holds `pull-requests: write` +
+`contents: write` to merge; maintainers gain **no** GitHub permission — their
+`@claude /merge` comment *authorizes* the agent, which executes. Auto-merge sits
+behind a repo kill-switch flag (default: **on for Kaden immediately**; maintainer
+gated-merge is v1).
+
+## 13. `ar gate` engine (the reusable core)
+
+New `autoresearch.ar` subcommand, sibling to `certify`:
+
+```
+python -m autoresearch.ar gate \
+  --arch <gfx> --base <sha> --head <sha> --pr <n> \
+  --dev <N> --card <N> [--harness codex|grok] [--models qwen3.6-27b,qwen3.6-a3b,…]
+```
+
+On-box, per arch: resolve `pr_gate.toml` → for each fitting `(model, arch)` cell
+run gates 0–3b via `orchestrator.certify(runner, base_daemon, var_daemon, …)`
+with a `LiveServeRunner`, then Gate 4. Emits a self-describing verdict row
+(`verdict.make_row` + the orchestrator's identity block: `gpu_arch, base_sha,
+variant_sha, prompt_md5, kv, tok/dur deltas, measurement_hash`).
+
+Everything except `LiveServeRunner` + rocprof is pure/no-GPU, so the engine is
+**unit-tested with a mock `ServeRunner`** + injected `cross_arch.preprocess`
+against captured-diff fixtures (extends `autoresearch/ar/tests`, runs under
+`no-gpu-ci.sh`). Topology-agnostic: the same `ar gate` runs under an ssh-fanout
+fallback if self-hosted runners ever prove painful.
+
+## 14. `gpu-gates.yml` workflow
+
+- **Trigger:** `pull_request` (opened/synchronize/reopened/ready_for_review) for
+  in-repo branches with `HAS_TOKEN`; **+ `issue_comment`** for `/gate` and
+  `@claude /merge` commands. Draft PRs gated out of auto-run.
+- **Matrix:** `strategy.matrix.arch: [gfx1100, gfx1151, gfx1201]`,
+  `runs-on: [self-hosted, <arch>]` → GH schedules each on the owning box (gfx1100
+  + gfx1151 → hipx; gfx1201 → hiptrx). Each job runs `ar gate` and publishes a
+  check-run `gpu-gate / <arch>`.
+- **Concurrency:** GH group per PR (`cancel-in-progress`) **+ on-box
+  `gpu-lock.sh`** so gate jobs serialize with the autoresearch loop and with each
+  other (hipx runs both gfx1100 and gfx1151 → they queue on hipx's lock). The
+  gate is a lock *citizen*, never `rm`s the lockfile.
+- **Aggregator / interpret job** (`workflow_run: completed`): re-invokes Claude
+  (Tier 2) to read the per-arch rows + drift state, post one PR comment (verdict
+  table + ledger rows), set the aggregate status, and take the merge/tag/BOD
+  action.
+- **Freshness:** on every landing, sync `master` + rebuild `staging` on hipx and
+  hiptrx (validators) and on the k9lin dev checkout (repo sync only; k9lin stays
+  zero-validation).
+
+## 15. Ledger
+
+Every landing appends a self-describing row to
+`autoresearch/ledger/pr_gate_merges.jsonl` (tracked; same shape as the swarm
+ledgers): `pr`, `author`, `archs`, `models`, `base_sha`, `staging_sha`,
+`master_sha`, `stacked_prs:[…]`, per-arch `{tok_delta_pct, dur_delta_pct, tok_p,
+dur_p}`, `parity`, `coherence`, `verdict`, `helpful`, `measurement_hash`,
+`landed_via` (`kaden-auto` | `maintainer-merge` | `gate-invoke`). This is the
+durable record of what landed, on what evidence.
+
+## 16. Runner bring-up contract (sub-project 0)
+
+Register self-hosted GitHub Actions runners; this spec names what each must
+provide (bring-up is Phase 0):
+
+| Runner | Labels | Archs | Executors | Tools required |
+|---|---|---|---|---|
+| **hipx** | `self-hosted, gfx1100, gfx1151` | gfx1100, gfx1151 | codex | rocprofv3, passwordless `sudo -n` (clock pin), `MODELS_DIR`, cargo, bun, `gpu-lock.sh` |
+| **hiptrx** | `self-hosted, gfx1201` | gfx1201 | codex + grok | same + `GROK_BIN` |
+
+Per-box `gpu-lock.sh` serializes the gate against the loop. Secrets:
+`CLAUDE_CODE_OAUTH_TOKEN` (Claude App, for Tier 2 dispatch/interpret/merge);
+codex/grok auth on-box.
+
+## 17. Error handling & edge cases
+
+- **GPU noise / clock skew** → `INCONCLUSIVE`/`VOID` → **neutral** status + one
+  auto-retry, then human — never a hard fail on noise.
+- **Runner offline / lock held by loop** → job queues; timeout → neutral, not
+  fail (surface "runner busy").
+- **Build fail at base or head** on an arch → `BUILD_FAIL` (real fail — the PR
+  broke that arch's daemon build; Tier 1 only covers the generic workspace).
+- **Agent round failure** (dispatch/interpret/merge-fix) → fall back to the
+  canonical battery / post a manual-review request; degrade coverage, never
+  block or false-pass.
+- **staging rebuild conflict** (an approved PR now clobbers after master moved) →
+  that PR drops from the stack + gets a re-run request; staging self-heals.
+
+## 18. Testing strategy
+
+- **`ar gate` core:** no-GPU unit tests (mock `ServeRunner`, injected
+  `preprocess`, captured-diff fixtures) asserting each gate's verdict; runs under
+  `no-gpu-ci.sh`.
+- **Perf governance:** unit-test the reject/pass/floor/drift logic against
+  synthetic sample vectors (reuse `perf.mwu`).
+- **Staging train:** unit-test the derived-branch rebuild + close-behind
+  bookkeeping with a mock git (`gitpilot` seam).
+- **Workflow:** first PRs adding `gpu-gates.yml` are docs/CI-only → Claude's plan
+  says "no GPU needed" → the gate gates itself trivially. Then a `/gate` dry-run
+  on a trivial in-repo PR.
+- **First real use:** `/gate` on `kernel-oracle → master` → the gate's debut and
+  the merge's safety net.
+
+## 19. Rollout
+
+1. **Phase 0** — runners on hipx/hiptrx (§16).
+2. **Phase 1** — `ar gate` engine (gates 0–3b) + no-GPU unit tests.
+3. **Phase 2** — Gate 4 non-clobber + codex merge-fix + BOD.
+4. **Phase 3** — `gpu-gates.yml` + re-enable/elevate `claude-review.yml`
+   (dispatch/interpret) + triggers. **Kaden auto-merge live**; maintainer
+   gated-merge (`@claude /merge`) live.
+5. **Phase 4** — perf governance (high-water B + drift guard + ledger).
+6. **Phase 5** — staging merge-train + freshness sync (the most complex phase;
+   may split into its own plan).
+7. **Phase 6 (later)** — pi.dev as a third executor (one `agent_exec` branch).
+
+## 20. Security considerations
+
+- Auto-merge is the one genuinely sensitive capability — an agent with merge
+  authority. It is gated by (author ∈ maintainers) ∧ (all deterministic gates
+  green) ∧ (Claude judges helpful), sits behind a kill-switch, and never runs on
+  untrusted fork code (secrets withheld on fork PRs).
+- codex merge-fix pushes only to **in-repo** PR branches; fork clobbers → BOD.
+- The agent holds write scope; maintainers do not — every merge is agent-executed
+  and ledger-recorded, so there is a durable audit trail of what landed and why.
+
+## 21. Open questions
+
+- Exact GitHub API path for "close PR as landed-via-stack" that maximizes the
+  "merged" badge (ancestry detection vs manual close) — resolve during Phase 5.
+- Whether the drift-guard investigation should ever auto-revert vs
+  always-recommend (spec says recommend-only for now).
+- pi.dev executor auth/flags (Phase 6).
