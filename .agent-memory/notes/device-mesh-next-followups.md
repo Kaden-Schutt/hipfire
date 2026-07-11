@@ -1,0 +1,78 @@
+---
+title: NEXT device-mesh follow-ups — #4 EP manifest replication + god-struct field collapse
+tags: [device-mesh, review, next, handover, weight-manifest, god-struct, archdispatch]
+created: 2026-07-11
+updated: 2026-07-11
+---
+
+# HANDOVER: tackle these two next (device-mesh review leftovers)
+
+Context: the 2026-07-10 external review had 6 findings (see
+`device-mesh-review-findings-2026-07-10.md`). #2 (TP/PP unload leak) + #3
+(peer-access order) fixed and GPU-validated; #1 (dense PP per-stage residency)
+DONE + validated (`eafd8663..460e3800`). **Remaining, in priority order:**
+
+## 1. #4 — Manifest replication is wrong for EP  (latent, structural)
+
+**Bug:** `crates/hipfire-runtime/src/weight_manifest.rs:68` —
+`_ => mesh.group_along(DimKind::Tp, &coord)`. On an **Ep-only mesh** there is no
+Tp axis, so `group_along(Tp)` returns a **singleton `[0]`**. A generic EP load
+would therefore place *replicated* attention / router / norm weights (the
+`Replicate` / `ColumnShard` / etc. arms that fall through to `_`) on **device 0
+only** — every other EP rank would be missing them.
+
+**Encoded in a test that currently asserts the bug** (`weight_manifest.rs:~520`):
+```rust
+let ep = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+assert_eq!(placement_devices(&e, &ep, 4), vec![0]);   // <-- a HeadSharded weight lands ONLY on dev 0
+```
+
+**Why it hasn't bitten yet (latent):** the LIVE EP path (deepseek4 / minimax)
+uses hand-written `forward_ep` + imperative loaders, NOT this manifest. The
+manifest/`fulfill_manifest` path is scaffolding not yet wired for EP serving. So
+this is correct-it-before-you-wire-EP-through-the-manifest, not a prod fire.
+
+**Fix direction (needs a decision, then small code):** on an Ep-only mesh,
+replicated (non-sharded) weights should span the **Ep group** (all ranks), not a
+Tp singleton. The clean shape is probably: replicate spans "the whole device set
+of the owning stage" = Tp-group ∪ Ep-group as appropriate, or explicitly the Ep
+group when there's no Tp axis. Decide the semantics for composed Tp×Ep meshes too
+(replicated weight on a 2×2 Tp×Ep mesh = on all 4? on the Tp group of each Ep
+rank?). Then flip the test to assert the correct placement. **Small diff, real
+design question — brainstorm the replicate-on-EP semantics first.** Verify with
+the existing `placement_where_by_mesh_and_policy` / `head_sharded_*` unit tests
+(pure CPU, no GPU).
+
+## 2. God-struct field collapse — `LoadedModel` ~20 `Option` fields  (the #462 surface)
+
+**State:** the ArchDispatch / ModelParallel work flipped ALL arches onto the one
+`ar_generate` driver (Axis A/B + minimax-EP + dense TP/PP folds — all done,
+`.superpowers/sdd/progress.md`). But that was the **driver-level** collapse. The
+`LoadedModel` **struct** still carries ~20 `Option<...>` fields (kv/dn state,
+tp/pp_dense/ep bundles, pflash, eviction, checkpoints, decoded_vocab, …) — the
+change-amplification / unknown-unknowns surface that the #462 class of bugs lives
+on. This is the one unification "actually worth it, INDEPENDENT of the Step-IR
+decomposition."
+
+**KEY CONSTRAINT discovered during the archdispatch review (do NOT forget):** the
+per-arch dispatch structs (`Qwen35Dispatch<'m>{ m: &'m mut LoadedModel }`, etc.,
+daemon.rs) **borrow `&mut LoadedModel`**, so they **cannot** be stored inside
+`LoadedModel` as the once-"approved" `LoadedModel { arch: Box<dyn ArchDispatch> }`
+— that is self-referential and won't compile. The current design sidesteps it by
+constructing the dispatch **transiently per-call**. So the god-struct collapse
+must adopt a DIFFERENT ownership model — e.g. arch state owned in a single
+`ModelState`/enum the dispatch borrows transiently, NOT a stored trait object.
+**This is a genuine design fork → brainstorm first, don't jump to code.**
+
+Refs: `docs/superpowers/specs/2026-07-09-daemon-god-struct-archdispatch-design.md`,
+`docs/superpowers/specs/2026-07-10-axis-b-modelparallel-collapse-design.md`,
+and the "Still NOT done" line in global MEMORY.md.
+
+## Process reminder (worked well this round)
+
+Both items are structural + latent (no GPU needed to START). The pattern that
+worked for #1: adversarial pre-review of the plan (correctness / borrow /
+teardown lenses) BEFORE implementing → subagent-driven per-task execution →
+opus final whole-branch review. Reach for `superpowers:brainstorming` first on
+both (each has a real design fork), then `writing-plans`, then
+`subagent-driven-development`.
