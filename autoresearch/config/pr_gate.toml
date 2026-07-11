@@ -1,0 +1,17 @@
+# Copyright (c) Kaden Schutt
+# autoresearch/config/pr_gate.toml — the Tier-3 PR merge-gate config.
+# Model x arch fit map, maintainer allowlist, and perf thresholds (mirror of the
+# loop's WIN-gate constants). Nothing hardcodes these elsewhere; the gate reads
+# it all from here.
+archs = ["gfx1100", "gfx1151", "gfx1201"]
+canonical_models = ["qwen3.6-27b", "qwen3.6-a3b"]
+maintainers = ["fivetide", "unverbraucht", "nwoolmer", "Kaden-Schutt"]
+floor = 0.15       # min |delta%| above clock noise (= perf.FLOOR)
+drift_pct = 3.0    # cumulative master drift vs high-water B that fires investigation
+alpha = 0.05       # Mann-Whitney significance for the regression test
+
+# Which archs each SKU fits (VRAM). A (model, arch) cell runs only if it fits.
+[fit]
+"qwen3.6-27b" = ["gfx1100", "gfx1151", "gfx1201"]
+"qwen3.6-a3b" = ["gfx1100", "gfx1151", "gfx1201"]
+"deepseek4" = ["gfx1151"]
