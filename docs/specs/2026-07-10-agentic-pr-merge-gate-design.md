@@ -104,6 +104,12 @@ gate runs only fitting cells.
 | `qwen3.6-a3b` (MoE) | ✅ | ✅ | ✅ | canonical |
 | `deepseek4` (EP) | ✗ | ✅ | (EP-4 multi) | example: DS4 change → gfx1151 only |
 
+The dispatch schema assigns one `models` list per box, and the runner applies
+that same list to every arch selected on the box. The list must therefore be the
+intersection of model support across the selected archs, never the union. For
+example, `deepseek4` is invalid in a hipx assignment containing both gfx1100 and
+gfx1151; it is valid only when that assignment selects gfx1151 alone.
+
 The **canonical battery** (`qwen3.6-27b` + `qwen3.6-a3b`) always runs on every
 arch it fits; a change that touches a specific model/arch **adds** that cell
 (Claude selects it — §8). Auto-merge requires clean + non-clobber on the

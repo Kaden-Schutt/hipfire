@@ -168,7 +168,7 @@ jobs:
                    "hipx": {
                      "run": true | false,
                      "archs": ["gfx1100", "gfx1151"],
-                     "models": ["model filenames from autoresearch/config/pr_gate.toml"],
+                     "models": ["dispatch_context model names fitting EVERY selected hipx arch"],
                      "behavior_tests": [
                        {"id":"stable-id", "what":"behavior", "prompt":"exact test",
                         "expect":"machine-checkable outcome"}
@@ -177,7 +177,7 @@ jobs:
                    "hiptrx": {
                      "run": true | false,
                      "archs": ["gfx1201"],
-                     "models": ["model filenames from autoresearch/config/pr_gate.toml"],
+                     "models": ["dispatch_context model names fitting EVERY selected hiptrx arch"],
                      "behavior_tests": []
                    }
                  }
@@ -190,6 +190,12 @@ jobs:
             the diff is truly trivial. decision="skip" is only for docs/workflow-only
             changes with no runtime behavior to test. Never omit an affected arch merely to
             save time: the validator will reject the plan and start zero runners.
+
+            IMPORTANT: a box's `models` list is run unchanged on EACH arch selected for that
+            box. Every listed model must therefore fit EVERY listed arch, using
+            dispatch_context.models as the authority. In particular, `deepseek4` fits only
+            gfx1151 and is INVALID when hipx selects both gfx1100 and gfx1151; omit it in that
+            case. Do not take the union of per-arch model support.
 
             The runner executes `ar gate --collect` then `--grade` mechanically for every
             selected arch. Use behavior_tests only for exact checks the deterministic GPU

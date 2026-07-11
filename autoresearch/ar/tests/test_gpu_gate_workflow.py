@@ -43,6 +43,14 @@ def test_claude_can_write_outputs_and_validator_owns_release_signal():
     assert "--validate-plan dispatch_plan.json" in dispatch
 
 
+def test_dispatch_prompt_explains_box_model_fit_is_an_intersection():
+    text = _text()
+    dispatch = text.split("\n  dispatch:\n", 1)[1].split("\n  no_runner:\n", 1)[0]
+    assert "Every listed model must therefore fit EVERY listed arch" in dispatch
+    assert "`deepseek4` fits only" in dispatch
+    assert "Do not take the union of per-arch model support" in dispatch
+
+
 def test_selected_runner_uses_mechanical_collect_and_grade_not_agent_verdict():
     text = _text()
     gate = text.split("\n  gate:\n", 1)[1].split("\n  interpret:\n", 1)[0]
