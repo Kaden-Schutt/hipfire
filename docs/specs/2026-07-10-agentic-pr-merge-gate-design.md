@@ -559,3 +559,46 @@ codex/grok auth on-box.
 - Whether the drift-guard investigation should ever auto-revert vs
   always-recommend (spec says recommend-only for now).
 - pi.dev executor auth/flags (Phase 6).
+
+## 22. As-built (2026-07-11) — agentic execution + activation runbook
+
+The gate was built and validated live. Two things landed differently from the
+early draft above and supersede it:
+
+**(a) Claude AUTHORS the codex prompt — it is not a structured `plan.json`.** The
+`dispatch` job has Claude read the PR diff+description and write
+`codex_gate_prompt.txt`: a self-contained, PR-scoped prompt telling codex what to
+build/serve, **which SKUs to test (Claude selects — not a hardcoded 27b/a3b list)**,
+and which serve_harness-unreachable behaviors to verify. The `gate` job runs
+`printf '%s' "$CLAUDE_PROMPT + per-box context" | codex exec …`. codex executes and
+adapts; the `interpret` job (Claude) renders the verdict/merge. Claude orchestrates
+and delegates; codex executes; Claude interprets.
+
+**(b) The eval is TOOLS the agent drives, not a monolith.** `ar gate --collect`
+(build base+head daemons via `gate.build` sha-cache + run `scripts/serve_harness.py`
+greedy base-vs-head per model → RAW rows, errors AS DATA) and `ar gate --grade`
+(deterministic parity=content-exact / coherence=attractor / perf=decode_tok_s WIN-gate
+mirror → per-(model,arch) ledger rows via `verdict.make_row` + itemized BOD). codex
+re-collects an EMPTY cell, treats `build_error` as REJECT, sanity-checks perf noise.
+`ar gate --run` (= `grade_collected(collect_cell_data(...))`) is the deterministic
+safety net when codex is unavailable. The old `LiveServeRunner` rocprof arm (which
+returned empty %-busy on RDNA → `median([])` crash) is not on this path.
+
+**Validated live (hipx/hiptrx, never k9lin):** PASS on all 3 archs (real build+serve,
+real decode tok/s, byte-exact content); REJECT via a live-kernel perturbation with
+per-model isolation — `27b + a3b.mq4r PARITY_FAIL`, `a3b.mq4p PASS` (Q8-router path
+bypasses the perturbed norm) — cross-checked independently by the Tier-2 reviewer.
+
+**Known limitation:** `claude-code-action` skips PRs that modify `.github/workflows/`
+(a security guard), so the gate's OWN PRs run a fallback codex prompt, not Claude's
+authored one. Claude-authoring activates for normal PRs once `gpu-gates.yml` is on
+master (i.e. after this PR merges).
+
+**Activation runbook (operator-run — the gate never self-merges to master):**
+```
+gh pr merge 509 --merge     # reviewer turn-budget fix (independent, safe)
+gh pr merge 507 --merge     # lands the gate + ar/ on master; Claude-authoring goes live
+# watch ONE real (non-workflow) PR get a Claude-authored + gated green run, THEN:
+gh variable set GATE_AUTOMERGE --body on   # enable Kaden-only auto-merge (kill-switch ON)
+gh workflow run gate-sweep.yml             # cold-start backlog sweep (§11.1)
+```
