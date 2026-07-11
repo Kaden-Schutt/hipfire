@@ -185,10 +185,21 @@ def collect_cell_data(arch, files, base, head, repo, cfg, *, dev=None, models=No
     bleed = [f for f in kernel_files if deferred_archs
              and cross_arch.check_cross_arch(f, arch, deferred_archs, repo, base_sha=base)]
 
-    dev = resolve_device(arch, default=dev if dev is not None else 0)
     kv = getattr(cfg, "kv_mode", None) or "q8"
     models_dir = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
     out = {"arch": arch, "deferred": False, "dev": dev, "cross_arch_bleed": bleed}
+
+    try:
+        # CI must never guess device 0 when rocminfo hangs or an eGPU disappears.
+        # An explicit local --dev remains an operator override for bring-up work.
+        dev = resolve_device(
+            arch, default=dev if dev is not None else 0, strict=dev is None,
+        )
+        out["dev"] = dev
+    except RuntimeError as e:
+        out["device_error"] = str(e)
+        out["cells"] = []
+        return out
 
     try:
         out["base_bin"] = build_daemon(base, repo)
@@ -229,6 +240,10 @@ def grade_collected(collected, *, cfg) -> dict:
     if collected.get("build_error"):
         return {"arch": arch, "verdict": "REJECT", "reasons": ["build_fail"], "bod": None,
                 "rows": [], "tok_delta_pct": 0.0, "detail": collected["build_error"]}
+    if collected.get("device_error"):
+        return {"arch": arch, "verdict": "REJECT", "reasons": ["device_unavailable"],
+                "bod": None, "rows": [], "tok_delta_pct": 0.0,
+                "detail": collected["device_error"]}
 
     rows, deltas = [], []
     for c in collected.get("cells", []):

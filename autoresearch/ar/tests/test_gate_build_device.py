@@ -40,6 +40,13 @@ def test_resolve_device_absent_arch_falls_back_to_default():
     assert resolve_device("gfx999", rocminfo_text="", default=3) == 3
 
 
+def test_strict_device_resolution_never_guesses_on_missing_or_empty_rocminfo():
+    with pytest.raises(RuntimeError, match="required arch gfx1201 absent"):
+        resolve_device("gfx1201", rocminfo_text=ROCMINFO, strict=True)
+    with pytest.raises(RuntimeError, match="rocminfo unavailable"):
+        resolve_device("gfx1100", rocminfo_text="", strict=True)
+
+
 # ---- arch->box deferral ----
 
 class _Cfg:

@@ -97,6 +97,37 @@ def test_interpret_folds_failed_behavior_as_bod(tmp_path):
     assert any("behavior:cli --foo" in str(b) for b in res["outcome"]["bod"]["blockers"])
 
 
+def test_grade_collected_maps_device_discovery_failure_to_clear_reject():
+    from autoresearch.ar.gate.run import grade_collected
+
+    result = grade_collected(
+        {"arch": "gfx1100", "device_error": "rocminfo unavailable", "cells": []},
+        cfg=_cfg(),
+    )
+    assert result["verdict"] == "REJECT"
+    assert result["reasons"] == ["device_unavailable"]
+    assert result["detail"] == "rocminfo unavailable"
+
+
+def test_collect_fails_device_discovery_before_build_or_gpu_work(monkeypatch):
+    from autoresearch.ar.gate import build, device
+    from autoresearch.ar.gate.run import collect_cell_data
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("required arch gfx1100 absent")
+
+    def must_not_build(*args, **kwargs):
+        raise AssertionError("device preflight must precede build")
+
+    monkeypatch.setattr(device, "resolve_device", unavailable)
+    monkeypatch.setattr(build, "build_daemon", must_not_build)
+    result = collect_cell_data(
+        "gfx1100", ["crates/hipfire-runtime/src/x.rs"], "base", "head", "/r", _cfg(),
+    )
+    assert result["device_error"] == "required arch gfx1100 absent"
+    assert result["cells"] == []
+
+
 def test_run_pr_gate_docs_only_is_trivial_and_tags_non_kaden():
     g = _git(name_only="docs/x.md\n", numstat="3\t0\tdocs/x.md\n")
     r = run_pr_gate(base="m", head="pr", repo="/r", author="fivetide", is_draft=False,
