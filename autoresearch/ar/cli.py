@@ -329,13 +329,69 @@ def cmd_config(a) -> int:
 
 
 def cmd_gate(a) -> int:
-    """Resolve + print the Tier-3 gate plan for an arch (the fitting models, the
-    cross-arch targets, the thresholds). No GPU here — the GPU run is the Phase-3
-    workflow. Reads autoresearch/config/pr_gate.toml."""
+    """Resolve (--plan) or execute (--run) the Tier-3 PR gate.
+
+    --plan: print an arch's resolved gate plan (fitting models / cross-arch targets
+    / thresholds), no GPU. --run: execute the PR gate (classify the diff -> route ->
+    per-arch gate -> decide). --run --dry-run uses a STUB per-arch gate (no GPU / no
+    daemon build) to demonstrate the classify->route->decide->comment pipeline on a
+    real diff; --run without --dry-run uses the live GPU adapter (self-hosted runner
+    only). Reads autoresearch/config/pr_gate.toml."""
     from .gate.config import load_gate_config
 
     path = a.gate_config or os.path.join(_repo(), "autoresearch", "config", "pr_gate.toml")
     cfg = load_gate_config(path)
+    repo = _repo()
+
+    if getattr(a, "interpret", False):
+        # The interpret job: aggregate the matrix's per-arch result JSONs -> decide.
+        from .gate.run import interpret_results
+
+        res = interpret_results(
+            results_dir=a.results, base=a.base, head=a.head, repo=repo,
+            author=(a.author or ""), is_draft=a.draft, helpful=(not a.not_helpful), cfg=cfg,
+        )
+        print(json.dumps({"pr": a.pr, "pr_class": res["pr_class"], "executor": res["route"],
+                          "outcome": res["outcome"]}, indent=2))
+        print("\n--- PR comment ---\n" + res["comment"])
+        return 1 if res["outcome"]["status"] == "failure" else 0
+
+    if getattr(a, "run", False):
+        from .gate.run import changed_files, live_arch_gate, run_pr_gate, stub_arch_gate
+
+        gate_fn = stub_arch_gate if a.dry_run else (
+            lambda arch, files, base, head, r, c:
+            live_arch_gate(arch, files, base, head, r, c, dev=a.dev, card=a.card))
+
+        # Matrix per-arch mode (live, one arch): emit just this arch's result; the
+        # interpret job aggregates all archs and decides.
+        if a.arch and not a.dry_run:
+            files = changed_files(a.base, a.head, repo)
+            ar = gate_fn(a.arch, files, a.base, a.head, repo, cfg)
+            print(json.dumps(ar, indent=2))
+            return 1 if ar["verdict"] in ("REJECT", "BOD") else 0
+
+        # Full pipeline (dry-run demo, or a single-box all-arch run).
+        res = run_pr_gate(
+            base=a.base, head=a.head, repo=repo, author=(a.author or ""),
+            is_draft=a.draft, helpful=(not a.not_helpful), cfg=cfg,
+            arch_gate_fn=gate_fn, archs=([a.arch] if a.arch else None),
+        )
+        out = {
+            "mode": "dry-run" if a.dry_run else "live", "pr": a.pr,
+            "base": a.base, "head": a.head, "author": a.author,
+            "pr_class": res["pr_class"], "executor": res["route"],
+            "arch_results": res["arch_results"], "outcome": res["outcome"],
+        }
+        print(json.dumps(out, indent=2))
+        print("\n--- PR comment ---\n" + res["comment"])
+        # CI exit: a failure verdict (any arch REJECT/BOD) reds the check.
+        return 1 if res["outcome"]["status"] == "failure" else 0
+
+    # --plan (default): per-arch resolved plan.
+    if not a.arch:
+        print(json.dumps({"error": "pass --arch for --plan, or --run for a PR-level gate"}))
+        return 2
     extra = tuple(m for m in (a.models.split(",") if a.models else []) if m)
     out = {
         "arch": a.arch,
@@ -486,9 +542,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--arch", default=None)
     s.add_argument("--json", action="store_true")
 
-    s = sub.add_parser("gate", help="operator: resolve/run the Tier-3 PR gate for an arch")
-    s.add_argument("--arch", required=True)
+    s = sub.add_parser("gate", help="operator: resolve (--plan) or execute (--run) the Tier-3 PR gate")
+    s.add_argument("--arch", default=None, help="single arch (for --plan); omit for a --run over all archs")
     s.add_argument("--plan", action="store_true", help="print the resolved gate plan (no GPU)")
+    s.add_argument("--run", action="store_true", help="execute the PR gate (classify -> per-arch -> decide)")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="run mode with a STUB per-arch gate (no GPU / no daemon build)")
+    s.add_argument("--interpret", action="store_true",
+                   help="aggregate per-arch result JSONs in --results and decide the PR outcome")
+    s.add_argument("--results", default=None, help="dir of per-arch result JSONs (for --interpret)")
+    s.add_argument("--base", default="origin/master", help="base ref the PR merges into")
+    s.add_argument("--head", default="HEAD", help="head ref (the PR)")
+    s.add_argument("--pr", default=None, help="PR number (label only)")
+    s.add_argument("--author", default=None, help="PR author login (authority)")
+    s.add_argument("--draft", action="store_true", help="PR is a draft (report only, no merge)")
+    s.add_argument("--not-helpful", action="store_true", dest="not_helpful",
+                   help="stub Claude's helpfulness judgment as false")
+    s.add_argument("--dev", type=int, default=0, help="HIP device (live mode)")
+    s.add_argument("--card", type=int, default=0, help="DRM card (live mode)")
     s.add_argument("--models", default=None, help="comma-separated change-specific SKUs to add")
     s.add_argument("--gate-config", dest="gate_config", default=None)
     s.add_argument("--json", action="store_true")
