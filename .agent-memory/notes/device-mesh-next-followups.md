@@ -12,7 +12,22 @@ Context: the 2026-07-10 external review had 6 findings (see
 (peer-access order) fixed and GPU-validated; #1 (dense PP per-stage residency)
 DONE + validated (`eafd8663..460e3800`). **Remaining, in priority order:**
 
-## 1. #4 — Manifest replication is wrong for EP  (latent, structural)
+## 1. #4 — Manifest replication is wrong for EP  ✅ DONE 2026-07-11
+
+**Fixed** in commits `4f55a274` (`DeviceMesh::stage_devices` = the owning stage's full
+compute grid), `8c441c76` (`placement_devices` + `plan_manifest` state route every
+non-Pin/Tied policy through `stage_devices`), `be5c4bdb` (`fulfill_manifest` derives the
+shard count from `mesh.size_of(Tp|Ep)`, not `devices.len()` — so a TP-shard policy on a
+Tp-less/EP mesh replicates instead of slicing/refusing). Both the `Replicate` (deepseek4)
+and the `ColumnShard`/`RowShard`/`FusedQkv` (minimax) attention classes now land on every
+EP rank. Composed Tp×Ep: placement is composed-correct (pure topology); fulfill
+`debug_assert`s single-axis — composed slicing deferred to **Phase 5b** (unreachable today:
+`resolve_mesh` builds single-axis only). Opus whole-branch review: READY TO MERGE, 3
+doc-only Minors (non-blocking). Verify: build + `--lib` PASS; mesh 8/8, weight_manifest
+10/10, weight_store 8/8. Spec: `docs/superpowers/specs/2026-07-11-ep-manifest-replication-design.md`.
+
+<details><summary>original bug writeup (kept for context)</summary>
+
 
 **Bug:** `crates/hipfire-runtime/src/weight_manifest.rs:68` —
 `_ => mesh.group_along(DimKind::Tp, &coord)`. On an **Ep-only mesh** there is no
@@ -43,7 +58,9 @@ design question — brainstorm the replicate-on-EP semantics first.** Verify wit
 the existing `placement_where_by_mesh_and_policy` / `head_sharded_*` unit tests
 (pure CPU, no GPU).
 
-## 2. God-struct field collapse — `LoadedModel` ~20 `Option` fields  (the #462 surface)
+</details>
+
+## 2. God-struct field collapse — `LoadedModel` ~20 `Option` fields  (the #462 surface)  ← REMAINING
 
 **State:** the ArchDispatch / ModelParallel work flipped ALL arches onto the one
 `ar_generate` driver (Axis A/B + minimax-EP + dense TP/PP folds — all done,
