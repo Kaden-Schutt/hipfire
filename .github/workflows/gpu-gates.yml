@@ -83,7 +83,7 @@ jobs:
             }
 
   dispatch:
-    name: dispatch (Claude classifies + plans)
+    name: dispatch (Claude orchestrates -> writes codex prompt)
     needs: decide
     if: ${{ needs.decide.outputs.run == 'true' }}
     runs-on: ubuntu-latest
@@ -91,7 +91,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Claude reads the diff -> plan.json
+      - name: Claude reads the PR -> AUTHORS the codex gate prompt
         uses: anthropics/claude-code-action@v1
         env:
           GH_TOKEN: ${{ github.token }}
@@ -101,38 +101,35 @@ jobs:
             --max-turns 15
             --disallowedTools WebSearch,WebFetch,Agent
           prompt: |
-            You are the Tier-3 gate DISPATCHER for hipfire PR #${{ needs.decide.outputs.pr }}.
-            Read the diff SEMANTICALLY (via `git diff ${{ needs.decide.outputs.base }}
-            ${{ needs.decide.outputs.head }}`) plus the PR description — understand what the change
-            actually DOES, not just which files it touches. Write a plan to `plan.json` in the
-            workspace root, exactly this shape:
-              {
-                "risk": "trivial|low|moderate|high-risk",
-                "models": ["<SKUs the serve_harness A/B should cover for THIS change — SELECT them,
-                   do not default: a dense-only change -> qwen3.6-27b.mq4; an MoE/router/expert
-                   change -> qwen3.6-35b-a3b.mq4r + qwen3.6-35b-a3b.mq4p; a shared change -> all
-                   fitting SKUs. Use [] to mean 'the canonical set for the arch'.>"],
-                "serve_floor": { "perf_ab": true|false },
-                "behavior_tests": [
-                  { "what": "<short>",
-                    "prompt": "<exact steps for codex to build/run/verify a behavior serve_harness
-                       CANNOT reach — a new CLI command/flag, a tokenizer/quant-format change, tooling>",
-                    "expect": "<pass condition>",
-                    "harness": "codex", "model": "gpt-5.6-luna|gpt-5.6-terra|gpt-5.6-sol",
-                    "effort": "high|xhigh" }
-                ],
-                "reason": "<one line>"
-              }
-            Rules: the serve_harness FLOOR always runs regardless of your plan — never disable it. Add
-            behavior_tests ONLY for behaviors serve_harness cannot exercise; use [] if the serve floor
-            fully covers the change. Route each behavior test's codex tier by the risk you read
-            (high-risk -> sol xhigh, moderate -> terra high, low -> luna high). Write ONLY plan.json.
-      - name: Upload plan
+            You are the Tier-3 gate ORCHESTRATOR for hipfire PR #${{ needs.decide.outputs.pr }}.
+            Read the diff SEMANTICALLY (`git diff ${{ needs.decide.outputs.base }}
+            ${{ needs.decide.outputs.head }}`) + the PR description and UNDERSTAND what this PR does.
+            Then WRITE, to `codex_gate_prompt.txt` in the workspace root, a complete self-contained
+            prompt that codex will run ON A GPU BOX to gate THIS PR — you author it, scoped to this
+            change; codex executes it. Your prompt must direct codex to:
+              - build the base-ref and head-ref daemons and run scripts/serve_harness.py greedy
+                base-vs-head. The tools: `python3 -m autoresearch.ar gate --collect --arch <arch>
+                --base <base> --head <head> --models <M>` (builds both daemons + serves both ->
+                raw rows; errors as data) then `--grade <collect.json>` (deterministic parity/
+                coherence/perf -> ledger rows + BOD). Tell codex to ADAPT: re-collect an EMPTY cell,
+                treat a build_error as REJECT build_fail, sanity-check perf vs the +/-1-3% noise band.
+              - test EXACTLY the SKUs you judge relevant to THIS change (name them in --models): a
+                dense-only change -> qwen3.6-27b.mq4; an MoE/router/expert change ->
+                qwen3.6-35b-a3b.mq4r + qwen3.6-35b-a3b.mq4p; a shared change -> all fitting. Explain
+                WHY (e.g. "this only touches the dense GEMM path, so 27B is the discriminating SKU").
+              - verify any PR-SPECIFIC behavior serve_harness CANNOT reach (a new CLI flag, a
+                tokenizer/quant-format change, a tooling change) — describe the exact build/run/check.
+              - emit the final arch verdict to results/<arch>.json {arch, verdict, reasons, bod, rows,
+                tok_delta_pct}; a real PARITY_FAIL / COHERENCE_FAIL / perf REGRESSION stays REJECT.
+            Do NOT hardcode a generic checklist — scope it to what THIS PR actually changes. The gate
+            step appends the per-box execution context (box/arch/base/head). Write ONLY
+            codex_gate_prompt.txt.
+      - name: Upload the codex gate prompt
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-plan
-          path: plan.json
+          name: codex-gate-prompt
+          path: codex_gate_prompt.txt
           if-no-files-found: warn
 
   gate:
@@ -159,13 +156,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Get the dispatch plan
+      - name: Get Claude's codex gate prompt
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: gate-plan
+          name: codex-gate-prompt
           path: .
-      - name: Gate the box's arch(s) — codex DRIVES collect+grade+adapt (agentic)
+      - name: Gate the box's arch(s) — run CLAUDE'S codex prompt (Claude drives, codex executes)
         run: |
           set +e
           source scripts/gpu-lock.sh
@@ -175,28 +172,30 @@ jobs:
           trap gpu_release EXIT
           mkdir -p results
           BASE="${{ needs.decide.outputs.base }}"; HEAD="${{ needs.decide.outputs.head }}"
+          # Claude AUTHORED codex_gate_prompt.txt (scoped to this PR). If it's absent —
+          # Claude's dispatch was skipped (a workflow-touching PR, per the security guard) —
+          # fall back to a generic mechanical prompt so the gate still runs.
+          if [ -s codex_gate_prompt.txt ]; then
+            GATE_PROMPT="$(cat codex_gate_prompt.txt)"
+          else
+            GATE_PROMPT="Gate this hipfire PR on the box. For each arch below: build the base+head
+          daemons and serve_harness base-vs-head, then judge parity/coherence/perf. Tools:
+          python3 -m autoresearch.ar gate --collect --arch <arch> --base <base> --head <head>
+          (builds both daemons + serves both -> raw rows; add --models <a,b> to pick SKUs, else the
+          canonical set) then --grade <collect.json>. ADAPT: re-collect an EMPTY cell; a build_error
+          is REJECT build_fail; sanity-check perf vs +/-1-3% noise. Do NOT fabricate a PASS."
+          fi
           for arch in ${{ matrix.archs }}; do
-            # AGENTIC path: codex drives the eval TOOLS (collect -> grade) and ADAPTS —
-            # re-collecting an EMPTY cell (transient serve/warm miss), diagnosing a
-            # build_error, sanity-checking perf deltas — instead of a program hard-failing.
-            # ar gate --arch resolves the arch's HIP device by gfxNNNN at runtime.
+            # Claude drives; codex executes Claude's scoped prompt + this per-box execution context.
+            CTX="$GATE_PROMPT
+
+          --- EXECUTION CONTEXT (box ${{ matrix.box }}) ---
+          arch=$arch   base=$BASE   head=$HEAD   PR=#${{ needs.decide.outputs.pr }}
+          Resolve the HIP device for $arch by its gfxNNNN line (never a fixed index). Run the
+          collect/grade tools with --arch $arch --base $BASE --head $HEAD. Write the FINAL arch
+          result JSON {arch, verdict, reasons, bod, rows, tok_delta_pct} to results/$arch.json."
             if command -v codex >/dev/null 2>&1; then
-              codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$PWD" - <<PROMPT
-          You are the hipfire Tier-3 GPU-gate executor for PR #${{ needs.decide.outputs.pr }} on $arch.
-          Drive the eval and ADAPT — do not give up after one command, and do NOT fabricate a PASS.
-          0. MODELS: if plan.json exists and its "models" is a non-empty list, those are the SKUs to
-             test (Claude selected them for this change) — pass them as --models <comma,list>. If
-             plan.json is absent (Claude's dispatch was skipped, e.g. a workflow-touching PR) or
-             "models" is [], omit --models so the canonical set for the arch is used. You MAY also
-             adjust the selection if the diff clearly implicates a specific SKU serve_harness must cover.
-          1. COLLECT (build base+head daemons + serve_harness base-vs-head per selected model):
-             python3 -m autoresearch.ar gate --collect --arch $arch --base $BASE --head $HEAD [--models <sel>] > /tmp/collect_$arch.json
-             If the JSON has "build_error", the PR does not compile -> the arch verdict is REJECT (build_fail); write that to results/$arch.json and stop.
-          2. GRADE (deterministic parity/coherence/perf per model):
-             python3 -m autoresearch.ar gate --grade /tmp/collect_$arch.json > results/$arch.json
-          3. REVIEW results/$arch.json. Any cell with verdict "EMPTY" is a transient serve miss, NOT a result: re-run step 1 once more and re-grade. If a cell is still EMPTY after one retry, leave it. Sanity-check perf deltas against the +/-1-3% noise band.
-          4. results/$arch.json MUST be the final arch result {arch, verdict, reasons, bod, rows, tok_delta_pct}. A real PARITY_FAIL / COHERENCE_FAIL / perf REGRESSION MUST remain REJECT — never soften it.
-          PROMPT
+              printf '%s' "$CTX" | codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$PWD" -
             fi
             # Safety net: if codex is unavailable or produced nothing usable, run the
             # deterministic collect+grade directly (same tools, no agent adaptation).
@@ -215,28 +214,6 @@ jobs:
         with:
           name: gate-results-${{ matrix.box }}
           path: results/*.json
-      - name: Bespoke behavior tests (codex, on hiptrx)
-        if: ${{ matrix.box == 'hiptrx' && hashFiles('plan.json') != '' }}
-        run: |
-          set +e
-          source scripts/gpu-lock.sh
-          gpu_acquire "gpu-gate-${{ needs.decide.outputs.pr }}-${{ matrix.box }}-behavior"
-          trap gpu_release EXIT
-          # Run Claude's bespoke behavior tests (codex, general — build/run/verify,
-          # NOT limited to serve_harness). No plan.behavior_tests => empty results.
-          python3 -m autoresearch.ar gate --behavior-tests plan.json \
-            --base "${{ needs.decide.outputs.base }}" \
-            --head "${{ needs.decide.outputs.head }}" \
-            --verdict-dir /tmp/gate-behavior \
-            > behavior_results.json
-          cat behavior_results.json
-      - name: Upload behavior results
-        if: ${{ always() && matrix.box == 'hiptrx' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: gate-behavior-results
-          path: behavior_results.json
-          if-no-files-found: ignore
       - name: Clean up the ephemeral PR checkout
         if: always()
         run: |
