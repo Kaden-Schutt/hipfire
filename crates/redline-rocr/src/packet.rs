@@ -49,6 +49,13 @@ impl HeaderPolicy {
         release: FenceScope::Agent,
     };
 
+    /// Same-agent continuation after a batch-entry System acquire.
+    pub const SAME_AGENT_DISPATCH: Self = Self {
+        barrier: true,
+        acquire: FenceScope::Agent,
+        release: FenceScope::Agent,
+    };
+
     /// Device-only phase/token dependency. The following dispatch performs the
     /// System acquire before it consumes data produced by the dependency.
     pub const TWO_QUEUE_DEPENDENCY: Self = Self {
@@ -73,6 +80,30 @@ impl HeaderPolicy {
     pub const BATCH_BOUNDARY_INTERNAL_SERIAL: Self = Self {
         barrier: true,
         acquire: FenceScope::None,
+        release: FenceScope::None,
+    };
+
+    pub const BATCH_INTERNAL_RELEASE_AGENT: Self = Self {
+        barrier: true,
+        acquire: FenceScope::None,
+        release: FenceScope::Agent,
+    };
+
+    pub const BATCH_INTERNAL_ACQUIRE_AGENT: Self = Self {
+        barrier: true,
+        acquire: FenceScope::Agent,
+        release: FenceScope::None,
+    };
+
+    pub const BATCH_INTERNAL_RELEASE_SYSTEM: Self = Self {
+        barrier: true,
+        acquire: FenceScope::None,
+        release: FenceScope::System,
+    };
+
+    pub const BATCH_INTERNAL_ACQUIRE_SYSTEM: Self = Self {
+        barrier: true,
+        acquire: FenceScope::System,
         release: FenceScope::None,
     };
 
@@ -104,6 +135,7 @@ pub struct LaunchGeometry {
     /// Total grid size in work-items, not work-group count.
     pub grid_workitems: [u32; 3],
     pub workgroup: [u16; 3],
+    dimensions: u16,
 }
 
 impl LaunchGeometry {
@@ -136,17 +168,12 @@ impl LaunchGeometry {
         Ok(Self {
             grid_workitems,
             workgroup,
+            dimensions,
         })
     }
 
     pub fn dimensions(self) -> u16 {
-        if self.grid_workitems[2] != 1 || self.workgroup[2] != 1 {
-            3
-        } else if self.grid_workitems[1] != 1 || self.workgroup[1] != 1 {
-            2
-        } else {
-            1
-        }
+        self.dimensions
     }
 
     /// Construct from work-group counts, matching HIP's grid convention while
@@ -163,6 +190,21 @@ impl LaunchGeometry {
                 })?;
         }
         Self::new(grid_workitems, workgroup)
+    }
+
+    /// Construct geometry for a HIP `dim3` launch.
+    ///
+    /// HIP supplies all three work-group IDs even when Y and Z have extent one.
+    /// Keeping the AQL packet three-dimensional is required for kernels which
+    /// read `blockIdx.y` while using a decode-time `grid.y == 1`; minimizing the
+    /// setup dimension would otherwise leave that ID unspecified.
+    pub fn from_hip_workgroups(
+        workgroups: [u32; 3],
+        workgroup: [u16; 3],
+    ) -> Result<Self, PacketError> {
+        let mut geometry = Self::from_workgroups(workgroups, workgroup)?;
+        geometry.dimensions = 3;
+        Ok(geometry)
     }
 }
 
@@ -251,14 +293,13 @@ impl KernelDispatchPacket {
                 required: metadata.kernarg_segment_size,
             });
         }
-        if dynamic_group_bytes != 0 {
-            // The public HSA agent query surface has no reliable per-agent LDS
-            // byte limit. Static group usage comes from loader metadata, but a
-            // dynamic increment cannot be validated before packet execution.
-            return Err(PacketError::DynamicGroupSegmentUnsupported {
-                requested: dynamic_group_bytes,
-            });
-        }
+        let group_segment_size = metadata
+            .group_segment_size
+            .checked_add(dynamic_group_bytes)
+            .ok_or(PacketError::DynamicGroupSegmentOverflow {
+                static_bytes: metadata.group_segment_size,
+                dynamic_bytes: dynamic_group_bytes,
+            })?;
         let setup = geometry.dimensions() << abi::KERNEL_DISPATCH_SETUP_DIMENSIONS;
         let header = packet_header(abi::PACKET_TYPE_KERNEL_DISPATCH, policy);
         Ok(Self {
@@ -271,7 +312,7 @@ impl KernelDispatchPacket {
             grid_size_y: geometry.grid_workitems[1],
             grid_size_z: geometry.grid_workitems[2],
             private_segment_size: metadata.private_segment_size,
-            group_segment_size: metadata.group_segment_size,
+            group_segment_size,
             kernel_object: metadata.kernel_object,
             kernarg_address,
             reserved2: 0,
@@ -413,8 +454,9 @@ pub enum PacketError {
         required: u32,
     },
     DynamicCallstackNeedsPrivateSize,
-    DynamicGroupSegmentUnsupported {
-        requested: u32,
+    DynamicGroupSegmentOverflow {
+        static_bytes: u32,
+        dynamic_bytes: u32,
     },
     TooManyBarrierDependencies {
         count: usize,
@@ -456,9 +498,12 @@ impl fmt::Display for PacketError {
                 f,
                 "dynamic-callstack kernel needs an explicit private-segment policy"
             ),
-            Self::DynamicGroupSegmentUnsupported { requested } => write!(
+            Self::DynamicGroupSegmentOverflow {
+                static_bytes,
+                dynamic_bytes,
+            } => write!(
                 f,
-                "dynamic group segment request of {requested} bytes is unsupported: the public HSA agent API exposes no reliable LDS byte limit"
+                "group segment size overflows: {static_bytes} static bytes + {dynamic_bytes} dynamic bytes"
             ),
             Self::TooManyBarrierDependencies { count, capacity } => write!(
                 f,
@@ -538,11 +583,10 @@ mod tests {
         assert_eq!(packet.published_header_word() & 0xffff, 0x1502);
         assert_eq!(packet.published_header_word() >> 16, 1);
         assert_eq!(packet.group_segment_size, 32);
-        assert_eq!(
+        let dynamic =
             KernelDispatchPacket::new(metadata, geometry, 16, std::ptr::null_mut(), abi::Signal(9))
-                .unwrap_err(),
-            PacketError::DynamicGroupSegmentUnsupported { requested: 16 }
-        );
+                .unwrap();
+        assert_eq!(dynamic.group_segment_size, 48);
     }
 
     #[test]

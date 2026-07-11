@@ -1625,6 +1625,7 @@ struct ExecutableInner {
 
 impl Executable {
     pub fn load(device: &GpuDevice, code_object: Arc<[u8]>) -> Result<Self, RuntimeError> {
+        let code_object = unwrap_clang_offload_bundle(code_object)?;
         if code_object.is_empty() {
             return Err(RuntimeError::EmptyCodeObject);
         }
@@ -1772,6 +1773,67 @@ impl Executable {
             metadata,
         })
     }
+}
+
+const CLANG_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+
+/// HIP accepts a clang offload bundle at `hipModuleLoad`, while the public HSA
+/// code-object reader accepts only the embedded AMDGPU ELF. Unwrap exactly one
+/// AMDGPU entry in-process so HIP and AQL consume byte-identical device code.
+fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeError> {
+    if !code.starts_with(CLANG_OFFLOAD_BUNDLE_MAGIC) {
+        return Ok(code);
+    }
+    let mut cursor = CLANG_OFFLOAD_BUNDLE_MAGIC.len();
+    let bundle_count = read_bundle_u64(&code, &mut cursor)?;
+    let mut amdgpu = None;
+    for _ in 0..bundle_count {
+        let offset = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+            .map_err(|_| RuntimeError::InvalidOffloadBundle("entry offset overflows usize"))?;
+        let size = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+            .map_err(|_| RuntimeError::InvalidOffloadBundle("entry size overflows usize"))?;
+        let id_len = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+            .map_err(|_| RuntimeError::InvalidOffloadBundle("entry ID length overflows usize"))?;
+        let id_end = cursor
+            .checked_add(id_len)
+            .ok_or(RuntimeError::InvalidOffloadBundle("entry ID range overflows"))?;
+        let id = code
+            .get(cursor..id_end)
+            .ok_or(RuntimeError::InvalidOffloadBundle("truncated entry ID"))?;
+        cursor = id_end;
+        let end = offset
+            .checked_add(size)
+            .ok_or(RuntimeError::InvalidOffloadBundle("entry payload range overflows"))?;
+        if end > code.len() {
+            return Err(RuntimeError::InvalidOffloadBundle(
+                "entry payload exceeds bundle",
+            ));
+        }
+        if id.windows(b"amdgcn-amd-amdhsa".len()).any(|window| window == b"amdgcn-amd-amdhsa") {
+            if amdgpu.replace((offset, end)).is_some() {
+                return Err(RuntimeError::InvalidOffloadBundle(
+                    "multiple AMDGPU code objects require an explicit target",
+                ));
+            }
+        }
+    }
+    let (start, end) = amdgpu.ok_or(RuntimeError::InvalidOffloadBundle(
+        "bundle contains no AMDGPU code object",
+    ))?;
+    Ok(Arc::from(&code[start..end]))
+}
+
+fn read_bundle_u64(code: &[u8], cursor: &mut usize) -> Result<u64, RuntimeError> {
+    let end = cursor
+        .checked_add(8)
+        .ok_or(RuntimeError::InvalidOffloadBundle("bundle header overflows"))?;
+    let bytes: [u8; 8] = code
+        .get(*cursor..end)
+        .ok_or(RuntimeError::InvalidOffloadBundle("truncated bundle header"))?
+        .try_into()
+        .expect("slice length checked");
+    *cursor = end;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 impl Drop for ExecutableInner {
@@ -1924,6 +1986,7 @@ pub enum RuntimeError {
         maximum: u64,
     },
     EmptyCodeObject,
+    InvalidOffloadBundle(&'static str),
     SymbolContainsNul,
     SymbolIsNotKernel(String),
 }
@@ -2028,6 +2091,9 @@ impl fmt::Display for RuntimeError {
                 "grid axis/total {axis} is {requested}, agent maximum is {maximum}"
             ),
             Self::EmptyCodeObject => write!(f, "HSACO code object is empty"),
+            Self::InvalidOffloadBundle(reason) => {
+                write!(f, "invalid clang offload bundle: {reason}")
+            }
             Self::SymbolContainsNul => write!(f, "kernel symbol contains an interior NUL"),
             Self::SymbolIsNotKernel(name) => {
                 write!(f, "executable symbol {name:?} is not a kernel")

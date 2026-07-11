@@ -19,6 +19,26 @@ use hip_bridge::{DeviceBuffer, HipResult};
 /// systematic bias that drifted the recurrent state on long generations.
 static GDN_REQUANT_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Reserve the same monotonically increasing stochastic-rounding frame IDs
+/// used by ordinary HIP GatedDeltaNet launches. Direct AQL replay calls this
+/// before submission so bypassing the Rust launch wrapper does not freeze the
+/// captured frame scalar.
+pub fn reserve_gdn_requant_frames(count: u32) -> u32 {
+    GDN_REQUANT_FRAME.fetch_add(count, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Snapshot the next Q8 GatedDeltaNet frame for a single-threaded coherence
+/// experiment. Production replay only reserves frames monotonically.
+pub fn gdn_requant_frame_checkpoint() -> u32 {
+    GDN_REQUANT_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Restore a coherence-experiment checkpoint so two mutually exclusive arms
+/// consume identical stochastic-rounding frame IDs.
+pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
+    GDN_REQUANT_FRAME.store(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Q8 DeltaNet-state requant cadence for batched (n_tokens>1) launches.
 /// `false` (DEFAULT) = single-end requant at the last token only (MQ4-fast path,
 /// recovers the per-token-requant DFlash regression). `true` = per-token Q8
@@ -2136,7 +2156,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let fr = reserve_gdn_requant_frames(1) as i32;
         let efp: *mut c_void = ef_residual
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
@@ -2335,9 +2355,7 @@ impl Gpu {
         // single batched launch gets the same stochastic-rounding dither
         // seed it would have gotten from n_tokens sequential per-token
         // launches. The kernel indexes these as `frame + t` (t = 0..n-1).
-        let mut fr = GDN_REQUANT_FRAME
-            .fetch_add(n_tokens as u32, std::sync::atomic::Ordering::Relaxed)
-            as i32;
+        let mut fr = reserve_gdn_requant_frames(n_tokens as u32) as i32;
         let mut efp: *mut c_void = ef_residual
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());

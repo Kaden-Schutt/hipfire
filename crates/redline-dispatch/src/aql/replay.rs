@@ -54,6 +54,7 @@ pub struct RecordedDispatch {
     kernel: Kernel,
     geometry: LaunchGeometry,
     kernarg: KernargBuffer,
+    dynamic_group_bytes: u32,
     dependencies: Vec<usize>,
 }
 
@@ -79,19 +80,17 @@ impl RecordedDispatch {
             kernel,
             geometry,
             kernarg,
+            dynamic_group_bytes: 0,
             dependencies: Vec::new(),
         })
     }
 
-    /// Dynamic LDS is deliberately rejected by this prototype: the public HSA
-    /// agent query surface does not expose a dependable LDS byte limit against
-    /// which static loader metadata plus this increment can be validated.
-    pub fn with_dynamic_group_bytes(self, bytes: u32) -> Result<Self, ReplayError> {
-        if bytes == 0 {
-            Ok(self)
-        } else {
-            Err(PacketError::DynamicGroupSegmentUnsupported { requested: bytes }.into())
-        }
+    /// Add the launch's dynamic LDS request to the loader-derived static LDS.
+    /// Packet construction checks arithmetic; queue execution remains the
+    /// authoritative hardware limit, as with HIP module launch.
+    pub fn with_dynamic_group_bytes(mut self, bytes: u32) -> Result<Self, ReplayError> {
+        self.dynamic_group_bytes = bytes;
+        Ok(self)
     }
 
     pub fn with_dependencies(mut self, dependencies: impl IntoIterator<Item = usize>) -> Self {
@@ -189,7 +188,7 @@ impl RecordedGraph {
             let packet = KernelDispatchPacket::new(
                 recorded.kernel.metadata(),
                 recorded.geometry,
-                0,
+                recorded.dynamic_group_bytes,
                 recorded.kernarg.address(),
                 node_signals[index].raw(),
             )?;
@@ -425,6 +424,7 @@ impl Drop for ReplaySubmission<'_> {
 pub enum BatchFencePolicy {
     SystemEveryDispatch,
     SystemAcquireAgentRelease,
+    AgentEveryInternalDispatch,
     BoundarySerialized,
     BoundaryIndependent,
 }
@@ -435,6 +435,8 @@ impl BatchFencePolicy {
         match self {
             Self::SystemEveryDispatch => HeaderPolicy::RECORDED_DISPATCH,
             Self::SystemAcquireAgentRelease => HeaderPolicy::TWO_QUEUE_DISPATCH,
+            Self::AgentEveryInternalDispatch if index == 0 => HeaderPolicy::TWO_QUEUE_DISPATCH,
+            Self::AgentEveryInternalDispatch => HeaderPolicy::SAME_AGENT_DISPATCH,
             Self::BoundarySerialized if index == 0 => HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL,
             Self::BoundarySerialized => HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL,
             Self::BoundaryIndependent if index == 0 => {
@@ -501,6 +503,7 @@ pub struct SingleQueueBatchGraph {
     batch: Vec<PacketImage>,
     policy: BatchFencePolicy,
     timestamp_frequency_hz: u64,
+    profiling: bool,
     in_flight: bool,
     usable: bool,
 }
@@ -524,10 +527,57 @@ impl SingleQueueBatchGraph {
         dispatches: Vec<RecordedDispatch>,
         policy: BatchFencePolicy,
     ) -> Result<Self, ReplayError> {
+        let headers = (0..dispatches.len())
+            .map(|index| policy.dispatch_header(index))
+            .collect();
+        Self::create_with_dispatch_headers(device, queue_size, dispatches, policy, headers)
+    }
+
+    pub fn create_with_dispatch_headers(
+        device: &GpuDevice,
+        queue_size: u32,
+        dispatches: Vec<RecordedDispatch>,
+        policy: BatchFencePolicy,
+        headers: Vec<redline_rocr::HeaderPolicy>,
+    ) -> Result<Self, ReplayError> {
+        Self::create_with_dispatch_headers_mode(
+            device, queue_size, dispatches, policy, headers, true,
+        )
+    }
+
+    pub fn create_unprofiled_with_dispatch_headers(
+        device: &GpuDevice,
+        queue_size: u32,
+        dispatches: Vec<RecordedDispatch>,
+        policy: BatchFencePolicy,
+        headers: Vec<redline_rocr::HeaderPolicy>,
+    ) -> Result<Self, ReplayError> {
+        Self::create_with_dispatch_headers_mode(
+            device, queue_size, dispatches, policy, headers, false,
+        )
+    }
+
+    fn create_with_dispatch_headers_mode(
+        device: &GpuDevice,
+        queue_size: u32,
+        dispatches: Vec<RecordedDispatch>,
+        policy: BatchFencePolicy,
+        headers: Vec<redline_rocr::HeaderPolicy>,
+        profiling: bool,
+    ) -> Result<Self, ReplayError> {
         if dispatches.len() < 2 {
             return Err(ReplayError::InvalidBatchShape(
                 "single-queue profiling batch requires at least two dispatches",
             ));
+        }
+        if headers.len() != dispatches.len() {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: format!(
+                    "single-queue batch has {} dispatches but {} packet headers",
+                    dispatches.len(),
+                    headers.len()
+                ),
+            });
         }
         validate_nodes(device, 1, &dispatches)?;
         for dispatch in &dispatches {
@@ -543,15 +593,17 @@ impl SingleQueueBatchGraph {
         }
 
         let queues = QueueSet::create(device, 1, queue_size)?;
-        queues.set_profiling(true)?;
+        if profiling {
+            queues.set_profiling(true)?;
+        }
         let first_signal = CompletionSignal::new(device)?;
         let last_signal = CompletionSignal::new(device)?;
         let final_signal = CompletionSignal::new(device)?;
         let mut batch = Vec::with_capacity(dispatches.len() + 1);
-        for (index, dispatch) in dispatches.iter().enumerate() {
-            let completion = if index == 0 {
+        for (index, (dispatch, header)) in dispatches.iter().zip(&headers).enumerate() {
+            let completion = if profiling && index == 0 {
                 first_signal.raw()
-            } else if index + 1 == dispatches.len() {
+            } else if profiling && index + 1 == dispatches.len() {
                 last_signal.raw()
             } else {
                 abi::Signal(0)
@@ -559,10 +611,10 @@ impl SingleQueueBatchGraph {
             let packet = KernelDispatchPacket::new_with_policy(
                 dispatch.kernel.metadata(),
                 dispatch.geometry,
-                0,
+                dispatch.dynamic_group_bytes,
                 dispatch.kernarg.address(),
                 completion,
-                policy.dispatch_header(index),
+                *header,
             )?;
             batch.push(PacketImage::kernel(&packet));
         }
@@ -576,7 +628,11 @@ impl SingleQueueBatchGraph {
                 capacity,
             });
         }
-        let timestamp_frequency_hz = device.timestamp_frequency_hz()?;
+        let timestamp_frequency_hz = if profiling {
+            device.timestamp_frequency_hz()?
+        } else {
+            1
+        };
 
         Ok(Self {
             device: device.clone(),
@@ -588,6 +644,7 @@ impl SingleQueueBatchGraph {
             batch,
             policy,
             timestamp_frequency_hz,
+            profiling,
             in_flight: false,
             usable: true,
         })
@@ -607,6 +664,48 @@ impl SingleQueueBatchGraph {
 
     pub fn queue_id(&self) -> u64 {
         self.queues.queue_ids().next().expect("one queue exists")
+    }
+
+    /// Patch one dynamic scalar in retained kernarg storage between replays.
+    pub fn patch_kernarg_u32(
+        &mut self,
+        dispatch: usize,
+        offset: usize,
+        value: u32,
+    ) -> Result<(), ReplayError> {
+        if self.in_flight {
+            return Err(ReplayError::KernargPatchWhileInFlight);
+        }
+        let recorded = self
+            .dispatches
+            .get_mut(dispatch)
+            .ok_or(ReplayError::KernargPatchOutOfBounds {
+                dispatch,
+                offset,
+                bytes: 4,
+                kernarg_bytes: 0,
+            })?;
+        let kernarg_bytes = recorded.kernarg.len();
+        let end = offset
+            .checked_add(4)
+            .ok_or(ReplayError::KernargPatchOutOfBounds {
+                dispatch,
+                offset,
+                bytes: 4,
+                kernarg_bytes,
+            })?;
+        let destination = recorded
+            .kernarg
+            .as_mut_bytes()
+            .get_mut(offset..end)
+            .ok_or(ReplayError::KernargPatchOutOfBounds {
+                dispatch,
+                offset,
+                bytes: 4,
+                kernarg_bytes,
+            })?;
+        destination.copy_from_slice(&value.to_le_bytes());
+        Ok(())
     }
 
     /// # Safety
@@ -659,6 +758,15 @@ impl SingleQueueBatchGraph {
         match self.queues.wait_signal(&self.final_signal, timeout) {
             Ok(()) => {
                 self.in_flight = false;
+                if !self.profiling {
+                    return Ok(GpuBatchTiming {
+                        first_start: 0,
+                        first_end: 0,
+                        last_start: 0,
+                        last_end: 0,
+                        frequency_hz: 1,
+                    });
+                }
                 let first = self.device.dispatch_time(&self.first_signal);
                 let last = self.device.dispatch_time(&self.last_signal);
                 match (first, last) {
@@ -905,7 +1013,7 @@ impl TwoQueuePhasedGraph {
                     let packet = KernelDispatchPacket::new_two_queue(
                         dispatch.kernel.metadata(),
                         dispatch.geometry,
-                        0,
+                        dispatch.dynamic_group_bytes,
                         dispatch.kernarg.address(),
                         completion,
                     )?;
@@ -1274,7 +1382,7 @@ impl TwoQueueSerializedBatchGraph {
                         let packet = KernelDispatchPacket::new_two_queue(
                             dispatch.kernel.metadata(),
                             dispatch.geometry,
-                            0,
+                            dispatch.dynamic_group_bytes,
                             dispatch.kernarg.address(),
                             completion,
                         )?;
@@ -1471,7 +1579,7 @@ impl TwoQueueSerializedBatchGraph {
                         let packet = KernelDispatchPacket::new_with_policy(
                             dispatch.kernel.metadata(),
                             dispatch.geometry,
-                            0,
+                            dispatch.dynamic_group_bytes,
                             dispatch.kernarg.address(),
                             completion_signal,
                             dispatch_policies[phase_index][lane][dispatch_index],
@@ -2026,6 +2134,13 @@ pub enum ReplayError {
         metadata_bytes: usize,
         buffer_bytes: usize,
     },
+    KernargPatchWhileInFlight,
+    KernargPatchOutOfBounds {
+        dispatch: usize,
+        offset: usize,
+        bytes: usize,
+        kernarg_bytes: usize,
+    },
     PolicyShapeMismatch {
         detail: String,
     },
@@ -2109,6 +2224,19 @@ impl fmt::Display for ReplayError {
             } => write!(
                 f,
                 "kernel {kernel:?} metadata requires {metadata_bytes} kernarg bytes, buffer has {buffer_bytes}"
+            ),
+            Self::KernargPatchWhileInFlight => {
+                write!(f, "cannot patch kernargs while an AQL replay is in flight")
+            }
+            Self::KernargPatchOutOfBounds {
+                dispatch,
+                offset,
+                bytes,
+                kernarg_bytes,
+            } => write!(
+                f,
+                "dispatch {dispatch} kernarg patch {offset}..{} exceeds {kernarg_bytes} bytes",
+                offset.saturating_add(*bytes)
             ),
             Self::PolicyShapeMismatch { detail } => {
                 write!(f, "derived packet policy shape mismatch: {detail}")

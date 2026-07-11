@@ -5108,8 +5108,11 @@ pub fn forward_scratch(
     }
     // MoE models require allow_moe (HIPFIRE_GRAPH_MOE=1) in addition to the
     // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    let use_graph =
-        ar_graph_test && graph_enabled && graph_eligible && (config.num_experts == 0 || allow_moe);
+    let use_graph = ar_graph_test
+        && graph_enabled
+        && graph_eligible
+        && !gpu.replay.is_enabled()
+        && (config.num_experts == 0 || allow_moe);
     let _ = gpu.graphs.ar_forward_replay_enabled; // suppress unused warning
 
     // Embedding lookup into scratch.x (always direct, changes per token)
@@ -5130,6 +5133,18 @@ pub fn forward_scratch(
     }
 
     let pos_i32 = pos as i32;
+    if gpu.replay.should_route_aql() {
+        gpu.hip
+            .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        let replay = unsafe { gpu.replay.replay_linear_aql() };
+        return match replay {
+            Ok(_) => Ok(()),
+            Err(reason) => {
+                gpu.replay.poison(format!("prepared AQL replay failed: {reason}"));
+                Err(HipError::new(0, &reason))
+            }
+        };
+    }
     if use_graph && gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_exec.is_some() {
         // ── Replay path: graph captured + kernels clean. Cheapest path: pos
         // memcpy + graph replay. The graph is position-agnostic (pos via
@@ -5186,6 +5201,53 @@ pub fn forward_scratch(
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
     }
+    if gpu.replay.should_auto_finalize_capture() {
+        gpu.hip.device_synchronize()?;
+        gpu.replay
+            .finish_capture()
+            .map_err(|reason| HipError::new(0, reason))?;
+        if let Err(reason) = gpu.replay.prepare_linear_aql(gpu.device_id as usize) {
+            gpu.replay
+                .poison(format!("AQL prepare after warmup failed: {reason}"));
+            eprintln!("[redline] falling back to HIP: {reason}");
+        }
+    }
+    Ok(())
+}
+
+/// Populate the two inputs that intentionally stay outside a prepared decode
+/// replay: the token embedding in `scratch.x` and the position scalar buffer.
+/// Redline uses this exact boundary before its AQL packet batch.
+pub fn prepare_scratch_inputs(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, config.dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, config.dim)?
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, config.dim)?
+        }
+        EmbeddingFormat::F32 => {
+            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, config.dim)?
+        }
+        other => {
+            return Err(HipError::new(
+                0,
+                &format!("unsupported embedding format for Redline: {other:?}"),
+            ));
+        }
+    }
+    gpu.hip
+        .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
     Ok(())
 }
 
@@ -13669,8 +13731,19 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         self.hd,
                     )?;
                 } else {
-                    gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, self.k_dim * 4)?;
-                    gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, self.k_dim * 4)?;
+                    // Keep the ratio-1 copy on the same kernel-dispatch
+                    // surface as ratio>1. One deterministic Q+K kernel
+                    // replaces two runtime memcpy nodes and makes the entire
+                    // lowered decode body recordable by Redline AQL.
+                    gpu.repeat_interleave_qk_f32(
+                        &s.dn_q_raw,
+                        &s.dn_k_raw,
+                        &s.dn_q,
+                        &s.dn_k,
+                        config.linear_num_key_heads,
+                        1,
+                        self.hd,
+                    )?;
                 }
                 Ok(())
             }

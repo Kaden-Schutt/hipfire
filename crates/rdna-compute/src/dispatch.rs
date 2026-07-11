@@ -1178,22 +1178,137 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        self.replay
-            .record_hip_launch(func_name, grid, block, shared_mem);
-        crate::scratch::launch_maybe_blob(
-            &self.hip,
-            &self.functions,
-            self.active_stream.as_ref(),
-            &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
-            func_name,
-            grid,
-            block,
-            shared_mem,
-            params,
-            blob_builder,
-        )
+        let record = self.replay.is_recording();
+        if record || self.graphs.capture_mode || self.flags.force_blob_path {
+            let mut blob = blob_builder();
+            blob.pad_to(16);
+            if record {
+                let artifact = self
+                    .compiler
+                    .compiled_kernels()
+                    .get(func_name)
+                    .or_else(|| match func_name {
+                        "mq_rotate_x" => self.compiler.compiled_kernels().get("gemv_mq4g256"),
+                        name if name.starts_with("gemv_hfq4g256_multirow_r") => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_multirow_default")
+                            .or_else(|| {
+                                self.compiler
+                                    .compiled_kernels()
+                                    .get("gemv_hfq4g256_multirow_rdna3")
+                            }),
+                        name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => self
+                            .compiler
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_residual_multirow_default")
+                            .or_else(|| {
+                                self.compiler
+                                    .compiled_kernels()
+                                    .get("gemv_hfq4g256_residual_multirow_rdna3")
+                            }),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        func_name
+                            .strip_suffix("_f32")
+                            .and_then(|name| self.compiler.compiled_kernels().get(name))
+                    })
+                    .cloned();
+                self.replay.record_hip_launch(
+                    func_name,
+                    artifact,
+                    grid,
+                    block,
+                    shared_mem,
+                    blob.as_bytes(),
+                );
+            }
+            let func = &self.functions[func_name];
+            if self.graphs.capture_mode {
+                self.graphs.capture_blobs.push(blob.into_vec());
+                let buf = self.graphs.capture_blobs.last_mut().unwrap();
+                // SAFETY: every caller's builder encodes the same argument
+                // values supplied by `params`; graph-owned storage stays live
+                // through graph instantiation and replay.
+                unsafe {
+                    self.hip.launch_kernel_blob(
+                        func,
+                        grid,
+                        block,
+                        shared_mem,
+                        self.active_stream.as_ref(),
+                        buf.as_mut_slice(),
+                    )
+                }
+            } else {
+                let mut bytes = blob.into_vec();
+                // SAFETY: HIP consumes the contiguous argument bytes during
+                // this one-shot launch; `bytes` remains live across the call.
+                unsafe {
+                    self.hip.launch_kernel_blob(
+                        func,
+                        grid,
+                        block,
+                        shared_mem,
+                        self.active_stream.as_ref(),
+                        bytes.as_mut_slice(),
+                    )
+                }
+            }
+        } else {
+            let func = &self.functions[func_name];
+            // SAFETY: forwarded from the typed launch wrapper that assembled
+            // `params` for this kernel signature.
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.active_stream.as_ref(),
+                    params,
+                )
+            }
+        }
+    }
+
+    /// Diagnostic oracle for Redline prefix localization: relaunch the exact
+    /// captured HIP blob sequence without re-entering model dispatch logic.
+    /// Inputs/state must be restored by the caller first.
+    pub fn replay_recorded_hip_prefix(&self, count: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        if count > self.replay.recorded_launches().len() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "captured HIP prefix {count} exceeds {} launches",
+                    self.replay.recorded_launches().len()
+                ),
+            ));
+        }
+        for launch in self.replay.recorded_launches().iter().take(count) {
+            let func = self.functions.get(&launch.kernel).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("captured HIP function {:?} is not loaded", launch.kernel),
+                )
+            })?;
+            let mut kernarg = launch.kernarg.clone();
+            // SAFETY: the bytes were captured from this exact loaded function
+            // and all pointees remain owned by this Gpu/model instance.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    launch.grid,
+                    launch.block,
+                    launch.shared_mem,
+                    self.active_stream.as_ref(),
+                    &mut kernarg,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`

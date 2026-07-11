@@ -520,7 +520,7 @@ fn lower_phases(
             u16::try_from(block.y).map_err(|_| GenericAqlError::BlockDimensionTooLarge(1))?,
             u16::try_from(block.z).map_err(|_| GenericAqlError::BlockDimensionTooLarge(2))?,
         ];
-        let geometry = LaunchGeometry::from_workgroups([grid.x, grid.y, grid.z], workgroup)
+        let geometry = LaunchGeometry::from_hip_workgroups([grid.x, grid.y, grid.z], workgroup)
             .map_err(ReplayError::from)?;
         device.validate_geometry(geometry)?;
         let recorded = RecordedDispatch::new(lane, registered.kernel.clone(), geometry, kernarg)?
