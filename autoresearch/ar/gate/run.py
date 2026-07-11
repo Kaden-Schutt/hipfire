@@ -162,23 +162,17 @@ def affected_archs(files, cfg) -> list:
 
 
 def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, model=None) -> dict:
-    """REAL per-arch gate (GPU) — runs on a self-hosted runner only. BUILDS the base +
-    head daemon binaries (``gate.build``, cached by sha), resolves the arch's HIP
-    device (``gate.device`` — by gfxNNNN, never a fixed index), then runs the Phase-1
-    ``run_gate`` over a ``LiveServeRunner`` driving those two REAL binaries (the fix for
-    the ``subprocess.run("base")`` scaffold), then the Phase-2 ``gate4`` non-clobber
-    merge. GPU adapter imported lazily so this module stays GPU-free at import time.
-
-    Requires the runner environment (ROCm, cargo, the models under
-    ``$HIPFIRE_MODELS_DIR`` (default ~/.hipfire/models), the GPU). Cannot execute on
-    the zero-validation dev box."""
+    """REAL per-arch gate (GPU) — self-hosted runner only. Deferral → cross-arch leak →
+    BUILD base+head daemons (``gate.build``, sha-cached) → per (model,arch) A/B via
+    ``scripts/serve_harness.py`` (``gate.serve_probe``): greedy content parity, decode
+    tok/s perf (WIN-gate mirror), attractor coherence. serve_harness drives the daemon
+    (spawn/warm/battery) so the gate reuses it rather than the untested LiveServeRunner
+    raw-daemon+rocprof arms. GPU/cargo imported lazily; needs ROCm + the models under
+    ``$HIPFIRE_MODELS_DIR`` (default ~/.hipfire/models). Not runnable on the dev box."""
     from .build import build_daemon                 # lazy: cargo/git, prod-only
     from .device import resolve_device
-    from .engine import run_gate
-    from .merge import gate4
-    from ..certify.serve_runner import LiveServeRunner
-
-    kernel_files = [f for f in files if f.startswith("kernels/") and f.endswith(".hip")]
+    from . import serve_probe
+    from ..certify import cross_arch
 
     # Arch→box deferral (§4.1): a box only runs archs the diff actually affects; an
     # unaffected arch is a no-op PASS (no build, no GPU) so it can never spuriously
@@ -187,13 +181,21 @@ def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, m
         return {"arch": arch, "verdict": "PASS", "reasons": ["deferred"], "bod": None,
                 "tok_delta_pct": 0.0}
 
+    # Gate 1 — cross-arch leak (file-based preprocessor invariance, no GPU): a changed
+    # kernel must not alter ANOTHER arch's device codegen.
+    kernel_files = [f for f in files if f.startswith("kernels/") and f.endswith(".hip")]
+    leaks = [f for f in kernel_files
+             if cross_arch.check_cross_arch(f, arch, cfg.other_archs(arch), repo, base_sha=base)]
+    if leaks:
+        return {"arch": arch, "verdict": "REJECT", "reasons": ["cross_arch"], "bod": None,
+                "tok_delta_pct": 0.0, "detail": f"arch-bleed: {leaks}"}
+
     dev = resolve_device(arch, default=dev if dev is not None else 0)
-    card = card if card is not None else dev
     kv = getattr(cfg, "kv_mode", None) or "q8"
     models_dir = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
 
-    # Build the two daemons FIRST — a head build failure = the PR doesn't compile at
-    # this ref => REJECT (not a crash); a base build failure is an infra error.
+    # Build the two daemons — a head build failure = the PR doesn't compile at this ref
+    # => REJECT (not a crash); a base build failure is an infra ERROR.
     try:
         base_bin = build_daemon(base, repo)
     except RuntimeError as e:
@@ -204,34 +206,26 @@ def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, m
         return {"arch": arch, "verdict": "REJECT", "reasons": ["build_fail"],
                 "bod": None, "detail": str(e)}
 
-    def factory(m):
-        # m is the SKU name (label); the runner drives the resolved model PATH.
-        return LiveServeRunner(model=os.path.join(models_dir, m), arch=arch, dev=dev,
-                               card=card, kv=kv)
+    # Per fitting model: serve_harness greedy A/B, graded parity → coherence → perf.
+    reasons, deltas = [], []
+    base_port = 11540 + dev * 40
+    for i, m in enumerate(cfg.models_for(arch)):
+        mp = os.path.join(models_dir, m)
+        try:
+            base_rows = serve_probe.run_serve_harness(base_bin, mp, dev, repo=repo, kv=kv,
+                                                      port=base_port + i * 2)
+            head_rows = serve_probe.run_serve_harness(head_bin, mp, dev, repo=repo, kv=kv,
+                                                      port=base_port + i * 2 + 1)
+        except RuntimeError as e:
+            return {"arch": arch, "verdict": "ERROR", "reasons": [f"serve:{m}"],
+                    "bod": None, "tok_delta_pct": 0.0, "detail": str(e)}
+        cell = serve_probe.grade_cell(base_rows, head_rows, arch=arch, model=m, floor=cfg.floor)
+        deltas.append(cell.get("tok_delta_pct", 0.0))
+        if cell["gate_verdict"] == "REJECT":
+            reasons.append(f"{cell['reason']}:{m}")
 
-    models = cfg.models_for(arch)
-
-    def _gate(bd, vd):
-        return run_gate(arch=arch, changed_kernel_files=kernel_files, models=models,
-                        base_ref=base, head_ref=head, repo=repo, cfg=cfg,
-                        runner_factory=factory, base_daemon=bd, var_daemon=vd)
-
-    gate = _gate(base_bin, head_bin)
-    if gate["verdict"] == "REJECT":
-        return {"arch": arch, "verdict": "REJECT", "reasons": gate["reasons"],
-                "bod": None, "tok_delta_pct": _tok_delta(gate)}
-
-    # Non-clobber merge: gate the merged tree vs the staging tip (here: base). The
-    # merged daemon is built from the trial-merge result inside gate4's run_merged_gate.
-    g4 = gate4(base_ref=base, head_ref=head, staging_ref=base, repo=repo,
-               run_merged_gate=lambda: _gate(base_bin, head_bin), merge_fix=None)
-    if g4["verdict"] == "BOD":
-        return {"arch": arch, "verdict": "BOD", "reasons": [], "bod": g4["bod"]}
-    return {"arch": arch, "verdict": "PASS", "reasons": [], "bod": None,
-            "tok_delta_pct": _tok_delta(gate)}
-
-
-def _tok_delta(gate) -> float:
-    """Surface the worst (most negative) per-cell tok/s delta for the sweep/BOD."""
-    deltas = [c.get("tok_delta_pct") for c in gate.get("cells", []) if c.get("tok_delta_pct") is not None]
-    return min(deltas) if deltas else 0.0
+    tok_delta = min(deltas) if deltas else 0.0
+    if reasons:
+        return {"arch": arch, "verdict": "REJECT", "reasons": reasons, "bod": None,
+                "tok_delta_pct": tok_delta}
+    return {"arch": arch, "verdict": "PASS", "reasons": [], "bod": None, "tok_delta_pct": tok_delta}

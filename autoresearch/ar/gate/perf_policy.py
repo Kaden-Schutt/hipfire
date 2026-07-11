@@ -14,7 +14,10 @@ from ..certify import perf
 
 
 def _delta_pct(base, var) -> float:
-    """Median %% change of var vs base (+ = var larger)."""
+    """Median %% change of var vs base (+ = var larger). Empty either side → 0.0
+    (no samples ⇒ no measurable delta; never crash on median([]))."""
+    if not base or not var:
+        return 0.0
     mb = _st.median(base)
     return (_st.median(var) - mb) / mb * 100.0 if mb else 0.0
 
