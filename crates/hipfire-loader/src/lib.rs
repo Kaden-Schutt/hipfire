@@ -20,7 +20,7 @@ use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
-use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
+use hipfire_arch_qwen35::qwen35::Qwen35ScratchSet;
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -241,7 +241,6 @@ impl Default for AsstTurnCache {
 // ─── ModelState ────────────────────────────────────────────────────────
 
 /// Arch-specific core state, dispatched in `LoadedModel.state`.
-/// Shared fields (kv_cache, dn_state) stay on `LoadedModel` directly.
 ///
 /// `unload_model` matches this exhaustively with NO wildcard: adding a variant
 /// without a teardown arm is a compile error, which is the whole point of
@@ -337,8 +336,6 @@ pub struct LoadedModel {
     pub pp_dense: Option<hipfire_runtime::pp_serve::PpModel>,
     // Shared arch state
     pub state: Option<ModelState>,
-    pub kv_cache: Option<llama::KvCache>,
-    pub dn_state: Option<DeltaNetState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
     pub qwen2_state: Option<qwen2::Qwen2State>,
     // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
@@ -424,8 +421,6 @@ impl LoadedModel {
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
             state: None,
-            kv_cache: None,
-            dn_state: None,
             qwen2_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
@@ -1953,12 +1948,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
-    }
-    if let Some(kv) = m.kv_cache {
-        kv.free_gpu(gpu);
-    }
-    if let Some(dn) = m.dn_state {
-        dn.free_gpu(gpu);
     }
     for (_, snap) in m.session.prefill_checkpoints {
         snap.free_gpu(gpu);
