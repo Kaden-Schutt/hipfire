@@ -3633,7 +3633,8 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
+                        let vl = m.vision_config.is_some()
+                            || matches!(m.state, Some(ModelState::DotsOcr(_)));
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
@@ -3651,17 +3652,12 @@ fn main() {
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
                             ),
-                            _ => {
-                                if let Some(ref c) = m.dots_ocr_config {
-                                    (
-                                        c.text.hidden_size,
-                                        c.text.num_hidden_layers,
-                                        c.text.vocab_size,
-                                    )
-                                } else {
-                                    (0, 0, 0)
-                                }
-                            }
+                            Some(ModelState::DotsOcr(b)) => (
+                                b.config.text.hidden_size,
+                                b.config.text.num_hidden_layers,
+                                b.config.text.vocab_size,
+                            ),
+                            _ => (0, 0, 0),
                         };
 
                         // Apply MTP config from load-message params.
@@ -4259,12 +4255,11 @@ fn main() {
                         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
                             b.kv.compact_offset = 0;
                         }
-                        if let Some(ref mut s) = m.qwen2_state {
-                            s.reset();
+                        // dots-ocr (arch_id=8) state is in ModelState::DotsOcr.
+                        if let Some(b) = m.dots_ocr_mut() {
+                            b.state.reset();
                         }
-                        // Live plain-qwen2 state is in the ModelState::Qwen2
-                        // bundle, not the (dots-ocr-only) qwen2_state field —
-                        // rewind it too for defense-in-depth.
+                        // Plain qwen2 (arch_id=7) state is in ModelState::Qwen2.
                         if let Some(b) = m.qwen2_mut() {
                             b.state.reset();
                         }
@@ -4637,10 +4632,11 @@ fn main() {
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
                 // and the per-step scratch share `Qwen2State`. Reset its position
                 // cursor here so bench_prefill measures cold prefill. The live
-                // state is in the ModelState::Qwen2 bundle; `qwen2_state` is only
-                // dots-ocr's — rewind both, else this measures warm prefill.
-                if let Some(ref mut s) = m.qwen2_state {
-                    s.reset();
+                // state is in the ModelState::Qwen2 bundle; dots-ocr (arch_id=8)
+                // is in ModelState::DotsOcr — rewind both, else this measures warm
+                // prefill.
+                if let Some(b) = m.dots_ocr_mut() {
+                    b.state.reset();
                 }
                 if let Some(b) = m.qwen2_mut() {
                     b.state.reset();
@@ -5621,8 +5617,9 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(ModelState::Llama(b)) = m.state.as_mut() {
         b.kv.compact_offset = 0;
     }
-    if let Some(ref mut s) = m.qwen2_state {
-        s.reset();
+    // dots-ocr (arch_id=8) recurrent state is now in ModelState::DotsOcr.
+    if let Some(b) = m.dots_ocr_mut() {
+        b.state.reset();
     }
     if let Some(b) = m.qwen2_mut() {
         b.state.reset();
@@ -14152,9 +14149,13 @@ fn generate_vl_dots_ocr(
 
     // 2. Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
+    let Some(ModelState::DotsOcr(b)) = m.state.as_mut() else {
+        write_error(stdout, id, "dots-ocr bundle missing on arch_id=8");
+        return;
+    };
+    let config = &b.config;
+    let weights = &b.weights;
+    let state = &mut b.state;
     let text_cfg = &config.text;
     let dim = text_cfg.hidden_size;
 
@@ -14301,11 +14302,11 @@ fn generate_vl_dots_ocr(
     // 6. Decode. Opt-in n-gram speculative decode when a speculator was built at
     // load (HIPFIRE_NGRAM_DRAFT=1, arch_id=8 gate in `spec_build`); else the
     // bespoke greedy AR loop below. The vision prefill above already advanced the
-    // shared Qwen2 KV (`m.qwen2_state`), so both paths decode from the same warm
-    // state — only the drafting differs. The n-gram verify always falls back to
-    // the target's greedy argmax, so spec output is byte-identical to AR; only τ
-    // (speed) changes. The prefill bindings above (`tokenizer`/`config`/`state`/…)
-    // are released here so the speculative branch can take `&mut m`; the AR path
+    // Qwen2 KV (`ModelState::DotsOcr(b).state`), so both paths decode from the
+    // same warm state — only the drafting differs. The n-gram verify always falls
+    // back to the target's greedy argmax, so spec output is byte-identical to AR;
+    // only τ (speed) changes. The prefill bindings above (`tokenizer`/`b`/…) are
+    // released here so the speculative branch can take `&mut m`; the AR path
     // re-borrows them below.
     if m.speculator.is_some() {
         decode_vl_dots_ocr_ngram(
@@ -14322,10 +14323,14 @@ fn generate_vl_dots_ocr(
         return;
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
+    let Some(ModelState::DotsOcr(b)) = m.state.as_mut() else {
+        write_error(stdout, id, "dots-ocr bundle missing on arch_id=8");
+        return;
+    };
+    let config = &b.config;
     let text_cfg = &config.text;
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
+    let weights = &b.weights;
+    let state = &mut b.state;
 
     // Greedy decode, streaming in the daemon JSONL protocol.
     let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
@@ -14424,13 +14429,12 @@ fn generate_vl_dots_ocr(
 /// when a model-free n-gram speculator was built at load (HIPFIRE_NGRAM_DRAFT=1).
 /// dots.ocr's text decoder IS Qwen2, so the speculator drives it through the
 /// `DotsOcrBundle: SpecTarget` impl. The vision prefill already advanced the
-/// shared `m.qwen2_state` KV, so this only replaces the *decode* phase.
+/// `ModelState::DotsOcr(b).state` KV, so this only replaces the *decode* phase.
 ///
-/// The flat decoder fields (`dots_ocr_config`/`dots_ocr_weights`/`qwen2_state`)
-/// are moved into a `DotsOcrBundle` for the `&mut dyn SpecTarget` borrow and
-/// restored on return — dots.ocr stores its state as flat `LoadedModel` fields,
-/// not a `ModelState` bundle, so the `Carrier::spec_target_guard` path (used by
-/// the text arches) does not apply here.
+/// The bundle is now live in `m.state` as `ModelState::DotsOcr`; borrow it
+/// in-place via `m.state.as_mut()` so the `spec_target_guard` contract holds
+/// without take/put churn. `m.speculator` and `m.tokenizer` are disjoint fields
+/// and coexist with the bundle borrow.
 #[allow(clippy::too_many_arguments)]
 fn decode_vl_dots_ocr_ngram(
     m: &mut LoadedModel,
@@ -14443,19 +14447,15 @@ fn decode_vl_dots_ocr_ngram(
     prefill_tokens: usize,
     prefill_s: f64,
 ) {
-    use hipfire_arch_dots_ocr::DotsOcrBundle;
-    // Move the live decoder state into a SpecTarget bundle; restored on return.
-    let mut bundle = DotsOcrBundle {
-        config: m.dots_ocr_config.take().unwrap(),
-        weights: m.dots_ocr_weights.take().unwrap(),
-        state: m.qwen2_state.take().unwrap(),
+    let Some(ModelState::DotsOcr(bundle)) = m.state.as_mut() else {
+        write_error(stdout, id, "dots-ocr bundle missing on arch_id=8");
+        return;
     };
     let mut spec = m.speculator.take().unwrap();
-    // `m.tokenizer` is a disjoint field → coexists with the takes above and the
-    // restore below; the loop never touches `m`.
+    // `m.tokenizer` is a disjoint field → coexists with the bundle borrow above.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     run_dots_ocr_ngram_loop(
-        &mut bundle,
+        bundle,
         spec.as_mut(),
         tokenizer,
         gpu,
@@ -14467,9 +14467,6 @@ fn decode_vl_dots_ocr_ngram(
         prefill_tokens,
         prefill_s,
     );
-    m.dots_ocr_config = Some(bundle.config);
-    m.dots_ocr_weights = Some(bundle.weights);
-    m.qwen2_state = Some(bundle.state);
     m.speculator = Some(spec);
 }
 

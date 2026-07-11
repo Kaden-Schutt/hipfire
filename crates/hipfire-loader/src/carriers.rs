@@ -852,9 +852,11 @@ impl Carrier for DotsOcrCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            qwen2_state: Some(state),
-            dots_ocr_config: Some(config),
-            dots_ocr_weights: Some(weights),
+            state: Some(crate::ModelState::DotsOcr(hipfire_arch_dots_ocr::DotsOcrBundle {
+                config,
+                weights,
+                state,
+            })),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,

@@ -16,10 +16,8 @@ pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
-use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
-use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::Qwen35ScratchSet;
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
@@ -254,6 +252,7 @@ pub enum ModelState {
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
+    DotsOcr(hipfire_arch_dots_ocr::DotsOcrBundle),
 }
 
 /// LFM2.5-MoE (arch_id=11) GPU bundle. Re-exported from the arch crate, which
@@ -336,8 +335,6 @@ pub struct LoadedModel {
     pub pp_dense: Option<hipfire_runtime::pp_serve::PpModel>,
     // Shared arch state
     pub state: Option<ModelState>,
-    // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
-    pub qwen2_state: Option<qwen2::Qwen2State>,
     // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
     // models — the eos must be carried here (mirrors `minimax_eos_tok`).
@@ -360,9 +357,6 @@ pub struct LoadedModel {
     // against it (so the recurrent MTP-KV never bleeds across requests). None
     // for every other arch and for qwen35 trunks without an MTP head.
     pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
-    // dots.ocr state
-    pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
-    pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
     // Vision state
     pub vision_config: Option<qwen35_vl::VisionConfig>,
     pub vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -417,15 +411,12 @@ impl LoadedModel {
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
             state: None,
-            qwen2_state: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
             qwen35_mtp_head: None,
-            dots_ocr_config: None,
-            dots_ocr_weights: None,
             vision_config: None,
             vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -476,10 +467,8 @@ impl LoadedModel {
     }
 
     /// Qwen2 bundle if this model is arch_id=7 (plain qwen2 via `Qwen2Carrier`),
-    /// else None. The live `Qwen2State` is at `.state`. NOTE: this is NOT the
-    /// `qwen2_state` direct field — that is None for plain qwen2 and is only
-    /// populated by dots-ocr (arch_id=8). Reset/checkpoint sites must rewind
-    /// BOTH or the reset silently no-ops (see scripts/qwen2-reset-gate.sh).
+    /// else None. The live `Qwen2State` is at `.state`. NOTE: dots-ocr (arch_id=8)
+    /// uses `ModelState::DotsOcr`, not this variant — see `dots_ocr_mut()`.
     pub fn qwen2_mut(&mut self) -> Option<&mut hipfire_arch_qwen2::Qwen2Bundle> {
         match &mut self.state {
             Some(ModelState::Qwen2(b)) => Some(b),
@@ -498,6 +487,14 @@ impl LoadedModel {
     pub fn cohere2moe_mut(&mut self) -> Option<&mut Cohere2MoeBundle> {
         match &mut self.state {
             Some(ModelState::Cohere2Moe(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// dots.ocr bundle if this model is arch_id=8, else None.
+    pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
+        match &mut self.state {
+            Some(ModelState::DotsOcr(b)) => Some(b),
             _ => None,
         }
     }
@@ -1921,6 +1918,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
             | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::DotsOcr(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -1985,19 +1983,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
+            ModelState::DotsOcr(b) => {
+                b.weights.free_gpu(gpu);
+                b.state.free_gpu(gpu);
+                // config is host-side — no GPU free
+            }
         }
     }
     // Non-core arch weights
-    if let Some(s) = m.qwen2_state {
-        s.free_gpu(gpu);
-    }
     if let Some(w) = m.vision_weights {
-        w.free_gpu(gpu);
-    }
-    // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive
-    // ModelState match above. dots_ocr already had a free_gpu, it just wasn't
-    // called here (still a loose Option — fold in a future pass).
-    if let Some(w) = m.dots_ocr_weights {
         w.free_gpu(gpu);
     }
     gpu.invalidate_weight_caches();
