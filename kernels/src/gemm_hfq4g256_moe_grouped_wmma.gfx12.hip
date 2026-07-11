@@ -77,8 +77,18 @@ extern "C" __global__ void gemm_hfq4g256_moe_grouped_wmma_gfx12(
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_base + g * 136;
-        _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
-        _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        // k_grp 0/1 share the same A-row header for a given m_lane. Load sc/zp
+        // once on k_grp==0 and broadcast via shfl — halves redundant header
+        // traffic on a mem-busy kernel (value-identical to dual loads).
+        unsigned int sc_bits = 0u, zp_bits = 0u;
+        if (k_grp == 0) {
+            sc_bits = *(const unsigned int*)(gp);
+            zp_bits = *(const unsigned int*)(gp + 4);
+        }
+        sc_bits = __shfl(sc_bits, m_lane);
+        zp_bits = __shfl(zp_bits, m_lane);
+        _Float16 sc_h = (_Float16)__builtin_bit_cast(float, sc_bits);
+        _Float16 zp_h = (_Float16)__builtin_bit_cast(float, zp_bits);
         const _Float16* xg = (x_base != nullptr) ? (x_base + g * 256) : nullptr;
 
         #define DQ8(pk) \
