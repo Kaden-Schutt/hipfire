@@ -209,13 +209,15 @@ jobs:
             - "bod": post the Bill of Debt via `gh pr comment ${{ needs.decide.outputs.pr }} --body "…"`
               — clear + actionable, listing each blocker (arch / kind / detail); for a perf_regression,
               tell the contributor to make the named change perf-neutral to that arch. Do NOT merge.
-            - "auto_merge": a clean, all-green Kaden-Schutt PR. Make the HELPFULNESS judgment YOURSELF
-              from the diff + description: if it is a genuine improvement / fix / feature, merge it
-              (`gh pr merge ${{ needs.decide.outputs.pr }} --merge`, subject to the kill-switch above);
-              if it is a no-op / unclear, instead comment "green but no measurable improvement —
-              clarify intent" and do NOT merge.
-            - "tag_maintainer": comment tagging @${{ needs.decide.outputs.author }}:
-              "✅ passed all gates — comment `@claude /merge` to land it." Do NOT merge.
+            - "auto_merge": a clean, all-green Kaden-Schutt PR (only Kaden-Schutt auto-merges, for
+              now). Make the HELPFULNESS judgment YOURSELF from the diff + description: if it is a
+              genuine improvement / fix / feature, merge it (`gh pr merge ${{ needs.decide.outputs.pr }}
+              --merge`, subject to the kill-switch above); if it is a no-op / unclear, instead comment
+              "green but no measurable improvement — clarify intent" and do NOT merge.
+            - "tag_maintainer": this is a non-Kaden maintainer PR, or a maintainer-invoked non-maintainer
+              PR. Post "✅ all gates green — cleared to merge." Do NOT merge and do NOT instruct
+              `@claude /merge` — only Kaden-Schutt auto-merges (for now); everyone else merges with
+              their own rights once this required gate check is green.
             - "draft_report": post the verdict + BOD; NEVER merge.
 
             Always post exactly ONE concise verdict comment, prefixed "### GPU PR Gate (Tier 3)",
