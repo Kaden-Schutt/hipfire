@@ -151,6 +151,27 @@ schema-validated test plan for Tier 3:
   round errors/times out, Tier 3 falls back to the canonical battery and flags
   degraded coverage — never blocks, never false-passes.
 
+### 8.1 Model routing (dispatcher tiers the executor by PR risk)
+
+The dispatcher (Claude review, **Opus** — high, and **xhigh** when it renders an
+auto-merge / helpfulness call) classifies the diff and sets `(harness, model,
+effort)` for the on-box executor via `agent_exec`. The executor only *selects
+tests and interprets* — parity/perf/coherence are rendered by the certify engine
+— so a cheaper tier degrades **coverage**, never **correctness**, which is what
+makes aggressive down-tiering safe. The table lives in `pr_gate.toml` and is
+re-tuned from the merge ledger's per-tier false-pass / false-reject rates:
+
+| PR class (by diff) | executor |
+|---|---|
+| trivial (docs/CI/config, no code) | *none* — deterministic `ar gate` + canonical battery |
+| semantic/low (small off-hot-path Rust: loader/CLI/tooling) | codex **luna high** |
+| moderate (engine/runtime/serve-path, non-kernel) | codex **terra high** |
+| high-risk (kernels / dispatch / forward-pass / quant / fusion / rmsnorm / sampling — the coherence-gate trigger set) | codex **sol xhigh**; **grok** on the gfx1201 arm as a diversity second-opinion (disagreement → flag for human, no auto-merge) |
+
+Classifier key = the coherence-gate trigger taxonomy `claude-review.yml` already
+encodes ("does the diff touch kernels/dispatch/forward-pass?"). pi.dev slots in
+as a fourth executor when added (§Phase 6).
+
 ## 9. Offender location → contributor recommendation
 
 `certify` runs per kernel, so a regression is attributed to the specific kernel
