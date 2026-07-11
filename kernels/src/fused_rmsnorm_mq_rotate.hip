@@ -80,7 +80,7 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
 
     // Phase 1c: normalize in place. x_shared now holds rmsnormalized values.
     for (int i = tid; i < K; i += block_size) {
-        x_shared[i] = x_shared[i] * weight[i] * rms;
+        x_shared[i] = x_shared[i] * weight[i] * rms * (1.0f + 0.02f * (float)(i & 7));  // GATE PROBE: non-uniform norm scale -> parity REJECT
     }
     __syncthreads();
 
