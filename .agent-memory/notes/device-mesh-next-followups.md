@@ -70,9 +70,17 @@ serve-multiturn PASS (#462 guard); byte-preserving. **Design resolved the self-r
 transient wrapper + lazy `parts_mut` (native disjoint-field borrow, no unsafe, NOT a stored trait
 object), 4-way split, compiler-total reset. Spec: `docs/superpowers/specs/2026-07-11-loadedmodel-god-struct-field-collapse-design.md`;
 Inc-1 plan+ledger: `docs/superpowers/plans/2026-07-11-god-struct-collapse-inc1-sessionstate.md` /
-`.superpowers/sdd/godstruct-inc1-progress.md`. **Inc 2 NEXT** = fold loose per-arch fields
-(kv_cache/dn_state/qwen2_state/deepseek4_pbs/qwen35_mtp_head/dots_ocr_*/vision_*/mtp_*) into the
-`ModelState` enum, one arch per step; then `ModelParallel` (the 7 axis fields); then `ImmutableMeta`.
+`.superpowers/sdd/godstruct-inc1-progress.md`. **Inc 2 Steps A+B DONE 2026-07-11** (`fa2edc62` drop dead always-None kv_cache/dn_state; `bf59147a`
+fold deepseek4_pbs → `Deepseek4Bundle.pbs`; opus READY-TO-LAND; ds4 probe + qwen35 serve-multiturn PASS;
+plan `docs/superpowers/plans/2026-07-11-god-struct-collapse-inc2-deadfields-ds4pbs.md`). **Inc 2 REMAINING
+(Steps C-H, hazard-ordered, own plans):** C dots-ocr → new `ModelState::DotsOcr` variant (config/weights/qwen2_state,
+~20 sites); D vision → `Qwen35Bundle` (~11); E `qwen35_mtp_head`+`mtp_weights_present` → `Qwen35Bundle`
+(needs `generate_qwen35_mtp` move-out borrow restructure); F `pp_gpus`/`pp_scratch_set`/`pp_dn_la_to_device`
+→ `Qwen35Bundle` (disjoint-borrow hazard: `reset_qwen35_recurrent` borrows `m.state` AND `m.pp_gpus`); G
+`deepseek4_eos_tok`/`minimax_eos_tok` → `EpArch::{Ds4,Minimax}` fields; H `mtp_mode`/`mtp_k` → request params.
+Then `ModelParallel` (7 axis fields), then `ImmutableMeta`. Terrain map in the Inc-2 exploration. LESSON:
+adding a REQUIRED bundle field needs `--workspace --all-targets` (breaks all construction sites, e.g.
+dspark_bench.rs, not just the daemon).
 GOTCHA: never run `fmt-changed.sh`/`cargo fmt` on daemon.rs/lib.rs (whole-file reformat churn) — edits
 are pure field-path renames, hand-write them rustfmt-clean. Original problem writeup below (still applies to Inc 2+).
 
