@@ -210,22 +210,44 @@ When the diff touches several kernels, codex/grok on-box bisects by re-running
 `ar gate` over kernel subsets to isolate the offender before Claude writes the
 recommendation.
 
-## 10. Gate 4 — non-clobber merge, codex merge-fix, BOD
+## 10. Gate 4 — post-merge anti-clobber validation, codex merge-fix, BOD
 
-Isolation-clean ≠ merge-clean. Gate 4 performs the actual merge into the
-**staging tip** (§11) locally and re-runs gates 3 + 3b on the *result*.
+**A git-clean merge is NOT clobber-free.** Two PRs can merge with *zero textual
+conflict* yet **semantically clobber** — PR-A changes behavior X, PR-B still assumes
+old X → they merge clean and run broken. Isolation-clean ≠ merge-clean, and
+textual-clean ≠ functional-clean. So Gate 4 performs the actual merge into the
+**staging tip** (§11) and **re-runs the full functional gate — parity / perf /
+coherence + the §8 bespoke behavior tests — on the POST-MERGE tree.** It never
+approves a merge it has not re-validated on the merged result; a clean `git merge`
+alone is never enough.
 
-- **Clobber (post-merge regression/incoherence)** → Claude dispatches a
-  **targeted codex merge-fix** (in-repo branches only — cannot push to a fork) →
-  re-fires the perf gate.
-- **Fix succeeds** → PR proceeds (folds onto staging).
-- **Fix fails** (or fork branch) → the PR receives a **Bill of Debt (BOD)**: the
-  itemized blockers (the conflicting hunks, the regressing kernel, the failed
-  coherence row) the contributor must clear before it can land.
-- **Documented-clobber exception:** when stacking surfaces a behavioral
-  interaction that is *resolved by a new command/feature* one PR introduces (not
-  a true regression), the gate flags it for **documentation** rather than
-  rejection; Claude records it in the landing ledger and requests a doc line.
+The post-merge re-validation checks the merged tree at **three reference points**:
+
+1. **vs its PR** — the PR's own behavior tests + coherence still pass on the merged
+   tree (the merge did not silently break what the PR does).
+2. **vs master** — the merged tree does not regress perf/coherence vs master (the
+   merge introduced no regression that neither PR had alone).
+3. **vs the staging stack** — the merged result is coherent with every already-folded
+   PR (no PR clobbers another's behavior).
+
+The merge stands only if all three are clobber-free.
+
+- **Clobber (any of the three fails)** → Claude dispatches a **targeted codex
+  merge-fix**, resolved on the agent-owned staging (§11), → **re-runs the functional
+  gate on the re-merged tree** (re-validating all three points).
+- **Fix succeeds** (clean at all three) → the PR folds onto staging.
+- **Fix fails** → a **Bill of Debt (BOD)**: the itemized blockers — conflicting
+  hunks, the regressing kernel, the failed coherence row, or *the PR whose behavior
+  the merge broke* — the contributor must clear.
+- **Documented-clobber exception:** when the post-merge check surfaces a behavioral
+  interaction *resolved by a new command/feature* one PR introduces (not a true
+  regression), the gate flags it for **documentation** rather than rejection; Claude
+  records it in the landing ledger and requests a doc line.
+
+**Landing re-validates too.** Because a single landing flushes the *whole* train to
+master, the gate **re-runs the functional check on the landed master** before the
+landing is final (§11) — the post-merge master is proven clobber-free vs every folded
+PR and vs the prior master, never approved on a textual-clean git result alone.
 
 ## 11. Staging merge-train (debt prevention)
 
