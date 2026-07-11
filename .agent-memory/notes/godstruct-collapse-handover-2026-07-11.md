@@ -7,9 +7,11 @@ updated: 2026-07-11
 
 # HANDOVER: LoadedModel god-struct collapse — resume here
 
-Self-contained pickup doc for a fresh session. Branch **`feature/device-mesh`**,
-HEAD **`53c9ba4f`** at handover. Worktree `/home/bjoern/hipfire/.claude/worktrees/feature+device-mesh`.
+Self-contained pickup doc for a fresh session. Branch **`feature/device-mesh`**.
+HEAD **`7e1aa7c2`** (updated after Inc 2 Step E + its leak-fix landed; was `53c9ba4f` at
+original handover). Worktree `/home/bjoern/hipfire/.claude/worktrees/feature+device-mesh`.
 Tree clean. This is one long refactor being landed increment-by-increment behind gates.
+**Next step: F** (see the hazard-ordered list below).
 
 ## What this is
 
@@ -43,6 +45,14 @@ this remaining work is the **struct field collapse**.
   collapsed the transient assemble/disassemble to an in-place `m.state` borrow. dots-ocr load PASS.
 - **Inc 2 Step D** `85007411` — `vision_config`+`vision_weights` → one loader-side
   `Option<Qwen35Vl>` field (see the crate-layering note under Step D below).
+- **Inc 2 Step E** `36660547` (+ leak-fix `7e1aa7c2`) — `qwen35_mtp_head` → `Qwen35Bundle.mtp_head`
+  (carried across the spec-decode transient by `ModelSlot`; `from_bundle`/`into_bundle` round-trip
+  it — the one correctness invariant), AND `mtp_weights_present` bool → computed method
+  (`ds4 mtp_layer/dspark || qwen35 mtp_head`; exact incl EP/PP None cases). Borrow shape resolved:
+  head rides as a read-only LOCAL in `generate_qwen35_mtp`, NLL ends each borrow before its re-pack
+  move — NO loop restructure. Added `qwen35()`/`qwen35_mut()` accessors. opus READY-TO-LAND;
+  serve-multiturn PASS + MTP probe OK. Leak-fix `7e1aa7c2` (separate commit): the 2 cvs-scratch
+  alloc-fail exits now free state + restore m.state (were pre-existing bricking bugs).
 
 Plans/ledgers (gitignored `docs/superpowers/` + git-tracked `.superpowers/sdd/*.md`):
 `2026-07-11-god-struct-collapse-inc1-sessionstate.md`,
@@ -61,11 +71,10 @@ Per-arch / misc: `qwen35_mtp_head`, `mtp_mode`, `mtp_k`, `mtp_weights_present`,
 The full terrain map (field → target, site counts, hazards) was produced by an Explore
 agent this session; the fold order and hazards:
 
-- **E — `qwen35_mtp_head` (+ `mtp_weights_present`) → `Qwen35Bundle`.** MEDIUM. Hazard:
-  `generate_qwen35_mtp` (daemon.rs) MOVES the qwen35 bundle out of `m.state`, then reads
-  `m.qwen35_mtp_head` — with the head inside the bundle it must be borrowed BEFORE the
-  move-out, or the fn restructured to borrow (not move) the bundle. Brainstorm the borrow
-  shape first. `mtp_weights_present` can likely be computed on the fly (`b.mtp_head.is_some()`).
+- **E — DONE** (`36660547` + `7e1aa7c2`). Resolved: head as read-only local, `ModelSlot` carries
+  `mtp_head` for the DFlash `from_bundle`/`into_bundle` round-trip; `mtp_weights_present` computed.
+  The feared move-out borrow was a non-issue — every non-MTP qwen35 site BORROWS the bundle, and
+  NLL ends the head-local borrow before each re-pack. See "Landed so far" above.
 - **F — `pp_gpus`/`pp_scratch_set`/`pp_dn_la_to_device` → `Qwen35Bundle` (or a `Qwen35PpState`).**
   MEDIUM. Hazard: `reset_qwen35_recurrent` (daemon.rs ~5567) borrows `m.state` (for `b.dn_state`)
   AND `m.pp_gpus` as disjoint fields; moving pp_* under `&mut b` removes that disjointness →
