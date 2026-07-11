@@ -60,7 +60,21 @@ the existing `placement_where_by_mesh_and_policy` / `head_sharded_*` unit tests
 
 </details>
 
-## 2. God-struct field collapse — `LoadedModel` ~20 `Option` fields  (the #462 surface)  ← REMAINING
+## 2. God-struct field collapse — `LoadedModel` ~20 `Option` fields  (the #462 surface)  ← IN PROGRESS
+
+**Spec DONE + Increment 1 LANDED 2026-07-11** (commits `33c9fe29..e16e7c01`): `SessionState`
+(resettable per-request fields: seq_pos/conversation_tokens/prefill+dflash_checkpoints/kv_adaptive)
++ `PersistState` (asst_turn_cache/decoded_vocab — SURVIVE reset) + `session_parts_mut` disjoint-borrow
+splitter + `reset_context`→`SessionState::reset(gpu)`. Opus whole-branch review READY-TO-LAND;
+serve-multiturn PASS (#462 guard); byte-preserving. **Design resolved the self-ref fork** (see below):
+transient wrapper + lazy `parts_mut` (native disjoint-field borrow, no unsafe, NOT a stored trait
+object), 4-way split, compiler-total reset. Spec: `docs/superpowers/specs/2026-07-11-loadedmodel-god-struct-field-collapse-design.md`;
+Inc-1 plan+ledger: `docs/superpowers/plans/2026-07-11-god-struct-collapse-inc1-sessionstate.md` /
+`.superpowers/sdd/godstruct-inc1-progress.md`. **Inc 2 NEXT** = fold loose per-arch fields
+(kv_cache/dn_state/qwen2_state/deepseek4_pbs/qwen35_mtp_head/dots_ocr_*/vision_*/mtp_*) into the
+`ModelState` enum, one arch per step; then `ModelParallel` (the 7 axis fields); then `ImmutableMeta`.
+GOTCHA: never run `fmt-changed.sh`/`cargo fmt` on daemon.rs/lib.rs (whole-file reformat churn) — edits
+are pure field-path renames, hand-write them rustfmt-clean. Original problem writeup below (still applies to Inc 2+).
 
 **State:** the ArchDispatch / ModelParallel work flipped ALL arches onto the one
 `ar_generate` driver (Axis A/B + minimax-EP + dense TP/PP folds — all done,
