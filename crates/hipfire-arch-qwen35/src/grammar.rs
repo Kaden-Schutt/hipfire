@@ -27,10 +27,18 @@
 //! moment the model commits to `<tool_call>`: from then until the JSON
 //! header `\n{"name": "<TOOL_NAME>", "arguments": ` is fully laid
 //! down, only tokens that continue that template are allowed. The
-//! `arguments` value itself is unconstrained (state `InArgs`) — qwen
-//! emits free-form JSON for the arguments object and naturally closes
-//! with `}\n</tool_call>`. Once `</tool_call>` lands, the matcher
+//! `arguments` value itself is free-form JSON (state `InArgs`), with one
+//! structural constraint: the model may not emit `</tool_call>` until the
+//! OUTER tool-call object is brace-balanced. The header opens `{...`, so
+//! the canonical close is `}}\n</tool_call>` — one `}` for the args value,
+//! one for the enclosing object. Once `</tool_call>` lands, the matcher
 //! returns to free emission.
+//!
+//! Enforcing the outer `}` is the "JSON-aware brace counting" future phase
+//! flagged below: qwen3.6:27b (mq4, temp>0) intermittently jumped from the
+//! inner `}` straight to `</tool_call>`, dropping the outer brace and
+//! emitting invalid JSON (`{"name":"read","arguments":{"path":"x"}`) that
+//! failed Pi's tool-call parser — the "dropped closing bracket" bug.
 //!
 //! ## States
 //!
@@ -40,18 +48,19 @@
 //! - [`State::AfterOpen`] — between `<tool_call>` and the
 //!   `"arguments": ` colon-space. Constrained to a literal byte
 //!   sequence that names one of the available tools.
-//! - [`State::InArgs`] — between `"arguments": ` and `</tool_call>`.
-//!   Unconstrained — qwen emits the args value as free JSON.
+//! - [`State::InArgs`] — between `"arguments": ` and `</tool_call>`. The
+//!   args value is free JSON, but `</tool_call>` is masked out until the
+//!   enclosing tool-call object is brace-balanced (the outer `}` is
+//!   emitted). String-aware, so `{`/`}`/`<` inside string values don't
+//!   count. The attractor force-close path is exempt.
 //! - (back to `Out` after `</tool_call>`.)
 //!
 //! ## What this does NOT do
 //!
-//! Enforce JSON-validity inside `arguments`. The args value can be a
-//! nested object, array, string, etc.; tracking JSON balance under
-//! BPE fragmentation would multiply the grammar code size for little
-//! payoff — the failure mode we care about (Pi turn 12) corrupts the
-//! header, not the body. A future phase can layer in JSON-aware
-//! brace counting if production traffic ever shows body drift.
+//! Enforce full JSON-validity inside `arguments` (well-formed keys,
+//! quoting, commas). It tracks only string-aware brace balance — enough
+//! to require the outer `}` before the close — leaving trailing-comma /
+//! unquoted-key glitches to the daemon's downstream tool-call repair.
 
 /// Position in the qwen35 tool-call grammar. See module docs for
 /// transitions.
@@ -369,6 +378,63 @@ impl Matcher {
         false
     }
 
+    /// Simulate the args-body brace state over `text` (seeded from the
+    /// committed [`State::InArgs`] state) and return whether the OUTER
+    /// tool-call object is already closed (`args_brace_depth < 0`) at the
+    /// point a `</tool_call>` marker begins within `text`.
+    ///
+    /// Used by [`Self::is_token_allowed`] to permit a close-forming token
+    /// iff it does not drop the outer `}`: a lone `</tool_call>` after the
+    /// inner `}` (depth back to 0) is rejected, while a merged
+    /// `}}\n</tool_call>` token — whose second `}` drives depth to -1 before
+    /// the marker — is allowed. A `<` inside a JSON string value is data,
+    /// not the marker, so the scan is string-aware. By the block invariant
+    /// (this gate rejects any premature close-prefix token), the marker can
+    /// only begin inside `text`, never straddling `partial_buf`.
+    fn outer_closed_before_marker(&self, text: &str) -> bool {
+        const CLOSE: &[u8] = b"</tool_call>";
+        let mut depth = self.args_brace_depth;
+        let mut in_string = self.args_in_string;
+        let mut escape = self.args_string_escape;
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len() {
+            let rem = &bytes[i..];
+            // A `</tool_call>` marker (full, or a terminal prefix running to
+            // the end of `text`) begins here — only meaningful outside a
+            // string value. Decide against the outer-object state at this
+            // position.
+            if !in_string && (rem.starts_with(CLOSE) || CLOSE.starts_with(rem)) {
+                return depth < 0;
+            }
+            let byte = bytes[i];
+            if escape {
+                escape = false;
+                continue;
+            }
+            if in_string {
+                match byte {
+                    b'\\' => escape = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        // No `</tool_call>` marker actually begins (outside a string) within
+        // `text` — the caller's `touches_close_marker` matched a `<` that is
+        // string-value CONTENT (heredoc `<<`, `#include <stdio.h>`, `a < b`,
+        // …) or a bare `<` that isn't a real close prefix. It does not close
+        // the tool call, so allow it. (A real close prefix outside a string is
+        // caught by the in-loop `return depth < 0` above.)
+        true
+    }
+
     /// True iff the n-gram loop guard has tripped on the current
     /// [`State::InArgs`] body. Exposed for diagnostics; the daemon
     /// uses this to log the trip event.
@@ -519,6 +585,16 @@ impl Matcher {
                 if !self.required_fields_satisfied() {
                     return false;
                 }
+                if self.args_brace_depth >= 0 {
+                    // The OUTER tool-call object `{"name":..,"arguments":<v>}` is
+                    // still open. `args_brace_depth` counts only the args-VALUE
+                    // object (it re-enters InArgs at 0, the header's outer `{`
+                    // already consumed), so a balanced value nets back to 0 while
+                    // the enclosing `}` is still outstanding (depth -> -1 once it
+                    // lands). Stay constrained so `is_token_allowed` can block a
+                    // premature `</tool_call>` before the outer brace.
+                    return false;
+                }
                 !Self::has_close_prefix(&self.partial_buf)
             }
         }
@@ -631,6 +707,24 @@ impl Matcher {
                         false
                     } else if self.would_close_args_body(text) {
                         false
+                    } else {
+                        true
+                    }
+                } else if !self.attractor_detected && self.args_brace_depth >= 0 {
+                    // Required fields are present, but the OUTER tool-call object
+                    // is not yet closed (`args_brace_depth` tracks only the
+                    // args-VALUE object, which nets to 0; the outer `}` drives it
+                    // to -1). A token that begins a `</tool_call>` marker while the
+                    // outer brace is still open would drop that brace and emit
+                    // structurally-invalid JSON (the Pi "dropped closing bracket"
+                    // failure: `{"name":"read","arguments":{"path":"x"}`). Allow a
+                    // close-forming token ONLY if the outer `}` lands (brace depth
+                    // < 0) before the marker begins — this still permits a merged
+                    // `}}\n</tool_call>` token. Non-close content is always free.
+                    // The attractor force-close path is exempt (falls through to
+                    // the `else` below) so a looped model can still escape.
+                    if Self::touches_close_marker(&combined) {
+                        self.outer_closed_before_marker(text)
                     } else {
                         true
                     }
@@ -944,13 +1038,20 @@ mod tests {
     }
 
     #[test]
-    fn in_args_is_free_until_close_prefix() {
+    fn in_args_allows_content_but_gates_close_until_outer_brace() {
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
-        assert!(m.is_free());
-        // Inside args, any payload is fine.
+        // The outer tool-call object is open (args_brace_depth == 0), so the
+        // matcher stays constrained — NOT free — to gate a premature close.
+        assert!(!m.is_free());
+        // Inside args, any non-close payload is still fine.
         assert!(m.is_token_allowed("{\"command\": \"ls -la\"}"));
         assert!(m.is_token_allowed("\n"));
+        // Once the full body (args value + outer `}`) is balanced, InArgs is
+        // free again and the close marker is allowed.
+        m.advance("{\"command\": \"ls -la\"}}");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("</tool_call>"));
     }
 
     #[test]
@@ -958,6 +1059,58 @@ mod tests {
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": {}}\n</tool_call>");
         assert!(matches!(m.state(), State::Out));
+    }
+
+    #[test]
+    fn close_blocked_until_outer_object_brace_emitted() {
+        // Regression (Pi "dropped closing bracket"): qwen3.6 mq4 at temp>0
+        // sometimes jumps from the inner args `}` straight to `</tool_call>`,
+        // dropping the OUTER tool-call object's `}` and emitting invalid JSON
+        // (`{"name":"read","arguments":{"path":"/x"}` — no outer close). The
+        // grammar must require the outer `}` before permitting the close.
+        let mut m = Matcher::new(schemas_with_required(&[("read", &["path"])]));
+        m.advance("<tool_call>\n{\"name\": \"read\", \"arguments\": ");
+        // Model emits the balanced args VALUE object (required "path" present).
+        m.advance("{\"path\": \"/x\"}");
+        // Inner object closed (args_brace_depth back to 0) but the OUTER
+        // tool-call object `}` is still outstanding — the close must be blocked.
+        assert!(
+            !m.is_token_allowed("</tool_call>"),
+            "close marker must be rejected while the outer object brace is unclosed"
+        );
+        // The outer `}` itself is still allowed (not a close-marker token).
+        assert!(m.is_token_allowed("}"));
+        // After the outer `}` lands, the close marker is allowed.
+        m.advance("}");
+        assert!(
+            m.is_token_allowed("</tool_call>"),
+            "close marker must be allowed once the outer object is balanced"
+        );
+    }
+
+    #[test]
+    fn lt_char_inside_string_value_is_allowed() {
+        // Regression: the outer-brace close gate must NOT block a `<` that is
+        // part of a JSON STRING VALUE (heredoc `<<`, `#include <stdio.h>`,
+        // `a < b`, …). `touches_close_marker` is not string-aware, so a token
+        // ending in `<` looks like a `</tool_call>` prefix; the gate must still
+        // allow it because inside a string it is content, not the close marker.
+        let mut m = Matcher::new(schemas_with_required(&[("bash", &["command"])]));
+        m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
+        // Inside the command string value; required field "command" present.
+        m.advance("{\"command\": \"cat > /tmp/x.c ");
+        assert!(
+            m.is_token_allowed("<"),
+            "a bare '<' inside a string value must be allowed (heredoc/include)"
+        );
+        assert!(
+            m.is_token_allowed("<< 'EOF'"),
+            "a heredoc token inside a string value must be allowed"
+        );
+        assert!(
+            m.is_token_allowed("#include <stdio.h>"),
+            "C include with '<' inside a string value must be allowed"
+        );
     }
 
     #[test]
@@ -1797,8 +1950,11 @@ mod tests {
             !m.attractor_detected(),
             "code repetition inside a string value must NOT trip the guard"
         );
-        // The args body is still free so the model keeps writing its file.
-        assert!(m.is_free());
+        // The args body still accepts content so the model keeps writing its
+        // file. (It is no longer `is_free` — the outer-brace close gate is
+        // active while the object is open — but non-close content tokens
+        // remain allowed.)
+        assert!(m.is_token_allowed(" more code here"));
     }
 
     #[test]
@@ -2009,9 +2165,12 @@ mod tests {
         let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
         m.advance("{\"path\":\"/tmp/x\",\"content\":\"hello\"");
-        // Both `"path"` and `"content"` present in ngram_history.
+        // Both `"path"` and `"content"` present in ngram_history. The inner
+        // args object still needs its `}` and the outer tool-call object needs
+        // one more — so the canonical close is `}}\n</tool_call>` (the merged
+        // token is allowed because both braces land before the marker).
         assert!(m.is_token_allowed("}"));
-        assert!(m.is_token_allowed("}\n</tool_call>"));
+        assert!(m.is_token_allowed("}}\n</tool_call>"));
     }
 
     #[test]
@@ -2117,8 +2276,9 @@ mod tests {
     fn required_field_guard_allows_close_when_all_satisfied() {
         let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
-        m.advance("{\"path\":\"/tmp/x\",\"content\":\"hello\"}");
-        // Both required fields present in body — close is now allowed.
+        m.advance("{\"path\":\"/tmp/x\",\"content\":\"hello\"}}");
+        // Both required fields present AND the object is fully closed (inner
+        // args `}` + outer tool-call `}`) — close is now allowed.
         assert!(m.is_token_allowed("\n"));
         assert!(m.is_token_allowed("\n</tool_call>"));
         m.advance("\n</tool_call>");
@@ -2132,8 +2292,9 @@ mod tests {
         // — the guard is a no-op. Close fires normally.
         let mut m = Matcher::new(schemas_with_required(&[("list", &[])]));
         m.advance("<tool_call>\n{\"name\": \"list\", \"arguments\": ");
-        m.advance("{}");
-        // No required fields → trivially satisfied.
+        m.advance("{}}");
+        // No required fields → trivially satisfied; the args object `{}` and
+        // the outer tool-call object are both closed.
         assert!(m.is_token_allowed("\n</tool_call>"));
     }
 
@@ -2172,8 +2333,9 @@ mod tests {
         let mut m = Matcher::new(schemas_with_required(&[("bash", &["command"])]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         // Field appears with spaces around the colon — still matches
-        // because we look for `"command"` substring.
-        m.advance("{ \"command\" : \"ls -la\" }");
+        // because we look for `"command"` substring. Close the inner args
+        // object and the outer tool-call object (`}}`) before the marker.
+        m.advance("{ \"command\" : \"ls -la\" }}");
         assert!(m.is_token_allowed("\n</tool_call>"));
     }
 
