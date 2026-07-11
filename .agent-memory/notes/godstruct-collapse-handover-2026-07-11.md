@@ -11,7 +11,7 @@ Self-contained pickup doc for a fresh session. Branch **`feature/device-mesh`**.
 HEAD **`7e1aa7c2`** (updated after Inc 2 Step E + its leak-fix landed; was `53c9ba4f` at
 original handover). Worktree `/home/bjoern/hipfire/.claude/worktrees/feature+device-mesh`.
 Tree clean. This is one long refactor being landed increment-by-increment behind gates.
-**Next step: H** (F DEFERRED→ModelParallel, G DEFERRED→ImmutableMeta; new order: H → ModelParallel (absorbs F's 4 pp* fields) → ImmutableMeta (absorbs G's 2 eos scalars). H is the only clean standalone fold left).
+**Next step: ModelParallel.** E–H fully analyzed: E landed; F→ModelParallel, G+H's mtp_mode→ImmutableMeta (all deferred, rationale below); H's mtp_k = flagged wiring bug (left in place). **Only TWO steps remain: `ModelParallel` (7 axis fields) → `ImmutableMeta` (immutable scalars incl eos + mtp_mode).**
 
 ## What this is
 
@@ -99,9 +99,24 @@ agent this session; the fold order and hazards:
   `arch_id`/`model_path`/`chat_template` → fold into `ImmutableMeta` when that step lands.
   (Single-GPU ds4/minimax also store eos in their bundle — a redundant second home that
   ImmutableMeta can unify.)
-- **H — `mtp_mode`/`mtp_k` → request params.** LOW but a design choice: these are per-request
-  knobs (set from the request), arguably not model state — thread them as generate params
-  instead of storing on `LoadedModel`.
+- **H — SPLIT/DEFERRED (bjoern 2026-07-11).** The "→ request params" framing was WRONG: both are
+  set ONCE at load (daemon.rs:3664-3665 from the load message), not per-request.
+  · `mtp_mode` — set at load, read once at the gate (daemon.rs:11347); immutable load-time serving
+    config → **fold into `ImmutableMeta`** (same category as G's eos).
+  · `mtp_k` — **DEAD as a field**: declared (lib.rs:361), init (:418), set from load message
+    (daemon.rs:3665), NEVER READ anywhere. generate reads `HIPFIRE_MTP_K` env (daemon.rs:6819)
+    instead. **⚠ FLAGGED AS A WIRING BUG (bjoern: fix outside god-struct):** the load-message
+    `mtp_k` knob is silently ignored — only the env var works. Re-wire generate to read the
+    load-config `mtp_k` (or drop the knob) deliberately, later. Left in place for now.
+
+**KEY STRATEGIC FINDING (this session):** the "E–H standalone folds, THEN big groups" hazard-order
+was substantially WRONG. **E was the only true standalone per-arch fold.** F, G, and H's `mtp_mode`
+are all big-group material — F→`ModelParallel` (cross-axis shared `gpus`), G+`mtp_mode`→`ImmutableMeta`
+(immutable per-model scalars). Two adversarial reviews (F) + field-semantics analysis (G, H)
+converged on: **don't pre-fold cross-axis or immutable fields into a single per-arch/per-axis struct
+— they belong in their big group.** So the REMAINING god-struct work is exactly TWO steps:
+**`ModelParallel`** (7 axis fields: pp, pp_gpus, pp_scratch_set, pp_dn_la_to_device, ep, tp, pp_dense)
+then **`ImmutableMeta`** (arch_id, model_path, chat_template, rec_*, the 2 eos scalars, mtp_mode).
 
 Then **`ModelParallel`** (group the 7 axis fields; the enum shape `Single/Tp/PpDense/PpQwen35/Ep`),
 then **`ImmutableMeta`** (arch_id/model_path/chat_template/rec_*). These are the biggest but the
