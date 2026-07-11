@@ -59,13 +59,13 @@ pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize
     match &entry.policy {
         // Pinned/tied non-sharded weights land on exactly one device.
         ShardPolicy::Pin(_) | ShardPolicy::Tied { .. } => vec![mesh.device_of(&coord)],
-        // Expert-sharded → the Ep group of the stage.
-        ShardPolicy::ExpertSharded { .. } => mesh.group_along(DimKind::Ep, &coord),
-        // Expert-tensor-sharded → the Tp group of the stage (TP-of-experts).
-        ShardPolicy::ExpertTensorSharded { .. } => mesh.group_along(DimKind::Tp, &coord),
-        // Everything else (replicate / column / row / fused-qkv / head / vocab)
-        // spans the stage's Tp group (replica or per-rank shard).
-        _ => mesh.group_along(DimKind::Tp, &coord),
+        // Every replicated or sharded weight lands on the owning stage's full
+        // compute grid. Placement is the "where" (which devices hold a copy or
+        // slice); the shard axis and per-device bytes are the "how", resolved by
+        // `fulfill_manifest` from the policy × mesh (see weight_store.rs). On a
+        // mesh with no Tp axis a TP-shard policy has nothing to shard and
+        // replicates across the grid — the EP-only fix.
+        _ => mesh.stage_devices(&coord),
     }
 }
 
@@ -132,7 +132,7 @@ pub fn plan_manifest(
             if let Some(idx) = mesh.axes().iter().position(|a| a.kind == DimKind::Pp) {
                 coord[idx] = stage;
             }
-            (e.clone(), mesh.group_along(DimKind::Tp, &coord))
+            (e.clone(), mesh.stage_devices(&coord))
         })
         .collect();
     let band_xfers = (0..n_layers)
@@ -513,11 +513,13 @@ mod tests {
         assert_eq!(collective_for_policy(&hs), None);
         let e = WeightEntry::layer("w_alpha", 2, vec![16 * 128], DType::F16, hs);
         // HeadSharded shards on the Tp axis → spans the Tp group; on an Ep-only
-        // mesh (no Tp axis) it lands on a singleton.
+        // mesh it replicates across the EP group.
         let tp = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
         assert_eq!(placement_devices(&e, &tp, 4), vec![0, 1]);
+        // On an Ep-only mesh a HeadSharded weight has no Tp axis to shard, so it
+        // replicates across the whole EP group (each rank runs full attention).
         let ep = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
-        assert_eq!(placement_devices(&e, &ep, 4), vec![0]);
+        assert_eq!(placement_devices(&e, &ep, 4), vec![0, 1]);
         // FusedQkv QkvZ layout (DeltaNet fused projection) is expressible.
         let fq = ShardPolicy::FusedQkv {
             q_heads: 8,
@@ -676,5 +678,35 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn ep_only_replicates_non_expert_weights() {
+        let ep = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        // Replicate (deepseek4 attention/norm/router class) → every EP rank.
+        let rep = WeightEntry::layer("attn_norm", 0, vec![8], DType::F32, ShardPolicy::Replicate);
+        assert_eq!(placement_devices(&rep, &ep, 4), vec![0, 1]);
+        // TP-shard policy (minimax attention class) → degenerates to replication
+        // across the EP group; there is no Tp axis to shard along.
+        let col = WeightEntry::layer(
+            "wq",
+            0,
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        assert_eq!(placement_devices(&col, &ep, 4), vec![0, 1]);
+        // ExpertSharded still spans the whole EP group (sliced by expert at fulfill).
+        let exp = WeightEntry::layer(
+            "experts",
+            0,
+            vec![4, 8, 8],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        );
+        assert_eq!(placement_devices(&exp, &ep, 4), vec![0, 1]);
     }
 }
