@@ -128,6 +128,31 @@ def test_collect_fails_device_discovery_before_build_or_gpu_work(monkeypatch):
     assert result["cells"] == []
 
 
+def test_collect_aborts_remaining_models_after_first_probe_failure(monkeypatch):
+    from autoresearch.ar.gate import build, device, serve_probe
+    from autoresearch.ar.gate.run import collect_cell_data, grade_collected
+
+    monkeypatch.setattr(device, "resolve_device", lambda *a, **kw: 0)
+    monkeypatch.setattr(build, "build_daemon", lambda ref, repo: f"/tmp/{ref}-daemon")
+    calls = []
+
+    def unavailable(*args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("serve_harness timeout after 300s")
+
+    monkeypatch.setattr(serve_probe, "run_serve_harness", unavailable)
+    collected = collect_cell_data(
+        "gfx1100", ["crates/hipfire-runtime/src/x.rs"], "base", "head", "/r", _cfg(),
+        models=["qwen3.6-27b", "qwen3.6-a3b"],
+    )
+    assert len(calls) == 1
+    assert len(collected["cells"]) == 1
+    assert "timeout" in collected["probe_error"]
+    graded = grade_collected(collected, cfg=_cfg())
+    assert graded["verdict"] == "REJECT"
+    assert graded["reasons"] == ["probe_unavailable"]
+
+
 def test_run_pr_gate_docs_only_is_trivial_and_tags_non_kaden():
     g = _git(name_only="docs/x.md\n", numstat="3\t0\tdocs/x.md\n")
     r = run_pr_gate(base="m", head="pr", repo="/r", author="fivetide", is_draft=False,

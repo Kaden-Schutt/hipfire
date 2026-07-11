@@ -511,6 +511,9 @@ codex/grok auth on-box.
 - **Runner device discovery failure** (`rocminfo` timeout/no agents or the
   assigned arch missing) → fail that arch immediately as `device_unavailable`;
   never guess device 0 or spend the battery timeout retrying a lost GPU.
+- **Runner probe timeout/failure** → cap one `serve_harness` invocation at five
+  minutes, fail the arch as `probe_unavailable`, and skip its remaining model
+  cells instead of multiplying an unavailable GPU across the matrix.
 - **Codex behavior failure** (nonzero exit, timeout, missing/malformed verdict)
   → record that assigned behavior as failed; never substitute a green result.
 - **Claude interpretation failure** → post/merge does not run. A deterministic

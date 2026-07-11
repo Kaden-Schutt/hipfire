@@ -1,7 +1,11 @@
 # Copyright (c) Kaden Schutt
 """serve_harness-driven cell grading -> a ledger ROW (verdict.make_row schema, gate
 verdict vocabulary) + per-(model,arch) BOD blockers. Pure grading, no GPU/serve."""
-from autoresearch.ar.gate.serve_probe import cell_blocker, grade_cell
+import subprocess
+
+import pytest
+
+from autoresearch.ar.gate.serve_probe import cell_blocker, grade_cell, run_serve_harness
 
 
 def _row(content, tok_s=130.0, wall=1.0, attractor=False):
@@ -78,3 +82,14 @@ def test_perf_blocker_detail_includes_delta():
                [_row("x", tok_s=150.0, wall=1.4) for _ in range(4)])
     b = cell_blocker(r)
     assert b["kind"] == "perf_regression" and "% tok/s" in b["detail"]
+
+
+def test_serve_probe_timeout_becomes_structured_runtime_error():
+    def timeout_runner(argv, env, timeout):
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    with pytest.raises(RuntimeError, match="serve_harness timeout after 7s"):
+        run_serve_harness(
+            "/tmp/daemon", "/tmp/model", 0, repo="/repo", timeout=7,
+            run=timeout_runner,
+        )

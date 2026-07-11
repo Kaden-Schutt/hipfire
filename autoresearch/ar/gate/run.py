@@ -223,6 +223,13 @@ def collect_cell_data(arch, files, base, head, repo, cfg, *, dev=None, models=No
             except RuntimeError as e:
                 cell[role] = None
                 cell.setdefault("errors", {})[role] = str(e)
+                # A runner/daemon probe failure is not improved by multiplying it
+                # across every remaining model. Preserve the failed cell as data
+                # and let the deterministic grader reject this arch immediately.
+                cells.append(cell)
+                out["cells"] = cells
+                out["probe_error"] = str(e)
+                return out
         cells.append(cell)
     out["cells"] = cells
     return out
@@ -244,6 +251,10 @@ def grade_collected(collected, *, cfg) -> dict:
         return {"arch": arch, "verdict": "REJECT", "reasons": ["device_unavailable"],
                 "bod": None, "rows": [], "tok_delta_pct": 0.0,
                 "detail": collected["device_error"]}
+    if collected.get("probe_error"):
+        return {"arch": arch, "verdict": "REJECT", "reasons": ["probe_unavailable"],
+                "bod": None, "rows": [], "tok_delta_pct": 0.0,
+                "detail": collected["probe_error"]}
 
     rows, deltas = [], []
     for c in collected.get("cells", []):

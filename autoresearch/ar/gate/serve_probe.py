@@ -27,7 +27,7 @@ from ..certify import verdict as V
 
 
 def run_serve_harness(daemon_bin, model_path, dev, *, repo, kv="q8", max_tokens=128,
-                      port=11540, timeout=1200, run=None) -> list:
+                      port=11540, timeout=300, run=None) -> list:
     """Run one greedy serve_harness battery against ``daemon_bin`` and return its
     per-turn rows (parsed from ``--out``). Raises ``RuntimeError`` on a spawn/parse
     failure so the caller can map it to an ERROR verdict (never a silent empty pass)."""
@@ -39,7 +39,13 @@ def run_serve_harness(daemon_bin, model_path, dev, *, repo, kv="q8", max_tokens=
             "--out", out, "--port", str(port)]
     env = dict(os.environ, HIPFIRE_DAEMON_BIN=daemon_bin, HIP_VISIBLE_DEVICES=str(dev))
     runner = run or (lambda a, e, t: subprocess.run(a, env=e, timeout=t, capture_output=True, text=True))
-    proc = runner(argv, env, timeout)
+    try:
+        proc = runner(argv, env, timeout)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"serve_harness timeout after {timeout}s for {os.path.basename(daemon_bin)}/"
+            f"{os.path.basename(model_path)}"
+        ) from e
     rc = getattr(proc, "returncode", 1)
     if rc != 0:
         tail = (getattr(proc, "stderr", "") or "")[-1500:]
