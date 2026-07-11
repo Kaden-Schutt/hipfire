@@ -10,8 +10,21 @@ floor = 0.15       # min |delta%| above clock noise (= perf.FLOOR)
 drift_pct = 3.0    # cumulative master drift vs high-water B that fires investigation
 alpha = 0.05       # Mann-Whitney significance for the regression test
 
+# Only these authors auto-merge on a clean pass (spec §12); other maintainers are
+# tagged to comment `@claude /merge`. The auto-merge kill-switch = this list.
+auto_merge_authors = ["Kaden-Schutt"]
+
 # Which archs each SKU fits (VRAM). A (model, arch) cell runs only if it fits.
 [fit]
 "qwen3.6-27b" = ["gfx1100", "gfx1151", "gfx1201"]
 "qwen3.6-a3b" = ["gfx1100", "gfx1151", "gfx1201"]
 "deepseek4" = ["gfx1151"]
+
+# Executor tier per PR risk class (spec §8.1). harness="none" => deterministic
+# gate only (no agentic executor). Re-tuned from the merge ledger's per-tier
+# false-pass / false-reject rates.
+[routing]
+trivial = { harness = "none", model = "", effort = "" }
+low = { harness = "codex", model = "gpt-5.6-luna", effort = "high" }
+moderate = { harness = "codex", model = "gpt-5.6-terra", effort = "high" }
+"high-risk" = { harness = "codex", model = "gpt-5.6-sol", effort = "xhigh" }

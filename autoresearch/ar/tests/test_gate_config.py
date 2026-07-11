@@ -11,6 +11,13 @@ maintainers = ["fivetide", "unverbraucht", "nwoolmer", "Kaden-Schutt"]
 floor = 0.15
 drift_pct = 3.0
 alpha = 0.05
+auto_merge_authors = ["Kaden-Schutt"]
+
+[routing]
+trivial = { harness = "none", model = "", effort = "" }
+low = { harness = "codex", model = "gpt-5.6-luna", effort = "high" }
+moderate = { harness = "codex", model = "gpt-5.6-terra", effort = "high" }
+"high-risk" = { harness = "codex", model = "gpt-5.6-sol", effort = "xhigh" }
 
 [fit]
 "qwen3.6-27b" = ["gfx1100", "gfx1151", "gfx1201"]
@@ -60,3 +67,27 @@ def test_models_for_filters_by_fit_and_adds_extra():
         "qwen3.6-27b", "qwen3.6-a3b", "deepseek4"]
     assert cfg.models_for("gfx1100", extra=("deepseek4",)) == [
         "qwen3.6-27b", "qwen3.6-a3b"]
+
+
+def test_route_returns_executor_tier():
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = load_gate_config(_write(tmp))
+    assert cfg.route("high-risk") == {"harness": "codex", "model": "gpt-5.6-sol", "effort": "xhigh"}
+    assert cfg.route("low")["model"] == "gpt-5.6-luna"
+    assert cfg.route("trivial")["harness"] == "none"
+
+
+def test_route_unknown_class_is_failsafe_high_risk():
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = load_gate_config(_write(tmp))
+    assert cfg.route("bogus") == cfg.route("high-risk")
+
+
+def test_auto_merge_author():
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = load_gate_config(_write(tmp))
+    assert cfg.is_auto_merge_author("Kaden-Schutt") is True
+    assert cfg.is_auto_merge_author("fivetide") is False

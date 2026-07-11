@@ -20,6 +20,16 @@ class GateConfig:
     floor: float = 0.15
     drift_pct: float = 3.0
     alpha: float = 0.05
+    routing: dict = field(default_factory=dict)
+    auto_merge_authors: list[str] = field(default_factory=list)
+
+    def route(self, pr_class: str) -> dict:
+        """Executor {harness, model, effort} for a PR risk class. Unknown class ->
+        the high-risk row (fail-safe strongest)."""
+        return self.routing.get(pr_class, self.routing.get("high-risk", {}))
+
+    def is_auto_merge_author(self, author: str) -> bool:
+        return author in self.auto_merge_authors
 
     def fits(self, model: str, arch: str) -> bool:
         """True iff SKU ``model`` fits ``arch`` per the [fit] map (unknown -> False)."""
@@ -50,4 +60,6 @@ def load_gate_config(path: str) -> GateConfig:
         floor=float(data.get("floor", 0.15)),
         drift_pct=float(data.get("drift_pct", 3.0)),
         alpha=float(data.get("alpha", 0.05)),
+        routing={str(k): dict(v) for k, v in data.get("routing", {}).items()},
+        auto_merge_authors=[str(a) for a in data.get("auto_merge_authors", [])],
     )
