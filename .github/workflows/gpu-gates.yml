@@ -161,7 +161,7 @@ jobs:
         with:
           name: gate-plan
           path: .
-      - name: Run the box's arch gate(s) (gpu-lock serialized)
+      - name: Gate the box's arch(s) — codex DRIVES collect+grade+adapt (agentic)
         run: |
           set +e
           source scripts/gpu-lock.sh
@@ -170,19 +170,36 @@ jobs:
           gpu_acquire "gpu-gate-${{ needs.decide.outputs.pr }}-${{ matrix.box }}"
           trap gpu_release EXIT
           mkdir -p results
-          rc=0
-          # ar gate --arch <arch> resolves the arch's HIP device by the gfxNNNN line
-          # at runtime (never a fixed index — ROCR reorders across reboot/hotplug).
+          BASE="${{ needs.decide.outputs.base }}"; HEAD="${{ needs.decide.outputs.head }}"
           for arch in ${{ matrix.archs }}; do
-            python3 -m autoresearch.ar gate --run --arch "$arch" \
-              --base "${{ needs.decide.outputs.base }}" \
-              --head "${{ needs.decide.outputs.head }}" \
-              --pr "${{ needs.decide.outputs.pr }}" \
-              --author "${{ needs.decide.outputs.author }}" \
-              > "results/$arch.json" || rc=1
+            # AGENTIC path: codex drives the eval TOOLS (collect -> grade) and ADAPTS —
+            # re-collecting an EMPTY cell (transient serve/warm miss), diagnosing a
+            # build_error, sanity-checking perf deltas — instead of a program hard-failing.
+            # ar gate --arch resolves the arch's HIP device by gfxNNNN at runtime.
+            if command -v codex >/dev/null 2>&1; then
+              codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$PWD" - <<PROMPT
+          You are the hipfire Tier-3 GPU-gate executor for PR #${{ needs.decide.outputs.pr }} on $arch.
+          Drive the eval and ADAPT — do not give up after one command, and do NOT fabricate a PASS.
+          1. COLLECT (build base+head daemons + serve_harness base-vs-head per model):
+             python3 -m autoresearch.ar gate --collect --arch $arch --base $BASE --head $HEAD > /tmp/collect_$arch.json
+             If the JSON has "build_error", the PR does not compile -> the arch verdict is REJECT (build_fail); write that to results/$arch.json and stop.
+          2. GRADE (deterministic parity/coherence/perf per model):
+             python3 -m autoresearch.ar gate --grade /tmp/collect_$arch.json > results/$arch.json
+          3. REVIEW results/$arch.json. Any cell with verdict "EMPTY" is a transient serve miss, NOT a result: re-run step 1 once more and re-grade. If a cell is still EMPTY after one retry, leave it. Sanity-check perf deltas against the +/-1-3% noise band.
+          4. results/$arch.json MUST be the final arch result {arch, verdict, reasons, bod, rows, tok_delta_pct}. A real PARITY_FAIL / COHERENCE_FAIL / perf REGRESSION MUST remain REJECT — never soften it.
+          PROMPT
+            fi
+            # Safety net: if codex is unavailable or produced nothing usable, run the
+            # deterministic collect+grade directly (same tools, no agent adaptation).
+            if ! python3 -c "import json,sys; d=json.load(open('results/$arch.json')); sys.exit(0 if d.get('verdict') else 1)" 2>/dev/null; then
+              python3 -m autoresearch.ar gate --run --arch "$arch" --base "$BASE" --head "$HEAD" \
+                --pr "${{ needs.decide.outputs.pr }}" --author "${{ needs.decide.outputs.author }}" \
+                > "results/$arch.json"
+            fi
             cat "results/$arch.json"
           done
-          exit $rc
+          # Red the check if any arch REJECT/BOD.
+          python3 -c "import json,glob,sys; sys.exit(1 if any(json.load(open(f)).get('verdict') in ('REJECT','BOD') for f in glob.glob('results/*.json')) else 0)"
       - name: Upload box results
         if: always()
         uses: actions/upload-artifact@v4

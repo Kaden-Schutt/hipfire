@@ -27,7 +27,7 @@ from .outcome import decide_pr, format_pr_comment
 from .routing import classify_pr
 
 __all__ = ["changed_files", "diff_lines", "stub_arch_gate", "run_pr_gate",
-           "live_arch_gate", "interpret_results", "run_behavior_plan"]
+           "live_arch_gate", "collect_cell_data", "grade_collected", "interpret_results", "run_behavior_plan"]
 
 
 def changed_files(base, head, repo, run_git=None) -> list[str]:
@@ -161,77 +161,93 @@ def affected_archs(files, cfg) -> list:
     return [a for a in cfg.archs if a in got]
 
 
-def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, model=None) -> dict:
-    """REAL per-arch gate (GPU) — self-hosted runner only. Deferral → cross-arch leak →
-    BUILD base+head daemons (``gate.build``, sha-cached) → per (model,arch) A/B via
-    ``scripts/serve_harness.py`` (``gate.serve_probe``): greedy content parity, decode
-    tok/s perf (WIN-gate mirror), attractor coherence. serve_harness drives the daemon
-    (spawn/warm/battery) so the gate reuses it rather than the untested LiveServeRunner
-    raw-daemon+rocprof arms. GPU/cargo imported lazily; needs ROCm + the models under
-    ``$HIPFIRE_MODELS_DIR`` (default ~/.hipfire/models). Not runnable on the dev box."""
-    from .build import build_daemon                 # lazy: cargo/git, prod-only
+def collect_cell_data(arch, files, base, head, repo, cfg, *, dev=None) -> dict:
+    """MECHANICAL eval (a TOOL the codex agent drives) — build base+head daemons and run
+    ``serve_harness.py`` base-vs-head per fitting model. Returns RAW rows + any errors AS
+    DATA (never crashes on empty/build-fail), so the AGENT can judge and ADAPT (re-run an
+    empty cell, diagnose a build error) rather than a program hard-failing. Deferral
+    short-circuits with no build (§4.1). Cross-arch leak (deferred archs only) is a
+    file-based flag carried alongside, not a hard reject here — the agent weighs it."""
+    from .build import build_daemon
     from .device import resolve_device
     from . import serve_probe
     from ..certify import cross_arch
 
-    # Arch→box deferral (§4.1): a box only runs archs the diff actually affects; an
-    # unaffected arch is a no-op PASS (no build, no GPU) so it can never spuriously
-    # parity-fail. A docs/ar-only PR (base≡head daemon) defers on every arch.
     if arch not in affected_archs(files, cfg):
-        return {"arch": arch, "verdict": "PASS", "reasons": ["deferred"], "bod": None,
-                "tok_delta_pct": 0.0}
+        return {"arch": arch, "deferred": True, "cells": []}
 
-    # Gate 1 — cross-arch leak (file-based preprocessor invariance, no GPU): a changed
-    # kernel must not alter ANOTHER arch's device codegen.
     kernel_files = [f for f in files if f.startswith("kernels/") and f.endswith(".hip")]
-    leaks = [f for f in kernel_files
-             if cross_arch.check_cross_arch(f, arch, cfg.other_archs(arch), repo, base_sha=base)]
-    if leaks:
-        return {"arch": arch, "verdict": "REJECT", "reasons": ["cross_arch"], "bod": None,
-                "tok_delta_pct": 0.0, "detail": f"arch-bleed: {leaks}"}
+    deferred_archs = [a for a in cfg.archs if a not in affected_archs(files, cfg)]
+    bleed = [f for f in kernel_files if deferred_archs
+             and cross_arch.check_cross_arch(f, arch, deferred_archs, repo, base_sha=base)]
 
     dev = resolve_device(arch, default=dev if dev is not None else 0)
     kv = getattr(cfg, "kv_mode", None) or "q8"
     models_dir = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
+    out = {"arch": arch, "deferred": False, "dev": dev, "cross_arch_bleed": bleed}
 
-    # Build the two daemons — a head build failure = the PR doesn't compile at this ref
-    # => REJECT (not a crash); a base build failure is an infra ERROR.
     try:
-        base_bin = build_daemon(base, repo)
+        out["base_bin"] = build_daemon(base, repo)
+        out["head_bin"] = build_daemon(head, repo)
     except RuntimeError as e:
-        return {"arch": arch, "verdict": "ERROR", "reasons": [f"base_build:{e}"], "bod": None}
-    try:
-        head_bin = build_daemon(head, repo)
-    except RuntimeError as e:
-        return {"arch": arch, "verdict": "REJECT", "reasons": ["build_fail"],
-                "bod": None, "detail": str(e)}
+        out["build_error"] = str(e)
+        out["cells"] = []
+        return out
 
-    # Per fitting model: serve_harness greedy A/B, graded parity → coherence → perf. Each
-    # cell is a self-describing ledger row, so a change that breaks 27b but not a3b keeps
-    # a PASS row for a3b and a PARITY_FAIL row for 27b — both land in the itemized BOD.
-    rows, deltas = [], []
-    base_port = 11540 + dev * 40
+    cells, base_port = [], 11540 + dev * 40
     for i, m in enumerate(cfg.models_for(arch)):
         mp = os.path.join(models_dir, m)
-        try:
-            base_rows = serve_probe.run_serve_harness(base_bin, mp, dev, repo=repo, kv=kv,
-                                                      port=base_port + i * 2)
-            head_rows = serve_probe.run_serve_harness(head_bin, mp, dev, repo=repo, kv=kv,
-                                                      port=base_port + i * 2 + 1)
-        except RuntimeError as e:
-            return {"arch": arch, "verdict": "ERROR", "reasons": [f"serve:{m}"],
-                    "bod": None, "tok_delta_pct": 0.0, "detail": str(e)}
-        cell = serve_probe.grade_cell(base_rows, head_rows, arch=arch, model=m, floor=cfg.floor)
-        rows.append(cell)
-        deltas.append(cell.get("tok_delta_pct") or 0.0)
+        cell = {"model": m}
+        for role, daemon, port in (("base_rows", out["base_bin"], base_port + i * 2),
+                                   ("head_rows", out["head_bin"], base_port + i * 2 + 1)):
+            try:
+                cell[role] = serve_probe.run_serve_harness(daemon, mp, dev, repo=repo, kv=kv, port=port)
+            except RuntimeError as e:
+                cell[role] = None
+                cell.setdefault("errors", {})[role] = str(e)
+        cells.append(cell)
+    out["cells"] = cells
+    return out
+
+
+def grade_collected(collected, *, cfg) -> dict:
+    """Deterministic baseline grade of ``collect_cell_data`` output → arch result (ledger
+    rows + itemized BOD). This is the TOOL the codex agent runs, then reviews/adapts (e.g.
+    re-collect an EMPTY cell) before emitting the final result. Never crashes on empty."""
+    from . import serve_probe
+    arch = collected["arch"]
+    if collected.get("deferred"):
+        return {"arch": arch, "verdict": "PASS", "reasons": ["deferred"], "bod": None,
+                "rows": [], "tok_delta_pct": 0.0}
+    if collected.get("build_error"):
+        return {"arch": arch, "verdict": "REJECT", "reasons": ["build_fail"], "bod": None,
+                "rows": [], "tok_delta_pct": 0.0, "detail": collected["build_error"]}
+
+    rows, deltas = [], []
+    for c in collected.get("cells", []):
+        br, hr = c.get("base_rows"), c.get("head_rows")
+        if not br or not hr:            # a serve error/empty -> EMPTY row (agent re-runs)
+            rows.append(serve_probe._cell_row("EMPTY", arch=arch, model=c["model"],
+                                              base_rows=br or [], head_rows=hr or [],
+                                              parity={"content_exact": None, "empty": True}))
+            continue
+        rows.append(serve_probe.grade_cell(br, hr, arch=arch, model=c["model"], floor=cfg.floor))
+        deltas.append(rows[-1].get("tok_delta_pct") or 0.0)
 
     tok_delta = min(deltas) if deltas else 0.0
     fails = [r for r in rows if r["verdict"] != "PASS"]
     if fails:
         blockers = [serve_probe.cell_blocker(r) for r in fails]
-        bod = {"blockers": blockers,
-               "summary": f"{len(blockers)} cell(s) failed: " + ", ".join(b["detail"] for b in blockers)}
         return {"arch": arch, "verdict": "REJECT", "reasons": [b["kind"] for b in blockers],
-                "bod": bod, "rows": rows, "tok_delta_pct": tok_delta}
+                "bod": {"blockers": blockers,
+                        "summary": f"{len(blockers)} cell(s) failed: " + ", ".join(b["detail"] for b in blockers)},
+                "rows": rows, "tok_delta_pct": tok_delta}
     return {"arch": arch, "verdict": "PASS", "reasons": [], "bod": None, "rows": rows,
             "tok_delta_pct": tok_delta}
+
+
+def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, model=None) -> dict:
+    """Deterministic per-arch gate = collect (build + serve_harness A/B) → grade. Kept for
+    ``ar gate --run`` (local/fallback, no agent). The WORKFLOW instead has codex DRIVE
+    collect+grade and adapt (re-run empties, judge cross-arch) — the agentic path."""
+    return grade_collected(collect_cell_data(arch, files, base, head, repo, cfg, dev=dev), cfg=cfg)

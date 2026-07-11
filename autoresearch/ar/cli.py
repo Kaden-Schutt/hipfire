@@ -395,6 +395,25 @@ def cmd_gate(a) -> int:
         print("\n--- PR comment ---\n" + res["comment"])
         return 1 if res["outcome"]["status"] == "failure" else 0
 
+    if getattr(a, "collect", False):
+        # MECHANICAL eval tool for the agentic gate: build base+head daemons + serve_harness
+        # base-vs-head per model -> RAW rows (errors as data). codex drives this, then judges.
+        from .gate.run import changed_files, collect_cell_data
+
+        files = changed_files(a.base, a.head, repo)
+        print(json.dumps(collect_cell_data(a.arch, files, a.base, a.head, repo, cfg, dev=a.dev), indent=2))
+        return 0
+
+    if getattr(a, "grade", None):
+        # Deterministic baseline grade of a collect JSON -> arch result (ledger rows + BOD).
+        # codex runs this, reviews it, re-collects any EMPTY cell, then emits the final result.
+        from .gate.run import grade_collected
+
+        with open(a.grade) as fh:
+            res = grade_collected(json.load(fh), cfg=cfg)
+        print(json.dumps(res, indent=2))
+        return 1 if res["verdict"] in ("REJECT", "BOD") else 0
+
     if getattr(a, "run", False):
         from .gate.run import changed_files, live_arch_gate, run_pr_gate, stub_arch_gate
 
@@ -585,6 +604,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--arch", default=None, help="single arch (for --plan); omit for a --run over all archs")
     s.add_argument("--plan", action="store_true", help="print the resolved gate plan (no GPU)")
     s.add_argument("--run", action="store_true", help="execute the PR gate (classify -> per-arch -> decide)")
+    s.add_argument("--collect", action="store_true",
+                   help="MECHANICAL tool: build base+head daemons + serve_harness A/B -> raw rows "
+                        "(errors as data). codex drives this in the agentic gate, then judges/adapts")
+    s.add_argument("--grade", default=None,
+                   help="deterministic baseline grade of a --collect JSON file -> arch result (rows + BOD)")
     s.add_argument("--dry-run", action="store_true", dest="dry_run",
                    help="run mode with a STUB per-arch gate (no GPU / no daemon build)")
     s.add_argument("--interpret", action="store_true",
