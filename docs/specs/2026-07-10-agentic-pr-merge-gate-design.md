@@ -127,50 +127,73 @@ Parity is token-exact greedy (FP32 + `HIPFIRE_DETERMINISTIC=1`). Coherence is
 + `mcnemar_worse` (paired base-vs-PR failure test). A perf improvement is
 accepted **only if** parity + coherence also pass — the loop's exact contract.
 
-## 8. Behavior test — Claude's dispatch intelligence
+## 8. Dispatch — Claude classifies + authors the behavior test
 
-Claude reads the diff **and the contributor's PR description** and produces a
-schema-validated test plan for Tier 3:
+**Claude classifies the PR — not a path regex.** The dispatcher (Claude) reads the
+diff **and the contributor's PR description** and *understands what it does*: a
+rename vs a real behavior change, risk hiding behind an innocent-looking path,
+whether the change is even reachable through the serve path at all. The
+deterministic `classify_pr` (path taxonomy) is **only a floor** — it pins a
+*minimum* risk tier that Claude may escalate above but never de-escalate below, so
+a kernel/dispatch/forward-pass change can never be mis-classified as trivial even
+if Claude errs or is unavailable. Claude's semantic read is the authority; the
+regex is the safety net.
 
+Claude's test plan has **two parts**:
+
+**1. serve_harness floor (deterministic, always runs).** The canonical
+coherence+perf battery over the **serve path** — parity / perf / attractor /
+McNemar on `qwen3.6-27b.mq4` + `a3b.mq4r`/`a3b.mq4p`, per fitting arch (gates 2/3/3b
+of §4). This is the hard regression gate: it catches anything that breaks or slows
+the serve path, and it runs regardless of Claude's plan. Claude may *add* coverage
+but never remove this floor.
+
+**2. Bespoke behavior test (Claude-authored, codex-executed) — the fix for the
+serve_harness blind spot.** `serve_harness` only exercises the *serve path*; it
+**cannot** reach a new CLI command, a tokenizer / quant-format change, a
+build/tooling change, or any behavior that never hits `serve`. For those, Claude
+writes a **bespoke test prompt** describing exactly what to verify ("this PR adds
+`hipfire foo --bar`; build it, run it on <input>, confirm <X>"), and **codex
+executes it generally on-box** — build, run the new path, check the output — **not
+limited to serve_harness**. Without this, a non-serve behavior would be untested
+and the gate would false-pass; this closes that hole. Claude passes this prompt
+**in addition to** the serve_harness bench, never instead of it.
+
+Plan shape:
 ```
-{ genres:[…], batteries:[…], long_context:bool, session_files:[…],
-  models:[…], archs:[…], extra_prompts:[{genre,prompt,expects}],
-  perf_ab: bool, reason:"…" }
+{ risk: "trivial|low|moderate|high-risk",
+  serve_floor: { models, archs, genres, long_context, session_files, perf_ab },
+  behavior_tests: [ { what, prompt, expect, harness, model, effort } ],
+  reason }
 ```
 
-- **Hot-path / behavioral change** (e.g. MTP, sampler, dispatch predicate) →
-  `perf_ab:true` + the touched behavior A/B'd vs master ("is this helpful?").
-- **Pure scaffolding off the hot path** → `perf_ab:false` (run gates 0–2, 4;
-  skip the perf A/B — nothing to regress).
-- Claude either sets the matrix inputs, **or** fires a scaffolded
-  `codex exec "<test the behavior the contributor described>"` on-box for a
-  behavior the fixed battery does not cover.
-- **Guardrail:** the **canonical regression battery always runs** regardless of
-  Claude's plan — Claude may *add* coverage, never remove the floor. An
-  agent-selection error therefore cannot manufacture a false PASS. If the agent
-  round errors/times out, Tier 3 falls back to the canonical battery and flags
-  degraded coverage — never blocks, never false-passes.
+**Verdict combination.** The serve_harness floor is the deterministic PASS/FAIL and
+is never overridden. Each bespoke behavior test contributes a codex pass/fail for
+its specific behavior. A PR passes iff the floor is green **AND** every bespoke
+test passes. (The floor's rigor is deterministic; the bespoke tests are the best
+available agentic check for behaviors that are not deterministically gateable.)
 
-### 8.1 Model routing (dispatcher tiers the executor by PR risk)
+**Degraded-coverage safety.** If Claude/codex errors or times out, Tier 3 falls
+back to the serve_harness floor + the `classify_pr` floor tier and **flags**
+degraded coverage — it never blocks and never false-passes on the floor.
 
-The dispatcher (Claude review, **Opus** — high, and **xhigh** when it renders an
-auto-merge / helpfulness call) classifies the diff and sets `(harness, model,
-effort)` for the on-box executor via `agent_exec`. The executor only *selects
-tests and interprets* — parity/perf/coherence are rendered by the certify engine
-— so a cheaper tier degrades **coverage**, never **correctness**, which is what
-makes aggressive down-tiering safe. The table lives in `pr_gate.toml` and is
-re-tuned from the merge ledger's per-tier false-pass / false-reject rates:
+### 8.1 Executor routing (Claude tiers codex by the risk it read)
 
-| PR class (by diff) | executor |
+Having classified the diff semantically, Claude sets `(harness, model, effort)`
+for each bespoke behavior test's on-box executor via `agent_exec`. The
+`classify_pr` floor pins the **minimum** tier; Claude escalates from there. The
+table lives in `pr_gate.toml`, re-tuned from the ledger's per-tier
+false-pass/false-reject rates:
+
+| risk (Claude's read; floored by `classify_pr`) | codex tier |
 |---|---|
-| trivial (docs/CI/config, no code) | *none* — deterministic `ar gate` + canonical battery |
-| semantic/low (small off-hot-path Rust: loader/CLI/tooling) | codex **luna high** |
-| moderate (engine/runtime/serve-path, non-kernel) | codex **terra high** |
-| high-risk (kernels / dispatch / forward-pass / quant / fusion / rmsnorm / sampling — the coherence-gate trigger set) | codex **sol xhigh**; **grok** on the gfx1201 arm as a diversity second-opinion (disagreement → flag for human, no auto-merge) |
+| trivial | *none* — serve_harness floor only |
+| low | codex **luna high** |
+| moderate | codex **terra high** |
+| high-risk | codex **sol xhigh** (+ **grok** on the gfx1201 arm as a diversity second-opinion; disagreement → human, no auto-merge) |
 
-Classifier key = the coherence-gate trigger taxonomy `claude-review.yml` already
-encodes ("does the diff touch kernels/dispatch/forward-pass?"). pi.dev slots in
-as a fourth executor when added (§Phase 6).
+codex authenticates **box-local** on hipx/hiptrx (not a GitHub secret). pi.dev
+slots in as a fourth harness when added (§Phase 6).
 
 ## 9. Offender location → contributor recommendation
 

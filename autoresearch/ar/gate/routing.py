@@ -1,11 +1,12 @@
 # Copyright (c) Kaden Schutt
-"""ar.gate.routing — PR risk classification (spec §8.1).
+"""ar.gate.routing — PR risk FLOOR (spec §8/§8.1).
 
-Maps a changed-file list to a risk class the dispatcher uses to pick the on-box
-executor tier. The high-risk set is exactly the coherence-gate trigger taxonomy
-CLAUDE.md guards (kernels / dispatch / forward-pass / quant): a change there can
-induce attractors / perf regressions and warrants the strongest executor + full
-behavior coverage. Conservative on ambiguity — err toward more testing.
+This is a deterministic *floor*, NOT the primary classifier: Claude reads the diff
+semantically and sets the authoritative risk class + behavior-test plan. classify_pr
+only pins a MINIMUM tier from the file paths — the coherence-gate trigger taxonomy
+CLAUDE.md guards (kernels / dispatch / forward-pass / quant) → high-risk — so Claude
+can escalate above it but a kernel PR can never be de-classified to trivial (even if
+Claude errs or is unavailable). Conservative on ambiguity — err toward more testing.
 """
 from __future__ import annotations
 
