@@ -62,8 +62,15 @@ jobs:
               }
             }
             if (run && pr) {
+              // pull.base.sha and refs/pull/N/merge can lag after master moves.
+              // Resolve the live base branch and build the merge locally instead.
+              const liveBase = await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${pr.base.ref}`,
+              });
               core.setOutput("run", "true");
-              core.setOutput("base", pr.base.sha);
+              core.setOutput("base", liveBase.data.object.sha);
               core.setOutput("head", pr.head.sha);
               core.setOutput("pr", String(pr.number));
               core.setOutput("author", pr.user.login);
@@ -82,35 +89,47 @@ jobs:
       decision: ${{ steps.validate.outputs.decision }}
       matrix: ${{ steps.validate.outputs.matrix }}
     steps:
-      # Use the PR merge ref so source reads include current master. The workflow
-      # itself is still security-validated by claude-code-action against master.
+      # GitHub's refs/pull/N/merge is lazily refreshed and can point at an old
+      # base after master moves. Check out the resolved live base and merge the
+      # immutable PR head ourselves in every job.
       - uses: actions/checkout@v4
         with:
-          ref: refs/pull/${{ needs.decide.outputs.pr }}/merge
+          ref: ${{ needs.decide.outputs.base }}
           fetch-depth: 0
+
+      - name: Materialize current-base PR merge
+        id: merge
+        env:
+          PR_HEAD: ${{ needs.decide.outputs.head }}
+        run: |
+          git -c user.name=github-actions -c user.email=actions@github.com \
+            merge --no-ff --no-edit "$PR_HEAD"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build immutable PR context
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.decide.outputs.pr }}
           BASE: ${{ needs.decide.outputs.base }}
-          HEAD: ${{ needs.decide.outputs.head }}
+          PR_HEAD: ${{ needs.decide.outputs.head }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
         run: |
           gh pr view "$PR" --json number,title,body,author,baseRefName,headRefName,headRefOid,files \
             > pr_context.json
-          git diff --binary "$BASE" "$HEAD" > pr.patch
+          git diff --binary "$BASE" "$MERGE_SHA" > pr.patch
           python3 - <<'PY'
           import hashlib, json, os
           p = json.load(open("pr_context.json"))
           p["base_sha"] = os.environ["BASE"]
-          p["head_sha"] = os.environ["HEAD"]
+          p["head_sha"] = os.environ["PR_HEAD"]
+          p["tested_merge_sha"] = os.environ["MERGE_SHA"]
           patch = open("pr.patch", "rb").read()
           p["diff_digest"] = "sha256:" + hashlib.sha256(patch).hexdigest()
           with open("pr_context.json", "w") as f:
               json.dump(p, f, indent=2)
           PY
           python3 -m autoresearch.ar gate --dispatch-context \
-            --base "$BASE" --head "$HEAD" > dispatch_context.json
+            --base "$BASE" --head "$MERGE_SHA" > dispatch_context.json
 
       - name: Claude reviews the PR and decides runner dispatch
         # Claude's process status is not a release signal. It may hit its turn
@@ -181,11 +200,11 @@ jobs:
         id: validate
         env:
           BASE: ${{ needs.decide.outputs.base }}
-          HEAD: ${{ needs.decide.outputs.head }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
         run: |
           set +e
           python3 -m autoresearch.ar gate --validate-plan dispatch_plan.json \
-            --base "$BASE" --head "$HEAD" > validated_dispatch.json
+            --base "$BASE" --head "$MERGE_SHA" > validated_dispatch.json
           rc=$?
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -232,8 +251,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/pull/${{ needs.decide.outputs.pr }}/merge
+          ref: ${{ needs.decide.outputs.base }}
           fetch-depth: 0
+
+      - name: Materialize current-base PR merge
+        id: merge
+        env:
+          PR_HEAD: ${{ needs.decide.outputs.head }}
+        run: |
+          git -c user.name=github-actions -c user.email=actions@github.com \
+            merge --no-ff --no-edit "$PR_HEAD"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Download Claude dispatch
         uses: actions/download-artifact@v4
@@ -262,7 +290,8 @@ jobs:
       - name: Collect and grade assigned GPU cells
         env:
           BASE: ${{ needs.decide.outputs.base }}
-          HEAD: ${{ needs.decide.outputs.head }}
+          PR_HEAD: ${{ needs.decide.outputs.head }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
           PR: ${{ needs.decide.outputs.pr }}
           BOX: ${{ matrix.box }}
           ARCHS: ${{ matrix.archs }}
@@ -282,14 +311,14 @@ jobs:
                      "reasons": ["no_gpu_cells_assigned"], "bod": None,
                      "rows": [], "tok_delta_pct": 0.0,
                      "pr": os.environ["PR"], "base_sha": os.environ["BASE"],
-                     "head_sha": os.environ["HEAD"], "box": box},
+                     "head_sha": os.environ["PR_HEAD"], "box": box},
                     open(f"results/behavior-only-{box}.json", "w"), indent=2)
           PY
           fi
 
           for arch in $ARCHS; do
             python3 -m autoresearch.ar gate --collect --arch "$arch" --base "$BASE" \
-              --head "$HEAD" --models "$MODELS" > "collects/$arch.json"
+              --head "$MERGE_SHA" --models "$MODELS" > "collects/$arch.json"
             # A deterministic REJECT is data, not an early shell exit. Preserve its JSON
             # so the final box check and evidence join can report it clearly.
             python3 -m autoresearch.ar gate --grade "collects/$arch.json" \
@@ -299,7 +328,7 @@ jobs:
           p = os.environ["RESULT"]
           d = json.load(open(p))
           d.update({"pr": os.environ["PR"], "base_sha": os.environ["BASE"],
-                    "head_sha": os.environ["HEAD"], "box": os.environ["BOX"],
+                    "head_sha": os.environ["PR_HEAD"], "box": os.environ["BOX"],
                     "arch": os.environ["ARCH"]})
           json.dump(d, open(p, "w"), indent=2)
           PY
@@ -310,7 +339,8 @@ jobs:
         if: always()
         env:
           BASE: ${{ needs.decide.outputs.base }}
-          HEAD: ${{ needs.decide.outputs.head }}
+          PR_HEAD: ${{ needs.decide.outputs.head }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
           BOX: ${{ matrix.box }}
         run: |
           set -eu
@@ -322,7 +352,7 @@ jobs:
             echo '[]' > "behavior-${BOX}.json"
           else
             python3 -m autoresearch.ar gate --behavior-tests behavior_plan.json \
-              --verdict-dir "behavior-verdicts-${BOX}" --base "$BASE" --head "$HEAD" \
+              --verdict-dir "behavior-verdicts-${BOX}" --base "$BASE" --head "$MERGE_SHA" \
               > "behavior-${BOX}.json" || true
           fi
           BEHAVIOR="behavior-${BOX}.json" python3 - <<'PY'
@@ -331,7 +361,7 @@ jobs:
           rows = json.load(open(p))
           for row in rows:
               row.update({"box": os.environ["BOX"], "base_sha": os.environ["BASE"],
-                          "head_sha": os.environ["HEAD"]})
+                          "head_sha": os.environ["PR_HEAD"]})
           json.dump(rows, open(p, "w"), indent=2)
           PY
           cat "behavior-${BOX}.json"
@@ -400,8 +430,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/pull/${{ needs.decide.outputs.pr }}/merge
+          ref: ${{ needs.decide.outputs.base }}
           fetch-depth: 0
+
+      - name: Materialize current-base PR merge
+        id: merge
+        env:
+          PR_HEAD: ${{ needs.decide.outputs.head }}
+        run: |
+          git -c user.name=github-actions -c user.email=actions@github.com \
+            merge --no-ff --no-edit "$PR_HEAD"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Download Claude dispatch
         uses: actions/download-artifact@v4
@@ -427,10 +466,10 @@ jobs:
         env:
           PR: ${{ needs.decide.outputs.pr }}
           BASE: ${{ needs.decide.outputs.base }}
-          HEAD: ${{ needs.decide.outputs.head }}
+          PR_HEAD: ${{ needs.decide.outputs.head }}
         run: |
           python3 -m autoresearch.ar gate --verify-evidence validated_dispatch.json \
-            --results results --behavior-dir behavior --pr "$PR" --base "$BASE" --head "$HEAD" \
+            --results results --behavior-dir behavior --pr "$PR" --base "$BASE" --head "$PR_HEAD" \
             > joined_evidence.json
           python3 - <<'PY'
           import json
@@ -444,7 +483,7 @@ jobs:
         id: deterministic
         env:
           BASE: ${{ needs.decide.outputs.base }}
-          HEAD: ${{ needs.decide.outputs.head }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
           PR: ${{ needs.decide.outputs.pr }}
           AUTHOR: ${{ needs.decide.outputs.author }}
           DRAFT: ${{ needs.decide.outputs.draft }}
@@ -453,7 +492,7 @@ jobs:
           draft=""
           [ "$DRAFT" = "true" ] && draft="--draft"
           python3 -m autoresearch.ar gate --interpret --results results \
-            --behavior-results behavior_results.json --base "$BASE" --head "$HEAD" \
+            --behavior-results behavior_results.json --base "$BASE" --head "$MERGE_SHA" \
             --pr "$PR" --author "$AUTHOR" $draft --json > interp.json
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
