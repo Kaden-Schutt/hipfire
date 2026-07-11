@@ -79,3 +79,12 @@ def test_gate_comment_cannot_hide_deterministic_reject():
 
 def test_gate_comment_does_not_cancel_an_active_same_pr_run():
     assert "cancel-in-progress: false" in _text()
+
+
+def test_each_phase_materializes_current_base_instead_of_stale_pull_merge_ref():
+    text = _text()
+    assert "ref: refs/pull/" not in text
+    assert "liveBase.data.object.sha" in text
+    assert text.count("- name: Materialize current-base PR merge") == 3
+    assert text.count('merge --no-ff --no-edit "$PR_HEAD"') == 3
+    assert 'p["tested_merge_sha"]' in text
