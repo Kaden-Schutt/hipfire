@@ -58,3 +58,59 @@ def test_bod_empty_is_clean():
     bod = assemble_bod()
     assert bod["blockers"] == []
     assert bod["summary"] == "no blockers"
+
+
+from autoresearch.ar.gate.merge import gate4
+
+
+def _clean_tm(*a, **k):
+    return {"clean": True, "merged_tree": "t", "conflicts": []}
+
+
+def _conflict_tm(*a, **k):
+    return {"clean": False, "merged_tree": "t", "conflicts": ["daemon.rs"]}
+
+
+def _gate(verdict, reasons=()):
+    return lambda: {"verdict": verdict, "reasons": list(reasons)}
+
+
+def test_clean_merge_clean_gate_passes():
+    r = gate4(base_ref="m", head_ref="pr", staging_ref="staging", repo="/repo",
+              run_merged_gate=_gate("PASS"), trial_merge_fn=_clean_tm)
+    assert r["verdict"] == "PASS" and r["bod"] is None
+
+
+def test_conflict_no_fixer_is_bod():
+    r = gate4(base_ref="m", head_ref="pr", staging_ref="staging", repo="/repo",
+              run_merged_gate=_gate("PASS"), merge_fix=None, trial_merge_fn=_conflict_tm)
+    assert r["verdict"] == "BOD"
+    assert r["bod"]["blockers"][0]["kind"] == "merge_conflict"
+
+
+def test_conflict_fixed_then_passes():
+    # trial-merge conflicts first, then (after fix) is clean
+    seq = [_conflict_tm(), _clean_tm()]
+    tm = lambda *a, **k: seq.pop(0)
+    r = gate4(base_ref="m", head_ref="pr", staging_ref="staging", repo="/repo",
+              run_merged_gate=_gate("PASS"),
+              merge_fix=lambda kind, detail: {"fixed": True}, trial_merge_fn=tm)
+    assert r["verdict"] == "PASS"
+
+
+def test_post_merge_clobber_no_fixer_is_bod_partitioned():
+    r = gate4(base_ref="m", head_ref="pr", staging_ref="staging", repo="/repo",
+              run_merged_gate=_gate("REJECT", ["perf_regression", "coherence"]),
+              merge_fix=None, trial_merge_fn=_clean_tm)
+    assert r["verdict"] == "BOD"
+    kinds = sorted(b["kind"] for b in r["bod"]["blockers"])
+    assert kinds == ["coherence", "perf_regression"]
+
+
+def test_post_merge_clobber_fixed_then_passes():
+    gates = [{"verdict": "REJECT", "reasons": ["perf_regression"]},
+             {"verdict": "PASS", "reasons": []}]
+    r = gate4(base_ref="m", head_ref="pr", staging_ref="staging", repo="/repo",
+              run_merged_gate=lambda: gates.pop(0),
+              merge_fix=lambda kind, detail: {"fixed": True}, trial_merge_fn=_clean_tm)
+    assert r["verdict"] == "PASS"
