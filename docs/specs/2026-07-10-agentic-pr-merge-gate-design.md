@@ -235,13 +235,17 @@ Isolation-clean ≠ merge-clean. Gate 4 performs the actual merge into the
 
 1. A PR that passes gates 0–3b is **folded onto staging**. Gate 4 trial-merges it
    against the **staging tip** (= master + prior approved stack). Clean → it folds.
-   **On a clobber the pipeline RESOLVES it — it does not punt.** Gate 4 dispatches
-   the codex merge-fix (§10): rebase the PR onto the staging tip / resolve the
-   specific conflict, then re-trial; the fold succeeds if the fix lands cleanly.
-   Only a conflict codex **cannot** resolve — or a **fork** PR whose branch the
-   agent cannot push the fix to — becomes a BOD, itemized with the split reason:
-   *"rebase on master"* for a stale-vs-master conflict, *"conflicts with approved
-   PR #X"* for a genuine stack interaction (per the §11 dry-run).
+   **On a clobber the pipeline RESOLVES it — it does not punt.** Because staging is
+   a **derived, agent-owned** branch, the agent resolves **on staging**: it rebases
+   the PR's commits onto the staging tip (a *mechanical* conflict — adjacent edits,
+   a change master already made — auto-resolves this way, as the dry-run showed for
+   #479), and escalates a *semantic* conflict to the codex merge-fix (§10). This
+   works for **fork PRs too** — the agent never needs to push to the PR's own branch
+   to stack it (the fork limitation applies only to Gate-4's *in-PR* fix). Only a
+   conflict codex genuinely **cannot** resolve becomes a BOD, itemized with the split
+   reason: *"rebase on master"* (stale) / *"conflicts with approved PR #X"* (a real
+   stack interaction) — and the codex-authored resolution of a fork PR is recorded in
+   the landing ledger so the contributor can review it.
 2. Approved PRs **accumulate** on staging (they stay "open" on GitHub; content
    rides staging).
 3. **Any landing event flushes the whole train:** Kaden's auto-merge **or** a
