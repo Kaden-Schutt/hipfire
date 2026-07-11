@@ -4,7 +4,9 @@
 # loop's WIN-gate constants). Nothing hardcodes these elsewhere; the gate reads
 # it all from here.
 archs = ["gfx1100", "gfx1151", "gfx1201"]
-canonical_models = ["qwen3.6-27b", "qwen3.6-a3b"]
+# Real model files under ~/.hipfire/models/ (verified present on hipx + hiptrx):
+# 27b dense (.mq4) + a3b MoE in both quant variants (.mq4r plain, .mq4p default).
+canonical_models = ["qwen3.6-27b.mq4", "qwen3.6-35b-a3b.mq4r", "qwen3.6-35b-a3b.mq4p"]
 maintainers = ["fivetide", "unverbraucht", "nwoolmer", "Kaden-Schutt"]
 floor = 0.15       # min |delta%| above clock noise (= perf.FLOOR)
 drift_pct = 3.0    # cumulative master drift vs high-water B that fires investigation
@@ -16,9 +18,10 @@ auto_merge_authors = ["Kaden-Schutt"]
 
 # Which archs each SKU fits (VRAM). A (model, arch) cell runs only if it fits.
 [fit]
-"qwen3.6-27b" = ["gfx1100", "gfx1151", "gfx1201"]
-"qwen3.6-a3b" = ["gfx1100", "gfx1151", "gfx1201"]
-"deepseek4" = ["gfx1151"]
+"qwen3.6-27b.mq4" = ["gfx1100", "gfx1151", "gfx1201"]
+"qwen3.6-35b-a3b.mq4r" = ["gfx1100", "gfx1151", "gfx1201"]
+"qwen3.6-35b-a3b.mq4p" = ["gfx1100", "gfx1151", "gfx1201"]
+"deepseek4" = ["gfx1151"]   # example: a big-VRAM-only SKU (not canonical)
 
 # Executor tier per PR risk class (spec §8.1). harness="none" => deterministic
 # gate only (no agentic executor). Re-tuned from the merge ledger's per-tier
