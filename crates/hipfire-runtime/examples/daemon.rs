@@ -5258,6 +5258,10 @@ fn generate_qwen35_mtp(
     let mut accepted_total = 0usize;
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
+    // Once the cap closes the first reasoning span, stop counting and continue
+    // into the visible answer. The close is applied at a spec-block boundary so
+    // the emitted stream and trunk/MTP caches remain aligned.
+    let mut think_closed = false;
 
     // Emit the seed token first (TTFT = prefill).
     streamed_tokens.push(seed_token);
@@ -5318,7 +5322,6 @@ fn generate_qwen35_mtp(
         accepted_total += result.accept_count;
 
         let mut hit_eos = false;
-        let mut think_cap_hit = false;
         for &tok in &result.committed {
             if generated >= max_tokens {
                 break;
@@ -5358,7 +5361,7 @@ fn generate_qwen35_mtp(
                     break;
                 }
             }
-            if max_think_tokens > 0 {
+            if max_think_tokens > 0 && !think_closed {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
@@ -5375,16 +5378,10 @@ fn generate_qwen35_mtp(
                     think_count += 1;
                 }
                 prev_in_think = in_think;
-                if in_think && think_count >= max_think_tokens {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":"</think>\n"}}"#,
-                        id
-                    );
-                    let _ = stdout.flush();
-                    think_cap_hit = true;
-                    break;
-                }
+                // Apply the close after this committed block. `spec_step`
+                // already advanced the trunk across the whole block, so
+                // stopping midway here would desynchronize visible tokens and
+                // model state.
             }
         }
         last_committed = match result.committed.last() {
@@ -5392,8 +5389,66 @@ fn generate_qwen35_mtp(
             None => break, // defensive: spec_step always commits ≥ 1
         };
         cur_pos += result.advance;
-        if result.hit_eos || hit_eos || think_cap_hit {
+        if result.hit_eos || hit_eos {
             break;
+        }
+
+        if max_think_tokens > 0 && !think_closed && prev_in_think && think_count >= max_think_tokens
+        {
+            let close_ids = tokenizer.encode(&think_continuation());
+            if !close_ids.is_empty() {
+                for &ct in &close_ids {
+                    if generated >= max_tokens {
+                        break;
+                    }
+                    emitted.push(ct);
+                    streamed_tokens.push(ct);
+                    emit_committed_event(
+                        stdout,
+                        id,
+                        ct,
+                        streamed_tokens.len() - 1,
+                        t0.elapsed().as_millis() as u64,
+                    );
+                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
+                    bytes_fed_to_filter = all_bytes.len();
+                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                        if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                                id,
+                                serde_json::to_string(&text).unwrap_or_default()
+                            );
+                            let _ = stdout.flush();
+                        }
+                    }
+                    generated += 1;
+                }
+
+                // Match the MTP loop's deferred-token invariant: advance the
+                // trunk and head cache over the prior deferred token plus every
+                // close token except the new deferred tail.
+                let mut advance_toks = Vec::with_capacity(close_ids.len());
+                advance_toks.push(last_committed);
+                advance_toks.extend_from_slice(&close_ids[..close_ids.len() - 1]);
+                if let Err(e) = mtp_spec::prefill_trunk_and_mtp_cache(
+                    gpu,
+                    &mut target,
+                    head,
+                    &mut state,
+                    &advance_toks,
+                    cur_pos,
+                ) {
+                    step_error = Some(format!("think force-close: {e:?}"));
+                    break;
+                }
+                cur_pos += advance_toks.len();
+                last_committed = *close_ids.last().unwrap();
+                think_closed = true;
+                prev_in_think = false;
+            }
         }
     }
 
@@ -7021,16 +7076,9 @@ fn generate(
     // rejection invariant) — a temp>0 request carrying a non-default top_p gets
     // temp-only sampling and a one-time warn below.
     //
-    // Exception: thinking-on + max_think_tokens currently needs the AR path.
-    // DFlash's budget cap can close/strip the think span but does not yet
-    // continue into visible answer text after the forced close. AR already
-    // splices </think> through KV and continues generation, so route budgeted
-    // thinking requests there until DFlash continuation is implemented.
-    let budgeted_thinking_needs_ar = max_think_tokens > 0
-        && !matches!(
-            assistant_prefix,
-            hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
-        );
+    // Budgeted thinking remains on the selected decode path. AR splices the
+    // continuation directly, DFlash uses SpecEmit::take_forced, and native MTP
+    // applies the same close at a committed-block boundary.
 
     // ── Qwen3.5/3.6 native-MTP serve path (opt-in) ─────────────────────
     //
@@ -7039,9 +7087,9 @@ fn generate(
     // compressed-serial). Gated tightly so the DEFAULT path (DFlash/AR) is
     // unchanged: requires the env opt-in `HIPFIRE_QWEN_MTP=1`, a loaded MTP
     // head (`m.qwen35_mtp_head`), greedy (temp≈0; MTP serve v1 is greedy/
-    // argmax-match), a qwen3.5/3.6 trunk (arch 5/6), single-GPU, and no
-    // budgeted-thinking (which needs the AR </think> splice). Anything not
-    // satisfying ALL of these falls through to the existing DFlash/AR routing.
+    // argmax-match), a qwen3.5/3.6 trunk (arch 5/6), and single-GPU. Budgeted
+    // thinking stays on MTP and uses the block-boundary continuation above.
+    // Anything not satisfying these gates falls through to DFlash/AR.
     //
     // SAMPLED (temp>0) MTP is now distribution-preserving and reachable here,
     // but gated behind an opt-in env flag until the temp>0 coherence battery
@@ -7073,7 +7121,6 @@ fn generate(
         && m.qwen35_mtp_head.is_some()
         && (temp <= 1e-6 || mtp_sampled_on)
         && (m.arch_id == 5 || m.arch_id == 6)
-        && !budgeted_thinking_needs_ar
     {
         generate_qwen35_mtp(
             m,
@@ -7183,7 +7230,6 @@ fn generate(
         && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
         && !qwen_dflash_route
         && !llama_dflash_route
-        && !budgeted_thinking_needs_ar
         && !force_ar_chat
     {
         let reason = if temp_spec_env_off {
@@ -7202,7 +7248,6 @@ fn generate(
         );
     }
     if m.speculator.is_some()
-        && !budgeted_thinking_needs_ar
         && !force_ar_chat
         && (qwen_dflash_route || llama_dflash_route)
     {
