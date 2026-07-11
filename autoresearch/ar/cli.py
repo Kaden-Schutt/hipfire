@@ -57,7 +57,7 @@ CAND_WALL = 3.0
 # Role scoping. Agent may ONLY read state + submit candidates.
 AGENT_VERBS = frozenset({"why", "status", "bod", "certify"})
 OPERATOR_VERBS = frozenset(
-    {"start", "stop", "status", "why", "bod", "ingest", "fold", "rollover", "config", "certify"}
+    {"start", "stop", "status", "why", "bod", "ingest", "fold", "rollover", "config", "certify", "gate"}
 )
 
 
@@ -328,6 +328,27 @@ def cmd_config(a) -> int:
     return 0
 
 
+def cmd_gate(a) -> int:
+    """Resolve + print the Tier-3 gate plan for an arch (the fitting models, the
+    cross-arch targets, the thresholds). No GPU here — the GPU run is the Phase-3
+    workflow. Reads autoresearch/config/pr_gate.toml."""
+    from .gate.config import load_gate_config
+
+    path = a.gate_config or os.path.join(_repo(), "autoresearch", "config", "pr_gate.toml")
+    cfg = load_gate_config(path)
+    extra = tuple(m for m in (a.models.split(",") if a.models else []) if m)
+    out = {
+        "arch": a.arch,
+        "models": cfg.models_for(a.arch, extra=extra),
+        "other_archs": cfg.other_archs(a.arch),
+        "floor": cfg.floor,
+        "alpha": cfg.alpha,
+        "drift_pct": cfg.drift_pct,
+    }
+    print(json.dumps(out, indent=2) if a.json else json.dumps(out))
+    return 0
+
+
 def cmd_start(a) -> int:
     """operator-only. Launch the config's workers (swarm) as detached loops.
 
@@ -465,6 +486,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--arch", default=None)
     s.add_argument("--json", action="store_true")
 
+    s = sub.add_parser("gate", help="operator: resolve/run the Tier-3 PR gate for an arch")
+    s.add_argument("--arch", required=True)
+    s.add_argument("--plan", action="store_true", help="print the resolved gate plan (no GPU)")
+    s.add_argument("--models", default=None, help="comma-separated change-specific SKUs to add")
+    s.add_argument("--gate-config", dest="gate_config", default=None)
+    s.add_argument("--json", action="store_true")
+
     return p
 
 
@@ -479,6 +507,7 @@ _DISPATCH = {
     "fold": cmd_fold,
     "rollover": cmd_rollover,
     "config": cmd_config,
+    "gate": cmd_gate,
 }
 
 
