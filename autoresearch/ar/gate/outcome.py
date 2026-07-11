@@ -18,15 +18,25 @@ def _aggregate_bod(arch_results) -> dict:
         elif r["verdict"] == "REJECT":
             for reason in r.get("reasons", []):
                 blockers.append({"kind": reason, "detail": reason, "arch": r["arch"]})
+        elif r["verdict"] != "PASS":
+            blockers.append({"kind": "invalid_verdict",
+                             "detail": f"unexpected verdict {r['verdict']!r}",
+                             "arch": r["arch"]})
     summary = f"{len(blockers)} blocker(s) across "
     summary += ", ".join(sorted({r["arch"] for r in arch_results
-                                 if r["verdict"] in ("REJECT", "BOD")}))
+                                 if r.get("verdict") != "PASS"}))
     return {"blockers": blockers, "summary": summary}
 
 
 def decide_pr(*, arch_results, author, is_draft, helpful, cfg) -> dict:
     """Decide the PR action from the per-arch verdicts + authority + helpfulness."""
-    failed = [r for r in arch_results if r["verdict"] in ("REJECT", "BOD")]
+    arch_results = list(arch_results)
+    if not arch_results:
+        arch_results.append({"arch": "evidence", "verdict": "REJECT",
+                             "reasons": ["missing_results"], "bod": None})
+    # PASS is the only green value. New, malformed, or agent-invented verdicts
+    # must not become green merely because this reducer does not recognize them.
+    failed = [r for r in arch_results if r.get("verdict") != "PASS"]
     if failed:
         return {"action": "bod", "status": "failure",
                 "reasons": sorted({r["arch"] for r in failed}),

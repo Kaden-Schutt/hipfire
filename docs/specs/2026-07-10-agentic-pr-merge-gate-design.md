@@ -1,6 +1,6 @@
 # Agentic PR Merge-Gate — Design Spec
 
-> Status: **DRAFT / approved-in-brainstorm** · Date: 2026-07-10 · Branch: `feat/rdna-kernel-oracle`
+> Status: **IMPLEMENTED CORE** · Date: 2026-07-11
 > Author: Kaden Schutt
 >
 > An agent-orchestrated, GPU-backed PR pipeline that reads a PR, tests the
@@ -35,31 +35,30 @@ Completes the pipeline `ci.yml` and `claude-review.yml` already reference:
 | Tier | Workflow | Runner | Role | Status |
 |---|---|---|---|---|
 | 1 | `ci.yml` | ubuntu | build + `test --lib` | exists, required |
-| 2 | `claude-review.yml` | ubuntu | **dispatcher + interpreter** (GPU-free): read diff → select tests → trigger Tier 3 → interpret results → verdict/merge/BOD | exists (re-enable + elevate) |
-| **3** | **`gpu-gates.yml`** | **self-hosted matrix** | **deterministic `ar gate`**: fit → cross-arch → parity → perf → coherence → non-clobber merge | **new** |
+| 2 | `gpu-gates.yml` dispatch/interpret jobs | ubuntu | **Claude dispatcher + interpreter** (GPU-free): review diff → write structured plan → validate coverage → release Tier 3; later explain the deterministic verdict | implemented |
+| **3** | **`gpu-gates.yml` dynamic matrix** | **selected self-hosted runners** | **deterministic `ar gate`**: collect → grade → publish same-head evidence; box-local Codex runs only bespoke behavior tests | **implemented** |
 
 **Division of labor (agentic-first).** Claude is the *brain*; **codex on the
 owning box is the hands**; the deterministic `gate_cell` math is the *ruler*. The
 per-PR flow, actor by actor:
 
 ```
-CLAUDE classify + route (§8)  →  CLAUDE writes codex directions (§8)
-  →  codex exec -p "[directions]"  on the box that OWNS the affected arch:
-       cargo build --release --features deltanet -p hipfire-runtime --example daemon
-         @base_ref AND @head_ref  (cache by sha),
-       run scripts/serve_harness.py parity/perf/coherence per (model, arch),
-       invoke the deterministic gate_cell to GRADE the measurements  →  results/<arch>.json
-  →  CLAUDE decide_pr (§8/§12)  →  CLAUDE PR comment (§9)
-  →  codex exec  Gate-4 non-clobber merge + merge-fix (§10)  →  staging train (§11)
-  →  CLAUDE automerge (§12, Kaden-only, behind GATE_AUTOMERGE)
+CLAUDE review + structured dispatch (§8)
+  → deterministic plan validator releases exactly the selected boxes
+  → each selected box mechanically runs `ar gate --collect` then `--grade`
+  → box-local codex runs only the assigned bespoke behavior tests
+  → deterministic same-PR/base/head evidence join + `decide_pr`
+  → CLAUDE explains that immutable verdict and proposes an allowed action
+  → deterministic action validator posts/merges (§12, Kaden-only, kill-switch)
 ```
 
-Two things that keep this honest: **codex RUNS `gate_cell`, it never *judges*
-parity** — the parity/perf/coherence math is deterministic (`certify/verdict.py`,
-reused from the loop), so codex reports token-ids / tok-s / detector output and the
-math decides PASS/FAIL. And **serve_harness is `scripts/serve_harness.py`
-(committed) — codex does NOT build it**; the only on-box build is the daemon,
-per ref. **Claude orchestrates; the deterministic core decides the raw verdict.**
+Three things keep this honest. **Claude cannot start a runner directly**: only a
+schema-valid plan that covers every deterministically affected arch produces a
+matrix. **Neither Claude nor codex judges parity**: the workflow itself invokes
+the committed collect/grade commands and preserves every deterministic REJECT.
+Finally, the interpreter can explain results but cannot turn a failed outcome into
+a green action; a second validator constrains the proposed action before GitHub is
+mutated. **Claude orchestrates; the deterministic core releases and decides.**
 
 ## 4. The gate pipeline (per eligible arch, cheapest-first, short-circuiting)
 
@@ -75,22 +74,24 @@ per ref. **Claude orchestrates; the deterministic core decides the raw verdict.*
 Gate 0 is per `(model, arch)` cell; a cell that does not fit is skipped as N/A,
 never a failure. "If any *eligible* arch regresses → reject."
 
-### 4.1 Arch → box deferral (neither box parity-fails on an arch it can't run)
+### 4.1 Arch → box dispatch (unselected boxes never start)
 
 The GPU fleet is **two** boxes: **hipx owns {gfx1100, gfx1151}**, **hiptrx owns
-{gfx1201}**. Claude's `decide` step computes the PR's **affected archs** from the
-diff. Each box gates only `affected_archs ∩ box_archs`:
+{gfx1201}**. Claude reads the PR and selects the necessary boxes, archs, models,
+and bespoke behavior tests. The deterministic validator separately computes the
+PR's minimum **affected archs** from the diff:
 
-- Non-empty → the box builds + runs the real gate for those archs.
-- **Empty → the box DEFERS: a no-op PASS, not a run.** hipx defers a gfx1201-only
-  change to hiptrx; hiptrx defers a gfx1100/1151 change to hipx. A box never spawns a
-  daemon for an arch its GPUs don't provide, so it can **never spuriously parity-fail**
-  on a non-owned arch (the 70 ms empty-output REJECT the scaffold produced).
+- If Claude covers every required arch with its owning box, the validator emits a
+  dynamic Actions matrix containing exactly those selected boxes.
+- If Claude omits a required arch, assigns an arch to the wrong owner, invents a
+  model, or produces malformed/missing JSON, validation fails and **zero
+  self-hosted jobs are scheduled**.
+- A validated `decision=skip` is permitted only for a deterministically trivial
+  diff and produces one explicit no-runner PASS on Ubuntu.
 
-The **cross-arch leak** check (Gate 1) is orthogonal and still fires everywhere: a
-gfx1201 change that alters the gfx1100 device codegen is a *real* REJECT on hipx —
-that is arch-bleed, not a deferral. Deferral skips the *battery* for a non-owned
-arch; it never skips the isolation check for an owned one.
+Thus a gfx1201-only change dispatches hiptrx without creating a no-op hipx job;
+a shared daemon change cannot dispatch until both hipx and hiptrx are covered.
+Cross-arch isolation remains part of the deterministic collected evidence.
 
 ## 5. Model × arch fit map (config-driven)
 
@@ -159,55 +160,58 @@ Parity is token-exact greedy (FP32 + `HIPFIRE_DETERMINISTIC=1`). Coherence is
 + `mcnemar_worse` (paired base-vs-PR failure test). A perf improvement is
 accepted **only if** parity + coherence also pass — the loop's exact contract.
 
-## 8. Dispatch — Claude classifies + authors the behavior test
+## 8. Dispatch — Claude reviews; a deterministic validator releases runners
 
-**Claude classifies the PR — not a path regex.** The dispatcher (Claude) reads the
-diff **and the contributor's PR description** and *understands what it does*: a
-rename vs a real behavior change, risk hiding behind an innocent-looking path,
-whether the change is even reachable through the serve path at all. The
-deterministic `classify_pr` (path taxonomy) is **only a floor** — it pins a
-*minimum* risk tier that Claude may escalate above but never de-escalate below, so
-a kernel/dispatch/forward-pass change can never be mis-classified as trivial even
-if Claude errs or is unavailable. Claude's semantic read is the authority; the
-regex is the safety net.
+**Claude classifies the PR — not a path regex.** The dispatcher reads the PR
+description, immutable patch, and affected source, writes a source-pinned review,
+and chooses the boxes, archs, model files, and behavior tests that discriminate
+the change. The deterministic `classify_pr`/`affected_archs` taxonomy remains a
+minimum coverage floor that Claude may escalate but never de-escalate.
 
-Claude's test plan has **two parts**:
+Claude must write `review.md` and exact JSON with this shape:
 
-**1. serve_harness floor (deterministic, always runs).** The canonical
-coherence+perf battery over the **serve path** — parity / perf / attractor /
-McNemar on `qwen3.6-27b.mq4` + `a3b.mq4r`/`a3b.mq4p`, per fitting arch (gates 2/3/3b
-of §4). This is the hard regression gate: it catches anything that breaks or slows
-the serve path, and it runs regardless of Claude's plan. Claude may *add* coverage
-but never remove this floor.
-
-**2. Bespoke behavior test (Claude-authored, codex-executed) — the fix for the
-serve_harness blind spot.** `serve_harness` only exercises the *serve path*; it
-**cannot** reach a new CLI command, a tokenizer / quant-format change, a
-build/tooling change, or any behavior that never hits `serve`. For those, Claude
-writes a **bespoke test prompt** describing exactly what to verify ("this PR adds
-`hipfire foo --bar`; build it, run it on <input>, confirm <X>"), and **codex
-executes it generally on-box** — build, run the new path, check the output — **not
-limited to serve_harness**. Without this, a non-serve behavior would be untested
-and the gate would false-pass; this closes that hole. Claude passes this prompt
-**in addition to** the serve_harness bench, never instead of it.
-
-Plan shape:
-```
-{ risk: "trivial|low|moderate|high-risk",
-  serve_floor: { models, archs, genres, long_context, session_files, perf_ab },
-  behavior_tests: [ { what, prompt, expect, harness, model, effort } ],
-  reason }
+```json
+{
+  "schema": 1,
+  "decision": "run",
+  "risk": "moderate",
+  "reason": "shared daemon path requires the full fleet",
+  "boxes": {
+    "hipx": {
+      "run": true,
+      "archs": ["gfx1100", "gfx1151"],
+      "models": ["qwen3.6-27b.mq4"],
+      "behavior_tests": [
+        {"id": "stable-id", "what": "specific behavior",
+         "prompt": "exact box-local test", "expect": "machine-checkable result"}
+      ]
+    },
+    "hiptrx": {
+      "run": true,
+      "archs": ["gfx1201"],
+      "models": ["qwen3.6-27b.mq4"],
+      "behavior_tests": []
+    }
+  }
+}
 ```
 
-**Verdict combination.** The serve_harness floor is the deterministic PASS/FAIL and
-is never overridden. Each bespoke behavior test contributes a codex pass/fail for
-its specific behavior. A PR passes iff the floor is green **AND** every bespoke
-test passes. (The floor's rigor is deterministic; the bespoke tests are the best
-available agentic check for behaviors that are not deterministically gateable.)
+`ar gate --validate-plan` verifies the schema, risk floor, fixed box ownership,
+model fit, behavior-test identity, and coverage of every affected arch. It emits
+the dynamic Actions matrix only on success. Missing files, invalid JSON, or
+insufficient coverage are a hard dispatch failure with an empty matrix — there is
+no prompt-only or canonical-battery fallback.
 
-**Degraded-coverage safety.** If Claude/codex errors or times out, Tier 3 falls
-back to the serve_harness floor + the `classify_pr` floor tier and **flags**
-degraded coverage — it never blocks and never false-passes on the floor.
+For selected archs, the runner mechanically executes the committed
+`--collect`/`--grade` implementation. Claude-authored tests cover paths the GPU
+battery cannot reach, such as a CLI or tokenizer behavior, and box-local Codex
+executes those exact assignments. A PR passes only if every deterministic arch
+result and every assigned behavior result passes.
+
+**Agent failure is fail-closed.** Claude failure starts no runner. Codex failure,
+timeout, missing verdict, or malformed bespoke evidence rejects that behavior.
+The final join also verifies that every selected box and behavior id reports the
+same PR/base/head before interpretation is allowed.
 
 ### 8.1 Executor routing (Claude tiers codex by the risk it read)
 
@@ -222,7 +226,7 @@ false-pass/false-reject rates:
 | trivial | *none* — serve_harness floor only |
 | low | codex **luna high** |
 | moderate | codex **terra high** |
-| high-risk | codex **sol xhigh** (+ **grok** on the gfx1201 arm as a diversity second-opinion; disagreement → human, no auto-merge) |
+| high-risk | codex **sol xhigh** |
 
 codex authenticates **box-local** on hipx/hiptrx (not a GitHub secret). pi.dev
 slots in as a fourth harness when added (§Phase 6).
@@ -435,23 +439,23 @@ fallback if self-hosted runners ever prove painful.
 ## 14. `gpu-gates.yml` workflow
 
 - **Trigger:** `pull_request` (opened/synchronize/reopened/ready_for_review) for
-  in-repo branches with `HAS_TOKEN`; **+ `issue_comment`** for `/gate` and
-  `@claude /merge` commands. Draft PRs gated out of auto-run.
-- **Matrix:** `strategy.matrix.arch: [gfx1100, gfx1151, gfx1201]`,
-  `runs-on: [self-hosted, <arch>]` → GH schedules each on the owning box (gfx1100
-  + gfx1151 → hipx; gfx1201 → hiptrx). Each job runs `ar gate` and publishes a
-  check-run `gpu-gate / <arch>`.
-- **Concurrency:** GH group per PR (`cancel-in-progress`) **+ on-box
-  `gpu-lock.sh`** so gate jobs serialize with the autoresearch loop and with each
-  other (hipx runs both gfx1100 and gfx1151 → they queue on hipx's per-box lock,
-  keeping co-resident perf measurements from perturbing each other). The gate is
+  trusted in-repo maintainer branches; **+ `issue_comment`** for a maintainer
+  `/gate`. Draft PRs are gated out of automatic runs. `/merge` is handled by the
+  separate merge-command workflow.
+- **Matrix:** emitted by `ar gate --validate-plan` from Claude's plan. It contains
+  zero, one, or both physical boxes; a selected hipx job runs its selected subset
+  of gfx1100/gfx1151 sequentially, while hiptrx owns gfx1201.
+- **Concurrency:** GH group per PR with `cancel-in-progress: false` **+ on-box
+  `gpu-lock.sh`**. A later `/gate` request queues instead of cancelling an active
+  dispatch or measurement. hipx runs its selected archs under one lock, keeping
+  co-resident perf measurements from perturbing each other. The gate is
   a lock *citizen* (never `rm`s the lockfile) but a **priority** one — it can
   preempt the background loop (§17) so a human waiting on a PR is never starved
   behind a 12h loop run.
-- **Aggregator / interpret job** (`workflow_run: completed`): re-invokes Claude
-  (Tier 2) to read the per-arch rows + drift state, post one PR comment (verdict
-  table + ledger rows), set the aggregate status, and take the merge/tag/BOD
-  action.
+- **Aggregator / interpret job:** downloads every selected box artifact, verifies
+  completeness and immutable identity, computes the authoritative outcome, then
+  re-invokes Claude to write one explanation/action. A validator constrains that
+  action before the workflow posts or merges.
 - **Freshness:** on every landing, sync `master` + rebuild `staging` on hipx and
   hiptrx (validators) and on the k9lin dev checkout (repo sync only; k9lin stays
   zero-validation).
@@ -506,9 +510,12 @@ codex/grok auth on-box.
     PR, and no job hangs to the GH ceiling.
 - **Build fail at base or head** on an arch → `BUILD_FAIL` (real fail — the PR
   broke that arch's daemon build; Tier 1 only covers the generic workspace).
-- **Agent round failure** (dispatch/interpret/merge-fix) → fall back to the
-  canonical battery / post a manual-review request; degrade coverage, never
-  block or false-pass.
+- **Claude dispatch failure** (missing files, timeout, invalid or incomplete
+  plan) → fail the dispatch job and create zero self-hosted runner jobs.
+- **Codex behavior failure** (nonzero exit, timeout, missing/malformed verdict)
+  → record that assigned behavior as failed; never substitute a green result.
+- **Claude interpretation failure** → post/merge does not run. A deterministic
+  REJECT remains red even if Claude proposes different wording or action.
 - **staging rebuild conflict** (an approved PR now clobbers after master moved) →
   that PR drops from the stack + gets a re-run request; staging self-heals.
 

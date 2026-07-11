@@ -8,7 +8,11 @@ from autoresearch.ar.gate.dispatch import (
     parse_plan,
     run_behavior_test,
     run_behavior_tests,
+    validate_dispatch_plan,
+    validate_interpret_action,
+    verify_evidence,
 )
+from autoresearch.ar.gate.config import load_gate_config
 
 
 # ---- floor_risk: escalate-only ----
@@ -108,3 +112,110 @@ def test_aggregate_behavior_fail_rejects_even_if_floor_green():
     behs = [{"what": "cli --foo", "passed": False}, {"what": "b", "passed": True}]
     out = aggregate(floor, behs)
     assert out["verdict"] == "REJECT" and "behavior:cli --foo" in out["reasons"]
+
+
+def _plan(*, hipx=None, hiptrx=None, decision="run"):
+    return {
+        "schema": 1,
+        "decision": decision,
+        "risk": "high-risk" if decision == "run" else "trivial",
+        "reason": "source-grounded dispatch",
+        "boxes": {
+            "hipx": hipx or {"run": False, "archs": [], "models": [], "behavior_tests": []},
+            "hiptrx": hiptrx or {"run": False, "archs": [], "models": [], "behavior_tests": []},
+        },
+    }
+
+
+def test_validate_dispatch_releases_only_claude_selected_owner(pr_gate_toml):
+    cfg = load_gate_config(pr_gate_toml)
+    plan = _plan(hiptrx={
+        "run": True,
+        "archs": ["gfx1201"],
+        "models": ["qwen3.6-27b"],
+        "behavior_tests": [],
+    })
+    out = validate_dispatch_plan(plan, ["kernels/src/foo.gfx1201.hip"], cfg, lines_changed=10)
+    assert out["valid"] is True
+    assert out["required_archs"] == ["gfx1201"]
+    assert [row["box"] for row in out["matrix"]["include"]] == ["hiptrx"]
+
+
+def test_validate_dispatch_blocks_missing_required_box(pr_gate_toml):
+    cfg = load_gate_config(pr_gate_toml)
+    plan = _plan(hiptrx={
+        "run": True,
+        "archs": ["gfx1201"],
+        "models": ["qwen3.6-27b"],
+        "behavior_tests": [],
+    })
+    out = validate_dispatch_plan(plan, ["kernels/src/shared.hip"], cfg, lines_changed=10)
+    assert out["valid"] is False
+    assert out["matrix"]["include"] == []
+    assert any("omitted affected archs: gfx1100,gfx1151" in e for e in out["errors"])
+
+
+def test_validate_dispatch_allows_trivial_skip_without_matrix(pr_gate_toml):
+    cfg = load_gate_config(pr_gate_toml)
+    out = validate_dispatch_plan(_plan(decision="skip"), ["docs/readme.md"], cfg, lines_changed=5)
+    assert out["valid"] is True
+    assert out["decision"] == "skip"
+    assert out["matrix"] == {"include": []}
+
+
+def test_validate_dispatch_requires_nontrivial_behavior_run(pr_gate_toml):
+    cfg = load_gate_config(pr_gate_toml)
+    out = validate_dispatch_plan(_plan(decision="skip"), ["cli/new_command.ts"], cfg, lines_changed=10)
+    assert out["valid"] is False
+    assert any("only trivial diffs may be skipped" in e for e in out["errors"])
+
+
+def test_validate_dispatch_normalizes_behavior_executor_tier(pr_gate_toml):
+    cfg = load_gate_config(pr_gate_toml)
+    plan = _plan(hipx={
+        "run": True,
+        "archs": [],
+        "models": [],
+        "behavior_tests": [{"id": "cli", "what": "new command", "prompt": "run it", "expect": "ok"}],
+    })
+    out = validate_dispatch_plan(plan, ["cli/new_command.ts"], cfg, lines_changed=10)
+    assert out["valid"] is True
+    bt = out["boxes"]["hipx"]["behavior_tests"][0]
+    assert bt["harness"] == "codex"
+    assert bt["model"] == "gpt-5.6-sol"  # Claude escalated to high-risk in the plan.
+    assert [row["box"] for row in out["matrix"]["include"]] == ["hipx"]
+
+
+def test_interpret_action_cannot_turn_bod_into_green():
+    interp = {"outcome": {"status": "failure", "action": "bod"}}
+    bad = validate_interpret_action(interp, {"action": "auto_merge", "comment_markdown": "green"})
+    assert bad["valid"] is False
+    good = validate_interpret_action(interp, {"action": "bod", "comment_markdown": "blocked"})
+    assert good["valid"] is True
+
+
+def test_verify_evidence_requires_every_selected_box_and_identity(tmp_path, pr_gate_toml):
+    cfg = load_gate_config(pr_gate_toml)
+    validated = validate_dispatch_plan(_plan(hiptrx={
+        "run": True,
+        "archs": ["gfx1201"],
+        "models": ["qwen3.6-27b"],
+        "behavior_tests": [],
+    }), ["kernels/src/foo.gfx1201.hip"], cfg, lines_changed=10)
+    results = tmp_path / "results"
+    behavior = tmp_path / "behavior"
+    results.mkdir()
+    behavior.mkdir()
+    (results / "gfx1201.json").write_text(json.dumps({
+        "arch": "gfx1201", "verdict": "PASS", "pr": "7", "base_sha": "b",
+        "head_sha": "h", "box": "hiptrx",
+    }))
+    (behavior / "behavior-hiptrx.json").write_text("[]")
+    out = verify_evidence(validated, results_dir=results, behavior_dir=behavior,
+                          pr="7", base_sha="b", head_sha="h")
+    assert out["valid"] is True
+    (behavior / "behavior-hiptrx.json").unlink()
+    missing = verify_evidence(validated, results_dir=results, behavior_dir=behavior,
+                              pr="7", base_sha="b", head_sha="h")
+    assert missing["valid"] is False
+    assert any("missing behavior result" in e for e in missing["errors"])
