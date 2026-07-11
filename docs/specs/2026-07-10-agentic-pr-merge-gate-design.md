@@ -508,6 +508,9 @@ codex/grok auth on-box.
   broke that arch's daemon build; Tier 1 only covers the generic workspace).
 - **Claude dispatch failure** (missing files, timeout, invalid or incomplete
   plan) → fail the dispatch job and create zero self-hosted runner jobs.
+- **Runner device discovery failure** (`rocminfo` timeout/no agents or the
+  assigned arch missing) → fail that arch immediately as `device_unavailable`;
+  never guess device 0 or spend the battery timeout retrying a lost GPU.
 - **Codex behavior failure** (nonzero exit, timeout, missing/malformed verdict)
   → record that assigned behavior as failed; never substitute a green result.
 - **Claude interpretation failure** → post/merge does not run. A deterministic

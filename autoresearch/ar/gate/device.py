@@ -16,7 +16,8 @@ import subprocess
 
 def _rocminfo() -> str:
     try:
-        return subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=30).stdout or ""
+        proc = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=15)
+        return proc.stdout if proc.returncode == 0 else ""
     except Exception:
         return ""
 
@@ -50,12 +51,21 @@ def gpu_gfx_order(rocminfo_text: str) -> list[str]:
     return order
 
 
-def resolve_device(arch, *, rocminfo_text=None, default=0) -> int:
+def resolve_device(arch, *, rocminfo_text=None, default=0, strict=False) -> int:
     """HIP device index for ``arch`` on this box (``default`` if rocminfo is unusable
-    or the arch isn't found — a single-GPU box then correctly uses 0)."""
+    or the arch isn't found — a single-GPU box then correctly uses 0).
+
+    ``strict=True`` is the merge-gate contract: an unavailable/hung ``rocminfo`` or
+    a missing arch raises instead of silently guessing device 0. Explicit local
+    callers retain the legacy fallback unless they opt into strict discovery.
+    """
     text = _rocminfo() if rocminfo_text is None else rocminfo_text
     order = gpu_gfx_order(text)
     for i, name in enumerate(order):
         if name == arch:
             return i
+    if strict:
+        if not order:
+            raise RuntimeError("rocminfo unavailable, timed out, or reported no GPU agents")
+        raise RuntimeError(f"required arch {arch} absent from rocminfo GPU order {order}")
     return default
