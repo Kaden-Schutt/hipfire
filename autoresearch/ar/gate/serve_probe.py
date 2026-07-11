@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 import subprocess
 
 from .perf_policy import _delta_pct, classify_perf
+from ..certify import verdict as V
 
 
 def run_serve_harness(daemon_bin, model_path, dev, *, repo, kv="q8", max_tokens=128,
@@ -54,36 +56,73 @@ def _content(rows) -> list:
     return [(r.get("assistant_content") or "") for r in rows]
 
 
-def grade_cell(base_rows, head_rows, *, arch, model, floor) -> dict:
-    """Grade one (model, arch) cell from base/head serve_harness rows. Order: parity →
-    coherence → perf (a value change or a new attractor is a hard REJECT; only then is
-    perf classified — NEUTRAL and IMPROVEMENT both PASS). Empty output on EITHER side is
-    a hard REJECT (a daemon that generates nothing is not a pass)."""
-    common = {"arch": arch, "model": model}
-    if not base_rows or not head_rows:
-        return {**common, "gate_verdict": "REJECT", "reason": "empty_generation", "tok_delta_pct": 0.0}
+def _samples(rows, key) -> list:
+    return [r[key] for r in rows if isinstance(r.get(key), (int, float))]
 
-    # 1. PARITY — greedy content must match byte-exact, per prompt (positional).
+
+def _median(xs):
+    return round(statistics.median(xs), 2) if xs else None
+
+
+def _cell_row(verdict, *, arch, model, base_rows, head_rows, tok_d=0.0,
+              parity=None, coherence=None) -> dict:
+    """A self-describing ledger row for one (model, arch) gate cell — the loop's
+    ``verdict.make_row`` schema (so the gate ledger + BOD read like the loop's), with a
+    gate verdict vocabulary: PASS / PARITY_FAIL / COHERENCE_FAIL / REGRESSION / EMPTY."""
+    bt, ht = _samples(base_rows, "decode_tok_s"), _samples(head_rows, "decode_tok_s")
+    return V.make_row(
+        arch, kernel=None, lever="pr-gate", verdict=verdict,
+        parity=parity, coherence=coherence, perf_delta=tok_d,
+        extra={"model": model, "cell_pass": verdict == "PASS",
+               "tok_delta_pct": tok_d, "base_decode": _median(bt), "var_decode": _median(ht),
+               "base_runs": bt, "var_runs": ht})
+
+
+def grade_cell(base_rows, head_rows, *, arch, model, floor) -> dict:
+    """Grade one (model, arch) cell from base/head serve_harness rows → a ledger ROW
+    (``_cell_row``). Order parity → coherence → perf: a value change or a NEW attractor
+    is a hard fail; only then is perf classified (NEUTRAL and IMPROVEMENT both PASS).
+    Empty output on EITHER side fails (a daemon that generates nothing is not a pass).
+    The row is per (model, arch), so a change that breaks 27b but not a3b yields a
+    PARITY_FAIL row for 27b and a PASS row for a3b — itemized straight into the BOD."""
+    if not base_rows or not head_rows:
+        return _cell_row("EMPTY", arch=arch, model=model, base_rows=base_rows, head_rows=head_rows,
+                         parity={"content_exact": None, "empty": True})
+
     bc, hc = _content(base_rows), _content(head_rows)
     if any(not c for c in bc + hc):
-        return {**common, "gate_verdict": "REJECT", "reason": "empty_generation", "tok_delta_pct": 0.0}
+        return _cell_row("EMPTY", arch=arch, model=model, base_rows=base_rows, head_rows=head_rows,
+                         parity={"content_exact": None, "empty": True})
     if bc != hc:
-        return {**common, "gate_verdict": "REJECT", "reason": "parity", "tok_delta_pct": 0.0}
+        return _cell_row("PARITY_FAIL", arch=arch, model=model, base_rows=base_rows,
+                         head_rows=head_rows, parity={"content_exact": False})
 
-    # 2. COHERENCE — a NEW attractor on the head (not already on base) is a regression.
     if any(h.get("attractor") and not b.get("attractor") for b, h in zip(base_rows, head_rows)):
-        return {**common, "gate_verdict": "REJECT", "reason": "coherence", "tok_delta_pct": 0.0}
+        return _cell_row("COHERENCE_FAIL", arch=arch, model=model, base_rows=base_rows,
+                         head_rows=head_rows, parity={"content_exact": True},
+                         coherence={"pass": False, "new_attractor": True})
 
-    # 3. PERF — conjunctive WIN-gate mirror over decode_tok_s (+) and wall_s (duration).
-    bt = [r["decode_tok_s"] for r in base_rows if isinstance(r.get("decode_tok_s"), (int, float))]
-    ht = [r["decode_tok_s"] for r in head_rows if isinstance(r.get("decode_tok_s"), (int, float))]
-    bw = [r["wall_s"] for r in base_rows if isinstance(r.get("wall_s"), (int, float))]
-    hw = [r["wall_s"] for r in head_rows if isinstance(r.get("wall_s"), (int, float))]
+    bt, ht = _samples(base_rows, "decode_tok_s"), _samples(head_rows, "decode_tok_s")
+    bw, hw = _samples(base_rows, "wall_s"), _samples(head_rows, "wall_s")
     tok_d = _delta_pct(bt, ht)
-    if bt and ht and bw and hw:
-        pclass = classify_perf(bt, ht, bw, hw, floor=floor)
-    else:
-        pclass = "NEUTRAL"      # no usable perf samples → don't fail on perf, just PASS neutral
-    if pclass == "REGRESSION":
-        return {**common, "gate_verdict": "REJECT", "reason": "perf_regression", "tok_delta_pct": tok_d}
-    return {**common, "gate_verdict": "PASS", "reason": pclass.lower(), "tok_delta_pct": tok_d}
+    pclass = classify_perf(bt, ht, bw, hw, floor=floor) if (bt and ht and bw and hw) else "NEUTRAL"
+    verdict = "REGRESSION" if pclass == "REGRESSION" else "PASS"
+    return _cell_row(verdict, arch=arch, model=model, base_rows=base_rows, head_rows=head_rows,
+                     tok_d=tok_d, parity={"content_exact": True},
+                     coherence={"pass": True})
+
+
+# BOD blocker kind per gate-cell verdict (spec §10 itemization vocabulary).
+_CELL_KIND = {"PARITY_FAIL": "parity", "COHERENCE_FAIL": "coherence",
+              "REGRESSION": "perf_regression", "EMPTY": "empty_generation"}
+
+
+def cell_blocker(row) -> dict:
+    """One itemized BOD blocker from a failing cell row — names the (arch, model, kind)
+    so the contributor sees exactly which (model × arch) broke (27b vs a3b)."""
+    kind = _CELL_KIND.get(row["verdict"], row["verdict"].lower())
+    m = row.get("model", "?")
+    detail = f"{m} @ {row['arch']}: {kind}"
+    if kind == "perf_regression" and row.get("tok_delta_pct") is not None:
+        detail += f" ({row['tok_delta_pct']:.1f}% tok/s)"
+    return {"kind": kind, "arch": row["arch"], "model": m, "detail": detail}

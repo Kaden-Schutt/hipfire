@@ -206,8 +206,10 @@ def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, m
         return {"arch": arch, "verdict": "REJECT", "reasons": ["build_fail"],
                 "bod": None, "detail": str(e)}
 
-    # Per fitting model: serve_harness greedy A/B, graded parity → coherence → perf.
-    reasons, deltas = [], []
+    # Per fitting model: serve_harness greedy A/B, graded parity → coherence → perf. Each
+    # cell is a self-describing ledger row, so a change that breaks 27b but not a3b keeps
+    # a PASS row for a3b and a PARITY_FAIL row for 27b — both land in the itemized BOD.
+    rows, deltas = [], []
     base_port = 11540 + dev * 40
     for i, m in enumerate(cfg.models_for(arch)):
         mp = os.path.join(models_dir, m)
@@ -220,12 +222,16 @@ def live_arch_gate(arch, files, base, head, repo, cfg, *, dev=None, card=None, m
             return {"arch": arch, "verdict": "ERROR", "reasons": [f"serve:{m}"],
                     "bod": None, "tok_delta_pct": 0.0, "detail": str(e)}
         cell = serve_probe.grade_cell(base_rows, head_rows, arch=arch, model=m, floor=cfg.floor)
-        deltas.append(cell.get("tok_delta_pct", 0.0))
-        if cell["gate_verdict"] == "REJECT":
-            reasons.append(f"{cell['reason']}:{m}")
+        rows.append(cell)
+        deltas.append(cell.get("tok_delta_pct") or 0.0)
 
     tok_delta = min(deltas) if deltas else 0.0
-    if reasons:
-        return {"arch": arch, "verdict": "REJECT", "reasons": reasons, "bod": None,
-                "tok_delta_pct": tok_delta}
-    return {"arch": arch, "verdict": "PASS", "reasons": [], "bod": None, "tok_delta_pct": tok_delta}
+    fails = [r for r in rows if r["verdict"] != "PASS"]
+    if fails:
+        blockers = [serve_probe.cell_blocker(r) for r in fails]
+        bod = {"blockers": blockers,
+               "summary": f"{len(blockers)} cell(s) failed: " + ", ".join(b["detail"] for b in blockers)}
+        return {"arch": arch, "verdict": "REJECT", "reasons": [b["kind"] for b in blockers],
+                "bod": bod, "rows": rows, "tok_delta_pct": tok_delta}
+    return {"arch": arch, "verdict": "PASS", "reasons": [], "bod": None, "rows": rows,
+            "tok_delta_pct": tok_delta}
