@@ -13,6 +13,20 @@ use std::ffi::c_void;
 
 const V_MODE_Q8: i32 = 8;
 
+#[inline]
+fn replay_stable_tile_count(
+    actual_tiles: usize,
+    max_tiles: usize,
+    graph_capture: bool,
+    redline_recording: bool,
+) -> usize {
+    if graph_capture || redline_recording {
+        max_tiles
+    } else {
+        actual_tiles
+    }
+}
+
 /// Opt-in gate for the WMMA flash-attention prefill path.
 fn is_wmma_fa_enabled() -> bool {
     use std::sync::OnceLock;
@@ -1851,11 +1865,16 @@ impl Gpu {
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         // For profiling / non-graph code paths, the actual tile count:
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.graphs.capture_mode {
-            max_tiles
-        } else {
-            actual_tiles
-        };
+        // Redline records an immutable launch sequence independently of
+        // hipGraph's capture_mode. Its replay updates pos_buf but cannot grow a
+        // recorded grid when seq_len crosses a 128-token tile boundary, so the
+        // recording pass must capture the same max_tiles superset as hipGraph.
+        let launch_tiles = replay_stable_tile_count(
+            actual_tiles,
+            max_tiles,
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        );
 
         // ── Tile kernel ──
         self.ensure_kernel(
@@ -10134,5 +10153,17 @@ impl Gpu {
             &mut params,
             blob_builder,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_stable_tile_count;
+
+    #[test]
+    fn q8_flash_uses_max_tiles_for_both_capture_backends() {
+        assert_eq!(replay_stable_tile_count(2, 64, false, false), 2);
+        assert_eq!(replay_stable_tile_count(2, 64, true, false), 64);
+        assert_eq!(replay_stable_tile_count(2, 64, false, true), 64);
     }
 }
