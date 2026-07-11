@@ -1,0 +1,36 @@
+Dispatch_Id,Kernel_Name,VGPR_Count,Accum_VGPR_Count,SGPR_Count,LDS_Block_Size,Scratch_Size,Counter_Name,Counter_Value,Start_Timestamp,End_Timestamp
+1,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,GL2C_HIT,3464286,0,735000
+1,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,GL2C_MISS,1000000,0,735000
+1,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,MemUnitBusy,41.4,0,735000
+1,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,OccupancyPercent,34.9,0,735000
+1,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,SQ_INST_CYCLES_VALU,2404260000,0,735000
+2,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,GL2C_HIT,3464286,735000,1470000
+2,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,GL2C_MISS,1000000,735000,1470000
+2,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,MemUnitBusy,41.4,735000,1470000
+2,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,OccupancyPercent,34.9,735000,1470000
+2,"fused_qkvza_hfq4g256(float*, __half const*, int)",72,0,128,0,0,SQ_INST_CYCLES_VALU,2404260000,735000,1470000
+3,"gemv_hfq4g256_moe_gate_up_k8_indexed(float*, int)",96,0,128,0,0,GL2C_HIT,1808989,1470000,2750000
+3,"gemv_hfq4g256_moe_gate_up_k8_indexed(float*, int)",96,0,128,0,0,GL2C_MISS,1000000,1470000,2750000
+3,"gemv_hfq4g256_moe_gate_up_k8_indexed(float*, int)",96,0,128,0,0,MemUnitBusy,54.7,1470000,2750000
+3,"gemv_hfq4g256_moe_gate_up_k8_indexed(float*, int)",96,0,128,0,0,OccupancyPercent,51.8,1470000,2750000
+3,"gemv_hfq4g256_moe_gate_up_k8_indexed(float*, int)",96,0,128,0,0,SQ_INST_CYCLES_VALU,3624140800,1470000,2750000
+4,"gemv_hfq4g256_residual_sigmoid_scaled_gpu(float*, int)",72,0,128,0,0,GL2C_HIT,458659,2750000,3540000
+4,"gemv_hfq4g256_residual_sigmoid_scaled_gpu(float*, int)",72,0,128,0,0,GL2C_MISS,100000,2750000,3540000
+4,"gemv_hfq4g256_residual_sigmoid_scaled_gpu(float*, int)",72,0,128,0,0,MemUnitBusy,8.7,2750000,3540000
+4,"gemv_hfq4g256_residual_sigmoid_scaled_gpu(float*, int)",72,0,128,0,0,OccupancyPercent,5.7,2750000,3540000
+4,"gemv_hfq4g256_residual_sigmoid_scaled_gpu(float*, int)",72,0,128,0,0,SQ_INST_CYCLES_VALU,329318400,2750000,3540000
+5,"gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(float*, int)",88,0,128,0,0,GL2C_HIT,3132231,3540000,4320000
+5,"gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(float*, int)",88,0,128,0,0,GL2C_MISS,1000000,3540000,4320000
+5,"gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(float*, int)",88,0,128,0,0,MemUnitBusy,43.5,3540000,4320000
+5,"gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(float*, int)",88,0,128,0,0,OccupancyPercent,42.5,3540000,4320000
+5,"gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(float*, int)",88,0,128,0,0,SQ_INST_CYCLES_VALU,2359296000,3540000,4320000
+6,"gemv_hfq4g256_multirow_r2(float*, int)",96,0,128,0,0,GL2C_HIT,3366812,4320000,5040000
+6,"gemv_hfq4g256_multirow_r2(float*, int)",96,0,128,0,0,GL2C_MISS,1000000,4320000,5040000
+6,"gemv_hfq4g256_multirow_r2(float*, int)",96,0,128,0,0,MemUnitBusy,93.0,4320000,5040000
+6,"gemv_hfq4g256_multirow_r2(float*, int)",96,0,128,0,0,OccupancyPercent,89.3,4320000,5040000
+6,"gemv_hfq4g256_multirow_r2(float*, int)",96,0,128,0,0,SQ_INST_CYCLES_VALU,2779445760,4320000,5040000
+7,"gemv_hfq4g256_residual(float*, int)",72,0,128,0,0,GL2C_HIT,3464286,5040000,5710000
+7,"gemv_hfq4g256_residual(float*, int)",72,0,128,0,0,GL2C_MISS,1000000,5040000,5710000
+7,"gemv_hfq4g256_residual(float*, int)",72,0,128,0,0,MemUnitBusy,45.3,5040000,5710000
+7,"gemv_hfq4g256_residual(float*, int)",72,0,128,0,0,OccupancyPercent,22.5,5040000,5710000
+7,"gemv_hfq4g256_residual(float*, int)",72,0,128,0,0,SQ_INST_CYCLES_VALU,1908736000,5040000,5710000

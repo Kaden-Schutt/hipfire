@@ -1,0 +1,49 @@
+{
+  "note": "Captured from real ab_certify_v2p.sh ledger rows. base_tok_s/var_tok_s are the recorded per-round kernel_decode_tok_s samples. The v2 conjunctive gate needs BOTH tok/s AND duration; the test derives duration = C/tok_s (a real kernel win moves both axes coherently, a DEAD moves neither), so the ported certify() must reproduce the same verdict + delta sign.",
+  "win": {
+    "source_ledger": "autoresearch/ledger/swarm_gfx1151_gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.jsonl",
+    "arch": "gfx1151",
+    "kernel": "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+    "label": "down_uint2_scale",
+    "ledger_verdict": "WIN",
+    "ledger_delta_pct": 0.59,
+    "ledger_mwu_dominance": 0.906,
+    "base_tok_s": [
+      83.9,
+      84.2,
+      84.1,
+      84.0
+    ],
+    "var_tok_s": [
+      84.5,
+      84.8,
+      84.1,
+      84.6
+    ],
+    "base_coh": "OK",
+    "var_coh": "OK"
+  },
+  "dead": {
+    "source_ledger": "autoresearch/ledger/swarm_gfx1151_fused_qkvza_hfq4g256.jsonl",
+    "arch": "gfx1151",
+    "kernel": "fused_qkvza_hfq4g256",
+    "label": "c2_qkvza_restrict_rowptr",
+    "ledger_verdict": "DEAD",
+    "ledger_delta_pct": 0.0,
+    "ledger_mwu_dominance": 0.375,
+    "base_tok_s": [
+      84.0,
+      84.0,
+      84.0,
+      84.6
+    ],
+    "var_tok_s": [
+      84.0,
+      84.0,
+      83.9,
+      84.1
+    ],
+    "base_coh": "OK",
+    "var_coh": "OK"
+  }
+}
