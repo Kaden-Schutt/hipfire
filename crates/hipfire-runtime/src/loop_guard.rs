@@ -15,7 +15,7 @@
 //!
 //! Behavior is byte-identical to the inline detector previously in
 //! `crates/hipfire-runtime/examples/daemon.rs`. The defaults are read from
-//! `HIPFIRE_NGRAM_LOOP_THRESHOLD` (default 8, 0 = disabled) and
+//! `HIPFIRE_NGRAM_LOOP_THRESHOLD` (default 0 = disabled) and
 //! `HIPFIRE_NGRAM_WINDOW` (default 256). The threshold is `>=`, not `>`.
 
 use std::collections::HashMap;
@@ -42,9 +42,9 @@ pub struct LoopGuard {
 impl LoopGuard {
     /// Construct a guard from environment variables.
     ///
-    /// - `HIPFIRE_NGRAM_LOOP_THRESHOLD` (default 8): a 4-gram count of this
-    ///   value or higher inside the window triggers the guard. Set to 0 to
-    ///   disable the guard entirely.
+    /// - `HIPFIRE_NGRAM_LOOP_THRESHOLD` (default 0 = disabled): a 4-gram count
+    ///   of this value or higher inside the window triggers the guard. Set an
+    ///   explicit positive value to opt in.
     /// - `HIPFIRE_NGRAM_WINDOW` (default 256): how many trailing tokens to
     ///   inspect on each `check` call.
     pub fn from_config(config: &crate::config::RuntimeConfig) -> Self {

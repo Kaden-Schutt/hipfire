@@ -91,10 +91,15 @@ impl RuntimeConfig {
                 .ok()
                 .as_deref()
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
+            // Default OFF (0 = disabled). The content-blind 4-gram guard can
+            // false-positive on repeated markdown/list scaffolding inside
+            // sampled reasoning and force-EOS before a visible answer. The
+            // think-budget force-close handles runaway reasoning instead;
+            // operators can opt this guard back in with an explicit threshold.
             ngram_loop_threshold: std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+                .unwrap_or(0),
             ngram_window: std::env::var("HIPFIRE_NGRAM_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -122,6 +127,21 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ngram_loop_guard_is_off_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD").ok();
+        std::env::remove_var("HIPFIRE_NGRAM_LOOP_THRESHOLD");
+
+        let cfg = RuntimeConfig::from_env();
+        assert_eq!(cfg.ngram_loop_threshold, 0);
+
+        match prev {
+            Some(value) => std::env::set_var("HIPFIRE_NGRAM_LOOP_THRESHOLD", value),
+            None => std::env::remove_var("HIPFIRE_NGRAM_LOOP_THRESHOLD"),
+        }
+    }
 
     #[test]
     fn normalize_prompt_accepts_no_as_false() {
