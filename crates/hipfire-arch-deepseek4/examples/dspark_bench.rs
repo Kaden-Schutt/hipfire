@@ -178,11 +178,13 @@ fn main() -> Result<(), String> {
         weights.dspark.is_some()
     );
 
+    let pbs = forward::PrefillBatchScratch::new(&mut gpu, &cfg, 256)?;
     let mut bundle = Deepseek4Bundle {
         config: cfg.clone(),
         weights,
         state,
         eos_tok,
+        pbs,
     };
 
     let ctx_cap = cfg.max_position_embeddings;

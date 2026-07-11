@@ -1013,9 +1013,9 @@ impl Carrier for Deepseek4Carrier {
                 weights,
                 state,
                 eos_tok,
+                pbs,
             })),
             speculator,
-            deepseek4_pbs: Some(pbs),
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,

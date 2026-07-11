@@ -338,10 +338,6 @@ pub struct LoadedModel {
     pub state: Option<ModelState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
     pub qwen2_state: Option<qwen2::Qwen2State>,
-    // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
-    // in `state` as ModelState::Deepseek4(Deepseek4Bundle) so unload teardown is
-    // compiler-enforced and the bundle can be borrowed as a `SpecTarget`.
-    pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
     // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
     // models — the eos must be carried here (mirrors `minimax_eos_tok`).
@@ -422,7 +418,6 @@ impl LoadedModel {
             pp_dn_la_to_device: None,
             state: None,
             qwen2_state: None,
-            deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
@@ -1986,6 +1981,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.weights.free_gpu(gpu);
             }
             ModelState::Deepseek4(b) => {
+                b.pbs.free_gpu(gpu);
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
@@ -1994,11 +1990,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Non-core arch weights
     if let Some(s) = m.qwen2_state {
         s.free_gpu(gpu);
-    }
-    // deepseek4 single-GPU scratch lives outside the bundle (relocated later);
-    // its config/weights/state freed via ModelState::Deepseek4 above.
-    if let Some(pbs) = m.deepseek4_pbs {
-        pbs.free_gpu(gpu);
     }
     if let Some(w) = m.vision_weights {
         w.free_gpu(gpu);

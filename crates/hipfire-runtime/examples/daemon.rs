@@ -11040,7 +11040,7 @@ fn generate(
 ///
 /// Parity with `deepseek4_chat`: batched chunked prefill +
 /// optional MTP spec-decode + greedy argmax sampler. PBS is pre-allocated
-/// once at load time (`m.deepseek4_pbs`), reused across every turn.
+/// once at load time (`b.pbs`), reused across every turn.
 ///
 /// Env knobs (read fresh per generate call so they can be toggled
 /// without daemon restart):
@@ -11584,16 +11584,10 @@ fn generate_deepseek4(
             return;
         }
     };
-    // `pbs` is a disjoint field from `m.state`, so it borrows independently of
-    // the bundle's `&mut state` below.
-    let pbs = m
-        .deepseek4_pbs
-        .as_ref()
-        .expect("deepseek4_pbs missing on arch_id=9 generate");
-    // The single-GPU ds4 bundle (config/weights/state/eos) lives in
-    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
-    // (shared) and `state` (`&mut`) are live simultaneously, exactly as the
-    // forward path needs.
+    // The single-GPU ds4 bundle (config/weights/state/eos/pbs) lives in
+    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`/
+    // `pbs` (shared) and `state` (`&mut`) are live simultaneously, exactly as
+    // the forward path needs.
     let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
         let _ = writeln!(
             stdout,
@@ -11607,6 +11601,7 @@ fn generate_deepseek4(
     let weights = &b.weights;
     let state = &mut b.state;
     let eos_tok = b.eos_tok;
+    let pbs = &b.pbs;
 
     let prompt_ids = build_deepseek4_dsml_prompt(
         tokenizer,

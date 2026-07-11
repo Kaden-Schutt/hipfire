@@ -35,6 +35,9 @@ pub struct Deepseek4Bundle {
     pub weights: DeepseekV4Weights,
     pub state: DeepseekV4State,
     pub eos_tok: u32,
+    /// Single-GPU chunked-prefill scratch, allocated once at load. (Relocated
+    /// here from a loose LoadedModel field — god-struct collapse Increment 2.)
+    pub pbs: crate::forward::PrefillBatchScratch,
 }
 
 /// Thin verify scratch for the DSpark `DsparkDrafter` path. DeepSeek V4's SWA
