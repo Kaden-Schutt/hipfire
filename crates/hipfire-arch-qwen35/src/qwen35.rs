@@ -5102,6 +5102,10 @@ pub fn forward_scratch(
     // capture or replay in a non-sequential context. An ineligible call also
     // INVALIDATES any captured graph (forces re-capture on the next plain call).
     let graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    // Redline's plain-AR capture/replay has the same eligibility contract as
+    // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
+    // or consume the immutable single-token replay sequence.
+    gpu.replay.set_forward_eligible(graph_eligible);
     if ar_graph_test && !graph_eligible {
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;

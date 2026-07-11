@@ -412,6 +412,45 @@ impl PacketImage {
         Self::copy(packet, packet.published_header_word())
     }
 
+    /// Build AMD's vendor-specific AQL packet carrying one PM4
+    /// INDIRECT_BUFFER command. Layout and constants match rocm-systems
+    /// `aqlprofile/src/core/amd_aql_pm4_ib_packet.h`.
+    pub fn pm4_indirect_buffer(
+        address: *mut c_void,
+        dwords: u32,
+        completion_signal: abi::Signal,
+    ) -> Result<Self, PacketError> {
+        if address.is_null() || (address as usize) & 3 != 0 {
+            return Err(PacketError::InvalidIndirectBufferAddress(
+                address as usize as u64,
+            ));
+        }
+        if dwords == 0 || dwords > 0x000f_ffff {
+            return Err(PacketError::InvalidIndirectBufferSize(dwords));
+        }
+        const PACKET3_INDIRECT_BUFFER: u32 = 0x3f;
+        const IB_VALID: u32 = 1 << 23;
+        const IB_TEMPORAL_LU: u32 = 3 << 28;
+        let address = address as usize as u64;
+        let pm4_header = (3_u32 << 30) | (2 << 16) | (PACKET3_INDIRECT_BUFFER << 8);
+        // Vendor-specific is packet type zero. Barrier keeps the nonzero 0x100
+        // publication header required by MES on gfx12.
+        let aql_header = 1_u16 << abi::PACKET_HEADER_BARRIER;
+        let mut bytes = [0_u8; AQL_PACKET_BYTES];
+        bytes[0..2].copy_from_slice(&aql_header.to_le_bytes());
+        bytes[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[4..8].copy_from_slice(&pm4_header.to_le_bytes());
+        bytes[8..12].copy_from_slice(&(address as u32 & 0xffff_fffc).to_le_bytes());
+        bytes[12..16].copy_from_slice(&((address >> 32) as u32).to_le_bytes());
+        bytes[16..20].copy_from_slice(&(dwords | IB_VALID | IB_TEMPORAL_LU).to_le_bytes());
+        bytes[20..24].copy_from_slice(&10_u32.to_le_bytes());
+        bytes[56..64].copy_from_slice(&completion_signal.0.to_le_bytes());
+        Ok(Self {
+            bytes,
+            header_word: u32::from(aql_header) | (1_u32 << 16),
+        })
+    }
+
     fn copy<T>(packet: &T, header_word: u32) -> Self {
         debug_assert_eq!(std::mem::size_of::<T>(), AQL_PACKET_BYTES);
         let mut bytes = [0_u8; AQL_PACKET_BYTES];
@@ -462,6 +501,8 @@ pub enum PacketError {
         count: usize,
         capacity: usize,
     },
+    InvalidIndirectBufferAddress(u64),
+    InvalidIndirectBufferSize(u32),
 }
 
 impl fmt::Display for PacketError {
@@ -508,6 +549,14 @@ impl fmt::Display for PacketError {
             Self::TooManyBarrierDependencies { count, capacity } => write!(
                 f,
                 "barrier has {count} dependencies; one AQL packet holds {capacity}"
+            ),
+            Self::InvalidIndirectBufferAddress(address) => write!(
+                f,
+                "PM4 indirect buffer address 0x{address:x} is null or unaligned"
+            ),
+            Self::InvalidIndirectBufferSize(dwords) => write!(
+                f,
+                "PM4 indirect buffer size {dwords} dwords is outside 1..=0xfffff"
             ),
         }
     }
@@ -603,6 +652,28 @@ mod tests {
                 abi::Signal(0),
                 abi::Signal(0)
             ]
+        );
+    }
+
+    #[test]
+    fn pm4_ib_packet_matches_aqlprofile_vendor_layout() {
+        let packet = PacketImage::pm4_indirect_buffer(
+            0x1234_5678_9000_usize as *mut c_void,
+            0x321,
+            abi::Signal(0x5566_7788_99aa_bbcc),
+        )
+        .unwrap();
+        assert_eq!(packet.header_word, 0x0001_0100);
+        assert_eq!(&packet.bytes[0..4], &0x0001_0100_u32.to_le_bytes());
+        assert_eq!(&packet.bytes[4..8], &0xc002_3f00_u32.to_le_bytes());
+        assert_eq!(&packet.bytes[8..12], &0x5678_9000_u32.to_le_bytes());
+        assert_eq!(&packet.bytes[12..16], &0x0000_1234_u32.to_le_bytes());
+        assert_eq!(&packet.bytes[16..20], &0x3080_0321_u32.to_le_bytes());
+        assert_eq!(&packet.bytes[20..24], &10_u32.to_le_bytes());
+        assert!(packet.bytes[24..56].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            &packet.bytes[56..64],
+            &0x5566_7788_99aa_bbcc_u64.to_le_bytes()
         );
     }
 

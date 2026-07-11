@@ -19,12 +19,92 @@ The source repository's certified results are:
   uninstrumented host-total timing, with separately profiled GPU lower bounds
   still above the historical RADV 1.14x result.
 
-No raw PM4/KMD path from Hipfire's older `redline` crate is used by this graft.
+No raw KMD submission path from Hipfire's older `redline` crate is used by the
+Qwen replay route.
 
-This branch does not transparently route `rdna-compute`'s raw `void **` launch
-surface to AQL. The central launch hook records kernel/grid/block metadata only;
-it cannot safely infer pointer aliasing, read/write intent, allocation lifetime,
-or the kernarg ABI. A model adapter must supply those declarations, build a
-`CompiledPlan`, run the two shadow certifications, and explicitly install the
-prepared plan before `auto` can report itself ready. Until that adapter exists,
-all real launches continue through HIP in every mode.
+The Qwen3.5 adapter now records the exact padded HIP kernarg bytes and owning
+code object for one ordinary single-token AR forward. `auto` lowers that fixed
+sequence to one public-HSA queue after the first eligible forward. Speculative,
+MTP re-seed, and verify forwards share HipGraph's one-shot
+`ar_graph_eligible` contract and can neither populate nor consume the plain-AR
+replay. Dynamic position stays in `pos_buf`; the stochastic GDN frame scalar is
+patched between replays. Any queue or preparation failure poisons the controller
+and fails closed.
+
+For adapter development, `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` arms the recorder
+without collecting model load or repeated decode traffic. The daemon's
+`bench_prefill` and `bench_decode` probes may then delimit one phase and return
+its launch-sequence fingerprint. These diagnostics do not install or route a
+plan; see `scripts/redline_daemon_harness.py` and the phase-capture checkpoint.
+
+## Local gfx1201 certification (2026-07-11, automatic clocks)
+
+- Qwen3.5 0.8B: 356 dispatches / 21 kernels, sequence hash
+  `55f99a58cb4b9363`.
+- Qwen3.5 9B: 475 dispatches / 21 kernels, sequence hash
+  `ac6495c537cd3e2a`.
+- Fifteen consecutive positions are bit-exact for logits, KV, and recurrent
+  state against both ordinary HIP execution and an exact HIP-kernarg-blob
+  oracle on both models.
+- The terminal packet uses agent release: the host consumes only the completion
+  signal, while payload buffers are consumed by the next queue on the same GPU.
+  This remained exact across the 15-position gate and reduced direct shadow
+  time to 42.999 ms vs 45.886 ms on 0.8B and 156.569 ms vs 158.078 ms on 9B.
+- Against the already-tuned HipGraph product path, per-dispatch AQL publication
+  is not yet a product win: resident medians were 363.762 vs 364.129 tok/s on
+  0.8B and 97.820 vs 97.806 tok/s on 9B. Treat both as neutral.
+
+The retained gfx12 PM4 indirect-buffer transport is now implemented behind
+`HIPFIRE_REPLAY_TRANSPORT=pm4`. It keeps public ROCr queue/resource ownership,
+but replaces the 356/475 per-dispatch AQL packet publications with one AMD
+vendor packet pointing at executable HSA command memory. Kernel descriptor
+resources and the relocated code entry are parsed from the exact HSA-loaded
+code object; unsupported scratch or implicit-SGPR contracts fail closed.
+
+The daemon coherence seam established the cache policy instruction by
+instruction. `CS_PARTIAL_FLUSH` orders dependent dispatches, while gfx12
+`ACQUIRE_MEM` is retained around the full-scope repeat-interleave, RoPE,
+MQ-rotation, and fused-SiLU boundaries. Three proven-independent sibling pairs
+omit their intermediate compute-idle wait and fan in at the next dependent
+boundary. Fifteen consecutive positions remain bit-exact for logits, KV, and
+recurrent state on both models.
+
+Matched resident product measurements at automatic clocks (10 runs, 100 decode
+positions per run, median) compare the existing HipGraph route with the normal
+auto-capture PM4 route:
+
+- Qwen3.5 0.8B: 363.682 -> 392.248 tok/s, **1.07855x**.
+- Qwen3.5 9B: 97.727 -> 98.775 tok/s, **1.01073x**.
+
+The product lifecycle must arm capture at the first eligible plain-AR forward;
+recording from model load accidentally mixes prefill setup into the decode tape
+and correctly triggers fail-closed artifact validation. Reproduce with
+`scripts/redline_product_bench.py --transport pm4`; `.redline-work/` holds the
+local raw JSON and daemon logs and is not a source artifact.
+
+The user-facing `serve_harness.py` transport/performance gate also completed at
+automatic clocks without replay faults. A five-prompt greedy battery reported
+no runaways and averaged 384.7 decode tok/s for Qwen3.5 0.8B and 99.3 tok/s for
+Qwen3.5 9B; prompt prefill ranged from 4.7-7.4 ms and 18.3-33.3 ms respectively.
+The response-coherence gate did not pass: the current Qwen thinking/content
+split yielded empty visible `content` after valid `stop` finishes. That failure
+reproduces outside the retained transport and remains a separate response-
+framing issue.
+
+## MTP boundary
+
+The retained transport was also tested on the bundled full-vocabulary
+`qwen3.5-9b.mq4-mtp` proposal head. A single retained region reproduces the
+first proposal step, but K>1 diverges when a later proposal consumes mutable
+token/KV state from the prior proposal. Splitting the region at token-chain
+boundaries and switching between PM4 and direct AQL does not restore parity;
+K=1 is slower than HIP (124.75 vs 134.78 tok/s). That route is therefore not
+shipped or selectable.
+
+The existing HipGraph proposal executor is now permitted to capture the same
+full-vocabulary Q8 head. It is token-identical at K=3 (tau 3.4737 and matching
+output), but remains neutral/slightly negative at 186.06 vs 187.95 tok/s, so it
+stays behind the existing explicit `HIPFIRE_MTP_PROPOSAL_GRAPH=on` opt-in. The
+product combination is consequently Redline PM4 for certified ordinary decode
+and the established HIP MTP path for speculative decode; there is no unsafe
+automatic crossover.

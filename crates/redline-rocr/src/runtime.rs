@@ -1443,6 +1443,29 @@ impl KernargPool {
     pub fn allocate_for(&self, metadata: KernelMetadata) -> Result<KernargBuffer, RuntimeError> {
         let length = metadata.kernarg_segment_size as usize;
         let required_alignment = (metadata.kernarg_segment_alignment as usize).max(16);
+        self.allocate_bytes(
+            length,
+            required_alignment,
+            abi::AMD_MEMORY_POOL_STANDARD_FLAG,
+        )
+    }
+
+    /// Allocate CPU-writable, GPU-accessible command memory. The executable
+    /// flag is required for MEC indirect-buffer fetches even though the PM4
+    /// words are data rather than shader ISA.
+    pub fn allocate_executable_bytes(
+        &self,
+        length: usize,
+    ) -> Result<KernargBuffer, RuntimeError> {
+        self.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG)
+    }
+
+    fn allocate_bytes(
+        &self,
+        length: usize,
+        required_alignment: usize,
+        flags: u32,
+    ) -> Result<KernargBuffer, RuntimeError> {
         if !required_alignment.is_power_of_two() {
             return Err(RuntimeError::InvalidKernargAlignment(required_alignment));
         }
@@ -1464,7 +1487,7 @@ impl KernargPool {
             (self.inner.runtime.symbols.memory_pool_allocate)(
                 self.inner.pool,
                 allocation_size,
-                abi::AMD_MEMORY_POOL_STANDARD_FLAG,
+                flags,
                 &mut pointer,
             )
         };

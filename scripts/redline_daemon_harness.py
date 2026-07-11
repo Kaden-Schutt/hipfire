@@ -114,6 +114,12 @@ def main():
     parser.add_argument("--capture-repeats", type=int, default=2)
     parser.add_argument("--measure-repeats", type=int, default=5)
     parser.add_argument("--decode-iterations", type=int, default=100)
+    parser.add_argument(
+        "--shadow-iterations",
+        type=int,
+        default=1,
+        help="consecutive token positions compared by the AQL/HIP/blob parity gate",
+    )
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--prefix", type=int, help="compare only the first N captured launches")
@@ -234,7 +240,11 @@ def main():
         )
         if args.prefix is None:
             report["aql_shadow"] = daemon.request(
-                {"type": "redline_shadow_aql", "context_tokens": args.decode_context}
+                {
+                    "type": "redline_shadow_aql",
+                    "context_tokens": args.decode_context,
+                    "iterations": args.shadow_iterations,
+                }
             )
             shadow_pass = report["aql_shadow"]["bit_exact"]
             print(

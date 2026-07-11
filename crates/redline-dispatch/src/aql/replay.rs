@@ -10,8 +10,8 @@ use redline_rocr::packet::{
     PacketError, PacketImage,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, GpuDevice, KernargBuffer, Kernel, QueueDepthReport,
-    QueueSet, RuntimeError,
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, GpuDevice, HeaderPolicy, KernargBuffer, Kernel,
+    QueueDepthReport, QueueSet, RuntimeError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,7 +618,16 @@ impl SingleQueueBatchGraph {
             )?;
             batch.push(PacketImage::kernel(&packet));
         }
-        let terminal = BarrierAndPacket::new_two_queue_host_terminal(&[], final_signal.raw())?;
+        // The host consumes only the completion signal; every payload buffer
+        // is consumed next by another queue on the same GPU agent. Agent
+        // release is therefore sufficient here and avoids a whole-system
+        // writeback at every token boundary. The following HIP submission is
+        // issued only after the host observes this terminal signal.
+        let terminal = BarrierAndPacket::new_with_policy(
+            &[],
+            final_signal.raw(),
+            HeaderPolicy::BATCH_INTERNAL_RELEASE_AGENT,
+        )?;
         batch.push(PacketImage::barrier(&terminal));
         let capacity = queues.size(0).expect("one queue was created") as usize;
         if batch.len() > capacity {
