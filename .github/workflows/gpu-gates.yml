@@ -131,6 +131,16 @@ jobs:
         with:
           name: gate-results-${{ matrix.box }}
           path: results/*.json
+      - name: Clean up the ephemeral PR checkout
+        if: always()
+        run: |
+          # The runner PROCESS persists (systemd service); the PR's checked-out CODE
+          # and build artifacts are EPHEMERAL and must not linger on the box between
+          # runs. Reset to a clean detached state and drop every untracked/ignored
+          # file (target/, built daemons, .hsaco caches, results/).
+          git reset --hard HEAD 2>/dev/null || true
+          git clean -ffdx 2>/dev/null || true
+          git checkout --detach 2>/dev/null || true
 
   interpret:
     name: interpret + verdict
