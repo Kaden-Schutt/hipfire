@@ -17,6 +17,19 @@ injected as a seam so the whole flow is unit-testable with no GPU and no real gi
 Reuses the Phase-1 `run_gate` (as an injected `run_merged_gate` thunk) and the
 `agent_exec` codex seam (as an injected `merge_fix`).
 
+> **Correction (post-adversarial-review, fix commit `b15d40e3`).** Two code
+> blocks below are WRONG as originally written — the passing tests hid it because
+> the mocks shared the same wrong assumption. Use the corrected forms:
+> 1. **Task 1 `trial_merge` conflict parse.** Real `git merge-tree --write-tree
+>    --name-only` output on conflict is `<OID>\n<conflicted path>*\n\n<freeform
+>    Auto-merging/CONFLICT prose>` — the paths are the lines **before** the first
+>    blank, not after. Parse `for ln in lines[1:]: if not ln.strip(): break;
+>    conflicts.append(ln.strip())`, and make `_git_conflict` put the path before
+>    the blank + prose after.
+> 2. **Task 3 `gate4` BOD.** Do not partition reasons by `perf`/`coher` substrings
+>    (drops `parity`/`cross_arch`). Give `assemble_bod` a generic `reasons=`
+>    itemizer and call `assemble_bod(reasons=g.get("reasons", []))`.
+
 ## Global Constraints
 
 - **No-GPU unit-testable** — every side-effect (git, the merged-tree gate, the
