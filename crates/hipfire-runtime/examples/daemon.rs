@@ -5613,10 +5613,7 @@ fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
 /// per-arch arms are no-ops when that arch is not loaded, so calling this
 /// function on any LoadedModel is always safe.
 fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
-    m.session.seq_pos = 0;
-    m.session.conversation_tokens.clear();
-    free_checkpoints(&mut m.session.prefill_checkpoints, gpu);
-    free_checkpoints(&mut m.session.dflash_checkpoints, gpu);
+    m.session.reset(gpu);
     if let Some(s) = m.speculator.as_mut() {
         s.reset(gpu);
     }
@@ -5648,9 +5645,6 @@ fn model_reset_context(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // #462-class multi-turn bleed on the `reset` command for cohere2moe.
     if let Some(b) = m.cohere2moe_mut() {
         let _ = b.state.reset(gpu);
-    }
-    if let Some(ref mut ad) = m.session.kv_adaptive {
-        ad.reset();
     }
     // Mesh (multi-GPU) state. The flipped EP/dense serve paths already reset per
     // turn (generate_ep's ep_reset_ds4_state / minimax's LCP rewind / dense's cold
