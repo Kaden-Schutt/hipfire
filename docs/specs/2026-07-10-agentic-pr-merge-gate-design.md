@@ -233,11 +233,11 @@ the ancestry it shows "merged"; otherwise "closed (landed via stack)".
 
 ## 12. Authority & triggers
 
-| Author | Gate acts? | On pass |
+| Author | Gate acts? | On green pass |
 |---|---|---|
-| **Kaden-Schutt** | yes (open, non-draft) | agent **auto-merges** (only Kaden auto-merges, for now) — the agentic review *is* the approval that gates everyone else |
-| **fivetide / unverbraucht / nwoolmer** | yes (open, non-draft) | agent posts **"✅ all gates green — cleared to merge"**; the maintainer merges with their **own** rights once the required gate check is green. Agent does **not** auto-merge them. |
-| **non-maintainer** | **only if a maintainer runs `/gate`** | on pass → "cleared to merge"; the **invoking maintainer** merges |
+| **Kaden-Schutt** | yes (open, non-draft) | agent **auto-merges** — only Kaden auto-merges, for now (behind the `GATE_AUTOMERGE` kill-switch). |
+| **fivetide / unverbraucht / nwoolmer** | yes (open, non-draft) | agent posts **"✅ green — comment `/merge` and I'll land it"**; the maintainer comments **`/merge`** → the **agent merges on their behalf** (re-confirming green first). Agent never merges them unprompted. |
+| **non-maintainer** | **only if a maintainer runs `/gate`** | on pass, the **invoking maintainer** comments `/merge` → agent merges on their behalf |
 | **Draft (any author)** | no | on invocation → **verdict + BOD only**, never merges |
 
 The gate **acts only** on maintainer-authored PRs, or when a maintainer runs
@@ -245,11 +245,13 @@ The gate **acts only** on maintainer-authored PRs, or when a maintainer runs
 `auto_merge_authors` (Kaden only, for now) live in `pr_gate.toml`. Fork PRs never
 auto-run (secrets withheld — the `claude-review` trust boundary).
 
-**Enforcement:** make the `gpu-gate / *` checks **required status checks** on
-master (branch protection) — then no one merges until the gate is green, the gate
-passing *is* what clears a maintainer to merge, and Kaden's is the only PR the
-agent merges automatically. This keeps maintainer GitHub permissions unchanged (no
-`@claude /merge` command needed).
+**The `/merge` command (`gate-merge.yml`).** Maintainer GitHub permissions are
+**unchanged** — a maintainer's `/merge` comment is their explicit approval, and the
+**agent executes the merge on their behalf**. The handler re-confirms the
+`gpu-gate / *` check-runs on the current head are ALL green before merging (never
+relies on branch protection alone), so a maintainer can never land a red/stale
+gate. Optionally also make `gpu-gate / *` **required status checks** on master as
+belt-and-suspenders.
 
 **"Meaningfully helpful" (the auto-merge judgment).** After all deterministic
 gates pass, Claude gates auto-merge on a helpfulness check to keep no-op churn
@@ -262,12 +264,13 @@ revert-churn, or a change whose only effect is a (permitted, sub-significance)
 regression. Helpfulness is a *merge* gate, not a *pass* gate — an unhelpful PR
 still gets a green verdict + a "no-op: clarify intent" note rather than a BOD.
 
-**Permissions:** the agent (Claude App / the elevated `interpret` job) holds
-`pull-requests: write` + `contents: write` — used **only** to auto-merge Kaden's
-green PRs and to post verdicts. Maintainers gain **no** new GitHub permission;
-they merge their own green PRs with their existing rights (the required gate check
-is what gates them). Auto-merge sits behind a repo kill-switch — the
-`GATE_AUTOMERGE` variable (must equal `on`; default off posts "would auto-merge").
+**Permissions:** the agent holds `pull-requests: write` + `contents: write` (in
+the elevated `interpret` job and `gate-merge.yml`) — used to (a) auto-merge
+Kaden's green PRs, (b) merge a maintainer's green PR **on their behalf when they
+comment `/merge`**, and (c) post verdicts. Maintainers gain **no** new GitHub
+permission — their `/merge` comment is the approval, the agent executes. Auto-merge
+(the only *unprompted* merge) sits behind a repo kill-switch — the `GATE_AUTOMERGE`
+variable (must equal `on`; default off posts "would auto-merge").
 
 ## 13. `ar gate` engine (the reusable core)
 

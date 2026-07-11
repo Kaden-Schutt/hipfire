@@ -215,9 +215,10 @@ jobs:
               --merge`, subject to the kill-switch above); if it is a no-op / unclear, instead comment
               "green but no measurable improvement — clarify intent" and do NOT merge.
             - "tag_maintainer": this is a non-Kaden maintainer PR, or a maintainer-invoked non-maintainer
-              PR. Post "✅ all gates green — cleared to merge." Do NOT merge and do NOT instruct
-              `@claude /merge` — only Kaden-Schutt auto-merges (for now); everyone else merges with
-              their own rights once this required gate check is green.
+              PR. Post "✅ all gates green — a maintainer can land it by commenting `/merge` and I'll
+              merge it on your behalf." Do NOT merge here yourself — only Kaden-Schutt auto-merges (for
+              now); everyone else lands via the `/merge` command (the gate-merge workflow), which merges
+              on the commenting maintainer's behalf ONLY after re-confirming the gpu-gate is green.
             - "draft_report": post the verdict + BOD; NEVER merge.
 
             Always post exactly ONE concise verdict comment, prefixed "### GPU PR Gate (Tier 3)",
